@@ -63,7 +63,8 @@ pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";
 pub const SERVER_TO_CLIENT_AAD: &[u8] = b"ParallaX v1 server appdata";
 
 pub fn max_plaintext_len(max_padding: u16) -> usize {
-    record::MAX_TLS_RECORD_PAYLOAD - max_padding as usize - AEAD_TAG_LEN - PADDING_LEN_FIELD
+    record::MAX_TLS_RECORD_PAYLOAD
+        .saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }
 
 #[cfg(test)]
@@ -103,5 +104,22 @@ mod tests {
         assert!(matches!(dec.open(&bad), Err(DataRecordError::Aead(_))));
         let good = enc.seal(b"hello", &mut rng).unwrap();
         assert_eq!(dec.open(&good).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn max_plaintext_len_saturates_when_padding_exceeds_record_capacity() {
+        assert_eq!(max_plaintext_len(u16::MAX), 0);
+        assert_eq!(
+            max_plaintext_len(
+                (record::MAX_TLS_RECORD_PAYLOAD - AEAD_TAG_LEN - PADDING_LEN_FIELD) as u16
+            ),
+            0
+        );
+        assert_eq!(
+            max_plaintext_len(
+                (record::MAX_TLS_RECORD_PAYLOAD - AEAD_TAG_LEN - PADDING_LEN_FIELD - 1) as u16
+            ),
+            1
+        );
     }
 }

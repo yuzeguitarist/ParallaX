@@ -66,7 +66,10 @@ pub enum ServerIdentityProofError {
 
 impl ConnectRequest {
     pub fn target(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        match self.host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => format!("[{}]:{}", self.host, self.port),
+            _ => format!("{}:{}", self.host, self.port),
+        }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, ConnectRequestError> {
@@ -249,6 +252,17 @@ mod tests {
 
         let encoded = request.encode().unwrap();
         assert_eq!(ConnectRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn connect_request_target_brackets_ipv6_literals() {
+        let request = ConnectRequest {
+            host: "::1".to_owned(),
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+
+        assert_eq!(request.target(), "[::1]:443");
     }
 
     #[test]
