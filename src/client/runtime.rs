@@ -204,3 +204,122 @@ fn is_clean_close(err: &io::Error) -> bool {
 fn _request_target(request: &SocksRequest) -> String {
     request.target()
 }
+
+#[cfg(test)]
+mod tests {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        time::{timeout, Duration},
+    };
+
+    use super::*;
+    use crate::{
+        config::ServerConfig,
+        crypto::session::X25519KeyPair,
+        handshake::server,
+        tls::{record::read_record, server_hello::tests::server_hello_fixture},
+    };
+
+    const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn socks_client_reaches_target_through_parallax_server() {
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (mut stream, _) = fallback_listener.accept().await.unwrap();
+            let _client_hello = read_record(&mut stream).await.unwrap();
+            stream.write_all(&server_hello_fixture()).await.unwrap();
+            let _ccs = timeout(Duration::from_secs(1), read_record(&mut stream))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_config = ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            fallback_addr: fallback_addr.to_string(),
+            data_target: None,
+            private_key: STANDARD.encode(server_keys.private),
+            authorized_sni: vec![String::from("example.com")],
+            strict_tls13: true,
+        };
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = parallax_listener.accept().await.unwrap();
+            server::handle_connection(stream, &server_config, TrafficConfig::default(), PSK)
+                .await
+                .unwrap();
+        });
+
+        let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        let client_config = ClientConfig {
+            listen: local_addr,
+            server_addr: parallax_addr.to_string(),
+            sni: "example.com".to_owned(),
+            server_public_key: STANDARD.encode(server_keys.public),
+        };
+        let client_task = tokio::spawn(async move {
+            let (stream, _) = local_listener.accept().await.unwrap();
+            handle_local_connection(
+                stream,
+                &client_config,
+                TrafficConfig::default(),
+                PSK,
+                &server_keys.public,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut app = TcpStream::connect(local_addr).await.unwrap();
+        app.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0_u8; 2];
+        app.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+
+        app.write_all(&[
+            5,
+            1,
+            0,
+            1,
+            127,
+            0,
+            0,
+            1,
+            (target_addr.port() >> 8) as u8,
+            (target_addr.port() & 0xff) as u8,
+        ])
+        .await
+        .unwrap();
+        let mut socks_reply = [0_u8; 10];
+        app.read_exact(&mut socks_reply).await.unwrap();
+        assert_eq!(socks_reply[0..2], [5, 0]);
+
+        app.write_all(b"ping").await.unwrap();
+        let mut response = [0_u8; 4];
+        app.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+
+        drop(app);
+        client_task.await.unwrap();
+        server_task.await.unwrap();
+        target_task.await.unwrap();
+        fallback_task.await.unwrap();
+    }
+}
