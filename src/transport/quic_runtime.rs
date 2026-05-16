@@ -1,16 +1,20 @@
 use std::{
     io,
     net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use hmac::{Hmac, Mac};
 use quinn::{crypto::rustls::QuicClientConfig, Endpoint};
+use rand::{rngs::OsRng, RngCore};
 use rcgen::generate_simple_self_signed;
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
     DigitallySignedStruct, SignatureScheme,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{copy, AsyncWriteExt},
@@ -19,12 +23,21 @@ use tokio::{
 
 use crate::{
     client::socks,
-    config::{ClientConfig, Config, ConfigError, Mode, ServerConfig},
+    config::{decode_psk, ClientConfig, Config, ConfigError, Mode, ServerConfig},
+    crypto::replay::{ReplayCache, ReplayCacheError, ReplayEntry},
     protocol::command::{ConnectRequest, ConnectRequestError},
 };
 
 const QUIC_ALPN: &[u8] = b"h3";
+const QUIC_AUTH_MAGIC: &[u8; 4] = b"PX1U";
+const QUIC_AUTH_LABEL: &[u8] = b"ParallaX v1 QUIC stream auth";
+const QUIC_AUTH_NONCE_LEN: usize = 16;
+const QUIC_AUTH_TAG_LEN: usize = 32;
+const QUIC_AUTH_WINDOW_SECS: u64 = 90;
+const MAX_AUTH_FRAME_LEN: usize = 512;
 const MAX_CONNECT_FRAME_LEN: usize = 4096;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Error)]
 pub enum QuicRuntimeError {
@@ -66,22 +79,45 @@ pub enum QuicRuntimeError {
     ConnectFrameTooLarge,
     #[error("connect frame length is invalid")]
     InvalidConnectFrameLength,
+    #[error("QUIC auth frame is too large")]
+    AuthFrameTooLarge,
+    #[error("QUIC auth frame is truncated")]
+    AuthFrameTruncated,
+    #[error("QUIC auth magic mismatch")]
+    AuthBadMagic,
+    #[error("QUIC auth SNI is not allowed: {0}")]
+    AuthSniNotAllowed(String),
+    #[error("QUIC auth tag mismatch")]
+    AuthTagMismatch,
+    #[error("QUIC auth timestamp is outside the allowed window")]
+    AuthStale,
+    #[error("QUIC auth replay detected")]
+    AuthReplay,
+    #[error("QUIC replay cache error: {0}")]
+    ReplayCache(#[from] ReplayCacheError),
+    #[error("system clock is before UNIX epoch")]
+    AuthClock,
 }
 
 pub async fn run_server(config: Config) -> Result<(), QuicRuntimeError> {
     if config.mode != Mode::Server {
         return Err(QuicRuntimeError::WrongServerMode);
     }
+    let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
     let server = config.server.ok_or(QuicRuntimeError::MissingServer)?;
+    let replay_cache = Arc::new(Mutex::new(ReplayCache::new(8192)));
     let endpoint = Endpoint::server(server_config(&server)?, server.listen)?;
     tracing::info!("ParallaX QUIC server listening on udp://{}", server.listen);
 
     while let Some(incoming) = endpoint.accept().await {
         let server = server.clone();
+        let psk = Arc::clone(&psk);
+        let replay_cache = Arc::clone(&replay_cache);
         tokio::spawn(async move {
             match incoming.await {
                 Ok(connection) => {
-                    if let Err(err) = handle_connection(connection, server).await {
+                    if let Err(err) = handle_connection(connection, server, psk, replay_cache).await
+                    {
                         tracing::debug!(error = %err, "QUIC connection closed");
                     }
                 }
@@ -97,6 +133,7 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
     if config.mode != Mode::Client {
         return Err(QuicRuntimeError::WrongClientMode);
     }
+    let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
     let client = config.client.ok_or(QuicRuntimeError::MissingClient)?;
     let server_addr = resolve_addr(&client.server_addr)?;
     let mut endpoint = Endpoint::client(bind_any_addr(server_addr))?;
@@ -112,8 +149,11 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
         let (local, peer) = listener.accept().await?;
         let endpoint = endpoint.clone();
         let client = client.clone();
+        let psk = Arc::clone(&psk);
         tokio::spawn(async move {
-            if let Err(err) = handle_local_connection(local, endpoint, server_addr, client).await {
+            if let Err(err) =
+                handle_local_connection(local, endpoint, server_addr, client, psk).await
+            {
                 tracing::debug!(%peer, error = %err, "QUIC client stream closed");
             }
         });
@@ -123,6 +163,8 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
 async fn handle_connection(
     connection: quinn::Connection,
     server: ServerConfig,
+    psk: Arc<Vec<u8>>,
+    replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
     loop {
         let (send, recv) = match connection.accept_bi().await {
@@ -132,8 +174,10 @@ async fn handle_connection(
             Err(err) => return Err(err.into()),
         };
         let server = server.clone();
+        let psk = Arc::clone(&psk);
+        let replay_cache = Arc::clone(&replay_cache);
         tokio::spawn(async move {
-            if let Err(err) = handle_stream(send, recv, server).await {
+            if let Err(err) = handle_stream(send, recv, server, psk, replay_cache).await {
                 tracing::debug!(error = %err, "QUIC stream closed");
             }
         });
@@ -144,8 +188,19 @@ async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     server: ServerConfig,
+    psk: Arc<Vec<u8>>,
+    replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
-    let request = read_connect_request(&mut recv).await?;
+    let auth_frame = read_auth_frame(&mut recv).await?;
+    let connect_payload = read_len_prefixed(&mut recv, MAX_CONNECT_FRAME_LEN).await?;
+    verify_auth_frame(
+        &auth_frame,
+        &psk,
+        &connect_payload,
+        &server.authorized_sni,
+        &replay_cache,
+    )?;
+    let request = ConnectRequest::decode(&connect_payload)?;
     let target_addr = server
         .data_target
         .clone()
@@ -180,6 +235,7 @@ async fn handle_local_connection(
     endpoint: Endpoint,
     server_addr: SocketAddr,
     client: ClientConfig,
+    psk: Arc<Vec<u8>>,
 ) -> Result<(), QuicRuntimeError> {
     local.set_nodelay(true)?;
     let request = socks::accept_connect(&mut local).await?;
@@ -190,7 +246,7 @@ async fn handle_local_connection(
         port: request.port,
         initial_payload: Vec::new(),
     };
-    write_connect_request(&mut send, &connect).await?;
+    write_authenticated_connect_request(&mut send, &psk, &client.sni, &connect).await?;
 
     let (mut local_read, mut local_write) = local.into_split();
     let upload = async {
@@ -209,32 +265,205 @@ async fn handle_local_connection(
     Ok(())
 }
 
-async fn write_connect_request(
+async fn write_authenticated_connect_request(
     send: &mut quinn::SendStream,
+    psk: &[u8],
+    sni: &str,
     request: &ConnectRequest,
 ) -> Result<(), QuicRuntimeError> {
-    let encoded = request.encode()?;
-    if encoded.len() > MAX_CONNECT_FRAME_LEN {
+    let connect_payload = request.encode()?;
+    if connect_payload.len() > MAX_CONNECT_FRAME_LEN {
         return Err(QuicRuntimeError::ConnectFrameTooLarge);
     }
-    send.write_all(&(encoded.len() as u16).to_be_bytes())
-        .await?;
-    send.write_all(&encoded).await?;
+    let auth = build_auth_frame(psk, sni, &connect_payload)?;
+    write_len_prefixed(send, &auth, MAX_AUTH_FRAME_LEN).await?;
+    write_len_prefixed(send, &connect_payload, MAX_CONNECT_FRAME_LEN).await?;
     Ok(())
 }
 
-async fn read_connect_request(
+async fn read_auth_frame(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, QuicRuntimeError> {
+    read_len_prefixed(recv, MAX_AUTH_FRAME_LEN).await
+}
+
+async fn write_len_prefixed(
+    send: &mut quinn::SendStream,
+    payload: &[u8],
+    max_len: usize,
+) -> Result<(), QuicRuntimeError> {
+    if payload.is_empty() || payload.len() > max_len || payload.len() > u16::MAX as usize {
+        return Err(QuicRuntimeError::InvalidConnectFrameLength);
+    }
+    send.write_all(&(payload.len() as u16).to_be_bytes())
+        .await?;
+    send.write_all(payload).await?;
+    Ok(())
+}
+
+async fn read_len_prefixed(
     recv: &mut quinn::RecvStream,
-) -> Result<ConnectRequest, QuicRuntimeError> {
+    max_len: usize,
+) -> Result<Vec<u8>, QuicRuntimeError> {
     let mut len = [0_u8; 2];
     recv.read_exact(&mut len).await?;
     let len = u16::from_be_bytes(len) as usize;
-    if len == 0 || len > MAX_CONNECT_FRAME_LEN {
+    if len == 0 || len > max_len {
         return Err(QuicRuntimeError::InvalidConnectFrameLength);
     }
-    let mut encoded = vec![0_u8; len];
-    recv.read_exact(&mut encoded).await?;
-    Ok(ConnectRequest::decode(&encoded)?)
+    let mut payload = vec![0_u8; len];
+    recv.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+fn build_auth_frame(
+    psk: &[u8],
+    sni: &str,
+    connect_payload: &[u8],
+) -> Result<Vec<u8>, QuicRuntimeError> {
+    let unix_time = unix_time_secs()?;
+    let mut nonce = [0_u8; QUIC_AUTH_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let tag = quic_auth_tag(psk, unix_time, &nonce, sni, connect_payload);
+
+    let sni_bytes = sni.as_bytes();
+    if sni_bytes.is_empty()
+        || sni_bytes.len() > u16::MAX as usize
+        || 4 + 8 + QUIC_AUTH_NONCE_LEN + 2 + sni_bytes.len() + QUIC_AUTH_TAG_LEN
+            > MAX_AUTH_FRAME_LEN
+    {
+        return Err(QuicRuntimeError::AuthFrameTooLarge);
+    }
+
+    let mut out =
+        Vec::with_capacity(4 + 8 + QUIC_AUTH_NONCE_LEN + 2 + sni_bytes.len() + QUIC_AUTH_TAG_LEN);
+    out.extend_from_slice(QUIC_AUTH_MAGIC);
+    out.extend_from_slice(&unix_time.to_be_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(sni_bytes);
+    out.extend_from_slice(&tag);
+    Ok(out)
+}
+
+fn verify_auth_frame(
+    auth_frame: &[u8],
+    psk: &[u8],
+    connect_payload: &[u8],
+    authorized_sni: &[String],
+    replay_cache: &Mutex<ReplayCache>,
+) -> Result<(), QuicRuntimeError> {
+    let parsed = parse_auth_frame(auth_frame)?;
+    if !authorized_sni
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(&parsed.sni))
+    {
+        return Err(QuicRuntimeError::AuthSniNotAllowed(parsed.sni));
+    }
+
+    let now = unix_time_secs()?;
+    let age = now.abs_diff(parsed.unix_time);
+    if age > QUIC_AUTH_WINDOW_SECS {
+        return Err(QuicRuntimeError::AuthStale);
+    }
+
+    let expected = quic_auth_tag(
+        psk,
+        parsed.unix_time,
+        &parsed.nonce,
+        &parsed.sni,
+        connect_payload,
+    );
+    if expected != parsed.tag {
+        return Err(QuicRuntimeError::AuthTagMismatch);
+    }
+
+    let fingerprint: [u8; 32] = Sha256::digest(auth_frame).into();
+    let mut replay_nonce = [0_u8; 8];
+    replay_nonce.copy_from_slice(&parsed.nonce[..8]);
+    let replay_entry = ReplayEntry {
+        timestamp: parsed.unix_time,
+        nonce: replay_nonce,
+        transcript_fingerprint: fingerprint,
+    };
+    if !replay_cache
+        .lock()
+        .expect("QUIC replay cache poisoned")
+        .insert_new(replay_entry, now)?
+    {
+        return Err(QuicRuntimeError::AuthReplay);
+    }
+
+    Ok(())
+}
+
+fn parse_auth_frame(input: &[u8]) -> Result<ParsedQuicAuth, QuicRuntimeError> {
+    let min_len = 4 + 8 + QUIC_AUTH_NONCE_LEN + 2 + QUIC_AUTH_TAG_LEN;
+    if input.len() < min_len {
+        return Err(QuicRuntimeError::AuthFrameTruncated);
+    }
+    if &input[..4] != QUIC_AUTH_MAGIC {
+        return Err(QuicRuntimeError::AuthBadMagic);
+    }
+
+    let unix_time = u64::from_be_bytes(input[4..12].try_into().expect("fixed timestamp length"));
+    let mut nonce = [0_u8; QUIC_AUTH_NONCE_LEN];
+    nonce.copy_from_slice(&input[12..12 + QUIC_AUTH_NONCE_LEN]);
+    let sni_len_offset = 12 + QUIC_AUTH_NONCE_LEN;
+    let sni_len = u16::from_be_bytes([input[sni_len_offset], input[sni_len_offset + 1]]) as usize;
+    let sni_start = sni_len_offset + 2;
+    let sni_end = sni_start
+        .checked_add(sni_len)
+        .ok_or(QuicRuntimeError::AuthFrameTruncated)?;
+    let tag_end = sni_end
+        .checked_add(QUIC_AUTH_TAG_LEN)
+        .ok_or(QuicRuntimeError::AuthFrameTruncated)?;
+    if tag_end != input.len() {
+        return Err(QuicRuntimeError::AuthFrameTruncated);
+    }
+
+    let sni = std::str::from_utf8(&input[sni_start..sni_end])
+        .map_err(|_| QuicRuntimeError::AuthFrameTruncated)?
+        .to_owned();
+    let mut tag = [0_u8; QUIC_AUTH_TAG_LEN];
+    tag.copy_from_slice(&input[sni_end..tag_end]);
+
+    Ok(ParsedQuicAuth {
+        unix_time,
+        nonce,
+        sni,
+        tag,
+    })
+}
+
+fn quic_auth_tag(
+    psk: &[u8],
+    unix_time: u64,
+    nonce: &[u8; QUIC_AUTH_NONCE_LEN],
+    sni: &str,
+    connect_payload: &[u8],
+) -> [u8; QUIC_AUTH_TAG_LEN] {
+    let mut mac = HmacSha256::new_from_slice(psk).expect("HMAC accepts any key length");
+    mac.update(QUIC_AUTH_LABEL);
+    mac.update(&unix_time.to_be_bytes());
+    mac.update(nonce);
+    mac.update(&(sni.len() as u16).to_be_bytes());
+    mac.update(sni.as_bytes());
+    mac.update(&(connect_payload.len() as u32).to_be_bytes());
+    mac.update(connect_payload);
+    mac.finalize().into_bytes().into()
+}
+
+fn unix_time_secs() -> Result<u64, QuicRuntimeError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| QuicRuntimeError::AuthClock)?
+        .as_secs())
+}
+
+struct ParsedQuicAuth {
+    unix_time: u64,
+    nonce: [u8; QUIC_AUTH_NONCE_LEN],
+    sni: String,
+    tag: [u8; QUIC_AUTH_TAG_LEN],
 }
 
 fn server_config(server: &ServerConfig) -> Result<quinn::ServerConfig, QuicRuntimeError> {
@@ -362,14 +591,52 @@ mod tests {
 
     #[tokio::test]
     async fn connect_request_frame_round_trip() {
+        let psk = b"0123456789abcdef0123456789abcdef";
         let request = ConnectRequest {
             host: "example.com".to_owned(),
             port: 443,
             initial_payload: Vec::new(),
         };
         let encoded = request.encode().unwrap();
+        let auth = build_auth_frame(psk, "example.com", &encoded).unwrap();
+        let replay = Mutex::new(ReplayCache::new(8));
+
         assert!(encoded.len() <= MAX_CONNECT_FRAME_LEN);
+        verify_auth_frame(
+            &auth,
+            psk,
+            &encoded,
+            &[String::from("example.com")],
+            &replay,
+        )
+        .unwrap();
         assert_eq!(ConnectRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn quic_auth_binds_connect_payload() {
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let good = ConnectRequest {
+            host: "example.com".to_owned(),
+            port: 443,
+            initial_payload: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let bad = ConnectRequest {
+            host: "blocked.example".to_owned(),
+            port: 443,
+            initial_payload: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let auth = build_auth_frame(psk, "example.com", &good).unwrap();
+        let replay = Mutex::new(ReplayCache::new(8));
+
+        assert!(matches!(
+            verify_auth_frame(&auth, psk, &bad, &[String::from("example.com")], &replay,),
+            Err(QuicRuntimeError::AuthTagMismatch)
+        ));
     }
 
     #[tokio::test]
@@ -402,7 +669,15 @@ mod tests {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
             let (send, recv) = connection.accept_bi().await.unwrap();
-            handle_stream(send, recv, server).await.unwrap();
+            handle_stream(
+                send,
+                recv,
+                server,
+                Arc::new(b"0123456789abcdef0123456789abcdef".to_vec()),
+                Arc::new(Mutex::new(ReplayCache::new(8))),
+            )
+            .await
+            .unwrap();
         });
 
         let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -413,8 +688,10 @@ mod tests {
             .await
             .unwrap();
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
-        write_connect_request(
+        write_authenticated_connect_request(
             &mut send,
+            b"0123456789abcdef0123456789abcdef",
+            "example.com",
             &ConnectRequest {
                 host: target_addr.ip().to_string(),
                 port: target_addr.port(),
