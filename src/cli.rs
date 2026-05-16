@@ -16,6 +16,7 @@ use crate::{
     },
     handshake::server,
     probe,
+    transport::quic_runtime,
 };
 
 #[derive(Debug, Parser)]
@@ -44,11 +45,17 @@ enum Command {
     Serve {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
+        /// Use UDP/QUIC transport instead of TCP camouflage transport.
+        #[arg(long)]
+        quic: bool,
     },
     /// Run the ParallaX local SOCKS5 client.
     Client {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
+        /// Use UDP/QUIC transport instead of TCP camouflage transport.
+        #[arg(long)]
+        quic: bool,
     },
     /// Run local CPU-only protocol benchmarks without touching system networking.
     #[command(name = "bench")]
@@ -128,15 +135,23 @@ pub async fn run() -> anyhow::Result<()> {
             anyhow::ensure!(plaintext == b"parallax", "AEAD self-test mismatch");
             println!("ok: crypto self-test passed");
         }
-        Command::Serve { config } => {
+        Command::Serve { config, quic } => {
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
-            server::run(cfg).await?;
+            if quic {
+                quic_runtime::run_server(cfg).await?;
+            } else {
+                server::run(cfg).await?;
+            }
         }
-        Command::Client { config } => {
+        Command::Client { config, quic } => {
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
-            runtime::run(cfg).await?;
+            if quic {
+                quic_runtime::run_client(cfg).await?;
+            } else {
+                runtime::run(cfg).await?;
+            }
         }
         Command::Benchmark {
             iterations,

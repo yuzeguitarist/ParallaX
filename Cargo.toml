@@ -19,6 +19,8 @@ rand = "0.8"
 pqcrypto-mlkem = "0.1"
 pqcrypto-mldsa = "0.1.2"
 pqcrypto-traits = "0.3"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
