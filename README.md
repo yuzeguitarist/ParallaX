@@ -65,3 +65,13 @@ sockets:
 ```bash
 cargo test -- --ignored
 ```
+
+## Benchmark
+
+Run local CPU-only protocol benchmarks without changing routes or touching
+system proxy/VPN state:
+
+```bash
+plx bench --iterations 1000 --warmup 100 --payload-size 1024
+plx bench --json
+```

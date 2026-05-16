@@ -7,6 +7,7 @@ use rand::{rngs::OsRng, RngCore};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    bench::{self, BenchmarkOptions},
     client::runtime,
     config::Config,
     crypto::{
@@ -47,6 +48,18 @@ enum Command {
     Client {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
+    },
+    /// Run local CPU-only protocol benchmarks without touching system networking.
+    #[command(name = "bench")]
+    Benchmark {
+        #[arg(long, default_value_t = 1_000)]
+        iterations: u64,
+        #[arg(long, default_value_t = 100)]
+        warmup: u64,
+        #[arg(long, default_value_t = 1_024)]
+        payload_size: usize,
+        #[arg(long)]
+        json: bool,
     },
     /// Print paired client/server parallax.toml templates with fresh keys.
     ConfigTemplate {
@@ -105,6 +118,20 @@ pub async fn run() -> anyhow::Result<()> {
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             runtime::run(cfg).await?;
+        }
+        Command::Benchmark {
+            iterations,
+            warmup,
+            payload_size,
+            json,
+        } => {
+            let options = BenchmarkOptions::new(iterations, warmup, payload_size)?;
+            let report = bench::run(options)?;
+            if json {
+                println!("{}", report.to_json());
+            } else {
+                print!("{}", report.to_text());
+            }
         }
         Command::ConfigTemplate {
             server_listen,
