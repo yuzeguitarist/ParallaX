@@ -1,12 +1,39 @@
+use std::io;
+
 use rand::{CryptoRng, RngCore};
 use thiserror::Error;
 
-use super::client_hello_builder::{ClientHelloBuildError, ClientHelloTemplate};
+use super::{
+    client_hello::ClientHelloError,
+    client_hello_builder::{ClientHelloBuildError, ClientHelloTemplate},
+    server_hello::ServerHelloError,
+};
+use crate::crypto::auth::AuthError;
 
 #[derive(Debug, Error)]
 pub enum TlsBackendError {
     #[error("ClientHello build failed: {0}")]
     ClientHello(#[from] ClientHelloBuildError),
+    #[error("ClientHello parse failed: {0}")]
+    ClientHelloParse(#[from] ClientHelloError),
+    #[error("ClientHello authentication failed: {0}")]
+    Auth(#[from] AuthError),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("rustls state machine error: {0}")]
+    Rustls(#[from] rustls::Error),
+    #[error("rustls config error: {0}")]
+    RustlsConfig(String),
+    #[error("invalid SNI for rustls ServerName: {0}")]
+    InvalidServerName(String),
+    #[error("ServerHello parse failed: {0}")]
+    ServerHello(#[from] ServerHelloError),
+    #[error("stateful TLS backend did not observe a TLS 1.3 ServerHello")]
+    MissingServerHello,
+    #[error("stateful TLS backend generated an unauthenticated ClientHello")]
+    UnauthenticatedClientHello,
+    #[error("stateful rustls hook was used outside a ParallaX handshake context")]
+    MissingPatchContext,
 }
 
 pub trait CamouflageTlsBackend {

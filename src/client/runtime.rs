@@ -16,18 +16,14 @@ use crate::{
         decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
         TrafficConfig,
     },
-    crypto::{
-        auth::{derive_client_auth_key, AuthError},
-        session::X25519KeyPair,
-    },
+    crypto::auth::AuthError,
     handshake::client::{self, ClientDataSession, ClientHandshakeError},
     protocol::command::ConnectRequest,
     protocol::data::max_plaintext_len,
     tls::{
-        backend::{CamouflageTlsBackend, NativeCamouflageBackend, TlsBackendError},
-        client_hello_builder::{ClientHelloBuildError, ClientHelloTemplate},
-        record::{alert_bad_record_mac, change_cipher_spec, read_record, TlsRecordError},
-        server_hello::{parse_server_hello, ServerHelloError},
+        backend::TlsBackendError,
+        record::{alert_bad_record_mac, read_record, TlsRecordError},
+        stateful::StatefulRustlsCamouflageBackend,
     },
 };
 
@@ -43,16 +39,10 @@ pub enum ClientRuntimeError {
     Io(#[from] io::Error),
     #[error("SOCKS error: {0}")]
     Socks(#[from] SocksError),
-    #[error("ClientHello build error: {0}")]
-    ClientHelloBuild(#[from] ClientHelloBuildError),
     #[error("TLS camouflage backend error: {0}")]
     TlsBackend(#[from] TlsBackendError),
     #[error("ClientHello auth error: {0}")]
     Auth(#[from] AuthError),
-    #[error("ServerHello parse failed: {0}")]
-    ServerHello(#[from] ServerHelloError),
-    #[error("server did not negotiate TLS 1.3")]
-    Tls13Required,
     #[error("client handshake error: {0}")]
     Handshake(#[from] ClientHandshakeError),
     #[error("TLS record error: {0}")]
@@ -124,7 +114,6 @@ pub async fn handle_local_connection(
         },
         &mut OsRng,
     )?;
-    server.write_all(&change_cipher_spec()).await?;
     server.write_all(&pq_record).await?;
     server.write_all(&connect_record).await?;
 
@@ -148,28 +137,15 @@ async fn establish_data_session(
     psk: &[u8],
     server_public: &[u8; 32],
 ) -> Result<ClientDataSession, ClientRuntimeError> {
-    let client_keys = X25519KeyPair::generate();
-    let auth_key = derive_client_auth_key(psk, &client_keys.private, server_public)?;
-    let client_hello = ClientHelloTemplate {
-        sni: config.sni.clone(),
-        x25519_public_key: client_keys.public,
-        profile: config.tls_profile,
-    };
-    let client_hello =
-        NativeCamouflageBackend.client_hello(&client_hello, &auth_key, &mut OsRng)?;
-
-    server.write_all(&client_hello).await?;
-    let server_hello_record = read_record(server).await?;
-    let server_hello = parse_server_hello(&server_hello_record)?;
-    if !server_hello.tls13_selected {
-        return Err(ClientRuntimeError::Tls13Required);
-    }
-
+    let completed = StatefulRustlsCamouflageBackend
+        .start(config.sni.clone(), psk, server_public, config.tls_profile)?
+        .complete(server)
+        .await?;
     let session_keys = client::derive_session_keys(
-        &client_keys.private,
+        &completed.client_x25519.private,
         server_public,
-        &client_hello,
-        &server_hello.random,
+        &completed.client_hello,
+        &completed.server_random,
     )?;
     Ok(ClientDataSession::new(session_keys, traffic)?)
 }
@@ -236,7 +212,10 @@ fn _request_target(request: &SocksRequest) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{io::Cursor, sync::Arc};
+
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         time::{timeout, Duration},
@@ -247,10 +226,11 @@ mod tests {
         config::ServerConfig,
         crypto::{pq, session::X25519KeyPair},
         handshake::server,
-        tls::{record::read_record, server_hello::tests::server_hello_fixture},
     };
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
+    const CAMOUFLAGE_CERT_DER_B64: &str = "MIIC9jCCAd6gAwIBAgIJAPNzR81y9p7pMA0GCSqGSIb3DQEBCwUAMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4XDTI2MDUxNjEyNDA0NloXDTI2MDUxNzEyNDA0NlowFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCnjSfVPv1Xy5razuOYABOSvGvlddr0MMVWQCSmjE47PMQEzvETytmburNZEdqQBzSjDVxTExxd8eIHFTp8ylkztsxma5yJftQo81uqxZEnwT00tJRaazg10OYTf0ZrH6PMNC2izwJML0GkYz7s6OMFqImMCG3v00PIAYknlDrlKoDjdmANco8V5FNrbQYp2kqIcFyXrbgYurcMIKCE9Wu8L2W0oKhW6DNyRVoBGTn5zN1wjXLBO+6TJsBj4thI4tM0mUcLc+YohOfoGVq7na/wgCESoK1B+m8PdrXIEuZ7gZ0x3ZqdZ7jxL23sTmkfm+AeNdp+XshxAS77l3dcrAV9AgMBAAGjRzBFMBYGA1UdEQQPMA2CC2V4YW1wbGUuY29tMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA0GCSqGSIb3DQEBCwUAA4IBAQA8KHWHoA4otNmYh9q+X8cZnYx9y0LUNfdbHLR8ebnk/9T+/WP5CgIGWvn3+L2ulEvuSMhDC23C20SnX0h815JfMBY/PiAbLKGp3UXrgIq1dWc8t40HQBGRuBKi2fc743Sup5kPQgNAqev+8kKs4WFDXaWBpdwqI55PADVPOX66h0WiObB7crp5YTEVEe37G6UsxX40HUAAZJXtCI9eqPLISNuuNOAjJEMDMjdRH7ZjcMyrqQSweuKLAwdvUam8UJQsUNe7rM2II6GlgPS/mKZx1Nihn70GIo0yu0Bsxc9cpSHbggzQarE3g8WRp+jI9GpWXXdjno7cyim5KEQVMZcz";
+    const CAMOUFLAGE_KEY_DER_B64: &str = "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCnjSfVPv1Xy5razuOYABOSvGvlddr0MMVWQCSmjE47PMQEzvETytmburNZEdqQBzSjDVxTExxd8eIHFTp8ylkztsxma5yJftQo81uqxZEnwT00tJRaazg10OYTf0ZrH6PMNC2izwJML0GkYz7s6OMFqImMCG3v00PIAYknlDrlKoDjdmANco8V5FNrbQYp2kqIcFyXrbgYurcMIKCE9Wu8L2W0oKhW6DNyRVoBGTn5zN1wjXLBO+6TJsBj4thI4tM0mUcLc+YohOfoGVq7na/wgCESoK1B+m8PdrXIEuZ7gZ0x3ZqdZ7jxL23sTmkfm+AeNdp+XshxAS77l3dcrAV9AgMBAAECggEAcsH8cVMWRAbBBnLDcX1D6rHBGMVy9ONelaeTMrtQbcQ94ak3dz3tc3sZkbznvNQimjbxcDjbqgCctgs1JvmUxRXDw7aa3ZWPjIi51SpCND9nQ20XWyKqujldDCeVPJPMJXXrd+JfCX0ocYZEOBF+RIbdxpqTabqCZz+eCAy/les95pv5YkkAjxEJkzhEfFTJtJRVIjIUBL/Gg8KwG4qs5nESoD1oiNGr8tgnbsS2KNXdozIsM1awitqNJ7drpDpEpkwDUoQGAqzuvyDiN2pPqsyg1UwZWH8kuA9RyXIAOWQoR9rIX/rUsYB5F4tKg6Tdy0n9Jb9ytTINYaletNjuIQKBgQDSEzvmO4Zan1Bz+0Eb4NWfnU1yyGKb7bBFBvcuigXPW/+as1yET2Zkc4qQBudye7DUgr+zXj0s+ZeXvv+HeGggD3Blnq5bl+gPkiPSeGd24QkfO38MF2RTpW5SoUT6Z9vTiaHjIgkwZIgQf3dfSPV/MskRVemqxB5o+Phd4NRzpQKBgQDMLhkoYeRurmFQ3iuWCLOaHWAwtA28j3ymknsHyP6EOkiHBVl3YWTpZ1ZcDGMJznHdkSrj4mNsnnDM71iFM0srgKKp07T4bumowOhmyeg/hYIblFGSoZS/nTl8tAusNzXtRJeVLa9GjkFjXihiC3E+t3J2s9ij2eE8bAM0tatC+QKBgCsAQuea0aKlL8u955L0T+YPRfYz7HNskQNgLKK7H/tVIpohEtQGiLgRKpDWyPOXPBgT93eY177oDE7EivvI+s9tOZ2jgJ9BFgBx8qE3gj5ETCC3hgcMlr3EhDOnzT3Qmp/PcXLT2butKGjwHphDj/UMiTniMyWAZZUpOXXF+tb9AoGAEKvG5BQyGZNlYLvzJRnqyC+T1gYthPLWQ6d8IiOYHGXB3DxklKnAGoqUc4mTYI6Zn3Sl4ttuMMUzApicSqvofFHRdjpR8WLk8yFlGFdt/hnBiMzwaB+HTKnisrrkpRgQ8CGEmuqTABjHX/ylIXQ7t9o0n1qJ2r8Ec/GBxYD7zckCgYBZzU7u9Ujq8XL+Ok6T2Zqgf3O8H3VBlKPjeYpfH6mqBRdj+773IfoifCs19Y31OL8Sb28N98XnutTlHo6xs4li0zE2KDN1O3i00K7S0dO3250Fr1QSm86CML8fSDuS1BcuMHH+RNkQkMb9Q49K23t6B1s0xnIFfBarwbusw9onAw==";
 
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
@@ -258,13 +238,8 @@ mod tests {
         let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fallback_addr = fallback_listener.local_addr().unwrap();
         let fallback_task = tokio::spawn(async move {
-            let (mut stream, _) = fallback_listener.accept().await.unwrap();
-            let _client_hello = read_record(&mut stream).await.unwrap();
-            stream.write_all(&server_hello_fixture()).await.unwrap();
-            let _ccs = timeout(Duration::from_secs(1), read_record(&mut stream))
-                .await
-                .unwrap()
-                .unwrap();
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            run_camouflage_tls_server(stream).await;
         });
 
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -355,5 +330,48 @@ mod tests {
         server_task.await.unwrap();
         target_task.await.unwrap();
         fallback_task.await.unwrap();
+    }
+
+    async fn run_camouflage_tls_server(mut stream: TcpStream) {
+        let mut server =
+            rustls::ServerConnection::new(rustls_server_config()).expect("rustls server config");
+        let mut buf = [0_u8; 4096];
+
+        while server.is_handshaking() {
+            flush_rustls_server(&mut server, &mut stream).await;
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            let mut cursor = Cursor::new(&buf[..n]);
+            server.read_tls(&mut cursor).unwrap();
+            server.process_new_packets().unwrap();
+        }
+
+        flush_rustls_server(&mut server, &mut stream).await;
+        let mut one = [0_u8; 1];
+        let _ = timeout(Duration::from_millis(500), stream.read(&mut one)).await;
+    }
+
+    async fn flush_rustls_server(server: &mut rustls::ServerConnection, stream: &mut TcpStream) {
+        while server.wants_write() {
+            let mut out = Vec::new();
+            server.write_tls(&mut out).unwrap();
+            if out.is_empty() {
+                break;
+            }
+            stream.write_all(&out).await.unwrap();
+        }
+    }
+
+    fn rustls_server_config() -> Arc<rustls::ServerConfig> {
+        let cert_der = CertificateDer::from(STANDARD.decode(CAMOUFLAGE_CERT_DER_B64).unwrap());
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            STANDARD.decode(CAMOUFLAGE_KEY_DER_B64).unwrap(),
+        ));
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap(),
+        )
     }
 }

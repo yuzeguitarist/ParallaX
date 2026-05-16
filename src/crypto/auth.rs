@@ -12,6 +12,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const SESSION_ID_LEN: usize = 32;
 pub const AUTH_TAG_LEN: usize = 16;
+pub const STATEFUL_AUTH_TAIL_LEN: usize = SESSION_ID_LEN - AUTH_TAG_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAuth {
@@ -58,6 +59,19 @@ where
     Ok(tag)
 }
 
+pub fn build_stateful_auth_session_id(
+    auth_key: &[u8],
+    sni: &str,
+    x25519_key_share: &[u8; 32],
+    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<[u8; SESSION_ID_LEN], AuthError> {
+    let tag = compute_stateful_tag(auth_key, sni, x25519_key_share, tail)?;
+    let mut session_id = [0_u8; SESSION_ID_LEN];
+    session_id[..AUTH_TAG_LEN].copy_from_slice(&tag);
+    session_id[AUTH_TAG_LEN..].copy_from_slice(tail);
+    Ok(session_id)
+}
+
 pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<ClientAuth, AuthError> {
     if auth_key.is_empty() {
         return Err(AuthError::EmptyPsk);
@@ -80,10 +94,21 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
         &parsed.session_id_range,
         auth_key,
     )?;
-    let authenticated = actual.ct_eq(&expected).into();
+    let transcript_authenticated: bool = actual.ct_eq(&expected).into();
+    let stateful_authenticated = match (parsed.sni.as_deref(), parsed.x25519_key_share) {
+        (Some(sni), Some(key_share)) => {
+            let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+            tail.copy_from_slice(
+                &record[parsed.session_id_range.start + AUTH_TAG_LEN..parsed.session_id_range.end],
+            );
+            let expected = compute_stateful_tag(auth_key, sni, &key_share, &tail)?;
+            bool::from(actual.ct_eq(&expected))
+        }
+        _ => false,
+    };
 
     Ok(ClientAuth {
-        authenticated,
+        authenticated: transcript_authenticated || stateful_authenticated,
         sni: parsed.sni,
         x25519_key_share: parsed.x25519_key_share,
     })
@@ -142,6 +167,29 @@ fn compute_tag(
     Ok(tag)
 }
 
+fn compute_stateful_tag(
+    auth_key: &[u8],
+    sni: &str,
+    x25519_key_share: &[u8; 32],
+    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<[u8; AUTH_TAG_LEN], AuthError> {
+    if auth_key.is_empty() {
+        return Err(AuthError::EmptyPsk);
+    }
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(auth_key).map_err(|_| AuthError::EmptyPsk)?;
+    mac.update(b"ParallaX v1 stateful rustls ClientHello auth");
+    mac.update(&(sni.len() as u16).to_be_bytes());
+    mac.update(sni.as_bytes());
+    mac.update(x25519_key_share);
+    mac.update(tail);
+    let digest = mac.finalize().into_bytes();
+
+    let mut tag = [0_u8; AUTH_TAG_LEN];
+    tag.copy_from_slice(&digest[..AUTH_TAG_LEN]);
+    Ok(tag)
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{rngs::StdRng, SeedableRng};
@@ -188,5 +236,23 @@ mod tests {
 
         let auth = verify_client_hello_auth(&hello, psk).unwrap();
         assert!(!auth.authenticated);
+    }
+
+    #[test]
+    fn verifies_stateful_rustls_session_id_auth() {
+        let mut hello = client_hello_fixture("example.com");
+        let parsed = parse_client_hello(&hello).unwrap();
+        let key_share = parsed.x25519_key_share.unwrap();
+        let tail = [9_u8; STATEFUL_AUTH_TAIL_LEN];
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let session_id =
+            build_stateful_auth_session_id(psk, "example.com", &key_share, &tail).unwrap();
+        hello[parsed.session_id_range].copy_from_slice(&session_id);
+
+        let auth = verify_client_hello_auth(&hello, psk).unwrap();
+
+        assert!(auth.authenticated);
+        assert_eq!(auth.sni.as_deref(), Some("example.com"));
+        assert_eq!(auth.x25519_key_share, Some(key_share));
     }
 }
