@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
+use rand::{rngs::OsRng, RngCore};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -43,6 +44,19 @@ enum Command {
     Client {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
+    },
+    /// Print paired client/server parallax.toml templates with fresh keys.
+    ConfigTemplate {
+        #[arg(long, default_value = "0.0.0.0:443")]
+        server_listen: String,
+        #[arg(long, default_value = "127.0.0.1:1080")]
+        client_listen: String,
+        #[arg(long, default_value = "YOUR_VPS_IP:443")]
+        server_addr: String,
+        #[arg(long, default_value = "example.com:443")]
+        fallback_addr: String,
+        #[arg(long, default_value = "example.com")]
+        sni: String,
     },
 }
 
@@ -89,7 +103,84 @@ pub async fn run() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to load {}", config.display()))?;
             runtime::run(cfg).await?;
         }
+        Command::ConfigTemplate {
+            server_listen,
+            client_listen,
+            server_addr,
+            fallback_addr,
+            sni,
+        } => print_config_template(
+            &server_listen,
+            &client_listen,
+            &server_addr,
+            &fallback_addr,
+            &sni,
+        ),
     }
 
     Ok(())
+}
+
+fn print_config_template(
+    server_listen: &str,
+    client_listen: &str,
+    server_addr: &str,
+    fallback_addr: &str,
+    sni: &str,
+) {
+    let mut psk = [0_u8; 32];
+    OsRng.fill_bytes(&mut psk);
+    let server_keys = X25519KeyPair::generate();
+
+    println!(
+        r#"# ===== server parallax.toml =====
+mode = "server"
+
+[crypto]
+psk = "{}"
+
+[traffic]
+min_padding = 0
+max_padding = 128
+min_delay_ms = 0
+max_delay_ms = 12
+max_concurrent_streams = 1
+
+[server]
+listen = "{}"
+fallback_addr = "{}"
+private_key = "{}"
+authorized_sni = ["{}"]
+strict_tls13 = true
+
+# ===== client parallax.toml =====
+mode = "client"
+
+[crypto]
+psk = "{}"
+
+[traffic]
+min_padding = 0
+max_padding = 128
+min_delay_ms = 0
+max_delay_ms = 12
+max_concurrent_streams = 1
+
+[client]
+listen = "{}"
+server_addr = "{}"
+sni = "{}"
+server_public_key = "{}"
+"#,
+        STANDARD.encode(psk),
+        server_listen,
+        fallback_addr,
+        STANDARD.encode(server_keys.private),
+        sni,
+        STANDARD.encode(psk),
+        client_listen,
+        server_addr,
+        sni,
+        STANDARD.encode(server_keys.public),
+    );
 }
