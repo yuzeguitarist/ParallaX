@@ -22,7 +22,7 @@ use crate::{
         data::{DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD},
     },
     tls::{
-        client_hello::{parse_client_hello, ClientHelloError},
+        client_hello::parse_client_hello,
         record::{alert_bad_record_mac, read_record},
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
@@ -45,8 +45,6 @@ pub enum HandshakeServerError {
     Auth(#[from] AuthError),
     #[error("ServerHello parse failed: {0}")]
     ServerHello(#[from] ServerHelloError),
-    #[error("ClientHello parse failed: {0}")]
-    ClientHello(#[from] ClientHelloError),
     #[error("handshake timed out")]
     Timeout,
     #[error("fallback ServerHello did not negotiate TLS 1.3")]
@@ -160,7 +158,10 @@ pub fn decide_inbound(
     authorized_sni: &[String],
     server_private: &[u8; 32],
 ) -> Result<InboundDecision, HandshakeServerError> {
-    let parsed = parse_client_hello(first_client_record)?;
+    let parsed = match parse_client_hello(first_client_record) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+    };
     let x25519_key_share = match parsed.x25519_key_share {
         Some(key) => key,
         None => {
@@ -170,7 +171,11 @@ pub fn decide_inbound(
         }
     };
     let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
-    let auth = verify_client_hello_auth(first_client_record, &auth_key)?;
+    let auth = match verify_client_hello_auth(first_client_record, &auth_key) {
+        Ok(auth) => auth,
+        Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
+        Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+    };
     if !auth.authenticated {
         return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed));
     }
@@ -492,6 +497,23 @@ mod tests {
         assert_eq!(
             decision,
             InboundDecision::Fallback(FallbackReason::UnauthorizedSni(String::from("example.com")))
+        );
+    }
+
+    #[test]
+    fn malformed_probe_falls_back_instead_of_closing() {
+        let server = X25519KeyPair::generate();
+        let decision = decide_inbound(
+            b"not a TLS ClientHello",
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            InboundDecision::Fallback(FallbackReason::AuthFailed)
         );
     }
 
