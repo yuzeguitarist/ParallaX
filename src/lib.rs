@@ -2,6 +2,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod crypto;
+pub mod fingerprint;
 pub mod handshake;
 pub mod protocol;
 pub mod tls;
