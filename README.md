@@ -35,6 +35,9 @@ Generate a ready-to-edit config:
 plx init cloudflare.com --server-addr YOUR_VPS_IP:443
 ```
 
+This creates `parallax.server.toml` and `parallax.client.toml` without
+overwriting existing files.
+
 For advanced/manual setups, the lower-level template command is still available:
 
 ```bash
