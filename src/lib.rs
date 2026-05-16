@@ -1,0 +1,9 @@
+pub mod cli;
+pub mod config;
+pub mod crypto;
+pub mod handshake;
+pub mod tls;
+pub mod traffic;
+
+pub const PROTOCOL_NAME: &str = "ParallaX";
+pub const PROTOCOL_VERSION: u8 = 1;
