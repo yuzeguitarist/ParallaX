@@ -319,6 +319,18 @@ server_identity_public_key = "{KEY}"
     }
 
     #[test]
+    fn rejects_padding_that_leaves_no_payload_room() {
+        let traffic = TrafficConfig {
+            max_padding: u16::MAX,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            traffic.validate().unwrap_err(),
+            ConfigError::ExcessivePadding
+        ));
+    }
+
+    #[test]
     fn rejects_multiplexing_until_safe() {
         let traffic = TrafficConfig {
             max_concurrent_streams: 2,

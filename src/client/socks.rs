@@ -11,7 +11,10 @@ pub struct SocksRequest {
 
 impl SocksRequest {
     pub fn target(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        match self.host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => format!("[{}]:{}", self.host, self.port),
+            _ => format!("{}:{}", self.host, self.port),
+        }
     }
 }
 
@@ -158,5 +161,15 @@ mod tests {
                 port: 443
             }
         );
+    }
+
+    #[test]
+    fn target_brackets_ipv6_literals() {
+        let request = SocksRequest {
+            host: "::1".to_owned(),
+            port: 443,
+        };
+
+        assert_eq!(request.target(), "[::1]:443");
     }
 }
