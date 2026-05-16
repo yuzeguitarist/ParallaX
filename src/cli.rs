@@ -15,6 +15,7 @@ use crate::{
         session::{derive_client_keys, AeadCodec, X25519KeyPair},
     },
     handshake::server,
+    probe,
 };
 
 #[derive(Debug, Parser)]
@@ -73,6 +74,24 @@ enum Command {
         fallback_addr: String,
         #[arg(long, default_value = "example.com")]
         sni: String,
+    },
+    /// Check a camouflage target. Easy mode: plx probe example.com
+    Probe {
+        /// Domain, domain:port, or https://domain. If omitted, read parallax.toml.
+        dest: Option<String>,
+        #[arg(short, long, default_value = "parallax.toml")]
+        config: PathBuf,
+    },
+    /// Generate a ready-to-edit config from one camouflage domain.
+    Init {
+        /// Camouflage domain, domain:port, or https://domain.
+        dest: String,
+        #[arg(long, default_value = "YOUR_VPS_IP:443")]
+        server_addr: String,
+        #[arg(long, default_value = "0.0.0.0:443")]
+        server_listen: String,
+        #[arg(long, default_value = "127.0.0.1:1080")]
+        client_listen: String,
     },
 }
 
@@ -146,6 +165,37 @@ pub async fn run() -> anyhow::Result<()> {
             &fallback_addr,
             &sni,
         ),
+        Command::Probe { dest, config } => {
+            let (target, sni) = match dest {
+                Some(dest) => {
+                    let target = probe::ProbeTarget::parse(&dest)?;
+                    let sni = target.host.clone();
+                    (target, sni)
+                }
+                None => {
+                    let cfg = Config::load(&config)
+                        .with_context(|| format!("failed to load {}", config.display()))?;
+                    probe::target_from_config(&cfg)?
+                }
+            };
+            let report = probe::probe(target, sni).await?;
+            print!("{}", report.summary());
+        }
+        Command::Init {
+            dest,
+            server_addr,
+            server_listen,
+            client_listen,
+        } => {
+            let target = probe::ProbeTarget::parse(&dest)?;
+            print_config_template(
+                &server_listen,
+                &client_listen,
+                &server_addr,
+                &target.authority(),
+                &target.host,
+            );
+        }
     }
 
     Ok(())
