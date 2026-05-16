@@ -6,6 +6,7 @@ pub mod handshake;
 pub mod protocol;
 pub mod tls;
 pub mod traffic;
+pub mod transport;
 
 pub const PROTOCOL_NAME: &str = "ParallaX";
 pub const PROTOCOL_VERSION: u8 = 1;
