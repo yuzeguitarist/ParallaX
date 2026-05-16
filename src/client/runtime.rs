@@ -24,6 +24,7 @@ use crate::{
     protocol::command::ConnectRequest,
     protocol::data::max_plaintext_len,
     tls::{
+        backend::{CamouflageTlsBackend, NativeCamouflageBackend, TlsBackendError},
         client_hello_builder::{ClientHelloBuildError, ClientHelloTemplate},
         record::{alert_bad_record_mac, change_cipher_spec, read_record, TlsRecordError},
         server_hello::{parse_server_hello, ServerHelloError},
@@ -44,6 +45,8 @@ pub enum ClientRuntimeError {
     Socks(#[from] SocksError),
     #[error("ClientHello build error: {0}")]
     ClientHelloBuild(#[from] ClientHelloBuildError),
+    #[error("TLS camouflage backend error: {0}")]
+    TlsBackend(#[from] TlsBackendError),
     #[error("ClientHello auth error: {0}")]
     Auth(#[from] AuthError),
     #[error("ServerHello parse failed: {0}")]
@@ -151,8 +154,9 @@ async fn establish_data_session(
         sni: config.sni.clone(),
         x25519_public_key: client_keys.public,
         profile: config.tls_profile,
-    }
-    .build_signed(&auth_key, &mut OsRng)?;
+    };
+    let client_hello =
+        NativeCamouflageBackend.client_hello(&client_hello, &auth_key, &mut OsRng)?;
 
     server.write_all(&client_hello).await?;
     let server_hello_record = read_record(server).await?;
