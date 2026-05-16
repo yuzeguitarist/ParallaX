@@ -1,6 +1,15 @@
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    io::{Cursor, Read},
+    sync::Arc,
+    time::Duration,
+};
 
-use rand::rngs::OsRng;
+use rustls::{
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+    DigitallySignedStruct, ProtocolVersion, SignatureScheme,
+};
 use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt,
@@ -10,16 +19,13 @@ use tokio::{
 
 use crate::{
     config::{Config, Mode},
-    crypto::session::X25519KeyPair,
-    tls::{
-        client_hello_builder::{BrowserProfile, ClientHelloBuildError, ClientHelloTemplate},
-        record::read_record,
-        server_hello::parse_server_hello,
-    },
+    tls::record::read_record,
 };
 
 const DEFAULT_PORT: u16 = 443;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const POST_HANDSHAKE_DRAIN_LIMIT: usize = 3;
+const POST_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(220);
 
 #[derive(Debug, Error)]
 pub enum ProbeError {
@@ -31,8 +37,8 @@ pub enum ProbeError {
     InvalidPort(String),
     #[error("配置里没有可检测的 fallback/SNI；请直接运行：plx probe example.com")]
     MissingConfigTarget,
-    #[error("ClientHello build error: {0}")]
-    ClientHello(#[from] ClientHelloBuildError),
+    #[error("SNI 不是合法域名：{0}")]
+    InvalidServerName(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +59,10 @@ pub struct ProbeReport {
     pub target: ProbeTarget,
     pub sni: String,
     pub tcp_latency: Option<Duration>,
+    pub handshake_latency: Option<Duration>,
     pub tls13: bool,
+    pub alpn: Option<String>,
+    pub post_handshake_records: usize,
     pub score: u8,
     pub verdict: ProbeVerdict,
     pub notes: Vec<String>,
@@ -123,6 +132,21 @@ impl ProbeReport {
             "  TLS 1.3       {}\n",
             if self.tls13 { "PASS" } else { "FAIL" }
         ));
+        match self.handshake_latency {
+            Some(latency) => out.push_str(&format!(
+                "  TLS 握手      PASS  {}ms\n",
+                latency.as_millis()
+            )),
+            None => out.push_str("  TLS 握手      FAIL\n"),
+        }
+        out.push_str(&format!(
+            "  ALPN          {}\n",
+            self.alpn.as_deref().unwrap_or("未协商")
+        ));
+        out.push_str(&format!(
+            "  会话票据/后握手 {} record(s)\n",
+            self.post_handshake_records
+        ));
         out.push_str(&format!(
             "  综合评分      {}/100 ({})\n\n",
             self.score, self.verdict
@@ -182,68 +206,86 @@ async fn probe_with_timeout(
 
     let Ok(Ok(mut stream)) = connect else {
         notes.push("TCP 无法连接。请确认域名、端口、网络和服务器防火墙。".to_owned());
-        return Ok(report(target, sni, None, false, notes));
+        return Ok(report(target, sni, ProbeSignals::default(), notes));
     };
 
     let tcp_latency = started.elapsed();
     let _ = stream.set_nodelay(true);
 
-    let client_keys = X25519KeyPair::generate();
-    let hello = ClientHelloTemplate {
-        sni: sni.clone(),
-        x25519_public_key: client_keys.public,
-        profile: BrowserProfile::Safari17,
-    }
-    .build_unsigned(&mut OsRng)?;
-
-    if timeout(deadline, stream.write_all(&hello)).await.is_err() {
-        notes.push("ClientHello 发送超时。目标站可能不适合作为 camouflage dest。".to_owned());
-        return Ok(report(target, sni, Some(tcp_latency), false, notes));
-    }
-
-    let tls13 = match timeout(deadline, read_record(&mut stream)).await {
-        Ok(Ok(record)) => match parse_server_hello(&record) {
-            Ok(server_hello) => server_hello.tls13_selected,
-            Err(_) => {
-                notes.push(
-                    "目标没有返回标准 ServerHello；可能是非 TLS 服务或中间设备拦截。".to_owned(),
-                );
-                false
-            }
-        },
-        _ => {
-            notes.push("等待 ServerHello 超时。建议换一个更稳定的目标站。".to_owned());
-            false
+    let tls = match complete_tls_probe(&mut stream, &sni, deadline).await {
+        Ok(tls) => tls,
+        Err(reason) => {
+            notes.push(reason);
+            return Ok(report(
+                target,
+                sni,
+                ProbeSignals {
+                    tcp_latency: Some(tcp_latency),
+                    ..ProbeSignals::default()
+                },
+                notes,
+            ));
         }
     };
 
-    if tls13 {
-        notes.push("目标可完成 TLS 1.3 ServerHello，可作为候选 camouflage dest。".to_owned());
+    if tls.tls13 {
+        notes.push("目标可完成真实 TLS 1.3 握手，可作为候选 camouflage dest。".to_owned());
     } else {
         notes.push("ParallaX 当前要求 TLS 1.3；该目标不建议使用。".to_owned());
     }
+    if matches!(tls.alpn.as_deref(), Some("h2")) {
+        notes.push("目标支持 h2，浏览器伪装兼容性更好。".to_owned());
+    }
+    if tls.post_handshake_records == 0 {
+        notes.push("未观察到后握手 record；可用但票据/恢复行为还需要线上复测。".to_owned());
+    }
 
-    Ok(report(target, sni, Some(tcp_latency), tls13, notes))
+    Ok(report(
+        target,
+        sni,
+        ProbeSignals {
+            tcp_latency: Some(tcp_latency),
+            handshake_latency: Some(tls.handshake_latency),
+            tls13: tls.tls13,
+            alpn: tls.alpn,
+            post_handshake_records: tls.post_handshake_records,
+        },
+        notes,
+    ))
+}
+
+#[derive(Debug, Default)]
+struct ProbeSignals {
+    tcp_latency: Option<Duration>,
+    handshake_latency: Option<Duration>,
+    tls13: bool,
+    alpn: Option<String>,
+    post_handshake_records: usize,
 }
 
 fn report(
     target: ProbeTarget,
     sni: String,
-    tcp_latency: Option<Duration>,
-    tls13: bool,
+    signals: ProbeSignals,
     notes: Vec<String>,
 ) -> ProbeReport {
     let mut score = 0_u8;
-    if let Some(latency) = tcp_latency {
-        score += 40;
+    if let Some(latency) = signals.tcp_latency {
+        score += 25;
         if latency <= Duration::from_millis(250) {
-            score += 20;
-        } else if latency <= Duration::from_secs(1) {
             score += 10;
+        } else if latency <= Duration::from_secs(1) {
+            score += 5;
         }
     }
-    if tls13 {
-        score += 40;
+    if signals.tls13 {
+        score += 35;
+    }
+    if let Some(alpn) = &signals.alpn {
+        score += if alpn == "h2" { 20 } else { 10 };
+    }
+    if signals.post_handshake_records > 0 {
+        score += 10;
     }
 
     let verdict = if score >= 80 {
@@ -257,11 +299,180 @@ fn report(
     ProbeReport {
         target,
         sni,
-        tcp_latency,
-        tls13,
+        tcp_latency: signals.tcp_latency,
+        handshake_latency: signals.handshake_latency,
+        tls13: signals.tls13,
+        alpn: signals.alpn,
+        post_handshake_records: signals.post_handshake_records,
         score,
         verdict,
         notes,
+    }
+}
+
+#[derive(Debug)]
+struct TlsProbeResult {
+    handshake_latency: Duration,
+    tls13: bool,
+    alpn: Option<String>,
+    post_handshake_records: usize,
+}
+
+async fn complete_tls_probe(
+    stream: &mut TcpStream,
+    sni: &str,
+    deadline: Duration,
+) -> Result<TlsProbeResult, String> {
+    let config = probe_client_config();
+    let server_name = ServerName::try_from(sni.to_owned())
+        .map_err(|_| ProbeError::InvalidServerName(sni.to_owned()).to_string())?;
+    let mut connection = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|err| format!("TLS 初始化失败：{err}"))?;
+
+    let started = Instant::now();
+    while connection.is_handshaking() {
+        flush_tls(&mut connection, stream, deadline).await?;
+        if connection.is_handshaking() {
+            let record = read_tls_record(stream, deadline).await?;
+            feed_tls_record(&mut connection, &record)?;
+        }
+    }
+    flush_tls(&mut connection, stream, deadline).await?;
+
+    let post_handshake_records =
+        drain_post_handshake_records(&mut connection, stream, POST_HANDSHAKE_DRAIN_LIMIT).await?;
+    let tls13 = connection.protocol_version() == Some(ProtocolVersion::TLSv1_3);
+    let alpn = connection
+        .alpn_protocol()
+        .map(|protocol| String::from_utf8_lossy(protocol).to_string());
+
+    Ok(TlsProbeResult {
+        handshake_latency: started.elapsed(),
+        tls13,
+        alpn,
+        post_handshake_records,
+    })
+}
+
+fn probe_client_config() -> rustls::ClientConfig {
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ProbeServerCertVerifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.enable_early_data = false;
+    config
+}
+
+async fn flush_tls(
+    connection: &mut rustls::ClientConnection,
+    stream: &mut TcpStream,
+    deadline: Duration,
+) -> Result<(), String> {
+    while connection.wants_write() {
+        let mut out = Vec::new();
+        let written = connection
+            .write_tls(&mut out)
+            .map_err(|err| format!("TLS 写入失败：{err}"))?;
+        if written == 0 || out.is_empty() {
+            break;
+        }
+        timeout(deadline, stream.write_all(&out))
+            .await
+            .map_err(|_| "TLS 发送超时。目标站可能不稳定。".to_owned())?
+            .map_err(|err| format!("TLS 发送失败：{err}"))?;
+    }
+    Ok(())
+}
+
+async fn read_tls_record(stream: &mut TcpStream, deadline: Duration) -> Result<Vec<u8>, String> {
+    timeout(deadline, read_record(stream))
+        .await
+        .map_err(|_| "等待 TLS 响应超时。建议换一个更稳定的目标站。".to_owned())?
+        .map_err(|err| format!("TLS 读取失败：{err}"))
+}
+
+fn feed_tls_record(connection: &mut rustls::ClientConnection, record: &[u8]) -> Result<(), String> {
+    let mut cursor = Cursor::new(record);
+    connection
+        .read_tls(&mut cursor)
+        .map_err(|err| format!("TLS record 输入失败：{err}"))?;
+    connection
+        .process_new_packets()
+        .map_err(|err| format!("TLS 握手失败：{err}"))?;
+
+    let mut plaintext = Vec::new();
+    match connection.reader().read_to_end(&mut plaintext) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(err) => return Err(format!("TLS 明文读取失败：{err}")),
+    }
+    Ok(())
+}
+
+async fn drain_post_handshake_records(
+    connection: &mut rustls::ClientConnection,
+    stream: &mut TcpStream,
+    limit: usize,
+) -> Result<usize, String> {
+    let mut observed = 0;
+    for _ in 0..limit {
+        let record = match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, read_record(stream)).await {
+            Ok(Ok(record)) => record,
+            Ok(Err(_)) | Err(_) => break,
+        };
+        feed_tls_record(connection, &record)?;
+        observed += 1;
+        flush_tls(connection, stream, POST_HANDSHAKE_DRAIN_TIMEOUT).await?;
+    }
+    Ok(observed)
+}
+
+#[derive(Debug)]
+struct ProbeServerCertVerifier;
+
+impl ServerCertVerifier for ProbeServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
     }
 }
 
@@ -337,8 +548,13 @@ mod tests {
                 port: 443,
             },
             "example.com".to_owned(),
-            Some(Duration::from_millis(30)),
-            true,
+            ProbeSignals {
+                tcp_latency: Some(Duration::from_millis(30)),
+                handshake_latency: Some(Duration::from_millis(55)),
+                tls13: true,
+                alpn: Some("h2".to_owned()),
+                post_handshake_records: 1,
+            },
             Vec::new(),
         );
 
