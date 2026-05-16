@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    client::runtime,
     config::Config,
     crypto::session::{derive_client_keys, AeadCodec, X25519KeyPair},
     handshake::server,
@@ -35,6 +36,11 @@ enum Command {
     CryptoSelfTest,
     /// Run the ParallaX server handshake/fallback listener.
     Serve {
+        #[arg(short, long, default_value = "parallax.toml")]
+        config: PathBuf,
+    },
+    /// Run the ParallaX local SOCKS5 client.
+    Client {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
     },
@@ -77,6 +83,11 @@ pub async fn run() -> anyhow::Result<()> {
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             server::run(cfg).await?;
+        }
+        Command::Client { config } => {
+            let cfg = Config::load(&config)
+                .with_context(|| format!("failed to load {}", config.display()))?;
+            runtime::run(cfg).await?;
         }
     }
 
