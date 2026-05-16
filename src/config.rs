@@ -1,4 +1,8 @@
-use std::{fmt, fs, net::SocketAddr, path::Path};
+use std::{
+    fmt, fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
@@ -81,6 +85,7 @@ pub struct ClientConfig {
     pub sni: String,
     pub server_public_key: String,
     pub server_pq_public_key: String,
+    pub server_identity_public_key: String,
     #[serde(default)]
     pub tls_profile: BrowserProfile,
 }
@@ -93,6 +98,9 @@ pub struct ServerConfig {
     pub data_target: Option<String>,
     pub private_key: String,
     pub pq_secret_key: String,
+    pub identity_secret_key: String,
+    #[serde(default = "default_replay_cache_path")]
+    pub replay_cache_path: PathBuf,
     #[serde(default)]
     pub authorized_sni: Vec<String>,
     #[serde(default = "default_true")]
@@ -144,6 +152,10 @@ impl Config {
                 require_non_empty("client.sni", &client.sni)?;
                 decode_key32("client.server_public_key", &client.server_public_key)?;
                 decode_base64_bytes("client.server_pq_public_key", &client.server_pq_public_key)?;
+                decode_base64_bytes(
+                    "client.server_identity_public_key",
+                    &client.server_identity_public_key,
+                )?;
             }
             Mode::Server => {
                 let server = self.server.as_ref().ok_or(ConfigError::MissingServer)?;
@@ -153,6 +165,7 @@ impl Config {
                 }
                 decode_key32("server.private_key", &server.private_key)?;
                 decode_base64_bytes("server.pq_secret_key", &server.pq_secret_key)?;
+                decode_base64_bytes("server.identity_secret_key", &server.identity_secret_key)?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
                 }
@@ -254,6 +267,10 @@ const fn default_max_concurrent_streams() -> u8 {
     1
 }
 
+fn default_replay_cache_path() -> PathBuf {
+    PathBuf::from("parallax-replay.cache")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +292,7 @@ server_addr = "example.com:443"
 sni = "example.com"
 server_public_key = "{KEY}"
 server_pq_public_key = "{KEY}"
+server_identity_public_key = "{KEY}"
 "#
         );
         let cfg = toml::from_str::<Config>(&raw).unwrap();

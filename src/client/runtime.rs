@@ -64,6 +64,10 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         "client.server_pq_public_key",
         &client.server_pq_public_key,
     )?);
+    let server_identity_public = Arc::new(decode_base64_bytes(
+        "client.server_identity_public_key",
+        &client.server_identity_public_key,
+    )?);
     let listener = TcpListener::bind(client.listen).await?;
     tracing::info!("ParallaX client SOCKS5 listening on {}", client.listen);
 
@@ -72,6 +76,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         let client = client.clone();
         let psk = Arc::clone(&psk);
         let server_pq_public = Arc::clone(&server_pq_public);
+        let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
         tokio::spawn(async move {
             if let Err(err) = handle_local_connection(
@@ -81,6 +86,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                 &psk,
                 &server_public,
                 &server_pq_public,
+                &server_identity_public,
             )
             .await
             {
@@ -97,6 +103,7 @@ pub async fn handle_local_connection(
     psk: &[u8],
     server_public: &[u8; 32],
     server_pq_public: &[u8],
+    server_identity_public: &[u8],
 ) -> Result<(), ClientRuntimeError> {
     local.set_nodelay(true)?;
     let request = socks::accept_connect(&mut local).await?;
@@ -106,6 +113,13 @@ pub async fn handle_local_connection(
     let mut data_session =
         establish_data_session(&mut server, config, traffic, psk, server_public).await?;
     let pq_record = data_session.build_pq_rekey_record(server_pq_public, &mut OsRng)?;
+    server.write_all(&pq_record).await?;
+    let identity_record = read_record(&mut server).await?;
+    data_session.verify_server_identity_record(
+        &identity_record,
+        server_identity_public,
+        server_public,
+    )?;
     let connect_record = data_session.build_connect_record(
         ConnectRequest {
             host: request.host,
@@ -114,7 +128,6 @@ pub async fn handle_local_connection(
         },
         &mut OsRng,
     )?;
-    server.write_all(&pq_record).await?;
     server.write_all(&connect_record).await?;
 
     let (local_read, local_write) = local.into_split();
@@ -145,7 +158,7 @@ async fn establish_data_session(
         &completed.client_x25519.private,
         server_public,
         &completed.client_hello,
-        &completed.server_random,
+        &completed.server_hello_record,
     )?;
     Ok(ClientDataSession::new(session_keys, traffic)?)
 }
@@ -254,12 +267,15 @@ mod tests {
 
         let server_keys = X25519KeyPair::generate();
         let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
         let server_config = ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: None,
             private_key: STANDARD.encode(server_keys.private),
             pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
+            identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
+            replay_cache_path: "parallax-replay.cache".into(),
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
         };
@@ -280,6 +296,7 @@ mod tests {
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
             server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
+            server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
             tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
         };
         let client_task = tokio::spawn(async move {
@@ -291,6 +308,7 @@ mod tests {
                 PSK,
                 &server_keys.public,
                 &server_pq_keys.public,
+                &server_identity_keys.public,
             )
             .await
             .unwrap();

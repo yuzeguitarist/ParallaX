@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{CryptoRng, RngCore};
@@ -13,12 +15,16 @@ type HmacSha256 = Hmac<Sha256>;
 pub const SESSION_ID_LEN: usize = 32;
 pub const AUTH_TAG_LEN: usize = 16;
 pub const STATEFUL_AUTH_TAIL_LEN: usize = SESSION_ID_LEN - AUTH_TAG_LEN;
+pub const AUTH_TIMESTAMP_LEN: usize = 8;
+pub const AUTH_NONCE_LEN: usize = STATEFUL_AUTH_TAIL_LEN - AUTH_TIMESTAMP_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAuth {
     pub authenticated: bool,
     pub sni: Option<String>,
     pub x25519_key_share: Option<[u8; 32]>,
+    pub timestamp: Option<u64>,
+    pub nonce: Option<[u8; AUTH_NONCE_LEN]>,
 }
 
 #[derive(Debug, Error)]
@@ -31,11 +37,29 @@ pub enum AuthError {
     InvalidSessionIdLen,
     #[error("ClientHello auth key derivation failed")]
     Hkdf,
+    #[error("system clock is before UNIX epoch")]
+    Clock,
 }
 
 pub fn sign_client_hello_session_id<R>(
     record: &mut [u8],
     auth_key: &[u8],
+    rng: &mut R,
+) -> Result<[u8; AUTH_TAG_LEN], AuthError>
+where
+    R: RngCore + CryptoRng,
+{
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AuthError::Clock)?
+        .as_secs();
+    sign_client_hello_session_id_at(record, auth_key, timestamp, rng)
+}
+
+pub fn sign_client_hello_session_id_at<R>(
+    record: &mut [u8],
+    auth_key: &[u8],
+    timestamp: u64,
     rng: &mut R,
 ) -> Result<[u8; AUTH_TAG_LEN], AuthError>
 where
@@ -52,7 +76,8 @@ where
     }
 
     record[range.start..range.start + AUTH_TAG_LEN].fill(0);
-    rng.fill_bytes(&mut record[range.start + AUTH_TAG_LEN..range.end]);
+    let tail = build_auth_tail_at(timestamp, rng);
+    record[range.start + AUTH_TAG_LEN..range.end].copy_from_slice(&tail);
 
     let tag = compute_tag(record, parsed.record_len, &range, auth_key)?;
     record[range.start..range.start + AUTH_TAG_LEN].copy_from_slice(&tag);
@@ -72,6 +97,24 @@ pub fn build_stateful_auth_session_id(
     Ok(session_id)
 }
 
+pub fn build_auth_tail<R>(rng: &mut R) -> Result<[u8; STATEFUL_AUTH_TAIL_LEN], AuthError>
+where
+    R: RngCore + CryptoRng,
+{
+    let timestamp = current_unix_timestamp()?;
+    Ok(build_auth_tail_at(timestamp, rng))
+}
+
+pub fn build_auth_tail_at<R>(timestamp: u64, rng: &mut R) -> [u8; STATEFUL_AUTH_TAIL_LEN]
+where
+    R: RngCore + CryptoRng,
+{
+    let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+    tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&timestamp.to_be_bytes());
+    rng.fill_bytes(&mut tail[AUTH_TIMESTAMP_LEN..]);
+    tail
+}
+
 pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<ClientAuth, AuthError> {
     if auth_key.is_empty() {
         return Err(AuthError::EmptyPsk);
@@ -83,6 +126,8 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
             authenticated: false,
             sni: parsed.sni,
             x25519_key_share: parsed.x25519_key_share,
+            timestamp: None,
+            nonce: None,
         });
     }
 
@@ -106,12 +151,31 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
         }
         _ => false,
     };
+    let timestamp_start = parsed.session_id_range.start + AUTH_TAG_LEN;
+    let timestamp = u64::from_be_bytes(
+        record[timestamp_start..timestamp_start + AUTH_TIMESTAMP_LEN]
+            .try_into()
+            .expect("timestamp range is fixed"),
+    );
+    let mut nonce = [0_u8; AUTH_NONCE_LEN];
+    nonce.copy_from_slice(
+        &record[timestamp_start + AUTH_TIMESTAMP_LEN..parsed.session_id_range.end],
+    );
 
     Ok(ClientAuth {
         authenticated: transcript_authenticated || stateful_authenticated,
         sni: parsed.sni,
         x25519_key_share: parsed.x25519_key_share,
+        timestamp: Some(timestamp),
+        nonce: Some(nonce),
     })
+}
+
+fn current_unix_timestamp() -> Result<u64, AuthError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AuthError::Clock)?
+        .as_secs())
 }
 
 pub fn derive_client_auth_key(
@@ -210,6 +274,8 @@ mod tests {
         assert!(auth.authenticated);
         assert_eq!(auth.sni.as_deref(), Some("example.com"));
         assert!(auth.x25519_key_share.is_some());
+        assert!(auth.timestamp.is_some());
+        assert!(auth.nonce.is_some());
     }
 
     #[test]

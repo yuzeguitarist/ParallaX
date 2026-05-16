@@ -549,6 +549,7 @@ dependencies = [
  "clap",
  "hkdf",
  "hmac",
+ "pqcrypto-mldsa",
  "pqcrypto-mlkem",
  "pqcrypto-traits",
  "rand",
@@ -565,6 +566,12 @@ dependencies = [
  "x25519-dalek",
  "zeroize",
 ]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pin-project-lite"
@@ -602,6 +609,20 @@ dependencies = [
  "dunce",
  "getrandom 0.3.4",
  "libc",
+]
+
+[[package]]
+name = "pqcrypto-mldsa"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f812cd126a2582599478a434fea75937b4b05d234c64a49e0cea129e130528"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
+ "paste",
+ "pqcrypto-internals",
+ "pqcrypto-traits",
 ]
 
 [[package]]

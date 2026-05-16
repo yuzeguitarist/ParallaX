@@ -31,6 +31,11 @@ impl X25519KeyPair {
     }
 }
 
+pub fn x25519_public_from_private(private: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    let private = StaticSecret::from(*private);
+    PublicKey::from(&private).to_bytes()
+}
+
 impl fmt::Debug for X25519KeyPair {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("X25519KeyPair")
@@ -40,12 +45,31 @@ impl fmt::Debug for X25519KeyPair {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
     pub client_key: [u8; KEY_LEN],
     pub server_key: [u8; KEY_LEN],
     pub client_nonce: [u8; NONCE_LEN],
     pub server_nonce: [u8; NONCE_LEN],
+    pub chain_secret: [u8; KEY_LEN],
+    pub epoch: u64,
+    pub transcript_hash: [u8; KEY_LEN],
+    pub x25519_shared_secret: [u8; KEY_LEN],
+}
+
+impl fmt::Debug for SessionKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionKeys")
+            .field("client_key", &"<redacted>")
+            .field("server_key", &"<redacted>")
+            .field("client_nonce", &"<redacted>")
+            .field("server_nonce", &"<redacted>")
+            .field("chain_secret", &"<redacted>")
+            .field("epoch", &self.epoch)
+            .field("transcript_hash", &self.transcript_hash)
+            .field("x25519_shared_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -61,54 +85,116 @@ pub enum SessionError {
 pub fn derive_client_keys(
     client_private: &[u8; KEY_LEN],
     server_public: &[u8; KEY_LEN],
-    context: &[u8],
+    transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    derive_keys(client_private, server_public, context)
+    derive_keys(client_private, server_public, transcript_hash)
 }
 
 pub fn derive_server_keys(
     server_private: &[u8; KEY_LEN],
     client_public: &[u8; KEY_LEN],
-    context: &[u8],
+    transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    derive_keys(server_private, client_public, context)
+    derive_keys(server_private, client_public, transcript_hash)
 }
 
 fn derive_keys(
     private: &[u8; KEY_LEN],
     peer_public: &[u8; KEY_LEN],
-    context: &[u8],
+    transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
     let private = StaticSecret::from(*private);
     let peer_public = PublicKey::from(*peer_public);
     let shared = private.diffie_hellman(&peer_public);
-    let hk = Hkdf::<Sha256>::new(Some(b"ParallaX v1 x25519"), shared.as_bytes());
+    let x25519_shared_secret = *shared.as_bytes();
+    let chain_secret = initial_chain_secret(&x25519_shared_secret, transcript_hash)?;
+    expand_epoch_keys(chain_secret, 0, *transcript_hash, x25519_shared_secret)
+}
+
+pub fn expand_epoch_keys(
+    chain_secret: [u8; KEY_LEN],
+    epoch: u64,
+    transcript_hash: [u8; KEY_LEN],
+    x25519_shared_secret: [u8; KEY_LEN],
+) -> Result<SessionKeys, SessionError> {
+    let hk = Hkdf::<Sha256>::from_prk(&chain_secret).map_err(|_| SessionError::Hkdf)?;
 
     let mut out = SessionKeys {
         client_key: [0; KEY_LEN],
         server_key: [0; KEY_LEN],
         client_nonce: [0; NONCE_LEN],
         server_nonce: [0; NONCE_LEN],
+        chain_secret,
+        epoch,
+        transcript_hash,
+        x25519_shared_secret,
     };
 
-    expand(&hk, b"client appdata key", context, &mut out.client_key)?;
-    expand(&hk, b"server appdata key", context, &mut out.server_key)?;
-    expand(&hk, b"client appdata nonce", context, &mut out.client_nonce)?;
-    expand(&hk, b"server appdata nonce", context, &mut out.server_nonce)?;
+    expand(
+        &hk,
+        b"client appdata key",
+        epoch,
+        &transcript_hash,
+        &mut out.client_key,
+    )?;
+    expand(
+        &hk,
+        b"server appdata key",
+        epoch,
+        &transcript_hash,
+        &mut out.server_key,
+    )?;
+    expand(
+        &hk,
+        b"client appdata nonce",
+        epoch,
+        &transcript_hash,
+        &mut out.client_nonce,
+    )?;
+    expand(
+        &hk,
+        b"server appdata nonce",
+        epoch,
+        &transcript_hash,
+        &mut out.server_nonce,
+    )?;
 
     Ok(out)
+}
+
+fn initial_chain_secret(
+    x25519_shared_secret: &[u8; KEY_LEN],
+    transcript_hash: &[u8; KEY_LEN],
+) -> Result<[u8; KEY_LEN], SessionError> {
+    let hk = Hkdf::<Sha256>::new(
+        Some(b"ParallaX v1 initial x25519 chain"),
+        x25519_shared_secret,
+    );
+    let mut chain_secret = [0_u8; KEY_LEN];
+    expand(
+        &hk,
+        b"initial chain secret",
+        0,
+        transcript_hash,
+        &mut chain_secret,
+    )?;
+    Ok(chain_secret)
 }
 
 fn expand(
     hk: &Hkdf<Sha256>,
     label: &[u8],
-    context: &[u8],
+    epoch: u64,
+    transcript_hash: &[u8; KEY_LEN],
     out: &mut [u8],
 ) -> Result<(), SessionError> {
-    let mut info = Vec::with_capacity(label.len() + context.len() + 1);
+    let epoch = epoch.to_be_bytes();
+    let mut info = Vec::with_capacity(label.len() + epoch.len() + transcript_hash.len() + 2);
     info.extend_from_slice(label);
     info.push(0);
-    info.extend_from_slice(context);
+    info.extend_from_slice(&epoch);
+    info.push(0);
+    info.extend_from_slice(transcript_hash);
     hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
 }
 
@@ -193,12 +279,31 @@ mod tests {
     fn x25519_derives_same_session_keys() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
-        let context = b"clienthello || serverhello";
+        let transcript_hash = [7_u8; 32];
 
-        let client_keys = derive_client_keys(&client.private, &server.public, context).unwrap();
-        let server_keys = derive_server_keys(&server.private, &client.public, context).unwrap();
+        let client_keys =
+            derive_client_keys(&client.private, &server.public, &transcript_hash).unwrap();
+        let server_keys =
+            derive_server_keys(&server.private, &client.public, &transcript_hash).unwrap();
 
         assert_eq!(client_keys, server_keys);
+        assert_eq!(client_keys.epoch, 0);
+        assert_eq!(client_keys.transcript_hash, transcript_hash);
+    }
+
+    #[test]
+    fn epoch_keys_change_when_epoch_changes() {
+        let chain_secret = [1_u8; 32];
+        let transcript_hash = [2_u8; 32];
+        let x25519_shared_secret = [3_u8; 32];
+
+        let epoch0 =
+            expand_epoch_keys(chain_secret, 0, transcript_hash, x25519_shared_secret).unwrap();
+        let epoch1 =
+            expand_epoch_keys(chain_secret, 1, transcript_hash, x25519_shared_secret).unwrap();
+
+        assert_ne!(epoch0.client_key, epoch1.client_key);
+        assert_ne!(epoch0.client_nonce, epoch1.client_nonce);
     }
 
     #[test]

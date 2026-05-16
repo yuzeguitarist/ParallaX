@@ -36,8 +36,8 @@ use super::{
 };
 use crate::crypto::{
     auth::{
-        build_stateful_auth_session_id, derive_client_auth_key, verify_client_hello_auth,
-        STATEFUL_AUTH_TAIL_LEN,
+        build_auth_tail, build_stateful_auth_session_id, derive_client_auth_key,
+        verify_client_hello_auth,
     },
     session::X25519KeyPair,
 };
@@ -80,8 +80,7 @@ impl ClientHelloMutator for PatchContext {
         let Some(key_share) = parsed.x25519_key_share else {
             return Err(TlsBackendError::UnauthenticatedClientHello);
         };
-        let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
-        OsRng.fill_bytes(&mut tail);
+        let tail = build_auth_tail(&mut OsRng)?;
         let session_id =
             build_stateful_auth_session_id(&self.auth_key, &self.sni, &key_share, &tail)?;
         out[parsed.session_id_range].copy_from_slice(&session_id);
@@ -230,13 +229,13 @@ impl StatefulRustlsSession {
         self.tap_records(RecordDirection::Outbound, &client_hello);
         stream.write_all(&self.client_hello).await?;
 
-        let mut server_random = None;
+        let mut server_hello_record = None;
         while self.connection.is_handshaking() {
             let record = read_record(stream).await?;
-            if server_random.is_none() {
+            if server_hello_record.is_none() {
                 if let Ok(server_hello) = parse_server_hello(&record) {
                     if server_hello.tls13_selected {
-                        server_random = Some(server_hello.random);
+                        server_hello_record = Some(record.clone());
                     }
                 }
             }
@@ -244,13 +243,13 @@ impl StatefulRustlsSession {
             self.flush_outbound(stream).await?;
         }
 
-        let server_random = server_random.ok_or(TlsBackendError::MissingServerHello)?;
+        let server_hello_record = server_hello_record.ok_or(TlsBackendError::MissingServerHello)?;
         self.drain_post_handshake(stream).await?;
 
         Ok(CompletedStatefulHandshake {
             client_hello: self.client_hello,
             client_x25519: self.x25519,
-            server_random,
+            server_hello_record,
             record_events: self.tap.events,
         })
     }
@@ -322,7 +321,7 @@ impl StatefulRustlsSession {
 pub struct CompletedStatefulHandshake {
     pub client_hello: Vec<u8>,
     pub client_x25519: X25519KeyPair,
-    pub server_random: [u8; 32],
+    pub server_hello_record: Vec<u8>,
     pub record_events: Vec<RecordEvent>,
 }
 
@@ -389,8 +388,7 @@ impl SecureRandom for ParallaxSecureRandom {
                 return;
             }
 
-            let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
-            OsRng.fill_bytes(&mut tail);
+            let tail = build_auth_tail(&mut OsRng).expect("system clock must be after UNIX epoch");
             let session_id = build_stateful_auth_session_id(
                 &context.auth_key,
                 &context.sni,

@@ -16,18 +16,25 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use super::transcript::session_context;
+use super::transcript::transcript_hash;
 
 use crate::{
     config::{decode_key32, decode_psk, Config, ConfigError, Mode, ServerConfig, TrafficConfig},
     crypto::{
         auth::{derive_server_auth_key, verify_client_hello_auth, AuthError},
+        identity::{self, IdentityError},
         pq::{self, PqError},
-        replay::ReplayCache,
-        session::{derive_server_keys, AeadCodec, SessionError, SessionKeys},
+        replay::{current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry},
+        session::{
+            derive_server_keys, expand_epoch_keys, x25519_public_from_private, AeadCodec,
+            SessionError, SessionKeys,
+        },
     },
     protocol::{
-        command::{ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest},
+        command::{
+            ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityProof,
+            ServerIdentityProofError,
+        },
         data::{
             max_plaintext_len, DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD,
             SERVER_TO_CLIENT_AAD,
@@ -73,6 +80,12 @@ pub enum HandshakeServerError {
     PqRekey(#[from] PqRekeyError),
     #[error("PQ crypto error: {0}")]
     Pq(#[from] PqError),
+    #[error("server identity proof command error: {0}")]
+    ServerIdentityProof(#[from] ServerIdentityProofError),
+    #[error("server identity signing failed: {0}")]
+    Identity(#[from] IdentityError),
+    #[error("replay cache error: {0}")]
+    ReplayCache(#[from] ReplayCacheError),
     #[error("missing encrypted connect request and no fixed server.data_target configured")]
     MissingConnectTarget,
 }
@@ -87,6 +100,9 @@ pub enum InboundDecision {
 pub struct AuthenticatedHello {
     pub sni: String,
     pub x25519_key_share: [u8; 32],
+    pub timestamp: u64,
+    pub nonce: [u8; 8],
+    pub transcript_fingerprint: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +127,7 @@ pub struct AuthenticatedHandshake {
     pub client_hello: AuthenticatedHello,
     pub server_hello: ServerHello,
     pub session_keys: SessionKeys,
+    pub server_public_key: [u8; 32],
 }
 
 pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
@@ -124,7 +141,10 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .ok_or(HandshakeServerError::MissingServer)?;
     let traffic = config.traffic;
     let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
-    let replay_cache = Arc::new(Mutex::new(ReplayCache::new(8192)));
+    let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create(
+        &server.replay_cache_path,
+        8192,
+    )?));
     let listener = TcpListener::bind(server.listen).await?;
     tracing::info!("ParallaX server listening on {}", server.listen);
 
@@ -185,11 +205,17 @@ async fn handle_connection_inner(
         }
         InboundDecision::Authenticated(client_hello) => {
             if let Some(replay_cache) = replay_cache {
-                let fingerprint = client_hello_fingerprint(&first_record);
                 if !replay_cache
                     .lock()
                     .expect("replay cache poisoned")
-                    .insert_new(fingerprint)
+                    .insert_new(
+                        ReplayEntry {
+                            timestamp: client_hello.timestamp,
+                            nonce: client_hello.nonce,
+                            transcript_fingerprint: client_hello.transcript_fingerprint,
+                        },
+                        current_unix_timestamp()?,
+                    )?
                 {
                     tracing::debug!("falling back on replayed ClientHello");
                     relay_fallback(client, &config.fallback_addr, first_record).await?;
@@ -206,10 +232,15 @@ async fn handle_connection_inner(
             );
             let pq_secret =
                 crate::config::decode_base64_bytes("server.pq_secret_key", &config.pq_secret_key)?;
+            let identity_secret = crate::config::decode_base64_bytes(
+                "server.identity_secret_key",
+                &config.identity_secret_key,
+            )?;
             run_authenticated_data_mode(
                 handshake,
                 config.data_target.as_deref(),
                 &pq_secret,
+                &identity_secret,
                 traffic,
             )
             .await?;
@@ -250,6 +281,14 @@ pub fn decide_inbound(
     if !auth.authenticated {
         return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed));
     }
+    let timestamp = match auth.timestamp {
+        Some(timestamp) => timestamp,
+        None => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+    };
+    let nonce = match auth.nonce {
+        Some(nonce) => nonce,
+        None => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+    };
 
     let sni = match auth.sni {
         Some(sni) => sni,
@@ -265,6 +304,9 @@ pub fn decide_inbound(
     Ok(InboundDecision::Authenticated(AuthenticatedHello {
         sni,
         x25519_key_share,
+        timestamp,
+        nonce,
+        transcript_fingerprint: client_hello_fingerprint(first_client_record),
     }))
 }
 
@@ -284,7 +326,7 @@ pub async fn accept_authenticated(
     }
     client.write_all(&forwarded.raw_record).await?;
 
-    let context = session_context(&first_client_record, &forwarded.parsed.random);
+    let context = transcript_hash(&first_client_record, &forwarded.raw_record);
     let session_keys =
         derive_server_keys(server_private, &client_hello.x25519_key_share, &context)?;
 
@@ -294,6 +336,7 @@ pub async fn accept_authenticated(
         client_hello,
         server_hello: forwarded.parsed,
         session_keys,
+        server_public_key: x25519_public_from_private(server_private),
     })
 }
 
@@ -327,6 +370,7 @@ async fn run_authenticated_data_mode(
     handshake: AuthenticatedHandshake,
     fixed_data_target: Option<&str>,
     pq_secret_key: &[u8],
+    identity_secret_key: &[u8],
     traffic: TrafficConfig,
 ) -> Result<(), HandshakeServerError> {
     let padding = PaddingProfile::from_config(traffic)?;
@@ -365,12 +409,25 @@ async fn run_authenticated_data_mode(
                         let pq_rekey = PqRekeyRequest::decode(&first_payload)?;
                         let pq_shared_secret =
                             pq::decapsulate(&pq_rekey.ciphertext, pq_secret_key)?;
-                        apply_server_pq_rekey(
+                        let rekeyed_keys = apply_server_pq_rekey(
                             &mut client_open,
                             &mut server_seal,
                             &handshake.session_keys,
                             &pq_shared_secret,
                         )?;
+                        let mut rng = StdRng::from_entropy();
+                        let identity_signature = identity::sign_server_identity(
+                            identity_secret_key,
+                            &rekeyed_keys.transcript_hash,
+                            &handshake.server_public_key,
+                            rekeyed_keys.epoch,
+                        )?;
+                        let identity_payload = ServerIdentityProof {
+                            signature: identity_signature,
+                        }
+                        .encode()?;
+                        let identity_record = server_seal.seal(&identity_payload, &mut rng)?;
+                        client_write.write_all(&identity_record).await?;
 
                         let record = read_record(&mut client_read).await?;
                         let first_payload = client_open.open(&record)?;
@@ -435,22 +492,21 @@ fn apply_server_pq_rekey(
     server_seal: &mut DataRecordCodec,
     keys: &SessionKeys,
     shared_secret: &[u8; 32],
-) -> Result<(), HandshakeServerError> {
-    let (client_key, client_nonce) = pq::hybrid_rekey(
-        &keys.client_key,
-        &keys.client_nonce,
+) -> Result<SessionKeys, HandshakeServerError> {
+    let chain_secret = pq::hybrid_rekey(
+        &keys.chain_secret,
+        &keys.x25519_shared_secret,
         shared_secret,
-        b"client",
     )?;
-    let (server_key, server_nonce) = pq::hybrid_rekey(
-        &keys.server_key,
-        &keys.server_nonce,
-        shared_secret,
-        b"server",
+    let next_keys = expand_epoch_keys(
+        chain_secret,
+        keys.epoch + 1,
+        keys.transcript_hash,
+        keys.x25519_shared_secret,
     )?;
-    client_open.rekey(client_key, client_nonce);
-    server_seal.rekey(server_key, server_nonce);
-    Ok(())
+    client_open.rekey(next_keys.client_key, next_keys.client_nonce);
+    server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
+    Ok(next_keys)
 }
 
 struct DataRelay {
@@ -658,6 +714,7 @@ mod tests {
 
         let server_keys = X25519KeyPair::generate();
         let server_pq_keys = pq::keypair();
+        let server_identity_keys = identity::keypair();
         let client_keys = X25519KeyPair::generate();
         let traffic = TrafficConfig::default();
         let config = ServerConfig {
@@ -666,6 +723,8 @@ mod tests {
             data_target: None,
             private_key: STANDARD.encode(server_keys.private),
             pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
+            identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
+            replay_cache_path: "parallax-replay.cache".into(),
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
         };
@@ -689,12 +748,12 @@ mod tests {
         client.write_all(&client_hello).await.unwrap();
 
         let server_hello_record = read_record(&mut client).await.unwrap();
-        let server_hello = parse_server_hello(&server_hello_record).unwrap();
+        let _server_hello = parse_server_hello(&server_hello_record).unwrap();
         let session_keys = crate::handshake::client::derive_session_keys(
             &client_keys.private,
             &server_keys.public,
             &client_hello,
-            &server_hello.random,
+            &server_hello_record,
         )
         .unwrap();
         let mut data_session = ClientDataSession::new(session_keys, traffic).unwrap();
@@ -702,6 +761,14 @@ mod tests {
             .build_pq_rekey_record(&server_pq_keys.public, &mut rng)
             .unwrap();
         client.write_all(&pq_record).await.unwrap();
+        let identity_record = read_record(&mut client).await.unwrap();
+        data_session
+            .verify_server_identity_record(
+                &identity_record,
+                &server_identity_keys.public,
+                &server_keys.public,
+            )
+            .unwrap();
         let connect = ConnectRequest {
             host: target_addr.ip().to_string(),
             port: target_addr.port(),

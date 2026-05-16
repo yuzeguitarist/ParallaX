@@ -1,15 +1,13 @@
 use sha2::{Digest, Sha256};
 
-pub fn session_context(client_hello_record: &[u8], server_random: &[u8; 32]) -> Vec<u8> {
+pub type TranscriptHash = [u8; 32];
+
+pub fn transcript_hash(client_hello_record: &[u8], server_hello_record: &[u8]) -> TranscriptHash {
     let mut hasher = Sha256::new();
     hasher.update(b"ParallaX v1 handshake transcript");
     hasher.update(client_hello_record);
-    let client_hello_hash = hasher.finalize();
-
-    let mut context = Vec::with_capacity(client_hello_hash.len() + server_random.len());
-    context.extend_from_slice(&client_hello_hash);
-    context.extend_from_slice(server_random);
-    context
+    hasher.update(server_hello_record);
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -17,13 +15,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_binds_client_hello_and_server_random() {
-        let a = session_context(b"client-hello-a", &[1; 32]);
-        let b = session_context(b"client-hello-b", &[1; 32]);
-        let c = session_context(b"client-hello-a", &[2; 32]);
+    fn transcript_hash_binds_client_and_server_hello() {
+        let a = transcript_hash(b"client-hello-a", b"server-hello-a");
+        let b = transcript_hash(b"client-hello-b", b"server-hello-a");
+        let c = transcript_hash(b"client-hello-a", b"server-hello-b");
 
         assert_ne!(a, b);
         assert_ne!(a, c);
-        assert_eq!(a.len(), 64);
+        assert_eq!(a.len(), 32);
     }
 }

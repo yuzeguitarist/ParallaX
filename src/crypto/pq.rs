@@ -1,5 +1,5 @@
 use hkdf::Hkdf;
-use pqcrypto_mlkem::mlkem768;
+use pqcrypto_mlkem::mlkem1024;
 use pqcrypto_traits::kem::{
     Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
     SharedSecret as KemSharedSecret,
@@ -33,7 +33,7 @@ pub struct MlKemEncapsulation {
 }
 
 pub fn keypair() -> MlKemKeyPair {
-    let (public, secret) = mlkem768::keypair();
+    let (public, secret) = mlkem1024::keypair();
     MlKemKeyPair {
         public: public.as_bytes().to_vec(),
         secret: secret.as_bytes().to_vec(),
@@ -42,8 +42,8 @@ pub fn keypair() -> MlKemKeyPair {
 
 pub fn encapsulate(public_key: &[u8]) -> Result<MlKemEncapsulation, PqError> {
     let public =
-        mlkem768::PublicKey::from_bytes(public_key).map_err(|_| PqError::InvalidPublicKey)?;
-    let (shared_secret, ciphertext) = mlkem768::encapsulate(&public);
+        mlkem1024::PublicKey::from_bytes(public_key).map_err(|_| PqError::InvalidPublicKey)?;
+    let (shared_secret, ciphertext) = mlkem1024::encapsulate(&public);
     Ok(MlKemEncapsulation {
         ciphertext: ciphertext.as_bytes().to_vec(),
         shared_secret: shared_secret_32(shared_secret.as_bytes())?,
@@ -52,37 +52,27 @@ pub fn encapsulate(public_key: &[u8]) -> Result<MlKemEncapsulation, PqError> {
 
 pub fn decapsulate(ciphertext: &[u8], secret_key: &[u8]) -> Result<[u8; 32], PqError> {
     let ciphertext =
-        mlkem768::Ciphertext::from_bytes(ciphertext).map_err(|_| PqError::InvalidCiphertext)?;
+        mlkem1024::Ciphertext::from_bytes(ciphertext).map_err(|_| PqError::InvalidCiphertext)?;
     let secret =
-        mlkem768::SecretKey::from_bytes(secret_key).map_err(|_| PqError::InvalidSecretKey)?;
-    let shared_secret = mlkem768::decapsulate(&ciphertext, &secret);
+        mlkem1024::SecretKey::from_bytes(secret_key).map_err(|_| PqError::InvalidSecretKey)?;
+    let shared_secret = mlkem1024::decapsulate(&ciphertext, &secret);
     shared_secret_32(shared_secret.as_bytes())
 }
 
 pub fn hybrid_rekey(
-    old_key: &[u8; 32],
-    old_nonce: &[u8; 12],
+    old_chain_secret: &[u8; 32],
+    x25519_shared_secret: &[u8; 32],
     pq_shared_secret: &[u8; 32],
-    label: &[u8],
-) -> Result<([u8; 32], [u8; 12]), PqError> {
-    let hk = Hkdf::<Sha256>::new(Some(b"ParallaX v1 ML-KEM hybrid rekey"), pq_shared_secret);
-    let mut key = [0_u8; 32];
-    let mut nonce = [0_u8; 12];
+) -> Result<[u8; 32], PqError> {
+    let mut ikm = [0_u8; 64];
+    ikm[..32].copy_from_slice(x25519_shared_secret);
+    ikm[32..].copy_from_slice(pq_shared_secret);
 
-    let mut key_info = Vec::with_capacity(label.len() + old_key.len() + 4);
-    key_info.extend_from_slice(label);
-    key_info.extend_from_slice(b" key");
-    key_info.extend_from_slice(old_key);
-    hk.expand(&key_info, &mut key).map_err(|_| PqError::Hkdf)?;
-
-    let mut nonce_info = Vec::with_capacity(label.len() + old_nonce.len() + 6);
-    nonce_info.extend_from_slice(label);
-    nonce_info.extend_from_slice(b" nonce");
-    nonce_info.extend_from_slice(old_nonce);
-    hk.expand(&nonce_info, &mut nonce)
-        .map_err(|_| PqError::Hkdf)?;
-
-    Ok((key, nonce))
+    let (prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm);
+    let mut chain_secret = [0_u8; 32];
+    chain_secret.copy_from_slice(&prk);
+    ikm.zeroize();
+    Ok(chain_secret)
 }
 
 fn shared_secret_32(shared_secret: &[u8]) -> Result<[u8; 32], PqError> {
@@ -104,12 +94,31 @@ mod tests {
         let enc = encapsulate(&keys.public).unwrap();
         let dec = decapsulate(&enc.ciphertext, &keys.secret).unwrap();
         assert_eq!(enc.shared_secret, dec);
+        assert_eq!(keys.public.len(), mlkem1024::public_key_bytes());
+        assert_eq!(keys.secret.len(), mlkem1024::secret_key_bytes());
+        assert_eq!(enc.ciphertext.len(), mlkem1024::ciphertext_bytes());
     }
 
     #[test]
     fn hybrid_rekey_changes_key_material() {
-        let (key, nonce) = hybrid_rekey(&[1; 32], &[2; 12], &[3; 32], b"C").unwrap();
-        assert_ne!(key, [1; 32]);
-        assert_ne!(nonce, [2; 12]);
+        let chain_secret = hybrid_rekey(&[1; 32], &[2; 32], &[3; 32]).unwrap();
+        assert_ne!(chain_secret, [1; 32]);
+    }
+
+    #[test]
+    fn hybrid_rekey_binds_old_chain_x25519_and_mlkem_secrets() {
+        let baseline = hybrid_rekey(&[1; 32], &[2; 32], &[3; 32]).unwrap();
+        assert_ne!(
+            baseline,
+            hybrid_rekey(&[9; 32], &[2; 32], &[3; 32]).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            hybrid_rekey(&[1; 32], &[9; 32], &[3; 32]).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            hybrid_rekey(&[1; 32], &[2; 32], &[9; 32]).unwrap()
+        );
     }
 }

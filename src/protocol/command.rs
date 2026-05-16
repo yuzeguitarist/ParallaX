@@ -2,6 +2,7 @@ use thiserror::Error;
 
 const CONNECT_MAGIC: &[u8; 4] = b"PX1C";
 const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
+const SERVER_IDENTITY_MAGIC: &[u8; 4] = b"PX1S";
 const MAX_HOST_LEN: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,11 @@ pub struct PqRekeyRequest {
     pub ciphertext: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerIdentityProof {
+    pub signature: Vec<u8>,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PqRekeyError {
     #[error("PQ rekey request is truncated")]
@@ -44,6 +50,18 @@ pub enum PqRekeyError {
     EmptyCiphertext,
     #[error("PQ rekey ciphertext length is invalid")]
     InvalidCiphertextLength,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ServerIdentityProofError {
+    #[error("server identity proof is truncated")]
+    Truncated,
+    #[error("server identity proof magic mismatch")]
+    BadMagic,
+    #[error("server identity proof signature is empty")]
+    EmptySignature,
+    #[error("server identity proof signature length is invalid")]
+    InvalidSignatureLength,
 }
 
 impl ConnectRequest {
@@ -148,6 +166,41 @@ impl PqRekeyRequest {
     }
 }
 
+impl ServerIdentityProof {
+    pub fn encode(&self) -> Result<Vec<u8>, ServerIdentityProofError> {
+        if self.signature.is_empty() {
+            return Err(ServerIdentityProofError::EmptySignature);
+        }
+        let mut out = Vec::with_capacity(8 + self.signature.len());
+        out.extend_from_slice(SERVER_IDENTITY_MAGIC);
+        out.extend_from_slice(&(self.signature.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.signature);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, ServerIdentityProofError> {
+        if input.len() < 4 {
+            return Err(ServerIdentityProofError::Truncated);
+        }
+        if &input[..4] != SERVER_IDENTITY_MAGIC {
+            return Err(ServerIdentityProofError::BadMagic);
+        }
+        if input.len() < 8 {
+            return Err(ServerIdentityProofError::Truncated);
+        }
+        let len = u32::from_be_bytes([input[4], input[5], input[6], input[7]]) as usize;
+        if len == 0 {
+            return Err(ServerIdentityProofError::EmptySignature);
+        }
+        if input.len() != 8 + len {
+            return Err(ServerIdentityProofError::InvalidSignatureLength);
+        }
+        Ok(Self {
+            signature: input[8..].to_vec(),
+        })
+    }
+}
+
 struct Cursor<'a> {
     input: &'a [u8],
     pos: usize,
@@ -213,5 +266,14 @@ mod tests {
         };
         let encoded = request.encode().unwrap();
         assert_eq!(PqRekeyRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn server_identity_proof_round_trip() {
+        let proof = ServerIdentityProof {
+            signature: vec![4, 5, 6],
+        };
+        let encoded = proof.encode().unwrap();
+        assert_eq!(ServerIdentityProof::decode(&encoded).unwrap(), proof);
     }
 }

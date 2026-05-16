@@ -10,7 +10,7 @@ use crate::{
     client::runtime,
     config::Config,
     crypto::{
-        pq,
+        identity, pq,
         session::{derive_client_keys, AeadCodec, X25519KeyPair},
     },
     handshake::server,
@@ -87,8 +87,8 @@ pub async fn run() -> anyhow::Result<()> {
         Command::CryptoSelfTest => {
             let server = X25519KeyPair::generate();
             let client = X25519KeyPair::generate();
-            let keys =
-                derive_client_keys(&client.private, &server.public, b"parallax-cli-self-test")?;
+            let transcript_hash = [0x53_u8; 32];
+            let keys = derive_client_keys(&client.private, &server.public, &transcript_hash)?;
             let mut enc = AeadCodec::new(keys.client_key, keys.client_nonce);
             let mut dec = AeadCodec::new(keys.client_key, keys.client_nonce);
             let ciphertext = enc.seal(b"parallax", b"self-test")?;
@@ -135,6 +135,7 @@ fn print_config_template(
     OsRng.fill_bytes(&mut psk);
     let server_keys = X25519KeyPair::generate();
     let server_pq_keys = pq::keypair();
+    let server_identity_keys = identity::keypair();
 
     println!(
         r#"# ===== server parallax.toml =====
@@ -155,6 +156,8 @@ listen = "{}"
 fallback_addr = "{}"
 private_key = "{}"
 pq_secret_key = "{}"
+identity_secret_key = "{}"
+replay_cache_path = "parallax-replay.cache"
 authorized_sni = ["{}"]
 strict_tls13 = true
 
@@ -177,6 +180,7 @@ server_addr = "{}"
 sni = "{}"
 server_public_key = "{}"
 server_pq_public_key = "{}"
+server_identity_public_key = "{}"
 tls_profile = "safari17"
 "#,
         STANDARD.encode(psk),
@@ -184,6 +188,7 @@ tls_profile = "safari17"
         fallback_addr,
         STANDARD.encode(server_keys.private),
         STANDARD.encode(&server_pq_keys.secret),
+        STANDARD.encode(&server_identity_keys.secret),
         sni,
         STANDARD.encode(psk),
         client_listen,
@@ -191,5 +196,6 @@ tls_profile = "safari17"
         sni,
         STANDARD.encode(server_keys.public),
         STANDARD.encode(&server_pq_keys.public),
+        STANDARD.encode(&server_identity_keys.public),
     );
 }
