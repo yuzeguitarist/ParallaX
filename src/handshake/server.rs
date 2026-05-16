@@ -19,7 +19,10 @@ use crate::{
     crypto::session::{derive_server_keys, AeadCodec, SessionError, SessionKeys},
     protocol::{
         command::{ConnectRequest, ConnectRequestError},
-        data::{DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD},
+        data::{
+            max_plaintext_len, DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD,
+            SERVER_TO_CLIENT_AAD,
+        },
     },
     tls::{
         client_hello::parse_client_hello,
@@ -301,7 +304,7 @@ async fn run_authenticated_data_mode(
                             target.write_all(&initial_payload).await?;
                         }
                         let (target_read, target_write) = target.into_split();
-                        return relay_data_channel(
+                        return DataRelay {
                             client_read,
                             client_write,
                             target_read,
@@ -309,7 +312,9 @@ async fn run_authenticated_data_mode(
                             client_open,
                             server_seal,
                             timing,
-                        )
+                            chunk_size: max_plaintext_len(traffic.max_padding),
+                        }
+                        .run()
                         .await;
                     }
                     Err(DataRecordError::Aead(_)) | Err(DataRecordError::NotApplicationData) => {
@@ -344,51 +349,56 @@ fn resolve_connect_target(
     }
 }
 
-async fn relay_data_channel(
-    mut client_read: OwnedReadHalf,
-    mut client_write: OwnedWriteHalf,
-    mut target_read: OwnedReadHalf,
-    mut target_write: OwnedWriteHalf,
-    mut client_open: DataRecordCodec,
-    mut server_seal: DataRecordCodec,
+struct DataRelay {
+    client_read: OwnedReadHalf,
+    client_write: OwnedWriteHalf,
+    target_read: OwnedReadHalf,
+    target_write: OwnedWriteHalf,
+    client_open: DataRecordCodec,
+    server_seal: DataRecordCodec,
     timing: TimingProfile,
-) -> Result<(), HandshakeServerError> {
-    let mut target_buf = vec![0_u8; 16 * 1024];
-    let mut rng = StdRng::from_entropy();
+    chunk_size: usize,
+}
 
-    loop {
-        tokio::select! {
-            record = read_record(&mut client_read) => {
-                let record = match record {
-                    Ok(record) => record,
-                    Err(err) if is_clean_close(&err) => return Ok(()),
-                    Err(err) => return Err(HandshakeServerError::Io(err)),
-                };
-                match client_open.open(&record) {
-                    Ok(payload) => {
-                        if !payload.is_empty() {
-                            target_write.write_all(&payload).await?;
+impl DataRelay {
+    async fn run(mut self) -> Result<(), HandshakeServerError> {
+        let mut target_buf = vec![0_u8; self.chunk_size];
+        let mut rng = StdRng::from_entropy();
+
+        loop {
+            tokio::select! {
+                record = read_record(&mut self.client_read) => {
+                    let record = match record {
+                        Ok(record) => record,
+                        Err(err) if is_clean_close(&err) => return Ok(()),
+                        Err(err) => return Err(HandshakeServerError::Io(err)),
+                    };
+                    match self.client_open.open(&record) {
+                        Ok(payload) => {
+                            if !payload.is_empty() {
+                                self.target_write.write_all(&payload).await?;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = self.client_write.write_all(&alert_bad_record_mac()).await;
+                            return Err(HandshakeServerError::DataRecord(err));
                         }
                     }
-                    Err(err) => {
-                        let _ = client_write.write_all(&alert_bad_record_mac()).await;
-                        return Err(HandshakeServerError::DataRecord(err));
+                }
+                read = self.target_read.read(&mut target_buf) => {
+                    let n = read?;
+                    if n == 0 {
+                        return Ok(());
                     }
-                }
-            }
-            read = target_read.read(&mut target_buf) => {
-                let n = read?;
-                if n == 0 {
-                    return Ok(());
-                }
 
-                let delay = timing.sample_delay(&mut rng);
-                if !delay.is_zero() {
-                    sleep(delay).await;
-                }
+                    let delay = self.timing.sample_delay(&mut rng);
+                    if !delay.is_zero() {
+                        sleep(delay).await;
+                    }
 
-                let record = server_seal.seal(&target_buf[..n], &mut rng)?;
-                client_write.write_all(&record).await?;
+                    let record = self.server_seal.seal(&target_buf[..n], &mut rng)?;
+                    self.client_write.write_all(&record).await?;
+                }
             }
         }
     }

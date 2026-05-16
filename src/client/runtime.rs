@@ -19,6 +19,7 @@ use crate::{
     },
     handshake::client::{self, ClientDataSession, ClientHandshakeError},
     protocol::command::ConnectRequest,
+    protocol::data::max_plaintext_len,
     tls::{
         client_hello_builder::{ClientHelloBuildError, ClientHelloTemplate},
         record::{change_cipher_spec, read_record, TlsRecordError},
@@ -114,6 +115,7 @@ pub async fn handle_local_connection(
         server_read,
         server_write,
         data_session,
+        max_plaintext_len(traffic.max_padding),
     )
     .await
 }
@@ -155,8 +157,9 @@ async fn relay(
     mut server_read: OwnedReadHalf,
     mut server_write: OwnedWriteHalf,
     mut data_session: ClientDataSession,
+    chunk_size: usize,
 ) -> Result<(), ClientRuntimeError> {
-    let mut local_buf = vec![0_u8; 16 * 1024];
+    let mut local_buf = vec![0_u8; chunk_size];
     let mut server_data_started = false;
 
     loop {

@@ -6,6 +6,9 @@ use crate::{
     traffic::{PaddingProfile, TrafficError},
 };
 
+const AEAD_TAG_LEN: usize = 16;
+const PADDING_LEN_FIELD: usize = 2;
+
 #[derive(Debug, Error)]
 pub enum DataRecordError {
     #[error("TLS record error: {0}")]
@@ -54,6 +57,10 @@ impl DataRecordCodec {
 
 pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";
 pub const SERVER_TO_CLIENT_AAD: &[u8] = b"ParallaX v1 server appdata";
+
+pub fn max_plaintext_len(max_padding: u16) -> usize {
+    record::MAX_TLS_RECORD_PAYLOAD - max_padding as usize - AEAD_TAG_LEN - PADDING_LEN_FIELD
+}
 
 #[cfg(test)]
 mod tests {

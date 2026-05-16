@@ -28,6 +28,8 @@ pub enum ConfigError {
     WeakPsk,
     #[error("traffic.max_padding must be >= traffic.min_padding")]
     InvalidPaddingRange,
+    #[error("traffic.max_padding leaves no room for encrypted payload")]
+    ExcessivePadding,
     #[error("traffic.max_delay_ms must be >= traffic.min_delay_ms")]
     InvalidDelayRange,
     #[error("traffic.max_concurrent_streams must be 1 until multiplexing has fingerprint-safe scheduling")]
@@ -158,6 +160,9 @@ impl TrafficConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.max_padding < self.min_padding {
             return Err(ConfigError::InvalidPaddingRange);
+        }
+        if crate::protocol::data::max_plaintext_len(self.max_padding) == 0 {
+            return Err(ConfigError::ExcessivePadding);
         }
         if self.max_delay_ms < self.min_delay_ms {
             return Err(ConfigError::InvalidDelayRange);
