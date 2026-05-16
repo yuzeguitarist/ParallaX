@@ -2,7 +2,7 @@ use std::fmt;
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Nonce,
+    XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
@@ -12,7 +12,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const KEY_LEN: usize = 32;
-pub const NONCE_LEN: usize = 12;
+pub const NONCE_LEN: usize = 24;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct X25519KeyPair {
@@ -199,7 +199,7 @@ fn expand(
 }
 
 pub struct AeadCodec {
-    cipher: ChaCha20Poly1305,
+    cipher: XChaCha20Poly1305,
     nonce_base: [u8; NONCE_LEN],
     sequence: u64,
 }
@@ -207,16 +207,16 @@ pub struct AeadCodec {
 impl AeadCodec {
     pub fn new(key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) -> Self {
         Self {
-            cipher: ChaCha20Poly1305::new_from_slice(&key)
-                .expect("ChaCha20-Poly1305 key length is fixed"),
+            cipher: XChaCha20Poly1305::new_from_slice(&key)
+                .expect("XChaCha20-Poly1305 key length is fixed"),
             nonce_base,
             sequence: 0,
         }
     }
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
-        self.cipher =
-            ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20-Poly1305 key length is fixed");
+        self.cipher = XChaCha20Poly1305::new_from_slice(&key)
+            .expect("XChaCha20-Poly1305 key length is fixed");
         self.nonce_base = nonce_base;
         self.sequence = 0;
     }
@@ -226,7 +226,7 @@ impl AeadCodec {
         let ciphertext = self
             .cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                XNonce::from_slice(&nonce),
                 Payload {
                     msg: plaintext,
                     aad,
@@ -242,7 +242,7 @@ impl AeadCodec {
         let plaintext = self
             .cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                XNonce::from_slice(&nonce),
                 Payload {
                     msg: ciphertext,
                     aad,

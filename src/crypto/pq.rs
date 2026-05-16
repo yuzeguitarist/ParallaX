@@ -64,9 +64,28 @@ pub fn hybrid_rekey(
     x25519_shared_secret: &[u8; 32],
     pq_shared_secret: &[u8; 32],
 ) -> Result<[u8; 32], PqError> {
-    let mut ikm = [0_u8; 64];
-    ikm[..32].copy_from_slice(x25519_shared_secret);
-    ikm[32..].copy_from_slice(pq_shared_secret);
+    hybrid_sandwich_rekey(
+        old_chain_secret,
+        x25519_shared_secret,
+        pq_shared_secret,
+        &[],
+    )
+}
+
+pub fn hybrid_sandwich_rekey(
+    old_chain_secret: &[u8; 32],
+    x25519_shared_secret: &[u8; 32],
+    pq_shared_secret: &[u8; 32],
+    symmetric_secret: &[u8],
+) -> Result<[u8; 32], PqError> {
+    let mut ikm = Vec::with_capacity(64 + symmetric_secret.len());
+    ikm.extend_from_slice(b"x25519:");
+    ikm.extend_from_slice(x25519_shared_secret);
+    ikm.extend_from_slice(b"|mlkem1024:");
+    ikm.extend_from_slice(pq_shared_secret);
+    ikm.extend_from_slice(b"|psk:");
+    ikm.extend_from_slice(&(symmetric_secret.len() as u32).to_be_bytes());
+    ikm.extend_from_slice(symmetric_secret);
 
     let (prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm);
     let mut chain_secret = [0_u8; 32];
@@ -119,6 +138,19 @@ mod tests {
         assert_ne!(
             baseline,
             hybrid_rekey(&[1; 32], &[2; 32], &[9; 32]).unwrap()
+        );
+    }
+
+    #[test]
+    fn hybrid_sandwich_rekey_binds_symmetric_secret() {
+        let baseline = hybrid_sandwich_rekey(&[1; 32], &[2; 32], &[3; 32], b"psk-a").unwrap();
+        assert_ne!(
+            baseline,
+            hybrid_sandwich_rekey(&[1; 32], &[2; 32], &[3; 32], b"psk-b").unwrap()
+        );
+        assert_ne!(
+            baseline,
+            hybrid_rekey(&[1; 32], &[2; 32], &[3; 32]).unwrap()
         );
     }
 }

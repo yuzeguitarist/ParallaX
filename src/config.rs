@@ -40,6 +40,8 @@ pub enum ConfigError {
     ExcessivePadding,
     #[error("traffic.max_delay_ms must be >= traffic.min_delay_ms")]
     InvalidDelayRange,
+    #[error("traffic.cover_max_interval_ms must be >= traffic.cover_min_interval_ms")]
+    InvalidCoverIntervalRange,
     #[error("traffic.max_concurrent_streams must be 1 until multiplexing has fingerprint-safe scheduling")]
     UnsupportedMultiplexing,
     #[error("server.authorized_sni must not be empty")]
@@ -117,6 +119,10 @@ pub struct TrafficConfig {
     pub min_delay_ms: u16,
     #[serde(default = "default_max_delay_ms")]
     pub max_delay_ms: u16,
+    #[serde(default = "default_cover_min_interval_ms")]
+    pub cover_min_interval_ms: u16,
+    #[serde(default = "default_cover_max_interval_ms")]
+    pub cover_max_interval_ms: u16,
     #[serde(default = "default_max_concurrent_streams")]
     pub max_concurrent_streams: u8,
 }
@@ -128,6 +134,8 @@ impl Default for TrafficConfig {
             max_padding: default_max_padding(),
             min_delay_ms: 0,
             max_delay_ms: default_max_delay_ms(),
+            cover_min_interval_ms: default_cover_min_interval_ms(),
+            cover_max_interval_ms: default_cover_max_interval_ms(),
             max_concurrent_streams: default_max_concurrent_streams(),
         }
     }
@@ -189,6 +197,9 @@ impl TrafficConfig {
         }
         if self.max_delay_ms < self.min_delay_ms {
             return Err(ConfigError::InvalidDelayRange);
+        }
+        if self.cover_max_interval_ms < self.cover_min_interval_ms {
+            return Err(ConfigError::InvalidCoverIntervalRange);
         }
         if self.max_concurrent_streams != 1 {
             return Err(ConfigError::UnsupportedMultiplexing);
@@ -261,6 +272,14 @@ const fn default_max_padding() -> u16 {
 
 const fn default_max_delay_ms() -> u16 {
     12
+}
+
+const fn default_cover_min_interval_ms() -> u16 {
+    15_000
+}
+
+const fn default_cover_max_interval_ms() -> u16 {
+    45_000
 }
 
 const fn default_max_concurrent_streams() -> u8 {
@@ -339,6 +358,19 @@ server_identity_public_key = "{KEY}"
         assert!(matches!(
             traffic.validate().unwrap_err(),
             ConfigError::UnsupportedMultiplexing
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_cover_interval_range() {
+        let traffic = TrafficConfig {
+            cover_min_interval_ms: 100,
+            cover_max_interval_ms: 10,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            traffic.validate().unwrap_err(),
+            ConfigError::InvalidCoverIntervalRange
         ));
     }
 }

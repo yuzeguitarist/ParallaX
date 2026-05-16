@@ -91,6 +91,7 @@ impl ClientDataSession {
     pub fn build_pq_rekey_record<R>(
         &mut self,
         server_pq_public_key: &[u8],
+        sandwich_secret: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, ClientHandshakeError>
     where
@@ -101,7 +102,7 @@ impl ClientDataSession {
             ciphertext: encapsulation.ciphertext,
         };
         let record = self.seal_to_server.seal(&request.encode()?, rng)?;
-        self.apply_pq_rekey(&encapsulation.shared_secret)?;
+        self.apply_pq_rekey(&encapsulation.shared_secret, sandwich_secret)?;
         Ok(record)
     }
 
@@ -150,11 +151,16 @@ impl ClientDataSession {
         Ok(())
     }
 
-    fn apply_pq_rekey(&mut self, shared_secret: &[u8; 32]) -> Result<(), ClientHandshakeError> {
-        let chain_secret = pq::hybrid_rekey(
+    fn apply_pq_rekey(
+        &mut self,
+        shared_secret: &[u8; 32],
+        sandwich_secret: &[u8],
+    ) -> Result<(), ClientHandshakeError> {
+        let chain_secret = pq::hybrid_sandwich_rekey(
             &self.keys.chain_secret,
             &self.keys.x25519_shared_secret,
             shared_secret,
+            sandwich_secret,
         )?;
         let next_keys = expand_epoch_keys(
             chain_secret,
@@ -178,7 +184,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        crypto::session::{derive_server_keys, X25519KeyPair},
+        crypto::session::{derive_server_keys, X25519KeyPair, NONCE_LEN},
         tls::client_hello::tests::client_hello_fixture,
     };
 
@@ -208,8 +214,8 @@ mod tests {
         let keys = SessionKeys {
             client_key: key,
             server_key: [8_u8; 32],
-            client_nonce: [7_u8; 12],
-            server_nonce: [6_u8; 12],
+            client_nonce: [7_u8; NONCE_LEN],
+            server_nonce: [6_u8; NONCE_LEN],
             chain_secret: [5_u8; 32],
             epoch: 0,
             transcript_hash: [4_u8; 32],
@@ -220,6 +226,8 @@ mod tests {
             max_padding: 0,
             min_delay_ms: 0,
             max_delay_ms: 0,
+            cover_min_interval_ms: 0,
+            cover_max_interval_ms: 0,
             max_concurrent_streams: 1,
         };
         let request = ConnectRequest {
@@ -245,8 +253,8 @@ mod tests {
         let keys = SessionKeys {
             client_key: [9_u8; 32],
             server_key: [8_u8; 32],
-            client_nonce: [7_u8; 12],
-            server_nonce: [6_u8; 12],
+            client_nonce: [7_u8; NONCE_LEN],
+            server_nonce: [6_u8; NONCE_LEN],
             chain_secret: [5_u8; 32],
             epoch: 0,
             transcript_hash: [4_u8; 32],
@@ -257,14 +265,19 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(6);
 
         let record = session
-            .build_pq_rekey_record(&pq_keys.public, &mut rng)
+            .build_pq_rekey_record(&pq_keys.public, b"test-psk", &mut rng)
             .unwrap();
         let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
         let request = PqRekeyRequest::decode(&server_open.open(&record).unwrap()).unwrap();
         let shared = pq::decapsulate(&request.ciphertext, &pq_keys.secret).unwrap();
 
-        let chain_secret =
-            pq::hybrid_rekey(&keys.chain_secret, &keys.x25519_shared_secret, &shared).unwrap();
+        let chain_secret = pq::hybrid_sandwich_rekey(
+            &keys.chain_secret,
+            &keys.x25519_shared_secret,
+            &shared,
+            b"test-psk",
+        )
+        .unwrap();
         let next_keys = expand_epoch_keys(
             chain_secret,
             keys.epoch + 1,

@@ -13,7 +13,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    time::{sleep, timeout},
+    time::{sleep, timeout, Instant},
 };
 
 use super::transcript::transcript_hash;
@@ -45,7 +45,8 @@ use crate::{
         record::{alert_bad_record_mac, read_record},
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
-    traffic::{PaddingProfile, TimingProfile, TrafficError},
+    traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
+    transport::tcp::tune_tcp_stream,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -196,6 +197,7 @@ async fn handle_connection_inner(
     psk: &[u8],
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
 ) -> Result<(), HandshakeServerError> {
+    tune_tcp_stream(&client)?;
     let server_private = decode_key32("server.private_key", &config.private_key)?;
     let first_record = read_first_record(&mut client).await?;
     match decide_inbound(&first_record, psk, &config.authorized_sni, &server_private)? {
@@ -241,6 +243,7 @@ async fn handle_connection_inner(
                 config.data_target.as_deref(),
                 &pq_secret,
                 &identity_secret,
+                psk,
                 traffic,
             )
             .await?;
@@ -318,6 +321,7 @@ pub async fn accept_authenticated(
     client_hello: AuthenticatedHello,
 ) -> Result<AuthenticatedHandshake, HandshakeServerError> {
     let mut fallback = TcpStream::connect(&config.fallback_addr).await?;
+    tune_tcp_stream(&fallback)?;
     fallback.write_all(&first_client_record).await?;
 
     let forwarded = read_forwarded_server_hello(&mut fallback).await?;
@@ -346,6 +350,7 @@ pub async fn relay_fallback(
     first_client_record: Vec<u8>,
 ) -> Result<(), HandshakeServerError> {
     let mut fallback = TcpStream::connect(fallback_addr).await?;
+    tune_tcp_stream(&fallback)?;
     fallback.write_all(&first_client_record).await?;
     copy_bidirectional(&mut client, &mut fallback).await?;
     Ok(())
@@ -371,10 +376,12 @@ async fn run_authenticated_data_mode(
     fixed_data_target: Option<&str>,
     pq_secret_key: &[u8],
     identity_secret_key: &[u8],
+    sandwich_secret: &[u8],
     traffic: TrafficConfig,
 ) -> Result<(), HandshakeServerError> {
     let padding = PaddingProfile::from_config(traffic)?;
     let timing = TimingProfile::from_config(traffic);
+    let cover = CoverTrafficProfile::from_config(traffic);
     let mut client_open = DataRecordCodec::new(
         AeadCodec::new(
             handshake.session_keys.client_key,
@@ -414,6 +421,7 @@ async fn run_authenticated_data_mode(
                             &mut server_seal,
                             &handshake.session_keys,
                             &pq_shared_secret,
+                            sandwich_secret,
                         )?;
                         let mut rng = StdRng::from_entropy();
                         let identity_signature = identity::sign_server_identity(
@@ -438,6 +446,7 @@ async fn run_authenticated_data_mode(
                         let (target_addr, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
                         let mut target = TcpStream::connect(target_addr).await?;
+                        tune_tcp_stream(&target)?;
                         if !initial_payload.is_empty() {
                             target.write_all(&initial_payload).await?;
                         }
@@ -450,6 +459,7 @@ async fn run_authenticated_data_mode(
                             client_open,
                             server_seal,
                             timing,
+                            cover,
                             chunk_size: max_plaintext_len(traffic.max_padding),
                         }
                         .run()
@@ -492,11 +502,13 @@ fn apply_server_pq_rekey(
     server_seal: &mut DataRecordCodec,
     keys: &SessionKeys,
     shared_secret: &[u8; 32],
+    sandwich_secret: &[u8],
 ) -> Result<SessionKeys, HandshakeServerError> {
-    let chain_secret = pq::hybrid_rekey(
+    let chain_secret = pq::hybrid_sandwich_rekey(
         &keys.chain_secret,
         &keys.x25519_shared_secret,
         shared_secret,
+        sandwich_secret,
     )?;
     let next_keys = expand_epoch_keys(
         chain_secret,
@@ -517,6 +529,7 @@ struct DataRelay {
     client_open: DataRecordCodec,
     server_seal: DataRecordCodec,
     timing: TimingProfile,
+    cover: CoverTrafficProfile,
     chunk_size: usize,
 }
 
@@ -524,9 +537,17 @@ impl DataRelay {
     async fn run(mut self) -> Result<(), HandshakeServerError> {
         let mut target_buf = vec![0_u8; self.chunk_size];
         let mut rng = StdRng::from_entropy();
+        let mut cover_sleep = Box::pin(sleep(self.cover.sample_interval(&mut rng)));
 
         loop {
             tokio::select! {
+                _ = &mut cover_sleep, if self.cover.is_enabled() => {
+                    let record = self.server_seal.seal(&[], &mut rng)?;
+                    self.client_write.write_all(&record).await?;
+                    cover_sleep.as_mut().reset(
+                        Instant::now() + self.cover.sample_interval(&mut rng),
+                    );
+                }
                 record = read_record(&mut self.client_read) => {
                     let record = match record {
                         Ok(record) => record,
@@ -758,7 +779,7 @@ mod tests {
         .unwrap();
         let mut data_session = ClientDataSession::new(session_keys, traffic).unwrap();
         let pq_record = data_session
-            .build_pq_rekey_record(&server_pq_keys.public, &mut rng)
+            .build_pq_rekey_record(&server_pq_keys.public, PSK, &mut rng)
             .unwrap();
         client.write_all(&pq_record).await.unwrap();
         let identity_record = read_record(&mut client).await.unwrap();

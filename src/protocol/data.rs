@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::{
-    crypto::session::{AeadCodec, SessionError},
+    crypto::session::{AeadCodec, SessionError, KEY_LEN, NONCE_LEN},
     tls::record::{self, TLS_CONTENT_APPLICATION_DATA},
     traffic::{PaddingProfile, TrafficError},
 };
@@ -54,7 +54,7 @@ impl DataRecordCodec {
         Ok(PaddingProfile::remove(&padded)?)
     }
 
-    pub fn rekey(&mut self, key: [u8; 32], nonce_base: [u8; 12]) {
+    pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
         self.aead.rekey(key, nonce_base);
     }
 }
@@ -72,8 +72,6 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
-    use crate::crypto::session::{KEY_LEN, NONCE_LEN};
-
     #[test]
     fn data_record_round_trip() {
         let key = [1_u8; KEY_LEN];

@@ -13,7 +13,7 @@ use crate::{
         auth::{derive_client_auth_key, derive_server_auth_key, verify_client_hello_auth},
         pq,
         replay::{ReplayCache, ReplayEntry},
-        session::{AeadCodec, X25519KeyPair},
+        session::{AeadCodec, X25519KeyPair, NONCE_LEN},
     },
     protocol::data::{max_plaintext_len, DataRecordCodec, CLIENT_TO_SERVER_AAD},
     tls::{
@@ -211,12 +211,12 @@ fn bench_data_record(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::from_config(traffic)?;
     let mut rng = StdRng::seed_from_u64(0x504c_5842);
     let mut seal = DataRecordCodec::new(
-        AeadCodec::new([1; 32], [3; 12]),
+        AeadCodec::new([1; 32], [3; NONCE_LEN]),
         padding,
         CLIENT_TO_SERVER_AAD,
     );
     let mut open = DataRecordCodec::new(
-        AeadCodec::new([1; 32], [3; 12]),
+        AeadCodec::new([1; 32], [3; NONCE_LEN]),
         padding,
         CLIENT_TO_SERVER_AAD,
     );

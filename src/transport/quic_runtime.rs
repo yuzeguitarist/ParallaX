@@ -2,11 +2,11 @@ use std::{
     io,
     net::{SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use hmac::{Hmac, Mac};
-use quinn::{crypto::rustls::QuicClientConfig, Endpoint};
+use quinn::{congestion, crypto::rustls::QuicClientConfig, Endpoint, VarInt};
 use rand::{rngs::OsRng, RngCore};
 use rcgen::generate_simple_self_signed;
 use rustls::{
@@ -26,6 +26,7 @@ use crate::{
     config::{decode_psk, ClientConfig, Config, ConfigError, Mode, ServerConfig},
     crypto::replay::{ReplayCache, ReplayCacheError, ReplayEntry},
     protocol::command::{ConnectRequest, ConnectRequestError},
+    transport::tcp::tune_tcp_stream,
 };
 
 const QUIC_ALPN: &[u8] = b"h3";
@@ -36,6 +37,9 @@ const QUIC_AUTH_TAG_LEN: usize = 32;
 const QUIC_AUTH_WINDOW_SECS: u64 = 90;
 const MAX_AUTH_FRAME_LEN: usize = 512;
 const MAX_CONNECT_FRAME_LEN: usize = 4096;
+const QUIC_FLOW_WINDOW: u32 = 16 * 1024 * 1024;
+const QUIC_BRUTAL_LIKE_INITIAL_WINDOW_PACKETS: u64 = 96;
+const QUIC_KEEP_ALIVE_SECS: u64 = 15;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -206,6 +210,7 @@ async fn handle_stream(
         .clone()
         .unwrap_or_else(|| request.target());
     let mut target = TcpStream::connect(&target_addr).await?;
+    tune_tcp_stream(&target)?;
     if !request.initial_payload.is_empty() {
         target.write_all(&request.initial_payload).await?;
     }
@@ -237,9 +242,9 @@ async fn handle_local_connection(
     client: ClientConfig,
     psk: Arc<Vec<u8>>,
 ) -> Result<(), QuicRuntimeError> {
-    local.set_nodelay(true)?;
+    tune_tcp_stream(&local)?;
     let request = socks::accept_connect(&mut local).await?;
-    let connection = endpoint.connect(server_addr, &client.sni)?.await?;
+    let connection = connect_with_0rtt(&endpoint, server_addr, &client.sni).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     let connect = ConnectRequest {
         host: request.host,
@@ -263,6 +268,24 @@ async fn handle_local_connection(
     };
     tokio::try_join!(upload, download)?;
     Ok(())
+}
+
+async fn connect_with_0rtt(
+    endpoint: &Endpoint,
+    server_addr: SocketAddr,
+    sni: &str,
+) -> Result<quinn::Connection, QuicRuntimeError> {
+    let connecting = endpoint.connect(server_addr, sni)?;
+    match connecting.into_0rtt() {
+        Ok((connection, accepted)) => {
+            tokio::spawn(async move {
+                let accepted = accepted.await;
+                tracing::debug!(accepted, "QUIC 0-RTT resumption result");
+            });
+            Ok(connection)
+        }
+        Err(connecting) => Ok(connecting.await?),
+    }
 }
 
 async fn write_authenticated_connect_request(
@@ -481,13 +504,12 @@ fn server_config(server: &ServerConfig) -> Result<quinn::ServerConfig, QuicRunti
         .with_single_cert(vec![cert_der], key_der)
         .map_err(|err| QuicRuntimeError::TlsConfig(err.to_string()))?;
     tls.alpn_protocols = vec![QUIC_ALPN.to_vec()];
+    tls.max_early_data_size = (MAX_AUTH_FRAME_LEN + MAX_CONNECT_FRAME_LEN + 4) as u32;
 
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
         .map_err(|err| QuicRuntimeError::TlsConfig(err.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(1_u8.into());
-    config.transport = Arc::new(transport);
+    config.transport = Arc::new(tuned_transport_config());
     Ok(config)
 }
 
@@ -502,10 +524,21 @@ fn client_config() -> Result<quinn::ClientConfig, QuicRuntimeError> {
     let crypto = QuicClientConfig::try_from(tls)
         .map_err(|err| QuicRuntimeError::TlsConfig(err.to_string()))?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(1_u8.into());
-    config.transport_config(Arc::new(transport));
+    config.transport_config(Arc::new(tuned_transport_config()));
     Ok(config)
+}
+
+fn tuned_transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    let mut bbr = congestion::BbrConfig::default();
+    bbr.initial_window(QUIC_BRUTAL_LIKE_INITIAL_WINDOW_PACKETS * 1200);
+    transport.congestion_controller_factory(Arc::new(bbr));
+    transport.max_concurrent_bidi_streams(1_u8.into());
+    transport.send_window(QUIC_FLOW_WINDOW as u64);
+    transport.receive_window(VarInt::from_u32(QUIC_FLOW_WINDOW));
+    transport.stream_receive_window(VarInt::from_u32(QUIC_FLOW_WINDOW));
+    transport.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)));
+    transport
 }
 
 fn resolve_addr(server_addr: &str) -> Result<SocketAddr, QuicRuntimeError> {

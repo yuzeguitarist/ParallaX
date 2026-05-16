@@ -281,6 +281,8 @@ min_padding = 0
 max_padding = 128
 min_delay_ms = 0
 max_delay_ms = 12
+cover_min_interval_ms = 15000
+cover_max_interval_ms = 45000
 max_concurrent_streams = 1
 
 [server]
@@ -308,6 +310,8 @@ min_padding = 0
 max_padding = 128
 min_delay_ms = 0
 max_delay_ms = 12
+cover_min_interval_ms = 15000
+cover_max_interval_ms = 45000
 max_concurrent_streams = 1
 
 [client]

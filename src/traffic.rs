@@ -27,6 +27,12 @@ pub struct TimingProfile {
     max: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverTrafficProfile {
+    min_interval: Duration,
+    max_interval: Duration,
+}
+
 const OBSERVED_PACKET_TARGETS: [u16; 18] = [
     64, 83, 91, 132, 144, 191, 286, 339, 469, 519, 569, 713, 735, 1353, 1440, 1459, 1500, 1500,
 ];
@@ -130,6 +136,32 @@ impl TimingProfile {
     }
 }
 
+impl CoverTrafficProfile {
+    pub fn from_config(config: TrafficConfig) -> Self {
+        Self {
+            min_interval: Duration::from_millis(config.cover_min_interval_ms as u64),
+            max_interval: Duration::from_millis(config.cover_max_interval_ms as u64),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.max_interval.is_zero()
+    }
+
+    pub fn sample_interval<R>(&self, rng: &mut R) -> Duration
+    where
+        R: Rng + ?Sized,
+    {
+        if !self.is_enabled() || self.min_interval >= self.max_interval {
+            return self.min_interval;
+        }
+
+        let min = self.min_interval.as_millis() as u64;
+        let max = self.max_interval.as_millis() as u64;
+        Duration::from_millis(rng.gen_range(min..=max))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{rngs::StdRng, SeedableRng};
@@ -181,5 +213,27 @@ mod tests {
         }
 
         assert!(saw_large);
+    }
+
+    #[test]
+    fn cover_profile_can_be_disabled_or_jittered() {
+        let disabled = CoverTrafficProfile::from_config(TrafficConfig {
+            cover_min_interval_ms: 0,
+            cover_max_interval_ms: 0,
+            ..TrafficConfig::default()
+        });
+        assert!(!disabled.is_enabled());
+
+        let cover = CoverTrafficProfile::from_config(TrafficConfig {
+            cover_min_interval_ms: 10,
+            cover_max_interval_ms: 20,
+            ..TrafficConfig::default()
+        });
+        let mut rng = StdRng::seed_from_u64(55);
+        for _ in 0..64 {
+            let sampled = cover.sample_interval(&mut rng);
+            assert!(sampled >= Duration::from_millis(10));
+            assert!(sampled <= Duration::from_millis(20));
+        }
     }
 }

@@ -1,6 +1,9 @@
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Duration};
 
-use rand::rngs::OsRng;
+use rand::{
+    rngs::{OsRng, StdRng},
+    SeedableRng,
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -8,6 +11,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
+    time::{sleep, timeout, Instant},
 };
 
 use crate::{
@@ -25,7 +29,12 @@ use crate::{
         record::{alert_bad_record_mac, read_record, TlsRecordError},
         stateful::StatefulRustlsCamouflageBackend,
     },
+    traffic::CoverTrafficProfile,
+    transport::tcp::tune_tcp_stream,
 };
+
+const INITIAL_PAYLOAD_CAPTURE_TIMEOUT: Duration = Duration::from_millis(2);
+const MAX_INITIAL_PAYLOAD_CAPTURE: usize = 4096;
 
 #[derive(Debug, Error)]
 pub enum ClientRuntimeError {
@@ -105,14 +114,16 @@ pub async fn handle_local_connection(
     server_pq_public: &[u8],
     server_identity_public: &[u8],
 ) -> Result<(), ClientRuntimeError> {
-    local.set_nodelay(true)?;
+    tune_tcp_stream(&local)?;
     let request = socks::accept_connect(&mut local).await?;
+    let chunk_size = max_plaintext_len(traffic.max_padding);
+    let initial_payload = read_initial_payload(&mut local, chunk_size).await?;
     let mut server = TcpStream::connect(&config.server_addr).await?;
-    server.set_nodelay(true)?;
+    tune_tcp_stream(&server)?;
 
     let mut data_session =
         establish_data_session(&mut server, config, traffic, psk, server_public).await?;
-    let pq_record = data_session.build_pq_rekey_record(server_pq_public, &mut OsRng)?;
+    let pq_record = data_session.build_pq_rekey_record(server_pq_public, psk, &mut OsRng)?;
     server.write_all(&pq_record).await?;
     let identity_record = read_record(&mut server).await?;
     data_session.verify_server_identity_record(
@@ -124,7 +135,7 @@ pub async fn handle_local_connection(
         ConnectRequest {
             host: request.host,
             port: request.port,
-            initial_payload: Vec::new(),
+            initial_payload,
         },
         &mut OsRng,
     )?;
@@ -138,9 +149,30 @@ pub async fn handle_local_connection(
         server_read,
         server_write,
         data_session,
-        max_plaintext_len(traffic.max_padding),
+        chunk_size,
+        CoverTrafficProfile::from_config(traffic),
     )
     .await
+}
+
+async fn read_initial_payload(
+    local: &mut TcpStream,
+    chunk_size: usize,
+) -> Result<Vec<u8>, io::Error> {
+    let cap = chunk_size.min(MAX_INITIAL_PAYLOAD_CAPTURE);
+    if cap == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut buf = vec![0_u8; cap];
+    match timeout(INITIAL_PAYLOAD_CAPTURE_TIMEOUT, local.read(&mut buf)).await {
+        Ok(Ok(n)) => {
+            buf.truncate(n);
+            Ok(buf)
+        }
+        Ok(Err(err)) => Err(err),
+        Err(_) => Ok(Vec::new()),
+    }
 }
 
 async fn establish_data_session(
@@ -170,18 +202,26 @@ async fn relay(
     mut server_write: OwnedWriteHalf,
     mut data_session: ClientDataSession,
     chunk_size: usize,
+    cover: CoverTrafficProfile,
 ) -> Result<(), ClientRuntimeError> {
     let mut local_buf = vec![0_u8; chunk_size];
     let mut server_data_started = false;
+    let mut rng = StdRng::from_entropy();
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
     loop {
         tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                let record = data_session.seal_payload(&[], &mut rng)?;
+                server_write.write_all(&record).await?;
+                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
+            }
             read = local_read.read(&mut local_buf) => {
                 let n = read?;
                 if n == 0 {
                     return Ok(());
                 }
-                let record = data_session.seal_payload(&local_buf[..n], &mut OsRng)?;
+                let record = data_session.seal_payload(&local_buf[..n], &mut rng)?;
                 server_write.write_all(&record).await?;
             }
             record = read_record(&mut server_read) => {
@@ -193,8 +233,8 @@ async fn relay(
 
                 match data_session.open_server_record(&record) {
                     Ok(payload) => {
-                        server_data_started = true;
                         if !payload.is_empty() {
+                            server_data_started = true;
                             local_write.write_all(&payload).await?;
                         }
                     }
