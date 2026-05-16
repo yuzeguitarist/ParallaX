@@ -24,6 +24,8 @@ pub enum ConfigError {
     },
     #[error("{field} must decode to exactly 32 bytes")]
     InvalidKeyLen { field: &'static str },
+    #[error("{field} must be valid base64")]
+    InvalidBytes { field: &'static str },
     #[error("crypto.psk must decode to at least 32 bytes")]
     WeakPsk,
     #[error("traffic.max_padding must be >= traffic.min_padding")]
@@ -76,6 +78,7 @@ pub struct ClientConfig {
     pub server_addr: String,
     pub sni: String,
     pub server_public_key: String,
+    pub server_pq_public_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +88,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub data_target: Option<String>,
     pub private_key: String,
+    pub pq_secret_key: String,
     #[serde(default)]
     pub authorized_sni: Vec<String>,
     #[serde(default = "default_true")]
@@ -135,6 +139,7 @@ impl Config {
                 require_host_port("client.server_addr", &client.server_addr)?;
                 require_non_empty("client.sni", &client.sni)?;
                 decode_key32("client.server_public_key", &client.server_public_key)?;
+                decode_base64_bytes("client.server_pq_public_key", &client.server_pq_public_key)?;
             }
             Mode::Server => {
                 let server = self.server.as_ref().ok_or(ConfigError::MissingServer)?;
@@ -143,6 +148,7 @@ impl Config {
                     require_host_port("server.data_target", data_target)?;
                 }
                 decode_key32("server.private_key", &server.private_key)?;
+                decode_base64_bytes("server.pq_secret_key", &server.pq_secret_key)?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
                 }
@@ -194,6 +200,16 @@ pub fn decode_key32(field: &'static str, value: &str) -> Result<[u8; 32], Config
     decoded
         .try_into()
         .map_err(|_| ConfigError::InvalidKeyLen { field })
+}
+
+pub fn decode_base64_bytes(field: &'static str, value: &str) -> Result<Vec<u8>, ConfigError> {
+    let decoded = STANDARD
+        .decode(value)
+        .map_err(|_| ConfigError::InvalidBytes { field })?;
+    if decoded.is_empty() {
+        return Err(ConfigError::InvalidBytes { field });
+    }
+    Ok(decoded)
 }
 
 fn require_host_port(field: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -254,6 +270,7 @@ listen = "127.0.0.1:1080"
 server_addr = "example.com:443"
 sni = "example.com"
 server_public_key = "{KEY}"
+server_pq_public_key = "{KEY}"
 "#
         );
         let cfg = toml::from_str::<Config>(&raw).unwrap();

@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 const CONNECT_MAGIC: &[u8; 4] = b"PX1C";
+const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
 const MAX_HOST_LEN: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,23 @@ pub enum ConnectRequestError {
     ZeroPort,
     #[error("connect request initial payload length is invalid")]
     InvalidPayloadLength,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqRekeyRequest {
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PqRekeyError {
+    #[error("PQ rekey request is truncated")]
+    Truncated,
+    #[error("PQ rekey request magic mismatch")]
+    BadMagic,
+    #[error("PQ rekey ciphertext is empty")]
+    EmptyCiphertext,
+    #[error("PQ rekey ciphertext length is invalid")]
+    InvalidCiphertextLength,
 }
 
 impl ConnectRequest {
@@ -95,6 +113,41 @@ impl ConnectRequest {
     }
 }
 
+impl PqRekeyRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, PqRekeyError> {
+        if self.ciphertext.is_empty() {
+            return Err(PqRekeyError::EmptyCiphertext);
+        }
+        let mut out = Vec::with_capacity(8 + self.ciphertext.len());
+        out.extend_from_slice(PQ_REKEY_MAGIC);
+        out.extend_from_slice(&(self.ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.ciphertext);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, PqRekeyError> {
+        if input.len() < 4 {
+            return Err(PqRekeyError::Truncated);
+        }
+        if &input[..4] != PQ_REKEY_MAGIC {
+            return Err(PqRekeyError::BadMagic);
+        }
+        if input.len() < 8 {
+            return Err(PqRekeyError::Truncated);
+        }
+        let len = u32::from_be_bytes([input[4], input[5], input[6], input[7]]) as usize;
+        if len == 0 {
+            return Err(PqRekeyError::EmptyCiphertext);
+        }
+        if input.len() != 8 + len {
+            return Err(PqRekeyError::InvalidCiphertextLength);
+        }
+        Ok(Self {
+            ciphertext: input[8..].to_vec(),
+        })
+    }
+}
+
 struct Cursor<'a> {
     input: &'a [u8],
     pos: usize,
@@ -151,5 +204,14 @@ mod tests {
             ConnectRequest::decode(b"BAD!").unwrap_err(),
             ConnectRequestError::BadMagic
         );
+    }
+
+    #[test]
+    fn pq_rekey_round_trip() {
+        let request = PqRekeyRequest {
+            ciphertext: vec![1, 2, 3],
+        };
+        let encoded = request.encode().unwrap();
+        assert_eq!(PqRekeyRequest::decode(&encoded).unwrap(), request);
     }
 }

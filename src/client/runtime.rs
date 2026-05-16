@@ -12,7 +12,10 @@ use tokio::{
 
 use crate::{
     client::socks::{self, SocksError, SocksRequest},
-    config::{decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode, TrafficConfig},
+    config::{
+        decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
+        TrafficConfig,
+    },
     crypto::{
         auth::{derive_client_auth_key, AuthError},
         session::X25519KeyPair,
@@ -64,6 +67,10 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         .ok_or(ClientRuntimeError::MissingClient)?;
     let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
     let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
+    let server_pq_public = Arc::new(decode_base64_bytes(
+        "client.server_pq_public_key",
+        &client.server_pq_public_key,
+    )?);
     let listener = TcpListener::bind(client.listen).await?;
     tracing::info!("ParallaX client SOCKS5 listening on {}", client.listen);
 
@@ -71,10 +78,18 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         let (local, peer) = listener.accept().await?;
         let client = client.clone();
         let psk = Arc::clone(&psk);
+        let server_pq_public = Arc::clone(&server_pq_public);
         let traffic = config.traffic;
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_local_connection(local, &client, traffic, &psk, &server_public).await
+            if let Err(err) = handle_local_connection(
+                local,
+                &client,
+                traffic,
+                &psk,
+                &server_public,
+                &server_pq_public,
+            )
+            .await
             {
                 tracing::debug!(%peer, error = %err, "client connection closed");
             }
@@ -88,6 +103,7 @@ pub async fn handle_local_connection(
     traffic: TrafficConfig,
     psk: &[u8],
     server_public: &[u8; 32],
+    server_pq_public: &[u8],
 ) -> Result<(), ClientRuntimeError> {
     local.set_nodelay(true)?;
     let request = socks::accept_connect(&mut local).await?;
@@ -96,6 +112,7 @@ pub async fn handle_local_connection(
 
     let mut data_session =
         establish_data_session(&mut server, config, traffic, psk, server_public).await?;
+    let pq_record = data_session.build_pq_rekey_record(server_pq_public, &mut OsRng)?;
     let connect_record = data_session.build_connect_record(
         ConnectRequest {
             host: request.host,
@@ -105,6 +122,7 @@ pub async fn handle_local_connection(
         &mut OsRng,
     )?;
     server.write_all(&change_cipher_spec()).await?;
+    server.write_all(&pq_record).await?;
     server.write_all(&connect_record).await?;
 
     let (local_read, local_write) = local.into_split();
@@ -222,7 +240,7 @@ mod tests {
     use super::*;
     use crate::{
         config::ServerConfig,
-        crypto::session::X25519KeyPair,
+        crypto::{pq, session::X25519KeyPair},
         handshake::server,
         tls::{record::read_record, server_hello::tests::server_hello_fixture},
     };
@@ -255,11 +273,13 @@ mod tests {
         });
 
         let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
         let server_config = ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: None,
             private_key: STANDARD.encode(server_keys.private),
+            pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
         };
@@ -279,6 +299,7 @@ mod tests {
             server_addr: parallax_addr.to_string(),
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
+            server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
         };
         let client_task = tokio::spawn(async move {
             let (stream, _) = local_listener.accept().await.unwrap();
@@ -288,6 +309,7 @@ mod tests {
                 TrafficConfig::default(),
                 PSK,
                 &server_keys.public,
+                &server_pq_keys.public,
             )
             .await
             .unwrap();

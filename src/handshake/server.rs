@@ -20,11 +20,14 @@ use super::transcript::session_context;
 
 use crate::{
     config::{decode_key32, decode_psk, Config, ConfigError, Mode, ServerConfig, TrafficConfig},
-    crypto::auth::{derive_server_auth_key, verify_client_hello_auth, AuthError},
-    crypto::replay::ReplayCache,
-    crypto::session::{derive_server_keys, AeadCodec, SessionError, SessionKeys},
+    crypto::{
+        auth::{derive_server_auth_key, verify_client_hello_auth, AuthError},
+        pq::{self, PqError},
+        replay::ReplayCache,
+        session::{derive_server_keys, AeadCodec, SessionError, SessionKeys},
+    },
     protocol::{
-        command::{ConnectRequest, ConnectRequestError},
+        command::{ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest},
         data::{
             max_plaintext_len, DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD,
             SERVER_TO_CLIENT_AAD,
@@ -66,6 +69,10 @@ pub enum HandshakeServerError {
     Traffic(#[from] TrafficError),
     #[error("connect request error: {0}")]
     ConnectRequest(#[from] ConnectRequestError),
+    #[error("PQ rekey command error: {0}")]
+    PqRekey(#[from] PqRekeyError),
+    #[error("PQ crypto error: {0}")]
+    Pq(#[from] PqError),
     #[error("missing encrypted connect request and no fixed server.data_target configured")]
     MissingConnectTarget,
 }
@@ -197,7 +204,15 @@ async fn handle_connection_inner(
                 tls13 = handshake.server_hello.tls13_selected,
                 "authenticated ParallaX handshake accepted"
             );
-            run_authenticated_data_mode(handshake, config.data_target.as_deref(), traffic).await?;
+            let pq_secret =
+                crate::config::decode_base64_bytes("server.pq_secret_key", &config.pq_secret_key)?;
+            run_authenticated_data_mode(
+                handshake,
+                config.data_target.as_deref(),
+                &pq_secret,
+                traffic,
+            )
+            .await?;
         }
     }
 
@@ -311,6 +326,7 @@ async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeS
 async fn run_authenticated_data_mode(
     handshake: AuthenticatedHandshake,
     fixed_data_target: Option<&str>,
+    pq_secret_key: &[u8],
     traffic: TrafficConfig,
 ) -> Result<(), HandshakeServerError> {
     let padding = PaddingProfile::from_config(traffic)?;
@@ -323,7 +339,7 @@ async fn run_authenticated_data_mode(
         padding,
         CLIENT_TO_SERVER_AAD,
     );
-    let server_seal = DataRecordCodec::new(
+    let mut server_seal = DataRecordCodec::new(
         AeadCodec::new(
             handshake.session_keys.server_key,
             handshake.session_keys.server_nonce,
@@ -346,6 +362,18 @@ async fn run_authenticated_data_mode(
 
                 match client_open.open(&record) {
                     Ok(first_payload) => {
+                        let pq_rekey = PqRekeyRequest::decode(&first_payload)?;
+                        let pq_shared_secret =
+                            pq::decapsulate(&pq_rekey.ciphertext, pq_secret_key)?;
+                        apply_server_pq_rekey(
+                            &mut client_open,
+                            &mut server_seal,
+                            &handshake.session_keys,
+                            &pq_shared_secret,
+                        )?;
+
+                        let record = read_record(&mut client_read).await?;
+                        let first_payload = client_open.open(&record)?;
                         drop(fallback_read);
                         drop(fallback_write);
                         tracing::debug!("ParallaX data mode switch confirmed");
@@ -400,6 +428,29 @@ fn resolve_connect_target(
         }
         Err(err) => Err(HandshakeServerError::ConnectRequest(err)),
     }
+}
+
+fn apply_server_pq_rekey(
+    client_open: &mut DataRecordCodec,
+    server_seal: &mut DataRecordCodec,
+    keys: &SessionKeys,
+    shared_secret: &[u8; 32],
+) -> Result<(), HandshakeServerError> {
+    let (client_key, client_nonce) = pq::hybrid_rekey(
+        &keys.client_key,
+        &keys.client_nonce,
+        shared_secret,
+        b"client",
+    )?;
+    let (server_key, server_nonce) = pq::hybrid_rekey(
+        &keys.server_key,
+        &keys.server_nonce,
+        shared_secret,
+        b"server",
+    )?;
+    client_open.rekey(client_key, client_nonce);
+    server_seal.rekey(server_key, server_nonce);
+    Ok(())
 }
 
 struct DataRelay {
@@ -480,6 +531,7 @@ mod tests {
     use crate::{
         crypto::{
             auth::{derive_client_auth_key, sign_client_hello_session_id},
+            pq,
             session::X25519KeyPair,
         },
         handshake::client::ClientDataSession,
@@ -605,6 +657,7 @@ mod tests {
         });
 
         let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
         let client_keys = X25519KeyPair::generate();
         let traffic = TrafficConfig::default();
         let config = ServerConfig {
@@ -612,6 +665,7 @@ mod tests {
             fallback_addr: fallback_addr.to_string(),
             data_target: None,
             private_key: STANDARD.encode(server_keys.private),
+            pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
         };
@@ -644,6 +698,10 @@ mod tests {
         )
         .unwrap();
         let mut data_session = ClientDataSession::new(session_keys, traffic).unwrap();
+        let pq_record = data_session
+            .build_pq_rekey_record(&server_pq_keys.public, &mut rng)
+            .unwrap();
+        client.write_all(&pq_record).await.unwrap();
         let connect = ConnectRequest {
             host: target_addr.ip().to_string(),
             port: target_addr.port(),

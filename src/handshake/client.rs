@@ -3,9 +3,12 @@ use thiserror::Error;
 
 use crate::{
     config::TrafficConfig,
-    crypto::session::{derive_client_keys, AeadCodec, SessionError, SessionKeys},
+    crypto::{
+        pq::{self, PqError},
+        session::{derive_client_keys, AeadCodec, SessionError, SessionKeys},
+    },
     protocol::{
-        command::{ConnectRequest, ConnectRequestError},
+        command::{ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest},
         data::{DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD},
     },
     traffic::{PaddingProfile, TrafficError},
@@ -23,6 +26,10 @@ pub enum ClientHandshakeError {
     ConnectRequest(#[from] ConnectRequestError),
     #[error("data record error: {0}")]
     DataRecord(#[from] DataRecordError),
+    #[error("PQ rekey error: {0}")]
+    Pq(#[from] PqError),
+    #[error("PQ rekey command error: {0}")]
+    PqCommand(#[from] PqRekeyError),
 }
 
 pub fn derive_session_keys(
@@ -56,6 +63,7 @@ pub fn data_codecs(
 pub struct ClientDataSession {
     seal_to_server: DataRecordCodec,
     open_from_server: DataRecordCodec,
+    keys: SessionKeys,
 }
 
 impl ClientDataSession {
@@ -64,7 +72,25 @@ impl ClientDataSession {
         Ok(Self {
             seal_to_server,
             open_from_server,
+            keys,
         })
+    }
+
+    pub fn build_pq_rekey_record<R>(
+        &mut self,
+        server_pq_public_key: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, ClientHandshakeError>
+    where
+        R: RngCore + CryptoRng + rand::Rng + ?Sized,
+    {
+        let encapsulation = pq::encapsulate(server_pq_public_key)?;
+        let request = PqRekeyRequest {
+            ciphertext: encapsulation.ciphertext,
+        };
+        let record = self.seal_to_server.seal(&request.encode()?, rng)?;
+        self.apply_pq_rekey(&encapsulation.shared_secret)?;
+        Ok(record)
     }
 
     pub fn build_connect_record<R>(
@@ -92,6 +118,29 @@ impl ClientDataSession {
 
     pub fn open_server_record(&mut self, record: &[u8]) -> Result<Vec<u8>, ClientHandshakeError> {
         Ok(self.open_from_server.open(record)?)
+    }
+
+    fn apply_pq_rekey(&mut self, shared_secret: &[u8; 32]) -> Result<(), ClientHandshakeError> {
+        let (client_key, client_nonce) = pq::hybrid_rekey(
+            &self.keys.client_key,
+            &self.keys.client_nonce,
+            shared_secret,
+            b"client",
+        )?;
+        let (server_key, server_nonce) = pq::hybrid_rekey(
+            &self.keys.server_key,
+            &self.keys.server_nonce,
+            shared_secret,
+            b"server",
+        )?;
+
+        self.seal_to_server.rekey(client_key, client_nonce);
+        self.open_from_server.rekey(server_key, server_nonce);
+        self.keys.client_key = client_key;
+        self.keys.client_nonce = client_nonce;
+        self.keys.server_key = server_key;
+        self.keys.server_nonce = server_nonce;
+        Ok(())
     }
 }
 
@@ -156,5 +205,31 @@ mod tests {
         let payload = open_from_client.open(&record).unwrap();
 
         assert_eq!(ConnectRequest::decode(&payload).unwrap(), request);
+    }
+
+    #[test]
+    fn pq_rekey_changes_client_session_keys() {
+        let pq_keys = pq::keypair();
+        let keys = SessionKeys {
+            client_key: [9_u8; 32],
+            server_key: [8_u8; 32],
+            client_nonce: [7_u8; 12],
+            server_nonce: [6_u8; 12],
+        };
+        let traffic = TrafficConfig::default();
+        let mut session = ClientDataSession::new(keys, traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(6);
+
+        let record = session
+            .build_pq_rekey_record(&pq_keys.public, &mut rng)
+            .unwrap();
+        let (mut server_open, _) = data_codecs(keys, traffic).unwrap();
+        let request = PqRekeyRequest::decode(&server_open.open(&record).unwrap()).unwrap();
+        let shared = pq::decapsulate(&request.ciphertext, &pq_keys.secret).unwrap();
+
+        let (client_key, client_nonce) =
+            pq::hybrid_rekey(&keys.client_key, &keys.client_nonce, &shared, b"client").unwrap();
+        assert_eq!(session.keys.client_key, client_key);
+        assert_eq!(session.keys.client_nonce, client_nonce);
     }
 }

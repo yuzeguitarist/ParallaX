@@ -9,7 +9,10 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     client::runtime,
     config::Config,
-    crypto::session::{derive_client_keys, AeadCodec, X25519KeyPair},
+    crypto::{
+        pq,
+        session::{derive_client_keys, AeadCodec, X25519KeyPair},
+    },
     handshake::server,
 };
 
@@ -131,6 +134,7 @@ fn print_config_template(
     let mut psk = [0_u8; 32];
     OsRng.fill_bytes(&mut psk);
     let server_keys = X25519KeyPair::generate();
+    let server_pq_keys = pq::keypair();
 
     println!(
         r#"# ===== server parallax.toml =====
@@ -150,6 +154,7 @@ max_concurrent_streams = 1
 listen = "{}"
 fallback_addr = "{}"
 private_key = "{}"
+pq_secret_key = "{}"
 authorized_sni = ["{}"]
 strict_tls13 = true
 
@@ -171,16 +176,19 @@ listen = "{}"
 server_addr = "{}"
 sni = "{}"
 server_public_key = "{}"
+server_pq_public_key = "{}"
 "#,
         STANDARD.encode(psk),
         server_listen,
         fallback_addr,
         STANDARD.encode(server_keys.private),
+        STANDARD.encode(&server_pq_keys.secret),
         sni,
         STANDARD.encode(psk),
         client_listen,
         server_addr,
         sni,
         STANDARD.encode(server_keys.public),
+        STANDARD.encode(&server_pq_keys.public),
     );
 }

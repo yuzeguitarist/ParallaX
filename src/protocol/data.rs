@@ -53,6 +53,10 @@ impl DataRecordCodec {
         let padded = self.aead.open(ciphertext, self.aad)?;
         Ok(PaddingProfile::remove(&padded)?)
     }
+
+    pub fn rekey(&mut self, key: [u8; 32], nonce_base: [u8; 12]) {
+        self.aead.rekey(key, nonce_base);
+    }
 }
 
 pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";

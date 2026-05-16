@@ -128,6 +128,13 @@ impl AeadCodec {
         }
     }
 
+    pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
+        self.cipher =
+            ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20-Poly1305 key length is fixed");
+        self.nonce_base = nonce_base;
+        self.sequence = 0;
+    }
+
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {
         let nonce = self.current_nonce();
         let ciphertext = self
