@@ -1,6 +1,11 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use rand::{rngs::StdRng, SeedableRng};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
@@ -16,6 +21,7 @@ use super::transcript::session_context;
 use crate::{
     config::{decode_key32, decode_psk, Config, ConfigError, Mode, ServerConfig, TrafficConfig},
     crypto::auth::{derive_server_auth_key, verify_client_hello_auth, AuthError},
+    crypto::replay::ReplayCache,
     crypto::session::{derive_server_keys, AeadCodec, SessionError, SessionKeys},
     protocol::{
         command::{ConnectRequest, ConnectRequestError},
@@ -79,6 +85,7 @@ pub struct AuthenticatedHello {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FallbackReason {
     AuthFailed,
+    Replay,
     MissingSni,
     UnauthorizedSni(String),
     MissingX25519KeyShare,
@@ -110,6 +117,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .ok_or(HandshakeServerError::MissingServer)?;
     let traffic = config.traffic;
     let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
+    let replay_cache = Arc::new(Mutex::new(ReplayCache::new(8192)));
     let listener = TcpListener::bind(server.listen).await?;
     tracing::info!("ParallaX server listening on {}", server.listen);
 
@@ -118,8 +126,17 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         let server = server.clone();
         let connection_traffic = traffic;
         let psk = Arc::clone(&psk);
+        let replay_cache = Arc::clone(&replay_cache);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(client, &server, connection_traffic, &psk).await {
+            if let Err(err) = handle_connection_with_replay(
+                client,
+                &server,
+                connection_traffic,
+                &psk,
+                replay_cache,
+            )
+            .await
+            {
                 tracing::debug!(%peer, error = %err, "connection closed");
             }
         });
@@ -127,10 +144,30 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
 }
 
 pub async fn handle_connection(
+    client: TcpStream,
+    config: &ServerConfig,
+    traffic: TrafficConfig,
+    psk: &[u8],
+) -> Result<(), HandshakeServerError> {
+    handle_connection_inner(client, config, traffic, psk, None).await
+}
+
+async fn handle_connection_with_replay(
+    client: TcpStream,
+    config: &ServerConfig,
+    traffic: TrafficConfig,
+    psk: &[u8],
+    replay_cache: Arc<Mutex<ReplayCache>>,
+) -> Result<(), HandshakeServerError> {
+    handle_connection_inner(client, config, traffic, psk, Some(replay_cache)).await
+}
+
+async fn handle_connection_inner(
     mut client: TcpStream,
     config: &ServerConfig,
     traffic: TrafficConfig,
     psk: &[u8],
+    replay_cache: Option<Arc<Mutex<ReplayCache>>>,
 ) -> Result<(), HandshakeServerError> {
     let server_private = decode_key32("server.private_key", &config.private_key)?;
     let first_record = read_first_record(&mut client).await?;
@@ -140,6 +177,18 @@ pub async fn handle_connection(
             relay_fallback(client, &config.fallback_addr, first_record).await?;
         }
         InboundDecision::Authenticated(client_hello) => {
+            if let Some(replay_cache) = replay_cache {
+                let fingerprint = client_hello_fingerprint(&first_record);
+                if !replay_cache
+                    .lock()
+                    .expect("replay cache poisoned")
+                    .insert_new(fingerprint)
+                {
+                    tracing::debug!("falling back on replayed ClientHello");
+                    relay_fallback(client, &config.fallback_addr, first_record).await?;
+                    return Ok(());
+                }
+            }
             let handshake =
                 accept_authenticated(client, config, &server_private, first_record, client_hello)
                     .await?;
@@ -153,6 +202,10 @@ pub async fn handle_connection(
     }
 
     Ok(())
+}
+
+fn client_hello_fingerprint(first_record: &[u8]) -> [u8; 32] {
+    Sha256::digest(first_record).into()
 }
 
 pub fn decide_inbound(
