@@ -27,6 +27,12 @@ pub struct TimingProfile {
     max: Duration,
 }
 
+const OBSERVED_PACKET_TARGETS: [u16; 18] = [
+    64, 83, 91, 132, 144, 191, 286, 339, 469, 519, 569, 713, 735, 1353, 1440, 1459, 1500, 1500,
+];
+
+const OBSERVED_DELAY_MS: [u16; 12] = [0, 3, 7, 12, 25, 25, 41, 218, 410, 747, 790, 804];
+
 impl PaddingProfile {
     pub fn new(min: u16, max: u16) -> Result<Self, TrafficError> {
         if max < min {
@@ -43,7 +49,7 @@ impl PaddingProfile {
     where
         R: Rng + RngCore + ?Sized,
     {
-        let pad_len = self.sample_padding_len(rng) as usize;
+        let pad_len = self.sample_padding_len(payload.len(), rng) as usize;
         let mut out = Vec::with_capacity(payload.len() + pad_len + 2);
         out.extend_from_slice(payload);
 
@@ -54,12 +60,21 @@ impl PaddingProfile {
         out
     }
 
-    fn sample_padding_len<R>(&self, rng: &mut R) -> u16
+    fn sample_padding_len<R>(&self, payload_len: usize, rng: &mut R) -> u16
     where
         R: Rng + ?Sized,
     {
         if self.min == self.max {
             return self.min;
+        }
+
+        if rng.gen_range(0..100) < 55 {
+            let target = OBSERVED_PACKET_TARGETS[rng.gen_range(0..OBSERVED_PACKET_TARGETS.len())];
+            let overhead = 2_u16;
+            let needed = target
+                .saturating_sub(payload_len as u16)
+                .saturating_sub(overhead);
+            return needed.clamp(self.min, self.max);
         }
 
         let span = self.max - self.min;
@@ -104,6 +119,11 @@ impl TimingProfile {
         if self.min >= self.max {
             return self.min;
         }
+        if rng.gen_range(0..100) < 60 {
+            let sampled = OBSERVED_DELAY_MS[rng.gen_range(0..OBSERVED_DELAY_MS.len())] as u64;
+            let clamped = sampled.clamp(self.min.as_millis() as u64, self.max.as_millis() as u64);
+            return Duration::from_millis(clamped);
+        }
         let min = self.min.as_millis() as u64;
         let max = self.max.as_millis() as u64;
         Duration::from_millis(rng.gen_range(min..=max))
@@ -144,5 +164,22 @@ mod tests {
             let pad_len = u16::from_be_bytes([padded[padded.len() - 2], padded[padded.len() - 1]]);
             assert!((3..=777).contains(&pad_len));
         }
+    }
+
+    #[test]
+    fn observed_profile_can_pad_toward_large_packets() {
+        let profile = PaddingProfile::new(0, 1500).unwrap();
+        let mut rng = StdRng::seed_from_u64(44);
+        let mut saw_large = false;
+
+        for _ in 0..200 {
+            let padded = profile.apply(&[0_u8; 32], &mut rng);
+            if padded.len() > 1000 {
+                saw_large = true;
+                break;
+            }
+        }
+
+        assert!(saw_large);
     }
 }
