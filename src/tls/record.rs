@@ -69,6 +69,10 @@ pub fn alert_bad_record_mac() -> Vec<u8> {
     vec![TLS_CONTENT_ALERT, 0x03, 0x03, 0x00, 0x02, 0x02, 0x14]
 }
 
+pub fn change_cipher_spec() -> Vec<u8> {
+    vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]
+}
+
 pub async fn read_record<R>(reader: &mut R) -> Result<Vec<u8>, std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -108,5 +112,10 @@ mod tests {
         let header = parse_header(&record).unwrap();
         assert_eq!(header.payload_len, 3);
         assert_eq!(header.total_len, 8);
+    }
+
+    #[test]
+    fn emits_tls13_compat_change_cipher_spec() {
+        assert_eq!(change_cipher_spec(), [0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
     }
 }

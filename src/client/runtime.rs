@@ -21,7 +21,7 @@ use crate::{
     protocol::command::ConnectRequest,
     tls::{
         client_hello_builder::{ClientHelloBuildError, ClientHelloTemplate},
-        record::{read_record, TlsRecordError},
+        record::{change_cipher_spec, read_record, TlsRecordError},
         server_hello::{parse_server_hello, ServerHelloError},
     },
 };
@@ -103,6 +103,7 @@ pub async fn handle_local_connection(
         },
         &mut OsRng,
     )?;
+    server.write_all(&change_cipher_spec()).await?;
     server.write_all(&connect_record).await?;
 
     let (local_read, local_write) = local.into_split();
