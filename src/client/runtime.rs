@@ -22,7 +22,7 @@ use crate::{
     protocol::data::max_plaintext_len,
     tls::{
         client_hello_builder::{ClientHelloBuildError, ClientHelloTemplate},
-        record::{change_cipher_spec, read_record, TlsRecordError},
+        record::{alert_bad_record_mac, change_cipher_spec, read_record, TlsRecordError},
         server_hello::{parse_server_hello, ServerHelloError},
     },
 };
@@ -189,7 +189,10 @@ async fn relay(
                     Err(err) if !server_data_started => {
                         tracing::trace!(error = %err, "ignoring residual camouflage TLS record");
                     }
-                    Err(err) => return Err(ClientRuntimeError::Handshake(err)),
+                    Err(err) => {
+                        let _ = server_write.write_all(&alert_bad_record_mac()).await;
+                        return Err(ClientRuntimeError::Handshake(err));
+                    }
                 }
             }
         }
