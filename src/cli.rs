@@ -177,6 +177,7 @@ server_addr = "{}"
 sni = "{}"
 server_public_key = "{}"
 server_pq_public_key = "{}"
+tls_profile = "safari17"
 "#,
         STANDARD.encode(psk),
         server_listen,

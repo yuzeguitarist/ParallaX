@@ -5,6 +5,8 @@ use serde::Deserialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::tls::client_hello_builder::BrowserProfile;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config: {0}")]
@@ -79,6 +81,8 @@ pub struct ClientConfig {
     pub sni: String,
     pub server_public_key: String,
     pub server_pq_public_key: String,
+    #[serde(default)]
+    pub tls_profile: BrowserProfile,
 }
 
 #[derive(Debug, Clone, Deserialize)]

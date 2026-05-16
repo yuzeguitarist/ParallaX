@@ -150,6 +150,7 @@ async fn establish_data_session(
     let client_hello = ClientHelloTemplate {
         sni: config.sni.clone(),
         x25519_public_key: client_keys.public,
+        profile: config.tls_profile,
     }
     .build_signed(&auth_key, &mut OsRng)?;
 
@@ -300,6 +301,7 @@ mod tests {
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
             server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
+            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
         };
         let client_task = tokio::spawn(async move {
             let (stream, _) = local_listener.accept().await.unwrap();
