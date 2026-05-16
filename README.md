@@ -38,6 +38,15 @@ plx init cloudflare.com --server-addr YOUR_VPS_IP:443
 This creates `parallax.server.toml` and `parallax.client.toml` without
 overwriting existing files.
 
+For private VPS deployment, keep source code local and upload only the built
+binary plus server config:
+
+```bash
+bash scripts/deploy-vps.sh root@YOUR_VPS_IP cloudflare.com
+```
+
+See `DEPLOYMENT.md` for the full local-build, binary-only workflow.
+
 For advanced/manual setups, the lower-level template command is still available:
 
 ```bash
