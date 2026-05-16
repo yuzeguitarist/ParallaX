@@ -24,10 +24,19 @@ That command will:
 5. upload only the binary and `parallax.server.toml` to the VPS
 6. install and restart `parallax.service` through systemd
 
-On macOS, the script uses local Docker by default to produce a Linux binary:
+On macOS, the script first uses Docker when available. If Docker is not
+installed, it falls back to local `cargo-zigbuild` and installs the missing
+local build helpers (`zig`, `cargo-zigbuild`, and the Rust Linux target) when
+possible:
 
 ```bash
-bash scripts/deploy-vps.sh --build-mode docker root@YOUR_VPS_IP cloudflare.com
+bash scripts/deploy-vps.sh root@YOUR_VPS_IP cloudflare.com
+```
+
+To force the no-Docker path:
+
+```bash
+bash scripts/deploy-vps.sh --build-mode zigbuild root@YOUR_VPS_IP cloudflare.com
 ```
 
 On Linux, it uses native `cargo build --release` by default.

@@ -29,9 +29,12 @@ Options:
   --remote-bin <path>          Remote plx binary path. Defaults to /usr/local/bin/plx.
   --remote-config <path>       Remote server config path. Defaults to /etc/parallax/parallax.toml.
   --service-name <name>        systemd service name. Defaults to parallax.
-  --build-mode <auto|docker|native>
-                               auto uses Docker on macOS and native cargo on Linux.
+  --build-mode <auto|docker|zigbuild|native>
+                               auto uses native cargo on Linux, then Docker or cargo-zigbuild on macOS.
+  --linux-target <triple>      Linux target triple for zigbuild. Defaults to x86_64-unknown-linux-gnu.
   --docker-image <image>       Docker Rust image. Defaults to rust:1-bookworm.
+  --install-build-tools        Install missing local build helpers when possible. Default in auto mode.
+  --no-install-build-tools     Do not install missing local build helpers; fail with instructions instead.
   --reuse-config               Reuse generated configs under target/parallax-deploy/<host>/.
   --sudo                       Force sudo for remote install commands.
   --no-sudo                    Run remote install commands without sudo. Auto-selected for root@ hosts.
@@ -145,18 +148,26 @@ build_linux_binary() {
     auto)
       if [[ "$uname_s" == "Linux" ]]; then
         BUILD_MODE="native"
-      else
+      elif command -v docker >/dev/null 2>&1; then
         BUILD_MODE="docker"
+      else
+        BUILD_MODE="zigbuild"
       fi
       ;;
-    docker|native) ;;
-    *) die "--build-mode must be auto, docker, or native" ;;
+    docker|zigbuild|native) ;;
+    *) die "--build-mode must be auto, docker, zigbuild, or native" ;;
   esac
 
   if [[ "$BUILD_MODE" == "native" ]]; then
     log "building Linux binary with local cargo"
     run cargo build --release --locked --bin plx
     LINUX_PLX="$root/target/release/plx"
+  elif [[ "$BUILD_MODE" == "zigbuild" ]]; then
+    ensure_zigbuild_tools
+    ensure_rust_target "$LINUX_TARGET"
+    log "building Linux binary with local cargo-zigbuild for $LINUX_TARGET"
+    run cargo zigbuild --release --locked --bin plx --target "$LINUX_TARGET"
+    LINUX_PLX="$root/target/$LINUX_TARGET/release/plx"
   else
     need_cmd docker
     log "building Linux binary inside local Docker; source is not uploaded to the VPS"
@@ -172,6 +183,49 @@ build_linux_binary() {
   fi
 
   [[ -x "$LINUX_PLX" || "$DRY_RUN" == "1" ]] || die "Linux plx binary not found: $LINUX_PLX"
+}
+
+ensure_rust_target() {
+  local target=$1
+  if rustup target list --installed 2>/dev/null | grep -qx "$target"; then
+    return
+  fi
+
+  need_cmd rustup
+  log "installing Rust target $target"
+  run rustup target add "$target"
+}
+
+maybe_install_build_tool() {
+  local tool=$1
+  local install_hint=$2
+
+  if command -v "$tool" >/dev/null 2>&1; then
+    return
+  fi
+
+  case "$INSTALL_BUILD_TOOLS" in
+    yes) ;;
+    no) die "$tool is required for --build-mode zigbuild. Install it first: $install_hint" ;;
+    *) die "invalid install-build-tools state: $INSTALL_BUILD_TOOLS" ;;
+  esac
+
+  if [[ "$tool" == "zig" ]]; then
+    need_cmd brew
+    log "installing local build helper: zig"
+    run brew install zig
+  elif [[ "$tool" == "cargo-zigbuild" ]]; then
+    need_cmd cargo
+    log "installing local build helper: cargo-zigbuild"
+    run cargo install cargo-zigbuild --locked
+  else
+    die "unsupported build helper: $tool"
+  fi
+}
+
+ensure_zigbuild_tools() {
+  maybe_install_build_tool "zig" "brew install zig"
+  maybe_install_build_tool "cargo-zigbuild" "cargo install cargo-zigbuild --locked"
 }
 
 write_unit_file() {
@@ -264,7 +318,9 @@ REMOTE_BIN="/usr/local/bin/plx"
 REMOTE_CONFIG="/etc/parallax/parallax.toml"
 SERVICE_NAME="parallax"
 BUILD_MODE="auto"
+LINUX_TARGET="x86_64-unknown-linux-gnu"
 DOCKER_IMAGE="${PARALLAX_DOCKER_IMAGE:-rust:1-bookworm}"
+INSTALL_BUILD_TOOLS="yes"
 REUSE_CONFIG="0"
 REMOTE_SUDO="auto"
 DRY_RUN="0"
@@ -282,7 +338,10 @@ while [[ $# -gt 0 ]]; do
     --remote-config) REMOTE_CONFIG=${2:-}; shift 2 ;;
     --service-name) SERVICE_NAME=${2:-}; shift 2 ;;
     --build-mode) BUILD_MODE=${2:-}; shift 2 ;;
+    --linux-target) LINUX_TARGET=${2:-}; shift 2 ;;
     --docker-image) DOCKER_IMAGE=${2:-}; shift 2 ;;
+    --install-build-tools) INSTALL_BUILD_TOOLS="yes"; shift ;;
+    --no-install-build-tools) INSTALL_BUILD_TOOLS="no"; shift ;;
     --reuse-config) REUSE_CONFIG="1"; shift ;;
     --sudo) REMOTE_SUDO="sudo"; shift ;;
     --no-sudo) REMOTE_SUDO="none"; shift ;;
