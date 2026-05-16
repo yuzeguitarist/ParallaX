@@ -1,19 +1,32 @@
 use std::{io, sync::Arc, time::Duration};
 
+use rand::{rngs::StdRng, SeedableRng};
 use thiserror::Error;
 use tokio::{
-    io::{copy_bidirectional, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    time::timeout,
+    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener, TcpStream,
+    },
+    time::{sleep, timeout},
 };
 
+use super::transcript::session_context;
+
 use crate::{
-    config::{decode_psk, Config, ConfigError, Mode, ServerConfig},
-    crypto::auth::{verify_client_hello_auth, AuthError},
+    config::{decode_key32, decode_psk, Config, ConfigError, Mode, ServerConfig, TrafficConfig},
+    crypto::auth::{derive_server_auth_key, verify_client_hello_auth, AuthError},
+    crypto::session::{derive_server_keys, AeadCodec, SessionError, SessionKeys},
+    protocol::{
+        command::{ConnectRequest, ConnectRequestError},
+        data::{DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD},
+    },
     tls::{
-        record::read_record,
+        client_hello::{parse_client_hello, ClientHelloError},
+        record::{alert_bad_record_mac, read_record},
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
+    traffic::{PaddingProfile, TimingProfile, TrafficError},
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -32,10 +45,22 @@ pub enum HandshakeServerError {
     Auth(#[from] AuthError),
     #[error("ServerHello parse failed: {0}")]
     ServerHello(#[from] ServerHelloError),
+    #[error("ClientHello parse failed: {0}")]
+    ClientHello(#[from] ClientHelloError),
     #[error("handshake timed out")]
     Timeout,
     #[error("fallback ServerHello did not negotiate TLS 1.3")]
     Tls13Required,
+    #[error("session key derivation failed: {0}")]
+    Session(#[from] SessionError),
+    #[error("data record error: {0}")]
+    DataRecord(#[from] DataRecordError),
+    #[error("traffic shaping error: {0}")]
+    Traffic(#[from] TrafficError),
+    #[error("connect request error: {0}")]
+    ConnectRequest(#[from] ConnectRequestError),
+    #[error("missing encrypted connect request and no fixed server.data_target configured")]
+    MissingConnectTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +95,7 @@ pub struct AuthenticatedHandshake {
     pub fallback: TcpStream,
     pub client_hello: AuthenticatedHello,
     pub server_hello: ServerHello,
+    pub session_keys: SessionKeys,
 }
 
 pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
@@ -81,6 +107,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .server
         .clone()
         .ok_or(HandshakeServerError::MissingServer)?;
+    let traffic = config.traffic;
     let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
     let listener = TcpListener::bind(server.listen).await?;
     tracing::info!("ParallaX server listening on {}", server.listen);
@@ -88,9 +115,10 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     loop {
         let (client, peer) = listener.accept().await?;
         let server = server.clone();
+        let connection_traffic = traffic;
         let psk = Arc::clone(&psk);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(client, &server, &psk).await {
+            if let Err(err) = handle_connection(client, &server, connection_traffic, &psk).await {
                 tracing::debug!(%peer, error = %err, "connection closed");
             }
         });
@@ -100,23 +128,26 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
 pub async fn handle_connection(
     mut client: TcpStream,
     config: &ServerConfig,
+    traffic: TrafficConfig,
     psk: &[u8],
 ) -> Result<(), HandshakeServerError> {
+    let server_private = decode_key32("server.private_key", &config.private_key)?;
     let first_record = read_first_record(&mut client).await?;
-    match decide_inbound(&first_record, psk, &config.authorized_sni)? {
+    match decide_inbound(&first_record, psk, &config.authorized_sni, &server_private)? {
         InboundDecision::Fallback(reason) => {
             tracing::debug!(?reason, "falling back to authenticated SNI target");
             relay_fallback(client, &config.fallback_addr, first_record).await?;
         }
         InboundDecision::Authenticated(client_hello) => {
             let handshake =
-                accept_authenticated(client, config, first_record, client_hello).await?;
+                accept_authenticated(client, config, &server_private, first_record, client_hello)
+                    .await?;
             tracing::debug!(
                 sni = %handshake.client_hello.sni,
                 tls13 = handshake.server_hello.tls13_selected,
                 "authenticated ParallaX handshake accepted"
             );
-            relay_authenticated_handshake_site(handshake).await?;
+            run_authenticated_data_mode(handshake, config.data_target.as_deref(), traffic).await?;
         }
     }
 
@@ -127,8 +158,19 @@ pub fn decide_inbound(
     first_client_record: &[u8],
     psk: &[u8],
     authorized_sni: &[String],
+    server_private: &[u8; 32],
 ) -> Result<InboundDecision, HandshakeServerError> {
-    let auth = verify_client_hello_auth(first_client_record, psk)?;
+    let parsed = parse_client_hello(first_client_record)?;
+    let x25519_key_share = match parsed.x25519_key_share {
+        Some(key) => key,
+        None => {
+            return Ok(InboundDecision::Fallback(
+                FallbackReason::MissingX25519KeyShare,
+            ));
+        }
+    };
+    let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
+    let auth = verify_client_hello_auth(first_client_record, &auth_key)?;
     if !auth.authenticated {
         return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed));
     }
@@ -144,15 +186,6 @@ pub fn decide_inbound(
         )));
     }
 
-    let x25519_key_share = match auth.x25519_key_share {
-        Some(key) => key,
-        None => {
-            return Ok(InboundDecision::Fallback(
-                FallbackReason::MissingX25519KeyShare,
-            ));
-        }
-    };
-
     Ok(InboundDecision::Authenticated(AuthenticatedHello {
         sni,
         x25519_key_share,
@@ -162,6 +195,7 @@ pub fn decide_inbound(
 pub async fn accept_authenticated(
     mut client: TcpStream,
     config: &ServerConfig,
+    server_private: &[u8; 32],
     first_client_record: Vec<u8>,
     client_hello: AuthenticatedHello,
 ) -> Result<AuthenticatedHandshake, HandshakeServerError> {
@@ -174,11 +208,16 @@ pub async fn accept_authenticated(
     }
     client.write_all(&forwarded.raw_record).await?;
 
+    let context = session_context(&first_client_record, &forwarded.parsed.random);
+    let session_keys =
+        derive_server_keys(server_private, &client_hello.x25519_key_share, &context)?;
+
     Ok(AuthenticatedHandshake {
         client,
         fallback,
         client_hello,
         server_hello: forwarded.parsed,
+        session_keys,
     })
 }
 
@@ -208,11 +247,153 @@ async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeS
         .map_err(HandshakeServerError::Io)
 }
 
-async fn relay_authenticated_handshake_site(
-    mut handshake: AuthenticatedHandshake,
+async fn run_authenticated_data_mode(
+    handshake: AuthenticatedHandshake,
+    fixed_data_target: Option<&str>,
+    traffic: TrafficConfig,
 ) -> Result<(), HandshakeServerError> {
-    copy_bidirectional(&mut handshake.client, &mut handshake.fallback).await?;
-    Ok(())
+    let padding = PaddingProfile::from_config(traffic)?;
+    let timing = TimingProfile::from_config(traffic);
+    let mut client_open = DataRecordCodec::new(
+        AeadCodec::new(
+            handshake.session_keys.client_key,
+            handshake.session_keys.client_nonce,
+        ),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let server_seal = DataRecordCodec::new(
+        AeadCodec::new(
+            handshake.session_keys.server_key,
+            handshake.session_keys.server_nonce,
+        ),
+        padding,
+        SERVER_TO_CLIENT_AAD,
+    );
+
+    let (mut client_read, mut client_write) = handshake.client.into_split();
+    let (mut fallback_read, mut fallback_write) = handshake.fallback.into_split();
+
+    loop {
+        tokio::select! {
+            record = read_record(&mut client_read) => {
+                let record = match record {
+                    Ok(record) => record,
+                    Err(err) if is_clean_close(&err) => return Ok(()),
+                    Err(err) => return Err(HandshakeServerError::Io(err)),
+                };
+
+                match client_open.open(&record) {
+                    Ok(first_payload) => {
+                        drop(fallback_read);
+                        drop(fallback_write);
+                        tracing::debug!("ParallaX data mode switch confirmed");
+
+                        let (target_addr, initial_payload) =
+                            resolve_connect_target(first_payload, fixed_data_target)?;
+                        let mut target = TcpStream::connect(target_addr).await?;
+                        if !initial_payload.is_empty() {
+                            target.write_all(&initial_payload).await?;
+                        }
+                        let (target_read, target_write) = target.into_split();
+                        return relay_data_channel(
+                            client_read,
+                            client_write,
+                            target_read,
+                            target_write,
+                            client_open,
+                            server_seal,
+                            timing,
+                        )
+                        .await;
+                    }
+                    Err(DataRecordError::Aead(_)) | Err(DataRecordError::NotApplicationData) => {
+                        fallback_write.write_all(&record).await?;
+                    }
+                    Err(err) => return Err(HandshakeServerError::DataRecord(err)),
+                }
+            }
+            record = read_record(&mut fallback_read) => {
+                let record = match record {
+                    Ok(record) => record,
+                    Err(err) if is_clean_close(&err) => return Ok(()),
+                    Err(err) => return Err(HandshakeServerError::Io(err)),
+                };
+                client_write.write_all(&record).await?;
+            }
+        }
+    }
+}
+
+fn resolve_connect_target(
+    first_payload: Vec<u8>,
+    fixed_data_target: Option<&str>,
+) -> Result<(String, Vec<u8>), HandshakeServerError> {
+    match ConnectRequest::decode(&first_payload) {
+        Ok(request) => Ok((request.target(), request.initial_payload)),
+        Err(ConnectRequestError::BadMagic) => {
+            let target = fixed_data_target.ok_or(HandshakeServerError::MissingConnectTarget)?;
+            Ok((target.to_owned(), first_payload))
+        }
+        Err(err) => Err(HandshakeServerError::ConnectRequest(err)),
+    }
+}
+
+async fn relay_data_channel(
+    mut client_read: OwnedReadHalf,
+    mut client_write: OwnedWriteHalf,
+    mut target_read: OwnedReadHalf,
+    mut target_write: OwnedWriteHalf,
+    mut client_open: DataRecordCodec,
+    mut server_seal: DataRecordCodec,
+    timing: TimingProfile,
+) -> Result<(), HandshakeServerError> {
+    let mut target_buf = vec![0_u8; 16 * 1024];
+    let mut rng = StdRng::from_entropy();
+
+    loop {
+        tokio::select! {
+            record = read_record(&mut client_read) => {
+                let record = match record {
+                    Ok(record) => record,
+                    Err(err) if is_clean_close(&err) => return Ok(()),
+                    Err(err) => return Err(HandshakeServerError::Io(err)),
+                };
+                match client_open.open(&record) {
+                    Ok(payload) => {
+                        if !payload.is_empty() {
+                            target_write.write_all(&payload).await?;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = client_write.write_all(&alert_bad_record_mac()).await;
+                        return Err(HandshakeServerError::DataRecord(err));
+                    }
+                }
+            }
+            read = target_read.read(&mut target_buf) => {
+                let n = read?;
+                if n == 0 {
+                    return Ok(());
+                }
+
+                let delay = timing.sample_delay(&mut rng);
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
+
+                let record = server_seal.seal(&target_buf[..n], &mut rng)?;
+                client_write.write_all(&record).await?;
+            }
+        }
+    }
+}
+
+fn is_clean_close(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+    )
 }
 
 fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {
@@ -223,27 +404,47 @@ fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use rand::{rngs::StdRng, SeedableRng};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::{
-        crypto::auth::sign_client_hello_session_id, tls::client_hello::tests::client_hello_fixture,
+        crypto::{
+            auth::{derive_client_auth_key, sign_client_hello_session_id},
+            session::X25519KeyPair,
+        },
+        handshake::client::ClientDataSession,
+        protocol::command::ConnectRequest,
+        tls::{
+            client_hello::tests::client_hello_fixture_with_key_share,
+            server_hello::{parse_server_hello, tests::server_hello_fixture},
+        },
     };
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
 
     #[test]
     fn decides_authenticated_inbound() {
-        let mut record = client_hello_fixture("example.com");
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let mut record = client_hello_fixture_with_key_share("example.com", &client.public);
         let mut rng = StdRng::seed_from_u64(1);
-        sign_client_hello_session_id(&mut record, PSK, &mut rng).unwrap();
+        sign_client_hello_session_id(&mut record, &auth_key, &mut rng).unwrap();
 
-        let decision = decide_inbound(&record, PSK, &[String::from("example.com")]).unwrap();
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
 
         match decision {
             InboundDecision::Authenticated(hello) => {
                 assert_eq!(hello.sni, "example.com");
-                assert_eq!(hello.x25519_key_share, [0x22; 32]);
+                assert_eq!(hello.x25519_key_share, client.public);
             }
             other => panic!("unexpected decision: {other:?}"),
         }
@@ -251,14 +452,17 @@ mod tests {
 
     #[test]
     fn falls_back_on_bad_auth() {
-        let mut record = client_hello_fixture("example.com");
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let mut record = client_hello_fixture_with_key_share("example.com", &client.public);
         let mut rng = StdRng::seed_from_u64(1);
-        sign_client_hello_session_id(&mut record, PSK, &mut rng).unwrap();
+        sign_client_hello_session_id(&mut record, b"wrong-auth-key", &mut rng).unwrap();
 
         let decision = decide_inbound(
             &record,
-            b"wrong-wrong-wrong-wrong-wrong-32",
+            PSK,
             &[String::from("example.com")],
+            &server.private,
         )
         .unwrap();
 
@@ -270,15 +474,108 @@ mod tests {
 
     #[test]
     fn falls_back_on_unauthorized_sni() {
-        let mut record = client_hello_fixture("example.com");
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let mut record = client_hello_fixture_with_key_share("example.com", &client.public);
         let mut rng = StdRng::seed_from_u64(1);
-        sign_client_hello_session_id(&mut record, PSK, &mut rng).unwrap();
+        sign_client_hello_session_id(&mut record, &auth_key, &mut rng).unwrap();
 
-        let decision = decide_inbound(&record, PSK, &[String::from("allowed.com")]).unwrap();
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("allowed.com")],
+            &server.private,
+        )
+        .unwrap();
 
         assert_eq!(
             decision,
             InboundDecision::Fallback(FallbackReason::UnauthorizedSni(String::from("example.com")))
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn authenticated_connection_switches_to_data_mode() {
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (mut stream, _) = fallback_listener.accept().await.unwrap();
+            let _client_hello = read_record(&mut stream).await.unwrap();
+            stream.write_all(&server_hello_fixture()).await.unwrap();
+
+            let mut one = [0_u8; 1];
+            let _ = timeout(Duration::from_millis(500), stream.read(&mut one)).await;
+        });
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut initial = [0_u8; 4];
+            stream.read_exact(&mut initial).await.unwrap();
+            assert_eq!(&initial, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let client_keys = X25519KeyPair::generate();
+        let traffic = TrafficConfig::default();
+        let config = ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            fallback_addr: fallback_addr.to_string(),
+            data_target: None,
+            private_key: STANDARD.encode(server_keys.private),
+            authorized_sni: vec![String::from("example.com")],
+            strict_tls13: true,
+        };
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = parallax_listener.accept().await.unwrap();
+            handle_connection(stream, &config, traffic, PSK)
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        let mut client_hello =
+            client_hello_fixture_with_key_share("example.com", &client_keys.public);
+        let mut rng = StdRng::seed_from_u64(20);
+        let auth_key =
+            derive_client_auth_key(PSK, &client_keys.private, &server_keys.public).unwrap();
+        sign_client_hello_session_id(&mut client_hello, &auth_key, &mut rng).unwrap();
+        client.write_all(&client_hello).await.unwrap();
+
+        let server_hello_record = read_record(&mut client).await.unwrap();
+        let server_hello = parse_server_hello(&server_hello_record).unwrap();
+        let session_keys = crate::handshake::client::derive_session_keys(
+            &client_keys.private,
+            &server_keys.public,
+            &client_hello,
+            &server_hello.random,
+        )
+        .unwrap();
+        let mut data_session = ClientDataSession::new(session_keys, traffic).unwrap();
+        let connect = ConnectRequest {
+            host: target_addr.ip().to_string(),
+            port: target_addr.port(),
+            initial_payload: b"ping".to_vec(),
+        };
+        let connect_record = data_session
+            .build_connect_record(connect, &mut rng)
+            .unwrap();
+        client.write_all(&connect_record).await.unwrap();
+
+        let response_record = read_record(&mut client).await.unwrap();
+        let response = data_session.open_server_record(&response_record).unwrap();
+        assert_eq!(response, b"pong");
+
+        drop(client);
+        server_task.await.unwrap();
+        target_task.await.unwrap();
+        fallback_task.await.unwrap();
     }
 }

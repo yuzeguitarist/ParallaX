@@ -129,8 +129,9 @@ impl AeadCodec {
     }
 
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let nonce = self.next_nonce()?;
-        self.cipher
+        let nonce = self.current_nonce();
+        let ciphertext = self
+            .cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
@@ -138,12 +139,15 @@ impl AeadCodec {
                     aad,
                 },
             )
-            .map_err(|_| SessionError::Aead)
+            .map_err(|_| SessionError::Aead)?;
+        self.advance_nonce()?;
+        Ok(ciphertext)
     }
 
     pub fn open(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let nonce = self.next_nonce()?;
-        self.cipher
+        let nonce = self.current_nonce();
+        let plaintext = self
+            .cipher
             .decrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
@@ -151,21 +155,26 @@ impl AeadCodec {
                     aad,
                 },
             )
-            .map_err(|_| SessionError::Aead)
+            .map_err(|_| SessionError::Aead)?;
+        self.advance_nonce()?;
+        Ok(plaintext)
     }
 
-    fn next_nonce(&mut self) -> Result<[u8; NONCE_LEN], SessionError> {
-        if self.sequence == u64::MAX {
-            return Err(SessionError::NonceExhausted);
-        }
-
+    fn current_nonce(&self) -> [u8; NONCE_LEN] {
         let mut nonce = self.nonce_base;
         let seq = self.sequence.to_be_bytes();
         for (dst, src) in nonce[NONCE_LEN - 8..].iter_mut().zip(seq) {
             *dst ^= src;
         }
+        nonce
+    }
+
+    fn advance_nonce(&mut self) -> Result<(), SessionError> {
+        if self.sequence == u64::MAX {
+            return Err(SessionError::NonceExhausted);
+        }
         self.sequence += 1;
-        Ok(nonce)
+        Ok(())
     }
 }
 

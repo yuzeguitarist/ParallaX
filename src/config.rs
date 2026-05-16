@@ -30,6 +30,8 @@ pub enum ConfigError {
     InvalidPaddingRange,
     #[error("traffic.max_delay_ms must be >= traffic.min_delay_ms")]
     InvalidDelayRange,
+    #[error("traffic.max_concurrent_streams must be 1 until multiplexing has fingerprint-safe scheduling")]
+    UnsupportedMultiplexing,
     #[error("server.authorized_sni must not be empty")]
     EmptyAuthorizedSni,
 }
@@ -78,7 +80,8 @@ pub struct ClientConfig {
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub fallback_addr: String,
-    pub data_target: String,
+    #[serde(default)]
+    pub data_target: Option<String>,
     pub private_key: String,
     #[serde(default)]
     pub authorized_sni: Vec<String>,
@@ -129,13 +132,15 @@ impl Config {
                 let client = self.client.as_ref().ok_or(ConfigError::MissingClient)?;
                 require_host_port("client.server_addr", &client.server_addr)?;
                 require_non_empty("client.sni", &client.sni)?;
-                decode_fixed32("client.server_public_key", &client.server_public_key)?;
+                decode_key32("client.server_public_key", &client.server_public_key)?;
             }
             Mode::Server => {
                 let server = self.server.as_ref().ok_or(ConfigError::MissingServer)?;
                 require_host_port("server.fallback_addr", &server.fallback_addr)?;
-                require_host_port("server.data_target", &server.data_target)?;
-                decode_fixed32("server.private_key", &server.private_key)?;
+                if let Some(data_target) = &server.data_target {
+                    require_host_port("server.data_target", data_target)?;
+                }
+                decode_key32("server.private_key", &server.private_key)?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
                 }
@@ -157,6 +162,9 @@ impl TrafficConfig {
         if self.max_delay_ms < self.min_delay_ms {
             return Err(ConfigError::InvalidDelayRange);
         }
+        if self.max_concurrent_streams != 1 {
+            return Err(ConfigError::UnsupportedMultiplexing);
+        }
         Ok(())
     }
 }
@@ -174,7 +182,7 @@ pub fn decode_psk(value: &str) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
     Ok(Zeroizing::new(decoded))
 }
 
-fn decode_fixed32(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {
+pub fn decode_key32(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {
     let decoded = STANDARD
         .decode(value)
         .map_err(|source| ConfigError::InvalidBase64 { field, source })?;
@@ -263,6 +271,18 @@ server_public_key = "{KEY}"
         assert!(matches!(
             traffic.validate().unwrap_err(),
             ConfigError::InvalidPaddingRange
+        ));
+    }
+
+    #[test]
+    fn rejects_multiplexing_until_safe() {
+        let traffic = TrafficConfig {
+            max_concurrent_streams: 2,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            traffic.validate().unwrap_err(),
+            ConfigError::UnsupportedMultiplexing
         ));
     }
 }

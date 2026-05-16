@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod crypto;
 pub mod handshake;
+pub mod protocol;
 pub mod tls;
 pub mod traffic;
 

@@ -271,6 +271,10 @@ pub mod tests {
     }
 
     pub fn client_hello_fixture(sni: &str) -> Vec<u8> {
+        client_hello_fixture_with_key_share(sni, &[0x22; 32])
+    }
+
+    pub fn client_hello_fixture_with_key_share(sni: &str, key_share_bytes: &[u8; 32]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // legacy_version
         body.extend_from_slice(&[0x11; 32]); // random
@@ -292,14 +296,14 @@ pub mod tests {
 
         extension(&mut extensions, EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]);
 
-        let mut key_share = Vec::new();
+        let mut key_share_data = Vec::new();
         let mut share = Vec::new();
         share.extend_from_slice(&NAMED_GROUP_X25519.to_be_bytes());
         share.extend_from_slice(&32_u16.to_be_bytes());
-        share.extend_from_slice(&[0x22; 32]);
-        key_share.extend_from_slice(&(share.len() as u16).to_be_bytes());
-        key_share.extend_from_slice(&share);
-        extension(&mut extensions, EXT_KEY_SHARE, &key_share);
+        share.extend_from_slice(key_share_bytes);
+        key_share_data.extend_from_slice(&(share.len() as u16).to_be_bytes());
+        key_share_data.extend_from_slice(&share);
+        extension(&mut extensions, EXT_KEY_SHARE, &key_share_data);
 
         body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
         body.extend_from_slice(&extensions);

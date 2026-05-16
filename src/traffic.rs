@@ -43,7 +43,7 @@ impl PaddingProfile {
     where
         R: Rng + RngCore + ?Sized,
     {
-        let pad_len = rng.gen_range(self.min..=self.max) as usize;
+        let pad_len = self.sample_padding_len(rng) as usize;
         let mut out = Vec::with_capacity(payload.len() + pad_len + 2);
         out.extend_from_slice(payload);
 
@@ -52,6 +52,26 @@ impl PaddingProfile {
         rng.fill_bytes(&mut out[start..]);
         out.extend_from_slice(&(pad_len as u16).to_be_bytes());
         out
+    }
+
+    fn sample_padding_len<R>(&self, rng: &mut R) -> u16
+    where
+        R: Rng + ?Sized,
+    {
+        if self.min == self.max {
+            return self.min;
+        }
+
+        let span = self.max - self.min;
+        let bucket = rng.gen_range(0..100);
+        let capped_span = if bucket < 70 {
+            span.min(64)
+        } else if bucket < 92 {
+            span.min(256)
+        } else {
+            span
+        };
+        self.min + rng.gen_range(0..=capped_span)
     }
 
     pub fn remove(padded: &[u8]) -> Result<Vec<u8>, TrafficError> {
@@ -112,5 +132,17 @@ mod tests {
             PaddingProfile::remove(&[0, 10]),
             Err(TrafficError::PaddingLengthOutOfRange)
         ));
+    }
+
+    #[test]
+    fn sampled_padding_stays_in_range() {
+        let profile = PaddingProfile::new(3, 777).unwrap();
+        let mut rng = StdRng::seed_from_u64(10);
+
+        for _ in 0..1000 {
+            let padded = profile.apply(b"x", &mut rng);
+            let pad_len = u16::from_be_bytes([padded[padded.len() - 2], padded[padded.len() - 1]]);
+            assert!((3..=777).contains(&pad_len));
+        }
     }
 }
