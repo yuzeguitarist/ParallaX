@@ -21,7 +21,24 @@ The package builds two binaries:
 - `parallax`
 - `plx`
 
-## Generate config
+## Quick start
+
+Pick a camouflage domain first:
+
+```bash
+plx probe cloudflare.com
+```
+
+Generate a ready-to-edit config:
+
+```bash
+plx init cloudflare.com --server-addr YOUR_VPS_IP:443
+```
+
+This creates `parallax.server.toml` and `parallax.client.toml` without
+overwriting existing files.
+
+For advanced/manual setups, the lower-level template command is still available:
 
 ```bash
 plx config-template \

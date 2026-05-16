@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -99,6 +102,9 @@ enum Command {
         server_listen: String,
         #[arg(long, default_value = "127.0.0.1:1080")]
         client_listen: String,
+        /// Directory for parallax.server.toml and parallax.client.toml.
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
     },
 }
 
@@ -201,15 +207,17 @@ pub async fn run() -> anyhow::Result<()> {
             server_addr,
             server_listen,
             client_listen,
+            output,
         } => {
             let target = probe::ProbeTarget::parse(&dest)?;
-            print_config_template(
+            let generated = generate_config_template(
                 &server_listen,
                 &client_listen,
                 &server_addr,
                 &target.authority(),
                 &target.host,
             );
+            write_init_files(&output, &generated)?;
         }
     }
 
@@ -223,15 +231,47 @@ fn print_config_template(
     fallback_addr: &str,
     sni: &str,
 ) {
+    let generated = generate_config_template(
+        server_listen,
+        client_listen,
+        server_addr,
+        fallback_addr,
+        sni,
+    );
+    println!(
+        "# ===== server parallax.toml =====\n{}# ===== client parallax.toml =====\n{}",
+        generated.server, generated.client
+    );
+}
+
+struct GeneratedConfig {
+    server: String,
+    client: String,
+}
+
+fn generate_config_template(
+    server_listen: &str,
+    client_listen: &str,
+    server_addr: &str,
+    fallback_addr: &str,
+    sni: &str,
+) -> GeneratedConfig {
     let mut psk = [0_u8; 32];
     OsRng.fill_bytes(&mut psk);
     let server_keys = X25519KeyPair::generate();
     let server_pq_keys = pq::keypair();
     let server_identity_keys = identity::keypair();
 
-    println!(
-        r#"# ===== server parallax.toml =====
-mode = "server"
+    let psk = STANDARD.encode(psk);
+    let server_private = STANDARD.encode(server_keys.private);
+    let server_public = STANDARD.encode(server_keys.public);
+    let pq_secret = STANDARD.encode(&server_pq_keys.secret);
+    let pq_public = STANDARD.encode(&server_pq_keys.public);
+    let identity_secret = STANDARD.encode(&server_identity_keys.secret);
+    let identity_public = STANDARD.encode(&server_identity_keys.public);
+
+    let server = format!(
+        r#"mode = "server"
 
 [crypto]
 psk = "{}"
@@ -253,8 +293,12 @@ replay_cache_path = "parallax-replay.cache"
 authorized_sni = ["{}"]
 strict_tls13 = true
 
-# ===== client parallax.toml =====
-mode = "client"
+"#,
+        psk, server_listen, fallback_addr, server_private, pq_secret, identity_secret, sni,
+    );
+
+    let client = format!(
+        r#"mode = "client"
 
 [crypto]
 psk = "{}"
@@ -275,19 +319,33 @@ server_pq_public_key = "{}"
 server_identity_public_key = "{}"
 tls_profile = "safari17"
 "#,
-        STANDARD.encode(psk),
-        server_listen,
-        fallback_addr,
-        STANDARD.encode(server_keys.private),
-        STANDARD.encode(&server_pq_keys.secret),
-        STANDARD.encode(&server_identity_keys.secret),
-        sni,
-        STANDARD.encode(psk),
-        client_listen,
-        server_addr,
-        sni,
-        STANDARD.encode(server_keys.public),
-        STANDARD.encode(&server_pq_keys.public),
-        STANDARD.encode(&server_identity_keys.public),
+        psk, client_listen, server_addr, sni, server_public, pq_public, identity_public,
     );
+
+    GeneratedConfig { server, client }
+}
+
+fn write_init_files(output: &Path, generated: &GeneratedConfig) -> anyhow::Result<()> {
+    let server_path = output.join("parallax.server.toml");
+    let client_path = output.join("parallax.client.toml");
+    anyhow::ensure!(
+        output.is_dir(),
+        "output directory does not exist: {}",
+        output.display()
+    );
+    anyhow::ensure!(
+        !server_path.exists() && !client_path.exists(),
+        "refusing to overwrite existing config files in {}",
+        output.display()
+    );
+
+    fs::write(&server_path, &generated.server)
+        .with_context(|| format!("failed to write {}", server_path.display()))?;
+    fs::write(&client_path, &generated.client)
+        .with_context(|| format!("failed to write {}", client_path.display()))?;
+    println!("已生成配置：");
+    println!("  server: {}", server_path.display());
+    println!("  client: {}", client_path.display());
+    println!("下一步：把 server 文件放到 VPS，把 client 文件留在本机。");
+    Ok(())
 }
