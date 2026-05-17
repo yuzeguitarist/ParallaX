@@ -275,6 +275,19 @@ impl AeadCodec {
         Ok(plaintext)
     }
 
+    pub fn open_in_place(
+        &mut self,
+        ciphertext_with_tag: &mut Vec<u8>,
+        aad: &[u8],
+    ) -> Result<(), SessionError> {
+        let nonce = self.current_nonce();
+        self.cipher
+            .decrypt_in_place(XNonce::from_slice(&nonce), aad, ciphertext_with_tag)
+            .map_err(|_| SessionError::Aead)?;
+        self.advance_nonce()?;
+        Ok(())
+    }
+
     fn current_nonce(&self) -> [u8; NONCE_LEN] {
         let mut nonce = self.nonce_base;
         let seq = self.sequence.to_be_bytes();
@@ -370,5 +383,18 @@ mod tests {
             dec.open(&ciphertext, b"tls-appdata"),
             Err(SessionError::Aead)
         ));
+    }
+
+    #[test]
+    fn aead_opens_in_place() {
+        let key = [7_u8; KEY_LEN];
+        let nonce = [9_u8; NONCE_LEN];
+        let mut enc = AeadCodec::new(key, nonce);
+        let mut dec = AeadCodec::new(key, nonce);
+
+        let mut ciphertext = enc.seal(b"payload", b"tls-appdata").unwrap();
+        dec.open_in_place(&mut ciphertext, b"tls-appdata").unwrap();
+
+        assert_eq!(ciphertext, b"payload");
     }
 }

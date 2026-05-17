@@ -1,6 +1,6 @@
 use std::io;
 
-use tokio::net::TcpStream;
+use tokio::net::{tcp::OwnedReadHalf, TcpStream};
 
 const RESERVED_PROCESS_FDS: usize = 64;
 const FDS_PER_RELAY_CONNECTION: usize = 2;
@@ -10,6 +10,22 @@ pub fn tune_tcp_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     set_low_latency_congestion(stream);
     Ok(())
+}
+
+pub fn drain_ready_tcp_read(
+    reader: &OwnedReadHalf,
+    buf: &mut [u8],
+    mut filled: usize,
+) -> io::Result<usize> {
+    while filled < buf.len() {
+        match reader.try_read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
 }
 
 #[cfg(unix)]

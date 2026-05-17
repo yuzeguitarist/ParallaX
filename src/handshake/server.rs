@@ -57,7 +57,9 @@ use crate::{
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
-    transport::tcp::{is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream},
+    transport::tcp::{
+        drain_ready_tcp_read, is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+    },
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -572,7 +574,7 @@ async fn run_authenticated_data_mode(
                         drop(fallback_write);
                         let record = client_records.read_record().await?;
                         log_record_read(cid, "client->server", "server-connect-reader", &record);
-                        let first_payload = client_open.open(&record)?;
+                        let first_payload = client_open.open_owned(record)?;
                         tracing::debug!(cid, "ParallaX data mode switch confirmed");
 
                         let (target_addr, initial_payload) =
@@ -747,7 +749,7 @@ impl DataRelay {
                         Err(err) => return Err(HandshakeServerError::Io(err)),
                     };
                     log_record_read(cid, "client->server", "server-data-client-reader", &record);
-                    match client_open.open(&record) {
+                    match client_open.open_owned(record) {
                         Ok(payload) => {
                             if !payload.is_empty() {
                                 target_write.write_all(&payload).await?;
@@ -763,6 +765,7 @@ impl DataRelay {
                     if n == 0 {
                         return Ok(());
                     }
+                    let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
 
                     let delay = timing.sample_delay(&mut rng);
                     if !delay.is_zero() {
