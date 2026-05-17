@@ -72,21 +72,37 @@ fn synthetic_random_payload(seed: u64, len: usize) -> Vec<u8> {
     bytes
 }
 
-fn pqrekey_serveridentity_burst_lengths() -> Vec<LengthObservation> {
-    // PqRekey: ~1.6 KB record from the server immediately after the handshake.
-    // ServerIdentity: ~4.6 KB record from the server immediately after PqRekey.
-    // The two arrive within a single burst (< 40 ms) and are *the* canonical
-    // ParallaX length signature.
+fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
+    // Current ParallaX sends an encrypted server key exchange, then fragments
+    // the ML-DSA identity proof into browser-sized records with >40 ms spacing.
+    // This keeps the largest post-handshake record below the old ~4.7 KB
+    // signature spike and prevents the signature chunks from aggregating into
+    // one ParallaX-specific burst.
     let start = Instant::now();
     vec![
         LengthObservation {
-            length: 1600,
+            length: 1550,
             at: start,
             client_to_server: false,
         },
         LengthObservation {
-            length: 4600,
+            length: 1320,
             at: start + Duration::from_millis(8),
+            client_to_server: false,
+        },
+        LengthObservation {
+            length: 1310,
+            at: start + Duration::from_millis(55),
+            client_to_server: false,
+        },
+        LengthObservation {
+            length: 1290,
+            at: start + Duration::from_millis(103),
+            client_to_server: false,
+        },
+        LengthObservation {
+            length: 1250,
+            at: start + Duration::from_millis(151),
             client_to_server: false,
         },
     ]
@@ -254,21 +270,21 @@ fn scenario_3_parallax_tcp_with_blocked_sni_is_reset_by_mbra() {
 // --------------------- scenario 4: ParallaX TCP w/ safe SNI ---------------------
 
 /// ParallaX over TCP with a Cloudflare-fronted SNI. The SNI layer cannot block,
-/// but the burst-statistics detector should fire when the PqRekey/ServerIdentity
-/// length signature surfaces.
+/// and the current PFS rekey + fragmented identity proof should not recreate
+/// the old PqRekey/ServerIdentity length spike.
 #[test]
-fn scenario_4_parallax_tcp_with_pqrekey_burst_is_caught_by_burst_statistics() {
+fn scenario_4_parallax_tcp_with_fragmented_identity_avoids_burst_signature() {
     let mut sim = GfwSimulator::new(GfwSimulatorConfig::default());
     let record = build_parallax_tcp_client_hello("cloudflare.com", 4004);
     let (cip, sip, port) = test_endpoints();
     let scenario = ScenarioInputs {
-        label: "ParallaX TCP, safe SNI, PqRekey burst",
-        flow_label: "parallax-tcp-pqrekey",
+        label: "ParallaX TCP, safe SNI, fragmented identity",
+        flow_label: "parallax-tcp-fragmented-identity",
         flow_key: Some(test_flow_key()),
         dns_query: None,
         events_c2s: vec![ClientToServerEvent::TcpPayload { bytes: record }],
         events_s2c: vec![],
-        length_series: pqrekey_serveridentity_burst_lengths(),
+        length_series: pfs_rekey_fragmented_identity_lengths(),
         probe_observations: vec![],
         precheck_residual_tuple: None,
         client_ip: cip,
@@ -282,12 +298,12 @@ fn scenario_4_parallax_tcp_with_pqrekey_burst_is_caught_by_burst_statistics() {
         .iter()
         .find(|v| v.layer == "burst_statistics")
         .expect("burst statistics layer must run");
-    assert_eq!(
+    assert_ne!(
         burst_verdict.kind,
         VerdictKind::Block,
-        "PqRekey burst must be caught"
+        "fragmented identity proof must not match the old ParallaX burst signature"
     );
-    assert_eq!(report.final_verdict(), VerdictKind::Block);
+    assert_ne!(report.final_verdict(), VerdictKind::Block);
 }
 
 // --------------------- scenario 5: ParallaX QUIC ---------------------
@@ -595,7 +611,7 @@ fn scenario_9_permissive_policy_disables_all_enforcement() {
         dns_query: None,
         events_c2s: vec![ClientToServerEvent::TcpPayload { bytes: record }],
         events_s2c: vec![],
-        length_series: pqrekey_serveridentity_burst_lengths(),
+        length_series: pfs_rekey_fragmented_identity_lengths(),
         probe_observations: vec![],
         precheck_residual_tuple: None,
         client_ip: cip,

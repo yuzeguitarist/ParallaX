@@ -35,6 +35,7 @@ use crate::{
 
 const INITIAL_PAYLOAD_CAPTURE_TIMEOUT: Duration = Duration::from_millis(2);
 const MAX_INITIAL_PAYLOAD_CAPTURE: usize = 4096;
+const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ClientRuntimeError {
@@ -54,6 +55,10 @@ pub enum ClientRuntimeError {
     Auth(#[from] AuthError),
     #[error("client handshake error: {0}")]
     Handshake(#[from] ClientHandshakeError),
+    #[error("server identity chunk sequence is invalid")]
+    InvalidServerIdentityChunks,
+    #[error("server identity proof is too large")]
+    ServerIdentityTooLarge,
     #[error("TLS record error: {0}")]
     TlsRecord(#[from] TlsRecordError),
 }
@@ -120,9 +125,9 @@ pub async fn handle_local_connection(
     server.write_all(&pq_record).await?;
     let key_exchange_record = read_record(&mut server).await?;
     data_session.apply_server_key_exchange_record(&key_exchange_record, pending_rekey, psk)?;
-    let identity_record = read_record(&mut server).await?;
-    data_session.verify_server_identity_record(
-        &identity_record,
+    let identity_payload = read_server_identity_payload(&mut server, &mut data_session).await?;
+    data_session.verify_server_identity_payload(
+        &identity_payload,
         server_identity_public,
         server_public,
     )?;
@@ -148,6 +153,40 @@ pub async fn handle_local_connection(
         CoverTrafficProfile::from_config(traffic),
     )
     .await
+}
+
+async fn read_server_identity_payload(
+    server: &mut TcpStream,
+    data_session: &mut ClientDataSession,
+) -> Result<Vec<u8>, ClientRuntimeError> {
+    let mut expected_total = None;
+    let mut assembled = Vec::new();
+
+    loop {
+        let record = read_record(server).await?;
+        let chunk = data_session.open_server_identity_chunk(&record)?;
+        let total_len = chunk.total_len as usize;
+        if total_len == 0 || total_len > MAX_SERVER_IDENTITY_PAYLOAD {
+            return Err(ClientRuntimeError::ServerIdentityTooLarge);
+        }
+        match expected_total {
+            Some(expected) if expected != total_len => {
+                return Err(ClientRuntimeError::InvalidServerIdentityChunks);
+            }
+            None => expected_total = Some(total_len),
+            _ => {}
+        }
+        if chunk.offset as usize != assembled.len() {
+            return Err(ClientRuntimeError::InvalidServerIdentityChunks);
+        }
+        assembled.extend_from_slice(&chunk.bytes);
+        if assembled.len() == total_len {
+            return Ok(assembled);
+        }
+        if assembled.len() > total_len {
+            return Err(ClientRuntimeError::InvalidServerIdentityChunks);
+        }
+    }
 }
 
 async fn read_initial_payload(

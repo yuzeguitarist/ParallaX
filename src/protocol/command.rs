@@ -4,6 +4,7 @@ const CONNECT_MAGIC: &[u8; 4] = b"PX1C";
 const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
 const SERVER_KEY_EXCHANGE_MAGIC: &[u8; 4] = b"PX1K";
 const SERVER_IDENTITY_MAGIC: &[u8; 4] = b"PX1S";
+const SERVER_IDENTITY_CHUNK_MAGIC: &[u8; 4] = b"PX1I";
 const MAX_HOST_LEN: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,13 @@ pub struct ServerIdentityProof {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerIdentityChunk {
+    pub total_len: u32,
+    pub offset: u32,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PqRekeyError {
     #[error("PQ rekey request is truncated")]
@@ -82,6 +90,20 @@ pub enum ServerIdentityProofError {
     EmptySignature,
     #[error("server identity proof signature length is invalid")]
     InvalidSignatureLength,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ServerIdentityChunkError {
+    #[error("server identity chunk is truncated")]
+    Truncated,
+    #[error("server identity chunk magic mismatch")]
+    BadMagic,
+    #[error("server identity chunk payload is empty")]
+    EmptyChunk,
+    #[error("server identity chunk length is invalid")]
+    InvalidChunkLength,
+    #[error("server identity chunk offset is invalid")]
+    InvalidOffset,
 }
 
 impl ConnectRequest {
@@ -267,6 +289,83 @@ impl ServerIdentityProof {
     }
 }
 
+impl ServerIdentityChunk {
+    pub fn encode(&self) -> Result<Vec<u8>, ServerIdentityChunkError> {
+        if self.bytes.is_empty() {
+            return Err(ServerIdentityChunkError::EmptyChunk);
+        }
+        let end = self
+            .offset
+            .checked_add(self.bytes.len() as u32)
+            .ok_or(ServerIdentityChunkError::InvalidOffset)?;
+        if self.total_len == 0 || end > self.total_len {
+            return Err(ServerIdentityChunkError::InvalidOffset);
+        }
+
+        let mut out = Vec::with_capacity(16 + self.bytes.len());
+        out.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
+        out.extend_from_slice(&self.total_len.to_be_bytes());
+        out.extend_from_slice(&self.offset.to_be_bytes());
+        out.extend_from_slice(&(self.bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.bytes);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, ServerIdentityChunkError> {
+        if input.len() < 4 {
+            return Err(ServerIdentityChunkError::Truncated);
+        }
+        if &input[..4] != SERVER_IDENTITY_CHUNK_MAGIC {
+            return Err(ServerIdentityChunkError::BadMagic);
+        }
+        if input.len() < 16 {
+            return Err(ServerIdentityChunkError::Truncated);
+        }
+        let total_len = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
+        let offset = u32::from_be_bytes([input[8], input[9], input[10], input[11]]);
+        let len = u32::from_be_bytes([input[12], input[13], input[14], input[15]]) as usize;
+        if len == 0 {
+            return Err(ServerIdentityChunkError::EmptyChunk);
+        }
+        if input.len() != 16 + len {
+            return Err(ServerIdentityChunkError::InvalidChunkLength);
+        }
+        let end = offset
+            .checked_add(len as u32)
+            .ok_or(ServerIdentityChunkError::InvalidOffset)?;
+        if total_len == 0 || end > total_len {
+            return Err(ServerIdentityChunkError::InvalidOffset);
+        }
+        Ok(Self {
+            total_len,
+            offset,
+            bytes: input[16..].to_vec(),
+        })
+    }
+
+    pub fn encode_all(
+        payload: &[u8],
+        max_chunk_len: usize,
+    ) -> Result<Vec<Vec<u8>>, ServerIdentityChunkError> {
+        if payload.is_empty() || max_chunk_len == 0 || payload.len() > u32::MAX as usize {
+            return Err(ServerIdentityChunkError::InvalidChunkLength);
+        }
+        let total_len = payload.len() as u32;
+        let mut chunks = Vec::new();
+        for (idx, bytes) in payload.chunks(max_chunk_len).enumerate() {
+            chunks.push(
+                Self {
+                    total_len,
+                    offset: (idx * max_chunk_len) as u32,
+                    bytes: bytes.to_vec(),
+                }
+                .encode()?,
+            );
+        }
+        Ok(chunks)
+    }
+}
+
 struct Cursor<'a> {
     input: &'a [u8],
     pos: usize,
@@ -363,5 +462,21 @@ mod tests {
         };
         let encoded = proof.encode().unwrap();
         assert_eq!(ServerIdentityProof::decode(&encoded).unwrap(), proof);
+    }
+
+    #[test]
+    fn server_identity_chunks_round_trip() {
+        let payload = (0..2000).map(|v| (v % 251) as u8).collect::<Vec<_>>();
+        let encoded = ServerIdentityChunk::encode_all(&payload, 700).unwrap();
+        assert_eq!(encoded.len(), 3);
+
+        let mut assembled = Vec::new();
+        for chunk in encoded {
+            let chunk = ServerIdentityChunk::decode(&chunk).unwrap();
+            assert_eq!(chunk.offset as usize, assembled.len());
+            assembled.extend_from_slice(&chunk.bytes);
+        }
+
+        assert_eq!(assembled, payload);
     }
 }

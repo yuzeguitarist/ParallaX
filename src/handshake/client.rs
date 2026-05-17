@@ -13,8 +13,9 @@ use crate::{
     },
     protocol::{
         command::{
-            ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityProof,
-            ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError,
+            ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
+            ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
+            ServerKeyExchange, ServerKeyExchangeError,
         },
         data::{DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD},
     },
@@ -41,6 +42,8 @@ pub enum ClientHandshakeError {
     ServerKeyExchange(#[from] ServerKeyExchangeError),
     #[error("server identity proof command error: {0}")]
     ServerIdentityProof(#[from] ServerIdentityProofError),
+    #[error("server identity chunk command error: {0}")]
+    ServerIdentityChunk(#[from] ServerIdentityChunkError),
     #[error("server identity verification failed: {0}")]
     Identity(#[from] IdentityError),
 }
@@ -157,6 +160,15 @@ impl ClientDataSession {
         Ok(self.open_from_server.open(record)?)
     }
 
+    pub fn open_server_identity_chunk(
+        &mut self,
+        record: &[u8],
+    ) -> Result<ServerIdentityChunk, ClientHandshakeError> {
+        Ok(ServerIdentityChunk::decode(
+            &self.open_from_server.open(record)?,
+        )?)
+    }
+
     pub fn verify_server_identity_record(
         &mut self,
         record: &[u8],
@@ -164,7 +176,20 @@ impl ClientDataSession {
         server_x25519_public_key: &[u8; 32],
     ) -> Result<(), ClientHandshakeError> {
         let payload = self.open_from_server.open(record)?;
-        let proof = ServerIdentityProof::decode(&payload)?;
+        self.verify_server_identity_payload(
+            &payload,
+            server_identity_public_key,
+            server_x25519_public_key,
+        )
+    }
+
+    pub fn verify_server_identity_payload(
+        &self,
+        payload: &[u8],
+        server_identity_public_key: &[u8],
+        server_x25519_public_key: &[u8; 32],
+    ) -> Result<(), ClientHandshakeError> {
+        let proof = ServerIdentityProof::decode(payload)?;
         identity::verify_server_identity(
             server_identity_public_key,
             &proof.signature,

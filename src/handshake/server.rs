@@ -38,8 +38,9 @@ use crate::{
     },
     protocol::{
         command::{
-            ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityProof,
-            ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError,
+            ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
+            ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
+            ServerKeyExchange, ServerKeyExchangeError,
         },
         data::{
             max_plaintext_len, DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD,
@@ -56,6 +57,8 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
+const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 
 #[derive(Debug, Error)]
 pub enum HandshakeServerError {
@@ -91,6 +94,8 @@ pub enum HandshakeServerError {
     Pq(#[from] PqError),
     #[error("server identity proof command error: {0}")]
     ServerIdentityProof(#[from] ServerIdentityProofError),
+    #[error("server identity chunk command error: {0}")]
+    ServerIdentityChunk(#[from] ServerIdentityChunkError),
     #[error("server identity signing failed: {0}")]
     Identity(#[from] IdentityError),
     #[error("replay cache error: {0}")]
@@ -475,8 +480,22 @@ async fn run_authenticated_data_mode(
                             signature: identity_signature,
                         }
                         .encode()?;
-                        let identity_record = server_seal.seal(&identity_payload, &mut rng)?;
-                        client_write.write_all(&identity_record).await?;
+                        let identity_chunks = ServerIdentityChunk::encode_all(
+                            &identity_payload,
+                            SERVER_IDENTITY_CHUNK_PLAINTEXT,
+                        )?;
+                        let identity_chunk_count = identity_chunks.len();
+                        for (idx, chunk) in identity_chunks.into_iter().enumerate() {
+                            let identity_record = server_seal.seal(&chunk, &mut rng)?;
+                            client_write.write_all(&identity_record).await?;
+                            if idx + 1 < identity_chunk_count {
+                                sleep(
+                                    SERVER_IDENTITY_CHUNK_MIN_DELAY
+                                        + timing.sample_delay(&mut rng),
+                                )
+                                .await;
+                            }
+                        }
 
                         let record = read_record(&mut client_read).await?;
                         let first_payload = client_open.open(&record)?;
@@ -826,10 +845,21 @@ mod tests {
         data_session
             .apply_server_key_exchange_record(&key_exchange_record, pending_rekey, PSK)
             .unwrap();
-        let identity_record = read_record(&mut client).await.unwrap();
+        let mut identity_payload = Vec::new();
+        loop {
+            let identity_record = read_record(&mut client).await.unwrap();
+            let chunk = data_session
+                .open_server_identity_chunk(&identity_record)
+                .unwrap();
+            assert_eq!(chunk.offset as usize, identity_payload.len());
+            identity_payload.extend_from_slice(&chunk.bytes);
+            if identity_payload.len() == chunk.total_len as usize {
+                break;
+            }
+        }
         data_session
-            .verify_server_identity_record(
-                &identity_record,
+            .verify_server_identity_payload(
+                &identity_payload,
                 &server_identity_keys.public,
                 &server_keys.public,
             )
