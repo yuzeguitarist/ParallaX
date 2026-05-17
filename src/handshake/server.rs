@@ -638,8 +638,9 @@ impl DataRelay {
                         sleep(delay).await;
                     }
 
-                    let record = self.server_seal.seal(&target_buf[..n], &mut rng)?;
-                    self.client_write.write_all(&record).await?;
+                    for record in self.server_seal.seal_chunks(&target_buf[..n], &mut rng)? {
+                        self.client_write.write_all(&record).await?;
+                    }
                 }
             }
         }

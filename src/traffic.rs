@@ -51,6 +51,10 @@ impl PaddingProfile {
         Self::new(config.min_padding, config.max_padding)
     }
 
+    pub fn max_len(&self) -> u16 {
+        self.max
+    }
+
     pub fn apply<R>(&self, payload: &[u8], rng: &mut R) -> Vec<u8>
     where
         R: Rng + RngCore + ?Sized,

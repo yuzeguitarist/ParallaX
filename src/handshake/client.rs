@@ -156,6 +156,17 @@ impl ClientDataSession {
         Ok(self.seal_to_server.seal(payload, rng)?)
     }
 
+    pub fn seal_payload_chunks<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<Vec<u8>>, ClientHandshakeError>
+    where
+        R: RngCore + CryptoRng + rand::Rng + ?Sized,
+    {
+        Ok(self.seal_to_server.seal_chunks(payload, rng)?)
+    }
+
     pub fn open_server_record(&mut self, record: &[u8]) -> Result<Vec<u8>, ClientHandshakeError> {
         Ok(self.open_from_server.open(record)?)
     }

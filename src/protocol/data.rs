@@ -6,6 +6,8 @@ use crate::{
     traffic::{PaddingProfile, TrafficError},
 };
 
+pub const OUTER_TLS_RECORD_LIMIT: usize = record::MAX_TLS_RECORD_PAYLOAD;
+
 const AEAD_TAG_LEN: usize = 16;
 const PADDING_LEN_FIELD: usize = 2;
 
@@ -41,6 +43,29 @@ impl DataRecordCodec {
         Ok(record::wrap_application_data(&encrypted)?)
     }
 
+    pub fn seal_chunks<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<Vec<u8>>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        let max_chunk_len = self.max_plaintext_len();
+        if max_chunk_len == 0 {
+            return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
+        }
+        if payload.is_empty() {
+            return Ok(vec![self.seal(payload, rng)?]);
+        }
+
+        let mut records = Vec::with_capacity(payload.len().div_ceil(max_chunk_len));
+        for chunk in payload.chunks(max_chunk_len) {
+            records.push(self.seal(chunk, rng)?);
+        }
+        Ok(records)
+    }
+
     pub fn open(&mut self, record: &[u8]) -> Result<Vec<u8>, DataRecordError> {
         let header = record::parse_header(record)?;
         if header.content_type != TLS_CONTENT_APPLICATION_DATA {
@@ -57,14 +82,17 @@ impl DataRecordCodec {
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
         self.aead.rekey(key, nonce_base);
     }
+
+    pub fn max_plaintext_len(&self) -> usize {
+        max_plaintext_len(self.padding.max_len())
+    }
 }
 
 pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";
 pub const SERVER_TO_CLIENT_AAD: &[u8] = b"ParallaX v1 server appdata";
 
 pub fn max_plaintext_len(max_padding: u16) -> usize {
-    record::MAX_TLS_RECORD_PAYLOAD
-        .saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
+    OUTER_TLS_RECORD_LIMIT.saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }
 
 #[cfg(test)]
@@ -85,6 +113,33 @@ mod tests {
 
         let record = enc.seal(b"hello", &mut rng).unwrap();
         assert_eq!(dec.open(&record).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn seal_chunks_splits_large_payload_into_tls_sized_records() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 128).unwrap();
+        let mut rng = StdRng::seed_from_u64(13);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let payload = (0..64 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let records = enc.seal_chunks(&payload, &mut rng).unwrap();
+
+        assert!(records.len() > 1);
+        let mut opened = Vec::with_capacity(payload.len());
+        for record in records {
+            let header = record::parse_header(&record).unwrap();
+            assert_eq!(header.content_type, TLS_CONTENT_APPLICATION_DATA);
+            assert!(header.payload_len <= OUTER_TLS_RECORD_LIMIT);
+            opened.extend_from_slice(&dec.open(&record).unwrap());
+        }
+        assert_eq!(opened, payload);
     }
 
     #[test]

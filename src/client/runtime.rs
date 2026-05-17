@@ -275,8 +275,9 @@ async fn relay(
                 if n == 0 {
                     return Ok(());
                 }
-                let record = data_session.seal_payload(&local_buf[..n], &mut rng)?;
-                server_write.write_all(&record).await?;
+                for record in data_session.seal_payload_chunks(&local_buf[..n], &mut rng)? {
+                    server_write.write_all(&record).await?;
+                }
             }
             record = read_record(&mut server_read) => {
                 let record = match record {
@@ -416,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
-    async fn socks_client_reaches_target_through_parallax_server() {
+    async fn socks_client_reaches_target_through_parallax_server_with_large_payloads() {
         let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fallback_addr = fallback_listener.local_addr().unwrap();
         let fallback_task = tokio::spawn(async move {
@@ -428,10 +429,14 @@ mod tests {
         let target_addr = target_listener.local_addr().unwrap();
         let target_task = tokio::spawn(async move {
             let (mut stream, _) = target_listener.accept().await.unwrap();
-            let mut request = [0_u8; 4];
-            stream.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"ping");
-            stream.write_all(b"pong").await.unwrap();
+            let mut buf = vec![0_u8; 64 * 1024];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                stream.write_all(&buf[..n]).await.unwrap();
+            }
         });
 
         let server_keys = X25519KeyPair::generate();
@@ -506,10 +511,13 @@ mod tests {
         app.read_exact(&mut socks_reply).await.unwrap();
         assert_eq!(socks_reply[0..2], [5, 0]);
 
-        app.write_all(b"ping").await.unwrap();
-        let mut response = [0_u8; 4];
-        app.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"pong");
+        for len in [32 * 1024, 64 * 1024, 256 * 1024] {
+            let payload = (0..len).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
+            app.write_all(&payload).await.unwrap();
+            let mut response = vec![0_u8; len];
+            app.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, payload);
+        }
 
         drop(app);
         client_task.await.unwrap();
