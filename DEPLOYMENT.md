@@ -41,6 +41,90 @@ bash scripts/deploy-vps.sh --build-mode zigbuild root@YOUR_VPS_IP cloudflare.com
 
 On Linux, it uses native `cargo build --release` by default.
 
+## Optional Polar Signals Cloud profiling
+
+Polar Signals Cloud uses the Parca Agent protocol. ParallaX keeps this
+integration opt-in because continuous profiling uploads process symbols,
+function names, binary paths, and timing data to a third-party backend.
+
+Use it for staging or short production investigations, not as a default
+always-on setting for sensitive nodes.
+
+1. Put the Polar Signals bearer token in a local file that is not committed:
+
+   ```bash
+   printf '%s' 'YOUR_POLAR_SIGNALS_TOKEN' > /tmp/parallax-polar.token
+   chmod 600 /tmp/parallax-polar.token
+   ```
+
+2. Deploy with the profiler-friendly Cargo profile:
+
+   ```bash
+   bash scripts/deploy-vps.sh \
+     --profile-mode polar-cloud \
+     --polar-token-file /tmp/parallax-polar.token \
+     --cargo-profile profiling \
+     root@YOUR_VPS_IP \
+     cloudflare.com
+   ```
+
+The deploy script uploads the token to:
+
+```text
+/etc/parallax/polarsignals.token
+```
+
+and installs:
+
+```text
+/etc/systemd/system/parca-agent.service
+/etc/parallax/polarsignals.env
+```
+
+If `parca-agent` is missing, the script installs it through the official snap
+package on the VPS. Use `--parca-agent-channel edge` only if you explicitly want
+the snap edge channel.
+
+The default remote store is:
+
+```text
+grpc.polarsignals.com:443
+```
+
+The Parca Agent local HTTP endpoint is bound to:
+
+```text
+127.0.0.1:7071
+```
+
+so it is not exposed publicly. To inspect it manually:
+
+```bash
+ssh -L 7071:127.0.0.1:7071 root@YOUR_VPS_IP
+```
+
+then open:
+
+```text
+http://127.0.0.1:7071
+```
+
+Check the profiler service:
+
+```bash
+ssh root@YOUR_VPS_IP 'sudo systemctl status parca-agent --no-pager'
+ssh root@YOUR_VPS_IP 'sudo journalctl -u parca-agent -n 120 --no-pager'
+```
+
+Security notes:
+
+- `parca-agent` must run with elevated privileges for eBPF profiling.
+- Do not pass the Polar token directly on the command line.
+- Do not enable process command-line metadata; ParallaX intentionally does not
+  set that Parca Agent flag.
+- Use `--cargo-profile release` for normal production and
+  `--cargo-profile profiling` only when you need useful flamegraphs.
+
 ## Explicit production form
 
 Use the explicit form when the SSH name is not the same as the public address

@@ -43,3 +43,10 @@ aes = "0.8"
 aes-gcm = "0.10"
 cipher = "0.4"
 md-5 = "0.10"
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+lto = "thin"
+codegen-units = 1
