@@ -60,8 +60,23 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
+        self.seal_into_reserved(payload, rng, out, true)
+    }
+
+    fn seal_into_reserved<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+        reserve_capacity: bool,
+    ) -> Result<std::ops::Range<usize>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
         let record_start = out.len();
-        out.reserve(record_capacity(payload.len(), self.padding.max_len()));
+        if reserve_capacity {
+            out.reserve(record_capacity(payload.len(), self.padding.max_len()));
+        }
         out.extend_from_slice(&[
             TLS_CONTENT_APPLICATION_DATA,
             TLS_LEGACY_VERSION[0],
@@ -120,8 +135,15 @@ impl DataRecordCodec {
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
+        let chunk_count = chunk_count(payload.len(), max_chunk_len);
+        records.reserve(chunk_count);
+        out.reserve(chunked_records_capacity(
+            payload.len(),
+            chunk_count,
+            self.padding.max_len(),
+        ));
         if payload.is_empty() {
-            let range = self.seal_into(payload, rng, out)?;
+            let range = self.seal_into_reserved(payload, rng, out, false)?;
             records.push(SealedRecord {
                 range,
                 plaintext_len: 0,
@@ -129,9 +151,8 @@ impl DataRecordCodec {
             return Ok(());
         }
 
-        records.reserve(payload.len().div_ceil(max_chunk_len));
         for chunk in payload.chunks(max_chunk_len) {
-            let range = self.seal_into(chunk, rng, out)?;
+            let range = self.seal_into_reserved(chunk, rng, out, false)?;
             records.push(SealedRecord {
                 range,
                 plaintext_len: chunk.len(),
@@ -202,6 +223,20 @@ pub fn relay_read_buffer_len(max_payload_chunk_len: usize) -> usize {
 
 fn record_capacity(payload_len: usize, max_padding: u16) -> usize {
     record::TLS_HEADER_LEN + payload_len + max_padding as usize + PADDING_LEN_FIELD + AEAD_TAG_LEN
+}
+
+fn chunk_count(payload_len: usize, max_chunk_len: usize) -> usize {
+    if payload_len == 0 {
+        1
+    } else {
+        payload_len.div_ceil(max_chunk_len)
+    }
+}
+
+fn chunked_records_capacity(payload_len: usize, record_count: usize, max_padding: u16) -> usize {
+    payload_len
+        + record_count
+            * (record::TLS_HEADER_LEN + max_padding as usize + PADDING_LEN_FIELD + AEAD_TAG_LEN)
 }
 
 #[cfg(test)]

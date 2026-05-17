@@ -805,14 +805,16 @@ where
     scratch.records_buf.clear();
     codec.seal_chunks_into_reusing(payload, rng, &mut scratch.records_buf, &mut scratch.records)?;
 
-    for record in scratch.records.iter() {
-        log_outer_write(
-            log.cid,
-            log.direction,
-            log.task_name,
-            record.plaintext_len,
-            &scratch.records_buf[record.range.clone()],
-        );
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for record in scratch.records.iter() {
+            log_outer_write(
+                log.cid,
+                log.direction,
+                log.task_name,
+                record.plaintext_len,
+                &scratch.records_buf[record.range.clone()],
+            );
+        }
     }
     writer.write_all(scratch.records_buf.as_slice()).await?;
     Ok(())
