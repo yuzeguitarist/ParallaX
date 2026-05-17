@@ -199,7 +199,12 @@ impl DataRecordCodec {
     }
 
     pub fn open_owned(&mut self, mut record: Vec<u8>) -> Result<Vec<u8>, DataRecordError> {
-        let header = record::parse_header(&record)?;
+        self.open_in_place(&mut record)?;
+        Ok(record)
+    }
+
+    pub fn open_in_place(&mut self, record: &mut Vec<u8>) -> Result<(), DataRecordError> {
+        let header = record::parse_header(record)?;
         if header.content_type != TLS_CONTENT_APPLICATION_DATA {
             return Err(DataRecordError::NotApplicationData);
         }
@@ -210,9 +215,9 @@ impl DataRecordCodec {
         record.truncate(header.total_len);
         record.copy_within(record::TLS_HEADER_LEN..header.total_len, 0);
         record.truncate(header.payload_len);
-        self.aead.open_in_place(&mut record, self.aad)?;
-        PaddingProfile::remove_in_place(&mut record)?;
-        Ok(record)
+        self.aead.open_in_place(record, self.aad)?;
+        PaddingProfile::remove_in_place(record)?;
+        Ok(())
     }
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
@@ -364,6 +369,25 @@ mod tests {
         let plaintext = dec.open_owned(record).unwrap();
 
         assert_eq!(plaintext, b"hello");
+    }
+
+    #[test]
+    fn open_in_place_reuses_record_buffer_for_plaintext() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(4, 4).unwrap();
+        let mut rng = StdRng::seed_from_u64(19);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+
+        let mut record = enc.seal(b"hello", &mut rng).unwrap();
+        let capacity = record.capacity();
+        dec.open_in_place(&mut record).unwrap();
+
+        assert_eq!(record, b"hello");
+        assert_eq!(record.capacity(), capacity);
     }
 
     #[test]

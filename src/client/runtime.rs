@@ -474,6 +474,7 @@ impl ClientRelay {
         let mut local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
         let mut server_records = TlsRecordReader::new(server_read);
         let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
+        let mut server_record = Vec::new();
         let mut rng = StdRng::from_entropy();
         let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
@@ -507,18 +508,18 @@ impl ClientRelay {
                     )
                     .await?;
                 }
-                record = server_records.read_record() => {
-                    let record = match record {
-                        Ok(record) => record,
+                record = server_records.read_record_into(&mut server_record) => {
+                    match record {
+                        Ok(()) => {}
                         Err(err) if is_clean_close(&err) => return Ok(()),
                         Err(err) => return Err(ClientRuntimeError::Io(err)),
                     };
-                    log_record_read(cid, "server->client", "client-outer-reader", &record);
+                    log_record_read(cid, "server->client", "client-outer-reader", &server_record);
 
-                    match data_session.open_server_record_owned(record) {
-                        Ok(payload) => {
-                            if !payload.is_empty() {
-                                local_write.write_all(&payload).await?;
+                    match data_session.open_server_record_in_place(&mut server_record) {
+                        Ok(()) => {
+                            if !server_record.is_empty() {
+                                local_write.write_all(&server_record).await?;
                             }
                         }
                         Err(err) => {
@@ -557,14 +558,16 @@ where
         &mut scratch.records,
     )?;
 
-    for record in scratch.records.iter() {
-        log_outer_write(
-            log.cid,
-            log.direction,
-            log.task_name,
-            record.plaintext_len,
-            &scratch.records_buf[record.range.clone()],
-        );
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for record in scratch.records.iter() {
+            log_outer_write(
+                log.cid,
+                log.direction,
+                log.task_name,
+                record.plaintext_len,
+                &scratch.records_buf[record.range.clone()],
+            );
+        }
     }
     writer.write_all(scratch.records_buf.as_slice()).await?;
     Ok(())

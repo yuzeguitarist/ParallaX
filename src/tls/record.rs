@@ -111,6 +111,12 @@ where
     R: AsyncRead + Unpin,
 {
     pub async fn read_record(&mut self) -> Result<Vec<u8>, std::io::Error> {
+        let mut record = Vec::new();
+        self.read_record_into(&mut record).await?;
+        Ok(record)
+    }
+
+    pub async fn read_record_into(&mut self, out: &mut Vec<u8>) -> Result<(), std::io::Error> {
         while self.header_pos < TLS_HEADER_LEN {
             let n = self
                 .reader
@@ -156,7 +162,9 @@ where
         self.header_pos = 0;
         self.payload_len = None;
         self.payload_pos = 0;
-        Ok(std::mem::take(&mut self.record))
+        out.clear();
+        std::mem::swap(out, &mut self.record);
+        Ok(())
     }
 }
 
@@ -178,6 +186,8 @@ pub fn log_record_read(cid: u64, direction: &'static str, task_name: &'static st
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncWriteExt;
+
     use super::*;
 
     #[test]
@@ -198,5 +208,26 @@ mod tests {
     #[test]
     fn emits_tls13_compat_change_cipher_spec() {
         assert_eq!(change_cipher_spec(), [0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+    }
+
+    #[tokio::test]
+    async fn record_reader_can_reuse_caller_buffer() {
+        let first = wrap_application_data(b"abc").unwrap();
+        let second = wrap_application_data(b"defgh").unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            writer.write_all(&first).await.unwrap();
+            writer.write_all(&second).await.unwrap();
+        });
+        let mut reader = TlsRecordReader::new(reader);
+        let mut out = Vec::with_capacity(64);
+
+        reader.read_record_into(&mut out).await.unwrap();
+        assert_eq!(&out[TLS_HEADER_LEN..], b"abc");
+        out.clear();
+        out.extend_from_slice(b"stale");
+
+        reader.read_record_into(&mut out).await.unwrap();
+        assert_eq!(&out[TLS_HEADER_LEN..], b"defgh");
     }
 }

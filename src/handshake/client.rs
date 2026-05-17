@@ -228,6 +228,13 @@ impl ClientDataSession {
         Ok(self.open_from_server.open_owned(record)?)
     }
 
+    pub fn open_server_record_in_place(
+        &mut self,
+        record: &mut Vec<u8>,
+    ) -> Result<(), ClientHandshakeError> {
+        Ok(self.open_from_server.open_in_place(record)?)
+    }
+
     pub fn open_server_identity_chunk(
         &mut self,
         record: &[u8],

@@ -723,6 +723,7 @@ impl DataRelay {
         } = self;
         let mut target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
         let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
+        let mut client_record = Vec::new();
         let mut rng = StdRng::from_entropy();
         let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
@@ -742,17 +743,17 @@ impl DataRelay {
                         Instant::now() + cover.sample_interval(&mut rng),
                     );
                 }
-                record = client_records.read_record() => {
-                    let record = match record {
-                        Ok(record) => record,
+                record = client_records.read_record_into(&mut client_record) => {
+                    match record {
+                        Ok(()) => {}
                         Err(err) if is_clean_close(&err) => return Ok(()),
                         Err(err) => return Err(HandshakeServerError::Io(err)),
                     };
-                    log_record_read(cid, "client->server", "server-data-client-reader", &record);
-                    match client_open.open_owned(record) {
-                        Ok(payload) => {
-                            if !payload.is_empty() {
-                                target_write.write_all(&payload).await?;
+                    log_record_read(cid, "client->server", "server-data-client-reader", &client_record);
+                    match client_open.open_in_place(&mut client_record) {
+                        Ok(()) => {
+                            if !client_record.is_empty() {
+                                target_write.write_all(&client_record).await?;
                             }
                         }
                         Err(err) => {
