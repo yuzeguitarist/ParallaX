@@ -382,10 +382,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let generated = GeneratedConfig {
-            server: "server-secret".to_owned(),
-            client: "client-secret".to_owned(),
-        };
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "example.com:443",
+            "example.com:443",
+            "example.com",
+        );
 
         write_init_files(dir.path(), &generated).unwrap();
 
@@ -397,5 +400,8 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+
+        let server_path = dir.path().join("parallax.server.toml");
+        Config::load(server_path).unwrap();
     }
 }
