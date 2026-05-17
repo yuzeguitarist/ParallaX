@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub const OUTER_TLS_RECORD_LIMIT: usize = record::MAX_TLS_RECORD_PAYLOAD;
+pub const RELAY_READ_BUFFER_TARGET: usize = 64 * 1024;
 
 const PADDING_LEN_FIELD: usize = 2;
 
@@ -174,6 +175,14 @@ pub fn max_plaintext_len(max_padding: u16) -> usize {
     OUTER_TLS_RECORD_LIMIT.saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }
 
+pub fn relay_read_buffer_len(max_payload_chunk_len: usize) -> usize {
+    if max_payload_chunk_len == 0 {
+        0
+    } else {
+        RELAY_READ_BUFFER_TARGET.max(max_payload_chunk_len)
+    }
+}
+
 fn record_capacity(payload_len: usize, max_padding: u16) -> usize {
     record::TLS_HEADER_LEN + payload_len + max_padding as usize + PADDING_LEN_FIELD + AEAD_TAG_LEN
 }
@@ -331,6 +340,16 @@ mod tests {
                 (record::MAX_TLS_RECORD_PAYLOAD - AEAD_TAG_LEN - PADDING_LEN_FIELD - 1) as u16
             ),
             1
+        );
+    }
+
+    #[test]
+    fn relay_read_buffer_is_large_enough_to_batch_records() {
+        assert_eq!(relay_read_buffer_len(0), 0);
+        assert_eq!(relay_read_buffer_len(1), RELAY_READ_BUFFER_TARGET);
+        assert_eq!(
+            relay_read_buffer_len(RELAY_READ_BUFFER_TARGET + 1),
+            RELAY_READ_BUFFER_TARGET + 1
         );
     }
 }

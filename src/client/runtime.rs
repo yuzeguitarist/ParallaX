@@ -31,7 +31,7 @@ use crate::{
     crypto::auth::AuthError,
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::ConnectRequest,
-    protocol::data::{max_plaintext_len, DataRecordError},
+    protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordError},
     tls::{
         backend::TlsBackendError,
         record::{read_record, spawn_record_reader, TlsRecordError},
@@ -319,7 +319,7 @@ struct ClientRelay {
 
 impl ClientRelay {
     async fn run(mut self) -> Result<(), ClientRuntimeError> {
-        let mut local_buf = vec![0_u8; self.chunk_size];
+        let mut local_buf = vec![0_u8; relay_read_buffer_len(self.chunk_size)];
         let mut server_records = spawn_record_reader(
             self.server_read,
             self.cid,

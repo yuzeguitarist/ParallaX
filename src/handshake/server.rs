@@ -46,8 +46,8 @@ use crate::{
             ServerKeyExchange, ServerKeyExchangeError,
         },
         data::{
-            max_plaintext_len, DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD,
-            SERVER_TO_CLIENT_AAD,
+            max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError,
+            CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD,
         },
     },
     tls::{
@@ -669,7 +669,7 @@ struct DataRelay {
 
 impl DataRelay {
     async fn run(mut self) -> Result<(), HandshakeServerError> {
-        let mut target_buf = vec![0_u8; self.chunk_size];
+        let mut target_buf = vec![0_u8; relay_read_buffer_len(self.chunk_size)];
         let mut rng = StdRng::from_entropy();
         let mut cover_sleep = Box::pin(sleep(self.cover.sample_interval(&mut rng)));
 
