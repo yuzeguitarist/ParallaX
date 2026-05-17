@@ -1,5 +1,9 @@
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    sync::mpsc,
+    task::JoinHandle,
+};
 
 pub const TLS_HEADER_LEN: usize = 5;
 pub const TLS_LEGACY_VERSION: [u8; 2] = [0x03, 0x03];
@@ -93,6 +97,64 @@ where
     record.resize(TLS_HEADER_LEN + payload_len, 0);
     reader.read_exact(&mut record[TLS_HEADER_LEN..]).await?;
     Ok(record)
+}
+
+pub type RecordReadResult = Result<Vec<u8>, std::io::Error>;
+
+pub struct RecordReader {
+    records: mpsc::Receiver<RecordReadResult>,
+    task: JoinHandle<()>,
+}
+
+impl RecordReader {
+    pub async fn recv(&mut self) -> Option<RecordReadResult> {
+        self.records.recv().await
+    }
+}
+
+impl Drop for RecordReader {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub fn spawn_record_reader<R>(
+    mut reader: R,
+    cid: u64,
+    direction: &'static str,
+    task_name: &'static str,
+) -> RecordReader
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (tx, records) = mpsc::channel(32);
+    let task = tokio::spawn(async move {
+        loop {
+            let result = read_record(&mut reader).await;
+            match result {
+                Ok(record) => {
+                    if let Ok(header) = parse_header(&record) {
+                        tracing::debug!(
+                            cid,
+                            direction,
+                            task_name,
+                            tls_content_type = header.content_type,
+                            outer_tls_payload_len = header.payload_len,
+                            "outer TLS record read"
+                        );
+                    }
+                    if tx.send(Ok(record)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+    });
+    RecordReader { records, task }
 }
 
 #[cfg(test)]

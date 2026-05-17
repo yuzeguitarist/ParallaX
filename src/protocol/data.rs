@@ -143,6 +143,36 @@ mod tests {
     }
 
     #[test]
+    fn seal_chunks_round_trips_5mb_in_both_directions() {
+        let payload = (0..5 * 1024 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+
+        for (aad, key, nonce) in [
+            (CLIENT_TO_SERVER_AAD, [1_u8; KEY_LEN], [2_u8; NONCE_LEN]),
+            (SERVER_TO_CLIENT_AAD, [3_u8; KEY_LEN], [4_u8; NONCE_LEN]),
+        ] {
+            let padding = PaddingProfile::new(0, 128).unwrap();
+            let mut rng = StdRng::seed_from_u64(14);
+            let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, aad);
+            let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, aad);
+
+            let records = enc.seal_chunks(&payload, &mut rng).unwrap();
+
+            assert!(records.len() > 300);
+            let mut opened = Vec::with_capacity(payload.len());
+            for record in records {
+                let header = record::parse_header(&record).unwrap();
+                assert_eq!(header.content_type, TLS_CONTENT_APPLICATION_DATA);
+                assert!(header.payload_len <= OUTER_TLS_RECORD_LIMIT);
+                assert_eq!(record.len(), record::TLS_HEADER_LEN + header.payload_len);
+                opened.extend_from_slice(&dec.open(&record).unwrap());
+            }
+            assert_eq!(opened, payload);
+        }
+    }
+
+    #[test]
     fn failed_open_does_not_advance_nonce() {
         let key = [1_u8; KEY_LEN];
         let nonce = [2_u8; NONCE_LEN];

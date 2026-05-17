@@ -1,4 +1,10 @@
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use rand::{
     rngs::{OsRng, StdRng},
@@ -6,7 +12,7 @@ use rand::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
@@ -27,7 +33,7 @@ use crate::{
     protocol::data::{max_plaintext_len, DataRecordError},
     tls::{
         backend::TlsBackendError,
-        record::{alert_bad_record_mac, read_record, TlsRecordError},
+        record::{read_record, spawn_record_reader, TlsRecordError},
         stateful::StatefulRustlsCamouflageBackend,
     },
     traffic::CoverTrafficProfile,
@@ -36,6 +42,8 @@ use crate::{
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
+
+static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 pub enum ClientRuntimeError {
@@ -83,36 +91,65 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
 
     loop {
         let (local, peer) = listener.accept().await?;
+        let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let client = client.clone();
         let psk = Arc::clone(&psk);
         let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
         tokio::spawn(async move {
-            if let Err(err) = handle_local_connection(
+            if let Err(err) = handle_local_connection_with_cid(
                 local,
                 &client,
                 traffic,
                 &psk,
                 &server_public,
                 &server_identity_public,
+                cid,
             )
             .await
             {
-                tracing::debug!(%peer, error = %err, "client connection closed");
+                tracing::debug!(cid, %peer, error = %err, "client connection closed");
             }
         });
     }
 }
 
 pub async fn handle_local_connection(
-    mut local: TcpStream,
+    local: TcpStream,
     config: &ClientConfig,
     traffic: TrafficConfig,
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: &[u8],
 ) -> Result<(), ClientRuntimeError> {
+    let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    handle_local_connection_with_cid(
+        local,
+        config,
+        traffic,
+        psk,
+        server_public,
+        server_identity_public,
+        cid,
+    )
+    .await
+}
+
+async fn handle_local_connection_with_cid(
+    mut local: TcpStream,
+    config: &ClientConfig,
+    traffic: TrafficConfig,
+    psk: &[u8],
+    server_public: &[u8; 32],
+    server_identity_public: &[u8],
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
     tune_tcp_stream(&local)?;
+    tracing::debug!(
+        cid,
+        task_name = "client-connection",
+        "accepted SOCKS connection"
+    );
     let request = socks::accept_connect(&mut local).await?;
     let chunk_size = max_plaintext_len(traffic.max_padding);
     let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
@@ -133,27 +170,35 @@ pub async fn handle_local_connection(
         server_identity_public,
         server_public,
     )?;
-    let connect_record = data_session.build_connect_record(
-        ConnectRequest {
-            host: request.host,
-            port: request.port,
-            initial_payload,
-        },
-        &mut OsRng,
-    )?;
+    let connect_request = ConnectRequest {
+        host: request.host,
+        port: request.port,
+        initial_payload,
+    };
+    let connect_plaintext_len = connect_request.encoded_len();
+    let connect_record = data_session.build_connect_record(connect_request, &mut OsRng)?;
+    log_outer_write(
+        cid,
+        "client->server",
+        "client-handshake",
+        connect_plaintext_len,
+        &connect_record,
+    );
     server.write_all(&connect_record).await?;
 
     let (local_read, local_write) = local.into_split();
     let (server_read, server_write) = server.into_split();
-    relay(
+    ClientRelay {
         local_read,
         local_write,
         server_read,
         server_write,
         data_session,
         chunk_size,
-        CoverTrafficProfile::from_config(traffic),
-    )
+        cover: CoverTrafficProfile::from_config(traffic),
+        cid,
+    }
+    .run()
     .await
 }
 
@@ -249,60 +294,131 @@ async fn establish_data_session(
     Ok(ClientDataSession::new(session_keys, traffic)?)
 }
 
-async fn relay(
-    mut local_read: OwnedReadHalf,
-    mut local_write: OwnedWriteHalf,
-    mut server_read: OwnedReadHalf,
-    mut server_write: OwnedWriteHalf,
-    mut data_session: ClientDataSession,
+struct ClientRelay {
+    local_read: OwnedReadHalf,
+    local_write: OwnedWriteHalf,
+    server_read: OwnedReadHalf,
+    server_write: OwnedWriteHalf,
+    data_session: ClientDataSession,
     chunk_size: usize,
     cover: CoverTrafficProfile,
-) -> Result<(), ClientRuntimeError> {
-    let mut local_buf = vec![0_u8; chunk_size];
-    let mut server_data_started = false;
-    let mut rng = StdRng::from_entropy();
-    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+    cid: u64,
+}
 
-    loop {
-        tokio::select! {
-            _ = &mut cover_sleep, if cover.is_enabled() => {
-                let record = data_session.seal_payload(&[], &mut rng)?;
-                server_write.write_all(&record).await?;
-                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
-            }
-            read = local_read.read(&mut local_buf) => {
-                let n = read?;
-                if n == 0 {
-                    return Ok(());
-                }
-                for record in data_session.seal_payload_chunks(&local_buf[..n], &mut rng)? {
-                    server_write.write_all(&record).await?;
-                }
-            }
-            record = read_record(&mut server_read) => {
-                let record = match record {
-                    Ok(record) => record,
-                    Err(err) if is_clean_close(&err) => return Ok(()),
-                    Err(err) => return Err(ClientRuntimeError::Io(err)),
-                };
+impl ClientRelay {
+    async fn run(mut self) -> Result<(), ClientRuntimeError> {
+        let mut local_buf = vec![0_u8; self.chunk_size];
+        let mut server_records = spawn_record_reader(
+            self.server_read,
+            self.cid,
+            "server->client",
+            "client-outer-reader",
+        );
+        let mut rng = StdRng::from_entropy();
+        let mut cover_sleep = Box::pin(sleep(self.cover.sample_interval(&mut rng)));
 
-                match data_session.open_server_record(&record) {
-                    Ok(payload) => {
-                        if !payload.is_empty() {
-                            server_data_started = true;
-                            local_write.write_all(&payload).await?;
+        loop {
+            tokio::select! {
+                _ = &mut cover_sleep, if self.cover.is_enabled() => {
+                    write_client_data_records_chunked(
+                        &mut self.server_write,
+                        &mut self.data_session,
+                        &[],
+                        &mut rng,
+                        self.cid,
+                        "client->server",
+                        "client-cover-writer",
+                    )
+                    .await?;
+                    cover_sleep.as_mut().reset(Instant::now() + self.cover.sample_interval(&mut rng));
+                }
+                read = self.local_read.read(&mut local_buf) => {
+                    let n = read?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    write_client_data_records_chunked(
+                        &mut self.server_write,
+                        &mut self.data_session,
+                        &local_buf[..n],
+                        &mut rng,
+                        self.cid,
+                        "client->server",
+                        "client-upload-writer",
+                    )
+                    .await?;
+                }
+                record = server_records.recv() => {
+                    let record = match record {
+                        Some(Ok(record)) => record,
+                        Some(Err(err)) if is_clean_close(&err) => return Ok(()),
+                        Some(Err(err)) => return Err(ClientRuntimeError::Io(err)),
+                        None => return Ok(()),
+                    };
+
+                    match self.data_session.open_server_record(&record) {
+                        Ok(payload) => {
+                            if !payload.is_empty() {
+                                self.local_write.write_all(&payload).await?;
+                            }
                         }
-                    }
-                    Err(err) if !server_data_started => {
-                        tracing::trace!(error = %err, "ignoring residual camouflage TLS record");
-                    }
-                    Err(err) => {
-                        let _ = server_write.write_all(&alert_bad_record_mac()).await;
-                        return Err(ClientRuntimeError::Handshake(err));
+                        Err(err) => {
+                            return Err(ClientRuntimeError::Handshake(err));
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+async fn write_client_data_records_chunked<W, R>(
+    writer: &mut W,
+    data_session: &mut ClientDataSession,
+    payload: &[u8],
+    rng: &mut R,
+    cid: u64,
+    direction: &'static str,
+    task_name: &'static str,
+) -> Result<(), ClientRuntimeError>
+where
+    W: AsyncWrite + Unpin,
+    R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
+{
+    let max_chunk_len = data_session.max_payload_chunk_len();
+    if payload.is_empty() {
+        let record = data_session.seal_payload(payload, rng)?;
+        log_outer_write(cid, direction, task_name, 0, &record);
+        writer.write_all(&record).await?;
+        return Ok(());
+    }
+
+    for chunk in payload.chunks(max_chunk_len) {
+        let record = data_session.seal_payload(chunk, rng)?;
+        log_outer_write(cid, direction, task_name, chunk.len(), &record);
+        writer.write_all(&record).await?;
+    }
+    Ok(())
+}
+
+fn log_outer_write(
+    cid: u64,
+    direction: &'static str,
+    task_name: &'static str,
+    plaintext_len: usize,
+    record: &[u8],
+) {
+    if let Ok(header) = crate::tls::record::parse_header(record) {
+        tracing::debug!(
+            cid,
+            direction,
+            task_name,
+            plaintext_len,
+            sealed_len = header.payload_len,
+            outer_tls_payload_len = header.payload_len,
+            tls_content_type = header.content_type,
+            "outer TLS record write"
+        );
     }
 }
 
@@ -511,15 +627,21 @@ mod tests {
         app.read_exact(&mut socks_reply).await.unwrap();
         assert_eq!(socks_reply[0..2], [5, 0]);
 
-        for len in [32 * 1024, 64 * 1024, 256 * 1024] {
+        let (mut app_read, mut app_write) = app.into_split();
+        for len in [32 * 1024, 64 * 1024, 256 * 1024, 5 * 1024 * 1024] {
             let payload = (0..len).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
-            app.write_all(&payload).await.unwrap();
             let mut response = vec![0_u8; len];
-            app.read_exact(&mut response).await.unwrap();
+            let (write_result, read_result) = tokio::join!(
+                app_write.write_all(&payload),
+                app_read.read_exact(&mut response)
+            );
+            write_result.unwrap();
+            read_result.unwrap();
             assert_eq!(response, payload);
         }
 
-        drop(app);
+        drop(app_read);
+        drop(app_write);
         client_task.await.unwrap();
         server_task.await.unwrap();
         target_task.await.unwrap();

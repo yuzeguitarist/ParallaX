@@ -1,6 +1,9 @@
 use std::{
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -8,7 +11,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
+    io::{copy_bidirectional, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
@@ -49,7 +52,7 @@ use crate::{
     },
     tls::{
         client_hello::parse_client_hello,
-        record::{alert_bad_record_mac, read_record},
+        record::{read_record, spawn_record_reader, RecordReader},
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
@@ -59,6 +62,8 @@ use crate::{
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
+
+static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 pub enum HandshakeServerError {
@@ -165,6 +170,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
 
     loop {
         let (client, peer) = listener.accept().await?;
+        let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let server = server.clone();
         let connection_traffic = traffic;
         let psk = Arc::clone(&psk);
@@ -176,10 +182,11 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 connection_traffic,
                 &psk,
                 replay_cache,
+                cid,
             )
             .await
             {
-                tracing::debug!(%peer, error = %err, "connection closed");
+                tracing::debug!(cid, %peer, error = %err, "connection closed");
             }
         });
     }
@@ -191,7 +198,8 @@ pub async fn handle_connection(
     traffic: TrafficConfig,
     psk: &[u8],
 ) -> Result<(), HandshakeServerError> {
-    handle_connection_inner(client, config, traffic, psk, None).await
+    let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    handle_connection_inner(client, config, traffic, psk, None, cid).await
 }
 
 async fn handle_connection_with_replay(
@@ -200,8 +208,9 @@ async fn handle_connection_with_replay(
     traffic: TrafficConfig,
     psk: &[u8],
     replay_cache: Arc<Mutex<ReplayCache>>,
+    cid: u64,
 ) -> Result<(), HandshakeServerError> {
-    handle_connection_inner(client, config, traffic, psk, Some(replay_cache)).await
+    handle_connection_inner(client, config, traffic, psk, Some(replay_cache), cid).await
 }
 
 async fn handle_connection_inner(
@@ -210,8 +219,14 @@ async fn handle_connection_inner(
     traffic: TrafficConfig,
     psk: &[u8],
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
+    cid: u64,
 ) -> Result<(), HandshakeServerError> {
     tune_tcp_stream(&client)?;
+    tracing::debug!(
+        cid,
+        task_name = "server-connection",
+        "accepted outer connection"
+    );
     let server_private = decode_key32_secret("server.private_key", &config.private_key)?;
     let first_record = read_first_record(&mut client).await?;
     match decide_inbound(&first_record, psk, &config.authorized_sni, &server_private)? {
@@ -242,6 +257,7 @@ async fn handle_connection_inner(
                 accept_authenticated(client, config, &server_private, first_record, client_hello)
                     .await?;
             tracing::debug!(
+                cid,
                 sni = %handshake.client_hello.sni,
                 tls13 = handshake.server_hello.tls13_selected,
                 "authenticated ParallaX handshake accepted"
@@ -254,6 +270,7 @@ async fn handle_connection_inner(
                 &identity_secret,
                 psk,
                 traffic,
+                cid,
             )
             .await?;
         }
@@ -410,6 +427,7 @@ async fn run_authenticated_data_mode(
     identity_secret_key: &[u8],
     sandwich_secret: &[u8],
     traffic: TrafficConfig,
+    cid: u64,
 ) -> Result<(), HandshakeServerError> {
     let padding = PaddingProfile::from_config(traffic)?;
     let timing = TimingProfile::from_config(traffic);
@@ -431,16 +449,29 @@ async fn run_authenticated_data_mode(
         SERVER_TO_CLIENT_AAD,
     );
 
-    let (mut client_read, mut client_write) = handshake.client.into_split();
-    let (mut fallback_read, mut fallback_write) = handshake.fallback.into_split();
+    let (client_read, mut client_write) = handshake.client.into_split();
+    let (fallback_read, mut fallback_write) = handshake.fallback.into_split();
+    let mut client_records = spawn_record_reader(
+        client_read,
+        cid,
+        "client->server",
+        "server-predata-client-reader",
+    );
+    let mut fallback_records = spawn_record_reader(
+        fallback_read,
+        cid,
+        "fallback->server",
+        "server-predata-fallback-reader",
+    );
 
     loop {
         tokio::select! {
-            record = read_record(&mut client_read) => {
+            record = client_records.recv() => {
                 let record = match record {
-                    Ok(record) => record,
-                    Err(err) if is_clean_close(&err) => return Ok(()),
-                    Err(err) => return Err(HandshakeServerError::Io(err)),
+                    Some(Ok(record)) => record,
+                    Some(Err(err)) if is_clean_close(&err) => return Ok(()),
+                    Some(Err(err)) => return Err(HandshakeServerError::Io(err)),
+                    None => return Ok(()),
                 };
 
                 match client_open.open(&record) {
@@ -461,6 +492,13 @@ async fn run_authenticated_data_mode(
                         let mut rng = StdRng::from_entropy();
                         let key_exchange_record =
                             server_seal.seal(&key_exchange_payload, &mut rng)?;
+                        log_outer_write(
+                            cid,
+                            "server->client",
+                            "server-key-exchange-writer",
+                            key_exchange_payload.len(),
+                            &key_exchange_record,
+                        );
                         client_write.write_all(&key_exchange_record).await?;
                         let rekeyed_keys = apply_server_pq_rekey(
                             &mut client_open,
@@ -487,6 +525,13 @@ async fn run_authenticated_data_mode(
                         let identity_chunk_count = identity_chunks.len();
                         for (idx, chunk) in identity_chunks.into_iter().enumerate() {
                             let identity_record = server_seal.seal(&chunk, &mut rng)?;
+                            log_outer_write(
+                                cid,
+                                "server->client",
+                                "server-identity-writer",
+                                chunk.len(),
+                                &identity_record,
+                            );
                             client_write.write_all(&identity_record).await?;
                             if idx + 1 < identity_chunk_count {
                                 sleep(
@@ -497,11 +542,15 @@ async fn run_authenticated_data_mode(
                             }
                         }
 
-                        let record = read_record(&mut client_read).await?;
+                        let record = match client_records.recv().await {
+                            Some(Ok(record)) => record,
+                            Some(Err(err)) => return Err(HandshakeServerError::Io(err)),
+                            None => return Ok(()),
+                        };
                         let first_payload = client_open.open(&record)?;
-                        drop(fallback_read);
+                        drop(fallback_records);
                         drop(fallback_write);
-                        tracing::debug!("ParallaX data mode switch confirmed");
+                        tracing::debug!(cid, "ParallaX data mode switch confirmed");
 
                         let (target_addr, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
@@ -512,7 +561,7 @@ async fn run_authenticated_data_mode(
                         }
                         let (target_read, target_write) = target.into_split();
                         return DataRelay {
-                            client_read,
+                            client_records,
                             client_write,
                             target_read,
                             target_write,
@@ -521,6 +570,7 @@ async fn run_authenticated_data_mode(
                             timing,
                             cover,
                             chunk_size: max_plaintext_len(traffic.max_padding),
+                            cid,
                         }
                         .run()
                         .await;
@@ -531,12 +581,23 @@ async fn run_authenticated_data_mode(
                     Err(err) => return Err(HandshakeServerError::DataRecord(err)),
                 }
             }
-            record = read_record(&mut fallback_read) => {
+            record = fallback_records.recv() => {
                 let record = match record {
-                    Ok(record) => record,
-                    Err(err) if is_clean_close(&err) => return Ok(()),
-                    Err(err) => return Err(HandshakeServerError::Io(err)),
+                    Some(Ok(record)) => record,
+                    Some(Err(err)) if is_clean_close(&err) => return Ok(()),
+                    Some(Err(err)) => return Err(HandshakeServerError::Io(err)),
+                    None => return Ok(()),
                 };
+                if let Ok(header) = crate::tls::record::parse_header(&record) {
+                    tracing::debug!(
+                        cid,
+                        direction = "fallback->client",
+                        task_name = "server-camouflage-writer",
+                        outer_tls_payload_len = header.payload_len,
+                        tls_content_type = header.content_type,
+                        "camouflage TLS record write"
+                    );
+                }
                 client_write.write_all(&record).await?;
             }
         }
@@ -583,7 +644,7 @@ fn apply_server_pq_rekey(
 }
 
 struct DataRelay {
-    client_read: OwnedReadHalf,
+    client_records: RecordReader,
     client_write: OwnedWriteHalf,
     target_read: OwnedReadHalf,
     target_write: OwnedWriteHalf,
@@ -592,6 +653,7 @@ struct DataRelay {
     timing: TimingProfile,
     cover: CoverTrafficProfile,
     chunk_size: usize,
+    cid: u64,
 }
 
 impl DataRelay {
@@ -603,17 +665,26 @@ impl DataRelay {
         loop {
             tokio::select! {
                 _ = &mut cover_sleep, if self.cover.is_enabled() => {
-                    let record = self.server_seal.seal(&[], &mut rng)?;
-                    self.client_write.write_all(&record).await?;
+                    write_server_data_records_chunked(
+                        &mut self.client_write,
+                        &mut self.server_seal,
+                        &[],
+                        &mut rng,
+                        self.cid,
+                        "server->client",
+                        "server-cover-writer",
+                    )
+                    .await?;
                     cover_sleep.as_mut().reset(
                         Instant::now() + self.cover.sample_interval(&mut rng),
                     );
                 }
-                record = read_record(&mut self.client_read) => {
+                record = self.client_records.recv() => {
                     let record = match record {
-                        Ok(record) => record,
-                        Err(err) if is_clean_close(&err) => return Ok(()),
-                        Err(err) => return Err(HandshakeServerError::Io(err)),
+                        Some(Ok(record)) => record,
+                        Some(Err(err)) if is_clean_close(&err) => return Ok(()),
+                        Some(Err(err)) => return Err(HandshakeServerError::Io(err)),
+                        None => return Ok(()),
                     };
                     match self.client_open.open(&record) {
                         Ok(payload) => {
@@ -622,7 +693,6 @@ impl DataRelay {
                             }
                         }
                         Err(err) => {
-                            let _ = self.client_write.write_all(&alert_bad_record_mac()).await;
                             return Err(HandshakeServerError::DataRecord(err));
                         }
                     }
@@ -638,12 +708,69 @@ impl DataRelay {
                         sleep(delay).await;
                     }
 
-                    for record in self.server_seal.seal_chunks(&target_buf[..n], &mut rng)? {
-                        self.client_write.write_all(&record).await?;
-                    }
+                    write_server_data_records_chunked(
+                        &mut self.client_write,
+                        &mut self.server_seal,
+                        &target_buf[..n],
+                        &mut rng,
+                        self.cid,
+                        "server->client",
+                        "server-download-writer",
+                    )
+                    .await?;
                 }
             }
         }
+    }
+}
+
+async fn write_server_data_records_chunked<W, R>(
+    writer: &mut W,
+    codec: &mut DataRecordCodec,
+    payload: &[u8],
+    rng: &mut R,
+    cid: u64,
+    direction: &'static str,
+    task_name: &'static str,
+) -> Result<(), HandshakeServerError>
+where
+    W: AsyncWrite + Unpin,
+    R: rand::Rng + rand::RngCore + ?Sized,
+{
+    let max_chunk_len = codec.max_plaintext_len();
+    if payload.is_empty() {
+        let record = codec.seal(payload, rng)?;
+        log_outer_write(cid, direction, task_name, 0, &record);
+        writer.write_all(&record).await?;
+        return Ok(());
+    }
+
+    for chunk in payload.chunks(max_chunk_len) {
+        let record = codec.seal(chunk, rng)?;
+        log_outer_write(cid, direction, task_name, chunk.len(), &record);
+        writer.write_all(&record).await?;
+    }
+    Ok(())
+}
+
+fn log_outer_write(
+    cid: u64,
+    direction: &'static str,
+    task_name: &'static str,
+    plaintext_len: usize,
+    record: &[u8],
+) {
+    if let Ok(header) = crate::tls::record::parse_header(record) {
+        tracing::debug!(
+            cid,
+            direction,
+            task_name,
+            plaintext_len,
+            sealed_len = header.payload_len,
+            outer_tls_payload_len = header.payload_len,
+            tls_content_type = header.content_type,
+            "outer TLS record write"
+        );
     }
 }
 
