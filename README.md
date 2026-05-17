@@ -7,7 +7,7 @@ TCP transport:
 - ECDH-bound ClientHello authentication hidden in SessionID
 - unauthenticated or malformed traffic falls back to the camouflage site
 - encrypted data mode is carried as TLS ApplicationData records
-- ChaCha20-Poly1305 data protection with per-direction nonces
+- XChaCha20-Poly1305 data protection with per-direction nonces
 - one stream per TCP connection by default to avoid multiplexing fingerprints
 
 ## Build

@@ -4,6 +4,7 @@ const CONNECT_MAGIC: &[u8; 4] = b"PX1C";
 const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
 const SERVER_IDENTITY_MAGIC: &[u8; 4] = b"PX1S";
 const MAX_HOST_LEN: usize = 255;
+const CONNECT_FIXED_LEN: usize = 4 + 2 + 2 + 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectRequest {
@@ -65,6 +66,14 @@ pub enum ServerIdentityProofError {
 }
 
 impl ConnectRequest {
+    pub fn max_initial_payload_len(host: &str, max_encoded_len: usize) -> usize {
+        max_encoded_len.saturating_sub(CONNECT_FIXED_LEN + host.len())
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        CONNECT_FIXED_LEN + self.host.len() + self.initial_payload.len()
+    }
+
     pub fn target(&self) -> String {
         match self.host.parse::<std::net::IpAddr>() {
             Ok(std::net::IpAddr::V6(_)) => format!("[{}]:{}", self.host, self.port),
@@ -84,7 +93,7 @@ impl ConnectRequest {
             return Err(ConnectRequestError::ZeroPort);
         }
 
-        let mut out = Vec::with_capacity(12 + host.len() + self.initial_payload.len());
+        let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(CONNECT_MAGIC);
         out.extend_from_slice(&(host.len() as u16).to_be_bytes());
         out.extend_from_slice(host);
@@ -263,6 +272,15 @@ mod tests {
         };
 
         assert_eq!(request.target(), "[::1]:443");
+    }
+
+    #[test]
+    fn connect_request_initial_payload_budget_accounts_for_host() {
+        assert_eq!(
+            ConnectRequest::max_initial_payload_len("example.com", 64),
+            64 - CONNECT_FIXED_LEN - "example.com".len()
+        );
+        assert_eq!(ConnectRequest::max_initial_payload_len("example.com", 4), 0);
     }
 
     #[test]
