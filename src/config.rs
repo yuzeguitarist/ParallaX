@@ -46,6 +46,14 @@ pub enum ConfigError {
     UnsupportedMultiplexing,
     #[error("server.authorized_sni must not be empty")]
     EmptyAuthorizedSni,
+    #[cfg(unix)]
+    #[error("server config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, current uid {euid}; expected owner=current user and no group/world permission bits")]
+    InsecureConfigPermissions {
+        path: PathBuf,
+        mode: u32,
+        uid: u32,
+        euid: u32,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,9 +151,11 @@ impl Default for TrafficConfig {
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
         let raw = fs::read_to_string(path)?;
         let cfg = toml::from_str::<Self>(&raw)?;
         cfg.validate()?;
+        cfg.validate_file_permissions(path)?;
         Ok(cfg)
     }
 
@@ -185,6 +195,37 @@ impl Config {
 
         Ok(())
     }
+
+    fn validate_file_permissions(&self, path: &Path) -> Result<(), ConfigError> {
+        if self.mode != Mode::Server {
+            return Ok(());
+        }
+        validate_secret_config_file_permissions(path)
+    }
+}
+
+#[cfg(unix)]
+fn validate_secret_config_file_permissions(path: &Path) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path)?;
+    let mode = metadata.mode() & 0o777;
+    let uid = metadata.uid();
+    let euid = unsafe { libc::geteuid() };
+    if mode & 0o077 != 0 || uid != euid {
+        return Err(ConfigError::InsecureConfigPermissions {
+            path: path.to_path_buf(),
+            mode,
+            uid,
+            euid,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_secret_config_file_permissions(_path: &Path) -> Result<(), ConfigError> {
+    Ok(())
 }
 
 impl TrafficConfig {
@@ -402,5 +443,40 @@ server_identity_public_key = "{KEY}"
             traffic.validate().unwrap_err(),
             ConfigError::InvalidCoverIntervalRange
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_config_load_enforces_secret_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+pq_secret_key = "{KEY}"
+identity_secret_key = "{KEY}"
+authorized_sni = ["example.com"]
+"#
+        );
+        fs::write(&path, raw).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::InsecureConfigPermissions { .. })
+        ));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        Config::load(&path).unwrap();
     }
 }

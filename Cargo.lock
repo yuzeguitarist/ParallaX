@@ -716,6 +716,7 @@ dependencies = [
  "clap",
  "hkdf",
  "hmac",
+ "libc",
  "md-5",
  "pqcrypto-mldsa",
  "pqcrypto-mlkem",
