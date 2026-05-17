@@ -6,12 +6,15 @@ use crate::{
     crypto::{
         identity::{self, IdentityError},
         pq::{self, PqError},
-        session::{derive_client_keys, expand_epoch_keys, AeadCodec, SessionError, SessionKeys},
+        session::{
+            derive_client_keys, expand_epoch_keys, x25519_shared_secret, AeadCodec, SessionError,
+            SessionKeys, X25519KeyPair,
+        },
     },
     protocol::{
         command::{
             ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityProof,
-            ServerIdentityProofError,
+            ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError,
         },
         data::{DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD},
     },
@@ -34,6 +37,8 @@ pub enum ClientHandshakeError {
     Pq(#[from] PqError),
     #[error("PQ rekey command error: {0}")]
     PqCommand(#[from] PqRekeyError),
+    #[error("server key exchange command error: {0}")]
+    ServerKeyExchange(#[from] ServerKeyExchangeError),
     #[error("server identity proof command error: {0}")]
     ServerIdentityProof(#[from] ServerIdentityProofError),
     #[error("server identity verification failed: {0}")]
@@ -78,6 +83,11 @@ pub struct ClientDataSession {
     keys: SessionKeys,
 }
 
+pub struct PendingPqRekey {
+    x25519: X25519KeyPair,
+    mlkem: pq::MlKemKeyPair,
+}
+
 impl ClientDataSession {
     pub fn new(keys: SessionKeys, traffic: TrafficConfig) -> Result<Self, ClientHandshakeError> {
         let (seal_to_server, open_from_server) = data_codecs(&keys, traffic)?;
@@ -90,20 +100,34 @@ impl ClientDataSession {
 
     pub fn build_pq_rekey_record<R>(
         &mut self,
-        server_pq_public_key: &[u8],
-        sandwich_secret: &[u8],
         rng: &mut R,
-    ) -> Result<Vec<u8>, ClientHandshakeError>
+    ) -> Result<(Vec<u8>, PendingPqRekey), ClientHandshakeError>
     where
         R: RngCore + CryptoRng + rand::Rng + ?Sized,
     {
-        let encapsulation = pq::encapsulate(server_pq_public_key)?;
+        let x25519 = X25519KeyPair::generate();
+        let mlkem = pq::keypair();
         let request = PqRekeyRequest {
-            ciphertext: encapsulation.ciphertext,
+            client_x25519_public: x25519.public,
+            client_mlkem_public_key: mlkem.public.clone(),
         };
         let record = self.seal_to_server.seal(&request.encode()?, rng)?;
-        self.apply_pq_rekey(&encapsulation.shared_secret, sandwich_secret)?;
-        Ok(record)
+        Ok((record, PendingPqRekey { x25519, mlkem }))
+    }
+
+    pub fn apply_server_key_exchange_record(
+        &mut self,
+        record: &[u8],
+        pending: PendingPqRekey,
+        sandwich_secret: &[u8],
+    ) -> Result<(), ClientHandshakeError> {
+        let payload = self.open_from_server.open(record)?;
+        let exchange = ServerKeyExchange::decode(&payload)?;
+        let x25519_shared =
+            x25519_shared_secret(&pending.x25519.private, &exchange.server_x25519_public);
+        let pq_shared = pq::decapsulate(&exchange.mlkem_ciphertext, &pending.mlkem.secret)?;
+        self.apply_pq_rekey(&x25519_shared, &pq_shared, sandwich_secret)?;
+        Ok(())
     }
 
     pub fn build_connect_record<R>(
@@ -153,20 +177,21 @@ impl ClientDataSession {
 
     fn apply_pq_rekey(
         &mut self,
-        shared_secret: &[u8; 32],
+        x25519_shared_secret: &[u8; 32],
+        pq_shared_secret: &[u8; 32],
         sandwich_secret: &[u8],
     ) -> Result<(), ClientHandshakeError> {
         let chain_secret = pq::hybrid_sandwich_rekey(
             &self.keys.chain_secret,
-            &self.keys.x25519_shared_secret,
-            shared_secret,
+            x25519_shared_secret,
+            pq_shared_secret,
             sandwich_secret,
         )?;
         let next_keys = expand_epoch_keys(
             chain_secret,
             self.keys.epoch + 1,
             self.keys.transcript_hash,
-            self.keys.x25519_shared_secret,
+            *x25519_shared_secret,
         )?;
 
         self.seal_to_server
@@ -249,7 +274,6 @@ mod tests {
 
     #[test]
     fn pq_rekey_changes_client_session_keys() {
-        let pq_keys = pq::keypair();
         let keys = SessionKeys {
             client_key: [9_u8; 32],
             server_key: [8_u8; 32],
@@ -264,17 +288,33 @@ mod tests {
         let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
         let mut rng = StdRng::seed_from_u64(6);
 
-        let record = session
-            .build_pq_rekey_record(&pq_keys.public, b"test-psk", &mut rng)
-            .unwrap();
+        let (record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
         let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
         let request = PqRekeyRequest::decode(&server_open.open(&record).unwrap()).unwrap();
-        let shared = pq::decapsulate(&request.ciphertext, &pq_keys.secret).unwrap();
+        let server_x25519 = X25519KeyPair::generate();
+        let x25519_shared =
+            x25519_shared_secret(&server_x25519.private, &request.client_x25519_public);
+        let encapsulation = pq::encapsulate(&request.client_mlkem_public_key).unwrap();
+        let (_, mut client_open) = data_codecs(&keys, traffic).unwrap();
+        let exchange_record = client_open
+            .seal(
+                &ServerKeyExchange {
+                    server_x25519_public: server_x25519.public,
+                    mlkem_ciphertext: encapsulation.ciphertext,
+                }
+                .encode()
+                .unwrap(),
+                &mut rng,
+            )
+            .unwrap();
+        session
+            .apply_server_key_exchange_record(&exchange_record, pending, b"test-psk")
+            .unwrap();
 
         let chain_secret = pq::hybrid_sandwich_rekey(
             &keys.chain_secret,
-            &keys.x25519_shared_secret,
-            &shared,
+            &x25519_shared,
+            &encapsulation.shared_secret,
             b"test-psk",
         )
         .unwrap();
@@ -282,7 +322,7 @@ mod tests {
             chain_secret,
             keys.epoch + 1,
             keys.transcript_hash,
-            keys.x25519_shared_secret,
+            x25519_shared,
         )
         .unwrap();
         assert_eq!(session.keys.epoch, 1);

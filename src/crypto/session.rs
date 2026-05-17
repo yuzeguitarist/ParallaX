@@ -36,6 +36,13 @@ pub fn x25519_public_from_private(private: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
     PublicKey::from(&private).to_bytes()
 }
 
+pub fn x25519_shared_secret(private: &[u8; KEY_LEN], peer_public: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    let private = StaticSecret::from(*private);
+    let peer_public = PublicKey::from(*peer_public);
+    let shared = private.diffie_hellman(&peer_public);
+    *shared.as_bytes()
+}
+
 impl fmt::Debug for X25519KeyPair {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("X25519KeyPair")
@@ -103,10 +110,7 @@ fn derive_keys(
     peer_public: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    let private = StaticSecret::from(*private);
-    let peer_public = PublicKey::from(*peer_public);
-    let shared = private.diffie_hellman(&peer_public);
-    let x25519_shared_secret = *shared.as_bytes();
+    let x25519_shared_secret = x25519_shared_secret(private, peer_public);
     let chain_secret = initial_chain_secret(&x25519_shared_secret, transcript_hash)?;
     expand_epoch_keys(chain_secret, 0, *transcript_hash, x25519_shared_secret)
 }
@@ -289,6 +293,17 @@ mod tests {
         assert_eq!(client_keys, server_keys);
         assert_eq!(client_keys.epoch, 0);
         assert_eq!(client_keys.transcript_hash, transcript_hash);
+    }
+
+    #[test]
+    fn x25519_shared_secret_matches_both_directions() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+
+        assert_eq!(
+            x25519_shared_secret(&client.private, &server.public),
+            x25519_shared_secret(&server.private, &client.public)
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use thiserror::Error;
 
 const CONNECT_MAGIC: &[u8; 4] = b"PX1C";
 const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
+const SERVER_KEY_EXCHANGE_MAGIC: &[u8; 4] = b"PX1K";
 const SERVER_IDENTITY_MAGIC: &[u8; 4] = b"PX1S";
 const MAX_HOST_LEN: usize = 255;
 
@@ -32,7 +33,14 @@ pub enum ConnectRequestError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PqRekeyRequest {
-    pub ciphertext: Vec<u8>,
+    pub client_x25519_public: [u8; 32],
+    pub client_mlkem_public_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerKeyExchange {
+    pub server_x25519_public: [u8; 32],
+    pub mlkem_ciphertext: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +54,21 @@ pub enum PqRekeyError {
     Truncated,
     #[error("PQ rekey request magic mismatch")]
     BadMagic,
-    #[error("PQ rekey ciphertext is empty")]
+    #[error("PQ rekey ML-KEM public key is empty")]
+    EmptyPublicKey,
+    #[error("PQ rekey ML-KEM public key length is invalid")]
+    InvalidPublicKeyLength,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ServerKeyExchangeError {
+    #[error("server key exchange is truncated")]
+    Truncated,
+    #[error("server key exchange magic mismatch")]
+    BadMagic,
+    #[error("server key exchange ML-KEM ciphertext is empty")]
     EmptyCiphertext,
-    #[error("PQ rekey ciphertext length is invalid")]
+    #[error("server key exchange ML-KEM ciphertext length is invalid")]
     InvalidCiphertextLength,
 }
 
@@ -136,13 +156,14 @@ impl ConnectRequest {
 
 impl PqRekeyRequest {
     pub fn encode(&self) -> Result<Vec<u8>, PqRekeyError> {
-        if self.ciphertext.is_empty() {
-            return Err(PqRekeyError::EmptyCiphertext);
+        if self.client_mlkem_public_key.is_empty() {
+            return Err(PqRekeyError::EmptyPublicKey);
         }
-        let mut out = Vec::with_capacity(8 + self.ciphertext.len());
+        let mut out = Vec::with_capacity(40 + self.client_mlkem_public_key.len());
         out.extend_from_slice(PQ_REKEY_MAGIC);
-        out.extend_from_slice(&(self.ciphertext.len() as u32).to_be_bytes());
-        out.extend_from_slice(&self.ciphertext);
+        out.extend_from_slice(&self.client_x25519_public);
+        out.extend_from_slice(&(self.client_mlkem_public_key.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.client_mlkem_public_key);
         Ok(out)
     }
 
@@ -153,18 +174,60 @@ impl PqRekeyRequest {
         if &input[..4] != PQ_REKEY_MAGIC {
             return Err(PqRekeyError::BadMagic);
         }
-        if input.len() < 8 {
+        if input.len() < 40 {
             return Err(PqRekeyError::Truncated);
         }
-        let len = u32::from_be_bytes([input[4], input[5], input[6], input[7]]) as usize;
+        let mut client_x25519_public = [0_u8; 32];
+        client_x25519_public.copy_from_slice(&input[4..36]);
+        let len = u32::from_be_bytes([input[36], input[37], input[38], input[39]]) as usize;
         if len == 0 {
-            return Err(PqRekeyError::EmptyCiphertext);
+            return Err(PqRekeyError::EmptyPublicKey);
         }
-        if input.len() != 8 + len {
-            return Err(PqRekeyError::InvalidCiphertextLength);
+        if input.len() != 40 + len {
+            return Err(PqRekeyError::InvalidPublicKeyLength);
         }
         Ok(Self {
-            ciphertext: input[8..].to_vec(),
+            client_x25519_public,
+            client_mlkem_public_key: input[40..].to_vec(),
+        })
+    }
+}
+
+impl ServerKeyExchange {
+    pub fn encode(&self) -> Result<Vec<u8>, ServerKeyExchangeError> {
+        if self.mlkem_ciphertext.is_empty() {
+            return Err(ServerKeyExchangeError::EmptyCiphertext);
+        }
+        let mut out = Vec::with_capacity(40 + self.mlkem_ciphertext.len());
+        out.extend_from_slice(SERVER_KEY_EXCHANGE_MAGIC);
+        out.extend_from_slice(&self.server_x25519_public);
+        out.extend_from_slice(&(self.mlkem_ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.mlkem_ciphertext);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, ServerKeyExchangeError> {
+        if input.len() < 4 {
+            return Err(ServerKeyExchangeError::Truncated);
+        }
+        if &input[..4] != SERVER_KEY_EXCHANGE_MAGIC {
+            return Err(ServerKeyExchangeError::BadMagic);
+        }
+        if input.len() < 40 {
+            return Err(ServerKeyExchangeError::Truncated);
+        }
+        let mut server_x25519_public = [0_u8; 32];
+        server_x25519_public.copy_from_slice(&input[4..36]);
+        let len = u32::from_be_bytes([input[36], input[37], input[38], input[39]]) as usize;
+        if len == 0 {
+            return Err(ServerKeyExchangeError::EmptyCiphertext);
+        }
+        if input.len() != 40 + len {
+            return Err(ServerKeyExchangeError::InvalidCiphertextLength);
+        }
+        Ok(Self {
+            server_x25519_public,
+            mlkem_ciphertext: input[40..].to_vec(),
         })
     }
 }
@@ -276,10 +339,21 @@ mod tests {
     #[test]
     fn pq_rekey_round_trip() {
         let request = PqRekeyRequest {
-            ciphertext: vec![1, 2, 3],
+            client_x25519_public: [9_u8; 32],
+            client_mlkem_public_key: vec![1, 2, 3],
         };
         let encoded = request.encode().unwrap();
         assert_eq!(PqRekeyRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn server_key_exchange_round_trip() {
+        let exchange = ServerKeyExchange {
+            server_x25519_public: [7_u8; 32],
+            mlkem_ciphertext: vec![1, 2, 3],
+        };
+        let encoded = exchange.encode().unwrap();
+        assert_eq!(ServerKeyExchange::decode(&encoded).unwrap(), exchange);
     }
 
     #[test]

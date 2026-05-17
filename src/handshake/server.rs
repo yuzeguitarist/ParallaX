@@ -26,14 +26,14 @@ use crate::{
         pq::{self, PqError},
         replay::{current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry},
         session::{
-            derive_server_keys, expand_epoch_keys, x25519_public_from_private, AeadCodec,
-            SessionError, SessionKeys,
+            derive_server_keys, expand_epoch_keys, x25519_public_from_private,
+            x25519_shared_secret, AeadCodec, SessionError, SessionKeys, X25519KeyPair,
         },
     },
     protocol::{
         command::{
             ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityProof,
-            ServerIdentityProofError,
+            ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError,
         },
         data::{
             max_plaintext_len, DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD,
@@ -79,6 +79,8 @@ pub enum HandshakeServerError {
     ConnectRequest(#[from] ConnectRequestError),
     #[error("PQ rekey command error: {0}")]
     PqRekey(#[from] PqRekeyError),
+    #[error("server key exchange command error: {0}")]
+    ServerKeyExchange(#[from] ServerKeyExchangeError),
     #[error("PQ crypto error: {0}")]
     Pq(#[from] PqError),
     #[error("server identity proof command error: {0}")]
@@ -232,8 +234,6 @@ async fn handle_connection_inner(
                 tls13 = handshake.server_hello.tls13_selected,
                 "authenticated ParallaX handshake accepted"
             );
-            let pq_secret =
-                crate::config::decode_base64_bytes("server.pq_secret_key", &config.pq_secret_key)?;
             let identity_secret = crate::config::decode_base64_bytes(
                 "server.identity_secret_key",
                 &config.identity_secret_key,
@@ -241,7 +241,6 @@ async fn handle_connection_inner(
             run_authenticated_data_mode(
                 handshake,
                 config.data_target.as_deref(),
-                &pq_secret,
                 &identity_secret,
                 psk,
                 traffic,
@@ -367,7 +366,6 @@ async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeS
 async fn run_authenticated_data_mode(
     handshake: AuthenticatedHandshake,
     fixed_data_target: Option<&str>,
-    pq_secret_key: &[u8],
     identity_secret_key: &[u8],
     sandwich_secret: &[u8],
     traffic: TrafficConfig,
@@ -407,16 +405,30 @@ async fn run_authenticated_data_mode(
                 match client_open.open(&record) {
                     Ok(first_payload) => {
                         let pq_rekey = PqRekeyRequest::decode(&first_payload)?;
-                        let pq_shared_secret =
-                            pq::decapsulate(&pq_rekey.ciphertext, pq_secret_key)?;
+                        let server_ephemeral = X25519KeyPair::generate();
+                        let x25519_ephemeral_shared = x25519_shared_secret(
+                            &server_ephemeral.private,
+                            &pq_rekey.client_x25519_public,
+                        );
+                        let pq_encapsulation =
+                            pq::encapsulate(&pq_rekey.client_mlkem_public_key)?;
+                        let key_exchange_payload = ServerKeyExchange {
+                            server_x25519_public: server_ephemeral.public,
+                            mlkem_ciphertext: pq_encapsulation.ciphertext,
+                        }
+                        .encode()?;
+                        let mut rng = StdRng::from_entropy();
+                        let key_exchange_record =
+                            server_seal.seal(&key_exchange_payload, &mut rng)?;
+                        client_write.write_all(&key_exchange_record).await?;
                         let rekeyed_keys = apply_server_pq_rekey(
                             &mut client_open,
                             &mut server_seal,
                             &handshake.session_keys,
-                            &pq_shared_secret,
+                            &x25519_ephemeral_shared,
+                            &pq_encapsulation.shared_secret,
                             sandwich_secret,
                         )?;
-                        let mut rng = StdRng::from_entropy();
                         let identity_signature = identity::sign_server_identity(
                             identity_secret_key,
                             &rekeyed_keys.transcript_hash,
@@ -494,20 +506,21 @@ fn apply_server_pq_rekey(
     client_open: &mut DataRecordCodec,
     server_seal: &mut DataRecordCodec,
     keys: &SessionKeys,
-    shared_secret: &[u8; 32],
+    x25519_shared_secret: &[u8; 32],
+    pq_shared_secret: &[u8; 32],
     sandwich_secret: &[u8],
 ) -> Result<SessionKeys, HandshakeServerError> {
     let chain_secret = pq::hybrid_sandwich_rekey(
         &keys.chain_secret,
-        &keys.x25519_shared_secret,
-        shared_secret,
+        x25519_shared_secret,
+        pq_shared_secret,
         sandwich_secret,
     )?;
     let next_keys = expand_epoch_keys(
         chain_secret,
         keys.epoch + 1,
         keys.transcript_hash,
-        keys.x25519_shared_secret,
+        *x25519_shared_secret,
     )?;
     client_open.rekey(next_keys.client_key, next_keys.client_nonce);
     server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
@@ -771,10 +784,12 @@ mod tests {
         )
         .unwrap();
         let mut data_session = ClientDataSession::new(session_keys, traffic).unwrap();
-        let pq_record = data_session
-            .build_pq_rekey_record(&server_pq_keys.public, PSK, &mut rng)
-            .unwrap();
+        let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut rng).unwrap();
         client.write_all(&pq_record).await.unwrap();
+        let key_exchange_record = read_record(&mut client).await.unwrap();
+        data_session
+            .apply_server_key_exchange_record(&key_exchange_record, pending_rekey, PSK)
+            .unwrap();
         let identity_record = read_record(&mut client).await.unwrap();
         data_session
             .verify_server_identity_record(

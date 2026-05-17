@@ -69,10 +69,6 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         .ok_or(ClientRuntimeError::MissingClient)?;
     let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
     let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
-    let server_pq_public = Arc::new(decode_base64_bytes(
-        "client.server_pq_public_key",
-        &client.server_pq_public_key,
-    )?);
     let server_identity_public = Arc::new(decode_base64_bytes(
         "client.server_identity_public_key",
         &client.server_identity_public_key,
@@ -84,7 +80,6 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         let (local, peer) = listener.accept().await?;
         let client = client.clone();
         let psk = Arc::clone(&psk);
-        let server_pq_public = Arc::clone(&server_pq_public);
         let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
         tokio::spawn(async move {
@@ -94,7 +89,6 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                 traffic,
                 &psk,
                 &server_public,
-                &server_pq_public,
                 &server_identity_public,
             )
             .await
@@ -111,7 +105,6 @@ pub async fn handle_local_connection(
     traffic: TrafficConfig,
     psk: &[u8],
     server_public: &[u8; 32],
-    server_pq_public: &[u8],
     server_identity_public: &[u8],
 ) -> Result<(), ClientRuntimeError> {
     tune_tcp_stream(&local)?;
@@ -123,8 +116,10 @@ pub async fn handle_local_connection(
 
     let mut data_session =
         establish_data_session(&mut server, config, traffic, psk, server_public).await?;
-    let pq_record = data_session.build_pq_rekey_record(server_pq_public, psk, &mut OsRng)?;
+    let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut OsRng)?;
     server.write_all(&pq_record).await?;
+    let key_exchange_record = read_record(&mut server).await?;
+    data_session.apply_server_key_exchange_record(&key_exchange_record, pending_rekey, psk)?;
     let identity_record = read_record(&mut server).await?;
     data_session.verify_server_identity_record(
         &identity_record,
@@ -347,7 +342,6 @@ mod tests {
                 TrafficConfig::default(),
                 PSK,
                 &server_keys.public,
-                &server_pq_keys.public,
                 &server_identity_keys.public,
             )
             .await
