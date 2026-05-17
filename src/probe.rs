@@ -29,15 +29,15 @@ const POST_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(220);
 
 #[derive(Debug, Error)]
 pub enum ProbeError {
-    #[error("目标不能为空。用法示例：plx probe example.com")]
+    #[error("target cannot be empty; example: plx probe example.com")]
     EmptyTarget,
-    #[error("只支持 TLS/HTTPS 目标，请使用 example.com 或 https://example.com")]
+    #[error("only TLS/HTTPS targets are supported (use example.com or https://example.com)")]
     UnsupportedScheme,
-    #[error("端口必须是 1-65535：{0}")]
+    #[error("port must be 1-65535: {0}")]
     InvalidPort(String),
-    #[error("配置里没有可检测的 fallback/SNI；请直接运行：plx probe example.com")]
+    #[error("no fallback/SNI in config to probe; run: plx probe example.com")]
     MissingConfigTarget,
-    #[error("SNI 不是合法域名：{0}")]
+    #[error("invalid TLS server name (SNI): {0}")]
     InvalidServerName(String),
 }
 
@@ -108,9 +108,9 @@ impl ProbeTarget {
 impl fmt::Display for ProbeVerdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Good => f.write_str("推荐"),
-            Self::Usable => f.write_str("可用"),
-            Self::Bad => f.write_str("不建议"),
+            Self::Good => f.write_str("Recommended"),
+            Self::Usable => f.write_str("Usable"),
+            Self::Bad => f.write_str("Not recommended"),
         }
     }
 }
@@ -118,15 +118,15 @@ impl fmt::Display for ProbeVerdict {
 impl ProbeReport {
     pub fn summary(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("ParallaX 目标检测：{}\n", self.target.authority()));
-        out.push_str(&format!("SNI：{}\n\n", self.sni));
+        out.push_str(&format!("ParallaX probe: {}\n", self.target.authority()));
+        out.push_str(&format!("SNI: {}\n\n", self.sni));
 
         match self.tcp_latency {
             Some(latency) => out.push_str(&format!(
-                "  TCP 连接      PASS  {}ms\n",
+                "  TCP connect      PASS  {}ms\n",
                 latency.as_millis()
             )),
-            None => out.push_str("  TCP 连接      FAIL\n"),
+            None => out.push_str("  TCP connect      FAIL\n"),
         }
         out.push_str(&format!(
             "  TLS 1.3       {}\n",
@@ -134,26 +134,26 @@ impl ProbeReport {
         ));
         match self.handshake_latency {
             Some(latency) => out.push_str(&format!(
-                "  TLS 握手      PASS  {}ms\n",
+                "  TLS handshake    PASS  {}ms\n",
                 latency.as_millis()
             )),
-            None => out.push_str("  TLS 握手      FAIL\n"),
+            None => out.push_str("  TLS handshake    FAIL\n"),
         }
         out.push_str(&format!(
-            "  ALPN          {}\n",
-            self.alpn.as_deref().unwrap_or("未协商")
+            "  ALPN             {}\n",
+            self.alpn.as_deref().unwrap_or("(none negotiated)")
         ));
         out.push_str(&format!(
-            "  会话票据/后握手 {} record(s)\n",
+            "  Tickets/post-handshake {} record(s)\n",
             self.post_handshake_records
         ));
         out.push_str(&format!(
-            "  综合评分      {}/100 ({})\n\n",
+            "  Score             {}/100 ({})\n\n",
             self.score, self.verdict
         ));
 
         if !self.notes.is_empty() {
-            out.push_str("说明：\n");
+            out.push_str("Notes:\n");
             for note in &self.notes {
                 out.push_str("  - ");
                 out.push_str(note);
@@ -205,7 +205,10 @@ async fn probe_with_timeout(
     let mut notes = Vec::new();
 
     let Ok(Ok(mut stream)) = connect else {
-        notes.push("TCP 无法连接。请确认域名、端口、网络和服务器防火墙。".to_owned());
+        notes.push(
+            "TCP connect failed — check hostname, port, routing, DNS, and the server firewall."
+                .to_owned(),
+        );
         return Ok(report(target, sni, ProbeSignals::default(), notes));
     };
 
@@ -229,15 +232,24 @@ async fn probe_with_timeout(
     };
 
     if tls.tls13 {
-        notes.push("目标可完成真实 TLS 1.3 握手，可作为候选 camouflage dest。".to_owned());
+        notes.push(
+            "Target completed a TLS 1.3 handshake — reasonable camouflage fallback candidate."
+                .to_owned(),
+        );
     } else {
-        notes.push("ParallaX 当前要求 TLS 1.3；该目标不建议使用。".to_owned());
+        notes.push(
+            "ParallaX currently requires TLS 1.3; this target is not recommended.".to_owned(),
+        );
     }
     if matches!(tls.alpn.as_deref(), Some("h2")) {
-        notes.push("目标支持 h2，浏览器伪装兼容性更好。".to_owned());
+        notes.push(
+            "Target negotiated HTTP/2 (ALPN h2): better browser-like camouflage.".to_owned(),
+        );
     }
     if tls.post_handshake_records == 0 {
-        notes.push("未观察到后握手 record；可用但票据/恢复行为还需要线上复测。".to_owned());
+        notes.push(
+            "No post-handshake records observed; acceptable but revisit ticket/session resumption in production.".to_owned(),
+        );
     }
 
     Ok(report(
@@ -327,7 +339,7 @@ async fn complete_tls_probe(
     let server_name = ServerName::try_from(sni.to_owned())
         .map_err(|_| ProbeError::InvalidServerName(sni.to_owned()).to_string())?;
     let mut connection = rustls::ClientConnection::new(Arc::new(config), server_name)
-        .map_err(|err| format!("TLS 初始化失败：{err}"))?;
+        .map_err(|err| format!("TLS client init failed: {err}"))?;
 
     let started = Instant::now();
     while connection.is_handshaking() {
@@ -377,14 +389,14 @@ async fn flush_tls(
         let mut out = Vec::new();
         let written = connection
             .write_tls(&mut out)
-            .map_err(|err| format!("TLS 写入失败：{err}"))?;
+            .map_err(|err| format!("TLS write_tls failed: {err}"))?;
         if written == 0 || out.is_empty() {
             break;
         }
         timeout(deadline, stream.write_all(&out))
             .await
-            .map_err(|_| "TLS 发送超时。目标站可能不稳定。".to_owned())?
-            .map_err(|err| format!("TLS 发送失败：{err}"))?;
+            .map_err(|_| "timed out writing TLS buffers; target may be unstable.".to_owned())?
+            .map_err(|err| format!("TCP write after TLS framing failed: {err}"))?;
     }
     Ok(())
 }
@@ -392,24 +404,24 @@ async fn flush_tls(
 async fn read_tls_record(stream: &mut TcpStream, deadline: Duration) -> Result<Vec<u8>, String> {
     timeout(deadline, read_record(stream))
         .await
-        .map_err(|_| "等待 TLS 响应超时。建议换一个更稳定的目标站。".to_owned())?
-        .map_err(|err| format!("TLS 读取失败：{err}"))
+        .map_err(|_| "timed out waiting for TLS ciphertext; try a more stable upstream.".to_owned())?
+        .map_err(|err| format!("TLS record read failed: {err}"))
 }
 
 fn feed_tls_record(connection: &mut rustls::ClientConnection, record: &[u8]) -> Result<(), String> {
     let mut cursor = Cursor::new(record);
     connection
         .read_tls(&mut cursor)
-        .map_err(|err| format!("TLS record 输入失败：{err}"))?;
+        .map_err(|err| format!("TLS read_tls failed: {err}"))?;
     connection
         .process_new_packets()
-        .map_err(|err| format!("TLS 握手失败：{err}"))?;
+        .map_err(|err| format!("TLS handshake failed: {err}"))?;
 
     let mut plaintext = Vec::new();
     match connection.reader().read_to_end(&mut plaintext) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-        Err(err) => return Err(format!("TLS 明文读取失败：{err}")),
+        Err(err) => return Err(format!("TLS plaintext read failed: {err}")),
     }
     Ok(())
 }

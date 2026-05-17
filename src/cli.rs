@@ -349,9 +349,9 @@ fn write_init_files(output: &Path, generated: &GeneratedConfig) -> anyhow::Resul
         .with_context(|| format!("failed to write {}", server_path.display()))?;
     fs::write(&client_path, &generated.client)
         .with_context(|| format!("failed to write {}", client_path.display()))?;
-    println!("已生成配置：");
+    println!("Configs written:");
     println!("  server: {}", server_path.display());
     println!("  client: {}", client_path.display());
-    println!("下一步：把 server 文件放到 VPS，把 client 文件留在本机。");
+    println!("Next: upload the server file to the VPS and keep the client file on this machine.");
     Ok(())
 }
