@@ -719,67 +719,70 @@ impl DataRelay {
             chunk_size,
             cid,
         } = self;
+        let upload = async move {
+            loop {
+                let record = match client_records.read_record().await {
+                    Ok(record) => record,
+                    Err(err) if is_clean_close(&err) => return Ok(()),
+                    Err(err) => return Err(HandshakeServerError::Io(err)),
+                };
+                log_record_read(cid, "client->server", "server-data-client-reader", &record);
+                let payload = client_open.open(&record)?;
+                if !payload.is_empty() {
+                    target_write.write_all(&payload).await?;
+                }
+            }
+        };
+
         let mut target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
         let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
         let mut rng = StdRng::from_entropy();
         let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
-
-        loop {
-            tokio::select! {
-                _ = &mut cover_sleep, if cover.is_enabled() => {
-                    write_server_data_records_chunked(
-                        &mut client_write,
-                        &mut server_seal,
-                        &[],
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "server->client", "server-cover-writer"),
-                    )
-                    .await?;
-                    cover_sleep.as_mut().reset(
-                        Instant::now() + cover.sample_interval(&mut rng),
-                    );
-                }
-                record = client_records.read_record() => {
-                    let record = match record {
-                        Ok(record) => record,
-                        Err(err) if is_clean_close(&err) => return Ok(()),
-                        Err(err) => return Err(HandshakeServerError::Io(err)),
-                    };
-                    log_record_read(cid, "client->server", "server-data-client-reader", &record);
-                    match client_open.open(&record) {
-                        Ok(payload) => {
-                            if !payload.is_empty() {
-                                target_write.write_all(&payload).await?;
-                            }
+        let download = async move {
+            loop {
+                tokio::select! {
+                    _ = &mut cover_sleep, if cover.is_enabled() => {
+                        write_server_data_records_chunked(
+                            &mut client_write,
+                            &mut server_seal,
+                            &[],
+                            &mut rng,
+                            &mut seal_scratch,
+                            RelayWriteLog::new(cid, "server->client", "server-cover-writer"),
+                        )
+                        .await?;
+                        cover_sleep.as_mut().reset(
+                            Instant::now() + cover.sample_interval(&mut rng),
+                        );
+                    }
+                    read = target_read.read(&mut target_buf) => {
+                        let n = read?;
+                        if n == 0 {
+                            return Ok(());
                         }
-                        Err(err) => {
-                            return Err(HandshakeServerError::DataRecord(err));
+
+                        let delay = timing.sample_delay(&mut rng);
+                        if !delay.is_zero() {
+                            sleep(delay).await;
                         }
-                    }
-                }
-                read = target_read.read(&mut target_buf) => {
-                    let n = read?;
-                    if n == 0 {
-                        return Ok(());
-                    }
 
-                    let delay = timing.sample_delay(&mut rng);
-                    if !delay.is_zero() {
-                        sleep(delay).await;
+                        write_server_data_records_chunked(
+                            &mut client_write,
+                            &mut server_seal,
+                            &target_buf[..n],
+                            &mut rng,
+                            &mut seal_scratch,
+                            RelayWriteLog::new(cid, "server->client", "server-download-writer"),
+                        )
+                        .await?;
                     }
-
-                    write_server_data_records_chunked(
-                        &mut client_write,
-                        &mut server_seal,
-                        &target_buf[..n],
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "server->client", "server-download-writer"),
-                    )
-                    .await?;
                 }
             }
+        };
+
+        tokio::select! {
+            result = upload => result,
+            result = download => result,
         }
     }
 }
