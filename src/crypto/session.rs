@@ -1,7 +1,7 @@
 use std::fmt;
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadInPlace, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
@@ -13,6 +13,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
+pub const AEAD_TAG_LEN: usize = 16;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct X25519KeyPair {
@@ -239,6 +240,23 @@ impl AeadCodec {
             .map_err(|_| SessionError::Aead)?;
         self.advance_nonce()?;
         Ok(ciphertext)
+    }
+
+    pub fn seal_in_place_detached(
+        &mut self,
+        plaintext: &mut [u8],
+        aad: &[u8],
+    ) -> Result<[u8; AEAD_TAG_LEN], SessionError> {
+        let nonce = self.current_nonce();
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, plaintext)
+            .map_err(|_| SessionError::Aead)?;
+        self.advance_nonce()?;
+
+        let mut out = [0_u8; AEAD_TAG_LEN];
+        out.copy_from_slice(tag.as_slice());
+        Ok(out)
     }
 
     pub fn open(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {

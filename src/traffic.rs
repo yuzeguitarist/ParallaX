@@ -59,15 +59,22 @@ impl PaddingProfile {
     where
         R: Rng + RngCore + ?Sized,
     {
+        let mut out = Vec::with_capacity(payload.len() + self.max as usize + 2);
+        self.apply_into(payload, rng, &mut out);
+        out
+    }
+
+    pub fn apply_into<R>(&self, payload: &[u8], rng: &mut R, out: &mut Vec<u8>)
+    where
+        R: Rng + RngCore + ?Sized,
+    {
         let pad_len = self.sample_padding_len(payload.len(), rng) as usize;
-        let mut out = Vec::with_capacity(payload.len() + pad_len + 2);
         out.extend_from_slice(payload);
 
         let start = out.len();
         out.resize(start + pad_len, 0);
         rng.fill_bytes(&mut out[start..]);
         out.extend_from_slice(&(pad_len as u16).to_be_bytes());
-        out
     }
 
     fn sample_padding_len<R>(&self, payload_len: usize, rng: &mut R) -> u16

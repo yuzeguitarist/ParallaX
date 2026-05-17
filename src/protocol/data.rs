@@ -1,14 +1,13 @@
 use thiserror::Error;
 
 use crate::{
-    crypto::session::{AeadCodec, SessionError, KEY_LEN, NONCE_LEN},
-    tls::record::{self, TLS_CONTENT_APPLICATION_DATA},
+    crypto::session::{AeadCodec, SessionError, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN},
+    tls::record::{self, TLS_CONTENT_APPLICATION_DATA, TLS_LEGACY_VERSION},
     traffic::{PaddingProfile, TrafficError},
 };
 
 pub const OUTER_TLS_RECORD_LIMIT: usize = record::MAX_TLS_RECORD_PAYLOAD;
 
-const AEAD_TAG_LEN: usize = 16;
 const PADDING_LEN_FIELD: usize = 2;
 
 #[derive(Debug, Error)]
@@ -38,9 +37,49 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
-        let padded = self.padding.apply(payload, rng);
-        let encrypted = self.aead.seal(&padded, self.aad)?;
-        Ok(record::wrap_application_data(&encrypted)?)
+        let mut out = Vec::with_capacity(record_capacity(payload.len(), self.padding.max_len()));
+        self.seal_into(payload, rng, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn seal_into<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        let record_start = out.len();
+        out.reserve(record_capacity(payload.len(), self.padding.max_len()));
+        out.extend_from_slice(&[
+            TLS_CONTENT_APPLICATION_DATA,
+            TLS_LEGACY_VERSION[0],
+            TLS_LEGACY_VERSION[1],
+            0,
+            0,
+        ]);
+
+        let ciphertext_start = out.len();
+        self.padding.apply_into(payload, rng, out);
+        let padded_len = out.len() - ciphertext_start;
+        if padded_len + AEAD_TAG_LEN > OUTER_TLS_RECORD_LIMIT {
+            out.truncate(record_start);
+            return Err(record::TlsRecordError::PayloadTooLarge(padded_len + AEAD_TAG_LEN).into());
+        }
+
+        let tag = self
+            .aead
+            .seal_in_place_detached(&mut out[ciphertext_start..], self.aad)?;
+        out.extend_from_slice(&tag);
+
+        let tls_payload_len = out.len() - ciphertext_start;
+        let len = (tls_payload_len as u16).to_be_bytes();
+        out[record_start + 3] = len[0];
+        out[record_start + 4] = len[1];
+
+        Ok(record_start..out.len())
     }
 
     pub fn seal_chunks<R>(
@@ -95,6 +134,10 @@ pub fn max_plaintext_len(max_padding: u16) -> usize {
     OUTER_TLS_RECORD_LIMIT.saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }
 
+fn record_capacity(payload_len: usize, max_padding: u16) -> usize {
+    record::TLS_HEADER_LEN + payload_len + max_padding as usize + PADDING_LEN_FIELD + AEAD_TAG_LEN
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{rngs::StdRng, SeedableRng};
@@ -140,6 +183,25 @@ mod tests {
             opened.extend_from_slice(&dec.open(&record).unwrap());
         }
         assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn seal_into_appends_record_without_clearing_existing_buffer() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(15);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut out = b"prefix".to_vec();
+
+        let range = enc.seal_into(b"hello", &mut rng, &mut out).unwrap();
+
+        assert_eq!(&out[..6], b"prefix");
+        assert_eq!(range.start, 6);
+        assert_eq!(dec.open(&out[range]).unwrap(), b"hello");
     }
 
     #[test]
