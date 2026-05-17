@@ -17,7 +17,10 @@ use crate::{
             ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
             ServerKeyExchange, ServerKeyExchangeError,
         },
-        data::{DataRecordCodec, DataRecordError, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD},
+        data::{
+            DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD,
+            SERVER_TO_CLIENT_AAD,
+        },
     },
     traffic::{PaddingProfile, TrafficError},
 };
@@ -165,6 +168,18 @@ impl ClientDataSession {
         R: RngCore + CryptoRng + rand::Rng + ?Sized,
     {
         Ok(self.seal_to_server.seal_chunks(payload, rng)?)
+    }
+
+    pub fn seal_payload_chunks_into<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<Vec<SealedRecord>, ClientHandshakeError>
+    where
+        R: RngCore + CryptoRng + rand::Rng + ?Sized,
+    {
+        Ok(self.seal_to_server.seal_chunks_into(payload, rng, out)?)
     }
 
     pub fn max_payload_chunk_len(&self) -> usize {

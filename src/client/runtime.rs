@@ -398,18 +398,24 @@ where
     R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
 {
     let max_chunk_len = data_session.max_payload_chunk_len();
-    if payload.is_empty() {
-        let record = data_session.seal_payload(payload, rng)?;
-        log_outer_write(cid, direction, task_name, 0, &record);
-        writer.write_all(&record).await?;
-        return Ok(());
+    if max_chunk_len == 0 {
+        return Err(ClientRuntimeError::TlsRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(payload.len()),
+        ));
     }
+    let mut records_buf = Vec::with_capacity(payload.len() + crate::tls::record::TLS_HEADER_LEN);
+    let records = data_session.seal_payload_chunks_into(payload, rng, &mut records_buf)?;
 
-    for chunk in payload.chunks(max_chunk_len) {
-        let record = data_session.seal_payload(chunk, rng)?;
-        log_outer_write(cid, direction, task_name, chunk.len(), &record);
-        writer.write_all(&record).await?;
+    for record in &records {
+        log_outer_write(
+            cid,
+            direction,
+            task_name,
+            record.plaintext_len,
+            &records_buf[record.range.clone()],
+        );
     }
+    writer.write_all(&records_buf).await?;
     Ok(())
 }
 

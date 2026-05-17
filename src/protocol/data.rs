@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use thiserror::Error;
 
 use crate::{
@@ -26,6 +28,12 @@ pub struct DataRecordCodec {
     aead: AeadCodec,
     padding: PaddingProfile,
     aad: &'static [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedRecord {
+    pub range: Range<usize>,
+    pub plaintext_len: usize,
 }
 
 impl DataRecordCodec {
@@ -80,6 +88,38 @@ impl DataRecordCodec {
         out[record_start + 4] = len[1];
 
         Ok(record_start..out.len())
+    }
+
+    pub fn seal_chunks_into<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<Vec<SealedRecord>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        let max_chunk_len = self.max_plaintext_len();
+        if max_chunk_len == 0 {
+            return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
+        }
+        if payload.is_empty() {
+            let range = self.seal_into(payload, rng, out)?;
+            return Ok(vec![SealedRecord {
+                range,
+                plaintext_len: 0,
+            }]);
+        }
+
+        let mut records = Vec::with_capacity(payload.len().div_ceil(max_chunk_len));
+        for chunk in payload.chunks(max_chunk_len) {
+            let range = self.seal_into(chunk, rng, out)?;
+            records.push(SealedRecord {
+                range,
+                plaintext_len: chunk.len(),
+            });
+        }
+        Ok(records)
     }
 
     pub fn seal_chunks<R>(
@@ -202,6 +242,32 @@ mod tests {
         assert_eq!(&out[..6], b"prefix");
         assert_eq!(range.start, 6);
         assert_eq!(dec.open(&out[range]).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn seal_chunks_into_batches_records_in_one_buffer() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(16);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let payload = (0..64 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+
+        let records = enc.seal_chunks_into(&payload, &mut rng, &mut out).unwrap();
+
+        assert!(records.len() > 1);
+        let mut opened = Vec::with_capacity(payload.len());
+        for record in records {
+            assert!(record.range.end <= out.len());
+            opened.extend_from_slice(&dec.open(&out[record.range]).unwrap());
+        }
+        assert_eq!(opened, payload);
     }
 
     #[test]
