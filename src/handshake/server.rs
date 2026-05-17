@@ -113,7 +113,6 @@ pub enum FallbackReason {
     Replay,
     MissingSni,
     UnauthorizedSni(String),
-    MissingX25519KeyShare,
 }
 
 #[derive(Debug)]
