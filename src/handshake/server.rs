@@ -16,6 +16,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
+    sync::{Semaphore, TryAcquireError},
     time::{sleep, timeout, Instant},
 };
 
@@ -56,7 +57,7 @@ use crate::{
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
-    transport::tcp::{is_fd_exhaustion_error, tune_tcp_stream},
+    transport::tcp::{is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream},
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -166,7 +167,13 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         &psk,
     )?));
     let listener = TcpListener::bind(server.listen).await?;
-    tracing::info!("ParallaX server listening on {}", server.listen);
+    let connection_limit = relay_connection_limit()?;
+    let connection_slots = Arc::new(Semaphore::new(connection_limit));
+    tracing::info!(
+        connection_limit,
+        "ParallaX server listening on {}",
+        server.listen
+    );
 
     loop {
         let (client, peer) = match listener.accept().await {
@@ -181,12 +188,28 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
             }
             Err(err) => return Err(err.into()),
         };
+        let connection_permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                tracing::warn!(
+                    %peer,
+                    connection_limit,
+                    "server connection limit reached; closing accepted socket"
+                );
+                drop(client);
+                continue;
+            }
+            Err(TryAcquireError::Closed) => {
+                return Err(io::Error::other("server connection limiter was closed").into());
+            }
+        };
         let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let server = server.clone();
         let connection_traffic = traffic;
         let psk = Arc::clone(&psk);
         let replay_cache = Arc::clone(&replay_cache);
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             if let Err(err) = handle_connection_with_replay(
                 client,
                 &server,

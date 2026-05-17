@@ -2,6 +2,10 @@ use std::io;
 
 use tokio::net::TcpStream;
 
+const RESERVED_PROCESS_FDS: usize = 64;
+const FDS_PER_RELAY_CONNECTION: usize = 2;
+const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
+
 pub fn tune_tcp_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     set_low_latency_congestion(stream);
@@ -55,6 +59,45 @@ pub fn is_fd_exhaustion_error(err: &io::Error) -> bool {
     }
 }
 
+pub fn relay_connection_limit() -> io::Result<usize> {
+    relay_connection_limit_from_nofile(nofile_soft_limit()?).ok_or_else(|| {
+        io::Error::other(
+            format!(
+                "RLIMIT_NOFILE soft limit is too low; need more than {RESERVED_PROCESS_FDS} file descriptors"
+            ),
+        )
+    })
+}
+
+pub fn relay_connection_limit_from_nofile(nofile_soft_limit: usize) -> Option<usize> {
+    let available = nofile_soft_limit.checked_sub(RESERVED_PROCESS_FDS)?;
+    let limit = available / FDS_PER_RELAY_CONNECTION;
+    if limit == 0 {
+        None
+    } else {
+        Some(limit.min(MAX_RELAY_CONNECTION_LIMIT))
+    }
+}
+
+#[cfg(unix)]
+fn nofile_soft_limit() -> io::Result<usize> {
+    use libc::{getrlimit, rlimit, RLIMIT_NOFILE};
+
+    let mut limit = rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(limit.rlim_cur as usize)
+}
+
+#[cfg(not(unix))]
+fn nofile_soft_limit() -> io::Result<usize> {
+    Ok(512)
+}
+
 #[cfg(target_os = "linux")]
 fn set_low_latency_congestion(stream: &TcpStream) {
     use std::{
@@ -97,3 +140,23 @@ fn set_low_latency_congestion(stream: &TcpStream) {
 
 #[cfg(not(target_os = "linux"))]
 fn set_low_latency_congestion(_stream: &TcpStream) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_connection_limit_reserves_process_fds() {
+        assert_eq!(relay_connection_limit_from_nofile(64), None);
+        assert_eq!(relay_connection_limit_from_nofile(66), Some(1));
+        assert_eq!(relay_connection_limit_from_nofile(256), Some(96));
+    }
+
+    #[test]
+    fn relay_connection_limit_is_capped() {
+        assert_eq!(
+            relay_connection_limit_from_nofile(usize::MAX),
+            Some(MAX_RELAY_CONNECTION_LIMIT)
+        );
+    }
+}

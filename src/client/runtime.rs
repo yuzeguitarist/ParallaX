@@ -18,6 +18,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
+    sync::{Semaphore, TryAcquireError},
     time::{sleep, Instant},
 };
 
@@ -38,7 +39,7 @@ use crate::{
         stateful::StatefulRustlsCamouflageBackend,
     },
     traffic::CoverTrafficProfile,
-    transport::tcp::{is_fd_exhaustion_error, tune_tcp_stream},
+    transport::tcp::{is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream},
 };
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
@@ -88,7 +89,13 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         &client.server_identity_public_key,
     )?);
     let listener = TcpListener::bind(client.listen).await?;
-    tracing::info!("ParallaX client SOCKS5 listening on {}", client.listen);
+    let connection_limit = relay_connection_limit()?;
+    let connection_slots = Arc::new(Semaphore::new(connection_limit));
+    tracing::info!(
+        connection_limit,
+        "ParallaX client SOCKS5 listening on {}",
+        client.listen
+    );
 
     loop {
         let (local, peer) = match listener.accept().await {
@@ -103,12 +110,28 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             }
             Err(err) => return Err(err.into()),
         };
+        let connection_permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                tracing::warn!(
+                    %peer,
+                    connection_limit,
+                    "client connection limit reached; closing accepted socket"
+                );
+                drop(local);
+                continue;
+            }
+            Err(TryAcquireError::Closed) => {
+                return Err(io::Error::other("client connection limiter was closed").into());
+            }
+        };
         let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let client = client.clone();
         let psk = Arc::clone(&psk);
         let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             if let Err(err) = handle_local_connection_with_cid(
                 local,
                 &client,
