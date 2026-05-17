@@ -47,6 +47,17 @@ bash scripts/deploy-vps.sh root@YOUR_VPS_IP cloudflare.com
 
 See `DEPLOYMENT.md` for the full local-build, binary-only workflow.
 
+Optional staging profiling through Polar Signals Cloud:
+
+```bash
+bash scripts/deploy-vps.sh \
+  --profile-mode polar-cloud \
+  --polar-token-file /tmp/parallax-polar.token \
+  --cargo-profile profiling \
+  root@YOUR_VPS_IP \
+  cloudflare.com
+```
+
 For advanced/manual setups, the lower-level template command is still available:
 
 ```bash
