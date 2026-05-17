@@ -481,12 +481,85 @@ deploy_info_log() {
   log "$1"
 }
 
+quiet_command_label() {
+  case "$1" in
+    cargo)
+      if [[ "${2:-}" == "run" ]]; then
+        local arg
+        for arg in "$@"; do
+          case "$arg" in
+            init)
+              printf 'Generating local ParallaX configs'
+              return 0
+              ;;
+            check)
+              printf 'Validating ParallaX configs'
+              return 0
+              ;;
+            probe)
+              printf 'Probing camouflage target'
+              return 0
+              ;;
+          esac
+        done
+        printf 'Running local ParallaX helper'
+      elif [[ "${2:-}" == "build" ]]; then
+        printf 'Building Linux binary with cargo'
+      elif [[ "${2:-}" == "zigbuild" ]]; then
+        printf 'Building Linux binary with cargo-zigbuild'
+      elif [[ "${2:-}" == "install" ]]; then
+        printf 'Installing local Rust helper'
+      else
+        printf 'Running cargo'
+      fi
+      ;;
+    docker) printf 'Building Linux binary inside local Docker' ;;
+    rustup) printf 'Installing Rust target' ;;
+    ssh) printf 'Running remote VPS setup over SSH' ;;
+    scp) printf 'Uploading deploy artifacts to VPS' ;;
+    *) printf 'Working' ;;
+  esac
+}
+
+run_quiet_with_spinner() {
+  local lf=$1
+  shift
+  local label pid ec spin_idx ch
+  local spin='|/-\'
+  label="$(quiet_command_label "$@")"
+
+  "$@" >"$lf" 2>&1 &
+  pid=$!
+
+  if [[ -t 2 ]]; then
+    spin_idx=0
+    while kill -0 "$pid" >/dev/null 2>&1; do
+      ch="${spin:$spin_idx:1}"
+      printf '\r[%s] %s...' "$ch" "$label" >&2
+      spin_idx=$(((spin_idx + 1) % ${#spin}))
+      sleep 0.18
+    done
+    wait "$pid"
+    ec=$?
+    printf '\r\033[K' >&2
+  else
+    printf '%s...\n' "$label" >&2
+    wait "$pid"
+    ec=$?
+  fi
+
+  if [[ "$ec" == "0" ]]; then
+    guided_ok_done "$label"
+  fi
+  return "$ec"
+}
+
 run() {
   if [[ "${DEPLOY_GUIDED_SILENT_TOOLS:-0}" == "1" ]] && [[ "$DRY_RUN" == "0" ]]; then
     local lf ec
     lf="$(mktemp "${TMPDIR:-/tmp}/parallax-quiet.XXXXXX")" || die "mktemp failed"
     set +e
-    "$@" >"$lf" 2>&1
+    run_quiet_with_spinner "$lf" "$@"
     ec=$?
     set -e
     if [[ "$ec" != "0" ]]; then
@@ -588,7 +661,7 @@ build_host_tools_and_configs() {
       local plf erc
       plf="$(mktemp "${TMPDIR:-/tmp}/parallax-probe.XXXXXX")" || die "mktemp failed"
       set +e
-      cargo run --locked --quiet --bin plx -- probe "$DEST" >"$plf" 2>&1
+      run_quiet_with_spinner "$plf" cargo run --locked --quiet --bin plx -- probe "$DEST"
       erc=$?
       set -e
       if [[ "$erc" != "0" ]]; then
