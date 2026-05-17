@@ -406,6 +406,17 @@ if ! command -v parca-agent >/dev/null 2>&1; then
     $sudo_prefix snap install parca-agent --classic
   fi
 fi
+agent_cmd="\$(command -v parca-agent || true)"
+if [[ -z "\$agent_cmd" && -x /snap/bin/parca-agent ]]; then
+  agent_cmd=/snap/bin/parca-agent
+fi
+if [[ -z "\$agent_cmd" ]]; then
+  echo "parca-agent was installed but no executable was found in PATH or /snap/bin" >&2
+  exit 1
+fi
+if [[ "\$agent_cmd" != "/usr/local/bin/parca-agent" ]]; then
+  $sudo_prefix ln -sf "\$agent_cmd" /usr/local/bin/parca-agent
+fi
 $sudo_prefix install -m 0600 "$remote_tmp/$(basename "$POLAR_TOKEN_FILE")" /etc/parallax/polarsignals.token
 $sudo_prefix install -m 0644 "$remote_tmp/polarsignals.env" /etc/parallax/polarsignals.env
 $sudo_prefix install -m 0644 "$remote_tmp/parca-agent.service" /etc/systemd/system/parca-agent.service
