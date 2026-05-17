@@ -79,6 +79,39 @@ warn() {
   printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2
 }
 
+# Guided mode ("no args" wizard): richer terminal UX + quieter tool output unless something breaks.
+DEPLOY_GUIDED_UI="${DEPLOY_GUIDED_UI:-0}"
+DEPLOY_GUIDED_SILENT_TOOLS="${DEPLOY_GUIDED_SILENT_TOOLS:-0}"
+
+C_GUIDE_PURPLE='\033[95m'
+C_GREEN='\033[1;32m'
+C_CYAN='\033[36m'
+C_RST='\033[0m'
+
+DEFAULT_CAMOUFLAGE_DEST="${DEFAULT_CAMOUFLAGE_DEST:-www.cloudflare.com}"
+
+guided_heading() {
+  [[ "${DEPLOY_GUIDED_UI}" != "1" ]] && return 0
+  printf '\n%b%s%b\n' "$C_GUIDE_PURPLE" "$1" "$C_RST" >&2
+}
+
+guided_step() {
+  [[ "${DEPLOY_GUIDED_UI}" != "1" ]] && return 0
+  local idx=$1 max=$2
+  shift 2
+  printf '%bStep %s / %s —%b %s\n' "$C_GUIDE_PURPLE" "$idx" "$max" "$C_RST" "$*" >&2
+}
+
+guided_hint() {
+  [[ "${DEPLOY_GUIDED_UI}" != "1" ]] && return 0
+  printf '%b    %s%b\n' "$C_CYAN" "$1" "$C_RST" >&2
+}
+
+guided_ok_done() {
+  [[ "${DEPLOY_GUIDED_UI}" != "1" ]] && return 0
+  printf '%b✓ %s%b\n' "$C_GREEN" "$1" "$C_RST" >&2
+}
+
 have_tty_stdio() {
   [[ -t 0 && -t 1 ]]
 }
@@ -273,14 +306,6 @@ interactive_prompt_polar_details() {
   if [[ -z "$POLAR_PROJECT_ID" ]]; then
     POLAR_PROJECT_ID="$(prompt_line_nonempty "Polar Signals project UUID")"
   fi
-  POLAR_STORE_ADDRESS="$(prompt_line_or_default "Polar gRPC endpoint (STORE_ADDRESS)" "$POLAR_STORE_ADDRESS")"
-  local node_default
-  node_default="${SSH_TARGET##*@}"
-  node_default="${node_default%%:*}"
-  POLAR_NODE="$(prompt_line_or_default "Polar node label (friendly name)" "${POLAR_NODE:-$node_default}")"
-  POLAR_LABELS="$(prompt_line_or_default "Extra Polar labels (KEY=VALUE;KEY=VALUE) optional" "${POLAR_LABELS}")"
-  PARCA_AGENT_CHANNEL="$(prompt_line_or_default "snap channel override for parca-agent (leave empty for stable)" "${PARCA_AGENT_CHANNEL}")"
-  PARCA_HTTP_ADDRESS="$(prompt_line_or_default "Parca Agent local HTTP metrics address" "$PARCA_HTTP_ADDRESS")"
   if [[ -z "$POLAR_BEARER_TOKEN" && -z "$POLAR_TOKEN_FILE" ]]; then
     prompt_polar_bearer_once
   fi
@@ -314,42 +339,52 @@ interactive_prompt_profiling_choice() {
 }
 
 interactive_flow_zero_argv() {
+  local smax=7
   interactive_banner
 
-  printf 'SSH login target, such as root@203.0.113.50 or ubuntu@your.host\n' >&2
-  SSH_TARGET="$(prompt_line_nonempty "SSH login target" 'e.g. root@203.0.113.50')"
+  guided_step 1 "$smax" "VPS SSH login"
+  guided_hint 'Example: root@203.0.113.50 or ubuntu@hostname'
+  SSH_TARGET="$(prompt_line_nonempty "SSH target" 'root@YOUR_SERVER_IP')"
   printf '\n' >&2
 
-  printf 'Fallback / camouflage TLS host name shown to outsiders (often a CDN domain).\n' >&2
-  DEST="$(prompt_line_nonempty "Fallback / camouflage domain (DEST)" 'e.g. www.cloudflare.com')"
+  guided_step 2 "$smax" "Fallback TLS camouflage hostname"
+  guided_hint "Press Enter alone to accept ${DEFAULT_CAMOUFLAGE_DEST} (looks like browsing that site)."
+  DEST="$(prompt_line_or_default "Camouflage / fallback hostname" "$DEFAULT_CAMOUFLAGE_DEST")"
   printf '\n' >&2
 
+  guided_step 3 "$smax" "Client dial address"
+  guided_hint 'Where clients reach this VPS (normally host + :443 inferred from SSH).'
   local inferred=""
   inferred="$(infer_server_addr "$SSH_TARGET")"
-  SERVER_ADDR="$(prompt_line_or_default "Address clients dial (SERVER_ADDR)" "$inferred")"
+  SERVER_ADDR="$(prompt_line_or_default "Server address shown to ParallaX clients" "$inferred")"
   printf '\n' >&2
-  SSH_PORT="$(prompt_line_or_default "SSH port" "$SSH_PORT")"
+
+  guided_step 4 "$smax" "SSH port on the VPS"
+  SSH_PORT="$(prompt_line_or_default "SSH TCP port on the VPS" "$SSH_PORT")"
   printf '\n' >&2
 
   if [[ -z "$SERVER_ADDR" ]]; then
     SERVER_ADDR="$(infer_server_addr "$SSH_TARGET")"
   fi
 
+  guided_step 5 "$smax" "Optional profiling backend"
   interactive_prompt_profiling_choice
 
-  printf '\nOptional: tune build mode, VPS paths, local SOCKS listen, sudo, and reuse-config.\n' >&2
+  guided_step 6 "$smax" "Advanced build / systemd paths"
+  guided_hint 'Skip unless you know you need overrides.'
   local reply
-  read -r -p "Open those advanced settings? [y/N]: " reply || die "stdin closed"
+  read -r -p "Tune build mode, systemd paths, listen addrs, reuse-config, sudo? [y/N]: " reply || die "stdin closed"
   reply="$(tolower_one "$reply")"
   if [[ "$reply" == "y" || "$reply" == "yes" ]]; then
     printf '\n' >&2
     interactive_advanced_paths_and_build
   fi
 
+  guided_step 7 "$smax" "Dry-run"
   interactive_prompt_dry_run
 
   printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' >&2
-  printf 'Thanks — kicking off deployment with those choices.\n' >&2
+  printf 'Questionnaire done — starting silent build/upload (errors will print).\n' >&2
   printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' >&2
 }
 
@@ -363,8 +398,8 @@ interactive_flow_partial_argv() {
   fi
 
   if [[ -z "$DEST" ]]; then
-    printf 'Fallback / camouflage TLS host name (DEST).\n' >&2
-    DEST="$(prompt_line_nonempty "Fallback / camouflage domain (DEST)")"
+    printf 'Camouflage / fallback hostname (Enter for %s).\n' "$DEFAULT_CAMOUFLAGE_DEST" >&2
+    DEST="$(prompt_line_or_default "Camouflage / fallback hostname" "$DEFAULT_CAMOUFLAGE_DEST")"
     printf '\n' >&2
   fi
 
@@ -410,8 +445,7 @@ interactive_collect_polar_if_needed() {
     return 0
   fi
 
-  printf '\nPolar Signals Cloud is enabled but no token was supplied yet.\n' >&2
-  printf 'Paste the bearer token when prompted (still no token file required).\n\n' >&2
+  printf '\nPolar Signals is on: paste the bearer token below (everything else stays at script defaults).\n\n' >&2
   interactive_prompt_polar_details
 }
 
@@ -442,7 +476,29 @@ quote_cmd() {
   done
 }
 
+deploy_info_log() {
+  [[ "${DEPLOY_GUIDED_SILENT_TOOLS:-0}" == "1" ]] && return 0
+  log "$1"
+}
+
 run() {
+  if [[ "${DEPLOY_GUIDED_SILENT_TOOLS:-0}" == "1" ]] && [[ "$DRY_RUN" == "0" ]]; then
+    local lf ec
+    lf="$(mktemp "${TMPDIR:-/tmp}/parallax-quiet.XXXXXX")" || die "mktemp failed"
+    set +e
+    "$@" >"$lf" 2>&1
+    ec=$?
+    set -e
+    if [[ "$ec" != "0" ]]; then
+      log "$(quote_cmd "$@")"
+      cat "$lf" >&2
+      rm -f "$lf"
+      die "command failed (exit $ec)"
+    fi
+    rm -f "$lf"
+    return 0
+  fi
+
   log "$(quote_cmd "$@")"
   if [[ "$DRY_RUN" == "0" ]]; then
     "$@"
@@ -509,7 +565,7 @@ build_host_tools_and_configs() {
     [[ -f "$client_cfg" ]] || die "--reuse-config requested but missing $client_cfg"
   else
     rm -f "$server_cfg" "$client_cfg"
-    log "generating local-only server/client configs"
+    deploy_info_log "generating local-only server/client configs"
     run cargo run --locked --quiet --bin plx -- init "$DEST" \
       --server-addr "$SERVER_ADDR" \
       --server-listen "$SERVER_LISTEN" \
@@ -526,10 +582,24 @@ build_host_tools_and_configs() {
   run cargo run --locked --quiet --bin plx -- check -c "$server_cfg"
   run cargo run --locked --quiet --bin plx -- check -c "$client_cfg"
 
-  log "probing camouflage target before deploy"
+  deploy_info_log "probing camouflage target before deploy"
   if [[ "$DRY_RUN" == "0" ]]; then
-    cargo run --locked --quiet --bin plx -- probe "$DEST" || \
-      warn "probe failed; deploy can continue, but choose a better camouflage target before production"
+    if [[ "${DEPLOY_GUIDED_SILENT_TOOLS:-0}" == "1" ]]; then
+      local plf erc
+      plf="$(mktemp "${TMPDIR:-/tmp}/parallax-probe.XXXXXX")" || die "mktemp failed"
+      set +e
+      cargo run --locked --quiet --bin plx -- probe "$DEST" >"$plf" 2>&1
+      erc=$?
+      set -e
+      if [[ "$erc" != "0" ]]; then
+        warn "probe failed; deploy can continue, but verify your camouflage host before prod."
+        tail -n 80 "$plf" >&2 || cat "$plf" >&2
+      fi
+      rm -f "$plf"
+    else
+      cargo run --locked --quiet --bin plx -- probe "$DEST" || \
+        warn "probe failed; deploy can continue, but choose a better camouflage target before production"
+    fi
   else
     log "$(quote_cmd cargo run --locked --quiet --bin plx -- probe "$DEST")"
   fi
@@ -555,18 +625,18 @@ build_linux_binary() {
   esac
 
   if [[ "$BUILD_MODE" == "native" ]]; then
-    log "building Linux binary with local cargo profile $CARGO_PROFILE"
-    run cargo build --profile "$CARGO_PROFILE" --locked --bin plx
+    deploy_info_log "building Linux binary with local cargo profile $CARGO_PROFILE"
+    run cargo build --profile "$CARGO_PROFILE" --locked --quiet --bin plx
     LINUX_PLX="$root/target/$CARGO_PROFILE/plx"
   elif [[ "$BUILD_MODE" == "zigbuild" ]]; then
     ensure_zigbuild_tools
     ensure_rust_target "$LINUX_TARGET"
-    log "building Linux binary with local cargo-zigbuild for $LINUX_TARGET profile $CARGO_PROFILE"
-    run cargo zigbuild --profile "$CARGO_PROFILE" --locked --bin plx --target "$LINUX_TARGET"
+    deploy_info_log "building Linux binary with local cargo-zigbuild for $LINUX_TARGET profile $CARGO_PROFILE"
+    run cargo zigbuild --profile "$CARGO_PROFILE" --locked --quiet --bin plx --target "$LINUX_TARGET"
     LINUX_PLX="$root/target/$LINUX_TARGET/$CARGO_PROFILE/plx"
   else
     need_cmd docker
-    log "building Linux binary inside local Docker with profile $CARGO_PROFILE; source is not uploaded to the VPS"
+    deploy_info_log "building Linux binary inside local Docker with profile $CARGO_PROFILE; source is not uploaded to the VPS"
     run docker run --rm \
       --user "$(id -u):$(id -g)" \
       -v "$root:/work" \
@@ -575,7 +645,7 @@ build_linux_binary() {
       -e CARGO_TARGET_DIR=/work/target/linux-deploy \
       -e CARGO_PROFILE="$CARGO_PROFILE" \
       "$DOCKER_IMAGE" \
-      bash -lc 'cargo build --profile "$CARGO_PROFILE" --locked --bin plx'
+      bash -lc 'cargo build --profile "$CARGO_PROFILE" --locked --quiet --bin plx'
     LINUX_PLX="$root/target/linux-deploy/$CARGO_PROFILE/plx"
   fi
 
@@ -604,7 +674,7 @@ ensure_rust_target() {
   fi
 
   need_cmd rustup
-  log "installing Rust target $target"
+  deploy_info_log "installing Rust target $target"
   run rustup target add "$target"
 }
 
@@ -624,11 +694,11 @@ maybe_install_build_tool() {
 
   if [[ "$tool" == "zig" ]]; then
     need_cmd brew
-    log "installing local build helper: zig"
+    deploy_info_log "installing local build helper: zig"
     run brew install zig
   elif [[ "$tool" == "cargo-zigbuild" ]]; then
     need_cmd cargo
-    log "installing local build helper: cargo-zigbuild"
+    deploy_info_log "installing local build helper: cargo-zigbuild"
     run cargo install cargo-zigbuild --locked
   else
     die "unsupported build helper: $tool"
@@ -911,13 +981,18 @@ REMOTE
 
   run "${ssh_args[@]}" "$remote_script"
 
-  log "deployment artifacts"
-  printf '  local client config: %s\n' "$deploy_dir/parallax.client.toml"
-  printf '  remote binary:       %s\n' "$REMOTE_BIN"
-  printf '  remote config:       %s\n' "$REMOTE_CONFIG"
-  printf '  remote service:      %s.service\n' "$SERVICE_NAME"
-  if profiling_enabled; then
-    printf '  profile mode:        Polar Signals Cloud via parca-agent.service\n'
+  if [[ "${DEPLOY_GUIDED_SILENT_TOOLS:-0}" == "1" ]] && [[ "$DRY_RUN" == "0" ]]; then
+    guided_ok_done "Uploaded artifacts and bounced remote systemd units."
+    printf 'Your client config:\n    %s/parallax.client.toml\n' "$deploy_dir" >&2
+  else
+    log "deployment artifacts"
+    printf '  local client config: %s\n' "$deploy_dir/parallax.client.toml"
+    printf '  remote binary:       %s\n' "$REMOTE_BIN"
+    printf '  remote config:       %s\n' "$REMOTE_CONFIG"
+    printf '  remote service:      %s.service\n' "$SERVICE_NAME"
+    if profiling_enabled; then
+      printf '  profile mode:        Polar Signals Cloud via parca-agent.service\n'
+    fi
   fi
 
   if [[ "$DRY_RUN" == "0" ]]; then
@@ -1006,6 +1081,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "${#ORIGINAL_ARGS[@]}" -eq 0 ]]; then
+  DEPLOY_GUIDED_UI=1
+  DEPLOY_GUIDED_SILENT_TOOLS=1
+fi
+
 if [[ "${#ORIGINAL_ARGS[@]}" -eq 0 ]] && ! have_tty_stdio; then
   die "guided mode needs an interactive terminal. Open iTerm / Terminal.app / ssh -t, or pass explicit flags (see scripts/deploy-vps.sh --help)."
 fi
@@ -1052,6 +1132,11 @@ need_cmd scp
 ROOT="$(repo_root)"
 cd "$ROOT"
 [[ -f Cargo.toml ]] || die "must run from the ParallaX repository"
+
+if [[ "${DEPLOY_GUIDED_UI:-0}" == "1" ]]; then
+  guided_heading "Build + upload phase"
+  guided_hint 'Toolchains stay quiet unless a command exits non-zero.'
+fi
 
 DEPLOY_DIR="$ROOT/target/parallax-deploy/$(safe_name "$SSH_TARGET")"
 SERVER_CFG="$DEPLOY_DIR/parallax.server.toml"
