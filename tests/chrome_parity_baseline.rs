@@ -19,6 +19,7 @@ const EXT_SNI: u16 = 0x0000;
 const EXT_EC_POINT_FORMATS: u16 = 0x000b;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_ALPN: u16 = 0x0010;
+const EXT_SESSION_TICKET: u16 = 0x0023;
 const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_KEY_SHARE: u16 = 0x0033;
@@ -28,7 +29,7 @@ const GROUP_X25519_MLKEM768: u16 = 0x11ec;
 const EXPECTED_CHROME_GUI_JA3: &str = "f15fe5d1f9edead72e873c77bfe9c606";
 const EXPECTED_CHROME_HEADLESS_JA3: &str = "f5b2bb9f2cc8fce256f5443aca5dd654";
 const EXPECTED_CHROME_JA4: &str = "t13d1516h2_8daaf6152771_d8a2da3f94cd";
-const EXPECTED_PARALLAX_JA4: &str = "t13d1010h2_61a7ad8aa9b6_648ed004696a";
+const EXPECTED_PARALLAX_JA4: &str = "t13d1011h2_61a7ad8aa9b6_6d021c4c45cd";
 
 const WHITELISTED_FIELD_DIFFS: &[&str] = &["cipher_suites", "extensions", "grease"];
 
@@ -167,6 +168,14 @@ fn assert_required_chrome_parity(
         parallax.ec_point_formats,
         vec![0],
         "ParallaX ec_point_formats changed"
+    );
+    assert!(
+        chrome.extensions.contains(&EXT_SESSION_TICKET),
+        "{sample} Chrome session_ticket extension disappeared"
+    );
+    assert!(
+        parallax.extensions.contains(&EXT_SESSION_TICKET),
+        "ParallaX should advertise Chrome-style empty session_ticket"
     );
 
     let chrome_signature_algorithms = vec![
@@ -751,7 +760,7 @@ fn markdown_report(
             fmt_hex(&non_grease(&headless.0.extensions))
         ),
         &fmt_hex(&non_grease(&parallax.0.extensions)),
-        "whitelisted: Chrome has ALPS/ECH/cert-compression/ticket/SCT/renegotiation extras",
+        "whitelisted: session_ticket is now present; Chrome still has ALPS/ECH/cert-compression/SCT/renegotiation extras",
     );
     write_field_row(
         &mut out,
@@ -802,7 +811,7 @@ fn markdown_report(
     .unwrap();
     writeln!(
         out,
-        "3. Add/shape Chrome-only extensions (ALPS 0x44cd, ECH GREASE 0xfe0d, cert compression, session ticket, SCT, renegotiation_info): 6-10h."
+        "3. Add/shape the remaining Chrome-only extensions (ALPS 0x44cd, ECH GREASE 0xfe0d, cert compression 0x001b, SCT 0x0012, renegotiation_info 0xff01): 6-10h."
     )
     .unwrap();
     writeln!(

@@ -1,10 +1,11 @@
 //! Stateful rustls camouflage backend.
 //!
-//! V2 keeps rustls in charge of the TLS 1.3 state machine, disables resumption
-//! so PSK binders cannot invalidate ParallaX authentication, and injects only
-//! two narrow hooks: the ParallaX X25519 public key in ClientHello.random and an
-//! authenticated legacy SessionID. The hand-written ClientHello builder remains
-//! available for tests, probes, and emergency fallback paths.
+//! V2 keeps rustls in charge of the TLS 1.3 state machine, uses an isolated
+//! per-handshake resumption cache so cached PSK binders cannot invalidate
+//! ParallaX authentication, and injects only two narrow hooks: the ParallaX
+//! X25519 public key in ClientHello.random and an authenticated legacy
+//! SessionID. The hand-written ClientHello builder remains available for tests,
+//! probes, and emergency fallback paths.
 
 use std::{
     cell::RefCell,
@@ -430,7 +431,10 @@ fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, 
         .with_custom_certificate_verifier(Arc::new(CamouflageVerifier))
         .with_no_client_auth();
     config.alpn_protocols = profile.alpn_protocols.clone();
-    config.resumption = Resumption::disabled();
+    // A fresh, non-shared cache lets rustls emit Chrome's empty TLS 1.2
+    // session_ticket request extension while preventing cached PSK binders from
+    // ever appearing in ParallaX's authenticated ClientHello.
+    config.resumption = Resumption::in_memory_sessions(1);
     config.enable_early_data = false;
     config.max_fragment_size = profile.max_fragment_size;
     Ok(config)
