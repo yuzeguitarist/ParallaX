@@ -363,7 +363,7 @@ After=network-online.target parallax.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/parca-agent --node=\${PARCA_NODE} --remote-store-address=\${PARCA_REMOTE_STORE_ADDRESS} --remote-store-bearer-token-file=/etc/parallax/polarsignals.token --http-address=\${PARCA_HTTP_ADDRESS} --metadata-external-labels=\${PARCA_EXTERNAL_LABELS}
+ExecStart=/snap/bin/parca-agent --node=\${PARCA_NODE} --remote-store-address=\${PARCA_REMOTE_STORE_ADDRESS} --remote-store-bearer-token-file=/etc/parallax/polarsignals.token --http-address=\${PARCA_HTTP_ADDRESS} --metadata-external-labels=\${PARCA_EXTERNAL_LABELS}
 EnvironmentFile=/etc/parallax/polarsignals.env
 Restart=always
 RestartSec=10
@@ -449,6 +449,10 @@ if [[ -z "\$agent_cmd" ]]; then
 fi
 if [[ "\$agent_cmd" != "/usr/local/bin/parca-agent" ]]; then
   $sudo_prefix ln -sf "\$agent_cmd" /usr/local/bin/parca-agent
+fi
+if [[ ! -x /snap/bin/parca-agent ]]; then
+  $sudo_prefix mkdir -p /snap/bin
+  $sudo_prefix ln -sf "\$agent_cmd" /snap/bin/parca-agent
 fi
 $sudo_prefix install -m 0600 "$remote_tmp/$(basename "$POLAR_TOKEN_FILE")" /etc/parallax/polarsignals.token
 $sudo_prefix install -m 0644 "$remote_tmp/polarsignals.env" /etc/parallax/polarsignals.env

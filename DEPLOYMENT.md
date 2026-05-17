@@ -82,9 +82,10 @@ and installs:
 ```
 
 If `parca-agent` is missing, the script installs it through the official snap
-package on the VPS and links the installed binary into
-`/usr/local/bin/parca-agent` for the systemd unit. Use
-`--parca-agent-channel edge` only if you explicitly want the snap edge channel.
+package on the VPS. The generated systemd unit calls the stable snap launcher
+path `/snap/bin/parca-agent` directly, avoiding boot-order races with
+`/usr/local/bin` compatibility links. Use `--parca-agent-channel edge` only if
+you explicitly want the snap edge channel.
 
 The default remote store is:
 
