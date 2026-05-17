@@ -88,6 +88,25 @@ require_no_space() {
   [[ "$value" != *" "* ]] || die "$name must not contain spaces: $value"
 }
 
+require_no_control() {
+  local name=$1 value=$2
+  [[ ! "$value" =~ [[:cntrl:]] ]] || die "$name must not contain control characters"
+}
+
+require_safe_remote_path() {
+  local name=$1 value=$2
+  [[ "$value" == /* ]] || die "$name must be an absolute path: $value"
+  require_no_space "$name" "$value"
+  require_no_control "$name" "$value"
+}
+
+require_safe_service_name() {
+  local name=$1 value=$2
+  [[ -n "$value" ]] || die "$name must not be empty"
+  [[ "$value" =~ ^[A-Za-z0-9_.@-]+$ ]] || \
+    die "$name must contain only letters, numbers, dot, underscore, dash, or @: $value"
+}
+
 repo_root() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -268,11 +287,12 @@ install_remote() {
   run "${ssh_args[@]}" "mkdir -p $(shell_quote "$remote_tmp")"
   run "${scp_args[@]}" "$LINUX_PLX" "$server_cfg" "$unit_file" "$SSH_TARGET:$remote_tmp/"
 
-  local q_tmp q_remote_bin q_remote_config q_service q_remote_bin_dir q_remote_config_dir
+  local q_tmp q_remote_bin q_remote_config q_service q_service_path q_remote_bin_dir q_remote_config_dir
   q_tmp=$(shell_quote "$remote_tmp")
   q_remote_bin=$(shell_quote "$REMOTE_BIN")
   q_remote_config=$(shell_quote "$REMOTE_CONFIG")
   q_service=$(shell_quote "$SERVICE_NAME.service")
+  q_service_path=$(shell_quote "/etc/systemd/system/$SERVICE_NAME.service")
   q_remote_bin_dir=$(shell_quote "$(dirname "$REMOTE_BIN")")
   q_remote_config_dir=$(shell_quote "$(dirname "$REMOTE_CONFIG")")
 
@@ -281,14 +301,14 @@ install_remote() {
   remote_script=$(cat <<REMOTE
 set -Eeuo pipefail
 $sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir /var/lib/parallax
-$sudo_prefix install -m 0755 "$remote_tmp/plx" $q_remote_bin
-$sudo_prefix install -m 0600 "$remote_tmp/parallax.server.toml" $q_remote_config
-$sudo_prefix install -m 0644 "$remote_tmp/parallax.service" "/etc/systemd/system/$SERVICE_NAME.service"
+$sudo_prefix install -m 0755 $q_tmp/plx $q_remote_bin
+$sudo_prefix install -m 0600 $q_tmp/parallax.server.toml $q_remote_config
+$sudo_prefix install -m 0644 $q_tmp/parallax.service $q_service_path
 if command -v systemctl >/dev/null 2>&1; then
   $sudo_prefix systemctl daemon-reload
-  $sudo_prefix systemctl enable "$SERVICE_NAME.service"
-  $sudo_prefix systemctl restart "$SERVICE_NAME.service"
-  $sudo_prefix systemctl --no-pager --full status "$SERVICE_NAME.service"
+  $sudo_prefix systemctl enable $q_service
+  $sudo_prefix systemctl restart $q_service
+  $sudo_prefix systemctl --no-pager --full status $q_service
 else
   echo "systemctl not found; binary and config were installed but service was not started" >&2
 fi
@@ -381,9 +401,9 @@ case "$REMOTE_SUDO" in
   *) die "--sudo/--no-sudo state is invalid" ;;
 esac
 
-require_no_space "--remote-bin" "$REMOTE_BIN"
-require_no_space "--remote-config" "$REMOTE_CONFIG"
-require_no_space "--service-name" "$SERVICE_NAME"
+require_safe_remote_path "--remote-bin" "$REMOTE_BIN"
+require_safe_remote_path "--remote-config" "$REMOTE_CONFIG"
+require_safe_service_name "--service-name" "$SERVICE_NAME"
 
 need_cmd ssh
 need_cmd scp
