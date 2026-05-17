@@ -22,7 +22,6 @@ use crate::{
         client_hello_builder::{BrowserProfile, ClientHelloTemplate},
     },
     traffic::PaddingProfile,
-    transport::quic::Salamander,
 };
 
 const BENCH_PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
@@ -164,7 +163,6 @@ pub fn run(options: BenchmarkOptions) -> Result<BenchmarkReport> {
         bench_data_record(options)?,
         bench_mlkem(options)?,
         bench_replay_cache(options)?,
-        bench_quic_obfuscation(options)?,
     ];
 
     Ok(BenchmarkReport {
@@ -280,26 +278,6 @@ fn bench_replay_cache(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     )
 }
 
-fn bench_quic_obfuscation(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    let payload = vec![0x51; options.payload_size.min(1_350)];
-    let salamander = Salamander::new(BENCH_PSK);
-    let mut rng = StdRng::seed_from_u64(0x5155_4943);
-
-    run_case(
-        "quic_salamander_roundtrip",
-        options.iterations,
-        options.warmup,
-        || {
-            let obfuscated = salamander.obfuscate(black_box(&payload), &mut rng)?;
-            let plain = salamander.deobfuscate(&obfuscated)?;
-            if plain != payload {
-                bail!("benchmark QUIC obfuscation round trip mismatch");
-            }
-            Ok(black_box((obfuscated.len() + plain.len()) as u64))
-        },
-    )
-}
-
 fn run_case<F>(name: &str, iterations: u64, warmup: u64, mut op: F) -> Result<BenchmarkCase>
 where
     F: FnMut() -> Result<u64>,
@@ -390,7 +368,7 @@ mod tests {
         let options = BenchmarkOptions::new(2, 0, 128).unwrap();
         let report = run(options).unwrap();
 
-        assert_eq!(report.cases.len(), 5);
+        assert_eq!(report.cases.len(), 4);
         assert!(report
             .cases
             .iter()

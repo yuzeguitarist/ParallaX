@@ -10,7 +10,6 @@ default-run = "parallax"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-blake2 = "0.10"
 chacha20poly1305 = { version = "0.10", features = ["alloc"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 hkdf = "0.12"
