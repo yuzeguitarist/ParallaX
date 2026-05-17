@@ -53,6 +53,7 @@ Optional staging profiling through Polar Signals Cloud:
 bash scripts/deploy-vps.sh \
   --profile-mode polar-cloud \
   --polar-token-file /tmp/parallax-polar.token \
+  --polar-project-id YOUR_POLAR_PROJECT_UUID \
   --cargo-profile profiling \
   root@YOUR_VPS_IP \
   cloudflare.com

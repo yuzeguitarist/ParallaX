@@ -53,16 +53,21 @@ always-on setting for sensitive nodes.
 1. Put the Polar Signals bearer token in a local file that is not committed:
 
    ```bash
-   printf '%s' 'YOUR_POLAR_SIGNALS_TOKEN' > /tmp/parallax-polar.token
+   printf '%s' 'psc_v1_YOUR_64_HEX_CHARS' > /tmp/parallax-polar.token
    chmod 600 /tmp/parallax-polar.token
    ```
 
-2. Deploy with the profiler-friendly Cargo profile:
+2. Copy the Polar Signals project UUID from the Cloud project settings. The
+   deploy script intentionally rejects project names here because Cloud writes
+   need the exact `projectID` gRPC metadata.
+
+3. Deploy with the profiler-friendly Cargo profile:
 
    ```bash
    bash scripts/deploy-vps.sh \
      --profile-mode polar-cloud \
      --polar-token-file /tmp/parallax-polar.token \
+     --polar-project-id YOUR_POLAR_PROJECT_UUID \
      --cargo-profile profiling \
      root@YOUR_VPS_IP \
      cloudflare.com

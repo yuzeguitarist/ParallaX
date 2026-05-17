@@ -38,6 +38,7 @@ Options:
   --no-install-build-tools     Do not install missing local build helpers; fail with instructions instead.
   --profile-mode <mode>        Profiling integration: none or polar-cloud. Defaults to none.
   --polar-token-file <path>    Local Polar Signals bearer token file. Required for polar-cloud.
+  --polar-project-id <uuid>    Polar Signals project UUID. Required for polar-cloud.
   --polar-store-address <addr> Polar Signals gRPC endpoint. Defaults to grpc.polarsignals.com:443.
   --polar-node <name>          Node label for Polar Signals. Defaults to the SSH host.
   --polar-labels <labels>      Extra profile labels as KEY=VALUE;KEY=VALUE.
@@ -306,8 +307,15 @@ validate_profile_options() {
   fi
 
   [[ -n "$POLAR_TOKEN_FILE" ]] || die "--polar-token-file is required with --profile-mode polar-cloud"
+  [[ -n "$POLAR_PROJECT_ID" ]] || die "--polar-project-id is required with --profile-mode polar-cloud"
+  [[ "$POLAR_PROJECT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || \
+    die "--polar-project-id must be a UUID, not a project name: $POLAR_PROJECT_ID"
   if [[ "$DRY_RUN" == "0" ]]; then
     [[ -r "$POLAR_TOKEN_FILE" ]] || die "Polar Signals token file is not readable: $POLAR_TOKEN_FILE"
+    local token
+    token="$(tr -d '\r\n[:space:]' < "$POLAR_TOKEN_FILE")"
+    [[ "$token" =~ ^psc_v1_[0-9a-fA-F]{64}$ ]] || \
+      die "Polar Signals token file is invalid. Expected format: psc_v1_ followed by 64 hex chars"
   fi
   [[ "$POLAR_TOKEN_FILE" != *" "* ]] || die "--polar-token-file must not contain spaces"
   [[ -n "$POLAR_STORE_ADDRESS" ]] || die "--polar-store-address must not be empty"
@@ -330,7 +338,7 @@ After=network-online.target parallax.service
 
 [Service]
 Type=simple
-ExecStart=/snap/bin/parca-agent --node=\${PARCA_NODE} --remote-store-address=\${PARCA_REMOTE_STORE_ADDRESS} --remote-store-bearer-token-file=/etc/parallax/polarsignals.token --http-address=\${PARCA_HTTP_ADDRESS} --metadata-external-labels=\${PARCA_EXTERNAL_LABELS}
+ExecStart=/snap/bin/parca-agent --node=\${PARCA_NODE} --remote-store-address=\${PARCA_REMOTE_STORE_ADDRESS} --remote-store-bearer-token-file=/etc/parallax/polarsignals.token --remote-store-grpc-headers=projectID=\${PARCA_PROJECT_ID} --http-address=\${PARCA_HTTP_ADDRESS} --metadata-external-labels=\${PARCA_EXTERNAL_LABELS}
 EnvironmentFile=/etc/parallax/polarsignals.env
 Restart=always
 RestartSec=10
@@ -348,7 +356,26 @@ PARCA_REMOTE_STORE_ADDRESS=$POLAR_STORE_ADDRESS
 PARCA_NODE=$POLAR_NODE
 PARCA_HTTP_ADDRESS=$PARCA_HTTP_ADDRESS
 PARCA_EXTERNAL_LABELS=$POLAR_LABELS
+PARCA_PROJECT_ID=$POLAR_PROJECT_ID
 ENV
+}
+
+prepare_polar_token_file() {
+  local token_file=$1
+  if [[ "$DRY_RUN" == "0" ]]; then
+    local token
+    token="$(tr -d '\r\n[:space:]' < "$POLAR_TOKEN_FILE")"
+    printf '%s' "$token" >"$token_file"
+    chmod 600 "$token_file"
+  else
+    log "would write sanitized Polar Signals token to $token_file"
+  fi
+}
+
+cleanup_polar_token_upload_file() {
+  if [[ -n "$POLAR_TOKEN_UPLOAD_FILE" && -f "$POLAR_TOKEN_UPLOAD_FILE" ]]; then
+    rm -f "$POLAR_TOKEN_UPLOAD_FILE"
+  fi
 }
 
 install_remote() {
@@ -371,7 +398,7 @@ install_remote() {
   local scp_payload=("$LINUX_PLX" "$server_cfg" "$unit_file")
 
   if profiling_enabled; then
-    scp_payload+=("$PARCA_UNIT_FILE" "$POLAR_ENV_FILE" "$POLAR_TOKEN_FILE")
+    scp_payload+=("$PARCA_UNIT_FILE" "$POLAR_ENV_FILE" "$POLAR_TOKEN_UPLOAD_FILE")
   fi
 
   run "${ssh_args[@]}" "mkdir -p $(shell_quote "$remote_tmp")"
@@ -406,6 +433,12 @@ if ! command -v parca-agent >/dev/null 2>&1; then
     $sudo_prefix snap install parca-agent --classic
   fi
 fi
+for i in {1..12}; do
+  if command -v parca-agent >/dev/null 2>&1 || [[ -x /snap/bin/parca-agent ]]; then
+    break
+  fi
+  sleep 2
+done
 agent_cmd="\$(command -v parca-agent || true)"
 if [[ -z "\$agent_cmd" && -x /snap/bin/parca-agent ]]; then
   agent_cmd=/snap/bin/parca-agent
@@ -421,7 +454,7 @@ if [[ ! -x /snap/bin/parca-agent ]]; then
   $sudo_prefix mkdir -p /snap/bin
   $sudo_prefix ln -sf "\$agent_cmd" /snap/bin/parca-agent
 fi
-$sudo_prefix install -m 0600 "$remote_tmp/$(basename "$POLAR_TOKEN_FILE")" /etc/parallax/polarsignals.token
+$sudo_prefix install -m 0600 "$remote_tmp/$(basename "$POLAR_TOKEN_UPLOAD_FILE")" /etc/parallax/polarsignals.token
 $sudo_prefix install -m 0644 "$remote_tmp/polarsignals.env" /etc/parallax/polarsignals.env
 $sudo_prefix install -m 0644 "$remote_tmp/parca-agent.service" /etc/systemd/system/parca-agent.service
 if command -v systemctl >/dev/null 2>&1; then
@@ -429,6 +462,28 @@ if command -v systemctl >/dev/null 2>&1; then
   $sudo_prefix systemctl enable parca-agent.service
   $sudo_prefix systemctl restart parca-agent.service
   $sudo_prefix systemctl --no-pager --full status parca-agent.service
+  if command -v curl >/dev/null 2>&1; then
+    ok=0
+    for i in {1..12}; do
+      metrics="\$(curl -fsS http://127.0.0.1:7071/metrics || true)"
+      if grep -q 'grpc_client_handled_total{grpc_code="OK",grpc_method="Write"' <<<"\$metrics"; then
+        ok=1
+        break
+      fi
+      sleep 10
+    done
+
+    if [[ "\$ok" != "1" ]]; then
+      echo "parca-agent is running, but Polar Signals Cloud write did not succeed." >&2
+      echo "Relevant metrics:" >&2
+      curl -s http://127.0.0.1:7071/metrics | egrep 'grpc_client_handled_total.*Write|sample_writes_total' >&2 || true
+      echo "If grpc_code is PermissionDenied, fix Polar Signals role binding: service account needs writer/profile-writer on this project." >&2
+      echo "If grpc_code is Unavailable, check projectID/token/network." >&2
+      exit 1
+    fi
+  else
+    echo "curl not found; skipping Polar Signals write verification" >&2
+  fi
 fi
 REMOTE_PROFILE
 )
@@ -489,6 +544,8 @@ DOCKER_IMAGE="${PARALLAX_DOCKER_IMAGE:-rust:1-bookworm}"
 INSTALL_BUILD_TOOLS="yes"
 PROFILE_MODE="none"
 POLAR_TOKEN_FILE=""
+POLAR_PROJECT_ID=""
+POLAR_TOKEN_UPLOAD_FILE=""
 POLAR_STORE_ADDRESS="grpc.polarsignals.com:443"
 POLAR_NODE=""
 POLAR_LABELS=""
@@ -518,6 +575,7 @@ while [[ $# -gt 0 ]]; do
     --no-install-build-tools) INSTALL_BUILD_TOOLS="no"; shift ;;
     --profile-mode) PROFILE_MODE=${2:-}; shift 2 ;;
     --polar-token-file) POLAR_TOKEN_FILE=${2:-}; shift 2 ;;
+    --polar-project-id) POLAR_PROJECT_ID=${2:-}; shift 2 ;;
     --polar-store-address) POLAR_STORE_ADDRESS=${2:-}; shift 2 ;;
     --polar-node) POLAR_NODE=${2:-}; shift 2 ;;
     --polar-labels) POLAR_LABELS=${2:-}; shift 2 ;;
@@ -568,6 +626,7 @@ require_safe_remote_path "--remote-config" "$REMOTE_CONFIG"
 require_safe_service_name "--service-name" "$SERVICE_NAME"
 require_no_space "--cargo-profile" "$CARGO_PROFILE"
 require_no_space "--profile-mode" "$PROFILE_MODE"
+require_no_space "--polar-project-id" "$POLAR_PROJECT_ID"
 require_no_space "--polar-store-address" "$POLAR_STORE_ADDRESS"
 require_no_space "--polar-node" "$POLAR_NODE"
 require_no_space "--polar-labels" "$POLAR_LABELS"
@@ -587,13 +646,16 @@ CLIENT_CFG="$DEPLOY_DIR/parallax.client.toml"
 UNIT_FILE="$DEPLOY_DIR/parallax.service"
 PARCA_UNIT_FILE="$DEPLOY_DIR/parca-agent.service"
 POLAR_ENV_FILE="$DEPLOY_DIR/polarsignals.env"
+POLAR_TOKEN_UPLOAD_FILE="$DEPLOY_DIR/polarsignals.token"
 
 build_host_tools_and_configs "$DEPLOY_DIR" "$SERVER_CFG" "$CLIENT_CFG"
 build_linux_binary "$ROOT"
 write_unit_file "$UNIT_FILE"
 if profiling_enabled; then
+  trap cleanup_polar_token_upload_file EXIT
   write_parca_agent_unit_file "$PARCA_UNIT_FILE"
   write_polar_env_file "$POLAR_ENV_FILE"
+  prepare_polar_token_file "$POLAR_TOKEN_UPLOAD_FILE"
 fi
 install_remote "$DEPLOY_DIR" "$SERVER_CFG" "$UNIT_FILE"
 
