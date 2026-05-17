@@ -355,10 +355,14 @@ async fn complete_tls_probe(
 }
 
 fn probe_client_config() -> rustls::ClientConfig {
-    let mut config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(ProbeServerCertVerifier))
-        .with_no_client_auth();
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("aws_lc_rs provider supports rustls default protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(ProbeServerCertVerifier))
+    .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     config.enable_early_data = false;
     config

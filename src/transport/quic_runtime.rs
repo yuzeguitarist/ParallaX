@@ -499,12 +499,16 @@ fn server_config(server: &ServerConfig) -> Result<quinn::ServerConfig, QuicRunti
     let cert_der = certified.cert.der().clone();
     let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
 
-    let mut tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .map_err(|err| QuicRuntimeError::TlsConfig(err.to_string()))?;
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|err| QuicRuntimeError::TlsConfig(err.to_string()))?
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der], key_der)
+    .map_err(|err| QuicRuntimeError::TlsConfig(err.to_string()))?;
     tls.alpn_protocols = vec![QUIC_ALPN.to_vec()];
-    tls.max_early_data_size = (MAX_AUTH_FRAME_LEN + MAX_CONNECT_FRAME_LEN + 4) as u32;
+    tls.max_early_data_size = u32::MAX;
 
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
         .map_err(|err| QuicRuntimeError::TlsConfig(err.to_string()))?;
@@ -514,10 +518,14 @@ fn server_config(server: &ServerConfig) -> Result<quinn::ServerConfig, QuicRunti
 }
 
 fn client_config() -> Result<quinn::ClientConfig, QuicRuntimeError> {
-    let mut tls = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptQuicServerCert))
-        .with_no_client_auth();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|err| QuicRuntimeError::TlsConfig(err.to_string()))?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptQuicServerCert))
+    .with_no_client_auth();
     tls.alpn_protocols = vec![QUIC_ALPN.to_vec()];
     tls.enable_early_data = true;
 

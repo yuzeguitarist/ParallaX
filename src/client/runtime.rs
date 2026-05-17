@@ -426,10 +426,14 @@ mod tests {
             STANDARD.decode(CAMOUFLAGE_KEY_DER_B64).unwrap(),
         ));
         Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![cert_der], key_der)
-                .unwrap(),
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("aws_lc_rs provider supports rustls default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap(),
         )
     }
 }
