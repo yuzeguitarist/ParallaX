@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::sni_filter::{parse_client_hello, SniFilter, SniVerdict};
+use super::sni_filter::{parse_client_hello, ClientHelloParseError, SniFilter, SniVerdict};
 use super::tls_fingerprint::{evaluate as evaluate_tls_fp, TlsFingerprintVerdict};
 
 /// State carried per (5-tuple) flow by MB-R.
@@ -29,6 +29,7 @@ pub struct MbrState {
     pub ja3: Option<String>,
     pub ja4: Option<String>,
     pub mbra_decision: Option<DualMbDecision>,
+    pub pending_client_hello: Vec<u8>,
     pub started: Instant,
 }
 
@@ -51,6 +52,7 @@ pub enum MbrStage {
 pub enum DualMbDecision {
     Allow,
     BlockSni { sni: String, matched_rule: String },
+    BlockEncryptedClientHello { kind: &'static str, ext_type: u16 },
     BlockFingerprint { fingerprint_summary: String },
     BlockNoSni,
     Suspicious { reason: String },
@@ -107,13 +109,54 @@ impl DualMiddlebox {
             ja3: None,
             ja4: None,
             mbra_decision: None,
+            pending_client_hello: Vec::new(),
             started: Instant::now(),
         });
 
         match state.stage {
             MbrStage::AwaitingClientHello => {
-                let verdict = self.mbra_filter.evaluate(record);
-                let fp_verdict = evaluate_tls_fp(record);
+                let candidate_owned;
+                let candidate = if state.pending_client_hello.is_empty() {
+                    record
+                } else {
+                    state.pending_client_hello.extend_from_slice(record);
+                    candidate_owned = state.pending_client_hello.clone();
+                    candidate_owned.as_slice()
+                };
+
+                let parsed = match parse_client_hello(candidate) {
+                    Ok(parsed) => parsed,
+                    Err(err)
+                        if state.pending_client_hello.is_empty()
+                            && is_incomplete_client_hello(&err) =>
+                    {
+                        state.pending_client_hello.extend_from_slice(record);
+                        let decision = DualMbDecision::Suspicious {
+                            reason: format!("buffering fragmented ClientHello ({err})"),
+                        };
+                        state.mbra_decision = Some(decision.clone());
+                        return decision;
+                    }
+                    Err(err)
+                        if is_incomplete_client_hello(&err)
+                            && state.pending_client_hello.len() < 8192 =>
+                    {
+                        let decision = DualMbDecision::Suspicious {
+                            reason: format!("buffering fragmented ClientHello ({err})"),
+                        };
+                        state.mbra_decision = Some(decision.clone());
+                        return decision;
+                    }
+                    Err(_) => {
+                        let decision = DualMbDecision::Allow;
+                        state.mbra_decision = Some(decision.clone());
+                        state.stage = MbrStage::Resolved;
+                        return decision;
+                    }
+                };
+                state.pending_client_hello.clear();
+                let verdict = self.mbra_filter.evaluate_parsed(&parsed);
+                let fp_verdict = evaluate_tls_fp(candidate);
                 match (verdict, fp_verdict) {
                     (SniVerdict::Block { sni, matched_rule }, _) => {
                         let decision = DualMbDecision::BlockSni {
@@ -121,6 +164,15 @@ impl DualMiddlebox {
                             matched_rule: matched_rule.clone(),
                         };
                         state.sni = Some(sni);
+                        state.mbra_decision = Some(decision.clone());
+                        state.stage = MbrStage::Resolved;
+                        decision
+                    }
+                    (SniVerdict::BlockEncryptedClientHello { kind, ext_type }, _) => {
+                        let decision = DualMbDecision::BlockEncryptedClientHello {
+                            kind: kind.label(),
+                            ext_type,
+                        };
                         state.mbra_decision = Some(decision.clone());
                         state.stage = MbrStage::Resolved;
                         decision
@@ -176,9 +228,6 @@ impl DualMiddlebox {
                         decision
                     }
                     (SniVerdict::NoSni, _) => {
-                        // MB-RA can't tell yet - defer to MB-R after server
-                        // certificate is observed. Per Bock et al. this is
-                        // exactly how the GFW handles ESNI/ECH today.
                         let decision = DualMbDecision::Suspicious {
                             reason: "no SNI extension".to_owned(),
                         };
@@ -187,8 +236,6 @@ impl DualMiddlebox {
                         decision
                     }
                     (SniVerdict::NotTls, _) => {
-                        // Not a TLS handshake at all - pass through; outer
-                        // layers (fully_encrypted, etc.) own this case.
                         let decision = DualMbDecision::Allow;
                         state.mbra_decision = Some(decision.clone());
                         state.stage = MbrStage::Resolved;
@@ -268,6 +315,15 @@ impl DualMiddlebox {
     }
 }
 
+fn is_incomplete_client_hello(err: &ClientHelloParseError) -> bool {
+    matches!(
+        err,
+        ClientHelloParseError::Truncated
+            | ClientHelloParseError::LengthMismatch
+            | ClientHelloParseError::UnexpectedEof(_)
+    )
+}
+
 /// Lightweight helper that classifies the first byte of a record into the broad
 /// TLS content type. Used by the runtime middlebox to drive `DualMiddlebox`
 /// transitions without owning a full TLS parser.
@@ -340,6 +396,27 @@ mod tests {
                 assert_eq!(matched_rule, "*.shadowsocks.io");
             }
             other => panic!("expected BlockSni, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reassembles_fragmented_clienthello_before_sni_decision() {
+        let record = parallax_client_hello("relay7.shadowsocks.io");
+        let mut mb = DualMiddlebox::default();
+        let flow = test_flow();
+        let split = 16;
+        match mb.on_client_record(flow, &record[..split]) {
+            DualMbDecision::Suspicious { reason } => {
+                assert!(reason.contains("fragmented ClientHello"));
+            }
+            other => panic!("expected buffering decision, got {other:?}"),
+        }
+        match mb.on_client_record(flow, &record[split..]) {
+            DualMbDecision::BlockSni { sni, matched_rule } => {
+                assert_eq!(sni, "relay7.shadowsocks.io");
+                assert_eq!(matched_rule, "*.shadowsocks.io");
+            }
+            other => panic!("expected BlockSni after reassembly, got {other:?}"),
         }
     }
 

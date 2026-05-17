@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use crate::gfw_sim::detection::{
     active_prober::ProbeAggregate, burst_statistics::BurstVerdict, dns_inject::DnsAction,
-    fully_encrypted::FullyEncryptedVerdict, quic_initial::QuicInitialVerdict,
-    sni_filter::SniVerdict, tcp_dual_mb::DualMbDecision, tls_fingerprint::TlsFingerprintVerdict,
+    fully_encrypted::FullyEncryptedVerdict, http_host::HttpHostVerdict,
+    quic_initial::QuicInitialVerdict, sni_filter::SniVerdict, tcp_dual_mb::DualMbDecision,
+    tls_fingerprint::TlsFingerprintVerdict,
 };
 use crate::gfw_sim::injection::EgressAction;
 
@@ -63,6 +64,10 @@ impl From<SniVerdict> for LayerVerdict {
                 "sni_filter",
                 format!("SNI={sni} matched_rule={matched_rule}"),
             ),
+            SniVerdict::BlockEncryptedClientHello { kind, ext_type } => LayerVerdict::block(
+                "sni_filter",
+                format!("{} extension type=0x{ext_type:04x}", kind.label()),
+            ),
             SniVerdict::NoSni => LayerVerdict::suspicious("sni_filter", "no SNI extension"),
             SniVerdict::NotTls => LayerVerdict::inconclusive("sni_filter", "not a TLS record"),
         }
@@ -77,6 +82,10 @@ impl From<DualMbDecision> for LayerVerdict {
                 "tcp_dual_mb",
                 format!("SNI={sni} matched_rule={matched_rule}"),
             ),
+            DualMbDecision::BlockEncryptedClientHello { kind, ext_type } => LayerVerdict::block(
+                "tcp_dual_mb",
+                format!("{kind} extension type=0x{ext_type:04x}"),
+            ),
             DualMbDecision::BlockFingerprint {
                 fingerprint_summary,
             } => LayerVerdict::block("tcp_dual_mb", fingerprint_summary),
@@ -84,6 +93,22 @@ impl From<DualMbDecision> for LayerVerdict {
             DualMbDecision::Suspicious { reason } => {
                 LayerVerdict::suspicious("tcp_dual_mb", reason)
             }
+        }
+    }
+}
+
+impl From<HttpHostVerdict> for LayerVerdict {
+    fn from(v: HttpHostVerdict) -> Self {
+        match v {
+            HttpHostVerdict::Allow { host } => {
+                LayerVerdict::allow("http_host", format!("Host={host}"))
+            }
+            HttpHostVerdict::Block { host, matched_rule } => LayerVerdict::block(
+                "http_host",
+                format!("Host={host} matched_rule={matched_rule}"),
+            ),
+            HttpHostVerdict::NoHost => LayerVerdict::suspicious("http_host", "no Host header"),
+            HttpHostVerdict::NotHttp => LayerVerdict::inconclusive("http_host", "not HTTP"),
         }
     }
 }
@@ -227,10 +252,15 @@ impl From<DnsAction> for LayerVerdict {
         match v {
             DnsAction::Allow => LayerVerdict::allow("dns_inject", "no keyword match"),
             DnsAction::InjectFakeResponse {
-                matched_keyword, ..
+                matched_keyword,
+                injector_trace,
+                ..
             } => LayerVerdict::block(
                 "dns_inject",
-                format!("injected fake A-record for keyword={matched_keyword}"),
+                format!(
+                    "injected fake A-record for keyword={matched_keyword} via {} injectors",
+                    injector_trace.len()
+                ),
             ),
             DnsAction::Drop { matched_keyword } => LayerVerdict::block(
                 "dns_inject",

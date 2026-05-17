@@ -242,9 +242,8 @@ async fn probe_with_timeout(
         );
     }
     if matches!(tls.alpn.as_deref(), Some("h2")) {
-        notes.push(
-            "Target negotiated HTTP/2 (ALPN h2): better browser-like camouflage.".to_owned(),
-        );
+        notes
+            .push("Target negotiated HTTP/2 (ALPN h2): better browser-like camouflage.".to_owned());
     }
     if tls.post_handshake_records == 0 {
         notes.push(
@@ -404,7 +403,9 @@ async fn flush_tls(
 async fn read_tls_record(stream: &mut TcpStream, deadline: Duration) -> Result<Vec<u8>, String> {
     timeout(deadline, read_record(stream))
         .await
-        .map_err(|_| "timed out waiting for TLS ciphertext; try a more stable upstream.".to_owned())?
+        .map_err(|_| {
+            "timed out waiting for TLS ciphertext; try a more stable upstream.".to_owned()
+        })?
         .map_err(|err| format!("TLS record read failed: {err}"))
 }
 
