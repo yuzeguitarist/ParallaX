@@ -94,6 +94,7 @@ pub struct ClientConfig {
     pub server_addr: String,
     pub sni: String,
     pub server_public_key: String,
+    #[serde(default)]
     pub server_pq_public_key: String,
     pub server_identity_public_key: String,
     #[serde(default)]
@@ -107,6 +108,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub data_target: Option<String>,
     pub private_key: String,
+    #[serde(default)]
     pub pq_secret_key: String,
     pub identity_secret_key: String,
     #[serde(default = "default_replay_cache_path")]
@@ -169,7 +171,12 @@ impl Config {
                 require_host_port("client.server_addr", &client.server_addr)?;
                 require_non_empty("client.sni", &client.sni)?;
                 decode_key32("client.server_public_key", &client.server_public_key)?;
-                decode_base64_bytes("client.server_pq_public_key", &client.server_pq_public_key)?;
+                if !client.server_pq_public_key.is_empty() {
+                    decode_base64_bytes(
+                        "client.server_pq_public_key",
+                        &client.server_pq_public_key,
+                    )?;
+                }
                 decode_base64_bytes(
                     "client.server_identity_public_key",
                     &client.server_identity_public_key,
@@ -182,7 +189,9 @@ impl Config {
                     require_host_port("server.data_target", data_target)?;
                 }
                 decode_key32_secret("server.private_key", &server.private_key)?;
-                decode_base64_secret("server.pq_secret_key", &server.pq_secret_key)?;
+                if !server.pq_secret_key.is_empty() {
+                    decode_base64_secret("server.pq_secret_key", &server.pq_secret_key)?;
+                }
                 decode_base64_secret("server.identity_secret_key", &server.identity_secret_key)?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
@@ -387,6 +396,49 @@ server_identity_public_key = "{KEY}"
         );
         let cfg = toml::from_str::<Config>(&raw).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validates_configs_without_legacy_static_pq_keys() {
+        let client_raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{KEY}"
+"#
+        );
+        toml::from_str::<Config>(&client_raw)
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        let server_raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{KEY}"
+authorized_sni = ["example.com"]
+"#
+        );
+        toml::from_str::<Config>(&server_raw)
+            .unwrap()
+            .validate()
+            .unwrap();
     }
 
     #[test]
