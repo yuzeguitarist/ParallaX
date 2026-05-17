@@ -155,6 +155,12 @@ build_host_tools_and_configs() {
       --output "$deploy_dir"
   fi
 
+  # plx check refuses group/other bits on config files (default umask often yields 0644).
+  if [[ "$DRY_RUN" == "0" ]]; then
+    [[ -f "$server_cfg" ]] && chmod 600 "$server_cfg"
+    [[ -f "$client_cfg" ]] && chmod 600 "$client_cfg"
+  fi
+
   run cargo run --locked --quiet --bin plx -- check -c "$server_cfg"
   run cargo run --locked --quiet --bin plx -- check -c "$client_cfg"
 
