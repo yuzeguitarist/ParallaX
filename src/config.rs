@@ -5,6 +5,8 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use pqcrypto_mldsa::mldsa87;
+use pqcrypto_mlkem::mlkem1024;
 use serde::Deserialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -32,6 +34,12 @@ pub enum ConfigError {
     InvalidKeyLen { field: &'static str },
     #[error("{field} must be valid base64")]
     InvalidBytes { field: &'static str },
+    #[error("{field} must decode to exactly {expected} bytes, got {actual}")]
+    InvalidBytesLen {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     #[error("crypto.psk must decode to at least 32 bytes")]
     WeakPsk,
     #[error("traffic.max_padding must be >= traffic.min_padding")]
@@ -179,14 +187,16 @@ impl Config {
                 require_non_empty("client.sni", &client.sni)?;
                 decode_key32("client.server_public_key", &client.server_public_key)?;
                 if !client.server_pq_public_key.is_empty() {
-                    decode_base64_bytes(
+                    decode_base64_bytes_exact(
                         "client.server_pq_public_key",
                         &client.server_pq_public_key,
+                        mlkem1024::public_key_bytes(),
                     )?;
                 }
-                decode_base64_bytes(
+                decode_base64_bytes_exact(
                     "client.server_identity_public_key",
                     &client.server_identity_public_key,
+                    mldsa87::public_key_bytes(),
                 )?;
             }
             Mode::Server => {
@@ -197,9 +207,17 @@ impl Config {
                 }
                 decode_key32_secret("server.private_key", &server.private_key)?;
                 if !server.pq_secret_key.is_empty() {
-                    decode_base64_secret("server.pq_secret_key", &server.pq_secret_key)?;
+                    decode_base64_secret_exact(
+                        "server.pq_secret_key",
+                        &server.pq_secret_key,
+                        mlkem1024::secret_key_bytes(),
+                    )?;
                 }
-                decode_base64_secret("server.identity_secret_key", &server.identity_secret_key)?;
+                decode_base64_secret_exact(
+                    "server.identity_secret_key",
+                    &server.identity_secret_key,
+                    mldsa87::secret_key_bytes(),
+                )?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
                 }
@@ -327,15 +345,65 @@ pub fn decode_base64_secret(
     Ok(Zeroizing::new(decoded))
 }
 
+pub fn decode_base64_bytes_exact(
+    field: &'static str,
+    value: &str,
+    expected: usize,
+) -> Result<Vec<u8>, ConfigError> {
+    let decoded = decode_base64_bytes(field, value)?;
+    if decoded.len() != expected {
+        return Err(ConfigError::InvalidBytesLen {
+            field,
+            expected,
+            actual: decoded.len(),
+        });
+    }
+    Ok(decoded)
+}
+
+pub fn decode_base64_secret_exact(
+    field: &'static str,
+    value: &str,
+    expected: usize,
+) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
+    let decoded = decode_base64_secret(field, value)?;
+    if decoded.len() != expected {
+        return Err(ConfigError::InvalidBytesLen {
+            field,
+            expected,
+            actual: decoded.len(),
+        });
+    }
+    Ok(decoded)
+}
+
 fn require_host_port(field: &'static str, value: &str) -> Result<(), ConfigError> {
-    if value.rsplit_once(':').is_some() {
-        Ok(())
-    } else {
-        Err(ConfigError::InvalidSocket {
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Err(ConfigError::InvalidSocket {
             field,
             value: value.to_owned(),
-        })
+        });
+    };
+    if host.trim().is_empty() || port.parse::<u16>().is_err() {
+        return Err(ConfigError::InvalidSocket {
+            field,
+            value: value.to_owned(),
+        });
     }
+    let bracketed = host.starts_with('[') || host.ends_with(']');
+    if bracketed && !(host.starts_with('[') && host.ends_with(']') && host.len() > 2) {
+        return Err(ConfigError::InvalidSocket {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err(ConfigError::InvalidSocket {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -385,6 +453,8 @@ mod tests {
 
     #[test]
     fn validates_client_config() {
+        let server_pq_public_key = STANDARD.encode(vec![0_u8; mlkem1024::public_key_bytes()]);
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
         let raw = format!(
             r#"
 mode = "client"
@@ -397,8 +467,8 @@ listen = "127.0.0.1:1080"
 server_addr = "example.com:443"
 sni = "example.com"
 server_public_key = "{KEY}"
-server_pq_public_key = "{KEY}"
-server_identity_public_key = "{KEY}"
+server_pq_public_key = "{server_pq_public_key}"
+server_identity_public_key = "{server_identity_public_key}"
 "#
         );
         let cfg = toml::from_str::<Config>(&raw).unwrap();
@@ -407,6 +477,8 @@ server_identity_public_key = "{KEY}"
 
     #[test]
     fn validates_configs_without_legacy_static_pq_keys() {
+        let identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
         let client_raw = format!(
             r#"
 mode = "client"
@@ -419,7 +491,7 @@ listen = "127.0.0.1:1080"
 server_addr = "example.com:443"
 sni = "example.com"
 server_public_key = "{KEY}"
-server_identity_public_key = "{KEY}"
+server_identity_public_key = "{identity_public_key}"
 "#
         );
         toml::from_str::<Config>(&client_raw)
@@ -438,7 +510,7 @@ psk = "{KEY}"
 listen = "127.0.0.1:8443"
 fallback_addr = "example.com:443"
 private_key = "{KEY}"
-identity_secret_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
 authorized_sni = ["example.com"]
 "#
         );
@@ -537,6 +609,7 @@ server_identity_public_key = "{KEY}"
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.toml");
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -548,8 +621,7 @@ psk = "{KEY}"
 listen = "127.0.0.1:8443"
 fallback_addr = "example.com:443"
 private_key = "{KEY}"
-pq_secret_key = "{KEY}"
-identity_secret_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
 authorized_sni = ["example.com"]
 "#
         );
@@ -563,5 +635,42 @@ authorized_sni = ["example.com"]
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         Config::load(&path).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_host_port() {
+        let err = require_host_port("client.server_addr", "example.com:").unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidSocket { .. }));
+
+        let err = require_host_port("client.server_addr", ":443").unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidSocket { .. }));
+
+        let err = require_host_port("client.server_addr", "::1:443").unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidSocket { .. }));
+
+        require_host_port("client.server_addr", "[::1]:443").unwrap();
+        require_host_port("client.server_addr", "example.com:443").unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_pq_key_length_during_validation() {
+        let err = decode_base64_bytes_exact(
+            "client.server_pq_public_key",
+            KEY,
+            mlkem1024::public_key_bytes(),
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::InvalidBytesLen {
+                field,
+                expected,
+                actual,
+            } => {
+                assert_eq!(field, "client.server_pq_public_key");
+                assert_eq!(expected, mlkem1024::public_key_bytes());
+                assert_eq!(actual, 32);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

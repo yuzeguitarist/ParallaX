@@ -25,6 +25,7 @@ use tokio::{
 };
 
 use crate::{
+    client::initial_payload,
     client::socks,
     config::{decode_psk, ClientConfig, Config, ConfigError, Mode, ServerConfig},
     crypto::replay::{ReplayCache, ReplayCacheError, ReplayEntry},
@@ -273,12 +274,16 @@ async fn handle_local_connection(
 ) -> Result<(), QuicRuntimeError> {
     tune_tcp_stream(&local)?;
     let request = socks::accept_connect(&mut local).await?;
+    let initial_payload_cap =
+        ConnectRequest::max_initial_payload_len(&request.host, MAX_CONNECT_FRAME_LEN);
+    let initial_payload =
+        initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
     let connection = connect_with_0rtt(&endpoint, server_addr, &client.sni).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     let connect = ConnectRequest {
         host: request.host,
         port: request.port,
-        initial_payload: Vec::new(),
+        initial_payload,
     };
     write_authenticated_connect_request(&mut send, &connection, &psk, &client.sni, &connect)
         .await?;

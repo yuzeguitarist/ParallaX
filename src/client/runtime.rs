@@ -1,4 +1,4 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::Arc};
 
 use rand::{
     rngs::{OsRng, StdRng},
@@ -11,10 +11,11 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    time::{sleep, timeout, Instant},
+    time::{sleep, Instant},
 };
 
 use crate::{
+    client::initial_payload,
     client::socks::{self, SocksError, SocksRequest},
     config::{
         decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
@@ -33,8 +34,6 @@ use crate::{
     transport::tcp::tune_tcp_stream,
 };
 
-const INITIAL_PAYLOAD_CAPTURE_TIMEOUT: Duration = Duration::from_millis(2);
-const MAX_INITIAL_PAYLOAD_CAPTURE: usize = 4096;
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 
 #[derive(Debug, Error)]
@@ -115,7 +114,9 @@ pub async fn handle_local_connection(
     tune_tcp_stream(&local)?;
     let request = socks::accept_connect(&mut local).await?;
     let chunk_size = max_plaintext_len(traffic.max_padding);
-    let initial_payload = read_initial_payload(&mut local, chunk_size).await?;
+    let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
+    let initial_payload =
+        initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
     let mut server = TcpStream::connect(&config.server_addr).await?;
     tune_tcp_stream(&server)?;
 
@@ -186,26 +187,6 @@ async fn read_server_identity_payload(
         if assembled.len() > total_len {
             return Err(ClientRuntimeError::InvalidServerIdentityChunks);
         }
-    }
-}
-
-async fn read_initial_payload(
-    local: &mut TcpStream,
-    chunk_size: usize,
-) -> Result<Vec<u8>, io::Error> {
-    let cap = chunk_size.min(MAX_INITIAL_PAYLOAD_CAPTURE);
-    if cap == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut buf = vec![0_u8; cap];
-    match timeout(INITIAL_PAYLOAD_CAPTURE_TIMEOUT, local.read(&mut buf)).await {
-        Ok(Ok(n)) => {
-            buf.truncate(n);
-            Ok(buf)
-        }
-        Ok(Err(err)) => Err(err),
-        Err(_) => Ok(Vec::new()),
     }
 }
 
