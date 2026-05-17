@@ -15,6 +15,7 @@ use rustls::{
     DigitallySignedStruct, SignatureScheme,
 };
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
     io::{copy, AsyncWriteExt},
@@ -395,7 +396,7 @@ fn verify_auth_frame(
         &parsed.sni,
         connect_payload,
     );
-    if expected != parsed.tag {
+    if !bool::from(expected.ct_eq(&parsed.tag)) {
         return Err(QuicRuntimeError::AuthTagMismatch);
     }
 
