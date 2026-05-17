@@ -7,7 +7,7 @@ use std::{
 
 use thiserror::Error;
 
-pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 10 * 60;
+pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 2 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayEntry {
