@@ -52,7 +52,7 @@ use crate::{
     },
     tls::{
         client_hello::parse_client_hello,
-        record::{read_record, spawn_record_reader, RecordReader},
+        record::{log_record_read, read_record, TlsRecordReader},
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
@@ -462,28 +462,18 @@ async fn run_authenticated_data_mode(
 
     let (client_read, mut client_write) = handshake.client.into_split();
     let (fallback_read, mut fallback_write) = handshake.fallback.into_split();
-    let mut client_records = spawn_record_reader(
-        client_read,
-        cid,
-        "client->server",
-        "server-predata-client-reader",
-    );
-    let mut fallback_records = spawn_record_reader(
-        fallback_read,
-        cid,
-        "fallback->server",
-        "server-predata-fallback-reader",
-    );
+    let mut client_records = TlsRecordReader::new(client_read);
+    let mut fallback_records = TlsRecordReader::new(fallback_read);
 
     loop {
         tokio::select! {
-            record = client_records.recv() => {
+            record = client_records.read_record() => {
                 let record = match record {
-                    Some(Ok(record)) => record,
-                    Some(Err(err)) if is_clean_close(&err) => return Ok(()),
-                    Some(Err(err)) => return Err(HandshakeServerError::Io(err)),
-                    None => return Ok(()),
+                    Ok(record) => record,
+                    Err(err) if is_clean_close(&err) => return Ok(()),
+                    Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
+                log_record_read(cid, "client->server", "server-predata-client-reader", &record);
 
                 match client_open.open(&record) {
                     Ok(first_payload) => {
@@ -553,14 +543,10 @@ async fn run_authenticated_data_mode(
                             }
                         }
 
-                        let record = match client_records.recv().await {
-                            Some(Ok(record)) => record,
-                            Some(Err(err)) => return Err(HandshakeServerError::Io(err)),
-                            None => return Ok(()),
-                        };
-                        let first_payload = client_open.open(&record)?;
-                        drop(fallback_records);
                         drop(fallback_write);
+                        let record = client_records.read_record().await?;
+                        log_record_read(cid, "client->server", "server-connect-reader", &record);
+                        let first_payload = client_open.open(&record)?;
                         tracing::debug!(cid, "ParallaX data mode switch confirmed");
 
                         let (target_addr, initial_payload) =
@@ -592,13 +578,13 @@ async fn run_authenticated_data_mode(
                     Err(err) => return Err(HandshakeServerError::DataRecord(err)),
                 }
             }
-            record = fallback_records.recv() => {
+            record = fallback_records.read_record() => {
                 let record = match record {
-                    Some(Ok(record)) => record,
-                    Some(Err(err)) if is_clean_close(&err) => return Ok(()),
-                    Some(Err(err)) => return Err(HandshakeServerError::Io(err)),
-                    None => return Ok(()),
+                    Ok(record) => record,
+                    Err(err) if is_clean_close(&err) => return Ok(()),
+                    Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
+                log_record_read(cid, "fallback->server", "server-predata-fallback-reader", &record);
                 if let Ok(header) = crate::tls::record::parse_header(&record) {
                     tracing::debug!(
                         cid,
@@ -655,7 +641,7 @@ fn apply_server_pq_rekey(
 }
 
 struct DataRelay {
-    client_records: RecordReader,
+    client_records: TlsRecordReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     target_read: OwnedReadHalf,
     target_write: OwnedWriteHalf,
@@ -668,39 +654,51 @@ struct DataRelay {
 }
 
 impl DataRelay {
-    async fn run(mut self) -> Result<(), HandshakeServerError> {
-        let mut target_buf = vec![0_u8; relay_read_buffer_len(self.chunk_size)];
+    async fn run(self) -> Result<(), HandshakeServerError> {
+        let DataRelay {
+            mut client_records,
+            mut client_write,
+            mut target_read,
+            mut target_write,
+            mut client_open,
+            mut server_seal,
+            timing,
+            cover,
+            chunk_size,
+            cid,
+        } = self;
+        let mut target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
         let mut rng = StdRng::from_entropy();
-        let mut cover_sleep = Box::pin(sleep(self.cover.sample_interval(&mut rng)));
+        let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
         loop {
             tokio::select! {
-                _ = &mut cover_sleep, if self.cover.is_enabled() => {
+                _ = &mut cover_sleep, if cover.is_enabled() => {
                     write_server_data_records_chunked(
-                        &mut self.client_write,
-                        &mut self.server_seal,
+                        &mut client_write,
+                        &mut server_seal,
                         &[],
                         &mut rng,
-                        self.cid,
+                        cid,
                         "server->client",
                         "server-cover-writer",
                     )
                     .await?;
                     cover_sleep.as_mut().reset(
-                        Instant::now() + self.cover.sample_interval(&mut rng),
+                        Instant::now() + cover.sample_interval(&mut rng),
                     );
                 }
-                record = self.client_records.recv() => {
+                record = client_records.read_record() => {
                     let record = match record {
-                        Some(Ok(record)) => record,
-                        Some(Err(err)) if is_clean_close(&err) => return Ok(()),
-                        Some(Err(err)) => return Err(HandshakeServerError::Io(err)),
-                        None => return Ok(()),
+                        Ok(record) => record,
+                        Err(err) if is_clean_close(&err) => return Ok(()),
+                        Err(err) => return Err(HandshakeServerError::Io(err)),
                     };
-                    match self.client_open.open(&record) {
+                    log_record_read(cid, "client->server", "server-data-client-reader", &record);
+                    match client_open.open(&record) {
                         Ok(payload) => {
                             if !payload.is_empty() {
-                                self.target_write.write_all(&payload).await?;
+                                target_write.write_all(&payload).await?;
                             }
                         }
                         Err(err) => {
@@ -708,23 +706,23 @@ impl DataRelay {
                         }
                     }
                 }
-                read = self.target_read.read(&mut target_buf) => {
+                read = target_read.read(&mut target_buf) => {
                     let n = read?;
                     if n == 0 {
                         return Ok(());
                     }
 
-                    let delay = self.timing.sample_delay(&mut rng);
+                    let delay = timing.sample_delay(&mut rng);
                     if !delay.is_zero() {
                         sleep(delay).await;
                     }
 
                     write_server_data_records_chunked(
-                        &mut self.client_write,
-                        &mut self.server_seal,
+                        &mut client_write,
+                        &mut server_seal,
                         &target_buf[..n],
                         &mut rng,
-                        self.cid,
+                        cid,
                         "server->client",
                         "server-download-writer",
                     )

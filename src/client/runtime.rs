@@ -34,7 +34,7 @@ use crate::{
     protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordError},
     tls::{
         backend::TlsBackendError,
-        record::{read_record, spawn_record_reader, TlsRecordError},
+        record::{log_record_read, read_record, TlsRecordError, TlsRecordReader},
         stateful::StatefulRustlsCamouflageBackend,
     },
     traffic::CoverTrafficProfile,
@@ -318,60 +318,65 @@ struct ClientRelay {
 }
 
 impl ClientRelay {
-    async fn run(mut self) -> Result<(), ClientRuntimeError> {
-        let mut local_buf = vec![0_u8; relay_read_buffer_len(self.chunk_size)];
-        let mut server_records = spawn_record_reader(
-            self.server_read,
-            self.cid,
-            "server->client",
-            "client-outer-reader",
-        );
+    async fn run(self) -> Result<(), ClientRuntimeError> {
+        let ClientRelay {
+            mut local_read,
+            mut local_write,
+            server_read,
+            mut server_write,
+            mut data_session,
+            chunk_size,
+            cover,
+            cid,
+        } = self;
+        let mut local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+        let mut server_records = TlsRecordReader::new(server_read);
         let mut rng = StdRng::from_entropy();
-        let mut cover_sleep = Box::pin(sleep(self.cover.sample_interval(&mut rng)));
+        let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
         loop {
             tokio::select! {
-                _ = &mut cover_sleep, if self.cover.is_enabled() => {
+                _ = &mut cover_sleep, if cover.is_enabled() => {
                     write_client_data_records_chunked(
-                        &mut self.server_write,
-                        &mut self.data_session,
+                        &mut server_write,
+                        &mut data_session,
                         &[],
                         &mut rng,
-                        self.cid,
+                        cid,
                         "client->server",
                         "client-cover-writer",
                     )
                     .await?;
-                    cover_sleep.as_mut().reset(Instant::now() + self.cover.sample_interval(&mut rng));
+                    cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
                 }
-                read = self.local_read.read(&mut local_buf) => {
+                read = local_read.read(&mut local_buf) => {
                     let n = read?;
                     if n == 0 {
                         return Ok(());
                     }
                     write_client_data_records_chunked(
-                        &mut self.server_write,
-                        &mut self.data_session,
+                        &mut server_write,
+                        &mut data_session,
                         &local_buf[..n],
                         &mut rng,
-                        self.cid,
+                        cid,
                         "client->server",
                         "client-upload-writer",
                     )
                     .await?;
                 }
-                record = server_records.recv() => {
+                record = server_records.read_record() => {
                     let record = match record {
-                        Some(Ok(record)) => record,
-                        Some(Err(err)) if is_clean_close(&err) => return Ok(()),
-                        Some(Err(err)) => return Err(ClientRuntimeError::Io(err)),
-                        None => return Ok(()),
+                        Ok(record) => record,
+                        Err(err) if is_clean_close(&err) => return Ok(()),
+                        Err(err) => return Err(ClientRuntimeError::Io(err)),
                     };
+                    log_record_read(cid, "server->client", "client-outer-reader", &record);
 
-                    match self.data_session.open_server_record(&record) {
+                    match data_session.open_server_record(&record) {
                         Ok(payload) => {
                             if !payload.is_empty() {
-                                self.local_write.write_all(&payload).await?;
+                                local_write.write_all(&payload).await?;
                             }
                         }
                         Err(err) => {

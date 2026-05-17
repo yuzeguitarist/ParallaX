@@ -1,9 +1,5 @@
 use thiserror::Error;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    sync::mpsc,
-    task::JoinHandle,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const TLS_HEADER_LEN: usize = 5;
 pub const TLS_LEGACY_VERSION: [u8; 2] = [0x03, 0x03];
@@ -81,80 +77,100 @@ pub async fn read_record<R>(reader: &mut R) -> Result<Vec<u8>, std::io::Error>
 where
     R: AsyncRead + Unpin,
 {
-    let mut header = [0_u8; TLS_HEADER_LEN];
-    reader.read_exact(&mut header).await?;
-
-    let parsed = parse_header(&header).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid TLS record header: {err}"),
-        )
-    })?;
-    let payload_len = parsed.payload_len;
-
-    let mut record = Vec::with_capacity(TLS_HEADER_LEN + payload_len);
-    record.extend_from_slice(&header);
-    record.resize(TLS_HEADER_LEN + payload_len, 0);
-    reader.read_exact(&mut record[TLS_HEADER_LEN..]).await?;
-    Ok(record)
+    TlsRecordReader::new(reader).read_record().await
 }
 
-pub type RecordReadResult = Result<Vec<u8>, std::io::Error>;
-
-pub struct RecordReader {
-    records: mpsc::Receiver<RecordReadResult>,
-    task: JoinHandle<()>,
+pub struct TlsRecordReader<R> {
+    reader: R,
+    header: [u8; TLS_HEADER_LEN],
+    header_pos: usize,
+    record: Vec<u8>,
+    payload_len: Option<usize>,
+    payload_pos: usize,
 }
 
-impl RecordReader {
-    pub async fn recv(&mut self) -> Option<RecordReadResult> {
-        self.records.recv().await
-    }
-}
-
-impl Drop for RecordReader {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-pub fn spawn_record_reader<R>(
-    mut reader: R,
-    cid: u64,
-    direction: &'static str,
-    task_name: &'static str,
-) -> RecordReader
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let (tx, records) = mpsc::channel(32);
-    let task = tokio::spawn(async move {
-        loop {
-            let result = read_record(&mut reader).await;
-            match result {
-                Ok(record) => {
-                    if let Ok(header) = parse_header(&record) {
-                        tracing::debug!(
-                            cid,
-                            direction,
-                            task_name,
-                            tls_content_type = header.content_type,
-                            outer_tls_payload_len = header.payload_len,
-                            "outer TLS record read"
-                        );
-                    }
-                    if tx.send(Ok(record)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    break;
-                }
-            }
+impl<R> TlsRecordReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            header: [0_u8; TLS_HEADER_LEN],
+            header_pos: 0,
+            record: Vec::new(),
+            payload_len: None,
+            payload_pos: 0,
         }
-    });
-    RecordReader { records, task }
+    }
+
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+}
+
+impl<R> TlsRecordReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    pub async fn read_record(&mut self) -> Result<Vec<u8>, std::io::Error> {
+        while self.header_pos < TLS_HEADER_LEN {
+            let n = self
+                .reader
+                .read(&mut self.header[self.header_pos..])
+                .await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "TLS record header ended early",
+                ));
+            }
+            self.header_pos += n;
+        }
+
+        if self.payload_len.is_none() {
+            let parsed = parse_header(&self.header).map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid TLS record header: {err}"),
+                )
+            })?;
+            self.record.clear();
+            self.record.extend_from_slice(&self.header);
+            self.record.resize(parsed.total_len, 0);
+            self.payload_len = Some(parsed.payload_len);
+            self.payload_pos = 0;
+        }
+
+        let payload_len = self.payload_len.expect("payload length is initialized");
+        while self.payload_pos < payload_len {
+            let start = TLS_HEADER_LEN + self.payload_pos;
+            let n = self.reader.read(&mut self.record[start..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "TLS record payload ended early",
+                ));
+            }
+            self.payload_pos += n;
+        }
+
+        self.header = [0_u8; TLS_HEADER_LEN];
+        self.header_pos = 0;
+        self.payload_len = None;
+        self.payload_pos = 0;
+        Ok(std::mem::take(&mut self.record))
+    }
+}
+
+pub fn log_record_read(cid: u64, direction: &'static str, task_name: &'static str, record: &[u8]) {
+    if let Ok(header) = parse_header(record) {
+        tracing::debug!(
+            cid,
+            direction,
+            task_name,
+            tls_content_type = header.content_type,
+            outer_tls_payload_len = header.payload_len,
+            "outer TLS record read"
+        );
+    }
 }
 
 #[cfg(test)]
