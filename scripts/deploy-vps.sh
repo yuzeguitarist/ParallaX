@@ -42,6 +42,8 @@ Options:
   --docker-image <image>       Docker Rust image. Defaults to rust:1-bookworm.
   --install-build-tools        Install missing local build helpers when possible. Default in auto mode.
   --no-install-build-tools     Do not install missing local build helpers; fail with instructions instead.
+  --enable-bbr                 Configure VPS tcp_bbr + fq during deploy. Default.
+  --no-enable-bbr              Skip remote BBR/fq sysctl configuration.
   --profile-mode <mode>        Profiling integration: none or polar-cloud. Defaults to none.
   --polar-bearer-token <token> Bearer token text (Polar Signals Cloud). Alternative to token file.
   --polar-token-file <path>    Read Polar Signals token from this local file instead of prompting.
@@ -271,6 +273,13 @@ interactive_advanced_paths_and_build() {
   tools="$(prompt_line_or_default "Install build helpers when missing [Y/n]" "y")"
   tools="$(tolower_one "$tools")"
   [[ -z "$tools" || "$tools" == "y" || "$tools" == "yes" ]] && INSTALL_BUILD_TOOLS="yes" || INSTALL_BUILD_TOOLS="no"
+  printf '\n' >&2
+
+  printf 'Configure TCP BBR + fq on the VPS for high-latency single-stream throughput?\n' >&2
+  local bbr_pick
+  bbr_pick="$(prompt_line_or_default "Enable VPS BBR/fq during deploy [Y/n]" "y")"
+  bbr_pick="$(tolower_one "$bbr_pick")"
+  [[ -z "$bbr_pick" || "$bbr_pick" == "y" || "$bbr_pick" == "yes" ]] && ENABLE_BBR="1" || ENABLE_BBR="0"
   printf '\n' >&2
 
   printf 'Reuse previously generated configs in target/parallax-deploy/<host>/ ?\n' >&2
@@ -954,6 +963,54 @@ install_remote() {
   q_remote_config_dir=$(shell_quote "$(dirname "$REMOTE_CONFIG")")
 
   local sudo_prefix=$REMOTE_SUDO
+  local bbr_install_script=""
+  if [[ "$ENABLE_BBR" == "1" ]]; then
+    bbr_install_script=$(cat <<REMOTE_BBR
+echo "Checking VPS TCP BBR/fq tuning..."
+if [[ "\$(uname -s)" != "Linux" ]]; then
+  echo "BBR auto-setup requires Linux on the VPS" >&2
+  exit 1
+fi
+available_cc="\$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+if ! grep -qw bbr <<<"\$available_cc"; then
+  if command -v modprobe >/dev/null 2>&1; then
+    $sudo_prefix modprobe tcp_bbr
+  elif command -v /sbin/modprobe >/dev/null 2>&1; then
+    $sudo_prefix /sbin/modprobe tcp_bbr
+  else
+    echo "tcp_bbr is not available and modprobe was not found" >&2
+    exit 1
+  fi
+fi
+available_cc="\$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+if ! grep -qw bbr <<<"\$available_cc"; then
+  echo "tcp_bbr is still unavailable after loading module; kernel may not support BBR" >&2
+  exit 1
+fi
+$sudo_prefix install -d -m 0755 /etc/modules-load.d /etc/sysctl.d
+printf '%s\n' tcp_bbr | $sudo_prefix tee /etc/modules-load.d/parallax-bbr.conf >/dev/null
+cat <<'PARALLAX_BBR_SYSCTL' | $sudo_prefix tee /etc/sysctl.d/99-parallax-bbr.conf >/dev/null
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+net.ipv4.tcp_mtu_probing=1
+PARALLAX_BBR_SYSCTL
+$sudo_prefix sysctl --system >/dev/null
+current_cc="\$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+current_qdisc="\$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+if [[ "\$current_cc" != "bbr" ]]; then
+  echo "failed to enable BBR: net.ipv4.tcp_congestion_control=\$current_cc" >&2
+  exit 1
+fi
+if [[ "\$current_qdisc" != "fq" ]]; then
+  echo "failed to enable fq qdisc: net.core.default_qdisc=\$current_qdisc" >&2
+  exit 1
+fi
+echo "BBR/fq enabled: tcp_congestion_control=\$current_cc default_qdisc=\$current_qdisc"
+REMOTE_BBR
+)
+  fi
   local profile_install_script=""
   if profiling_enabled; then
     profile_install_script=$(cat <<REMOTE_PROFILE
@@ -1032,6 +1089,7 @@ REMOTE_PROFILE
   remote_script=$(cat <<REMOTE
 set -Eeuo pipefail
 PARCA_AGENT_CHANNEL="$PARCA_AGENT_CHANNEL"
+$bbr_install_script
 $sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir /var/lib/parallax
 $sudo_prefix install -m 0755 $q_tmp/plx $q_remote_bin
 $sudo_prefix install -m 0600 $q_tmp/parallax.server.toml $q_remote_config
@@ -1066,6 +1124,9 @@ REMOTE
     if profiling_enabled; then
       printf '  profile mode:        Polar Signals Cloud via parca-agent.service\n'
     fi
+    if [[ "$ENABLE_BBR" == "1" ]]; then
+      printf '  remote tcp tuning:   BBR + fq verified during deploy\n'
+    fi
   fi
 
   if [[ "$DRY_RUN" == "0" ]]; then
@@ -1088,6 +1149,7 @@ CARGO_PROFILE="release"
 CARGO_PROFILE_SET="0"
 DOCKER_IMAGE="${PARALLAX_DOCKER_IMAGE:-rust:1-bookworm}"
 INSTALL_BUILD_TOOLS="yes"
+ENABLE_BBR="1"
 PROFILE_MODE="none"
 POLAR_TOKEN_FILE=""
 POLAR_PROJECT_ID=""
@@ -1122,6 +1184,8 @@ while [[ $# -gt 0 ]]; do
     --docker-image) DOCKER_IMAGE=${2:-}; shift 2 ;;
     --install-build-tools) INSTALL_BUILD_TOOLS="yes"; shift ;;
     --no-install-build-tools) INSTALL_BUILD_TOOLS="no"; shift ;;
+    --enable-bbr) ENABLE_BBR="1"; shift ;;
+    --no-enable-bbr) ENABLE_BBR="0"; shift ;;
     --profile-mode) PROFILE_MODE=${2:-}; shift 2 ;;
     --polar-bearer-token) POLAR_BEARER_TOKEN=${2:-}; shift 2 ;;
     --polar-token-file) POLAR_TOKEN_FILE=${2:-}; shift 2 ;;

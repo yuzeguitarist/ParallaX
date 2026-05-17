@@ -21,8 +21,48 @@ That command will:
 2. validate the server and client configs
 3. probe the camouflage target
 4. build a Linux `plx` binary locally
-5. upload only the binary and `parallax.server.toml` to the VPS
-6. install and restart `parallax.service` through systemd
+5. enable and verify TCP BBR + `fq` on the VPS
+6. upload only the binary and `parallax.server.toml` to the VPS
+7. install and restart `parallax.service` through systemd
+
+## VPS TCP BBR tuning
+
+The deploy script enables VPS-side BBR by default because ParallaX TCP mode is
+sensitive to single-flow congestion control on high-latency links.
+
+During remote install it:
+
+1. checks whether `bbr` is in `net.ipv4.tcp_available_congestion_control`
+2. loads `tcp_bbr` with `modprobe` when needed
+3. persists module loading in `/etc/modules-load.d/parallax-bbr.conf`
+4. writes `/etc/sysctl.d/99-parallax-bbr.conf`
+5. applies sysctls immediately
+6. fails the deploy if `tcp_congestion_control=bbr` or `default_qdisc=fq`
+   cannot be verified
+
+The sysctl file contains:
+
+```text
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+net.ipv4.tcp_mtu_probing=1
+```
+
+To skip this remote system tuning explicitly:
+
+```bash
+bash scripts/deploy-vps.sh --no-enable-bbr root@YOUR_VPS_IP cloudflare.com
+```
+
+Manual verification on the VPS:
+
+```bash
+sysctl net.ipv4.tcp_available_congestion_control
+sysctl net.ipv4.tcp_congestion_control
+sysctl net.core.default_qdisc
+```
 
 On macOS, the script first uses Docker when available. If Docker is not
 installed, it falls back to local `cargo-zigbuild` and installs the missing
