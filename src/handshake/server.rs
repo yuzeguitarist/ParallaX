@@ -19,7 +19,10 @@ use tokio::{
 use super::transcript::transcript_hash;
 
 use crate::{
-    config::{decode_key32, decode_psk, Config, ConfigError, Mode, ServerConfig, TrafficConfig},
+    config::{
+        decode_base64_secret, decode_key32_secret, decode_psk, Config, ConfigError, Mode,
+        ServerConfig, TrafficConfig,
+    },
     crypto::{
         auth::{
             derive_server_auth_key, recover_stateful_auth_material, verify_client_hello_auth,
@@ -146,7 +149,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .clone()
         .ok_or(HandshakeServerError::MissingServer)?;
     let traffic = config.traffic;
-    let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
+    let psk = Arc::new(decode_psk(&config.crypto.psk)?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create(
         &server.replay_cache_path,
         8192,
@@ -203,7 +206,7 @@ async fn handle_connection_inner(
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
 ) -> Result<(), HandshakeServerError> {
     tune_tcp_stream(&client)?;
-    let server_private = decode_key32("server.private_key", &config.private_key)?;
+    let server_private = decode_key32_secret("server.private_key", &config.private_key)?;
     let first_record = read_first_record(&mut client).await?;
     match decide_inbound(&first_record, psk, &config.authorized_sni, &server_private)? {
         InboundDecision::Fallback(reason) => {
@@ -237,10 +240,8 @@ async fn handle_connection_inner(
                 tls13 = handshake.server_hello.tls13_selected,
                 "authenticated ParallaX handshake accepted"
             );
-            let identity_secret = crate::config::decode_base64_bytes(
-                "server.identity_secret_key",
-                &config.identity_secret_key,
-            )?;
+            let identity_secret =
+                decode_base64_secret("server.identity_secret_key", &config.identity_secret_key)?;
             run_authenticated_data_mode(
                 handshake,
                 config.data_target.as_deref(),

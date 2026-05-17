@@ -35,6 +35,7 @@ use tokio::{
     net::TcpStream,
     time::{sleep, timeout},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     backend::TlsBackendError, client_hello_builder::BrowserProfile, record::read_record,
@@ -68,7 +69,7 @@ thread_local! {
 #[derive(Clone)]
 struct PatchContext {
     sni: String,
-    psk: Vec<u8>,
+    psk: Zeroizing<Vec<u8>>,
     auth_key: [u8; 32],
     x25519: X25519KeyPair,
     encoded_client_random: Option<[u8; 32]>,
@@ -80,13 +81,20 @@ impl PatchContext {
     fn new(sni: String, psk: &[u8], auth_key: [u8; 32], x25519: X25519KeyPair) -> Self {
         Self {
             sni,
-            psk: psk.to_vec(),
+            psk: Zeroizing::new(psk.to_vec()),
             auth_key,
             x25519,
             encoded_client_random: None,
             session_id_pending: true,
             random_pending: true,
         }
+    }
+}
+
+impl Drop for PatchContext {
+    fn drop(&mut self) {
+        self.auth_key.zeroize();
+        self.encoded_client_random.zeroize();
     }
 }
 

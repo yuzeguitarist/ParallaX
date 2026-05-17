@@ -30,6 +30,7 @@ use crate::{
     protocol::command::{ConnectRequest, ConnectRequestError},
     transport::tcp::tune_tcp_stream,
 };
+use zeroize::Zeroizing;
 
 const QUIC_ALPN: &[u8] = b"h3";
 const QUIC_AUTH_MAGIC: &[u8; 4] = b"PX1U";
@@ -47,6 +48,7 @@ const QUIC_BRUTAL_LIKE_INITIAL_WINDOW_PACKETS: u64 = 96;
 const QUIC_KEEP_ALIVE_SECS: u64 = 15;
 
 type HmacSha256 = Hmac<Sha256>;
+type SharedPsk = Arc<Zeroizing<Vec<u8>>>;
 
 #[derive(Debug, Error)]
 pub enum QuicRuntimeError {
@@ -116,7 +118,7 @@ pub async fn run_server(config: Config) -> Result<(), QuicRuntimeError> {
     if config.mode != Mode::Server {
         return Err(QuicRuntimeError::WrongServerMode);
     }
-    let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
+    let psk = Arc::new(decode_psk(&config.crypto.psk)?);
     let server = config.server.ok_or(QuicRuntimeError::MissingServer)?;
     let replay_cache = Arc::new(Mutex::new(ReplayCache::new(8192)));
     let endpoint = Endpoint::server(server_config(&server)?, server.listen)?;
@@ -146,7 +148,7 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
     if config.mode != Mode::Client {
         return Err(QuicRuntimeError::WrongClientMode);
     }
-    let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
+    let psk = Arc::new(decode_psk(&config.crypto.psk)?);
     let client = config.client.ok_or(QuicRuntimeError::MissingClient)?;
     let server_addr = resolve_addr(&client.server_addr)?;
     let mut endpoint = Endpoint::client(bind_any_addr(server_addr))?;
@@ -176,7 +178,7 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
 async fn handle_connection(
     connection: quinn::Connection,
     server: ServerConfig,
-    psk: Arc<Vec<u8>>,
+    psk: SharedPsk,
     replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
     loop {
@@ -204,7 +206,7 @@ async fn handle_stream(
     mut recv: quinn::RecvStream,
     connection: quinn::Connection,
     server: ServerConfig,
-    psk: Arc<Vec<u8>>,
+    psk: SharedPsk,
     replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
     let auth_frame = read_auth_frame(&mut recv).await?;
@@ -253,7 +255,7 @@ async fn handle_local_connection(
     endpoint: Endpoint,
     server_addr: SocketAddr,
     client: ClientConfig,
-    psk: Arc<Vec<u8>>,
+    psk: SharedPsk,
 ) -> Result<(), QuicRuntimeError> {
     tune_tcp_stream(&local)?;
     let request = socks::accept_connect(&mut local).await?;
@@ -787,7 +789,7 @@ mod tests {
                 recv,
                 connection,
                 server,
-                Arc::new(b"0123456789abcdef0123456789abcdef".to_vec()),
+                Arc::new(Zeroizing::new(b"0123456789abcdef0123456789abcdef".to_vec())),
                 Arc::new(Mutex::new(ReplayCache::new(8))),
             )
             .await

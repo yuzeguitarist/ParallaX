@@ -67,7 +67,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         .client
         .clone()
         .ok_or(ClientRuntimeError::MissingClient)?;
-    let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
+    let psk = Arc::new(decode_psk(&config.crypto.psk)?);
     let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
     let server_identity_public = Arc::new(decode_base64_bytes(
         "client.server_identity_public_key",

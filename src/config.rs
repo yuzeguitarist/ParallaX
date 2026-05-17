@@ -171,9 +171,9 @@ impl Config {
                 if let Some(data_target) = &server.data_target {
                     require_host_port("server.data_target", data_target)?;
                 }
-                decode_key32("server.private_key", &server.private_key)?;
-                decode_base64_bytes("server.pq_secret_key", &server.pq_secret_key)?;
-                decode_base64_bytes("server.identity_secret_key", &server.identity_secret_key)?;
+                decode_key32_secret("server.private_key", &server.private_key)?;
+                decode_base64_secret("server.pq_secret_key", &server.pq_secret_key)?;
+                decode_base64_secret("server.identity_secret_key", &server.identity_secret_key)?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
                 }
@@ -230,6 +230,23 @@ pub fn decode_key32(field: &'static str, value: &str) -> Result<[u8; 32], Config
         .map_err(|_| ConfigError::InvalidKeyLen { field })
 }
 
+pub fn decode_key32_secret(
+    field: &'static str,
+    value: &str,
+) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
+    let decoded = Zeroizing::new(
+        STANDARD
+            .decode(value)
+            .map_err(|source| ConfigError::InvalidBase64 { field, source })?,
+    );
+    if decoded.len() != 32 {
+        return Err(ConfigError::InvalidKeyLen { field });
+    }
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&decoded);
+    Ok(Zeroizing::new(out))
+}
+
 pub fn decode_base64_bytes(field: &'static str, value: &str) -> Result<Vec<u8>, ConfigError> {
     let decoded = STANDARD
         .decode(value)
@@ -238,6 +255,19 @@ pub fn decode_base64_bytes(field: &'static str, value: &str) -> Result<Vec<u8>, 
         return Err(ConfigError::InvalidBytes { field });
     }
     Ok(decoded)
+}
+
+pub fn decode_base64_secret(
+    field: &'static str,
+    value: &str,
+) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
+    let decoded = STANDARD
+        .decode(value)
+        .map_err(|_| ConfigError::InvalidBytes { field })?;
+    if decoded.is_empty() {
+        return Err(ConfigError::InvalidBytes { field });
+    }
+    Ok(Zeroizing::new(decoded))
 }
 
 fn require_host_port(field: &'static str, value: &str) -> Result<(), ConfigError> {
