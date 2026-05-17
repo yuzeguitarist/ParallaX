@@ -10,7 +10,7 @@
 use std::{
     cell::RefCell,
     io::{Cursor, Read, Write},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -18,9 +18,17 @@ use rand::{rngs::OsRng, RngCore};
 use rustls::{
     client::danger::HandshakeSignatureValid,
     client::Resumption,
-    crypto::{GetRandomFailed, SecureRandom},
+    crypto::{
+        cipher::{
+            AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, MessageDecrypter,
+            MessageEncrypter, OutboundOpaqueMessage, OutboundPlainMessage, Tls13AeadAlgorithm,
+            UnsupportedOperationError,
+        },
+        ActiveKeyExchange, GetRandomFailed, SecureRandom, SupportedKxGroup,
+    },
     pki_types::{CertificateDer, ServerName, UnixTime},
-    DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+    CipherSuite, CipherSuiteCommon, ConnectionTrafficSecrets, DigitallySignedStruct,
+    Error as RustlsError, NamedGroup, SignatureScheme, SupportedCipherSuite, Tls13CipherSuite,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -47,6 +55,7 @@ const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
 const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const H2_OPEN_HEADERS_DELAY: Duration = Duration::from_millis(12);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
+const CHROME_GREASE_VALUE: u16 = 0x0a0a;
 
 thread_local! {
     static PATCH_CONTEXT: RefCell<Option<PatchContext>> = const { RefCell::new(None) };
@@ -422,6 +431,7 @@ fn with_patch_context<T>(
 fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, TlsBackendError> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     shape_cipher_suites_for_profile(&mut provider, profile.browser);
+    shape_key_exchange_groups_for_profile(&mut provider, profile.browser);
     provider.secure_random = &PARALLAX_RANDOM;
 
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -455,6 +465,7 @@ fn shape_cipher_suites_for_profile(
     // Chrome's legacy CBC/RSA-GCM tail, so we order the supported subset to
     // match BoringSSL and let rustls append SCSV when TLS 1.2 is enabled.
     provider.cipher_suites = vec![
+        grease_cipher_suite(),
         cipher_suite::TLS13_AES_128_GCM_SHA256,
         cipher_suite::TLS13_AES_256_GCM_SHA384,
         cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
@@ -465,6 +476,122 @@ fn shape_cipher_suites_for_profile(
         cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
         cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
     ];
+}
+
+fn shape_key_exchange_groups_for_profile(
+    provider: &mut rustls::crypto::CryptoProvider,
+    browser: BrowserProfile,
+) {
+    if !matches!(browser, BrowserProfile::Chrome124) {
+        return;
+    }
+
+    use rustls::crypto::aws_lc_rs::kx_group;
+
+    // BoringSSL places a GREASE named group before the real hybrid/classical
+    // groups. The GREASE provider delegates its actual key-share generation to
+    // X25519MLKEM768, so rustls' transcript and key schedule stay internally
+    // consistent while the supported_groups vector becomes Chrome-shaped.
+    provider.kx_groups = vec![
+        &GREASE_KX_GROUP,
+        kx_group::X25519MLKEM768,
+        kx_group::X25519,
+        kx_group::SECP256R1,
+        kx_group::SECP384R1,
+    ];
+}
+
+fn grease_cipher_suite() -> SupportedCipherSuite {
+    static GREASE_CIPHER: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    let base = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .expect("AES-128-GCM is a TLS 1.3 cipher suite");
+    SupportedCipherSuite::Tls13(GREASE_CIPHER.get_or_init(|| Tls13CipherSuite {
+        common: CipherSuiteCommon {
+            suite: CipherSuite::Unknown(CHROME_GREASE_VALUE),
+            hash_provider: base.common.hash_provider,
+            confidentiality_limit: base.common.confidentiality_limit,
+        },
+        hkdf_provider: base.hkdf_provider,
+        aead_alg: &GREASE_REJECTING_AEAD,
+        quic: None,
+    }))
+}
+
+#[derive(Debug)]
+struct GreaseKxGroup;
+
+static GREASE_KX_GROUP: GreaseKxGroup = GreaseKxGroup;
+
+impl SupportedKxGroup for GreaseKxGroup {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, RustlsError> {
+        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768.start()
+    }
+
+    fn name(&self) -> NamedGroup {
+        NamedGroup::Unknown(CHROME_GREASE_VALUE)
+    }
+
+    fn fips(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+struct RejectingGreaseAead;
+
+static GREASE_REJECTING_AEAD: RejectingGreaseAead = RejectingGreaseAead;
+
+impl Tls13AeadAlgorithm for RejectingGreaseAead {
+    fn encrypter(&self, _key: AeadKey, _iv: Iv) -> Box<dyn MessageEncrypter> {
+        Box::new(RejectingGreaseCipher)
+    }
+
+    fn decrypter(&self, _key: AeadKey, _iv: Iv) -> Box<dyn MessageDecrypter> {
+        Box::new(RejectingGreaseCipher)
+    }
+
+    fn key_len(&self) -> usize {
+        16
+    }
+
+    fn extract_keys(
+        &self,
+        _key: AeadKey,
+        _iv: Iv,
+    ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+        Err(UnsupportedOperationError)
+    }
+}
+
+struct RejectingGreaseCipher;
+
+impl MessageEncrypter for RejectingGreaseCipher {
+    fn encrypt(
+        &mut self,
+        _msg: OutboundPlainMessage<'_>,
+        _seq: u64,
+    ) -> Result<OutboundOpaqueMessage, RustlsError> {
+        Err(grease_selected_error())
+    }
+
+    fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+        payload_len
+    }
+}
+
+impl MessageDecrypter for RejectingGreaseCipher {
+    fn decrypt<'a>(
+        &mut self,
+        _msg: InboundOpaqueMessage<'a>,
+        _seq: u64,
+    ) -> Result<InboundPlainMessage<'a>, RustlsError> {
+        Err(grease_selected_error())
+    }
+}
+
+fn grease_selected_error() -> RustlsError {
+    RustlsError::General("peer selected a GREASE cipher suite".to_owned())
 }
 
 #[derive(Debug)]

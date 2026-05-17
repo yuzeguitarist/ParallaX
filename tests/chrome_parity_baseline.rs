@@ -207,6 +207,16 @@ fn assert_required_chrome_parity(
         rustls_supported_chrome_order,
         "ParallaX cipher_suites must keep Chrome order for the rustls/aws-lc supported subset"
     );
+    assert_eq!(
+        positions(&parallax.cipher_suites),
+        vec![0],
+        "ParallaX should now GREASE cipher_suites at Chrome's first position"
+    );
+    assert_eq!(
+        positions(&parallax.supported_groups),
+        vec![0],
+        "ParallaX should now GREASE supported_groups at Chrome's first position"
+    );
 }
 
 async fn generate_parallax_client_hello() -> Vec<u8> {
@@ -778,7 +788,7 @@ fn markdown_report(
             grease_positions(headless.0)
         ),
         &grease_positions(parallax.0),
-        "whitelisted: current rustls path does not emit Chrome-style GREASE",
+        "whitelisted: cipher/group GREASE is present; rustls still cannot add extra GREASE extensions/key_share entries without deeper hooks",
     );
     writeln!(out).unwrap();
     writeln!(out, "## code_refs/chrome-fp-src cross-check").unwrap();
@@ -806,7 +816,7 @@ fn markdown_report(
     .unwrap();
     writeln!(
         out,
-        "2. Add Chrome-style GREASE in cipher/group/key_share/extensions without breaking ParallaX auth patching: 4-6h."
+        "2. Add the remaining Chrome GREASE positions in extensions and key_share without breaking rustls transcript/auth patching: 4-6h."
     )
     .unwrap();
     writeln!(
