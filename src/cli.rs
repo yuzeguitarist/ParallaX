@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -345,7 +346,7 @@ fn write_init_files(output: &Path, generated: &GeneratedConfig) -> anyhow::Resul
         output.display()
     );
 
-    fs::write(&server_path, &generated.server)
+    write_private_file(&server_path, &generated.server)
         .with_context(|| format!("failed to write {}", server_path.display()))?;
     fs::write(&client_path, &generated.client)
         .with_context(|| format!("failed to write {}", client_path.display()))?;
@@ -354,4 +355,66 @@ fn write_init_files(output: &Path, generated: &GeneratedConfig) -> anyhow::Resul
     println!("  client: {}", client_path.display());
     println!("Next: upload the server file to the VPS and keep the client file on this machine.");
     Ok(())
+}
+
+fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut file = open_private_file(path)?;
+    file.write_all(contents.as_bytes())?;
+    set_private_file_permissions(&file)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private_file(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(file: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_file: &fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn init_writes_loadable_private_server_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "example.com:443",
+            "example.com:443",
+            "example.com",
+        );
+
+        write_init_files(dir.path(), &generated).unwrap();
+
+        let server_path = dir.path().join("parallax.server.toml");
+        let mode = fs::metadata(&server_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        Config::load(server_path).unwrap();
+    }
 }
