@@ -193,11 +193,11 @@ fn expand(
     out: &mut [u8],
 ) -> Result<(), SessionError> {
     let epoch = epoch.to_be_bytes();
-    let mut info = Vec::with_capacity(label.len() + epoch.len() + transcript_hash.len() + 2);
+    let mut info = Vec::with_capacity(2 + label.len() + epoch.len() + 2 + transcript_hash.len());
+    info.extend_from_slice(&(label.len() as u16).to_be_bytes());
     info.extend_from_slice(label);
-    info.push(0);
     info.extend_from_slice(&epoch);
-    info.push(0);
+    info.extend_from_slice(&(transcript_hash.len() as u16).to_be_bytes());
     info.extend_from_slice(transcript_hash);
     hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
 }
@@ -319,6 +319,19 @@ mod tests {
 
         assert_ne!(epoch0.client_key, epoch1.client_key);
         assert_ne!(epoch0.client_nonce, epoch1.client_nonce);
+    }
+
+    #[test]
+    fn hkdf_info_uses_length_prefixes() {
+        let hk = Hkdf::<Sha256>::new(None, b"test secret");
+        let transcript_hash = [2_u8; 32];
+        let mut with_nul = [0_u8; 32];
+        let mut without_nul = [0_u8; 32];
+
+        expand(&hk, b"label\0suffix", 1, &transcript_hash, &mut with_nul).unwrap();
+        expand(&hk, b"label", 1, &transcript_hash, &mut without_nul).unwrap();
+
+        assert_ne!(with_nul, without_nul);
     }
 
     #[test]
