@@ -524,10 +524,54 @@ quiet_command_label() {
       ;;
     docker) printf 'Building Linux binary inside local Docker' ;;
     rustup) printf 'Installing Rust target' ;;
-    ssh) printf 'Running remote VPS setup over SSH' ;;
+    ssh)
+      local arg last_arg=""
+      for arg in "$@"; do
+        last_arg=$arg
+      done
+      if [[ "$last_arg" == *"mkdir -p"* ]]; then
+        printf 'Connecting to VPS and preparing upload directory'
+      elif [[ "$last_arg" == *"systemctl"* || "$last_arg" == *"install -m"* ]]; then
+        printf 'Installing and starting ParallaX on VPS'
+      else
+        printf 'Running remote VPS setup over SSH'
+      fi
+      ;;
     scp) printf 'Uploading deploy artifacts to VPS' ;;
     *) printf 'Working' ;;
   esac
+}
+
+quiet_command_may_prompt_tty() {
+  case "$1" in
+    ssh|scp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_quiet_promptable() {
+  local lf=$1
+  shift
+  local label ec
+  label="$(quiet_command_label "$@")"
+
+  if [[ -t 2 ]]; then
+    printf '%b→ %s%b\n' "$C_CYAN" "$label" "$C_RST" >&2
+    if [[ "${DEPLOY_SSH_PASSWORD_HINT_SHOWN:-0}" != "1" ]]; then
+      printf '%b    If SSH asks for a password, type your VPS login password and press Enter. Input stays hidden.%b\n' "$C_CYAN" "$C_RST" >&2
+      DEPLOY_SSH_PASSWORD_HINT_SHOWN=1
+    fi
+  else
+    printf '%s...\n' "$label" >&2
+  fi
+
+  "$@" >"$lf" 2>&1
+  ec=$?
+
+  if [[ "$ec" == "0" ]]; then
+    guided_ok_done "$label"
+  fi
+  return "$ec"
 }
 
 run_quiet_with_spinner() {
@@ -536,6 +580,11 @@ run_quiet_with_spinner() {
   local label pid ec spin_idx ch
   local spin='|/-\'
   label="$(quiet_command_label "$@")"
+
+  if quiet_command_may_prompt_tty "$@"; then
+    run_quiet_promptable "$lf" "$@"
+    return $?
+  fi
 
   "$@" >"$lf" 2>&1 &
   pid=$!
