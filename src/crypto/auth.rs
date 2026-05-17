@@ -22,10 +22,17 @@ pub const AUTH_NONCE_LEN: usize = STATEFUL_AUTH_TAIL_LEN - AUTH_TIMESTAMP_LEN;
 pub struct ClientAuth {
     pub authenticated: bool,
     pub sni: Option<String>,
-    /// ParallaX ephemeral X25519 public key carried in ClientHello.random.
+    /// ParallaX ephemeral X25519 public key recovered from the authenticated
+    /// ClientHello carrier.
     pub x25519_key_share: Option<[u8; 32]>,
     pub timestamp: Option<u64>,
     pub nonce: Option<[u8; AUTH_NONCE_LEN]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatefulAuthMaterial {
+    pub x25519_public: [u8; 32],
+    pub tail: [u8; STATEFUL_AUTH_TAIL_LEN],
 }
 
 #[derive(Debug, Error)]
@@ -98,6 +105,69 @@ pub fn build_stateful_auth_session_id(
     Ok(session_id)
 }
 
+pub fn build_masked_stateful_client_random(
+    psk: &[u8],
+    sni: &str,
+    parallax_x25519_public: &[u8; 32],
+    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<[u8; 32], AuthError> {
+    let mask = stateful_client_random_mask(psk, sni, tail)?;
+    let mut encoded = [0_u8; 32];
+    for (dst, (public, mask)) in encoded
+        .iter_mut()
+        .zip(parallax_x25519_public.iter().zip(mask))
+    {
+        *dst = public ^ mask;
+    }
+    Ok(encoded)
+}
+
+pub fn build_masked_stateful_auth_session_id(
+    psk: &[u8],
+    auth_key: &[u8],
+    sni: &str,
+    parallax_x25519_public: &[u8; 32],
+    encoded_client_random: &[u8; 32],
+    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<[u8; SESSION_ID_LEN], AuthError> {
+    let encoded_tail = encode_stateful_auth_tail(psk, sni, encoded_client_random, tail)?;
+    let tag = compute_masked_stateful_tag(
+        auth_key,
+        sni,
+        parallax_x25519_public,
+        tail,
+        encoded_client_random,
+        &encoded_tail,
+    )?;
+    let mut session_id = [0_u8; SESSION_ID_LEN];
+    session_id[..AUTH_TAG_LEN].copy_from_slice(&tag);
+    session_id[AUTH_TAG_LEN..].copy_from_slice(&encoded_tail);
+    Ok(session_id)
+}
+
+pub fn recover_stateful_auth_material(
+    record: &[u8],
+    psk: &[u8],
+) -> Result<Option<StatefulAuthMaterial>, AuthError> {
+    let parsed = parse_client_hello(record)?;
+    if parsed.session_id_range.len() != SESSION_ID_LEN {
+        return Ok(None);
+    }
+    let Some(sni) = parsed.sni.as_deref() else {
+        return Ok(None);
+    };
+    let mut encoded_tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+    encoded_tail.copy_from_slice(
+        &record[parsed.session_id_range.start + AUTH_TAG_LEN..parsed.session_id_range.end],
+    );
+    Ok(Some(decode_stateful_auth_material(
+        psk,
+        sni,
+        &parsed.client_random,
+        &encoded_tail,
+    )?))
+}
+
 pub fn build_auth_tail<R>(rng: &mut R) -> Result<[u8; STATEFUL_AUTH_TAIL_LEN], AuthError>
 where
     R: RngCore + CryptoRng,
@@ -117,6 +187,14 @@ where
 }
 
 pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<ClientAuth, AuthError> {
+    verify_client_hello_auth_with_material(record, auth_key, None)
+}
+
+pub fn verify_client_hello_auth_with_material(
+    record: &[u8],
+    auth_key: &[u8],
+    material: Option<StatefulAuthMaterial>,
+) -> Result<ClientAuth, AuthError> {
     if auth_key.is_empty() {
         return Err(AuthError::EmptyPsk);
     }
@@ -126,7 +204,10 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
         return Ok(ClientAuth {
             authenticated: false,
             sni: parsed.sni,
-            x25519_key_share: Some(parsed.client_random),
+            x25519_key_share: material
+                .as_ref()
+                .map(|material| material.x25519_public)
+                .or(Some(parsed.client_random)),
             timestamp: None,
             nonce: None,
         });
@@ -143,30 +224,47 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
     let transcript_authenticated: bool = actual.ct_eq(&expected).into();
     let stateful_authenticated = match parsed.sni.as_deref() {
         Some(sni) => {
-            let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
-            tail.copy_from_slice(
+            let mut encoded_tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+            encoded_tail.copy_from_slice(
                 &record[parsed.session_id_range.start + AUTH_TAG_LEN..parsed.session_id_range.end],
             );
-            let expected = compute_stateful_tag(auth_key, sni, &parsed.client_random, &tail)?;
+            let expected = match material.as_ref() {
+                Some(material) => compute_masked_stateful_tag(
+                    auth_key,
+                    sni,
+                    &material.x25519_public,
+                    &material.tail,
+                    &parsed.client_random,
+                    &encoded_tail,
+                )?,
+                None => compute_stateful_tag(auth_key, sni, &parsed.client_random, &encoded_tail)?,
+            };
             bool::from(actual.ct_eq(&expected))
         }
         None => false,
     };
     let timestamp_start = parsed.session_id_range.start + AUTH_TAG_LEN;
+    let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+    if let Some(material) = material.as_ref() {
+        tail.copy_from_slice(&material.tail);
+    } else {
+        tail.copy_from_slice(&record[timestamp_start..parsed.session_id_range.end]);
+    }
     let timestamp = u64::from_be_bytes(
-        record[timestamp_start..timestamp_start + AUTH_TIMESTAMP_LEN]
+        tail[..AUTH_TIMESTAMP_LEN]
             .try_into()
             .expect("timestamp range is fixed"),
     );
     let mut nonce = [0_u8; AUTH_NONCE_LEN];
-    nonce.copy_from_slice(
-        &record[timestamp_start + AUTH_TIMESTAMP_LEN..parsed.session_id_range.end],
-    );
+    nonce.copy_from_slice(&tail[AUTH_TIMESTAMP_LEN..]);
 
     Ok(ClientAuth {
         authenticated: transcript_authenticated || stateful_authenticated,
         sni: parsed.sni,
-        x25519_key_share: Some(parsed.client_random),
+        x25519_key_share: material
+            .as_ref()
+            .map(|material| material.x25519_public)
+            .or(Some(parsed.client_random)),
         timestamp: Some(timestamp),
         nonce: Some(nonce),
     })
@@ -257,6 +355,126 @@ fn compute_stateful_tag(
     Ok(tag)
 }
 
+fn compute_masked_stateful_tag(
+    auth_key: &[u8],
+    sni: &str,
+    parallax_x25519_public: &[u8; 32],
+    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+    encoded_client_random: &[u8; 32],
+    encoded_tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<[u8; AUTH_TAG_LEN], AuthError> {
+    if auth_key.is_empty() {
+        return Err(AuthError::EmptyPsk);
+    }
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(auth_key).map_err(|_| AuthError::EmptyPsk)?;
+    mac.update(b"ParallaX v3 masked stateful rustls ClientHello auth");
+    mac.update(&(sni.len() as u16).to_be_bytes());
+    mac.update(sni.as_bytes());
+    mac.update(parallax_x25519_public);
+    mac.update(tail);
+    mac.update(encoded_client_random);
+    mac.update(encoded_tail);
+    let digest = mac.finalize().into_bytes();
+
+    let mut tag = [0_u8; AUTH_TAG_LEN];
+    tag.copy_from_slice(&digest[..AUTH_TAG_LEN]);
+    Ok(tag)
+}
+
+fn decode_stateful_auth_material(
+    psk: &[u8],
+    sni: &str,
+    encoded_client_random: &[u8; 32],
+    encoded_tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<StatefulAuthMaterial, AuthError> {
+    let tail = decode_stateful_auth_tail(psk, sni, encoded_client_random, encoded_tail)?;
+    let mask = stateful_client_random_mask(psk, sni, &tail)?;
+    let mut x25519_public = [0_u8; 32];
+    for (dst, (encoded, mask)) in x25519_public
+        .iter_mut()
+        .zip(encoded_client_random.iter().zip(mask))
+    {
+        *dst = encoded ^ mask;
+    }
+    Ok(StatefulAuthMaterial {
+        x25519_public,
+        tail,
+    })
+}
+
+fn encode_stateful_auth_tail(
+    psk: &[u8],
+    sni: &str,
+    encoded_client_random: &[u8; 32],
+    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<[u8; STATEFUL_AUTH_TAIL_LEN], AuthError> {
+    let mask = stateful_auth_tail_mask(psk, sni, encoded_client_random)?;
+    let mut encoded = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+    for (dst, (plain, mask)) in encoded.iter_mut().zip(tail.iter().zip(mask)) {
+        *dst = plain ^ mask;
+    }
+    Ok(encoded)
+}
+
+fn decode_stateful_auth_tail(
+    psk: &[u8],
+    sni: &str,
+    encoded_client_random: &[u8; 32],
+    encoded_tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<[u8; STATEFUL_AUTH_TAIL_LEN], AuthError> {
+    let mask = stateful_auth_tail_mask(psk, sni, encoded_client_random)?;
+    let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+    for (dst, (encoded, mask)) in tail.iter_mut().zip(encoded_tail.iter().zip(mask)) {
+        *dst = encoded ^ mask;
+    }
+    Ok(tail)
+}
+
+fn stateful_client_random_mask(
+    psk: &[u8],
+    sni: &str,
+    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
+) -> Result<[u8; 32], AuthError> {
+    stateful_mask(psk, b"ParallaX v3 ClientHello.random mask", sni, tail, &[])
+}
+
+fn stateful_auth_tail_mask(
+    psk: &[u8],
+    sni: &str,
+    encoded_client_random: &[u8; 32],
+) -> Result<[u8; 32], AuthError> {
+    stateful_mask(
+        psk,
+        b"ParallaX v3 ClientHello session_id tail mask",
+        sni,
+        encoded_client_random,
+        &[],
+    )
+}
+
+fn stateful_mask(
+    psk: &[u8],
+    label: &[u8],
+    sni: &str,
+    first: &[u8],
+    second: &[u8],
+) -> Result<[u8; 32], AuthError> {
+    if psk.is_empty() {
+        return Err(AuthError::EmptyPsk);
+    }
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(psk).map_err(|_| AuthError::EmptyPsk)?;
+    mac.update(label);
+    mac.update(&(sni.len() as u16).to_be_bytes());
+    mac.update(sni.as_bytes());
+    mac.update(&(first.len() as u16).to_be_bytes());
+    mac.update(first);
+    mac.update(&(second.len() as u16).to_be_bytes());
+    mac.update(second);
+    Ok(mac.finalize().into_bytes().into())
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{rngs::StdRng, SeedableRng};
@@ -341,5 +559,43 @@ mod tests {
         assert!(auth.authenticated);
         assert_eq!(auth.sni.as_deref(), Some("example.com"));
         assert_eq!(auth.x25519_key_share, Some(key_share));
+    }
+
+    #[test]
+    fn verifies_masked_stateful_client_random_and_tail() {
+        let mut hello = client_hello_fixture("example.com");
+        let parsed = parse_client_hello(&hello).unwrap();
+        let public = parsed.client_random;
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let auth_key = psk;
+        let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+        tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&1234_u64.to_be_bytes());
+        tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&[7_u8; AUTH_NONCE_LEN]);
+        let encoded_random =
+            build_masked_stateful_client_random(psk, "example.com", &public, &tail).unwrap();
+        assert_ne!(encoded_random, public);
+        let session_id = build_masked_stateful_auth_session_id(
+            psk,
+            auth_key,
+            "example.com",
+            &public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        hello[parsed.session_id_range].copy_from_slice(&session_id);
+
+        let material = recover_stateful_auth_material(&hello, psk)
+            .unwrap()
+            .unwrap();
+        let auth =
+            verify_client_hello_auth_with_material(&hello, auth_key, Some(material)).unwrap();
+
+        assert!(auth.authenticated);
+        assert_eq!(auth.x25519_key_share, Some(public));
+        assert_eq!(auth.timestamp, Some(1234));
+        assert_eq!(auth.nonce, Some([7_u8; AUTH_NONCE_LEN]));
     }
 }

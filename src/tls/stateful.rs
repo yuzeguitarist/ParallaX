@@ -42,8 +42,9 @@ use super::{
 };
 use crate::crypto::{
     auth::{
-        build_auth_tail, build_stateful_auth_session_id, derive_client_auth_key,
-        verify_client_hello_auth,
+        build_auth_tail, build_masked_stateful_auth_session_id,
+        build_masked_stateful_client_random, derive_client_auth_key,
+        recover_stateful_auth_material, verify_client_hello_auth_with_material,
     },
     session::X25519KeyPair,
 };
@@ -67,18 +68,22 @@ thread_local! {
 #[derive(Clone)]
 struct PatchContext {
     sni: String,
+    psk: Vec<u8>,
     auth_key: [u8; 32],
     x25519: X25519KeyPair,
+    encoded_client_random: Option<[u8; 32]>,
     session_id_pending: bool,
     random_pending: bool,
 }
 
 impl PatchContext {
-    fn new(sni: String, auth_key: [u8; 32], x25519: X25519KeyPair) -> Self {
+    fn new(sni: String, psk: &[u8], auth_key: [u8; 32], x25519: X25519KeyPair) -> Self {
         Self {
             sni,
+            psk: psk.to_vec(),
             auth_key,
             x25519,
+            encoded_client_random: None,
             session_id_pending: true,
             random_pending: true,
         }
@@ -180,7 +185,7 @@ impl StatefulRustlsCamouflageBackend {
         let x25519 = X25519KeyPair::generate();
         let auth_key = derive_client_auth_key(psk, &x25519.private, server_public_key)?;
         let profile = ProfileConfig::for_browser(browser);
-        let context = PatchContext::new(sni.clone(), auth_key, x25519.clone());
+        let context = PatchContext::new(sni.clone(), psk, auth_key, x25519.clone());
 
         let (connection, client_hello) = with_patch_context(context, || {
             let config = build_client_config(&profile)?;
@@ -192,7 +197,8 @@ impl StatefulRustlsCamouflageBackend {
             Ok((connection, client_hello))
         })?;
 
-        let auth = verify_client_hello_auth(&client_hello, &auth_key)?;
+        let material = recover_stateful_auth_material(&client_hello, psk)?;
+        let auth = verify_client_hello_auth_with_material(&client_hello, &auth_key, material)?;
         if !auth.authenticated || auth.x25519_key_share != Some(x25519.public) {
             return Err(TlsBackendError::UnauthenticatedClientHello);
         }
@@ -694,13 +700,23 @@ impl SecureRandom for ParallaxSecureRandom {
                 // before ClientHello.random for non-QUIC clients.
                 let tail =
                     build_auth_tail(&mut OsRng).expect("system clock must be after UNIX epoch");
-                let session_id = build_stateful_auth_session_id(
-                    &context.auth_key,
+                let encoded_client_random = build_masked_stateful_client_random(
+                    &context.psk,
                     &context.sni,
                     &context.x25519.public,
                     &tail,
                 )
+                .expect("stateful ClientHello.random mask inputs are valid");
+                let session_id = build_masked_stateful_auth_session_id(
+                    &context.psk,
+                    &context.auth_key,
+                    &context.sni,
+                    &context.x25519.public,
+                    &encoded_client_random,
+                    &tail,
+                )
                 .expect("stateful auth inputs are fixed length");
+                context.encoded_client_random = Some(encoded_client_random);
                 buf.copy_from_slice(&session_id);
                 context.session_id_pending = false;
                 handled = true;
@@ -708,7 +724,10 @@ impl SecureRandom for ParallaxSecureRandom {
             }
 
             if context.random_pending {
-                buf.copy_from_slice(&context.x25519.public);
+                let encoded_client_random = context
+                    .encoded_client_random
+                    .expect("SessionID must be generated before ClientHello.random");
+                buf.copy_from_slice(&encoded_client_random);
                 context.random_pending = false;
                 handled = true;
             }
@@ -800,10 +819,19 @@ mod tests {
             .unwrap();
 
         let parsed = parse_client_hello(&session.client_hello).unwrap();
-        let auth_key = derive_server_auth_key(psk, &server.private, &parsed.client_random).unwrap();
-        let auth = verify_client_hello_auth(&session.client_hello, &auth_key).unwrap();
+        let material = recover_stateful_auth_material(&session.client_hello, psk)
+            .unwrap()
+            .unwrap();
+        let auth_key =
+            derive_server_auth_key(psk, &server.private, &material.x25519_public).unwrap();
+        let auth = verify_client_hello_auth_with_material(
+            &session.client_hello,
+            &auth_key,
+            Some(material),
+        )
+        .unwrap();
 
-        assert_eq!(parsed.client_random, session.x25519.public);
+        assert_ne!(parsed.client_random, session.x25519.public);
         assert!(auth.authenticated);
         assert_eq!(auth.sni.as_deref(), Some("example.com"));
         assert_eq!(auth.x25519_key_share, Some(session.x25519.public));
@@ -832,7 +860,11 @@ mod tests {
         }
 
         let parsed = parse_client_hello(&session.client_hello).unwrap();
-        assert_eq!(parsed.client_random, session.x25519.public);
+        let material = recover_stateful_auth_material(&session.client_hello, psk)
+            .unwrap()
+            .unwrap();
+        assert_ne!(parsed.client_random, session.x25519.public);
+        assert_eq!(material.x25519_public, session.x25519.public);
         assert!(
             session
                 .client_hello

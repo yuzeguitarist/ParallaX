@@ -21,7 +21,10 @@ use super::transcript::transcript_hash;
 use crate::{
     config::{decode_key32, decode_psk, Config, ConfigError, Mode, ServerConfig, TrafficConfig},
     crypto::{
-        auth::{derive_server_auth_key, verify_client_hello_auth, AuthError},
+        auth::{
+            derive_server_auth_key, recover_stateful_auth_material, verify_client_hello_auth,
+            verify_client_hello_auth_with_material, AuthError, ClientAuth,
+        },
         identity::{self, IdentityError},
         pq::{self, PqError},
         replay::{current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry},
@@ -266,6 +269,28 @@ pub fn decide_inbound(
         Ok(parsed) => parsed,
         Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
     };
+    if let Some(material) = recover_stateful_auth_material(first_client_record, psk)? {
+        let x25519_key_share = material.x25519_public;
+        let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
+        let auth = match verify_client_hello_auth_with_material(
+            first_client_record,
+            &auth_key,
+            Some(material),
+        ) {
+            Ok(auth) => auth,
+            Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
+            Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+        };
+        if auth.authenticated {
+            return authenticated_decision(
+                first_client_record,
+                auth,
+                authorized_sni,
+                x25519_key_share,
+            );
+        }
+    }
+
     let x25519_key_share = parsed.client_random;
     let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
     let auth = match verify_client_hello_auth(first_client_record, &auth_key) {
@@ -276,6 +301,15 @@ pub fn decide_inbound(
     if !auth.authenticated {
         return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed));
     }
+    authenticated_decision(first_client_record, auth, authorized_sni, x25519_key_share)
+}
+
+fn authenticated_decision(
+    first_client_record: &[u8],
+    auth: ClientAuth,
+    authorized_sni: &[String],
+    x25519_key_share: [u8; 32],
+) -> Result<InboundDecision, HandshakeServerError> {
     let timestamp = match auth.timestamp {
         Some(timestamp) => timestamp,
         None => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
