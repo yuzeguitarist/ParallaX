@@ -28,14 +28,9 @@ const GROUP_X25519_MLKEM768: u16 = 0x11ec;
 const EXPECTED_CHROME_GUI_JA3: &str = "f15fe5d1f9edead72e873c77bfe9c606";
 const EXPECTED_CHROME_HEADLESS_JA3: &str = "f5b2bb9f2cc8fce256f5443aca5dd654";
 const EXPECTED_CHROME_JA4: &str = "t13d1516h2_8daaf6152771_d8a2da3f94cd";
-const EXPECTED_PARALLAX_JA4: &str = "t13d1010h2_61a7ad8aa9b6_4989b96115f4";
+const EXPECTED_PARALLAX_JA4: &str = "t13d1010h2_61a7ad8aa9b6_648ed004696a";
 
-const WHITELISTED_FIELD_DIFFS: &[&str] = &[
-    "cipher_suites",
-    "extensions",
-    "signature_algorithms",
-    "grease",
-];
+const WHITELISTED_FIELD_DIFFS: &[&str] = &["cipher_suites", "extensions", "grease"];
 
 const CHROME_GUI_HEX: &str = "16030106d2010006ce0303191b75ac9e43d69c4deb59abf279397cf71f561d3fad472a6f4fa73dba4f511a206d0e6c7c2d7122146b6676359b2ecd39743ffe9b0337702ccb54d818123e0cb50020aaaa130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f0035010006651a1a0000002d00020101000d00120010040308040401050308050501080606010000000e000c0000096c6f63616c686f7374000b0002010044cd00050003026832fe0d00da0000010001cf002095873fe655d62cd4db3014a43a40ab981b969c1eb6fc2ad7399cd39473a9775a00b07204f721ecf7729cfb161fbd05014b1e9dd5eed5841dd57717d06c735d7ee35c65afb8047ce64863729d94e51263c918b48575012f2e87a9ba981a25a664ea9045aac3bc49d394fb4952750c40d47462764b48cdab5281ae8043f5a552602edf5b3807051fe7e12ce8562cea7a9d9982b97b3d798636087f4aaef5e9e3329ebcf049df6fb4b658577fb9f01cf16004d72a3f9b776eda2cea59cdd09184e1c92c4b1478155a5b2d29a21b9c10468af6a3001b00030200020005000501000000000010000e000c02683208687474702f312e31003304ef04ed3a3a00010011ec04c00d443258d14739738de9c13df0eab555b5c62f51b46d47187af547fbe981af669bf0464f7b895da7c7ca8c74533228b7b3c83f40e9b92c92bea0989691a5389dccaa09845eeb96c4354924d14286ed56c94748aac546520e594ccc13a7ae8c1823cb130858b63568265e8b68fc326614c1191019b90d13507f46856d926e24e70274453bd8364a9906a16618bd09a17d73d4443695b6c7f4478aa656d6d81be7ca922a66a15f63647bd0b7bbc1a2924103b25c0421c0cda4d6aad8173201b865a33a40edb036618ccfcb4a2bc1a949a9b8399f5b0c321b85e30cb0471c1d89cc08f3412f80c491f7590423698c2673782e7b2ff917b1d194a7e935a9481b82e5dca8630ba341c65e93fa19ec692a07c01b5741a1d659b8da22472d82661b093d4507ca37631e85f4998787b14f6236aa59ad1f76210454ac4cc35f2f58cc23073f79e57950741cea1c21c5f39db9353b0d50c5aa9177f76968e89c9c5ad3796ae7ba69b545b3e222bef7bce2c28d1f1a73d3bb9ab528582fd628c58c31c4c84bee8a0d2ef493c92c4d772b02e39025e387663cc1b7035a2b0112c8cb6c90af0c2d1a5a9f6bc35b16c36d1fc3a1cc6c7f1e204edf1bb1c419042a0c2a14f0b8e3c8563eac8e965913fd89ae179b1f0ed62cc22082e010cc784149c6629029371bc8130bb056347fc819ff035eb6c21e26b526d9072c73ab62459bbb1ef81f98b55fabea23fbdaaabaa22c5eb3b6518412c80c7c895c612dd8c9469245039b23f67b2520480d36f1c0cc115a8f721afe13be41ba09b573c89a64ba2c60825bb86bf50b4d6b601074b3c3c4ab020f6bc5c7012c86b1786032a8deda9a8eca225bf4548baa7a6dfa1dd73203eb4570a527641fe056dab0663565856bf6cafd76ab057454914b0fac7751f5b5c6f2f9be43128f21da13ab6c4b53a24ba25900558b471fc73ed9d286b70cafd2e66063b2bc1f892080045bcd4385f4fb24eb7359e3847433dc7d686433a4954a3757b80fe96ad4bc445ac709df71406c132302099c81d61ebb429267a4910fd96a53b9556d8087f32b1a963a8c8f6957d1f39362974fd33101a3ca0c7f076dd9ecccad4b8412e364c9297667c219dae208a870c75253929325301c500d022b88adda945a25983e31921e587652369578062fb72bc430323a9751b6da968934db1f64419d70d1b704666fe5fb2820b0946c667feacaa247d5ac5490430182774b30c96e6a5f46a132fa337c8631afac829eb2970ce7044dc6d2bfc5233ff831aa0d9345ff20ae99dc32e370c0a7b566d9f6c49517317cc877b6d496c3c6701d11658867456b36512286a13415a8f72125988230e2a939d2436a2f94783462327907286c0973196c6dfbc4c82d3507c507a5f73ab0d9378a34b8bdac459a09b0cb052020e0589d9b902af492791ce66188b06a89bb4e7f3b61fe8b307df260272992dd608391316fb6f27016162be7fb575be27a98f256a72471dc5836c884a5d32324ac92217b63775d5684e9453a0087765ce74268a4108bb0c7b2c782a9f963fd353b97a153f4608adc49233cd7b0e6e34d66e87cae8aaa2c813dedbc9f26172a147211f2982cd711cf27068f05804a02d8512e685a36e83f80e973dcce846cbac780da1ed05d6d9eff9db7b1a709588511862e7c69ffc9b948a1fc2902fa227b0d86ad42904d8b0b6c3ffed160ca489ffde5eea214001d00206fbfab789c39f8ba2eef965aa40fce5fa6055f1dde4373cc82e53a20eb4a1728000a000c000a3a3a11ec001d00170018002300000017000000120000002b000706aaaa03040303ff010001005a5a000100";
 
@@ -172,6 +167,18 @@ fn assert_required_chrome_parity(
         parallax.ec_point_formats,
         vec![0],
         "ParallaX ec_point_formats changed"
+    );
+
+    let chrome_signature_algorithms = vec![
+        0x0403_u16, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+    ];
+    assert_eq!(
+        chrome.signature_algorithms, chrome_signature_algorithms,
+        "{sample} Chrome signature_algorithms changed"
+    );
+    assert_eq!(
+        parallax.signature_algorithms, chrome_signature_algorithms,
+        "ParallaX signature_algorithms must stay Chrome/BoringSSL-shaped"
     );
 }
 
@@ -736,7 +743,7 @@ fn markdown_report(
         "signature_algorithms",
         &format!("Chrome `{}`", fmt_hex(&gui.0.signature_algorithms)),
         &format!("ParallaX `{}`", fmt_hex(&parallax.0.signature_algorithms)),
-        "whitelisted: rustls order and Ed25519 entry differ from BoringSSL",
+        "assert_eq: shaped to Chrome/BoringSSL order without Ed25519",
     );
     write_field_row(
         &mut out,
@@ -785,12 +792,7 @@ fn markdown_report(
     .unwrap();
     writeln!(
         out,
-        "4. Align signature_algorithms order and remove/position rustls-specific Ed25519 behavior if exact BoringSSL parity is required: 2-4h."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "5. If exact JA3 parity is a goal, expose deterministic extension permutation/GREASE seeding for test snapshots only: 4-8h."
+        "4. If exact JA3 parity is a goal, expose deterministic extension permutation/GREASE seeding for test snapshots only: 4-8h."
     )
     .unwrap();
     out

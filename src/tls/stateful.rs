@@ -519,14 +519,16 @@ impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         vec![
+            // Chrome/BoringSSL advertises the browser-facing schemes in this order.
+            // Keeping rustls' verifier permissive while shaping this list narrows the
+            // externally visible ClientHello delta without changing ParallaX auth.
             SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
             SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
             SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA384,
             SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
             SignatureScheme::RSA_PKCS1_SHA512,
         ]
     }
