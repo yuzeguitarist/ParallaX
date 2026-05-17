@@ -45,6 +45,7 @@ use zeroize::Zeroizing;
 
 const QUIC_ALPN: &[u8] = b"h3";
 const QUIC_AUTH_MAGIC: &[u8; 4] = b"PX1U";
+const QUIC_STREAM_OPEN_PREAMBLE: &[u8; 4] = b"PX1O";
 const QUIC_AUTH_LABEL: &[u8] = b"ParallaX v1 QUIC stream auth";
 const QUIC_AUTH_EXPORTER_LABEL: &[u8] = b"ParallaX v1 QUIC TLS exporter auth binding";
 const QUIC_AUTH_KEY_LABEL: &[u8] = b"ParallaX v2 QUIC stream auth key";
@@ -115,6 +116,8 @@ pub enum QuicRuntimeError {
     AuthFrameTruncated,
     #[error("QUIC auth magic mismatch")]
     AuthBadMagic,
+    #[error("QUIC stream open preamble mismatch")]
+    StreamOpenPreambleMismatch,
     #[error("QUIC auth SNI is not allowed: {0}")]
     AuthSniNotAllowed(String),
     #[error("QUIC auth tag mismatch")]
@@ -137,6 +140,8 @@ pub enum QuicRuntimeError {
     InvalidServerIdentityFrameLength,
     #[error("system clock is before UNIX epoch")]
     AuthClock,
+    #[error("blocking runtime task failed: {0}")]
+    BlockingTask(#[from] tokio::task::JoinError),
 }
 
 pub async fn run_server(config: Config) -> Result<(), QuicRuntimeError> {
@@ -237,6 +242,9 @@ async fn handle_stream(
     psk: SharedPsk,
     replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
+    timeout(QUIC_AUTH_TIMEOUT, read_stream_open_preamble(&mut recv))
+        .await
+        .map_err(|_| QuicRuntimeError::AuthTimeout)??;
     write_server_identity_frame(&mut send, &connection, &server).await?;
     let auth_frame = timeout(QUIC_AUTH_TIMEOUT, read_auth_frame(&mut recv))
         .await
@@ -247,14 +255,14 @@ async fn handle_stream(
     )
     .await
     .map_err(|_| QuicRuntimeError::AuthTimeout)??;
-    verify_auth_frame(
+    let (replay_entry, replay_now) = verify_auth_frame(
         &auth_frame,
         &connection,
         &psk,
         &connect_payload,
         &server.authorized_sni,
-        &replay_cache,
     )?;
+    insert_quic_replay_entry_blocking(replay_cache, replay_entry, replay_now).await?;
     let request = ConnectRequest::decode(&connect_payload)?;
     let target_addr = server
         .data_target
@@ -301,6 +309,7 @@ async fn handle_local_connection(
         initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
     let connection = connect_with_0rtt(&endpoint, server_addr, &client.sni).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
+    write_stream_open_preamble(&mut send).await?;
     read_and_verify_server_identity_frame(&mut recv, &connection, &client).await?;
     let connect = ConnectRequest {
         host: request.host,
@@ -375,6 +384,20 @@ async fn write_server_identity_frame(
     let context = quic_server_identity_context(connection)?;
     let frame = build_server_identity_frame(server, &context)?;
     write_identity_len_prefixed(send, &frame).await
+}
+
+async fn write_stream_open_preamble(send: &mut quinn::SendStream) -> Result<(), QuicRuntimeError> {
+    send.write_all(QUIC_STREAM_OPEN_PREAMBLE).await?;
+    Ok(())
+}
+
+async fn read_stream_open_preamble(recv: &mut quinn::RecvStream) -> Result<(), QuicRuntimeError> {
+    let mut preamble = [0_u8; QUIC_STREAM_OPEN_PREAMBLE.len()];
+    recv.read_exact(&mut preamble).await?;
+    if &preamble != QUIC_STREAM_OPEN_PREAMBLE {
+        return Err(QuicRuntimeError::StreamOpenPreambleMismatch);
+    }
+    Ok(())
 }
 
 async fn read_and_verify_server_identity_frame(
@@ -518,19 +541,13 @@ fn verify_auth_frame(
     psk: &[u8],
     connect_payload: &[u8],
     authorized_sni: &[String],
-    replay_cache: &Mutex<ReplayCache>,
-) -> Result<(), QuicRuntimeError> {
+) -> Result<(ReplayEntry, u64), QuicRuntimeError> {
     let parsed = parse_auth_frame(auth_frame)?;
     let auth_key = derive_quic_auth_key(connection, psk, &parsed.sni, connect_payload)?;
-    verify_auth_frame_with_key(
-        auth_frame,
-        &auth_key,
-        connect_payload,
-        authorized_sni,
-        replay_cache,
-    )
+    verified_auth_replay_entry(auth_frame, &auth_key, connect_payload, authorized_sni)
 }
 
+#[cfg(test)]
 fn verify_auth_frame_with_key(
     auth_frame: &[u8],
     auth_key: &[u8; 32],
@@ -538,6 +555,25 @@ fn verify_auth_frame_with_key(
     authorized_sni: &[String],
     replay_cache: &Mutex<ReplayCache>,
 ) -> Result<(), QuicRuntimeError> {
+    let (replay_entry, now) =
+        verified_auth_replay_entry(auth_frame, auth_key, connect_payload, authorized_sni)?;
+    if !replay_cache
+        .lock()
+        .expect("QUIC replay cache poisoned")
+        .insert_new(replay_entry, now)?
+    {
+        return Err(QuicRuntimeError::AuthReplay);
+    }
+
+    Ok(())
+}
+
+fn verified_auth_replay_entry(
+    auth_frame: &[u8],
+    auth_key: &[u8; 32],
+    connect_payload: &[u8],
+    authorized_sni: &[String],
+) -> Result<(ReplayEntry, u64), QuicRuntimeError> {
     let parsed = parse_auth_frame(auth_frame)?;
     if !authorized_sni
         .iter()
@@ -571,15 +607,26 @@ fn verify_auth_frame_with_key(
         nonce: replay_nonce,
         transcript_fingerprint: fingerprint,
     };
-    if !replay_cache
-        .lock()
-        .expect("QUIC replay cache poisoned")
-        .insert_new(replay_entry, now)?
-    {
-        return Err(QuicRuntimeError::AuthReplay);
-    }
+    Ok((replay_entry, now))
+}
 
-    Ok(())
+async fn insert_quic_replay_entry_blocking(
+    replay_cache: Arc<Mutex<ReplayCache>>,
+    replay_entry: ReplayEntry,
+    now: u64,
+) -> Result<(), QuicRuntimeError> {
+    if tokio::task::spawn_blocking(move || {
+        replay_cache
+            .lock()
+            .expect("QUIC replay cache poisoned")
+            .insert_new(replay_entry, now)
+    })
+    .await??
+    {
+        Ok(())
+    } else {
+        Err(QuicRuntimeError::AuthReplay)
+    }
 }
 
 fn derive_quic_auth_key(
@@ -1014,6 +1061,7 @@ mod tests {
             .await
             .unwrap();
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_stream_open_preamble(&mut send).await.unwrap();
         read_and_verify_server_identity_frame(
             &mut recv,
             &connection,

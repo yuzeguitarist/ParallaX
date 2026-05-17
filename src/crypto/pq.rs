@@ -78,7 +78,7 @@ pub fn hybrid_sandwich_rekey(
     pq_shared_secret: &[u8; 32],
     symmetric_secret: &[u8],
 ) -> Result<[u8; 32], PqError> {
-    let mut ikm = Vec::with_capacity(64 + symmetric_secret.len());
+    let mut ikm = Vec::with_capacity(7 + 32 + 11 + 32 + 5 + 4 + symmetric_secret.len());
     ikm.extend_from_slice(b"x25519:");
     ikm.extend_from_slice(x25519_shared_secret);
     ikm.extend_from_slice(b"|mlkem1024:");
