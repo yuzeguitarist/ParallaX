@@ -144,6 +144,11 @@ The generated client config stays local:
 target/parallax-deploy/<host>/parallax.client.toml
 ```
 
+If that local deploy directory was removed later, `--reuse-config` will fetch
+the existing server config back from `/etc/parallax/parallax.toml` over SSH and
+perform a server-only redeploy. Your already-working local client config is not
+regenerated or changed.
+
 The uploaded server config is installed as:
 
 ```text

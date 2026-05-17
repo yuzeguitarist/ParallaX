@@ -134,6 +134,32 @@ safe_name() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
 }
 
+fetch_remote_server_config() {
+  local server_cfg=$1
+  local control_path="/tmp/parallax-ssh-$(safe_name "$SSH_TARGET")-$SSH_PORT"
+  local ssh_common_opts=(
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o ControlMaster=auto
+    -o ControlPersist=5m
+    -o "ControlPath=$control_path"
+  )
+  local remote_config_q
+  remote_config_q=$(shell_quote "$REMOTE_CONFIG")
+  local read_cmd="${REMOTE_SUDO:+$REMOTE_SUDO }cat $remote_config_q"
+  local tmp="$server_cfg.tmp"
+
+  log "local server config is missing; fetching existing remote config from $REMOTE_CONFIG"
+  if [[ "$DRY_RUN" == "0" ]]; then
+    mkdir -p "$(dirname "$server_cfg")"
+    ssh -p "$SSH_PORT" "${ssh_common_opts[@]}" "$SSH_TARGET" "$read_cmd" >"$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$server_cfg"
+  else
+    log "$(quote_cmd ssh -p "$SSH_PORT" "${ssh_common_opts[@]}" "$SSH_TARGET" "$read_cmd") > $(quote_cmd "$tmp")"
+  fi
+}
+
 build_host_tools_and_configs() {
   local deploy_dir=$1
   local server_cfg=$2
@@ -143,8 +169,13 @@ build_host_tools_and_configs() {
   mkdir -p "$deploy_dir"
 
   if [[ "$REUSE_CONFIG" == "1" ]]; then
+    if [[ ! -f "$server_cfg" ]]; then
+      fetch_remote_server_config "$server_cfg"
+    fi
     [[ -f "$server_cfg" ]] || die "--reuse-config requested but missing $server_cfg"
-    [[ -f "$client_cfg" ]] || die "--reuse-config requested but missing $client_cfg"
+    if [[ ! -f "$client_cfg" ]]; then
+      warn "--reuse-config did not find $client_cfg; preserving your existing client config and doing a server-only redeploy"
+    fi
   else
     rm -f "$server_cfg" "$client_cfg"
     log "generating local-only server/client configs"
@@ -162,7 +193,9 @@ build_host_tools_and_configs() {
   fi
 
   run cargo run --locked --quiet --bin plx -- check -c "$server_cfg"
-  run cargo run --locked --quiet --bin plx -- check -c "$client_cfg"
+  if [[ -f "$client_cfg" ]]; then
+    run cargo run --locked --quiet --bin plx -- check -c "$client_cfg"
+  fi
 
   log "probing camouflage target before deploy"
   if [[ "$DRY_RUN" == "0" ]]; then
@@ -596,13 +629,25 @@ install_remote "$DEPLOY_DIR" "$SERVER_CFG" "$UNIT_FILE"
 cat <<NEXT
 
 ParallaX VPS deploy finished.
+NEXT
 
+if [[ -f "$CLIENT_CFG" ]]; then
+  cat <<NEXT_CLIENT
 Start the local client:
   plx client -c "$CLIENT_CFG"
 
 Test through the local SOCKS5 listener:
   curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
+NEXT_CLIENT
+else
+  cat <<NEXT_CLIENT
+Local client config was not regenerated. Keep using the client config that is
+already working on this machine, then test:
+  curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
+NEXT_CLIENT
+fi
 
+cat <<NEXT
 Check the server later:
   ssh -p "$SSH_PORT" "$SSH_TARGET" '${REMOTE_SUDO:+$REMOTE_SUDO }systemctl status $SERVICE_NAME --no-pager'
   ssh -p "$SSH_PORT" "$SSH_TARGET" '${REMOTE_SUDO:+$REMOTE_SUDO }journalctl -u $SERVICE_NAME -n 80 --no-pager'
