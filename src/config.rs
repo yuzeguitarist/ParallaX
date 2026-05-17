@@ -44,6 +44,10 @@ pub enum ConfigError {
     InvalidCoverIntervalRange,
     #[error("traffic.max_concurrent_streams must be 1 until multiplexing has fingerprint-safe scheduling")]
     UnsupportedMultiplexing,
+    #[error(
+        "client.listen must bind to a loopback address because SOCKS5 has no authentication: {0}"
+    )]
+    UnsafeClientListen(SocketAddr),
     #[error("server.authorized_sni must not be empty")]
     EmptyAuthorizedSni,
 }
@@ -156,6 +160,9 @@ impl Config {
         match self.mode {
             Mode::Client => {
                 let client = self.client.as_ref().ok_or(ConfigError::MissingClient)?;
+                if !client.listen.ip().is_loopback() {
+                    return Err(ConfigError::UnsafeClientListen(client.listen));
+                }
                 require_host_port("client.server_addr", &client.server_addr)?;
                 require_non_empty("client.sni", &client.sni)?;
                 decode_key32("client.server_public_key", &client.server_public_key)?;
@@ -316,6 +323,32 @@ server_identity_public_key = "{KEY}"
         );
         let cfg = toml::from_str::<Config>(&raw).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_non_loopback_client_listener() {
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "0.0.0.0:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_pq_public_key = "{KEY}"
+server_identity_public_key = "{KEY}"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::UnsafeClientListen(_)
+        ));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio::{
     io::{copy, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    time::timeout,
 };
 
 use crate::{
@@ -40,6 +41,7 @@ const MAX_CONNECT_FRAME_LEN: usize = 4096;
 const QUIC_FLOW_WINDOW: u32 = 16 * 1024 * 1024;
 const QUIC_BRUTAL_LIKE_INITIAL_WINDOW_PACKETS: u64 = 96;
 const QUIC_KEEP_ALIVE_SECS: u64 = 15;
+const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(8);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -95,6 +97,8 @@ pub enum QuicRuntimeError {
     AuthTagMismatch,
     #[error("QUIC auth timestamp is outside the allowed window")]
     AuthStale,
+    #[error("QUIC auth timed out")]
+    AuthTimeout,
     #[error("QUIC auth replay detected")]
     AuthReplay,
     #[error("QUIC replay cache error: {0}")]
@@ -109,7 +113,10 @@ pub async fn run_server(config: Config) -> Result<(), QuicRuntimeError> {
     }
     let psk = Arc::new(decode_psk(&config.crypto.psk)?.to_vec());
     let server = config.server.ok_or(QuicRuntimeError::MissingServer)?;
-    let replay_cache = Arc::new(Mutex::new(ReplayCache::new(8192)));
+    let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create(
+        &server.replay_cache_path,
+        8192,
+    )?));
     let endpoint = Endpoint::server(server_config(&server)?, server.listen)?;
     tracing::info!("ParallaX QUIC server listening on udp://{}", server.listen);
 
@@ -195,8 +202,15 @@ async fn handle_stream(
     psk: Arc<Vec<u8>>,
     replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
-    let auth_frame = read_auth_frame(&mut recv).await?;
-    let connect_payload = read_len_prefixed(&mut recv, MAX_CONNECT_FRAME_LEN).await?;
+    let auth_frame = timeout(QUIC_AUTH_TIMEOUT, read_auth_frame(&mut recv))
+        .await
+        .map_err(|_| QuicRuntimeError::AuthTimeout)??;
+    let connect_payload = timeout(
+        QUIC_AUTH_TIMEOUT,
+        read_len_prefixed(&mut recv, MAX_CONNECT_FRAME_LEN),
+    )
+    .await
+    .map_err(|_| QuicRuntimeError::AuthTimeout)??;
     verify_auth_frame(
         &auth_frame,
         &psk,
