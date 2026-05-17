@@ -61,7 +61,9 @@ always-on setting for sensitive nodes.
    deploy script intentionally rejects project names here because Cloud writes
    need the exact `projectID` gRPC metadata.
 
-3. Deploy with the profiler-friendly Cargo profile:
+3. Deploy with the profiler-friendly Cargo profile. `polar-cloud` refuses
+   non-`profiling` builds so the VPS binary keeps embedded DWARF symbols for
+   line-level flamegraphs.
 
    ```bash
    bash scripts/deploy-vps.sh \
@@ -129,8 +131,9 @@ Security notes:
 - Do not pass the Polar token directly on the command line.
 - Do not enable process command-line metadata; ParallaX intentionally does not
   set that Parca Agent flag.
-- Use `--cargo-profile release` for normal production and
-  `--cargo-profile profiling` only when you need useful flamegraphs.
+- Use `--cargo-profile release` for normal production. Polar Signals Cloud
+  deployments use `--cargo-profile profiling`, which embeds full DWARF symbols
+  and keeps the binary unstripped for useful flamegraphs.
 
 ## Explicit production form
 

@@ -32,7 +32,7 @@ Options:
   --build-mode <auto|docker|zigbuild|native>
                                auto uses native cargo on Linux, then Docker or cargo-zigbuild on macOS.
   --linux-target <triple>      Linux target triple for zigbuild. Defaults to x86_64-unknown-linux-gnu.
-  --cargo-profile <profile>    Cargo profile to build. Use profiling for profiler-friendly symbols.
+  --cargo-profile <profile>    Cargo profile to build. polar-cloud requires profiling with DWARF symbols.
   --docker-image <image>       Docker Rust image. Defaults to rust:1-bookworm.
   --install-build-tools        Install missing local build helpers when possible. Default in auto mode.
   --no-install-build-tools     Do not install missing local build helpers; fail with instructions instead.
@@ -221,6 +221,21 @@ build_linux_binary() {
   [[ -x "$LINUX_PLX" || "$DRY_RUN" == "1" ]] || die "Linux plx binary not found: $LINUX_PLX"
 }
 
+verify_profiling_binary_symbols() {
+  if ! profiling_enabled || [[ "$DRY_RUN" == "1" ]]; then
+    return
+  fi
+
+  need_cmd file
+
+  local file_info
+  file_info="$(file "$LINUX_PLX")"
+  [[ "$file_info" == *"not stripped"* ]] || \
+    die "Polar Signals Cloud requires an unstripped profiling binary, but built artifact is: $file_info"
+  [[ "$file_info" == *"debug_info"* || "$file_info" == *"with debug_info"* ]] || \
+    die "Polar Signals Cloud requires DWARF debug_info in the uploaded binary, but built artifact is: $file_info"
+}
+
 ensure_rust_target() {
   local target=$1
   if rustup target list --installed 2>/dev/null | grep -qx "$target"; then
@@ -323,9 +338,8 @@ validate_profile_options() {
   POLAR_NODE="${POLAR_NODE%%:*}"
   [[ -n "$POLAR_LABELS" ]] || POLAR_LABELS="service=parallax;profile_mode=polar-cloud"
 
-  if [[ "$CARGO_PROFILE" == "release" ]]; then
-    warn "Polar Signals Cloud is enabled with a stripped release build. Use --cargo-profile profiling for better Rust symbols."
-  fi
+  [[ "$CARGO_PROFILE" == "profiling" ]] || \
+    die "Polar Signals Cloud requires --cargo-profile profiling so the VPS binary keeps full DWARF symbols; got: $CARGO_PROFILE"
 }
 
 write_parca_agent_unit_file() {
@@ -540,6 +554,7 @@ SERVICE_NAME="parallax"
 BUILD_MODE="auto"
 LINUX_TARGET="x86_64-unknown-linux-gnu"
 CARGO_PROFILE="release"
+CARGO_PROFILE_SET="0"
 DOCKER_IMAGE="${PARALLAX_DOCKER_IMAGE:-rust:1-bookworm}"
 INSTALL_BUILD_TOOLS="yes"
 PROFILE_MODE="none"
@@ -569,7 +584,7 @@ while [[ $# -gt 0 ]]; do
     --service-name) SERVICE_NAME=${2:-}; shift 2 ;;
     --build-mode) BUILD_MODE=${2:-}; shift 2 ;;
     --linux-target) LINUX_TARGET=${2:-}; shift 2 ;;
-    --cargo-profile) CARGO_PROFILE=${2:-}; shift 2 ;;
+    --cargo-profile) CARGO_PROFILE=${2:-}; CARGO_PROFILE_SET="1"; shift 2 ;;
     --docker-image) DOCKER_IMAGE=${2:-}; shift 2 ;;
     --install-build-tools) INSTALL_BUILD_TOOLS="yes"; shift ;;
     --no-install-build-tools) INSTALL_BUILD_TOOLS="no"; shift ;;
@@ -606,6 +621,9 @@ done
 [[ -n "$SSH_TARGET" ]] || die "missing --host or positional SSH target"
 [[ -n "$DEST" ]] || die "missing --dest or positional camouflage domain"
 [[ -n "$SERVER_ADDR" ]] || SERVER_ADDR="$(infer_server_addr "$SSH_TARGET")"
+if profiling_enabled && [[ "$CARGO_PROFILE_SET" == "0" ]]; then
+  CARGO_PROFILE="profiling"
+fi
 validate_profile_options
 
 case "$REMOTE_SUDO" in
@@ -650,6 +668,7 @@ POLAR_TOKEN_UPLOAD_FILE="$DEPLOY_DIR/polarsignals.token"
 
 build_host_tools_and_configs "$DEPLOY_DIR" "$SERVER_CFG" "$CLIENT_CFG"
 build_linux_binary "$ROOT"
+verify_profiling_binary_symbols
 write_unit_file "$UNIT_FILE"
 if profiling_enabled; then
   trap cleanup_polar_token_upload_file EXIT

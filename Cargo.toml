@@ -46,7 +46,8 @@ md-5 = "0.10"
 
 [profile.profiling]
 inherits = "release"
-debug = "line-tables-only"
+debug = 2
+split-debuginfo = "off"
 strip = false
 lto = "thin"
 codegen-units = 1
