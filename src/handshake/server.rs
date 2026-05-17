@@ -150,9 +150,10 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .ok_or(HandshakeServerError::MissingServer)?;
     let traffic = config.traffic;
     let psk = Arc::new(decode_psk(&config.crypto.psk)?);
-    let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create(
+    let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create_authenticated(
         &server.replay_cache_path,
         8192,
+        &psk,
     )?));
     let listener = TcpListener::bind(server.listen).await?;
     tracing::info!("ParallaX server listening on {}", server.listen);
