@@ -171,9 +171,27 @@ impl DataRecordCodec {
         if record.len() < header.total_len {
             return Err(record::TlsRecordError::IncompletePayload.into());
         }
-        let ciphertext = &record[record::TLS_HEADER_LEN..header.total_len];
-        let padded = self.aead.open(ciphertext, self.aad)?;
-        Ok(PaddingProfile::remove(&padded)?)
+        let mut padded = record[record::TLS_HEADER_LEN..header.total_len].to_vec();
+        self.aead.open_in_place(&mut padded, self.aad)?;
+        PaddingProfile::remove_in_place(&mut padded)?;
+        Ok(padded)
+    }
+
+    pub fn open_owned(&mut self, mut record: Vec<u8>) -> Result<Vec<u8>, DataRecordError> {
+        let header = record::parse_header(&record)?;
+        if header.content_type != TLS_CONTENT_APPLICATION_DATA {
+            return Err(DataRecordError::NotApplicationData);
+        }
+        if record.len() < header.total_len {
+            return Err(record::TlsRecordError::IncompletePayload.into());
+        }
+
+        record.truncate(header.total_len);
+        record.copy_within(record::TLS_HEADER_LEN..header.total_len, 0);
+        record.truncate(header.payload_len);
+        self.aead.open_in_place(&mut record, self.aad)?;
+        PaddingProfile::remove_in_place(&mut record)?;
+        Ok(record)
     }
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
@@ -294,6 +312,23 @@ mod tests {
             opened.extend_from_slice(&dec.open(&out[record.range]).unwrap());
         }
         assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn open_owned_round_trips_without_changing_wire_format() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(4, 4).unwrap();
+        let mut rng = StdRng::seed_from_u64(18);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+
+        let record = enc.seal(b"hello", &mut rng).unwrap();
+        let plaintext = dec.open_owned(record).unwrap();
+
+        assert_eq!(plaintext, b"hello");
     }
 
     #[test]

@@ -41,7 +41,9 @@ use crate::{
         stateful::StatefulRustlsCamouflageBackend,
     },
     traffic::CoverTrafficProfile,
-    transport::tcp::{is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream},
+    transport::tcp::{
+        drain_ready_tcp_read, is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+    },
 };
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
@@ -494,6 +496,7 @@ impl ClientRelay {
                     if n == 0 {
                         return Ok(());
                     }
+                    let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
                     write_client_data_records_chunked(
                         &mut server_write,
                         &mut data_session,
@@ -512,7 +515,7 @@ impl ClientRelay {
                     };
                     log_record_read(cid, "server->client", "client-outer-reader", &record);
 
-                    match data_session.open_server_record(&record) {
+                    match data_session.open_server_record_owned(record) {
                         Ok(payload) => {
                             if !payload.is_empty() {
                                 local_write.write_all(&payload).await?;

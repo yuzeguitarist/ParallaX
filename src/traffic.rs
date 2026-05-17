@@ -119,6 +119,21 @@ impl PaddingProfile {
 
         Ok(padded[..padded.len() - pad_len - 2].to_vec())
     }
+
+    pub fn remove_in_place(padded: &mut Vec<u8>) -> Result<(), TrafficError> {
+        if padded.len() < 2 {
+            return Err(TrafficError::PaddedFrameTooShort);
+        }
+
+        let pad_len =
+            u16::from_be_bytes([padded[padded.len() - 2], padded[padded.len() - 1]]) as usize;
+        if pad_len + 2 > padded.len() {
+            return Err(TrafficError::PaddingLengthOutOfRange);
+        }
+
+        padded.truncate(padded.len() - pad_len - 2);
+        Ok(())
+    }
 }
 
 impl TimingProfile {
@@ -187,6 +202,10 @@ mod tests {
         let padded = profile.apply(b"hello", &mut rng);
         assert_eq!(padded.len(), 5 + 8 + 2);
         assert_eq!(PaddingProfile::remove(&padded).unwrap(), b"hello");
+
+        let mut in_place = padded.clone();
+        PaddingProfile::remove_in_place(&mut in_place).unwrap();
+        assert_eq!(in_place, b"hello");
     }
 
     #[test]
