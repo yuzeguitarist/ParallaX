@@ -27,9 +27,18 @@ use tokio::{
 use crate::{
     client::initial_payload,
     client::socks,
-    config::{decode_psk, ClientConfig, Config, ConfigError, Mode, ServerConfig},
-    crypto::replay::{ReplayCache, ReplayCacheError, ReplayEntry},
-    protocol::command::{ConnectRequest, ConnectRequestError},
+    config::{
+        decode_base64_bytes, decode_base64_secret, decode_key32, decode_key32_secret, decode_psk,
+        ClientConfig, Config, ConfigError, Mode, ServerConfig,
+    },
+    crypto::{
+        identity::{self, IdentityError},
+        replay::{ReplayCache, ReplayCacheError, ReplayEntry},
+        session::x25519_public_from_private,
+    },
+    protocol::command::{
+        ConnectRequest, ConnectRequestError, ServerIdentityProof, ServerIdentityProofError,
+    },
     transport::tcp::tune_tcp_stream,
 };
 use zeroize::Zeroizing;
@@ -40,10 +49,13 @@ const QUIC_AUTH_LABEL: &[u8] = b"ParallaX v1 QUIC stream auth";
 const QUIC_AUTH_EXPORTER_LABEL: &[u8] = b"ParallaX v1 QUIC TLS exporter auth binding";
 const QUIC_AUTH_KEY_LABEL: &[u8] = b"ParallaX v2 QUIC stream auth key";
 const QUIC_AUTH_CONTEXT_LABEL: &[u8] = b"ParallaX v2 QUIC auth context";
+const QUIC_SERVER_IDENTITY_EXPORTER_LABEL: &[u8] = b"ParallaX v1 QUIC TLS exporter server identity";
+const QUIC_SERVER_IDENTITY_CONTEXT: &[u8] = b"ParallaX v1 QUIC server identity context";
 const QUIC_AUTH_NONCE_LEN: usize = 16;
 const QUIC_AUTH_TAG_LEN: usize = 32;
 const QUIC_AUTH_WINDOW_SECS: u64 = 90;
 const MAX_AUTH_FRAME_LEN: usize = 512;
+const MAX_SERVER_IDENTITY_FRAME_LEN: usize = 8192;
 const MAX_CONNECT_FRAME_LEN: usize = 4096;
 const QUIC_FLOW_WINDOW: u32 = 16 * 1024 * 1024;
 const QUIC_BRUTAL_LIKE_INITIAL_WINDOW_PACKETS: u64 = 96;
@@ -115,6 +127,14 @@ pub enum QuicRuntimeError {
     AuthReplay,
     #[error("QUIC replay cache error: {0}")]
     ReplayCache(#[from] ReplayCacheError),
+    #[error("QUIC server identity proof command error: {0}")]
+    ServerIdentityProof(#[from] ServerIdentityProofError),
+    #[error("QUIC server identity verification failed: {0}")]
+    Identity(#[from] IdentityError),
+    #[error("QUIC server identity frame is too large")]
+    ServerIdentityFrameTooLarge,
+    #[error("QUIC server identity frame length is invalid")]
+    InvalidServerIdentityFrameLength,
     #[error("system clock is before UNIX epoch")]
     AuthClock,
 }
@@ -217,6 +237,7 @@ async fn handle_stream(
     psk: SharedPsk,
     replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
+    write_server_identity_frame(&mut send, &connection, &server).await?;
     let auth_frame = timeout(QUIC_AUTH_TIMEOUT, read_auth_frame(&mut recv))
         .await
         .map_err(|_| QuicRuntimeError::AuthTimeout)??;
@@ -280,6 +301,7 @@ async fn handle_local_connection(
         initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
     let connection = connect_with_0rtt(&endpoint, server_addr, &client.sni).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
+    read_and_verify_server_identity_frame(&mut recv, &connection, &client).await?;
     let connect = ConnectRequest {
         host: request.host,
         port: request.port,
@@ -343,6 +365,92 @@ async fn write_authenticated_connect_request(
 
 async fn read_auth_frame(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, QuicRuntimeError> {
     read_len_prefixed(recv, MAX_AUTH_FRAME_LEN).await
+}
+
+async fn write_server_identity_frame(
+    send: &mut quinn::SendStream,
+    connection: &quinn::Connection,
+    server: &ServerConfig,
+) -> Result<(), QuicRuntimeError> {
+    let context = quic_server_identity_context(connection)?;
+    let frame = build_server_identity_frame(server, &context)?;
+    write_identity_len_prefixed(send, &frame).await
+}
+
+async fn read_and_verify_server_identity_frame(
+    recv: &mut quinn::RecvStream,
+    connection: &quinn::Connection,
+    client: &ClientConfig,
+) -> Result<(), QuicRuntimeError> {
+    let frame = timeout(QUIC_AUTH_TIMEOUT, read_identity_len_prefixed(recv))
+        .await
+        .map_err(|_| QuicRuntimeError::AuthTimeout)??;
+    let context = quic_server_identity_context(connection)?;
+    verify_server_identity_frame(&frame, client, &context)
+}
+
+fn build_server_identity_frame(
+    server: &ServerConfig,
+    context: &[u8; 32],
+) -> Result<Vec<u8>, QuicRuntimeError> {
+    let server_private = decode_key32_secret("server.private_key", &server.private_key)?;
+    let server_public = x25519_public_from_private(&server_private);
+    let identity_secret =
+        decode_base64_secret("server.identity_secret_key", &server.identity_secret_key)?;
+    let signature =
+        identity::sign_server_identity(identity_secret.as_slice(), context, &server_public, 0)?;
+    Ok(ServerIdentityProof { signature }.encode()?)
+}
+
+fn verify_server_identity_frame(
+    frame: &[u8],
+    client: &ClientConfig,
+    context: &[u8; 32],
+) -> Result<(), QuicRuntimeError> {
+    let proof = ServerIdentityProof::decode(frame)?;
+    let server_identity_public = decode_base64_bytes(
+        "client.server_identity_public_key",
+        &client.server_identity_public_key,
+    )?;
+    let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
+    identity::verify_server_identity(
+        &server_identity_public,
+        &proof.signature,
+        context,
+        &server_public,
+        0,
+    )?;
+    Ok(())
+}
+
+async fn write_identity_len_prefixed(
+    send: &mut quinn::SendStream,
+    payload: &[u8],
+) -> Result<(), QuicRuntimeError> {
+    if payload.is_empty()
+        || payload.len() > MAX_SERVER_IDENTITY_FRAME_LEN
+        || payload.len() > u16::MAX as usize
+    {
+        return Err(QuicRuntimeError::ServerIdentityFrameTooLarge);
+    }
+    send.write_all(&(payload.len() as u16).to_be_bytes())
+        .await?;
+    send.write_all(payload).await?;
+    Ok(())
+}
+
+async fn read_identity_len_prefixed(
+    recv: &mut quinn::RecvStream,
+) -> Result<Vec<u8>, QuicRuntimeError> {
+    let mut len = [0_u8; 2];
+    recv.read_exact(&mut len).await?;
+    let len = u16::from_be_bytes(len) as usize;
+    if len == 0 || len > MAX_SERVER_IDENTITY_FRAME_LEN {
+        return Err(QuicRuntimeError::InvalidServerIdentityFrameLength);
+    }
+    let mut payload = vec![0_u8; len];
+    recv.read_exact(&mut payload).await?;
+    Ok(payload)
 }
 
 async fn write_len_prefixed(
@@ -493,6 +601,20 @@ fn derive_quic_auth_key(
     hk.expand(QUIC_AUTH_KEY_LABEL, &mut out)
         .map_err(|_| QuicRuntimeError::AuthKey)?;
     Ok(out)
+}
+
+fn quic_server_identity_context(
+    connection: &quinn::Connection,
+) -> Result<[u8; 32], QuicRuntimeError> {
+    let mut exporter = [0_u8; 32];
+    connection
+        .export_keying_material(
+            &mut exporter,
+            QUIC_SERVER_IDENTITY_EXPORTER_LABEL,
+            QUIC_SERVER_IDENTITY_CONTEXT,
+        )
+        .map_err(|_| QuicRuntimeError::AuthExporter)?;
+    Ok(Sha256::digest(exporter).into())
 }
 
 fn quic_auth_exporter_context(sni: &str, connect_payload: &[u8]) -> [u8; 32] {
@@ -702,6 +824,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::crypto::{identity, session::X25519KeyPair};
 
     const KEY32: [u8; 32] = [7_u8; 32];
 
@@ -773,9 +896,77 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn quic_server_identity_frame_verifies_configured_identity() {
+        let server_x25519 = X25519KeyPair::generate();
+        let server_identity = identity::keypair();
+        let context = [9_u8; 32];
+        let server = ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            fallback_addr: "example.com:443".to_owned(),
+            data_target: None,
+            private_key: STANDARD.encode(server_x25519.private),
+            pq_secret_key: STANDARD.encode(KEY32),
+            identity_secret_key: STANDARD.encode(&server_identity.secret),
+            replay_cache_path: "parallax-test.cache".into(),
+            authorized_sni: vec!["example.com".to_owned()],
+            strict_tls13: true,
+        };
+        let client = ClientConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            server_addr: "127.0.0.1:443".to_owned(),
+            sni: "example.com".to_owned(),
+            server_public_key: STANDARD.encode(server_x25519.public),
+            server_pq_public_key: String::new(),
+            server_identity_public_key: STANDARD.encode(&server_identity.public),
+            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
+        };
+
+        let frame = build_server_identity_frame(&server, &context).unwrap();
+
+        verify_server_identity_frame(&frame, &client, &context).unwrap();
+    }
+
+    #[test]
+    fn quic_server_identity_frame_rejects_wrong_identity() {
+        let server_x25519 = X25519KeyPair::generate();
+        let server_identity = identity::keypair();
+        let wrong_identity = identity::keypair();
+        let context = [9_u8; 32];
+        let server = ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            fallback_addr: "example.com:443".to_owned(),
+            data_target: None,
+            private_key: STANDARD.encode(server_x25519.private),
+            pq_secret_key: STANDARD.encode(KEY32),
+            identity_secret_key: STANDARD.encode(&server_identity.secret),
+            replay_cache_path: "parallax-test.cache".into(),
+            authorized_sni: vec!["example.com".to_owned()],
+            strict_tls13: true,
+        };
+        let client = ClientConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            server_addr: "127.0.0.1:443".to_owned(),
+            sni: "example.com".to_owned(),
+            server_public_key: STANDARD.encode(server_x25519.public),
+            server_pq_public_key: String::new(),
+            server_identity_public_key: STANDARD.encode(&wrong_identity.public),
+            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
+        };
+
+        let frame = build_server_identity_frame(&server, &context).unwrap();
+
+        assert!(matches!(
+            verify_server_identity_frame(&frame, &client, &context),
+            Err(QuicRuntimeError::Identity(_))
+        ));
+    }
+
     #[tokio::test]
     #[ignore = "requires UDP and TCP loopback sockets"]
     async fn quic_stream_reaches_tcp_target() {
+        let server_identity = identity::keypair();
+        let server_public_key = crate::crypto::session::x25519_public_from_private(&KEY32);
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target_listener.local_addr().unwrap();
         let target_task = tokio::spawn(async move {
@@ -792,7 +983,7 @@ mod tests {
             data_target: None,
             private_key: STANDARD.encode(KEY32),
             pq_secret_key: STANDARD.encode(KEY32),
-            identity_secret_key: STANDARD.encode(KEY32),
+            identity_secret_key: STANDARD.encode(&server_identity.secret),
             replay_cache_path: "parallax-test.cache".into(),
             authorized_sni: vec!["example.com".to_owned()],
             strict_tls13: true,
@@ -823,6 +1014,21 @@ mod tests {
             .await
             .unwrap();
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        read_and_verify_server_identity_frame(
+            &mut recv,
+            &connection,
+            &ClientConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server_addr: server_addr.to_string(),
+                sni: "example.com".to_owned(),
+                server_public_key: STANDARD.encode(server_public_key),
+                server_pq_public_key: String::new(),
+                server_identity_public_key: STANDARD.encode(&server_identity.public),
+                tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
+            },
+        )
+        .await
+        .unwrap();
         write_authenticated_connect_request(
             &mut send,
             &connection,

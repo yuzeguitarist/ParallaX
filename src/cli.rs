@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -345,13 +346,56 @@ fn write_init_files(output: &Path, generated: &GeneratedConfig) -> anyhow::Resul
         output.display()
     );
 
-    fs::write(&server_path, &generated.server)
-        .with_context(|| format!("failed to write {}", server_path.display()))?;
-    fs::write(&client_path, &generated.client)
-        .with_context(|| format!("failed to write {}", client_path.display()))?;
+    write_secret_file(&server_path, &generated.server)?;
+    write_secret_file(&client_path, &generated.client)?;
     println!("Configs written:");
     println!("  server: {}", server_path.display());
     println!("  client: {}", client_path.display());
     println!("Next: upload the server file to the VPS and keep the client file on this machine.");
     Ok(())
+}
+
+fn write_secret_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn init_files_are_user_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let generated = GeneratedConfig {
+            server: "server-secret".to_owned(),
+            client: "client-secret".to_owned(),
+        };
+
+        write_init_files(dir.path(), &generated).unwrap();
+
+        for name in ["parallax.server.toml", "parallax.client.toml"] {
+            let mode = fs::metadata(dir.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
 }
