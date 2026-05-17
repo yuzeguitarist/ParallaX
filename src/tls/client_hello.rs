@@ -14,6 +14,7 @@ const NAMED_GROUP_X25519: u16 = 0x001d;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHello {
     pub record_len: usize,
+    pub client_random: [u8; 32],
     pub session_id_range: Range<usize>,
     pub sni: Option<String>,
     pub tls13_supported: bool,
@@ -62,7 +63,8 @@ pub fn parse_client_hello(record: &[u8]) -> Result<ClientHello, ClientHelloError
 
     cursor.set_end(body_end);
     cursor.skip(2)?; // legacy_version
-    cursor.skip(32)?; // random
+    let mut client_random = [0_u8; 32];
+    client_random.copy_from_slice(cursor.bytes(32)?);
     let session_len = cursor.u8()? as usize;
     let session_start = cursor.pos;
     cursor.skip(session_len)?;
@@ -77,6 +79,7 @@ pub fn parse_client_hello(record: &[u8]) -> Result<ClientHello, ClientHelloError
     if cursor.remaining() == 0 {
         return Ok(ClientHello {
             record_len: header.total_len,
+            client_random,
             session_id_range,
             sni,
             tls13_supported,
@@ -107,6 +110,7 @@ pub fn parse_client_hello(record: &[u8]) -> Result<ClientHello, ClientHelloError
 
     Ok(ClientHello {
         record_len: header.total_len,
+        client_random,
         session_id_range,
         sni,
         tls13_supported,
@@ -265,6 +269,7 @@ pub mod tests {
         let parsed = parse_client_hello(&record).unwrap();
 
         assert_eq!(parsed.sni.as_deref(), Some("example.com"));
+        assert_eq!(parsed.client_random, [0x22; 32]);
         assert_eq!(parsed.session_id_range.len(), 32);
         assert!(parsed.tls13_supported);
         assert!(parsed.x25519_key_share.is_some());
@@ -275,9 +280,17 @@ pub mod tests {
     }
 
     pub fn client_hello_fixture_with_key_share(sni: &str, key_share_bytes: &[u8; 32]) -> Vec<u8> {
+        client_hello_fixture_with_random_and_key_share(sni, key_share_bytes, key_share_bytes)
+    }
+
+    pub fn client_hello_fixture_with_random_and_key_share(
+        sni: &str,
+        client_random: &[u8; 32],
+        key_share_bytes: &[u8; 32],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // legacy_version
-        body.extend_from_slice(&[0x11; 32]); // random
+        body.extend_from_slice(client_random); // ParallaX v2 public key carrier
         body.push(32);
         body.extend_from_slice(&[0_u8; 32]); // ParallaX signed SessionID placeholder
         body.extend_from_slice(&2_u16.to_be_bytes());

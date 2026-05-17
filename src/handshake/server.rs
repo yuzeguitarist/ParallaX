@@ -100,6 +100,7 @@ pub enum InboundDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedHello {
     pub sni: String,
+    /// ParallaX ephemeral X25519 public key carried in ClientHello.random.
     pub x25519_key_share: [u8; 32],
     pub timestamp: u64,
     pub nonce: [u8; 8],
@@ -267,14 +268,7 @@ pub fn decide_inbound(
         Ok(parsed) => parsed,
         Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
     };
-    let x25519_key_share = match parsed.x25519_key_share {
-        Some(key) => key,
-        None => {
-            return Ok(InboundDecision::Fallback(
-                FallbackReason::MissingX25519KeyShare,
-            ));
-        }
-    };
+    let x25519_key_share = parsed.client_random;
     let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
     let auth = match verify_client_hello_auth(first_client_record, &auth_key) {
         Ok(auth) => auth,

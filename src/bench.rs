@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use rand::{rngs::OsRng, rngs::StdRng, SeedableRng};
 
 use crate::{
@@ -191,9 +191,7 @@ fn bench_client_hello(options: BenchmarkOptions) -> Result<BenchmarkCase> {
             };
             let record = NativeCamouflageBackend.client_hello(&template, &auth_key, &mut OsRng)?;
             let parsed = parse_client_hello(&record)?;
-            let client_public = parsed
-                .x25519_key_share
-                .context("benchmark ClientHello did not contain x25519 key_share")?;
+            let client_public = parsed.client_random;
             let server_auth_key =
                 derive_server_auth_key(BENCH_PSK, &server.private, &client_public)?;
             let auth = verify_client_hello_auth(&record, &server_auth_key)?;

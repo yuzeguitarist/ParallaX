@@ -22,6 +22,7 @@ pub const AUTH_NONCE_LEN: usize = STATEFUL_AUTH_TAIL_LEN - AUTH_TIMESTAMP_LEN;
 pub struct ClientAuth {
     pub authenticated: bool,
     pub sni: Option<String>,
+    /// ParallaX ephemeral X25519 public key carried in ClientHello.random.
     pub x25519_key_share: Option<[u8; 32]>,
     pub timestamp: Option<u64>,
     pub nonce: Option<[u8; AUTH_NONCE_LEN]>,
@@ -87,10 +88,10 @@ where
 pub fn build_stateful_auth_session_id(
     auth_key: &[u8],
     sni: &str,
-    x25519_key_share: &[u8; 32],
+    parallax_x25519_public: &[u8; 32],
     tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
 ) -> Result<[u8; SESSION_ID_LEN], AuthError> {
-    let tag = compute_stateful_tag(auth_key, sni, x25519_key_share, tail)?;
+    let tag = compute_stateful_tag(auth_key, sni, parallax_x25519_public, tail)?;
     let mut session_id = [0_u8; SESSION_ID_LEN];
     session_id[..AUTH_TAG_LEN].copy_from_slice(&tag);
     session_id[AUTH_TAG_LEN..].copy_from_slice(tail);
@@ -125,7 +126,7 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
         return Ok(ClientAuth {
             authenticated: false,
             sni: parsed.sni,
-            x25519_key_share: parsed.x25519_key_share,
+            x25519_key_share: Some(parsed.client_random),
             timestamp: None,
             nonce: None,
         });
@@ -140,16 +141,16 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
         auth_key,
     )?;
     let transcript_authenticated: bool = actual.ct_eq(&expected).into();
-    let stateful_authenticated = match (parsed.sni.as_deref(), parsed.x25519_key_share) {
-        (Some(sni), Some(key_share)) => {
+    let stateful_authenticated = match parsed.sni.as_deref() {
+        Some(sni) => {
             let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
             tail.copy_from_slice(
                 &record[parsed.session_id_range.start + AUTH_TAG_LEN..parsed.session_id_range.end],
             );
-            let expected = compute_stateful_tag(auth_key, sni, &key_share, &tail)?;
+            let expected = compute_stateful_tag(auth_key, sni, &parsed.client_random, &tail)?;
             bool::from(actual.ct_eq(&expected))
         }
-        _ => false,
+        None => false,
     };
     let timestamp_start = parsed.session_id_range.start + AUTH_TAG_LEN;
     let timestamp = u64::from_be_bytes(
@@ -165,7 +166,7 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
     Ok(ClientAuth {
         authenticated: transcript_authenticated || stateful_authenticated,
         sni: parsed.sni,
-        x25519_key_share: parsed.x25519_key_share,
+        x25519_key_share: Some(parsed.client_random),
         timestamp: Some(timestamp),
         nonce: Some(nonce),
     })
@@ -223,6 +224,7 @@ fn compute_tag(
     signed[session_id_range.start..session_id_range.start + AUTH_TAG_LEN].fill(0);
 
     let mut mac = <HmacSha256 as Mac>::new_from_slice(psk).map_err(|_| AuthError::EmptyPsk)?;
+    mac.update(b"ParallaX v2 transcript ClientHello auth");
     mac.update(&signed[crate::tls::record::TLS_HEADER_LEN..record_len]);
     let digest = mac.finalize().into_bytes();
 
@@ -234,7 +236,7 @@ fn compute_tag(
 fn compute_stateful_tag(
     auth_key: &[u8],
     sni: &str,
-    x25519_key_share: &[u8; 32],
+    parallax_x25519_public: &[u8; 32],
     tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
 ) -> Result<[u8; AUTH_TAG_LEN], AuthError> {
     if auth_key.is_empty() {
@@ -242,10 +244,11 @@ fn compute_stateful_tag(
     }
 
     let mut mac = <HmacSha256 as Mac>::new_from_slice(auth_key).map_err(|_| AuthError::EmptyPsk)?;
-    mac.update(b"ParallaX v1 stateful rustls ClientHello auth");
+    mac.update(b"ParallaX v2 stateful rustls ClientHello auth");
     mac.update(&(sni.len() as u16).to_be_bytes());
     mac.update(sni.as_bytes());
-    mac.update(x25519_key_share);
+    // v2 binds the ParallaX ephemeral X25519 public key carried in ClientHello.random.
+    mac.update(parallax_x25519_public);
     mac.update(tail);
     let digest = mac.finalize().into_bytes();
 
@@ -305,10 +308,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_modified_stateful_client_random() {
+        let mut hello = client_hello_fixture("example.com");
+        let parsed = parse_client_hello(&hello).unwrap();
+        let parallax_public = parsed.client_random;
+        let tail = [9_u8; STATEFUL_AUTH_TAIL_LEN];
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let session_id =
+            build_stateful_auth_session_id(psk, "example.com", &parallax_public, &tail).unwrap();
+        hello[parsed.session_id_range].copy_from_slice(&session_id);
+
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        hello[random_offset] ^= 0x55;
+
+        let auth = verify_client_hello_auth(&hello, psk).unwrap();
+        assert!(!auth.authenticated);
+    }
+
+    #[test]
     fn verifies_stateful_rustls_session_id_auth() {
         let mut hello = client_hello_fixture("example.com");
         let parsed = parse_client_hello(&hello).unwrap();
-        let key_share = parsed.x25519_key_share.unwrap();
+        let key_share = parsed.client_random;
         let tail = [9_u8; STATEFUL_AUTH_TAIL_LEN];
         let psk = b"0123456789abcdef0123456789abcdef";
         let session_id =

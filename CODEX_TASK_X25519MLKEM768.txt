@@ -1,0 +1,333 @@
+# Codex 任务：让 ParallaX 切到 aws_lc_rs provider，让 ClientHello 携带 X25519MLKEM768 key_share
+
+> 这是一个全新窗口；先读完整篇再动手。本任务约 300~500 行 Rust 改动 + 测试。
+> 全程在仓库根目录工作（仓库已经 clone 好），不需要下载任何外部代码。
+
+---
+
+## 0. 你的工具与工作守则
+
+- 用 **Context7 MCP**（已配置）查 rustls 0.23.x、aws-lc-rs、quinn、x25519-dalek 的最新文档和 API 签名。
+  - 怎么用：直接在工具列表里调用 context7，库 ID 例如 `/websites/rs_rustls_rustls`，查询用具体问题描述。
+  - 任何关于 rustls API 的猜测都先查 context7 确认，**不要**用训练数据里的旧记忆。
+- 不要联网下载任何东西，不要换镜像源；构建工具链已经好了。
+- **一切改动只动源码 + 必要的测试**。不要新增 markdown 文档或在 README 里加废话。
+- 改完后**必须**跑这三条验证（命令在文末）：
+  1. `cargo fmt --check`
+  2. `cargo clippy --all-targets -- -D warnings`
+  3. `cargo test`（要求 67 个 lib test 全绿；3 个 ignored 不跑）
+
+---
+
+## 1. 项目背景（30 秒读懂）
+
+ParallaX 是一个 **Rust 写的抗审查 TLS 代理**：客户端伪装成访问某个真实 HTTPS 站（例如 cloudflare.com），跟服务端建立隐蔽通道。目标是让 GFW 看到的流量字节级接近真 Chrome。
+
+代码骨架（重要的）：
+
+- `src/tls/stateful.rs` — 用 **rustls** 这个工业级 TLS 库生成 ClientHello（不是手搓），再注入两个 hook：
+  1. 把 ClientHello 里 32 字节的 SessionID 替换成 ParallaX 的认证签名（HMAC tag + 时间戳 + nonce）
+  2. 替换 X25519 key share 的私钥为 ParallaX 自己生成的 keypair（因为服务端用同一对 keypair 做 ECDH 派生 session keys）
+- `src/crypto/auth.rs` — ClientHello 认证逻辑：HMAC 签名 / 验证。
+- `src/crypto/session.rs` — X25519 ECDH + HKDF + AEAD（XChaCha20-Poly1305）。
+- `src/handshake/server.rs` / `src/handshake/client.rs` — 服务端/客户端握手流程编排。
+- `src/tls/client_hello.rs` — ClientHello 字节解析器（服务端用来读 SNI、SessionID、X25519 key_share）。
+- `src/tls/client_hello_builder.rs` — 一个 v1 的手搓 ClientHello（**只用于 tests / probe / 紧急回落**，不是生产路径）。
+
+服务端**不跑 rustls**：它直接读裸 TCP 字节，解析 ClientHello 头，把记录转发给伪装站拿 ServerHello，然后切到 ParallaX 自己的加密层。所以服务端不能用 rustls 的 `export_keying_material`。
+
+---
+
+## 2. 当前工作区状态（很重要，先 git diff 看一下）
+
+工作区已经有未提交改动：
+
+```
+modified:   Cargo.lock     # cargo 自动同步，把 aws-lc-rs / aws-lc-sys 引入
+modified:   Cargo.toml     # rustls 依赖从 features = ["std", "ring"] 改成 ["std", "aws_lc_rs"]
+                           # （default features 也开了，包含 prefer-post-quantum）
+```
+
+这两个改动**保留**，是本任务的前置条件。`quinn` 仍然用 `rustls-ring` feature，不动它。
+
+代码层面：`src/tls/stateful.rs:455` 还在调 `rustls::crypto::ring::default_provider()`。这是本次要改的核心入口之一。
+
+---
+
+## 3. 任务目标
+
+让 **ClientHello 同时携带 X25519MLKEM768 + X25519 两个 key_share**，跟 Chrome 124+ 的 JA4 指纹对齐。
+
+**直接路径行不通**——光把 provider 切成 `aws_lc_rs::default_provider()` 会让现有 stateful 单元测试 `stateful_backend_emits_authenticated_client_hello` 立刻挂，错误码 `UnauthenticatedClientHello`。原因：
+
+> rustls 在启用 `prefer-post-quantum` (默认开) 时，会优先用 X25519MLKEM768 做 hybrid key exchange。
+> 根据 rustls 文档（`rustls::crypto::ActiveKeyExchange::hybrid_component`）：
+> 当用 hybrid group 时，rustls 会从 `hybrid_component()` 直接拿到 X25519 公钥并写入第二个 key_share，**不会**调用 X25519 group 的 `SupportedKxGroup::start()`。
+>
+> 这意味着 ParallaX 现有的 `PARALLAX_X25519` hook（替换 X25519 SupportedKxGroup 来注入自己的私钥）**不会触发**——X25519MLKEM768 内部有自己的 X25519，跟 ParallaX 注入的不是同一对。
+>
+> 结果：ClientHello 里两个 X25519 公钥都是 aws_lc_rs 生成的，ParallaX 的认证（HMAC 输入包含"ParallaX 自己的 X25519 公钥"）跟 ClientHello 里的对不上。
+
+所以本任务要**重新设计认证机制**，让它不依赖"注入 X25519 私钥"这个手段，但**仍然保持 ECDH-bound**（攻击者就算偷了 PSK 也不能伪造 ClientHello）。
+
+---
+
+## 4. 推荐设计方案：ClientHello.random 作为 ParallaX X25519 公钥载体
+
+### 4.1 核心思想
+
+```
+TLS 1.3 ClientHello 的 32 字节 random 字段：
+  当前：rustls 的 SecureRandom 生成的随机数
+  改造后：ParallaX 自己生成一对 X25519 keypair，把公钥（32 字节）填进去
+
+服务端解析时：
+  - 从 ClientHello.random 直接读出 ParallaX X25519 公钥
+  - 用服务端 X25519 私钥跟它做 ECDH → x25519_shared_secret
+  - 派生 auth_key 验证 SessionID HMAC
+  - 派生 session_keys（保持原协议）
+
+rustls 自身的 X25519MLKEM768 + X25519 用 aws_lc_rs 生成，正常 TLS 1.3 握手流程不变。
+ParallaX 的 ECDH 与 rustls 的 ECDH 完全独立。
+```
+
+### 4.2 为什么用 random 字段？
+
+- 32 字节，**正好**装 X25519 公钥
+- TLS 1.3 客户端 random 是公开的明文字段，服务端能直接读到
+- TLS 协议只要求 random 唯一（防重放），不要求"看起来是均匀随机"
+- X25519 公钥从外部看，统计上跟 32 字节随机几乎一样（不会引入低熵特征）
+- **JA4 指纹不受影响**：JA4 不哈希 random 字段
+- 不需要任何额外扩展，所以也不会破坏跟 Chrome 的扩展数/顺序对齐
+
+### 4.3 安全等价性论证
+
+- **当前协议**：auth_key = HKDF(PSK || ECDH(client_x25519_priv, server_pub))；ClientHello 里 X25519 公钥就是 client_x25519_priv 对应的。
+- **新协议**：完全一样的 auth_key 派生，**唯一区别**是 client_x25519 keypair 是 ParallaX 自己 ephemeral 生成的（每次连接新生成），公钥载体从"key_share 扩展里的 X25519 group"换成"ClientHello.random 字段"。
+- ECDH-binding 性质保持：攻击者拿到 PSK 也无法伪造 ClientHello，因为他不知道 ParallaX 那对 ephemeral X25519 的私钥。
+- PFS 保持：ParallaX X25519 keypair 是 ephemeral 的，每次连接新生成，连接结束就丢弃。
+- 重放保护保持：现有 replay cache 用 (timestamp, nonce, transcript_fingerprint)，跟 X25519 公钥载体位置无关。
+
+---
+
+## 5. 必读文件（动手前全部读完）
+
+按顺序读，每个都全读：
+
+1. `src/tls/stateful.rs` — 重点：`PatchContext`、`ParallaxSecureRandom`、`ParallaxX25519Group`、`patched_kx_groups`、`build_client_config`、`StatefulRustlsCamouflageBackend::start`
+2. `src/tls/client_hello.rs` — 解析器，要扩展返回 `random` 字段
+3. `src/crypto/auth.rs` — `compute_stateful_tag` / `verify_client_hello_auth` / `build_stateful_auth_session_id`
+4. `src/handshake/server.rs:decide_inbound` 和 `accept_authenticated` — 服务端用 `parsed.x25519_key_share` 的两个地方
+5. `src/handshake/client.rs:derive_session_keys` — 客户端从握手结果派生 session keys
+6. `src/client/runtime.rs:establish_data_session` — 怎么把 stateful session 的 X25519 keypair 传出来
+7. `src/tls/client_hello_builder.rs` — v1 手搓路径，认证逻辑要同步改造（保持 v1 和 v2 的认证语义一致）
+8. `src/bench.rs` — 跑 bench 时用了 ClientHello fixture，确保兼容
+9. `src/lib.rs`、`Cargo.toml` — 整体上下文
+
+跟用户协议（必看）：
+- `README.md`
+- 仓库根的 `code_refs/` 和 `docs/` 目录扫一眼，知道哪些是设计文档（**不需要更新它们**，避免文档漂移）
+
+---
+
+## 6. 改动清单（按文件）
+
+### 6.1 `src/tls/client_hello.rs`
+
+- 在 `ClientHello` struct 添加 `pub client_random: [u8; 32]`
+- `parse_client_hello`：现在 `cursor.skip(32)` 跳过 random，改成读出来塞进 `client_random`
+- 测试 fixture（`client_hello_fixture` 等）保持兼容；同步更新 fixture 让 random 字段可控
+- 添加单元测试：parse 后能正确拿到 client_random
+
+### 6.2 `src/crypto/auth.rs`
+
+`compute_stateful_tag` 当前签名是：
+```rust
+fn compute_stateful_tag(auth_key: &[u8], sni: &str, x25519_key_share: &[u8; 32], tail: &[u8; 16]) -> ...
+```
+**保持函数签名不变**（向后兼容、最小改动），但**调用方传入的 32 字节内容**从"ClientHello key_share 里的 X25519 公钥"改为"ClientHello.random（也就是 ParallaX 自己的 X25519 公钥）"。
+
+也就是**HMAC 输入的语义变化**了，所以**必须**同步更新两处：
+1. domain separation 字符串：`b"ParallaX v1 stateful rustls ClientHello auth"` → `b"ParallaX v2 stateful rustls ClientHello auth"`（升版本号防止 v1/v2 跨版本误验证通过）
+2. 注释里说明：第 3 个参数现在是 "ParallaX ephemeral X25519 public key carried in ClientHello.random"
+
+`verify_client_hello_auth`：
+- 用 `parsed.client_random` 替换 `parsed.x25519_key_share` 作为 HMAC 输入
+- `ClientAuth.x25519_key_share` 字段语义保持：返回**用于 ECDH 的 ParallaX X25519 公钥**（现在从 `client_random` 读，不是 key_share 扩展）
+- 同样升级 transcript-based HMAC 的 domain separation 标签到 v2（如果你保留双签名机制；如果决定只保留 stateful 路径，请在 PR 描述里说明并删除死代码）
+
+### 6.3 `src/tls/stateful.rs`
+
+这个文件改动最大，按下面顺序处理：
+
+1. `build_client_config`: `rustls::crypto::ring::default_provider()` → `rustls::crypto::aws_lc_rs::default_provider()`
+2. `patched_kx_groups`: 不再替换 X25519 group。可以**整个移除**这个函数，直接用 provider 默认 kx_groups。这样 X25519MLKEM768 + X25519 + secp256r1 + secp384r1 都会按 prefer-post-quantum 顺序进 ClientHello。
+3. **删除** `ParallaxX25519Group` / `ParallaxActiveX25519` / `static PARALLAX_X25519`、`ExternalKeyShareProvider` trait（连带 `PatchContext` 对它的实现）。这些不再需要。
+4. **改造 `ParallaxSecureRandom::fill`**：现在要响应**两次** 32 字节请求：
+   - 第 1 次（rustls 调用 fill 生成 client_random）：用 `context.x25519.public` 作为 32 字节输出
+   - 第 2 次（rustls 调用 fill 生成 SessionID）：用 `build_stateful_auth_session_id(...)` 输出
+   - 用 `PatchContext` 里增加一个状态机字段，比如 `random_pending: bool` 配合现有的 `session_id_pending: bool`
+   - **关键**：先用 context7 查 rustls 0.23 ClientConnection 的 ClientHello 构造路径，确认对 SecureRandom 的调用顺序（client_random 一定先于 SessionID，但要验证）。**不要靠猜**——可以临时加一个 `tracing::debug!` log 看顺序，跑完测试再删除 log。
+   - 万一顺序反了或者 rustls 在中间插入别的 32 字节调用：用计数器更稳，比如 `random_calls_seen: u8`，按调用次数派发 random vs session_id；超过预期次数就 fallback 到 OsRng。
+5. `PatchContext::new(...)` 和 `install_auth_session_id`：保持接口可用，但 `install_auth_session_id` 现在的参考 X25519 来源是 `context.x25519.public`（不再是 `parse_client_hello(out)?.x25519_key_share`，因为那不再是 ParallaX 的）
+6. `StatefulRustlsCamouflageBackend::start` 末尾的认证自检：
+   ```rust
+   let auth = verify_client_hello_auth(&client_hello, &auth_key)?;
+   if !auth.authenticated || auth.x25519_key_share != Some(x25519.public) {
+       return Err(TlsBackendError::UnauthenticatedClientHello);
+   }
+   ```
+   这段保留，但 `auth.x25519_key_share` 现在来自 `client_random`，应该等于 `x25519.public`，逻辑天然对齐。
+
+### 6.4 `src/handshake/server.rs`
+
+`decide_inbound` 当前用 `parsed.x25519_key_share` 做两件事：
+- 派生 auth_key（`derive_server_auth_key(psk, server_priv, &x25519_key_share)`）
+- 后面 `accept_authenticated` 里的 `derive_server_keys(server_priv, &client_hello.x25519_key_share, ...)` 派生 session keys
+
+新逻辑：`x25519_key_share` 字段语义变了——它现在是**从 client_random 字段读取的 ParallaX X25519 公钥**。`AuthenticatedHello.x25519_key_share` 保持字段名不变（避免大规模 rename），但加注释说明语义。
+
+如果你觉得字段名误导，可以**重命名**为 `parallax_x25519_pubkey: [u8; 32]`，但要全仓库一起改。**非必须**，看你时间。
+
+`client_hello_fingerprint` 不受影响（它哈希整个 ClientHello）。
+
+### 6.5 `src/handshake/client.rs`
+
+`derive_session_keys(client_x25519_priv, server_pub, client_hello, server_hello)` 不变——但调用方传入的 `client_x25519_priv` 现在来自 stateful session 暴露的 keypair。已经是这样了，确认即可。
+
+### 6.6 `src/client/runtime.rs:establish_data_session`
+
+确认 `completed.client_x25519` 仍然能拿到 ParallaX 那对 keypair。当前代码已经这样工作，只要 stateful.rs 里 `CompletedStatefulHandshake.client_x25519` 字段保留，这边不动。
+
+### 6.7 `src/tls/client_hello_builder.rs`（v1 手搓路径）
+
+这是 fixture 用的。同步改：
+- 让生成的 ClientHello 把 `x25519_public_key` 也填进 random 字段（保持跟 v2 一致的认证语义）
+- 注释清楚 v1 也升级成 v2 协议
+- 如果原来 random 是随机的，现在改成 keypair 的公钥
+
+### 6.8 `src/crypto/auth.rs` 测试更新
+
+- `signs_and_verifies_client_hello_session_id`、`verifies_stateful_rustls_session_id_auth` 等测试需要确保 fixture 的 `random` 字段就是 `x25519_public_key`
+- 增加新测试：篡改 random 字段后认证失败
+
+---
+
+## 7. 实现顺序（建议这样推进）
+
+1. 先**只**改 `client_hello.rs`：导出 `client_random: [u8; 32]`。跑 `cargo test`，确保现有 67 个测试还全绿（这是纯增字段，不应该破坏任何东西）。
+2. 改 `auth.rs` 的 `compute_stateful_tag` / `verify_client_hello_auth`：HMAC 输入用 `client_random`，domain separation 字符串升 v2。同步改 `client_hello_builder.rs` 让 random = pubkey，让现有测试继续通过。这一步会让一批认证测试需要更新 fixture。
+3. 改 `stateful.rs`：先**保留** `PARALLAX_X25519` hook（不要删），但把 `ParallaxSecureRandom::fill` 改造成两阶段填充（random + session_id）。这一步切换 provider 到 aws_lc_rs，跑 `cargo test`。这时 `stateful_backend_emits_authenticated_client_hello` 应该开始通过。
+4. 验证 ClientHello 里**有** X25519MLKEM768 key_share：写一个临时测试，把 client_hello 字节 hex dump 出来，肉眼或代码确认存在 `0x11 0xec` (group X25519MLKEM768)。
+5. 移除 `PARALLAX_X25519` 相关代码（dead code），最终清理。
+6. 跑 `cargo fmt`、`cargo clippy --all-targets -- -D warnings`、`cargo test`，全部通过。
+
+---
+
+## 8. 必须验证的清单
+
+跑这些命令并粘贴输出：
+
+```bash
+# 格式化
+cargo fmt --check
+
+# 静态检查（warnings as errors）
+cargo clippy --all-targets -- -D warnings
+
+# 全部测试（lib + bin tests，不跑 ignored 的网络集成测试）
+cargo test
+
+# 输出应该是：
+# test result: ok. <N> passed; 0 failed; 3 ignored; ...
+# 至少 67 个 lib 测试通过；新加的测试也要算进去。
+```
+
+另外**必须**手动验证一次，把改完后的 ClientHello 字节 hexdump 出来贴在 PR 描述里：
+
+```rust
+// 在 stateful.rs::tests 里临时加一个测试：
+#[test]
+fn debug_dump_client_hello_has_mlkem768() {
+    use crate::crypto::session::X25519KeyPair;
+    let server = X25519KeyPair::generate();
+    let psk = b"0123456789abcdef0123456789abcdef";
+    let session = StatefulRustlsCamouflageBackend
+        .start("example.com".to_owned(), psk, &server.public, BrowserProfile::Chrome124)
+        .unwrap();
+    eprintln!("len={}", session.client_hello().len());
+    for chunk in session.client_hello().chunks(32) {
+        for b in chunk { eprint!("{:02x}", b); }
+        eprintln!();
+    }
+    // X25519MLKEM768 group id 是 0x11ec，应该出现在字节流里
+    let needle = [0x11_u8, 0xec];
+    assert!(session.client_hello().windows(2).any(|w| w == needle),
+        "X25519MLKEM768 group id (0x11ec) not found in ClientHello");
+}
+```
+
+跑完 `cargo test debug_dump_client_hello_has_mlkem768 -- --nocapture`，确认通过且能在输出里看到 `11ec`。
+
+**这个测试可以保留**（提交进 PR），命名改成 `client_hello_carries_x25519_mlkem768_key_share` 之类，作为长期回归保证。
+
+---
+
+## 9. 风险点 & 边界情况
+
+读完后心里有数，遇到时不慌：
+
+1. **rustls 调用 SecureRandom 的顺序和次数**——如果不止两次 32 字节调用（比如还有内部 nonce），状态机要 robust。先 log 再写逻辑。
+2. **Quinn 仍然用 rustls-ring**——`Cargo.toml` 里 quinn 的 feature 不动；rustls 同时启用 ring 和 aws_lc_rs 是合法的（lock 已经包含两个），quinn 内部走 ring 不影响 ParallaX 这边走 aws_lc_rs。
+3. **client_hello_builder.rs 是 v1**——如果完全废弃了，请在 PR 描述里说明；如果保留，必须改造成 v2 协议（fixture 跟生产路径一致）。
+4. **bench.rs 用 ClientHello**——确认 bench 不跑测试时能 build；不要破坏 `plx bench` 命令。
+5. **不要重命名公开类型/函数**，除非确实必要——保持 diff 小。
+6. **不要碰 QUIC 路径**（`src/transport/quic_runtime.rs`）。它是另一条独立链路。
+7. **不要更新 README、不要新增 markdown 文档**。代码里加必要的 doc comment 即可。
+
+---
+
+## 10. 完成后给 PR 描述写什么
+
+按这个模板：
+
+```
+## 改动概要
+- ParallaX TLS camouflage 切到 rustls 的 aws_lc_rs provider
+- ClientHello 现在携带 X25519MLKEM768 + X25519 两个 key_share，跟 Chrome 124+ 对齐
+- 认证机制从"注入 X25519 私钥"改成"ParallaX ephemeral X25519 公钥嵌入 ClientHello.random 字段"
+- 协议版本：stateful auth domain separation 字符串升级到 v2
+
+## 安全等价性
+- ECDH-binding 保留：攻击者拿到 PSK 仍无法伪造 ClientHello（不知道 ephemeral 私钥）
+- PFS 保留：每次连接新生成 keypair
+- 重放保护保留：replay cache 不受影响
+
+## 验证
+- cargo fmt --check  ✓
+- cargo clippy --all-targets -- -D warnings  ✓
+- cargo test  ✓ 67+ passed, 0 failed
+- 手动 hexdump 确认 0x11ec (X25519MLKEM768 group id) 出现在 ClientHello
+
+## 兼容性
+- 旧客户端（v1 协议）连新服务端 → 失败（domain separation 不匹配，按设计）
+- 新客户端连旧服务端 → 失败（同上）
+- 部署需要客户端+服务端同步升级
+```
+
+完成。把所有改动 commit 在一个干净的 commit 里（commit message 精炼，1~3 行），不要中间 wip 提交。
+
+---
+
+## 11. 如果遇到设计上的判断题
+
+下面这些是 ParallaX 的"灵魂"问题，遇到不确定**直接保守选**：
+
+- **"是否要保留 v1 协议兼容"**：不要。让 v1 客户端连不上 v2 服务端，强制升级。
+- **"是否要把 client_random 字段变成 deterministic（同一个 keypair 每次相同）"**：不要。每次连接新生成 ephemeral keypair，PFS 第一原则。
+- **"是否要把 ParallaX X25519 公钥同时也放到 key_share 扩展"**：不要。冗余的认证位置 = 攻击面增大。
+- **"client_random 改成 ParallaX 公钥后，rustls 内部用它做 nonce 会出问题吗"**：不会。client_random 在 TLS 1.3 中用作 transcript hash 的一部分，对它的要求只是 32 字节 + 唯一，X25519 ephemeral 公钥两个属性都满足。
+
+---
+
+完了。

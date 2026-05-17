@@ -1,14 +1,13 @@
 //! Stateful rustls camouflage backend.
 //!
-//! V1 keeps rustls in charge of the TLS 1.3 state machine, disables resumption
+//! V2 keeps rustls in charge of the TLS 1.3 state machine, disables resumption
 //! so PSK binders cannot invalidate ParallaX authentication, and injects only
-//! two narrow hooks: an externally supplied X25519 key share and an authenticated
-//! legacy SessionID. The hand-written ClientHello builder remains available for
-//! tests, probes, and emergency fallback paths.
+//! two narrow hooks: the ParallaX X25519 public key in ClientHello.random and an
+//! authenticated legacy SessionID. The hand-written ClientHello builder remains
+//! available for tests, probes, and emergency fallback paths.
 
 use std::{
     cell::RefCell,
-    fmt,
     io::{Cursor, Read, Write},
     sync::Arc,
     time::Duration,
@@ -18,25 +17,19 @@ use rand::{rngs::OsRng, RngCore};
 use rustls::{
     client::danger::HandshakeSignatureValid,
     client::Resumption,
-    crypto::{
-        ActiveKeyExchange, CryptoProvider, GetRandomFailed, SecureRandom, SharedSecret,
-        SupportedKxGroup,
-    },
-    ffdhe_groups::FfdheGroup,
+    crypto::{GetRandomFailed, SecureRandom},
     pki_types::{CertificateDer, ServerName, UnixTime},
-    DigitallySignedStruct, Error as RustlsError, NamedGroup, SignatureScheme,
+    DigitallySignedStruct, Error as RustlsError, SignatureScheme,
 };
-use subtle::ConstantTimeEq;
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
     time::{sleep, timeout},
 };
-use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::{
-    backend::TlsBackendError, client_hello::parse_client_hello,
-    client_hello_builder::BrowserProfile, record::read_record, server_hello::parse_server_hello,
+    backend::TlsBackendError, client_hello_builder::BrowserProfile, record::read_record,
+    server_hello::parse_server_hello,
 };
 use crate::crypto::{
     auth::{
@@ -64,6 +57,7 @@ struct PatchContext {
     auth_key: [u8; 32],
     x25519: X25519KeyPair,
     session_id_pending: bool,
+    random_pending: bool,
 }
 
 impl PatchContext {
@@ -73,27 +67,8 @@ impl PatchContext {
             auth_key,
             x25519,
             session_id_pending: true,
+            random_pending: true,
         }
-    }
-}
-
-impl ExternalKeyShareProvider for PatchContext {
-    fn x25519_keypair(&self) -> X25519KeyPair {
-        self.x25519.clone()
-    }
-}
-
-impl ClientHelloMutator for PatchContext {
-    fn install_auth_session_id(&self, out: &mut [u8]) -> Result<(), TlsBackendError> {
-        let parsed = parse_client_hello(out)?;
-        let Some(key_share) = parsed.x25519_key_share else {
-            return Err(TlsBackendError::UnauthenticatedClientHello);
-        };
-        let tail = build_auth_tail(&mut OsRng)?;
-        let session_id =
-            build_stateful_auth_session_id(&self.auth_key, &self.sni, &key_share, &tail)?;
-        out[parsed.session_id_range].copy_from_slice(&session_id);
-        Ok(())
     }
 }
 
@@ -129,14 +104,6 @@ impl RecordEventTap for VecRecordTap {
     fn on_record(&mut self, event: RecordEvent) {
         self.events.push(event);
     }
-}
-
-pub trait ExternalKeyShareProvider {
-    fn x25519_keypair(&self) -> X25519KeyPair;
-}
-
-pub trait ClientHelloMutator {
-    fn install_auth_session_id(&self, out: &mut [u8]) -> Result<(), TlsBackendError>;
 }
 
 pub trait PostHandshakeDrain {
@@ -452,8 +419,7 @@ fn with_patch_context<T>(
 }
 
 fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, TlsBackendError> {
-    let mut provider = rustls::crypto::ring::default_provider();
-    provider.kx_groups = patched_kx_groups(&provider);
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.secure_random = &PARALLAX_RANDOM;
 
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -469,20 +435,6 @@ fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, 
     Ok(config)
 }
 
-fn patched_kx_groups(provider: &CryptoProvider) -> Vec<&'static dyn SupportedKxGroup> {
-    provider
-        .kx_groups
-        .iter()
-        .map(|group| {
-            if group.name() == NamedGroup::X25519 {
-                &PARALLAX_X25519 as &'static dyn SupportedKxGroup
-            } else {
-                *group
-            }
-        })
-        .collect()
-}
-
 #[derive(Debug)]
 struct ParallaxSecureRandom;
 
@@ -496,84 +448,39 @@ impl SecureRandom for ParallaxSecureRandom {
             let Some(context) = slot.as_mut() else {
                 return;
             };
-            if !context.session_id_pending || buf.len() != crate::crypto::auth::SESSION_ID_LEN {
+            if buf.len() != crate::crypto::auth::SESSION_ID_LEN {
                 return;
             }
 
-            let tail = build_auth_tail(&mut OsRng).expect("system clock must be after UNIX epoch");
-            let session_id = build_stateful_auth_session_id(
-                &context.auth_key,
-                &context.sni,
-                &context.x25519.public,
-                &tail,
-            )
-            .expect("stateful auth inputs are fixed length");
-            buf.copy_from_slice(&session_id);
-            context.session_id_pending = false;
-            handled = true;
+            if context.session_id_pending {
+                // rustls 0.23 constructs the TLS 1.3 compatibility SessionID
+                // before ClientHello.random for non-QUIC clients.
+                let tail =
+                    build_auth_tail(&mut OsRng).expect("system clock must be after UNIX epoch");
+                let session_id = build_stateful_auth_session_id(
+                    &context.auth_key,
+                    &context.sni,
+                    &context.x25519.public,
+                    &tail,
+                )
+                .expect("stateful auth inputs are fixed length");
+                buf.copy_from_slice(&session_id);
+                context.session_id_pending = false;
+                handled = true;
+                return;
+            }
+
+            if context.random_pending {
+                buf.copy_from_slice(&context.x25519.public);
+                context.random_pending = false;
+                handled = true;
+            }
         });
 
         if !handled {
             OsRng.fill_bytes(buf);
         }
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct ParallaxX25519Group;
-
-static PARALLAX_X25519: ParallaxX25519Group = ParallaxX25519Group;
-
-impl SupportedKxGroup for ParallaxX25519Group {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, RustlsError> {
-        let keypair = PATCH_CONTEXT
-            .with(|slot| slot.borrow().as_ref().map(|context| context.x25519.clone()))
-            .ok_or(TlsBackendError::MissingPatchContext)
-            .map_err(|err| RustlsError::General(err.to_string()))?;
-
-        Ok(Box::new(ParallaxActiveX25519 { keypair }))
-    }
-
-    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        None
-    }
-
-    fn name(&self) -> NamedGroup {
-        NamedGroup::X25519
-    }
-}
-
-struct ParallaxActiveX25519 {
-    keypair: X25519KeyPair,
-}
-
-impl ActiveKeyExchange for ParallaxActiveX25519 {
-    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, RustlsError> {
-        let peer_pub_key: [u8; 32] = peer_pub_key
-            .try_into()
-            .map_err(|_| RustlsError::General("invalid X25519 peer key length".to_owned()))?;
-        let private = StaticSecret::from(self.keypair.private);
-        let public = PublicKey::from(peer_pub_key);
-        let shared = private.diffie_hellman(&public);
-        if bool::from(shared.as_bytes().ct_eq(&[0_u8; 32])) {
-            return Err(RustlsError::General(
-                "invalid all-zero X25519 shared secret".to_owned(),
-            ));
-        }
-        Ok(SharedSecret::from(shared.as_bytes().as_slice()))
-    }
-
-    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        None
-    }
-
-    fn pub_key(&self) -> &[u8] {
-        &self.keypair.public
-    }
-
-    fn group(&self) -> NamedGroup {
-        NamedGroup::X25519
     }
 }
 
@@ -625,14 +532,6 @@ impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
     }
 }
 
-impl fmt::Debug for ParallaxActiveX25519 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ParallaxActiveX25519")
-            .field("public", &self.keypair.public)
-            .finish_non_exhaustive()
-    }
-}
-
 fn is_clean_close(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -646,6 +545,7 @@ fn is_clean_close(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::crypto::{auth::derive_server_auth_key, session::X25519KeyPair};
+    use crate::tls::client_hello::parse_client_hello;
 
     #[test]
     fn stateful_backend_emits_authenticated_client_hello() {
@@ -661,14 +561,45 @@ mod tests {
             .unwrap();
 
         let parsed = parse_client_hello(&session.client_hello).unwrap();
-        let auth_key =
-            derive_server_auth_key(psk, &server.private, &parsed.x25519_key_share.unwrap())
-                .unwrap();
+        let auth_key = derive_server_auth_key(psk, &server.private, &parsed.client_random).unwrap();
         let auth = verify_client_hello_auth(&session.client_hello, &auth_key).unwrap();
 
+        assert_eq!(parsed.client_random, session.x25519.public);
         assert!(auth.authenticated);
         assert_eq!(auth.sni.as_deref(), Some("example.com"));
         assert_eq!(auth.x25519_key_share, Some(session.x25519.public));
         assert!(session.connection.is_handshaking());
+    }
+
+    #[test]
+    fn client_hello_carries_x25519_mlkem768_key_share() {
+        let server = X25519KeyPair::generate();
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let session = StatefulRustlsCamouflageBackend
+            .start(
+                "example.com".to_owned(),
+                psk,
+                &server.public,
+                BrowserProfile::Chrome124,
+            )
+            .unwrap();
+
+        eprintln!("len={}", session.client_hello.len());
+        for chunk in session.client_hello.chunks(32) {
+            for b in chunk {
+                eprint!("{b:02x}");
+            }
+            eprintln!();
+        }
+
+        let parsed = parse_client_hello(&session.client_hello).unwrap();
+        assert_eq!(parsed.client_random, session.x25519.public);
+        assert!(
+            session
+                .client_hello
+                .windows(4)
+                .any(|w| w == [0x11, 0xec, 0x04, 0xc0].as_slice()),
+            "X25519MLKEM768 key_share header (0x11ec, len 0x04c0) not found in ClientHello"
+        );
     }
 }

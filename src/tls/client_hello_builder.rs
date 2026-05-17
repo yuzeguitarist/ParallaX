@@ -77,7 +77,8 @@ impl ClientHelloTemplate {
 
         let mut body = Vec::with_capacity(512);
         body.extend_from_slice(&TLS12_LEGACY_VERSION.to_be_bytes());
-        push_random(&mut body, rng);
+        // ParallaX v2 carries its own ephemeral X25519 public key in ClientHello.random.
+        body.extend_from_slice(&self.x25519_public_key);
         body.push(32);
         body.extend_from_slice(&[0_u8; 32]);
 
@@ -169,15 +170,6 @@ fn push_profile_extensions(
             push_alpn(out, &[b"h2".as_slice(), b"http/1.1".as_slice()]);
         }
     }
-}
-
-fn push_random<R>(out: &mut Vec<u8>, rng: &mut R)
-where
-    R: RngCore + CryptoRng,
-{
-    let mut random = [0_u8; 32];
-    rng.fill_bytes(&mut random);
-    out.extend_from_slice(&random);
 }
 
 fn push_sni(out: &mut Vec<u8>, sni: &[u8]) {
@@ -305,6 +297,7 @@ mod tests {
         let verified = verify_client_hello_auth(&record, &server_auth).unwrap();
 
         assert_eq!(parsed.sni.as_deref(), Some("example.com"));
+        assert_eq!(parsed.client_random, client.public);
         assert_eq!(parsed.x25519_key_share, Some(client.public));
         assert!(parsed.tls13_supported);
         assert!(verified.authenticated);
