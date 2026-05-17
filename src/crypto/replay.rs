@@ -1,6 +1,8 @@
 use std::{
     collections::{HashSet, VecDeque},
-    fmt, fs, io,
+    fmt,
+    fs::{self, OpenOptions},
+    io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,10 +14,11 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 2 * 60;
-const AUTH_CACHE_VERSION: &str = "parallax-replay-cache-v2";
-const CACHE_FILE_MAC_LABEL: &[u8] = b"ParallaX v1 replay cache file MAC";
-const CACHE_LINE_MAC_LABEL: &[u8] = b"ParallaX v1 replay cache line MAC";
+const AUTH_JOURNAL_VERSION: &str = "parallax-replay-cache-v3";
 const CACHE_KEY_LABEL: &[u8] = b"ParallaX v1 replay cache MAC key";
+const CACHE_JOURNAL_HEADER_MAC_LABEL: &[u8] = b"ParallaX v1 replay cache journal header MAC";
+const CACHE_JOURNAL_ENTRY_MAC_LABEL: &[u8] = b"ParallaX v1 replay cache journal entry MAC";
+const AUTH_JOURNAL_HEADER_LEN: usize = 187;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -49,12 +52,19 @@ impl fmt::Debug for CacheMacKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthJournalState {
+    count: u64,
+    tail_mac: [u8; 32],
+}
+
 #[derive(Debug)]
 pub struct ReplayCache {
     capacity: usize,
     window_secs: u64,
     path: Option<PathBuf>,
     mac_key: Option<CacheMacKey>,
+    auth_journal: Option<AuthJournalState>,
     order: VecDeque<ReplayEntry>,
     encoded_entries: VecDeque<String>,
     nonces: HashSet<[u8; 8]>,
@@ -68,6 +78,7 @@ impl ReplayCache {
             window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             path: None,
             mac_key: None,
+            auth_journal: None,
             order: VecDeque::with_capacity(capacity),
             encoded_entries: VecDeque::with_capacity(capacity),
             nonces: HashSet::with_capacity(capacity),
@@ -94,6 +105,7 @@ impl ReplayCache {
             cache.insert_loaded(entry);
         }
         cache.prune_expired(current_unix_timestamp()?);
+        cache.prune_capacity();
         Ok(cache)
     }
 
@@ -107,6 +119,10 @@ impl ReplayCache {
         let mut cache = Self {
             path: Some(path.clone()),
             mac_key: Some(mac_key),
+            auth_journal: Some(AuthJournalState {
+                count: 0,
+                tail_mac: [0_u8; 32],
+            }),
             ..Self::new(capacity)
         };
         if !path.exists() {
@@ -115,10 +131,13 @@ impl ReplayCache {
 
         let raw = fs::read_to_string(&path)?;
         let mac_key = cache.mac_key.as_ref().expect("authenticated cache has key");
-        for entry in parse_authenticated_entries(&raw, mac_key)? {
+        let (entries, journal) = parse_authenticated_journal_entries(&raw, mac_key)?;
+        cache.auth_journal = Some(journal);
+        for entry in entries {
             cache.insert_loaded(entry);
         }
         cache.prune_expired(current_unix_timestamp()?);
+        cache.prune_capacity();
         Ok(cache)
     }
 
@@ -147,11 +166,13 @@ impl ReplayCache {
     }
 
     fn insert_loaded(&mut self, entry: ReplayEntry) {
-        let encoded = self.encode_entry_line(&entry);
+        let encoded = self.mac_key.is_none().then(|| encode_plain_entry(&entry));
         self.nonces.insert(entry.nonce);
         self.transcripts.insert(entry.transcript_fingerprint);
         self.order.push_back(entry);
-        self.encoded_entries.push_back(encoded);
+        if let Some(encoded) = encoded {
+            self.encoded_entries.push_back(encoded);
+        }
     }
 
     fn prune_expired(&mut self, now: u64) {
@@ -177,44 +198,89 @@ impl ReplayCache {
         }
     }
 
-    fn persist(&self) -> Result<(), ReplayCacheError> {
-        let Some(path) = &self.path else {
+    fn persist(&mut self) -> Result<(), ReplayCacheError> {
+        let Some(path) = self.path.clone() else {
             return Ok(());
         };
-
-        let body = serialize_cached_entries(&self.encoded_entries);
-        let raw = match self.mac_key.as_ref() {
-            Some(mac_key) => wrap_authenticated_body(&body, mac_key),
-            None => body,
+        let Some(mac_key) = self.mac_key.clone() else {
+            return self.persist_plain(&path);
         };
 
+        self.persist_authenticated(&path, &mac_key)
+    }
+
+    fn persist_plain(&self, path: &Path) -> Result<(), ReplayCacheError> {
+        let body = serialize_cached_entries(&self.encoded_entries);
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, raw)?;
+        fs::write(&tmp, body)?;
         fs::rename(tmp, path)?;
         Ok(())
     }
 
-    fn encode_entry_line(&self, entry: &ReplayEntry) -> String {
-        let mut line = String::with_capacity(if self.mac_key.is_some() { 168 } else { 103 });
-        line.push_str(&entry.timestamp.to_string());
-        line.push(' ');
-        push_hex(&mut line, &entry.nonce);
-        line.push(' ');
-        push_hex(&mut line, &entry.transcript_fingerprint);
-        if let Some(mac_key) = self.mac_key.as_ref() {
-            line.push(' ');
-            push_hex(
-                &mut line,
-                &cache_line_mac(
-                    mac_key,
-                    entry.timestamp,
-                    &entry.nonce,
-                    &entry.transcript_fingerprint,
-                ),
-            );
+    fn persist_authenticated(
+        &mut self,
+        path: &Path,
+        mac_key: &CacheMacKey,
+    ) -> Result<(), ReplayCacheError> {
+        let Some(journal) = self.auth_journal else {
+            return self.compact_authenticated_journal(path, mac_key);
+        };
+        if self.should_compact_authenticated_journal(journal) {
+            return self.compact_authenticated_journal(path, mac_key);
         }
-        line.push('\n');
-        line
+        let Some(entry) = self.order.back() else {
+            return self.compact_authenticated_journal(path, mac_key);
+        };
+
+        let next_count = journal.count.saturating_add(1);
+        let (line, next_tail_mac) =
+            encode_authenticated_journal_entry(mac_key, next_count, entry, &journal.tail_mac);
+        let next_header = authenticated_journal_header(mac_key, next_count, &next_tail_mac);
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        if file.metadata()?.len() == 0 {
+            if journal.count != 0 {
+                drop(file);
+                return self.compact_authenticated_journal(path, mac_key);
+            }
+            let empty_header = authenticated_journal_header(mac_key, 0, &[0_u8; 32]);
+            file.write_all(empty_header.as_bytes())?;
+        }
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(line.as_bytes())?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(next_header.as_bytes())?;
+        file.flush()?;
+        self.auth_journal = Some(AuthJournalState {
+            count: next_count,
+            tail_mac: next_tail_mac,
+        });
+        Ok(())
+    }
+
+    fn should_compact_authenticated_journal(&self, journal: AuthJournalState) -> bool {
+        let active_len = self.order.len() as u64;
+        let stale_entries = journal.count.saturating_sub(active_len);
+        let stale_threshold = self.capacity.max(1024) as u64;
+        stale_entries > stale_threshold
+    }
+
+    fn compact_authenticated_journal(
+        &mut self,
+        path: &Path,
+        mac_key: &CacheMacKey,
+    ) -> Result<(), ReplayCacheError> {
+        let (raw, journal) = serialize_authenticated_journal(&self.order, mac_key);
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, raw)?;
+        fs::rename(tmp, path)?;
+        self.auth_journal = Some(journal);
+        Ok(())
     }
 }
 
@@ -253,41 +319,76 @@ fn parse_entry(line: &str) -> Result<ReplayEntry, ReplayCacheError> {
     })
 }
 
-fn parse_authenticated_entries(
+fn parse_authenticated_journal_entries(
     raw: &str,
     mac_key: &CacheMacKey,
-) -> Result<Vec<ReplayEntry>, ReplayCacheError> {
+) -> Result<(Vec<ReplayEntry>, AuthJournalState), ReplayCacheError> {
     let (header, body) = raw
         .split_once('\n')
         .ok_or_else(|| ReplayCacheError::MalformedLine("missing replay cache header".to_owned()))?;
-    let mut header_parts = header.split_whitespace();
-    if header_parts.next() != Some(AUTH_CACHE_VERSION) {
+    let journal = parse_authenticated_journal_header(header, mac_key)?;
+    let mut entries = Vec::with_capacity(journal.count.min(8192) as usize);
+    let mut previous_mac = [0_u8; 32];
+    let mut lines = body.lines().filter(|line| !line.trim().is_empty());
+    for index in 1..=journal.count {
+        let line = lines.next().ok_or_else(|| {
+            ReplayCacheError::MalformedLine("truncated replay journal".to_owned())
+        })?;
+        let (entry, entry_mac) =
+            parse_authenticated_journal_entry(line, mac_key, index, &previous_mac)?;
+        previous_mac = entry_mac;
+        entries.push(entry);
+    }
+    if !bool::from(previous_mac.ct_eq(&journal.tail_mac)) {
+        return Err(ReplayCacheError::MacMismatch);
+    }
+    Ok((entries, journal))
+}
+
+fn parse_authenticated_journal_header(
+    header: &str,
+    mac_key: &CacheMacKey,
+) -> Result<AuthJournalState, ReplayCacheError> {
+    let mut parts = header.split_whitespace();
+    if parts.next() != Some(AUTH_JOURNAL_VERSION) {
         return Err(ReplayCacheError::MalformedLine(header.to_owned()));
     }
-    let file_mac_hex = header_parts
+    let count_hex = parts
         .next()
+        .and_then(|part| part.strip_prefix("count="))
         .ok_or_else(|| ReplayCacheError::MalformedLine(header.to_owned()))?;
-    if header_parts.next().is_some() {
+    let tail_hex = parts
+        .next()
+        .and_then(|part| part.strip_prefix("tail="))
+        .ok_or_else(|| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    let header_mac_hex = parts
+        .next()
+        .and_then(|part| part.strip_prefix("mac="))
+        .ok_or_else(|| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    if parts.next().is_some() {
         return Err(ReplayCacheError::MalformedLine(header.to_owned()));
     }
-    let mut expected_file_mac = [0_u8; 32];
-    decode_hex_exact(file_mac_hex, &mut expected_file_mac)?;
-    let actual_file_mac = cache_file_mac(mac_key, body.as_bytes());
-    if !bool::from(actual_file_mac.ct_eq(&expected_file_mac)) {
+
+    let count = u64::from_str_radix(count_hex, 16)
+        .map_err(|_| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    let mut tail_mac = [0_u8; 32];
+    decode_hex_exact(tail_hex, &mut tail_mac)?;
+    let mut expected_header_mac = [0_u8; 32];
+    decode_hex_exact(header_mac_hex, &mut expected_header_mac)?;
+    let actual_header_mac = cache_journal_header_mac(mac_key, count, &tail_mac);
+    if !bool::from(actual_header_mac.ct_eq(&expected_header_mac)) {
         return Err(ReplayCacheError::MacMismatch);
     }
 
-    let mut entries = Vec::new();
-    for line in body.lines().filter(|line| !line.trim().is_empty()) {
-        entries.push(parse_authenticated_entry(line, mac_key)?);
-    }
-    Ok(entries)
+    Ok(AuthJournalState { count, tail_mac })
 }
 
-fn parse_authenticated_entry(
+fn parse_authenticated_journal_entry(
     line: &str,
     mac_key: &CacheMacKey,
-) -> Result<ReplayEntry, ReplayCacheError> {
+    index: u64,
+    expected_previous_mac: &[u8; 32],
+) -> Result<(ReplayEntry, [u8; 32]), ReplayCacheError> {
     let mut parts = line.split_whitespace();
     let timestamp = parts
         .next()
@@ -300,7 +401,10 @@ fn parse_authenticated_entry(
     let transcript_hex = parts
         .next()
         .ok_or_else(|| ReplayCacheError::MalformedLine(line.to_owned()))?;
-    let line_mac_hex = parts
+    let previous_mac_hex = parts
+        .next()
+        .ok_or_else(|| ReplayCacheError::MalformedLine(line.to_owned()))?;
+    let entry_mac_hex = parts
         .next()
         .ok_or_else(|| ReplayCacheError::MalformedLine(line.to_owned()))?;
     if parts.next().is_some() {
@@ -311,18 +415,33 @@ fn parse_authenticated_entry(
     decode_hex_exact(nonce_hex, &mut nonce)?;
     let mut transcript_fingerprint = [0_u8; 32];
     decode_hex_exact(transcript_hex, &mut transcript_fingerprint)?;
-    let mut expected_line_mac = [0_u8; 32];
-    decode_hex_exact(line_mac_hex, &mut expected_line_mac)?;
-    let actual_line_mac = cache_line_mac(mac_key, timestamp, &nonce, &transcript_fingerprint);
-    if !bool::from(actual_line_mac.ct_eq(&expected_line_mac)) {
+    let mut previous_mac = [0_u8; 32];
+    decode_hex_exact(previous_mac_hex, &mut previous_mac)?;
+    if !bool::from(previous_mac.ct_eq(expected_previous_mac)) {
+        return Err(ReplayCacheError::MacMismatch);
+    }
+    let mut expected_entry_mac = [0_u8; 32];
+    decode_hex_exact(entry_mac_hex, &mut expected_entry_mac)?;
+    let actual_entry_mac = cache_journal_entry_mac(
+        mac_key,
+        index,
+        timestamp,
+        &nonce,
+        &transcript_fingerprint,
+        expected_previous_mac,
+    );
+    if !bool::from(actual_entry_mac.ct_eq(&expected_entry_mac)) {
         return Err(ReplayCacheError::MacMismatch);
     }
 
-    Ok(ReplayEntry {
-        timestamp,
-        nonce,
-        transcript_fingerprint,
-    })
+    Ok((
+        ReplayEntry {
+            timestamp,
+            nonce,
+            transcript_fingerprint,
+        },
+        actual_entry_mac,
+    ))
 }
 
 fn serialize_cached_entries(entries: &VecDeque<String>) -> String {
@@ -333,14 +452,84 @@ fn serialize_cached_entries(entries: &VecDeque<String>) -> String {
     body
 }
 
-fn wrap_authenticated_body(body: &str, mac_key: &CacheMacKey) -> String {
-    let mut raw = String::with_capacity(AUTH_CACHE_VERSION.len() + 1 + 64 + 1 + body.len());
-    raw.push_str(AUTH_CACHE_VERSION);
-    raw.push(' ');
-    push_hex(&mut raw, &cache_file_mac(mac_key, body.as_bytes()));
+fn encode_plain_entry(entry: &ReplayEntry) -> String {
+    let mut line = String::with_capacity(103);
+    line.push_str(&entry.timestamp.to_string());
+    line.push(' ');
+    push_hex(&mut line, &entry.nonce);
+    line.push(' ');
+    push_hex(&mut line, &entry.transcript_fingerprint);
+    line.push('\n');
+    line
+}
+
+fn serialize_authenticated_journal(
+    entries: &VecDeque<ReplayEntry>,
+    mac_key: &CacheMacKey,
+) -> (String, AuthJournalState) {
+    let mut body = String::new();
+    let mut previous_mac = [0_u8; 32];
+    let mut count = 0_u64;
+    for entry in entries {
+        count += 1;
+        let (line, entry_mac) =
+            encode_authenticated_journal_entry(mac_key, count, entry, &previous_mac);
+        body.push_str(&line);
+        previous_mac = entry_mac;
+    }
+
+    let journal = AuthJournalState {
+        count,
+        tail_mac: previous_mac,
+    };
+    let header = authenticated_journal_header(mac_key, count, &journal.tail_mac);
+    let mut raw = String::with_capacity(header.len() + body.len());
+    raw.push_str(&header);
+    raw.push_str(&body);
+    (raw, journal)
+}
+
+fn authenticated_journal_header(mac_key: &CacheMacKey, count: u64, tail_mac: &[u8; 32]) -> String {
+    let header_mac = cache_journal_header_mac(mac_key, count, tail_mac);
+    let mut raw = String::with_capacity(AUTH_JOURNAL_HEADER_LEN);
+    raw.push_str(AUTH_JOURNAL_VERSION);
+    raw.push_str(" count=");
+    raw.push_str(&format!("{count:016x}"));
+    raw.push_str(" tail=");
+    push_hex(&mut raw, tail_mac);
+    raw.push_str(" mac=");
+    push_hex(&mut raw, &header_mac);
     raw.push('\n');
-    raw.push_str(body);
+    debug_assert_eq!(raw.len(), AUTH_JOURNAL_HEADER_LEN);
     raw
+}
+
+fn encode_authenticated_journal_entry(
+    mac_key: &CacheMacKey,
+    index: u64,
+    entry: &ReplayEntry,
+    previous_mac: &[u8; 32],
+) -> (String, [u8; 32]) {
+    let entry_mac = cache_journal_entry_mac(
+        mac_key,
+        index,
+        entry.timestamp,
+        &entry.nonce,
+        &entry.transcript_fingerprint,
+        previous_mac,
+    );
+    let mut line = String::with_capacity(240);
+    line.push_str(&entry.timestamp.to_string());
+    line.push(' ');
+    push_hex(&mut line, &entry.nonce);
+    line.push(' ');
+    push_hex(&mut line, &entry.transcript_fingerprint);
+    line.push(' ');
+    push_hex(&mut line, previous_mac);
+    line.push(' ');
+    push_hex(&mut line, &entry_mac);
+    line.push('\n');
+    (line, entry_mac)
 }
 
 fn cache_mac_key(key_material: &[u8]) -> CacheMacKey {
@@ -352,25 +541,29 @@ fn cache_mac_key(key_material: &[u8]) -> CacheMacKey {
     CacheMacKey(out)
 }
 
-fn cache_file_mac(mac_key: &CacheMacKey, body: &[u8]) -> [u8; 32] {
+fn cache_journal_header_mac(mac_key: &CacheMacKey, count: u64, tail_mac: &[u8; 32]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(&mac_key.0).expect("HMAC accepts any key length");
-    mac.update(CACHE_FILE_MAC_LABEL);
-    mac.update(&(body.len() as u64).to_be_bytes());
-    mac.update(body);
+    mac.update(CACHE_JOURNAL_HEADER_MAC_LABEL);
+    mac.update(&count.to_be_bytes());
+    mac.update(tail_mac);
     mac.finalize().into_bytes().into()
 }
 
-fn cache_line_mac(
+fn cache_journal_entry_mac(
     mac_key: &CacheMacKey,
+    index: u64,
     timestamp: u64,
     nonce: &[u8; 8],
     transcript_fingerprint: &[u8; 32],
+    previous_mac: &[u8; 32],
 ) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(&mac_key.0).expect("HMAC accepts any key length");
-    mac.update(CACHE_LINE_MAC_LABEL);
+    mac.update(CACHE_JOURNAL_ENTRY_MAC_LABEL);
+    mac.update(&index.to_be_bytes());
     mac.update(&timestamp.to_be_bytes());
     mac.update(nonce);
     mac.update(transcript_fingerprint);
+    mac.update(previous_mac);
     mac.finalize().into_bytes().into()
 }
 
@@ -484,11 +677,16 @@ mod tests {
 
         let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
         assert!(cache.insert_new(entry.clone(), now).unwrap());
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with(AUTH_JOURNAL_VERSION));
         let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
         assert!(!loaded.insert_new(entry, now).unwrap());
 
-        let raw = fs::read_to_string(&path).unwrap();
-        fs::write(&path, raw.replace('3', "7")).unwrap();
+        fs::write(
+            &path,
+            raw.replacen("0303030303030303", "0703030303030303", 1),
+        )
+        .unwrap();
         assert!(matches!(
             ReplayCache::load_or_create_authenticated(&path, 8, key),
             Err(ReplayCacheError::MacMismatch) | Err(ReplayCacheError::MalformedHex)
@@ -517,10 +715,54 @@ mod tests {
         assert!(cache.insert_new(second.clone(), now).unwrap());
 
         let raw = fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("0101010101010101"));
+        assert!(raw.starts_with(AUTH_JOURNAL_VERSION));
+        assert!(raw.contains("0101010101010101"));
         assert!(raw.contains("0303030303030303"));
 
         let mut loaded = ReplayCache::load_or_create_authenticated(&path, 1, key).unwrap();
         assert!(!loaded.insert_new(second, now).unwrap());
+    }
+
+    #[test]
+    fn authenticated_journal_detects_committed_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-truncate.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache
+            .insert_new(
+                ReplayEntry {
+                    timestamp: now,
+                    nonce: [1; 8],
+                    transcript_fingerprint: [2; 32],
+                },
+                now,
+            )
+            .unwrap());
+        assert!(cache
+            .insert_new(
+                ReplayEntry {
+                    timestamp: now,
+                    nonce: [3; 8],
+                    transcript_fingerprint: [4; 32],
+                },
+                now,
+            )
+            .unwrap());
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut lines = raw.lines();
+        let truncated = format!(
+            "{}\n{}\n",
+            lines.next().expect("journal header"),
+            lines.next().expect("first journal entry")
+        );
+        fs::write(&path, truncated).unwrap();
+
+        assert!(matches!(
+            ReplayCache::load_or_create_authenticated(&path, 8, key),
+            Err(ReplayCacheError::MalformedLine(_)) | Err(ReplayCacheError::MacMismatch)
+        ));
     }
 }
