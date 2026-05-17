@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use rand::{
@@ -37,7 +38,7 @@ use crate::{
         stateful::StatefulRustlsCamouflageBackend,
     },
     traffic::CoverTrafficProfile,
-    transport::tcp::tune_tcp_stream,
+    transport::tcp::{is_fd_exhaustion_error, tune_tcp_stream},
 };
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
@@ -90,7 +91,18 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     tracing::info!("ParallaX client SOCKS5 listening on {}", client.listen);
 
     loop {
-        let (local, peer) = listener.accept().await?;
+        let (local, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) if is_fd_exhaustion_error(&err) => {
+                tracing::error!(
+                    error = %err,
+                    "accept() ran out of file descriptors; backing off 100ms"
+                );
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let client = client.clone();
         let psk = Arc::clone(&psk);

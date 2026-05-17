@@ -56,7 +56,7 @@ use crate::{
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
-    transport::tcp::tune_tcp_stream,
+    transport::tcp::{is_fd_exhaustion_error, tune_tcp_stream},
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -169,7 +169,18 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     tracing::info!("ParallaX server listening on {}", server.listen);
 
     loop {
-        let (client, peer) = listener.accept().await?;
+        let (client, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) if is_fd_exhaustion_error(&err) => {
+                tracing::error!(
+                    error = %err,
+                    "accept() ran out of file descriptors; backing off 100ms"
+                );
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let server = server.clone();
         let connection_traffic = traffic;

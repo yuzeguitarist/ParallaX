@@ -422,19 +422,19 @@ const fn default_true() -> bool {
 }
 
 const fn default_max_padding() -> u16 {
-    128
+    0
 }
 
 const fn default_max_delay_ms() -> u16 {
-    12
+    0
 }
 
 const fn default_cover_min_interval_ms() -> u16 {
-    15_000
+    0
 }
 
 const fn default_cover_max_interval_ms() -> u16 {
-    45_000
+    0
 }
 
 const fn default_max_concurrent_streams() -> u8 {
@@ -518,6 +518,19 @@ authorized_sni = ["example.com"]
             .unwrap()
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn traffic_defaults_are_throughput_first() {
+        let traffic = TrafficConfig::default();
+
+        assert_eq!(traffic.min_padding, 0);
+        assert_eq!(traffic.max_padding, 0);
+        assert_eq!(traffic.min_delay_ms, 0);
+        assert_eq!(traffic.max_delay_ms, 0);
+        assert_eq!(traffic.cover_min_interval_ms, 0);
+        assert_eq!(traffic.cover_max_interval_ms, 0);
+        assert_eq!(traffic.max_concurrent_streams, 1);
     }
 
     #[test]

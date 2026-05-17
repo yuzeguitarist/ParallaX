@@ -19,7 +19,7 @@ use crate::{
     },
     handshake::server,
     probe,
-    transport::quic_runtime,
+    transport::{quic_runtime, tcp::bump_nofile_soft_limit},
 };
 
 #[derive(Debug, Parser)]
@@ -142,6 +142,7 @@ pub async fn run() -> anyhow::Result<()> {
             println!("ok: crypto self-test passed");
         }
         Command::Serve { config, quic } => {
+            bump_nofile_soft_limit();
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             if quic {
@@ -151,6 +152,7 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Command::Client { config, quic } => {
+            bump_nofile_soft_limit();
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             if quic {
@@ -278,11 +280,11 @@ psk = "{}"
 
 [traffic]
 min_padding = 0
-max_padding = 128
+max_padding = 0
 min_delay_ms = 0
-max_delay_ms = 12
-cover_min_interval_ms = 15000
-cover_max_interval_ms = 45000
+max_delay_ms = 0
+cover_min_interval_ms = 0
+cover_max_interval_ms = 0
 max_concurrent_streams = 1
 
 [server]
@@ -307,11 +309,11 @@ psk = "{}"
 
 [traffic]
 min_padding = 0
-max_padding = 128
+max_padding = 0
 min_delay_ms = 0
-max_delay_ms = 12
-cover_min_interval_ms = 15000
-cover_max_interval_ms = 45000
+max_delay_ms = 0
+cover_min_interval_ms = 0
+cover_max_interval_ms = 0
 max_concurrent_streams = 1
 
 [client]
