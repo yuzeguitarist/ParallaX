@@ -94,6 +94,16 @@ pub struct PendingPqRekey {
     mlkem: pq::MlKemKeyPair,
 }
 
+impl PendingPqRekey {
+    pub fn x25519_shared_secret(&self, server_public: &[u8; 32]) -> [u8; 32] {
+        x25519_shared_secret(&self.x25519.private, server_public)
+    }
+
+    pub fn mlkem_secret_key(&self) -> &[u8] {
+        &self.mlkem.secret
+    }
+}
+
 impl ClientDataSession {
     pub fn new(keys: SessionKeys, traffic: TrafficConfig) -> Result<Self, ClientHandshakeError> {
         let (seal_to_server, open_from_server) = data_codecs(&keys, traffic)?;
@@ -127,13 +137,19 @@ impl ClientDataSession {
         pending: &PendingPqRekey,
         sandwich_secret: &[u8],
     ) -> Result<(), ClientHandshakeError> {
-        let payload = self.open_from_server.open(record)?;
-        let exchange = ServerKeyExchange::decode(&payload)?;
-        let x25519_shared =
-            x25519_shared_secret(&pending.x25519.private, &exchange.server_x25519_public);
+        let exchange = self.open_server_key_exchange_record(record)?;
+        let x25519_shared = pending.x25519_shared_secret(&exchange.server_x25519_public);
         let pq_shared = pq::decapsulate(&exchange.mlkem_ciphertext, &pending.mlkem.secret)?;
-        self.apply_pq_rekey(&x25519_shared, &pq_shared, sandwich_secret)?;
+        self.apply_pq_rekey_shared(&x25519_shared, &pq_shared, sandwich_secret)?;
         Ok(())
+    }
+
+    pub fn open_server_key_exchange_record(
+        &mut self,
+        record: &[u8],
+    ) -> Result<ServerKeyExchange, ClientHandshakeError> {
+        let payload = self.open_from_server.open(record)?;
+        Ok(ServerKeyExchange::decode(&payload)?)
     }
 
     pub fn build_connect_record<R>(
@@ -230,7 +246,22 @@ impl ClientDataSession {
         Ok(())
     }
 
-    fn apply_pq_rekey(
+    pub fn decode_server_identity_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<ServerIdentityProof, ClientHandshakeError> {
+        Ok(ServerIdentityProof::decode(payload)?)
+    }
+
+    pub fn transcript_hash(&self) -> [u8; 32] {
+        self.keys.transcript_hash
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.keys.epoch
+    }
+
+    pub fn apply_pq_rekey_shared(
         &mut self,
         x25519_shared_secret: &[u8; 32],
         pq_shared_secret: &[u8; 32],

@@ -29,7 +29,7 @@ use crate::{
         decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
         TrafficConfig,
     },
-    crypto::auth::AuthError,
+    crypto::{auth::AuthError, identity, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::ConnectRequest,
     protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordError},
@@ -71,6 +71,8 @@ pub enum ClientRuntimeError {
     ServerIdentityTooLarge,
     #[error("TLS record error: {0}")]
     TlsRecord(#[from] TlsRecordError),
+    #[error("blocking crypto task failed: {0}")]
+    BlockingTask(#[from] tokio::task::JoinError),
 }
 
 pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
@@ -200,11 +202,13 @@ async fn handle_local_connection_with_cid(
     apply_server_key_exchange_after_residuals(&mut server, &mut data_session, &pending_rekey, psk)
         .await?;
     let identity_payload = read_server_identity_payload(&mut server, &mut data_session).await?;
-    data_session.verify_server_identity_payload(
+    verify_server_identity_payload_blocking(
+        &data_session,
         &identity_payload,
         server_identity_public,
         server_public,
-    )?;
+    )
+    .await?;
     let connect_request = ConnectRequest {
         host: request.host,
         port: request.port,
@@ -249,9 +253,11 @@ where
     let mut skipped = 0;
     loop {
         let record = read_record(server).await?;
-        match data_session.apply_server_key_exchange_record(&record, pending_rekey, psk) {
+        match apply_server_key_exchange_record_blocking(data_session, &record, pending_rekey, psk)
+            .await
+        {
             Ok(()) => return Ok(()),
-            Err(err)
+            Err(ClientRuntimeError::Handshake(err))
                 if is_residual_camouflage_record(&err)
                     && skipped < MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE =>
             {
@@ -261,9 +267,53 @@ where
                     "ignoring residual camouflage TLS record before ParallaX key exchange"
                 );
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         }
     }
+}
+
+async fn apply_server_key_exchange_record_blocking(
+    data_session: &mut ClientDataSession,
+    record: &[u8],
+    pending_rekey: &PendingPqRekey,
+    psk: &[u8],
+) -> Result<(), ClientRuntimeError> {
+    let exchange = data_session.open_server_key_exchange_record(record)?;
+    let x25519_shared = pending_rekey.x25519_shared_secret(&exchange.server_x25519_public);
+    let ciphertext = exchange.mlkem_ciphertext;
+    let secret_key = zeroize::Zeroizing::new(pending_rekey.mlkem_secret_key().to_vec());
+    let pq_shared =
+        tokio::task::spawn_blocking(move || pq::decapsulate(&ciphertext, secret_key.as_slice()))
+            .await?
+            .map_err(ClientHandshakeError::from)?;
+    data_session.apply_pq_rekey_shared(&x25519_shared, &pq_shared, psk)?;
+    Ok(())
+}
+
+async fn verify_server_identity_payload_blocking(
+    data_session: &ClientDataSession,
+    payload: &[u8],
+    server_identity_public_key: &[u8],
+    server_x25519_public_key: &[u8; 32],
+) -> Result<(), ClientRuntimeError> {
+    let proof = data_session.decode_server_identity_payload(payload)?;
+    let public_key = server_identity_public_key.to_vec();
+    let signature = proof.signature;
+    let transcript_hash = data_session.transcript_hash();
+    let server_x25519_public_key = *server_x25519_public_key;
+    let epoch = data_session.epoch();
+    tokio::task::spawn_blocking(move || {
+        identity::verify_server_identity(
+            &public_key,
+            &signature,
+            &transcript_hash,
+            &server_x25519_public_key,
+            epoch,
+        )
+    })
+    .await?
+    .map_err(ClientHandshakeError::from)?;
+    Ok(())
 }
 
 fn is_residual_camouflage_record(err: &ClientHandshakeError) -> bool {

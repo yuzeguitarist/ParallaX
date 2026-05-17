@@ -108,6 +108,8 @@ pub enum HandshakeServerError {
     ReplayCache(#[from] ReplayCacheError),
     #[error("missing encrypted connect request and no fixed server.data_target configured")]
     MissingConnectTarget,
+    #[error("blocking crypto task failed: {0}")]
+    BlockingTask(#[from] tokio::task::JoinError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,7 +509,7 @@ async fn run_authenticated_data_mode(
                             &pq_rekey.client_x25519_public,
                         );
                         let pq_encapsulation =
-                            pq::encapsulate(&pq_rekey.client_mlkem_public_key)?;
+                            encapsulate_mlkem_blocking(pq_rekey.client_mlkem_public_key).await?;
                         let key_exchange_payload = ServerKeyExchange {
                             server_x25519_public: server_ephemeral.public,
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
@@ -532,12 +534,13 @@ async fn run_authenticated_data_mode(
                             &pq_encapsulation.shared_secret,
                             sandwich_secret,
                         )?;
-                        let identity_signature = identity::sign_server_identity(
+                        let identity_signature = sign_server_identity_blocking(
                             identity_secret_key,
-                            &rekeyed_keys.transcript_hash,
-                            &handshake.server_public_key,
+                            rekeyed_keys.transcript_hash,
+                            handshake.server_public_key,
                             rekeyed_keys.epoch,
-                        )?;
+                        )
+                        .await?;
                         let identity_payload = ServerIdentityProof {
                             signature: identity_signature,
                         }
@@ -636,6 +639,30 @@ fn resolve_connect_target(
         }
         Err(err) => Err(HandshakeServerError::ConnectRequest(err)),
     }
+}
+
+async fn encapsulate_mlkem_blocking(
+    client_mlkem_public_key: Vec<u8>,
+) -> Result<pq::MlKemEncapsulation, HandshakeServerError> {
+    Ok(tokio::task::spawn_blocking(move || pq::encapsulate(&client_mlkem_public_key)).await??)
+}
+
+async fn sign_server_identity_blocking(
+    identity_secret_key: &[u8],
+    transcript_hash: [u8; 32],
+    server_public_key: [u8; 32],
+    epoch: u64,
+) -> Result<Vec<u8>, HandshakeServerError> {
+    let identity_secret_key = zeroize::Zeroizing::new(identity_secret_key.to_vec());
+    Ok(tokio::task::spawn_blocking(move || {
+        identity::sign_server_identity(
+            identity_secret_key.as_slice(),
+            &transcript_hash,
+            &server_public_key,
+            epoch,
+        )
+    })
+    .await??)
 }
 
 fn apply_server_pq_rekey(
