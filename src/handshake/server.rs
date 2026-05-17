@@ -843,7 +843,7 @@ mod tests {
         client.write_all(&pq_record).await.unwrap();
         let key_exchange_record = read_record(&mut client).await.unwrap();
         data_session
-            .apply_server_key_exchange_record(&key_exchange_record, pending_rekey, PSK)
+            .apply_server_key_exchange_record(&key_exchange_record, &pending_rekey, PSK)
             .unwrap();
         let mut identity_payload = Vec::new();
         loop {

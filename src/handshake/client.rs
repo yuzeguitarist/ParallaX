@@ -121,7 +121,7 @@ impl ClientDataSession {
     pub fn apply_server_key_exchange_record(
         &mut self,
         record: &[u8],
-        pending: PendingPqRekey,
+        pending: &PendingPqRekey,
         sandwich_secret: &[u8],
     ) -> Result<(), ClientHandshakeError> {
         let payload = self.open_from_server.open(record)?;
@@ -333,7 +333,7 @@ mod tests {
             )
             .unwrap();
         session
-            .apply_server_key_exchange_record(&exchange_record, pending, b"test-psk")
+            .apply_server_key_exchange_record(&exchange_record, &pending, b"test-psk")
             .unwrap();
 
         let chain_secret = pq::hybrid_sandwich_rekey(

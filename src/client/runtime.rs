@@ -6,7 +6,7 @@ use rand::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
@@ -22,9 +22,9 @@ use crate::{
         TrafficConfig,
     },
     crypto::auth::AuthError,
-    handshake::client::{self, ClientDataSession, ClientHandshakeError},
+    handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::ConnectRequest,
-    protocol::data::max_plaintext_len,
+    protocol::data::{max_plaintext_len, DataRecordError},
     tls::{
         backend::TlsBackendError,
         record::{alert_bad_record_mac, read_record, TlsRecordError},
@@ -35,6 +35,7 @@ use crate::{
 };
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
+const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum ClientRuntimeError {
@@ -124,8 +125,8 @@ pub async fn handle_local_connection(
         establish_data_session(&mut server, config, traffic, psk, server_public).await?;
     let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut OsRng)?;
     server.write_all(&pq_record).await?;
-    let key_exchange_record = read_record(&mut server).await?;
-    data_session.apply_server_key_exchange_record(&key_exchange_record, pending_rekey, psk)?;
+    apply_server_key_exchange_after_residuals(&mut server, &mut data_session, &pending_rekey, psk)
+        .await?;
     let identity_payload = read_server_identity_payload(&mut server, &mut data_session).await?;
     data_session.verify_server_identity_payload(
         &identity_payload,
@@ -154,6 +155,44 @@ pub async fn handle_local_connection(
         CoverTrafficProfile::from_config(traffic),
     )
     .await
+}
+
+async fn apply_server_key_exchange_after_residuals<R>(
+    server: &mut R,
+    data_session: &mut ClientDataSession,
+    pending_rekey: &PendingPqRekey,
+    psk: &[u8],
+) -> Result<(), ClientRuntimeError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut skipped = 0;
+    loop {
+        let record = read_record(server).await?;
+        match data_session.apply_server_key_exchange_record(&record, pending_rekey, psk) {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if is_residual_camouflage_record(&err)
+                    && skipped < MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE =>
+            {
+                skipped += 1;
+                tracing::trace!(
+                    skipped,
+                    "ignoring residual camouflage TLS record before ParallaX key exchange"
+                );
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn is_residual_camouflage_record(err: &ClientHandshakeError) -> bool {
+    matches!(
+        err,
+        ClientHandshakeError::DataRecord(
+            DataRecordError::Aead(_) | DataRecordError::NotApplicationData
+        )
+    )
 }
 
 async fn read_server_identity_payload(
@@ -285,20 +324,95 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{duplex, AsyncReadExt, AsyncWriteExt},
         time::{timeout, Duration},
     };
 
     use super::*;
     use crate::{
         config::ServerConfig,
-        crypto::{pq, session::X25519KeyPair},
-        handshake::server,
+        crypto::{
+            pq,
+            session::{derive_client_keys, expand_epoch_keys, X25519KeyPair},
+        },
+        handshake::{client::data_codecs, server},
+        protocol::command::{PqRekeyRequest, ServerKeyExchange},
+        tls::record,
     };
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
     const CAMOUFLAGE_CERT_DER_B64: &str = "MIIC9jCCAd6gAwIBAgIJAPNzR81y9p7pMA0GCSqGSIb3DQEBCwUAMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4XDTI2MDUxNjEyNDA0NloXDTI2MDUxNzEyNDA0NlowFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCnjSfVPv1Xy5razuOYABOSvGvlddr0MMVWQCSmjE47PMQEzvETytmburNZEdqQBzSjDVxTExxd8eIHFTp8ylkztsxma5yJftQo81uqxZEnwT00tJRaazg10OYTf0ZrH6PMNC2izwJML0GkYz7s6OMFqImMCG3v00PIAYknlDrlKoDjdmANco8V5FNrbQYp2kqIcFyXrbgYurcMIKCE9Wu8L2W0oKhW6DNyRVoBGTn5zN1wjXLBO+6TJsBj4thI4tM0mUcLc+YohOfoGVq7na/wgCESoK1B+m8PdrXIEuZ7gZ0x3ZqdZ7jxL23sTmkfm+AeNdp+XshxAS77l3dcrAV9AgMBAAGjRzBFMBYGA1UdEQQPMA2CC2V4YW1wbGUuY29tMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA0GCSqGSIb3DQEBCwUAA4IBAQA8KHWHoA4otNmYh9q+X8cZnYx9y0LUNfdbHLR8ebnk/9T+/WP5CgIGWvn3+L2ulEvuSMhDC23C20SnX0h815JfMBY/PiAbLKGp3UXrgIq1dWc8t40HQBGRuBKi2fc743Sup5kPQgNAqev+8kKs4WFDXaWBpdwqI55PADVPOX66h0WiObB7crp5YTEVEe37G6UsxX40HUAAZJXtCI9eqPLISNuuNOAjJEMDMjdRH7ZjcMyrqQSweuKLAwdvUam8UJQsUNe7rM2II6GlgPS/mKZx1Nihn70GIo0yu0Bsxc9cpSHbggzQarE3g8WRp+jI9GpWXXdjno7cyim5KEQVMZcz";
     const CAMOUFLAGE_KEY_DER_B64: &str = "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCnjSfVPv1Xy5razuOYABOSvGvlddr0MMVWQCSmjE47PMQEzvETytmburNZEdqQBzSjDVxTExxd8eIHFTp8ylkztsxma5yJftQo81uqxZEnwT00tJRaazg10OYTf0ZrH6PMNC2izwJML0GkYz7s6OMFqImMCG3v00PIAYknlDrlKoDjdmANco8V5FNrbQYp2kqIcFyXrbgYurcMIKCE9Wu8L2W0oKhW6DNyRVoBGTn5zN1wjXLBO+6TJsBj4thI4tM0mUcLc+YohOfoGVq7na/wgCESoK1B+m8PdrXIEuZ7gZ0x3ZqdZ7jxL23sTmkfm+AeNdp+XshxAS77l3dcrAV9AgMBAAECggEAcsH8cVMWRAbBBnLDcX1D6rHBGMVy9ONelaeTMrtQbcQ94ak3dz3tc3sZkbznvNQimjbxcDjbqgCctgs1JvmUxRXDw7aa3ZWPjIi51SpCND9nQ20XWyKqujldDCeVPJPMJXXrd+JfCX0ocYZEOBF+RIbdxpqTabqCZz+eCAy/les95pv5YkkAjxEJkzhEfFTJtJRVIjIUBL/Gg8KwG4qs5nESoD1oiNGr8tgnbsS2KNXdozIsM1awitqNJ7drpDpEpkwDUoQGAqzuvyDiN2pPqsyg1UwZWH8kuA9RyXIAOWQoR9rIX/rUsYB5F4tKg6Tdy0n9Jb9ytTINYaletNjuIQKBgQDSEzvmO4Zan1Bz+0Eb4NWfnU1yyGKb7bBFBvcuigXPW/+as1yET2Zkc4qQBudye7DUgr+zXj0s+ZeXvv+HeGggD3Blnq5bl+gPkiPSeGd24QkfO38MF2RTpW5SoUT6Z9vTiaHjIgkwZIgQf3dfSPV/MskRVemqxB5o+Phd4NRzpQKBgQDMLhkoYeRurmFQ3iuWCLOaHWAwtA28j3ymknsHyP6EOkiHBVl3YWTpZ1ZcDGMJznHdkSrj4mNsnnDM71iFM0srgKKp07T4bumowOhmyeg/hYIblFGSoZS/nTl8tAusNzXtRJeVLa9GjkFjXihiC3E+t3J2s9ij2eE8bAM0tatC+QKBgCsAQuea0aKlL8u955L0T+YPRfYz7HNskQNgLKK7H/tVIpohEtQGiLgRKpDWyPOXPBgT93eY177oDE7EivvI+s9tOZ2jgJ9BFgBx8qE3gj5ETCC3hgcMlr3EhDOnzT3Qmp/PcXLT2butKGjwHphDj/UMiTniMyWAZZUpOXXF+tb9AoGAEKvG5BQyGZNlYLvzJRnqyC+T1gYthPLWQ6d8IiOYHGXB3DxklKnAGoqUc4mTYI6Zn3Sl4ttuMMUzApicSqvofFHRdjpR8WLk8yFlGFdt/hnBiMzwaB+HTKnisrrkpRgQ8CGEmuqTABjHX/ylIXQ7t9o0n1qJ2r8Ec/GBxYD7zckCgYBZzU7u9Ujq8XL+Ok6T2Zqgf3O8H3VBlKPjeYpfH6mqBRdj+773IfoifCs19Y31OL8Sb28N98XnutTlHo6xs4li0zE2KDN1O3i00K7S0dO3250Fr1QSm86CML8fSDuS1BcuMHH+RNkQkMb9Q49K23t6B1s0xnIFfBarwbusw9onAw==";
+
+    #[tokio::test]
+    async fn key_exchange_reader_skips_residual_camouflage_records() {
+        let client_keys = X25519KeyPair::generate();
+        let server_keys = X25519KeyPair::generate();
+        let transcript_hash = [4_u8; 32];
+        let session_keys =
+            derive_client_keys(&client_keys.private, &server_keys.public, &transcript_hash)
+                .unwrap();
+        let traffic = TrafficConfig::default();
+        let mut data_session = ClientDataSession::new(session_keys.clone(), traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(90);
+
+        let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut rng).unwrap();
+        let (mut server_open, mut server_seal) = data_codecs(&session_keys, traffic).unwrap();
+        let pq_request = PqRekeyRequest::decode(&server_open.open(&pq_record).unwrap()).unwrap();
+        let server_ephemeral = X25519KeyPair::generate();
+        let x25519_ephemeral_shared = crate::crypto::session::x25519_shared_secret(
+            &server_ephemeral.private,
+            &pq_request.client_x25519_public,
+        );
+        let pq_encapsulation = pq::encapsulate(&pq_request.client_mlkem_public_key).unwrap();
+        let key_exchange_record = server_seal
+            .seal(
+                &ServerKeyExchange {
+                    server_x25519_public: server_ephemeral.public,
+                    mlkem_ciphertext: pq_encapsulation.ciphertext,
+                }
+                .encode()
+                .unwrap(),
+                &mut rng,
+            )
+            .unwrap();
+
+        let residual = record::wrap_application_data(b"residual camouflage TLS data").unwrap();
+        let (mut client_side, mut server_side) = duplex(32 * 1024);
+        server_side.write_all(&residual).await.unwrap();
+        server_side.write_all(&key_exchange_record).await.unwrap();
+
+        apply_server_key_exchange_after_residuals(
+            &mut client_side,
+            &mut data_session,
+            &pending_rekey,
+            PSK,
+        )
+        .await
+        .unwrap();
+
+        let chain_secret = pq::hybrid_sandwich_rekey(
+            &session_keys.chain_secret,
+            &x25519_ephemeral_shared,
+            &pq_encapsulation.shared_secret,
+            PSK,
+        )
+        .unwrap();
+        let next_keys = expand_epoch_keys(
+            chain_secret,
+            session_keys.epoch + 1,
+            session_keys.transcript_hash,
+            x25519_ephemeral_shared,
+        )
+        .unwrap();
+        server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
+        let post_rekey_record = server_seal.seal(b"ok", &mut rng).unwrap();
+
+        assert_eq!(
+            data_session.open_server_record(&post_rekey_record).unwrap(),
+            b"ok"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
