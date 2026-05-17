@@ -360,7 +360,7 @@ impl ServerIdentityChunk {
             return Err(ServerIdentityChunkError::InvalidChunkLength);
         }
         let total_len = payload.len() as u32;
-        let mut chunks = Vec::new();
+        let mut chunks = Vec::with_capacity(payload.len().div_ceil(max_chunk_len));
         for (idx, bytes) in payload.chunks(max_chunk_len).enumerate() {
             chunks.push(
                 Self {

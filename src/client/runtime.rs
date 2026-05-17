@@ -414,7 +414,10 @@ async fn read_server_identity_payload(
             Some(expected) if expected != total_len => {
                 return Err(ClientRuntimeError::InvalidServerIdentityChunks);
             }
-            None => expected_total = Some(total_len),
+            None => {
+                expected_total = Some(total_len);
+                assembled.reserve(total_len);
+            }
             _ => {}
         }
         if chunk.offset as usize != assembled.len() {
@@ -464,78 +467,106 @@ struct ClientRelay {
 impl ClientRelay {
     async fn run(self) -> Result<(), ClientRuntimeError> {
         let ClientRelay {
-            mut local_read,
-            mut local_write,
+            local_read,
+            local_write,
             server_read,
-            mut server_write,
+            server_write,
             data_session,
             chunk_size,
             cover,
             cid,
         } = self;
-        let (mut seal_to_server, mut open_from_server) = data_session.into_data_codecs();
-        let mut local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
-        let mut upload_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
-        let mut upload_rng = StdRng::from_entropy();
-        let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut upload_rng)));
-        let upload = async move {
-            loop {
-                tokio::select! {
-                    _ = &mut cover_sleep, if cover.is_enabled() => {
-                        write_client_data_records_chunked(
-                            &mut server_write,
-                            &mut seal_to_server,
-                            &[],
-                            &mut upload_rng,
-                            &mut upload_scratch,
-                            RelayWriteLog::new(cid, "client->server", "client-cover-writer"),
-                        )
-                        .await?;
-                        cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut upload_rng));
-                    }
-                    read = local_read.read(&mut local_buf) => {
-                        let n = read?;
-                        if n == 0 {
-                            return Ok(());
-                        }
-                        let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
-                        write_client_data_records_chunked(
-                            &mut server_write,
-                            &mut seal_to_server,
-                            &local_buf[..n],
-                            &mut upload_rng,
-                            &mut upload_scratch,
-                            RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
-                        )
-                        .await?;
-                    }
-                }
-            }
-        };
-
-        let mut server_records = TlsRecordReader::new(server_read);
-        let mut server_record = Vec::new();
-        let download = async move {
-            loop {
-                match server_records.read_record_into(&mut server_record).await {
-                    Ok(()) => {}
-                    Err(err) if is_clean_close(&err) => return Ok(()),
-                    Err(err) => return Err(ClientRuntimeError::Io(err)),
-                };
-                log_record_read(cid, "server->client", "client-outer-reader", &server_record);
-
-                open_from_server
-                    .open_in_place(&mut server_record)
-                    .map_err(ClientHandshakeError::from)?;
-                if !server_record.is_empty() {
-                    local_write.write_all(&server_record).await?;
-                }
-            }
-        };
+        let local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+        let (seal_to_server, open_from_server) = data_session.into_data_codecs();
+        let upload = client_upload_loop(
+            local_read,
+            server_write,
+            seal_to_server,
+            local_buf,
+            cover,
+            cid,
+        );
+        let download = client_download_loop(server_read, local_write, open_from_server, cid);
 
         tokio::select! {
             result = upload => result,
             result = download => result,
+        }
+    }
+}
+
+async fn client_upload_loop(
+    mut local_read: OwnedReadHalf,
+    mut server_write: OwnedWriteHalf,
+    mut seal_to_server: DataRecordCodec,
+    mut local_buf: Vec<u8>,
+    cover: CoverTrafficProfile,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
+    let mut rng = StdRng::from_entropy();
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+
+    loop {
+        tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                write_client_data_records_chunked(
+                    &mut server_write,
+                    &mut seal_to_server,
+                    &[],
+                    &mut rng,
+                    &mut seal_scratch,
+                    RelayWriteLog::new(cid, "client->server", "client-cover-writer"),
+                )
+                .await?;
+                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
+            }
+            read = local_read.read(&mut local_buf) => {
+                let n = read?;
+                if n == 0 {
+                    return Ok(());
+                }
+                let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+                write_client_data_records_chunked(
+                    &mut server_write,
+                    &mut seal_to_server,
+                    &local_buf[..n],
+                    &mut rng,
+                    &mut seal_scratch,
+                    RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+async fn client_download_loop(
+    server_read: OwnedReadHalf,
+    mut local_write: OwnedWriteHalf,
+    mut open_from_server: DataRecordCodec,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    let mut server_records = TlsRecordReader::new(server_read);
+    let mut server_record = Vec::new();
+
+    loop {
+        match server_records.read_record_into(&mut server_record).await {
+            Ok(()) => {}
+            Err(err) if is_clean_close(&err) => return Ok(()),
+            Err(err) => return Err(ClientRuntimeError::Io(err)),
+        };
+        log_record_read(cid, "server->client", "client-outer-reader", &server_record);
+
+        match open_from_server.open_in_place(&mut server_record) {
+            Ok(()) => {
+                if !server_record.is_empty() {
+                    local_write.write_all(&server_record).await?;
+                }
+            }
+            Err(err) => {
+                return Err(ClientRuntimeError::Handshake(err.into()));
+            }
         }
     }
 }
