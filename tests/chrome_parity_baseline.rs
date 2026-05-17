@@ -180,6 +180,24 @@ fn assert_required_chrome_parity(
         parallax.signature_algorithms, chrome_signature_algorithms,
         "ParallaX signature_algorithms must stay Chrome/BoringSSL-shaped"
     );
+
+    let chrome_cipher_suites = vec![
+        0x1301_u16, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014,
+        0x009c, 0x009d, 0x002f, 0x0035,
+    ];
+    assert_eq!(
+        non_grease(&chrome.cipher_suites),
+        chrome_cipher_suites,
+        "{sample} Chrome cipher_suites changed"
+    );
+    let rustls_supported_chrome_order = vec![
+        0x1301_u16, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0x00ff,
+    ];
+    assert_eq!(
+        non_grease(&parallax.cipher_suites),
+        rustls_supported_chrome_order,
+        "ParallaX cipher_suites must keep Chrome order for the rustls/aws-lc supported subset"
+    );
 }
 
 async fn generate_parallax_client_hello() -> Vec<u8> {
@@ -718,14 +736,11 @@ fn markdown_report(
         &mut out,
         "cipher_suites",
         &format!(
-            "Chrome non-GREASE count {}",
-            non_grease(&gui.0.cipher_suites).len()
+            "Chrome `{}`",
+            fmt_hex(&non_grease(&gui.0.cipher_suites))
         ),
-        &format!(
-            "ParallaX non-GREASE count {}",
-            non_grease(&parallax.0.cipher_suites).len()
-        ),
-        "whitelisted: rustls/aws-lc emits a shorter suite list and includes SCSV 0x00ff",
+        &fmt_hex(&non_grease(&parallax.0.cipher_suites)),
+        "whitelisted: rustls/aws-lc subset now follows Chrome order; legacy tail unsupported and SCSV remains",
     );
     write_field_row(
         &mut out,
@@ -777,7 +792,7 @@ fn markdown_report(
     writeln!(out, "## Still missing, by priority").unwrap();
     writeln!(
         out,
-        "1. Match Chrome cipher catalog/order, including the extra ECDHE and legacy suites: 3-5h."
+        "1. Add the remaining Chrome cipher tail (`0xc013`, `0xc014`, `0x009c`, `0x009d`, `0x002f`, `0x0035`) or move the stateful path to a BoringSSL-backed ClientHello generator: 6-10h."
     )
     .unwrap();
     writeln!(

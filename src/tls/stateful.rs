@@ -420,6 +420,7 @@ fn with_patch_context<T>(
 
 fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, TlsBackendError> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    shape_cipher_suites_for_profile(&mut provider, profile.browser);
     provider.secure_random = &PARALLAX_RANDOM;
 
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -433,6 +434,33 @@ fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, 
     config.enable_early_data = false;
     config.max_fragment_size = profile.max_fragment_size;
     Ok(config)
+}
+
+fn shape_cipher_suites_for_profile(
+    provider: &mut rustls::crypto::CryptoProvider,
+    browser: BrowserProfile,
+) {
+    if !matches!(browser, BrowserProfile::Chrome124) {
+        return;
+    }
+
+    use rustls::crypto::aws_lc_rs::cipher_suite;
+
+    // Chrome 148 offers AES-128 TLS 1.3 first, then AES-256, CHACHA, then the
+    // ECDHE GCM/CHACHA TLS 1.2 suites. rustls/aws-lc-rs cannot implement
+    // Chrome's legacy CBC/RSA-GCM tail, so we order the supported subset to
+    // match BoringSSL and let rustls append SCSV when TLS 1.2 is enabled.
+    provider.cipher_suites = vec![
+        cipher_suite::TLS13_AES_128_GCM_SHA256,
+        cipher_suite::TLS13_AES_256_GCM_SHA384,
+        cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    ];
 }
 
 #[derive(Debug)]
