@@ -8,7 +8,7 @@ use super::{
     client_hello_builder::{ClientHelloBuildError, ClientHelloTemplate},
     server_hello::ServerHelloError,
 };
-use crate::crypto::auth::AuthError;
+use crate::{crypto::auth::AuthError, fingerprint::http2::Http2FingerprintError};
 
 #[derive(Debug, Error)]
 pub enum TlsBackendError {
@@ -24,6 +24,8 @@ pub enum TlsBackendError {
     Rustls(#[from] rustls::Error),
     #[error("rustls config error: {0}")]
     RustlsConfig(String),
+    #[error("HTTP/2 fingerprint build failed: {0}")]
+    Http2Fingerprint(#[from] Http2FingerprintError),
     #[error("invalid SNI for rustls ServerName: {0}")]
     InvalidServerName(String),
     #[error("ServerHello parse failed: {0}")]

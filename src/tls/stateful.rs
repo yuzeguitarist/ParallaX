@@ -9,7 +9,7 @@
 use std::{
     cell::RefCell,
     fmt,
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
     sync::Arc,
     time::Duration,
 };
@@ -27,7 +27,11 @@ use rustls::{
     DigitallySignedStruct, Error as RustlsError, NamedGroup, SignatureScheme,
 };
 use subtle::ConstantTimeEq;
-use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpStream,
+    time::{sleep, timeout},
+};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::{
@@ -41,9 +45,14 @@ use crate::crypto::{
     },
     session::X25519KeyPair,
 };
+use crate::fingerprint::http2::{Http2Fingerprint, Http2FrameHeader, Http2PeerProfile};
 
 const POST_HANDSHAKE_DRAIN_LIMIT: usize = 4;
 const POST_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(180);
+const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
+const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+const H2_OPEN_HEADERS_DELAY: Duration = Duration::from_millis(12);
+const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
 
 thread_local! {
     static PATCH_CONTEXT: RefCell<Option<PatchContext>> = const { RefCell::new(None) };
@@ -138,6 +147,7 @@ pub trait PostHandshakeDrain {
 #[derive(Debug, Clone)]
 pub struct ProfileConfig {
     pub browser: BrowserProfile,
+    pub http2_profile: Http2PeerProfile,
     pub alpn_protocols: Vec<Vec<u8>>,
     pub max_fragment_size: Option<usize>,
     pub post_handshake_records: usize,
@@ -151,8 +161,13 @@ impl ProfileConfig {
                 vec![b"h2".to_vec(), b"http/1.1".to_vec()]
             }
         };
+        let http2_profile = match browser {
+            BrowserProfile::Safari17 => Http2PeerProfile::Safari17,
+            BrowserProfile::Chrome124 => Http2PeerProfile::Chrome124,
+        };
         Self {
             browser,
+            http2_profile,
             alpn_protocols,
             max_fragment_size: None,
             post_handshake_records: POST_HANDSHAKE_DRAIN_LIMIT,
@@ -206,6 +221,7 @@ impl StatefulRustlsCamouflageBackend {
             connection,
             client_hello,
             x25519,
+            sni,
             profile,
             tap: VecRecordTap::default(),
         })
@@ -216,6 +232,7 @@ pub struct StatefulRustlsSession {
     connection: rustls::ClientConnection,
     client_hello: Vec<u8>,
     x25519: X25519KeyPair,
+    sni: String,
     profile: ProfileConfig,
     tap: VecRecordTap,
 }
@@ -245,6 +262,7 @@ impl StatefulRustlsSession {
 
         let server_hello_record = server_hello_record.ok_or(TlsBackendError::MissingServerHello)?;
         self.drain_post_handshake(stream).await?;
+        self.open_http2_connection(stream).await?;
 
         Ok(CompletedStatefulHandshake {
             client_hello: self.client_hello,
@@ -255,6 +273,14 @@ impl StatefulRustlsSession {
     }
 
     fn feed_inbound_record(&mut self, record: &[u8]) -> Result<(), TlsBackendError> {
+        self.feed_inbound_record_collect_plaintext(record)
+            .map(|_| ())
+    }
+
+    fn feed_inbound_record_collect_plaintext(
+        &mut self,
+        record: &[u8],
+    ) -> Result<Vec<u8>, TlsBackendError> {
         self.tap_records(RecordDirection::Inbound, record);
         let mut cursor = Cursor::new(record);
         self.connection.read_tls(&mut cursor)?;
@@ -266,7 +292,7 @@ impl StatefulRustlsSession {
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err) => return Err(err.into()),
         }
-        Ok(())
+        Ok(plaintext)
     }
 
     async fn flush_outbound(&mut self, stream: &mut TcpStream) -> Result<(), TlsBackendError> {
@@ -297,6 +323,92 @@ impl StatefulRustlsSession {
             self.flush_outbound(stream).await?;
         }
         Ok(())
+    }
+
+    async fn open_http2_connection(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> Result<(), TlsBackendError> {
+        if !self.negotiated_h2() {
+            return Ok(());
+        }
+
+        let fingerprint = Http2Fingerprint::for_profile(self.profile.http2_profile);
+        let preface = fingerprint.connection_preface()?;
+        self.write_application_data(stream, &preface).await?;
+        self.await_http2_settings_ack(stream).await?;
+
+        let headers = fingerprint.headers_frame(&self.sni)?;
+        self.write_application_data(stream, &headers).await?;
+        sleep(H2_OPEN_HEADERS_DELAY).await;
+        Ok(())
+    }
+
+    fn negotiated_h2(&self) -> bool {
+        matches!(self.connection.alpn_protocol(), Some(protocol) if protocol == b"h2")
+    }
+
+    async fn write_application_data(
+        &mut self,
+        stream: &mut TcpStream,
+        plaintext: &[u8],
+    ) -> Result<(), TlsBackendError> {
+        self.connection.writer().write_all(plaintext)?;
+        self.flush_outbound(stream).await
+    }
+
+    async fn await_http2_settings_ack(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> Result<(), TlsBackendError> {
+        let mut plaintext = Vec::new();
+        for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
+            let record = match timeout(H2_SETTINGS_ACK_TIMEOUT, read_record(stream)).await {
+                Ok(Ok(record)) => record,
+                Ok(Err(err)) if is_clean_close(&err) => return Ok(()),
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) => return Ok(()),
+            };
+            let chunk = self.feed_inbound_record_collect_plaintext(&record)?;
+            plaintext.extend_from_slice(&chunk);
+            if plaintext.len() > H2_FRAME_BUFFER_LIMIT {
+                plaintext.clear();
+            }
+            if self.process_http2_frames(&mut plaintext, stream).await? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_http2_frames(
+        &mut self,
+        plaintext: &mut Vec<u8>,
+        stream: &mut TcpStream,
+    ) -> Result<bool, TlsBackendError> {
+        let mut offset = 0;
+        let mut saw_settings_ack = false;
+        let mut should_ack_peer_settings = false;
+
+        while let Some((header, total)) = Http2FrameHeader::parse_complete(&plaintext[offset..]) {
+            if header.is_settings_ack() {
+                saw_settings_ack = true;
+            } else if header.is_settings() {
+                should_ack_peer_settings = true;
+            }
+            offset += total;
+        }
+
+        if offset > 0 {
+            plaintext.drain(..offset);
+        }
+
+        if should_ack_peer_settings {
+            let ack = Http2Fingerprint::settings_ack_frame()?;
+            self.write_application_data(stream, &ack).await?;
+        }
+
+        Ok(saw_settings_ack)
     }
 
     fn tap_records(&mut self, direction: RecordDirection, records: &[u8]) {
