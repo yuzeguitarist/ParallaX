@@ -10,7 +10,13 @@ This script keeps source code on the local machine:
   - generates server/client configs locally
   - uploads only the binary + server config + systemd unit over SSH
 
-Basic usage:
+Interactive (recommended for beginners):
+  scripts/deploy-vps.sh
+
+  With no arguments, you'll be prompted step by step on a normal terminal.
+  Polar Signals tokens are pasted at the prompt (no token file needed).
+
+Traditional usage (explicit arguments):
   scripts/deploy-vps.sh root@1.2.3.4 cloudflare.com
 
 Equivalent explicit form:
@@ -37,7 +43,9 @@ Options:
   --install-build-tools        Install missing local build helpers when possible. Default in auto mode.
   --no-install-build-tools     Do not install missing local build helpers; fail with instructions instead.
   --profile-mode <mode>        Profiling integration: none or polar-cloud. Defaults to none.
-  --polar-token-file <path>    Local Polar Signals bearer token file. Required for polar-cloud.
+  --polar-bearer-token <token> Bearer token text (Polar Signals Cloud). Alternative to token file.
+  --polar-token-file <path>    Read Polar Signals token from this local file instead of prompting.
+                               Useful for CI; mutually exclusive with --polar-bearer-token.
   --polar-project-id <uuid>    Polar Signals project UUID. Required for polar-cloud.
   --polar-store-address <addr> Polar Signals gRPC endpoint. Defaults to grpc.polarsignals.com:443.
   --polar-node <name>          Node label for Polar Signals. Defaults to the SSH host.
@@ -49,6 +57,7 @@ Options:
   --sudo                       Force sudo for remote install commands.
   --no-sudo                    Run remote install commands without sudo. Auto-selected for root@ hosts.
   --dry-run                    Print commands without executing them.
+  --non-interactive            Never prompt; require all values via flags (or fail with a clear error).
   -h, --help                   Show this help.
 
 After deploy:
@@ -68,6 +77,358 @@ log() {
 
 warn() {
   printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2
+}
+
+have_tty_stdio() {
+  [[ -t 0 && -t 1 ]]
+}
+
+trim_space() {
+  local s=$1
+  s="${s//$'\r'/}"
+  # shellcheck disable=SC2001
+  s="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$s")"
+  printf '%s' "$s"
+}
+
+prompt_line_nonempty() {
+  local label=$1
+  local hint=${2:-}
+  local reply
+  local prompt_text
+  while true; do
+    if [[ -n "$hint" ]]; then
+      prompt_text="${label} (${hint}): "
+    else
+      prompt_text="${label}: "
+    fi
+    read -r -p "$prompt_text" reply || die "stdin closed before reading input"
+    reply="$(trim_space "$reply")"
+    if [[ -n "$reply" ]]; then
+      printf '%s' "$reply"
+      return 0
+    fi
+    printf 'This cannot be empty. Try again.\n\n' >&2
+  done
+}
+
+prompt_line_or_default() {
+  local prompt=$1 default=$2 reply
+  read -r -p "$prompt [${default}]: " reply || die "stdin closed before reading input"
+  reply="$(trim_space "$reply")"
+  [[ -z "$reply" ]] && reply=$default
+  printf '%s' "$reply"
+}
+
+prompt_polar_normalize_paste() {
+  local raw=$1
+  raw="$(trim_space "$raw")"
+  local bearer_head
+  bearer_head="$(printf '%.6s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$bearer_head" == "bearer" ]]; then
+    raw="${raw:6}"
+    raw="$(trim_space "$raw")"
+  fi
+
+  local len=${#raw}
+  if [[ "$len" -ge 2 ]]; then
+    local first="${raw:0:1}" last="${raw:$((len - 1)):1}"
+    if { [[ "$first" == "'" ]] && [[ "$last" == "'" ]]; } || [[ "$first" == '"' && "$last" == '"' ]]; then
+      raw="${raw:1:$((len - 2))}"
+      raw="$(trim_space "$raw")"
+    fi
+  fi
+
+  printf '%s' "$raw" | tr -d '[:space:]'
+}
+
+prompt_polar_bearer_once() {
+  printf '\nPolar Signals bearer token (paste ONE line).\nInput is hidden; press Enter when done.\n(Ctrl-D cancels)\n\n' >&2
+  local token
+  while true; do
+    token=""
+    if ! read -r -s token; then
+      printf '\n' >&2
+      die "Polar token prompt cancelled"
+    fi
+    printf '\n' >&2
+    token="$(prompt_polar_normalize_paste "$token")"
+    if [[ -z "$token" ]]; then
+      warn "token was empty — paste one line ending with Enter (no stray spaces only)."
+      continue
+    fi
+    if [[ "$token" =~ ^psc_v1_[0-9a-fA-F]{64}$ ]]; then
+      POLAR_BEARER_TOKEN="$token"
+      return 0
+    fi
+    warn "token shape does not look like Polar (need psc_v1_ plus exactly 64 hex digits). Common misses: Slack/code-block quotes or an incomplete copy."
+    printf 'Try pasting again (hidden).\n\n' >&2
+  done
+}
+
+tolower_one() {
+  trim_space "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+}
+
+interactive_banner() {
+  cat <<'BANNER'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ParallaX VPS deploy — guided setup
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You will answer a few prompts. Brackets show defaults; press Enter to keep them.
+
+For Polar Signals, you paste a single-line token at the prompt (no token file).
+
+Secrets are typed hidden and are never echoed back here.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BANNER
+}
+
+interactive_prompt_dry_run() {
+  printf '\nDry-run only prints SSH/cargo/docker commands instead of running them.\n' >&2
+  local dry_pick
+  dry_pick="$(prompt_line_or_default "Enable dry-run [y/N]" "n")"
+  dry_pick="$(tolower_one "$dry_pick")"
+  [[ "$dry_pick" == "y" || "$dry_pick" == "yes" ]] && DRY_RUN="1" || DRY_RUN="0"
+}
+
+interactive_advanced_paths_and_build() {
+  SERVER_LISTEN="$(prompt_line_or_default "Server listen bind (SERVER_LISTEN)" "$SERVER_LISTEN")"
+  CLIENT_LISTEN="$(prompt_line_or_default "Local SOCKS listen (CLIENT_LISTEN)" "$CLIENT_LISTEN")"
+  REMOTE_BIN="$(prompt_line_or_default "Remote plx binary path (REMOTE_BIN)" "$REMOTE_BIN")"
+  REMOTE_CONFIG="$(prompt_line_or_default "Remote server config path (REMOTE_CONFIG)" "$REMOTE_CONFIG")"
+  SERVICE_NAME="$(prompt_line_or_default "systemd service name (SERVICE_NAME)" "$SERVICE_NAME")"
+  printf '\n' >&2
+
+  printf 'Choose how your Linux binary is built locally:\n' >&2
+  printf '  1) auto (recommended on macOS picks Docker or zigbuild)\n' >&2
+  printf '  2) docker\n' >&2
+  printf '  3) zigbuild\n' >&2
+  printf '  4) native (works when you'\''re already on Linux)\n' >&2
+  local bm bm_lc
+  bm="$(prompt_line_or_default "Build mode selection (1-4)" "1")"
+  bm_lc="$(tolower_one "$bm")"
+  case "$bm_lc" in
+    1|auto|"")
+      BUILD_MODE="auto"
+      ;;
+    2|docker)
+      BUILD_MODE="docker"
+      ;;
+    3|zigbuild)
+      BUILD_MODE="zigbuild"
+      ;;
+    4|native)
+      BUILD_MODE="native"
+      ;;
+    *)
+      die "unknown build selection: $bm (use 1-4)"
+      ;;
+  esac
+
+  LINUX_TARGET="$(prompt_line_or_default "Linux zigbuild triple (LINUX_TARGET)" "$LINUX_TARGET")"
+  DOCKER_IMAGE="$(prompt_line_or_default "Rust Docker image (DOCKER_IMAGE)" "$DOCKER_IMAGE")"
+  printf '\n' >&2
+
+  printf 'Automatically install zig / cargo-zigbuild when zigbuild mode needs them?\n' >&2
+  local tools
+  tools="$(prompt_line_or_default "Install build helpers when missing [Y/n]" "y")"
+  tools="$(tolower_one "$tools")"
+  [[ -z "$tools" || "$tools" == "y" || "$tools" == "yes" ]] && INSTALL_BUILD_TOOLS="yes" || INSTALL_BUILD_TOOLS="no"
+  printf '\n' >&2
+
+  printf 'Reuse previously generated configs in target/parallax-deploy/<host>/ ?\n' >&2
+  local reuse
+  reuse="$(prompt_line_or_default "Reuse local configs instead of regenerating [y/N]" "n")"
+  reuse="$(tolower_one "$reuse")"
+  [[ "$reuse" == "y" || "$reuse" == "yes" ]] && REUSE_CONFIG="1" || REUSE_CONFIG="0"
+
+  printf '\nHow should installs run over SSH on the VPS?\n' >&2
+  printf '  1) auto (recommended) — omit sudo when user is root, otherwise use sudo\n' >&2
+  printf '  2) Always sudo\n' >&2
+  printf '  3) Never sudo\n' >&2
+  local sudo_pick sudo_lc
+  sudo_pick="$(prompt_line_or_default "Remote privilege selection (1-3)" "1")"
+  sudo_lc="$(tolower_one "$sudo_pick")"
+  case "$sudo_lc" in
+    1|auto|'')
+      REMOTE_SUDO="auto"
+      ;;
+    2|sudo)
+      REMOTE_SUDO="sudo"
+      ;;
+    3|none|no|"no sudo")
+      REMOTE_SUDO="none"
+      ;;
+    *)
+      die "unknown sudo selection: $sudo_pick"
+      ;;
+  esac
+}
+
+interactive_prompt_polar_details() {
+  if [[ -z "$POLAR_PROJECT_ID" ]]; then
+    POLAR_PROJECT_ID="$(prompt_line_nonempty "Polar Signals project UUID")"
+  fi
+  POLAR_STORE_ADDRESS="$(prompt_line_or_default "Polar gRPC endpoint (STORE_ADDRESS)" "$POLAR_STORE_ADDRESS")"
+  local node_default
+  node_default="${SSH_TARGET##*@}"
+  node_default="${node_default%%:*}"
+  POLAR_NODE="$(prompt_line_or_default "Polar node label (friendly name)" "${POLAR_NODE:-$node_default}")"
+  POLAR_LABELS="$(prompt_line_or_default "Extra Polar labels (KEY=VALUE;KEY=VALUE) optional" "${POLAR_LABELS}")"
+  PARCA_AGENT_CHANNEL="$(prompt_line_or_default "snap channel override for parca-agent (leave empty for stable)" "${PARCA_AGENT_CHANNEL}")"
+  PARCA_HTTP_ADDRESS="$(prompt_line_or_default "Parca Agent local HTTP metrics address" "$PARCA_HTTP_ADDRESS")"
+  if [[ -z "$POLAR_BEARER_TOKEN" && -z "$POLAR_TOKEN_FILE" ]]; then
+    prompt_polar_bearer_once
+  fi
+}
+
+interactive_prompt_profiling_choice() {
+  local default_pick=1
+  if [[ "$PROFILE_MODE" == "polar-cloud" ]]; then
+    default_pick=2
+  fi
+
+  printf '\nProfiling integration:\n' >&2
+  printf '  1) none — normal optimized binary\n' >&2
+  printf '  2) Polar Signals Cloud — Parca Agent + profiling binary with symbols\n' >&2
+  local pick pick_lc
+  pick="$(prompt_line_or_default "Select profiling mode (1-2)" "$default_pick")"
+  pick_lc="$(tolower_one "$pick")"
+  case "$pick_lc" in
+    1|none|'')
+      PROFILE_MODE="none"
+      ;;
+    2|polar|polar-cloud|signals)
+      PROFILE_MODE="polar-cloud"
+      printf '\n' >&2
+      interactive_prompt_polar_details
+      ;;
+    *)
+      die "unknown profiling selection: $pick"
+      ;;
+  esac
+}
+
+interactive_flow_zero_argv() {
+  interactive_banner
+
+  printf 'SSH login target, such as root@203.0.113.50 or ubuntu@your.host\n' >&2
+  SSH_TARGET="$(prompt_line_nonempty "SSH login target" 'e.g. root@203.0.113.50')"
+  printf '\n' >&2
+
+  printf 'Fallback / camouflage TLS host name shown to outsiders (often a CDN domain).\n' >&2
+  DEST="$(prompt_line_nonempty "Fallback / camouflage domain (DEST)" 'e.g. www.cloudflare.com')"
+  printf '\n' >&2
+
+  local inferred=""
+  inferred="$(infer_server_addr "$SSH_TARGET")"
+  SERVER_ADDR="$(prompt_line_or_default "Address clients dial (SERVER_ADDR)" "$inferred")"
+  printf '\n' >&2
+  SSH_PORT="$(prompt_line_or_default "SSH port" "$SSH_PORT")"
+  printf '\n' >&2
+
+  if [[ -z "$SERVER_ADDR" ]]; then
+    SERVER_ADDR="$(infer_server_addr "$SSH_TARGET")"
+  fi
+
+  interactive_prompt_profiling_choice
+
+  printf '\nOptional: tune build mode, VPS paths, local SOCKS listen, sudo, and reuse-config.\n' >&2
+  local reply
+  read -r -p "Open those advanced settings? [y/N]: " reply || die "stdin closed"
+  reply="$(tolower_one "$reply")"
+  if [[ "$reply" == "y" || "$reply" == "yes" ]]; then
+    printf '\n' >&2
+    interactive_advanced_paths_and_build
+  fi
+
+  interactive_prompt_dry_run
+
+  printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' >&2
+  printf 'Thanks — kicking off deployment with those choices.\n' >&2
+  printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' >&2
+}
+
+interactive_flow_partial_argv() {
+  printf '\nSome settings already came from the command line; only missing values are required.\n\n' >&2
+
+  if [[ -z "$SSH_TARGET" ]]; then
+    printf 'SSH login target, such as root@203.0.113.50\n' >&2
+    SSH_TARGET="$(prompt_line_nonempty "SSH login target")"
+    printf '\n' >&2
+  fi
+
+  if [[ -z "$DEST" ]]; then
+    printf 'Fallback / camouflage TLS host name (DEST).\n' >&2
+    DEST="$(prompt_line_nonempty "Fallback / camouflage domain (DEST)")"
+    printf '\n' >&2
+  fi
+
+  local inferred=""
+  inferred="$(infer_server_addr "$SSH_TARGET")"
+  if [[ -z "$SERVER_ADDR" ]]; then
+    SERVER_ADDR="$inferred"
+  fi
+  SERVER_ADDR="$(prompt_line_or_default "Address clients dial (SERVER_ADDR)" "$SERVER_ADDR")"
+  printf '\n' >&2
+  SSH_PORT="$(prompt_line_or_default "SSH port" "$SSH_PORT")"
+  printf '\n' >&2
+
+  if [[ -z "$SERVER_ADDR" ]]; then
+    SERVER_ADDR="$(infer_server_addr "$SSH_TARGET")"
+  fi
+
+  printf 'Optional: review profiling, build mode, remote paths, sudo, reuse-config, or dry-run.\n' >&2
+  local reply
+  read -r -p "Open the interactive review? [y/N]: " reply || die "stdin closed"
+  reply="$(tolower_one "$reply")"
+  if [[ "$reply" == "y" || "$reply" == "yes" ]]; then
+    printf '\n' >&2
+    interactive_prompt_profiling_choice
+    printf '\n' >&2
+    interactive_advanced_paths_and_build
+    interactive_prompt_dry_run
+  fi
+
+  printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' >&2
+  printf 'Starting deploy with SSH=%s DEST=%s\n' "$SSH_TARGET" "$DEST" >&2
+  printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' >&2
+}
+
+interactive_collect_polar_if_needed() {
+  if ! profiling_enabled; then
+    return 0
+  fi
+  if [[ -n "$POLAR_TOKEN_FILE" || -n "$POLAR_BEARER_TOKEN" ]]; then
+    return 0
+  fi
+  if [[ "$NON_INTERACTIVE" == "1" ]] || ! have_tty_stdio; then
+    return 0
+  fi
+
+  printf '\nPolar Signals Cloud is enabled but no token was supplied yet.\n' >&2
+  printf 'Paste the bearer token when prompted (still no token file required).\n\n' >&2
+  interactive_prompt_polar_details
+}
+
+interactive_configure() {
+  if [[ "$NON_INTERACTIVE" == "1" ]] || ! have_tty_stdio; then
+    return
+  fi
+
+  if [[ "${#ORIGINAL_ARGS[@]}" -eq 0 ]]; then
+    interactive_flow_zero_argv
+    return
+  fi
+
+  if [[ -z "$SSH_TARGET" || -z "$DEST" ]]; then
+    interactive_flow_partial_argv
+    return
+  fi
 }
 
 need_cmd() {
@@ -321,18 +682,34 @@ validate_profile_options() {
     return
   fi
 
-  [[ -n "$POLAR_TOKEN_FILE" ]] || die "--polar-token-file is required with --profile-mode polar-cloud"
   [[ -n "$POLAR_PROJECT_ID" ]] || die "--polar-project-id is required with --profile-mode polar-cloud"
   [[ "$POLAR_PROJECT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || \
     die "--polar-project-id must be a UUID, not a project name: $POLAR_PROJECT_ID"
-  if [[ "$DRY_RUN" == "0" ]]; then
-    [[ -r "$POLAR_TOKEN_FILE" ]] || die "Polar Signals token file is not readable: $POLAR_TOKEN_FILE"
-    local token
-    token="$(tr -d '\r\n[:space:]' < "$POLAR_TOKEN_FILE")"
-    [[ "$token" =~ ^psc_v1_[0-9a-fA-F]{64}$ ]] || \
-      die "Polar Signals token file is invalid. Expected format: psc_v1_ followed by 64 hex chars"
+
+  if [[ -n "$POLAR_TOKEN_FILE" && -n "$POLAR_BEARER_TOKEN" ]]; then
+    die "use either --polar-token-file or an inline bearer token (--polar-bearer-token / guided paste), not both"
   fi
-  [[ "$POLAR_TOKEN_FILE" != *" "* ]] || die "--polar-token-file must not contain spaces"
+
+  local token_normalized=""
+  if [[ -n "$POLAR_TOKEN_FILE" ]]; then
+    [[ "$POLAR_TOKEN_FILE" != *" "* ]] || die "--polar-token-file path must not contain spaces"
+    if [[ "$DRY_RUN" == "0" ]]; then
+      [[ -r "$POLAR_TOKEN_FILE" ]] || die "Polar Signals token file is not readable: $POLAR_TOKEN_FILE"
+    fi
+    if [[ -r "$POLAR_TOKEN_FILE" ]]; then
+      token_normalized="$(tr -d '\r\n[:space:]' < "$POLAR_TOKEN_FILE")"
+    fi
+  elif [[ -n "$POLAR_BEARER_TOKEN" ]]; then
+    token_normalized="$(printf '%s' "$POLAR_BEARER_TOKEN" | tr -d '\r\n[:space:]')"
+  else
+    die "Polar Signals Cloud needs a bearer token (interactive paste, --polar-bearer-token, or --polar-token-file)"
+  fi
+
+  if [[ -n "$token_normalized" ]]; then
+    [[ "$token_normalized" =~ ^psc_v1_[0-9a-fA-F]{64}$ ]] || \
+      die "Polar Signals bearer token is invalid — expected format: psc_v1_ followed by 64 hex chars"
+  fi
+
   [[ -n "$POLAR_STORE_ADDRESS" ]] || die "--polar-store-address must not be empty"
   [[ -n "$POLAR_NODE" ]] || POLAR_NODE="$(infer_server_addr "$SSH_TARGET")"
   POLAR_NODE="${POLAR_NODE%%:*}"
@@ -377,13 +754,19 @@ ENV
 prepare_polar_token_file() {
   local token_file=$1
   if [[ "$DRY_RUN" == "0" ]]; then
-    local token
-    token="$(tr -d '\r\n[:space:]' < "$POLAR_TOKEN_FILE")"
+    local token=""
+    if [[ -n "$POLAR_TOKEN_FILE" ]]; then
+      token="$(tr -d '\r\n[:space:]' < "$POLAR_TOKEN_FILE")"
+    else
+      token="$(printf '%s' "$POLAR_BEARER_TOKEN" | tr -d '\r\n[:space:]')"
+    fi
+    [[ -n "$token" ]] || die "Polar Signals bearer token resolved empty"
     printf '%s' "$token" >"$token_file"
     chmod 600 "$token_file"
   else
     log "would write sanitized Polar Signals token to $token_file"
   fi
+  unset POLAR_BEARER_TOKEN
 }
 
 cleanup_polar_token_upload_file() {
@@ -570,7 +953,10 @@ REUSE_CONFIG="0"
 REMOTE_SUDO="auto"
 DRY_RUN="0"
 LINUX_PLX=""
+NON_INTERACTIVE="0"
+POLAR_BEARER_TOKEN=""
 
+ORIGINAL_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host) SSH_TARGET=${2:-}; shift 2 ;;
@@ -589,6 +975,7 @@ while [[ $# -gt 0 ]]; do
     --install-build-tools) INSTALL_BUILD_TOOLS="yes"; shift ;;
     --no-install-build-tools) INSTALL_BUILD_TOOLS="no"; shift ;;
     --profile-mode) PROFILE_MODE=${2:-}; shift 2 ;;
+    --polar-bearer-token) POLAR_BEARER_TOKEN=${2:-}; shift 2 ;;
     --polar-token-file) POLAR_TOKEN_FILE=${2:-}; shift 2 ;;
     --polar-project-id) POLAR_PROJECT_ID=${2:-}; shift 2 ;;
     --polar-store-address) POLAR_STORE_ADDRESS=${2:-}; shift 2 ;;
@@ -600,6 +987,7 @@ while [[ $# -gt 0 ]]; do
     --sudo) REMOTE_SUDO="sudo"; shift ;;
     --no-sudo) REMOTE_SUDO="none"; shift ;;
     --dry-run) DRY_RUN="1"; shift ;;
+    --non-interactive) NON_INTERACTIVE="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*)
@@ -618,12 +1006,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$SSH_TARGET" ]] || die "missing --host or positional SSH target"
-[[ -n "$DEST" ]] || die "missing --dest or positional camouflage domain"
+if [[ "${#ORIGINAL_ARGS[@]}" -eq 0 ]] && ! have_tty_stdio; then
+  die "guided mode needs an interactive terminal. Open iTerm / Terminal.app / ssh -t, or pass explicit flags (see scripts/deploy-vps.sh --help)."
+fi
+
+interactive_configure
+
+[[ -n "$SSH_TARGET" ]] || die "missing SSH target — run scripts/deploy-vps.sh with no arguments for prompts, or pass --host / a positional SSH target"
+[[ -n "$DEST" ]] || die "missing camouflage DEST — run scripts/deploy-vps.sh with no arguments for prompts, or pass --dest / a second positional domain"
 [[ -n "$SERVER_ADDR" ]] || SERVER_ADDR="$(infer_server_addr "$SSH_TARGET")"
 if profiling_enabled && [[ "$CARGO_PROFILE_SET" == "0" ]]; then
   CARGO_PROFILE="profiling"
 fi
+interactive_collect_polar_if_needed
 validate_profile_options
 
 case "$REMOTE_SUDO" in
