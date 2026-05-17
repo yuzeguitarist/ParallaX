@@ -217,6 +217,10 @@ impl ClientDataSession {
         self.seal_to_server.max_plaintext_len()
     }
 
+    pub fn into_data_codecs(self) -> (DataRecordCodec, DataRecordCodec) {
+        (self.seal_to_server, self.open_from_server)
+    }
+
     pub fn open_server_record(&mut self, record: &[u8]) -> Result<Vec<u8>, ClientHandshakeError> {
         Ok(self.open_from_server.open(record)?)
     }

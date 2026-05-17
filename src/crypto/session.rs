@@ -5,6 +5,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use sha2::Sha256;
 use thiserror::Error;
@@ -14,6 +15,13 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
 pub const AEAD_TAG_LEN: usize = 16;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const RECORD_RATCHET_INIT_LABEL: &[u8] = b"ParallaX v2 record ratchet init";
+const RECORD_RATCHET_KEY_LABEL: &[u8] = b"ParallaX v2 record ratchet key";
+const RECORD_RATCHET_NONCE_LABEL: &[u8] = b"ParallaX v2 record ratchet nonce";
+const RECORD_RATCHET_ADVANCE_LABEL: &[u8] = b"ParallaX v2 record ratchet advance";
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct X25519KeyPair {
@@ -203,42 +211,29 @@ fn expand(
     hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AeadCodec {
-    cipher: XChaCha20Poly1305,
-    nonce_base: [u8; NONCE_LEN],
+    root_secret: [u8; KEY_LEN],
     sequence: u64,
 }
 
 impl AeadCodec {
     pub fn new(key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) -> Self {
         Self {
-            cipher: XChaCha20Poly1305::new_from_slice(&key)
-                .expect("XChaCha20-Poly1305 key length is fixed"),
-            nonce_base,
+            root_secret: initial_record_root(&key, &nonce_base),
             sequence: 0,
         }
     }
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
-        self.cipher = XChaCha20Poly1305::new_from_slice(&key)
-            .expect("XChaCha20-Poly1305 key length is fixed");
-        self.nonce_base = nonce_base;
+        self.root_secret = initial_record_root(&key, &nonce_base);
         self.sequence = 0;
     }
 
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let nonce = self.current_nonce();
-        let ciphertext = self
-            .cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
-            .map_err(|_| SessionError::Aead)?;
-        self.advance_nonce()?;
+        let mut ciphertext = plaintext.to_vec();
+        let tag = self.seal_in_place_detached(&mut ciphertext, aad)?;
+        ciphertext.extend_from_slice(&tag);
         Ok(ciphertext)
     }
 
@@ -247,31 +242,39 @@ impl AeadCodec {
         plaintext: &mut [u8],
         aad: &[u8],
     ) -> Result<[u8; AEAD_TAG_LEN], SessionError> {
-        let nonce = self.current_nonce();
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, plaintext)
+        self.ensure_can_process_next_record()?;
+        let material = self.derive_record_material(aad)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&material.key)
+            .expect("XChaCha20-Poly1305 key length is fixed");
+        let tag = cipher
+            .encrypt_in_place_detached(XNonce::from_slice(&material.nonce), aad, plaintext)
             .map_err(|_| SessionError::Aead)?;
-        self.advance_nonce()?;
 
         let mut out = [0_u8; AEAD_TAG_LEN];
         out.copy_from_slice(tag.as_slice());
+        self.advance_record_ratchet(aad, plaintext, &out)?;
         Ok(out)
     }
 
     pub fn open(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let nonce = self.current_nonce();
-        let plaintext = self
-            .cipher
+        if ciphertext.len() < AEAD_TAG_LEN {
+            return Err(SessionError::Aead);
+        }
+        self.ensure_can_process_next_record()?;
+        let material = self.derive_record_material(aad)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&material.key)
+            .expect("XChaCha20-Poly1305 key length is fixed");
+        let plaintext = cipher
             .decrypt(
-                XNonce::from_slice(&nonce),
+                XNonce::from_slice(&material.nonce),
                 Payload {
                     msg: ciphertext,
                     aad,
                 },
             )
             .map_err(|_| SessionError::Aead)?;
-        self.advance_nonce()?;
+        let tag_start = ciphertext.len() - AEAD_TAG_LEN;
+        self.advance_record_ratchet(aad, &ciphertext[..tag_start], &ciphertext[tag_start..])?;
         Ok(plaintext)
     }
 
@@ -280,30 +283,128 @@ impl AeadCodec {
         ciphertext_with_tag: &mut Vec<u8>,
         aad: &[u8],
     ) -> Result<(), SessionError> {
-        let nonce = self.current_nonce();
-        self.cipher
-            .decrypt_in_place(XNonce::from_slice(&nonce), aad, ciphertext_with_tag)
+        if ciphertext_with_tag.len() < AEAD_TAG_LEN {
+            return Err(SessionError::Aead);
+        }
+        self.ensure_can_process_next_record()?;
+        let material = self.derive_record_material(aad)?;
+        let next_root = {
+            let tag_start = ciphertext_with_tag.len() - AEAD_TAG_LEN;
+            self.next_record_root(
+                aad,
+                &ciphertext_with_tag[..tag_start],
+                &ciphertext_with_tag[tag_start..],
+            )?
+        };
+        let cipher = XChaCha20Poly1305::new_from_slice(&material.key)
+            .expect("XChaCha20-Poly1305 key length is fixed");
+        cipher
+            .decrypt_in_place(
+                XNonce::from_slice(&material.nonce),
+                aad,
+                ciphertext_with_tag,
+            )
             .map_err(|_| SessionError::Aead)?;
-        self.advance_nonce()?;
-        Ok(())
-    }
-
-    fn current_nonce(&self) -> [u8; NONCE_LEN] {
-        let mut nonce = self.nonce_base;
-        let seq = self.sequence.to_be_bytes();
-        for (dst, src) in nonce[NONCE_LEN - 8..].iter_mut().zip(seq) {
-            *dst ^= src;
-        }
-        nonce
-    }
-
-    fn advance_nonce(&mut self) -> Result<(), SessionError> {
-        if self.sequence == u64::MAX {
-            return Err(SessionError::NonceExhausted);
-        }
+        self.root_secret = next_root;
         self.sequence += 1;
         Ok(())
     }
+
+    fn ensure_can_process_next_record(&self) -> Result<(), SessionError> {
+        if self.sequence == u64::MAX {
+            return Err(SessionError::NonceExhausted);
+        }
+        Ok(())
+    }
+
+    fn derive_record_material(&self, aad: &[u8]) -> Result<RecordMaterial, SessionError> {
+        let hk = Hkdf::<Sha256>::from_prk(&self.root_secret).map_err(|_| SessionError::Hkdf)?;
+        let mut material = RecordMaterial {
+            key: [0; KEY_LEN],
+            nonce: [0; NONCE_LEN],
+        };
+        expand_record_secret(
+            &hk,
+            RECORD_RATCHET_KEY_LABEL,
+            self.sequence,
+            aad,
+            &mut material.key,
+        )?;
+        expand_record_secret(
+            &hk,
+            RECORD_RATCHET_NONCE_LABEL,
+            self.sequence,
+            aad,
+            &mut material.nonce,
+        )?;
+        Ok(material)
+    }
+
+    fn advance_record_ratchet(
+        &mut self,
+        aad: &[u8],
+        ciphertext_without_tag: &[u8],
+        tag: &[u8],
+    ) -> Result<(), SessionError> {
+        self.ensure_can_process_next_record()?;
+        self.root_secret = self.next_record_root(aad, ciphertext_without_tag, tag)?;
+        self.sequence += 1;
+        Ok(())
+    }
+
+    fn next_record_root(
+        &self,
+        aad: &[u8],
+        ciphertext_without_tag: &[u8],
+        tag: &[u8],
+    ) -> Result<[u8; KEY_LEN], SessionError> {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.root_secret)
+            .map_err(|_| SessionError::Hkdf)?;
+        mac.update(RECORD_RATCHET_ADVANCE_LABEL);
+        mac.update(&self.sequence.to_be_bytes());
+        mac.update(&(aad.len() as u64).to_be_bytes());
+        mac.update(aad);
+        mac.update(&(ciphertext_without_tag.len() as u64).to_be_bytes());
+        mac.update(ciphertext_without_tag);
+        mac.update(tag);
+        let digest = mac.finalize().into_bytes();
+        let mut next_root = [0_u8; KEY_LEN];
+        next_root.copy_from_slice(&digest[..KEY_LEN]);
+        Ok(next_root)
+    }
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct RecordMaterial {
+    key: [u8; KEY_LEN],
+    nonce: [u8; NONCE_LEN],
+}
+
+fn initial_record_root(key: &[u8; KEY_LEN], nonce_base: &[u8; NONCE_LEN]) -> [u8; KEY_LEN] {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key length is unrestricted");
+    mac.update(RECORD_RATCHET_INIT_LABEL);
+    mac.update(nonce_base);
+    let digest = mac.finalize().into_bytes();
+    let mut out = [0_u8; KEY_LEN];
+    out.copy_from_slice(&digest[..KEY_LEN]);
+    out
+}
+
+fn expand_record_secret(
+    hk: &Hkdf<Sha256>,
+    label: &[u8],
+    sequence: u64,
+    aad: &[u8],
+    out: &mut [u8],
+) -> Result<(), SessionError> {
+    let mut info = Vec::with_capacity(2 + label.len() + 8 + 8 + aad.len());
+    info.extend_from_slice(&(label.len() as u16).to_be_bytes());
+    info.extend_from_slice(label);
+    info.extend_from_slice(&sequence.to_be_bytes());
+    info.extend_from_slice(&(aad.len() as u64).to_be_bytes());
+    info.extend_from_slice(aad);
+    hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
 }
 
 #[cfg(test)]
@@ -396,5 +497,35 @@ mod tests {
         dec.open_in_place(&mut ciphertext, b"tls-appdata").unwrap();
 
         assert_eq!(ciphertext, b"payload");
+    }
+
+    #[test]
+    fn aead_ratchet_rejects_replayed_record_after_success() {
+        let key = [7_u8; KEY_LEN];
+        let nonce = [9_u8; NONCE_LEN];
+        let mut enc = AeadCodec::new(key, nonce);
+        let mut dec = AeadCodec::new(key, nonce);
+
+        let first = enc.seal(b"same payload", b"tls-appdata").unwrap();
+        let second = enc.seal(b"same payload", b"tls-appdata").unwrap();
+
+        assert_eq!(dec.open(&first, b"tls-appdata").unwrap(), b"same payload");
+        assert!(matches!(
+            dec.open(&first, b"tls-appdata"),
+            Err(SessionError::Aead)
+        ));
+        assert_eq!(dec.open(&second, b"tls-appdata").unwrap(), b"same payload");
+    }
+
+    #[test]
+    fn aead_ratchet_changes_ciphertext_for_repeated_plaintext() {
+        let key = [7_u8; KEY_LEN];
+        let nonce = [9_u8; NONCE_LEN];
+        let mut enc = AeadCodec::new(key, nonce);
+
+        let first = enc.seal(b"same payload", b"tls-appdata").unwrap();
+        let second = enc.seal(b"same payload", b"tls-appdata").unwrap();
+
+        assert_ne!(first, second);
     }
 }

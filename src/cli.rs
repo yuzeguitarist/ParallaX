@@ -281,11 +281,11 @@ psk = "{}"
 
 [traffic]
 min_padding = 0
-max_padding = 0
+max_padding = 512
 min_delay_ms = 0
 max_delay_ms = 0
-cover_min_interval_ms = 0
-cover_max_interval_ms = 0
+cover_min_interval_ms = 5000
+cover_max_interval_ms = 15000
 max_concurrent_streams = 1
 
 [server]
@@ -310,11 +310,11 @@ psk = "{}"
 
 [traffic]
 min_padding = 0
-max_padding = 0
+max_padding = 512
 min_delay_ms = 0
 max_delay_ms = 0
-cover_min_interval_ms = 0
-cover_max_interval_ms = 0
+cover_min_interval_ms = 5000
+cover_max_interval_ms = 15000
 max_concurrent_streams = 1
 
 [client]

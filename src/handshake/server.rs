@@ -721,69 +721,77 @@ impl DataRelay {
             chunk_size,
             cid,
         } = self;
-        let mut target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
-        let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
         let mut client_record = Vec::new();
-        let mut rng = StdRng::from_entropy();
-        let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
-
-        loop {
-            tokio::select! {
-                _ = &mut cover_sleep, if cover.is_enabled() => {
-                    write_server_data_records_chunked(
-                        &mut client_write,
-                        &mut server_seal,
-                        &[],
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "server->client", "server-cover-writer"),
-                    )
-                    .await?;
-                    cover_sleep.as_mut().reset(
-                        Instant::now() + cover.sample_interval(&mut rng),
-                    );
-                }
-                record = client_records.read_record_into(&mut client_record) => {
-                    match record {
-                        Ok(()) => {}
-                        Err(err) if is_clean_close(&err) => return Ok(()),
-                        Err(err) => return Err(HandshakeServerError::Io(err)),
-                    };
-                    log_record_read(cid, "client->server", "server-data-client-reader", &client_record);
-                    match client_open.open_in_place(&mut client_record) {
-                        Ok(()) => {
-                            if !client_record.is_empty() {
-                                target_write.write_all(&client_record).await?;
-                            }
-                        }
-                        Err(err) => {
-                            return Err(HandshakeServerError::DataRecord(err));
-                        }
-                    }
-                }
-                read = target_read.read(&mut target_buf) => {
-                    let n = read?;
-                    if n == 0 {
-                        return Ok(());
-                    }
-                    let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
-
-                    let delay = timing.sample_delay(&mut rng);
-                    if !delay.is_zero() {
-                        sleep(delay).await;
-                    }
-
-                    write_server_data_records_chunked(
-                        &mut client_write,
-                        &mut server_seal,
-                        &target_buf[..n],
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "server->client", "server-download-writer"),
-                    )
-                    .await?;
+        let upload = async move {
+            loop {
+                match client_records.read_record_into(&mut client_record).await {
+                    Ok(()) => {}
+                    Err(err) if is_clean_close(&err) => return Ok(()),
+                    Err(err) => return Err(HandshakeServerError::Io(err)),
+                };
+                log_record_read(
+                    cid,
+                    "client->server",
+                    "server-data-client-reader",
+                    &client_record,
+                );
+                client_open.open_in_place(&mut client_record)?;
+                if !client_record.is_empty() {
+                    target_write.write_all(&client_record).await?;
                 }
             }
+        };
+
+        let mut target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+        let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
+        let mut rng = StdRng::from_entropy();
+        let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+        let download = async move {
+            loop {
+                tokio::select! {
+                    _ = &mut cover_sleep, if cover.is_enabled() => {
+                        write_server_data_records_chunked(
+                            &mut client_write,
+                            &mut server_seal,
+                            &[],
+                            &mut rng,
+                            &mut seal_scratch,
+                            RelayWriteLog::new(cid, "server->client", "server-cover-writer"),
+                        )
+                        .await?;
+                        cover_sleep.as_mut().reset(
+                            Instant::now() + cover.sample_interval(&mut rng),
+                        );
+                    }
+                    read = target_read.read(&mut target_buf) => {
+                        let n = read?;
+                        if n == 0 {
+                            return Ok(());
+                        }
+
+                        let delay = timing.sample_delay(&mut rng);
+                        if !delay.is_zero() {
+                            sleep(delay).await;
+                        }
+                        let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
+
+                        write_server_data_records_chunked(
+                            &mut client_write,
+                            &mut server_seal,
+                            &target_buf[..n],
+                            &mut rng,
+                            &mut seal_scratch,
+                            RelayWriteLog::new(cid, "server->client", "server-download-writer"),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        };
+
+        tokio::select! {
+            result = upload => result,
+            result = download => result,
         }
     }
 }
