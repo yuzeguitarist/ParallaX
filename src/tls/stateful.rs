@@ -55,7 +55,10 @@ const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
 const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const H2_OPEN_HEADERS_DELAY: Duration = Duration::from_millis(12);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
-const CHROME_GREASE_VALUE: u16 = 0x0a0a;
+const CHROME_GREASE_VALUES: [u16; 16] = [
+    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
+    0xcaca, 0xdada, 0xeaea, 0xfafa,
+];
 
 thread_local! {
     static PATCH_CONTEXT: RefCell<Option<PatchContext>> = const { RefCell::new(None) };
@@ -430,8 +433,9 @@ fn with_patch_context<T>(
 
 fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, TlsBackendError> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    shape_cipher_suites_for_profile(&mut provider, profile.browser);
-    shape_key_exchange_groups_for_profile(&mut provider, profile.browser);
+    let (cipher_grease, group_grease) = chrome_grease_indices_from_context();
+    shape_cipher_suites_for_profile(&mut provider, profile.browser, cipher_grease);
+    shape_key_exchange_groups_for_profile(&mut provider, profile.browser, group_grease);
     provider.secure_random = &PARALLAX_RANDOM;
 
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -453,6 +457,7 @@ fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, 
 fn shape_cipher_suites_for_profile(
     provider: &mut rustls::crypto::CryptoProvider,
     browser: BrowserProfile,
+    grease_index: usize,
 ) {
     if !matches!(browser, BrowserProfile::Chrome124) {
         return;
@@ -465,7 +470,7 @@ fn shape_cipher_suites_for_profile(
     // Chrome's legacy CBC/RSA-GCM tail, so we order the supported subset to
     // match BoringSSL and let rustls append SCSV when TLS 1.2 is enabled.
     provider.cipher_suites = vec![
-        grease_cipher_suite(),
+        grease_cipher_suite(grease_index),
         cipher_suite::TLS13_AES_128_GCM_SHA256,
         cipher_suite::TLS13_AES_256_GCM_SHA384,
         cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
@@ -481,6 +486,7 @@ fn shape_cipher_suites_for_profile(
 fn shape_key_exchange_groups_for_profile(
     provider: &mut rustls::crypto::CryptoProvider,
     browser: BrowserProfile,
+    grease_index: usize,
 ) {
     if !matches!(browser, BrowserProfile::Chrome124) {
         return;
@@ -493,7 +499,7 @@ fn shape_key_exchange_groups_for_profile(
     // X25519MLKEM768, so rustls' transcript and key schedule stay internally
     // consistent while the supported_groups vector becomes Chrome-shaped.
     provider.kx_groups = vec![
-        &GREASE_KX_GROUP,
+        grease_kx_group(grease_index),
         kx_group::X25519MLKEM768,
         kx_group::X25519,
         kx_group::SECP256R1,
@@ -501,14 +507,63 @@ fn shape_key_exchange_groups_for_profile(
     ];
 }
 
-fn grease_cipher_suite() -> SupportedCipherSuite {
-    static GREASE_CIPHER: OnceLock<Tls13CipherSuite> = OnceLock::new();
+fn chrome_grease_indices_from_context() -> (usize, usize) {
+    PATCH_CONTEXT.with(|slot| {
+        let slot = slot.borrow();
+        let Some(context) = slot.as_ref() else {
+            return (0, 1);
+        };
+        (
+            (context.x25519.public[0] as usize) % CHROME_GREASE_VALUES.len(),
+            (context.x25519.public[1] as usize) % CHROME_GREASE_VALUES.len(),
+        )
+    })
+}
+
+fn grease_cipher_suite(index: usize) -> SupportedCipherSuite {
+    static GREASE_CIPHER_0: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_1: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_2: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_3: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_4: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_5: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_6: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_7: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_8: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_9: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_10: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_11: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_12: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_13: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_14: OnceLock<Tls13CipherSuite> = OnceLock::new();
+    static GREASE_CIPHER_15: OnceLock<Tls13CipherSuite> = OnceLock::new();
+
+    let index = index % CHROME_GREASE_VALUES.len();
+    let lock = match index {
+        0 => &GREASE_CIPHER_0,
+        1 => &GREASE_CIPHER_1,
+        2 => &GREASE_CIPHER_2,
+        3 => &GREASE_CIPHER_3,
+        4 => &GREASE_CIPHER_4,
+        5 => &GREASE_CIPHER_5,
+        6 => &GREASE_CIPHER_6,
+        7 => &GREASE_CIPHER_7,
+        8 => &GREASE_CIPHER_8,
+        9 => &GREASE_CIPHER_9,
+        10 => &GREASE_CIPHER_10,
+        11 => &GREASE_CIPHER_11,
+        12 => &GREASE_CIPHER_12,
+        13 => &GREASE_CIPHER_13,
+        14 => &GREASE_CIPHER_14,
+        _ => &GREASE_CIPHER_15,
+    };
+    let grease_value = CHROME_GREASE_VALUES[index];
     let base = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
         .tls13()
         .expect("AES-128-GCM is a TLS 1.3 cipher suite");
-    SupportedCipherSuite::Tls13(GREASE_CIPHER.get_or_init(|| Tls13CipherSuite {
+    SupportedCipherSuite::Tls13(lock.get_or_init(|| Tls13CipherSuite {
         common: CipherSuiteCommon {
-            suite: CipherSuite::Unknown(CHROME_GREASE_VALUE),
+            suite: CipherSuite::Unknown(grease_value),
             hash_provider: base.common.hash_provider,
             confidentiality_limit: base.common.confidentiality_limit,
         },
@@ -519,9 +574,32 @@ fn grease_cipher_suite() -> SupportedCipherSuite {
 }
 
 #[derive(Debug)]
-struct GreaseKxGroup;
+struct GreaseKxGroup {
+    value: u16,
+}
 
-static GREASE_KX_GROUP: GreaseKxGroup = GreaseKxGroup;
+static GREASE_KX_GROUPS: [GreaseKxGroup; 16] = [
+    GreaseKxGroup { value: 0x0a0a },
+    GreaseKxGroup { value: 0x1a1a },
+    GreaseKxGroup { value: 0x2a2a },
+    GreaseKxGroup { value: 0x3a3a },
+    GreaseKxGroup { value: 0x4a4a },
+    GreaseKxGroup { value: 0x5a5a },
+    GreaseKxGroup { value: 0x6a6a },
+    GreaseKxGroup { value: 0x7a7a },
+    GreaseKxGroup { value: 0x8a8a },
+    GreaseKxGroup { value: 0x9a9a },
+    GreaseKxGroup { value: 0xaaaa },
+    GreaseKxGroup { value: 0xbaba },
+    GreaseKxGroup { value: 0xcaca },
+    GreaseKxGroup { value: 0xdada },
+    GreaseKxGroup { value: 0xeaea },
+    GreaseKxGroup { value: 0xfafa },
+];
+
+fn grease_kx_group(index: usize) -> &'static dyn SupportedKxGroup {
+    &GREASE_KX_GROUPS[index % GREASE_KX_GROUPS.len()]
+}
 
 impl SupportedKxGroup for GreaseKxGroup {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, RustlsError> {
@@ -529,7 +607,7 @@ impl SupportedKxGroup for GreaseKxGroup {
     }
 
     fn name(&self) -> NamedGroup {
-        NamedGroup::Unknown(CHROME_GREASE_VALUE)
+        NamedGroup::Unknown(self.value)
     }
 
     fn fips(&self) -> bool {
