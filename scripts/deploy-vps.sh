@@ -357,8 +357,17 @@ install_remote() {
   local unit_file=$3
   local remote_tmp="/tmp/parallax-deploy-$(date +%s)-$$"
 
-  local ssh_args=(ssh -p "$SSH_PORT" -o ServerAliveInterval=10 -o ServerAliveCountMax=3 "$SSH_TARGET")
-  local scp_args=(scp -P "$SSH_PORT")
+  local control_path="/tmp/parallax-ssh-$(safe_name "$SSH_TARGET")-$SSH_PORT"
+  local ssh_common_opts=(
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o ControlMaster=auto
+    -o ControlPersist=5m
+    -o "ControlPath=$control_path"
+  )
+
+  local ssh_args=(ssh -p "$SSH_PORT" "${ssh_common_opts[@]}" "$SSH_TARGET")
+  local scp_args=(scp -P "$SSH_PORT" "${ssh_common_opts[@]}")
   local scp_payload=("$LINUX_PLX" "$server_cfg" "$unit_file")
 
   if profiling_enabled; then
@@ -442,6 +451,10 @@ REMOTE
   printf '  remote service:      %s.service\n' "$SERVICE_NAME"
   if profiling_enabled; then
     printf '  profile mode:        Polar Signals Cloud via parca-agent.service\n'
+  fi
+
+  if [[ "$DRY_RUN" == "0" ]]; then
+    ssh -p "$SSH_PORT" "${ssh_common_opts[@]}" -O exit "$SSH_TARGET" >/dev/null 2>&1 || true
   fi
 }
 
