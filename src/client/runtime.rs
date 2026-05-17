@@ -1,5 +1,6 @@
 use std::{
     io,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -15,10 +16,11 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
+        lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{Semaphore, TryAcquireError},
+    sync::{Mutex, Semaphore, TryAcquireError},
     time::{sleep, Instant},
 };
 
@@ -32,7 +34,7 @@ use crate::{
     crypto::{auth::AuthError, identity, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::ConnectRequest,
-    protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordError},
+    protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordError, SealedRecord},
     tls::{
         backend::TlsBackendError,
         record::{log_record_read, read_record, TlsRecordError, TlsRecordReader},
@@ -91,6 +93,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         &client.server_identity_public_key,
     )?);
     let listener = TcpListener::bind(client.listen).await?;
+    let server_addr = ServerAddrResolver::new(&client.server_addr).await?;
     let connection_limit = relay_connection_limit()?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
     tracing::info!(
@@ -132,19 +135,18 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         let psk = Arc::clone(&psk);
         let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
+        let server_addr = server_addr.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
-            if let Err(err) = handle_local_connection_with_cid(
-                local,
-                &client,
+            let context = ClientConnectionContext {
+                config: &client,
+                server_addr,
                 traffic,
-                &psk,
-                &server_public,
-                &server_identity_public,
-                cid,
-            )
-            .await
-            {
+                psk: psk.as_ref().as_slice(),
+                server_public: &server_public,
+                server_identity_public: &server_identity_public,
+            };
+            if let Err(err) = handle_local_connection_with_cid(local, context, cid).await {
                 tracing::debug!(cid, %peer, error = %err, "client connection closed");
             }
         });
@@ -160,27 +162,40 @@ pub async fn handle_local_connection(
     server_identity_public: &[u8],
 ) -> Result<(), ClientRuntimeError> {
     let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    handle_local_connection_with_cid(
-        local,
+    let server_addr = ServerAddrResolver::new(&config.server_addr).await?;
+    let context = ClientConnectionContext {
         config,
+        server_addr,
         traffic,
         psk,
         server_public,
         server_identity_public,
-        cid,
-    )
-    .await
+    };
+    handle_local_connection_with_cid(local, context, cid).await
+}
+
+struct ClientConnectionContext<'a> {
+    config: &'a ClientConfig,
+    server_addr: ServerAddrResolver,
+    traffic: TrafficConfig,
+    psk: &'a [u8],
+    server_public: &'a [u8; 32],
+    server_identity_public: &'a [u8],
 }
 
 async fn handle_local_connection_with_cid(
     mut local: TcpStream,
-    config: &ClientConfig,
-    traffic: TrafficConfig,
-    psk: &[u8],
-    server_public: &[u8; 32],
-    server_identity_public: &[u8],
+    context: ClientConnectionContext<'_>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
+    let ClientConnectionContext {
+        config,
+        server_addr,
+        traffic,
+        psk,
+        server_public,
+        server_identity_public,
+    } = context;
     tune_tcp_stream(&local)?;
     tracing::debug!(
         cid,
@@ -192,7 +207,7 @@ async fn handle_local_connection_with_cid(
     let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
     let initial_payload =
         initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
-    let mut server = TcpStream::connect(&config.server_addr).await?;
+    let mut server = server_addr.connect().await?;
     tune_tcp_stream(&server)?;
 
     let mut data_session =
@@ -239,6 +254,58 @@ async fn handle_local_connection_with_cid(
     }
     .run()
     .await
+}
+
+#[derive(Clone)]
+struct ServerAddrResolver {
+    original: Arc<str>,
+    cached: Arc<Mutex<SocketAddr>>,
+    literal: bool,
+}
+
+impl ServerAddrResolver {
+    async fn new(server_addr: &str) -> Result<Self, ClientRuntimeError> {
+        let parsed = server_addr.parse::<SocketAddr>().ok();
+        let initial = match parsed {
+            Some(addr) => addr,
+            None => resolve_client_server_addr(server_addr).await?,
+        };
+        Ok(Self {
+            original: Arc::<str>::from(server_addr),
+            cached: Arc::new(Mutex::new(initial)),
+            literal: parsed.is_some(),
+        })
+    }
+
+    async fn connect(&self) -> Result<TcpStream, ClientRuntimeError> {
+        let cached = *self.cached.lock().await;
+        match TcpStream::connect(cached).await {
+            Ok(stream) => Ok(stream),
+            Err(err) if self.literal => Err(err.into()),
+            Err(first_err) => {
+                let refreshed = resolve_client_server_addr(self.original.as_ref()).await?;
+                *self.cached.lock().await = refreshed;
+                if refreshed == cached {
+                    return Err(first_err.into());
+                }
+                Ok(TcpStream::connect(refreshed).await?)
+            }
+        }
+    }
+}
+
+async fn resolve_client_server_addr(server_addr: &str) -> Result<SocketAddr, ClientRuntimeError> {
+    if let Ok(addr) = server_addr.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let mut addrs = lookup_host(server_addr).await?;
+    addrs.next().ok_or_else(|| {
+        ClientRuntimeError::Io(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("client.server_addr did not resolve: {server_addr}"),
+        ))
+    })
 }
 
 async fn apply_server_key_exchange_after_residuals<R>(
@@ -404,6 +471,7 @@ impl ClientRelay {
         } = self;
         let mut local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
         let mut server_records = TlsRecordReader::new(server_read);
+        let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
         let mut rng = StdRng::from_entropy();
         let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
@@ -415,9 +483,8 @@ impl ClientRelay {
                         &mut data_session,
                         &[],
                         &mut rng,
-                        cid,
-                        "client->server",
-                        "client-cover-writer",
+                        &mut seal_scratch,
+                        RelayWriteLog::new(cid, "client->server", "client-cover-writer"),
                     )
                     .await?;
                     cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
@@ -432,9 +499,8 @@ impl ClientRelay {
                         &mut data_session,
                         &local_buf[..n],
                         &mut rng,
-                        cid,
-                        "client->server",
-                        "client-upload-writer",
+                        &mut seal_scratch,
+                        RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
                     )
                     .await?;
                 }
@@ -467,9 +533,8 @@ async fn write_client_data_records_chunked<W, R>(
     data_session: &mut ClientDataSession,
     payload: &[u8],
     rng: &mut R,
-    cid: u64,
-    direction: &'static str,
-    task_name: &'static str,
+    scratch: &mut RelaySealScratch,
+    log: RelayWriteLog,
 ) -> Result<(), ClientRuntimeError>
 where
     W: AsyncWrite + Unpin,
@@ -481,20 +546,56 @@ where
             crate::tls::record::TlsRecordError::PayloadTooLarge(payload.len()),
         ));
     }
-    let mut records_buf = Vec::with_capacity(payload.len() + crate::tls::record::TLS_HEADER_LEN);
-    let records = data_session.seal_payload_chunks_into(payload, rng, &mut records_buf)?;
+    scratch.records_buf.clear();
+    data_session.seal_payload_chunks_into_reusing(
+        payload,
+        rng,
+        &mut scratch.records_buf,
+        &mut scratch.records,
+    )?;
 
-    for record in &records {
+    for record in scratch.records.iter() {
         log_outer_write(
+            log.cid,
+            log.direction,
+            log.task_name,
+            record.plaintext_len,
+            &scratch.records_buf[record.range.clone()],
+        );
+    }
+    writer.write_all(scratch.records_buf.as_slice()).await?;
+    Ok(())
+}
+
+struct RelaySealScratch {
+    records_buf: Vec<u8>,
+    records: Vec<SealedRecord>,
+}
+
+impl RelaySealScratch {
+    fn with_payload_capacity(capacity: usize) -> Self {
+        Self {
+            records_buf: Vec::with_capacity(capacity + crate::tls::record::TLS_HEADER_LEN),
+            records: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RelayWriteLog {
+    cid: u64,
+    direction: &'static str,
+    task_name: &'static str,
+}
+
+impl RelayWriteLog {
+    fn new(cid: u64, direction: &'static str, task_name: &'static str) -> Self {
+        Self {
             cid,
             direction,
             task_name,
-            record.plaintext_len,
-            &records_buf[record.range.clone()],
-        );
+        }
     }
-    writer.write_all(&records_buf).await?;
-    Ok(())
 }
 
 fn log_outer_write(
@@ -504,6 +605,9 @@ fn log_outer_write(
     plaintext_len: usize,
     record: &[u8],
 ) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     if let Ok(header) = crate::tls::record::parse_header(record) {
         tracing::debug!(
             cid,

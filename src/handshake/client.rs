@@ -198,6 +198,21 @@ impl ClientDataSession {
         Ok(self.seal_to_server.seal_chunks_into(payload, rng, out)?)
     }
 
+    pub fn seal_payload_chunks_into_reusing<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+        records: &mut Vec<SealedRecord>,
+    ) -> Result<(), ClientHandshakeError>
+    where
+        R: RngCore + CryptoRng + rand::Rng + ?Sized,
+    {
+        Ok(self
+            .seal_to_server
+            .seal_chunks_into_reusing(payload, rng, out, records)?)
+    }
+
     pub fn max_payload_chunk_len(&self) -> usize {
         self.seal_to_server.max_plaintext_len()
     }

@@ -100,19 +100,36 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
+        let mut records = Vec::new();
+        self.seal_chunks_into_reusing(payload, rng, out, &mut records)?;
+        Ok(records)
+    }
+
+    pub fn seal_chunks_into_reusing<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+        records: &mut Vec<SealedRecord>,
+    ) -> Result<(), DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        records.clear();
         let max_chunk_len = self.max_plaintext_len();
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
         if payload.is_empty() {
             let range = self.seal_into(payload, rng, out)?;
-            return Ok(vec![SealedRecord {
+            records.push(SealedRecord {
                 range,
                 plaintext_len: 0,
-            }]);
+            });
+            return Ok(());
         }
 
-        let mut records = Vec::with_capacity(payload.len().div_ceil(max_chunk_len));
+        records.reserve(payload.len().div_ceil(max_chunk_len));
         for chunk in payload.chunks(max_chunk_len) {
             let range = self.seal_into(chunk, rng, out)?;
             records.push(SealedRecord {
@@ -120,7 +137,7 @@ impl DataRecordCodec {
                 plaintext_len: chunk.len(),
             });
         }
-        Ok(records)
+        Ok(())
     }
 
     pub fn seal_chunks<R>(
@@ -277,6 +294,30 @@ mod tests {
             opened.extend_from_slice(&dec.open(&out[record.range]).unwrap());
         }
         assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn seal_chunks_into_reusing_reuses_record_metadata() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(17);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut out = Vec::new();
+        let mut records = vec![SealedRecord {
+            range: 0..0,
+            plaintext_len: usize::MAX,
+        }];
+
+        enc.seal_chunks_into_reusing(b"hello", &mut rng, &mut out, &mut records)
+            .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].plaintext_len, 5);
+        assert_eq!(dec.open(&out[records[0].range.clone()]).unwrap(), b"hello");
     }
 
     #[test]

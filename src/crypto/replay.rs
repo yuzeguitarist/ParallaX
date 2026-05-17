@@ -56,6 +56,7 @@ pub struct ReplayCache {
     path: Option<PathBuf>,
     mac_key: Option<CacheMacKey>,
     order: VecDeque<ReplayEntry>,
+    encoded_entries: VecDeque<String>,
     nonces: HashSet<[u8; 8]>,
     transcripts: HashSet<[u8; 32]>,
 }
@@ -68,6 +69,7 @@ impl ReplayCache {
             path: None,
             mac_key: None,
             order: VecDeque::with_capacity(capacity),
+            encoded_entries: VecDeque::with_capacity(capacity),
             nonces: HashSet::with_capacity(capacity),
             transcripts: HashSet::with_capacity(capacity),
         }
@@ -145,9 +147,11 @@ impl ReplayCache {
     }
 
     fn insert_loaded(&mut self, entry: ReplayEntry) {
+        let encoded = self.encode_entry_line(&entry);
         self.nonces.insert(entry.nonce);
         self.transcripts.insert(entry.transcript_fingerprint);
         self.order.push_back(entry);
+        self.encoded_entries.push_back(encoded);
     }
 
     fn prune_expired(&mut self, now: u64) {
@@ -156,6 +160,7 @@ impl ReplayCache {
                 break;
             }
             if let Some(old) = self.order.pop_front() {
+                let _ = self.encoded_entries.pop_front();
                 self.nonces.remove(&old.nonce);
                 self.transcripts.remove(&old.transcript_fingerprint);
             }
@@ -165,6 +170,7 @@ impl ReplayCache {
     fn prune_capacity(&mut self) {
         while self.order.len() > self.capacity {
             if let Some(old) = self.order.pop_front() {
+                let _ = self.encoded_entries.pop_front();
                 self.nonces.remove(&old.nonce);
                 self.transcripts.remove(&old.transcript_fingerprint);
             }
@@ -176,26 +182,39 @@ impl ReplayCache {
             return Ok(());
         };
 
+        let body = serialize_cached_entries(&self.encoded_entries);
         let raw = match self.mac_key.as_ref() {
-            Some(mac_key) => serialize_authenticated_entries(&self.order, mac_key),
-            None => {
-                let mut raw = String::new();
-                for entry in &self.order {
-                    raw.push_str(&entry.timestamp.to_string());
-                    raw.push(' ');
-                    push_hex(&mut raw, &entry.nonce);
-                    raw.push(' ');
-                    push_hex(&mut raw, &entry.transcript_fingerprint);
-                    raw.push('\n');
-                }
-                raw
-            }
+            Some(mac_key) => wrap_authenticated_body(&body, mac_key),
+            None => body,
         };
 
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, raw)?;
         fs::rename(tmp, path)?;
         Ok(())
+    }
+
+    fn encode_entry_line(&self, entry: &ReplayEntry) -> String {
+        let mut line = String::with_capacity(if self.mac_key.is_some() { 168 } else { 103 });
+        line.push_str(&entry.timestamp.to_string());
+        line.push(' ');
+        push_hex(&mut line, &entry.nonce);
+        line.push(' ');
+        push_hex(&mut line, &entry.transcript_fingerprint);
+        if let Some(mac_key) = self.mac_key.as_ref() {
+            line.push(' ');
+            push_hex(
+                &mut line,
+                &cache_line_mac(
+                    mac_key,
+                    entry.timestamp,
+                    &entry.nonce,
+                    &entry.transcript_fingerprint,
+                ),
+            );
+        }
+        line.push('\n');
+        line
     }
 }
 
@@ -306,36 +325,21 @@ fn parse_authenticated_entry(
     })
 }
 
-fn serialize_authenticated_entries(
-    entries: &VecDeque<ReplayEntry>,
-    mac_key: &CacheMacKey,
-) -> String {
-    let mut body = String::new();
+fn serialize_cached_entries(entries: &VecDeque<String>) -> String {
+    let mut body = String::with_capacity(entries.iter().map(String::len).sum());
     for entry in entries {
-        body.push_str(&entry.timestamp.to_string());
-        body.push(' ');
-        push_hex(&mut body, &entry.nonce);
-        body.push(' ');
-        push_hex(&mut body, &entry.transcript_fingerprint);
-        body.push(' ');
-        push_hex(
-            &mut body,
-            &cache_line_mac(
-                mac_key,
-                entry.timestamp,
-                &entry.nonce,
-                &entry.transcript_fingerprint,
-            ),
-        );
-        body.push('\n');
+        body.push_str(entry);
     }
+    body
+}
 
-    let mut raw = String::new();
+fn wrap_authenticated_body(body: &str, mac_key: &CacheMacKey) -> String {
+    let mut raw = String::with_capacity(AUTH_CACHE_VERSION.len() + 1 + 64 + 1 + body.len());
     raw.push_str(AUTH_CACHE_VERSION);
     raw.push(' ');
     push_hex(&mut raw, &cache_file_mac(mac_key, body.as_bytes()));
     raw.push('\n');
-    raw.push_str(&body);
+    raw.push_str(body);
     raw
 }
 
@@ -489,5 +493,34 @@ mod tests {
             ReplayCache::load_or_create_authenticated(&path, 8, key),
             Err(ReplayCacheError::MacMismatch) | Err(ReplayCacheError::MalformedHex)
         ));
+    }
+
+    #[test]
+    fn persisted_cache_tracks_capacity_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-prune.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let first = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 1, key).unwrap();
+        assert!(cache.insert_new(first, now).unwrap());
+        assert!(cache.insert_new(second.clone(), now).unwrap());
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("0101010101010101"));
+        assert!(raw.contains("0303030303030303"));
+
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 1, key).unwrap();
+        assert!(!loaded.insert_new(second, now).unwrap());
     }
 }

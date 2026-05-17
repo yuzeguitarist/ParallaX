@@ -48,7 +48,7 @@ use crate::{
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError,
-            CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD,
+            SealedRecord, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD,
         },
     },
     tls::{
@@ -611,15 +611,17 @@ async fn run_authenticated_data_mode(
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
                 log_record_read(cid, "fallback->server", "server-predata-fallback-reader", &record);
-                if let Ok(header) = crate::tls::record::parse_header(&record) {
-                    tracing::debug!(
-                        cid,
-                        direction = "fallback->client",
-                        task_name = "server-camouflage-writer",
-                        outer_tls_payload_len = header.payload_len,
-                        tls_content_type = header.content_type,
-                        "camouflage TLS record write"
-                    );
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    if let Ok(header) = crate::tls::record::parse_header(&record) {
+                        tracing::debug!(
+                            cid,
+                            direction = "fallback->client",
+                            task_name = "server-camouflage-writer",
+                            outer_tls_payload_len = header.payload_len,
+                            tls_content_type = header.content_type,
+                            "camouflage TLS record write"
+                        );
+                    }
                 }
                 client_write.write_all(&record).await?;
             }
@@ -718,6 +720,7 @@ impl DataRelay {
             cid,
         } = self;
         let mut target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+        let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
         let mut rng = StdRng::from_entropy();
         let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
@@ -729,9 +732,8 @@ impl DataRelay {
                         &mut server_seal,
                         &[],
                         &mut rng,
-                        cid,
-                        "server->client",
-                        "server-cover-writer",
+                        &mut seal_scratch,
+                        RelayWriteLog::new(cid, "server->client", "server-cover-writer"),
                     )
                     .await?;
                     cover_sleep.as_mut().reset(
@@ -772,9 +774,8 @@ impl DataRelay {
                         &mut server_seal,
                         &target_buf[..n],
                         &mut rng,
-                        cid,
-                        "server->client",
-                        "server-download-writer",
+                        &mut seal_scratch,
+                        RelayWriteLog::new(cid, "server->client", "server-download-writer"),
                     )
                     .await?;
                 }
@@ -788,9 +789,8 @@ async fn write_server_data_records_chunked<W, R>(
     codec: &mut DataRecordCodec,
     payload: &[u8],
     rng: &mut R,
-    cid: u64,
-    direction: &'static str,
-    task_name: &'static str,
+    scratch: &mut RelaySealScratch,
+    log: RelayWriteLog,
 ) -> Result<(), HandshakeServerError>
 where
     W: AsyncWrite + Unpin,
@@ -802,20 +802,51 @@ where
             crate::tls::record::TlsRecordError::PayloadTooLarge(payload.len()).into(),
         ));
     }
-    let mut records_buf = Vec::with_capacity(payload.len() + crate::tls::record::TLS_HEADER_LEN);
-    let records = codec.seal_chunks_into(payload, rng, &mut records_buf)?;
+    scratch.records_buf.clear();
+    codec.seal_chunks_into_reusing(payload, rng, &mut scratch.records_buf, &mut scratch.records)?;
 
-    for record in &records {
+    for record in scratch.records.iter() {
         log_outer_write(
+            log.cid,
+            log.direction,
+            log.task_name,
+            record.plaintext_len,
+            &scratch.records_buf[record.range.clone()],
+        );
+    }
+    writer.write_all(scratch.records_buf.as_slice()).await?;
+    Ok(())
+}
+
+struct RelaySealScratch {
+    records_buf: Vec<u8>,
+    records: Vec<SealedRecord>,
+}
+
+impl RelaySealScratch {
+    fn with_payload_capacity(capacity: usize) -> Self {
+        Self {
+            records_buf: Vec::with_capacity(capacity + crate::tls::record::TLS_HEADER_LEN),
+            records: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RelayWriteLog {
+    cid: u64,
+    direction: &'static str,
+    task_name: &'static str,
+}
+
+impl RelayWriteLog {
+    fn new(cid: u64, direction: &'static str, task_name: &'static str) -> Self {
+        Self {
             cid,
             direction,
             task_name,
-            record.plaintext_len,
-            &records_buf[record.range.clone()],
-        );
+        }
     }
-    writer.write_all(&records_buf).await?;
-    Ok(())
 }
 
 fn log_outer_write(
@@ -825,6 +856,9 @@ fn log_outer_write(
     plaintext_len: usize,
     record: &[u8],
 ) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     if let Ok(header) = crate::tls::record::parse_header(record) {
         tracing::debug!(
             cid,

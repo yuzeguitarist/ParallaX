@@ -161,6 +161,9 @@ where
 }
 
 pub fn log_record_read(cid: u64, direction: &'static str, task_name: &'static str, record: &[u8]) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     if let Ok(header) = parse_header(record) {
         tracing::debug!(
             cid,
