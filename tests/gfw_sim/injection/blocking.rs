@@ -37,6 +37,8 @@ impl ResidualBlockTuple {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpResetReason {
     SniBlocklist,
+    EncryptedClientHello,
+    HttpHostBlocklist,
     KnownProxyFingerprint,
     FullyEncryptedSampling,
     DualMbReinforcement,
@@ -133,6 +135,8 @@ impl ResidualBlockTable {
 #[derive(Debug, Clone)]
 pub struct BlockingPolicy {
     pub enforce_sni_blocklist: bool,
+    pub enforce_encrypted_client_hello: bool,
+    pub enforce_http_host_blocklist: bool,
     pub enforce_fully_encrypted_sampling: bool,
     pub enforce_known_proxy_fingerprint: bool,
     pub enforce_active_probe_confirmation: bool,
@@ -144,6 +148,8 @@ impl Default for BlockingPolicy {
     fn default() -> Self {
         Self {
             enforce_sni_blocklist: true,
+            enforce_encrypted_client_hello: true,
+            enforce_http_host_blocklist: true,
             enforce_fully_encrypted_sampling: true,
             enforce_known_proxy_fingerprint: true,
             enforce_active_probe_confirmation: true,
@@ -157,6 +163,8 @@ impl BlockingPolicy {
     pub fn permissive() -> Self {
         Self {
             enforce_sni_blocklist: false,
+            enforce_encrypted_client_hello: false,
+            enforce_http_host_blocklist: false,
             enforce_fully_encrypted_sampling: false,
             enforce_known_proxy_fingerprint: false,
             enforce_active_probe_confirmation: false,
@@ -217,6 +225,8 @@ mod tests {
     fn permissive_policy_disables_all_enforcement() {
         let p = BlockingPolicy::permissive();
         assert!(!p.enforce_sni_blocklist);
+        assert!(!p.enforce_encrypted_client_hello);
+        assert!(!p.enforce_http_host_blocklist);
         assert!(!p.enforce_fully_encrypted_sampling);
         assert!(!p.enforce_known_proxy_fingerprint);
         assert!(!p.enforce_active_probe_confirmation);

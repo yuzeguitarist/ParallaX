@@ -11,8 +11,8 @@
 //! - InterSecLab, *The Internet Coup* (2025), §"DNS-layer enforcement".
 //!
 //! The real GFW issues several different response patterns; this simulator
-//! models the most common one (A-record sinkhole) plus a "drop" mode used in
-//! more recent deployments.
+//! models the common A-record sinkhole, the three-injector race observed in
+//! Triplet Censors measurements, and a newer "drop" mode.
 
 use std::time::{Duration, Instant};
 
@@ -138,6 +138,14 @@ fn read_name(bytes: &[u8], start: usize) -> Result<(String, usize), DnsParseErro
 
 /// Action chosen by [`DnsInjector`] when it sees a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsInjectionTrace {
+    pub injector: &'static str,
+    pub ttl: u32,
+    pub sinkhole: [u8; 4],
+    pub echoes_probe_ttl: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsAction {
     /// Forward upstream; no injection.
     Allow,
@@ -147,6 +155,7 @@ pub enum DnsAction {
     InjectFakeResponse {
         forged_response: Vec<u8>,
         matched_keyword: String,
+        injector_trace: Vec<DnsInjectionTrace>,
     },
     /// Newer drop-mode: silently swallow the query (the real resolver also
     /// answers, but the response is RST'd by the residual rule).
@@ -213,13 +222,14 @@ impl DnsInjector {
                 let matched_keyword = keyword.to_owned();
                 match self.mode {
                     InjectionMode::FakeResponse => {
-                        let resp = self.forge_a_response(&query, question);
+                        let (resp, trace) = self.forge_a_response(&query, question);
                         let mut stats = self.stats.borrow_mut();
                         stats.injections_issued += 1;
                         stats.last_injection = Some(Instant::now());
                         return DnsAction::InjectFakeResponse {
                             forged_response: resp,
                             matched_keyword,
+                            injector_trace: trace,
                         };
                     }
                     InjectionMode::Drop => {
@@ -232,10 +242,15 @@ impl DnsInjector {
         DnsAction::Allow
     }
 
-    fn forge_a_response(&self, query: &DnsQuery, question: &DnsQuestion) -> Vec<u8> {
+    fn forge_a_response(
+        &self,
+        query: &DnsQuery,
+        question: &DnsQuestion,
+    ) -> (Vec<u8>, Vec<DnsInjectionTrace>) {
         let idx = self.sinkhole_idx.get();
         self.sinkhole_idx.set((idx + 1) % SINKHOLE_A_RECORDS.len());
         let sink = SINKHOLE_A_RECORDS[idx];
+        let trace = self.three_injector_trace(idx);
 
         let mut resp = Vec::with_capacity(64);
         resp.extend_from_slice(&query.transaction_id.to_be_bytes());
@@ -255,10 +270,33 @@ impl DnsInjector {
         resp.extend_from_slice(&1_u16.to_be_bytes()); // CLASS = IN
                                                       // Classic GFW responses use a high TTL to make them stick in resolvers.
                                                       // The leaked Tiangou configs picked 86400 (24h); we mirror that.
-        resp.extend_from_slice(&86_400_u32.to_be_bytes());
+        resp.extend_from_slice(&trace[0].ttl.to_be_bytes());
         resp.extend_from_slice(&4_u16.to_be_bytes()); // RDLENGTH
         resp.extend_from_slice(&sink);
-        resp
+        (resp, trace)
+    }
+
+    fn three_injector_trace(&self, idx: usize) -> Vec<DnsInjectionTrace> {
+        vec![
+            DnsInjectionTrace {
+                injector: "dns-a-static-ttl",
+                ttl: 86_400,
+                sinkhole: SINKHOLE_A_RECORDS[idx % SINKHOLE_A_RECORDS.len()],
+                echoes_probe_ttl: false,
+            },
+            DnsInjectionTrace {
+                injector: "dns-b-ttl-echo",
+                ttl: 0,
+                sinkhole: SINKHOLE_A_RECORDS[(idx + 3) % SINKHOLE_A_RECORDS.len()],
+                echoes_probe_ttl: true,
+            },
+            DnsInjectionTrace {
+                injector: "dns-c-keyword-cluster",
+                ttl: 600,
+                sinkhole: SINKHOLE_A_RECORDS[(idx + 7) % SINKHOLE_A_RECORDS.len()],
+                echoes_probe_ttl: false,
+            },
+        ]
     }
 
     pub fn stats_snapshot(&self) -> DnsInjectorStats {
@@ -336,9 +374,12 @@ mod tests {
             DnsAction::InjectFakeResponse {
                 forged_response,
                 matched_keyword,
+                injector_trace,
             } => {
                 assert_eq!(matched_keyword, "v2ray");
                 assert!(forged_response.len() > 12);
+                assert_eq!(injector_trace.len(), 3);
+                assert!(injector_trace.iter().any(|entry| entry.echoes_probe_ttl));
                 // The forged response is a valid DNS message with QR=1.
                 let flags = u16::from_be_bytes([forged_response[2], forged_response[3]]);
                 assert_eq!(flags & 0x8000, 0x8000, "QR bit must be set");

@@ -10,6 +10,7 @@ use crate::gfw_sim::detection::{
     burst_statistics::{BurstDetector, LengthObservation},
     dns_inject::{DnsAction, DnsInjector},
     fully_encrypted::{evaluate as fe_evaluate, FullyEncryptedVerdict},
+    http_host::{HttpHostFilter, HttpHostVerdict},
     quic_initial::{QuicInitialDetector, QuicInitialVerdict, QuicTriple},
     sni_filter::{SniFilter, SniVerdict},
     tcp_dual_mb::{DualMbDecision, DualMiddlebox, FlowKey, MbrStage},
@@ -73,6 +74,7 @@ pub struct GfwSimulator {
     dual_mb: DualMiddlebox,
     quic_detector: QuicInitialDetector,
     dns_injector: DnsInjector,
+    http_host_filter: HttpHostFilter,
     burst_detector: BurstDetector,
     active_prober: ActiveProber,
     residual: ResidualBlockTable,
@@ -93,6 +95,7 @@ impl GfwSimulator {
             dual_mb,
             quic_detector: QuicInitialDetector::default(),
             dns_injector: DnsInjector::default(),
+            http_host_filter: HttpHostFilter::default(),
             burst_detector: BurstDetector::default(),
             active_prober: ActiveProber::default(),
             residual,
@@ -285,7 +288,22 @@ impl GfwSimulator {
         layer_verdicts: &mut Vec<LayerVerdict>,
         egress_actions: &mut Vec<EgressAction>,
     ) {
-        // (a) SNI / dual middlebox.
+        // (a) Plaintext HTTP Host / CONNECT authority path.
+        let http = self.http_host_filter.evaluate(bytes);
+        if let HttpHostVerdict::Block { .. } = &http {
+            if self.config.blocking_policy.enforce_http_host_blocklist {
+                if let Some(triple) = scenario.tcp_triple() {
+                    egress_actions.push(EgressAction::TcpReset {
+                        reason: TcpResetReason::HttpHostBlocklist,
+                        seq_ack_note: "HTTP Host keyword block".to_owned(),
+                    });
+                    self.residual.record(triple);
+                }
+            }
+        }
+        layer_verdicts.push(LayerVerdict::from(http));
+
+        // (b) SNI / dual middlebox.
         if let Some(flow_key) = scenario.flow_key {
             let decision = self.dual_mb.on_client_record(flow_key, bytes);
             let derived = LayerVerdict::from(decision.clone());
@@ -296,6 +314,18 @@ impl GfwSimulator {
                     egress_actions.push(EgressAction::TcpReset {
                         reason: TcpResetReason::SniBlocklist,
                         seq_ack_note: format!("MB-RA block on flow {flow_key:?}"),
+                    });
+                    self.residual.record(triple);
+                }
+            } else if matches!(decision, DualMbDecision::BlockEncryptedClientHello { .. })
+                && self.config.blocking_policy.enforce_encrypted_client_hello
+            {
+                if let Some(triple) = scenario.tcp_triple() {
+                    egress_actions.push(EgressAction::TcpReset {
+                        reason: TcpResetReason::EncryptedClientHello,
+                        seq_ack_note: format!(
+                            "MB-RA encrypted ClientHello block on flow {flow_key:?}"
+                        ),
                     });
                     self.residual.record(triple);
                 }
@@ -314,16 +344,25 @@ impl GfwSimulator {
         } else {
             // No flow context: standalone SNI evaluation.
             let v = self.sni_filter.evaluate(bytes);
-            if let SniVerdict::Block { .. } = &v {
-                egress_actions.push(EgressAction::TcpReset {
-                    reason: TcpResetReason::SniBlocklist,
-                    seq_ack_note: "MB-RA block (no flow ctx)".to_owned(),
-                });
+            match &v {
+                SniVerdict::Block { .. } => {
+                    egress_actions.push(EgressAction::TcpReset {
+                        reason: TcpResetReason::SniBlocklist,
+                        seq_ack_note: "MB-RA block (no flow ctx)".to_owned(),
+                    });
+                }
+                SniVerdict::BlockEncryptedClientHello { .. } => {
+                    egress_actions.push(EgressAction::TcpReset {
+                        reason: TcpResetReason::EncryptedClientHello,
+                        seq_ack_note: "MB-RA encrypted ClientHello block (no flow ctx)".to_owned(),
+                    });
+                }
+                _ => {}
             }
             layer_verdicts.push(LayerVerdict::from(v));
         }
 
-        // (b) JA3/JA4 fingerprint as a separate verdict line for visibility.
+        // (c) JA3/JA4 fingerprint as a separate verdict line for visibility.
         let fp = tls_fp_evaluate(bytes);
         let mark = LayerVerdict::from(fp.clone());
         layer_verdicts.push(mark);
@@ -339,7 +378,7 @@ impl GfwSimulator {
             }
         }
 
-        // (c) USENIX'23 fully-encrypted heuristic.
+        // (d) USENIX'23 fully-encrypted heuristic.
         let fe = fe_evaluate(bytes, &mut self.rng);
         let mark = LayerVerdict::from(fe.clone());
         layer_verdicts.push(mark);

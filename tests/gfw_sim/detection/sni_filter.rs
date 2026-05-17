@@ -27,6 +27,8 @@ pub const EXT_ALPN: u16 = 0x0010;
 pub const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 pub const EXT_KEY_SHARE: u16 = 0x0033;
 pub const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
+pub const EXT_ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
+pub const EXT_ENCRYPTED_SERVER_NAME: u16 = 0xffce;
 
 pub const TLS13_VERSION: u16 = 0x0304;
 
@@ -45,6 +47,7 @@ pub struct ParsedClientHello {
     pub compression_methods: Vec<u8>,
     pub extensions_order: Vec<u16>,
     pub sni: Option<String>,
+    pub encrypted_client_hello: Option<EncryptedClientHelloKind>,
     pub supported_versions: Vec<u16>,
     pub supported_groups: Vec<u16>,
     pub ec_point_formats: Vec<u8>,
@@ -60,6 +63,21 @@ pub struct ParsedClientHello {
 pub struct KeyShare {
     pub group: u16,
     pub key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptedClientHelloKind {
+    Ech,
+    Esni,
+}
+
+impl EncryptedClientHelloKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            EncryptedClientHelloKind::Ech => "ECH",
+            EncryptedClientHelloKind::Esni => "ESNI",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -122,6 +140,7 @@ pub fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello, ClientHello
 
     let mut extensions_order = Vec::new();
     let mut sni: Option<String> = None;
+    let mut encrypted_client_hello = None;
     let mut supported_versions = Vec::new();
     let mut supported_groups = Vec::new();
     let mut ec_point_formats = Vec::new();
@@ -162,6 +181,12 @@ pub fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello, ClientHello
             EXT_PSK_KEY_EXCHANGE_MODES => {
                 psk_modes = parse_u8_list_u8len(&ext_data, ext_type)?;
             }
+            EXT_ENCRYPTED_CLIENT_HELLO => {
+                encrypted_client_hello = Some(EncryptedClientHelloKind::Ech);
+            }
+            EXT_ENCRYPTED_SERVER_NAME => {
+                encrypted_client_hello = Some(EncryptedClientHelloKind::Esni);
+            }
             _ => {}
         }
 
@@ -181,6 +206,7 @@ pub fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello, ClientHello
         compression_methods,
         extensions_order,
         sni,
+        encrypted_client_hello,
         supported_versions,
         supported_groups,
         ec_point_formats,
@@ -419,6 +445,12 @@ pub enum SniVerdict {
     /// SNI was extracted and matches a blocklist rule. `matched_rule` is the
     /// pattern that fired (for logging).
     Block { sni: String, matched_rule: String },
+    /// ECH / ESNI extension was advertised; public measurements show ESNI and
+    /// ECH-style encrypted SNI paths are treated as censorable TLS metadata.
+    BlockEncryptedClientHello {
+        kind: EncryptedClientHelloKind,
+        ext_type: u16,
+    },
     /// Record was malformed, or no SNI extension was present. Real GFW behavior:
     /// the connection is allowed past MB-RA but flagged for MB-R inspection.
     NoSni,
@@ -461,23 +493,35 @@ impl SniFilter {
         &self.blocklist
     }
 
+    /// Run the filter on a parsed ClientHello.
+    pub fn evaluate_parsed(&self, parsed: &ParsedClientHello) -> SniVerdict {
+        if let Some(kind) = parsed.encrypted_client_hello {
+            let ext_type = match kind {
+                EncryptedClientHelloKind::Ech => EXT_ENCRYPTED_CLIENT_HELLO,
+                EncryptedClientHelloKind::Esni => EXT_ENCRYPTED_SERVER_NAME,
+            };
+            return SniVerdict::BlockEncryptedClientHello { kind, ext_type };
+        }
+        match &parsed.sni {
+            Some(sni) => {
+                if let Some(rule) = self.blocklist.matched_rule(sni) {
+                    SniVerdict::Block {
+                        sni: sni.clone(),
+                        matched_rule: rule,
+                    }
+                } else {
+                    SniVerdict::Allow { sni: sni.clone() }
+                }
+            }
+            None => SniVerdict::NoSni,
+        }
+    }
+
     /// Run the filter on a raw ClientHello record. Equivalent to MB-RA's
     /// single-pass decision.
     pub fn evaluate(&self, bytes: &[u8]) -> SniVerdict {
         match parse_client_hello(bytes) {
-            Ok(parsed) => match parsed.sni {
-                Some(sni) => {
-                    if let Some(rule) = self.blocklist.matched_rule(&sni) {
-                        SniVerdict::Block {
-                            sni,
-                            matched_rule: rule,
-                        }
-                    } else {
-                        SniVerdict::Allow { sni }
-                    }
-                }
-                None => SniVerdict::NoSni,
-            },
+            Ok(parsed) => self.evaluate_parsed(&parsed),
             Err(_) => SniVerdict::NotTls,
         }
     }
@@ -521,6 +565,37 @@ mod tests {
         assert!(matches!(filter.evaluate(&record), SniVerdict::Allow { .. }));
     }
 
+    fn client_hello_with_extension(ext_type: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(0);
+        body.extend_from_slice(&2_u16.to_be_bytes());
+        body.extend_from_slice(&0x1301_u16.to_be_bytes());
+        body.extend_from_slice(&[1, 0]);
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&ext_type.to_be_bytes());
+        exts.extend_from_slice(&0_u16.to_be_bytes());
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let hs_len = body.len() as u32;
+        let mut handshake = vec![
+            HANDSHAKE_CLIENT_HELLO,
+            ((hs_len >> 16) & 0xff) as u8,
+            ((hs_len >> 8) & 0xff) as u8,
+            (hs_len & 0xff) as u8,
+        ];
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(TLS_CONTENT_HANDSHAKE);
+        record.extend_from_slice(&[0x03, 0x03]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
     #[test]
     fn default_filter_blocks_known_circumvention_sni() {
         let record = parallax_client_hello("relay7.shadowsocks.io");
@@ -531,6 +606,19 @@ mod tests {
                 assert_eq!(matched_rule, "*.shadowsocks.io");
             }
             other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encrypted_client_hello_extension_is_blocked() {
+        let filter = SniFilter::default();
+        let record = client_hello_with_extension(EXT_ENCRYPTED_SERVER_NAME);
+        match filter.evaluate(&record) {
+            SniVerdict::BlockEncryptedClientHello { kind, ext_type } => {
+                assert_eq!(kind, EncryptedClientHelloKind::Esni);
+                assert_eq!(ext_type, EXT_ENCRYPTED_SERVER_NAME);
+            }
+            other => panic!("expected encrypted ClientHello block, got {other:?}"),
         }
     }
 
