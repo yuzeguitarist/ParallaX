@@ -332,9 +332,11 @@ const CASES: &[CaseRunner] = &[
     bench_aead_round_trip_1k,
     bench_record_seal_1k,
     bench_record_open_in_place_1k,
+    bench_record_open_payload_range_1k,
     bench_record_round_trip_1k,
     bench_record_bulk_1mb,
     bench_record_bulk_1mb_in_place,
+    bench_record_bulk_1mb_payload_range,
     bench_padding_apply_1k,
     bench_padding_remove_1k,
     bench_replay_cache_insert,
@@ -785,6 +787,27 @@ fn bench_record_seal_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
 }
 
 fn bench_record_open_in_place_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    bench_record_open_1k(options, "record.open_in_place_1k", |codec, record| {
+        codec.open_in_place(record)?;
+        Ok(record.len())
+    })
+}
+
+fn bench_record_open_payload_range_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    bench_record_open_1k(options, "record.open_payload_range_1k", |codec, record| {
+        let plaintext = codec.open_in_place_payload_range(record)?;
+        Ok(plaintext.len())
+    })
+}
+
+fn bench_record_open_1k<F>(
+    options: BenchmarkOptions,
+    name: &'static str,
+    mut open: F,
+) -> Result<BenchmarkCase>
+where
+    F: FnMut(&mut DataRecordCodec, &mut Vec<u8>) -> Result<usize>,
+{
     let (iterations, warmup) = effective_tier(TIER_FAST, options);
     let total_records = iterations.saturating_add(warmup) as usize;
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
@@ -812,23 +835,17 @@ fn bench_record_open_in_place_1k(options: BenchmarkOptions) -> Result<BenchmarkC
     let mut record_buf = Vec::with_capacity(SIZE_1K + RECORD_PADDING_MAX as usize);
     let mut record_idx = 0_usize;
 
-    run_case(
-        BenchGroup::RecordPipeline,
-        "record.open_in_place_1k",
-        TIER_FAST,
-        options,
-        || {
-            let sealed = &records[record_idx];
-            record_idx += 1;
-            record_buf.clear();
-            record_buf.extend_from_slice(&encoded[sealed.range.clone()]);
-            dec.open_in_place(&mut record_buf)?;
-            if record_buf.len() != sealed.plaintext_len {
-                bail!("record.open_in_place_1k plaintext length mismatch");
-            }
-            Ok(black_box(record_buf.len() as u64))
-        },
-    )
+    run_case(BenchGroup::RecordPipeline, name, TIER_FAST, options, || {
+        let sealed = &records[record_idx];
+        record_idx += 1;
+        record_buf.clear();
+        record_buf.extend_from_slice(&encoded[sealed.range.clone()]);
+        let plaintext_len = open(&mut dec, &mut record_buf)?;
+        if plaintext_len != sealed.plaintext_len {
+            bail!("{name} plaintext length mismatch");
+        }
+        Ok(black_box(plaintext_len as u64))
+    })
 }
 
 fn bench_record_round_trip_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
@@ -903,6 +920,27 @@ fn bench_record_bulk_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
 }
 
 fn bench_record_bulk_1mb_in_place(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    bench_record_bulk_1mb_with_open(options, "record.bulk_1mb_in_place", |codec, record| {
+        codec.open_in_place(record)?;
+        Ok(record.len())
+    })
+}
+
+fn bench_record_bulk_1mb_payload_range(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    bench_record_bulk_1mb_with_open(options, "record.bulk_1mb_payload_range", |codec, record| {
+        let plaintext = codec.open_in_place_payload_range(record)?;
+        Ok(plaintext.len())
+    })
+}
+
+fn bench_record_bulk_1mb_with_open<F>(
+    options: BenchmarkOptions,
+    name: &'static str,
+    mut open: F,
+) -> Result<BenchmarkCase>
+where
+    F: FnMut(&mut DataRecordCodec, &mut Vec<u8>) -> Result<usize>,
+{
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
     let mut enc = DataRecordCodec::new(
         AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
@@ -919,31 +957,24 @@ fn bench_record_bulk_1mb_in_place(options: BenchmarkOptions) -> Result<Benchmark
     let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M * 2);
     let mut records: Vec<SealedRecord> = Vec::with_capacity(128);
     let mut record_buf = Vec::with_capacity(SIZE_16K + RECORD_PADDING_MAX as usize);
-    run_case(
-        BenchGroup::RecordPipeline,
-        "record.bulk_1mb_in_place",
-        TIER_BULK,
-        options,
-        || {
-            buf.clear();
-            records.clear();
-            enc.seal_chunks_into_reusing(&payload, &mut rng, &mut buf, &mut records)?;
-            let mut recovered = 0_usize;
-            for sealed in &records {
-                record_buf.clear();
-                record_buf.extend_from_slice(&buf[sealed.range.clone()]);
-                dec.open_in_place(&mut record_buf)?;
-                recovered += record_buf.len();
-            }
-            if recovered != payload.len() {
-                bail!(
-                    "record.bulk_1mb_in_place lost {} bytes of plaintext",
-                    payload.len() - recovered
-                );
-            }
-            Ok(black_box((buf.len() + payload.len()) as u64))
-        },
-    )
+    run_case(BenchGroup::RecordPipeline, name, TIER_BULK, options, || {
+        buf.clear();
+        records.clear();
+        enc.seal_chunks_into_reusing(&payload, &mut rng, &mut buf, &mut records)?;
+        let mut recovered = 0_usize;
+        for sealed in &records {
+            record_buf.clear();
+            record_buf.extend_from_slice(&buf[sealed.range.clone()]);
+            recovered += open(&mut dec, &mut record_buf)?;
+        }
+        if recovered != payload.len() {
+            bail!(
+                "{name} lost {} bytes of plaintext",
+                payload.len() - recovered
+            );
+        }
+        Ok(black_box((buf.len() + payload.len()) as u64))
+    })
 }
 
 // ---------------------------------------------------------------------------

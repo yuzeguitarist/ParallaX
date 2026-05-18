@@ -843,10 +843,10 @@ async fn server_upload_loop(
             "server-data-client-reader",
             &client_record,
         );
-        match client_open.open_in_place(&mut client_record) {
-            Ok(()) => {
-                if !client_record.is_empty() {
-                    target_write.write_all(&client_record).await?;
+        match client_open.open_in_place_payload_range(&mut client_record) {
+            Ok(plaintext) => {
+                if !plaintext.is_empty() {
+                    target_write.write_all(&client_record[plaintext]).await?;
                 }
             }
             Err(err) => {
