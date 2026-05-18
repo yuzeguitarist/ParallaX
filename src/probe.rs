@@ -101,7 +101,10 @@ impl ProbeTarget {
     }
 
     pub fn authority(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        match self.host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => format!("[{}]:{}", self.host, self.port),
+            _ => format!("{}:{}", self.host, self.port),
+        }
     }
 }
 
@@ -547,6 +550,13 @@ mod tests {
                 port: 8443
             }
         );
+    }
+
+    #[test]
+    fn authority_brackets_ipv6_literals() {
+        let target = ProbeTarget::parse("[::1]:8443").unwrap();
+
+        assert_eq!(target.authority(), "[::1]:8443");
     }
 
     #[test]
