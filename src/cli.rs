@@ -19,7 +19,7 @@ use crate::{
         session::{derive_client_keys, AeadCodec, X25519KeyPair},
     },
     handshake::server,
-    probe,
+    probe, process_hardening,
     transport::{quic_runtime, tcp::bump_nofile_soft_limit},
 };
 
@@ -146,9 +146,11 @@ pub async fn run() -> anyhow::Result<()> {
             println!("ok: crypto self-test passed");
         }
         Command::Serve { config, quic } => {
+            process_hardening::harden_current_process();
             bump_nofile_soft_limit();
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
+            cfg.protect_secret_memory();
             if quic {
                 quic_runtime::run_server(cfg).await?;
             } else {
@@ -156,9 +158,11 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Command::Client { config, quic } => {
+            process_hardening::harden_current_process();
             bump_nofile_soft_limit();
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
+            cfg.protect_secret_memory();
             if quic {
                 quic_runtime::run_client(cfg).await?;
             } else {

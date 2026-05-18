@@ -168,12 +168,35 @@ impl Default for TrafficConfig {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let raw = fs::read_to_string(path)?;
-        let mut cfg = toml::from_str::<Self>(&raw)?;
+        let raw = Zeroizing::new(fs::read_to_string(path)?);
+        let mut cfg = toml::from_str::<Self>(raw.as_str())?;
         cfg.resolve_paths_relative_to(path);
         cfg.validate()?;
         cfg.validate_file_permissions(path)?;
         Ok(cfg)
+    }
+
+    pub fn protect_secret_memory(&self) {
+        crate::process_hardening::protect_secret_bytes(
+            "config.crypto.psk",
+            self.crypto.psk.as_bytes(),
+        );
+        if let Some(server) = &self.server {
+            crate::process_hardening::protect_secret_bytes(
+                "config.server.private_key",
+                server.private_key.as_bytes(),
+            );
+            if !server.pq_secret_key.is_empty() {
+                crate::process_hardening::protect_secret_bytes(
+                    "config.server.pq_secret_key",
+                    server.pq_secret_key.as_bytes(),
+                );
+            }
+            crate::process_hardening::protect_secret_bytes(
+                "config.server.identity_secret_key",
+                server.identity_secret_key.as_bytes(),
+            );
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {

@@ -19,6 +19,7 @@ use tokio::{
     sync::{Semaphore, TryAcquireError},
     time::{sleep, timeout, Instant},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use super::transcript::transcript_hash;
 
@@ -170,7 +171,9 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .clone()
         .ok_or(HandshakeServerError::MissingServer)?;
     let traffic = config.traffic;
-    let psk = Arc::new(decode_psk(&config.crypto.psk)?);
+    let psk = decode_psk(&config.crypto.psk)?;
+    crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
+    let psk = Arc::new(psk);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create_authenticated(
         &server.replay_cache_path,
         8192,
@@ -338,15 +341,17 @@ struct ServerRuntimeSecrets {
 
 impl ServerRuntimeSecrets {
     fn decode(config: &ServerConfig) -> Result<Self, ConfigError> {
+        let private_key = decode_key32_secret("server.private_key", &config.private_key)?;
+        crate::process_hardening::protect_secret_bytes("runtime.server.private_key", &*private_key);
+        let identity_secret_key =
+            decode_base64_secret("server.identity_secret_key", &config.identity_secret_key)?;
+        crate::process_hardening::protect_secret_bytes(
+            "runtime.server.identity_secret_key",
+            identity_secret_key.as_slice(),
+        );
         Ok(Self {
-            private_key: Arc::new(decode_key32_secret(
-                "server.private_key",
-                &config.private_key,
-            )?),
-            identity_secret_key: Arc::new(decode_base64_secret(
-                "server.identity_secret_key",
-                &config.identity_secret_key,
-            )?),
+            private_key: Arc::new(private_key),
+            identity_secret_key: Arc::new(identity_secret_key),
         })
     }
 
@@ -463,6 +468,7 @@ pub async fn accept_authenticated(
     let context = transcript_hash(&first_client_record, &forwarded.raw_record);
     let session_keys =
         derive_server_keys(server_private, &client_hello.x25519_key_share, &context)?;
+    session_keys.protect_secret_memory();
 
     Ok(AuthenticatedHandshake {
         client,
@@ -531,6 +537,7 @@ async fn run_authenticated_data_mode(
     traffic: TrafficConfig,
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
+    handshake.session_keys.protect_secret_memory();
     let padding = PaddingProfile::from_config(traffic)?;
     let timing = TimingProfile::from_config(traffic);
     let cover = CoverTrafficProfile::from_config(traffic);
@@ -550,6 +557,8 @@ async fn run_authenticated_data_mode(
         padding,
         SERVER_TO_CLIENT_AAD,
     );
+    client_open.protect_secret_memory();
+    server_seal.protect_secret_memory();
 
     let (client_read, mut client_write) = handshake.client.into_split();
     let (fallback_read, mut fallback_write) = handshake.fallback.into_split();
@@ -570,6 +579,10 @@ async fn run_authenticated_data_mode(
                     Ok(first_payload) => {
                         let pq_rekey = PqRekeyRequest::decode(&first_payload)?;
                         let server_ephemeral = X25519KeyPair::generate();
+                        crate::process_hardening::protect_secret_bytes(
+                            "pq_rekey.server_x25519_private",
+                            &server_ephemeral.private,
+                        );
                         let x25519_ephemeral_shared = x25519_shared_secret(
                             &server_ephemeral.private,
                             &pq_rekey.client_x25519_public,
@@ -581,6 +594,10 @@ async fn run_authenticated_data_mode(
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
                         }
                         .encode()?;
+                        crate::process_hardening::protect_secret_bytes(
+                            "pq_rekey.mlkem_shared_secret",
+                            &pq_encapsulation.shared_secret,
+                        );
                         let mut rng = StdRng::from_entropy();
                         let key_exchange_record =
                             server_seal.seal(&key_exchange_payload, &mut rng)?;
@@ -600,6 +617,7 @@ async fn run_authenticated_data_mode(
                             &pq_encapsulation.shared_secret,
                             sandwich_secret,
                         )?;
+                        rekeyed_keys.protect_secret_memory();
                         let identity_signature = sign_server_identity_blocking(
                             identity_secret_key,
                             rekeyed_keys.transcript_hash,
@@ -641,12 +659,13 @@ async fn run_authenticated_data_mode(
                         let first_payload = client_open.open_owned(record)?;
                         tracing::debug!(cid, "ParallaX data mode switch confirmed");
 
-                        let (target_addr, initial_payload) =
+                        let (target_addr, mut initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
                         let mut target = TcpStream::connect(target_addr).await?;
                         tune_tcp_stream(&target)?;
                         if !initial_payload.is_empty() {
                             target.write_all(&initial_payload).await?;
+                            initial_payload.zeroize();
                         }
                         let (target_read, target_write) = target.into_split();
                         return DataRelay {
@@ -699,16 +718,33 @@ fn resolve_connect_target(
     first_payload: Vec<u8>,
     fixed_data_target: Option<&str>,
 ) -> Result<(String, Vec<u8>), HandshakeServerError> {
-    match ConnectRequest::decode(&first_payload) {
-        Ok(request) => {
+    let mut first_payload = Zeroizing::new(first_payload);
+    crate::process_hardening::exclude_from_core_dump(
+        "connect_request.first_payload",
+        first_payload.as_slice(),
+    );
+    match ConnectRequest::decode(first_payload.as_slice()) {
+        Ok(mut request) => {
+            request.protect_plaintext_memory();
             let target = fixed_data_target
                 .map(str::to_owned)
                 .unwrap_or_else(|| request.target());
-            Ok((target, request.initial_payload))
+            let initial_payload = std::mem::take(&mut request.initial_payload);
+            crate::process_hardening::exclude_from_core_dump(
+                "connect_request.initial_payload",
+                &initial_payload,
+            );
+            Ok((target, initial_payload))
         }
         Err(ConnectRequestError::BadMagic | ConnectRequestError::Truncated) => {
             let target = fixed_data_target.ok_or(HandshakeServerError::MissingConnectTarget)?;
-            Ok((target.to_owned(), first_payload))
+            let mut initial_payload = Vec::new();
+            std::mem::swap(&mut initial_payload, &mut *first_payload);
+            crate::process_hardening::exclude_from_core_dump(
+                "connect_request.fixed_target_payload",
+                &initial_payload,
+            );
+            Ok((target.to_owned(), initial_payload))
         }
         Err(err) => Err(HandshakeServerError::ConnectRequest(err)),
     }
@@ -772,8 +808,11 @@ fn apply_server_pq_rekey(
         keys.transcript_hash,
         *x25519_shared_secret,
     )?;
+    next_keys.protect_secret_memory();
     client_open.rekey(next_keys.client_key, next_keys.client_nonce);
     server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
+    client_open.protect_secret_memory();
+    server_seal.protect_secret_memory();
     Ok(next_keys)
 }
 

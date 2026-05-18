@@ -1,4 +1,5 @@
 use thiserror::Error;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const CONNECT_MAGIC: &[u8; 4] = b"PX1C";
 const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
@@ -8,7 +9,7 @@ const SERVER_IDENTITY_CHUNK_MAGIC: &[u8; 4] = b"PX1I";
 const MAX_HOST_LEN: usize = 255;
 const CONNECT_FIXED_LEN: usize = 4 + 2 + 2 + 4;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct ConnectRequest {
     pub host: String,
     pub port: u16,
@@ -149,6 +150,7 @@ impl ConnectRequest {
         out.extend_from_slice(&self.port.to_be_bytes());
         out.extend_from_slice(&(self.initial_payload.len() as u32).to_be_bytes());
         out.extend_from_slice(&self.initial_payload);
+        crate::process_hardening::exclude_from_core_dump("connect_request.encoded", &out);
         Ok(out)
     }
 
@@ -184,11 +186,24 @@ impl ConnectRequest {
         }
         let initial_payload = cursor.bytes(payload_len)?.to_vec();
 
-        Ok(Self {
+        let request = Self {
             host,
             port,
             initial_payload,
-        })
+        };
+        request.protect_plaintext_memory();
+        Ok(request)
+    }
+
+    pub fn protect_plaintext_memory(&self) {
+        crate::process_hardening::exclude_from_core_dump(
+            "connect_request.host",
+            self.host.as_bytes(),
+        );
+        crate::process_hardening::exclude_from_core_dump(
+            "connect_request.initial_payload",
+            &self.initial_payload,
+        );
     }
 }
 
