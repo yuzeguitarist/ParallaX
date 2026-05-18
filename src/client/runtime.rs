@@ -329,15 +329,37 @@ where
             .await
         {
             Ok(()) => return Ok(()),
-            Err(ClientRuntimeError::Handshake(err))
-                if is_residual_camouflage_record(&err)
-                    && skipped < MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE =>
-            {
-                skipped += 1;
-                tracing::trace!(
-                    skipped,
-                    "ignoring residual camouflage TLS record before ParallaX key exchange"
-                );
+            Err(ClientRuntimeError::Handshake(err)) if is_residual_camouflage_record(&err) => {
+                if skipped < MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE {
+                    skipped += 1;
+                    // Loud-on-purpose: hitting this path at all means the
+                    // camouflage host is racing ahead of the ParallaX server's
+                    // key-exchange record. We still tolerate it up to the
+                    // budget, but operators need to see it without bumping the
+                    // global log level to trace.
+                    tracing::debug!(
+                        skipped,
+                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        record_len = record.len(),
+                        "skipping residual camouflage TLS record before ParallaX key exchange"
+                    );
+                } else {
+                    // Fast-fail: do NOT silently keep reading. Surface this as
+                    // a hard error with the exact diagnostic an operator needs
+                    // (skipped count, last record length, underlying cause) so
+                    // a future "灵异事件" never has to be reverse-engineered
+                    // from a blank log.
+                    tracing::error!(
+                        skipped,
+                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        record_len = record.len(),
+                        error = %err,
+                        "exceeded residual camouflage record budget before ParallaX key exchange; \
+                         fallback host likely answered the H2 camouflage GET ahead of the \
+                         ParallaX server's key-exchange record"
+                    );
+                    return Err(ClientRuntimeError::Handshake(err));
+                }
             }
             Err(err) => return Err(err),
         }
