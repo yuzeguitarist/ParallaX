@@ -1,0 +1,115 @@
+name: ci-pr
+
+# Full CI tier: runs on every PR to main and on pushes to main (post-merge
+# safety net). Splits work into parallel jobs so failures are localized and
+# `test` / `gfw-sim` can be set as separate required status checks.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'ParallaX-DeepWiki/**'
+      - 'DEPLOYMENT.md'
+      - 'AGENTS.md'
+      - 'README.md'
+      - '.gitignore'
+      - 'LICENSE*'
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'ParallaX-DeepWiki/**'
+      - 'DEPLOYMENT.md'
+      - 'AGENTS.md'
+      - 'README.md'
+      - '.gitignore'
+      - 'LICENSE*'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: parallax-ci
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: parallax-ci
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      # Unit tests + parity baselines + any other integration test except gfw_simulator.
+      # gfw_simulator has its own required status check below.
+      - name: cargo test (lib, bins, parity baselines)
+        run: |
+          cargo test --locked --no-fail-fast \
+            --lib \
+            --bins \
+            --test chrome_parity_baseline \
+            --test safari_parity_baseline \
+            --test safari_h2_parity_baseline
+
+      # Loopback integration tests are marked #[ignore] because they open
+      # local TCP sockets. Run them serially so the OS doesn't get into a
+      # weird state with bound ports.
+      - name: cargo test -- --ignored (loopback integration)
+        run: cargo test --locked --no-fail-fast -- --ignored --test-threads=1
+
+  gfw-sim:
+    name: gfw-sim
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: parallax-ci
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: cargo test --test gfw_simulator
+        run: cargo test --test gfw_simulator --locked --no-fail-fast
