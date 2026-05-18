@@ -521,7 +521,7 @@ authorized_sni = ["example.com"]
     }
 
     #[test]
-    fn traffic_defaults_are_throughput_first() {
+    fn traffic_defaults_are_speed_first() {
         let traffic = TrafficConfig::default();
 
         assert_eq!(traffic.min_padding, 0);

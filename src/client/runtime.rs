@@ -34,7 +34,9 @@ use crate::{
     crypto::{auth::AuthError, identity, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::ConnectRequest,
-    protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordError, SealedRecord},
+    protocol::data::{
+        max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
+    },
     tls::{
         backend::TlsBackendError,
         record::{log_record_read, read_record, TlsRecordError, TlsRecordReader},
@@ -412,7 +414,10 @@ async fn read_server_identity_payload(
             Some(expected) if expected != total_len => {
                 return Err(ClientRuntimeError::InvalidServerIdentityChunks);
             }
-            None => expected_total = Some(total_len),
+            None => {
+                expected_total = Some(total_len);
+                assembled.reserve(total_len);
+            }
             _ => {}
         }
         if chunk.offset as usize != assembled.len() {
@@ -462,71 +467,105 @@ struct ClientRelay {
 impl ClientRelay {
     async fn run(self) -> Result<(), ClientRuntimeError> {
         let ClientRelay {
-            mut local_read,
-            mut local_write,
+            local_read,
+            local_write,
             server_read,
-            mut server_write,
-            mut data_session,
+            server_write,
+            data_session,
             chunk_size,
             cover,
             cid,
         } = self;
-        let mut local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
-        let mut server_records = TlsRecordReader::new(server_read);
-        let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
-        let mut server_record = Vec::new();
-        let mut rng = StdRng::from_entropy();
-        let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+        let local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+        let (seal_to_server, open_from_server) = data_session.into_data_codecs();
+        let upload = client_upload_loop(
+            local_read,
+            server_write,
+            seal_to_server,
+            local_buf,
+            cover,
+            cid,
+        );
+        let download = client_download_loop(server_read, local_write, open_from_server, cid);
 
-        loop {
-            tokio::select! {
-                _ = &mut cover_sleep, if cover.is_enabled() => {
-                    write_client_data_records_chunked(
-                        &mut server_write,
-                        &mut data_session,
-                        &[],
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "client->server", "client-cover-writer"),
-                    )
-                    .await?;
-                    cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
-                }
-                read = local_read.read(&mut local_buf) => {
-                    let n = read?;
-                    if n == 0 {
-                        return Ok(());
-                    }
-                    let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
-                    write_client_data_records_chunked(
-                        &mut server_write,
-                        &mut data_session,
-                        &local_buf[..n],
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
-                    )
-                    .await?;
-                }
-                record = server_records.read_record_into(&mut server_record) => {
-                    match record {
-                        Ok(()) => {}
-                        Err(err) if is_clean_close(&err) => return Ok(()),
-                        Err(err) => return Err(ClientRuntimeError::Io(err)),
-                    };
-                    log_record_read(cid, "server->client", "client-outer-reader", &server_record);
+        tokio::select! {
+            result = upload => result,
+            result = download => result,
+        }
+    }
+}
 
-                    match data_session.open_server_record_in_place(&mut server_record) {
-                        Ok(()) => {
-                            if !server_record.is_empty() {
-                                local_write.write_all(&server_record).await?;
-                            }
-                        }
-                        Err(err) => {
-                            return Err(ClientRuntimeError::Handshake(err));
-                        }
-                    }
+async fn client_upload_loop(
+    mut local_read: OwnedReadHalf,
+    mut server_write: OwnedWriteHalf,
+    mut seal_to_server: DataRecordCodec,
+    mut local_buf: Vec<u8>,
+    cover: CoverTrafficProfile,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
+    let mut rng = StdRng::from_entropy();
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+
+    loop {
+        tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                write_client_data_records_chunked(
+                    &mut server_write,
+                    &mut seal_to_server,
+                    &[],
+                    &mut rng,
+                    &mut seal_scratch,
+                    RelayWriteLog::new(cid, "client->server", "client-cover-writer"),
+                )
+                .await?;
+                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
+            }
+            read = local_read.read(&mut local_buf) => {
+                let n = read?;
+                if n == 0 {
+                    return Ok(());
                 }
+                let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+                write_client_data_records_chunked(
+                    &mut server_write,
+                    &mut seal_to_server,
+                    &local_buf[..n],
+                    &mut rng,
+                    &mut seal_scratch,
+                    RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+async fn client_download_loop(
+    server_read: OwnedReadHalf,
+    mut local_write: OwnedWriteHalf,
+    mut open_from_server: DataRecordCodec,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    let mut server_records = TlsRecordReader::new(server_read);
+    let mut server_record = Vec::new();
+
+    loop {
+        match server_records.read_record_into(&mut server_record).await {
+            Ok(()) => {}
+            Err(err) if is_clean_close(&err) => return Ok(()),
+            Err(err) => return Err(ClientRuntimeError::Io(err)),
+        };
+        log_record_read(cid, "server->client", "client-outer-reader", &server_record);
+
+        match open_from_server.open_in_place(&mut server_record) {
+            Ok(()) => {
+                if !server_record.is_empty() {
+                    local_write.write_all(&server_record).await?;
+                }
+            }
+            Err(err) => {
+                return Err(ClientRuntimeError::Handshake(err.into()));
             }
         }
     }
@@ -534,7 +573,7 @@ impl ClientRelay {
 
 async fn write_client_data_records_chunked<W, R>(
     writer: &mut W,
-    data_session: &mut ClientDataSession,
+    codec: &mut DataRecordCodec,
     payload: &[u8],
     rng: &mut R,
     scratch: &mut RelaySealScratch,
@@ -544,19 +583,16 @@ where
     W: AsyncWrite + Unpin,
     R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
 {
-    let max_chunk_len = data_session.max_payload_chunk_len();
+    let max_chunk_len = codec.max_plaintext_len();
     if max_chunk_len == 0 {
         return Err(ClientRuntimeError::TlsRecord(
             crate::tls::record::TlsRecordError::PayloadTooLarge(payload.len()),
         ));
     }
     scratch.records_buf.clear();
-    data_session.seal_payload_chunks_into_reusing(
-        payload,
-        rng,
-        &mut scratch.records_buf,
-        &mut scratch.records,
-    )?;
+    codec
+        .seal_chunks_into_reusing(payload, rng, &mut scratch.records_buf, &mut scratch.records)
+        .map_err(ClientHandshakeError::from)?;
 
     if tracing::enabled!(tracing::Level::DEBUG) {
         for record in scratch.records.iter() {
@@ -837,10 +873,14 @@ mod tests {
         for len in [32 * 1024, 64 * 1024, 256 * 1024, 5 * 1024 * 1024] {
             let payload = (0..len).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
             let mut response = vec![0_u8; len];
-            let (write_result, read_result) = tokio::join!(
-                app_write.write_all(&payload),
-                app_read.read_exact(&mut response)
-            );
+            let (write_result, read_result) = timeout(Duration::from_secs(20), async {
+                tokio::join!(
+                    app_write.write_all(&payload),
+                    app_read.read_exact(&mut response)
+                )
+            })
+            .await
+            .unwrap_or_else(|_| panic!("payload round trip timed out for {len} bytes"));
             write_result.unwrap();
             read_result.unwrap();
             assert_eq!(response, payload);
@@ -848,10 +888,22 @@ mod tests {
 
         drop(app_read);
         drop(app_write);
-        client_task.await.unwrap();
-        server_task.await.unwrap();
-        target_task.await.unwrap();
-        fallback_task.await.unwrap();
+        timeout(Duration::from_secs(5), client_task)
+            .await
+            .expect("client task timed out")
+            .unwrap();
+        timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task timed out")
+            .unwrap();
+        timeout(Duration::from_secs(5), target_task)
+            .await
+            .expect("target task timed out")
+            .unwrap();
+        timeout(Duration::from_secs(5), fallback_task)
+            .await
+            .expect("fallback task timed out")
+            .unwrap();
     }
 
     async fn run_camouflage_tls_server(mut stream: TcpStream) {

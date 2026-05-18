@@ -61,15 +61,18 @@ enum Command {
         #[arg(long)]
         quic: bool,
     },
-    /// Run local CPU-only protocol benchmarks without touching system networking.
+    /// Run the ParallaX protocol benchmark suite (CPU-only, fixed-parameter).
+    ///
+    /// The suite is intentionally non-configurable: case counts and payload
+    /// sizes are baked into the binary so reported numbers stay comparable
+    /// across releases.
     #[command(name = "bench")]
     Benchmark {
-        #[arg(long, default_value_t = 1_000)]
-        iterations: u64,
-        #[arg(long, default_value_t = 100)]
-        warmup: u64,
-        #[arg(long, default_value_t = 1_024)]
-        payload_size: usize,
+        /// Run the smoke profile (~1% of the iteration budget). Useful for
+        /// CI checks and quick sanity sweeps.
+        #[arg(long)]
+        quick: bool,
+        /// Emit a machine-readable JSON document instead of the text table.
         #[arg(long)]
         json: bool,
     },
@@ -162,13 +165,12 @@ pub async fn run() -> anyhow::Result<()> {
                 runtime::run(cfg).await?;
             }
         }
-        Command::Benchmark {
-            iterations,
-            warmup,
-            payload_size,
-            json,
-        } => {
-            let options = BenchmarkOptions::new(iterations, warmup, payload_size)?;
+        Command::Benchmark { quick, json } => {
+            let options = if quick {
+                BenchmarkOptions::quick()
+            } else {
+                BenchmarkOptions::standard()
+            };
             let report = bench::run(options)?;
             if json {
                 println!("{}", report.to_json());

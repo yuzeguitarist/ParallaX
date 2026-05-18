@@ -170,6 +170,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         8192,
         &psk,
     )?));
+    let secrets = ServerRuntimeSecrets::decode(&server)?;
     let listener = TcpListener::bind(server.listen).await?;
     let connection_limit = relay_connection_limit()?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
@@ -212,6 +213,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         let connection_traffic = traffic;
         let psk = Arc::clone(&psk);
         let replay_cache = Arc::clone(&replay_cache);
+        let secrets = secrets.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
             if let Err(err) = handle_connection_with_replay(
@@ -220,6 +222,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 connection_traffic,
                 &psk,
                 replay_cache,
+                &secrets,
                 cid,
             )
             .await
@@ -237,7 +240,8 @@ pub async fn handle_connection(
     psk: &[u8],
 ) -> Result<(), HandshakeServerError> {
     let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    handle_connection_inner(client, config, traffic, psk, None, cid).await
+    let secrets = ServerRuntimeSecrets::decode(config)?;
+    handle_connection_inner(client, config, traffic, psk, None, &secrets, cid).await
 }
 
 async fn handle_connection_with_replay(
@@ -246,9 +250,19 @@ async fn handle_connection_with_replay(
     traffic: TrafficConfig,
     psk: &[u8],
     replay_cache: Arc<Mutex<ReplayCache>>,
+    secrets: &ServerRuntimeSecrets,
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
-    handle_connection_inner(client, config, traffic, psk, Some(replay_cache), cid).await
+    handle_connection_inner(
+        client,
+        config,
+        traffic,
+        psk,
+        Some(replay_cache),
+        secrets,
+        cid,
+    )
+    .await
 }
 
 async fn handle_connection_inner(
@@ -257,6 +271,7 @@ async fn handle_connection_inner(
     traffic: TrafficConfig,
     psk: &[u8],
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
+    secrets: &ServerRuntimeSecrets,
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
     tune_tcp_stream(&client)?;
@@ -265,34 +280,28 @@ async fn handle_connection_inner(
         task_name = "server-connection",
         "accepted outer connection"
     );
-    let server_private = decode_key32_secret("server.private_key", &config.private_key)?;
+    let server_private = secrets.private_key();
     let first_record = read_first_record(&mut client).await?;
-    match decide_inbound(&first_record, psk, &config.authorized_sni, &server_private)? {
+    match decide_inbound(&first_record, psk, &config.authorized_sni, server_private)? {
         InboundDecision::Fallback(reason) => {
             tracing::debug!(?reason, "falling back to authenticated SNI target");
             relay_fallback(client, &config.fallback_addr, first_record).await?;
         }
         InboundDecision::Authenticated(client_hello) => {
             if let Some(replay_cache) = replay_cache {
-                if !replay_cache
-                    .lock()
-                    .expect("replay cache poisoned")
-                    .insert_new(
-                        ReplayEntry {
-                            timestamp: client_hello.timestamp,
-                            nonce: client_hello.nonce,
-                            transcript_fingerprint: client_hello.transcript_fingerprint,
-                        },
-                        current_unix_timestamp()?,
-                    )?
-                {
+                let replay_entry = ReplayEntry {
+                    timestamp: client_hello.timestamp,
+                    nonce: client_hello.nonce,
+                    transcript_fingerprint: client_hello.transcript_fingerprint,
+                };
+                if !insert_replay_entry_blocking(replay_cache, replay_entry).await? {
                     tracing::debug!("falling back on replayed ClientHello");
                     relay_fallback(client, &config.fallback_addr, first_record).await?;
                     return Ok(());
                 }
             }
             let handshake =
-                accept_authenticated(client, config, &server_private, first_record, client_hello)
+                accept_authenticated(client, config, server_private, first_record, client_hello)
                     .await?;
             tracing::debug!(
                 cid,
@@ -300,12 +309,10 @@ async fn handle_connection_inner(
                 tls13 = handshake.server_hello.tls13_selected,
                 "authenticated ParallaX handshake accepted"
             );
-            let identity_secret =
-                decode_base64_secret("server.identity_secret_key", &config.identity_secret_key)?;
             run_authenticated_data_mode(
                 handshake,
                 config.data_target.as_deref(),
-                &identity_secret,
+                secrets.identity_secret_key(),
                 psk,
                 traffic,
                 cid,
@@ -315,6 +322,35 @@ async fn handle_connection_inner(
     }
 
     Ok(())
+}
+
+#[derive(Clone)]
+struct ServerRuntimeSecrets {
+    private_key: Arc<zeroize::Zeroizing<[u8; 32]>>,
+    identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
+}
+
+impl ServerRuntimeSecrets {
+    fn decode(config: &ServerConfig) -> Result<Self, ConfigError> {
+        Ok(Self {
+            private_key: Arc::new(decode_key32_secret(
+                "server.private_key",
+                &config.private_key,
+            )?),
+            identity_secret_key: Arc::new(decode_base64_secret(
+                "server.identity_secret_key",
+                &config.identity_secret_key,
+            )?),
+        })
+    }
+
+    fn private_key(&self) -> &[u8; 32] {
+        &self.private_key
+    }
+
+    fn identity_secret_key(&self) -> &[u8] {
+        self.identity_secret_key.as_slice()
+    }
 }
 
 fn client_hello_fingerprint(first_record: &[u8]) -> [u8; 32] {
@@ -669,6 +705,20 @@ async fn sign_server_identity_blocking(
     .await??)
 }
 
+async fn insert_replay_entry_blocking(
+    replay_cache: Arc<Mutex<ReplayCache>>,
+    entry: ReplayEntry,
+) -> Result<bool, HandshakeServerError> {
+    Ok(tokio::task::spawn_blocking(move || {
+        let now = current_unix_timestamp()?;
+        replay_cache
+            .lock()
+            .expect("replay cache poisoned")
+            .insert_new(entry, now)
+    })
+    .await??)
+}
+
 fn apply_server_pq_rekey(
     client_open: &mut DataRecordCodec,
     server_seal: &mut DataRecordCodec,
@@ -710,79 +760,119 @@ struct DataRelay {
 impl DataRelay {
     async fn run(self) -> Result<(), HandshakeServerError> {
         let DataRelay {
-            mut client_records,
-            mut client_write,
-            mut target_read,
-            mut target_write,
-            mut client_open,
-            mut server_seal,
+            client_records,
+            client_write,
+            target_read,
+            target_write,
+            client_open,
+            server_seal,
             timing,
             cover,
             chunk_size,
             cid,
         } = self;
-        let mut target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
-        let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
-        let mut client_record = Vec::new();
-        let mut rng = StdRng::from_entropy();
-        let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+        let target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+        let upload = server_upload_loop(client_records, target_write, client_open, cid);
+        let download = server_download_loop(
+            target_read,
+            client_write,
+            server_seal,
+            target_buf,
+            timing,
+            cover,
+            cid,
+        );
 
-        loop {
-            tokio::select! {
-                _ = &mut cover_sleep, if cover.is_enabled() => {
-                    write_server_data_records_chunked(
-                        &mut client_write,
-                        &mut server_seal,
-                        &[],
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "server->client", "server-cover-writer"),
-                    )
-                    .await?;
-                    cover_sleep.as_mut().reset(
-                        Instant::now() + cover.sample_interval(&mut rng),
-                    );
-                }
-                record = client_records.read_record_into(&mut client_record) => {
-                    match record {
-                        Ok(()) => {}
-                        Err(err) if is_clean_close(&err) => return Ok(()),
-                        Err(err) => return Err(HandshakeServerError::Io(err)),
-                    };
-                    log_record_read(cid, "client->server", "server-data-client-reader", &client_record);
-                    match client_open.open_in_place(&mut client_record) {
-                        Ok(()) => {
-                            if !client_record.is_empty() {
-                                target_write.write_all(&client_record).await?;
-                            }
-                        }
-                        Err(err) => {
-                            return Err(HandshakeServerError::DataRecord(err));
-                        }
-                    }
-                }
-                read = target_read.read(&mut target_buf) => {
-                    let n = read?;
-                    if n == 0 {
-                        return Ok(());
-                    }
-                    let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
+        tokio::select! {
+            result = upload => result,
+            result = download => result,
+        }
+    }
+}
 
-                    let delay = timing.sample_delay(&mut rng);
-                    if !delay.is_zero() {
-                        sleep(delay).await;
-                    }
+async fn server_upload_loop(
+    mut client_records: TlsRecordReader<OwnedReadHalf>,
+    mut target_write: OwnedWriteHalf,
+    mut client_open: DataRecordCodec,
+    cid: u64,
+) -> Result<(), HandshakeServerError> {
+    let mut client_record = Vec::new();
 
-                    write_server_data_records_chunked(
-                        &mut client_write,
-                        &mut server_seal,
-                        &target_buf[..n],
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "server->client", "server-download-writer"),
-                    )
-                    .await?;
+    loop {
+        match client_records.read_record_into(&mut client_record).await {
+            Ok(()) => {}
+            Err(err) if is_clean_close(&err) => return Ok(()),
+            Err(err) => return Err(HandshakeServerError::Io(err)),
+        };
+        log_record_read(
+            cid,
+            "client->server",
+            "server-data-client-reader",
+            &client_record,
+        );
+        match client_open.open_in_place(&mut client_record) {
+            Ok(()) => {
+                if !client_record.is_empty() {
+                    target_write.write_all(&client_record).await?;
                 }
+            }
+            Err(err) => {
+                return Err(HandshakeServerError::DataRecord(err));
+            }
+        }
+    }
+}
+
+async fn server_download_loop(
+    mut target_read: OwnedReadHalf,
+    mut client_write: OwnedWriteHalf,
+    mut server_seal: DataRecordCodec,
+    mut target_buf: Vec<u8>,
+    timing: TimingProfile,
+    cover: CoverTrafficProfile,
+    cid: u64,
+) -> Result<(), HandshakeServerError> {
+    let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
+    let mut rng = StdRng::from_entropy();
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+
+    loop {
+        tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                write_server_data_records_chunked(
+                    &mut client_write,
+                    &mut server_seal,
+                    &[],
+                    &mut rng,
+                    &mut seal_scratch,
+                    RelayWriteLog::new(cid, "server->client", "server-cover-writer"),
+                )
+                .await?;
+                cover_sleep.as_mut().reset(
+                    Instant::now() + cover.sample_interval(&mut rng),
+                );
+            }
+            read = target_read.read(&mut target_buf) => {
+                let n = read?;
+                if n == 0 {
+                    return Ok(());
+                }
+                let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
+
+                let delay = timing.sample_delay(&mut rng);
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
+
+                write_server_data_records_chunked(
+                    &mut client_write,
+                    &mut server_seal,
+                    &target_buf[..n],
+                    &mut rng,
+                    &mut seal_scratch,
+                    RelayWriteLog::new(cid, "server->client", "server-download-writer"),
+                )
+                .await?;
             }
         }
     }

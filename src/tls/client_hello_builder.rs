@@ -83,11 +83,7 @@ impl ClientHelloTemplate {
         body.extend_from_slice(&[0_u8; 32]);
 
         let grease = grease_value(rng);
-        let cipher_suites = cipher_suites(self.profile, grease);
-        body.extend_from_slice(&((cipher_suites.len() * 2) as u16).to_be_bytes());
-        for suite in &cipher_suites {
-            body.extend_from_slice(&suite.to_be_bytes());
-        }
+        push_cipher_suites(&mut body, self.profile, grease);
 
         body.push(1);
         body.push(0);
@@ -120,28 +116,34 @@ impl ClientHelloTemplate {
     }
 }
 
-fn cipher_suites(profile: BrowserProfile, grease: u16) -> Vec<u16> {
-    match profile {
-        BrowserProfile::Safari17 => vec![
-            grease,
-            TLS_AES_128_GCM_SHA256,
-            TLS_AES_256_GCM_SHA384,
-            TLS_CHACHA20_POLY1305_SHA256,
-            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-            TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        ],
-        BrowserProfile::Chrome124 => vec![
-            grease,
-            TLS_AES_128_GCM_SHA256,
-            TLS_AES_256_GCM_SHA384,
-            TLS_CHACHA20_POLY1305_SHA256,
-            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-            TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        ],
+fn push_cipher_suites(out: &mut Vec<u8>, profile: BrowserProfile, grease: u16) {
+    const SAFARI17_SUITES: [u16; 7] = [
+        TLS_AES_128_GCM_SHA256,
+        TLS_AES_256_GCM_SHA384,
+        TLS_CHACHA20_POLY1305_SHA256,
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    ];
+    const CHROME124_SUITES: [u16; 7] = [
+        TLS_AES_128_GCM_SHA256,
+        TLS_AES_256_GCM_SHA384,
+        TLS_CHACHA20_POLY1305_SHA256,
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    ];
+    let suites = match profile {
+        BrowserProfile::Safari17 => &SAFARI17_SUITES,
+        BrowserProfile::Chrome124 => &CHROME124_SUITES,
+    };
+
+    out.extend_from_slice(&(((suites.len() + 1) * 2) as u16).to_be_bytes());
+    out.extend_from_slice(&grease.to_be_bytes());
+    for suite in suites {
+        out.extend_from_slice(&suite.to_be_bytes());
     }
 }
 
@@ -173,45 +175,41 @@ fn push_profile_extensions(
 }
 
 fn push_sni(out: &mut Vec<u8>, sni: &[u8]) {
-    let mut data = Vec::with_capacity(5 + sni.len());
-    data.extend_from_slice(&((1 + 2 + sni.len()) as u16).to_be_bytes());
-    data.push(0);
-    data.extend_from_slice(&(sni.len() as u16).to_be_bytes());
-    data.extend_from_slice(sni);
-    extension(out, EXT_SERVER_NAME, &data);
+    extension_header(out, EXT_SERVER_NAME, 5 + sni.len());
+    out.extend_from_slice(&((1 + 2 + sni.len()) as u16).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    out.extend_from_slice(sni);
 }
 
 fn push_supported_groups(out: &mut Vec<u8>, grease: u16) {
     let groups = [grease, GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1];
-    let mut data = Vec::with_capacity(2 + groups.len() * 2);
-    data.extend_from_slice(&((groups.len() * 2) as u16).to_be_bytes());
+    extension_header(out, EXT_SUPPORTED_GROUPS, 2 + groups.len() * 2);
+    out.extend_from_slice(&((groups.len() * 2) as u16).to_be_bytes());
     for group in groups {
-        data.extend_from_slice(&group.to_be_bytes());
+        out.extend_from_slice(&group.to_be_bytes());
     }
-    extension(out, EXT_SUPPORTED_GROUPS, &data);
 }
 
 fn push_signature_algorithms(out: &mut Vec<u8>) {
     let schemes = [
         0x0403_u16, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
     ];
-    let mut data = Vec::with_capacity(2 + schemes.len() * 2);
-    data.extend_from_slice(&((schemes.len() * 2) as u16).to_be_bytes());
+    extension_header(out, EXT_SIGNATURE_ALGORITHMS, 2 + schemes.len() * 2);
+    out.extend_from_slice(&((schemes.len() * 2) as u16).to_be_bytes());
     for scheme in schemes {
-        data.extend_from_slice(&scheme.to_be_bytes());
+        out.extend_from_slice(&scheme.to_be_bytes());
     }
-    extension(out, EXT_SIGNATURE_ALGORITHMS, &data);
 }
 
 fn push_alpn(out: &mut Vec<u8>, protocols: &[&[u8]]) {
     let list_len: usize = protocols.iter().map(|p| p.len() + 1).sum();
-    let mut data = Vec::with_capacity(2 + list_len);
-    data.extend_from_slice(&(list_len as u16).to_be_bytes());
+    extension_header(out, EXT_ALPN, 2 + list_len);
+    out.extend_from_slice(&(list_len as u16).to_be_bytes());
     for protocol in protocols {
-        data.push(protocol.len() as u8);
-        data.extend_from_slice(protocol);
+        out.push(protocol.len() as u8);
+        out.extend_from_slice(protocol);
     }
-    extension(out, EXT_ALPN, &data);
 }
 
 fn push_supported_versions(out: &mut Vec<u8>) {
@@ -223,18 +221,15 @@ fn push_psk_modes(out: &mut Vec<u8>) {
 }
 
 fn push_key_share(out: &mut Vec<u8>, grease: u16, x25519_public_key: &[u8; 32]) {
-    let mut share = Vec::with_capacity(4 + x25519_public_key.len());
-    share.extend_from_slice(&grease.to_be_bytes());
-    share.extend_from_slice(&1_u16.to_be_bytes());
-    share.push(0);
-    share.extend_from_slice(&GROUP_X25519.to_be_bytes());
-    share.extend_from_slice(&(x25519_public_key.len() as u16).to_be_bytes());
-    share.extend_from_slice(x25519_public_key);
-
-    let mut data = Vec::with_capacity(2 + share.len());
-    data.extend_from_slice(&(share.len() as u16).to_be_bytes());
-    data.extend_from_slice(&share);
-    extension(out, EXT_KEY_SHARE, &data);
+    let share_len = 2 + 2 + 1 + 2 + 2 + x25519_public_key.len();
+    extension_header(out, EXT_KEY_SHARE, 2 + share_len);
+    out.extend_from_slice(&(share_len as u16).to_be_bytes());
+    out.extend_from_slice(&grease.to_be_bytes());
+    out.extend_from_slice(&1_u16.to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&GROUP_X25519.to_be_bytes());
+    out.extend_from_slice(&(x25519_public_key.len() as u16).to_be_bytes());
+    out.extend_from_slice(x25519_public_key);
 }
 
 fn push_grease_extension(out: &mut Vec<u8>, grease: u16) {
@@ -253,9 +248,13 @@ where
 }
 
 fn extension(out: &mut Vec<u8>, ext_type: u16, data: &[u8]) {
-    out.extend_from_slice(&ext_type.to_be_bytes());
-    out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    extension_header(out, ext_type, data.len());
     out.extend_from_slice(data);
+}
+
+fn extension_header(out: &mut Vec<u8>, ext_type: u16, data_len: usize) {
+    out.extend_from_slice(&ext_type.to_be_bytes());
+    out.extend_from_slice(&(data_len as u16).to_be_bytes());
 }
 
 fn push_u24(out: &mut Vec<u8>, value: u32) {
