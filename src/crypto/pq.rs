@@ -8,6 +8,8 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+const HYBRID_REKEY_IKM_STACK_LEN: usize = 128;
+
 #[derive(Debug, Error)]
 pub enum PqError {
     #[error("invalid ML-KEM public key")]
@@ -78,20 +80,79 @@ pub fn hybrid_sandwich_rekey(
     pq_shared_secret: &[u8; 32],
     symmetric_secret: &[u8],
 ) -> Result<[u8; 32], PqError> {
-    let mut ikm = Vec::with_capacity(7 + 32 + 11 + 32 + 5 + 4 + symmetric_secret.len());
-    ikm.extend_from_slice(b"x25519:");
-    ikm.extend_from_slice(x25519_shared_secret);
-    ikm.extend_from_slice(b"|mlkem1024:");
-    ikm.extend_from_slice(pq_shared_secret);
-    ikm.extend_from_slice(b"|psk:");
-    ikm.extend_from_slice(&(symmetric_secret.len() as u32).to_be_bytes());
-    ikm.extend_from_slice(symmetric_secret);
-
-    let (prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm);
+    let ikm_len = hybrid_rekey_ikm_len(symmetric_secret.len());
+    let (prk, _) = if ikm_len <= HYBRID_REKEY_IKM_STACK_LEN {
+        let mut ikm = [0_u8; HYBRID_REKEY_IKM_STACK_LEN];
+        let used = write_hybrid_rekey_ikm(
+            &mut ikm,
+            x25519_shared_secret,
+            pq_shared_secret,
+            symmetric_secret,
+        );
+        let extracted = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm[..used]);
+        ikm.zeroize();
+        extracted
+    } else {
+        let mut ikm = Vec::with_capacity(ikm_len);
+        append_hybrid_rekey_ikm(
+            &mut ikm,
+            x25519_shared_secret,
+            pq_shared_secret,
+            symmetric_secret,
+        );
+        let extracted = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm);
+        ikm.zeroize();
+        extracted
+    };
     let mut chain_secret = [0_u8; 32];
     chain_secret.copy_from_slice(&prk);
-    ikm.zeroize();
     Ok(chain_secret)
+}
+
+fn hybrid_rekey_ikm_len(symmetric_secret_len: usize) -> usize {
+    b"x25519:".len() + 32 + b"|mlkem1024:".len() + 32 + b"|psk:".len() + 4 + symmetric_secret_len
+}
+
+fn write_hybrid_rekey_ikm(
+    out: &mut [u8; HYBRID_REKEY_IKM_STACK_LEN],
+    x25519_shared_secret: &[u8; 32],
+    pq_shared_secret: &[u8; 32],
+    symmetric_secret: &[u8],
+) -> usize {
+    let mut offset = 0;
+    write_bytes(out, &mut offset, b"x25519:");
+    write_bytes(out, &mut offset, x25519_shared_secret);
+    write_bytes(out, &mut offset, b"|mlkem1024:");
+    write_bytes(out, &mut offset, pq_shared_secret);
+    write_bytes(out, &mut offset, b"|psk:");
+    write_bytes(
+        out,
+        &mut offset,
+        &(symmetric_secret.len() as u32).to_be_bytes(),
+    );
+    write_bytes(out, &mut offset, symmetric_secret);
+    offset
+}
+
+fn append_hybrid_rekey_ikm(
+    out: &mut Vec<u8>,
+    x25519_shared_secret: &[u8; 32],
+    pq_shared_secret: &[u8; 32],
+    symmetric_secret: &[u8],
+) {
+    out.extend_from_slice(b"x25519:");
+    out.extend_from_slice(x25519_shared_secret);
+    out.extend_from_slice(b"|mlkem1024:");
+    out.extend_from_slice(pq_shared_secret);
+    out.extend_from_slice(b"|psk:");
+    out.extend_from_slice(&(symmetric_secret.len() as u32).to_be_bytes());
+    out.extend_from_slice(symmetric_secret);
+}
+
+fn write_bytes(out: &mut [u8; HYBRID_REKEY_IKM_STACK_LEN], offset: &mut usize, bytes: &[u8]) {
+    let end = *offset + bytes.len();
+    out[*offset..end].copy_from_slice(bytes);
+    *offset = end;
 }
 
 fn shared_secret_32(shared_secret: &[u8]) -> Result<[u8; 32], PqError> {
