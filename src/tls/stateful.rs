@@ -883,16 +883,17 @@ impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
                 SignatureScheme::RSA_PKCS1_SHA512,
             ],
             BrowserProfile::Safari17 => vec![
-                // Safari 26.4 / CoreCrypto order (apple.com capture). Apple's
-                // real list also contains a duplicate `rsa_pss_rsae_sha384`
-                // entry and `rsa_pss_pss_sha512` (0x080a); rustls 0.23 dedupes
-                // its scheme list and has no enum variant for 0x080a, so we
-                // omit those two and accept the resulting JA4 sig-algs hash
-                // delta as a known limitation.
+                // Safari 26.4 / CoreCrypto wire order (verified against
+                // apple.com + cloudflare.com captures). Apple emits
+                // `rsa_pss_rsae_sha384` twice in a row; rustls 0.23 stores
+                // signature_schemes as a plain `Vec<SignatureScheme>` and
+                // does NOT dedupe, so the duplicate survives end-to-end on
+                // the wire, giving us byte-for-byte JA4 sig-algs parity.
                 SignatureScheme::ECDSA_NISTP256_SHA256,
                 SignatureScheme::RSA_PSS_SHA256,
                 SignatureScheme::RSA_PKCS1_SHA256,
                 SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA384,
                 SignatureScheme::RSA_PSS_SHA384,
                 SignatureScheme::RSA_PKCS1_SHA384,
                 SignatureScheme::RSA_PSS_SHA512,

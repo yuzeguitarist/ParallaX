@@ -60,17 +60,13 @@ const SAFARI_SUPPORTED_GROUPS: &[u16] = &[
     GROUP_SECP521R1,
 ];
 
-/// Safari 26.4 signature_algorithms in apple.com wire order. The real Apple
-/// list contains a duplicate `rsa_pss_rsae_sha384` and `rsa_pss_pss_sha512`
-/// (0x080a); rustls 0.23 dedupes its scheme list and has no enum variant for
-/// 0x080a, so the parallax ClientHello drops both entries. See
-/// `SAFARI_RUSTLS_SUPPORTED_SIG_ALGS` for the subset we lock down.
+/// Safari 26.4 signature_algorithms in apple.com wire order, including the
+/// duplicated `rsa_pss_rsae_sha384` (0x0805) entry Apple emits twice. rustls
+/// 0.23 stores `signature_schemes` as a plain `Vec<SignatureScheme>` and does
+/// NOT dedupe, so the Safari17 profile in `src/tls/stateful.rs` can — and
+/// does — emit the duplicate to land exact JA4 sig-algs parity.
 const SAFARI_SIGNATURE_ALGORITHMS_REAL: &[u16] = &[
     0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201,
-];
-
-const SAFARI_RUSTLS_SUPPORTED_SIG_ALGS: &[u16] = &[
-    0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201,
 ];
 
 const SAFARI_APPLE_FIXTURE: &[u8] = include_bytes!("fixtures/safari26_apple_com_clienthello.bin");
@@ -269,17 +265,25 @@ fn assert_parallax_matches_safari(safari: &ClientHelloFields, parallax: &ClientH
     );
 
     // --- Signature algorithms -------------------------------------------
+    //
+    // Apple emits `rsa_pss_rsae_sha384` (0x0805) twice; rustls 0.23 stores
+    // the scheme list as `Vec<SignatureScheme>` and does not dedupe, so the
+    // Safari17 profile reproduces the duplicate verbatim. This gives us
+    // byte-for-byte parity with the apple.com fixture.
     assert_eq!(
-        parallax.signature_algorithms, SAFARI_RUSTLS_SUPPORTED_SIG_ALGS,
-        "ParallaX signature_algorithms must match Safari's rustls-supported subset"
+        parallax.signature_algorithms, SAFARI_SIGNATURE_ALGORITHMS_REAL,
+        "ParallaX signature_algorithms must match Safari 26.4 exactly (including the duplicate 0x0805)"
     );
-    // The Safari fixture is the source of truth for which schemes we drop
-    // (the duplicate 0x0805 and 0x080a). Make sure those two entries are
-    // still present in the fixture so a future Safari release that fixes
-    // this list trips the assertion and we re-calibrate.
-    let safari_sig_algs = &safari.signature_algorithms;
     assert_eq!(
-        safari_sig_algs.iter().filter(|s| **s == 0x0805).count(),
+        parallax.signature_algorithms, safari.signature_algorithms,
+        "ParallaX signature_algorithms must equal the apple.com fixture byte-for-byte"
+    );
+    assert_eq!(
+        safari
+            .signature_algorithms
+            .iter()
+            .filter(|s| **s == 0x0805)
+            .count(),
         2,
         "Safari fixture lost its duplicate rsa_pss_rsae_sha384 entry"
     );
