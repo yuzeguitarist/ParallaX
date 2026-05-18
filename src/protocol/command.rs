@@ -57,6 +57,13 @@ pub struct ServerIdentityChunk {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerIdentityChunkRef<'a> {
+    pub total_len: u32,
+    pub offset: u32,
+    pub bytes: &'a [u8],
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PqRekeyError {
     #[error("PQ rekey request is truncated")]
@@ -187,14 +194,21 @@ impl ConnectRequest {
 
 impl PqRekeyRequest {
     pub fn encode(&self) -> Result<Vec<u8>, PqRekeyError> {
-        if self.client_mlkem_public_key.is_empty() {
+        Self::encode_borrowed(&self.client_x25519_public, &self.client_mlkem_public_key)
+    }
+
+    pub(crate) fn encode_borrowed(
+        client_x25519_public: &[u8; 32],
+        client_mlkem_public_key: &[u8],
+    ) -> Result<Vec<u8>, PqRekeyError> {
+        if client_mlkem_public_key.is_empty() {
             return Err(PqRekeyError::EmptyPublicKey);
         }
-        let mut out = Vec::with_capacity(40 + self.client_mlkem_public_key.len());
+        let mut out = Vec::with_capacity(40 + client_mlkem_public_key.len());
         out.extend_from_slice(PQ_REKEY_MAGIC);
-        out.extend_from_slice(&self.client_x25519_public);
-        out.extend_from_slice(&(self.client_mlkem_public_key.len() as u32).to_be_bytes());
-        out.extend_from_slice(&self.client_mlkem_public_key);
+        out.extend_from_slice(client_x25519_public);
+        out.extend_from_slice(&(client_mlkem_public_key.len() as u32).to_be_bytes());
+        out.extend_from_slice(client_mlkem_public_key);
         Ok(out)
     }
 
@@ -276,6 +290,12 @@ impl ServerIdentityProof {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, ServerIdentityProofError> {
+        Ok(Self {
+            signature: Self::signature(input)?.to_vec(),
+        })
+    }
+
+    pub fn signature(input: &[u8]) -> Result<&[u8], ServerIdentityProofError> {
         if input.len() < 4 {
             return Err(ServerIdentityProofError::Truncated);
         }
@@ -292,9 +312,7 @@ impl ServerIdentityProof {
         if input.len() != 8 + len {
             return Err(ServerIdentityProofError::InvalidSignatureLength);
         }
-        Ok(Self {
-            signature: input[8..].to_vec(),
-        })
+        Ok(&input[8..])
     }
 }
 
@@ -321,6 +339,17 @@ impl ServerIdentityChunk {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, ServerIdentityChunkError> {
+        let chunk = Self::decode_ref(input)?;
+        Ok(Self {
+            total_len: chunk.total_len,
+            offset: chunk.offset,
+            bytes: chunk.bytes.to_vec(),
+        })
+    }
+
+    pub fn decode_ref(
+        input: &[u8],
+    ) -> Result<ServerIdentityChunkRef<'_>, ServerIdentityChunkError> {
         if input.len() < 4 {
             return Err(ServerIdentityChunkError::Truncated);
         }
@@ -345,10 +374,10 @@ impl ServerIdentityChunk {
         if total_len == 0 || end > total_len {
             return Err(ServerIdentityChunkError::InvalidOffset);
         }
-        Ok(Self {
+        Ok(ServerIdentityChunkRef {
             total_len,
             offset,
-            bytes: input[16..].to_vec(),
+            bytes: &input[16..],
         })
     }
 
@@ -524,6 +553,23 @@ mod tests {
     }
 
     #[test]
+    fn pq_rekey_borrowed_encode_matches_owned_request() {
+        let request = PqRekeyRequest {
+            client_x25519_public: [9_u8; 32],
+            client_mlkem_public_key: vec![1, 2, 3],
+        };
+
+        assert_eq!(
+            PqRekeyRequest::encode_borrowed(
+                &request.client_x25519_public,
+                &request.client_mlkem_public_key
+            )
+            .unwrap(),
+            request.encode().unwrap()
+        );
+    }
+
+    #[test]
     fn server_key_exchange_round_trip() {
         let exchange = ServerKeyExchange {
             server_x25519_public: [7_u8; 32],
@@ -539,6 +585,10 @@ mod tests {
             signature: vec![4, 5, 6],
         };
         let encoded = proof.encode().unwrap();
+        assert_eq!(
+            ServerIdentityProof::signature(&encoded).unwrap(),
+            proof.signature
+        );
         assert_eq!(ServerIdentityProof::decode(&encoded).unwrap(), proof);
     }
 
@@ -550,7 +600,9 @@ mod tests {
 
         let mut assembled = Vec::new();
         for chunk in encoded {
+            let chunk_ref = ServerIdentityChunk::decode_ref(&chunk).unwrap();
             let chunk = ServerIdentityChunk::decode(&chunk).unwrap();
+            assert_eq!(chunk_ref.bytes, chunk.bytes);
             assert_eq!(chunk.offset as usize, assembled.len());
             assembled.extend_from_slice(&chunk.bytes);
         }

@@ -108,7 +108,6 @@ pub fn hybrid_sandwich_rekey(
     }
     Ok(chain_secret)
 }
-
 fn write_hybrid_rekey_ikm(
     out: &mut [u8; HYBRID_REKEY_IKM_STACK_LEN],
     x25519_shared_secret: &[u8; 32],
@@ -150,7 +149,6 @@ fn write_hybrid_rekey_ikm_vec(
     out.extend_from_slice(&(symmetric_secret.len() as u32).to_be_bytes());
     out.extend_from_slice(symmetric_secret);
 }
-
 fn shared_secret_32(shared_secret: &[u8]) -> Result<[u8; 32], PqError> {
     if shared_secret.len() != 32 {
         return Err(PqError::InvalidCiphertext);

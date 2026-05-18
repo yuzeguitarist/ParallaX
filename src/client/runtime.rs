@@ -33,8 +33,7 @@ use crate::{
     },
     crypto::{auth::AuthError, identity, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
-    protocol::command::ConnectRequest,
-    protocol::command::ServerIdentityChunk,
+    protocol::command::{ConnectRequest, ServerIdentityChunk, ServerIdentityProof},
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
     },
@@ -224,7 +223,7 @@ async fn handle_local_connection_with_cid(
     let identity_payload = read_server_identity_payload(&mut server, &mut data_session).await?;
     verify_server_identity_payload_blocking(
         &data_session,
-        &identity_payload,
+        identity_payload,
         server_identity_public,
         server_public,
     )
@@ -386,27 +385,27 @@ async fn apply_server_key_exchange_record_blocking(
 
 async fn verify_server_identity_payload_blocking(
     data_session: &ClientDataSession,
-    payload: &[u8],
+    payload: Vec<u8>,
     server_identity_public_key: &[u8],
     server_x25519_public_key: &[u8; 32],
 ) -> Result<(), ClientRuntimeError> {
-    let proof = data_session.decode_server_identity_payload(payload)?;
     let public_key = server_identity_public_key.to_vec();
-    let signature = proof.signature;
     let transcript_hash = data_session.transcript_hash();
     let server_x25519_public_key = *server_x25519_public_key;
     let epoch = data_session.epoch();
     tokio::task::spawn_blocking(move || {
+        let signature =
+            ServerIdentityProof::signature(&payload).map_err(ClientHandshakeError::from)?;
         identity::verify_server_identity(
             &public_key,
-            &signature,
+            signature,
             &transcript_hash,
             &server_x25519_public_key,
             epoch,
         )
+        .map_err(ClientHandshakeError::from)
     })
-    .await?
-    .map_err(ClientHandshakeError::from)?;
+    .await??;
     Ok(())
 }
 
@@ -431,7 +430,7 @@ async fn read_server_identity_payload(
     loop {
         server_records.read_record_into(&mut record).await?;
         data_session.open_server_record_in_place(&mut record)?;
-        let chunk = ServerIdentityChunk::decode(&record).map_err(ClientHandshakeError::from)?;
+        let chunk = ServerIdentityChunk::decode_ref(&record).map_err(ClientHandshakeError::from)?;
         let total_len = chunk.total_len as usize;
         if total_len == 0 || total_len > MAX_SERVER_IDENTITY_PAYLOAD {
             return Err(ClientRuntimeError::ServerIdentityTooLarge);
@@ -449,7 +448,7 @@ async fn read_server_identity_payload(
         if chunk.offset as usize != assembled.len() {
             return Err(ClientRuntimeError::InvalidServerIdentityChunks);
         }
-        assembled.extend_from_slice(&chunk.bytes);
+        assembled.extend_from_slice(chunk.bytes);
         if assembled.len() == total_len {
             return Ok(assembled);
         }
