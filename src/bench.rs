@@ -8,7 +8,7 @@
 //!
 //! Design notes:
 //!
-//! * 32 cases across six groups exercise the asymmetric primitives, KDFs,
+//! * 34 cases across six groups exercise the asymmetric primitives, KDFs,
 //!   handshake composition, application-data AEAD pipeline, traffic shaping,
 //!   and replay-cache bookkeeping that dominate ParallaX's wall-clock cost.
 //! * Each case declares an iteration [`Tier`]. Tiers are static constants so
@@ -41,7 +41,7 @@ use crate::{
     },
     handshake::client::ClientDataSession,
     protocol::{
-        command::{ConnectRequest, ServerIdentityProof},
+        command::{ConnectRequest, ServerIdentityChunk, ServerIdentityProof},
         data::{DataRecordCodec, SealedRecord, CLIENT_TO_SERVER_AAD},
     },
     tls::{
@@ -74,6 +74,7 @@ const SIZE_1M: usize = 1024 * 1024;
 /// throughput numbers) stay stable as long as the protocol does.
 const RECORD_PADDING_MIN: u16 = 0;
 const RECORD_PADDING_MAX: u16 = 1500;
+const BENCH_SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
 
 /// Iteration / warmup pair for one benchmark case.
 ///
@@ -331,6 +332,8 @@ const CASES: &[CaseRunner] = &[
     bench_clienthello_verify_auth,
     bench_client_pq_rekey_record,
     bench_client_connect_record_1k,
+    bench_client_identity_chunks_decode,
+    bench_client_identity_proof_extract,
     bench_quic_server_identity_build_decode_each_time,
     bench_quic_server_identity_build_cached,
     bench_quic_client_identity_verify_decode_each_time,
@@ -689,6 +692,45 @@ fn bench_client_connect_record_1k(options: BenchmarkOptions) -> Result<Benchmark
     )
 }
 
+fn bench_client_identity_chunks_decode(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let payload = server_identity_payload_fixture()?;
+    let chunks = ServerIdentityChunk::encode_all(&payload, BENCH_SERVER_IDENTITY_CHUNK_PLAINTEXT)?;
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "client.identity_chunks_decode",
+        TIER_FAST,
+        options,
+        || {
+            let mut assembled = Vec::with_capacity(payload.len());
+            for encoded in &chunks {
+                let chunk = ServerIdentityChunk::decode(encoded)?;
+                if chunk.offset as usize != assembled.len() {
+                    bail!("benchmark identity chunk offset mismatch");
+                }
+                assembled.extend_from_slice(&chunk.bytes);
+            }
+            if assembled != payload {
+                bail!("benchmark identity chunk assembly mismatch");
+            }
+            Ok(black_box(assembled.len() as u64))
+        },
+    )
+}
+
+fn bench_client_identity_proof_extract(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let payload = server_identity_payload_fixture()?;
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "client.identity_proof_extract",
+        TIER_FAST,
+        options,
+        || {
+            let proof = ServerIdentityProof::decode(&payload)?;
+            Ok(black_box(proof.signature.len() as u64))
+        },
+    )
+}
+
 fn session_keys_fixture() -> Result<SessionKeys> {
     let client = X25519KeyPair::generate();
     let server = X25519KeyPair::generate();
@@ -698,6 +740,15 @@ fn session_keys_fixture() -> Result<SessionKeys> {
         &server.public,
         &transcript,
     )?)
+}
+
+fn server_identity_payload_fixture() -> Result<Vec<u8>> {
+    let identity_keys = identity::keypair();
+    let server = X25519KeyPair::generate();
+    let transcript = [0x33_u8; KEY_LEN];
+    let signature =
+        identity::sign_server_identity(&identity_keys.secret, &transcript, &server.public, 0)?;
+    Ok(ServerIdentityProof { signature }.encode()?)
 }
 
 // ---------------------------------------------------------------------------
