@@ -167,7 +167,8 @@ impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let raw = fs::read_to_string(path)?;
-        let cfg = toml::from_str::<Self>(&raw)?;
+        let mut cfg = toml::from_str::<Self>(&raw)?;
+        cfg.resolve_paths_relative_to(path);
         cfg.validate()?;
         cfg.validate_file_permissions(path)?;
         Ok(cfg)
@@ -228,6 +229,21 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    fn resolve_paths_relative_to(&mut self, config_path: &Path) {
+        let Some(server) = self.server.as_mut() else {
+            return;
+        };
+        if server.replay_cache_path.is_absolute() {
+            return;
+        }
+
+        let config_dir = config_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        server.replay_cache_path = config_dir.join(&server.replay_cache_path);
     }
 
     fn validate_file_permissions(&self, path: &Path) -> Result<(), ConfigError> {
@@ -648,6 +664,42 @@ authorized_sni = ["example.com"]
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         Config::load(&path).unwrap();
+    }
+
+    #[test]
+    fn server_replay_cache_default_resolves_against_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        fs::write(&path, raw).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let cfg = Config::load(&path).unwrap();
+        let server = cfg.server.unwrap();
+
+        assert_eq!(
+            server.replay_cache_path,
+            dir.path().join("parallax-replay.cache")
+        );
     }
 
     #[test]
