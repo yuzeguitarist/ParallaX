@@ -57,7 +57,9 @@ const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
 const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const H2_OPEN_HEADERS_DELAY: Duration = Duration::from_millis(12);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
-const CHROME_GREASE_VALUES: [u16; 16] = [
+/// Standard GREASE values from RFC 8701. Both Chrome (BoringSSL) and Safari
+/// (CoreCrypto) sample from this set when injecting GREASE into ClientHello.
+const BROWSER_GREASE_VALUES: [u16; 16] = [
     0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
     0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
@@ -232,6 +234,14 @@ pub struct StatefulRustlsSession {
 }
 
 impl StatefulRustlsSession {
+    /// Borrow the raw ClientHello TLS record that was emitted during
+    /// [`StatefulRustlsCamouflageBackend::start`]. Useful for fingerprint
+    /// regression tests that need to inspect the on-the-wire bytes without
+    /// driving a full handshake against a real peer.
+    pub fn client_hello_bytes(&self) -> &[u8] {
+        &self.client_hello
+    }
+
     pub async fn complete(
         mut self,
         stream: &mut TcpStream,
@@ -447,7 +457,7 @@ fn with_patch_context<T>(
 
 fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, TlsBackendError> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    let (cipher_grease, group_grease) = chrome_grease_indices_from_context();
+    let (cipher_grease, group_grease) = browser_grease_indices_from_context();
     shape_cipher_suites_for_profile(&mut provider, profile.browser, cipher_grease);
     shape_key_exchange_groups_for_profile(&mut provider, profile.browser, group_grease);
     provider.secure_random = &PARALLAX_RANDOM;
@@ -456,7 +466,9 @@ fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, 
         .with_safe_default_protocol_versions()
         .map_err(|err| TlsBackendError::RustlsConfig(err.to_string()))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(CamouflageVerifier))
+        .with_custom_certificate_verifier(Arc::new(CamouflageVerifier::for_browser(
+            profile.browser,
+        )))
         .with_no_client_auth();
     config.alpn_protocols = profile.alpn_protocols.clone();
     // A fresh, non-shared cache lets rustls emit Chrome's empty TLS 1.2
@@ -473,28 +485,49 @@ fn shape_cipher_suites_for_profile(
     browser: BrowserProfile,
     grease_index: usize,
 ) {
-    if !matches!(browser, BrowserProfile::Chrome124) {
-        return;
-    }
-
     use rustls::crypto::aws_lc_rs::cipher_suite;
 
-    // Chrome 148 offers AES-128 TLS 1.3 first, then AES-256, CHACHA, then the
-    // ECDHE GCM/CHACHA TLS 1.2 suites. rustls/aws-lc-rs cannot implement
-    // Chrome's legacy CBC/RSA-GCM tail, so we order the supported subset to
-    // match BoringSSL and let rustls append SCSV when TLS 1.2 is enabled.
-    provider.cipher_suites = vec![
-        grease_cipher_suite(grease_index),
-        cipher_suite::TLS13_AES_128_GCM_SHA256,
-        cipher_suite::TLS13_AES_256_GCM_SHA384,
-        cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-        cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-    ];
+    match browser {
+        BrowserProfile::Chrome124 => {
+            // Chrome 148 offers AES-128 TLS 1.3 first, then AES-256, CHACHA, then the
+            // ECDHE GCM/CHACHA TLS 1.2 suites. rustls/aws-lc-rs cannot implement
+            // Chrome's legacy CBC/RSA-GCM tail, so we order the supported subset to
+            // match BoringSSL and let rustls append SCSV when TLS 1.2 is enabled.
+            provider.cipher_suites = vec![
+                grease_cipher_suite(grease_index),
+                cipher_suite::TLS13_AES_128_GCM_SHA256,
+                cipher_suite::TLS13_AES_256_GCM_SHA384,
+                cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ];
+        }
+        BrowserProfile::Safari17 => {
+            // Safari 26.4 ClientHello order (apple.com capture):
+            //   GREASE, TLS13_AES_256_GCM, TLS13_CHACHA20, TLS13_AES_128_GCM,
+            //   ECDHE_ECDSA(AES256/AES128/CHACHA), ECDHE_RSA(AES256/AES128/CHACHA),
+            //   <legacy ECDHE-CBC, RSA, 3DES tail>.
+            // rustls + aws-lc-rs cannot emit the legacy CBC / RSA-only tail, so we
+            // match the front of Apple's list exactly and let rustls append SCSV
+            // (00ff) at the end when TLS 1.2 stays enabled.
+            provider.cipher_suites = vec![
+                grease_cipher_suite(grease_index),
+                cipher_suite::TLS13_AES_256_GCM_SHA384,
+                cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                cipher_suite::TLS13_AES_128_GCM_SHA256,
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ];
+        }
+    }
 }
 
 fn shape_key_exchange_groups_for_profile(
@@ -502,34 +535,53 @@ fn shape_key_exchange_groups_for_profile(
     browser: BrowserProfile,
     grease_index: usize,
 ) {
-    if !matches!(browser, BrowserProfile::Chrome124) {
-        return;
-    }
-
     use rustls::crypto::aws_lc_rs::kx_group;
 
-    // BoringSSL places a GREASE named group before the real hybrid/classical
-    // groups. The GREASE provider delegates its actual key-share generation to
-    // X25519MLKEM768, so rustls' transcript and key schedule stay internally
-    // consistent while the supported_groups vector becomes Chrome-shaped.
-    provider.kx_groups = vec![
-        grease_kx_group(grease_index),
-        kx_group::X25519MLKEM768,
-        kx_group::X25519,
-        kx_group::SECP256R1,
-        kx_group::SECP384R1,
-    ];
+    // BoringSSL/CoreCrypto both place a GREASE named group before the real
+    // hybrid/classical groups. The GREASE provider delegates its actual
+    // key-share generation to X25519MLKEM768, so rustls' transcript and key
+    // schedule stay internally consistent while the supported_groups vector
+    // becomes browser-shaped.
+    match browser {
+        BrowserProfile::Chrome124 => {
+            provider.kx_groups = vec![
+                grease_kx_group(grease_index),
+                kx_group::X25519MLKEM768,
+                kx_group::X25519,
+                kx_group::SECP256R1,
+                kx_group::SECP384R1,
+            ];
+        }
+        BrowserProfile::Safari17 => {
+            // Safari 26.4 supported_groups (apple.com capture):
+            //   GREASE, X25519MLKEM768, X25519, secp256r1, secp384r1, secp521r1.
+            //
+            // rustls 0.23 + aws-lc-rs only exposes SupportedKxGroup statics for
+            // SECP256R1 / SECP384R1, so we announce secp521r1 via the
+            // announce-only stub below. rustls picks key_share entries from the
+            // front of this list (GREASE + the hybrid group + its classical
+            // pair), so the stub's `start()` is never reached in practice.
+            provider.kx_groups = vec![
+                grease_kx_group(grease_index),
+                kx_group::X25519MLKEM768,
+                kx_group::X25519,
+                kx_group::SECP256R1,
+                kx_group::SECP384R1,
+                &ANNOUNCE_ONLY_SECP521R1,
+            ];
+        }
+    }
 }
 
-fn chrome_grease_indices_from_context() -> (usize, usize) {
+fn browser_grease_indices_from_context() -> (usize, usize) {
     PATCH_CONTEXT.with(|slot| {
         let slot = slot.borrow();
         let Some(context) = slot.as_ref() else {
             return (0, 1);
         };
         (
-            (context.x25519.public[0] as usize) % CHROME_GREASE_VALUES.len(),
-            (context.x25519.public[1] as usize) % CHROME_GREASE_VALUES.len(),
+            (context.x25519.public[0] as usize) % BROWSER_GREASE_VALUES.len(),
+            (context.x25519.public[1] as usize) % BROWSER_GREASE_VALUES.len(),
         )
     })
 }
@@ -552,7 +604,7 @@ fn grease_cipher_suite(index: usize) -> SupportedCipherSuite {
     static GREASE_CIPHER_14: OnceLock<Tls13CipherSuite> = OnceLock::new();
     static GREASE_CIPHER_15: OnceLock<Tls13CipherSuite> = OnceLock::new();
 
-    let index = index % CHROME_GREASE_VALUES.len();
+    let index = index % BROWSER_GREASE_VALUES.len();
     let lock = match index {
         0 => &GREASE_CIPHER_0,
         1 => &GREASE_CIPHER_1,
@@ -571,7 +623,7 @@ fn grease_cipher_suite(index: usize) -> SupportedCipherSuite {
         14 => &GREASE_CIPHER_14,
         _ => &GREASE_CIPHER_15,
     };
-    let grease_value = CHROME_GREASE_VALUES[index];
+    let grease_value = BROWSER_GREASE_VALUES[index];
     let base = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
         .tls13()
         .expect("AES-128-GCM is a TLS 1.3 cipher suite");
@@ -613,6 +665,31 @@ static GREASE_KX_GROUPS: [GreaseKxGroup; 16] = [
 
 fn grease_kx_group(index: usize) -> &'static dyn SupportedKxGroup {
     &GREASE_KX_GROUPS[index % GREASE_KX_GROUPS.len()]
+}
+
+/// Announce-only `secp521r1`: present so Apple's supported_groups vector is
+/// reproducible, but never picked by rustls because the hybrid/x25519/p256/p384
+/// groups are listed first and rustls only generates `key_share` entries for
+/// the front of the list. If anything ever does call `start()` we delegate to
+/// X25519 so the connection still completes; the wire-level `NamedGroup` value
+/// stays `secp521r1` (0x0019).
+#[derive(Debug)]
+struct AnnounceOnlySecp521r1;
+
+static ANNOUNCE_ONLY_SECP521R1: AnnounceOnlySecp521r1 = AnnounceOnlySecp521r1;
+
+impl SupportedKxGroup for AnnounceOnlySecp521r1 {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, RustlsError> {
+        rustls::crypto::aws_lc_rs::kx_group::X25519.start()
+    }
+
+    fn name(&self) -> NamedGroup {
+        NamedGroup::secp521r1
+    }
+
+    fn fips(&self) -> bool {
+        false
+    }
 }
 
 impl SupportedKxGroup for GreaseKxGroup {
@@ -749,7 +826,15 @@ impl SecureRandom for ParallaxSecureRandom {
 }
 
 #[derive(Debug)]
-struct CamouflageVerifier;
+struct CamouflageVerifier {
+    browser: BrowserProfile,
+}
+
+impl CamouflageVerifier {
+    fn for_browser(browser: BrowserProfile) -> Self {
+        Self { browser }
+    }
+}
 
 impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
     fn verify_server_cert(
@@ -782,19 +867,39 @@ impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            // Chrome/BoringSSL advertises the browser-facing schemes in this order.
-            // Keeping rustls' verifier permissive while shaping this list narrows the
-            // externally visible ClientHello delta without changing ParallaX auth.
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
+        // rustls 0.23 builds the ClientHello `signature_algorithms` extension
+        // from this list, so it is the only seam we have for matching the
+        // browser-specific scheme order without forking rustls.
+        match self.browser {
+            BrowserProfile::Chrome124 => vec![
+                // Chrome/BoringSSL order.
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::RSA_PKCS1_SHA512,
+            ],
+            BrowserProfile::Safari17 => vec![
+                // Safari 26.4 / CoreCrypto order (apple.com capture). Apple's
+                // real list also contains a duplicate `rsa_pss_rsae_sha384`
+                // entry and `rsa_pss_pss_sha512` (0x080a); rustls 0.23 dedupes
+                // its scheme list and has no enum variant for 0x080a, so we
+                // omit those two and accept the resulting JA4 sig-algs hash
+                // delta as a known limitation.
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::RSA_PKCS1_SHA1,
+            ],
+        }
     }
 }
 
