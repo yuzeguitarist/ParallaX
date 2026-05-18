@@ -116,37 +116,18 @@ fn nofile_soft_limit() -> io::Result<usize> {
 
 #[cfg(target_os = "linux")]
 fn set_low_latency_congestion(stream: &TcpStream) {
-    use std::{
-        ffi::CString,
-        os::{
-            fd::AsRawFd,
-            raw::{c_int, c_void},
-        },
-    };
-
-    const IPPROTO_TCP: c_int = 6;
-    const TCP_CONGESTION: c_int = 13;
-
-    unsafe extern "C" {
-        fn setsockopt(
-            socket: c_int,
-            level: c_int,
-            option_name: c_int,
-            option_value: *const c_void,
-            option_len: u32,
-        ) -> c_int;
-    }
+    use std::{ffi::CString, os::fd::AsRawFd};
 
     let Ok(algorithm) = CString::new("bbr") else {
         return;
     };
     let rc = unsafe {
-        setsockopt(
+        libc::setsockopt(
             stream.as_raw_fd(),
-            IPPROTO_TCP,
-            TCP_CONGESTION,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
             algorithm.as_ptr().cast(),
-            algorithm.as_bytes_with_nul().len() as u32,
+            algorithm.as_bytes_with_nul().len() as libc::socklen_t,
         )
     };
     if rc != 0 {
