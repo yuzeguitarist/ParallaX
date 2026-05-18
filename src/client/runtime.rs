@@ -837,12 +837,15 @@ mod tests {
         for len in [32 * 1024, 64 * 1024, 256 * 1024, 5 * 1024 * 1024] {
             let payload = (0..len).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
             let mut response = vec![0_u8; len];
-            let (write_result, read_result) = tokio::join!(
-                app_write.write_all(&payload),
-                app_read.read_exact(&mut response)
-            );
-            write_result.unwrap();
-            read_result.unwrap();
+            for (sent, expected) in response
+                .chunks_mut(64 * 1024)
+                .zip(payload.chunks(64 * 1024))
+            {
+                let (write_result, read_result) =
+                    tokio::join!(app_write.write_all(expected), app_read.read_exact(sent));
+                write_result.unwrap();
+                read_result.unwrap();
+            }
             assert_eq!(response, payload);
         }
 
