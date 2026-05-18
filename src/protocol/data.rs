@@ -211,12 +211,22 @@ impl DataRecordCodec {
         if record.len() < header.total_len {
             return Err(record::TlsRecordError::IncompletePayload.into());
         }
+        if header.payload_len < AEAD_TAG_LEN {
+            return Err(SessionError::Aead.into());
+        }
 
         record.truncate(header.total_len);
-        record.copy_within(record::TLS_HEADER_LEN..header.total_len, 0);
-        record.truncate(header.payload_len);
-        self.aead.open_in_place(record, self.aad)?;
-        PaddingProfile::remove_in_place(record)?;
+        let ciphertext_start = record::TLS_HEADER_LEN;
+        let tag_start = header.total_len - AEAD_TAG_LEN;
+        let plaintext_len = {
+            let payload = &mut record[ciphertext_start..header.total_len];
+            let (ciphertext, tag) = payload.split_at_mut(tag_start - ciphertext_start);
+            self.aead
+                .open_in_place_detached(ciphertext, tag, self.aad)?;
+            PaddingProfile::plaintext_len(ciphertext)?
+        };
+        record.copy_within(ciphertext_start..ciphertext_start + plaintext_len, 0);
+        record.truncate(plaintext_len);
         Ok(())
     }
 
@@ -459,6 +469,27 @@ mod tests {
         assert!(matches!(dec.open(&bad), Err(DataRecordError::Aead(_))));
         let good = enc.seal(b"hello", &mut rng).unwrap();
         assert_eq!(dec.open(&good).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn failed_open_in_place_does_not_advance_nonce() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(20);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut bad = record::wrap_application_data(b"not-valid-ciphertext").unwrap();
+
+        assert!(matches!(
+            dec.open_in_place(&mut bad),
+            Err(DataRecordError::Aead(_))
+        ));
+        let mut good = enc.seal(b"hello", &mut rng).unwrap();
+        dec.open_in_place(&mut good).unwrap();
+        assert_eq!(good, b"hello");
     }
 
     #[test]
