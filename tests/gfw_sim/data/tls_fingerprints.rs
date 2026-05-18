@@ -26,9 +26,8 @@ pub struct BrowserFingerprintEntry {
 ///
 /// JA4 reference: https://github.com/FoxIO-LLC/ja4
 pub const KNOWN_BROWSER_FINGERPRINTS: &[BrowserFingerprintEntry] = &[
-    // Chrome 124+ (desktop, macOS) - matches the ParallaX `chrome_parity_baseline`
-    // fixture so that the simulator can confirm the parity sample is treated as
-    // a legitimate browser.
+    // Chrome 124+ (desktop, macOS) reference captures used by the simulator to
+    // confirm real-browser fingerprints are treated as legitimate browsers.
     BrowserFingerprintEntry {
         label: "chrome-124-macos-gui",
         ja3_md5: "f15fe5d1f9edead72e873c77bfe9c606",
@@ -80,7 +79,9 @@ pub const KNOWN_BROWSER_FINGERPRINTS: &[BrowserFingerprintEntry] = &[
         ja3_md5: "9d77556faae2bd1f7e72a4b164d31632",
         ja4: "t13d1516h2_8daaf6152771_5e95e36d18bf",
     },
-    // ParallaX itself, captured by the `chrome_parity_baseline` integration test.
+    // Historical ParallaX Chrome-shaping sample, kept as a known non-browser
+    // reference for simulator scenarios after the stateful Chrome path was
+    // retired.
     // We intentionally list it as a *known non-browser* in `KNOWN_PROXY_FINGERPRINTS`
     // below; here we record the corresponding JA4 so red-team scenarios can verify
     // that the simulator distinguishes ParallaX from Chrome.

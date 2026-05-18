@@ -328,7 +328,6 @@ const CASES: &[CaseRunner] = &[
     bench_hkdf_hybrid_sandwich_rekey,
     bench_clienthello_build_signed,
     bench_stateful_clienthello_start_safari,
-    bench_stateful_clienthello_start_chrome,
     bench_clienthello_parse,
     bench_clienthello_verify_auth,
     bench_client_pq_rekey_record,
@@ -588,10 +587,6 @@ fn bench_clienthello_build_signed(options: BenchmarkOptions) -> Result<Benchmark
 
 fn bench_stateful_clienthello_start_safari(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     bench_stateful_clienthello_start(options, "stateful.start_safari", BrowserProfile::Safari26)
-}
-
-fn bench_stateful_clienthello_start_chrome(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    bench_stateful_clienthello_start(options, "stateful.start_chrome", BrowserProfile::Chrome124)
 }
 
 fn bench_stateful_clienthello_start(

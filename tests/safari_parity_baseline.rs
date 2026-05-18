@@ -6,9 +6,9 @@
 //! corresponding hostname. They are the ground truth that the Safari26
 //! profile is calibrated against in `src/tls/stateful.rs`.
 //!
-//! These tests intentionally use the same loopback rustls server harness as
-//! `chrome_parity_baseline.rs` so the parallax ClientHello bytes are the
-//! exact ones produced on a real TLS handshake, not a synthetic snapshot.
+//! These tests drive the stateful rustls backend directly so the ParallaX
+//! ClientHello bytes are the exact ones produced by the maintained TLS
+//! camouflage path, not a synthetic snapshot.
 
 use parallax::{
     crypto::session::X25519KeyPair,
@@ -365,11 +365,10 @@ fn assert_parallax_matches_safari(safari: &ClientHelloFields, parallax: &ClientH
 }
 
 /// Drive rustls just far enough to materialise the ClientHello bytes. We
-/// deliberately do not run a full handshake here: the integration tests in
-/// `chrome_parity_baseline.rs` that do drive a loopback handshake are all
-/// `#[ignore]` because `StatefulRustlsSession::complete` also writes the
-/// HTTP/2 connection preface, which requires a real h2 peer. For fingerprint
-/// regression we only need the wire-level ClientHello.
+/// deliberately do not run a full handshake here because
+/// `StatefulRustlsSession::complete` also writes the HTTP/2 connection
+/// preface, which requires a real h2 peer. For fingerprint regression we only
+/// need the wire-level ClientHello.
 fn generate_parallax_safari_client_hello() -> Vec<u8> {
     let server = X25519KeyPair::generate();
     let psk = b"0123456789abcdef0123456789abcdef";

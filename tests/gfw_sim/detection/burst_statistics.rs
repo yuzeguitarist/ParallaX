@@ -235,8 +235,8 @@ pub const PROXY_CENTROIDS: &[ProxyCentroid] = &[
         variance: [10_000.0, 2500.0, 9_000_000.0, 200.0, 4900.0],
     },
     // ParallaX-specific centroid driven by the PqRekey + ServerIdentity records
-    // (1.6 KB + 4.6 KB) sitting just after the TLS handshake. Captured from the
-    // `chrome_parity_baseline` test fixtures and refined in the analysis report.
+    // (1.6 KB + 4.6 KB) sitting just after the TLS handshake. Captured from
+    // historical parity fixtures and refined in the analysis report.
     ProxyCentroid {
         label: "parallax-pqrekey",
         mean: [3000.0, 1400.0, 6500.0, 2.0, 4700.0],
