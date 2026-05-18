@@ -318,12 +318,11 @@ fn compute_tag(
     session_id_range: &std::ops::Range<usize>,
     psk: &[u8],
 ) -> Result<[u8; AUTH_TAG_LEN], AuthError> {
-    let mut signed = record[..record_len].to_vec();
-    signed[session_id_range.start..session_id_range.start + AUTH_TAG_LEN].fill(0);
-
     let mut mac = <HmacSha256 as Mac>::new_from_slice(psk).map_err(|_| AuthError::EmptyPsk)?;
     mac.update(b"ParallaX v2 transcript ClientHello auth");
-    mac.update(&signed[crate::tls::record::TLS_HEADER_LEN..record_len]);
+    mac.update(&record[crate::tls::record::TLS_HEADER_LEN..session_id_range.start]);
+    mac.update(&[0_u8; AUTH_TAG_LEN]);
+    mac.update(&record[session_id_range.start + AUTH_TAG_LEN..record_len]);
     let digest = mac.finalize().into_bytes();
 
     let mut tag = [0_u8; AUTH_TAG_LEN];

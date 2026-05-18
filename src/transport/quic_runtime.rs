@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
-    io::{copy, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::timeout,
 };
@@ -63,6 +63,7 @@ const QUIC_FLOW_WINDOW: u32 = 16 * 1024 * 1024;
 const QUIC_BRUTAL_LIKE_INITIAL_WINDOW_PACKETS: u64 = 96;
 const QUIC_KEEP_ALIVE_SECS: u64 = 15;
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(8);
+const QUIC_RELAY_BUFFER_LEN: usize = 64 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 type SharedPsk = Arc<Zeroizing<Vec<u8>>>;
@@ -278,7 +279,7 @@ async fn handle_stream(
 
     let (mut target_read, mut target_write) = target.into_split();
     let upload = async {
-        copy(&mut recv, &mut target_write)
+        copy_relay(&mut recv, &mut target_write)
             .await
             .map_err(QuicRuntimeError::Io)?;
         target_write
@@ -288,7 +289,7 @@ async fn handle_stream(
         Ok::<(), QuicRuntimeError>(())
     };
     let download = async {
-        copy(&mut target_read, &mut send).await?;
+        copy_relay(&mut target_read, &mut send).await?;
         send.finish()?;
         Ok::<(), QuicRuntimeError>(())
     };
@@ -323,12 +324,12 @@ async fn handle_local_connection(
 
     let (mut local_read, mut local_write) = local.into_split();
     let upload = async {
-        copy(&mut local_read, &mut send).await?;
+        copy_relay(&mut local_read, &mut send).await?;
         send.finish()?;
         Ok::<(), QuicRuntimeError>(())
     };
     let download = async {
-        copy(&mut recv, &mut local_write)
+        copy_relay(&mut recv, &mut local_write)
             .await
             .map_err(QuicRuntimeError::Io)?;
         local_write.shutdown().await.map_err(QuicRuntimeError::Io)?;
@@ -396,6 +397,7 @@ async fn write_server_identity_frame(
 
 async fn write_stream_open_preamble(send: &mut quinn::SendStream) -> Result<(), QuicRuntimeError> {
     send.write_all(QUIC_STREAM_OPEN_PREAMBLE).await?;
+    send.flush().await?;
     Ok(())
 }
 
@@ -467,6 +469,7 @@ async fn write_identity_len_prefixed(
     send.write_all(&(payload.len() as u16).to_be_bytes())
         .await?;
     send.write_all(payload).await?;
+    send.flush().await?;
     Ok(())
 }
 
@@ -495,7 +498,25 @@ async fn write_len_prefixed(
     send.write_all(&(payload.len() as u16).to_be_bytes())
         .await?;
     send.write_all(payload).await?;
+    send.flush().await?;
     Ok(())
+}
+
+async fn copy_relay<R, W>(reader: &mut R, writer: &mut W) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0_u8; QUIC_RELAY_BUFFER_LEN];
+    let mut written = 0_u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(written);
+        }
+        writer.write_all(&buf[..n]).await?;
+        written += n as u64;
+    }
 }
 
 async fn read_len_prefixed(
@@ -551,8 +572,14 @@ fn verify_auth_frame(
     authorized_sni: &[String],
 ) -> Result<(ReplayEntry, u64), QuicRuntimeError> {
     let parsed = parse_auth_frame(auth_frame)?;
-    let auth_key = derive_quic_auth_key(connection, psk, &parsed.sni, connect_payload)?;
-    verified_auth_replay_entry(auth_frame, &auth_key, connect_payload, authorized_sni)
+    let auth_key = derive_quic_auth_key(connection, psk, parsed.sni, connect_payload)?;
+    verified_auth_replay_entry(
+        auth_frame,
+        &parsed,
+        &auth_key,
+        connect_payload,
+        authorized_sni,
+    )
 }
 
 #[cfg(test)]
@@ -563,8 +590,14 @@ fn verify_auth_frame_with_key(
     authorized_sni: &[String],
     replay_cache: &Mutex<ReplayCache>,
 ) -> Result<(), QuicRuntimeError> {
-    let (replay_entry, now) =
-        verified_auth_replay_entry(auth_frame, auth_key, connect_payload, authorized_sni)?;
+    let parsed = parse_auth_frame(auth_frame)?;
+    let (replay_entry, now) = verified_auth_replay_entry(
+        auth_frame,
+        &parsed,
+        auth_key,
+        connect_payload,
+        authorized_sni,
+    )?;
     if !replay_cache
         .lock()
         .expect("QUIC replay cache poisoned")
@@ -578,16 +611,16 @@ fn verify_auth_frame_with_key(
 
 fn verified_auth_replay_entry(
     auth_frame: &[u8],
+    parsed: &ParsedQuicAuth<'_>,
     auth_key: &[u8; 32],
     connect_payload: &[u8],
     authorized_sni: &[String],
 ) -> Result<(ReplayEntry, u64), QuicRuntimeError> {
-    let parsed = parse_auth_frame(auth_frame)?;
     if !authorized_sni
         .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(&parsed.sni))
+        .any(|candidate| candidate.eq_ignore_ascii_case(parsed.sni))
     {
-        return Err(QuicRuntimeError::AuthSniNotAllowed(parsed.sni));
+        return Err(QuicRuntimeError::AuthSniNotAllowed(parsed.sni.to_owned()));
     }
 
     let now = unix_time_secs()?;
@@ -600,7 +633,7 @@ fn verified_auth_replay_entry(
         auth_key,
         parsed.unix_time,
         &parsed.nonce,
-        &parsed.sni,
+        parsed.sni,
         connect_payload,
     );
     if !bool::from(expected.ct_eq(&parsed.tag)) {
@@ -682,7 +715,7 @@ fn quic_auth_exporter_context(sni: &str, connect_payload: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-fn parse_auth_frame(input: &[u8]) -> Result<ParsedQuicAuth, QuicRuntimeError> {
+fn parse_auth_frame(input: &[u8]) -> Result<ParsedQuicAuth<'_>, QuicRuntimeError> {
     let min_len = 4 + 8 + QUIC_AUTH_NONCE_LEN + 2 + QUIC_AUTH_TAG_LEN;
     if input.len() < min_len {
         return Err(QuicRuntimeError::AuthFrameTruncated);
@@ -708,8 +741,7 @@ fn parse_auth_frame(input: &[u8]) -> Result<ParsedQuicAuth, QuicRuntimeError> {
     }
 
     let sni = std::str::from_utf8(&input[sni_start..sni_end])
-        .map_err(|_| QuicRuntimeError::AuthFrameTruncated)?
-        .to_owned();
+        .map_err(|_| QuicRuntimeError::AuthFrameTruncated)?;
     let mut tag = [0_u8; QUIC_AUTH_TAG_LEN];
     tag.copy_from_slice(&input[sni_end..tag_end]);
 
@@ -746,10 +778,10 @@ fn unix_time_secs() -> Result<u64, QuicRuntimeError> {
         .as_secs())
 }
 
-struct ParsedQuicAuth {
+struct ParsedQuicAuth<'a> {
     unix_time: u64,
     nonce: [u8; QUIC_AUTH_NONCE_LEN],
-    sni: String,
+    sni: &'a str,
     tag: [u8; QUIC_AUTH_TAG_LEN],
 }
 
