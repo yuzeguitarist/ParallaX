@@ -187,14 +187,21 @@ impl ConnectRequest {
 
 impl PqRekeyRequest {
     pub fn encode(&self) -> Result<Vec<u8>, PqRekeyError> {
-        if self.client_mlkem_public_key.is_empty() {
+        Self::encode_borrowed(&self.client_x25519_public, &self.client_mlkem_public_key)
+    }
+
+    pub(crate) fn encode_borrowed(
+        client_x25519_public: &[u8; 32],
+        client_mlkem_public_key: &[u8],
+    ) -> Result<Vec<u8>, PqRekeyError> {
+        if client_mlkem_public_key.is_empty() {
             return Err(PqRekeyError::EmptyPublicKey);
         }
-        let mut out = Vec::with_capacity(40 + self.client_mlkem_public_key.len());
+        let mut out = Vec::with_capacity(40 + client_mlkem_public_key.len());
         out.extend_from_slice(PQ_REKEY_MAGIC);
-        out.extend_from_slice(&self.client_x25519_public);
-        out.extend_from_slice(&(self.client_mlkem_public_key.len() as u32).to_be_bytes());
-        out.extend_from_slice(&self.client_mlkem_public_key);
+        out.extend_from_slice(client_x25519_public);
+        out.extend_from_slice(&(client_mlkem_public_key.len() as u32).to_be_bytes());
+        out.extend_from_slice(client_mlkem_public_key);
         Ok(out)
     }
 
@@ -521,6 +528,23 @@ mod tests {
         };
         let encoded = request.encode().unwrap();
         assert_eq!(PqRekeyRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn pq_rekey_borrowed_encode_matches_owned_request() {
+        let request = PqRekeyRequest {
+            client_x25519_public: [9_u8; 32],
+            client_mlkem_public_key: vec![1, 2, 3],
+        };
+
+        assert_eq!(
+            PqRekeyRequest::encode_borrowed(
+                &request.client_x25519_public,
+                &request.client_mlkem_public_key
+            )
+            .unwrap(),
+            request.encode().unwrap()
+        );
     }
 
     #[test]

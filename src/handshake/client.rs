@@ -123,11 +123,8 @@ impl ClientDataSession {
     {
         let x25519 = X25519KeyPair::generate();
         let mlkem = pq::keypair();
-        let request = PqRekeyRequest {
-            client_x25519_public: x25519.public,
-            client_mlkem_public_key: mlkem.public.clone(),
-        };
-        let record = self.seal_to_server.seal(&request.encode()?, rng)?;
+        let request = PqRekeyRequest::encode_borrowed(&x25519.public, &mlkem.public)?;
+        let record = self.seal_to_server.seal(&request, rng)?;
         Ok((record, PendingPqRekey { x25519, mlkem }))
     }
 
