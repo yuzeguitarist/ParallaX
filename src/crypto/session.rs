@@ -22,6 +22,7 @@ const RECORD_RATCHET_INIT_LABEL: &[u8] = b"ParallaX v2 record ratchet init";
 const RECORD_RATCHET_KEY_LABEL: &[u8] = b"ParallaX v2 record ratchet key";
 const RECORD_RATCHET_NONCE_LABEL: &[u8] = b"ParallaX v2 record ratchet nonce";
 const RECORD_RATCHET_ADVANCE_LABEL: &[u8] = b"ParallaX v2 record ratchet advance";
+const HKDF_INFO_STACK_LEN: usize = 128;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct X25519KeyPair {
@@ -201,14 +202,41 @@ fn expand(
     transcript_hash: &[u8; KEY_LEN],
     out: &mut [u8],
 ) -> Result<(), SessionError> {
-    let epoch = epoch.to_be_bytes();
-    let mut info = Vec::with_capacity(2 + label.len() + epoch.len() + 2 + transcript_hash.len());
-    info.extend_from_slice(&(label.len() as u16).to_be_bytes());
-    info.extend_from_slice(label);
-    info.extend_from_slice(&epoch);
-    info.extend_from_slice(&(transcript_hash.len() as u16).to_be_bytes());
-    info.extend_from_slice(transcript_hash);
-    hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
+    let info_len = 2 + label.len() + 8 + 2 + transcript_hash.len();
+    if info_len <= HKDF_INFO_STACK_LEN {
+        let mut info = [0_u8; HKDF_INFO_STACK_LEN];
+        let used = write_epoch_hkdf_info(&mut info, label, epoch, transcript_hash);
+        hk.expand(&info[..used], out)
+            .map_err(|_| SessionError::Hkdf)
+    } else {
+        let epoch = epoch.to_be_bytes();
+        let mut info = Vec::with_capacity(info_len);
+        info.extend_from_slice(&(label.len() as u16).to_be_bytes());
+        info.extend_from_slice(label);
+        info.extend_from_slice(&epoch);
+        info.extend_from_slice(&(transcript_hash.len() as u16).to_be_bytes());
+        info.extend_from_slice(transcript_hash);
+        hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
+    }
+}
+
+fn write_epoch_hkdf_info(
+    out: &mut [u8; HKDF_INFO_STACK_LEN],
+    label: &[u8],
+    epoch: u64,
+    transcript_hash: &[u8; KEY_LEN],
+) -> usize {
+    let mut offset = 0;
+    write_bytes(out, &mut offset, &(label.len() as u16).to_be_bytes());
+    write_bytes(out, &mut offset, label);
+    write_bytes(out, &mut offset, &epoch.to_be_bytes());
+    write_bytes(
+        out,
+        &mut offset,
+        &(transcript_hash.len() as u16).to_be_bytes(),
+    );
+    write_bytes(out, &mut offset, transcript_hash);
+    offset
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -398,13 +426,42 @@ fn expand_record_secret(
     aad: &[u8],
     out: &mut [u8],
 ) -> Result<(), SessionError> {
-    let mut info = Vec::with_capacity(2 + label.len() + 8 + 8 + aad.len());
-    info.extend_from_slice(&(label.len() as u16).to_be_bytes());
-    info.extend_from_slice(label);
-    info.extend_from_slice(&sequence.to_be_bytes());
-    info.extend_from_slice(&(aad.len() as u64).to_be_bytes());
-    info.extend_from_slice(aad);
-    hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
+    let info_len = 2 + label.len() + 8 + 8 + aad.len();
+    if info_len <= HKDF_INFO_STACK_LEN {
+        let mut info = [0_u8; HKDF_INFO_STACK_LEN];
+        let used = write_record_hkdf_info(&mut info, label, sequence, aad);
+        hk.expand(&info[..used], out)
+            .map_err(|_| SessionError::Hkdf)
+    } else {
+        let mut info = Vec::with_capacity(info_len);
+        info.extend_from_slice(&(label.len() as u16).to_be_bytes());
+        info.extend_from_slice(label);
+        info.extend_from_slice(&sequence.to_be_bytes());
+        info.extend_from_slice(&(aad.len() as u64).to_be_bytes());
+        info.extend_from_slice(aad);
+        hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
+    }
+}
+
+fn write_record_hkdf_info(
+    out: &mut [u8; HKDF_INFO_STACK_LEN],
+    label: &[u8],
+    sequence: u64,
+    aad: &[u8],
+) -> usize {
+    let mut offset = 0;
+    write_bytes(out, &mut offset, &(label.len() as u16).to_be_bytes());
+    write_bytes(out, &mut offset, label);
+    write_bytes(out, &mut offset, &sequence.to_be_bytes());
+    write_bytes(out, &mut offset, &(aad.len() as u64).to_be_bytes());
+    write_bytes(out, &mut offset, aad);
+    offset
+}
+
+fn write_bytes(out: &mut [u8; HKDF_INFO_STACK_LEN], offset: &mut usize, bytes: &[u8]) {
+    let end = *offset + bytes.len();
+    out[*offset..end].copy_from_slice(bytes);
+    *offset = end;
 }
 
 #[cfg(test)]
