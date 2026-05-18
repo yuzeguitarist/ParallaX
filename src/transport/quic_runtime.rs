@@ -50,6 +50,7 @@ const QUIC_AUTH_LABEL: &[u8] = b"ParallaX v1 QUIC stream auth";
 const QUIC_AUTH_EXPORTER_LABEL: &[u8] = b"ParallaX v1 QUIC TLS exporter auth binding";
 const QUIC_AUTH_KEY_LABEL: &[u8] = b"ParallaX v2 QUIC stream auth key";
 const QUIC_AUTH_CONTEXT_LABEL: &[u8] = b"ParallaX v2 QUIC auth context";
+const QUIC_STREAM_AUTH_CONTEXT_PAYLOAD: &[u8] = b"";
 const QUIC_SERVER_IDENTITY_EXPORTER_LABEL: &[u8] = b"ParallaX v1 QUIC TLS exporter server identity";
 const QUIC_SERVER_IDENTITY_CONTEXT: &[u8] = b"ParallaX v1 QUIC server identity context";
 const QUIC_AUTH_NONCE_LEN: usize = 16;
@@ -248,22 +249,22 @@ async fn handle_stream(
     let auth_frame = timeout(QUIC_AUTH_TIMEOUT, read_auth_frame(&mut recv))
         .await
         .map_err(|_| QuicRuntimeError::AuthTimeout)??;
+    let (replay_entry, replay_now) = verify_auth_frame(
+        &auth_frame,
+        &connection,
+        &psk,
+        QUIC_STREAM_AUTH_CONTEXT_PAYLOAD,
+        &server.authorized_sni,
+    )?;
+    insert_quic_replay_entry_blocking(replay_cache, replay_entry, replay_now).await?;
+    write_server_identity_frame(&mut send, &connection, &server).await?;
     let connect_payload = timeout(
         QUIC_AUTH_TIMEOUT,
         read_len_prefixed(&mut recv, MAX_CONNECT_FRAME_LEN),
     )
     .await
     .map_err(|_| QuicRuntimeError::AuthTimeout)??;
-    let (replay_entry, replay_now) = verify_auth_frame(
-        &auth_frame,
-        &connection,
-        &psk,
-        &connect_payload,
-        &server.authorized_sni,
-    )?;
-    insert_quic_replay_entry_blocking(replay_cache, replay_entry, replay_now).await?;
     let request = ConnectRequest::decode(&connect_payload)?;
-    write_server_identity_frame(&mut send, &connection, &server).await?;
     let target_addr = server
         .data_target
         .clone()
@@ -310,14 +311,14 @@ async fn handle_local_connection(
     let connection = connect_with_0rtt(&endpoint, server_addr, &client.sni).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     write_stream_open_preamble(&mut send).await?;
+    write_quic_auth_frame(&mut send, &connection, &psk, &client.sni).await?;
     let connect = ConnectRequest {
         host: request.host,
         port: request.port,
         initial_payload,
     };
-    write_authenticated_connect_request(&mut send, &connection, &psk, &client.sni, &connect)
-        .await?;
     read_and_verify_server_identity_frame(&mut recv, &connection, &client).await?;
+    write_connect_request(&mut send, &connect).await?;
 
     let (mut local_read, mut local_write) = local.into_split();
     let upload = async {
@@ -354,20 +355,26 @@ async fn connect_with_0rtt(
     }
 }
 
-async fn write_authenticated_connect_request(
+async fn write_quic_auth_frame(
     send: &mut quinn::SendStream,
     connection: &quinn::Connection,
     psk: &[u8],
     sni: &str,
+) -> Result<(), QuicRuntimeError> {
+    let auth_key = derive_quic_auth_key(connection, psk, sni, QUIC_STREAM_AUTH_CONTEXT_PAYLOAD)?;
+    let auth = build_auth_frame(&auth_key, sni, QUIC_STREAM_AUTH_CONTEXT_PAYLOAD)?;
+    write_len_prefixed(send, &auth, MAX_AUTH_FRAME_LEN).await?;
+    Ok(())
+}
+
+async fn write_connect_request(
+    send: &mut quinn::SendStream,
     request: &ConnectRequest,
 ) -> Result<(), QuicRuntimeError> {
     let connect_payload = request.encode()?;
     if connect_payload.len() > MAX_CONNECT_FRAME_LEN {
         return Err(QuicRuntimeError::ConnectFrameTooLarge);
     }
-    let auth_key = derive_quic_auth_key(connection, psk, sni, &connect_payload)?;
-    let auth = build_auth_frame(&auth_key, sni, &connect_payload)?;
-    write_len_prefixed(send, &auth, MAX_AUTH_FRAME_LEN).await?;
     write_len_prefixed(send, &connect_payload, MAX_CONNECT_FRAME_LEN).await?;
     Ok(())
 }
@@ -1010,6 +1017,71 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires UDP loopback sockets"]
+    async fn quic_server_identity_waits_for_authenticated_stream() {
+        let server_identity = identity::keypair();
+        let server = ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            fallback_addr: "example.com:443".to_owned(),
+            data_target: None,
+            private_key: STANDARD.encode(KEY32),
+            pq_secret_key: STANDARD.encode(KEY32),
+            identity_secret_key: STANDARD.encode(&server_identity.secret),
+            replay_cache_path: "parallax-test.cache".into(),
+            authorized_sni: vec!["example.com".to_owned()],
+            strict_tls13: true,
+        };
+        let endpoint = Endpoint::server(server_config(&server).unwrap(), server.listen).unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let (send, recv) = connection.accept_bi().await.unwrap();
+            let err = handle_stream(
+                send,
+                recv,
+                connection,
+                server,
+                Arc::new(Zeroizing::new(b"0123456789abcdef0123456789abcdef".to_vec())),
+                Arc::new(Mutex::new(ReplayCache::new(8))),
+            )
+            .await
+            .expect_err("unauthenticated stream must not complete");
+            assert!(matches!(
+                err,
+                QuicRuntimeError::ReadExact(_)
+                    | QuicRuntimeError::Read(_)
+                    | QuicRuntimeError::Connection(_)
+                    | QuicRuntimeError::AuthTimeout
+            ));
+        });
+
+        let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_config().unwrap());
+        let connection = client_endpoint
+            .connect(server_addr, "example.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_stream_open_preamble(&mut send).await.unwrap();
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                read_identity_len_prefixed(&mut recv)
+            )
+            .await
+            .is_err(),
+            "server identity must not be sent before a valid QUIC auth frame"
+        );
+
+        send.finish().unwrap();
+        drop(recv);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires UDP and TCP loopback sockets"]
     async fn quic_stream_reaches_tcp_target() {
         let server_identity = identity::keypair();
@@ -1062,16 +1134,11 @@ mod tests {
             .unwrap();
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
         write_stream_open_preamble(&mut send).await.unwrap();
-        write_authenticated_connect_request(
+        write_quic_auth_frame(
             &mut send,
             &connection,
             b"0123456789abcdef0123456789abcdef",
             "example.com",
-            &ConnectRequest {
-                host: target_addr.ip().to_string(),
-                port: target_addr.port(),
-                initial_payload: b"ping".to_vec(),
-            },
         )
         .await
         .unwrap();
@@ -1086,6 +1153,16 @@ mod tests {
                 server_pq_public_key: String::new(),
                 server_identity_public_key: STANDARD.encode(&server_identity.public),
                 tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
+            },
+        )
+        .await
+        .unwrap();
+        write_connect_request(
+            &mut send,
+            &ConnectRequest {
+                host: target_addr.ip().to_string(),
+                port: target_addr.port(),
+                initial_payload: b"ping".to_vec(),
             },
         )
         .await

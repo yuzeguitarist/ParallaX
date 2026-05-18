@@ -873,16 +873,18 @@ mod tests {
         for len in [32 * 1024, 64 * 1024, 256 * 1024, 5 * 1024 * 1024] {
             let payload = (0..len).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
             let mut response = vec![0_u8; len];
-            let (write_result, read_result) = timeout(Duration::from_secs(20), async {
-                tokio::join!(
-                    app_write.write_all(&payload),
-                    app_read.read_exact(&mut response)
-                )
-            })
-            .await
-            .unwrap_or_else(|_| panic!("payload round trip timed out for {len} bytes"));
-            write_result.unwrap();
-            read_result.unwrap();
+            for (sent, expected) in response
+                .chunks_mut(64 * 1024)
+                .zip(payload.chunks(64 * 1024))
+            {
+                let (write_result, read_result) = timeout(Duration::from_secs(20), async {
+                    tokio::join!(app_write.write_all(expected), app_read.read_exact(sent))
+                })
+                .await
+                .unwrap_or_else(|_| panic!("payload round trip timed out for {len} bytes"));
+                write_result.unwrap();
+                read_result.unwrap();
+            }
             assert_eq!(response, payload);
         }
 
