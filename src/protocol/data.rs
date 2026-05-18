@@ -130,7 +130,35 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
-        self.seal_chunks_into_reusing_maybe_tracked(payload, rng, out, Some(records))
+        records.clear();
+        let max_chunk_len = self.max_plaintext_len();
+        if max_chunk_len == 0 {
+            return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
+        }
+        let chunk_count = chunk_count(payload.len(), max_chunk_len);
+        records.reserve(chunk_count);
+        out.reserve(chunked_records_capacity(
+            payload.len(),
+            chunk_count,
+            self.padding.max_len(),
+        ));
+        if payload.is_empty() {
+            let range = self.seal_into_reserved(payload, rng, out, false)?;
+            records.push(SealedRecord {
+                range,
+                plaintext_len: 0,
+            });
+            return Ok(());
+        }
+
+        for chunk in payload.chunks(max_chunk_len) {
+            let range = self.seal_into_reserved(chunk, rng, out, false)?;
+            records.push(SealedRecord {
+                range,
+                plaintext_len: chunk.len(),
+            });
+        }
+        Ok(())
     }
 
     pub fn seal_chunks_into_untracked<R>(
@@ -142,54 +170,23 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
-        self.seal_chunks_into_reusing_maybe_tracked(payload, rng, out, None)
-    }
-
-    fn seal_chunks_into_reusing_maybe_tracked<R>(
-        &mut self,
-        payload: &[u8],
-        rng: &mut R,
-        out: &mut Vec<u8>,
-        mut records: Option<&mut Vec<SealedRecord>>,
-    ) -> Result<(), DataRecordError>
-    where
-        R: rand::Rng + rand::RngCore + ?Sized,
-    {
-        if let Some(records) = records.as_mut() {
-            records.clear();
-        }
         let max_chunk_len = self.max_plaintext_len();
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
         let chunk_count = chunk_count(payload.len(), max_chunk_len);
-        if let Some(records) = records.as_mut() {
-            records.reserve(chunk_count);
-        }
         out.reserve(chunked_records_capacity(
             payload.len(),
             chunk_count,
             self.padding.max_len(),
         ));
         if payload.is_empty() {
-            let range = self.seal_into_reserved(payload, rng, out, false)?;
-            if let Some(records) = records.as_mut() {
-                records.push(SealedRecord {
-                    range,
-                    plaintext_len: 0,
-                });
-            }
+            self.seal_into_reserved(payload, rng, out, false)?;
             return Ok(());
         }
 
         for chunk in payload.chunks(max_chunk_len) {
-            let range = self.seal_into_reserved(chunk, rng, out, false)?;
-            if let Some(records) = records.as_mut() {
-                records.push(SealedRecord {
-                    range,
-                    plaintext_len: chunk.len(),
-                });
-            }
+            self.seal_into_reserved(chunk, rng, out, false)?;
         }
         Ok(())
     }

@@ -334,6 +334,7 @@ const CASES: &[CaseRunner] = &[
     bench_client_pq_rekey_record,
     bench_client_connect_record_1k,
     bench_connect_request_decode_1k_owned,
+    bench_connect_request_decode_1k_borrowed,
     bench_client_identity_chunks_decode,
     bench_client_identity_proof_extract,
     bench_quic_server_identity_build_decode_each_time,
@@ -717,6 +718,28 @@ fn bench_connect_request_decode_1k_owned(options: BenchmarkOptions) -> Result<Be
         options,
         || {
             let decoded = ConnectRequest::decode(black_box(encoded.as_slice()))?;
+            Ok(black_box(
+                (decoded.host.len() + decoded.initial_payload.len()) as u64,
+            ))
+        },
+    )
+}
+
+fn bench_connect_request_decode_1k_borrowed(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let request = ConnectRequest {
+        host: BENCH_SNI.to_owned(),
+        port: 443,
+        initial_payload: vec![0x42_u8; SIZE_1K],
+    };
+    let encoded = request.encode()?;
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "connect_request.decode_1k_borrowed",
+        TIER_FAST,
+        options,
+        || {
+            let decoded = ConnectRequest::decode_ref(black_box(encoded.as_slice()))?;
             Ok(black_box(
                 (decoded.host.len() + decoded.initial_payload.len()) as u64,
             ))

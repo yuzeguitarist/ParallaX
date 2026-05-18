@@ -636,9 +636,11 @@ async fn run_authenticated_data_mode(
                         }
 
                         drop(fallback_write);
-                        let record = client_records.read_record().await?;
+                        let mut record = client_records.read_record().await?;
                         log_record_read(cid, "client->server", "server-connect-reader", &record);
-                        let first_payload = client_open.open_owned(record)?;
+                        let first_payload_range =
+                            client_open.open_in_place_payload_range(&mut record)?;
+                        let first_payload = &record[first_payload_range];
                         tracing::debug!(cid, "ParallaX data mode switch confirmed");
 
                         let (target_addr, initial_payload) =
@@ -646,7 +648,7 @@ async fn run_authenticated_data_mode(
                         let mut target = TcpStream::connect(target_addr).await?;
                         tune_tcp_stream(&target)?;
                         if !initial_payload.is_empty() {
-                            target.write_all(&initial_payload).await?;
+                            target.write_all(initial_payload).await?;
                         }
                         let (target_read, target_write) = target.into_split();
                         return DataRelay {
@@ -695,11 +697,11 @@ async fn run_authenticated_data_mode(
     }
 }
 
-fn resolve_connect_target(
-    first_payload: Vec<u8>,
+fn resolve_connect_target<'a>(
+    first_payload: &'a [u8],
     fixed_data_target: Option<&str>,
-) -> Result<(String, Vec<u8>), HandshakeServerError> {
-    match ConnectRequest::decode(&first_payload) {
+) -> Result<(String, &'a [u8]), HandshakeServerError> {
+    match ConnectRequest::decode_ref(first_payload) {
         Ok(request) => {
             let target = fixed_data_target
                 .map(str::to_owned)
@@ -1167,8 +1169,8 @@ mod tests {
             initial_payload: b"hello".to_vec(),
         };
 
-        let (target, initial_payload) =
-            resolve_connect_target(request.encode().unwrap(), None).unwrap();
+        let encoded = request.encode().unwrap();
+        let (target, initial_payload) = resolve_connect_target(&encoded, None).unwrap();
 
         assert_eq!(target, "[2001:db8::1]:443");
         assert_eq!(initial_payload, b"hello");
@@ -1182,8 +1184,9 @@ mod tests {
             initial_payload: b"hello".to_vec(),
         };
 
+        let encoded = request.encode().unwrap();
         let (target, initial_payload) =
-            resolve_connect_target(request.encode().unwrap(), Some("target.example:443")).unwrap();
+            resolve_connect_target(&encoded, Some("target.example:443")).unwrap();
 
         assert_eq!(target, "target.example:443");
         assert_eq!(initial_payload, b"hello");
@@ -1191,11 +1194,8 @@ mod tests {
 
     #[test]
     fn resolve_connect_target_uses_fixed_target_for_raw_payload() {
-        let (target, initial_payload) = resolve_connect_target(
-            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
-            Some("target.example:443"),
-        )
-        .unwrap();
+        let (target, initial_payload) =
+            resolve_connect_target(b"GET / HTTP/1.1\r\n\r\n", Some("target.example:443")).unwrap();
 
         assert_eq!(target, "target.example:443");
         assert_eq!(initial_payload, b"GET / HTTP/1.1\r\n\r\n");
@@ -1204,7 +1204,7 @@ mod tests {
     #[test]
     fn resolve_connect_target_requires_fixed_target_for_raw_payload() {
         assert!(matches!(
-            resolve_connect_target(b"raw".to_vec(), None).unwrap_err(),
+            resolve_connect_target(b"raw", None).unwrap_err(),
             HandshakeServerError::MissingConnectTarget
         ));
     }
@@ -1216,7 +1216,7 @@ mod tests {
         encoded.extend_from_slice(&0_u16.to_be_bytes());
 
         assert!(matches!(
-            resolve_connect_target(encoded, Some("target.example:443")).unwrap_err(),
+            resolve_connect_target(&encoded, Some("target.example:443")).unwrap_err(),
             HandshakeServerError::ConnectRequest(ConnectRequestError::EmptyHost)
         ));
     }
