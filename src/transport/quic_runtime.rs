@@ -365,8 +365,7 @@ async fn handle_local_connection(
         initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
     let connection = connect_with_0rtt(&endpoint, server_addr, client.sni.as_ref()).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    write_stream_open_preamble(&mut send).await?;
-    write_quic_auth_frame(&mut send, &connection, &psk, client.sni.as_ref()).await?;
+    write_stream_open_and_auth_frame(&mut send, &connection, &psk, client.sni.as_ref()).await?;
     let connect = ConnectRequest {
         host: request.host,
         port: request.port,
@@ -410,6 +409,7 @@ async fn connect_with_0rtt(
     }
 }
 
+#[cfg(test)]
 async fn write_quic_auth_frame(
     send: &mut quinn::SendStream,
     connection: &quinn::Connection,
@@ -419,6 +419,22 @@ async fn write_quic_auth_frame(
     let auth_key = derive_quic_auth_key(connection, psk, sni, QUIC_STREAM_AUTH_CONTEXT_PAYLOAD)?;
     let auth = build_auth_frame(&auth_key, sni, QUIC_STREAM_AUTH_CONTEXT_PAYLOAD)?;
     write_len_prefixed(send, &auth, MAX_AUTH_FRAME_LEN).await?;
+    Ok(())
+}
+
+async fn write_stream_open_and_auth_frame(
+    send: &mut quinn::SendStream,
+    connection: &quinn::Connection,
+    psk: &[u8],
+    sni: &str,
+) -> Result<(), QuicRuntimeError> {
+    let auth_key = derive_quic_auth_key(connection, psk, sni, QUIC_STREAM_AUTH_CONTEXT_PAYLOAD)?;
+    let auth = build_auth_frame(&auth_key, sni, QUIC_STREAM_AUTH_CONTEXT_PAYLOAD)?;
+    let mut frame = Vec::with_capacity(QUIC_STREAM_OPEN_PREAMBLE.len() + 2 + auth.len());
+    frame.extend_from_slice(QUIC_STREAM_OPEN_PREAMBLE);
+    extend_len_prefixed(&mut frame, &auth, MAX_AUTH_FRAME_LEN)?;
+    send.write_all(&frame).await?;
+    send.flush().await?;
     Ok(())
 }
 
@@ -448,6 +464,7 @@ async fn write_server_identity_frame(
     write_identity_len_prefixed(send, &frame).await
 }
 
+#[cfg(test)]
 async fn write_stream_open_preamble(send: &mut quinn::SendStream) -> Result<(), QuicRuntimeError> {
     send.write_all(QUIC_STREAM_OPEN_PREAMBLE).await?;
     send.flush().await?;
@@ -514,9 +531,10 @@ async fn write_identity_len_prefixed(
     {
         return Err(QuicRuntimeError::ServerIdentityFrameTooLarge);
     }
-    send.write_all(&(payload.len() as u16).to_be_bytes())
-        .await?;
-    send.write_all(payload).await?;
+    let mut frame = Vec::with_capacity(2 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    frame.extend_from_slice(payload);
+    send.write_all(&frame).await?;
     send.flush().await?;
     Ok(())
 }
@@ -540,13 +558,23 @@ async fn write_len_prefixed(
     payload: &[u8],
     max_len: usize,
 ) -> Result<(), QuicRuntimeError> {
+    let mut frame = Vec::with_capacity(2 + payload.len());
+    extend_len_prefixed(&mut frame, payload, max_len)?;
+    send.write_all(&frame).await?;
+    send.flush().await?;
+    Ok(())
+}
+
+fn extend_len_prefixed(
+    out: &mut Vec<u8>,
+    payload: &[u8],
+    max_len: usize,
+) -> Result<(), QuicRuntimeError> {
     if payload.is_empty() || payload.len() > max_len || payload.len() > u16::MAX as usize {
         return Err(QuicRuntimeError::InvalidConnectFrameLength);
     }
-    send.write_all(&(payload.len() as u16).to_be_bytes())
-        .await?;
-    send.write_all(payload).await?;
-    send.flush().await?;
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
     Ok(())
 }
 
