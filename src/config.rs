@@ -59,7 +59,7 @@ pub enum ConfigError {
     #[error("server.authorized_sni must not be empty")]
     EmptyAuthorizedSni,
     #[cfg(unix)]
-    #[error("server config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, current uid {euid}; expected owner=current user and no group/world permission bits")]
+    #[error("config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, current uid {euid}; expected owner=current user and no group/world permission bits")]
     InsecureConfigPermissions {
         path: PathBuf,
         mode: u32,
@@ -231,9 +231,6 @@ impl Config {
     }
 
     fn validate_file_permissions(&self, path: &Path) -> Result<(), ConfigError> {
-        if self.mode != Mode::Server {
-            return Ok(());
-        }
         validate_secret_config_file_permissions(path)
     }
 }
@@ -636,6 +633,43 @@ fallback_addr = "example.com:443"
 private_key = "{KEY}"
 identity_secret_key = "{identity_secret_key}"
 authorized_sni = ["example.com"]
+"#
+        );
+        fs::write(&path, raw).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::InsecureConfigPermissions { .. })
+        ));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        Config::load(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_config_load_enforces_secret_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.toml");
+        let server_pq_public_key = STANDARD.encode(vec![0_u8; mlkem1024::public_key_bytes()]);
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_pq_public_key = "{server_pq_public_key}"
+server_identity_public_key = "{server_identity_public_key}"
 "#
         );
         fs::write(&path, raw).unwrap();
