@@ -703,11 +703,11 @@ fn bench_client_identity_chunks_decode(options: BenchmarkOptions) -> Result<Benc
         || {
             let mut assembled = Vec::with_capacity(payload.len());
             for encoded in &chunks {
-                let chunk = ServerIdentityChunk::decode(encoded)?;
+                let chunk = ServerIdentityChunk::decode_ref(black_box(encoded.as_slice()))?;
                 if chunk.offset as usize != assembled.len() {
                     bail!("benchmark identity chunk offset mismatch");
                 }
-                assembled.extend_from_slice(&chunk.bytes);
+                assembled.extend_from_slice(chunk.bytes);
             }
             if assembled != payload {
                 bail!("benchmark identity chunk assembly mismatch");
@@ -725,8 +725,8 @@ fn bench_client_identity_proof_extract(options: BenchmarkOptions) -> Result<Benc
         TIER_FAST,
         options,
         || {
-            let proof = ServerIdentityProof::decode(&payload)?;
-            Ok(black_box(proof.signature.len() as u64))
+            let signature = ServerIdentityProof::signature(black_box(payload.as_slice()))?;
+            Ok(black_box(signature.len() as u64))
         },
     )
 }

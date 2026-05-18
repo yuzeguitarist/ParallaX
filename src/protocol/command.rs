@@ -57,6 +57,13 @@ pub struct ServerIdentityChunk {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerIdentityChunkRef<'a> {
+    pub total_len: u32,
+    pub offset: u32,
+    pub bytes: &'a [u8],
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PqRekeyError {
     #[error("PQ rekey request is truncated")]
@@ -283,6 +290,12 @@ impl ServerIdentityProof {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, ServerIdentityProofError> {
+        Ok(Self {
+            signature: Self::signature(input)?.to_vec(),
+        })
+    }
+
+    pub fn signature(input: &[u8]) -> Result<&[u8], ServerIdentityProofError> {
         if input.len() < 4 {
             return Err(ServerIdentityProofError::Truncated);
         }
@@ -299,9 +312,7 @@ impl ServerIdentityProof {
         if input.len() != 8 + len {
             return Err(ServerIdentityProofError::InvalidSignatureLength);
         }
-        Ok(Self {
-            signature: input[8..].to_vec(),
-        })
+        Ok(&input[8..])
     }
 }
 
@@ -328,6 +339,17 @@ impl ServerIdentityChunk {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, ServerIdentityChunkError> {
+        let chunk = Self::decode_ref(input)?;
+        Ok(Self {
+            total_len: chunk.total_len,
+            offset: chunk.offset,
+            bytes: chunk.bytes.to_vec(),
+        })
+    }
+
+    pub fn decode_ref(
+        input: &[u8],
+    ) -> Result<ServerIdentityChunkRef<'_>, ServerIdentityChunkError> {
         if input.len() < 4 {
             return Err(ServerIdentityChunkError::Truncated);
         }
@@ -352,10 +374,10 @@ impl ServerIdentityChunk {
         if total_len == 0 || end > total_len {
             return Err(ServerIdentityChunkError::InvalidOffset);
         }
-        Ok(Self {
+        Ok(ServerIdentityChunkRef {
             total_len,
             offset,
-            bytes: input[16..].to_vec(),
+            bytes: &input[16..],
         })
     }
 
@@ -563,6 +585,10 @@ mod tests {
             signature: vec![4, 5, 6],
         };
         let encoded = proof.encode().unwrap();
+        assert_eq!(
+            ServerIdentityProof::signature(&encoded).unwrap(),
+            proof.signature
+        );
         assert_eq!(ServerIdentityProof::decode(&encoded).unwrap(), proof);
     }
 
@@ -574,7 +600,9 @@ mod tests {
 
         let mut assembled = Vec::new();
         for chunk in encoded {
+            let chunk_ref = ServerIdentityChunk::decode_ref(&chunk).unwrap();
             let chunk = ServerIdentityChunk::decode(&chunk).unwrap();
+            assert_eq!(chunk_ref.bytes, chunk.bytes);
             assert_eq!(chunk.offset as usize, assembled.len());
             assembled.extend_from_slice(&chunk.bytes);
         }
