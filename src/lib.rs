@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod fingerprint;
 pub mod handshake;
 pub mod probe;
+pub mod process_hardening;
 pub mod protocol;
 pub mod tls;
 pub mod traffic;

@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use thiserror::Error;
+use zeroize::Zeroize;
 
 use crate::{
     crypto::session::{AeadCodec, SessionError, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN},
@@ -40,6 +41,10 @@ pub struct SealedRecord {
 impl DataRecordCodec {
     pub fn new(aead: AeadCodec, padding: PaddingProfile, aad: &'static [u8]) -> Self {
         Self { aead, padding, aad }
+    }
+
+    pub fn protect_secret_memory(&self) {
+        self.aead.protect_secret_memory();
     }
 
     pub fn seal<R>(&mut self, payload: &[u8], rng: &mut R) -> Result<Vec<u8>, DataRecordError>
@@ -93,9 +98,21 @@ impl DataRecordCodec {
             return Err(record::TlsRecordError::PayloadTooLarge(padded_len + AEAD_TAG_LEN).into());
         }
 
-        let tag = self
+        crate::process_hardening::exclude_from_core_dump(
+            "data_record.seal_plaintext",
+            &out[ciphertext_start..],
+        );
+        let tag = match self
             .aead
-            .seal_in_place_detached(&mut out[ciphertext_start..], self.aad)?;
+            .seal_in_place_detached(&mut out[ciphertext_start..], self.aad)
+        {
+            Ok(tag) => tag,
+            Err(err) => {
+                out[ciphertext_start..].zeroize();
+                out.truncate(record_start);
+                return Err(err.into());
+            }
+        };
         out.extend_from_slice(&tag);
 
         let tls_payload_len = out.len() - ciphertext_start;
@@ -161,7 +178,7 @@ impl DataRecordCodec {
         Ok(())
     }
 
-    pub fn seal_chunks_into_buffered<R>(
+    pub fn seal_chunks_into_untracked<R>(
         &mut self,
         payload: &[u8],
         rng: &mut R,
@@ -230,9 +247,18 @@ impl DataRecordCodec {
         let mut tag = [0_u8; AEAD_TAG_LEN];
         tag.copy_from_slice(&record[tag_start..header.total_len]);
         let mut padded = record[record::TLS_HEADER_LEN..tag_start].to_vec();
-        self.aead
-            .open_in_place_detached(&mut padded, &tag, self.aad)?;
-        PaddingProfile::remove_in_place(&mut padded)?;
+        crate::process_hardening::exclude_from_core_dump("data_record.open_plaintext", &padded);
+        if let Err(err) = self
+            .aead
+            .open_in_place_detached(&mut padded, &tag, self.aad)
+        {
+            padded.zeroize();
+            return Err(err.into());
+        }
+        if let Err(err) = PaddingProfile::remove_in_place(&mut padded) {
+            padded.zeroize();
+            return Err(err.into());
+        }
         Ok(padded)
     }
 
@@ -269,9 +295,21 @@ impl DataRecordCodec {
         let plaintext_len = {
             let payload = &mut record[ciphertext_start..header.total_len];
             let (ciphertext, tag) = payload.split_at_mut(tag_start - ciphertext_start);
-            self.aead
-                .open_in_place_detached(ciphertext, tag, self.aad)?;
-            PaddingProfile::unpadded_len(ciphertext)?
+            crate::process_hardening::exclude_from_core_dump(
+                "data_record.open_in_place_plaintext",
+                ciphertext,
+            );
+            if let Err(err) = self.aead.open_in_place_detached(ciphertext, tag, self.aad) {
+                ciphertext.zeroize();
+                return Err(err.into());
+            }
+            match PaddingProfile::unpadded_len(ciphertext) {
+                Ok(len) => len,
+                Err(err) => {
+                    ciphertext.zeroize();
+                    return Err(err.into());
+                }
+            }
         };
         let plaintext = ciphertext_start..ciphertext_start + plaintext_len;
         record.truncate(plaintext.end);
@@ -494,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn seal_chunks_into_buffered_skips_record_metadata() {
+    fn seal_chunks_into_untracked_batches_without_metadata() {
         let key = [1_u8; KEY_LEN];
         let nonce = [2_u8; NONCE_LEN];
         let padding = PaddingProfile::new(0, 0).unwrap();
@@ -508,11 +546,11 @@ mod tests {
             .collect::<Vec<_>>();
         let mut out = Vec::new();
 
-        enc.seal_chunks_into_buffered(&payload, &mut rng, &mut out)
+        enc.seal_chunks_into_untracked(&payload, &mut rng, &mut out)
             .unwrap();
 
-        let mut opened = Vec::with_capacity(payload.len());
         let mut offset = 0;
+        let mut opened = Vec::with_capacity(payload.len());
         while offset < out.len() {
             let header = record::parse_header(&out[offset..]).unwrap();
             let end = offset + header.total_len;

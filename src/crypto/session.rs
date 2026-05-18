@@ -89,6 +89,20 @@ impl fmt::Debug for SessionKeys {
     }
 }
 
+impl SessionKeys {
+    pub fn protect_secret_memory(&self) {
+        crate::process_hardening::protect_secret_bytes("session.client_key", &self.client_key);
+        crate::process_hardening::protect_secret_bytes("session.server_key", &self.server_key);
+        crate::process_hardening::protect_secret_bytes("session.client_nonce", &self.client_nonce);
+        crate::process_hardening::protect_secret_bytes("session.server_nonce", &self.server_nonce);
+        crate::process_hardening::protect_secret_bytes("session.chain_secret", &self.chain_secret);
+        crate::process_hardening::protect_secret_bytes(
+            "session.x25519_shared_secret",
+            &self.x25519_shared_secret,
+        );
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("HKDF expansion failed")]
@@ -247,15 +261,22 @@ pub struct AeadCodec {
 
 impl AeadCodec {
     pub fn new(key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) -> Self {
-        Self {
+        let codec = Self {
             root_secret: initial_record_root(&key, &nonce_base),
             sequence: 0,
-        }
+        };
+        codec.protect_secret_memory();
+        codec
     }
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
         self.root_secret = initial_record_root(&key, &nonce_base);
         self.sequence = 0;
+        self.protect_secret_memory();
+    }
+
+    pub fn protect_secret_memory(&self) {
+        crate::process_hardening::protect_secret_bytes("aead.root_secret", &self.root_secret);
     }
 
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {

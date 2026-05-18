@@ -41,7 +41,7 @@ use crate::{
     },
     transport::tcp::tune_tcp_stream,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const QUIC_ALPN: &[u8] = b"h3";
 const QUIC_AUTH_MAGIC: &[u8; 4] = b"PX1U";
@@ -78,11 +78,15 @@ struct QuicServerRuntime {
 impl QuicServerRuntime {
     fn decode(config: ServerConfig) -> Result<Self, ConfigError> {
         let private_key = decode_key32_secret("server.private_key", &config.private_key)?;
+        crate::process_hardening::protect_secret_bytes("quic.server.private_key", &*private_key);
         let x25519_public_key = x25519_public_from_private(&private_key);
-        let identity_secret_key = Arc::new(decode_base64_secret(
-            "server.identity_secret_key",
-            &config.identity_secret_key,
-        )?);
+        let identity_secret_key =
+            decode_base64_secret("server.identity_secret_key", &config.identity_secret_key)?;
+        crate::process_hardening::protect_secret_bytes(
+            "quic.server.identity_secret_key",
+            identity_secret_key.as_slice(),
+        );
+        let identity_secret_key = Arc::new(identity_secret_key);
         Ok(Self {
             config,
             x25519_public_key,
@@ -196,7 +200,9 @@ pub async fn run_server(config: Config) -> Result<(), QuicRuntimeError> {
     if config.mode != Mode::Server {
         return Err(QuicRuntimeError::WrongServerMode);
     }
-    let psk = Arc::new(decode_psk(&config.crypto.psk)?);
+    let psk = decode_psk(&config.crypto.psk)?;
+    crate::process_hardening::protect_secret_bytes("quic.crypto.psk", psk.as_slice());
+    let psk = Arc::new(psk);
     let server = config.server.ok_or(QuicRuntimeError::MissingServer)?;
     let server = Arc::new(QuicServerRuntime::decode(server)?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create_authenticated(
@@ -234,7 +240,9 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
     if config.mode != Mode::Client {
         return Err(QuicRuntimeError::WrongClientMode);
     }
-    let psk = Arc::new(decode_psk(&config.crypto.psk)?);
+    let psk = decode_psk(&config.crypto.psk)?;
+    crate::process_hardening::protect_secret_bytes("quic.crypto.psk", psk.as_slice());
+    let psk = Arc::new(psk);
     let client = config.client.ok_or(QuicRuntimeError::MissingClient)?;
     let server_addr = resolve_addr(&client.server_addr)?;
     let listen = client.listen;
@@ -318,7 +326,12 @@ async fn handle_stream(
     )
     .await
     .map_err(|_| QuicRuntimeError::AuthTimeout)??;
-    let request = ConnectRequest::decode(&connect_payload)?;
+    let connect_payload = Zeroizing::new(connect_payload);
+    crate::process_hardening::exclude_from_core_dump(
+        "quic.connect_request.payload",
+        connect_payload.as_slice(),
+    );
+    let mut request = ConnectRequest::decode(connect_payload.as_slice())?;
     let target_addr = server
         .config
         .data_target
@@ -328,6 +341,7 @@ async fn handle_stream(
     tune_tcp_stream(&target)?;
     if !request.initial_payload.is_empty() {
         target.write_all(&request.initial_payload).await?;
+        request.initial_payload.zeroize();
     }
 
     let (mut target_read, mut target_write) = target.into_split();
@@ -442,11 +456,12 @@ async fn write_connect_request(
     send: &mut quinn::SendStream,
     request: &ConnectRequest,
 ) -> Result<(), QuicRuntimeError> {
-    let connect_payload = request.encode()?;
+    request.protect_plaintext_memory();
+    let connect_payload = Zeroizing::new(request.encode()?);
     if connect_payload.len() > MAX_CONNECT_FRAME_LEN {
         return Err(QuicRuntimeError::ConnectFrameTooLarge);
     }
-    write_len_prefixed(send, &connect_payload, MAX_CONNECT_FRAME_LEN).await?;
+    write_len_prefixed(send, connect_payload.as_slice(), MAX_CONNECT_FRAME_LEN).await?;
     Ok(())
 }
 

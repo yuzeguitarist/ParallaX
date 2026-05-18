@@ -90,7 +90,9 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         .client
         .clone()
         .ok_or(ClientRuntimeError::MissingClient)?;
-    let psk = Arc::new(decode_psk(&config.crypto.psk)?);
+    let psk = decode_psk(&config.crypto.psk)?;
+    crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
+    let psk = Arc::new(psk);
     let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
     let server_identity_public = Arc::new(decode_base64_bytes(
         "client.server_identity_public_key",
@@ -615,8 +617,8 @@ where
         ));
     }
     scratch.records_buf.clear();
-
-    if tracing::enabled!(tracing::Level::DEBUG) {
+    let debug_records = tracing::enabled!(tracing::Level::DEBUG);
+    if debug_records {
         codec
             .seal_chunks_into_reusing(payload, rng, &mut scratch.records_buf, &mut scratch.records)
             .map_err(ClientHandshakeError::from)?;
@@ -631,7 +633,7 @@ where
         }
     } else {
         codec
-            .seal_chunks_into_buffered(payload, rng, &mut scratch.records_buf)
+            .seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)
             .map_err(ClientHandshakeError::from)?;
     }
     writer.write_all(scratch.records_buf.as_slice()).await?;

@@ -1,5 +1,6 @@
 use rand::{CryptoRng, RngCore};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{
     config::TrafficConfig,
@@ -107,11 +108,15 @@ impl PendingPqRekey {
 impl ClientDataSession {
     pub fn new(keys: SessionKeys, traffic: TrafficConfig) -> Result<Self, ClientHandshakeError> {
         let (seal_to_server, open_from_server) = data_codecs(&keys, traffic)?;
-        Ok(Self {
+        let session = Self {
             seal_to_server,
             open_from_server,
             keys,
-        })
+        };
+        session.keys.protect_secret_memory();
+        session.seal_to_server.protect_secret_memory();
+        session.open_from_server.protect_secret_memory();
+        Ok(session)
     }
 
     pub fn build_pq_rekey_record<R>(
@@ -123,6 +128,8 @@ impl ClientDataSession {
     {
         let x25519 = X25519KeyPair::generate();
         let mlkem = pq::keypair();
+        crate::process_hardening::protect_secret_bytes("pq_rekey.x25519_private", &x25519.private);
+        crate::process_hardening::protect_secret_bytes("pq_rekey.mlkem_secret", &mlkem.secret);
         let request = PqRekeyRequest::encode_borrowed(&x25519.public, &mlkem.public)?;
         let record = self.seal_to_server.seal(&request, rng)?;
         Ok((record, PendingPqRekey { x25519, mlkem }))
@@ -157,8 +164,9 @@ impl ClientDataSession {
     where
         R: RngCore + CryptoRng + rand::Rng + ?Sized,
     {
-        let payload = request.encode()?;
-        Ok(self.seal_to_server.seal(&payload, rng)?)
+        request.protect_plaintext_memory();
+        let payload = Zeroizing::new(request.encode()?);
+        Ok(self.seal_to_server.seal(payload.as_slice(), rng)?)
     }
 
     pub fn seal_payload<R>(
@@ -309,12 +317,16 @@ impl ClientDataSession {
             self.keys.transcript_hash,
             *x25519_shared_secret,
         )?;
+        next_keys.protect_secret_memory();
 
         self.seal_to_server
             .rekey(next_keys.client_key, next_keys.client_nonce);
         self.open_from_server
             .rekey(next_keys.server_key, next_keys.server_nonce);
         self.keys = next_keys;
+        self.keys.protect_secret_memory();
+        self.seal_to_server.protect_secret_memory();
+        self.open_from_server.protect_secret_memory();
         Ok(())
     }
 }
