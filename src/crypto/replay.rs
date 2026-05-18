@@ -147,14 +147,19 @@ impl ReplayCache {
         }
 
         self.prune_expired(now);
-        if !self.is_fresh(entry.timestamp, now)
-            || self.nonces.contains(&entry.nonce)
-            || self.transcripts.contains(&entry.transcript_fingerprint)
-        {
+        if !self.is_fresh(entry.timestamp, now) {
             return Ok(false);
         }
 
-        self.insert_loaded(entry);
+        if !self.nonces.insert(entry.nonce) {
+            return Ok(false);
+        }
+        if !self.transcripts.insert(entry.transcript_fingerprint) {
+            self.nonces.remove(&entry.nonce);
+            return Ok(false);
+        }
+
+        self.push_loaded_entry(entry);
         self.prune_capacity();
         self.persist()?;
         Ok(true)
@@ -166,9 +171,14 @@ impl ReplayCache {
     }
 
     fn insert_loaded(&mut self, entry: ReplayEntry) {
-        let encoded = self.mac_key.is_none().then(|| encode_plain_entry(&entry));
         self.nonces.insert(entry.nonce);
         self.transcripts.insert(entry.transcript_fingerprint);
+        self.push_loaded_entry(entry);
+    }
+
+    fn push_loaded_entry(&mut self, entry: ReplayEntry) {
+        let encoded =
+            (self.path.is_some() && self.mac_key.is_none()).then(|| encode_plain_entry(&entry));
         self.order.push_back(entry);
         if let Some(encoded) = encoded {
             self.encoded_entries.push_back(encoded);
@@ -629,6 +639,55 @@ mod tests {
                 101,
             )
             .unwrap());
+    }
+
+    #[test]
+    fn transcript_replay_rolls_back_tentative_nonce_insert() {
+        let mut cache = ReplayCache::new(8);
+        let first = ReplayEntry {
+            timestamp: 100,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+
+        assert!(cache.insert_new(first, 100).unwrap());
+        assert!(!cache
+            .insert_new(
+                ReplayEntry {
+                    timestamp: 101,
+                    nonce: [9; 8],
+                    transcript_fingerprint: [2; 32],
+                },
+                101,
+            )
+            .unwrap());
+        assert!(cache
+            .insert_new(
+                ReplayEntry {
+                    timestamp: 102,
+                    nonce: [9; 8],
+                    transcript_fingerprint: [10; 32],
+                },
+                102,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn in_memory_cache_skips_plain_journal_encoding() {
+        let mut cache = ReplayCache::new(8);
+
+        assert!(cache
+            .insert_new(
+                ReplayEntry {
+                    timestamp: 100,
+                    nonce: [1; 8],
+                    transcript_fingerprint: [2; 32],
+                },
+                100,
+            )
+            .unwrap());
+        assert!(cache.encoded_entries.is_empty());
     }
 
     #[test]

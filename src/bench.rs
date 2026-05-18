@@ -333,6 +333,7 @@ const CASES: &[CaseRunner] = &[
     bench_record_seal_1k,
     bench_record_round_trip_1k,
     bench_record_bulk_1mb,
+    bench_record_bulk_1mb_in_place_open,
     bench_padding_apply_1k,
     bench_padding_remove_1k,
     bench_replay_cache_insert,
@@ -845,6 +846,50 @@ fn bench_record_bulk_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
             if recovered != payload.len() {
                 bail!(
                     "record.bulk_1mb lost {} bytes of plaintext",
+                    payload.len() - recovered
+                );
+            }
+            Ok(black_box((buf.len() + payload.len()) as u64))
+        },
+    )
+}
+
+fn bench_record_bulk_1mb_in_place_open(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut enc = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let mut dec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_1M];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M * 2);
+    let mut records: Vec<SealedRecord> = Vec::with_capacity(128);
+    let mut open_scratch: Vec<u8> = Vec::with_capacity(SIZE_16K + RECORD_PADDING_MAX as usize);
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.bulk_1mb_in_place_open",
+        TIER_BULK,
+        options,
+        || {
+            buf.clear();
+            records.clear();
+            enc.seal_chunks_into_reusing(&payload, &mut rng, &mut buf, &mut records)?;
+            let mut recovered = 0_usize;
+            for sealed in &records {
+                open_scratch.clear();
+                open_scratch.extend_from_slice(&buf[sealed.range.clone()]);
+                dec.open_in_place(&mut open_scratch)?;
+                recovered += open_scratch.len();
+            }
+            if recovered != payload.len() {
+                bail!(
+                    "record.bulk_1mb_in_place_open lost {} bytes of plaintext",
                     payload.len() - recovered
                 );
             }
