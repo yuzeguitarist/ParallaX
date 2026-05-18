@@ -216,14 +216,18 @@ impl DataRecordCodec {
             return Err(SessionError::Aead.into());
         }
 
-        let payload_start = record::TLS_HEADER_LEN;
+        record.truncate(header.total_len);
+        let ciphertext_start = record::TLS_HEADER_LEN;
         let tag_start = header.total_len - AEAD_TAG_LEN;
-        let mut tag = [0_u8; AEAD_TAG_LEN];
-        tag.copy_from_slice(&record[tag_start..header.total_len]);
-        self.aead
-            .open_in_place_detached(&mut record[payload_start..tag_start], &tag, self.aad)?;
-        let plaintext_len = PaddingProfile::unpadded_len(&record[payload_start..tag_start])?;
-        record.copy_within(payload_start..payload_start + plaintext_len, 0);
+        let (ciphertext_with_header, tag) = record[..header.total_len].split_at_mut(tag_start);
+        self.aead.open_in_place_detached(
+            &mut ciphertext_with_header[ciphertext_start..],
+            tag,
+            self.aad,
+        )?;
+
+        let plaintext_len = PaddingProfile::unpadded_len(&record[ciphertext_start..tag_start])?;
+        record.copy_within(ciphertext_start..ciphertext_start + plaintext_len, 0);
         record.truncate(plaintext_len);
         Ok(())
     }
