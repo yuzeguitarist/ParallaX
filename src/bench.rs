@@ -344,10 +344,12 @@ const CASES: &[CaseRunner] = &[
     bench_aead_round_trip_1k,
     bench_record_seal_1k,
     bench_record_open_in_place_1k,
+    bench_record_open_payload_range_1k,
     bench_record_round_trip_1k,
     bench_record_round_trip_default_1k,
     bench_record_bulk_1mb,
     bench_record_bulk_1mb_in_place_open,
+    bench_record_bulk_1mb_payload_range,
     bench_padding_apply_1k,
     bench_padding_apply_default_1k,
     bench_padding_remove_1k,
@@ -1012,6 +1014,43 @@ fn bench_record_open_in_place_1k(options: BenchmarkOptions) -> Result<BenchmarkC
     )
 }
 
+fn bench_record_open_payload_range_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut enc = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let mut dec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_1K];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let (iterations, warmup) = effective_tier(TIER_FAST, options);
+    let total_records = iterations.saturating_add(warmup) as usize;
+    let records = sealed_record_fixtures(&mut enc, &payload, &mut rng, total_records)?;
+    let mut scratch = Vec::with_capacity(record_fixture_capacity(payload.len(), padding.max_len()));
+    let mut index = 0_usize;
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.open_payload_range_1k",
+        TIER_FAST,
+        options,
+        || {
+            scratch.clear();
+            scratch.extend_from_slice(&records[index]);
+            index += 1;
+            let plaintext = dec.open_in_place_payload_range(&mut scratch)?;
+            if plaintext.len() != payload.len() {
+                bail!("DataRecord open-payload-range plaintext length mismatch");
+            }
+            Ok(black_box(plaintext.len() as u64))
+        },
+    )
+}
+
 fn bench_record_round_trip_default_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(0, 0)?;
     let mut enc = DataRecordCodec::new(
@@ -1119,6 +1158,50 @@ fn bench_record_bulk_1mb_in_place_open(options: BenchmarkOptions) -> Result<Benc
             if recovered != payload.len() {
                 bail!(
                     "record.bulk_1mb_in_place_open lost {} bytes of plaintext",
+                    payload.len() - recovered
+                );
+            }
+            Ok(black_box((buf.len() + payload.len()) as u64))
+        },
+    )
+}
+
+fn bench_record_bulk_1mb_payload_range(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut enc = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let mut dec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_1M];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M * 2);
+    let mut records: Vec<SealedRecord> = Vec::with_capacity(128);
+    let mut open_scratch: Vec<u8> = Vec::with_capacity(SIZE_16K + RECORD_PADDING_MAX as usize);
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.bulk_1mb_payload_range",
+        TIER_BULK,
+        options,
+        || {
+            buf.clear();
+            records.clear();
+            enc.seal_chunks_into_reusing(&payload, &mut rng, &mut buf, &mut records)?;
+            let mut recovered = 0_usize;
+            for sealed in &records {
+                open_scratch.clear();
+                open_scratch.extend_from_slice(&buf[sealed.range.clone()]);
+                let plaintext = dec.open_in_place_payload_range(&mut open_scratch)?;
+                recovered += plaintext.len();
+            }
+            if recovered != payload.len() {
+                bail!(
+                    "record.bulk_1mb_payload_range lost {} bytes of plaintext",
                     payload.len() - recovered
                 );
             }

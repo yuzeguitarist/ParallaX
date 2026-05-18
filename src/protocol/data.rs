@@ -204,6 +204,16 @@ impl DataRecordCodec {
     }
 
     pub fn open_in_place(&mut self, record: &mut Vec<u8>) -> Result<(), DataRecordError> {
+        let plaintext = self.open_in_place_payload_range(record)?;
+        record.copy_within(plaintext.clone(), 0);
+        record.truncate(plaintext.len());
+        Ok(())
+    }
+
+    pub fn open_in_place_payload_range(
+        &mut self,
+        record: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, DataRecordError> {
         let header = record::parse_header(record)?;
         if header.content_type != TLS_CONTENT_APPLICATION_DATA {
             return Err(DataRecordError::NotApplicationData);
@@ -211,7 +221,6 @@ impl DataRecordCodec {
         if record.len() < header.total_len {
             return Err(record::TlsRecordError::IncompletePayload.into());
         }
-
         if header.payload_len < AEAD_TAG_LEN {
             return Err(SessionError::Aead.into());
         }
@@ -219,17 +228,16 @@ impl DataRecordCodec {
         record.truncate(header.total_len);
         let ciphertext_start = record::TLS_HEADER_LEN;
         let tag_start = header.total_len - AEAD_TAG_LEN;
-        let (ciphertext_with_header, tag) = record[..header.total_len].split_at_mut(tag_start);
-        self.aead.open_in_place_detached(
-            &mut ciphertext_with_header[ciphertext_start..],
-            tag,
-            self.aad,
-        )?;
-
-        let plaintext_len = PaddingProfile::unpadded_len(&record[ciphertext_start..tag_start])?;
-        record.copy_within(ciphertext_start..ciphertext_start + plaintext_len, 0);
-        record.truncate(plaintext_len);
-        Ok(())
+        let plaintext_len = {
+            let payload = &mut record[ciphertext_start..header.total_len];
+            let (ciphertext, tag) = payload.split_at_mut(tag_start - ciphertext_start);
+            self.aead
+                .open_in_place_detached(ciphertext, tag, self.aad)?;
+            PaddingProfile::unpadded_len(ciphertext)?
+        };
+        let plaintext = ciphertext_start..ciphertext_start + plaintext_len;
+        record.truncate(plaintext.end);
+        Ok(plaintext)
     }
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
@@ -400,6 +408,27 @@ mod tests {
 
         assert_eq!(record, b"hello");
         assert_eq!(record.capacity(), capacity);
+    }
+
+    #[test]
+    fn open_in_place_payload_range_avoids_plaintext_front_copy() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(4, 4).unwrap();
+        let mut rng = StdRng::seed_from_u64(21);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+
+        let mut record = enc.seal(b"hello", &mut rng).unwrap();
+        let plaintext = dec.open_in_place_payload_range(&mut record).unwrap();
+
+        assert_eq!(
+            plaintext,
+            record::TLS_HEADER_LEN..record::TLS_HEADER_LEN + 5
+        );
+        assert_eq!(&record[plaintext], b"hello");
     }
 
     #[test]

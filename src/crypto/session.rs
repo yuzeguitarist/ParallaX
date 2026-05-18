@@ -1,7 +1,7 @@
 use std::fmt;
 
 use chacha20poly1305::{
-    aead::{Aead, AeadInPlace, KeyInit, Payload},
+    aead::{AeadInPlace, KeyInit},
     Tag, XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
@@ -289,21 +289,8 @@ impl AeadCodec {
         if ciphertext.len() < AEAD_TAG_LEN {
             return Err(SessionError::Aead);
         }
-        self.ensure_can_process_next_record()?;
-        let material = self.derive_record_material(aad)?;
-        let cipher = XChaCha20Poly1305::new_from_slice(&material.key)
-            .expect("XChaCha20-Poly1305 key length is fixed");
-        let plaintext = cipher
-            .decrypt(
-                XNonce::from_slice(&material.nonce),
-                Payload {
-                    msg: ciphertext,
-                    aad,
-                },
-            )
-            .map_err(|_| SessionError::Aead)?;
-        let tag_start = ciphertext.len() - AEAD_TAG_LEN;
-        self.advance_record_ratchet(aad, &ciphertext[..tag_start], &ciphertext[tag_start..])?;
+        let mut plaintext = ciphertext.to_vec();
+        self.open_in_place(&mut plaintext, aad)?;
         Ok(plaintext)
     }
 
@@ -315,7 +302,6 @@ impl AeadCodec {
         if ciphertext_with_tag.len() < AEAD_TAG_LEN {
             return Err(SessionError::Aead);
         }
-
         let tag_start = ciphertext_with_tag.len() - AEAD_TAG_LEN;
         let (ciphertext_without_tag, tag) = ciphertext_with_tag.split_at_mut(tag_start);
         self.open_in_place_detached(ciphertext_without_tag, tag, aad)?;

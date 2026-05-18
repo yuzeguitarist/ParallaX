@@ -583,10 +583,10 @@ async fn client_download_loop(
         };
         log_record_read(cid, "server->client", "client-outer-reader", &server_record);
 
-        match open_from_server.open_in_place(&mut server_record) {
-            Ok(()) => {
-                if !server_record.is_empty() {
-                    local_write.write_all(&server_record).await?;
+        match open_from_server.open_in_place_payload_range(&mut server_record) {
+            Ok(plaintext) => {
+                if !plaintext.is_empty() {
+                    local_write.write_all(&server_record[plaintext]).await?;
                 }
             }
             Err(err) => {
