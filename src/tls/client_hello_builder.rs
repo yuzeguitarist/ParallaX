@@ -301,4 +301,39 @@ mod tests {
         assert!(parsed.tls13_supported);
         assert!(verified.authenticated);
     }
+
+    #[test]
+    fn chrome_profile_builds_parseable_tls13_client_hello() {
+        let client = X25519KeyPair::generate();
+        let mut rng = StdRng::seed_from_u64(101);
+
+        let record = ClientHelloTemplate {
+            sni: "cloudflare.com".to_owned(),
+            x25519_public_key: client.public,
+            profile: BrowserProfile::Chrome124,
+        }
+        .build_unsigned(&mut rng)
+        .unwrap();
+        let parsed = parse_client_hello(&record).unwrap();
+
+        assert_eq!(parsed.sni.as_deref(), Some("cloudflare.com"));
+        assert_eq!(parsed.client_random, client.public);
+        assert_eq!(parsed.x25519_key_share, Some(client.public));
+        assert!(parsed.tls13_supported);
+        assert_eq!(parsed.record_len, record.len());
+    }
+
+    #[test]
+    fn rejects_empty_sni() {
+        let mut rng = StdRng::seed_from_u64(102);
+        let err = ClientHelloTemplate {
+            sni: String::new(),
+            x25519_public_key: [1_u8; 32],
+            profile: BrowserProfile::Safari17,
+        }
+        .build_unsigned(&mut rng)
+        .unwrap_err();
+
+        assert!(matches!(err, ClientHelloBuildError::EmptySni));
+    }
 }

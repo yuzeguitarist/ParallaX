@@ -996,7 +996,7 @@ mod tests {
             session::X25519KeyPair,
         },
         handshake::client::ClientDataSession,
-        protocol::command::ConnectRequest,
+        protocol::command::{ConnectRequest, ConnectRequestError},
         tls::{
             client_hello::tests::client_hello_fixture_with_key_share,
             server_hello::{parse_server_hello, tests::server_hello_fixture},
@@ -1077,6 +1077,32 @@ mod tests {
     }
 
     #[test]
+    fn authorized_sni_matching_is_case_insensitive() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let mut record = client_hello_fixture_with_key_share("Example.COM", &client.public);
+        let mut rng = StdRng::seed_from_u64(2);
+        sign_client_hello_session_id(&mut record, &auth_key, &mut rng).unwrap();
+
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+
+        match decision {
+            InboundDecision::Authenticated(hello) => {
+                assert_eq!(hello.sni, "Example.COM");
+                assert_eq!(hello.x25519_key_share, client.public);
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
     fn malformed_probe_falls_back_instead_of_closing() {
         let server = X25519KeyPair::generate();
         let decision = decide_inbound(
@@ -1091,6 +1117,52 @@ mod tests {
             decision,
             InboundDecision::Fallback(FallbackReason::AuthFailed)
         );
+    }
+
+    #[test]
+    fn resolve_connect_target_decodes_explicit_request() {
+        let request = ConnectRequest {
+            host: "2001:db8::1".to_owned(),
+            port: 443,
+            initial_payload: b"hello".to_vec(),
+        };
+
+        let (target, initial_payload) =
+            resolve_connect_target(request.encode().unwrap(), Some("fallback.example:443"))
+                .unwrap();
+
+        assert_eq!(target, "[2001:db8::1]:443");
+        assert_eq!(initial_payload, b"hello");
+    }
+
+    #[test]
+    fn resolve_connect_target_uses_fixed_target_for_raw_payload() {
+        let (target, initial_payload) =
+            resolve_connect_target(b"GET / HTTP/1.1\r\n\r\n".to_vec(), Some("target.example:443"))
+                .unwrap();
+
+        assert_eq!(target, "target.example:443");
+        assert_eq!(initial_payload, b"GET / HTTP/1.1\r\n\r\n");
+    }
+
+    #[test]
+    fn resolve_connect_target_requires_fixed_target_for_raw_payload() {
+        assert!(matches!(
+            resolve_connect_target(b"raw".to_vec(), None).unwrap_err(),
+            HandshakeServerError::MissingConnectTarget
+        ));
+    }
+
+    #[test]
+    fn resolve_connect_target_rejects_malformed_connect_request() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(b"PX1C");
+        encoded.extend_from_slice(&0_u16.to_be_bytes());
+
+        assert!(matches!(
+            resolve_connect_target(encoded, Some("target.example:443")).unwrap_err(),
+            HandshakeServerError::ConnectRequest(ConnectRequestError::EmptyHost)
+        ));
     }
 
     #[tokio::test]

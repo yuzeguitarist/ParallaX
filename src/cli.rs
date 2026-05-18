@@ -378,6 +378,64 @@ fn write_secret_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generated_templates_validate_and_share_key_material() {
+        let generated = generate_config_template(
+            "0.0.0.0:443",
+            "127.0.0.1:1080",
+            "203.0.113.10:443",
+            "cloudflare.com:443",
+            "cloudflare.com",
+        );
+
+        let server = toml::from_str::<Config>(&generated.server).unwrap();
+        let client = toml::from_str::<Config>(&generated.client).unwrap();
+
+        server.validate().unwrap();
+        client.validate().unwrap();
+        assert_eq!(server.mode, crate::config::Mode::Server);
+        assert_eq!(client.mode, crate::config::Mode::Client);
+        assert_eq!(server.crypto.psk, client.crypto.psk);
+
+        let server_cfg = server.server.as_ref().unwrap();
+        let client_cfg = client.client.as_ref().unwrap();
+        let server_private =
+            crate::config::decode_key32_secret("server.private_key", &server_cfg.private_key)
+                .unwrap();
+        let server_public =
+            crate::config::decode_key32("client.server_public_key", &client_cfg.server_public_key)
+                .unwrap();
+
+        assert_eq!(
+            crate::crypto::session::x25519_public_from_private(&server_private),
+            server_public
+        );
+        assert_eq!(server_cfg.fallback_addr, "cloudflare.com:443");
+        assert_eq!(
+            server_cfg.authorized_sni,
+            vec![String::from("cloudflare.com")]
+        );
+        assert_eq!(client_cfg.server_addr, "203.0.113.10:443");
+        assert_eq!(client_cfg.sni, "cloudflare.com");
+    }
+
+    #[test]
+    fn init_files_refuse_to_overwrite_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_path = dir.path().join("parallax.server.toml");
+        fs::write(&server_path, "existing").unwrap();
+        let generated = GeneratedConfig {
+            server: "server".to_owned(),
+            client: "client".to_owned(),
+        };
+
+        let err = write_init_files(dir.path(), &generated).unwrap_err();
+
+        assert!(err.to_string().contains("refusing to overwrite"));
+        assert_eq!(fs::read_to_string(server_path).unwrap(), "existing");
+        assert!(!dir.path().join("parallax.client.toml").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn init_files_are_user_only_on_unix() {

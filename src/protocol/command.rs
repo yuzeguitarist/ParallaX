@@ -454,6 +454,66 @@ mod tests {
     }
 
     #[test]
+    fn connect_request_rejects_invalid_fields() {
+        assert_eq!(
+            ConnectRequest {
+                host: String::new(),
+                port: 443,
+                initial_payload: Vec::new(),
+            }
+            .encode()
+            .unwrap_err(),
+            ConnectRequestError::EmptyHost
+        );
+        assert_eq!(
+            ConnectRequest {
+                host: "example.com".to_owned(),
+                port: 0,
+                initial_payload: Vec::new(),
+            }
+            .encode()
+            .unwrap_err(),
+            ConnectRequestError::ZeroPort
+        );
+        assert_eq!(
+            ConnectRequest {
+                host: "x".repeat(MAX_HOST_LEN + 1),
+                port: 443,
+                initial_payload: Vec::new(),
+            }
+            .encode()
+            .unwrap_err(),
+            ConnectRequestError::HostTooLong
+        );
+
+        let mut invalid_host = Vec::new();
+        invalid_host.extend_from_slice(CONNECT_MAGIC);
+        invalid_host.extend_from_slice(&1_u16.to_be_bytes());
+        invalid_host.push(0xff);
+        invalid_host.extend_from_slice(&443_u16.to_be_bytes());
+        invalid_host.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            ConnectRequest::decode(&invalid_host).unwrap_err(),
+            ConnectRequestError::InvalidHost
+        );
+
+        let mut invalid_payload_len = ConnectRequest {
+            host: "example.com".to_owned(),
+            port: 443,
+            initial_payload: b"hello".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        let payload_len_offset = 4 + 2 + "example.com".len() + 2;
+        invalid_payload_len[payload_len_offset..payload_len_offset + 4]
+            .copy_from_slice(&6_u32.to_be_bytes());
+        assert_eq!(
+            ConnectRequest::decode(&invalid_payload_len).unwrap_err(),
+            ConnectRequestError::InvalidPayloadLength
+        );
+    }
+
+    #[test]
     fn pq_rekey_round_trip() {
         let request = PqRekeyRequest {
             client_x25519_public: [9_u8; 32],
@@ -496,5 +556,96 @@ mod tests {
         }
 
         assert_eq!(assembled, payload);
+    }
+
+    #[test]
+    fn rejects_malformed_length_prefixed_commands() {
+        assert_eq!(
+            PqRekeyRequest {
+                client_x25519_public: [9_u8; 32],
+                client_mlkem_public_key: Vec::new(),
+            }
+            .encode()
+            .unwrap_err(),
+            PqRekeyError::EmptyPublicKey
+        );
+        let mut pq = Vec::new();
+        pq.extend_from_slice(PQ_REKEY_MAGIC);
+        pq.extend_from_slice(&[9_u8; 32]);
+        pq.extend_from_slice(&3_u32.to_be_bytes());
+        pq.extend_from_slice(&[1, 2]);
+        assert_eq!(
+            PqRekeyRequest::decode(&pq).unwrap_err(),
+            PqRekeyError::InvalidPublicKeyLength
+        );
+
+        assert_eq!(
+            ServerKeyExchange {
+                server_x25519_public: [7_u8; 32],
+                mlkem_ciphertext: Vec::new(),
+            }
+            .encode()
+            .unwrap_err(),
+            ServerKeyExchangeError::EmptyCiphertext
+        );
+        let mut exchange = Vec::new();
+        exchange.extend_from_slice(SERVER_KEY_EXCHANGE_MAGIC);
+        exchange.extend_from_slice(&[7_u8; 32]);
+        exchange.extend_from_slice(&3_u32.to_be_bytes());
+        exchange.extend_from_slice(&[1, 2]);
+        assert_eq!(
+            ServerKeyExchange::decode(&exchange).unwrap_err(),
+            ServerKeyExchangeError::InvalidCiphertextLength
+        );
+
+        assert_eq!(
+            ServerIdentityProof {
+                signature: Vec::new(),
+            }
+            .encode()
+            .unwrap_err(),
+            ServerIdentityProofError::EmptySignature
+        );
+        let mut proof = Vec::new();
+        proof.extend_from_slice(SERVER_IDENTITY_MAGIC);
+        proof.extend_from_slice(&3_u32.to_be_bytes());
+        proof.extend_from_slice(&[1, 2]);
+        assert_eq!(
+            ServerIdentityProof::decode(&proof).unwrap_err(),
+            ServerIdentityProofError::InvalidSignatureLength
+        );
+    }
+
+    #[test]
+    fn server_identity_chunks_reject_invalid_ranges() {
+        assert_eq!(
+            ServerIdentityChunk::encode_all(&[], 700).unwrap_err(),
+            ServerIdentityChunkError::InvalidChunkLength
+        );
+        assert_eq!(
+            ServerIdentityChunk::encode_all(b"payload", 0).unwrap_err(),
+            ServerIdentityChunkError::InvalidChunkLength
+        );
+        assert_eq!(
+            ServerIdentityChunk {
+                total_len: 3,
+                offset: 2,
+                bytes: vec![1, 2],
+            }
+            .encode()
+            .unwrap_err(),
+            ServerIdentityChunkError::InvalidOffset
+        );
+
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
+        chunk.extend_from_slice(&3_u32.to_be_bytes());
+        chunk.extend_from_slice(&2_u32.to_be_bytes());
+        chunk.extend_from_slice(&2_u32.to_be_bytes());
+        chunk.extend_from_slice(&[1, 2]);
+        assert_eq!(
+            ServerIdentityChunk::decode(&chunk).unwrap_err(),
+            ServerIdentityChunkError::InvalidOffset
+        );
     }
 }
