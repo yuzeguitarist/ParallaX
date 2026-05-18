@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::{copy_bidirectional, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
@@ -63,6 +63,12 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const FALLBACK_MIN_RECORDS: usize = 2;
+const FALLBACK_MAX_RECORDS: usize = 4;
+const FALLBACK_MIN_BYTES: usize = 8 * 1024;
+const FALLBACK_MAX_BYTES: usize = 16 * 1024;
+const FALLBACK_MIN_IDLE_TIMEOUT_MS: u64 = 800;
+const FALLBACK_MAX_IDLE_TIMEOUT_MS: u64 = 2200;
 const SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 
@@ -476,7 +482,29 @@ pub async fn relay_fallback(
     let mut fallback = TcpStream::connect(fallback_addr).await?;
     tune_tcp_stream(&fallback)?;
     fallback.write_all(&first_client_record).await?;
-    copy_bidirectional(&mut client, &mut fallback).await?;
+    let mut rng = StdRng::from_entropy();
+    let max_records = rng.gen_range(FALLBACK_MIN_RECORDS..=FALLBACK_MAX_RECORDS);
+    let max_bytes = rng.gen_range(FALLBACK_MIN_BYTES..=FALLBACK_MAX_BYTES);
+    let idle_timeout = Duration::from_millis(
+        rng.gen_range(FALLBACK_MIN_IDLE_TIMEOUT_MS..=FALLBACK_MAX_IDLE_TIMEOUT_MS),
+    );
+    let mut forwarded_records = 0;
+    let mut forwarded_bytes = 0;
+    while forwarded_records < max_records && forwarded_bytes < max_bytes {
+        let record = match timeout(idle_timeout, read_record(&mut fallback)).await {
+            Ok(Ok(record)) => record,
+            Ok(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+            Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
+            Err(_) => break,
+        };
+        if forwarded_bytes + record.len() > max_bytes {
+            break;
+        }
+        client.write_all(&record).await?;
+        forwarded_records += 1;
+        forwarded_bytes += record.len();
+    }
+    client.shutdown().await?;
     Ok(())
 }
 
