@@ -19,7 +19,7 @@ use tokio::{
     sync::{Semaphore, TryAcquireError},
     time::{sleep, timeout, Instant},
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use super::transcript::transcript_hash;
 
@@ -654,17 +654,19 @@ async fn run_authenticated_data_mode(
                         }
 
                         drop(fallback_write);
-                        let record = client_records.read_record().await?;
+                        let mut record = client_records.read_record().await?;
                         log_record_read(cid, "client->server", "server-connect-reader", &record);
-                        let first_payload = client_open.open_owned(record)?;
+                        let first_payload_range =
+                            client_open.open_in_place_payload_range(&mut record)?;
+                        let first_payload = &mut record[first_payload_range];
                         tracing::debug!(cid, "ParallaX data mode switch confirmed");
 
-                        let (target_addr, mut initial_payload) =
+                        let (target_addr, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
                         let mut target = TcpStream::connect(target_addr).await?;
                         tune_tcp_stream(&target)?;
                         if !initial_payload.is_empty() {
-                            target.write_all(&initial_payload).await?;
+                            target.write_all(initial_payload).await?;
                             initial_payload.zeroize();
                         }
                         let (target_read, target_write) = target.into_split();
@@ -714,37 +716,36 @@ async fn run_authenticated_data_mode(
     }
 }
 
-fn resolve_connect_target(
-    first_payload: Vec<u8>,
+fn resolve_connect_target<'a>(
+    first_payload: &'a mut [u8],
     fixed_data_target: Option<&str>,
-) -> Result<(String, Vec<u8>), HandshakeServerError> {
-    let mut first_payload = Zeroizing::new(first_payload);
+) -> Result<(String, &'a mut [u8]), HandshakeServerError> {
     crate::process_hardening::exclude_from_core_dump(
         "connect_request.first_payload",
-        first_payload.as_slice(),
+        first_payload,
     );
-    match ConnectRequest::decode(first_payload.as_slice()) {
-        Ok(mut request) => {
+    match ConnectRequest::decode_ref(first_payload) {
+        Ok(request) => {
             request.protect_plaintext_memory();
+            let payload_len = request.initial_payload.len();
             let target = fixed_data_target
                 .map(str::to_owned)
                 .unwrap_or_else(|| request.target());
-            let initial_payload = std::mem::take(&mut request.initial_payload);
+            let start = first_payload.len().saturating_sub(payload_len);
+            let initial_payload = &mut first_payload[start..];
             crate::process_hardening::exclude_from_core_dump(
                 "connect_request.initial_payload",
-                &initial_payload,
+                initial_payload,
             );
             Ok((target, initial_payload))
         }
         Err(ConnectRequestError::BadMagic | ConnectRequestError::Truncated) => {
             let target = fixed_data_target.ok_or(HandshakeServerError::MissingConnectTarget)?;
-            let mut initial_payload = Vec::new();
-            std::mem::swap(&mut initial_payload, &mut *first_payload);
             crate::process_hardening::exclude_from_core_dump(
                 "connect_request.fixed_target_payload",
-                &initial_payload,
+                first_payload,
             );
-            Ok((target.to_owned(), initial_payload))
+            Ok((target.to_owned(), first_payload))
         }
         Err(err) => Err(HandshakeServerError::ConnectRequest(err)),
     }
@@ -969,9 +970,14 @@ where
         ));
     }
     scratch.records_buf.clear();
-    codec.seal_chunks_into_reusing(payload, rng, &mut scratch.records_buf, &mut scratch.records)?;
-
-    if tracing::enabled!(tracing::Level::DEBUG) {
+    let debug_records = tracing::enabled!(tracing::Level::DEBUG);
+    if debug_records {
+        codec.seal_chunks_into_reusing(
+            payload,
+            rng,
+            &mut scratch.records_buf,
+            &mut scratch.records,
+        )?;
         for record in scratch.records.iter() {
             log_outer_write(
                 log.cid,
@@ -981,6 +987,8 @@ where
                 &scratch.records_buf[record.range.clone()],
             );
         }
+    } else {
+        codec.seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)?;
     }
     writer.write_all(scratch.records_buf.as_slice()).await?;
     Ok(())
@@ -1199,8 +1207,8 @@ mod tests {
             initial_payload: b"hello".to_vec(),
         };
 
-        let (target, initial_payload) =
-            resolve_connect_target(request.encode().unwrap(), None).unwrap();
+        let mut encoded = request.encode().unwrap();
+        let (target, initial_payload) = resolve_connect_target(&mut encoded, None).unwrap();
 
         assert_eq!(target, "[2001:db8::1]:443");
         assert_eq!(initial_payload, b"hello");
@@ -1214,8 +1222,9 @@ mod tests {
             initial_payload: b"hello".to_vec(),
         };
 
+        let mut encoded = request.encode().unwrap();
         let (target, initial_payload) =
-            resolve_connect_target(request.encode().unwrap(), Some("target.example:443")).unwrap();
+            resolve_connect_target(&mut encoded, Some("target.example:443")).unwrap();
 
         assert_eq!(target, "target.example:443");
         assert_eq!(initial_payload, b"hello");
@@ -1223,11 +1232,9 @@ mod tests {
 
     #[test]
     fn resolve_connect_target_uses_fixed_target_for_raw_payload() {
-        let (target, initial_payload) = resolve_connect_target(
-            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
-            Some("target.example:443"),
-        )
-        .unwrap();
+        let mut raw = *b"GET / HTTP/1.1\r\n\r\n";
+        let (target, initial_payload) =
+            resolve_connect_target(&mut raw, Some("target.example:443")).unwrap();
 
         assert_eq!(target, "target.example:443");
         assert_eq!(initial_payload, b"GET / HTTP/1.1\r\n\r\n");
@@ -1235,8 +1242,9 @@ mod tests {
 
     #[test]
     fn resolve_connect_target_requires_fixed_target_for_raw_payload() {
+        let mut raw = *b"raw";
         assert!(matches!(
-            resolve_connect_target(b"raw".to_vec(), None).unwrap_err(),
+            resolve_connect_target(&mut raw, None).unwrap_err(),
             HandshakeServerError::MissingConnectTarget
         ));
     }
@@ -1248,7 +1256,7 @@ mod tests {
         encoded.extend_from_slice(&0_u16.to_be_bytes());
 
         assert!(matches!(
-            resolve_connect_target(encoded, Some("target.example:443")).unwrap_err(),
+            resolve_connect_target(&mut encoded, Some("target.example:443")).unwrap_err(),
             HandshakeServerError::ConnectRequest(ConnectRequestError::EmptyHost)
         ));
     }

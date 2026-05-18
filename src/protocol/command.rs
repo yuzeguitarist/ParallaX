@@ -16,6 +16,13 @@ pub struct ConnectRequest {
     pub initial_payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectRequestRef<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub initial_payload: &'a [u8],
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ConnectRequestError {
     #[error("connect request is truncated")]
@@ -125,10 +132,7 @@ impl ConnectRequest {
     }
 
     pub fn target(&self) -> String {
-        match self.host.parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V6(_)) => format!("[{}]:{}", self.host, self.port),
-            _ => format!("{}:{}", self.host, self.port),
-        }
+        connect_target(&self.host, self.port)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, ConnectRequestError> {
@@ -155,6 +159,15 @@ impl ConnectRequest {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, ConnectRequestError> {
+        let request = Self::decode_ref(input)?;
+        Ok(Self {
+            host: request.host.to_owned(),
+            port: request.port,
+            initial_payload: request.initial_payload.to_vec(),
+        })
+    }
+
+    pub fn decode_ref(input: &[u8]) -> Result<ConnectRequestRef<'_>, ConnectRequestError> {
         if input.len() < 4 {
             return Err(ConnectRequestError::Truncated);
         }
@@ -171,9 +184,7 @@ impl ConnectRequest {
             return Err(ConnectRequestError::HostTooLong);
         }
         let host = cursor.bytes(host_len)?;
-        let host = std::str::from_utf8(host)
-            .map_err(|_| ConnectRequestError::InvalidHost)?
-            .to_owned();
+        let host = std::str::from_utf8(host).map_err(|_| ConnectRequestError::InvalidHost)?;
 
         let port = cursor.u16()?;
         if port == 0 {
@@ -184,9 +195,9 @@ impl ConnectRequest {
         if cursor.remaining() != payload_len {
             return Err(ConnectRequestError::InvalidPayloadLength);
         }
-        let initial_payload = cursor.bytes(payload_len)?.to_vec();
+        let initial_payload = cursor.bytes(payload_len)?;
 
-        let request = Self {
+        let request = ConnectRequestRef {
             host,
             port,
             initial_payload,
@@ -204,6 +215,30 @@ impl ConnectRequest {
             "connect_request.initial_payload",
             &self.initial_payload,
         );
+    }
+}
+
+impl ConnectRequestRef<'_> {
+    pub fn target(&self) -> String {
+        connect_target(self.host, self.port)
+    }
+
+    pub fn protect_plaintext_memory(&self) {
+        crate::process_hardening::exclude_from_core_dump(
+            "connect_request.host",
+            self.host.as_bytes(),
+        );
+        crate::process_hardening::exclude_from_core_dump(
+            "connect_request.initial_payload",
+            self.initial_payload,
+        );
+    }
+}
+
+fn connect_target(host: &str, port: u16) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
     }
 }
 
@@ -467,6 +502,23 @@ mod tests {
 
         let encoded = request.encode().unwrap();
         assert_eq!(ConnectRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn connect_request_decode_ref_borrows_payload() {
+        let request = ConnectRequest {
+            host: "example.com".to_owned(),
+            port: 443,
+            initial_payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+        };
+
+        let encoded = request.encode().unwrap();
+        let decoded = ConnectRequest::decode_ref(&encoded).unwrap();
+
+        assert_eq!(decoded.host, request.host);
+        assert_eq!(decoded.port, request.port);
+        assert_eq!(decoded.initial_payload, request.initial_payload);
+        assert_eq!(decoded.target(), "example.com:443");
     }
 
     #[test]

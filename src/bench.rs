@@ -67,6 +67,7 @@ const RNG_SEED: u64 = 0x504c_5842_5f42_454e; // "PLXB_BEN"
 const SIZE_64B: usize = 64;
 const SIZE_1K: usize = 1024;
 const SIZE_16K: usize = 16 * 1024;
+const SIZE_64K: usize = 64 * 1024;
 const SIZE_1M: usize = 1024 * 1024;
 
 /// Padding profile applied to every [`DataRecordCodec`] benchmark. Fixed at
@@ -332,6 +333,8 @@ const CASES: &[CaseRunner] = &[
     bench_clienthello_verify_auth,
     bench_client_pq_rekey_record,
     bench_client_connect_record_1k,
+    bench_connect_request_decode_1k_owned,
+    bench_connect_request_decode_1k_borrowed,
     bench_client_identity_chunks_decode,
     bench_client_identity_proof_extract,
     bench_quic_server_identity_build_decode_each_time,
@@ -347,6 +350,8 @@ const CASES: &[CaseRunner] = &[
     bench_record_open_payload_range_1k,
     bench_record_round_trip_1k,
     bench_record_round_trip_default_1k,
+    bench_record_relay_seal_tracked_64k,
+    bench_record_relay_seal_untracked_64k,
     bench_record_bulk_1mb,
     bench_record_bulk_1mb_in_place_open,
     bench_record_bulk_1mb_payload_range,
@@ -694,6 +699,50 @@ fn bench_client_connect_record_1k(options: BenchmarkOptions) -> Result<Benchmark
             let mut session = ClientDataSession::new(keys.clone(), traffic)?;
             let record = session.build_connect_record(request.clone(), &mut rng)?;
             Ok(black_box(record.len() as u64))
+        },
+    )
+}
+
+fn bench_connect_request_decode_1k_owned(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let request = ConnectRequest {
+        host: BENCH_SNI.to_owned(),
+        port: 443,
+        initial_payload: vec![0x42_u8; SIZE_1K],
+    };
+    let encoded = request.encode()?;
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "connect_request.decode_1k_owned",
+        TIER_FAST,
+        options,
+        || {
+            let decoded = ConnectRequest::decode(black_box(encoded.as_slice()))?;
+            Ok(black_box(
+                (decoded.host.len() + decoded.initial_payload.len()) as u64,
+            ))
+        },
+    )
+}
+
+fn bench_connect_request_decode_1k_borrowed(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let request = ConnectRequest {
+        host: BENCH_SNI.to_owned(),
+        port: 443,
+        initial_payload: vec![0x42_u8; SIZE_1K],
+    };
+    let encoded = request.encode()?;
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "connect_request.decode_1k_borrowed",
+        TIER_FAST,
+        options,
+        || {
+            let decoded = ConnectRequest::decode_ref(black_box(encoded.as_slice()))?;
+            Ok(black_box(
+                (decoded.host.len() + decoded.initial_payload.len()) as u64,
+            ))
         },
     )
 }
@@ -1077,6 +1126,57 @@ fn bench_record_round_trip_default_1k(options: BenchmarkOptions) -> Result<Bench
                 bail!("default DataRecord round-trip length mismatch");
             }
             Ok(black_box((record.len() + plaintext.len()) as u64))
+        },
+    )
+}
+
+fn bench_record_relay_seal_tracked_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut codec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_64K];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let max_chunk_len = codec.max_plaintext_len();
+    let mut buf: Vec<u8> = Vec::with_capacity(SIZE_64K * 2);
+    let mut records: Vec<SealedRecord> = Vec::with_capacity(payload.len().div_ceil(max_chunk_len));
+
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.relay_seal_tracked_64k",
+        TIER_MEDIUM,
+        options,
+        || {
+            buf.clear();
+            records.clear();
+            codec.seal_chunks_into_reusing(&payload, &mut rng, &mut buf, &mut records)?;
+            Ok(black_box(buf.len() as u64))
+        },
+    )
+}
+
+fn bench_record_relay_seal_untracked_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut codec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_64K];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let mut buf: Vec<u8> = Vec::with_capacity(SIZE_64K * 2);
+
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.relay_seal_untracked_64k",
+        TIER_MEDIUM,
+        options,
+        || {
+            buf.clear();
+            codec.seal_chunks_into_untracked(&payload, &mut rng, &mut buf)?;
+            Ok(black_box(buf.len() as u64))
         },
     )
 }
