@@ -130,13 +130,42 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
-        records.clear();
+        self.seal_chunks_into_reusing_maybe_tracked(payload, rng, out, Some(records))
+    }
+
+    pub fn seal_chunks_into_untracked<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        self.seal_chunks_into_reusing_maybe_tracked(payload, rng, out, None)
+    }
+
+    fn seal_chunks_into_reusing_maybe_tracked<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+        mut records: Option<&mut Vec<SealedRecord>>,
+    ) -> Result<(), DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        if let Some(records) = records.as_mut() {
+            records.clear();
+        }
         let max_chunk_len = self.max_plaintext_len();
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
         let chunk_count = chunk_count(payload.len(), max_chunk_len);
-        records.reserve(chunk_count);
+        if let Some(records) = records.as_mut() {
+            records.reserve(chunk_count);
+        }
         out.reserve(chunked_records_capacity(
             payload.len(),
             chunk_count,
@@ -144,19 +173,23 @@ impl DataRecordCodec {
         ));
         if payload.is_empty() {
             let range = self.seal_into_reserved(payload, rng, out, false)?;
-            records.push(SealedRecord {
-                range,
-                plaintext_len: 0,
-            });
+            if let Some(records) = records.as_mut() {
+                records.push(SealedRecord {
+                    range,
+                    plaintext_len: 0,
+                });
+            }
             return Ok(());
         }
 
         for chunk in payload.chunks(max_chunk_len) {
             let range = self.seal_into_reserved(chunk, rng, out, false)?;
-            records.push(SealedRecord {
-                range,
-                plaintext_len: chunk.len(),
-            });
+            if let Some(records) = records.as_mut() {
+                records.push(SealedRecord {
+                    range,
+                    plaintext_len: chunk.len(),
+                });
+            }
         }
         Ok(())
     }
@@ -461,6 +494,35 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].plaintext_len, 5);
         assert_eq!(dec.open(&out[records[0].range.clone()]).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn seal_chunks_into_untracked_batches_without_metadata() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(22);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let payload = (0..64 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+
+        enc.seal_chunks_into_untracked(&payload, &mut rng, &mut out)
+            .unwrap();
+
+        let mut offset = 0;
+        let mut opened = Vec::with_capacity(payload.len());
+        while offset < out.len() {
+            let header = record::parse_header(&out[offset..]).unwrap();
+            let end = offset + header.total_len;
+            opened.extend_from_slice(&dec.open(&out[offset..end]).unwrap());
+            offset = end;
+        }
+        assert_eq!(opened, payload);
     }
 
     #[test]

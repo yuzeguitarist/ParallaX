@@ -350,6 +350,7 @@ const CASES: &[CaseRunner] = &[
     bench_record_round_trip_1k,
     bench_record_round_trip_default_1k,
     bench_record_relay_seal_tracked_64k,
+    bench_record_relay_seal_untracked_64k,
     bench_record_bulk_1mb,
     bench_record_bulk_1mb_in_place_open,
     bench_record_bulk_1mb_payload_range,
@@ -1128,6 +1129,30 @@ fn bench_record_relay_seal_tracked_64k(options: BenchmarkOptions) -> Result<Benc
             buf.clear();
             records.clear();
             codec.seal_chunks_into_reusing(&payload, &mut rng, &mut buf, &mut records)?;
+            Ok(black_box(buf.len() as u64))
+        },
+    )
+}
+
+fn bench_record_relay_seal_untracked_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut codec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_64K];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let mut buf: Vec<u8> = Vec::with_capacity(SIZE_64K * 2);
+
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.relay_seal_untracked_64k",
+        TIER_MEDIUM,
+        options,
+        || {
+            buf.clear();
+            codec.seal_chunks_into_untracked(&payload, &mut rng, &mut buf)?;
             Ok(black_box(buf.len() as u64))
         },
     )

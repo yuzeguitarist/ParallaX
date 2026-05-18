@@ -615,11 +615,11 @@ where
         ));
     }
     scratch.records_buf.clear();
-    codec
-        .seal_chunks_into_reusing(payload, rng, &mut scratch.records_buf, &mut scratch.records)
-        .map_err(ClientHandshakeError::from)?;
-
-    if tracing::enabled!(tracing::Level::DEBUG) {
+    let debug_records = tracing::enabled!(tracing::Level::DEBUG);
+    if debug_records {
+        codec
+            .seal_chunks_into_reusing(payload, rng, &mut scratch.records_buf, &mut scratch.records)
+            .map_err(ClientHandshakeError::from)?;
         for record in scratch.records.iter() {
             log_outer_write(
                 log.cid,
@@ -629,6 +629,10 @@ where
                 &scratch.records_buf[record.range.clone()],
             );
         }
+    } else {
+        codec
+            .seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)
+            .map_err(ClientHandshakeError::from)?;
     }
     writer.write_all(scratch.records_buf.as_slice()).await?;
     Ok(())
