@@ -529,7 +529,7 @@ fn bench_clienthello_build_signed(options: BenchmarkOptions) -> Result<Benchmark
     let template = ClientHelloTemplate {
         sni: BENCH_SNI.to_owned(),
         x25519_public_key: client.public,
-        profile: BrowserProfile::Safari17,
+        profile: BrowserProfile::Safari26,
     };
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     run_case(
@@ -585,7 +585,7 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN])> {
     let template = ClientHelloTemplate {
         sni: BENCH_SNI.to_owned(),
         x25519_public_key: client.public,
-        profile: BrowserProfile::Safari17,
+        profile: BrowserProfile::Safari26,
     };
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let record = template.build_signed(&client_auth, &mut rng)?;

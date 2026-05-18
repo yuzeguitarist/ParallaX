@@ -94,7 +94,7 @@ Initializes the session by generating the `X25519KeyPair`, deriving the `auth_ke
 
 ### `ProfileConfig`
 
-Maps a `BrowserProfile` (e.g., Chrome 124, Safari 17) to specific TLS and HTTP/2 behaviors, including ALPN protocols and post-handshake record limits.
+Maps a `BrowserProfile` (e.g., Chrome 124, Safari 26) to specific TLS and HTTP/2 behaviors, including ALPN protocols and post-handshake record limits.
 
 - Location: [src/tls/stateful.rs#114-122](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/stateful.rs#L114-L122)
 - Defaults: Uses `POST_HANDSHAKE_DRAIN_LIMIT` (4) and `POST_HANDSHAKE_DRAIN_TIMEOUT` (180ms) to simulate natural network latency [src/tls/stateful.rs#135-142](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/stateful.rs#L135-L142)

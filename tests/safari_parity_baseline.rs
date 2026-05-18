@@ -1,9 +1,9 @@
-//! Regression baseline that locks the Safari 17 ParallaX ClientHello against
+//! Regression baseline that locks the Safari 26 ParallaX ClientHello against
 //! real Safari 26.4 (macOS Tahoe) captures.
 //!
 //! The fixtures under `tests/fixtures/safari26_*.bin` are raw TLS records
 //! taken from `tcpdump -i en0 'tcp port 443'` while Safari 26.4 fetched the
-//! corresponding hostname. They are the ground truth that the Safari17
+//! corresponding hostname. They are the ground truth that the Safari26
 //! profile is calibrated against in `src/tls/stateful.rs`.
 //!
 //! These tests intentionally use the same loopback rustls server harness as
@@ -63,7 +63,7 @@ const SAFARI_SUPPORTED_GROUPS: &[u16] = &[
 /// Safari 26.4 signature_algorithms in apple.com wire order, including the
 /// duplicated `rsa_pss_rsae_sha384` (0x0805) entry Apple emits twice. rustls
 /// 0.23 stores `signature_schemes` as a plain `Vec<SignatureScheme>` and does
-/// NOT dedupe, so the Safari17 profile in `src/tls/stateful.rs` can — and
+/// NOT dedupe, so the Safari26 profile in `src/tls/stateful.rs` can — and
 /// does — emit the duplicate to land exact JA4 sig-algs parity.
 const SAFARI_SIGNATURE_ALGORITHMS_REAL: &[u16] = &[
     0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201,
@@ -268,7 +268,7 @@ fn assert_parallax_matches_safari(safari: &ClientHelloFields, parallax: &ClientH
     //
     // Apple emits `rsa_pss_rsae_sha384` (0x0805) twice; rustls 0.23 stores
     // the scheme list as `Vec<SignatureScheme>` and does not dedupe, so the
-    // Safari17 profile reproduces the duplicate verbatim. This gives us
+    // Safari26 profile reproduces the duplicate verbatim. This gives us
     // byte-for-byte parity with the apple.com fixture.
     assert_eq!(
         parallax.signature_algorithms, SAFARI_SIGNATURE_ALGORITHMS_REAL,
@@ -378,7 +378,7 @@ fn generate_parallax_safari_client_hello() -> Vec<u8> {
             "apple.com".to_owned(),
             psk,
             &server.public,
-            BrowserProfile::Safari17,
+            BrowserProfile::Safari26,
         )
         .expect("start stateful ParallaX TLS camouflage");
     session.client_hello_bytes().to_vec()

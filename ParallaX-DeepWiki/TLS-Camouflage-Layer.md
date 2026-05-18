@@ -34,7 +34,7 @@ Sources:[src/tls/client_hello_builder.rs#27-33](https://github.com/yuzeguitarist
 
 ParallaX provides a hand-written `ClientHello` construction engine used for high-fidelity mimicry. This component ensures that extension ordering, GREASE values, and cipher suites perfectly match the target browser.
 
-- Browser Profiles: Supports `Safari17` and `Chrome124`[src/tls/client_hello_builder.rs#27-33](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/client_hello_builder.rs#L27-L33)
+- Browser Profiles: Supports `Safari26` and `Chrome124`[src/tls/client_hello_builder.rs#27-33](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/client_hello_builder.rs#L27-L33)
 - Authentication Hijacking: ParallaX hijacks the TLS `random` field to carry the client's X25519 public key [src/tls/client_hello_builder.rs#80-81](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/client_hello_builder.rs#L80-L81) and the `legacy_session_id` to carry an authentication tag [src/tls/client_hello_builder.rs#61-62](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/client_hello_builder.rs#L61-L62)
 - GREASE Injection: Implements RFC 8701 to inject "Generate Random Extensions And Sustain Extensibility" values into cipher suites and extensions [src/tls/client_hello_builder.rs#85-89](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/client_hello_builder.rs#L85-L89)
 

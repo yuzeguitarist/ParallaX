@@ -333,7 +333,7 @@ sni = "{}"
 server_public_key = "{}"
 server_pq_public_key = "{}"
 server_identity_public_key = "{}"
-tls_profile = "safari17"
+tls_profile = "safari26"
 "#,
         psk, client_listen, server_addr, sni, server_public, pq_public, identity_public,
     );

@@ -18,7 +18,7 @@ ParallaX defines specific profiles to mimic the fingerprint of modern browsers. 
 
 | Profile | Target Browser | Characteristics |
 | --- | --- | --- |
-| `Safari17` | Apple Safari 17 | Specific extension order; includes `h2` and `http/1.1` ALPN [src/tls/client_hello_builder.rs#156-163](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/client_hello_builder.rs#L156-L163) |
+| `Safari26` | Apple Safari 26 | Specific extension order; includes `h2` and `http/1.1` ALPN [src/tls/client_hello_builder.rs#156-163](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/client_hello_builder.rs#L156-L163) |
 | `Chrome124` | Google Chrome 124 | Different extension ordering compared to Safari; standard Chrome cipher suites [src/tls/client_hello_builder.rs#164-171](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/client_hello_builder.rs#L164-L171) |
 
 ### Cipher Suite Selection

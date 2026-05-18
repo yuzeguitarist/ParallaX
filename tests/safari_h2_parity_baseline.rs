@@ -1,4 +1,4 @@
-//! Regression baseline that locks the Safari 17 HTTP/2 fingerprint against a
+//! Regression baseline that locks the Safari 26 HTTP/2 fingerprint against a
 //! real Safari 26.4 (macOS Tahoe) capture of the connection preface.
 //!
 //! The fixture under `tests/fixtures/safari26_h2_preface_localhost.bin` was
@@ -172,7 +172,7 @@ fn safari_h2_fixture_opening_headers_match_known_shape() {
 
 #[test]
 fn parallax_safari_h2_preface_matches_fixture_byte_for_byte() {
-    let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari17);
+    let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari26);
 
     let preface = fp.connection_preface().expect("build ParallaX preface");
     let safari_frames = parse_frames(fixture_after_preface());
@@ -188,11 +188,11 @@ fn parallax_safari_h2_preface_matches_fixture_byte_for_byte() {
         .expect("ParallaX SETTINGS frame");
     assert_eq!(
         parallax_settings.payload, safari_settings.payload,
-        "ParallaX Safari17 SETTINGS payload must match Safari 26.4 byte-for-byte"
+        "ParallaX Safari26 SETTINGS payload must match Safari 26.4 byte-for-byte"
     );
     assert_eq!(
         parallax_settings.flags, safari_settings.flags,
-        "ParallaX Safari17 SETTINGS flags must match (no ACK on outbound)"
+        "ParallaX Safari26 SETTINGS flags must match (no ACK on outbound)"
     );
 
     let safari_wu = safari_frames
@@ -205,13 +205,13 @@ fn parallax_safari_h2_preface_matches_fixture_byte_for_byte() {
         .expect("ParallaX WINDOW_UPDATE");
     assert_eq!(
         parallax_wu.payload, safari_wu.payload,
-        "ParallaX Safari17 WINDOW_UPDATE increment must match Safari 26.4 byte-for-byte"
+        "ParallaX Safari26 WINDOW_UPDATE increment must match Safari 26.4 byte-for-byte"
     );
 }
 
 #[test]
 fn parallax_safari_opening_headers_match_fixture_pseudo_header_section() {
-    let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari17);
+    let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari26);
     let parallax_headers_frame = fp
         .headers_frame(FIXTURE_AUTHORITY)
         .expect("build ParallaX Safari HEADERS");
@@ -236,7 +236,7 @@ fn parallax_safari_opening_headers_match_fixture_pseudo_header_section() {
     );
     assert_eq!(
         parallax_headers.flags, safari_headers.flags,
-        "ParallaX Safari17 HEADERS flags must match Safari (END_STREAM | END_HEADERS)"
+        "ParallaX Safari26 HEADERS flags must match Safari (END_STREAM | END_HEADERS)"
     );
     assert_eq!(
         parallax_headers.flags,
@@ -257,7 +257,7 @@ fn parallax_safari_opening_headers_match_fixture_pseudo_header_section() {
     assert_eq!(
         parallax_headers.payload.as_slice(),
         &safari_headers.payload[..prefix_len],
-        "ParallaX Safari17 HPACK prefix diverged from Safari 26.4 byte-for-byte"
+        "ParallaX Safari26 HPACK prefix diverged from Safari 26.4 byte-for-byte"
     );
     assert_eq!(
         &parallax_headers.payload[..4],
@@ -269,6 +269,6 @@ fn parallax_safari_opening_headers_match_fixture_pseudo_header_section() {
     assert_eq!(
         &parallax_headers.payload[4..],
         &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
-        "ParallaX Safari17 :authority must be HPACK-Huffman-encoded to match Safari 26.4"
+        "ParallaX Safari26 :authority must be HPACK-Huffman-encoded to match Safari 26.4"
     );
 }

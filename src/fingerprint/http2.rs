@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Http2PeerProfile {
-    Safari17,
+    Safari26,
     Chrome124,
 }
 
@@ -52,7 +52,7 @@ impl Http2Fingerprint {
             // order, and the 10 MiB connection-level WINDOW_UPDATE increment
             // are byte-for-byte stable across fresh connections.
             // Ground truth: `tests/fixtures/safari26_h2_preface_localhost.bin`.
-            Http2PeerProfile::Safari17 => Self {
+            Http2PeerProfile::Safari26 => Self {
                 settings: vec![
                     Http2Setting { id: 0x2, value: 0 },
                     Http2Setting {
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn settings_frame_has_expected_length() {
-        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari17);
+        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari26);
         let frame = fp.settings_frame().unwrap();
         assert_eq!(&frame[0..3], &[0, 0, 24]);
         assert_eq!(frame[3], 0x4);
@@ -405,8 +405,8 @@ mod tests {
     /// followed by `a0 e4 1d 13 9d 09 b8 f3 4d 33`. Capture: see
     /// `tests/fixtures/safari26_h2_preface_localhost.bin`.
     #[test]
-    fn safari17_authority_matches_captured_huffman_bytes() {
-        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari17);
+    fn safari26_authority_matches_captured_huffman_bytes() {
+        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari26);
         let frame = fp.headers_frame("localhost:8443").unwrap();
         let payload = &frame[9..];
         assert_eq!(
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(
             &payload[4..],
             &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
-            "Safari17 :authority huffman bytes drifted from captured baseline",
+            "Safari26 :authority huffman bytes drifted from captured baseline",
         );
     }
 

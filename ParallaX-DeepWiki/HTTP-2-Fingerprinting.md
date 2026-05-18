@@ -11,7 +11,7 @@ The HTTP/2 fingerprinting layer in ParallaX ensures that once the TLS 1.3 handsh
 
 ParallaX defines specific profiles to match common browser behaviors. Each profile dictates the initial `SETTINGS` parameters, the connection-level flow control window, and whether priority frames are sent.
 
-- Safari 17: Configures a smaller header table size (4096) and a large initial window increment (15,663,105) [src/fingerprint/http2.rs#39-60](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/fingerprint/http2.rs#L39-L60)
+- Safari 26: Configures a smaller header table size (4096) and a large initial window increment (15,663,105) [src/fingerprint/http2.rs#39-60](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/fingerprint/http2.rs#L39-L60)
 - Chrome 124: Configures a larger header table size (65,536) and explicitly disables server push [src/fingerprint/http2.rs#61-83](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/fingerprint/http2.rs#L61-L83)
 
 The `Http2Fingerprint` struct encapsulates these parameters and provides methods to generate the corresponding binary frames [src/fingerprint/http2.rs#16-20](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/fingerprint/http2.rs#L16-L20)

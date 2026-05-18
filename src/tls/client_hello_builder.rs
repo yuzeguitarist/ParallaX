@@ -28,7 +28,7 @@ const GROUP_SECP384R1: u16 = 0x0018;
 #[serde(rename_all = "kebab-case")]
 pub enum BrowserProfile {
     #[default]
-    Safari17,
+    Safari26,
     Chrome124,
 }
 
@@ -117,7 +117,7 @@ impl ClientHelloTemplate {
 }
 
 fn push_cipher_suites(out: &mut Vec<u8>, profile: BrowserProfile, grease: u16) {
-    const SAFARI17_SUITES: [u16; 7] = [
+    const SAFARI26_SUITES: [u16; 7] = [
         TLS_AES_128_GCM_SHA256,
         TLS_AES_256_GCM_SHA384,
         TLS_CHACHA20_POLY1305_SHA256,
@@ -136,7 +136,7 @@ fn push_cipher_suites(out: &mut Vec<u8>, profile: BrowserProfile, grease: u16) {
         TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
     ];
     let suites = match profile {
-        BrowserProfile::Safari17 => &SAFARI17_SUITES,
+        BrowserProfile::Safari26 => &SAFARI26_SUITES,
         BrowserProfile::Chrome124 => &CHROME124_SUITES,
     };
 
@@ -155,7 +155,7 @@ fn push_profile_extensions(
     x25519_public_key: &[u8; 32],
 ) {
     match profile {
-        BrowserProfile::Safari17 => {
+        BrowserProfile::Safari26 => {
             push_sni(out, sni);
             push_supported_groups(out, grease);
             push_signature_algorithms(out);
@@ -288,7 +288,7 @@ mod tests {
         let record = ClientHelloTemplate {
             sni: "example.com".to_owned(),
             x25519_public_key: client.public,
-            profile: BrowserProfile::Safari17,
+            profile: BrowserProfile::Safari26,
         }
         .build_signed(&client_auth, &mut rng)
         .unwrap();
@@ -329,7 +329,7 @@ mod tests {
         let err = ClientHelloTemplate {
             sni: String::new(),
             x25519_public_key: [1_u8; 32],
-            profile: BrowserProfile::Safari17,
+            profile: BrowserProfile::Safari26,
         }
         .build_unsigned(&mut rng)
         .unwrap_err();

@@ -152,12 +152,12 @@ pub struct ProfileConfig {
 impl ProfileConfig {
     pub fn for_browser(browser: BrowserProfile) -> Self {
         let alpn_protocols = match browser {
-            BrowserProfile::Safari17 | BrowserProfile::Chrome124 => {
+            BrowserProfile::Safari26 | BrowserProfile::Chrome124 => {
                 vec![b"h2".to_vec(), b"http/1.1".to_vec()]
             }
         };
         let http2_profile = match browser {
-            BrowserProfile::Safari17 => Http2PeerProfile::Safari17,
+            BrowserProfile::Safari26 => Http2PeerProfile::Safari26,
             BrowserProfile::Chrome124 => Http2PeerProfile::Chrome124,
         };
         Self {
@@ -506,7 +506,7 @@ fn shape_cipher_suites_for_profile(
                 cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
             ];
         }
-        BrowserProfile::Safari17 => {
+        BrowserProfile::Safari26 => {
             // Safari 26.4 ClientHello order (apple.com capture):
             //   GREASE, TLS13_AES_256_GCM, TLS13_CHACHA20, TLS13_AES_128_GCM,
             //   ECDHE_ECDSA(AES256/AES128/CHACHA), ECDHE_RSA(AES256/AES128/CHACHA),
@@ -552,7 +552,7 @@ fn shape_key_exchange_groups_for_profile(
                 kx_group::SECP384R1,
             ];
         }
-        BrowserProfile::Safari17 => {
+        BrowserProfile::Safari26 => {
             // Safari 26.4 supported_groups (apple.com capture):
             //   GREASE, X25519MLKEM768, X25519, secp256r1, secp384r1, secp521r1.
             //
@@ -882,7 +882,7 @@ impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
                 SignatureScheme::RSA_PSS_SHA512,
                 SignatureScheme::RSA_PKCS1_SHA512,
             ],
-            BrowserProfile::Safari17 => vec![
+            BrowserProfile::Safari26 => vec![
                 // Safari 26.4 / CoreCrypto wire order (verified against
                 // apple.com + cloudflare.com captures). Apple emits
                 // `rsa_pss_rsae_sha384` twice in a row; rustls 0.23 stores
@@ -928,7 +928,7 @@ mod tests {
                 "example.com".to_owned(),
                 psk,
                 &server.public,
-                BrowserProfile::Safari17,
+                BrowserProfile::Safari26,
             )
             .unwrap();
 

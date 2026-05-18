@@ -55,7 +55,7 @@ The `[client]` section [src/config.rs#84-93](https://github.com/yuzeguitarist/Pa
 - `server_public_key`: Base64-encoded X25519 public key of the server [src/config.rs#88](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L88-L88)
 - `server_pq_public_key`: Base64-encoded ML-KEM-1024 public key [src/config.rs#89](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L89-L89)
 - `server_identity_public_key`: Base64-encoded ML-DSA-87 public key [src/config.rs#90](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L90-L90)
-- `tls_profile`: The browser fingerprint to emulate (e.g., `Chrome124`, `Safari17`) [src/config.rs#92](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L92-L92)
+- `tls_profile`: The browser fingerprint to emulate (e.g., `Chrome124`, `Safari26`) [src/config.rs#92](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L92-L92)
 
 ### Configuration Logic Flow
 

@@ -1032,10 +1032,10 @@ mod tests {
     }
 
     #[test]
-    fn quic_server_identity_frame_verifies_configured_identity() {
+    fn quic_server_identity_frame_accepts_matching_identity() {
         let server_x25519 = X25519KeyPair::generate();
         let server_identity = identity::keypair();
-        let context = [9_u8; 32];
+        let context = [7_u8; 32];
         let server = ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: "example.com:443".to_owned(),
@@ -1054,7 +1054,7 @@ mod tests {
             server_public_key: STANDARD.encode(server_x25519.public),
             server_pq_public_key: String::new(),
             server_identity_public_key: STANDARD.encode(&server_identity.public),
-            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
+            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari26,
         };
 
         let server = QuicServerRuntime::decode(server).unwrap();
@@ -1088,7 +1088,7 @@ mod tests {
             server_public_key: STANDARD.encode(server_x25519.public),
             server_pq_public_key: String::new(),
             server_identity_public_key: STANDARD.encode(&wrong_identity.public),
-            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
+            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari26,
         };
 
         let server = QuicServerRuntime::decode(server).unwrap();
@@ -1239,7 +1239,7 @@ mod tests {
                 server_public_key: STANDARD.encode(server_public_key),
                 server_pq_public_key: String::new(),
                 server_identity_public_key: STANDARD.encode(&server_identity.public),
-                tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
+                tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari26,
             })
             .unwrap(),
         )

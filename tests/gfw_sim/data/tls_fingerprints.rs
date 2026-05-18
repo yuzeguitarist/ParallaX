@@ -52,14 +52,14 @@ pub const KNOWN_BROWSER_FINGERPRINTS: &[BrowserFingerprintEntry] = &[
         ja3_md5: "773906b0efdefa24a7f2b8eb6985bf37",
         ja4: "t13d1517h2_8daaf6152771_b0da82dd1658",
     },
-    // Safari 17 (macOS).
+    // Safari 26 (macOS).
     BrowserFingerprintEntry {
-        label: "safari-17-macos",
+        label: "safari-26-macos",
         ja3_md5: "1538eeb4d31b9ff9f81b00cae0a1d0c9",
         ja4: "t13d2014h2_a09f3c656075_e1a3cbb20efb",
     },
     BrowserFingerprintEntry {
-        label: "safari-17-ios",
+        label: "safari-26-ios",
         ja3_md5: "a8e23f8a51a8a89cd66ad6b4e7d3b7c6",
         ja4: "t13d2014h2_a09f3c656075_b5f5c9b6f6a4",
     },
