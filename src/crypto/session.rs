@@ -259,7 +259,8 @@ impl AeadCodec {
     }
 
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let mut ciphertext = plaintext.to_vec();
+        let mut ciphertext = Vec::with_capacity(plaintext.len() + AEAD_TAG_LEN);
+        ciphertext.extend_from_slice(plaintext);
         let tag = self.seal_in_place_detached(&mut ciphertext, aad)?;
         ciphertext.extend_from_slice(&tag);
         Ok(ciphertext)
