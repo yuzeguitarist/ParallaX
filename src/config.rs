@@ -384,7 +384,7 @@ fn require_host_port(field: &'static str, value: &str) -> Result<(), ConfigError
             value: value.to_owned(),
         });
     };
-    if host.trim().is_empty() || port.parse::<u16>().is_err() {
+    if host.trim().is_empty() || !matches!(port.parse::<u16>(), Ok(port) if port != 0) {
         return Err(ConfigError::InvalidSocket {
             field,
             value: value.to_owned(),
@@ -659,6 +659,9 @@ authorized_sni = ["example.com"]
         assert!(matches!(err, ConfigError::InvalidSocket { .. }));
 
         let err = require_host_port("client.server_addr", "::1:443").unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidSocket { .. }));
+
+        let err = require_host_port("client.server_addr", "example.com:0").unwrap_err();
         assert!(matches!(err, ConfigError::InvalidSocket { .. }));
 
         require_host_port("client.server_addr", "[::1]:443").unwrap();

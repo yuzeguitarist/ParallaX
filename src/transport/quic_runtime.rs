@@ -151,9 +151,10 @@ pub async fn run_server(config: Config) -> Result<(), QuicRuntimeError> {
     }
     let psk = Arc::new(decode_psk(&config.crypto.psk)?);
     let server = config.server.ok_or(QuicRuntimeError::MissingServer)?;
-    let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create(
+    let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create_authenticated(
         &server.replay_cache_path,
         8192,
+        psk.as_ref().as_slice(),
     )?));
     let endpoint = Endpoint::server(server_config(&server)?, server.listen)?;
     tracing::info!("ParallaX QUIC server listening on udp://{}", server.listen);
