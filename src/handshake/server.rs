@@ -673,7 +673,7 @@ fn resolve_connect_target(
 ) -> Result<(String, Vec<u8>), HandshakeServerError> {
     match ConnectRequest::decode(&first_payload) {
         Ok(request) => Ok((request.target(), request.initial_payload)),
-        Err(ConnectRequestError::BadMagic) => {
+        Err(ConnectRequestError::BadMagic | ConnectRequestError::Truncated) => {
             let target = fixed_data_target.ok_or(HandshakeServerError::MissingConnectTarget)?;
             Ok((target.to_owned(), first_payload))
         }
