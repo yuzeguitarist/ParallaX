@@ -8,7 +8,7 @@
 //!
 //! Design notes:
 //!
-//! * 23 cases across six groups exercise the asymmetric primitives, KDFs,
+//! * 32 cases across six groups exercise the asymmetric primitives, KDFs,
 //!   handshake composition, application-data AEAD pipeline, traffic shaping,
 //!   and replay-cache bookkeeping that dominate ParallaX's wall-clock cost.
 //! * Each case declares an iteration [`Tier`]. Tiers are static constants so
@@ -27,23 +27,27 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::{
-    config::{decode_base64_bytes, decode_base64_secret, decode_key32, decode_key32_secret},
+    config::{
+        decode_base64_bytes, decode_base64_secret, decode_key32, decode_key32_secret, TrafficConfig,
+    },
     crypto::{
         auth::{derive_client_auth_key, derive_server_auth_key, verify_client_hello_auth},
         identity, pq,
         replay::{ReplayCache, ReplayEntry},
         session::{
             derive_client_keys, x25519_public_from_private, x25519_shared_secret, AeadCodec,
-            X25519KeyPair, KEY_LEN, NONCE_LEN,
+            SessionKeys, X25519KeyPair, KEY_LEN, NONCE_LEN,
         },
     },
+    handshake::client::ClientDataSession,
     protocol::{
-        command::ServerIdentityProof,
+        command::{ConnectRequest, ServerIdentityProof},
         data::{DataRecordCodec, SealedRecord, CLIENT_TO_SERVER_AAD},
     },
     tls::{
         client_hello::parse_client_hello,
         client_hello_builder::{BrowserProfile, ClientHelloTemplate},
+        stateful::StatefulRustlsCamouflageBackend,
     },
     traffic::PaddingProfile,
 };
@@ -319,9 +323,14 @@ const CASES: &[CaseRunner] = &[
     bench_mldsa_verify,
     bench_hkdf_session_keys,
     bench_hkdf_hybrid_rekey,
+    bench_hkdf_hybrid_sandwich_rekey,
     bench_clienthello_build_signed,
+    bench_stateful_clienthello_start_safari,
+    bench_stateful_clienthello_start_chrome,
     bench_clienthello_parse,
     bench_clienthello_verify_auth,
+    bench_client_pq_rekey_record,
+    bench_client_connect_record_1k,
     bench_quic_server_identity_build_decode_each_time,
     bench_quic_server_identity_build_cached,
     bench_quic_client_identity_verify_decode_each_time,
@@ -518,6 +527,22 @@ fn bench_hkdf_hybrid_rekey(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     )
 }
 
+fn bench_hkdf_hybrid_sandwich_rekey(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let chain = [0x11_u8; KEY_LEN];
+    let x25519_shared = [0x22_u8; KEY_LEN];
+    let pq_shared = [0x33_u8; KEY_LEN];
+    run_case(
+        BenchGroup::HandshakeCrypto,
+        "hkdf.hybrid_sandwich_rekey",
+        TIER_FAST,
+        options,
+        || {
+            let derived = pq::hybrid_sandwich_rekey(&chain, &x25519_shared, &pq_shared, BENCH_PSK)?;
+            Ok(black_box(derived.len() as u64))
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // handshake.protocol
 // ---------------------------------------------------------------------------
@@ -540,6 +565,37 @@ fn bench_clienthello_build_signed(options: BenchmarkOptions) -> Result<Benchmark
         || {
             let record = template.build_signed(&auth_key, &mut rng)?;
             Ok(black_box(record.len() as u64))
+        },
+    )
+}
+
+fn bench_stateful_clienthello_start_safari(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    bench_stateful_clienthello_start(options, "stateful.start_safari", BrowserProfile::Safari17)
+}
+
+fn bench_stateful_clienthello_start_chrome(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    bench_stateful_clienthello_start(options, "stateful.start_chrome", BrowserProfile::Chrome124)
+}
+
+fn bench_stateful_clienthello_start(
+    options: BenchmarkOptions,
+    name: &'static str,
+    profile: BrowserProfile,
+) -> Result<BenchmarkCase> {
+    let server = X25519KeyPair::generate();
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        name,
+        TIER_MEDIUM,
+        options,
+        || {
+            let session = StatefulRustlsCamouflageBackend.start(
+                BENCH_SNI.to_owned(),
+                BENCH_PSK,
+                &server.public,
+                profile,
+            )?;
+            Ok(black_box(session.client_hello_bytes().len() as u64))
         },
     )
 }
@@ -590,6 +646,58 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN])> {
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let record = template.build_signed(&client_auth, &mut rng)?;
     Ok((record, server_auth))
+}
+
+fn bench_client_pq_rekey_record(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let keys = session_keys_fixture()?;
+    let traffic = TrafficConfig::default();
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "client.pq_rekey_record",
+        TIER_MEDIUM,
+        options,
+        || {
+            let mut session = ClientDataSession::new(keys.clone(), traffic)?;
+            let (record, pending) = session.build_pq_rekey_record(&mut rng)?;
+            Ok(black_box(
+                (record.len() + pending.mlkem_secret_key().len()) as u64,
+            ))
+        },
+    )
+}
+
+fn bench_client_connect_record_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let keys = session_keys_fixture()?;
+    let traffic = TrafficConfig::default();
+    let request = ConnectRequest {
+        host: BENCH_SNI.to_owned(),
+        port: 443,
+        initial_payload: vec![0x42_u8; SIZE_1K],
+    };
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "client.connect_record_1k",
+        TIER_FAST,
+        options,
+        || {
+            let mut session = ClientDataSession::new(keys.clone(), traffic)?;
+            let record = session.build_connect_record(request.clone(), &mut rng)?;
+            Ok(black_box(record.len() as u64))
+        },
+    )
+}
+
+fn session_keys_fixture() -> Result<SessionKeys> {
+    let client = X25519KeyPair::generate();
+    let server = X25519KeyPair::generate();
+    let transcript = [0x42_u8; KEY_LEN];
+    Ok(derive_client_keys(
+        &client.private,
+        &server.public,
+        &transcript,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
