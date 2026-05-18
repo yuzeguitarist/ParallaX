@@ -192,8 +192,16 @@ impl DataRecordCodec {
         if record.len() < header.total_len {
             return Err(record::TlsRecordError::IncompletePayload.into());
         }
-        let mut padded = record[record::TLS_HEADER_LEN..header.total_len].to_vec();
-        self.aead.open_in_place(&mut padded, self.aad)?;
+        if header.payload_len < AEAD_TAG_LEN {
+            return Err(SessionError::Aead.into());
+        }
+
+        let tag_start = header.total_len - AEAD_TAG_LEN;
+        let mut tag = [0_u8; AEAD_TAG_LEN];
+        tag.copy_from_slice(&record[tag_start..header.total_len]);
+        let mut padded = record[record::TLS_HEADER_LEN..tag_start].to_vec();
+        self.aead
+            .open_in_place_detached(&mut padded, &tag, self.aad)?;
         PaddingProfile::remove_in_place(&mut padded)?;
         Ok(padded)
     }
@@ -213,10 +221,20 @@ impl DataRecordCodec {
         }
 
         record.truncate(header.total_len);
-        record.copy_within(record::TLS_HEADER_LEN..header.total_len, 0);
-        record.truncate(header.payload_len);
-        self.aead.open_in_place(record, self.aad)?;
-        PaddingProfile::remove_in_place(record)?;
+        if header.payload_len < AEAD_TAG_LEN {
+            return Err(SessionError::Aead.into());
+        }
+
+        let payload_start = record::TLS_HEADER_LEN;
+        let tag_start = header.total_len - AEAD_TAG_LEN;
+        let mut tag = [0_u8; AEAD_TAG_LEN];
+        tag.copy_from_slice(&record[tag_start..header.total_len]);
+        self.aead
+            .open_in_place_detached(&mut record[payload_start..tag_start], &tag, self.aad)?;
+
+        let plaintext_len = PaddingProfile::plaintext_len(&record[payload_start..tag_start])?;
+        record.copy_within(payload_start..payload_start + plaintext_len, 0);
+        record.truncate(plaintext_len);
         Ok(())
     }
 
