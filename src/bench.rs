@@ -34,12 +34,12 @@ use crate::{
         replay::{ReplayCache, ReplayEntry},
         session::{
             derive_client_keys, x25519_public_from_private, x25519_shared_secret, AeadCodec,
-            X25519KeyPair, KEY_LEN, NONCE_LEN,
+            X25519KeyPair, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN,
         },
     },
     protocol::{
         command::ServerIdentityProof,
-        data::{DataRecordCodec, SealedRecord, CLIENT_TO_SERVER_AAD},
+        data::{DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD},
     },
     tls::{
         client_hello::parse_client_hello,
@@ -331,9 +331,12 @@ const CASES: &[CaseRunner] = &[
     bench_aead_seal_16k,
     bench_aead_round_trip_1k,
     bench_record_seal_1k,
+    bench_record_open_in_place_1k,
     bench_record_round_trip_1k,
+    bench_record_round_trip_default_1k,
     bench_record_bulk_1mb,
     bench_padding_apply_1k,
+    bench_padding_apply_default_1k,
     bench_padding_remove_1k,
     bench_replay_cache_insert,
 ];
@@ -812,6 +815,73 @@ fn bench_record_round_trip_1k(options: BenchmarkOptions) -> Result<BenchmarkCase
     )
 }
 
+fn bench_record_open_in_place_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut enc = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let mut dec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_1K];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let (iterations, warmup) = effective_tier(TIER_FAST, options);
+    let total_records = iterations.saturating_add(warmup) as usize;
+    let records = sealed_record_fixtures(&mut enc, &payload, &mut rng, total_records)?;
+    let mut scratch = Vec::with_capacity(record_fixture_capacity(payload.len(), padding.max_len()));
+    let mut index = 0_usize;
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.open_in_place_1k",
+        TIER_FAST,
+        options,
+        || {
+            scratch.clear();
+            scratch.extend_from_slice(&records[index]);
+            index += 1;
+            dec.open_in_place(&mut scratch)?;
+            if scratch.len() != payload.len() {
+                bail!("DataRecord open-in-place plaintext length mismatch");
+            }
+            Ok(black_box(scratch.len() as u64))
+        },
+    )
+}
+
+fn bench_record_round_trip_default_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(0, 0)?;
+    let mut enc = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let mut dec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_1K];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.round_trip_default_1k",
+        TIER_FAST,
+        options,
+        || {
+            let record = enc.seal(&payload, &mut rng)?;
+            let plaintext = dec.open(&record)?;
+            if plaintext.len() != payload.len() {
+                bail!("default DataRecord round-trip length mismatch");
+            }
+            Ok(black_box((record.len() + plaintext.len()) as u64))
+        },
+    )
+}
+
 fn bench_record_bulk_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
     let mut enc = DataRecordCodec::new(
@@ -864,6 +934,22 @@ fn bench_padding_apply_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     run_case(
         BenchGroup::Traffic,
         "padding.apply_1k",
+        TIER_HOT,
+        options,
+        || {
+            let padded = padding.apply(&payload, &mut rng);
+            Ok(black_box(padded.len() as u64))
+        },
+    )
+}
+
+fn bench_padding_apply_default_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(0, 0)?;
+    let payload = vec![0x42_u8; SIZE_1K];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    run_case(
+        BenchGroup::Traffic,
+        "padding.apply_default_1k",
         TIER_HOT,
         options,
         || {
@@ -958,6 +1044,26 @@ where
         elapsed: start.elapsed(),
         processed_bytes,
     })
+}
+
+fn sealed_record_fixtures<R>(
+    codec: &mut DataRecordCodec,
+    payload: &[u8],
+    rng: &mut R,
+    count: usize,
+) -> Result<Vec<Vec<u8>>, DataRecordError>
+where
+    R: rand::Rng + rand::RngCore + ?Sized,
+{
+    let mut records = Vec::with_capacity(count);
+    for _ in 0..count {
+        records.push(codec.seal(payload, rng)?);
+    }
+    Ok(records)
+}
+
+fn record_fixture_capacity(payload_len: usize, max_padding: u16) -> usize {
+    crate::tls::record::TLS_HEADER_LEN + payload_len + max_padding as usize + 2 + AEAD_TAG_LEN
 }
 
 /// Apply the quick-mode scaling factor to a tier, clamping iterations so the

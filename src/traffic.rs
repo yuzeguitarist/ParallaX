@@ -107,20 +107,17 @@ impl PaddingProfile {
     }
 
     pub fn remove(padded: &[u8]) -> Result<Vec<u8>, TrafficError> {
-        if padded.len() < 2 {
-            return Err(TrafficError::PaddedFrameTooShort);
-        }
-
-        let pad_len =
-            u16::from_be_bytes([padded[padded.len() - 2], padded[padded.len() - 1]]) as usize;
-        if pad_len + 2 > padded.len() {
-            return Err(TrafficError::PaddingLengthOutOfRange);
-        }
-
-        Ok(padded[..padded.len() - pad_len - 2].to_vec())
+        let plaintext_len = Self::unpadded_len(padded)?;
+        Ok(padded[..plaintext_len].to_vec())
     }
 
     pub fn remove_in_place(padded: &mut Vec<u8>) -> Result<(), TrafficError> {
+        let plaintext_len = Self::unpadded_len(padded)?;
+        padded.truncate(plaintext_len);
+        Ok(())
+    }
+
+    pub(crate) fn unpadded_len(padded: &[u8]) -> Result<usize, TrafficError> {
         if padded.len() < 2 {
             return Err(TrafficError::PaddedFrameTooShort);
         }
@@ -131,8 +128,7 @@ impl PaddingProfile {
             return Err(TrafficError::PaddingLengthOutOfRange);
         }
 
-        padded.truncate(padded.len() - pad_len - 2);
-        Ok(())
+        Ok(padded.len() - pad_len - 2)
     }
 }
 
