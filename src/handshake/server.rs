@@ -1165,9 +1165,11 @@ mod tests {
 
     #[test]
     fn resolve_connect_target_uses_fixed_target_for_raw_payload() {
-        let (target, initial_payload) =
-            resolve_connect_target(b"GET / HTTP/1.1\r\n\r\n".to_vec(), Some("target.example:443"))
-                .unwrap();
+        let (target, initial_payload) = resolve_connect_target(
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            Some("target.example:443"),
+        )
+        .unwrap();
 
         assert_eq!(target, "target.example:443");
         assert_eq!(initial_payload, b"GET / HTTP/1.1\r\n\r\n");
