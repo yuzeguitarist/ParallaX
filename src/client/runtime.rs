@@ -804,6 +804,8 @@ mod tests {
         let server_keys = X25519KeyPair::generate();
         let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = replay_cache_dir.path().join("parallax-replay.cache");
         let server_config = ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
@@ -811,7 +813,7 @@ mod tests {
             private_key: STANDARD.encode(server_keys.private),
             pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
             identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
-            replay_cache_path: "parallax-replay.cache".into(),
+            replay_cache_path,
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
         };

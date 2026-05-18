@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     bench::{self, BenchmarkOptions},
     client::runtime,
-    config::Config,
+    config::{Config, DEFAULT_REPLAY_CACHE_PATH},
     crypto::{
         identity, pq,
         session::{derive_client_keys, AeadCodec, X25519KeyPair},
@@ -296,12 +296,19 @@ fallback_addr = "{}"
 private_key = "{}"
 pq_secret_key = "{}"
 identity_secret_key = "{}"
-replay_cache_path = "parallax-replay.cache"
+replay_cache_path = "{}"
 authorized_sni = ["{}"]
 strict_tls13 = true
 
 "#,
-        psk, server_listen, fallback_addr, server_private, pq_secret, identity_secret, sni,
+        psk,
+        server_listen,
+        fallback_addr,
+        server_private,
+        pq_secret,
+        identity_secret,
+        DEFAULT_REPLAY_CACHE_PATH,
+        sni,
     );
 
     let client = format!(
@@ -414,6 +421,10 @@ mod tests {
         assert_eq!(
             server_cfg.authorized_sni,
             vec![String::from("cloudflare.com")]
+        );
+        assert_eq!(
+            server_cfg.replay_cache_path,
+            PathBuf::from(DEFAULT_REPLAY_CACHE_PATH)
         );
         assert_eq!(client_cfg.server_addr, "203.0.113.10:443");
         assert_eq!(client_cfg.sni, "cloudflare.com");

@@ -13,6 +13,8 @@ use zeroize::Zeroizing;
 
 use crate::tls::client_hello_builder::BrowserProfile;
 
+pub(crate) const DEFAULT_REPLAY_CACHE_PATH: &str = "/var/lib/parallax/parallax-replay.cache";
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config: {0}")]
@@ -455,7 +457,7 @@ const fn default_max_concurrent_streams() -> u8 {
 }
 
 fn default_replay_cache_path() -> PathBuf {
-    PathBuf::from("parallax-replay.cache")
+    PathBuf::from(DEFAULT_REPLAY_CACHE_PATH)
 }
 
 #[cfg(test)]
@@ -701,7 +703,7 @@ server_identity_public_key = "{server_identity_public_key}"
     }
 
     #[test]
-    fn server_replay_cache_default_resolves_against_config_dir() {
+    fn server_replay_cache_default_uses_writable_state_dir() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.toml");
         let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
@@ -732,7 +734,7 @@ authorized_sni = ["example.com"]
 
         assert_eq!(
             server.replay_cache_path,
-            dir.path().join("parallax-replay.cache")
+            PathBuf::from(DEFAULT_REPLAY_CACHE_PATH)
         );
     }
 

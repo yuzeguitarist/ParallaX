@@ -683,6 +683,16 @@ safe_name() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
 }
 
+require_deploy_replay_cache_path() {
+  local server_cfg=$1 bad_line
+  bad_line="$(
+    grep -E '^[[:space:]]*replay_cache_path[[:space:]]*=' "$server_cfg" 2>/dev/null \
+      | grep -Ev '^[[:space:]]*replay_cache_path[[:space:]]*=[[:space:]]*"/var/lib/parallax/parallax-replay\.cache"[[:space:]]*(#.*)?$' \
+      || true
+  )"
+  [[ -z "$bad_line" ]] || die "server config replay_cache_path must be /var/lib/parallax/parallax-replay.cache under the deployed systemd sandbox; rerun without --reuse-config to regenerate $server_cfg"
+}
+
 build_host_tools_and_configs() {
   local deploy_dir=$1
   local server_cfg=$2
@@ -703,6 +713,8 @@ build_host_tools_and_configs() {
       --client-listen "$CLIENT_LISTEN" \
       --output "$deploy_dir"
   fi
+
+  require_deploy_replay_cache_path "$server_cfg"
 
   # plx check refuses group/other bits on config files (default umask often yields 0644).
   if [[ "$DRY_RUN" == "0" ]]; then
