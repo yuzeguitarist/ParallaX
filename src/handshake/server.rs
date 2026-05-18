@@ -700,7 +700,12 @@ fn resolve_connect_target(
     fixed_data_target: Option<&str>,
 ) -> Result<(String, Vec<u8>), HandshakeServerError> {
     match ConnectRequest::decode(&first_payload) {
-        Ok(request) => Ok((request.target(), request.initial_payload)),
+        Ok(request) => {
+            let target = fixed_data_target
+                .map(str::to_owned)
+                .unwrap_or_else(|| request.target());
+            Ok((target, request.initial_payload))
+        }
         Err(ConnectRequestError::BadMagic | ConnectRequestError::Truncated) => {
             let target = fixed_data_target.ok_or(HandshakeServerError::MissingConnectTarget)?;
             Ok((target.to_owned(), first_payload))
@@ -1156,10 +1161,24 @@ mod tests {
         };
 
         let (target, initial_payload) =
-            resolve_connect_target(request.encode().unwrap(), Some("fallback.example:443"))
-                .unwrap();
+            resolve_connect_target(request.encode().unwrap(), None).unwrap();
 
         assert_eq!(target, "[2001:db8::1]:443");
+        assert_eq!(initial_payload, b"hello");
+    }
+
+    #[test]
+    fn resolve_connect_target_honors_fixed_target_for_connect_request() {
+        let request = ConnectRequest {
+            host: "2001:db8::1".to_owned(),
+            port: 443,
+            initial_payload: b"hello".to_vec(),
+        };
+
+        let (target, initial_payload) =
+            resolve_connect_target(request.encode().unwrap(), Some("target.example:443")).unwrap();
+
+        assert_eq!(target, "target.example:443");
         assert_eq!(initial_payload, b"hello");
     }
 
