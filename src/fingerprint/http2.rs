@@ -17,6 +17,11 @@ pub struct Http2Fingerprint {
     pub settings: Vec<Http2Setting>,
     pub initial_window_update: Option<u32>,
     pub priority_frames: u8,
+    /// Flags byte set on the initial HEADERS frame for stream 1. Safari sets
+    /// END_STREAM together with END_HEADERS on its opening `GET /` because the
+    /// request has no body; Chrome only sets END_HEADERS and keeps stream 1
+    /// half-open.
+    pub initial_headers_flags: u8,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -36,27 +41,27 @@ pub struct Http2FrameHeader {
 impl Http2Fingerprint {
     pub fn for_profile(profile: Http2PeerProfile) -> Self {
         match profile {
+            // Safari 26.4 (macOS Tahoe) HTTP/2 preface, observed against a
+            // local TLS-terminating capture (ALPN h2). The 4 SETTINGS, their
+            // order, and the 10 MiB connection-level WINDOW_UPDATE increment
+            // are byte-for-byte stable across fresh connections.
+            // Ground truth: `tests/fixtures/safari26_h2_preface_localhost.bin`.
             Http2PeerProfile::Safari17 => Self {
                 settings: vec![
+                    Http2Setting { id: 0x2, value: 0 },
                     Http2Setting {
-                        id: 0x1,
-                        value: 4096,
+                        id: 0x4,
+                        value: 4_194_304,
                     },
                     Http2Setting {
                         id: 0x3,
                         value: 100,
                     },
-                    Http2Setting {
-                        id: 0x4,
-                        value: 2_097_152,
-                    },
-                    Http2Setting {
-                        id: 0x6,
-                        value: 262_144,
-                    },
+                    Http2Setting { id: 0x9, value: 1 },
                 ],
-                initial_window_update: Some(15_663_105),
+                initial_window_update: Some(10_485_760),
                 priority_frames: 0,
+                initial_headers_flags: 0x5,
             },
             Http2PeerProfile::Chrome124 => Self {
                 settings: vec![
@@ -80,6 +85,7 @@ impl Http2Fingerprint {
                 ],
                 initial_window_update: Some(15_663_105),
                 priority_frames: 0,
+                initial_headers_flags: 0x4,
             },
         }
     }
@@ -121,7 +127,7 @@ impl Http2Fingerprint {
         payload.push(0x84); // :path: /
         payload.push(0x41); // literal with indexed name: :authority
         push_hpack_string(&mut payload, authority.as_bytes());
-        frame(0x1, 0x4, 1, &payload)
+        frame(0x1, self.initial_headers_flags, 1, &payload)
     }
 }
 
