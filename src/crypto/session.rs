@@ -1,7 +1,7 @@
 use std::fmt;
 
 use chacha20poly1305::{
-    aead::{Aead, AeadInPlace, KeyInit, Payload},
+    aead::{Aead, AeadInPlace, KeyInit, Payload, Tag},
     XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
@@ -339,6 +339,33 @@ impl AeadCodec {
         Ok(())
     }
 
+    pub(crate) fn open_in_place_detached(
+        &mut self,
+        ciphertext_without_tag: &mut [u8],
+        tag: &[u8],
+        aad: &[u8],
+    ) -> Result<(), SessionError> {
+        if tag.len() != AEAD_TAG_LEN {
+            return Err(SessionError::Aead);
+        }
+        self.ensure_can_process_next_record()?;
+        let material = self.derive_record_material(aad)?;
+        let next_root = self.next_record_root(aad, ciphertext_without_tag, tag)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&material.key)
+            .expect("XChaCha20-Poly1305 key length is fixed");
+        cipher
+            .decrypt_in_place_detached(
+                XNonce::from_slice(&material.nonce),
+                aad,
+                ciphertext_without_tag,
+                Tag::<XChaCha20Poly1305>::from_slice(tag),
+            )
+            .map_err(|_| SessionError::Aead)?;
+        self.root_secret = next_root;
+        self.sequence += 1;
+        Ok(())
+    }
+
     fn ensure_can_process_next_record(&self) -> Result<(), SessionError> {
         if self.sequence == u64::MAX {
             return Err(SessionError::NonceExhausted);
@@ -375,7 +402,6 @@ impl AeadCodec {
         ciphertext_without_tag: &[u8],
         tag: &[u8],
     ) -> Result<(), SessionError> {
-        self.ensure_can_process_next_record()?;
         self.root_secret = self.next_record_root(aad, ciphertext_without_tag, tag)?;
         self.sequence += 1;
         Ok(())
