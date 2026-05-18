@@ -14,8 +14,9 @@
 //!   `MAX_CONCURRENT_STREAMS=100`, `NO_RFC7540_PRIORITIES=1` in that order
 //! * the connection-level WINDOW_UPDATE increment of 10_485_760 (10 MiB)
 //! * the opening HEADERS frame on stream 1 with
-//!   `flags = END_STREAM | END_HEADERS` and pseudo-header order
-//!   `:method, :scheme, :path, :authority`
+//!   `flags = END_STREAM | END_HEADERS`, pseudo-header order
+//!   `:method, :scheme, :path, :authority`, and the `:authority` value
+//!   HPACK-Huffman-encoded per RFC 7541.
 
 use parallax::fingerprint::http2::{Http2Fingerprint, Http2PeerProfile};
 
@@ -150,13 +151,22 @@ fn safari_h2_fixture_opening_headers_match_known_shape() {
     );
 
     // Pseudo-header section: indexed `:method GET` (#2), `:scheme https` (#7),
-    // `:path /` (#4), then literal-with-indexed-name `:authority` (#1).
-    // Safari huffman-encodes the authority value, but the leading 4 HPACK
-    // bytes are independent of the value encoding.
+    // `:path /` (#4), then literal-with-indexed-name `:authority` (#1) whose
+    // value is HPACK-Huffman-encoded (high bit of the length prefix set).
+    // For `localhost:8443` Safari emits these 11 bytes immediately after the
+    // pseudo-header preamble; Safari additionally sends `accept`, `user-agent`,
+    // `accept-language` etc. afterwards, which we deliberately don't mimic
+    // (over-specific camouflage is more fingerprintable than under-specific),
+    // so this assertion locks just the prefix that ParallaX also emits.
     assert_eq!(
         &headers.payload[..4],
         &[0x82, 0x87, 0x84, 0x41],
         "Safari pseudo-header order changed (expected :method, :scheme, :path, :authority)"
+    );
+    assert_eq!(
+        &headers.payload[4..15],
+        &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
+        "Safari 26.4 :authority huffman bytes for `localhost:8443` drifted"
     );
 }
 
@@ -233,42 +243,32 @@ fn parallax_safari_opening_headers_match_fixture_pseudo_header_section() {
         FLAG_END_STREAM | FLAG_END_HEADERS,
         "ParallaX must set END_STREAM | END_HEADERS on its initial GET /"
     );
-    // Pseudo-header section is the only HPACK prefix we can lock to Safari
-    // without huffman-encoding the authority value. Both Safari and ParallaX
-    // emit `82 87 84 41 <authority-literal>` in this order.
+    // ParallaX deliberately emits only the four pseudo-headers
+    // (`:method`, `:scheme`, `:path`, `:authority`); Safari additionally sends
+    // `accept`, `user-agent`, `accept-language`, etc., which we don't mimic
+    // because over-specific camouflage is more fingerprintable than
+    // under-specific. So we lock the ParallaX payload prefix against the
+    // matching prefix of Safari's HPACK block.
+    let prefix_len = parallax_headers.payload.len();
     assert_eq!(
-        &parallax_headers.payload[..4],
-        &safari_headers.payload[..4],
-        "ParallaX Safari17 pseudo-header section diverged from Safari 26.4"
+        prefix_len, 15,
+        "ParallaX HPACK payload must be 4 pseudo-header bytes + 11 :authority bytes"
+    );
+    assert_eq!(
+        parallax_headers.payload.as_slice(),
+        &safari_headers.payload[..prefix_len],
+        "ParallaX Safari17 HPACK prefix diverged from Safari 26.4 byte-for-byte"
     );
     assert_eq!(
         &parallax_headers.payload[..4],
         &[0x82, 0x87, 0x84, 0x41],
         "ParallaX pseudo-header order must be :method, :scheme, :path, :authority"
     );
-
-    // The :authority literal that follows is encoded as plain (non-huffman)
-    // because the current `push_hpack_string` helper does not implement HPACK
-    // huffman coding. This is a known wire-level delta from Safari, which
-    // huffman-encodes the value. Document it as a positive assertion so a
-    // future huffman-aware implementation will trip this test and remind us
-    // to retire this carve-out.
-    let authority_len_byte = parallax_headers.payload[4];
+    // `8a` = 0x80 (Huffman flag) | 0x0a (encoded length = 10 bytes) for
+    // `localhost:8443`; the 10 trailing bytes are the RFC 7541 Huffman code.
     assert_eq!(
-        authority_len_byte & 0x80,
-        0,
-        "ParallaX currently emits a plain (non-huffman) :authority value; \
-         Safari uses huffman. If this assertion fails, the huffman path was \
-         added and the test needs to be reworked."
-    );
-    assert_eq!(
-        authority_len_byte as usize,
-        FIXTURE_AUTHORITY.len(),
-        "ParallaX :authority length prefix must encode the literal length"
-    );
-    assert_eq!(
-        &parallax_headers.payload[5..5 + FIXTURE_AUTHORITY.len()],
-        FIXTURE_AUTHORITY.as_bytes(),
-        "ParallaX :authority literal must match the fixture's host"
+        &parallax_headers.payload[4..],
+        &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
+        "ParallaX Safari17 :authority must be HPACK-Huffman-encoded to match Safari 26.4"
     );
 }
