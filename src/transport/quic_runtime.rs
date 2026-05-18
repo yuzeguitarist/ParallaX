@@ -237,7 +237,6 @@ async fn handle_stream(
     psk: SharedPsk,
     replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
-    write_server_identity_frame(&mut send, &connection, &server).await?;
     let auth_frame = timeout(QUIC_AUTH_TIMEOUT, read_auth_frame(&mut recv))
         .await
         .map_err(|_| QuicRuntimeError::AuthTimeout)??;
@@ -256,6 +255,7 @@ async fn handle_stream(
         &replay_cache,
     )?;
     let request = ConnectRequest::decode(&connect_payload)?;
+    write_server_identity_frame(&mut send, &connection, &server).await?;
     let target_addr = server
         .data_target
         .clone()
@@ -301,7 +301,6 @@ async fn handle_local_connection(
         initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
     let connection = connect_with_0rtt(&endpoint, server_addr, &client.sni).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    read_and_verify_server_identity_frame(&mut recv, &connection, &client).await?;
     let connect = ConnectRequest {
         host: request.host,
         port: request.port,
@@ -309,6 +308,7 @@ async fn handle_local_connection(
     };
     write_authenticated_connect_request(&mut send, &connection, &psk, &client.sni, &connect)
         .await?;
+    read_and_verify_server_identity_frame(&mut recv, &connection, &client).await?;
 
     let (mut local_read, mut local_write) = local.into_split();
     let upload = async {
@@ -1014,6 +1014,19 @@ mod tests {
             .await
             .unwrap();
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_authenticated_connect_request(
+            &mut send,
+            &connection,
+            b"0123456789abcdef0123456789abcdef",
+            "example.com",
+            &ConnectRequest {
+                host: target_addr.ip().to_string(),
+                port: target_addr.port(),
+                initial_payload: b"ping".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
         read_and_verify_server_identity_frame(
             &mut recv,
             &connection,
@@ -1025,19 +1038,6 @@ mod tests {
                 server_pq_public_key: String::new(),
                 server_identity_public_key: STANDARD.encode(&server_identity.public),
                 tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
-            },
-        )
-        .await
-        .unwrap();
-        write_authenticated_connect_request(
-            &mut send,
-            &connection,
-            b"0123456789abcdef0123456789abcdef",
-            "example.com",
-            &ConnectRequest {
-                host: target_addr.ip().to_string(),
-                port: target_addr.port(),
-                initial_payload: b"ping".to_vec(),
             },
         )
         .await

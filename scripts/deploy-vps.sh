@@ -1002,7 +1002,7 @@ install_remote() {
   run "${ssh_args[@]}" "mkdir -p $(shell_quote "$remote_tmp")"
   run "${scp_args[@]}" "${scp_payload[@]}" "$SSH_TARGET:$remote_tmp/"
 
-  local q_tmp q_remote_bin q_remote_config q_service q_service_path q_remote_bin_dir q_remote_config_dir
+  local q_tmp q_remote_bin q_remote_config q_service q_service_path q_remote_bin_dir q_remote_config_dir q_parca_agent_channel
   q_tmp=$(shell_quote "$remote_tmp")
   q_remote_bin=$(shell_quote "$REMOTE_BIN")
   q_remote_config=$(shell_quote "$REMOTE_CONFIG")
@@ -1010,6 +1010,7 @@ install_remote() {
   q_service_path=$(shell_quote "/etc/systemd/system/$SERVICE_NAME.service")
   q_remote_bin_dir=$(shell_quote "$(dirname "$REMOTE_BIN")")
   q_remote_config_dir=$(shell_quote "$(dirname "$REMOTE_CONFIG")")
+  q_parca_agent_channel=$(shell_quote "$PARCA_AGENT_CHANNEL")
 
   local sudo_prefix=$REMOTE_SUDO
   local bbr_install_script=""
@@ -1137,7 +1138,7 @@ REMOTE_PROFILE
   local remote_script
   remote_script=$(cat <<REMOTE
 set -Eeuo pipefail
-PARCA_AGENT_CHANNEL="$PARCA_AGENT_CHANNEL"
+PARCA_AGENT_CHANNEL=$q_parca_agent_channel
 $bbr_install_script
 $sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir /var/lib/parallax
 $sudo_prefix install -m 0755 $q_tmp/plx $q_remote_bin
