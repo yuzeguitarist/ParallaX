@@ -1,13 +1,13 @@
 use std::{
     io,
-    net::{SocketAddr, ToSocketAddrs},
+    net::{SocketAddr, ToSocketAddrs, UdpSocket},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use quinn::{congestion, crypto::rustls::QuicClientConfig, Endpoint, VarInt};
+use quinn::{congestion, crypto::rustls::QuicClientConfig, default_runtime, Endpoint, VarInt};
 use rand::{rngs::OsRng, RngCore};
 use rcgen::generate_simple_self_signed;
 use rustls::{
@@ -16,11 +16,13 @@ use rustls::{
     DigitallySignedStruct, SignatureScheme,
 };
 use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol, Socket, Type};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Mutex as AsyncMutex,
     time::timeout,
 };
 
@@ -59,14 +61,19 @@ const QUIC_AUTH_WINDOW_SECS: u64 = 90;
 const MAX_AUTH_FRAME_LEN: usize = 512;
 const MAX_SERVER_IDENTITY_FRAME_LEN: usize = 8192;
 const MAX_CONNECT_FRAME_LEN: usize = 4096;
-const QUIC_FLOW_WINDOW: u32 = 16 * 1024 * 1024;
+const QUIC_CONN_FLOW_WINDOW: u32 = 64 * 1024 * 1024;
+const QUIC_STREAM_FLOW_WINDOW: u32 = 32 * 1024 * 1024;
+const QUIC_UDP_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
 const QUIC_BRUTAL_LIKE_INITIAL_WINDOW_PACKETS: u64 = 96;
+const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 64;
 const QUIC_KEEP_ALIVE_SECS: u64 = 15;
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(8);
 const QUIC_RELAY_BUFFER_LEN: usize = 64 * 1024;
+const QUIC_RELAY_FLUSH_THRESHOLD: usize = 4 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 type SharedPsk = Arc<Zeroizing<Vec<u8>>>;
+type SharedQuicConnection = Arc<AsyncMutex<Option<quinn::Connection>>>;
 
 #[derive(Clone)]
 struct QuicServerRuntime {
@@ -210,7 +217,7 @@ pub async fn run_server(config: Config) -> Result<(), QuicRuntimeError> {
         8192,
         psk.as_ref().as_slice(),
     )?));
-    let endpoint = Endpoint::server(server_config(&server.config)?, server.config.listen)?;
+    let endpoint = tuned_server_endpoint(server_config(&server.config)?, server.config.listen)?;
     tracing::info!(
         "ParallaX QUIC server listening on udp://{}",
         server.config.listen
@@ -247,9 +254,10 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
     let server_addr = resolve_addr(&client.server_addr)?;
     let listen = client.listen;
     let client = Arc::new(QuicClientRuntime::decode(client)?);
-    let mut endpoint = Endpoint::client(bind_any_addr(server_addr))?;
+    let mut endpoint = tuned_client_endpoint(bind_any_addr(server_addr))?;
     endpoint.set_default_client_config(client_config()?);
     let listener = TcpListener::bind(listen).await?;
+    let connection_cache = Arc::new(AsyncMutex::new(None));
     tracing::info!(
         "ParallaX QUIC client SOCKS5 listening on {} -> udp://{}",
         listen,
@@ -261,9 +269,11 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
         let endpoint = endpoint.clone();
         let client = Arc::clone(&client);
         let psk = Arc::clone(&psk);
+        let connection_cache = Arc::clone(&connection_cache);
         tokio::spawn(async move {
             if let Err(err) =
-                handle_local_connection(local, endpoint, server_addr, client, psk).await
+                handle_local_connection(local, endpoint, server_addr, client, psk, connection_cache)
+                    .await
             {
                 tracing::debug!(%peer, error = %err, "QUIC client stream closed");
             }
@@ -370,6 +380,7 @@ async fn handle_local_connection(
     server_addr: SocketAddr,
     client: Arc<QuicClientRuntime>,
     psk: SharedPsk,
+    connection_cache: SharedQuicConnection,
 ) -> Result<(), QuicRuntimeError> {
     tune_tcp_stream(&local)?;
     let request = socks::accept_connect(&mut local).await?;
@@ -377,8 +388,13 @@ async fn handle_local_connection(
         ConnectRequest::max_initial_payload_len(&request.host, MAX_CONNECT_FRAME_LEN);
     let initial_payload =
         initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
-    let connection = connect_with_0rtt(&endpoint, server_addr, client.sni.as_ref()).await?;
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let (connection, mut send, mut recv) = open_cached_bi(
+        &connection_cache,
+        &endpoint,
+        server_addr,
+        client.sni.as_ref(),
+    )
+    .await?;
     write_stream_open_and_auth_frame(&mut send, &connection, &psk, client.sni.as_ref()).await?;
     let connect = ConnectRequest {
         host: request.host,
@@ -403,6 +419,61 @@ async fn handle_local_connection(
     };
     tokio::try_join!(upload, download)?;
     Ok(())
+}
+
+async fn open_cached_bi(
+    connection_cache: &SharedQuicConnection,
+    endpoint: &Endpoint,
+    server_addr: SocketAddr,
+    sni: &str,
+) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream), QuicRuntimeError> {
+    let connection = cached_quic_connection(connection_cache, endpoint, server_addr, sni).await?;
+    match connection.open_bi().await {
+        Ok((send, recv)) => Ok((connection, send, recv)),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "cached QUIC connection could not open a stream; reconnecting"
+            );
+            clear_cached_quic_connection(connection_cache, &connection).await;
+            let connection =
+                cached_quic_connection(connection_cache, endpoint, server_addr, sni).await?;
+            let (send, recv) = connection.open_bi().await?;
+            Ok((connection, send, recv))
+        }
+    }
+}
+
+async fn cached_quic_connection(
+    connection_cache: &SharedQuicConnection,
+    endpoint: &Endpoint,
+    server_addr: SocketAddr,
+    sni: &str,
+) -> Result<quinn::Connection, QuicRuntimeError> {
+    let mut cached = connection_cache.lock().await;
+    if let Some(connection) = cached
+        .as_ref()
+        .filter(|connection| connection.close_reason().is_none())
+    {
+        return Ok(connection.clone());
+    }
+
+    let connection = connect_with_0rtt(endpoint, server_addr, sni).await?;
+    *cached = Some(connection.clone());
+    Ok(connection)
+}
+
+async fn clear_cached_quic_connection(
+    connection_cache: &SharedQuicConnection,
+    connection: &quinn::Connection,
+) {
+    let mut cached = connection_cache.lock().await;
+    if cached
+        .as_ref()
+        .is_some_and(|candidate| candidate.stable_id() == connection.stable_id())
+    {
+        *cached = None;
+    }
 }
 
 async fn connect_with_0rtt(
@@ -606,6 +677,9 @@ where
             return Ok(written);
         }
         writer.write_all(&buf[..n]).await?;
+        if n <= QUIC_RELAY_FLUSH_THRESHOLD {
+            writer.flush().await?;
+        }
         written += n as u64;
     }
 }
@@ -928,12 +1002,66 @@ fn tuned_transport_config() -> quinn::TransportConfig {
     let mut bbr = congestion::BbrConfig::default();
     bbr.initial_window(QUIC_BRUTAL_LIKE_INITIAL_WINDOW_PACKETS * 1200);
     transport.congestion_controller_factory(Arc::new(bbr));
-    transport.max_concurrent_bidi_streams(1_u8.into());
-    transport.send_window(QUIC_FLOW_WINDOW as u64);
-    transport.receive_window(VarInt::from_u32(QUIC_FLOW_WINDOW));
-    transport.stream_receive_window(VarInt::from_u32(QUIC_FLOW_WINDOW));
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS));
+    transport.send_window(QUIC_CONN_FLOW_WINDOW as u64);
+    transport.receive_window(VarInt::from_u32(QUIC_CONN_FLOW_WINDOW));
+    transport.stream_receive_window(VarInt::from_u32(QUIC_STREAM_FLOW_WINDOW));
     transport.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)));
     transport
+}
+
+fn tuned_server_endpoint(
+    config: quinn::ServerConfig,
+    addr: SocketAddr,
+) -> Result<Endpoint, QuicRuntimeError> {
+    Ok(Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        bind_tuned_udp_socket(addr)?,
+        quinn_runtime()?,
+    )?)
+}
+
+fn tuned_client_endpoint(addr: SocketAddr) -> Result<Endpoint, QuicRuntimeError> {
+    Ok(Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        bind_tuned_udp_socket(addr)?,
+        quinn_runtime()?,
+    )?)
+}
+
+fn quinn_runtime() -> io::Result<Arc<dyn quinn::Runtime>> {
+    default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))
+}
+
+fn bind_tuned_udp_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        if let Err(err) = socket.set_only_v6(false) {
+            tracing::debug!(error = %err, "unable to make QUIC UDP socket dual-stack");
+        }
+    }
+    tune_udp_socket_buffers(&socket);
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+fn tune_udp_socket_buffers(socket: &Socket) {
+    if let Err(err) = socket.set_recv_buffer_size(QUIC_UDP_SOCKET_BUFFER) {
+        tracing::trace!(
+            error = %err,
+            requested = QUIC_UDP_SOCKET_BUFFER,
+            "failed to raise QUIC UDP receive buffer"
+        );
+    }
+    if let Err(err) = socket.set_send_buffer_size(QUIC_UDP_SOCKET_BUFFER) {
+        tracing::trace!(
+            error = %err,
+            requested = QUIC_UDP_SOCKET_BUFFER,
+            "failed to raise QUIC UDP send buffer"
+        );
+    }
 }
 
 fn resolve_addr(server_addr: &str) -> Result<SocketAddr, QuicRuntimeError> {
@@ -998,8 +1126,13 @@ impl ServerCertVerifier for AcceptQuicServerCert {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
     use super::*;
     use crate::crypto::{identity, session::X25519KeyPair};
@@ -1016,6 +1149,87 @@ mod tests {
             bind_any_addr("[::1]:443".parse().unwrap()),
             "[::]:0".parse().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn quic_relay_flushes_latency_sized_chunks() {
+        let payload = vec![42_u8; QUIC_RELAY_FLUSH_THRESHOLD];
+        let mut reader = OneChunkReader::new(payload.clone());
+        let mut writer = FlushCountingWriter::default();
+
+        let copied = copy_relay(&mut reader, &mut writer).await.unwrap();
+
+        assert_eq!(copied, payload.len() as u64);
+        assert_eq!(writer.bytes, payload);
+        assert_eq!(writer.flushes, 1);
+    }
+
+    #[tokio::test]
+    async fn quic_relay_does_not_flush_bulk_chunks() {
+        let payload = vec![43_u8; QUIC_RELAY_FLUSH_THRESHOLD + 1];
+        let mut reader = OneChunkReader::new(payload.clone());
+        let mut writer = FlushCountingWriter::default();
+
+        let copied = copy_relay(&mut reader, &mut writer).await.unwrap();
+
+        assert_eq!(copied, payload.len() as u64);
+        assert_eq!(writer.bytes, payload);
+        assert_eq!(writer.flushes, 0);
+    }
+
+    struct OneChunkReader {
+        data: Vec<u8>,
+        emitted: bool,
+    }
+
+    impl OneChunkReader {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                emitted: false,
+            }
+        }
+    }
+
+    impl AsyncRead for OneChunkReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.emitted {
+                return Poll::Ready(Ok(()));
+            }
+            buf.put_slice(&self.data);
+            self.emitted = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushCountingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for FlushCountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[tokio::test]

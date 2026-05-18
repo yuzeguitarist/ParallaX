@@ -717,6 +717,7 @@ dependencies = [
  "rustls",
  "serde",
  "sha2",
+ "socket2",
  "subtle",
  "tempfile",
  "thiserror",
