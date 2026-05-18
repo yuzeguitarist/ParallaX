@@ -34,6 +34,7 @@ use crate::{
     crypto::{auth::AuthError, identity, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::ConnectRequest,
+    protocol::command::ServerIdentityChunk,
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
     },
@@ -402,10 +403,13 @@ async fn read_server_identity_payload(
 ) -> Result<Vec<u8>, ClientRuntimeError> {
     let mut expected_total = None;
     let mut assembled = Vec::new();
+    let mut server_records = TlsRecordReader::new(server);
+    let mut record = Vec::new();
 
     loop {
-        let record = read_record(server).await?;
-        let chunk = data_session.open_server_identity_chunk(&record)?;
+        server_records.read_record_into(&mut record).await?;
+        data_session.open_server_record_in_place(&mut record)?;
+        let chunk = ServerIdentityChunk::decode(&record).map_err(ClientHandshakeError::from)?;
         let total_len = chunk.total_len as usize;
         if total_len == 0 || total_len > MAX_SERVER_IDENTITY_PAYLOAD {
             return Err(ClientRuntimeError::ServerIdentityTooLarge);

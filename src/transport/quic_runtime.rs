@@ -68,6 +68,52 @@ const QUIC_RELAY_BUFFER_LEN: usize = 64 * 1024;
 type HmacSha256 = Hmac<Sha256>;
 type SharedPsk = Arc<Zeroizing<Vec<u8>>>;
 
+#[derive(Clone)]
+struct QuicServerRuntime {
+    config: ServerConfig,
+    x25519_public_key: [u8; 32],
+    identity_secret_key: Arc<Zeroizing<Vec<u8>>>,
+}
+
+impl QuicServerRuntime {
+    fn decode(config: ServerConfig) -> Result<Self, ConfigError> {
+        let private_key = decode_key32_secret("server.private_key", &config.private_key)?;
+        let x25519_public_key = x25519_public_from_private(&private_key);
+        let identity_secret_key = Arc::new(decode_base64_secret(
+            "server.identity_secret_key",
+            &config.identity_secret_key,
+        )?);
+        Ok(Self {
+            config,
+            x25519_public_key,
+            identity_secret_key,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct QuicClientRuntime {
+    sni: Arc<str>,
+    server_public_key: [u8; 32],
+    server_identity_public_key: Arc<[u8]>,
+}
+
+impl QuicClientRuntime {
+    fn decode(config: ClientConfig) -> Result<Self, ConfigError> {
+        let server_public_key =
+            decode_key32("client.server_public_key", &config.server_public_key)?;
+        let server_identity_public_key = Arc::<[u8]>::from(decode_base64_bytes(
+            "client.server_identity_public_key",
+            &config.server_identity_public_key,
+        )?);
+        Ok(Self {
+            sni: Arc::<str>::from(config.sni),
+            server_public_key,
+            server_identity_public_key,
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum QuicRuntimeError {
     #[error("config error: {0}")]
@@ -152,16 +198,20 @@ pub async fn run_server(config: Config) -> Result<(), QuicRuntimeError> {
     }
     let psk = Arc::new(decode_psk(&config.crypto.psk)?);
     let server = config.server.ok_or(QuicRuntimeError::MissingServer)?;
+    let server = Arc::new(QuicServerRuntime::decode(server)?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create_authenticated(
-        &server.replay_cache_path,
+        &server.config.replay_cache_path,
         8192,
         psk.as_ref().as_slice(),
     )?));
-    let endpoint = Endpoint::server(server_config(&server)?, server.listen)?;
-    tracing::info!("ParallaX QUIC server listening on udp://{}", server.listen);
+    let endpoint = Endpoint::server(server_config(&server.config)?, server.config.listen)?;
+    tracing::info!(
+        "ParallaX QUIC server listening on udp://{}",
+        server.config.listen
+    );
 
     while let Some(incoming) = endpoint.accept().await {
-        let server = server.clone();
+        let server = Arc::clone(&server);
         let psk = Arc::clone(&psk);
         let replay_cache = Arc::clone(&replay_cache);
         tokio::spawn(async move {
@@ -187,19 +237,21 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
     let psk = Arc::new(decode_psk(&config.crypto.psk)?);
     let client = config.client.ok_or(QuicRuntimeError::MissingClient)?;
     let server_addr = resolve_addr(&client.server_addr)?;
+    let listen = client.listen;
+    let client = Arc::new(QuicClientRuntime::decode(client)?);
     let mut endpoint = Endpoint::client(bind_any_addr(server_addr))?;
     endpoint.set_default_client_config(client_config()?);
-    let listener = TcpListener::bind(client.listen).await?;
+    let listener = TcpListener::bind(listen).await?;
     tracing::info!(
         "ParallaX QUIC client SOCKS5 listening on {} -> udp://{}",
-        client.listen,
+        listen,
         server_addr
     );
 
     loop {
         let (local, peer) = listener.accept().await?;
         let endpoint = endpoint.clone();
-        let client = client.clone();
+        let client = Arc::clone(&client);
         let psk = Arc::clone(&psk);
         tokio::spawn(async move {
             if let Err(err) =
@@ -213,7 +265,7 @@ pub async fn run_client(config: Config) -> Result<(), QuicRuntimeError> {
 
 async fn handle_connection(
     connection: quinn::Connection,
-    server: ServerConfig,
+    server: Arc<QuicServerRuntime>,
     psk: SharedPsk,
     replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
@@ -225,7 +277,7 @@ async fn handle_connection(
             Err(err) => return Err(err.into()),
         };
         let connection = connection.clone();
-        let server = server.clone();
+        let server = Arc::clone(&server);
         let psk = Arc::clone(&psk);
         let replay_cache = Arc::clone(&replay_cache);
         tokio::spawn(async move {
@@ -241,7 +293,7 @@ async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     connection: quinn::Connection,
-    server: ServerConfig,
+    server: Arc<QuicServerRuntime>,
     psk: SharedPsk,
     replay_cache: Arc<Mutex<ReplayCache>>,
 ) -> Result<(), QuicRuntimeError> {
@@ -256,7 +308,7 @@ async fn handle_stream(
         &connection,
         &psk,
         QUIC_STREAM_AUTH_CONTEXT_PAYLOAD,
-        &server.authorized_sni,
+        &server.config.authorized_sni,
     )?;
     insert_quic_replay_entry_blocking(replay_cache, replay_entry, replay_now).await?;
     write_server_identity_frame(&mut send, &connection, &server).await?;
@@ -268,6 +320,7 @@ async fn handle_stream(
     .map_err(|_| QuicRuntimeError::AuthTimeout)??;
     let request = ConnectRequest::decode(&connect_payload)?;
     let target_addr = server
+        .config
         .data_target
         .clone()
         .unwrap_or_else(|| request.target());
@@ -301,7 +354,7 @@ async fn handle_local_connection(
     mut local: TcpStream,
     endpoint: Endpoint,
     server_addr: SocketAddr,
-    client: ClientConfig,
+    client: Arc<QuicClientRuntime>,
     psk: SharedPsk,
 ) -> Result<(), QuicRuntimeError> {
     tune_tcp_stream(&local)?;
@@ -310,10 +363,10 @@ async fn handle_local_connection(
         ConnectRequest::max_initial_payload_len(&request.host, MAX_CONNECT_FRAME_LEN);
     let initial_payload =
         initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
-    let connection = connect_with_0rtt(&endpoint, server_addr, &client.sni).await?;
+    let connection = connect_with_0rtt(&endpoint, server_addr, client.sni.as_ref()).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     write_stream_open_preamble(&mut send).await?;
-    write_quic_auth_frame(&mut send, &connection, &psk, &client.sni).await?;
+    write_quic_auth_frame(&mut send, &connection, &psk, client.sni.as_ref()).await?;
     let connect = ConnectRequest {
         host: request.host,
         port: request.port,
@@ -388,7 +441,7 @@ async fn read_auth_frame(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, QuicRu
 async fn write_server_identity_frame(
     send: &mut quinn::SendStream,
     connection: &quinn::Connection,
-    server: &ServerConfig,
+    server: &QuicServerRuntime,
 ) -> Result<(), QuicRuntimeError> {
     let context = quic_server_identity_context(connection)?;
     let frame = build_server_identity_frame(server, &context)?;
@@ -413,7 +466,7 @@ async fn read_stream_open_preamble(recv: &mut quinn::RecvStream) -> Result<(), Q
 async fn read_and_verify_server_identity_frame(
     recv: &mut quinn::RecvStream,
     connection: &quinn::Connection,
-    client: &ClientConfig,
+    client: &QuicClientRuntime,
 ) -> Result<(), QuicRuntimeError> {
     let frame = timeout(QUIC_AUTH_TIMEOUT, read_identity_len_prefixed(recv))
         .await
@@ -423,34 +476,29 @@ async fn read_and_verify_server_identity_frame(
 }
 
 fn build_server_identity_frame(
-    server: &ServerConfig,
+    server: &QuicServerRuntime,
     context: &[u8; 32],
 ) -> Result<Vec<u8>, QuicRuntimeError> {
-    let server_private = decode_key32_secret("server.private_key", &server.private_key)?;
-    let server_public = x25519_public_from_private(&server_private);
-    let identity_secret =
-        decode_base64_secret("server.identity_secret_key", &server.identity_secret_key)?;
-    let signature =
-        identity::sign_server_identity(identity_secret.as_slice(), context, &server_public, 0)?;
+    let signature = identity::sign_server_identity(
+        server.identity_secret_key.as_ref().as_slice(),
+        context,
+        &server.x25519_public_key,
+        0,
+    )?;
     Ok(ServerIdentityProof { signature }.encode()?)
 }
 
 fn verify_server_identity_frame(
     frame: &[u8],
-    client: &ClientConfig,
+    client: &QuicClientRuntime,
     context: &[u8; 32],
 ) -> Result<(), QuicRuntimeError> {
     let proof = ServerIdentityProof::decode(frame)?;
-    let server_identity_public = decode_base64_bytes(
-        "client.server_identity_public_key",
-        &client.server_identity_public_key,
-    )?;
-    let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
     identity::verify_server_identity(
-        &server_identity_public,
+        client.server_identity_public_key.as_ref(),
         &proof.signature,
         context,
-        &server_public,
+        &client.server_public_key,
         0,
     )?;
     Ok(())
@@ -1009,6 +1057,8 @@ mod tests {
             tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
         };
 
+        let server = QuicServerRuntime::decode(server).unwrap();
+        let client = QuicClientRuntime::decode(client).unwrap();
         let frame = build_server_identity_frame(&server, &context).unwrap();
 
         verify_server_identity_frame(&frame, &client, &context).unwrap();
@@ -1041,6 +1091,8 @@ mod tests {
             tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
         };
 
+        let server = QuicServerRuntime::decode(server).unwrap();
+        let client = QuicClientRuntime::decode(client).unwrap();
         let frame = build_server_identity_frame(&server, &context).unwrap();
 
         assert!(matches!(
@@ -1066,6 +1118,7 @@ mod tests {
         };
         let endpoint = Endpoint::server(server_config(&server).unwrap(), server.listen).unwrap();
         let server_addr = endpoint.local_addr().unwrap();
+        let server = Arc::new(QuicServerRuntime::decode(server).unwrap());
         let server_task = tokio::spawn(async move {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
@@ -1142,6 +1195,7 @@ mod tests {
         };
         let endpoint = Endpoint::server(server_config(&server).unwrap(), server.listen).unwrap();
         let server_addr = endpoint.local_addr().unwrap();
+        let server = Arc::new(QuicServerRuntime::decode(server).unwrap());
         let server_task = tokio::spawn(async move {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
@@ -1178,7 +1232,7 @@ mod tests {
         read_and_verify_server_identity_frame(
             &mut recv,
             &connection,
-            &ClientConfig {
+            &QuicClientRuntime::decode(ClientConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 server_addr: server_addr.to_string(),
                 sni: "example.com".to_owned(),
@@ -1186,7 +1240,8 @@ mod tests {
                 server_pq_public_key: String::new(),
                 server_identity_public_key: STANDARD.encode(&server_identity.public),
                 tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari17,
-            },
+            })
+            .unwrap(),
         )
         .await
         .unwrap();

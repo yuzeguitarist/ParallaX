@@ -23,18 +23,24 @@ use std::{
 };
 
 use anyhow::{bail, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::{
+    config::{decode_base64_bytes, decode_base64_secret, decode_key32, decode_key32_secret},
     crypto::{
         auth::{derive_client_auth_key, derive_server_auth_key, verify_client_hello_auth},
         identity, pq,
         replay::{ReplayCache, ReplayEntry},
         session::{
-            derive_client_keys, x25519_shared_secret, AeadCodec, X25519KeyPair, KEY_LEN, NONCE_LEN,
+            derive_client_keys, x25519_public_from_private, x25519_shared_secret, AeadCodec,
+            X25519KeyPair, KEY_LEN, NONCE_LEN,
         },
     },
-    protocol::data::{DataRecordCodec, SealedRecord, CLIENT_TO_SERVER_AAD},
+    protocol::{
+        command::ServerIdentityProof,
+        data::{DataRecordCodec, SealedRecord, CLIENT_TO_SERVER_AAD},
+    },
     tls::{
         client_hello::parse_client_hello,
         client_hello_builder::{BrowserProfile, ClientHelloTemplate},
@@ -139,6 +145,8 @@ pub enum BenchGroup {
     HandshakeCrypto,
     /// Composed handshake operations (ClientHello build/parse/verify).
     HandshakeProtocol,
+    /// QUIC-specific control frames and identity handshakes.
+    QuicProtocol,
     /// Raw AEAD seal/open at fixed payload sizes.
     RecordAead,
     /// Full application-data record pipeline including padding shaping.
@@ -155,6 +163,7 @@ impl BenchGroup {
         match self {
             BenchGroup::HandshakeCrypto => "handshake.crypto",
             BenchGroup::HandshakeProtocol => "handshake.protocol",
+            BenchGroup::QuicProtocol => "quic.protocol",
             BenchGroup::RecordAead => "record.aead",
             BenchGroup::RecordPipeline => "record.pipeline",
             BenchGroup::Traffic => "traffic",
@@ -313,6 +322,10 @@ const CASES: &[CaseRunner] = &[
     bench_clienthello_build_signed,
     bench_clienthello_parse,
     bench_clienthello_verify_auth,
+    bench_quic_server_identity_build_decode_each_time,
+    bench_quic_server_identity_build_cached,
+    bench_quic_client_identity_verify_decode_each_time,
+    bench_quic_client_identity_verify_cached,
     bench_aead_seal_64b,
     bench_aead_seal_1k,
     bench_aead_seal_16k,
@@ -577,6 +590,117 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN])> {
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let record = template.build_signed(&client_auth, &mut rng)?;
     Ok((record, server_auth))
+}
+
+// ---------------------------------------------------------------------------
+// quic.protocol
+// ---------------------------------------------------------------------------
+
+fn bench_quic_server_identity_build_decode_each_time(
+    options: BenchmarkOptions,
+) -> Result<BenchmarkCase> {
+    let server = X25519KeyPair::generate();
+    let identity_keys = identity::keypair();
+    let server_private = STANDARD.encode(server.private);
+    let identity_secret = STANDARD.encode(&identity_keys.secret);
+    let context = [0x51_u8; KEY_LEN];
+
+    run_case(
+        BenchGroup::QuicProtocol,
+        "server_identity.build_decode",
+        TIER_SLOW,
+        options,
+        || {
+            let private = decode_key32_secret("server.private_key", &server_private)?;
+            let server_public = x25519_public_from_private(&private);
+            let identity_secret =
+                decode_base64_secret("server.identity_secret_key", &identity_secret)?;
+            let signature =
+                identity::sign_server_identity(&identity_secret, &context, &server_public, 0)?;
+            let frame = ServerIdentityProof { signature }.encode()?;
+            Ok(black_box(frame.len() as u64))
+        },
+    )
+}
+
+fn bench_quic_server_identity_build_cached(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let server = X25519KeyPair::generate();
+    let identity_keys = identity::keypair();
+    let context = [0x51_u8; KEY_LEN];
+
+    run_case(
+        BenchGroup::QuicProtocol,
+        "server_identity.build_cached",
+        TIER_SLOW,
+        options,
+        || {
+            let signature =
+                identity::sign_server_identity(&identity_keys.secret, &context, &server.public, 0)?;
+            let frame = ServerIdentityProof { signature }.encode()?;
+            Ok(black_box(frame.len() as u64))
+        },
+    )
+}
+
+fn bench_quic_client_identity_verify_decode_each_time(
+    options: BenchmarkOptions,
+) -> Result<BenchmarkCase> {
+    let server = X25519KeyPair::generate();
+    let identity_keys = identity::keypair();
+    let context = [0x51_u8; KEY_LEN];
+    let signature =
+        identity::sign_server_identity(&identity_keys.secret, &context, &server.public, 0)?;
+    let frame = ServerIdentityProof { signature }.encode()?;
+    let server_public = STANDARD.encode(server.public);
+    let identity_public = STANDARD.encode(&identity_keys.public);
+
+    run_case(
+        BenchGroup::QuicProtocol,
+        "client_identity.verify_decode",
+        TIER_SLOW,
+        options,
+        || {
+            let proof = ServerIdentityProof::decode(&frame)?;
+            let identity_public =
+                decode_base64_bytes("client.server_identity_public_key", &identity_public)?;
+            let server_public = decode_key32("client.server_public_key", &server_public)?;
+            identity::verify_server_identity(
+                &identity_public,
+                &proof.signature,
+                &context,
+                &server_public,
+                0,
+            )?;
+            Ok(black_box(proof.signature.len() as u64))
+        },
+    )
+}
+
+fn bench_quic_client_identity_verify_cached(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let server = X25519KeyPair::generate();
+    let identity_keys = identity::keypair();
+    let context = [0x51_u8; KEY_LEN];
+    let signature =
+        identity::sign_server_identity(&identity_keys.secret, &context, &server.public, 0)?;
+    let frame = ServerIdentityProof { signature }.encode()?;
+
+    run_case(
+        BenchGroup::QuicProtocol,
+        "client_identity.verify_cached",
+        TIER_SLOW,
+        options,
+        || {
+            let proof = ServerIdentityProof::decode(&frame)?;
+            identity::verify_server_identity(
+                &identity_keys.public,
+                &proof.signature,
+                &context,
+                &server.public,
+                0,
+            )?;
+            Ok(black_box(proof.signature.len() as u64))
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +1014,7 @@ mod tests {
         for expected in [
             BenchGroup::HandshakeCrypto,
             BenchGroup::HandshakeProtocol,
+            BenchGroup::QuicProtocol,
             BenchGroup::RecordAead,
             BenchGroup::RecordPipeline,
             BenchGroup::Traffic,
