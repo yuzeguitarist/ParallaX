@@ -71,9 +71,11 @@ impl PaddingProfile {
         let pad_len = self.sample_padding_len(payload.len(), rng) as usize;
         out.extend_from_slice(payload);
 
-        let start = out.len();
-        out.resize(start + pad_len, 0);
-        rng.fill_bytes(&mut out[start..]);
+        if pad_len != 0 {
+            let start = out.len();
+            out.resize(start + pad_len, 0);
+            rng.fill_bytes(&mut out[start..]);
+        }
         out.extend_from_slice(&(pad_len as u16).to_be_bytes());
     }
 
@@ -138,6 +140,10 @@ impl TimingProfile {
             min: Duration::from_millis(config.min_delay_ms as u64),
             max: Duration::from_millis(config.max_delay_ms as u64),
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.max.is_zero()
     }
 
     pub fn sample_delay<R>(&self, rng: &mut R) -> Duration
@@ -261,5 +267,18 @@ mod tests {
             assert!(sampled >= Duration::from_millis(10));
             assert!(sampled <= Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn timing_profile_can_be_disabled_or_enabled() {
+        let disabled = TimingProfile::from_config(TrafficConfig::default());
+        assert!(!disabled.is_enabled());
+
+        let enabled = TimingProfile::from_config(TrafficConfig {
+            min_delay_ms: 0,
+            max_delay_ms: 1,
+            ..TrafficConfig::default()
+        });
+        assert!(enabled.is_enabled());
     }
 }

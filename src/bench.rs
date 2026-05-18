@@ -8,7 +8,7 @@
 //!
 //! Design notes:
 //!
-//! * 38 cases across six groups exercise the asymmetric primitives, KDFs,
+//! * 39 cases across six groups exercise the asymmetric primitives, KDFs,
 //!   handshake composition, application-data AEAD pipeline, traffic shaping,
 //!   and replay-cache bookkeeping that dominate ParallaX's wall-clock cost.
 //! * Each case declares an iteration [`Tier`]. Tiers are static constants so
@@ -350,6 +350,7 @@ const CASES: &[CaseRunner] = &[
     bench_record_bulk_1mb,
     bench_record_bulk_1mb_in_place_open,
     bench_record_bulk_1mb_payload_range,
+    bench_record_bulk_1mb_default,
     bench_padding_apply_1k,
     bench_padding_apply_default_1k,
     bench_padding_remove_1k,
@@ -1202,6 +1203,50 @@ fn bench_record_bulk_1mb_payload_range(options: BenchmarkOptions) -> Result<Benc
             if recovered != payload.len() {
                 bail!(
                     "record.bulk_1mb_payload_range lost {} bytes of plaintext",
+                    payload.len() - recovered
+                );
+            }
+            Ok(black_box((buf.len() + payload.len()) as u64))
+        },
+    )
+}
+
+fn bench_record_bulk_1mb_default(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(0, 0)?;
+    let mut enc = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let mut dec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        CLIENT_TO_SERVER_AAD,
+    );
+    let payload = vec![0x42_u8; SIZE_1M];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M + 2048);
+    let mut records: Vec<SealedRecord> = Vec::with_capacity(128);
+    let mut open_scratch: Vec<u8> = Vec::with_capacity(SIZE_16K + AEAD_TAG_LEN);
+    run_case(
+        BenchGroup::RecordPipeline,
+        "record.bulk_1mb_default",
+        TIER_BULK,
+        options,
+        || {
+            buf.clear();
+            records.clear();
+            enc.seal_chunks_into_reusing(&payload, &mut rng, &mut buf, &mut records)?;
+            let mut recovered = 0_usize;
+            for sealed in &records {
+                open_scratch.clear();
+                open_scratch.extend_from_slice(&buf[sealed.range.clone()]);
+                let plaintext = dec.open_in_place_payload_range(&mut open_scratch)?;
+                recovered += plaintext.len();
+            }
+            if recovered != payload.len() {
+                bail!(
+                    "record.bulk_1mb_default lost {} bytes of plaintext",
                     payload.len() - recovered
                 );
             }

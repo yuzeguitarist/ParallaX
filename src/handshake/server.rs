@@ -555,18 +555,20 @@ async fn run_authenticated_data_mode(
     let (fallback_read, mut fallback_write) = handshake.fallback.into_split();
     let mut client_records = TlsRecordReader::new(client_read);
     let mut fallback_records = TlsRecordReader::new(fallback_read);
+    let mut client_record = Vec::new();
+    let mut fallback_record = Vec::new();
 
     loop {
         tokio::select! {
-            record = client_records.read_record() => {
-                let record = match record {
-                    Ok(record) => record,
+            read = client_records.read_record_into(&mut client_record) => {
+                match read {
+                    Ok(()) => {}
                     Err(err) if is_clean_close(&err) => return Ok(()),
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
-                log_record_read(cid, "client->server", "server-predata-client-reader", &record);
+                log_record_read(cid, "client->server", "server-predata-client-reader", &client_record);
 
-                match client_open.open(&record) {
+                match client_open.open(&client_record) {
                     Ok(first_payload) => {
                         let pq_rekey = PqRekeyRequest::decode(&first_payload)?;
                         let server_ephemeral = X25519KeyPair::generate();
@@ -627,18 +629,17 @@ async fn run_authenticated_data_mode(
                             );
                             client_write.write_all(&identity_record).await?;
                             if idx + 1 < identity_chunk_count {
-                                sleep(
-                                    SERVER_IDENTITY_CHUNK_MIN_DELAY
-                                        + timing.sample_delay(&mut rng),
-                                )
-                                .await;
+                                let delay = server_identity_chunk_delay(timing, &mut rng);
+                                if !delay.is_zero() {
+                                    sleep(delay).await;
+                                }
                             }
                         }
 
                         drop(fallback_write);
-                        let record = client_records.read_record().await?;
-                        log_record_read(cid, "client->server", "server-connect-reader", &record);
-                        let first_payload = client_open.open_owned(record)?;
+                        client_records.read_record_into(&mut client_record).await?;
+                        log_record_read(cid, "client->server", "server-connect-reader", &client_record);
+                        let first_payload = client_open.open_owned(std::mem::take(&mut client_record))?;
                         tracing::debug!(cid, "ParallaX data mode switch confirmed");
 
                         let (target_addr, initial_payload) =
@@ -665,20 +666,20 @@ async fn run_authenticated_data_mode(
                         .await;
                     }
                     Err(DataRecordError::Aead(_)) | Err(DataRecordError::NotApplicationData) => {
-                        fallback_write.write_all(&record).await?;
+                        fallback_write.write_all(&client_record).await?;
                     }
                     Err(err) => return Err(HandshakeServerError::DataRecord(err)),
                 }
             }
-            record = fallback_records.read_record() => {
-                let record = match record {
-                    Ok(record) => record,
+            read = fallback_records.read_record_into(&mut fallback_record) => {
+                match read {
+                    Ok(()) => {}
                     Err(err) if is_clean_close(&err) => return Ok(()),
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
-                log_record_read(cid, "fallback->server", "server-predata-fallback-reader", &record);
+                log_record_read(cid, "fallback->server", "server-predata-fallback-reader", &fallback_record);
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    if let Ok(header) = crate::tls::record::parse_header(&record) {
+                    if let Ok(header) = crate::tls::record::parse_header(&fallback_record) {
                         tracing::debug!(
                             cid,
                             direction = "fallback->client",
@@ -689,7 +690,7 @@ async fn run_authenticated_data_mode(
                         );
                     }
                 }
-                client_write.write_all(&record).await?;
+                client_write.write_all(&fallback_record).await?;
             }
         }
     }
@@ -775,6 +776,17 @@ fn apply_server_pq_rekey(
     client_open.rekey(next_keys.client_key, next_keys.client_nonce);
     server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
     Ok(next_keys)
+}
+
+fn server_identity_chunk_delay<R>(timing: TimingProfile, rng: &mut R) -> Duration
+where
+    R: Rng + ?Sized,
+{
+    if timing.is_enabled() {
+        SERVER_IDENTITY_CHUNK_MIN_DELAY + timing.sample_delay(rng)
+    } else {
+        Duration::ZERO
+    }
 }
 
 struct DataRelay {
@@ -1037,6 +1049,32 @@ mod tests {
     };
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn identity_chunk_delay_is_zero_for_speed_first_traffic() {
+        let timing = TimingProfile::from_config(TrafficConfig::default());
+        let mut rng = StdRng::seed_from_u64(101);
+
+        assert_eq!(
+            server_identity_chunk_delay(timing, &mut rng),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn identity_chunk_delay_keeps_camouflage_floor_when_timing_enabled() {
+        let timing = TimingProfile::from_config(TrafficConfig {
+            min_delay_ms: 1,
+            max_delay_ms: 1,
+            ..TrafficConfig::default()
+        });
+        let mut rng = StdRng::seed_from_u64(102);
+
+        assert_eq!(
+            server_identity_chunk_delay(timing, &mut rng),
+            SERVER_IDENTITY_CHUNK_MIN_DELAY + Duration::from_millis(1)
+        );
+    }
 
     #[test]
     fn decides_authenticated_inbound() {
