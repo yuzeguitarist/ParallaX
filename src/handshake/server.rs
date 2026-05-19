@@ -32,7 +32,8 @@ use crate::{
     crypto::{
         auth::{
             derive_server_auth_key_from_shared, recover_stateful_auth_material_from_parsed,
-            verify_client_hello_auth_with_parsed, AuthError, ClientAuth,
+            verify_client_hello_auth_with_parsed,
+            verify_masked_stateful_client_hello_auth_with_parsed_material, AuthError, ClientAuth,
         },
         identity::{self, IdentityError},
         pq::{self, PqError},
@@ -434,11 +435,11 @@ fn decide_connection_inbound(
         let x25519_key_share = material.x25519_public;
         let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
         let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
-        let auth = match verify_client_hello_auth_with_parsed(
+        let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
             first_client_record,
             &auth_key,
-            Some(material),
-            parsed.clone(),
+            &material,
+            &parsed,
         ) {
             Ok(auth) => auth,
             Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
@@ -1382,14 +1383,20 @@ mod tests {
     use super::*;
     use crate::{
         crypto::{
-            auth::{derive_client_auth_key, sign_client_hello_session_id},
+            auth::{
+                build_auth_tail_at, build_masked_stateful_auth_session_id,
+                build_masked_stateful_client_random, derive_client_auth_key,
+                sign_client_hello_session_id,
+            },
             pq,
             session::X25519KeyPair,
         },
         handshake::client::ClientDataSession,
         protocol::command::{ConnectRequest, ConnectRequestError},
         tls::{
-            client_hello::tests::client_hello_fixture_with_key_share,
+            client_hello::tests::{
+                client_hello_fixture_with_key_share, client_hello_fixture_with_random_and_key_share,
+            },
             server_hello::{parse_server_hello, tests::server_hello_fixture},
         },
     };
@@ -1538,6 +1545,52 @@ mod tests {
                 );
             }
             ConnectionDecision::Fallback(reason) => panic!("unexpected fallback: {reason:?}"),
+        }
+    }
+
+    #[test]
+    fn decides_masked_stateful_inbound() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let mut record = client_hello_fixture_with_random_and_key_share(
+            "example.com",
+            &client.public,
+            &[0x44_u8; 32],
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let mut rng = StdRng::seed_from_u64(3);
+        let tail = build_auth_tail_at(1_700_000_001, &mut rng);
+        let encoded_random =
+            build_masked_stateful_client_random(PSK, "example.com", &client.public, &tail).unwrap();
+        let session_id = build_masked_stateful_auth_session_id(
+            PSK,
+            &auth_key,
+            "example.com",
+            &client.public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        record[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        record[parsed.session_id_range].copy_from_slice(&session_id);
+
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+
+        match decision {
+            InboundDecision::Authenticated(hello) => {
+                assert_eq!(hello.sni, "example.com");
+                assert_eq!(hello.x25519_key_share, client.public);
+                assert_eq!(hello.timestamp, 1_700_000_001);
+            }
+            other => panic!("unexpected decision: {other:?}"),
         }
     }
 
