@@ -319,6 +319,10 @@ impl DataRecordCodec {
     pub fn max_plaintext_len(&self) -> usize {
         max_plaintext_len(self.padding.max_len())
     }
+
+    pub(crate) fn max_sealed_len(&self, payload_len: usize) -> usize {
+        record_capacity(payload_len, self.padding.max_len())
+    }
 }
 
 pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";
