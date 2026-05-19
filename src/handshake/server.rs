@@ -1069,10 +1069,8 @@ impl DataRelay {
             cid,
         );
 
-        tokio::select! {
-            result = upload => result,
-            result = download => result,
-        }
+        let ((), ()) = tokio::try_join!(upload, download)?;
+        Ok(())
     }
 }
 
@@ -1254,7 +1252,10 @@ async fn server_upload_loop(
     loop {
         match client_records.read_record_into(&mut client_record).await {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => return Ok(()),
+            Err(err) if is_clean_close(&err) => {
+                let _ = target_write.shutdown().await;
+                return Ok(());
+            }
             Err(err) => return Err(HandshakeServerError::Io(err)),
         };
         log_record_read(
@@ -1308,6 +1309,7 @@ async fn server_download_loop(
             read = target_read.read(&mut target_buf) => {
                 let n = read?;
                 if n == 0 {
+                    let _ = client_write.shutdown().await;
                     return Ok(());
                 }
                 let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
