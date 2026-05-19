@@ -795,8 +795,41 @@ mod tests {
     };
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
-    const CAMOUFLAGE_CERT_DER_B64: &str = "MIIC9jCCAd6gAwIBAgIJAPNzR81y9p7pMA0GCSqGSIb3DQEBCwUAMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4XDTI2MDUxNjEyNDA0NloXDTI2MDUxNzEyNDA0NlowFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCnjSfVPv1Xy5razuOYABOSvGvlddr0MMVWQCSmjE47PMQEzvETytmburNZEdqQBzSjDVxTExxd8eIHFTp8ylkztsxma5yJftQo81uqxZEnwT00tJRaazg10OYTf0ZrH6PMNC2izwJML0GkYz7s6OMFqImMCG3v00PIAYknlDrlKoDjdmANco8V5FNrbQYp2kqIcFyXrbgYurcMIKCE9Wu8L2W0oKhW6DNyRVoBGTn5zN1wjXLBO+6TJsBj4thI4tM0mUcLc+YohOfoGVq7na/wgCESoK1B+m8PdrXIEuZ7gZ0x3ZqdZ7jxL23sTmkfm+AeNdp+XshxAS77l3dcrAV9AgMBAAGjRzBFMBYGA1UdEQQPMA2CC2V4YW1wbGUuY29tMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA0GCSqGSIb3DQEBCwUAA4IBAQA8KHWHoA4otNmYh9q+X8cZnYx9y0LUNfdbHLR8ebnk/9T+/WP5CgIGWvn3+L2ulEvuSMhDC23C20SnX0h815JfMBY/PiAbLKGp3UXrgIq1dWc8t40HQBGRuBKi2fc743Sup5kPQgNAqev+8kKs4WFDXaWBpdwqI55PADVPOX66h0WiObB7crp5YTEVEe37G6UsxX40HUAAZJXtCI9eqPLISNuuNOAjJEMDMjdRH7ZjcMyrqQSweuKLAwdvUam8UJQsUNe7rM2II6GlgPS/mKZx1Nihn70GIo0yu0Bsxc9cpSHbggzQarE3g8WRp+jI9GpWXXdjno7cyim5KEQVMZcz";
-    const CAMOUFLAGE_KEY_DER_B64: &str = "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCnjSfVPv1Xy5razuOYABOSvGvlddr0MMVWQCSmjE47PMQEzvETytmburNZEdqQBzSjDVxTExxd8eIHFTp8ylkztsxma5yJftQo81uqxZEnwT00tJRaazg10OYTf0ZrH6PMNC2izwJML0GkYz7s6OMFqImMCG3v00PIAYknlDrlKoDjdmANco8V5FNrbQYp2kqIcFyXrbgYurcMIKCE9Wu8L2W0oKhW6DNyRVoBGTn5zN1wjXLBO+6TJsBj4thI4tM0mUcLc+YohOfoGVq7na/wgCESoK1B+m8PdrXIEuZ7gZ0x3ZqdZ7jxL23sTmkfm+AeNdp+XshxAS77l3dcrAV9AgMBAAECggEAcsH8cVMWRAbBBnLDcX1D6rHBGMVy9ONelaeTMrtQbcQ94ak3dz3tc3sZkbznvNQimjbxcDjbqgCctgs1JvmUxRXDw7aa3ZWPjIi51SpCND9nQ20XWyKqujldDCeVPJPMJXXrd+JfCX0ocYZEOBF+RIbdxpqTabqCZz+eCAy/les95pv5YkkAjxEJkzhEfFTJtJRVIjIUBL/Gg8KwG4qs5nESoD1oiNGr8tgnbsS2KNXdozIsM1awitqNJ7drpDpEpkwDUoQGAqzuvyDiN2pPqsyg1UwZWH8kuA9RyXIAOWQoR9rIX/rUsYB5F4tKg6Tdy0n9Jb9ytTINYaletNjuIQKBgQDSEzvmO4Zan1Bz+0Eb4NWfnU1yyGKb7bBFBvcuigXPW/+as1yET2Zkc4qQBudye7DUgr+zXj0s+ZeXvv+HeGggD3Blnq5bl+gPkiPSeGd24QkfO38MF2RTpW5SoUT6Z9vTiaHjIgkwZIgQf3dfSPV/MskRVemqxB5o+Phd4NRzpQKBgQDMLhkoYeRurmFQ3iuWCLOaHWAwtA28j3ymknsHyP6EOkiHBVl3YWTpZ1ZcDGMJznHdkSrj4mNsnnDM71iFM0srgKKp07T4bumowOhmyeg/hYIblFGSoZS/nTl8tAusNzXtRJeVLa9GjkFjXihiC3E+t3J2s9ij2eE8bAM0tatC+QKBgCsAQuea0aKlL8u955L0T+YPRfYz7HNskQNgLKK7H/tVIpohEtQGiLgRKpDWyPOXPBgT93eY177oDE7EivvI+s9tOZ2jgJ9BFgBx8qE3gj5ETCC3hgcMlr3EhDOnzT3Qmp/PcXLT2butKGjwHphDj/UMiTniMyWAZZUpOXXF+tb9AoGAEKvG5BQyGZNlYLvzJRnqyC+T1gYthPLWQ6d8IiOYHGXB3DxklKnAGoqUc4mTYI6Zn3Sl4ttuMMUzApicSqvofFHRdjpR8WLk8yFlGFdt/hnBiMzwaB+HTKnisrrkpRgQ8CGEmuqTABjHX/ylIXQ7t9o0n1qJ2r8Ec/GBxYD7zckCgYBZzU7u9Ujq8XL+Ok6T2Zqgf3O8H3VBlKPjeYpfH6mqBRdj+773IfoifCs19Y31OL8Sb28N98XnutTlHo6xs4li0zE2KDN1O3i00K7S0dO3250Fr1QSm86CML8fSDuS1BcuMHH+RNkQkMb9Q49K23t6B1s0xnIFfBarwbusw9onAw==";
+    const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
+        "MIIC9jCCAd6gAwIBAgIJAPNzR81y9p7pMA0GCSqGSIb3DQEBCwUAMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4X",
+        "DTI2MDUxNjEyNDA0NloXDTI2MDUxNzEyNDA0NlowFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wggEiMA0GCSqGSIb3",
+        "DQEBAQUAA4IBDwAwggEKAoIBAQCnjSfVPv1Xy5razuOYABOSvGvlddr0MMVWQCSmjE47PMQEzvETytmburNZEdqQ",
+        "BzSjDVxTExxd8eIHFTp8ylkztsxma5yJftQo81uqxZEnwT00tJRaazg10OYTf0ZrH6PMNC2izwJML0GkYz7s6OMF",
+        "qImMCG3v00PIAYknlDrlKoDjdmANco8V5FNrbQYp2kqIcFyXrbgYurcMIKCE9Wu8L2W0oKhW6DNyRVoBGTn5zN1w",
+        "jXLBO+6TJsBj4thI4tM0mUcLc+YohOfoGVq7na/wgCESoK1B+m8PdrXIEuZ7gZ0x3ZqdZ7jxL23sTmkfm+AeNdp+",
+        "XshxAS77l3dcrAV9AgMBAAGjRzBFMBYGA1UdEQQPMA2CC2V4YW1wbGUuY29tMAkGA1UdEwQCMAAwCwYDVR0PBAQD",
+        "AgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA0GCSqGSIb3DQEBCwUAA4IBAQA8KHWHoA4otNmYh9q+X8cZnYx9y0LU",
+        "NfdbHLR8ebnk/9T+/WP5CgIGWvn3+L2ulEvuSMhDC23C20SnX0h815JfMBY/PiAbLKGp3UXrgIq1dWc8t40HQBGR",
+        "uBKi2fc743Sup5kPQgNAqev+8kKs4WFDXaWBpdwqI55PADVPOX66h0WiObB7crp5YTEVEe37G6UsxX40HUAAZJXt",
+        "CI9eqPLISNuuNOAjJEMDMjdRH7ZjcMyrqQSweuKLAwdvUam8UJQsUNe7rM2II6GlgPS/mKZx1Nihn70GIo0yu0Bs",
+        "xc9cpSHbggzQarE3g8WRp+jI9GpWXXdjno7cyim5KEQVMZcz",
+    );
+    const CAMOUFLAGE_KEY_DER_B64: &str = concat!(
+        "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCnjSfVPv1Xy5razuOYABOSvGvlddr0MMVWQCSm",
+        "jE47PMQEzvETytmburNZEdqQBzSjDVxTExxd8eIHFTp8ylkztsxma5yJftQo81uqxZEnwT00tJRaazg10OYTf0Zr",
+        "H6PMNC2izwJML0GkYz7s6OMFqImMCG3v00PIAYknlDrlKoDjdmANco8V5FNrbQYp2kqIcFyXrbgYurcMIKCE9Wu8",
+        "L2W0oKhW6DNyRVoBGTn5zN1wjXLBO+6TJsBj4thI4tM0mUcLc+YohOfoGVq7na/wgCESoK1B+m8PdrXIEuZ7gZ0x",
+        "3ZqdZ7jxL23sTmkfm+AeNdp+XshxAS77l3dcrAV9AgMBAAECggEAcsH8cVMWRAbBBnLDcX1D6rHBGMVy9ONelaeT",
+        "MrtQbcQ94ak3dz3tc3sZkbznvNQimjbxcDjbqgCctgs1JvmUxRXDw7aa3ZWPjIi51SpCND9nQ20XWyKqujldDCeV",
+        "PJPMJXXrd+JfCX0ocYZEOBF+RIbdxpqTabqCZz+eCAy/les95pv5YkkAjxEJkzhEfFTJtJRVIjIUBL/Gg8KwG4qs",
+        "5nESoD1oiNGr8tgnbsS2KNXdozIsM1awitqNJ7drpDpEpkwDUoQGAqzuvyDiN2pPqsyg1UwZWH8kuA9RyXIAOWQo",
+        "R9rIX/rUsYB5F4tKg6Tdy0n9Jb9ytTINYaletNjuIQKBgQDSEzvmO4Zan1Bz+0Eb4NWfnU1yyGKb7bBFBvcuigXP",
+        "W/+as1yET2Zkc4qQBudye7DUgr+zXj0s+ZeXvv+HeGggD3Blnq5bl+gPkiPSeGd24QkfO38MF2RTpW5SoUT6Z9vT",
+        "iaHjIgkwZIgQf3dfSPV/MskRVemqxB5o+Phd4NRzpQKBgQDMLhkoYeRurmFQ3iuWCLOaHWAwtA28j3ymknsHyP6E",
+        "OkiHBVl3YWTpZ1ZcDGMJznHdkSrj4mNsnnDM71iFM0srgKKp07T4bumowOhmyeg/hYIblFGSoZS/nTl8tAusNzXt",
+        "RJeVLa9GjkFjXihiC3E+t3J2s9ij2eE8bAM0tatC+QKBgCsAQuea0aKlL8u955L0T+YPRfYz7HNskQNgLKK7H/tV",
+        "IpohEtQGiLgRKpDWyPOXPBgT93eY177oDE7EivvI+s9tOZ2jgJ9BFgBx8qE3gj5ETCC3hgcMlr3EhDOnzT3Qmp/P",
+        "cXLT2butKGjwHphDj/UMiTniMyWAZZUpOXXF+tb9AoGAEKvG5BQyGZNlYLvzJRnqyC+T1gYthPLWQ6d8IiOYHGXB",
+        "3DxklKnAGoqUc4mTYI6Zn3Sl4ttuMMUzApicSqvofFHRdjpR8WLk8yFlGFdt/hnBiMzwaB+HTKnisrrkpRgQ8CGE",
+        "muqTABjHX/ylIXQ7t9o0n1qJ2r8Ec/GBxYD7zckCgYBZzU7u9Ujq8XL+Ok6T2Zqgf3O8H3VBlKPjeYpfH6mqBRdj",
+        "+773IfoifCs19Y31OL8Sb28N98XnutTlHo6xs4li0zE2KDN1O3i00K7S0dO3250Fr1QSm86CML8fSDuS1BcuMHH+",
+        "RNkQkMb9Q49K23t6B1s0xnIFfBarwbusw9onAw==",
+    );
 
     #[tokio::test]
     async fn key_exchange_reader_skips_residual_camouflage_records() {
@@ -871,17 +904,54 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_client_reaches_target_through_parallax_server_with_large_payloads() {
-        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fallback_addr = fallback_listener.local_addr().unwrap();
-        let fallback_task = tokio::spawn(async move {
-            let (stream, _) = fallback_listener.accept().await.unwrap();
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_echo_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
+        let (local_addr, client_task) = spawn_local_client(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+        )
+        .await;
+
+        let app = connect_socks_target(local_addr, target_addr).await;
+        assert_large_payload_round_trips(app).await;
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
+    async fn spawn_camouflage_fallback() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
             run_camouflage_tls_server(stream).await;
         });
+        (addr, task)
+    }
 
-        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target_listener.local_addr().unwrap();
-        let target_task = tokio::spawn(async move {
-            let (mut stream, _) = target_listener.accept().await.unwrap();
+    async fn spawn_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = vec![0_u8; 64 * 1024];
             loop {
                 let n = stream.read(&mut buf).await.unwrap();
@@ -891,13 +961,17 @@ mod tests {
                 stream.write_all(&buf[..n]).await.unwrap();
             }
         });
+        (addr, task)
+    }
 
-        let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
-        let server_identity_keys = crate::crypto::identity::keypair();
-        let replay_cache_dir = tempfile::tempdir().unwrap();
-        let replay_cache_path = replay_cache_dir.path().join("parallax-replay.cache");
-        let server_config = ServerConfig {
+    fn large_payload_server_config(
+        fallback_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_pq_keys: &pq::MlKemKeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+        replay_cache_path: std::path::PathBuf,
+    ) -> ServerConfig {
+        ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: None,
@@ -907,40 +981,58 @@ mod tests {
             replay_cache_path,
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
-        };
-        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let parallax_addr = parallax_listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = parallax_listener.accept().await.unwrap();
+        }
+    }
+
+    async fn spawn_parallax_server(
+        server_config: ServerConfig,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
             server::handle_connection(stream, &server_config, TrafficConfig::default(), PSK)
                 .await
                 .unwrap();
         });
+        (addr, task)
+    }
 
-        let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local_addr = local_listener.local_addr().unwrap();
+    async fn spawn_local_client(
+        parallax_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_pq_keys: &pq::MlKemKeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let client_config = ClientConfig {
-            listen: local_addr,
+            listen: addr,
             server_addr: parallax_addr.to_string(),
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
             server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
         };
-        let client_task = tokio::spawn(async move {
-            let (stream, _) = local_listener.accept().await.unwrap();
+        let server_public_key = server_keys.public;
+        let server_identity_public_key = server_identity_keys.public.clone();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
             handle_local_connection(
                 stream,
                 &client_config,
                 TrafficConfig::default(),
                 PSK,
-                &server_keys.public,
-                &server_identity_keys.public,
+                &server_public_key,
+                &server_identity_public_key,
             )
             .await
             .unwrap();
         });
+        (addr, task)
+    }
 
+    async fn connect_socks_target(local_addr: SocketAddr, target_addr: SocketAddr) -> TcpStream {
         let mut app = TcpStream::connect(local_addr).await.unwrap();
         app.write_all(&[5, 1, 0]).await.unwrap();
         let mut method = [0_u8; 2];
@@ -964,7 +1056,10 @@ mod tests {
         let mut socks_reply = [0_u8; 10];
         app.read_exact(&mut socks_reply).await.unwrap();
         assert_eq!(socks_reply[0..2], [5, 0]);
+        app
+    }
 
+    async fn assert_large_payload_round_trips(app: TcpStream) {
         let (mut app_read, mut app_write) = app.into_split();
         for len in [32 * 1024, 64 * 1024, 256 * 1024, 5 * 1024 * 1024] {
             let payload = (0..len).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
@@ -986,21 +1081,12 @@ mod tests {
 
         drop(app_read);
         drop(app_write);
-        timeout(Duration::from_secs(5), client_task)
+    }
+
+    async fn wait_for_task(name: &str, task: tokio::task::JoinHandle<()>) {
+        timeout(Duration::from_secs(5), task)
             .await
-            .expect("client task timed out")
-            .unwrap();
-        timeout(Duration::from_secs(5), server_task)
-            .await
-            .expect("server task timed out")
-            .unwrap();
-        timeout(Duration::from_secs(5), target_task)
-            .await
-            .expect("target task timed out")
-            .unwrap();
-        timeout(Duration::from_secs(5), fallback_task)
-            .await
-            .expect("fallback task timed out")
+            .unwrap_or_else(|_| panic!("{name} task timed out"))
             .unwrap();
     }
 

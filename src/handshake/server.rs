@@ -1370,6 +1370,7 @@ fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {
 mod tests {
     use std::{
         io,
+        net::SocketAddr,
         pin::Pin,
         task::{Context, Poll},
     };
@@ -1693,35 +1694,76 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn authenticated_connection_switches_to_data_mode() {
-        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fallback_addr = fallback_listener.local_addr().unwrap();
-        let fallback_task = tokio::spawn(async move {
-            let (mut stream, _) = fallback_listener.accept().await.unwrap();
+        let (fallback_addr, fallback_task) = spawn_server_hello_fallback().await;
+        let (target_addr, target_task) = spawn_ping_pong_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = identity::keypair();
+        let client_keys = X25519KeyPair::generate();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let traffic = TrafficConfig::default();
+        let config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_authenticated_server(config, traffic).await;
+        let (mut client, mut data_session, mut rng) = open_authenticated_data_session(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys.public,
+            &client_keys,
+            traffic,
+        )
+        .await;
+
+        send_ping_connect(&mut client, &mut data_session, &mut rng, target_addr).await;
+
+        drop(client);
+        server_task.await.unwrap();
+        target_task.await.unwrap();
+        fallback_task.await.unwrap();
+    }
+
+    async fn spawn_server_hello_fallback() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
             let _client_hello = read_record(&mut stream).await.unwrap();
             stream.write_all(&server_hello_fixture()).await.unwrap();
 
             let mut one = [0_u8; 1];
             let _ = timeout(Duration::from_millis(500), stream.read(&mut one)).await;
         });
+        (addr, task)
+    }
 
-        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target_listener.local_addr().unwrap();
-        let target_task = tokio::spawn(async move {
-            let (mut stream, _) = target_listener.accept().await.unwrap();
+    async fn spawn_ping_pong_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
             let mut initial = [0_u8; 4];
             stream.read_exact(&mut initial).await.unwrap();
             assert_eq!(&initial, b"ping");
             stream.write_all(b"pong").await.unwrap();
         });
+        (addr, task)
+    }
 
-        let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
-        let server_identity_keys = identity::keypair();
-        let client_keys = X25519KeyPair::generate();
-        let replay_cache_dir = tempfile::tempdir().unwrap();
-        let replay_cache_path = replay_cache_dir.path().join("parallax-replay.cache");
-        let traffic = TrafficConfig::default();
-        let config = ServerConfig {
+    fn authenticated_server_config(
+        fallback_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_pq_keys: &pq::MlKemKeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+        replay_cache_path: std::path::PathBuf,
+    ) -> ServerConfig {
+        ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: None,
@@ -1731,17 +1773,31 @@ mod tests {
             replay_cache_path,
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
-        };
+        }
+    }
 
-        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let parallax_addr = parallax_listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = parallax_listener.accept().await.unwrap();
+    async fn spawn_authenticated_server(
+        config: ServerConfig,
+        traffic: TrafficConfig,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
             handle_connection(stream, &config, traffic, PSK)
                 .await
                 .unwrap();
         });
+        (addr, task)
+    }
 
+    async fn open_authenticated_data_session(
+        parallax_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_identity_public_key: &[u8],
+        client_keys: &X25519KeyPair,
+        traffic: TrafficConfig,
+    ) -> (TcpStream, ClientDataSession, StdRng) {
         let mut client = TcpStream::connect(parallax_addr).await.unwrap();
         let mut client_hello =
             client_hello_fixture_with_key_share("example.com", &client_keys.public);
@@ -1782,27 +1838,30 @@ mod tests {
         data_session
             .verify_server_identity_payload(
                 &identity_payload,
-                &server_identity_keys.public,
+                server_identity_public_key,
                 &server_keys.public,
             )
             .unwrap();
+
+        (client, data_session, rng)
+    }
+
+    async fn send_ping_connect(
+        client: &mut TcpStream,
+        data_session: &mut ClientDataSession,
+        rng: &mut StdRng,
+        target_addr: SocketAddr,
+    ) {
         let connect = ConnectRequest {
             host: target_addr.ip().to_string(),
             port: target_addr.port(),
             initial_payload: b"ping".to_vec(),
         };
-        let connect_record = data_session
-            .build_connect_record(connect, &mut rng)
-            .unwrap();
+        let connect_record = data_session.build_connect_record(connect, rng).unwrap();
         client.write_all(&connect_record).await.unwrap();
 
-        let response_record = read_record(&mut client).await.unwrap();
+        let response_record = read_record(client).await.unwrap();
         let response = data_session.open_server_record(&response_record).unwrap();
         assert_eq!(response, b"pong");
-
-        drop(client);
-        server_task.await.unwrap();
-        target_task.await.unwrap();
-        fallback_task.await.unwrap();
     }
 }

@@ -119,74 +119,18 @@ pub async fn run() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    match Cli::parse().command {
-        Command::Check { config } => {
-            let cfg = Config::load(&config)
-                .with_context(|| format!("failed to load {}", config.display()))?;
-            cfg.validate()?;
-            println!(
-                "ok: {} mode config is valid ({})",
-                cfg.mode,
-                config.display()
-            );
-        }
-        Command::Keygen => {
-            let pair = X25519KeyPair::generate();
-            println!("private_key = \"{}\"", STANDARD.encode(pair.private));
-            println!("public_key = \"{}\"", STANDARD.encode(pair.public));
-        }
-        Command::CryptoSelfTest => {
-            let server = X25519KeyPair::generate();
-            let client = X25519KeyPair::generate();
-            let transcript_hash = [0x53_u8; 32];
-            let keys = derive_client_keys(&client.private, &server.public, &transcript_hash)?;
-            let mut enc = AeadCodec::new(keys.client_key, keys.client_nonce);
-            let mut dec = AeadCodec::new(keys.client_key, keys.client_nonce);
-            let ciphertext = enc.seal(b"parallax", b"self-test")?;
-            let plaintext = dec.open(&ciphertext, b"self-test")?;
-            anyhow::ensure!(plaintext == b"parallax", "AEAD self-test mismatch");
-            println!("ok: crypto self-test passed");
-        }
-        Command::Serve { config } => {
-            process_hardening::harden_current_process();
-            bump_nofile_soft_limit();
-            let cfg = Config::load(&config)
-                .with_context(|| format!("failed to load {}", config.display()))?;
-            cfg.protect_secret_memory();
-            server::run(cfg).await?;
-        }
-        Command::Client { config } => {
-            process_hardening::harden_current_process();
-            bump_nofile_soft_limit();
-            let cfg = Config::load(&config)
-                .with_context(|| format!("failed to load {}", config.display()))?;
-            cfg.protect_secret_memory();
-            let _guard = RuntimeGuard::acquire_client(&cfg)?;
-            runtime::run(cfg).await?;
-        }
-        Command::Speed { config } => {
-            process_hardening::harden_current_process();
-            bump_nofile_soft_limit();
-            let cfg = Config::load(&config)
-                .with_context(|| format!("failed to load {}", config.display()))?;
-            cfg.protect_secret_memory();
-            let _guard = RuntimeGuard::acquire_speed(&cfg)?;
-            let report = speed::run(cfg).await?;
-            print!("{}", report.to_text());
-        }
-        Command::Benchmark { quick, json } => {
-            let options = if quick {
-                BenchmarkOptions::quick()
-            } else {
-                BenchmarkOptions::standard()
-            };
-            let report = bench::run(options)?;
-            if json {
-                println!("{}", report.to_json());
-            } else {
-                print!("{}", report.to_text());
-            }
-        }
+    handle_command(Cli::parse().command).await
+}
+
+async fn handle_command(command: Command) -> anyhow::Result<()> {
+    match command {
+        Command::Check { config } => check_config(config)?,
+        Command::Keygen => print_keypair(),
+        Command::CryptoSelfTest => crypto_self_test()?,
+        Command::Serve { config } => run_server(config).await?,
+        Command::Client { config } => run_client(config).await?,
+        Command::Speed { config } => run_speed(config).await?,
+        Command::Benchmark { quick, json } => run_benchmark(quick, json)?,
         Command::ConfigTemplate {
             server_listen,
             client_listen,
@@ -200,42 +144,140 @@ pub async fn run() -> anyhow::Result<()> {
             &fallback_addr,
             &sni,
         ),
-        Command::Probe { dest, config } => {
-            let (target, sni) = match dest {
-                Some(dest) => {
-                    let target = probe::ProbeTarget::parse(&dest)?;
-                    let sni = target.host.clone();
-                    (target, sni)
-                }
-                None => {
-                    let cfg = Config::load(&config)
-                        .with_context(|| format!("failed to load {}", config.display()))?;
-                    probe::target_from_config(&cfg)?
-                }
-            };
-            let report = probe::probe(target, sni).await?;
-            print!("{}", report.summary());
-        }
+        Command::Probe { dest, config } => run_probe(dest, config).await?,
         Command::Init {
             dest,
             server_addr,
             server_listen,
             client_listen,
             output,
-        } => {
+        } => write_init_config(&dest, &server_addr, &server_listen, &client_listen, &output)?,
+    }
+    Ok(())
+}
+
+fn check_config(config: PathBuf) -> anyhow::Result<()> {
+    let cfg = load_config(&config)?;
+    cfg.validate()?;
+    println!(
+        "ok: {} mode config is valid ({})",
+        cfg.mode,
+        config.display()
+    );
+    Ok(())
+}
+
+fn print_keypair() {
+    let pair = X25519KeyPair::generate();
+    println!("private_key = \"{}\"", STANDARD.encode(pair.private));
+    println!("public_key = \"{}\"", STANDARD.encode(pair.public));
+}
+
+fn crypto_self_test() -> anyhow::Result<()> {
+    let server = X25519KeyPair::generate();
+    let client = X25519KeyPair::generate();
+    let transcript_hash = [0x53_u8; 32];
+    let keys = derive_client_keys(&client.private, &server.public, &transcript_hash)?;
+    let mut enc = AeadCodec::new(keys.client_key, keys.client_nonce);
+    let mut dec = AeadCodec::new(keys.client_key, keys.client_nonce);
+    let ciphertext = enc.seal(b"parallax", b"self-test")?;
+    let plaintext = dec.open(&ciphertext, b"self-test")?;
+    anyhow::ensure!(plaintext == b"parallax", "AEAD self-test mismatch");
+    println!("ok: crypto self-test passed");
+    Ok(())
+}
+
+async fn run_server(config: PathBuf) -> anyhow::Result<()> {
+    prepare_long_lived_process();
+    let cfg = load_config(&config)?;
+    cfg.protect_secret_memory();
+    server::run(cfg).await?;
+    Ok(())
+}
+
+async fn run_client(config: PathBuf) -> anyhow::Result<()> {
+    prepare_long_lived_process();
+    let cfg = load_config(&config)?;
+    cfg.protect_secret_memory();
+    let _guard = RuntimeGuard::acquire_client(&cfg)?;
+    runtime::run(cfg).await?;
+    Ok(())
+}
+
+async fn run_speed(config: PathBuf) -> anyhow::Result<()> {
+    prepare_long_lived_process();
+    let cfg = load_config(&config)?;
+    cfg.protect_secret_memory();
+    let _guard = RuntimeGuard::acquire_speed(&cfg)?;
+    let report = speed::run(cfg).await?;
+    print!("{}", report.to_text());
+    Ok(())
+}
+
+fn run_benchmark(quick: bool, json: bool) -> anyhow::Result<()> {
+    let options = if quick {
+        BenchmarkOptions::quick()
+    } else {
+        BenchmarkOptions::standard()
+    };
+    let report = bench::run(options)?;
+    if json {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.to_text());
+    }
+    Ok(())
+}
+
+async fn run_probe(dest: Option<String>, config: PathBuf) -> anyhow::Result<()> {
+    let (target, sni) = probe_target(dest, &config)?;
+    let report = probe::probe(target, sni).await?;
+    print!("{}", report.summary());
+    Ok(())
+}
+
+fn write_init_config(
+    dest: &str,
+    server_addr: &str,
+    server_listen: &str,
+    client_listen: &str,
+    output: &Path,
+) -> anyhow::Result<()> {
+    let target = probe::ProbeTarget::parse(dest)?;
+    let generated = generate_config_template(
+        server_listen,
+        client_listen,
+        server_addr,
+        &target.authority(),
+        &target.host,
+    );
+    write_init_files(output, &generated)
+}
+
+fn prepare_long_lived_process() {
+    process_hardening::harden_current_process();
+    bump_nofile_soft_limit();
+}
+
+fn load_config(config: &Path) -> anyhow::Result<Config> {
+    Config::load(config).with_context(|| format!("failed to load {}", config.display()))
+}
+
+fn probe_target(
+    dest: Option<String>,
+    config: &Path,
+) -> anyhow::Result<(probe::ProbeTarget, String)> {
+    match dest {
+        Some(dest) => {
             let target = probe::ProbeTarget::parse(&dest)?;
-            let generated = generate_config_template(
-                &server_listen,
-                &client_listen,
-                &server_addr,
-                &target.authority(),
-                &target.host,
-            );
-            write_init_files(&output, &generated)?;
+            let sni = target.host.clone();
+            Ok((target, sni))
+        }
+        None => {
+            let cfg = load_config(config)?;
+            Ok(probe::target_from_config(&cfg)?)
         }
     }
-
-    Ok(())
 }
 
 fn print_config_template(

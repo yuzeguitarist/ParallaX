@@ -224,6 +224,32 @@ impl BenchmarkCase {
         }
         (self.processed_bytes as f64 / (1024.0 * 1024.0)) / seconds(self.elapsed)
     }
+
+    fn write_json(&self, out: &mut String) {
+        let _ = write!(
+            out,
+            concat!(
+                "{{\"group\":\"{}\",",
+                "\"name\":\"{}\",",
+                "\"iterations\":{},",
+                "\"warmup\":{},",
+                "\"elapsed_ns\":{},",
+                "\"ns_per_op\":{:.4},",
+                "\"ops_per_second\":{:.4},",
+                "\"processed_bytes\":{},",
+                "\"mib_per_second\":{:.4}}}"
+            ),
+            self.group.label(),
+            self.name,
+            self.iterations,
+            self.warmup,
+            self.elapsed.as_nanos(),
+            self.ns_per_op(),
+            self.ops_per_second(),
+            self.processed_bytes,
+            self.mib_per_second(),
+        );
+    }
 }
 
 /// Aggregate benchmark output for a single invocation of [`run`].
@@ -293,19 +319,7 @@ impl BenchmarkReport {
             if idx > 0 {
                 out.push(',');
             }
-            let _ = write!(
-                out,
-                "{{\"group\":\"{}\",\"name\":\"{}\",\"iterations\":{},\"warmup\":{},\"elapsed_ns\":{},\"ns_per_op\":{:.4},\"ops_per_second\":{:.4},\"processed_bytes\":{},\"mib_per_second\":{:.4}}}",
-                case.group.label(),
-                case.name,
-                case.iterations,
-                case.warmup,
-                case.elapsed.as_nanos(),
-                case.ns_per_op(),
-                case.ops_per_second(),
-                case.processed_bytes,
-                case.mib_per_second(),
-            );
+            case.write_json(&mut out);
         }
         out.push_str("]}");
         out
