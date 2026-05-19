@@ -332,7 +332,16 @@ where
         match apply_server_key_exchange_record_blocking(data_session, &record, pending_rekey, psk)
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if skipped > 0 {
+                    tracing::warn!(
+                        skipped,
+                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        "accepted server key exchange after skipping residual camouflage records"
+                    );
+                }
+                return Ok(());
+            }
             Err(ClientRuntimeError::Handshake(err)) if is_residual_camouflage_record(&err) => {
                 if skipped < MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE {
                     skipped += 1;
@@ -341,7 +350,7 @@ where
                     // key-exchange record. We still tolerate it up to the
                     // budget, but operators need to see it without bumping the
                     // global log level to trace.
-                    tracing::debug!(
+                    tracing::warn!(
                         skipped,
                         budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
                         record_len = record.len(),

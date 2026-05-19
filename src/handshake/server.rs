@@ -72,6 +72,7 @@ const FALLBACK_MIN_IDLE_TIMEOUT_MS: u64 = 800;
 const FALLBACK_MAX_IDLE_TIMEOUT_MS: u64 = 2200;
 const SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
+const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -284,7 +285,7 @@ async fn handle_connection_inner(
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
     tune_tcp_stream(&client)?;
-    tracing::debug!(
+    tracing::info!(
         cid,
         task_name = "server-connection",
         "accepted outer connection"
@@ -293,7 +294,7 @@ async fn handle_connection_inner(
     let first_record = read_first_record(&mut client).await?;
     match decide_inbound(&first_record, psk, &config.authorized_sni, server_private)? {
         InboundDecision::Fallback(reason) => {
-            tracing::debug!(?reason, "falling back to authenticated SNI target");
+            tracing::info!(cid, ?reason, "falling back to camouflage origin");
             relay_fallback(client, &config.fallback_addr, first_record).await?;
         }
         InboundDecision::Authenticated(client_hello) => {
@@ -304,7 +305,7 @@ async fn handle_connection_inner(
                     transcript_fingerprint: client_hello.transcript_fingerprint,
                 };
                 if !insert_replay_entry_blocking(replay_cache, replay_entry).await? {
-                    tracing::debug!("falling back on replayed ClientHello");
+                    tracing::warn!(cid, "falling back on replayed ClientHello");
                     relay_fallback(client, &config.fallback_addr, first_record).await?;
                     return Ok(());
                 }
@@ -312,7 +313,7 @@ async fn handle_connection_inner(
             let handshake =
                 accept_authenticated(client, config, server_private, first_record, client_hello)
                     .await?;
-            tracing::debug!(
+            tracing::info!(
                 cid,
                 sni = %handshake.client_hello.sni,
                 tls13 = handshake.server_hello.tls13_selected,
@@ -570,6 +571,16 @@ async fn run_authenticated_data_mode(
     let mut fallback_records = TlsRecordReader::new(fallback_read);
     let mut client_record = Vec::new();
     let mut fallback_record = Vec::new();
+    let mut client_camouflage_records_before_pq = 0usize;
+    let mut client_camouflage_bytes_before_pq = 0usize;
+    let mut fallback_records_before_pq = 0usize;
+    let mut fallback_bytes_before_pq = 0usize;
+
+    tracing::info!(
+        cid,
+        sni = %handshake.client_hello.sni,
+        "authenticated pre-data mode started; waiting for client PQ rekey"
+    );
 
     loop {
         tokio::select! {
@@ -615,6 +626,15 @@ async fn run_authenticated_data_mode(
                             &key_exchange_record,
                         );
                         client_write.write_all(&key_exchange_record).await?;
+                        tracing::info!(
+                            cid,
+                            client_camouflage_records_before_pq,
+                            client_camouflage_bytes_before_pq,
+                            fallback_records_before_pq,
+                            fallback_bytes_before_pq,
+                            key_exchange_record_len = key_exchange_record.len(),
+                            "server key exchange record written"
+                        );
                         let rekeyed_keys = apply_server_pq_rekey(
                             &mut client_open,
                             &mut server_seal,
@@ -669,7 +689,12 @@ async fn run_authenticated_data_mode(
                         let first_payload_range =
                             client_open.open_in_place_payload_range(&mut client_record)?;
                         let first_payload = &mut client_record[first_payload_range];
-                        tracing::debug!(cid, "ParallaX data mode switch confirmed");
+                        tracing::info!(
+                            cid,
+                            client_camouflage_records_before_pq,
+                            fallback_records_before_pq,
+                            "ParallaX data mode switch confirmed"
+                        );
 
                         let (target_addr, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
@@ -696,6 +721,19 @@ async fn run_authenticated_data_mode(
                         .await;
                     }
                     Err(DataRecordError::Aead(_)) | Err(DataRecordError::NotApplicationData) => {
+                        client_camouflage_records_before_pq += 1;
+                        client_camouflage_bytes_before_pq += client_record.len();
+                        if client_camouflage_records_before_pq == 1
+                            || client_camouflage_records_before_pq == 8
+                        {
+                            tracing::info!(
+                                cid,
+                                client_camouflage_records_before_pq,
+                                client_camouflage_bytes_before_pq,
+                                record_len = client_record.len(),
+                                "forwarding client camouflage record before ParallaX PQ rekey"
+                            );
+                        }
                         fallback_write.write_all(&client_record).await?;
                     }
                     Err(err) => return Err(HandshakeServerError::DataRecord(err)),
@@ -708,15 +746,33 @@ async fn run_authenticated_data_mode(
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
                 log_record_read(cid, "fallback->server", "server-predata-fallback-reader", &fallback_record);
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    if let Ok(header) = crate::tls::record::parse_header(&fallback_record) {
-                        tracing::debug!(
+                fallback_records_before_pq += 1;
+                fallback_bytes_before_pq += fallback_record.len();
+                if let Ok(header) = crate::tls::record::parse_header(&fallback_record) {
+                    if fallback_records_before_pq == 1 || fallback_records_before_pq == 8 {
+                        tracing::info!(
                             cid,
                             direction = "fallback->client",
                             task_name = "server-camouflage-writer",
+                            fallback_records_before_pq,
+                            fallback_bytes_before_pq,
                             outer_tls_payload_len = header.payload_len,
                             tls_content_type = header.content_type,
-                            "camouflage TLS record write"
+                            "forwarding fallback camouflage record before ParallaX PQ rekey"
+                        );
+                    } else if fallback_records_before_pq >= CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
+                        && fallback_records_before_pq % CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET == 0
+                    {
+                        tracing::warn!(
+                            cid,
+                            direction = "fallback->client",
+                            task_name = "server-camouflage-writer",
+                            fallback_records_before_pq,
+                            fallback_bytes_before_pq,
+                            outer_tls_payload_len = header.payload_len,
+                            tls_content_type = header.content_type,
+                            client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
+                            "fallback camouflage records may exhaust client residual budget before ParallaX PQ rekey"
                         );
                     }
                 }
