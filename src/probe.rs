@@ -499,20 +499,20 @@ impl ServerCertVerifier for ProbeServerCertVerifier {
 fn split_host_port(authority: &str) -> Result<(String, u16), ProbeError> {
     if let Some(host) = authority.strip_prefix('[') {
         let Some((host, rest)) = host.split_once(']') else {
-            return Ok((authority.to_owned(), DEFAULT_PORT));
+            return Err(ProbeError::InvalidPort(authority.to_owned()));
         };
         let port = match rest.strip_prefix(':') {
             Some(raw) if !raw.is_empty() => parse_port(raw)?,
-            _ => DEFAULT_PORT,
+            Some(raw) => return Err(ProbeError::InvalidPort(raw.to_owned())),
+            None if rest.is_empty() => DEFAULT_PORT,
+            None => return Err(ProbeError::InvalidPort(rest.to_owned())),
         };
         return Ok((host.to_owned(), port));
     }
 
     if authority.matches(':').count() == 1 {
         let (host, raw_port) = authority.rsplit_once(':').expect("count checked");
-        if raw_port.chars().all(|ch| ch.is_ascii_digit()) {
-            return Ok((host.to_owned(), parse_port(raw_port)?));
-        }
+        return Ok((host.to_owned(), parse_port(raw_port)?));
     }
 
     Ok((authority.to_owned(), DEFAULT_PORT))
@@ -564,6 +564,26 @@ mod tests {
         assert!(matches!(
             ProbeTarget::parse("http://example.com"),
             Err(ProbeError::UnsupportedScheme)
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_authority_ports() {
+        assert!(matches!(
+            ProbeTarget::parse("example.com:abc"),
+            Err(ProbeError::InvalidPort(_))
+        ));
+        assert!(matches!(
+            ProbeTarget::parse("example.com:"),
+            Err(ProbeError::InvalidPort(_))
+        ));
+        assert!(matches!(
+            ProbeTarget::parse("[::1]garbage"),
+            Err(ProbeError::InvalidPort(_))
+        ));
+        assert!(matches!(
+            ProbeTarget::parse("[::1]:"),
+            Err(ProbeError::InvalidPort(_))
         ));
     }
 
