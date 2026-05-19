@@ -8,7 +8,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::tls::client_hello::{parse_client_hello, ClientHelloError};
+use crate::tls::client_hello::{parse_client_hello, ClientHello, ClientHelloError};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -150,6 +150,14 @@ pub fn recover_stateful_auth_material(
     psk: &[u8],
 ) -> Result<Option<StatefulAuthMaterial>, AuthError> {
     let parsed = parse_client_hello(record)?;
+    recover_stateful_auth_material_from_parsed(record, psk, &parsed)
+}
+
+pub(crate) fn recover_stateful_auth_material_from_parsed(
+    record: &[u8],
+    psk: &[u8],
+    parsed: &ClientHello,
+) -> Result<Option<StatefulAuthMaterial>, AuthError> {
     if parsed.session_id_range.len() != SESSION_ID_LEN {
         return Ok(None);
     }
@@ -187,7 +195,8 @@ where
 }
 
 pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<ClientAuth, AuthError> {
-    verify_client_hello_auth_with_material(record, auth_key, None)
+    let parsed = parse_client_hello(record)?;
+    verify_client_hello_auth_with_parsed(record, auth_key, None, parsed)
 }
 
 pub fn verify_client_hello_auth_with_material(
@@ -195,11 +204,20 @@ pub fn verify_client_hello_auth_with_material(
     auth_key: &[u8],
     material: Option<StatefulAuthMaterial>,
 ) -> Result<ClientAuth, AuthError> {
+    let parsed = parse_client_hello(record)?;
+    verify_client_hello_auth_with_parsed(record, auth_key, material, parsed)
+}
+
+pub(crate) fn verify_client_hello_auth_with_parsed(
+    record: &[u8],
+    auth_key: &[u8],
+    material: Option<StatefulAuthMaterial>,
+    parsed: ClientHello,
+) -> Result<ClientAuth, AuthError> {
     if auth_key.is_empty() {
         return Err(AuthError::EmptyPsk);
     }
 
-    let parsed = parse_client_hello(record)?;
     if parsed.session_id_range.len() != SESSION_ID_LEN {
         return Ok(ClientAuth {
             authenticated: false,

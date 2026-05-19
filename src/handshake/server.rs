@@ -30,8 +30,8 @@ use crate::{
     },
     crypto::{
         auth::{
-            derive_server_auth_key, recover_stateful_auth_material, verify_client_hello_auth,
-            verify_client_hello_auth_with_material, AuthError, ClientAuth,
+            derive_server_auth_key, recover_stateful_auth_material_from_parsed,
+            verify_client_hello_auth_with_parsed, AuthError, ClientAuth,
         },
         identity::{self, IdentityError},
         pq::{self, PqError},
@@ -378,13 +378,16 @@ pub fn decide_inbound(
         Ok(parsed) => parsed,
         Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
     };
-    if let Some(material) = recover_stateful_auth_material(first_client_record, psk)? {
+    if let Some(material) =
+        recover_stateful_auth_material_from_parsed(first_client_record, psk, &parsed)?
+    {
         let x25519_key_share = material.x25519_public;
         let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
-        let auth = match verify_client_hello_auth_with_material(
+        let auth = match verify_client_hello_auth_with_parsed(
             first_client_record,
             &auth_key,
             Some(material),
+            parsed.clone(),
         ) {
             Ok(auth) => auth,
             Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
@@ -402,11 +405,12 @@ pub fn decide_inbound(
 
     let x25519_key_share = parsed.client_random;
     let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
-    let auth = match verify_client_hello_auth(first_client_record, &auth_key) {
-        Ok(auth) => auth,
-        Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
-        Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
-    };
+    let auth =
+        match verify_client_hello_auth_with_parsed(first_client_record, &auth_key, None, parsed) {
+            Ok(auth) => auth,
+            Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
+            Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+        };
     if !auth.authenticated {
         return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed));
     }
