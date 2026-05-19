@@ -339,6 +339,17 @@ const HPACK_HUFFMAN: [(u32, u8); 256] = [
 mod tests {
     use super::*;
 
+    const SAFARI26_HEADERS_CAPTURE_HEX: &str = concat!(
+        "828784418aa0e41d139d09b8f34d33",
+        "53032a2f2a",
+        "7ad8d07f66a281b0dae053fad0321aa49d13fda992a49685340c8a6adca7e281",
+        "04416e277fb521aeba0bc8b1e63258700dae15c2da9fd66c7bf467fa528375",
+        "2a988a4ea7fed4e25b1063d4c05d5c0a6e1ca3b0cc3806d70ae16f",
+        "4086aec31ec327d703753d33",
+        "518b2d4b70ddf45abefb4005df",
+        "508d9bd9abfa5242cb40d25fa523b3",
+    );
+
     #[test]
     fn builds_http2_preface() {
         let fp = Http2Fingerprint::safari26();
@@ -429,7 +440,7 @@ mod tests {
         );
         assert_eq!(
             &payload[4..15],
-            &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
+            &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33,],
             "Safari26 :authority huffman bytes drifted from captured baseline",
         );
     }
@@ -444,15 +455,11 @@ mod tests {
         assert_eq!(header.len, 150);
         assert_eq!(
             payload,
-            hex(
-                b"828784418aa0e41d139d09b8f34d33\
-                  53032a2f2a\
-                  7ad8d07f66a281b0dae053fad0321aa49d13fda992a49685340c8a6adca7e28104416e277fb521aeba0bc8b1e63258700dae15c2da9fd66c7bf467fa5283752a988a4ea7fed4e25b1063d4c05d5c0a6e1ca3b0cc3806d70ae16f\
-                  4086aec31ec327d703753d33\
-                  518b2d4b70ddf45abefb4005df\
-                  508d9bd9abfa5242cb40d25fa523b3",
+            hex(SAFARI26_HEADERS_CAPTURE_HEX.as_bytes()),
+            concat!(
+                "Safari26 HEADERS metadata should match the capture except for ",
+                "the configured English accept-language value",
             ),
-            "Safari26 HEADERS metadata should match the capture except for the configured English accept-language value",
         );
         assert!(SAFARI26_ACCEPT_LANGUAGE.starts_with("en-US"));
         assert!(

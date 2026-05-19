@@ -669,7 +669,12 @@ async fn run_authenticated_data_mode(
                     Err(err) if is_clean_close(&err) => return Ok(()),
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
-                log_record_read(cid, "client->server", "server-predata-client-reader", &client_record);
+                log_record_read(
+                    cid,
+                    "client->server",
+                    "server-predata-client-reader",
+                    &client_record,
+                );
 
                 match client_open.open(&client_record) {
                     Ok(first_payload) => {
@@ -829,7 +834,12 @@ async fn run_authenticated_data_mode(
                     Err(err) if is_clean_close(&err) => return Ok(()),
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
-                log_record_read(cid, "fallback->server", "server-predata-fallback-reader", &fallback_record);
+                log_record_read(
+                    cid,
+                    "fallback->server",
+                    "server-predata-fallback-reader",
+                    &fallback_record,
+                );
                 fallback_records_before_pq += 1;
                 fallback_bytes_before_pq += fallback_record.len();
                 if let Ok(header) = crate::tls::record::parse_header(&fallback_record) {
@@ -844,8 +854,11 @@ async fn run_authenticated_data_mode(
                             tls_content_type = header.content_type,
                             "forwarding fallback camouflage record before ParallaX PQ rekey"
                         );
-                    } else if fallback_records_before_pq >= CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
-                        && fallback_records_before_pq % CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET == 0
+                    } else if fallback_records_before_pq
+                        >= CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
+                        && fallback_records_before_pq
+                            % CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
+                            == 0
                     {
                         tracing::warn!(
                             cid,
@@ -856,7 +869,8 @@ async fn run_authenticated_data_mode(
                             outer_tls_payload_len = header.payload_len,
                             tls_content_type = header.content_type,
                             client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
-                            "fallback camouflage records may exhaust client residual budget before ParallaX PQ rekey"
+                            "fallback camouflage records may exhaust client residual \
+                             budget before ParallaX PQ rekey"
                         );
                     }
                 }

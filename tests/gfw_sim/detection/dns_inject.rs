@@ -268,9 +268,10 @@ impl DnsInjector {
         encode_name(&mut resp, &question.name);
         resp.extend_from_slice(&1_u16.to_be_bytes()); // TYPE = A
         resp.extend_from_slice(&1_u16.to_be_bytes()); // CLASS = IN
-                                                      // Classic GFW responses use a high TTL to make them stick in
-                                                      // resolvers. The leaked Tiangou configs picked 86400 (24h);
-                                                      // we mirror that.
+
+        // Classic GFW responses use a high TTL to make them stick in
+        // resolvers. The leaked Tiangou configs picked 86400 (24h);
+        // we mirror that.
         resp.extend_from_slice(&trace[0].ttl.to_be_bytes());
         resp.extend_from_slice(&4_u16.to_be_bytes()); // RDLENGTH
         resp.extend_from_slice(&sink);
