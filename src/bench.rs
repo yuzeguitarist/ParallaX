@@ -19,12 +19,16 @@
 use std::{
     fmt::Write as _,
     hint::black_box,
+    io,
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::{rngs::StdRng, SeedableRng};
+use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
     config::{
@@ -75,6 +79,11 @@ const SIZE_1M: usize = 1024 * 1024;
 const RECORD_PADDING_MIN: u16 = 0;
 const RECORD_PADDING_MAX: u16 = 1500;
 const BENCH_SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
+/// Synthetic TCP read size for TLS-record reader benchmarks.
+///
+/// 1460 bytes approximates one Ethernet TCP payload without adding real socket
+/// noise to the CPU-only benchmark.
+const TLS_RECORD_READER_CHUNK: usize = 1460;
 
 /// Iteration / warmup pair for one benchmark case.
 ///
@@ -352,6 +361,7 @@ const CASES: &[CaseRunner] = &[
     bench_record_seal_bulk_1mb_default_metadata,
     bench_record_seal_bulk_1mb_default_untracked,
     bench_record_bulk_1mb_default,
+    bench_tls_record_reader_bulk_1mb,
     bench_padding_apply_1k,
     bench_padding_apply_default_1k,
     bench_padding_remove_1k,
@@ -1364,6 +1374,28 @@ fn bench_record_seal_bulk_1mb_default_untracked(
     )
 }
 
+fn bench_tls_record_reader_bulk_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let payload = vec![0x42_u8; SIZE_1M];
+    let records = tls_record_reader_fixture(&payload)?;
+
+    run_case(
+        BenchGroup::RecordPipeline,
+        "tls_record_reader.bulk_1mb",
+        TIER_BULK,
+        options,
+        || {
+            let read_len = read_tls_record_fixture_blocking(&records, TLS_RECORD_READER_CHUNK)?;
+            if read_len != records.len() {
+                bail!(
+                    "TLS record reader consumed {read_len} bytes, expected {}",
+                    records.len()
+                );
+            }
+            Ok(black_box(read_len as u64))
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // traffic
 // ---------------------------------------------------------------------------
@@ -1505,6 +1537,82 @@ where
 
 fn record_fixture_capacity(payload_len: usize, max_padding: u16) -> usize {
     crate::tls::record::TLS_HEADER_LEN + payload_len + max_padding as usize + 2 + AEAD_TAG_LEN
+}
+
+fn tls_record_reader_fixture(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(
+        payload.len()
+            + payload
+                .len()
+                .div_ceil(crate::tls::record::MAX_TLS_RECORD_PAYLOAD)
+                * crate::tls::record::TLS_HEADER_LEN,
+    );
+    for chunk in payload.chunks(crate::tls::record::MAX_TLS_RECORD_PAYLOAD) {
+        out.extend_from_slice(&crate::tls::record::wrap_application_data(chunk)?);
+    }
+    Ok(out)
+}
+
+fn read_tls_record_fixture_blocking(input: &[u8], max_chunk: usize) -> Result<usize> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(read_tls_record_fixture(input, max_chunk))
+        }),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(read_tls_record_fixture(input, max_chunk)),
+    }
+}
+
+async fn read_tls_record_fixture(input: &[u8], max_chunk: usize) -> Result<usize> {
+    let reader = SliceAsyncRead::new(input, max_chunk);
+    let mut reader = crate::tls::record::TlsRecordReader::new(reader);
+    let mut record = Vec::with_capacity(
+        crate::tls::record::TLS_HEADER_LEN + crate::tls::record::MAX_TLS_RECORD_PAYLOAD,
+    );
+    let mut read_len = 0_usize;
+
+    while read_len < input.len() {
+        reader.read_record_into(&mut record).await?;
+        read_len += record.len();
+        black_box(record.as_slice());
+    }
+    Ok(read_len)
+}
+
+struct SliceAsyncRead<'a> {
+    input: &'a [u8],
+    offset: usize,
+    max_chunk: usize,
+}
+
+impl<'a> SliceAsyncRead<'a> {
+    fn new(input: &'a [u8], max_chunk: usize) -> Self {
+        Self {
+            input,
+            offset: 0,
+            max_chunk: max_chunk.max(1),
+        }
+    }
+}
+
+impl AsyncRead for SliceAsyncRead<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset >= this.input.len() || buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let remaining = this.input.len() - this.offset;
+        let len = remaining.min(buf.remaining()).min(this.max_chunk);
+        buf.put_slice(&this.input[this.offset..this.offset + len]);
+        this.offset += len;
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Apply the quick-mode scaling factor to a tier, clamping iterations so the
