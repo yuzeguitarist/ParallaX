@@ -190,6 +190,63 @@ pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<Client
     verify_client_hello_auth_with_material(record, auth_key, None)
 }
 
+pub(crate) fn verify_masked_stateful_client_hello_auth_with_material(
+    record: &[u8],
+    auth_key: &[u8],
+    material: &StatefulAuthMaterial,
+) -> Result<ClientAuth, AuthError> {
+    if auth_key.is_empty() {
+        return Err(AuthError::EmptyPsk);
+    }
+
+    let parsed = parse_client_hello(record)?;
+    if parsed.session_id_range.len() != SESSION_ID_LEN {
+        return Ok(ClientAuth {
+            authenticated: false,
+            sni: parsed.sni,
+            x25519_key_share: Some(material.x25519_public),
+            timestamp: None,
+            nonce: None,
+        });
+    }
+
+    let Some(sni) = parsed.sni.as_deref() else {
+        let (timestamp, nonce) = auth_tail_timestamp_nonce(&material.tail);
+        return Ok(ClientAuth {
+            authenticated: false,
+            sni: parsed.sni,
+            x25519_key_share: Some(material.x25519_public),
+            timestamp: Some(timestamp),
+            nonce: Some(nonce),
+        });
+    };
+
+    let actual =
+        &record[parsed.session_id_range.start..parsed.session_id_range.start + AUTH_TAG_LEN];
+    let mut encoded_tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+    encoded_tail.copy_from_slice(
+        &record[parsed.session_id_range.start + AUTH_TAG_LEN..parsed.session_id_range.end],
+    );
+    let expected = compute_masked_stateful_tag(
+        auth_key,
+        sni,
+        &material.x25519_public,
+        &material.tail,
+        &parsed.client_random,
+        &encoded_tail,
+    )?;
+    let authenticated = bool::from(actual.ct_eq(&expected));
+    let (timestamp, nonce) = auth_tail_timestamp_nonce(&material.tail);
+
+    Ok(ClientAuth {
+        authenticated,
+        sni: parsed.sni,
+        x25519_key_share: Some(material.x25519_public),
+        timestamp: Some(timestamp),
+        nonce: Some(nonce),
+    })
+}
+
 pub fn verify_client_hello_auth_with_material(
     record: &[u8],
     auth_key: &[u8],
@@ -250,13 +307,7 @@ pub fn verify_client_hello_auth_with_material(
     } else {
         tail.copy_from_slice(&record[timestamp_start..parsed.session_id_range.end]);
     }
-    let timestamp = u64::from_be_bytes(
-        tail[..AUTH_TIMESTAMP_LEN]
-            .try_into()
-            .expect("timestamp range is fixed"),
-    );
-    let mut nonce = [0_u8; AUTH_NONCE_LEN];
-    nonce.copy_from_slice(&tail[AUTH_TIMESTAMP_LEN..]);
+    let (timestamp, nonce) = auth_tail_timestamp_nonce(&tail);
 
     Ok(ClientAuth {
         authenticated: transcript_authenticated || stateful_authenticated,
@@ -268,6 +319,17 @@ pub fn verify_client_hello_auth_with_material(
         timestamp: Some(timestamp),
         nonce: Some(nonce),
     })
+}
+
+fn auth_tail_timestamp_nonce(tail: &[u8; STATEFUL_AUTH_TAIL_LEN]) -> (u64, [u8; AUTH_NONCE_LEN]) {
+    let timestamp = u64::from_be_bytes(
+        tail[..AUTH_TIMESTAMP_LEN]
+            .try_into()
+            .expect("timestamp range is fixed"),
+    );
+    let mut nonce = [0_u8; AUTH_NONCE_LEN];
+    nonce.copy_from_slice(&tail[AUTH_TIMESTAMP_LEN..]);
+    (timestamp, nonce)
 }
 
 fn current_unix_timestamp() -> Result<u64, AuthError> {
@@ -283,6 +345,13 @@ pub fn derive_client_auth_key(
     server_public: &[u8; 32],
 ) -> Result<[u8; 32], AuthError> {
     derive_auth_key(psk, client_private, server_public)
+}
+
+pub fn derive_client_auth_key_from_shared(
+    psk: &[u8],
+    x25519_shared_secret: &[u8; 32],
+) -> Result<[u8; 32], AuthError> {
+    derive_auth_key_from_shared(psk, x25519_shared_secret)
 }
 
 pub fn derive_server_auth_key(
@@ -305,7 +374,18 @@ fn derive_auth_key(
     let private = StaticSecret::from(*private);
     let peer_public = PublicKey::from(*peer_public);
     let shared = private.diffie_hellman(&peer_public);
-    let hk = Hkdf::<Sha256>::new(Some(psk), shared.as_bytes());
+    derive_auth_key_from_shared(psk, shared.as_bytes())
+}
+
+fn derive_auth_key_from_shared(
+    psk: &[u8],
+    x25519_shared_secret: &[u8; 32],
+) -> Result<[u8; 32], AuthError> {
+    if psk.is_empty() {
+        return Err(AuthError::EmptyPsk);
+    }
+
+    let hk = Hkdf::<Sha256>::new(Some(psk), x25519_shared_secret);
     let mut out = [0_u8; 32];
     hk.expand(b"ParallaX v1 ClientHello authentication", &mut out)
         .map_err(|_| AuthError::Hkdf)?;
@@ -511,6 +591,19 @@ mod tests {
     }
 
     #[test]
+    fn derives_same_client_auth_key_from_cached_shared_secret() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let shared = crate::crypto::session::x25519_shared_secret(&client.private, &server.public);
+
+        let from_private = derive_client_auth_key(psk, &client.private, &server.public).unwrap();
+        let from_shared = derive_client_auth_key_from_shared(psk, &shared).unwrap();
+
+        assert_eq!(from_private, from_shared);
+    }
+
+    #[test]
     fn rejects_modified_client_hello() {
         let mut hello = client_hello_fixture("example.com");
         let mut rng = StdRng::seed_from_u64(7);
@@ -591,6 +684,44 @@ mod tests {
             .unwrap();
         let auth =
             verify_client_hello_auth_with_material(&hello, auth_key, Some(material)).unwrap();
+
+        assert!(auth.authenticated);
+        assert_eq!(auth.x25519_key_share, Some(public));
+        assert_eq!(auth.timestamp, Some(1234));
+        assert_eq!(auth.nonce, Some([7_u8; AUTH_NONCE_LEN]));
+    }
+
+    #[test]
+    fn verifies_masked_stateful_auth_without_transcript_fallback_work() {
+        let mut hello = client_hello_fixture("example.com");
+        let parsed = parse_client_hello(&hello).unwrap();
+        let public = parsed.client_random;
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let auth_key = psk;
+        let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+        tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&1234_u64.to_be_bytes());
+        tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&[7_u8; AUTH_NONCE_LEN]);
+        let encoded_random =
+            build_masked_stateful_client_random(psk, "example.com", &public, &tail).unwrap();
+        let session_id = build_masked_stateful_auth_session_id(
+            psk,
+            auth_key,
+            "example.com",
+            &public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        hello[parsed.session_id_range].copy_from_slice(&session_id);
+        let material = recover_stateful_auth_material(&hello, psk)
+            .unwrap()
+            .unwrap();
+
+        let auth =
+            verify_masked_stateful_client_hello_auth_with_material(&hello, auth_key, &material)
+                .unwrap();
 
         assert!(auth.authenticated);
         assert_eq!(auth.x25519_key_share, Some(public));

@@ -38,8 +38,9 @@ use crate::{
         identity, pq,
         replay::{ReplayCache, ReplayEntry},
         session::{
-            derive_client_keys, x25519_public_from_private, x25519_shared_secret, AeadCodec,
-            SessionKeys, X25519KeyPair, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN,
+            derive_client_keys, derive_client_keys_from_shared, x25519_public_from_private,
+            x25519_shared_secret, AeadCodec, SessionKeys, X25519KeyPair, AEAD_TAG_LEN, KEY_LEN,
+            NONCE_LEN,
         },
     },
     handshake::client::ClientDataSession,
@@ -320,6 +321,7 @@ const CASES: &[CaseRunner] = &[
     bench_mldsa_sign,
     bench_mldsa_verify,
     bench_hkdf_session_keys,
+    bench_hkdf_session_keys_from_shared,
     bench_hkdf_hybrid_rekey,
     bench_hkdf_hybrid_sandwich_rekey,
     bench_safari26_clienthello_start,
@@ -517,6 +519,23 @@ fn bench_hkdf_session_keys(options: BenchmarkOptions) -> Result<BenchmarkCase> {
         options,
         || {
             let keys = derive_client_keys(&client.private, &server.public, &transcript)?;
+            Ok(black_box(keys.client_key.len() as u64))
+        },
+    )
+}
+
+fn bench_hkdf_session_keys_from_shared(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let client = X25519KeyPair::generate();
+    let server = X25519KeyPair::generate();
+    let shared = x25519_shared_secret(&client.private, &server.public);
+    let transcript = [0x42_u8; KEY_LEN];
+    run_case(
+        BenchGroup::HandshakeCrypto,
+        "hkdf.session_keys_from_shared",
+        TIER_FAST,
+        options,
+        || {
+            let keys = derive_client_keys_from_shared(&shared, &transcript)?;
             Ok(black_box(keys.client_key.len() as u64))
         },
     )

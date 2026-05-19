@@ -6,6 +6,7 @@
 
 use std::{
     cell::RefCell,
+    fmt,
     io::{self, Cursor, Read, Write},
     sync::{Arc, OnceLock},
     time::Duration,
@@ -39,10 +40,11 @@ use super::{record::read_record, server_hello::parse_server_hello};
 use crate::crypto::{
     auth::{
         build_auth_tail, build_masked_stateful_auth_session_id,
-        build_masked_stateful_client_random, derive_client_auth_key,
-        recover_stateful_auth_material, verify_client_hello_auth_with_material, AuthError,
+        build_masked_stateful_client_random, derive_client_auth_key_from_shared,
+        recover_stateful_auth_material, verify_masked_stateful_client_hello_auth_with_material,
+        AuthError,
     },
-    session::X25519KeyPair,
+    session::{x25519_shared_secret, X25519KeyPair},
 };
 use crate::fingerprint::http2::{Http2Fingerprint, Http2FingerprintError, Http2FrameHeader};
 use crate::tls::server_hello::ServerHelloError;
@@ -163,7 +165,8 @@ impl Safari26TlsCamouflage {
         server_public_key: &[u8; 32],
     ) -> Result<Safari26TlsSession, Safari26TlsError> {
         let x25519 = X25519KeyPair::generate();
-        let auth_key = derive_client_auth_key(psk, &x25519.private, server_public_key)?;
+        let shared_secret = x25519_shared_secret(&x25519.private, server_public_key);
+        let auth_key = derive_client_auth_key_from_shared(psk, &shared_secret)?;
         let context = PatchContext::new(sni.clone(), psk, auth_key, x25519.clone());
 
         let (connection, client_hello) = with_patch_context(context, || {
@@ -176,8 +179,14 @@ impl Safari26TlsCamouflage {
             Ok((connection, client_hello))
         })?;
 
-        let material = recover_stateful_auth_material(&client_hello, psk)?;
-        let auth = verify_client_hello_auth_with_material(&client_hello, &auth_key, material)?;
+        let Some(material) = recover_stateful_auth_material(&client_hello, psk)? else {
+            return Err(Safari26TlsError::UnauthenticatedClientHello);
+        };
+        let auth = verify_masked_stateful_client_hello_auth_with_material(
+            &client_hello,
+            &auth_key,
+            &material,
+        )?;
         if !auth.authenticated || auth.x25519_key_share != Some(x25519.public) {
             return Err(Safari26TlsError::UnauthenticatedClientHello);
         }
@@ -186,6 +195,7 @@ impl Safari26TlsCamouflage {
             connection,
             client_hello,
             x25519,
+            x25519_shared_secret: Zeroizing::new(shared_secret),
             sni,
             tap: VecRecordTap::default(),
         })
@@ -196,6 +206,7 @@ pub struct Safari26TlsSession {
     connection: rustls::ClientConnection,
     client_hello: Vec<u8>,
     x25519: X25519KeyPair,
+    x25519_shared_secret: Zeroizing<[u8; 32]>,
     sni: String,
     tap: VecRecordTap,
 }
@@ -239,6 +250,7 @@ impl Safari26TlsSession {
         Ok(CompletedSafari26Handshake {
             client_hello: self.client_hello,
             client_x25519: self.x25519,
+            x25519_shared_secret: self.x25519_shared_secret,
             server_hello_record,
             record_events: self.tap.events,
         })
@@ -401,12 +413,30 @@ impl Safari26TlsSession {
     }
 }
 
-#[derive(Debug)]
 pub struct CompletedSafari26Handshake {
     pub client_hello: Vec<u8>,
     pub client_x25519: X25519KeyPair,
     pub server_hello_record: Vec<u8>,
     pub record_events: Vec<RecordEvent>,
+    x25519_shared_secret: Zeroizing<[u8; 32]>,
+}
+
+impl CompletedSafari26Handshake {
+    pub fn x25519_shared_secret(&self) -> &[u8; 32] {
+        &self.x25519_shared_secret
+    }
+}
+
+impl fmt::Debug for CompletedSafari26Handshake {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletedSafari26Handshake")
+            .field("client_hello", &self.client_hello)
+            .field("client_x25519", &self.client_x25519)
+            .field("x25519_shared_secret", &"<redacted>")
+            .field("server_hello_record", &self.server_hello_record)
+            .field("record_events", &self.record_events)
+            .finish()
+    }
 }
 
 fn with_patch_context<T>(
@@ -821,7 +851,10 @@ fn is_clean_close(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{auth::derive_server_auth_key, session::X25519KeyPair};
+    use crate::crypto::{
+        auth::{derive_server_auth_key, verify_client_hello_auth_with_material},
+        session::X25519KeyPair,
+    };
     use crate::tls::client_hello::parse_client_hello;
 
     #[test]
