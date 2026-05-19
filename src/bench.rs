@@ -19,12 +19,16 @@
 use std::{
     fmt::Write as _,
     hint::black_box,
+    io,
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::{rngs::StdRng, SeedableRng};
+use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
     config::{
@@ -44,6 +48,7 @@ use crate::{
         },
     },
     handshake::client::ClientDataSession,
+    handshake::server::{decide_inbound, InboundDecision},
     protocol::{
         command::{ConnectRequest, ServerIdentityChunk, ServerIdentityProof},
         data::{DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD},
@@ -76,6 +81,11 @@ const SIZE_1M: usize = 1024 * 1024;
 const RECORD_PADDING_MIN: u16 = 0;
 const RECORD_PADDING_MAX: u16 = 1500;
 const BENCH_SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
+/// Synthetic TCP read size for TLS-record reader benchmarks.
+///
+/// 1460 bytes approximates one Ethernet TCP payload without adding real socket
+/// noise to the CPU-only benchmark.
+const TLS_RECORD_READER_CHUNK: usize = 1460;
 
 /// Iteration / warmup pair for one benchmark case.
 ///
@@ -327,6 +337,7 @@ const CASES: &[CaseRunner] = &[
     bench_safari26_clienthello_start,
     bench_clienthello_parse,
     bench_clienthello_verify_auth,
+    bench_server_decide_inbound,
     bench_client_pq_rekey_record,
     bench_client_connect_record_1k,
     bench_connect_request_decode_1k_owned,
@@ -354,6 +365,7 @@ const CASES: &[CaseRunner] = &[
     bench_record_seal_bulk_1mb_default_metadata,
     bench_record_seal_bulk_1mb_default_untracked,
     bench_record_bulk_1mb_default,
+    bench_tls_record_reader_bulk_1mb,
     bench_padding_apply_1k,
     bench_padding_apply_default_1k,
     bench_padding_remove_1k,
@@ -627,6 +639,23 @@ fn bench_clienthello_verify_auth(options: BenchmarkOptions) -> Result<BenchmarkC
     )
 }
 
+fn bench_server_decide_inbound(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let (record, server_private) = authenticated_client_hello_fixture()?;
+    let authorized_sni = [BENCH_SNI.to_owned()];
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "server.decide_inbound",
+        TIER_FAST,
+        options,
+        || match decide_inbound(&record, BENCH_PSK, &authorized_sni, &server_private)? {
+            InboundDecision::Authenticated(hello) if hello.sni == BENCH_SNI => {
+                Ok(black_box(record.len() as u64))
+            }
+            other => bail!("benchmark ClientHello was not accepted: {other:?}"),
+        },
+    )
+}
+
 /// Build a signed ClientHello together with the matching server-side auth key
 /// so verification benchmarks can run without re-deriving keys per call.
 fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuthMaterial)> {
@@ -637,6 +666,12 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuth
         .expect("Safari26 ClientHello must carry stateful auth material");
     let server_auth = derive_server_auth_key(BENCH_PSK, &server.private, &material.x25519_public)?;
     Ok((record, server_auth, material))
+}
+
+fn authenticated_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN])> {
+    let server = X25519KeyPair::generate();
+    let session = Safari26TlsCamouflage.start(BENCH_SNI.to_owned(), BENCH_PSK, &server.public)?;
+    Ok((session.client_hello_bytes().to_vec(), server.private))
 }
 
 fn bench_client_pq_rekey_record(options: BenchmarkOptions) -> Result<BenchmarkCase> {
@@ -1383,6 +1418,28 @@ fn bench_record_seal_bulk_1mb_default_untracked(
     )
 }
 
+fn bench_tls_record_reader_bulk_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let payload = vec![0x42_u8; SIZE_1M];
+    let records = tls_record_reader_fixture(&payload)?;
+
+    run_case(
+        BenchGroup::RecordPipeline,
+        "tls_record_reader.bulk_1mb",
+        TIER_BULK,
+        options,
+        || {
+            let read_len = read_tls_record_fixture_blocking(&records, TLS_RECORD_READER_CHUNK)?;
+            if read_len != records.len() {
+                bail!(
+                    "TLS record reader consumed {read_len} bytes, expected {}",
+                    records.len()
+                );
+            }
+            Ok(black_box(read_len as u64))
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // traffic
 // ---------------------------------------------------------------------------
@@ -1524,6 +1581,82 @@ where
 
 fn record_fixture_capacity(payload_len: usize, max_padding: u16) -> usize {
     crate::tls::record::TLS_HEADER_LEN + payload_len + max_padding as usize + 2 + AEAD_TAG_LEN
+}
+
+fn tls_record_reader_fixture(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(
+        payload.len()
+            + payload
+                .len()
+                .div_ceil(crate::tls::record::MAX_TLS_RECORD_PAYLOAD)
+                * crate::tls::record::TLS_HEADER_LEN,
+    );
+    for chunk in payload.chunks(crate::tls::record::MAX_TLS_RECORD_PAYLOAD) {
+        out.extend_from_slice(&crate::tls::record::wrap_application_data(chunk)?);
+    }
+    Ok(out)
+}
+
+fn read_tls_record_fixture_blocking(input: &[u8], max_chunk: usize) -> Result<usize> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(read_tls_record_fixture(input, max_chunk))
+        }),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(read_tls_record_fixture(input, max_chunk)),
+    }
+}
+
+async fn read_tls_record_fixture(input: &[u8], max_chunk: usize) -> Result<usize> {
+    let reader = SliceAsyncRead::new(input, max_chunk);
+    let mut reader = crate::tls::record::TlsRecordReader::new(reader);
+    let mut record = Vec::with_capacity(
+        crate::tls::record::TLS_HEADER_LEN + crate::tls::record::MAX_TLS_RECORD_PAYLOAD,
+    );
+    let mut read_len = 0_usize;
+
+    while read_len < input.len() {
+        reader.read_record_into(&mut record).await?;
+        read_len += record.len();
+        black_box(record.as_slice());
+    }
+    Ok(read_len)
+}
+
+struct SliceAsyncRead<'a> {
+    input: &'a [u8],
+    offset: usize,
+    max_chunk: usize,
+}
+
+impl<'a> SliceAsyncRead<'a> {
+    fn new(input: &'a [u8], max_chunk: usize) -> Self {
+        Self {
+            input,
+            offset: 0,
+            max_chunk: max_chunk.max(1),
+        }
+    }
+}
+
+impl AsyncRead for SliceAsyncRead<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset >= this.input.len() || buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let remaining = this.input.len() - this.offset;
+        let len = remaining.min(buf.remaining()).min(this.max_chunk);
+        buf.put_slice(&this.input[this.offset..this.offset + len]);
+        this.offset += len;
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Apply the quick-mode scaling factor to a tier, clamping iterations so the

@@ -140,15 +140,19 @@ where
             })?;
             self.record.clear();
             self.record.extend_from_slice(&self.header);
-            self.record.resize(parsed.total_len, 0);
+            self.record
+                .reserve(parsed.total_len.saturating_sub(self.record.len()));
             self.payload_len = Some(parsed.payload_len);
             self.payload_pos = 0;
         }
 
         let payload_len = self.payload_len.expect("payload length is initialized");
         while self.payload_pos < payload_len {
-            let start = TLS_HEADER_LEN + self.payload_pos;
-            let n = self.reader.read(&mut self.record[start..]).await?;
+            let remaining = payload_len - self.payload_pos;
+            let n = (&mut self.reader)
+                .take(remaining as u64)
+                .read_buf(&mut self.record)
+                .await?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
