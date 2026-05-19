@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -92,6 +93,8 @@ pub enum HandshakeServerError {
     ServerHello(#[from] ServerHelloError),
     #[error("handshake timed out")]
     Timeout,
+    #[error("outbound TCP connect timed out")]
+    OutboundConnectTimeout,
     #[error("fallback ServerHello did not negotiate TLS 1.3")]
     Tls13Required,
     #[error("session key derivation failed: {0}")]
@@ -517,7 +520,7 @@ pub async fn accept_authenticated(
     first_client_record: Vec<u8>,
     client_hello: AuthenticatedHello,
 ) -> Result<AuthenticatedHandshake, HandshakeServerError> {
-    let mut fallback = TcpStream::connect(&config.fallback_addr).await?;
+    let mut fallback = connect_tcp_with_timeout(&config.fallback_addr).await?;
     tune_tcp_stream(&fallback)?;
     fallback.write_all(&first_client_record).await?;
 
@@ -546,7 +549,7 @@ pub async fn relay_fallback(
     fallback_addr: &str,
     first_client_record: Vec<u8>,
 ) -> Result<(), HandshakeServerError> {
-    let mut fallback = TcpStream::connect(fallback_addr).await?;
+    let mut fallback = connect_tcp_with_timeout(fallback_addr).await?;
     tune_tcp_stream(&fallback)?;
     fallback.write_all(&first_client_record).await?;
     let mut rng = StdRng::from_entropy();
@@ -587,6 +590,23 @@ async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeS
     timeout(HANDSHAKE_TIMEOUT, read_record(stream))
         .await
         .map_err(|_| HandshakeServerError::Timeout)?
+        .map_err(HandshakeServerError::Io)
+}
+
+async fn connect_tcp_with_timeout(addr: &str) -> Result<TcpStream, HandshakeServerError> {
+    connect_future_with_timeout(TcpStream::connect(addr), HANDSHAKE_TIMEOUT).await
+}
+
+async fn connect_future_with_timeout<F>(
+    connect: F,
+    connect_timeout: Duration,
+) -> Result<TcpStream, HandshakeServerError>
+where
+    F: Future<Output = io::Result<TcpStream>>,
+{
+    timeout(connect_timeout, connect)
+        .await
+        .map_err(|_| HandshakeServerError::OutboundConnectTimeout)?
         .map_err(HandshakeServerError::Io)
 }
 
@@ -754,7 +774,7 @@ async fn run_authenticated_data_mode(
 
                         let (target_addr, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
-                        let mut target = TcpStream::connect(target_addr).await?;
+                        let mut target = connect_tcp_with_timeout(&target_addr).await?;
                         tune_tcp_stream(&target)?;
                         if !initial_payload.is_empty() {
                             target.write_all(initial_payload).await?;
@@ -1196,6 +1216,8 @@ fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1216,6 +1238,18 @@ mod tests {
     };
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn outbound_connect_timeout_maps_to_server_timeout_error() {
+        let err = connect_future_with_timeout(
+            std::future::pending::<io::Result<TcpStream>>(),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HandshakeServerError::OutboundConnectTimeout));
+    }
 
     #[test]
     fn identity_chunk_delay_is_zero_for_speed_first_traffic() {
