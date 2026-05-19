@@ -147,11 +147,15 @@ where
         }
 
         let payload_len = self.payload_len.expect("payload length is initialized");
+        let payload_end = TLS_HEADER_LEN + payload_len;
+        if self.record.len() < payload_end {
+            self.record.resize(payload_end, 0);
+        }
         while self.payload_pos < payload_len {
-            let remaining = payload_len - self.payload_pos;
-            let n = (&mut self.reader)
-                .take(remaining as u64)
-                .read_buf(&mut self.record)
+            let start = TLS_HEADER_LEN + self.payload_pos;
+            let n = self
+                .reader
+                .read(&mut self.record[start..payload_end])
                 .await?;
             if n == 0 {
                 return Err(std::io::Error::new(

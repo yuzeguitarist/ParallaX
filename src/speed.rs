@@ -11,6 +11,7 @@ use crate::{
     protocol::command::{
         SpeedTestAck, SpeedTestAckError, SpeedTestAckKind, SpeedTestRequest, SpeedTestRequestError,
     },
+    protocol::data::relay_read_buffer_len,
     tls::record::TlsRecordReader,
 };
 
@@ -186,9 +187,10 @@ async fn write_upload(
             "speed upload chunk size is zero",
         )));
     }
-    let payload = vec![0x5A; chunk_len];
+    let batch_len = relay_read_buffer_len(chunk_len);
+    let payload = vec![0x5A; batch_len];
     let mut rng = OsRng;
-    let mut sealed = Vec::with_capacity(chunk_len + 256);
+    let mut sealed = Vec::with_capacity(batch_len);
     let mut records = Vec::new();
     let mut remaining = expected_bytes;
     let start = Instant::now();

@@ -5,8 +5,10 @@ use tokio::net::{tcp::OwnedReadHalf, TcpStream};
 const RESERVED_PROCESS_FDS: usize = 64;
 const FDS_PER_RELAY_CONNECTION: usize = 2;
 const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
+const TCP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn tune_tcp_stream(stream: &TcpStream) -> io::Result<()> {
+    set_socket_buffers(stream);
     stream.set_nodelay(true)?;
     set_low_latency_congestion(stream);
     set_quick_ack(stream);
@@ -93,6 +95,38 @@ pub fn relay_connection_limit_from_nofile(nofile_soft_limit: usize) -> Option<us
         None
     } else {
         Some(limit.min(MAX_RELAY_CONNECTION_LIMIT))
+    }
+}
+
+#[cfg(unix)]
+fn set_socket_buffers(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+
+    set_socket_buffer(stream.as_raw_fd(), libc::SO_RCVBUF, "SO_RCVBUF");
+    set_socket_buffer(stream.as_raw_fd(), libc::SO_SNDBUF, "SO_SNDBUF");
+}
+
+#[cfg(not(unix))]
+fn set_socket_buffers(_stream: &TcpStream) {}
+
+#[cfg(unix)]
+fn set_socket_buffer(fd: std::os::fd::RawFd, opt: libc::c_int, name: &'static str) {
+    let size = TCP_SOCKET_BUFFER_BYTES as libc::c_int;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of_val(&size) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::trace!(
+            option = name,
+            error = %io::Error::last_os_error(),
+            "TCP socket buffer tuning is unavailable; keeping kernel default"
+        );
     }
 }
 

@@ -1099,7 +1099,8 @@ async fn run_authenticated_speed_test_mode(
 
     let mut rng = StdRng::from_entropy();
     let mut scratch = RelaySealScratch::with_payload_capacity(chunk_size);
-    let payload = vec![0xA5; chunk_size];
+    let batch_len = relay_read_buffer_len(chunk_size);
+    let payload = vec![0xA5; batch_len];
     let mut remaining = request.download_bytes;
     while remaining > 0 {
         let len = remaining.min(payload.len() as u64) as usize;
