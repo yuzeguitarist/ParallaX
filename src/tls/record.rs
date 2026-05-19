@@ -238,4 +238,21 @@ mod tests {
         reader.read_record_into(&mut out).await.unwrap();
         assert_eq!(&out[TLS_HEADER_LEN..], b"defgh");
     }
+
+    #[tokio::test]
+    async fn record_reader_handles_fragmented_payload_reads() {
+        let record = wrap_application_data(b"fragmented payload").unwrap();
+        let split = TLS_HEADER_LEN + 4;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            writer.write_all(&record[..split]).await.unwrap();
+            writer.write_all(&record[split..]).await.unwrap();
+        });
+        let mut reader = TlsRecordReader::new(reader);
+        let mut out = Vec::new();
+
+        reader.read_record_into(&mut out).await.unwrap();
+
+        assert_eq!(&out[TLS_HEADER_LEN..], b"fragmented payload");
+    }
 }

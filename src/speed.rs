@@ -286,4 +286,15 @@ mod tests {
         assert!(text.contains("download:"));
         assert!(text.contains("upload:"));
     }
+
+    #[test]
+    fn speed_upload_uses_relay_sized_batches() {
+        let chunk_len = crate::protocol::data::max_plaintext_len(
+            crate::config::TrafficConfig::default().max_padding,
+        );
+        let batch_len = relay_read_buffer_len(chunk_len);
+
+        assert!(batch_len > chunk_len);
+        assert_eq!(batch_len, crate::protocol::data::RELAY_READ_BUFFER_TARGET);
+    }
 }
