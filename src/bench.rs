@@ -51,6 +51,7 @@ use crate::{
     handshake::server::{decide_inbound, InboundDecision},
     protocol::{
         command::{ConnectRequest, ServerIdentityChunk, ServerIdentityProof},
+        data::SERVER_TO_CLIENT_AAD,
         data::{DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD},
     },
     tls::{client_hello::parse_client_hello, safari26::Safari26TlsCamouflage},
@@ -354,6 +355,8 @@ const CASES: &[CaseRunner] = &[
     bench_server_decide_inbound,
     bench_client_pq_rekey_record,
     bench_client_connect_record_1k,
+    bench_client_speed_upload_seal_1mb,
+    bench_client_speed_download_open_1mb,
     bench_connect_request_decode_1k_owned,
     bench_connect_request_decode_1k_borrowed,
     bench_client_identity_chunks_decode,
@@ -726,6 +729,92 @@ fn bench_client_connect_record_1k(options: BenchmarkOptions) -> Result<Benchmark
             let mut session = ClientDataSession::new(keys.clone(), traffic)?;
             let record = session.build_connect_record(request.clone(), &mut rng)?;
             Ok(black_box(record.len() as u64))
+        },
+    )
+}
+
+fn bench_client_speed_upload_seal_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let keys = session_keys_fixture()?;
+    let mut session = ClientDataSession::new(keys, TrafficConfig::default())?;
+    let chunk_len = session.max_payload_chunk_len();
+    let payload = vec![0x5A_u8; chunk_len];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let mut sealed = Vec::with_capacity(chunk_len + 256);
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "client.speed_upload_seal_1mb",
+        TIER_BULK,
+        options,
+        || {
+            let mut remaining = SIZE_1M;
+            let mut written = 0_usize;
+            while remaining > 0 {
+                let len = remaining.min(payload.len());
+                sealed.clear();
+                session.seal_payload_chunks_into_untracked(
+                    &payload[..len],
+                    &mut rng,
+                    &mut sealed,
+                )?;
+                written += sealed.len();
+                remaining -= len;
+            }
+            Ok(black_box((written + SIZE_1M) as u64))
+        },
+    )
+}
+
+fn bench_client_speed_download_open_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let keys = session_keys_fixture()?;
+    let padding = PaddingProfile::new(0, 0)?;
+    let mut server_seal = DataRecordCodec::new(
+        AeadCodec::new(keys.server_key, keys.server_nonce),
+        padding,
+        SERVER_TO_CLIENT_AAD,
+    );
+    let mut session = ClientDataSession::new(keys, TrafficConfig::default())?;
+    let payload = vec![0x5A_u8; SIZE_1M];
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let (iterations, warmup) = effective_tier(TIER_BULK, options);
+    let total_batches = iterations.saturating_add(warmup) as usize;
+    let mut encoded = Vec::with_capacity((SIZE_1M + 2048) * total_batches);
+    let mut batch_ranges = Vec::with_capacity(total_batches);
+    let mut records = Vec::new();
+    for _ in 0..total_batches {
+        records.clear();
+        server_seal.seal_chunks_into_reusing(&payload, &mut rng, &mut encoded, &mut records)?;
+        batch_ranges.push(
+            records
+                .iter()
+                .map(|record| record.range.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+    let mut scratch = Vec::with_capacity(SIZE_16K + AEAD_TAG_LEN);
+    let mut batch_idx = 0_usize;
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "client.speed_download_open_1mb",
+        TIER_BULK,
+        options,
+        || {
+            let mut recovered = 0_usize;
+            for range in &batch_ranges[batch_idx] {
+                scratch.clear();
+                scratch.extend_from_slice(&encoded[range.clone()]);
+                let plaintext = session.open_server_record_payload_range(&mut scratch)?;
+                recovered += plaintext.len();
+            }
+            batch_idx += 1;
+            if recovered != payload.len() {
+                bail!(
+                    "client.speed_download_open_1mb lost {} bytes of plaintext",
+                    payload.len() - recovered
+                );
+            }
+            Ok(black_box(recovered as u64))
         },
     )
 }

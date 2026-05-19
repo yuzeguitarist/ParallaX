@@ -142,11 +142,11 @@ async fn read_download(
 
     while received < expected_bytes {
         records.read_record_into(&mut record).await?;
-        data_session.open_server_record_in_place(&mut record)?;
-        if record.is_empty() {
+        let plaintext = data_session.open_server_record_payload_range(&mut record)?;
+        if plaintext.is_empty() {
             continue;
         }
-        let len = record.len() as u64;
+        let len = plaintext.len() as u64;
         if received + len > expected_bytes {
             return Err(SpeedError::TooManyBytes);
         }
@@ -189,19 +189,13 @@ async fn write_upload(
     let payload = vec![0x5A; chunk_len];
     let mut rng = OsRng;
     let mut sealed = Vec::with_capacity(chunk_len + 256);
-    let mut records = Vec::new();
     let mut remaining = expected_bytes;
     let start = Instant::now();
 
     while remaining > 0 {
         let len = remaining.min(payload.len() as u64) as usize;
         sealed.clear();
-        data_session.seal_payload_chunks_into_reusing(
-            &payload[..len],
-            &mut rng,
-            &mut sealed,
-            &mut records,
-        )?;
+        data_session.seal_payload_chunks_into_untracked(&payload[..len], &mut rng, &mut sealed)?;
         server.write_all(&sealed).await?;
         remaining -= len as u64;
     }
