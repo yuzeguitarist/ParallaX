@@ -208,4 +208,74 @@ mod tests {
             hybrid_rekey(&[1; 32], &[2; 32], &[3; 32]).unwrap()
         );
     }
+
+    #[test]
+    fn hybrid_sandwich_rekey_uses_heap_path_for_large_symmetric_secrets() {
+        let small = hybrid_sandwich_rekey(&[1; 32], &[2; 32], &[3; 32], b"small").unwrap();
+        let big_secret = vec![0xAB; HYBRID_REKEY_IKM_STACK_LEN];
+        let big = hybrid_sandwich_rekey(&[1; 32], &[2; 32], &[3; 32], &big_secret).unwrap();
+        assert_ne!(small, big);
+
+        // Heap and stack paths must produce identical output for the same inputs.
+        let psk = b"boundary-psk-input-for-hashing";
+        let stack = hybrid_sandwich_rekey(&[7; 32], &[8; 32], &[9; 32], psk).unwrap();
+        let heap = {
+            let mut ikm = Vec::new();
+            write_hybrid_rekey_ikm_vec(&mut ikm, &[8; 32], &[9; 32], psk);
+            let (prk, _) = Hkdf::<Sha256>::extract(Some(&[7_u8; 32]), &ikm);
+            let mut out = [0_u8; 32];
+            out.copy_from_slice(&prk);
+            out
+        };
+        assert_eq!(stack, heap);
+    }
+
+    #[test]
+    fn encapsulate_rejects_malformed_public_key() {
+        let err = encapsulate(&[0_u8; 4]).unwrap_err();
+        assert!(matches!(err, PqError::InvalidPublicKey));
+    }
+
+    #[test]
+    fn decapsulate_rejects_malformed_ciphertext() {
+        let keys = keypair();
+        let err = decapsulate(&[0_u8; 4], &keys.secret).unwrap_err();
+        assert!(matches!(err, PqError::InvalidCiphertext));
+    }
+
+    #[test]
+    fn decapsulate_rejects_malformed_secret_key() {
+        let keys = keypair();
+        let enc = encapsulate(&keys.public).unwrap();
+        let err = decapsulate(&enc.ciphertext, &[0_u8; 4]).unwrap_err();
+        assert!(matches!(err, PqError::InvalidSecretKey));
+    }
+
+    #[test]
+    fn shared_secret_32_rejects_wrong_length() {
+        let err = shared_secret_32(&[0_u8; 31]).unwrap_err();
+        assert!(matches!(err, PqError::InvalidCiphertext));
+        let err = shared_secret_32(&[0_u8; 33]).unwrap_err();
+        assert!(matches!(err, PqError::InvalidCiphertext));
+
+        let ok = shared_secret_32(&[1_u8; 32]).unwrap();
+        assert_eq!(ok, [1_u8; 32]);
+    }
+
+    #[test]
+    fn pq_error_messages_are_stable() {
+        assert_eq!(
+            PqError::InvalidPublicKey.to_string(),
+            "invalid ML-KEM public key"
+        );
+        assert_eq!(
+            PqError::InvalidSecretKey.to_string(),
+            "invalid ML-KEM secret key"
+        );
+        assert_eq!(
+            PqError::InvalidCiphertext.to_string(),
+            "invalid ML-KEM ciphertext"
+        );
+        assert_eq!(PqError::Hkdf.to_string(), "HKDF expansion failed");
+    }
 }

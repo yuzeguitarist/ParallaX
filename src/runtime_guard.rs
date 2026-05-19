@@ -488,4 +488,115 @@ mod tests {
         assert!(matches!(err, RuntimeGuardError::Conflict(_)));
         assert!(err.to_string().contains("plx speed run is already active"));
     }
+
+    #[test]
+    fn speed_blocks_concurrent_speed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = config("203.0.113.20:443");
+        let b = config("203.0.113.21:443");
+        let _first = RuntimeGuard::acquire_speed_in_dir(&a, dir.path()).unwrap();
+
+        let err = RuntimeGuard::acquire_speed_in_dir(&b, dir.path()).unwrap_err();
+        match err {
+            RuntimeGuardError::Conflict(conflict) => {
+                assert!(conflict
+                    .to_string()
+                    .contains("plx speed run is already active"));
+                assert!(conflict.pid() > 0);
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_releases_lock_so_next_acquire_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config("203.0.113.30:443");
+        {
+            let _guard = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap();
+        }
+        // After the first guard drops, the directory should be empty of lock files
+        // and a fresh acquire should succeed.
+        let _guard = RuntimeGuard::acquire_speed_in_dir(&cfg, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn server_mode_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config("203.0.113.40:443");
+        cfg.mode = Mode::Server;
+        let err = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeGuardError::WrongMode));
+    }
+
+    #[test]
+    fn missing_client_section_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config("203.0.113.50:443");
+        cfg.client = None;
+        let err = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeGuardError::MissingClient));
+    }
+
+    #[test]
+    fn instance_decode_rejects_malformed_metadata() {
+        assert!(matches!(
+            RuntimeInstance::decode("not-a-key-value-line"),
+            Err(RuntimeGuardError::InvalidMetadata(_))
+        ));
+        assert!(matches!(
+            RuntimeInstance::decode("role=unknown\npid=1\nconfig_id=a\nserver_addr=b\n"),
+            Err(RuntimeGuardError::InvalidMetadata(_))
+        ));
+        assert!(matches!(
+            RuntimeInstance::decode("role=client\npid=not-a-number\nconfig_id=a\nserver_addr=b\n"),
+            Err(RuntimeGuardError::InvalidMetadata(_))
+        ));
+        assert!(matches!(
+            RuntimeInstance::decode("role=client\npid=1\nconfig_id=a\n"),
+            Err(RuntimeGuardError::InvalidMetadata(_))
+        ));
+        assert!(matches!(
+            RuntimeInstance::decode("role=client\npid=1\nconfig_id=a\nunknown=x\nserver_addr=b\n"),
+            Err(RuntimeGuardError::InvalidMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn instance_round_trip_preserves_fields() {
+        let raw = "role=speed\npid=4321\nconfig_id=deadbeef\nserver_addr=1.2.3.4:5\n";
+        let decoded = RuntimeInstance::decode(raw).unwrap();
+        assert_eq!(decoded.role, RuntimeRole::Speed);
+        assert_eq!(decoded.pid, 4321);
+        assert_eq!(decoded.config_id, "deadbeef");
+        assert_eq!(decoded.server_addr, "1.2.3.4:5");
+        assert_eq!(decoded.encode(), raw);
+    }
+
+    #[test]
+    fn client_config_id_changes_with_each_field() {
+        let base = config("203.0.113.60:443");
+        let base_id = client_config_id(base.client.as_ref().unwrap());
+        assert_eq!(base_id.len(), 64);
+
+        let mut alt = base.clone();
+        alt.client.as_mut().unwrap().server_addr = "203.0.113.61:443".to_owned();
+        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+
+        let mut alt = base.clone();
+        alt.client.as_mut().unwrap().sni = "different.example".to_owned();
+        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+
+        let mut alt = base.clone();
+        alt.client.as_mut().unwrap().server_public_key = "rotated".to_owned();
+        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+
+        let mut alt = base.clone();
+        alt.client.as_mut().unwrap().server_pq_public_key = "rotated-pq".to_owned();
+        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+
+        let mut alt = base.clone();
+        alt.client.as_mut().unwrap().server_identity_public_key = "rotated-id".to_owned();
+        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+    }
 }

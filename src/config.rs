@@ -799,4 +799,251 @@ authorized_sni = ["example.com"]
             other => panic!("unexpected error: {other:?}"),
         }
     }
+
+    #[test]
+    fn mode_display_is_serde_consistent() {
+        assert_eq!(Mode::Client.to_string(), "client");
+        assert_eq!(Mode::Server.to_string(), "server");
+    }
+
+    #[test]
+    fn decode_key32_rejects_invalid_base64_and_wrong_length() {
+        let err = decode_key32("client.server_public_key", "***not-base64***").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidBase64 {
+                field: "client.server_public_key",
+                ..
+            }
+        ));
+
+        // Two valid base64 bytes -> length mismatch.
+        let err = decode_key32("client.server_public_key", "AAA=").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidKeyLen {
+                field: "client.server_public_key"
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_key32_secret_rejects_invalid_base64_and_wrong_length() {
+        let err = decode_key32_secret("server.private_key", "***not-base64***").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidBase64 {
+                field: "server.private_key",
+                ..
+            }
+        ));
+        let err = decode_key32_secret("server.private_key", "AAA=").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidKeyLen {
+                field: "server.private_key"
+            }
+        ));
+
+        let key = decode_key32_secret("server.private_key", KEY).unwrap();
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn decode_base64_bytes_rejects_invalid_base64_and_empty_value() {
+        let err = decode_base64_bytes("crypto.psk", "***").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidBytes {
+                field: "crypto.psk"
+            }
+        ));
+        let err = decode_base64_bytes("crypto.psk", "").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidBytes {
+                field: "crypto.psk"
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_base64_secret_rejects_invalid_base64_and_empty_value() {
+        let err = decode_base64_secret("server.identity_secret_key", "***").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidBytes {
+                field: "server.identity_secret_key"
+            }
+        ));
+        let err = decode_base64_secret("server.identity_secret_key", "").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidBytes {
+                field: "server.identity_secret_key"
+            }
+        ));
+    }
+
+    #[test]
+    fn require_non_empty_rejects_whitespace_only() {
+        assert!(matches!(
+            require_non_empty("client.sni", "   ").unwrap_err(),
+            ConfigError::InvalidSocket { .. }
+        ));
+        assert!(require_non_empty("client.sni", "example.com").is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_delay_range() {
+        let traffic = TrafficConfig {
+            min_delay_ms: 50,
+            max_delay_ms: 1,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            traffic.validate().unwrap_err(),
+            ConfigError::InvalidDelayRange
+        ));
+    }
+
+    #[test]
+    fn server_replay_cache_path_is_resolved_relative_to_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("conf");
+        fs::create_dir(&nested).unwrap();
+        let path = nested.join("server.toml");
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+replay_cache_path = "state/replay.cache"
+authorized_sni = ["example.com"]
+"#
+        );
+        fs::write(&path, raw).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let cfg = Config::load(&path).unwrap();
+        let server = cfg.server.unwrap();
+        assert_eq!(server.replay_cache_path, nested.join("state/replay.cache"));
+    }
+
+    #[test]
+    fn server_validate_rejects_empty_authorized_sni_entry() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["  "]
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidSocket { .. }
+        ));
+    }
+
+    #[test]
+    fn server_validate_rejects_bad_data_target() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+data_target = "not-a-host-port"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidSocket { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_server_section_in_server_mode_is_rejected() {
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::MissingServer
+        ));
+    }
+
+    #[test]
+    fn missing_client_section_in_client_mode_is_rejected() {
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::MissingClient
+        ));
+    }
+
+    #[test]
+    fn config_load_propagates_toml_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        fs::write(&path, "this is = not valid = toml").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(matches!(Config::load(&path), Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn config_load_propagates_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.toml");
+        assert!(matches!(Config::load(&missing), Err(ConfigError::Read(_))));
+    }
 }

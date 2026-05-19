@@ -265,6 +265,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ClientConfig, CryptoConfig, ServerConfig, TrafficConfig};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use pqcrypto_mldsa::mldsa87;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
 
     #[test]
     fn speed_report_formats_rates() {
@@ -283,5 +288,120 @@ mod tests {
         assert!(text.contains("ParallaX speed test complete"));
         assert!(text.contains("download:"));
         assert!(text.contains("upload:"));
+    }
+
+    #[test]
+    fn megabits_per_second_handles_zero_elapsed() {
+        let m = SpeedMeasurement {
+            bytes: 1_000_000,
+            elapsed: Duration::ZERO,
+        };
+        assert_eq!(m.megabits_per_second(), 0.0);
+    }
+
+    #[test]
+    fn megabits_per_second_matches_formula() {
+        let m = SpeedMeasurement {
+            bytes: 1_250_000, // 10 Mbps over one second
+            elapsed: Duration::from_secs(1),
+        };
+        assert!((m.megabits_per_second() - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn mebibytes_matches_formula() {
+        let m = SpeedMeasurement {
+            bytes: 2 * 1024 * 1024,
+            elapsed: Duration::from_secs(1),
+        };
+        assert!((m.mebibytes() - 2.0).abs() < f64::EPSILON);
+    }
+
+    fn server_only_config() -> Config {
+        Config {
+            mode: Mode::Server,
+            crypto: CryptoConfig {
+                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            },
+            traffic: TrafficConfig::default(),
+            client: None,
+            server: Some(ServerConfig {
+                listen: "127.0.0.1:8443".parse::<SocketAddr>().unwrap(),
+                fallback_addr: "fallback.example:443".to_owned(),
+                data_target: None,
+                private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                pq_secret_key: String::new(),
+                identity_secret_key: STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]),
+                replay_cache_path: PathBuf::from("/tmp/parallax-speed-test-replay.cache"),
+                authorized_sni: vec!["example.com".to_owned()],
+                strict_tls13: true,
+            }),
+        }
+    }
+
+    fn client_only_config() -> Config {
+        Config {
+            mode: Mode::Client,
+            crypto: CryptoConfig {
+                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            },
+            traffic: TrafficConfig::default(),
+            client: None,
+            server: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rejects_server_mode() {
+        let cfg = server_only_config();
+        let err = run(cfg).await.unwrap_err();
+        assert!(matches!(err, SpeedError::WrongMode));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_missing_client_section() {
+        let cfg = client_only_config();
+        let err = run(cfg).await.unwrap_err();
+        assert!(matches!(err, SpeedError::MissingClient));
+    }
+
+    #[tokio::test]
+    async fn run_propagates_invalid_psk() {
+        let mut cfg = client_only_config();
+        cfg.crypto.psk = "AA==".to_owned();
+        cfg.client = Some(ClientConfig {
+            listen: "127.0.0.1:1080".parse().unwrap(),
+            server_addr: "example.com:443".to_owned(),
+            sni: "example.com".to_owned(),
+            server_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            server_pq_public_key: String::new(),
+            server_identity_public_key: STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]),
+        });
+        let err = run(cfg).await.unwrap_err();
+        assert!(matches!(err, SpeedError::Config(ConfigError::WeakPsk)));
+    }
+
+    #[test]
+    fn speed_error_messages_are_human_readable() {
+        let err = SpeedError::UnexpectedAck {
+            expected: SpeedTestAckKind::DownloadDone,
+            actual: SpeedTestAckKind::UploadDone,
+        };
+        let text = err.to_string();
+        assert!(text.contains("unexpected speed test ack"));
+        assert!(text.contains("DownloadDone"));
+        assert!(text.contains("UploadDone"));
+
+        let mismatch = SpeedError::ByteCountMismatch {
+            expected: 10,
+            actual: 5,
+        };
+        assert!(mismatch
+            .to_string()
+            .contains("byte count mismatch: expected 10, got 5"));
+        assert_eq!(
+            SpeedError::TooManyBytes.to_string(),
+            "speed test stream sent more bytes than requested"
+        );
     }
 }

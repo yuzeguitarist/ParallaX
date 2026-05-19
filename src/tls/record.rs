@@ -214,6 +214,125 @@ mod tests {
         assert_eq!(change_cipher_spec(), [0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
     }
 
+    #[test]
+    fn parse_header_rejects_short_input() {
+        assert!(matches!(
+            parse_header(&[]),
+            Err(TlsRecordError::IncompleteHeader)
+        ));
+        assert!(matches!(
+            parse_header(&[0x17, 0x03, 0x03, 0x00]),
+            Err(TlsRecordError::IncompleteHeader)
+        ));
+    }
+
+    #[test]
+    fn parse_header_rejects_oversized_payload() {
+        let mut header = [0_u8; TLS_HEADER_LEN];
+        header[0] = TLS_CONTENT_APPLICATION_DATA;
+        header[1] = TLS_LEGACY_VERSION[0];
+        header[2] = TLS_LEGACY_VERSION[1];
+        let oversized = (MAX_TLS_RECORD_PAYLOAD + 257) as u16;
+        header[3..5].copy_from_slice(&oversized.to_be_bytes());
+
+        assert!(matches!(
+            parse_header(&header),
+            Err(TlsRecordError::PayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn parse_exact_requires_complete_payload() {
+        let record = wrap_application_data(b"abcdef").unwrap();
+        let (_, payload) = parse_exact(&record).unwrap();
+        assert_eq!(payload, b"abcdef");
+
+        // truncate the last byte: header reports 6 bytes, only 5 follow.
+        let truncated = &record[..record.len() - 1];
+        assert!(matches!(
+            parse_exact(truncated),
+            Err(TlsRecordError::IncompletePayload)
+        ));
+    }
+
+    #[test]
+    fn wrap_application_data_rejects_oversized_payload() {
+        let too_large = vec![0_u8; MAX_TLS_RECORD_PAYLOAD + 1];
+        assert!(matches!(
+            wrap_application_data(&too_large),
+            Err(TlsRecordError::PayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn alert_bad_record_mac_emits_fixed_alert() {
+        let alert = alert_bad_record_mac();
+        assert_eq!(alert.len(), 7);
+        assert_eq!(alert[0], TLS_CONTENT_ALERT);
+        assert_eq!(&alert[1..3], &TLS_LEGACY_VERSION);
+        assert_eq!(&alert[3..5], &(2_u16).to_be_bytes());
+        // AlertLevel::fatal(2), AlertDescription::bad_record_mac(20)
+        assert_eq!(alert[5], 0x02);
+        assert_eq!(alert[6], 0x14);
+    }
+
+    #[tokio::test]
+    async fn record_reader_into_inner_returns_underlying_reader() {
+        let record = wrap_application_data(b"abc").unwrap();
+        let (mut writer, reader) = tokio::io::duplex(32);
+        tokio::spawn(async move {
+            writer.write_all(&record).await.unwrap();
+        });
+        let mut reader = TlsRecordReader::new(reader);
+        let _ = reader.read_record().await.unwrap();
+        let _inner = reader.into_inner();
+    }
+
+    #[tokio::test]
+    async fn record_reader_reports_eof_during_header() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            writer.write_all(&[0x17, 0x03]).await.unwrap();
+            drop(writer);
+        });
+        let mut reader = TlsRecordReader::new(reader);
+        let err = reader.read_record().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn record_reader_reports_eof_during_payload() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            // Announce 4 bytes of payload but only deliver 2 before closing.
+            writer
+                .write_all(&[0x17, 0x03, 0x03, 0x00, 0x04, 0x01, 0x02])
+                .await
+                .unwrap();
+            drop(writer);
+        });
+        let mut reader = TlsRecordReader::new(reader);
+        let err = reader.read_record().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn record_reader_reports_invalid_header_payload_length() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            let mut header = [0_u8; TLS_HEADER_LEN];
+            header[0] = TLS_CONTENT_APPLICATION_DATA;
+            header[1] = TLS_LEGACY_VERSION[0];
+            header[2] = TLS_LEGACY_VERSION[1];
+            let oversized = (MAX_TLS_RECORD_PAYLOAD + 1024) as u16;
+            header[3..5].copy_from_slice(&oversized.to_be_bytes());
+            writer.write_all(&header).await.unwrap();
+        });
+        let mut reader = TlsRecordReader::new(reader);
+        let err = reader.read_record().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
     #[tokio::test]
     async fn record_reader_can_reuse_caller_buffer() {
         let first = wrap_application_data(b"abc").unwrap();
