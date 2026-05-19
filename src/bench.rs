@@ -47,6 +47,7 @@ use crate::{
         },
     },
     handshake::client::ClientDataSession,
+    handshake::server::{decide_inbound, InboundDecision},
     protocol::{
         command::{ConnectRequest, ServerIdentityChunk, ServerIdentityProof},
         data::{DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD},
@@ -334,6 +335,7 @@ const CASES: &[CaseRunner] = &[
     bench_safari26_clienthello_start,
     bench_clienthello_parse,
     bench_clienthello_verify_auth,
+    bench_server_decide_inbound,
     bench_client_pq_rekey_record,
     bench_client_connect_record_1k,
     bench_connect_request_decode_1k_owned,
@@ -618,6 +620,23 @@ fn bench_clienthello_verify_auth(options: BenchmarkOptions) -> Result<BenchmarkC
     )
 }
 
+fn bench_server_decide_inbound(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let (record, server_private) = authenticated_client_hello_fixture()?;
+    let authorized_sni = [BENCH_SNI.to_owned()];
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "server.decide_inbound",
+        TIER_FAST,
+        options,
+        || match decide_inbound(&record, BENCH_PSK, &authorized_sni, &server_private)? {
+            InboundDecision::Authenticated(hello) if hello.sni == BENCH_SNI => {
+                Ok(black_box(record.len() as u64))
+            }
+            other => bail!("benchmark ClientHello was not accepted: {other:?}"),
+        },
+    )
+}
+
 /// Build a signed ClientHello together with the matching server-side auth key
 /// so verification benchmarks can run without re-deriving keys per call.
 fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuthMaterial)> {
@@ -628,6 +647,12 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuth
         .expect("Safari26 ClientHello must carry stateful auth material");
     let server_auth = derive_server_auth_key(BENCH_PSK, &server.private, &material.x25519_public)?;
     Ok((record, server_auth, material))
+}
+
+fn authenticated_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN])> {
+    let server = X25519KeyPair::generate();
+    let session = Safari26TlsCamouflage.start(BENCH_SNI.to_owned(), BENCH_PSK, &server.public)?;
+    Ok((session.client_hello_bytes().to_vec(), server.private))
 }
 
 fn bench_client_pq_rekey_record(options: BenchmarkOptions) -> Result<BenchmarkCase> {
