@@ -20,7 +20,7 @@ use crate::{
     },
     handshake::server,
     probe, process_hardening,
-    transport::{quic_runtime, tcp::bump_nofile_soft_limit},
+    transport::tcp::bump_nofile_soft_limit,
 };
 
 #[derive(Debug, Parser)]
@@ -49,17 +49,11 @@ enum Command {
     Serve {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
-        /// Use UDP/QUIC transport instead of TCP camouflage transport.
-        #[arg(long)]
-        quic: bool,
     },
     /// Run the ParallaX local SOCKS5 client.
     Client {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
-        /// Use UDP/QUIC transport instead of TCP camouflage transport.
-        #[arg(long)]
-        quic: bool,
     },
     /// Run the ParallaX protocol benchmark suite (CPU-only, fixed-parameter).
     ///
@@ -145,29 +139,21 @@ pub async fn run() -> anyhow::Result<()> {
             anyhow::ensure!(plaintext == b"parallax", "AEAD self-test mismatch");
             println!("ok: crypto self-test passed");
         }
-        Command::Serve { config, quic } => {
+        Command::Serve { config } => {
             process_hardening::harden_current_process();
             bump_nofile_soft_limit();
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             cfg.protect_secret_memory();
-            if quic {
-                quic_runtime::run_server(cfg).await?;
-            } else {
-                server::run(cfg).await?;
-            }
+            server::run(cfg).await?;
         }
-        Command::Client { config, quic } => {
+        Command::Client { config } => {
             process_hardening::harden_current_process();
             bump_nofile_soft_limit();
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             cfg.protect_secret_memory();
-            if quic {
-                quic_runtime::run_client(cfg).await?;
-            } else {
-                runtime::run(cfg).await?;
-            }
+            runtime::run(cfg).await?;
         }
         Command::Benchmark { quick, json } => {
             let options = if quick {

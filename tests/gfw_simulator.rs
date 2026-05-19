@@ -10,7 +10,7 @@
 //! The intent is *not* to prove that ParallaX always evades or always loses -
 //! it's to ground-truth what each detector sees on ParallaX-shaped traffic.
 //! Scenarios that the analysis report predicts as ParallaX weaknesses
-//! (PqRekey burst, QUIC self-signed, JA4 drift) are exercised here.
+//! (PqRekey burst, active-probe behavior, JA4 drift) are exercised here.
 
 mod gfw_sim;
 
@@ -34,20 +34,6 @@ use crate::gfw_sim::runtime::{
 
 fn build_parallax_tcp_client_hello(sni: &str, seed: u64) -> Vec<u8> {
     synthetic_tls13_client_hello(sni, seed)
-}
-
-fn build_parallax_quic_initial(sni: &str, seed: u64) -> Vec<u8> {
-    let record = synthetic_tls13_client_hello(sni, seed);
-    let handshake = record[5..].to_vec();
-    let dcid = b"\x01\x02\x03\x04\x05\x06\x07\x08";
-    crate::gfw_sim::detection::quic_initial::build_test_initial_packet(
-        dcid,
-        b"\xa0\xa1\xa2\xa3",
-        &handshake,
-        0,
-        1200,
-    )
-    .expect("build_test_initial_packet")
 }
 
 fn synthetic_random_payload(seed: u64, len: usize) -> Vec<u8> {
@@ -289,69 +275,6 @@ fn scenario_4_parallax_tcp_with_fragmented_identity_avoids_burst_signature() {
         "fragmented identity proof must not match the old ParallaX burst signature"
     );
     assert_ne!(report.final_verdict(), VerdictKind::Block);
-}
-
-// --------------------- scenario 5: ParallaX QUIC ---------------------
-
-/// ParallaX over QUIC with the SNI carried inside the Initial packet's Crypto
-/// frames. The QUIC Initial detector must decrypt and extract the SNI.
-#[test]
-fn scenario_5_parallax_quic_initial_blocked_sni_is_dropped() {
-    let mut sim = GfwSimulator::new(GfwSimulatorConfig::default());
-    let datagram = build_parallax_quic_initial("relay9.shadowsocks.io", 5005);
-    let (cip, sip, port) = test_endpoints();
-    let scenario = ScenarioInputs {
-        label: "ParallaX QUIC, blocked SNI",
-        flow_label: "parallax-quic-blocked-sni",
-        flow_key: Some(test_flow_key()),
-        dns_query: None,
-        events_c2s: vec![ClientToServerEvent::UdpDatagram { bytes: datagram }],
-        events_s2c: vec![],
-        length_series: vec![],
-        probe_observations: vec![],
-        precheck_residual_tuple: None,
-        client_ip: cip,
-        server_ip: sip,
-        server_port: port,
-    };
-    let report = sim.run_scenario(scenario);
-    print_report(&report);
-    let quic_verdict = report
-        .layer_verdicts
-        .iter()
-        .find(|v| v.layer == "quic_initial")
-        .expect("quic_initial layer must run");
-    assert_eq!(quic_verdict.kind, VerdictKind::Block);
-}
-
-#[test]
-fn scenario_5b_parallax_quic_initial_safe_sni_passes_quic_layer() {
-    let mut sim = GfwSimulator::new(GfwSimulatorConfig::default());
-    let datagram = build_parallax_quic_initial("cloudflare.com", 5050);
-    let (cip, sip, port) = test_endpoints();
-    let scenario = ScenarioInputs {
-        label: "ParallaX QUIC, safe SNI",
-        flow_label: "parallax-quic-safe-sni",
-        flow_key: Some(test_flow_key()),
-        dns_query: None,
-        events_c2s: vec![ClientToServerEvent::UdpDatagram { bytes: datagram }],
-        events_s2c: vec![],
-        length_series: vec![],
-        probe_observations: vec![],
-        precheck_residual_tuple: None,
-        client_ip: cip,
-        server_ip: sip,
-        server_port: port,
-    };
-    let report = sim.run_scenario(scenario);
-    print_report(&report);
-    let quic_verdict = report
-        .layer_verdicts
-        .iter()
-        .find(|v| v.layer == "quic_initial")
-        .expect("quic_initial layer must run");
-    // Should be Allow (SNI extracted, no rule fired).
-    assert_eq!(quic_verdict.kind, VerdictKind::Allow);
 }
 
 // --------------------- scenario 6: active probe exchange ---------------------

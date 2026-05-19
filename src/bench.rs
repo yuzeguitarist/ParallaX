@@ -150,8 +150,6 @@ pub enum BenchGroup {
     HandshakeCrypto,
     /// Composed handshake operations (ClientHello build/parse/verify).
     HandshakeProtocol,
-    /// QUIC-specific control frames and identity handshakes.
-    QuicProtocol,
     /// Raw AEAD seal/open at fixed payload sizes.
     RecordAead,
     /// Full application-data record pipeline including padding shaping.
@@ -168,7 +166,6 @@ impl BenchGroup {
         match self {
             BenchGroup::HandshakeCrypto => "handshake.crypto",
             BenchGroup::HandshakeProtocol => "handshake.protocol",
-            BenchGroup::QuicProtocol => "quic.protocol",
             BenchGroup::RecordAead => "record.aead",
             BenchGroup::RecordPipeline => "record.pipeline",
             BenchGroup::Traffic => "traffic",
@@ -334,10 +331,10 @@ const CASES: &[CaseRunner] = &[
     bench_connect_request_decode_1k_borrowed,
     bench_client_identity_chunks_decode,
     bench_client_identity_proof_extract,
-    bench_quic_server_identity_build_decode_each_time,
-    bench_quic_server_identity_build_cached,
-    bench_quic_client_identity_verify_decode_each_time,
-    bench_quic_client_identity_verify_cached,
+    bench_server_identity_build_decode_each_time,
+    bench_server_identity_build_cached,
+    bench_client_identity_verify_decode_each_time,
+    bench_client_identity_verify_cached,
     bench_aead_seal_64b,
     bench_aead_seal_1k,
     bench_aead_seal_16k,
@@ -768,10 +765,10 @@ fn server_identity_payload_fixture() -> Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// quic.protocol
+// server identity protocol
 // ---------------------------------------------------------------------------
 
-fn bench_quic_server_identity_build_decode_each_time(
+fn bench_server_identity_build_decode_each_time(
     options: BenchmarkOptions,
 ) -> Result<BenchmarkCase> {
     let server = X25519KeyPair::generate();
@@ -781,7 +778,7 @@ fn bench_quic_server_identity_build_decode_each_time(
     let context = [0x51_u8; KEY_LEN];
 
     run_case(
-        BenchGroup::QuicProtocol,
+        BenchGroup::HandshakeProtocol,
         "server_identity.build_decode",
         TIER_SLOW,
         options,
@@ -798,13 +795,13 @@ fn bench_quic_server_identity_build_decode_each_time(
     )
 }
 
-fn bench_quic_server_identity_build_cached(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+fn bench_server_identity_build_cached(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let server = X25519KeyPair::generate();
     let identity_keys = identity::keypair();
     let context = [0x51_u8; KEY_LEN];
 
     run_case(
-        BenchGroup::QuicProtocol,
+        BenchGroup::HandshakeProtocol,
         "server_identity.build_cached",
         TIER_SLOW,
         options,
@@ -817,7 +814,7 @@ fn bench_quic_server_identity_build_cached(options: BenchmarkOptions) -> Result<
     )
 }
 
-fn bench_quic_client_identity_verify_decode_each_time(
+fn bench_client_identity_verify_decode_each_time(
     options: BenchmarkOptions,
 ) -> Result<BenchmarkCase> {
     let server = X25519KeyPair::generate();
@@ -830,7 +827,7 @@ fn bench_quic_client_identity_verify_decode_each_time(
     let identity_public = STANDARD.encode(&identity_keys.public);
 
     run_case(
-        BenchGroup::QuicProtocol,
+        BenchGroup::HandshakeProtocol,
         "client_identity.verify_decode",
         TIER_SLOW,
         options,
@@ -851,7 +848,7 @@ fn bench_quic_client_identity_verify_decode_each_time(
     )
 }
 
-fn bench_quic_client_identity_verify_cached(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+fn bench_client_identity_verify_cached(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let server = X25519KeyPair::generate();
     let identity_keys = identity::keypair();
     let context = [0x51_u8; KEY_LEN];
@@ -860,7 +857,7 @@ fn bench_quic_client_identity_verify_cached(options: BenchmarkOptions) -> Result
     let frame = ServerIdentityProof { signature }.encode()?;
 
     run_case(
-        BenchGroup::QuicProtocol,
+        BenchGroup::HandshakeProtocol,
         "client_identity.verify_cached",
         TIER_SLOW,
         options,
@@ -1564,7 +1561,6 @@ mod tests {
         for expected in [
             BenchGroup::HandshakeCrypto,
             BenchGroup::HandshakeProtocol,
-            BenchGroup::QuicProtocol,
             BenchGroup::RecordAead,
             BenchGroup::RecordPipeline,
             BenchGroup::Traffic,

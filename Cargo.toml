@@ -19,14 +19,11 @@ rand = "0.8"
 pqcrypto-mlkem = "0.1"
 pqcrypto-mldsa = "0.1.2"
 pqcrypto-traits = "0.3"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rcgen = "0.13"
 # Stateful TLS camouflage patches rustls' ClientHello RNG slots; keep the
 # patch version fixed until src/tls/safari26.rs tests pass against a new one.
 rustls = { version = "=0.23.40", features = ["std", "aws_lc_rs"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-socket2 = "0.6"
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
