@@ -665,6 +665,19 @@ require_safe_service_name() {
     die "$name must contain only letters, numbers, dot, underscore, dash, or @: $value"
 }
 
+require_safe_ssh_target() {
+  local value=$1
+  [[ -n "$value" ]] || die "missing SSH target"
+  [[ "$value" != -* ]] || die "--host must not start with '-': $value"
+  require_no_space "--host" "$value"
+  require_no_control "--host" "$value"
+}
+
+require_safe_ssh_port() {
+  local value=$1
+  [[ "$value" =~ ^[0-9]+$ ]] || die "--ssh-port must be a number: $value"
+}
+
 repo_root() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1327,6 +1340,8 @@ case "$REMOTE_SUDO" in
   *) die "--sudo/--no-sudo state is invalid" ;;
 esac
 
+require_safe_ssh_target "$SSH_TARGET"
+require_safe_ssh_port "$SSH_PORT"
 require_safe_remote_path "--remote-bin" "$REMOTE_BIN"
 require_safe_remote_path "--remote-config" "$REMOTE_CONFIG"
 require_safe_service_name "--service-name" "$SERVICE_NAME"
@@ -1338,6 +1353,14 @@ require_no_space "--polar-node" "$POLAR_NODE"
 require_no_space "--polar-labels" "$POLAR_LABELS"
 require_no_space "--parca-agent-channel" "$PARCA_AGENT_CHANNEL"
 require_no_space "--parca-http-address" "$PARCA_HTTP_ADDRESS"
+require_no_control "--cargo-profile" "$CARGO_PROFILE"
+require_no_control "--profile-mode" "$PROFILE_MODE"
+require_no_control "--polar-project-id" "$POLAR_PROJECT_ID"
+require_no_control "--polar-store-address" "$POLAR_STORE_ADDRESS"
+require_no_control "--polar-node" "$POLAR_NODE"
+require_no_control "--polar-labels" "$POLAR_LABELS"
+require_no_control "--parca-agent-channel" "$PARCA_AGENT_CHANNEL"
+require_no_control "--parca-http-address" "$PARCA_HTTP_ADDRESS"
 
 need_cmd ssh
 need_cmd scp
