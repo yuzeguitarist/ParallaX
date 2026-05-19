@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -244,6 +245,28 @@ struct GeneratedConfig {
     client: String,
 }
 
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\u{08}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            ch if ch <= '\u{1f}' || ch == '\u{7f}' => {
+                write!(&mut out, "\\u{:04X}", ch as u32).expect("writing to a String cannot fail");
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn generate_config_template(
     server_listen: &str,
     client_listen: &str,
@@ -264,6 +287,11 @@ fn generate_config_template(
     let pq_public = STANDARD.encode(&server_pq_keys.public);
     let identity_secret = STANDARD.encode(&server_identity_keys.secret);
     let identity_public = STANDARD.encode(&server_identity_keys.public);
+    let server_listen = toml_basic_string(server_listen);
+    let client_listen = toml_basic_string(client_listen);
+    let server_addr = toml_basic_string(server_addr);
+    let fallback_addr = toml_basic_string(fallback_addr);
+    let sni = toml_basic_string(sni);
 
     let server = format!(
         r#"mode = "server"
@@ -281,13 +309,13 @@ cover_max_interval_ms = 0
 max_concurrent_streams = 1
 
 [server]
-listen = "{}"
-fallback_addr = "{}"
+listen = {}
+fallback_addr = {}
 private_key = "{}"
 pq_secret_key = "{}"
 identity_secret_key = "{}"
 replay_cache_path = "{}"
-authorized_sni = ["{}"]
+authorized_sni = [{}]
 strict_tls13 = true
 
 "#,
@@ -317,9 +345,9 @@ cover_max_interval_ms = 0
 max_concurrent_streams = 1
 
 [client]
-listen = "{}"
-server_addr = "{}"
-sni = "{}"
+listen = {}
+server_addr = {}
+sni = {}
 server_public_key = "{}"
 server_pq_public_key = "{}"
 server_identity_public_key = "{}"
@@ -417,6 +445,31 @@ mod tests {
         );
         assert_eq!(client_cfg.server_addr, "203.0.113.10:443");
         assert_eq!(client_cfg.sni, "cloudflare.com");
+    }
+
+    #[test]
+    fn generated_templates_escape_toml_string_values() {
+        let fallback_addr = "fallback.example:443\"\ndata_target = \"127.0.0.1:25";
+        let sni = "safe.example\", \"extra.example";
+        let generated = generate_config_template(
+            "0.0.0.0:443",
+            "127.0.0.1:1080",
+            "203.0.113.10:443",
+            fallback_addr,
+            sni,
+        );
+
+        let server = toml::from_str::<toml::Value>(&generated.server).unwrap();
+        let server_table = server["server"].as_table().unwrap();
+        assert_eq!(server_table["fallback_addr"].as_str(), Some(fallback_addr));
+        assert!(server_table.get("data_target").is_none());
+
+        let authorized_sni = server_table["authorized_sni"].as_array().unwrap();
+        assert_eq!(authorized_sni.len(), 1);
+        assert_eq!(authorized_sni[0].as_str(), Some(sni));
+
+        let client = toml::from_str::<toml::Value>(&generated.client).unwrap();
+        assert_eq!(client["client"]["sni"].as_str(), Some(sni));
     }
 
     #[test]
