@@ -243,15 +243,11 @@ impl DataRecordCodec {
             return Err(SessionError::Aead.into());
         }
 
-        let tag_start = header.total_len - AEAD_TAG_LEN;
-        let mut tag = [0_u8; AEAD_TAG_LEN];
-        tag.copy_from_slice(&record[tag_start..header.total_len]);
-        let mut padded = record[record::TLS_HEADER_LEN..tag_start].to_vec();
+        let payload = &record[record::TLS_HEADER_LEN..header.total_len];
+        let (ciphertext, tag) = payload.split_at(payload.len() - AEAD_TAG_LEN);
+        let mut padded = ciphertext.to_vec();
         crate::process_hardening::exclude_from_core_dump("data_record.open_plaintext", &padded);
-        if let Err(err) = self
-            .aead
-            .open_in_place_detached(&mut padded, &tag, self.aad)
-        {
+        if let Err(err) = self.aead.open_in_place_detached(&mut padded, tag, self.aad) {
             padded.zeroize();
             return Err(err.into());
         }
