@@ -1,15 +1,38 @@
-# ParallaX private deployment
+# ParallaX deployment
 
-This project should be deployed as a **local-build, binary-only** system:
+> **Local build. Binary-only upload. No source code on the VPS.**
 
-- do not clone the source repository on an untrusted VPS
-- do not put private protocol code into a public repository
-- build the Linux binary on the trusted local machine
-- upload only the `plx` binary, the server config, and a systemd unit
+ParallaX is designed to be deployed as a *local-build, binary-only* system:
 
-## One-command VPS deploy
+- you build the Linux `plx` binary on a trusted local machine;
+- you upload only the binary, the server config, and a hardened `systemd` unit;
+- the VPS never sees the source tree, the client config, or any of your
+  private key material that isn't strictly needed to serve traffic.
+
+`scripts/deploy-vps.sh` automates the full pipeline. It has two front ends:
+
+- **Guided wizard** — run with no arguments. Recommended the first time.
+- **Explicit flags** — the same pipeline, scriptable for CI / repeat use.
+
+`scripts/uninstall-vps.sh` is the symmetric tear-down.
+
+---
+
+## Guided wizard (recommended)
 
 From the repository root on the local machine:
+
+```bash
+bash scripts/deploy-vps.sh
+```
+
+The wizard walks you through SSH target, camouflage origin, public address,
+optional Polar Signals profiling, and confirmation. Polar Signals bearer
+tokens are pasted at the prompt — no token file needed.
+
+---
+
+## One-command explicit deploy
 
 ```bash
 bash scripts/deploy-vps.sh root@YOUR_VPS_IP cloudflare.com
@@ -17,28 +40,43 @@ bash scripts/deploy-vps.sh root@YOUR_VPS_IP cloudflare.com
 
 That command will:
 
-1. generate fresh local configs under `target/parallax-deploy/<host>/`
-2. validate the server and client configs
-3. probe the camouflage target
-4. build a Linux `plx` binary locally
-5. enable and verify TCP BBR + `fq` on the VPS
-6. upload only the binary and `parallax.server.toml` to the VPS
-7. install and restart `parallax.service` through systemd
+1. generate fresh local configs under `target/parallax-deploy/<host>/`;
+2. validate the server and client configs (`plx check`);
+3. probe the camouflage target (`plx probe`);
+4. build a Linux `plx` binary locally;
+5. enable and verify TCP BBR + `fq` on the VPS;
+6. upload only the binary and `parallax.server.toml` to the VPS;
+7. install and restart `parallax.service` through systemd.
+
+The generated client config stays local at:
+
+```text
+target/parallax-deploy/<host>/parallax.client.toml
+```
+
+The uploaded server config is installed at:
+
+```text
+/etc/parallax/parallax.toml
+```
+
+---
 
 ## VPS TCP BBR tuning
 
-The deploy script enables VPS-side BBR by default because ParallaX TCP mode is
-sensitive to single-flow congestion control on high-latency links.
+The deploy script enables VPS-side BBR by default because ParallaX's
+single-flow TCP transport is sensitive to congestion control on
+high-latency links.
 
 During remote install it:
 
-1. checks whether `bbr` is in `net.ipv4.tcp_available_congestion_control`
-2. loads `tcp_bbr` with `modprobe` when needed
-3. persists module loading in `/etc/modules-load.d/parallax-bbr.conf`
-4. writes `/etc/sysctl.d/99-parallax-bbr.conf`
-5. applies sysctls immediately
+1. checks whether `bbr` is in `net.ipv4.tcp_available_congestion_control`;
+2. loads `tcp_bbr` with `modprobe` when needed;
+3. persists module loading in `/etc/modules-load.d/parallax-bbr.conf`;
+4. writes `/etc/sysctl.d/99-parallax-bbr.conf`;
+5. applies sysctls immediately;
 6. fails the deploy if `tcp_congestion_control=bbr` or `default_qdisc=fq`
-   cannot be verified
+   cannot be verified.
 
 The sysctl file contains:
 
@@ -50,7 +88,7 @@ net.ipv4.tcp_wmem=4096 65536 67108864
 net.ipv4.tcp_mtu_probing=1
 ```
 
-To skip this remote system tuning explicitly:
+Skip remote system tuning explicitly:
 
 ```bash
 bash scripts/deploy-vps.sh --no-enable-bbr root@YOUR_VPS_IP cloudflare.com
@@ -64,22 +102,27 @@ sysctl net.ipv4.tcp_congestion_control
 sysctl net.core.default_qdisc
 ```
 
-On macOS, the script first uses Docker when available. If Docker is not
-installed, it falls back to local `cargo-zigbuild` and installs the missing
-local build helpers (`zig`, `cargo-zigbuild`, and the Rust Linux target) when
-possible:
+---
+
+## Local build modes
+
+On **Linux**, the script uses native `cargo build --release` by default.
+
+On **macOS**, it prefers Docker when available; otherwise it falls back to
+local `cargo-zigbuild` and installs the missing local build helpers
+(`zig`, `cargo-zigbuild`, and the Rust Linux target) when possible:
 
 ```bash
 bash scripts/deploy-vps.sh root@YOUR_VPS_IP cloudflare.com
 ```
 
-To force the no-Docker path:
+Force the no-Docker path explicitly:
 
 ```bash
 bash scripts/deploy-vps.sh --build-mode zigbuild root@YOUR_VPS_IP cloudflare.com
 ```
 
-On Linux, it uses native `cargo build --release` by default.
+---
 
 ## Optional Polar Signals Cloud profiling
 
@@ -87,8 +130,8 @@ Polar Signals Cloud uses the Parca Agent protocol. ParallaX keeps this
 integration opt-in because continuous profiling uploads process symbols,
 function names, binary paths, and timing data to a third-party backend.
 
-Use it for staging or short production investigations, not as a default
-always-on setting for sensitive nodes.
+Use it for staging or short production investigations, **not** as a
+default always-on setting for sensitive nodes.
 
 1. Put the Polar Signals bearer token in a local file that is not committed:
 
@@ -98,12 +141,12 @@ always-on setting for sensitive nodes.
    ```
 
 2. Copy the Polar Signals project UUID from the Cloud project settings. The
-   deploy script intentionally rejects project names here because Cloud writes
-   need the exact `projectID` gRPC metadata.
+   deploy script intentionally rejects project names here because Cloud
+   writes need the exact `projectID` gRPC metadata.
 
 3. Deploy with the profiler-friendly Cargo profile. `polar-cloud` refuses
-   non-`profiling` builds so the VPS binary keeps embedded DWARF symbols for
-   line-level flamegraphs.
+   non-`profiling` builds so the VPS binary keeps embedded DWARF symbols
+   for line-level flamegraphs.
 
    ```bash
    bash scripts/deploy-vps.sh \
@@ -128,11 +171,11 @@ and installs:
 /etc/parallax/polarsignals.env
 ```
 
-If `parca-agent` is missing, the script installs it through the official snap
-package on the VPS. The generated systemd unit calls the stable snap launcher
-path `/snap/bin/parca-agent` directly, avoiding boot-order races with
-`/usr/local/bin` compatibility links. Use `--parca-agent-channel edge` only if
-you explicitly want the snap edge channel.
+If `parca-agent` is missing, the script installs it through the official
+snap package on the VPS. The generated systemd unit calls the stable snap
+launcher path `/snap/bin/parca-agent` directly, avoiding boot-order races
+with `/usr/local/bin` compatibility links. Use `--parca-agent-channel edge`
+only if you explicitly want the snap edge channel.
 
 The default remote store is:
 
@@ -165,20 +208,22 @@ ssh root@YOUR_VPS_IP 'sudo systemctl status parca-agent --no-pager'
 ssh root@YOUR_VPS_IP 'sudo journalctl -u parca-agent -n 120 --no-pager'
 ```
 
-Security notes:
+**Security notes:**
 
 - `parca-agent` must run with elevated privileges for eBPF profiling.
 - Do not pass the Polar token directly on the command line.
-- Do not enable process command-line metadata; ParallaX intentionally does not
-  set that Parca Agent flag.
+- Do not enable process command-line metadata; ParallaX intentionally does
+  not set that Parca Agent flag.
 - Use `--cargo-profile release` for normal production. Polar Signals Cloud
-  deployments use `--cargo-profile profiling`, which embeds full DWARF symbols
-  and keeps the binary unstripped for useful flamegraphs.
+  deployments use `--cargo-profile profiling`, which embeds full DWARF
+  symbols and keeps the binary unstripped for useful flamegraphs.
+
+---
 
 ## Explicit production form
 
-Use the explicit form when the SSH name is not the same as the public address
-that clients should dial:
+Use the explicit form when the SSH name is not the same as the public
+address that clients should dial:
 
 ```bash
 bash scripts/deploy-vps.sh \
@@ -187,22 +232,23 @@ bash scripts/deploy-vps.sh \
   --server-addr YOUR_VPS_IP:443
 ```
 
-The generated client config stays local:
+If the local deploy directory was removed later, `--reuse-config` will
+fetch the existing server config back from `/etc/parallax/parallax.toml`
+over SSH and perform a server-only redeploy. Your already-working local
+client config is not regenerated or changed.
 
-```text
-target/parallax-deploy/<host>/parallax.client.toml
+For unattended / CI use:
+
+```bash
+bash scripts/deploy-vps.sh --non-interactive \
+  --host root@YOUR_VPS_IP \
+  --dest cloudflare.com \
+  --server-addr YOUR_VPS_IP:443
 ```
 
-If that local deploy directory was removed later, `--reuse-config` will fetch
-the existing server config back from `/etc/parallax/parallax.toml` over SSH and
-perform a server-only redeploy. Your already-working local client config is not
-regenerated or changed.
+`--dry-run` prints the full pipeline without executing it.
 
-The uploaded server config is installed as:
-
-```text
-/etc/parallax/parallax.toml
-```
+---
 
 ## Start the local client
 
@@ -226,10 +272,13 @@ curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 
 If the returned IP is the VPS IP, the tunnel is working.
 
-## Beijing / domestic-path verification
+---
 
-Use a machine that is actually on the target domestic network. Do not use a
-machine that is already routed through another VPN/proxy as the final proof.
+## Domestic-path verification
+
+Use a machine that is actually on the target restricted network. Do not
+use a machine that is already routed through another VPN/proxy as the
+final proof.
 
 Run:
 
@@ -252,6 +301,8 @@ direct connection fails or is blocked
 ParallaX SOCKS connection succeeds
 ```
 
+---
+
 ## Server operations
 
 Check status:
@@ -272,10 +323,29 @@ Restart:
 ssh root@YOUR_VPS_IP 'sudo systemctl restart parallax'
 ```
 
+---
+
+## Uninstall
+
+```bash
+bash scripts/uninstall-vps.sh
+```
+
+The guided uninstaller removes ParallaX from one VPS and can remove the
+local client configuration generated by `scripts/deploy-vps.sh`. Explicit
+flags mirror the deployer (`--host`, `--service-name`, `--keep-local`,
+`--remove-parca-agent`, `--dry-run`, `--yes`, `--non-interactive`, …).
+Run `bash scripts/uninstall-vps.sh --help` for the full list.
+
+---
+
 ## Notes
 
-- The deploy script does not change local system proxy settings and does not
-  touch Surge.
+- The deploy script does not change local system proxy settings and does
+  not touch Surge or any other client-side proxy manager.
 - The deploy script does not enable a remote firewall. If `ufw` is already
   active, it only attempts to allow TCP/443.
 - Generated TOML files contain secrets and are ignored by git.
+- Server config files are installed with mode `0600` and are validated by
+  `plx serve` on every start — incorrect ownership or permissions cause
+  the service to refuse to start.
