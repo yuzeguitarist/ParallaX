@@ -344,6 +344,7 @@ const CASES: &[CaseRunner] = &[
     bench_connect_request_decode_1k_borrowed,
     bench_client_identity_chunks_decode,
     bench_client_identity_proof_extract,
+    bench_server_identity_chunks_encode_all,
     bench_server_identity_build_decode_each_time,
     bench_server_identity_build_cached,
     bench_client_identity_verify_decode_each_time,
@@ -794,6 +795,21 @@ fn bench_client_identity_proof_extract(options: BenchmarkOptions) -> Result<Benc
         || {
             let signature = ServerIdentityProof::signature(black_box(payload.as_slice()))?;
             Ok(black_box(signature.len() as u64))
+        },
+    )
+}
+
+fn bench_server_identity_chunks_encode_all(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let payload = server_identity_payload_fixture()?;
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "server_identity.chunks_encode_all",
+        TIER_FAST,
+        options,
+        || {
+            let chunks =
+                ServerIdentityChunk::encode_all(&payload, BENCH_SERVER_IDENTITY_CHUNK_PLAINTEXT)?;
+            Ok(black_box(chunks.iter().map(Vec::len).sum::<usize>() as u64))
         },
     )
 }

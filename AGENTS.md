@@ -67,3 +67,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ## 5. Respect Scoped Stop Instructions
 
 When the user says not to keep doing something, not to continue optimizing, or not to keep changing an area, apply that stop instruction only to the specific area or activity the user named. Do not broaden it into a global stop for the whole task. For example, "don't keep editing docs" means stop touching docs, while continuing the requested code work. Do not revert existing changes unless the user explicitly asks for a rollback. If the scope is unclear, ask or choose the narrowest reasonable scope instead of stopping unrelated work.
+
+## 6. Use Patch Tools for File Edits
+
+When changing source code, configuration, documentation, or any repository file content, use the dedicated patch/edit tool instead of writing file changes through shell scripts, inline Python, sed/perl replacement commands, heredocs, or shell redirection. Terminal commands are acceptable for inspection, tests, benchmarks, formatting checks, and git operations, but content edits must go through the patch/edit tool unless the user explicitly authorizes another method.

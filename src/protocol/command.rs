@@ -411,23 +411,30 @@ impl ServerIdentityProof {
 
 impl ServerIdentityChunk {
     pub fn encode(&self) -> Result<Vec<u8>, ServerIdentityChunkError> {
-        if self.bytes.is_empty() {
+        Self::encode_borrowed(self.total_len, self.offset, &self.bytes)
+    }
+
+    fn encode_borrowed(
+        total_len: u32,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, ServerIdentityChunkError> {
+        if bytes.is_empty() {
             return Err(ServerIdentityChunkError::EmptyChunk);
         }
-        let end = self
-            .offset
-            .checked_add(self.bytes.len() as u32)
+        let end = offset
+            .checked_add(bytes.len() as u32)
             .ok_or(ServerIdentityChunkError::InvalidOffset)?;
-        if self.total_len == 0 || end > self.total_len {
+        if total_len == 0 || end > total_len {
             return Err(ServerIdentityChunkError::InvalidOffset);
         }
 
-        let mut out = Vec::with_capacity(16 + self.bytes.len());
+        let mut out = Vec::with_capacity(16 + bytes.len());
         out.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
-        out.extend_from_slice(&self.total_len.to_be_bytes());
-        out.extend_from_slice(&self.offset.to_be_bytes());
-        out.extend_from_slice(&(self.bytes.len() as u32).to_be_bytes());
-        out.extend_from_slice(&self.bytes);
+        out.extend_from_slice(&total_len.to_be_bytes());
+        out.extend_from_slice(&offset.to_be_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(bytes);
         Ok(out)
     }
 
@@ -484,14 +491,11 @@ impl ServerIdentityChunk {
         let total_len = payload.len() as u32;
         let mut chunks = Vec::with_capacity(payload.len().div_ceil(max_chunk_len));
         for (idx, bytes) in payload.chunks(max_chunk_len).enumerate() {
-            chunks.push(
-                Self {
-                    total_len,
-                    offset: (idx * max_chunk_len) as u32,
-                    bytes: bytes.to_vec(),
-                }
-                .encode()?,
-            );
+            chunks.push(Self::encode_borrowed(
+                total_len,
+                (idx * max_chunk_len) as u32,
+                bytes,
+            )?);
         }
         Ok(chunks)
     }

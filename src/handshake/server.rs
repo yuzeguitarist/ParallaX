@@ -738,24 +738,15 @@ async fn run_authenticated_data_mode(
                             &identity_payload,
                             SERVER_IDENTITY_CHUNK_PLAINTEXT,
                         )?;
-                        let identity_chunk_count = identity_chunks.len();
-                        for (idx, chunk) in identity_chunks.into_iter().enumerate() {
-                            let identity_record = server_seal.seal(&chunk, &mut rng)?;
-                            log_outer_write(
-                                cid,
-                                "server->client",
-                                "server-identity-writer",
-                                chunk.len(),
-                                &identity_record,
-                            );
-                            client_write.write_all(&identity_record).await?;
-                            if idx + 1 < identity_chunk_count {
-                                let delay = server_identity_chunk_delay(timing, &mut rng);
-                                if !delay.is_zero() {
-                                    sleep(delay).await;
-                                }
-                            }
-                        }
+                        write_server_identity_chunks(
+                            &mut client_write,
+                            &mut server_seal,
+                            identity_chunks,
+                            &mut rng,
+                            timing,
+                            cid,
+                        )
+                        .await?;
 
                         drop(fallback_write);
                         client_records.read_record_into(&mut client_record).await?;
@@ -984,6 +975,59 @@ where
     } else {
         Duration::ZERO
     }
+}
+
+async fn write_server_identity_chunks<W, R>(
+    client_write: &mut W,
+    server_seal: &mut DataRecordCodec,
+    identity_chunks: Vec<Vec<u8>>,
+    rng: &mut R,
+    timing: TimingProfile,
+    cid: u64,
+) -> Result<(), HandshakeServerError>
+where
+    W: AsyncWrite + Unpin,
+    R: Rng + rand::RngCore + ?Sized,
+{
+    if timing.is_enabled() {
+        let identity_chunk_count = identity_chunks.len();
+        for (idx, chunk) in identity_chunks.into_iter().enumerate() {
+            let identity_record = server_seal.seal(&chunk, rng)?;
+            log_outer_write(
+                cid,
+                "server->client",
+                "server-identity-writer",
+                chunk.len(),
+                &identity_record,
+            );
+            client_write.write_all(&identity_record).await?;
+            if idx + 1 < identity_chunk_count {
+                let delay = server_identity_chunk_delay(timing, rng);
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let capacity = identity_chunks
+        .iter()
+        .map(|chunk| server_seal.max_sealed_len(chunk.len()))
+        .sum();
+    let mut identity_records = Vec::with_capacity(capacity);
+    for chunk in identity_chunks {
+        let range = server_seal.seal_into(&chunk, rng, &mut identity_records)?;
+        log_outer_write(
+            cid,
+            "server->client",
+            "server-identity-writer",
+            chunk.len(),
+            &identity_records[range],
+        );
+    }
+    client_write.write_all(&identity_records).await?;
+    Ok(())
 }
 
 struct DataRelay {
@@ -1324,11 +1368,15 @@ fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use rand::{rngs::StdRng, SeedableRng};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
     use crate::{
@@ -1383,6 +1431,70 @@ mod tests {
             server_identity_chunk_delay(timing, &mut rng),
             SERVER_IDENTITY_CHUNK_MIN_DELAY + Duration::from_millis(1)
         );
+    }
+
+    #[tokio::test]
+    async fn speed_first_identity_writer_batches_chunks_into_one_write() {
+        let traffic = TrafficConfig::default();
+        let padding = PaddingProfile::from_config(traffic).unwrap();
+        let timing = TimingProfile::from_config(traffic);
+        let mut server_seal = DataRecordCodec::new(
+            AeadCodec::new([3_u8; 32], [4_u8; 24]),
+            padding,
+            SERVER_TO_CLIENT_AAD,
+        );
+        let mut client_open = DataRecordCodec::new(
+            AeadCodec::new([3_u8; 32], [4_u8; 24]),
+            padding,
+            SERVER_TO_CLIENT_AAD,
+        );
+        let payload = vec![0x42_u8; SERVER_IDENTITY_CHUNK_PLAINTEXT * 2 + 1];
+        let chunks =
+            ServerIdentityChunk::encode_all(&payload, SERVER_IDENTITY_CHUNK_PLAINTEXT).unwrap();
+        let expected_chunks = chunks.clone();
+        let mut rng = StdRng::seed_from_u64(103);
+        let mut writer = CountingWriter::default();
+
+        write_server_identity_chunks(&mut writer, &mut server_seal, chunks, &mut rng, timing, 7)
+            .await
+            .unwrap();
+
+        assert_eq!(writer.writes, 1);
+        let mut opened_chunks = Vec::new();
+        let mut offset = 0;
+        while offset < writer.bytes.len() {
+            let header = crate::tls::record::parse_header(&writer.bytes[offset..]).unwrap();
+            let end = offset + header.total_len;
+            opened_chunks.push(client_open.open(&writer.bytes[offset..end]).unwrap());
+            offset = end;
+        }
+        assert_eq!(opened_chunks, expected_chunks);
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[test]
