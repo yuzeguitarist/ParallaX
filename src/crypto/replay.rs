@@ -222,7 +222,7 @@ impl ReplayCache {
     fn persist_plain(&self, path: &Path) -> Result<(), ReplayCacheError> {
         let body = serialize_cached_entries(&self.encoded_entries);
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, body)?;
+        write_cache_file(&tmp, body.as_bytes())?;
         fs::rename(tmp, path)?;
         Ok(())
     }
@@ -247,12 +247,7 @@ impl ReplayCache {
             encode_authenticated_journal_entry(mac_key, next_count, entry, &journal.tail_mac);
         let next_header = authenticated_journal_header(mac_key, next_count, &next_tail_mac);
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
+        let mut file = open_cache_file_for_append(path)?;
         if file.metadata()?.len() == 0 {
             if journal.count != 0 {
                 drop(file);
@@ -287,11 +282,36 @@ impl ReplayCache {
     ) -> Result<(), ReplayCacheError> {
         let (raw, journal) = serialize_authenticated_journal(&self.order, mac_key);
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, raw)?;
+        write_cache_file(&tmp, raw.as_bytes())?;
         fs::rename(tmp, path)?;
         self.auth_journal = Some(journal);
         Ok(())
     }
+}
+
+fn open_cache_file_for_append(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn write_cache_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let _ = fs::remove_file(path);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.flush()
 }
 
 pub fn current_unix_timestamp() -> Result<u64, ReplayCacheError> {
@@ -720,6 +740,51 @@ mod tests {
 
         let mut loaded = ReplayCache::load_or_create(&path, 8).unwrap();
         assert!(!loaded.insert_new(entry, now).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_cache_files_are_private_when_created() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plain_path = dir.path().join("replay.cache");
+        let auth_path = dir.path().join("replay-auth.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+
+        let mut plain = ReplayCache::load_or_create(&plain_path, 8).unwrap();
+        assert!(plain
+            .insert_new(
+                ReplayEntry {
+                    timestamp: now,
+                    nonce: [1; 8],
+                    transcript_fingerprint: [2; 32],
+                },
+                now,
+            )
+            .unwrap());
+        let mut authenticated =
+            ReplayCache::load_or_create_authenticated(&auth_path, 8, key).unwrap();
+        assert!(authenticated
+            .insert_new(
+                ReplayEntry {
+                    timestamp: now,
+                    nonce: [3; 8],
+                    transcript_fingerprint: [4; 32],
+                },
+                now,
+            )
+            .unwrap());
+
+        assert_eq!(
+            fs::metadata(&plain_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

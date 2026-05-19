@@ -174,6 +174,7 @@ require_safe_service_name() {
 require_safe_ssh_target() {
   local value=$1
   [[ -n "$value" ]] || die "missing SSH target"
+  [[ "$value" != -* ]] || die "--host must not start with '-': $value"
   require_no_space "--host" "$value"
   require_no_control "--host" "$value"
 }
