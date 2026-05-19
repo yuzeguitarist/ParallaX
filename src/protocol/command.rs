@@ -6,6 +6,9 @@ const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
 const SERVER_KEY_EXCHANGE_MAGIC: &[u8; 4] = b"PX1K";
 const SERVER_IDENTITY_MAGIC: &[u8; 4] = b"PX1S";
 const SERVER_IDENTITY_CHUNK_MAGIC: &[u8; 4] = b"PX1I";
+const SPEED_TEST_MAGIC: &[u8; 4] = b"PX1T";
+const SPEED_DOWNLOAD_DONE_MAGIC: &[u8; 4] = b"PX1D";
+const SPEED_UPLOAD_DONE_MAGIC: &[u8; 4] = b"PX1U";
 const MAX_HOST_LEN: usize = 255;
 const CONNECT_FIXED_LEN: usize = 4 + 2 + 2 + 4;
 
@@ -72,6 +75,24 @@ pub struct ServerIdentityChunkRef<'a> {
     pub bytes: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeedTestRequest {
+    pub download_bytes: u64,
+    pub upload_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedTestAckKind {
+    DownloadDone,
+    UploadDone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeedTestAck {
+    pub kind: SpeedTestAckKind,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PqRekeyError {
     #[error("PQ rekey request is truncated")]
@@ -120,6 +141,28 @@ pub enum ServerIdentityChunkError {
     InvalidChunkLength,
     #[error("server identity chunk offset is invalid")]
     InvalidOffset,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SpeedTestRequestError {
+    #[error("speed test request is truncated")]
+    Truncated,
+    #[error("speed test request magic mismatch")]
+    BadMagic,
+    #[error("speed test request byte count must not be zero")]
+    ZeroBytes,
+    #[error("speed test request length is invalid")]
+    InvalidLength,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SpeedTestAckError {
+    #[error("speed test ack is truncated")]
+    Truncated,
+    #[error("speed test ack magic mismatch")]
+    BadMagic,
+    #[error("speed test ack length is invalid")]
+    InvalidLength,
 }
 
 impl ConnectRequest {
@@ -454,6 +497,98 @@ impl ServerIdentityChunk {
     }
 }
 
+impl SpeedTestRequest {
+    pub fn has_magic(input: &[u8]) -> bool {
+        input.len() >= 4 && &input[..4] == SPEED_TEST_MAGIC
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, SpeedTestRequestError> {
+        if self.download_bytes == 0 || self.upload_bytes == 0 {
+            return Err(SpeedTestRequestError::ZeroBytes);
+        }
+        let mut out = Vec::with_capacity(20);
+        out.extend_from_slice(SPEED_TEST_MAGIC);
+        out.extend_from_slice(&self.download_bytes.to_be_bytes());
+        out.extend_from_slice(&self.upload_bytes.to_be_bytes());
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, SpeedTestRequestError> {
+        if input.len() < 4 {
+            return Err(SpeedTestRequestError::Truncated);
+        }
+        if &input[..4] != SPEED_TEST_MAGIC {
+            return Err(SpeedTestRequestError::BadMagic);
+        }
+        if input.len() < 20 {
+            return Err(SpeedTestRequestError::Truncated);
+        }
+        if input.len() != 20 {
+            return Err(SpeedTestRequestError::InvalidLength);
+        }
+        let download_bytes = u64::from_be_bytes([
+            input[4], input[5], input[6], input[7], input[8], input[9], input[10], input[11],
+        ]);
+        let upload_bytes = u64::from_be_bytes([
+            input[12], input[13], input[14], input[15], input[16], input[17], input[18], input[19],
+        ]);
+        if download_bytes == 0 || upload_bytes == 0 {
+            return Err(SpeedTestRequestError::ZeroBytes);
+        }
+        Ok(Self {
+            download_bytes,
+            upload_bytes,
+        })
+    }
+}
+
+impl SpeedTestAck {
+    pub fn download_done(bytes: u64) -> Self {
+        Self {
+            kind: SpeedTestAckKind::DownloadDone,
+            bytes,
+        }
+    }
+
+    pub fn upload_done(bytes: u64) -> Self {
+        Self {
+            kind: SpeedTestAckKind::UploadDone,
+            bytes,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12);
+        out.extend_from_slice(match self.kind {
+            SpeedTestAckKind::DownloadDone => SPEED_DOWNLOAD_DONE_MAGIC,
+            SpeedTestAckKind::UploadDone => SPEED_UPLOAD_DONE_MAGIC,
+        });
+        out.extend_from_slice(&self.bytes.to_be_bytes());
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, SpeedTestAckError> {
+        if input.len() < 4 {
+            return Err(SpeedTestAckError::Truncated);
+        }
+        let kind = match &input[..4] {
+            magic if magic == SPEED_DOWNLOAD_DONE_MAGIC => SpeedTestAckKind::DownloadDone,
+            magic if magic == SPEED_UPLOAD_DONE_MAGIC => SpeedTestAckKind::UploadDone,
+            _ => return Err(SpeedTestAckError::BadMagic),
+        };
+        if input.len() < 12 {
+            return Err(SpeedTestAckError::Truncated);
+        }
+        if input.len() != 12 {
+            return Err(SpeedTestAckError::InvalidLength);
+        }
+        let bytes = u64::from_be_bytes([
+            input[4], input[5], input[6], input[7], input[8], input[9], input[10], input[11],
+        ]);
+        Ok(Self { kind, bytes })
+    }
+}
+
 struct Cursor<'a> {
     input: &'a [u8],
     pos: usize,
@@ -675,6 +810,26 @@ mod tests {
         }
 
         assert_eq!(assembled, payload);
+    }
+
+    #[test]
+    fn speed_test_request_round_trip() {
+        let request = SpeedTestRequest {
+            download_bytes: 16 * 1024 * 1024,
+            upload_bytes: 8 * 1024 * 1024,
+        };
+
+        let encoded = request.encode().unwrap();
+        assert_eq!(SpeedTestRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn speed_test_ack_round_trip() {
+        let download = SpeedTestAck::download_done(123);
+        let upload = SpeedTestAck::upload_done(456);
+
+        assert_eq!(SpeedTestAck::decode(&download.encode()).unwrap(), download);
+        assert_eq!(SpeedTestAck::decode(&upload.encode()).unwrap(), upload);
     }
 
     #[test]

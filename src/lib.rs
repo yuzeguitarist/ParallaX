@@ -8,6 +8,8 @@ pub mod handshake;
 pub mod probe;
 pub mod process_hardening;
 pub mod protocol;
+pub mod runtime_guard;
+pub mod speed;
 pub mod tls;
 pub mod traffic;
 pub mod transport;

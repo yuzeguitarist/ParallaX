@@ -217,22 +217,16 @@ async fn handle_local_connection_with_cid(
             .await
             .map_err(ClientRuntimeError::Io)
     };
-    let server_session_fut =
-        connect_and_establish_data_session(&server_addr, config, traffic, psk, server_public);
+    let server_session_fut = establish_authenticated_data_session_with_resolver(
+        &server_addr,
+        config,
+        traffic,
+        psk,
+        server_public,
+        server_identity_public,
+    );
     let (initial_payload, (mut server, mut data_session)) =
         tokio::try_join!(initial_payload_fut, server_session_fut)?;
-    let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut OsRng)?;
-    server.write_all(&pq_record).await?;
-    apply_server_key_exchange_after_residuals(&mut server, &mut data_session, &pending_rekey, psk)
-        .await?;
-    let identity_payload = read_server_identity_payload(&mut server, &mut data_session).await?;
-    verify_server_identity_payload_blocking(
-        &data_session,
-        identity_payload,
-        server_identity_public,
-        server_public,
-    )
-    .await?;
     let connect_request = ConnectRequest {
         host: request.host,
         port: request.port,
@@ -263,6 +257,51 @@ async fn handle_local_connection_with_cid(
     }
     .run()
     .await
+}
+
+pub(crate) async fn establish_authenticated_data_session(
+    config: &ClientConfig,
+    traffic: TrafficConfig,
+    psk: &[u8],
+    server_public: &[u8; 32],
+    server_identity_public: &[u8],
+) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
+    let server_addr = ServerAddrResolver::new(&config.server_addr).await?;
+    establish_authenticated_data_session_with_resolver(
+        &server_addr,
+        config,
+        traffic,
+        psk,
+        server_public,
+        server_identity_public,
+    )
+    .await
+}
+
+async fn establish_authenticated_data_session_with_resolver(
+    server_addr: &ServerAddrResolver,
+    config: &ClientConfig,
+    traffic: TrafficConfig,
+    psk: &[u8],
+    server_public: &[u8; 32],
+    server_identity_public: &[u8],
+) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
+    let (mut server, mut data_session) =
+        connect_and_establish_data_session(server_addr, config, traffic, psk, server_public)
+            .await?;
+    let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut OsRng)?;
+    server.write_all(&pq_record).await?;
+    apply_server_key_exchange_after_residuals(&mut server, &mut data_session, &pending_rekey, psk)
+        .await?;
+    let identity_payload = read_server_identity_payload(&mut server, &mut data_session).await?;
+    verify_server_identity_payload_blocking(
+        &data_session,
+        identity_payload,
+        server_identity_public,
+        server_public,
+    )
+    .await?;
+    Ok((server, data_session))
 }
 
 #[derive(Clone)]

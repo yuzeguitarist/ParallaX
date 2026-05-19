@@ -45,7 +45,8 @@ use crate::{
         command::{
             ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
             ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
-            ServerKeyExchange, ServerKeyExchangeError,
+            ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest,
+            SpeedTestRequestError,
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError,
@@ -102,6 +103,8 @@ pub enum HandshakeServerError {
     Traffic(#[from] TrafficError),
     #[error("connect request error: {0}")]
     ConnectRequest(#[from] ConnectRequestError),
+    #[error("speed test request error: {0}")]
+    SpeedTestRequest(#[from] SpeedTestRequestError),
     #[error("PQ rekey command error: {0}")]
     PqRekey(#[from] PqRekeyError),
     #[error("server key exchange command error: {0}")]
@@ -752,6 +755,20 @@ async fn run_authenticated_data_mode(
                             "ParallaX data mode switch confirmed"
                         );
 
+                        if SpeedTestRequest::has_magic(first_payload) {
+                            let request = SpeedTestRequest::decode(first_payload)?;
+                            return run_authenticated_speed_test_mode(
+                                client_records,
+                                client_write,
+                                client_open,
+                                server_seal,
+                                request,
+                                max_plaintext_len(traffic.max_padding),
+                                cid,
+                            )
+                            .await;
+                        }
+
                         let (target_addr, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
                         let mut target = TcpStream::connect(target_addr).await?;
@@ -993,6 +1010,97 @@ impl DataRelay {
             result = download => result,
         }
     }
+}
+
+async fn run_authenticated_speed_test_mode(
+    mut client_records: TlsRecordReader<OwnedReadHalf>,
+    mut client_write: OwnedWriteHalf,
+    mut client_open: DataRecordCodec,
+    mut server_seal: DataRecordCodec,
+    request: SpeedTestRequest,
+    chunk_size: usize,
+    cid: u64,
+) -> Result<(), HandshakeServerError> {
+    tracing::info!(
+        cid,
+        download_bytes = request.download_bytes,
+        upload_bytes = request.upload_bytes,
+        "ParallaX speed test mode started"
+    );
+    if chunk_size == 0 {
+        return Err(HandshakeServerError::DataRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(0).into(),
+        ));
+    }
+
+    let mut rng = StdRng::from_entropy();
+    let mut scratch = RelaySealScratch::with_payload_capacity(chunk_size);
+    let payload = vec![0xA5; chunk_size];
+    let mut remaining = request.download_bytes;
+    while remaining > 0 {
+        let len = remaining.min(payload.len() as u64) as usize;
+        write_server_data_records_chunked(
+            &mut client_write,
+            &mut server_seal,
+            &payload[..len],
+            &mut rng,
+            &mut scratch,
+            RelayWriteLog::new(cid, "server->client", "server-speed-download-writer"),
+        )
+        .await?;
+        remaining -= len as u64;
+    }
+    let download_done = SpeedTestAck::download_done(request.download_bytes).encode();
+    write_server_data_records_chunked(
+        &mut client_write,
+        &mut server_seal,
+        &download_done,
+        &mut rng,
+        &mut scratch,
+        RelayWriteLog::new(cid, "server->client", "server-speed-download-done"),
+    )
+    .await?;
+
+    let mut uploaded = 0_u64;
+    let mut client_record = Vec::new();
+    while uploaded < request.upload_bytes {
+        match client_records.read_record_into(&mut client_record).await {
+            Ok(()) => {}
+            Err(err) if is_clean_close(&err) => return Ok(()),
+            Err(err) => return Err(HandshakeServerError::Io(err)),
+        };
+        log_record_read(
+            cid,
+            "client->server",
+            "server-speed-upload-reader",
+            &client_record,
+        );
+        let plaintext = client_open.open_in_place_payload_range(&mut client_record)?;
+        let len = plaintext.len() as u64;
+        if len == 0 {
+            continue;
+        }
+        if uploaded + len > request.upload_bytes {
+            return Err(HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "speed upload sent more bytes than requested",
+            )));
+        }
+        uploaded += len;
+    }
+
+    let upload_done = SpeedTestAck::upload_done(uploaded).encode();
+    write_server_data_records_chunked(
+        &mut client_write,
+        &mut server_seal,
+        &upload_done,
+        &mut rng,
+        &mut scratch,
+        RelayWriteLog::new(cid, "server->client", "server-speed-upload-done"),
+    )
+    .await?;
+    tracing::info!(cid, uploaded, "ParallaX speed test mode finished");
+    Ok(())
 }
 
 async fn server_upload_loop(

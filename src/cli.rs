@@ -21,6 +21,8 @@ use crate::{
     },
     handshake::server,
     probe, process_hardening,
+    runtime_guard::RuntimeGuard,
+    speed,
     transport::tcp::bump_nofile_soft_limit,
 };
 
@@ -53,6 +55,11 @@ enum Command {
     },
     /// Run the ParallaX local SOCKS5 client.
     Client {
+        #[arg(short, long, default_value = "parallax.toml")]
+        config: PathBuf,
+    },
+    /// Run a one-shot ParallaX network speed test against the configured server.
+    Speed {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
     },
@@ -154,7 +161,18 @@ pub async fn run() -> anyhow::Result<()> {
             let cfg = Config::load(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             cfg.protect_secret_memory();
+            let _guard = RuntimeGuard::acquire_client(&cfg)?;
             runtime::run(cfg).await?;
+        }
+        Command::Speed { config } => {
+            process_hardening::harden_current_process();
+            bump_nofile_soft_limit();
+            let cfg = Config::load(&config)
+                .with_context(|| format!("failed to load {}", config.display()))?;
+            cfg.protect_secret_memory();
+            let _guard = RuntimeGuard::acquire_speed(&cfg)?;
+            let report = speed::run(cfg).await?;
+            print!("{}", report.to_text());
         }
         Command::Benchmark { quick, json } => {
             let options = if quick {

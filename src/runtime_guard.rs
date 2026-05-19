@@ -1,0 +1,491 @@
+use std::{
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process,
+};
+
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use crate::config::{ClientConfig, Config, Mode};
+
+#[derive(Debug, Error)]
+pub enum RuntimeGuardError {
+    #[error("runtime guard I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Conflict(RuntimeConflict),
+    #[error("runtime guard requires mode = \"client\"")]
+    WrongMode,
+    #[error("runtime guard requires [client] config")]
+    MissingClient,
+    #[error("runtime guard metadata is invalid: {0}")]
+    InvalidMetadata(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConflict {
+    message: String,
+    pid: u32,
+}
+
+impl RuntimeConflict {
+    fn client_blocked_by_speed(speed: &RuntimeInstance) -> Self {
+        Self {
+            message: format!(
+                "A plx speed run is already active (pid {}). Wait for it to finish or stop it first. Stop command: kill -TERM {}",
+                speed.pid, speed.pid
+            ),
+            pid: speed.pid,
+        }
+    }
+
+    fn speed_blocked_by_client(client: &RuntimeInstance) -> Self {
+        Self {
+            message: format!(
+                "A plx client is already active for this server (pid {}). Test a different server or stop the existing plx client first. Stop command: kill -TERM {}",
+                client.pid, client.pid
+            ),
+            pid: client.pid,
+        }
+    }
+
+    fn speed_blocked_by_speed(speed: &RuntimeInstance) -> Self {
+        Self {
+            message: format!(
+                "A plx speed run is already active (pid {}). Wait for it to finish or stop it first. Stop command: kill -TERM {}",
+                speed.pid, speed.pid
+            ),
+            pid: speed.pid,
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+impl fmt::Display for RuntimeConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeRole {
+    Client,
+    Speed,
+}
+
+impl RuntimeRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Speed => "speed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, RuntimeGuardError> {
+        match value {
+            "client" => Ok(Self::Client),
+            "speed" => Ok(Self::Speed),
+            other => Err(RuntimeGuardError::InvalidMetadata(format!(
+                "unknown role `{other}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeInstance {
+    role: RuntimeRole,
+    pid: u32,
+    config_id: String,
+    server_addr: String,
+}
+
+impl RuntimeInstance {
+    fn new(role: RuntimeRole, client: &ClientConfig) -> Self {
+        Self {
+            role,
+            pid: process::id(),
+            config_id: client_config_id(client),
+            server_addr: client.server_addr.clone(),
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "role={}\npid={}\nconfig_id={}\nserver_addr={}\n",
+            self.role.as_str(),
+            self.pid,
+            self.config_id,
+            self.server_addr
+        )
+    }
+
+    fn decode(raw: &str) -> Result<Self, RuntimeGuardError> {
+        let mut role = None;
+        let mut pid = None;
+        let mut config_id = None;
+        let mut server_addr = None;
+
+        for line in raw.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(RuntimeGuardError::InvalidMetadata(format!(
+                    "malformed line `{line}`"
+                )));
+            };
+            match key {
+                "role" => role = Some(RuntimeRole::parse(value)?),
+                "pid" => {
+                    pid = Some(value.parse::<u32>().map_err(|err| {
+                        RuntimeGuardError::InvalidMetadata(format!("invalid pid `{value}`: {err}"))
+                    })?);
+                }
+                "config_id" => config_id = Some(value.to_owned()),
+                "server_addr" => server_addr = Some(value.to_owned()),
+                other => {
+                    return Err(RuntimeGuardError::InvalidMetadata(format!(
+                        "unknown key `{other}`"
+                    )));
+                }
+            }
+        }
+
+        Ok(Self {
+            role: role.ok_or_else(|| missing_field("role"))?,
+            pid: pid.ok_or_else(|| missing_field("pid"))?,
+            config_id: config_id.ok_or_else(|| missing_field("config_id"))?,
+            server_addr: server_addr.ok_or_else(|| missing_field("server_addr"))?,
+        })
+    }
+}
+
+fn missing_field(field: &'static str) -> RuntimeGuardError {
+    RuntimeGuardError::InvalidMetadata(format!("missing {field}"))
+}
+
+#[derive(Debug)]
+pub struct RuntimeGuard {
+    path: PathBuf,
+    file: File,
+}
+
+impl RuntimeGuard {
+    pub fn acquire_client(config: &Config) -> Result<Self, RuntimeGuardError> {
+        let dir = default_state_dir();
+        Self::acquire_client_in_dir(config, &dir)
+    }
+
+    pub fn acquire_speed(config: &Config) -> Result<Self, RuntimeGuardError> {
+        let dir = default_state_dir();
+        Self::acquire_speed_in_dir(config, &dir)
+    }
+
+    fn acquire_client_in_dir(config: &Config, dir: &Path) -> Result<Self, RuntimeGuardError> {
+        let instance = instance_for_config(RuntimeRole::Client, config)?;
+        acquire_with_registry(dir, instance, |active, _current| {
+            active
+                .iter()
+                .find(|instance| instance.role == RuntimeRole::Speed)
+                .map(RuntimeConflict::client_blocked_by_speed)
+        })
+    }
+
+    fn acquire_speed_in_dir(config: &Config, dir: &Path) -> Result<Self, RuntimeGuardError> {
+        let instance = instance_for_config(RuntimeRole::Speed, config)?;
+        acquire_with_registry(dir, instance, |active, current| {
+            if let Some(speed) = active
+                .iter()
+                .find(|instance| instance.role == RuntimeRole::Speed)
+            {
+                return Some(RuntimeConflict::speed_blocked_by_speed(speed));
+            }
+            active
+                .iter()
+                .find(|instance| {
+                    instance.role == RuntimeRole::Client && instance.config_id == current.config_id
+                })
+                .map(RuntimeConflict::speed_blocked_by_client)
+        })
+    }
+}
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        let _ = unlock_file(&self.file);
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn instance_for_config(
+    role: RuntimeRole,
+    config: &Config,
+) -> Result<RuntimeInstance, RuntimeGuardError> {
+    if config.mode != Mode::Client {
+        return Err(RuntimeGuardError::WrongMode);
+    }
+    let client = config
+        .client
+        .as_ref()
+        .ok_or(RuntimeGuardError::MissingClient)?;
+    Ok(RuntimeInstance::new(role, client))
+}
+
+fn acquire_with_registry<F>(
+    dir: &Path,
+    instance: RuntimeInstance,
+    conflict: F,
+) -> Result<RuntimeGuard, RuntimeGuardError>
+where
+    F: FnOnce(&[RuntimeInstance], &RuntimeInstance) -> Option<RuntimeConflict>,
+{
+    ensure_state_dir(dir)?;
+    let registry_path = dir.join("registry.lock");
+    let registry = open_lock_file(&registry_path)?;
+    if !try_lock_file(&registry)? {
+        return Err(RuntimeGuardError::InvalidMetadata(
+            "runtime registry is locked by another process but did not block correctly".to_owned(),
+        ));
+    }
+
+    let active = active_instances(dir)?;
+    if let Some(conflict) = conflict(&active, &instance) {
+        return Err(RuntimeGuardError::Conflict(conflict));
+    }
+
+    let path = dir.join(format!(
+        "{}-{}-{}.lock",
+        instance.role.as_str(),
+        instance.pid,
+        instance.config_id
+    ));
+    let mut file = open_lock_file(&path)?;
+    if !try_lock_file(&file)? {
+        return Err(RuntimeGuardError::InvalidMetadata(format!(
+            "runtime lock path is already active: {}",
+            path.display()
+        )));
+    }
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(instance.encode().as_bytes())?;
+    file.sync_data()?;
+
+    Ok(RuntimeGuard { path, file })
+}
+
+fn active_instances(dir: &Path) -> Result<Vec<RuntimeInstance>, RuntimeGuardError> {
+    let mut active = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some("registry.lock") {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
+            continue;
+        }
+
+        let mut file = open_lock_file(&path)?;
+        if try_lock_file(&file)? {
+            unlock_file(&file)?;
+            fs::remove_file(&path)?;
+            continue;
+        }
+
+        let mut raw = String::new();
+        file.seek(SeekFrom::Start(0))?;
+        file.read_to_string(&mut raw)?;
+        active.push(RuntimeInstance::decode(&raw)?);
+    }
+    Ok(active)
+}
+
+fn ensure_state_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    }
+}
+
+fn default_state_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and does not dereference pointers.
+        let uid = unsafe { libc::geteuid() };
+        PathBuf::from(format!("/tmp/parallax-{uid}/runtime"))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("parallax").join("runtime")
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: flock only operates on the valid file descriptor borrowed from File.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(false),
+        _ => Err(err),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_file(_file: &File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "runtime guard requires Unix file locking",
+    ))
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: flock only operates on the valid file descriptor borrowed from File.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn unlock_file(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+fn client_config_id(client: &ClientConfig) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, "server_addr", &client.server_addr);
+    hash_field(&mut hasher, "sni", &client.sni);
+    hash_field(&mut hasher, "server_public_key", &client.server_public_key);
+    hash_field(
+        &mut hasher,
+        "server_pq_public_key",
+        &client.server_pq_public_key,
+    );
+    hash_field(
+        &mut hasher,
+        "server_identity_public_key",
+        &client.server_identity_public_key,
+    );
+    hex_lower(&hasher.finalize())
+}
+
+fn hash_field(hasher: &mut Sha256, name: &str, value: &str) {
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    hasher.update([0]);
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+    use crate::config::{CryptoConfig, TrafficConfig};
+
+    fn config(server_addr: &str) -> Config {
+        Config {
+            mode: Mode::Client,
+            crypto: CryptoConfig {
+                psk: "test-psk-not-read-by-runtime-guard".to_owned(),
+            },
+            traffic: TrafficConfig::default(),
+            client: Some(ClientConfig {
+                listen: "127.0.0.1:1080".parse::<SocketAddr>().unwrap(),
+                server_addr: server_addr.to_owned(),
+                sni: "example.com".to_owned(),
+                server_public_key: "server-public".to_owned(),
+                server_pq_public_key: "server-pq-public".to_owned(),
+                server_identity_public_key: "server-identity-public".to_owned(),
+            }),
+            server: None,
+        }
+    }
+
+    #[test]
+    fn speed_rejects_same_server_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config("203.0.113.10:443");
+        let _client = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap();
+
+        let err = RuntimeGuard::acquire_speed_in_dir(&cfg, dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeGuardError::Conflict(_)));
+        assert!(err.to_string().contains("Test a different server"));
+    }
+
+    #[test]
+    fn speed_allows_different_server_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let client_cfg = config("203.0.113.10:443");
+        let speed_cfg = config("203.0.113.11:443");
+        let _client = RuntimeGuard::acquire_client_in_dir(&client_cfg, dir.path()).unwrap();
+
+        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn client_rejects_any_active_speed() {
+        let dir = tempfile::tempdir().unwrap();
+        let speed_cfg = config("203.0.113.10:443");
+        let client_cfg = config("203.0.113.11:443");
+        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, dir.path()).unwrap();
+
+        let err = RuntimeGuard::acquire_client_in_dir(&client_cfg, dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeGuardError::Conflict(_)));
+        assert!(err.to_string().contains("plx speed run is already active"));
+    }
+}
