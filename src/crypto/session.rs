@@ -129,12 +129,26 @@ pub fn derive_server_keys(
     derive_keys(server_private, client_public, transcript_hash)
 }
 
+pub fn derive_client_keys_from_shared(
+    x25519_shared_secret: &[u8; KEY_LEN],
+    transcript_hash: &[u8; KEY_LEN],
+) -> Result<SessionKeys, SessionError> {
+    derive_keys_from_shared(*x25519_shared_secret, transcript_hash)
+}
+
 fn derive_keys(
     private: &[u8; KEY_LEN],
     peer_public: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
     let x25519_shared_secret = x25519_shared_secret(private, peer_public);
+    derive_keys_from_shared(x25519_shared_secret, transcript_hash)
+}
+
+fn derive_keys_from_shared(
+    x25519_shared_secret: [u8; KEY_LEN],
+    transcript_hash: &[u8; KEY_LEN],
+) -> Result<SessionKeys, SessionError> {
     let chain_secret = initial_chain_secret(&x25519_shared_secret, transcript_hash)?;
     expand_epoch_keys(chain_secret, 0, *transcript_hash, x25519_shared_secret)
 }
@@ -500,6 +514,20 @@ mod tests {
         assert_eq!(client_keys, server_keys);
         assert_eq!(client_keys.epoch, 0);
         assert_eq!(client_keys.transcript_hash, transcript_hash);
+    }
+
+    #[test]
+    fn cached_x25519_shared_secret_derives_same_session_keys() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let transcript_hash = [7_u8; 32];
+        let shared = x25519_shared_secret(&client.private, &server.public);
+
+        let from_private =
+            derive_client_keys(&client.private, &server.public, &transcript_hash).unwrap();
+        let from_shared = derive_client_keys_from_shared(&shared, &transcript_hash).unwrap();
+
+        assert_eq!(from_private, from_shared);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use crate::{
         identity::{self, IdentityError},
         pq::{self, PqError},
         session::{
-            derive_client_keys, expand_epoch_keys, x25519_shared_secret, AeadCodec, SessionError,
-            SessionKeys, X25519KeyPair,
+            derive_client_keys, derive_client_keys_from_shared, expand_epoch_keys,
+            x25519_shared_secret, AeadCodec, SessionError, SessionKeys, X25519KeyPair,
         },
     },
     protocol::{
@@ -62,6 +62,18 @@ pub fn derive_session_keys(
     Ok(derive_client_keys(
         client_private,
         server_public,
+        &transcript_hash,
+    )?)
+}
+
+pub fn derive_session_keys_from_shared(
+    x25519_shared_secret: &[u8; 32],
+    client_hello_record: &[u8],
+    server_hello_record: &[u8],
+) -> Result<SessionKeys, ClientHandshakeError> {
+    let transcript_hash = transcript_hash(client_hello_record, server_hello_record);
+    Ok(derive_client_keys_from_shared(
+        x25519_shared_secret,
         &transcript_hash,
     )?)
 }
@@ -359,6 +371,27 @@ mod tests {
         let server_keys = derive_server_keys(&server.private, &client.public, &hash).unwrap();
 
         assert_eq!(client_keys, server_keys);
+    }
+
+    #[test]
+    fn derive_session_keys_from_shared_matches_private_key_path() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let client_hello = client_hello_fixture("example.com");
+        let server_hello = crate::tls::server_hello::tests::server_hello_fixture();
+        let shared = x25519_shared_secret(&client.private, &server.public);
+
+        let from_private = derive_session_keys(
+            &client.private,
+            &server.public,
+            &client_hello,
+            &server_hello,
+        )
+        .unwrap();
+        let from_shared =
+            derive_session_keys_from_shared(&shared, &client_hello, &server_hello).unwrap();
+
+        assert_eq!(from_private, from_shared);
     }
 
     #[test]

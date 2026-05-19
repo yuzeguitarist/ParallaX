@@ -474,9 +474,8 @@ async fn establish_data_session(
         .start(config.sni.clone(), psk, server_public)?
         .complete(server)
         .await?;
-    let session_keys = client::derive_session_keys(
-        &completed.client_x25519.private,
-        server_public,
+    let session_keys = client::derive_session_keys_from_shared(
+        completed.x25519_shared_secret(),
         &completed.client_hello,
         &completed.server_hello_record,
     )?;
