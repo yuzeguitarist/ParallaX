@@ -9,6 +9,7 @@ const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
 pub fn tune_tcp_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     set_low_latency_congestion(stream);
+    set_quick_ack(stream);
     Ok(())
 }
 
@@ -137,6 +138,28 @@ fn set_low_latency_congestion(stream: &TcpStream) {
 
 #[cfg(not(target_os = "linux"))]
 fn set_low_latency_congestion(_stream: &TcpStream) {}
+
+#[cfg(target_os = "linux")]
+fn set_quick_ack(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+
+    let enabled: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::trace!("TCP_QUICKACK is unavailable; keeping kernel delayed-ACK defaults");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_quick_ack(_stream: &TcpStream) {}
 
 #[cfg(test)]
 mod tests {
