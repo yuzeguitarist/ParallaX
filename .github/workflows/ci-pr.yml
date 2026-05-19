@@ -82,14 +82,13 @@ jobs:
           shared-key: parallax-ci
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
-      # Unit tests + parity baselines + any other integration test except gfw_simulator.
+      # Unit tests + Safari parity baselines + any other integration test except gfw_simulator.
       # gfw_simulator has its own required status check below.
       - name: cargo test (lib, bins, parity baselines)
         run: |
           cargo test --locked --no-fail-fast \
             --lib \
             --bins \
-            --test chrome_parity_baseline \
             --test safari_parity_baseline \
             --test safari_h2_parity_baseline
 
