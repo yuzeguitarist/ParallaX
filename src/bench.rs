@@ -8,7 +8,7 @@
 //!
 //! Design notes:
 //!
-//! * 42 cases across six groups exercise the asymmetric primitives, KDFs,
+//! * 51 cases across six groups exercise the asymmetric primitives, KDFs,
 //!   handshake composition, application-data AEAD pipeline, traffic shaping,
 //!   and replay-cache bookkeeping that dominate ParallaX's wall-clock cost.
 //! * Each case declares an iteration [`Tier`]. Tiers are static constants so
@@ -21,6 +21,7 @@ use std::{
     hint::black_box,
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -358,6 +359,8 @@ const CASES: &[CaseRunner] = &[
     bench_connect_request_decode_1k_borrowed,
     bench_client_identity_chunks_decode,
     bench_client_identity_proof_extract,
+    bench_client_identity_public_key_vec_clone,
+    bench_client_identity_public_key_arc_clone,
     bench_server_identity_chunks_encode_all,
     bench_server_identity_build_decode_each_time,
     bench_server_identity_build_cached,
@@ -809,6 +812,36 @@ fn bench_client_identity_proof_extract(options: BenchmarkOptions) -> Result<Benc
         || {
             let signature = ServerIdentityProof::signature(black_box(payload.as_slice()))?;
             Ok(black_box(signature.len() as u64))
+        },
+    )
+}
+
+fn bench_client_identity_public_key_vec_clone(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let keys = identity::keypair();
+    let public_key = keys.public.clone();
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "client_identity.public_key_vec_clone",
+        TIER_HOT,
+        options,
+        || {
+            let cloned = public_key.clone();
+            Ok(black_box(cloned.len() as u64))
+        },
+    )
+}
+
+fn bench_client_identity_public_key_arc_clone(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let keys = identity::keypair();
+    let public_key = Arc::<[u8]>::from(keys.public.clone().into_boxed_slice());
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "client_identity.public_key_arc_clone",
+        TIER_HOT,
+        options,
+        || {
+            let cloned = Arc::clone(&public_key);
+            Ok(black_box(cloned.len() as u64))
         },
     )
 }

@@ -204,15 +204,26 @@ pub(crate) fn verify_masked_stateful_client_hello_auth_with_material(
     auth_key: &[u8],
     material: &StatefulAuthMaterial,
 ) -> Result<ClientAuth, AuthError> {
+    let parsed = parse_client_hello(record)?;
+    verify_masked_stateful_client_hello_auth_with_parsed_material(
+        record, auth_key, material, &parsed,
+    )
+}
+
+pub(crate) fn verify_masked_stateful_client_hello_auth_with_parsed_material(
+    record: &[u8],
+    auth_key: &[u8],
+    material: &StatefulAuthMaterial,
+    parsed: &ClientHello,
+) -> Result<ClientAuth, AuthError> {
     if auth_key.is_empty() {
         return Err(AuthError::EmptyPsk);
     }
 
-    let parsed = parse_client_hello(record)?;
     if parsed.session_id_range.len() != SESSION_ID_LEN {
         return Ok(ClientAuth {
             authenticated: false,
-            sni: parsed.sni,
+            sni: parsed.sni.clone(),
             x25519_key_share: Some(material.x25519_public),
             timestamp: None,
             nonce: None,
@@ -223,7 +234,7 @@ pub(crate) fn verify_masked_stateful_client_hello_auth_with_material(
         let (timestamp, nonce) = auth_tail_timestamp_nonce(&material.tail);
         return Ok(ClientAuth {
             authenticated: false,
-            sni: parsed.sni,
+            sni: parsed.sni.clone(),
             x25519_key_share: Some(material.x25519_public),
             timestamp: Some(timestamp),
             nonce: Some(nonce),
@@ -249,7 +260,7 @@ pub(crate) fn verify_masked_stateful_client_hello_auth_with_material(
 
     Ok(ClientAuth {
         authenticated,
-        sni: parsed.sni,
+        sni: parsed.sni.clone(),
         x25519_key_share: Some(material.x25519_public),
         timestamp: Some(timestamp),
         nonce: Some(nonce),

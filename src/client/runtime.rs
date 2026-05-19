@@ -93,10 +93,13 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
     let psk = Arc::new(psk);
     let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
-    let server_identity_public = Arc::new(decode_base64_bytes(
-        "client.server_identity_public_key",
-        &client.server_identity_public_key,
-    )?);
+    let server_identity_public = Arc::<[u8]>::from(
+        decode_base64_bytes(
+            "client.server_identity_public_key",
+            &client.server_identity_public_key,
+        )?
+        .into_boxed_slice(),
+    );
     let listener = TcpListener::bind(client.listen).await?;
     let server_addr = ServerAddrResolver::new(&client.server_addr).await?;
     let connection_limit = relay_connection_limit()?;
@@ -149,7 +152,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                 traffic,
                 psk: psk.as_ref().as_slice(),
                 server_public: &server_public,
-                server_identity_public: &server_identity_public,
+                server_identity_public,
             };
             if let Err(err) = handle_local_connection_with_cid(local, context, cid).await {
                 tracing::debug!(cid, %peer, error = %err, "client connection closed");
@@ -168,6 +171,8 @@ pub async fn handle_local_connection(
 ) -> Result<(), ClientRuntimeError> {
     let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let server_addr = ServerAddrResolver::new(&config.server_addr).await?;
+    let server_identity_public =
+        Arc::<[u8]>::from(server_identity_public.to_vec().into_boxed_slice());
     let context = ClientConnectionContext {
         config,
         server_addr,
@@ -185,7 +190,7 @@ struct ClientConnectionContext<'a> {
     traffic: TrafficConfig,
     psk: &'a [u8],
     server_public: &'a [u8; 32],
-    server_identity_public: &'a [u8],
+    server_identity_public: Arc<[u8]>,
 }
 
 async fn handle_local_connection_with_cid(
@@ -267,6 +272,8 @@ pub(crate) async fn establish_authenticated_data_session(
     server_identity_public: &[u8],
 ) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
     let server_addr = ServerAddrResolver::new(&config.server_addr).await?;
+    let server_identity_public =
+        Arc::<[u8]>::from(server_identity_public.to_vec().into_boxed_slice());
     establish_authenticated_data_session_with_resolver(
         &server_addr,
         config,
@@ -284,7 +291,7 @@ async fn establish_authenticated_data_session_with_resolver(
     traffic: TrafficConfig,
     psk: &[u8],
     server_public: &[u8; 32],
-    server_identity_public: &[u8],
+    server_identity_public: Arc<[u8]>,
 ) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
     let (mut server, mut data_session) =
         connect_and_establish_data_session(server_addr, config, traffic, psk, server_public)
@@ -439,10 +446,9 @@ async fn apply_server_key_exchange_record_blocking(
 async fn verify_server_identity_payload_blocking(
     data_session: &ClientDataSession,
     payload: Vec<u8>,
-    server_identity_public_key: &[u8],
+    server_identity_public_key: Arc<[u8]>,
     server_x25519_public_key: &[u8; 32],
 ) -> Result<(), ClientRuntimeError> {
-    let public_key = server_identity_public_key.to_vec();
     let transcript_hash = data_session.transcript_hash();
     let server_x25519_public_key = *server_x25519_public_key;
     let epoch = data_session.epoch();
@@ -450,7 +456,7 @@ async fn verify_server_identity_payload_blocking(
         let signature =
             ServerIdentityProof::signature(&payload).map_err(ClientHandshakeError::from)?;
         identity::verify_server_identity(
-            &public_key,
+            server_identity_public_key.as_ref(),
             signature,
             &transcript_hash,
             &server_x25519_public_key,
