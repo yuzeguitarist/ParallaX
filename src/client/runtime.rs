@@ -210,13 +210,17 @@ async fn handle_local_connection_with_cid(
     let request = socks::accept_connect(&mut local).await?;
     let chunk_size = max_plaintext_len(traffic.max_padding);
     let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
-    let initial_payload =
-        initial_payload::read_initial_payload(&mut local, initial_payload_cap).await?;
-    let mut server = server_addr.connect().await?;
-    tune_tcp_stream(&server)?;
-
-    let mut data_session =
-        establish_data_session(&mut server, config, traffic, psk, server_public).await?;
+    // Keep the zero-RTT-style initial payload capture, but hide its small wait
+    // behind the remote TCP/TLS setup instead of putting it on the critical path.
+    let initial_payload_fut = async {
+        initial_payload::read_initial_payload(&mut local, initial_payload_cap)
+            .await
+            .map_err(ClientRuntimeError::Io)
+    };
+    let server_session_fut =
+        connect_and_establish_data_session(&server_addr, config, traffic, psk, server_public);
+    let (initial_payload, (mut server, mut data_session)) =
+        tokio::try_join!(initial_payload_fut, server_session_fut)?;
     let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut OsRng)?;
     server.write_all(&pq_record).await?;
     apply_server_key_exchange_after_residuals(&mut server, &mut data_session, &pending_rekey, psk)
@@ -477,6 +481,20 @@ async fn establish_data_session(
         &completed.server_hello_record,
     )?;
     Ok(ClientDataSession::new(session_keys, traffic)?)
+}
+
+async fn connect_and_establish_data_session(
+    server_addr: &ServerAddrResolver,
+    config: &ClientConfig,
+    traffic: TrafficConfig,
+    psk: &[u8],
+    server_public: &[u8; 32],
+) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
+    let mut server = server_addr.connect().await?;
+    tune_tcp_stream(&server)?;
+    let data_session =
+        establish_data_session(&mut server, config, traffic, psk, server_public).await?;
+    Ok((server, data_session))
 }
 
 struct ClientRelay {
