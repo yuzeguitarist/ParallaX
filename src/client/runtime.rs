@@ -579,10 +579,8 @@ impl ClientRelay {
         );
         let download = client_download_loop(server_read, local_write, open_from_server, cid);
 
-        tokio::select! {
-            result = upload => result,
-            result = download => result,
-        }
+        let ((), ()) = tokio::try_join!(upload, download)?;
+        Ok(())
     }
 }
 
@@ -615,6 +613,7 @@ async fn client_upload_loop(
             read = local_read.read(&mut local_buf) => {
                 let n = read?;
                 if n == 0 {
+                    let _ = server_write.shutdown().await;
                     return Ok(());
                 }
                 let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
@@ -644,7 +643,10 @@ async fn client_download_loop(
     loop {
         match server_records.read_record_into(&mut server_record).await {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => return Ok(()),
+            Err(err) if is_clean_close(&err) => {
+                let _ = local_write.shutdown().await;
+                return Ok(());
+            }
             Err(err) => return Err(ClientRuntimeError::Io(err)),
         };
         log_record_read(cid, "server->client", "client-outer-reader", &server_record);
@@ -937,6 +939,50 @@ mod tests {
         wait_for_task("fallback", fallback_task).await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn socks_client_receives_response_after_local_write_half_close() {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_eof_response_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
+        let (local_addr, client_task) = spawn_local_client(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+        )
+        .await;
+
+        let mut app = connect_socks_target(local_addr, target_addr).await;
+        app.write_all(b"request-before-half-close").await.unwrap();
+        app.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), app.read_to_end(&mut response))
+            .await
+            .unwrap_or_else(|_| panic!("half-close response timed out"))
+            .unwrap();
+        assert_eq!(response, b"response-after-half-close");
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
     async fn spawn_camouflage_fallback() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -960,6 +1006,23 @@ mod tests {
                 }
                 stream.write_all(&buf[..n]).await.unwrap();
             }
+        });
+        (addr, task)
+    }
+
+    async fn spawn_eof_response_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"request-before-half-close");
+            stream
+                .write_all(b"response-after-half-close")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
         });
         (addr, task)
     }
