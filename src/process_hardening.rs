@@ -125,6 +125,12 @@ fn page_aligned_range(addr: usize, len: usize) -> Option<(usize, usize)> {
 
 #[cfg(target_os = "linux")]
 fn page_size() -> usize {
+    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE_SIZE.get_or_init(query_page_size)
+}
+
+#[cfg(target_os = "linux")]
+fn query_page_size() -> usize {
     // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and no memory
     // safety requirements.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };

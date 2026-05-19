@@ -136,6 +136,13 @@ pub fn derive_client_keys_from_shared(
     derive_keys_from_shared(*x25519_shared_secret, transcript_hash)
 }
 
+pub fn derive_server_keys_from_shared(
+    x25519_shared_secret: &[u8; KEY_LEN],
+    transcript_hash: &[u8; KEY_LEN],
+) -> Result<SessionKeys, SessionError> {
+    derive_keys_from_shared(*x25519_shared_secret, transcript_hash)
+}
+
 fn derive_keys(
     private: &[u8; KEY_LEN],
     peer_public: &[u8; KEY_LEN],
@@ -526,6 +533,20 @@ mod tests {
         let from_private =
             derive_client_keys(&client.private, &server.public, &transcript_hash).unwrap();
         let from_shared = derive_client_keys_from_shared(&shared, &transcript_hash).unwrap();
+
+        assert_eq!(from_private, from_shared);
+    }
+
+    #[test]
+    fn cached_x25519_shared_secret_derives_same_server_session_keys() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let transcript_hash = [7_u8; 32];
+        let shared = x25519_shared_secret(&server.private, &client.public);
+
+        let from_private =
+            derive_server_keys(&server.private, &client.public, &transcript_hash).unwrap();
+        let from_shared = derive_server_keys_from_shared(&shared, &transcript_hash).unwrap();
 
         assert_eq!(from_private, from_shared);
     }

@@ -372,6 +372,13 @@ pub fn derive_client_auth_key_from_shared(
     derive_auth_key_from_shared(psk, x25519_shared_secret)
 }
 
+pub fn derive_server_auth_key_from_shared(
+    psk: &[u8],
+    x25519_shared_secret: &[u8; 32],
+) -> Result<[u8; 32], AuthError> {
+    derive_auth_key_from_shared(psk, x25519_shared_secret)
+}
+
 pub fn derive_server_auth_key(
     psk: &[u8],
     server_private: &[u8; 32],

@@ -30,14 +30,14 @@ use crate::{
     },
     crypto::{
         auth::{
-            derive_server_auth_key, recover_stateful_auth_material_from_parsed,
+            derive_server_auth_key_from_shared, recover_stateful_auth_material_from_parsed,
             verify_client_hello_auth_with_parsed, AuthError, ClientAuth,
         },
         identity::{self, IdentityError},
         pq::{self, PqError},
         replay::{current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry},
         session::{
-            derive_server_keys, expand_epoch_keys, x25519_public_from_private,
+            derive_server_keys_from_shared, expand_epoch_keys, x25519_public_from_private,
             x25519_shared_secret, AeadCodec, SessionError, SessionKeys, X25519KeyPair,
         },
     },
@@ -162,6 +162,16 @@ pub struct AuthenticatedHandshake {
     pub server_public_key: [u8; 32],
 }
 
+struct AuthenticatedInbound {
+    hello: AuthenticatedHello,
+    x25519_shared_secret: [u8; 32],
+}
+
+enum ConnectionDecision {
+    Authenticated(AuthenticatedInbound),
+    Fallback(FallbackReason),
+}
+
 pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     if config.mode != Mode::Server {
         return Err(HandshakeServerError::WrongMode);
@@ -171,6 +181,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .server
         .clone()
         .ok_or(HandshakeServerError::MissingServer)?;
+    let server = Arc::new(server);
     let traffic = config.traffic;
     let psk = decode_psk(&config.crypto.psk)?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
@@ -219,7 +230,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
             }
         };
         let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-        let server = server.clone();
+        let server = Arc::clone(&server);
         let connection_traffic = traffic;
         let psk = Arc::clone(&psk);
         let replay_cache = Arc::clone(&replay_cache);
@@ -291,13 +302,18 @@ async fn handle_connection_inner(
         "accepted outer connection"
     );
     let server_private = secrets.private_key();
+    let server_public_key = secrets.server_public_key();
     let first_record = read_first_record(&mut client).await?;
-    match decide_inbound(&first_record, psk, &config.authorized_sni, server_private)? {
-        InboundDecision::Fallback(reason) => {
+    match decide_connection_inbound(&first_record, psk, &config.authorized_sni, server_private)? {
+        ConnectionDecision::Fallback(reason) => {
             tracing::info!(cid, ?reason, "falling back to camouflage origin");
             relay_fallback(client, &config.fallback_addr, first_record).await?;
         }
-        InboundDecision::Authenticated(client_hello) => {
+        ConnectionDecision::Authenticated(authenticated) => {
+            let AuthenticatedInbound {
+                hello: client_hello,
+                x25519_shared_secret,
+            } = authenticated;
             if let Some(replay_cache) = replay_cache {
                 let replay_entry = ReplayEntry {
                     timestamp: client_hello.timestamp,
@@ -310,9 +326,15 @@ async fn handle_connection_inner(
                     return Ok(());
                 }
             }
-            let handshake =
-                accept_authenticated(client, config, server_private, first_record, client_hello)
-                    .await?;
+            let handshake = accept_authenticated(
+                client,
+                config,
+                server_public_key,
+                x25519_shared_secret,
+                first_record,
+                client_hello,
+            )
+            .await?;
             tracing::info!(
                 cid,
                 sni = %handshake.client_hello.sni,
@@ -337,6 +359,7 @@ async fn handle_connection_inner(
 #[derive(Clone)]
 struct ServerRuntimeSecrets {
     private_key: Arc<zeroize::Zeroizing<[u8; 32]>>,
+    server_public_key: [u8; 32],
     identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
 }
 
@@ -344,6 +367,7 @@ impl ServerRuntimeSecrets {
     fn decode(config: &ServerConfig) -> Result<Self, ConfigError> {
         let private_key = decode_key32_secret("server.private_key", &config.private_key)?;
         crate::process_hardening::protect_secret_bytes("runtime.server.private_key", &*private_key);
+        let server_public_key = x25519_public_from_private(&private_key);
         let identity_secret_key =
             decode_base64_secret("server.identity_secret_key", &config.identity_secret_key)?;
         crate::process_hardening::protect_secret_bytes(
@@ -352,6 +376,7 @@ impl ServerRuntimeSecrets {
         );
         Ok(Self {
             private_key: Arc::new(private_key),
+            server_public_key,
             identity_secret_key: Arc::new(identity_secret_key),
         })
     }
@@ -360,8 +385,12 @@ impl ServerRuntimeSecrets {
         &self.private_key
     }
 
-    fn identity_secret_key(&self) -> &[u8] {
-        self.identity_secret_key.as_slice()
+    fn server_public_key(&self) -> [u8; 32] {
+        self.server_public_key
+    }
+
+    fn identity_secret_key(&self) -> Arc<zeroize::Zeroizing<Vec<u8>>> {
+        Arc::clone(&self.identity_secret_key)
     }
 }
 
@@ -375,15 +404,30 @@ pub fn decide_inbound(
     authorized_sni: &[String],
     server_private: &[u8; 32],
 ) -> Result<InboundDecision, HandshakeServerError> {
+    match decide_connection_inbound(first_client_record, psk, authorized_sni, server_private)? {
+        ConnectionDecision::Authenticated(authenticated) => {
+            Ok(InboundDecision::Authenticated(authenticated.hello))
+        }
+        ConnectionDecision::Fallback(reason) => Ok(InboundDecision::Fallback(reason)),
+    }
+}
+
+fn decide_connection_inbound(
+    first_client_record: &[u8],
+    psk: &[u8],
+    authorized_sni: &[String],
+    server_private: &[u8; 32],
+) -> Result<ConnectionDecision, HandshakeServerError> {
     let parsed = match parse_client_hello(first_client_record) {
         Ok(parsed) => parsed,
-        Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+        Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
     };
     if let Some(material) =
         recover_stateful_auth_material_from_parsed(first_client_record, psk, &parsed)?
     {
         let x25519_key_share = material.x25519_public;
-        let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
+        let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
+        let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
         let auth = match verify_client_hello_auth_with_parsed(
             first_client_record,
             &auth_key,
@@ -392,7 +436,7 @@ pub fn decide_inbound(
         ) {
             Ok(auth) => auth,
             Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
-            Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+            Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
         };
         if auth.authenticated {
             return authenticated_decision(
@@ -400,22 +444,30 @@ pub fn decide_inbound(
                 auth,
                 authorized_sni,
                 x25519_key_share,
+                x25519_shared_secret,
             );
         }
     }
 
     let x25519_key_share = parsed.client_random;
-    let auth_key = derive_server_auth_key(psk, server_private, &x25519_key_share)?;
+    let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
+    let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
     let auth =
         match verify_client_hello_auth_with_parsed(first_client_record, &auth_key, None, parsed) {
             Ok(auth) => auth,
             Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
-            Err(_) => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+            Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
         };
     if !auth.authenticated {
-        return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed));
+        return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
     }
-    authenticated_decision(first_client_record, auth, authorized_sni, x25519_key_share)
+    authenticated_decision(
+        first_client_record,
+        auth,
+        authorized_sni,
+        x25519_key_share,
+        x25519_shared_secret,
+    )
 }
 
 fn authenticated_decision(
@@ -423,40 +475,45 @@ fn authenticated_decision(
     auth: ClientAuth,
     authorized_sni: &[String],
     x25519_key_share: [u8; 32],
-) -> Result<InboundDecision, HandshakeServerError> {
+    x25519_shared_secret: [u8; 32],
+) -> Result<ConnectionDecision, HandshakeServerError> {
     let timestamp = match auth.timestamp {
         Some(timestamp) => timestamp,
-        None => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+        None => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
     };
     let nonce = match auth.nonce {
         Some(nonce) => nonce,
-        None => return Ok(InboundDecision::Fallback(FallbackReason::AuthFailed)),
+        None => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
     };
 
     let sni = match auth.sni {
         Some(sni) => sni,
-        None => return Ok(InboundDecision::Fallback(FallbackReason::MissingSni)),
+        None => return Ok(ConnectionDecision::Fallback(FallbackReason::MissingSni)),
     };
 
     if !is_authorized_sni(&sni, authorized_sni) {
-        return Ok(InboundDecision::Fallback(FallbackReason::UnauthorizedSni(
-            sni,
-        )));
+        return Ok(ConnectionDecision::Fallback(
+            FallbackReason::UnauthorizedSni(sni),
+        ));
     }
 
-    Ok(InboundDecision::Authenticated(AuthenticatedHello {
-        sni,
-        x25519_key_share,
-        timestamp,
-        nonce,
-        transcript_fingerprint: client_hello_fingerprint(first_client_record),
+    Ok(ConnectionDecision::Authenticated(AuthenticatedInbound {
+        hello: AuthenticatedHello {
+            sni,
+            x25519_key_share,
+            timestamp,
+            nonce,
+            transcript_fingerprint: client_hello_fingerprint(first_client_record),
+        },
+        x25519_shared_secret,
     }))
 }
 
 pub async fn accept_authenticated(
     mut client: TcpStream,
     config: &ServerConfig,
-    server_private: &[u8; 32],
+    server_public_key: [u8; 32],
+    x25519_shared_secret: [u8; 32],
     first_client_record: Vec<u8>,
     client_hello: AuthenticatedHello,
 ) -> Result<AuthenticatedHandshake, HandshakeServerError> {
@@ -471,8 +528,7 @@ pub async fn accept_authenticated(
     client.write_all(&forwarded.raw_record).await?;
 
     let context = transcript_hash(&first_client_record, &forwarded.raw_record);
-    let session_keys =
-        derive_server_keys(server_private, &client_hello.x25519_key_share, &context)?;
+    let session_keys = derive_server_keys_from_shared(&x25519_shared_secret, &context)?;
     session_keys.protect_secret_memory();
 
     Ok(AuthenticatedHandshake {
@@ -481,7 +537,7 @@ pub async fn accept_authenticated(
         client_hello,
         server_hello: forwarded.parsed,
         session_keys,
-        server_public_key: x25519_public_from_private(server_private),
+        server_public_key,
     })
 }
 
@@ -537,7 +593,7 @@ async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeS
 async fn run_authenticated_data_mode(
     handshake: AuthenticatedHandshake,
     fixed_data_target: Option<&str>,
-    identity_secret_key: &[u8],
+    identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
     sandwich_secret: &[u8],
     traffic: TrafficConfig,
     cid: u64,
@@ -824,12 +880,11 @@ async fn encapsulate_mlkem_blocking(
 }
 
 async fn sign_server_identity_blocking(
-    identity_secret_key: &[u8],
+    identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
     transcript_hash: [u8; 32],
     server_public_key: [u8; 32],
     epoch: u64,
 ) -> Result<Vec<u8>, HandshakeServerError> {
-    let identity_secret_key = zeroize::Zeroizing::new(identity_secret_key.to_vec());
     Ok(tokio::task::spawn_blocking(move || {
         identity::sign_server_identity(
             identity_secret_key.as_slice(),
@@ -1211,6 +1266,23 @@ mod tests {
                 assert_eq!(hello.x25519_key_share, client.public);
             }
             other => panic!("unexpected decision: {other:?}"),
+        }
+
+        let decision = decide_connection_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+        match decision {
+            ConnectionDecision::Authenticated(authenticated) => {
+                assert_eq!(
+                    authenticated.x25519_shared_secret,
+                    x25519_shared_secret(&server.private, &client.public)
+                );
+            }
+            ConnectionDecision::Fallback(reason) => panic!("unexpected fallback: {reason:?}"),
         }
     }
 
