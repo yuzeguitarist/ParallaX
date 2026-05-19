@@ -62,6 +62,9 @@ enum Command {
     Speed {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
+        /// Emit a machine-readable evidence report.
+        #[arg(long)]
+        json: bool,
     },
     /// Run the ParallaX protocol benchmark suite (CPU-only, fixed-parameter).
     ///
@@ -129,7 +132,7 @@ async fn handle_command(command: Command) -> anyhow::Result<()> {
         Command::CryptoSelfTest => crypto_self_test()?,
         Command::Serve { config } => run_server(config).await?,
         Command::Client { config } => run_client(config).await?,
-        Command::Speed { config } => run_speed(config).await?,
+        Command::Speed { config, json } => run_speed(config, json).await?,
         Command::Benchmark { quick, json } => run_benchmark(quick, json)?,
         Command::ConfigTemplate {
             server_listen,
@@ -204,13 +207,17 @@ async fn run_client(config: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_speed(config: PathBuf) -> anyhow::Result<()> {
+async fn run_speed(config: PathBuf, json: bool) -> anyhow::Result<()> {
     prepare_long_lived_process();
     let cfg = load_config(&config)?;
     cfg.protect_secret_memory();
     let _guard = RuntimeGuard::acquire_speed(&cfg)?;
     let report = speed::run(cfg).await?;
-    print!("{}", report.to_text());
+    if json {
+        print!("{}", report.to_json());
+    } else {
+        print!("{}", report.to_text());
+    }
     Ok(())
 }
 

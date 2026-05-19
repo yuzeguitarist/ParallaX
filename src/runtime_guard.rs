@@ -111,7 +111,7 @@ impl RuntimeInstance {
         Self {
             role,
             pid: process::id(),
-            config_id: client_config_id(client),
+            config_id: client_config_fingerprint(client),
             server_addr: client.server_addr.clone(),
         }
     }
@@ -395,7 +395,7 @@ fn unlock_file(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn client_config_id(client: &ClientConfig) -> String {
+pub(crate) fn client_config_fingerprint(client: &ClientConfig) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, "server_addr", &client.server_addr);
     hash_field(&mut hasher, "sni", &client.sni);

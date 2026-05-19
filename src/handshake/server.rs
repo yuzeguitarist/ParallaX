@@ -1087,8 +1087,10 @@ async fn run_authenticated_speed_test_mode(
 ) -> Result<(), HandshakeServerError> {
     tracing::info!(
         cid,
+        warmup_bytes = request.warmup_bytes,
         download_bytes = request.download_bytes,
         upload_bytes = request.upload_bytes,
+        sample_count = request.sample_count,
         "ParallaX speed test mode started"
     );
     if chunk_size == 0 {
@@ -1100,51 +1102,127 @@ async fn run_authenticated_speed_test_mode(
     let mut rng = StdRng::from_entropy();
     let mut scratch = RelaySealScratch::with_payload_capacity(chunk_size);
     let payload = vec![0xA5; chunk_size];
-    let mut remaining = request.download_bytes;
+    let mut io = SpeedServerIo {
+        client_records: &mut client_records,
+        client_write: &mut client_write,
+        client_open: &mut client_open,
+        server_seal: &mut server_seal,
+        rng: &mut rng,
+        scratch: &mut scratch,
+        cid,
+    };
+
+    write_speed_download_phase(
+        &mut io,
+        &payload,
+        request.warmup_bytes,
+        SpeedTestAck::warmup_download_done(request.warmup_bytes),
+    )
+    .await?;
+    read_speed_upload_phase(
+        &mut io,
+        request.warmup_bytes,
+        SpeedTestAck::warmup_upload_done(request.warmup_bytes),
+    )
+    .await?;
+
+    for _ in 0..request.sample_count {
+        write_speed_download_phase(
+            &mut io,
+            &payload,
+            request.download_bytes,
+            SpeedTestAck::download_done(request.download_bytes),
+        )
+        .await?;
+    }
+    for _ in 0..request.sample_count {
+        read_speed_upload_phase(
+            &mut io,
+            request.upload_bytes,
+            SpeedTestAck::upload_done(request.upload_bytes),
+        )
+        .await?;
+    }
+
+    tracing::info!(cid, "ParallaX speed test mode finished");
+    Ok(())
+}
+
+struct SpeedServerIo<'a, R: ?Sized> {
+    client_records: &'a mut TlsRecordReader<OwnedReadHalf>,
+    client_write: &'a mut OwnedWriteHalf,
+    client_open: &'a mut DataRecordCodec,
+    server_seal: &'a mut DataRecordCodec,
+    rng: &'a mut R,
+    scratch: &'a mut RelaySealScratch,
+    cid: u64,
+}
+
+async fn write_speed_download_phase<R>(
+    io: &mut SpeedServerIo<'_, R>,
+    payload: &[u8],
+    bytes: u64,
+    ack: SpeedTestAck,
+) -> Result<(), HandshakeServerError>
+where
+    R: Rng + rand::RngCore + ?Sized,
+{
+    let mut remaining = bytes;
     while remaining > 0 {
         let len = remaining.min(payload.len() as u64) as usize;
         write_server_data_records_chunked(
-            &mut client_write,
-            &mut server_seal,
+            io.client_write,
+            io.server_seal,
             &payload[..len],
-            &mut rng,
-            &mut scratch,
-            RelayWriteLog::new(cid, "server->client", "server-speed-download-writer"),
+            io.rng,
+            io.scratch,
+            RelayWriteLog::new(io.cid, "server->client", "server-speed-download-writer"),
         )
         .await?;
         remaining -= len as u64;
     }
-    let download_done = SpeedTestAck::download_done(request.download_bytes).encode();
+    let ack = ack.encode();
     write_server_data_records_chunked(
-        &mut client_write,
-        &mut server_seal,
-        &download_done,
-        &mut rng,
-        &mut scratch,
-        RelayWriteLog::new(cid, "server->client", "server-speed-download-done"),
+        io.client_write,
+        io.server_seal,
+        &ack,
+        io.rng,
+        io.scratch,
+        RelayWriteLog::new(io.cid, "server->client", "server-speed-download-done"),
     )
-    .await?;
+    .await
+}
 
+async fn read_speed_upload_phase<R>(
+    io: &mut SpeedServerIo<'_, R>,
+    bytes: u64,
+    ack: SpeedTestAck,
+) -> Result<(), HandshakeServerError>
+where
+    R: Rng + rand::RngCore + ?Sized,
+{
     let mut uploaded = 0_u64;
     let mut client_record = Vec::new();
-    while uploaded < request.upload_bytes {
-        match client_records.read_record_into(&mut client_record).await {
+    while uploaded < bytes {
+        match io.client_records.read_record_into(&mut client_record).await {
             Ok(()) => {}
             Err(err) if is_clean_close(&err) => return Ok(()),
             Err(err) => return Err(HandshakeServerError::Io(err)),
         };
         log_record_read(
-            cid,
+            io.cid,
             "client->server",
             "server-speed-upload-reader",
             &client_record,
         );
-        let plaintext = client_open.open_in_place_payload_range(&mut client_record)?;
+        let plaintext = io
+            .client_open
+            .open_in_place_payload_range(&mut client_record)?;
         let len = plaintext.len() as u64;
         if len == 0 {
             continue;
         }
-        if uploaded + len > request.upload_bytes {
+        if uploaded + len > bytes {
             return Err(HandshakeServerError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "speed upload sent more bytes than requested",
@@ -1153,18 +1231,16 @@ async fn run_authenticated_speed_test_mode(
         uploaded += len;
     }
 
-    let upload_done = SpeedTestAck::upload_done(uploaded).encode();
+    let ack = ack.encode();
     write_server_data_records_chunked(
-        &mut client_write,
-        &mut server_seal,
-        &upload_done,
-        &mut rng,
-        &mut scratch,
-        RelayWriteLog::new(cid, "server->client", "server-speed-upload-done"),
+        io.client_write,
+        io.server_seal,
+        &ack,
+        io.rng,
+        io.scratch,
+        RelayWriteLog::new(io.cid, "server->client", "server-speed-upload-done"),
     )
-    .await?;
-    tracing::info!(cid, uploaded, "ParallaX speed test mode finished");
-    Ok(())
+    .await
 }
 
 async fn server_upload_loop(
