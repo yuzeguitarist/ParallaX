@@ -250,7 +250,9 @@ async fn probe_with_timeout(
     }
     if tls.post_handshake_records == 0 {
         notes.push(
-            "No post-handshake records observed; acceptable but revisit ticket/session resumption in production.".to_owned(),
+            "No post-handshake records observed; acceptable but revisit ticket/session \
+             resumption in production."
+                .to_owned(),
         );
     }
 

@@ -59,7 +59,10 @@ pub enum ConfigError {
     #[error("server.authorized_sni must not be empty")]
     EmptyAuthorizedSni,
     #[cfg(unix)]
-    #[error("config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, current uid {euid}; expected owner=current user and no group/world permission bits")]
+    #[error(
+        "config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, \
+         current uid {euid}; expected owner=current user and no group/world permission bits"
+    )]
     InsecureConfigPermissions {
         path: PathBuf,
         mode: u32,
