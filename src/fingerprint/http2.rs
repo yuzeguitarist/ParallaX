@@ -12,6 +12,15 @@ pub struct Http2Fingerprint {
     pub initial_window_update: Option<u32>,
 }
 
+pub const SAFARI26_USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+     (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+pub const SAFARI26_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+
+const SAFARI26_ACCEPT: &str = "*/*";
+const SAFARI26_PRIORITY: &str = "u=3";
+const SAFARI26_ACCEPT_ENCODING: &str = "gzip, deflate, br";
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum Http2FingerprintError {
     #[error("HTTP/2 frame payload is too large")]
@@ -81,12 +90,37 @@ impl Http2Fingerprint {
     }
 
     pub fn headers_frame(&self, authority: &str) -> Result<Vec<u8>, Http2FingerprintError> {
-        let mut payload = Vec::with_capacity(5 + authority.len());
+        let mut payload = Vec::with_capacity(160 + authority.len());
         payload.push(0x82); // :method: GET
         payload.push(0x87); // :scheme: https
         payload.push(0x84); // :path: /
-        payload.push(0x41); // literal with indexed name: :authority
-        push_hpack_huffman_string(&mut payload, authority.as_bytes());
+        push_hpack_literal_with_indexed_name(&mut payload, 1, authority.as_bytes(), true);
+        push_hpack_literal_with_indexed_name(&mut payload, 19, SAFARI26_ACCEPT.as_bytes(), false);
+        push_hpack_literal_with_indexed_name(
+            &mut payload,
+            58,
+            SAFARI26_USER_AGENT.as_bytes(),
+            true,
+        );
+        push_hpack_literal_with_new_name(
+            &mut payload,
+            b"priority",
+            true,
+            SAFARI26_PRIORITY.as_bytes(),
+            false,
+        );
+        push_hpack_literal_with_indexed_name(
+            &mut payload,
+            17,
+            SAFARI26_ACCEPT_LANGUAGE.as_bytes(),
+            true,
+        );
+        push_hpack_literal_with_indexed_name(
+            &mut payload,
+            16,
+            SAFARI26_ACCEPT_ENCODING.as_bytes(),
+            true,
+        );
         frame(0x1, 0x5, 1, &payload)
     }
 }
@@ -148,6 +182,28 @@ fn frame(
     Ok(out)
 }
 
+fn push_hpack_literal_with_indexed_name(
+    out: &mut Vec<u8>,
+    static_name_index: usize,
+    value: &[u8],
+    huffman: bool,
+) {
+    push_hpack_integer(out, static_name_index, 6, 0x40);
+    push_hpack_string(out, value, huffman);
+}
+
+fn push_hpack_literal_with_new_name(
+    out: &mut Vec<u8>,
+    name: &[u8],
+    name_huffman: bool,
+    value: &[u8],
+    value_huffman: bool,
+) {
+    push_hpack_integer(out, 0, 6, 0x40);
+    push_hpack_string(out, name, name_huffman);
+    push_hpack_string(out, value, value_huffman);
+}
+
 fn push_hpack_integer(out: &mut Vec<u8>, value: usize, prefix_bits: u8, first_byte_mask: u8) {
     let max_prefix_value = (1_usize << prefix_bits) - 1;
     if value < max_prefix_value {
@@ -162,6 +218,16 @@ fn push_hpack_integer(out: &mut Vec<u8>, value: usize, prefix_bits: u8, first_by
         remaining >>= 7;
     }
     out.push(remaining as u8);
+}
+
+fn push_hpack_string(out: &mut Vec<u8>, value: &[u8], huffman: bool) {
+    if huffman {
+        push_hpack_huffman_string(out, value);
+        return;
+    }
+
+    push_hpack_integer(out, value.len(), 7, 0);
+    out.extend_from_slice(value);
 }
 
 /// HPACK Huffman-encode `value` and emit it as an HPACK string literal with the
@@ -306,6 +372,10 @@ mod tests {
         assert_eq!(header.flags, 0x5);
         assert_eq!(header.stream_id, 1);
         assert_eq!(&frame[9..13], &[0x82, 0x87, 0x84, 0x41]);
+        assert!(
+            header.len > 15,
+            "Safari HEADERS must include browser metadata"
+        );
     }
 
     #[test]
@@ -358,9 +428,36 @@ mod tests {
             "pseudo-header section must precede :authority literal",
         );
         assert_eq!(
-            &payload[4..],
+            &payload[4..15],
             &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
             "Safari26 :authority huffman bytes drifted from captured baseline",
+        );
+    }
+
+    #[test]
+    fn safari26_headers_include_browser_metadata_with_english_language() {
+        let fp = Http2Fingerprint::safari26();
+        let frame = fp.headers_frame("localhost:8443").unwrap();
+        let (header, total) = Http2FrameHeader::parse_complete(&frame).unwrap();
+        let payload = &frame[Http2FrameHeader::SIZE..total];
+
+        assert_eq!(header.len, 150);
+        assert_eq!(
+            payload,
+            hex(
+                b"828784418aa0e41d139d09b8f34d33\
+                  53032a2f2a\
+                  7ad8d07f66a281b0dae053fad0321aa49d13fda992a49685340c8a6adca7e28104416e277fb521aeba0bc8b1e63258700dae15c2da9fd66c7bf467fa5283752a988a4ea7fed4e25b1063d4c05d5c0a6e1ca3b0cc3806d70ae16f\
+                  4086aec31ec327d703753d33\
+                  518b2d4b70ddf45abefb4005df\
+                  508d9bd9abfa5242cb40d25fa523b3",
+            ),
+            "Safari26 HEADERS metadata should match the capture except for the configured English accept-language value",
+        );
+        assert!(SAFARI26_ACCEPT_LANGUAGE.starts_with("en-US"));
+        assert!(
+            !SAFARI26_ACCEPT_LANGUAGE.contains("zh"),
+            "Safari26 accept-language must stay English-only"
         );
     }
 

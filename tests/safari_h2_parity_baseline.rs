@@ -15,10 +15,10 @@
 //! * the connection-level WINDOW_UPDATE increment of 10_485_760 (10 MiB)
 //! * the opening HEADERS frame on stream 1 with
 //!   `flags = END_STREAM | END_HEADERS`, pseudo-header order
-//!   `:method, :scheme, :path, :authority`, and the `:authority` value
-//!   HPACK-Huffman-encoded per RFC 7541.
+//!   `:method, :scheme, :path, :authority`, browser metadata headers, and
+//!   HPACK-Huffman-encoded values where Safari uses Huffman.
 
-use parallax::fingerprint::http2::Http2Fingerprint;
+use parallax::fingerprint::http2::{Http2Fingerprint, SAFARI26_ACCEPT_LANGUAGE};
 
 const SAFARI_H2_FIXTURE: &[u8] = include_bytes!("fixtures/safari26_h2_preface_localhost.bin");
 
@@ -153,11 +153,9 @@ fn safari_h2_fixture_opening_headers_match_known_shape() {
     // Pseudo-header section: indexed `:method GET` (#2), `:scheme https` (#7),
     // `:path /` (#4), then literal-with-indexed-name `:authority` (#1) whose
     // value is HPACK-Huffman-encoded (high bit of the length prefix set).
-    // For `localhost:8443` Safari emits these 11 bytes immediately after the
-    // pseudo-header preamble; Safari additionally sends `accept`, `user-agent`,
-    // `accept-language` etc. afterwards, which we deliberately don't mimic
-    // (over-specific camouflage is more fingerprintable than under-specific),
-    // so this assertion locks just the prefix that ParallaX also emits.
+    // The remaining byte ranges lock Safari's request metadata shape:
+    // `accept`, `user-agent`, `priority`, `accept-language`, and
+    // `accept-encoding` in that order.
     assert_eq!(
         &headers.payload[..4],
         &[0x82, 0x87, 0x84, 0x41],
@@ -167,6 +165,22 @@ fn safari_h2_fixture_opening_headers_match_known_shape() {
         &headers.payload[4..15],
         &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
         "Safari 26.4 :authority huffman bytes for `localhost:8443` drifted"
+    );
+    assert_eq!(&headers.payload[15..20], &[0x53, 0x03, b'*', b'/', b'*']);
+    assert_eq!(
+        &headers.payload[110..122],
+        &[0x40, 0x86, 0xae, 0xc3, 0x1e, 0xc3, 0x27, 0xd7, 0x03, b'u', b'=', b'3'],
+        "Safari 26.4 priority header shape drifted"
+    );
+    assert_eq!(
+        &headers.payload[122..140],
+        &hex(b"5190f73ad7b4fd7b9d6c63a91f7da002efff"),
+        "Safari 26.4 captured accept-language bytes drifted"
+    );
+    assert_eq!(
+        &headers.payload[140..],
+        &hex(b"508d9bd9abfa5242cb40d25fa523b3"),
+        "Safari 26.4 accept-encoding bytes drifted"
     );
 }
 
@@ -210,7 +224,7 @@ fn parallax_safari_h2_preface_matches_fixture_byte_for_byte() {
 }
 
 #[test]
-fn parallax_safari_opening_headers_match_fixture_pseudo_header_section() {
+fn parallax_safari_opening_headers_match_fixture_metadata_except_language() {
     let fp = Http2Fingerprint::safari26();
     let parallax_headers_frame = fp
         .headers_frame(FIXTURE_AUTHORITY)
@@ -243,32 +257,47 @@ fn parallax_safari_opening_headers_match_fixture_pseudo_header_section() {
         FLAG_END_STREAM | FLAG_END_HEADERS,
         "ParallaX must set END_STREAM | END_HEADERS on its initial GET /"
     );
-    // ParallaX deliberately emits only the four pseudo-headers
-    // (`:method`, `:scheme`, `:path`, `:authority`); Safari additionally sends
-    // `accept`, `user-agent`, `accept-language`, etc., which we don't mimic
-    // because over-specific camouflage is more fingerprintable than
-    // under-specific. So we lock the ParallaX payload prefix against the
-    // matching prefix of Safari's HPACK block.
-    let prefix_len = parallax_headers.payload.len();
+    // The provided Safari capture carries a Chinese accept-language setting.
+    // ParallaX keeps the same HPACK/order shape but uses the project's
+    // English-only default so deployments do not carry a locale-specific
+    // Chinese marker by default.
+    let before_language = 122;
+    let parallax_accept_encoding = 135;
+    let safari_accept_encoding = 140;
     assert_eq!(
-        prefix_len, 15,
-        "ParallaX HPACK payload must be 4 pseudo-header bytes + 11 :authority bytes"
+        parallax_headers.payload.len(),
+        150,
+        "ParallaX HPACK payload must include Safari browser metadata with English language"
     );
     assert_eq!(
-        parallax_headers.payload.as_slice(),
-        &safari_headers.payload[..prefix_len],
-        "ParallaX Safari26 HPACK prefix diverged from Safari 26.4 byte-for-byte"
+        &parallax_headers.payload[..before_language],
+        &safari_headers.payload[..before_language],
+        "ParallaX Safari26 metadata before accept-language diverged from the capture"
     );
     assert_eq!(
-        &parallax_headers.payload[..4],
-        &[0x82, 0x87, 0x84, 0x41],
-        "ParallaX pseudo-header order must be :method, :scheme, :path, :authority"
+        &parallax_headers.payload[before_language..parallax_accept_encoding],
+        &hex(b"518b2d4b70ddf45abefb4005df"),
+        "ParallaX Safari26 accept-language must be HPACK-Huffman encoded English"
     );
-    // `8a` = 0x80 (Huffman flag) | 0x0a (encoded length = 10 bytes) for
-    // `localhost:8443`; the 10 trailing bytes are the RFC 7541 Huffman code.
     assert_eq!(
-        &parallax_headers.payload[4..],
-        &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
-        "ParallaX Safari26 :authority must be HPACK-Huffman-encoded to match Safari 26.4"
+        &parallax_headers.payload[parallax_accept_encoding..],
+        &safari_headers.payload[safari_accept_encoding..],
+        "ParallaX Safari26 accept-encoding diverged from the capture"
     );
+    assert_eq!(SAFARI26_ACCEPT_LANGUAGE, "en-US,en;q=0.9");
+    assert!(!SAFARI26_ACCEPT_LANGUAGE.contains("zh"));
+}
+
+fn hex(s: &[u8]) -> Vec<u8> {
+    fn nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => panic!("non-hex byte"),
+        }
+    }
+    s.chunks(2)
+        .map(|c| (nibble(c[0]) << 4) | nibble(c[1]))
+        .collect()
 }
