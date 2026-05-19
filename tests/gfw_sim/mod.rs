@@ -33,5 +33,6 @@
 
 pub mod data;
 pub mod detection;
+pub mod fixtures;
 pub mod injection;
 pub mod runtime;

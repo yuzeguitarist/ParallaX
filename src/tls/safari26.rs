@@ -1,15 +1,12 @@
-//! Stateful rustls camouflage backend.
+//! Safari 26 rustls camouflage backend.
 //!
-//! V2 keeps rustls in charge of the TLS 1.3 state machine, uses an isolated
-//! per-handshake resumption cache so cached PSK binders cannot invalidate
-//! ParallaX authentication, and injects only two narrow hooks: the ParallaX
-//! X25519 public key in ClientHello.random and an authenticated legacy
-//! SessionID. The hand-written ClientHello builder remains available for tests,
-//! probes, and emergency fallback paths.
+//! This is the TCP/TLS data-mode entry point. rustls owns the TLS 1.3 state
+//! machine, while ParallaX injects only the authenticated ClientHello.random
+//! and compatibility SessionID material required by the server.
 
 use std::{
     cell::RefCell,
-    io::{Cursor, Read, Write},
+    io::{self, Cursor, Read, Write},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -30,6 +27,7 @@ use rustls::{
     CipherSuite, CipherSuiteCommon, ConnectionTrafficSecrets, DigitallySignedStruct,
     Error as RustlsError, NamedGroup, SignatureScheme, SupportedCipherSuite, Tls13CipherSuite,
 };
+use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -37,19 +35,17 @@ use tokio::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{
-    backend::TlsBackendError, client_hello_builder::BrowserProfile, record::read_record,
-    server_hello::parse_server_hello,
-};
+use super::{record::read_record, server_hello::parse_server_hello};
 use crate::crypto::{
     auth::{
         build_auth_tail, build_masked_stateful_auth_session_id,
         build_masked_stateful_client_random, derive_client_auth_key,
-        recover_stateful_auth_material, verify_client_hello_auth_with_material,
+        recover_stateful_auth_material, verify_client_hello_auth_with_material, AuthError,
     },
     session::X25519KeyPair,
 };
-use crate::fingerprint::http2::{Http2Fingerprint, Http2FrameHeader, Http2PeerProfile};
+use crate::fingerprint::http2::{Http2Fingerprint, Http2FingerprintError, Http2FrameHeader};
+use crate::tls::server_hello::ServerHelloError;
 
 const POST_HANDSHAKE_DRAIN_LIMIT: usize = 4;
 const POST_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(180);
@@ -63,6 +59,28 @@ const BROWSER_GREASE_VALUES: [u16; 16] = [
     0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
     0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
+
+#[derive(Debug, Error)]
+pub enum Safari26TlsError {
+    #[error("ClientHello authentication failed: {0}")]
+    Auth(#[from] AuthError),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("rustls state machine error: {0}")]
+    Rustls(#[from] rustls::Error),
+    #[error("rustls config error: {0}")]
+    RustlsConfig(String),
+    #[error("HTTP/2 fingerprint build failed: {0}")]
+    Http2Fingerprint(#[from] Http2FingerprintError),
+    #[error("invalid SNI for rustls ServerName: {0}")]
+    InvalidServerName(String),
+    #[error("ServerHello parse failed: {0}")]
+    ServerHello(#[from] ServerHelloError),
+    #[error("Safari 26 TLS camouflage did not observe a TLS 1.3 ServerHello")]
+    MissingServerHello,
+    #[error("Safari 26 TLS camouflage generated an unauthenticated ClientHello")]
+    UnauthenticatedClientHello,
+}
 
 thread_local! {
     static PATCH_CONTEXT: RefCell<Option<PatchContext>> = const { RefCell::new(None) };
@@ -134,72 +152,24 @@ impl RecordEventTap for VecRecordTap {
     }
 }
 
-pub trait PostHandshakeDrain {
-    fn drain_record_limit(&self) -> usize;
-    fn drain_timeout(&self) -> Duration;
-}
-
-#[derive(Debug, Clone)]
-pub struct ProfileConfig {
-    pub http2_profile: Http2PeerProfile,
-    pub alpn_protocols: Vec<Vec<u8>>,
-    pub max_fragment_size: Option<usize>,
-    pub post_handshake_records: usize,
-    pub post_handshake_timeout: Duration,
-}
-
-impl ProfileConfig {
-    pub fn for_browser(browser: BrowserProfile) -> Self {
-        let http2_profile = match browser {
-            BrowserProfile::Safari26 => Http2PeerProfile::Safari26,
-            BrowserProfile::Chrome124 => {
-                // The stateful rustls Chrome124 fingerprint path was only a
-                // partial parity experiment and is intentionally retired. Keep
-                // accepting old configs, but route them through the maintained
-                // Safari26 path.
-                Http2PeerProfile::Safari26
-            }
-        };
-        Self {
-            http2_profile,
-            alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-            max_fragment_size: None,
-            post_handshake_records: POST_HANDSHAKE_DRAIN_LIMIT,
-            post_handshake_timeout: POST_HANDSHAKE_DRAIN_TIMEOUT,
-        }
-    }
-}
-
-impl PostHandshakeDrain for ProfileConfig {
-    fn drain_record_limit(&self) -> usize {
-        self.post_handshake_records
-    }
-
-    fn drain_timeout(&self) -> Duration {
-        self.post_handshake_timeout
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy)]
-pub struct StatefulRustlsCamouflageBackend;
+pub struct Safari26TlsCamouflage;
 
-impl StatefulRustlsCamouflageBackend {
+impl Safari26TlsCamouflage {
     pub fn start(
         &self,
         sni: String,
         psk: &[u8],
         server_public_key: &[u8; 32],
-        browser: BrowserProfile,
-    ) -> Result<StatefulRustlsSession, TlsBackendError> {
+    ) -> Result<Safari26TlsSession, Safari26TlsError> {
         let x25519 = X25519KeyPair::generate();
         let auth_key = derive_client_auth_key(psk, &x25519.private, server_public_key)?;
-        let profile = ProfileConfig::for_browser(browser);
         let context = PatchContext::new(sni.clone(), psk, auth_key, x25519.clone());
 
         let (connection, client_hello) = with_patch_context(context, || {
-            let config = build_client_config(&profile)?;
+            let config = build_client_config()?;
             let server_name = ServerName::try_from(sni.clone())
-                .map_err(|_| TlsBackendError::InvalidServerName(sni.clone()))?;
+                .map_err(|_| Safari26TlsError::InvalidServerName(sni.clone()))?;
             let mut connection = rustls::ClientConnection::new(Arc::new(config), server_name)?;
             let mut client_hello = Vec::new();
             connection.write_tls(&mut client_hello)?;
@@ -209,32 +179,30 @@ impl StatefulRustlsCamouflageBackend {
         let material = recover_stateful_auth_material(&client_hello, psk)?;
         let auth = verify_client_hello_auth_with_material(&client_hello, &auth_key, material)?;
         if !auth.authenticated || auth.x25519_key_share != Some(x25519.public) {
-            return Err(TlsBackendError::UnauthenticatedClientHello);
+            return Err(Safari26TlsError::UnauthenticatedClientHello);
         }
 
-        Ok(StatefulRustlsSession {
+        Ok(Safari26TlsSession {
             connection,
             client_hello,
             x25519,
             sni,
-            profile,
             tap: VecRecordTap::default(),
         })
     }
 }
 
-pub struct StatefulRustlsSession {
+pub struct Safari26TlsSession {
     connection: rustls::ClientConnection,
     client_hello: Vec<u8>,
     x25519: X25519KeyPair,
     sni: String,
-    profile: ProfileConfig,
     tap: VecRecordTap,
 }
 
-impl StatefulRustlsSession {
+impl Safari26TlsSession {
     /// Borrow the raw ClientHello TLS record that was emitted during
-    /// [`StatefulRustlsCamouflageBackend::start`]. Useful for fingerprint
+    /// [`Safari26TlsCamouflage::start`]. Useful for fingerprint
     /// regression tests that need to inspect the on-the-wire bytes without
     /// driving a full handshake against a real peer.
     pub fn client_hello_bytes(&self) -> &[u8] {
@@ -244,7 +212,7 @@ impl StatefulRustlsSession {
     pub async fn complete(
         mut self,
         stream: &mut TcpStream,
-    ) -> Result<CompletedStatefulHandshake, TlsBackendError> {
+    ) -> Result<CompletedSafari26Handshake, Safari26TlsError> {
         let client_hello = self.client_hello.clone();
         self.tap_records(RecordDirection::Outbound, &client_hello);
         stream.write_all(&self.client_hello).await?;
@@ -263,11 +231,12 @@ impl StatefulRustlsSession {
             self.flush_outbound(stream).await?;
         }
 
-        let server_hello_record = server_hello_record.ok_or(TlsBackendError::MissingServerHello)?;
+        let server_hello_record =
+            server_hello_record.ok_or(Safari26TlsError::MissingServerHello)?;
         self.drain_post_handshake(stream).await?;
         self.open_http2_connection(stream).await?;
 
-        Ok(CompletedStatefulHandshake {
+        Ok(CompletedSafari26Handshake {
             client_hello: self.client_hello,
             client_x25519: self.x25519,
             server_hello_record,
@@ -275,7 +244,7 @@ impl StatefulRustlsSession {
         })
     }
 
-    fn feed_inbound_record(&mut self, record: &[u8]) -> Result<(), TlsBackendError> {
+    fn feed_inbound_record(&mut self, record: &[u8]) -> Result<(), Safari26TlsError> {
         self.feed_inbound_record_collect_plaintext(record)
             .map(|_| ())
     }
@@ -283,7 +252,7 @@ impl StatefulRustlsSession {
     fn feed_inbound_record_collect_plaintext(
         &mut self,
         record: &[u8],
-    ) -> Result<Vec<u8>, TlsBackendError> {
+    ) -> Result<Vec<u8>, Safari26TlsError> {
         self.tap_records(RecordDirection::Inbound, record);
         let mut cursor = Cursor::new(record);
         self.connection.read_tls(&mut cursor)?;
@@ -298,7 +267,7 @@ impl StatefulRustlsSession {
         Ok(plaintext)
     }
 
-    async fn flush_outbound(&mut self, stream: &mut TcpStream) -> Result<(), TlsBackendError> {
+    async fn flush_outbound(&mut self, stream: &mut TcpStream) -> Result<(), Safari26TlsError> {
         while self.connection.wants_write() {
             let mut out = Vec::new();
             let written = self.connection.write_tls(&mut out)?;
@@ -314,9 +283,9 @@ impl StatefulRustlsSession {
     async fn drain_post_handshake(
         &mut self,
         stream: &mut TcpStream,
-    ) -> Result<(), TlsBackendError> {
-        for _ in 0..self.profile.drain_record_limit() {
-            let record = match timeout(self.profile.drain_timeout(), read_record(stream)).await {
+    ) -> Result<(), Safari26TlsError> {
+        for _ in 0..POST_HANDSHAKE_DRAIN_LIMIT {
+            let record = match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, read_record(stream)).await {
                 Ok(Ok(record)) => record,
                 Ok(Err(err)) if is_clean_close(&err) => return Ok(()),
                 Ok(Err(err)) => return Err(err.into()),
@@ -331,12 +300,12 @@ impl StatefulRustlsSession {
     async fn open_http2_connection(
         &mut self,
         stream: &mut TcpStream,
-    ) -> Result<(), TlsBackendError> {
+    ) -> Result<(), Safari26TlsError> {
         if !self.negotiated_h2() {
             return Ok(());
         }
 
-        let fingerprint = Http2Fingerprint::for_profile(self.profile.http2_profile);
+        let fingerprint = Http2Fingerprint::safari26();
         let preface = fingerprint.connection_preface()?;
         self.write_application_data(stream, &preface).await?;
         self.await_http2_settings_ack(stream).await?;
@@ -355,7 +324,7 @@ impl StatefulRustlsSession {
         &mut self,
         stream: &mut TcpStream,
         plaintext: &[u8],
-    ) -> Result<(), TlsBackendError> {
+    ) -> Result<(), Safari26TlsError> {
         self.connection.writer().write_all(plaintext)?;
         self.flush_outbound(stream).await
     }
@@ -363,7 +332,7 @@ impl StatefulRustlsSession {
     async fn await_http2_settings_ack(
         &mut self,
         stream: &mut TcpStream,
-    ) -> Result<(), TlsBackendError> {
+    ) -> Result<(), Safari26TlsError> {
         let mut plaintext = Vec::new();
         for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
             let record = match timeout(H2_SETTINGS_ACK_TIMEOUT, read_record(stream)).await {
@@ -388,7 +357,7 @@ impl StatefulRustlsSession {
         &mut self,
         plaintext: &mut Vec<u8>,
         stream: &mut TcpStream,
-    ) -> Result<bool, TlsBackendError> {
+    ) -> Result<bool, Safari26TlsError> {
         let mut offset = 0;
         let mut saw_settings_ack = false;
         let mut should_ack_peer_settings = false;
@@ -433,7 +402,7 @@ impl StatefulRustlsSession {
 }
 
 #[derive(Debug)]
-pub struct CompletedStatefulHandshake {
+pub struct CompletedSafari26Handshake {
     pub client_hello: Vec<u8>,
     pub client_x25519: X25519KeyPair,
     pub server_hello_record: Vec<u8>,
@@ -442,8 +411,8 @@ pub struct CompletedStatefulHandshake {
 
 fn with_patch_context<T>(
     context: PatchContext,
-    f: impl FnOnce() -> Result<T, TlsBackendError>,
-) -> Result<T, TlsBackendError> {
+    f: impl FnOnce() -> Result<T, Safari26TlsError>,
+) -> Result<T, Safari26TlsError> {
     PATCH_CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(context);
     });
@@ -454,7 +423,7 @@ fn with_patch_context<T>(
     result
 }
 
-fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, TlsBackendError> {
+fn build_client_config() -> Result<rustls::ClientConfig, Safari26TlsError> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     let (cipher_grease, group_grease) = browser_grease_indices_from_context();
     shape_safari_cipher_suites(&mut provider, cipher_grease);
@@ -463,17 +432,17 @@ fn build_client_config(profile: &ProfileConfig) -> Result<rustls::ClientConfig, 
 
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
-        .map_err(|err| TlsBackendError::RustlsConfig(err.to_string()))?
+        .map_err(|err| Safari26TlsError::RustlsConfig(err.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(CamouflageVerifier))
         .with_no_client_auth();
-    config.alpn_protocols = profile.alpn_protocols.clone();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     // A fresh, non-shared cache lets rustls emit an empty TLS 1.2
     // session_ticket request extension while preventing cached PSK binders from
     // ever appearing in ParallaX's authenticated ClientHello.
     config.resumption = Resumption::in_memory_sessions(1);
     config.enable_early_data = false;
-    config.max_fragment_size = profile.max_fragment_size;
+    config.max_fragment_size = None;
     Ok(config)
 }
 
@@ -856,27 +825,11 @@ mod tests {
     use crate::tls::client_hello::parse_client_hello;
 
     #[test]
-    fn chrome_profile_is_retired_to_safari_stateful_path() {
-        let profile = ProfileConfig::for_browser(BrowserProfile::Chrome124);
-
-        assert_eq!(profile.http2_profile, Http2PeerProfile::Safari26);
-        assert_eq!(
-            profile.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
-    }
-
-    #[test]
-    fn stateful_backend_emits_authenticated_client_hello() {
+    fn safari26_camouflage_emits_authenticated_client_hello() {
         let server = X25519KeyPair::generate();
         let psk = b"0123456789abcdef0123456789abcdef";
-        let session = StatefulRustlsCamouflageBackend
-            .start(
-                "example.com".to_owned(),
-                psk,
-                &server.public,
-                BrowserProfile::Safari26,
-            )
+        let session = Safari26TlsCamouflage
+            .start("example.com".to_owned(), psk, &server.public)
             .unwrap();
 
         let parsed = parse_client_hello(&session.client_hello).unwrap();
@@ -903,22 +856,9 @@ mod tests {
     fn safari_client_hello_carries_x25519_mlkem768_key_share() {
         let server = X25519KeyPair::generate();
         let psk = b"0123456789abcdef0123456789abcdef";
-        let session = StatefulRustlsCamouflageBackend
-            .start(
-                "example.com".to_owned(),
-                psk,
-                &server.public,
-                BrowserProfile::Safari26,
-            )
+        let session = Safari26TlsCamouflage
+            .start("example.com".to_owned(), psk, &server.public)
             .unwrap();
-
-        eprintln!("len={}", session.client_hello.len());
-        for chunk in session.client_hello.chunks(32) {
-            for b in chunk {
-                eprint!("{b:02x}");
-            }
-            eprintln!();
-        }
 
         let parsed = parse_client_hello(&session.client_hello).unwrap();
         let material = recover_stateful_auth_material(&session.client_hello, psk)

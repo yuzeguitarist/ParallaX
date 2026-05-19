@@ -367,28 +367,16 @@ pub fn ja4_quic(parsed: &ParsedClientHello) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use parallax::{
-        crypto::session::X25519KeyPair,
-        tls::client_hello_builder::{BrowserProfile, ClientHelloTemplate},
-    };
-    use rand::{rngs::StdRng, SeedableRng};
-
     use super::*;
+    use crate::gfw_sim::fixtures::synthetic_tls13_client_hello;
 
-    fn parallax_record(profile: BrowserProfile) -> Vec<u8> {
-        let kp = X25519KeyPair::generate();
-        let template = ClientHelloTemplate {
-            sni: "cloudflare.com".to_owned(),
-            x25519_public_key: kp.public,
-            profile,
-        };
-        let mut rng = StdRng::seed_from_u64(7);
-        template.build_unsigned(&mut rng).unwrap()
+    fn test_client_hello() -> Vec<u8> {
+        synthetic_tls13_client_hello("cloudflare.com", 7)
     }
 
     #[test]
     fn ja3_format_has_five_comma_separated_fields() {
-        let bytes = parallax_record(BrowserProfile::Chrome124);
+        let bytes = test_client_hello();
         let parsed = parse_client_hello(&bytes).unwrap();
         let fp = fingerprint(&parsed);
         assert_eq!(fp.ja3_raw.split(',').count(), 5);
@@ -399,7 +387,7 @@ mod tests {
 
     #[test]
     fn ja4_starts_with_t13() {
-        let bytes = parallax_record(BrowserProfile::Chrome124);
+        let bytes = test_client_hello();
         let parsed = parse_client_hello(&bytes).unwrap();
         let fp = fingerprint(&parsed);
         assert!(fp.ja4.starts_with("t13"), "ja4 = {}", fp.ja4);
@@ -414,7 +402,7 @@ mod tests {
     fn parallax_record_classifies_as_known_proxy() {
         // ParallaX's stock JA4 is registered in tls_fingerprints::KNOWN_PROXY_FINGERPRINTS.
         // The actual JA4 derived from the cipher_suites + extensions matches that entry.
-        let bytes = parallax_record(BrowserProfile::Chrome124);
+        let bytes = test_client_hello();
         let parsed = parse_client_hello(&bytes).unwrap();
         let fp = fingerprint(&parsed);
         let index = FingerprintIndex::new();
@@ -435,7 +423,7 @@ mod tests {
 
     #[test]
     fn quic_variant_swaps_protocol_prefix() {
-        let bytes = parallax_record(BrowserProfile::Chrome124);
+        let bytes = test_client_hello();
         let parsed = parse_client_hello(&bytes).unwrap();
         let (ja4_q, _) = ja4_quic(&parsed);
         assert!(ja4_q.starts_with("q13"), "got {ja4_q}");

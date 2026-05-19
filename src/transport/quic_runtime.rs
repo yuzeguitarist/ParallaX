@@ -1311,7 +1311,6 @@ mod tests {
             server_public_key: STANDARD.encode(server_x25519.public),
             server_pq_public_key: String::new(),
             server_identity_public_key: STANDARD.encode(&server_identity.public),
-            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari26,
         };
 
         let server = QuicServerRuntime::decode(server).unwrap();
@@ -1345,7 +1344,6 @@ mod tests {
             server_public_key: STANDARD.encode(server_x25519.public),
             server_pq_public_key: String::new(),
             server_identity_public_key: STANDARD.encode(&wrong_identity.public),
-            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari26,
         };
 
         let server = QuicServerRuntime::decode(server).unwrap();
@@ -1496,7 +1494,6 @@ mod tests {
                 server_public_key: STANDARD.encode(server_public_key),
                 server_pq_public_key: String::new(),
                 server_identity_public_key: STANDARD.encode(&server_identity.public),
-                tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari26,
             })
             .unwrap(),
         )

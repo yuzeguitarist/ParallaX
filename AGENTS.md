@@ -63,3 +63,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## 5. Respect Scoped Stop Instructions
+
+When the user says not to keep doing something, not to continue optimizing, or not to keep changing an area, apply that stop instruction only to the specific area or activity the user named. Do not broaden it into a global stop for the whole task. For example, "don't keep editing docs" means stop touching docs, while continuing the requested code work. Do not revert existing changes unless the user explicitly asks for a rollback. If the scope is unclear, ask or choose the narrowest reasonable scope instead of stopping unrelated work.

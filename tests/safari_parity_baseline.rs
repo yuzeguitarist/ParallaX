@@ -4,16 +4,13 @@
 //! The fixtures under `tests/fixtures/safari26_*.bin` are raw TLS records
 //! taken from `tcpdump -i en0 'tcp port 443'` while Safari 26.4 fetched the
 //! corresponding hostname. They are the ground truth that the Safari26
-//! profile is calibrated against in `src/tls/stateful.rs`.
+//! profile is calibrated against in `src/tls/safari26.rs`.
 //!
-//! These tests drive the stateful rustls backend directly so the ParallaX
+//! These tests drive the Safari 26 rustls backend directly so the ParallaX
 //! ClientHello bytes are the exact ones produced by the maintained TLS
 //! camouflage path, not a synthetic snapshot.
 
-use parallax::{
-    crypto::session::X25519KeyPair,
-    tls::{client_hello_builder::BrowserProfile, stateful::StatefulRustlsCamouflageBackend},
-};
+use parallax::{crypto::session::X25519KeyPair, tls::safari26::Safari26TlsCamouflage};
 
 const TLS12: u16 = 0x0303;
 const TLS13: u16 = 0x0304;
@@ -63,7 +60,7 @@ const SAFARI_SUPPORTED_GROUPS: &[u16] = &[
 /// Safari 26.4 signature_algorithms in apple.com wire order, including the
 /// duplicated `rsa_pss_rsae_sha384` (0x0805) entry Apple emits twice. rustls
 /// 0.23 stores `signature_schemes` as a plain `Vec<SignatureScheme>` and does
-/// NOT dedupe, so the Safari26 profile in `src/tls/stateful.rs` can — and
+/// NOT dedupe, so the Safari26 profile in `src/tls/safari26.rs` can — and
 /// does — emit the duplicate to land exact JA4 sig-algs parity.
 const SAFARI_SIGNATURE_ALGORITHMS_REAL: &[u16] = &[
     0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201,
@@ -366,20 +363,15 @@ fn assert_parallax_matches_safari(safari: &ClientHelloFields, parallax: &ClientH
 
 /// Drive rustls just far enough to materialise the ClientHello bytes. We
 /// deliberately do not run a full handshake here because
-/// `StatefulRustlsSession::complete` also writes the HTTP/2 connection
+/// `Safari26TlsSession::complete` also writes the HTTP/2 connection
 /// preface, which requires a real h2 peer. For fingerprint regression we only
 /// need the wire-level ClientHello.
 fn generate_parallax_safari_client_hello() -> Vec<u8> {
     let server = X25519KeyPair::generate();
     let psk = b"0123456789abcdef0123456789abcdef";
-    let session = StatefulRustlsCamouflageBackend
-        .start(
-            "apple.com".to_owned(),
-            psk,
-            &server.public,
-            BrowserProfile::Safari26,
-        )
-        .expect("start stateful ParallaX TLS camouflage");
+    let session = Safari26TlsCamouflage
+        .start("apple.com".to_owned(), psk, &server.public)
+        .expect("start Safari 26 ParallaX TLS camouflage");
     session.client_hello_bytes().to_vec()
 }
 

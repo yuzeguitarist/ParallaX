@@ -529,23 +529,11 @@ impl SniFilter {
 
 #[cfg(test)]
 mod tests {
-    use parallax::{
-        crypto::session::X25519KeyPair,
-        tls::client_hello_builder::{BrowserProfile, ClientHelloTemplate},
-    };
-    use rand::{rngs::StdRng, SeedableRng};
-
     use super::*;
+    use crate::gfw_sim::fixtures::synthetic_tls13_client_hello;
 
     fn parallax_client_hello(sni: &str) -> Vec<u8> {
-        let kp = X25519KeyPair::generate();
-        let template = ClientHelloTemplate {
-            sni: sni.to_owned(),
-            x25519_public_key: kp.public,
-            profile: BrowserProfile::Chrome124,
-        };
-        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-        template.build_unsigned(&mut rng).unwrap()
+        synthetic_tls13_client_hello(sni, 0xC0FFEE)
     }
 
     #[test]

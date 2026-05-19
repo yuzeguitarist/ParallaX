@@ -713,13 +713,8 @@ pub(crate) fn build_test_initial_packet(
 
 #[cfg(test)]
 mod tests {
-    use parallax::{
-        crypto::session::X25519KeyPair,
-        tls::client_hello_builder::{BrowserProfile, ClientHelloTemplate},
-    };
-    use rand::{rngs::StdRng, SeedableRng};
-
     use super::*;
+    use crate::gfw_sim::fixtures::synthetic_tls13_client_hello;
 
     #[test]
     fn varint_round_trip_within_each_class() {
@@ -752,14 +747,7 @@ mod tests {
     }
 
     fn build_parallax_initial_packet(sni: &str) -> (Vec<u8>, Vec<u8>) {
-        let kp = X25519KeyPair::generate();
-        let template = ClientHelloTemplate {
-            sni: sni.to_owned(),
-            x25519_public_key: kp.public,
-            profile: BrowserProfile::Chrome124,
-        };
-        let mut rng = StdRng::seed_from_u64(13);
-        let record = template.build_unsigned(&mut rng).unwrap();
+        let record = synthetic_tls13_client_hello(sni, 13);
         // Strip the 5-byte TLS record header to get the handshake message.
         let handshake = record[5..].to_vec();
         let dcid = b"01234567";

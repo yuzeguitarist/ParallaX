@@ -38,9 +38,8 @@ use crate::{
         max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
     },
     tls::{
-        backend::TlsBackendError,
         record::{log_record_read, read_record, TlsRecordError, TlsRecordReader},
-        stateful::StatefulRustlsCamouflageBackend,
+        safari26::{Safari26TlsCamouflage, Safari26TlsError},
     },
     traffic::CoverTrafficProfile,
     transport::tcp::{
@@ -65,8 +64,8 @@ pub enum ClientRuntimeError {
     Io(#[from] io::Error),
     #[error("SOCKS error: {0}")]
     Socks(#[from] SocksError),
-    #[error("TLS camouflage backend error: {0}")]
-    TlsBackend(#[from] TlsBackendError),
+    #[error("Safari 26 TLS camouflage error: {0}")]
+    Safari26Tls(#[from] Safari26TlsError),
     #[error("ClientHello auth error: {0}")]
     Auth(#[from] AuthError),
     #[error("client handshake error: {0}")]
@@ -467,8 +466,8 @@ async fn establish_data_session(
     psk: &[u8],
     server_public: &[u8; 32],
 ) -> Result<ClientDataSession, ClientRuntimeError> {
-    let completed = StatefulRustlsCamouflageBackend
-        .start(config.sni.clone(), psk, server_public, config.tls_profile)?
+    let completed = Safari26TlsCamouflage
+        .start(config.sni.clone(), psk, server_public)?
         .complete(server)
         .await?;
     let session_keys = client::derive_session_keys(
@@ -862,7 +861,6 @@ mod tests {
             server_public_key: STANDARD.encode(server_keys.public),
             server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
-            tls_profile: crate::tls::client_hello_builder::BrowserProfile::Safari26,
         };
         let client_task = tokio::spawn(async move {
             let (stream, _) = local_listener.accept().await.unwrap();

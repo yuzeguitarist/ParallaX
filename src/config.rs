@@ -11,8 +11,6 @@ use serde::Deserialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::tls::client_hello_builder::BrowserProfile;
-
 pub(crate) const DEFAULT_REPLAY_CACHE_PATH: &str = "/var/lib/parallax/parallax-replay.cache";
 
 #[derive(Debug, Error)]
@@ -111,8 +109,6 @@ pub struct ClientConfig {
     #[serde(default)]
     pub server_pq_public_key: String,
     pub server_identity_public_key: String,
-    #[serde(default)]
-    pub tls_profile: BrowserProfile,
 }
 
 #[derive(Debug, Clone, Deserialize)]

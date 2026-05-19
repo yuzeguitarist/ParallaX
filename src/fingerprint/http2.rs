@@ -1,12 +1,6 @@
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Http2PeerProfile {
-    Safari26,
-    Chrome124,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Http2Setting {
     pub id: u16,
     pub value: u32,
@@ -16,18 +10,6 @@ pub struct Http2Setting {
 pub struct Http2Fingerprint {
     pub settings: Vec<Http2Setting>,
     pub initial_window_update: Option<u32>,
-    pub priority_frames: u8,
-    /// Flags byte set on the initial HEADERS frame for stream 1. Safari sets
-    /// END_STREAM together with END_HEADERS on its opening `GET /` because the
-    /// request has no body; Chrome only sets END_HEADERS and keeps stream 1
-    /// half-open.
-    pub initial_headers_flags: u8,
-    /// Whether `:authority` literal values must be HPACK Huffman-encoded.
-    /// Safari (and Chrome too, in real captures) uses Huffman; we keep this as
-    /// a per-profile flag so the existing Chrome124 path — which has not been
-    /// verified against a real capture yet — stays on the safer plain-literal
-    /// encoding until it gets its own calibration PR.
-    pub authority_huffman: bool,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -45,56 +27,26 @@ pub struct Http2FrameHeader {
 }
 
 impl Http2Fingerprint {
-    pub fn for_profile(profile: Http2PeerProfile) -> Self {
-        match profile {
-            // Safari 26.4 (macOS Tahoe) HTTP/2 preface, observed against a
-            // local TLS-terminating capture (ALPN h2). The 4 SETTINGS, their
-            // order, and the 10 MiB connection-level WINDOW_UPDATE increment
-            // are byte-for-byte stable across fresh connections.
-            // Ground truth: `tests/fixtures/safari26_h2_preface_localhost.bin`.
-            Http2PeerProfile::Safari26 => Self {
-                settings: vec![
-                    Http2Setting { id: 0x2, value: 0 },
-                    Http2Setting {
-                        id: 0x4,
-                        value: 4_194_304,
-                    },
-                    Http2Setting {
-                        id: 0x3,
-                        value: 100,
-                    },
-                    Http2Setting { id: 0x9, value: 1 },
-                ],
-                initial_window_update: Some(10_485_760),
-                priority_frames: 0,
-                initial_headers_flags: 0x5,
-                authority_huffman: true,
-            },
-            Http2PeerProfile::Chrome124 => Self {
-                settings: vec![
-                    Http2Setting {
-                        id: 0x1,
-                        value: 65_536,
-                    },
-                    Http2Setting { id: 0x2, value: 0 },
-                    Http2Setting {
-                        id: 0x3,
-                        value: 1000,
-                    },
-                    Http2Setting {
-                        id: 0x4,
-                        value: 6_291_456,
-                    },
-                    Http2Setting {
-                        id: 0x6,
-                        value: 262_144,
-                    },
-                ],
-                initial_window_update: Some(15_663_105),
-                priority_frames: 0,
-                initial_headers_flags: 0x4,
-                authority_huffman: false,
-            },
+    pub fn safari26() -> Self {
+        // Safari 26.4 (macOS Tahoe) HTTP/2 preface, observed against a local
+        // TLS-terminating capture (ALPN h2). The 4 SETTINGS, their order, and
+        // the 10 MiB connection-level WINDOW_UPDATE increment are byte-for-byte
+        // stable across fresh connections.
+        // Ground truth: `tests/fixtures/safari26_h2_preface_localhost.bin`.
+        Self {
+            settings: vec![
+                Http2Setting { id: 0x2, value: 0 },
+                Http2Setting {
+                    id: 0x4,
+                    value: 4_194_304,
+                },
+                Http2Setting {
+                    id: 0x3,
+                    value: 100,
+                },
+                Http2Setting { id: 0x9, value: 1 },
+            ],
+            initial_window_update: Some(10_485_760),
         }
     }
 
@@ -134,12 +86,8 @@ impl Http2Fingerprint {
         payload.push(0x87); // :scheme: https
         payload.push(0x84); // :path: /
         payload.push(0x41); // literal with indexed name: :authority
-        if self.authority_huffman {
-            push_hpack_huffman_string(&mut payload, authority.as_bytes());
-        } else {
-            push_hpack_string(&mut payload, authority.as_bytes());
-        }
-        frame(0x1, self.initial_headers_flags, 1, &payload)
+        push_hpack_huffman_string(&mut payload, authority.as_bytes());
+        frame(0x1, 0x5, 1, &payload)
     }
 }
 
@@ -198,11 +146,6 @@ fn frame(
     out.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
     out.extend_from_slice(payload);
     Ok(out)
-}
-
-fn push_hpack_string(out: &mut Vec<u8>, value: &[u8]) {
-    push_hpack_integer(out, value.len(), 7, 0);
-    out.extend_from_slice(value);
 }
 
 fn push_hpack_integer(out: &mut Vec<u8>, value: usize, prefix_bits: u8, first_byte_mask: u8) {
@@ -332,7 +275,7 @@ mod tests {
 
     #[test]
     fn builds_http2_preface() {
-        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Chrome124);
+        let fp = Http2Fingerprint::safari26();
         let preface = fp.connection_preface().unwrap();
         assert!(preface.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
         assert!(preface.len() > 24);
@@ -340,7 +283,7 @@ mod tests {
 
     #[test]
     fn settings_frame_has_expected_length() {
-        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari26);
+        let fp = Http2Fingerprint::safari26();
         let frame = fp.settings_frame().unwrap();
         assert_eq!(&frame[0..3], &[0, 0, 24]);
         assert_eq!(frame[3], 0x4);
@@ -354,15 +297,15 @@ mod tests {
 
     #[test]
     fn builds_opening_headers_frame() {
-        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Chrome124);
+        let fp = Http2Fingerprint::safari26();
         let frame = fp.headers_frame("example.com").unwrap();
         let (header, total) = Http2FrameHeader::parse_complete(&frame).unwrap();
 
         assert_eq!(total, frame.len());
         assert_eq!(header.frame_type, 0x1);
-        assert_eq!(header.flags, 0x4);
+        assert_eq!(header.flags, 0x5);
         assert_eq!(header.stream_id, 1);
-        assert_eq!(&frame[9..14], &[0x82, 0x87, 0x84, 0x41, 11]);
+        assert_eq!(&frame[9..13], &[0x82, 0x87, 0x84, 0x41]);
     }
 
     #[test]
@@ -406,7 +349,7 @@ mod tests {
     /// `tests/fixtures/safari26_h2_preface_localhost.bin`.
     #[test]
     fn safari26_authority_matches_captured_huffman_bytes() {
-        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari26);
+        let fp = Http2Fingerprint::safari26();
         let frame = fp.headers_frame("localhost:8443").unwrap();
         let payload = &frame[9..];
         assert_eq!(
@@ -418,25 +361,6 @@ mod tests {
             &payload[4..],
             &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
             "Safari26 :authority huffman bytes drifted from captured baseline",
-        );
-    }
-
-    /// Chrome124 path is intentionally left on the plain-literal encoding
-    /// until it gets its own real capture; assert the existing shape so a
-    /// future toggle doesn't accidentally regress Chrome.
-    #[test]
-    fn chrome124_authority_stays_plain_literal() {
-        let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Chrome124);
-        let frame = fp.headers_frame("example.com").unwrap();
-        assert_eq!(
-            &frame[9..14],
-            &[0x82, 0x87, 0x84, 0x41, 11],
-            "Chrome124 must still emit plain-literal :authority for now",
-        );
-        assert_eq!(
-            &frame[14..14 + 11],
-            b"example.com",
-            "Chrome124 :authority literal must be the host bytes verbatim",
         );
     }
 

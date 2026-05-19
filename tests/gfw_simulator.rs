@@ -17,13 +17,12 @@ mod gfw_sim;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
-use parallax::crypto::session::X25519KeyPair;
-use parallax::tls::client_hello_builder::{BrowserProfile, ClientHelloTemplate};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 use crate::gfw_sim::detection::active_prober::ProbeObservation;
 use crate::gfw_sim::detection::burst_statistics::LengthObservation;
 use crate::gfw_sim::detection::tcp_dual_mb::FlowKey;
+use crate::gfw_sim::fixtures::synthetic_tls13_client_hello;
 use crate::gfw_sim::injection::BlockingPolicy;
 use crate::gfw_sim::runtime::{
     middlebox::{ClientToServerEvent, ScenarioInputs, ServerToClientEvent},
@@ -34,25 +33,11 @@ use crate::gfw_sim::runtime::{
 // --------------------- helpers ---------------------
 
 fn build_parallax_tcp_client_hello(sni: &str, seed: u64) -> Vec<u8> {
-    let kp = X25519KeyPair::generate();
-    let template = ClientHelloTemplate {
-        sni: sni.to_owned(),
-        x25519_public_key: kp.public,
-        profile: BrowserProfile::Chrome124,
-    };
-    let mut rng = StdRng::seed_from_u64(seed);
-    template.build_unsigned(&mut rng).unwrap()
+    synthetic_tls13_client_hello(sni, seed)
 }
 
 fn build_parallax_quic_initial(sni: &str, seed: u64) -> Vec<u8> {
-    let kp = X25519KeyPair::generate();
-    let template = ClientHelloTemplate {
-        sni: sni.to_owned(),
-        x25519_public_key: kp.public,
-        profile: BrowserProfile::Chrome124,
-    };
-    let mut rng = StdRng::seed_from_u64(seed);
-    let record = template.build_unsigned(&mut rng).unwrap();
+    let record = synthetic_tls13_client_hello(sni, seed);
     let handshake = record[5..].to_vec();
     let dcid = b"\x01\x02\x03\x04\x05\x06\x07\x08";
     crate::gfw_sim::detection::quic_initial::build_test_initial_packet(

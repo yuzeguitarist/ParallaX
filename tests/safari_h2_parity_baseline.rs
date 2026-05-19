@@ -18,7 +18,7 @@
 //!   `:method, :scheme, :path, :authority`, and the `:authority` value
 //!   HPACK-Huffman-encoded per RFC 7541.
 
-use parallax::fingerprint::http2::{Http2Fingerprint, Http2PeerProfile};
+use parallax::fingerprint::http2::Http2Fingerprint;
 
 const SAFARI_H2_FIXTURE: &[u8] = include_bytes!("fixtures/safari26_h2_preface_localhost.bin");
 
@@ -172,7 +172,7 @@ fn safari_h2_fixture_opening_headers_match_known_shape() {
 
 #[test]
 fn parallax_safari_h2_preface_matches_fixture_byte_for_byte() {
-    let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari26);
+    let fp = Http2Fingerprint::safari26();
 
     let preface = fp.connection_preface().expect("build ParallaX preface");
     let safari_frames = parse_frames(fixture_after_preface());
@@ -211,7 +211,7 @@ fn parallax_safari_h2_preface_matches_fixture_byte_for_byte() {
 
 #[test]
 fn parallax_safari_opening_headers_match_fixture_pseudo_header_section() {
-    let fp = Http2Fingerprint::for_profile(Http2PeerProfile::Safari26);
+    let fp = Http2Fingerprint::safari26();
     let parallax_headers_frame = fp
         .headers_frame(FIXTURE_AUTHORITY)
         .expect("build ParallaX Safari HEADERS");

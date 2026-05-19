@@ -8,7 +8,7 @@
 //!
 //! Design notes:
 //!
-//! * 43 cases across six groups exercise the asymmetric primitives, KDFs,
+//! * 42 cases across six groups exercise the asymmetric primitives, KDFs,
 //!   handshake composition, application-data AEAD pipeline, traffic shaping,
 //!   and replay-cache bookkeeping that dominate ParallaX's wall-clock cost.
 //! * Each case declares an iteration [`Tier`]. Tiers are static constants so
@@ -31,7 +31,10 @@ use crate::{
         decode_base64_bytes, decode_base64_secret, decode_key32, decode_key32_secret, TrafficConfig,
     },
     crypto::{
-        auth::{derive_client_auth_key, derive_server_auth_key, verify_client_hello_auth},
+        auth::{
+            derive_server_auth_key, recover_stateful_auth_material,
+            verify_client_hello_auth_with_material, StatefulAuthMaterial,
+        },
         identity, pq,
         replay::{ReplayCache, ReplayEntry},
         session::{
@@ -44,11 +47,7 @@ use crate::{
         command::{ConnectRequest, ServerIdentityChunk, ServerIdentityProof},
         data::{DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD},
     },
-    tls::{
-        client_hello::parse_client_hello,
-        client_hello_builder::{BrowserProfile, ClientHelloTemplate},
-        stateful::StatefulRustlsCamouflageBackend,
-    },
+    tls::{client_hello::parse_client_hello, safari26::Safari26TlsCamouflage},
     traffic::PaddingProfile,
 };
 
@@ -326,8 +325,7 @@ const CASES: &[CaseRunner] = &[
     bench_hkdf_session_keys,
     bench_hkdf_hybrid_rekey,
     bench_hkdf_hybrid_sandwich_rekey,
-    bench_clienthello_build_signed,
-    bench_stateful_clienthello_start_safari,
+    bench_safari26_clienthello_start,
     bench_clienthello_parse,
     bench_clienthello_verify_auth,
     bench_client_pq_rekey_record,
@@ -563,57 +561,23 @@ fn bench_hkdf_hybrid_sandwich_rekey(options: BenchmarkOptions) -> Result<Benchma
 // handshake.protocol
 // ---------------------------------------------------------------------------
 
-fn bench_clienthello_build_signed(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    let client = X25519KeyPair::generate();
-    let server = X25519KeyPair::generate();
-    let auth_key = derive_client_auth_key(BENCH_PSK, &client.private, &server.public)?;
-    let template = ClientHelloTemplate {
-        sni: BENCH_SNI.to_owned(),
-        x25519_public_key: client.public,
-        profile: BrowserProfile::Safari26,
-    };
-    let mut rng = StdRng::seed_from_u64(RNG_SEED);
-    run_case(
-        BenchGroup::HandshakeProtocol,
-        "clienthello.build_signed",
-        TIER_MEDIUM,
-        options,
-        || {
-            let record = template.build_signed(&auth_key, &mut rng)?;
-            Ok(black_box(record.len() as u64))
-        },
-    )
-}
-
-fn bench_stateful_clienthello_start_safari(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    bench_stateful_clienthello_start(options, "stateful.start_safari", BrowserProfile::Safari26)
-}
-
-fn bench_stateful_clienthello_start(
-    options: BenchmarkOptions,
-    name: &'static str,
-    profile: BrowserProfile,
-) -> Result<BenchmarkCase> {
+fn bench_safari26_clienthello_start(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let server = X25519KeyPair::generate();
     run_case(
         BenchGroup::HandshakeProtocol,
-        name,
+        "safari26.clienthello_start",
         TIER_MEDIUM,
         options,
         || {
-            let session = StatefulRustlsCamouflageBackend.start(
-                BENCH_SNI.to_owned(),
-                BENCH_PSK,
-                &server.public,
-                profile,
-            )?;
+            let session =
+                Safari26TlsCamouflage.start(BENCH_SNI.to_owned(), BENCH_PSK, &server.public)?;
             Ok(black_box(session.client_hello_bytes().len() as u64))
         },
     )
 }
 
 fn bench_clienthello_parse(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    let (record, _server_auth) = signed_client_hello_fixture()?;
+    let (record, _server_auth, _material) = signed_client_hello_fixture()?;
     run_case(
         BenchGroup::HandshakeProtocol,
         "clienthello.parse",
@@ -627,14 +591,18 @@ fn bench_clienthello_parse(options: BenchmarkOptions) -> Result<BenchmarkCase> {
 }
 
 fn bench_clienthello_verify_auth(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    let (record, server_auth) = signed_client_hello_fixture()?;
+    let (record, server_auth, material) = signed_client_hello_fixture()?;
     run_case(
         BenchGroup::HandshakeProtocol,
         "clienthello.verify_auth",
         TIER_FAST,
         options,
         || {
-            let auth = verify_client_hello_auth(&record, &server_auth)?;
+            let auth = verify_client_hello_auth_with_material(
+                &record,
+                &server_auth,
+                Some(material.clone()),
+            )?;
             if !auth.authenticated {
                 bail!("benchmark ClientHello did not authenticate");
             }
@@ -645,19 +613,14 @@ fn bench_clienthello_verify_auth(options: BenchmarkOptions) -> Result<BenchmarkC
 
 /// Build a signed ClientHello together with the matching server-side auth key
 /// so verification benchmarks can run without re-deriving keys per call.
-fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN])> {
-    let client = X25519KeyPair::generate();
+fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuthMaterial)> {
     let server = X25519KeyPair::generate();
-    let client_auth = derive_client_auth_key(BENCH_PSK, &client.private, &server.public)?;
-    let server_auth = derive_server_auth_key(BENCH_PSK, &server.private, &client.public)?;
-    let template = ClientHelloTemplate {
-        sni: BENCH_SNI.to_owned(),
-        x25519_public_key: client.public,
-        profile: BrowserProfile::Safari26,
-    };
-    let mut rng = StdRng::seed_from_u64(RNG_SEED);
-    let record = template.build_signed(&client_auth, &mut rng)?;
-    Ok((record, server_auth))
+    let session = Safari26TlsCamouflage.start(BENCH_SNI.to_owned(), BENCH_PSK, &server.public)?;
+    let record = session.client_hello_bytes().to_vec();
+    let material = recover_stateful_auth_material(&record, BENCH_PSK)?
+        .expect("Safari26 ClientHello must carry stateful auth material");
+    let server_auth = derive_server_auth_key(BENCH_PSK, &server.private, &material.x25519_public)?;
+    Ok((record, server_auth, material))
 }
 
 fn bench_client_pq_rekey_record(options: BenchmarkOptions) -> Result<BenchmarkCase> {
