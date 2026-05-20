@@ -952,7 +952,7 @@ mod tests {
 
     #[test]
     fn megabits_per_second_handles_zero_elapsed() {
-        let m = SpeedMeasurement {
+        let m = PhaseMeasurement {
             bytes: 1_000_000,
             elapsed: Duration::ZERO,
         };
@@ -961,7 +961,7 @@ mod tests {
 
     #[test]
     fn megabits_per_second_matches_formula() {
-        let m = SpeedMeasurement {
+        let m = PhaseMeasurement {
             bytes: 1_250_000, // 10 Mbps over one second
             elapsed: Duration::from_secs(1),
         };
@@ -970,7 +970,7 @@ mod tests {
 
     #[test]
     fn mebibytes_matches_formula() {
-        let m = SpeedMeasurement {
+        let m = PhaseMeasurement {
             bytes: 2 * 1024 * 1024,
             elapsed: Duration::from_secs(1),
         };

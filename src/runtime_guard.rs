@@ -581,29 +581,44 @@ mod tests {
     }
 
     #[test]
-    fn client_config_id_changes_with_each_field() {
+    fn client_config_fingerprint_changes_with_each_field() {
         let base = config("203.0.113.60:443");
-        let base_id = client_config_id(base.client.as_ref().unwrap());
+        let base_id = client_config_fingerprint(base.client.as_ref().unwrap());
         assert_eq!(base_id.len(), 64);
 
         let mut alt = base.clone();
         alt.client.as_mut().unwrap().server_addr = "203.0.113.61:443".to_owned();
-        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+        assert_ne!(
+            client_config_fingerprint(alt.client.as_ref().unwrap()),
+            base_id
+        );
 
         let mut alt = base.clone();
         alt.client.as_mut().unwrap().sni = "different.example".to_owned();
-        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+        assert_ne!(
+            client_config_fingerprint(alt.client.as_ref().unwrap()),
+            base_id
+        );
 
         let mut alt = base.clone();
         alt.client.as_mut().unwrap().server_public_key = "rotated".to_owned();
-        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+        assert_ne!(
+            client_config_fingerprint(alt.client.as_ref().unwrap()),
+            base_id
+        );
 
         let mut alt = base.clone();
         alt.client.as_mut().unwrap().server_pq_public_key = "rotated-pq".to_owned();
-        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+        assert_ne!(
+            client_config_fingerprint(alt.client.as_ref().unwrap()),
+            base_id
+        );
 
         let mut alt = base.clone();
         alt.client.as_mut().unwrap().server_identity_public_key = "rotated-id".to_owned();
-        assert_ne!(client_config_id(alt.client.as_ref().unwrap()), base_id);
+        assert_ne!(
+            client_config_fingerprint(alt.client.as_ref().unwrap()),
+            base_id
+        );
     }
 }
