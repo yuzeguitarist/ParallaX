@@ -25,7 +25,8 @@
 //! (<https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md>):
 //!
 //! ```text
-//! <protocol><version><sni><n_ciphers><n_extensions><alpn_first_last>_<sha256_ciphers[:12]>_<sha256_extensions[:12]>
+//! <protocol><version><sni><n_ciphers><n_extensions><alpn_first_last>_
+//! <sha256_ciphers[:12]>_<sha256_extensions[:12]>
 //! ```
 //!
 //! Where:

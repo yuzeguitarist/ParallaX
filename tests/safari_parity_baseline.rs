@@ -269,7 +269,8 @@ fn assert_parallax_matches_safari(safari: &ClientHelloFields, parallax: &ClientH
     // byte-for-byte parity with the apple.com fixture.
     assert_eq!(
         parallax.signature_algorithms, SAFARI_SIGNATURE_ALGORITHMS_REAL,
-        "ParallaX signature_algorithms must match Safari 26.4 exactly (including the duplicate 0x0805)"
+        "ParallaX signature_algorithms must match Safari 26.4 exactly \
+         (including the duplicate 0x0805)"
     );
     assert_eq!(
         parallax.signature_algorithms, safari.signature_algorithms,

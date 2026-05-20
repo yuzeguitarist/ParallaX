@@ -70,12 +70,14 @@ impl Probe {
         hello.push(0); // session_id_len
         hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // ciphers: TLS_AES_128_GCM_SHA256
         hello.extend_from_slice(&[0x01, 0x00]); // compression: null
-                                                // SNI extension: "obfs4.example"
+
+        // SNI extension: "obfs4.example"
         let sni_bytes = b"obfs4.example";
         let mut sni_ext = Vec::new();
         sni_ext.extend_from_slice(&[0x00, 0x00]); // ext_type
         sni_ext.extend_from_slice(&((sni_bytes.len() + 5) as u16).to_be_bytes());
-        sni_ext.extend_from_slice(&((sni_bytes.len() + 3) as u16).to_be_bytes()); // server_name_list_len
+        // server_name_list_len
+        sni_ext.extend_from_slice(&((sni_bytes.len() + 3) as u16).to_be_bytes());
         sni_ext.push(0); // host_name
         sni_ext.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
         sni_ext.extend_from_slice(sni_bytes);
@@ -84,7 +86,8 @@ impl Probe {
         let mut alpn_ext = Vec::new();
         alpn_ext.extend_from_slice(&[0x00, 0x10]); // ext_type
         alpn_ext.extend_from_slice(&((alpn.len() + 3) as u16).to_be_bytes());
-        alpn_ext.extend_from_slice(&((alpn.len() + 1) as u16).to_be_bytes()); // protocol_name_list_len
+        // protocol_name_list_len
+        alpn_ext.extend_from_slice(&((alpn.len() + 1) as u16).to_be_bytes());
         alpn_ext.push(alpn.len() as u8);
         alpn_ext.extend_from_slice(alpn);
 

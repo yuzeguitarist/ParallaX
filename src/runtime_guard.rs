@@ -33,32 +33,39 @@ pub struct RuntimeConflict {
 
 impl RuntimeConflict {
     fn client_blocked_by_speed(speed: &RuntimeInstance) -> Self {
-        Self {
-            message: format!(
-                "A plx speed run is already active (pid {}). Wait for it to finish or stop it first. Stop command: kill -TERM {}",
-                speed.pid, speed.pid
-            ),
-            pid: speed.pid,
-        }
+        Self::blocked_by_speed(speed.pid)
     }
 
     fn speed_blocked_by_client(client: &RuntimeInstance) -> Self {
+        let pid = client.pid;
         Self {
             message: format!(
-                "A plx client is already active for this server (pid {}). Test a different server or stop the existing plx client first. Stop command: kill -TERM {}",
-                client.pid, client.pid
+                concat!(
+                    "A plx client is already active for this server (pid {}). ",
+                    "Test a different server or stop the existing plx client first. ",
+                    "Stop command: kill -TERM {}"
+                ),
+                pid, pid
             ),
-            pid: client.pid,
+            pid,
         }
     }
 
     fn speed_blocked_by_speed(speed: &RuntimeInstance) -> Self {
+        Self::blocked_by_speed(speed.pid)
+    }
+
+    fn blocked_by_speed(pid: u32) -> Self {
         Self {
             message: format!(
-                "A plx speed run is already active (pid {}). Wait for it to finish or stop it first. Stop command: kill -TERM {}",
-                speed.pid, speed.pid
+                concat!(
+                    "A plx speed run is already active (pid {}). ",
+                    "Wait for it to finish or stop it first. ",
+                    "Stop command: kill -TERM {}"
+                ),
+                pid, pid
             ),
-            pid: speed.pid,
+            pid,
         }
     }
 

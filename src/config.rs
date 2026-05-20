@@ -50,7 +50,10 @@ pub enum ConfigError {
     InvalidDelayRange,
     #[error("traffic.cover_max_interval_ms must be >= traffic.cover_min_interval_ms")]
     InvalidCoverIntervalRange,
-    #[error("traffic.max_concurrent_streams must be 1 until multiplexing has fingerprint-safe scheduling")]
+    #[error(
+        "traffic.max_concurrent_streams must be 1 until multiplexing has \
+         fingerprint-safe scheduling"
+    )]
     UnsupportedMultiplexing,
     #[error(
         "client.listen must bind to a loopback address because SOCKS5 has no authentication: {0}"
