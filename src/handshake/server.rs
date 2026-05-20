@@ -32,7 +32,8 @@ use crate::{
     crypto::{
         auth::{
             derive_server_auth_key_from_shared, recover_stateful_auth_material_from_parsed,
-            verify_client_hello_auth_with_parsed, AuthError, ClientAuth,
+            verify_client_hello_auth_with_parsed,
+            verify_masked_stateful_client_hello_auth_with_parsed_material, AuthError, ClientAuth,
         },
         identity::{self, IdentityError},
         pq::{self, PqError},
@@ -434,11 +435,11 @@ fn decide_connection_inbound(
         let x25519_key_share = material.x25519_public;
         let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
         let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
-        let auth = match verify_client_hello_auth_with_parsed(
+        let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
             first_client_record,
             &auth_key,
-            Some(material),
-            parsed.clone(),
+            &material,
+            &parsed,
         ) {
             Ok(auth) => auth,
             Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
@@ -669,7 +670,12 @@ async fn run_authenticated_data_mode(
                     Err(err) if is_clean_close(&err) => return Ok(()),
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
-                log_record_read(cid, "client->server", "server-predata-client-reader", &client_record);
+                log_record_read(
+                    cid,
+                    "client->server",
+                    "server-predata-client-reader",
+                    &client_record,
+                );
 
                 match client_open.open(&client_record) {
                     Ok(first_payload) => {
@@ -829,7 +835,12 @@ async fn run_authenticated_data_mode(
                     Err(err) if is_clean_close(&err) => return Ok(()),
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
-                log_record_read(cid, "fallback->server", "server-predata-fallback-reader", &fallback_record);
+                log_record_read(
+                    cid,
+                    "fallback->server",
+                    "server-predata-fallback-reader",
+                    &fallback_record,
+                );
                 fallback_records_before_pq += 1;
                 fallback_bytes_before_pq += fallback_record.len();
                 if let Ok(header) = crate::tls::record::parse_header(&fallback_record) {
@@ -844,8 +855,11 @@ async fn run_authenticated_data_mode(
                             tls_content_type = header.content_type,
                             "forwarding fallback camouflage record before ParallaX PQ rekey"
                         );
-                    } else if fallback_records_before_pq >= CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
-                        && fallback_records_before_pq % CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET == 0
+                    } else if fallback_records_before_pq
+                        >= CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
+                        && fallback_records_before_pq
+                            % CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
+                            == 0
                     {
                         tracing::warn!(
                             cid,
@@ -856,7 +870,8 @@ async fn run_authenticated_data_mode(
                             outer_tls_payload_len = header.payload_len,
                             tls_content_type = header.content_type,
                             client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
-                            "fallback camouflage records may exhaust client residual budget before ParallaX PQ rekey"
+                            "fallback camouflage records may exhaust client residual \
+                             budget before ParallaX PQ rekey"
                         );
                     }
                 }
@@ -1069,10 +1084,8 @@ impl DataRelay {
             cid,
         );
 
-        tokio::select! {
-            result = upload => result,
-            result = download => result,
-        }
+        let ((), ()) = tokio::try_join!(upload, download)?;
+        Ok(())
     }
 }
 
@@ -1087,8 +1100,10 @@ async fn run_authenticated_speed_test_mode(
 ) -> Result<(), HandshakeServerError> {
     tracing::info!(
         cid,
+        warmup_bytes = request.warmup_bytes,
         download_bytes = request.download_bytes,
         upload_bytes = request.upload_bytes,
+        sample_count = request.sample_count,
         "ParallaX speed test mode started"
     );
     if chunk_size == 0 {
@@ -1100,51 +1115,127 @@ async fn run_authenticated_speed_test_mode(
     let mut rng = StdRng::from_entropy();
     let mut scratch = RelaySealScratch::with_payload_capacity(chunk_size);
     let payload = vec![0xA5; chunk_size];
-    let mut remaining = request.download_bytes;
+    let mut io = SpeedServerIo {
+        client_records: &mut client_records,
+        client_write: &mut client_write,
+        client_open: &mut client_open,
+        server_seal: &mut server_seal,
+        rng: &mut rng,
+        scratch: &mut scratch,
+        cid,
+    };
+
+    write_speed_download_phase(
+        &mut io,
+        &payload,
+        request.warmup_bytes,
+        SpeedTestAck::warmup_download_done(request.warmup_bytes),
+    )
+    .await?;
+    read_speed_upload_phase(
+        &mut io,
+        request.warmup_bytes,
+        SpeedTestAck::warmup_upload_done(request.warmup_bytes),
+    )
+    .await?;
+
+    for _ in 0..request.sample_count {
+        write_speed_download_phase(
+            &mut io,
+            &payload,
+            request.download_bytes,
+            SpeedTestAck::download_done(request.download_bytes),
+        )
+        .await?;
+    }
+    for _ in 0..request.sample_count {
+        read_speed_upload_phase(
+            &mut io,
+            request.upload_bytes,
+            SpeedTestAck::upload_done(request.upload_bytes),
+        )
+        .await?;
+    }
+
+    tracing::info!(cid, "ParallaX speed test mode finished");
+    Ok(())
+}
+
+struct SpeedServerIo<'a, R: ?Sized> {
+    client_records: &'a mut TlsRecordReader<OwnedReadHalf>,
+    client_write: &'a mut OwnedWriteHalf,
+    client_open: &'a mut DataRecordCodec,
+    server_seal: &'a mut DataRecordCodec,
+    rng: &'a mut R,
+    scratch: &'a mut RelaySealScratch,
+    cid: u64,
+}
+
+async fn write_speed_download_phase<R>(
+    io: &mut SpeedServerIo<'_, R>,
+    payload: &[u8],
+    bytes: u64,
+    ack: SpeedTestAck,
+) -> Result<(), HandshakeServerError>
+where
+    R: Rng + rand::RngCore + ?Sized,
+{
+    let mut remaining = bytes;
     while remaining > 0 {
         let len = remaining.min(payload.len() as u64) as usize;
         write_server_data_records_chunked(
-            &mut client_write,
-            &mut server_seal,
+            io.client_write,
+            io.server_seal,
             &payload[..len],
-            &mut rng,
-            &mut scratch,
-            RelayWriteLog::new(cid, "server->client", "server-speed-download-writer"),
+            io.rng,
+            io.scratch,
+            RelayWriteLog::new(io.cid, "server->client", "server-speed-download-writer"),
         )
         .await?;
         remaining -= len as u64;
     }
-    let download_done = SpeedTestAck::download_done(request.download_bytes).encode();
+    let ack = ack.encode();
     write_server_data_records_chunked(
-        &mut client_write,
-        &mut server_seal,
-        &download_done,
-        &mut rng,
-        &mut scratch,
-        RelayWriteLog::new(cid, "server->client", "server-speed-download-done"),
+        io.client_write,
+        io.server_seal,
+        &ack,
+        io.rng,
+        io.scratch,
+        RelayWriteLog::new(io.cid, "server->client", "server-speed-download-done"),
     )
-    .await?;
+    .await
+}
 
+async fn read_speed_upload_phase<R>(
+    io: &mut SpeedServerIo<'_, R>,
+    bytes: u64,
+    ack: SpeedTestAck,
+) -> Result<(), HandshakeServerError>
+where
+    R: Rng + rand::RngCore + ?Sized,
+{
     let mut uploaded = 0_u64;
     let mut client_record = Vec::new();
-    while uploaded < request.upload_bytes {
-        match client_records.read_record_into(&mut client_record).await {
+    while uploaded < bytes {
+        match io.client_records.read_record_into(&mut client_record).await {
             Ok(()) => {}
             Err(err) if is_clean_close(&err) => return Ok(()),
             Err(err) => return Err(HandshakeServerError::Io(err)),
         };
         log_record_read(
-            cid,
+            io.cid,
             "client->server",
             "server-speed-upload-reader",
             &client_record,
         );
-        let plaintext = client_open.open_in_place_payload_range(&mut client_record)?;
+        let plaintext = io
+            .client_open
+            .open_in_place_payload_range(&mut client_record)?;
         let len = plaintext.len() as u64;
         if len == 0 {
             continue;
         }
-        if uploaded + len > request.upload_bytes {
+        if uploaded + len > bytes {
             return Err(HandshakeServerError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "speed upload sent more bytes than requested",
@@ -1153,18 +1244,16 @@ async fn run_authenticated_speed_test_mode(
         uploaded += len;
     }
 
-    let upload_done = SpeedTestAck::upload_done(uploaded).encode();
+    let ack = ack.encode();
     write_server_data_records_chunked(
-        &mut client_write,
-        &mut server_seal,
-        &upload_done,
-        &mut rng,
-        &mut scratch,
-        RelayWriteLog::new(cid, "server->client", "server-speed-upload-done"),
+        io.client_write,
+        io.server_seal,
+        &ack,
+        io.rng,
+        io.scratch,
+        RelayWriteLog::new(io.cid, "server->client", "server-speed-upload-done"),
     )
-    .await?;
-    tracing::info!(cid, uploaded, "ParallaX speed test mode finished");
-    Ok(())
+    .await
 }
 
 async fn server_upload_loop(
@@ -1178,7 +1267,10 @@ async fn server_upload_loop(
     loop {
         match client_records.read_record_into(&mut client_record).await {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => return Ok(()),
+            Err(err) if is_clean_close(&err) => {
+                let _ = target_write.shutdown().await;
+                return Ok(());
+            }
             Err(err) => return Err(HandshakeServerError::Io(err)),
         };
         log_record_read(
@@ -1232,6 +1324,7 @@ async fn server_download_loop(
             read = target_read.read(&mut target_buf) => {
                 let n = read?;
                 if n == 0 {
+                    let _ = client_write.shutdown().await;
                     return Ok(());
                 }
                 let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
@@ -1382,14 +1475,20 @@ mod tests {
     use super::*;
     use crate::{
         crypto::{
-            auth::{derive_client_auth_key, sign_client_hello_session_id},
+            auth::{
+                build_auth_tail_at, build_masked_stateful_auth_session_id,
+                build_masked_stateful_client_random, derive_client_auth_key,
+                sign_client_hello_session_id,
+            },
             pq,
             session::X25519KeyPair,
         },
         handshake::client::ClientDataSession,
         protocol::command::{ConnectRequest, ConnectRequestError},
         tls::{
-            client_hello::tests::client_hello_fixture_with_key_share,
+            client_hello::tests::{
+                client_hello_fixture_with_key_share, client_hello_fixture_with_random_and_key_share,
+            },
             server_hello::{parse_server_hello, tests::server_hello_fixture},
         },
     };
@@ -1538,6 +1637,52 @@ mod tests {
                 );
             }
             ConnectionDecision::Fallback(reason) => panic!("unexpected fallback: {reason:?}"),
+        }
+    }
+
+    #[test]
+    fn decides_masked_stateful_inbound() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let mut record = client_hello_fixture_with_random_and_key_share(
+            "example.com",
+            &client.public,
+            &[0x44_u8; 32],
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let mut rng = StdRng::seed_from_u64(3);
+        let tail = build_auth_tail_at(1_700_000_001, &mut rng);
+        let encoded_random =
+            build_masked_stateful_client_random(PSK, "example.com", &client.public, &tail).unwrap();
+        let session_id = build_masked_stateful_auth_session_id(
+            PSK,
+            &auth_key,
+            "example.com",
+            &client.public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        record[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        record[parsed.session_id_range].copy_from_slice(&session_id);
+
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+
+        match decision {
+            InboundDecision::Authenticated(hello) => {
+                assert_eq!(hello.sni, "example.com");
+                assert_eq!(hello.x25519_key_share, client.public);
+                assert_eq!(hello.timestamp, 1_700_000_001);
+            }
+            other => panic!("unexpected decision: {other:?}"),
         }
     }
 

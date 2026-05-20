@@ -7,6 +7,8 @@ const SERVER_KEY_EXCHANGE_MAGIC: &[u8; 4] = b"PX1K";
 const SERVER_IDENTITY_MAGIC: &[u8; 4] = b"PX1S";
 const SERVER_IDENTITY_CHUNK_MAGIC: &[u8; 4] = b"PX1I";
 const SPEED_TEST_MAGIC: &[u8; 4] = b"PX1T";
+const SPEED_WARMUP_DOWNLOAD_DONE_MAGIC: &[u8; 4] = b"PX1W";
+const SPEED_WARMUP_UPLOAD_DONE_MAGIC: &[u8; 4] = b"PX1V";
 const SPEED_DOWNLOAD_DONE_MAGIC: &[u8; 4] = b"PX1D";
 const SPEED_UPLOAD_DONE_MAGIC: &[u8; 4] = b"PX1U";
 const MAX_HOST_LEN: usize = 255;
@@ -77,12 +79,16 @@ pub struct ServerIdentityChunkRef<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeedTestRequest {
+    pub warmup_bytes: u64,
     pub download_bytes: u64,
     pub upload_bytes: u64,
+    pub sample_count: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeedTestAckKind {
+    WarmupDownloadDone,
+    WarmupUploadDone,
     DownloadDone,
     UploadDone,
 }
@@ -151,6 +157,8 @@ pub enum SpeedTestRequestError {
     BadMagic,
     #[error("speed test request byte count must not be zero")]
     ZeroBytes,
+    #[error("speed test request sample count must not be zero")]
+    ZeroSamples,
     #[error("speed test request length is invalid")]
     InvalidLength,
 }
@@ -507,13 +515,18 @@ impl SpeedTestRequest {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, SpeedTestRequestError> {
-        if self.download_bytes == 0 || self.upload_bytes == 0 {
+        if self.warmup_bytes == 0 || self.download_bytes == 0 || self.upload_bytes == 0 {
             return Err(SpeedTestRequestError::ZeroBytes);
         }
-        let mut out = Vec::with_capacity(20);
+        if self.sample_count == 0 {
+            return Err(SpeedTestRequestError::ZeroSamples);
+        }
+        let mut out = Vec::with_capacity(30);
         out.extend_from_slice(SPEED_TEST_MAGIC);
+        out.extend_from_slice(&self.warmup_bytes.to_be_bytes());
         out.extend_from_slice(&self.download_bytes.to_be_bytes());
         out.extend_from_slice(&self.upload_bytes.to_be_bytes());
+        out.extend_from_slice(&self.sample_count.to_be_bytes());
         Ok(out)
     }
 
@@ -524,29 +537,52 @@ impl SpeedTestRequest {
         if &input[..4] != SPEED_TEST_MAGIC {
             return Err(SpeedTestRequestError::BadMagic);
         }
-        if input.len() < 20 {
+        if input.len() < 30 {
             return Err(SpeedTestRequestError::Truncated);
         }
-        if input.len() != 20 {
+        if input.len() != 30 {
             return Err(SpeedTestRequestError::InvalidLength);
         }
-        let download_bytes = u64::from_be_bytes([
+        let warmup_bytes = u64::from_be_bytes([
             input[4], input[5], input[6], input[7], input[8], input[9], input[10], input[11],
         ]);
-        let upload_bytes = u64::from_be_bytes([
+        let download_bytes = u64::from_be_bytes([
             input[12], input[13], input[14], input[15], input[16], input[17], input[18], input[19],
         ]);
-        if download_bytes == 0 || upload_bytes == 0 {
+        let upload_bytes = u64::from_be_bytes([
+            input[20], input[21], input[22], input[23], input[24], input[25], input[26], input[27],
+        ]);
+        let sample_count = u16::from_be_bytes([input[28], input[29]]);
+        if warmup_bytes == 0 || download_bytes == 0 || upload_bytes == 0 {
             return Err(SpeedTestRequestError::ZeroBytes);
         }
+        if sample_count == 0 {
+            return Err(SpeedTestRequestError::ZeroSamples);
+        }
         Ok(Self {
+            warmup_bytes,
             download_bytes,
             upload_bytes,
+            sample_count,
         })
     }
 }
 
 impl SpeedTestAck {
+    pub fn warmup_download_done(bytes: u64) -> Self {
+        Self {
+            kind: SpeedTestAckKind::WarmupDownloadDone,
+            bytes,
+        }
+    }
+
+    pub fn warmup_upload_done(bytes: u64) -> Self {
+        Self {
+            kind: SpeedTestAckKind::WarmupUploadDone,
+            bytes,
+        }
+    }
+
     pub fn download_done(bytes: u64) -> Self {
         Self {
             kind: SpeedTestAckKind::DownloadDone,
@@ -564,6 +600,8 @@ impl SpeedTestAck {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(12);
         out.extend_from_slice(match self.kind {
+            SpeedTestAckKind::WarmupDownloadDone => SPEED_WARMUP_DOWNLOAD_DONE_MAGIC,
+            SpeedTestAckKind::WarmupUploadDone => SPEED_WARMUP_UPLOAD_DONE_MAGIC,
             SpeedTestAckKind::DownloadDone => SPEED_DOWNLOAD_DONE_MAGIC,
             SpeedTestAckKind::UploadDone => SPEED_UPLOAD_DONE_MAGIC,
         });
@@ -576,6 +614,10 @@ impl SpeedTestAck {
             return Err(SpeedTestAckError::Truncated);
         }
         let kind = match &input[..4] {
+            magic if magic == SPEED_WARMUP_DOWNLOAD_DONE_MAGIC => {
+                SpeedTestAckKind::WarmupDownloadDone
+            }
+            magic if magic == SPEED_WARMUP_UPLOAD_DONE_MAGIC => SpeedTestAckKind::WarmupUploadDone,
             magic if magic == SPEED_DOWNLOAD_DONE_MAGIC => SpeedTestAckKind::DownloadDone,
             magic if magic == SPEED_UPLOAD_DONE_MAGIC => SpeedTestAckKind::UploadDone,
             _ => return Err(SpeedTestAckError::BadMagic),
@@ -819,8 +861,10 @@ mod tests {
     #[test]
     fn speed_test_request_round_trip() {
         let request = SpeedTestRequest {
+            warmup_bytes: 1024 * 1024,
             download_bytes: 16 * 1024 * 1024,
             upload_bytes: 8 * 1024 * 1024,
+            sample_count: 3,
         };
 
         let encoded = request.encode().unwrap();
@@ -829,11 +873,47 @@ mod tests {
 
     #[test]
     fn speed_test_ack_round_trip() {
+        let warmup_download = SpeedTestAck::warmup_download_done(111);
+        let warmup_upload = SpeedTestAck::warmup_upload_done(222);
         let download = SpeedTestAck::download_done(123);
         let upload = SpeedTestAck::upload_done(456);
 
+        assert_eq!(
+            SpeedTestAck::decode(&warmup_download.encode()).unwrap(),
+            warmup_download
+        );
+        assert_eq!(
+            SpeedTestAck::decode(&warmup_upload.encode()).unwrap(),
+            warmup_upload
+        );
         assert_eq!(SpeedTestAck::decode(&download.encode()).unwrap(), download);
         assert_eq!(SpeedTestAck::decode(&upload.encode()).unwrap(), upload);
+    }
+
+    #[test]
+    fn speed_test_request_rejects_zero_values() {
+        assert_eq!(
+            SpeedTestRequest {
+                warmup_bytes: 0,
+                download_bytes: 1,
+                upload_bytes: 1,
+                sample_count: 1,
+            }
+            .encode()
+            .unwrap_err(),
+            SpeedTestRequestError::ZeroBytes
+        );
+        assert_eq!(
+            SpeedTestRequest {
+                warmup_bytes: 1,
+                download_bytes: 1,
+                upload_bytes: 1,
+                sample_count: 0,
+            }
+            .encode()
+            .unwrap_err(),
+            SpeedTestRequestError::ZeroSamples
+        );
     }
 
     #[test]

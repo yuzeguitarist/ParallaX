@@ -1019,7 +1019,6 @@ install_remote() {
   local deploy_dir=$1
   local server_cfg=$2
   local unit_file=$3
-  local remote_tmp="/tmp/parallax-deploy-$(date +%s)-$$"
 
   local control_path="/tmp/parallax-ssh-$(safe_name "$SSH_TARGET")-$SSH_PORT"
   local ssh_common_opts=(
@@ -1033,12 +1032,27 @@ install_remote() {
   local ssh_args=(ssh -p "$SSH_PORT" "${ssh_common_opts[@]}" "$SSH_TARGET")
   local scp_args=(scp -P "$SSH_PORT" "${ssh_common_opts[@]}")
   local scp_payload=("$LINUX_PLX" "$server_cfg" "$unit_file")
+  local remote_tmp mktemp_cmd
+  # shellcheck disable=SC2016 # expand TMPDIR on the remote shell, not locally.
+  mktemp_cmd='umask 077; mktemp -d "${TMPDIR:-/tmp}/parallax-deploy.XXXXXX"'
 
   if profiling_enabled; then
     scp_payload+=("$PARCA_UNIT_FILE" "$POLAR_ENV_FILE" "$POLAR_TOKEN_UPLOAD_FILE")
   fi
 
-  run "${ssh_args[@]}" "mkdir -p $(shell_quote "$remote_tmp")"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    remote_tmp="/tmp/parallax-deploy.XXXXXX"
+    run "${ssh_args[@]}" "$mktemp_cmd"
+  else
+    deploy_info_log "creating secure remote temporary directory"
+    if ! remote_tmp="$("${ssh_args[@]}" "$mktemp_cmd")"; then
+      die "failed to create secure remote temporary directory on $SSH_TARGET"
+    fi
+    [[ "$remote_tmp" == /* ]] || die "remote temporary directory must be absolute: $remote_tmp"
+    require_no_space "remote temporary directory" "$remote_tmp"
+    require_no_control "remote temporary directory" "$remote_tmp"
+  fi
+
   run "${scp_args[@]}" "${scp_payload[@]}" "$SSH_TARGET:$remote_tmp/"
 
   local q_tmp q_remote_bin q_remote_config q_service q_service_path q_remote_bin_dir q_remote_config_dir q_parca_agent_channel
@@ -1178,6 +1192,10 @@ REMOTE_PROFILE
   remote_script=$(cat <<REMOTE
 set -Eeuo pipefail
 PARCA_AGENT_CHANNEL=$q_parca_agent_channel
+cleanup_remote_tmp() {
+  rm -rf $q_tmp
+}
+trap cleanup_remote_tmp EXIT
 $bbr_install_script
 $sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir /var/lib/parallax
 $sudo_prefix install -m 0755 $q_tmp/plx $q_remote_bin
@@ -1195,7 +1213,8 @@ if command -v ufw >/dev/null 2>&1 && $sudo_prefix ufw status | grep -q "Status: 
   $sudo_prefix ufw allow 443/tcp comment ParallaX || true
 fi
 $profile_install_script
-rm -rf $q_tmp
+cleanup_remote_tmp
+trap - EXIT
 REMOTE
 )
 

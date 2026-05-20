@@ -165,7 +165,8 @@ plx keygen              Print a fresh X25519 key pair.
 plx crypto-self-test    Locally verify AEAD key derivation.
 plx serve   -c …        Run the server (handshake + fallback listener).
 plx client  -c …        Run the SOCKS5 client.
-plx speed   -c …        Run a one-shot network speed test against the server.
+plx speed   -c … [--json]
+                        Run a one-shot network speed evidence test.
 plx probe   <dest>      Probe a camouflage target's real TLS behavior.
 plx init    <dest>      Generate paired server/client configs.
 plx config-template …   Print paired configs to stdout (advanced; no file IO).
@@ -210,13 +211,18 @@ plx bench --json       # full suite, machine-readable
 plx bench --quick      # ~1% iteration budget, CI smoke profile
 ```
 
-`plx speed -c parallax.client.toml` is a network test, not the local CPU
-benchmark above. It connects directly to the configured `plx serve`, runs a
-fixed one-shot upload/download test, prints the result, and exits. Do not start
-`plx client` while a speed test is active; the client command fails fast until
-the speed run is finished. If a matching `plx client` is already active for the
-same configured server, `plx speed` fails fast and prints the `kill -TERM …`
-command for the conflicting process.
+`plx speed -c parallax.client.toml` is a network evidence test, not the local
+CPU benchmark above. It connects directly to the configured `plx serve`, runs a
+fixed warmup plus three measured upload/download samples, prints a structured
+report, and exits. Use `--json` when the result should be archived by scripts.
+The report includes the config fingerprint, server address, SNI, traffic
+profile, payload chunk size, handshake timing, warmup timing, every sample, and
+median/mean/min/max/stddev throughput summaries.
+
+Do not start `plx client` while a speed test is active; the client command
+fails fast until the speed run is finished. If a matching `plx client` is
+already active for the same configured server, `plx speed` fails fast and
+prints the `kill -TERM …` command for the conflicting process.
 
 The suite covers asymmetric primitives (X25519, ML-KEM-1024 keygen /
 encap / decap, ML-DSA-87 sign / verify), KDFs (HKDF, sandwich rekey),

@@ -230,6 +230,20 @@ impl ClientDataSession {
             .seal_chunks_into_reusing(payload, rng, out, records)?)
     }
 
+    pub fn seal_payload_chunks_into_untracked<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ClientHandshakeError>
+    where
+        R: RngCore + CryptoRng + rand::Rng + ?Sized,
+    {
+        Ok(self
+            .seal_to_server
+            .seal_chunks_into_untracked(payload, rng, out)?)
+    }
+
     pub fn max_payload_chunk_len(&self) -> usize {
         self.seal_to_server.max_plaintext_len()
     }
@@ -254,6 +268,13 @@ impl ClientDataSession {
         record: &mut Vec<u8>,
     ) -> Result<(), ClientHandshakeError> {
         Ok(self.open_from_server.open_in_place(record)?)
+    }
+
+    pub fn open_server_record_in_place_payload_range(
+        &mut self,
+        record: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, ClientHandshakeError> {
+        Ok(self.open_from_server.open_in_place_payload_range(record)?)
     }
 
     pub fn open_server_identity_chunk(

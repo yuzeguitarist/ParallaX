@@ -78,11 +78,10 @@ pub fn is_fd_exhaustion_error(err: &io::Error) -> bool {
 
 pub fn relay_connection_limit() -> io::Result<usize> {
     relay_connection_limit_from_nofile(nofile_soft_limit()?).ok_or_else(|| {
-        io::Error::other(
-            format!(
-                "RLIMIT_NOFILE soft limit is too low; need more than {RESERVED_PROCESS_FDS} file descriptors"
-            ),
-        )
+        io::Error::other(format!(
+            "RLIMIT_NOFILE soft limit is too low; need more than \
+                 {RESERVED_PROCESS_FDS} file descriptors"
+        ))
     })
 }
 
