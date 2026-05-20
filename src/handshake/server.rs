@@ -76,6 +76,7 @@ const FALLBACK_MAX_IDLE_TIMEOUT_MS: u64 = 2200;
 const SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
+const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET / 2;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -829,7 +830,8 @@ async fn run_authenticated_data_mode(
                     Err(err) => return Err(HandshakeServerError::DataRecord(err)),
                 }
             }
-            read = fallback_records.read_record_into(&mut fallback_record) => {
+            read = fallback_records.read_record_into(&mut fallback_record),
+                if fallback_records_before_pq < PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT => {
                 match read {
                     Ok(()) => {}
                     Err(err) if is_clean_close(&err) => return Ok(()),
@@ -844,7 +846,7 @@ async fn run_authenticated_data_mode(
                 fallback_records_before_pq += 1;
                 fallback_bytes_before_pq += fallback_record.len();
                 if let Ok(header) = crate::tls::record::parse_header(&fallback_record) {
-                    if fallback_records_before_pq == 1 || fallback_records_before_pq == 8 {
+                    if fallback_records_before_pq == 1 {
                         tracing::info!(
                             cid,
                             direction = "fallback->client",
@@ -855,12 +857,7 @@ async fn run_authenticated_data_mode(
                             tls_content_type = header.content_type,
                             "forwarding fallback camouflage record before ParallaX PQ rekey"
                         );
-                    } else if fallback_records_before_pq
-                        >= CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
-                        && fallback_records_before_pq
-                            % CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET
-                            == 0
-                    {
+                    } else if fallback_records_before_pq == PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT {
                         tracing::warn!(
                             cid,
                             direction = "fallback->client",
@@ -870,10 +867,22 @@ async fn run_authenticated_data_mode(
                             outer_tls_payload_len = header.payload_len,
                             tls_content_type = header.content_type,
                             client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
-                            "fallback camouflage records may exhaust client residual \
-                             budget before ParallaX PQ rekey"
+                            pre_pq_forward_limit = PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT,
+                            "pre-PQ fallback camouflage forward limit reached; pausing fallback \
+                             reads until ParallaX PQ rekey"
                         );
                     }
+                } else if fallback_records_before_pq == PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT {
+                    tracing::warn!(
+                        cid,
+                        fallback_records_before_pq,
+                        fallback_bytes_before_pq,
+                        record_len = fallback_record.len(),
+                        client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
+                        pre_pq_forward_limit = PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT,
+                        "pre-PQ fallback camouflage forward limit reached with unparsed TLS \
+                         record; pausing fallback reads until ParallaX PQ rekey"
+                    );
                 }
                 client_write.write_all(&fallback_record).await?;
             }
