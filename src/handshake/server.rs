@@ -1114,7 +1114,8 @@ async fn run_authenticated_speed_test_mode(
 
     let mut rng = StdRng::from_entropy();
     let mut scratch = RelaySealScratch::with_payload_capacity(chunk_size);
-    let payload = vec![0xA5; chunk_size];
+    let batch_len = relay_read_buffer_len(chunk_size);
+    let payload = vec![0xA5; batch_len];
     let mut io = SpeedServerIo {
         client_records: &mut client_records,
         client_write: &mut client_write,

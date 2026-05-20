@@ -17,6 +17,7 @@ use crate::{
     protocol::command::{
         SpeedTestAck, SpeedTestAckError, SpeedTestAckKind, SpeedTestRequest, SpeedTestRequestError,
     },
+    protocol::data::relay_read_buffer_len,
     runtime_guard::client_config_fingerprint,
     tls::record::TlsRecordReader,
     PROTOCOL_NAME, PROTOCOL_VERSION,
@@ -457,9 +458,10 @@ async fn write_upload_phase(
             "speed upload chunk size is zero",
         )));
     }
-    let payload = vec![0x5A; chunk_len];
+    let batch_len = relay_read_buffer_len(chunk_len);
+    let payload = vec![0x5A; batch_len];
     let mut rng = OsRng;
-    let mut sealed = Vec::with_capacity(chunk_len + 256);
+    let mut sealed = Vec::with_capacity(batch_len + 256);
     let mut remaining = expected_bytes;
     let start = Instant::now();
 
@@ -1063,5 +1065,16 @@ mod tests {
             SpeedError::TooManyBytes.to_string(),
             "speed test stream sent more bytes than requested"
         );
+    }
+
+    #[test]
+    fn speed_upload_uses_relay_sized_batches() {
+        let chunk_len = crate::protocol::data::max_plaintext_len(
+            crate::config::TrafficConfig::default().max_padding,
+        );
+        let batch_len = relay_read_buffer_len(chunk_len);
+
+        assert!(batch_len > chunk_len);
+        assert_eq!(batch_len, crate::protocol::data::RELAY_READ_BUFFER_TARGET);
     }
 }
