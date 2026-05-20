@@ -556,6 +556,150 @@ mod tests {
         assert!(!dir.path().join("parallax.client.toml").exists());
     }
 
+    #[test]
+    fn toml_basic_string_escapes_control_and_meta_characters() {
+        assert_eq!(toml_basic_string("plain"), "\"plain\"");
+        assert_eq!(
+            toml_basic_string("tab\there\nand\"quotes\\\u{08}\u{0c}\r"),
+            "\"tab\\there\\nand\\\"quotes\\\\\\b\\f\\r\""
+        );
+
+        let with_unicode_control = toml_basic_string("abc\u{7f}d\u{1}");
+        assert_eq!(with_unicode_control, "\"abc\\u007Fd\\u0001\"");
+    }
+
+    #[test]
+    fn check_config_returns_error_for_invalid_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        let err = check_config(missing.clone()).unwrap_err();
+        let chain = format!("{:?}", err);
+        assert!(chain.contains("failed to load"));
+    }
+
+    #[test]
+    fn check_config_accepts_valid_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "example.com:443",
+            "example.com:443",
+            "example.com",
+        );
+        let server_path = dir.path().join("parallax.server.toml");
+        fs::write(&server_path, &generated.server).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&server_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        check_config(server_path).unwrap();
+    }
+
+    #[test]
+    fn crypto_self_test_round_trips() {
+        crypto_self_test().unwrap();
+    }
+
+    #[test]
+    fn run_benchmark_quick_text_and_json() {
+        run_benchmark(true, false).unwrap();
+        run_benchmark(true, true).unwrap();
+    }
+
+    #[test]
+    fn probe_target_uses_explicit_dest_string() {
+        let (target, sni) = probe_target(
+            Some("example.com:8443".to_owned()),
+            Path::new("/does/not/exist"),
+        )
+        .unwrap();
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 8443);
+        assert_eq!(sni, "example.com");
+    }
+
+    #[test]
+    fn probe_target_falls_back_to_config_when_dest_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "203.0.113.10:443",
+            "cloudflare.com:443",
+            "cloudflare.com",
+        );
+        let client_path = dir.path().join("parallax.client.toml");
+        fs::write(&client_path, &generated.client).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&client_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let (target, sni) = probe_target(None, &client_path).unwrap();
+        assert_eq!(target.host, "cloudflare.com");
+        assert_eq!(target.port, 443);
+        assert_eq!(sni, "cloudflare.com");
+    }
+
+    #[test]
+    fn write_init_config_creates_paired_files_for_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_init_config(
+            "example.com",
+            "203.0.113.10:443",
+            "0.0.0.0:443",
+            "127.0.0.1:1080",
+            dir.path(),
+        )
+        .unwrap();
+        let server_path = dir.path().join("parallax.server.toml");
+        let client_path = dir.path().join("parallax.client.toml");
+        assert!(server_path.exists());
+        assert!(client_path.exists());
+
+        let server: Config = toml::from_str(&fs::read_to_string(&server_path).unwrap()).unwrap();
+        server.validate().unwrap();
+        let client: Config = toml::from_str(&fs::read_to_string(&client_path).unwrap()).unwrap();
+        client.validate().unwrap();
+        assert_eq!(client.client.unwrap().server_addr, "203.0.113.10:443");
+        assert_eq!(
+            server.server.unwrap().authorized_sni,
+            vec![String::from("example.com")]
+        );
+    }
+
+    #[test]
+    fn write_init_config_rejects_malformed_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_init_config(
+            "",
+            "203.0.113.10:443",
+            "0.0.0.0:443",
+            "127.0.0.1:1080",
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("target cannot be empty"));
+    }
+
+    #[test]
+    fn init_files_require_existing_output_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does/not/exist");
+        let err = write_init_files(
+            &missing,
+            &GeneratedConfig {
+                server: "server".to_owned(),
+                client: "client".to_owned(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("output directory does not exist"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn init_files_are_user_only_on_unix() {

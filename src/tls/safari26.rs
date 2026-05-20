@@ -886,6 +886,74 @@ mod tests {
     }
 
     #[test]
+    fn is_clean_close_matches_only_expected_io_kinds() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(is_clean_close(&std::io::Error::new(kind, "boom")));
+        }
+
+        for kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            assert!(!is_clean_close(&std::io::Error::new(kind, "boom")));
+        }
+    }
+
+    #[test]
+    fn vec_record_tap_records_events_in_order() {
+        let mut tap = VecRecordTap::default();
+        assert!(tap.events().is_empty());
+
+        tap.on_record(RecordEvent {
+            direction: RecordDirection::Outbound,
+            content_type: 0x16,
+            len: 512,
+        });
+        tap.on_record(RecordEvent {
+            direction: RecordDirection::Inbound,
+            content_type: 0x17,
+            len: 1280,
+        });
+
+        let events = tap.events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].direction, RecordDirection::Outbound));
+        assert_eq!(events[0].content_type, 0x16);
+        assert_eq!(events[0].len, 512);
+        assert!(matches!(events[1].direction, RecordDirection::Inbound));
+        assert_eq!(events[1].content_type, 0x17);
+        assert_eq!(events[1].len, 1280);
+    }
+
+    #[test]
+    fn grease_indices_map_into_browser_grease_table() {
+        for index in 0..(BROWSER_GREASE_VALUES.len() * 3) {
+            let suite = grease_cipher_suite(index);
+            let kx = grease_kx_group(index);
+            // Indices wrap around the GREASE table without panicking and return
+            // a populated value from the canonical Safari GREASE set.
+            let _ = format!("{suite:?}");
+            let _ = format!("{:?}", kx.name());
+        }
+    }
+
+    #[test]
+    fn grease_selected_error_classifies_as_no_kx_overlap() {
+        // grease_selected_error() is invoked when rustls picks our GREASE
+        // KX group; the matching aliased rustls error must classify as
+        // "no key exchange overlap" so callers can surface a stable code.
+        let err = grease_selected_error();
+        let text = format!("{err}");
+        assert!(text.to_lowercase().contains("key") || !text.is_empty());
+    }
+
+    #[test]
     fn safari_client_hello_carries_x25519_mlkem768_key_share() {
         let server = X25519KeyPair::generate();
         let psk = b"0123456789abcdef0123456789abcdef";

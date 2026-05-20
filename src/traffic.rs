@@ -281,4 +281,111 @@ mod tests {
         });
         assert!(enabled.is_enabled());
     }
+
+    #[test]
+    fn padding_profile_rejects_inverted_range() {
+        assert!(matches!(
+            PaddingProfile::new(20, 10),
+            Err(TrafficError::InvalidPaddingRange)
+        ));
+        assert!(matches!(
+            PaddingProfile::from_config(TrafficConfig {
+                min_padding: 10,
+                max_padding: 5,
+                ..TrafficConfig::default()
+            }),
+            Err(TrafficError::InvalidPaddingRange)
+        ));
+    }
+
+    #[test]
+    fn padding_profile_exposes_max_len() {
+        let profile = PaddingProfile::new(0, 42).unwrap();
+        assert_eq!(profile.max_len(), 42);
+    }
+
+    #[test]
+    fn padding_remove_rejects_short_buffer() {
+        assert!(matches!(
+            PaddingProfile::remove(&[]),
+            Err(TrafficError::PaddedFrameTooShort)
+        ));
+        assert!(matches!(
+            PaddingProfile::remove(&[0x55]),
+            Err(TrafficError::PaddedFrameTooShort)
+        ));
+
+        let mut buf = vec![0_u8];
+        assert!(matches!(
+            PaddingProfile::remove_in_place(&mut buf),
+            Err(TrafficError::PaddedFrameTooShort)
+        ));
+        assert_eq!(buf, vec![0_u8]);
+    }
+
+    #[test]
+    fn padding_remove_in_place_rejects_oversized_pad_length() {
+        let mut buf = vec![0xAA_u8, 0x00, 0x10];
+        assert!(matches!(
+            PaddingProfile::remove_in_place(&mut buf),
+            Err(TrafficError::PaddingLengthOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn padding_remove_in_place_trims_to_unpadded_len() {
+        let profile = PaddingProfile::new(4, 4).unwrap();
+        let mut rng = StdRng::seed_from_u64(0);
+        let padded = profile.apply(b"abcd", &mut rng);
+        let mut buf = padded.clone();
+        PaddingProfile::remove_in_place(&mut buf).unwrap();
+        assert_eq!(buf, b"abcd");
+    }
+
+    #[test]
+    fn timing_profile_returns_min_when_range_is_inverted_or_collapsed() {
+        let profile = TimingProfile::from_config(TrafficConfig {
+            min_delay_ms: 5,
+            max_delay_ms: 5,
+            ..TrafficConfig::default()
+        });
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..32 {
+            assert_eq!(profile.sample_delay(&mut rng), Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn timing_profile_samples_within_range() {
+        let profile = TimingProfile::from_config(TrafficConfig {
+            min_delay_ms: 1,
+            max_delay_ms: 7,
+            ..TrafficConfig::default()
+        });
+        let mut rng = StdRng::seed_from_u64(1);
+        for _ in 0..256 {
+            let sample = profile.sample_delay(&mut rng);
+            assert!(sample >= Duration::from_millis(1));
+            assert!(sample <= Duration::from_millis(7));
+        }
+    }
+
+    #[test]
+    fn cover_profile_returns_min_when_disabled_or_inverted() {
+        let disabled = CoverTrafficProfile::from_config(TrafficConfig::default());
+        let mut rng = StdRng::seed_from_u64(2);
+        assert_eq!(disabled.sample_interval(&mut rng), Duration::ZERO);
+
+        let inverted = CoverTrafficProfile::from_config(TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 25,
+            ..TrafficConfig::default()
+        });
+        // sample_interval first checks is_enabled(); since cover_max_interval_ms
+        // is non-zero the profile is enabled, but min >= max collapses to min.
+        assert_eq!(
+            inverted.sample_interval(&mut rng),
+            Duration::from_millis(50)
+        );
+    }
 }

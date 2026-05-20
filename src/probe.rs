@@ -610,4 +610,302 @@ mod tests {
         assert_eq!(report.score, 100);
         assert_eq!(report.verdict, ProbeVerdict::Good);
     }
+
+    use crate::config::{ClientConfig, CryptoConfig, Mode, ServerConfig, TrafficConfig};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use pqcrypto_mldsa::mldsa87;
+    use pqcrypto_mlkem::mlkem1024;
+    use std::path::PathBuf;
+
+    #[test]
+    fn empty_targets_are_rejected() {
+        assert!(matches!(
+            ProbeTarget::parse(""),
+            Err(ProbeError::EmptyTarget)
+        ));
+        assert!(matches!(
+            ProbeTarget::parse("   "),
+            Err(ProbeError::EmptyTarget)
+        ));
+        assert!(matches!(
+            ProbeTarget::parse("https://"),
+            Err(ProbeError::EmptyTarget)
+        ));
+        assert!(matches!(
+            ProbeTarget::parse("/just/a/path"),
+            Err(ProbeError::EmptyTarget)
+        ));
+    }
+
+    #[test]
+    fn trims_query_and_fragment_suffix() {
+        let target = ProbeTarget::parse("example.com:8443?q=1#frag").unwrap();
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 8443);
+    }
+
+    #[test]
+    fn rejects_zero_port_via_parse() {
+        assert!(matches!(
+            ProbeTarget::parse("example.com:0"),
+            Err(ProbeError::InvalidPort(_))
+        ));
+        assert!(matches!(
+            ProbeTarget::parse("[::1]:0"),
+            Err(ProbeError::InvalidPort(_))
+        ));
+    }
+
+    #[test]
+    fn ipv6_literal_with_no_port_defaults_to_443() {
+        let target = ProbeTarget::parse("[::1]").unwrap();
+        assert_eq!(target.host, "::1");
+        assert_eq!(target.port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn authority_uses_plain_host_for_non_ipv6() {
+        let target = ProbeTarget::parse("example.com:8443").unwrap();
+        assert_eq!(target.authority(), "example.com:8443");
+
+        let v4 = ProbeTarget::parse("127.0.0.1:9000").unwrap();
+        assert_eq!(v4.authority(), "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn verdict_display_strings_are_stable() {
+        assert_eq!(format!("{}", ProbeVerdict::Good), "Recommended");
+        assert_eq!(format!("{}", ProbeVerdict::Usable), "Usable");
+        assert_eq!(format!("{}", ProbeVerdict::Bad), "Not recommended");
+    }
+
+    fn synthetic_report(signals: ProbeSignals, notes: Vec<String>) -> ProbeReport {
+        report(
+            ProbeTarget {
+                host: "example.com".to_owned(),
+                port: 443,
+            },
+            "example.com".to_owned(),
+            signals,
+            notes,
+        )
+    }
+
+    #[test]
+    fn score_thresholds_map_to_verdicts() {
+        let bad = synthetic_report(ProbeSignals::default(), Vec::new());
+        assert_eq!(bad.score, 0);
+        assert_eq!(bad.verdict, ProbeVerdict::Bad);
+
+        let usable = synthetic_report(
+            ProbeSignals {
+                tcp_latency: Some(Duration::from_millis(30)),
+                tls13: true,
+                ..ProbeSignals::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(usable.score, 70);
+        assert_eq!(usable.verdict, ProbeVerdict::Usable);
+
+        let h11 = synthetic_report(
+            ProbeSignals {
+                tcp_latency: Some(Duration::from_millis(30)),
+                handshake_latency: Some(Duration::from_millis(40)),
+                tls13: true,
+                alpn: Some("http/1.1".to_owned()),
+                post_handshake_records: 0,
+            },
+            Vec::new(),
+        );
+        assert_eq!(h11.score, 80);
+        assert_eq!(h11.verdict, ProbeVerdict::Good);
+    }
+
+    #[test]
+    fn score_buckets_tcp_latency() {
+        let fast = synthetic_report(
+            ProbeSignals {
+                tcp_latency: Some(Duration::from_millis(250)),
+                ..ProbeSignals::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(fast.score, 35);
+
+        let mid = synthetic_report(
+            ProbeSignals {
+                tcp_latency: Some(Duration::from_millis(700)),
+                ..ProbeSignals::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(mid.score, 30);
+
+        let slow = synthetic_report(
+            ProbeSignals {
+                tcp_latency: Some(Duration::from_secs(3)),
+                ..ProbeSignals::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(slow.score, 25);
+    }
+
+    #[test]
+    fn summary_lists_failures_and_notes() {
+        let mut report = synthetic_report(ProbeSignals::default(), Vec::new());
+        report.notes.push("first note".to_owned());
+        report.notes.push("second note".to_owned());
+
+        let summary = report.summary();
+        assert!(summary.contains("ParallaX probe: example.com:443"));
+        assert!(summary.contains("SNI: example.com"));
+        assert!(summary.contains("TCP connect      FAIL"));
+        assert!(summary.contains("TLS 1.3       FAIL"));
+        assert!(summary.contains("TLS handshake    FAIL"));
+        assert!(summary.contains("ALPN             (none negotiated)"));
+        assert!(summary.contains("Tickets/post-handshake 0 record(s)"));
+        assert!(summary.contains("Score             0/100 (Not recommended)"));
+        assert!(summary.contains("Notes:\n  - first note\n  - second note\n"));
+    }
+
+    #[test]
+    fn summary_includes_alpn_when_negotiated() {
+        let report = synthetic_report(
+            ProbeSignals {
+                tcp_latency: Some(Duration::from_millis(7)),
+                handshake_latency: Some(Duration::from_millis(11)),
+                tls13: true,
+                alpn: Some("h2".to_owned()),
+                post_handshake_records: 2,
+            },
+            Vec::new(),
+        );
+        let summary = report.summary();
+
+        assert!(summary.contains("TCP connect      PASS  7ms"));
+        assert!(summary.contains("TLS 1.3       PASS"));
+        assert!(summary.contains("TLS handshake    PASS  11ms"));
+        assert!(summary.contains("ALPN             h2"));
+        assert!(summary.contains("Tickets/post-handshake 2 record(s)"));
+        assert!(!summary.contains("Notes:"));
+    }
+
+    fn client_config() -> Config {
+        let server_pq_public_key = STANDARD.encode(vec![0_u8; mlkem1024::public_key_bytes()]);
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        Config {
+            mode: Mode::Client,
+            crypto: CryptoConfig {
+                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            },
+            traffic: TrafficConfig::default(),
+            client: Some(ClientConfig {
+                listen: "127.0.0.1:1080".parse().unwrap(),
+                server_addr: "example.com:443".to_owned(),
+                sni: "camouflage.example:443".to_owned(),
+                server_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                server_pq_public_key,
+                server_identity_public_key,
+            }),
+            server: None,
+        }
+    }
+
+    fn server_config_with_sni(authorized_sni: Vec<String>) -> Config {
+        Config {
+            mode: Mode::Server,
+            crypto: CryptoConfig {
+                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            },
+            traffic: TrafficConfig::default(),
+            client: None,
+            server: Some(ServerConfig {
+                listen: "127.0.0.1:8443".parse().unwrap(),
+                fallback_addr: "fallback.example:443".to_owned(),
+                data_target: None,
+                private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                pq_secret_key: String::new(),
+                identity_secret_key: STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]),
+                replay_cache_path: PathBuf::from("/tmp/parallax-test-replay.cache"),
+                authorized_sni,
+                strict_tls13: true,
+            }),
+        }
+    }
+
+    #[test]
+    fn target_from_config_uses_client_sni() {
+        let cfg = client_config();
+        let (target, sni) = target_from_config(&cfg).unwrap();
+        assert_eq!(target.host, "camouflage.example");
+        assert_eq!(target.port, 443);
+        assert_eq!(sni, "camouflage.example:443");
+    }
+
+    #[test]
+    fn target_from_config_for_server_uses_fallback_and_first_sni() {
+        let cfg = server_config_with_sni(vec![
+            "primary.example".to_owned(),
+            "secondary.example".to_owned(),
+        ]);
+        let (target, sni) = target_from_config(&cfg).unwrap();
+        assert_eq!(target.host, "fallback.example");
+        assert_eq!(target.port, 443);
+        assert_eq!(sni, "primary.example");
+    }
+
+    #[test]
+    fn target_from_config_for_server_falls_back_to_target_host_when_no_sni() {
+        let cfg = server_config_with_sni(Vec::new());
+        let (target, sni) = target_from_config(&cfg).unwrap();
+        assert_eq!(target.host, "fallback.example");
+        assert_eq!(sni, "fallback.example");
+    }
+
+    #[test]
+    fn target_from_config_requires_section() {
+        let mut cfg = client_config();
+        cfg.client = None;
+        assert!(matches!(
+            target_from_config(&cfg).unwrap_err(),
+            ProbeError::MissingConfigTarget
+        ));
+
+        let mut cfg = server_config_with_sni(vec!["example.com".to_owned()]);
+        cfg.server = None;
+        assert!(matches!(
+            target_from_config(&cfg).unwrap_err(),
+            ProbeError::MissingConfigTarget
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_marks_unreachable_targets_as_bad() {
+        // Bind a TCP port and immediately drop it to ensure the OS owns the
+        // address but refuses connections. This keeps the test deterministic
+        // without relying on outbound network.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let target = ProbeTarget {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        };
+        let report =
+            probe_with_timeout(target, "example.com".to_owned(), Duration::from_millis(150))
+                .await
+                .unwrap();
+
+        assert_eq!(report.tcp_latency, None);
+        assert_eq!(report.handshake_latency, None);
+        assert!(!report.tls13);
+        assert_eq!(report.verdict, ProbeVerdict::Bad);
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("TCP connect failed")));
+    }
 }

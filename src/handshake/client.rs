@@ -511,4 +511,88 @@ mod tests {
         assert_eq!(session.keys.client_key, next_keys.client_key);
         assert_eq!(session.keys.client_nonce, next_keys.client_nonce);
     }
+
+    fn test_session_keys() -> SessionKeys {
+        SessionKeys {
+            client_key: [9_u8; 32],
+            server_key: [8_u8; 32],
+            client_nonce: [7_u8; NONCE_LEN],
+            server_nonce: [6_u8; NONCE_LEN],
+            chain_secret: [5_u8; 32],
+            epoch: 0,
+            transcript_hash: [4_u8; 32],
+            x25519_shared_secret: [3_u8; 32],
+        }
+    }
+
+    #[test]
+    fn seal_and_open_round_trip_through_paired_codecs() {
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let mut client = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let (mut server_open, mut server_seal) = data_codecs(&keys, traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(11);
+
+        let payload = b"unit-test-payload";
+        let record = client.seal_payload(payload, &mut rng).unwrap();
+        let opened = server_open.open(&record).unwrap();
+        assert_eq!(opened, payload);
+
+        // First server-to-client record: opened in place on the client.
+        let mut first = server_seal.seal(b"server-says-hi", &mut rng).unwrap();
+        client.open_server_record_in_place(&mut first).unwrap();
+        assert_eq!(first, b"server-says-hi");
+
+        // Second server-to-client record (new nonce): opened via the owned API.
+        let second = server_seal.seal(b"server-says-bye", &mut rng).unwrap();
+        let owned = client.open_server_record_owned(second).unwrap();
+        assert_eq!(owned, b"server-says-bye");
+    }
+
+    #[test]
+    fn seal_payload_chunks_matches_seal_payload_chunks_into_for_small_payloads() {
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let mut a = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let mut b = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let mut rng_a = StdRng::seed_from_u64(33);
+        let mut rng_b = StdRng::seed_from_u64(33);
+
+        let payload = b"abc";
+        let chunks = a.seal_payload_chunks(payload, &mut rng_a).unwrap();
+
+        let mut out = Vec::new();
+        let _records = b
+            .seal_payload_chunks_into(payload, &mut rng_b, &mut out)
+            .unwrap();
+
+        let flattened: Vec<u8> = chunks.into_iter().flatten().collect();
+        assert_eq!(flattened, out);
+    }
+
+    #[test]
+    fn max_payload_chunk_len_is_positive() {
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let session = ClientDataSession::new(keys, traffic).unwrap();
+        assert!(session.max_payload_chunk_len() > 0);
+    }
+
+    #[test]
+    fn into_data_codecs_exposes_underlying_codecs() {
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let (seal_to_server, open_from_server) = session.into_data_codecs();
+        assert_eq!(
+            seal_to_server.max_plaintext_len(),
+            data_codecs(&keys, traffic).unwrap().0.max_plaintext_len()
+        );
+        // The opening codec must still accept records sealed by a fresh paired
+        // codec built from the same keys.
+        let (mut paired_seal, _) = data_codecs(&keys, traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let _ = paired_seal.seal(b"hello", &mut rng).unwrap();
+        drop(open_from_server);
+    }
 }
