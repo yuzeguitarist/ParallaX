@@ -169,6 +169,11 @@ struct AuthenticatedInbound {
     x25519_shared_secret: [u8; 32],
 }
 
+struct PendingReplayEntry {
+    cache: Arc<Mutex<ReplayCache>>,
+    entry: ReplayEntry,
+}
+
 enum ConnectionDecision {
     Authenticated(AuthenticatedInbound),
     Fallback(FallbackReason),
@@ -333,18 +338,14 @@ async fn handle_connection_inner(
                 hello: client_hello,
                 x25519_shared_secret,
             } = authenticated;
-            if let Some(replay_cache) = replay_cache {
-                let replay_entry = ReplayEntry {
+            let pending_replay = replay_cache.map(|cache| PendingReplayEntry {
+                cache,
+                entry: ReplayEntry {
                     timestamp: client_hello.timestamp,
                     nonce: client_hello.nonce,
                     transcript_fingerprint: client_hello.transcript_fingerprint,
-                };
-                if !insert_replay_entry_blocking(replay_cache, replay_entry).await? {
-                    tracing::warn!(cid, "falling back on replayed ClientHello");
-                    relay_fallback(client, &config.fallback_addr, first_record).await?;
-                    return Ok(());
-                }
-            }
+                },
+            });
             let handshake = accept_authenticated(
                 client,
                 config,
@@ -366,6 +367,7 @@ async fn handle_connection_inner(
                 secrets.identity_secret_key(),
                 psk,
                 traffic,
+                pending_replay,
                 cid,
             )
             .await?;
@@ -671,6 +673,7 @@ async fn run_authenticated_data_mode(
     identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
     sandwich_secret: &[u8],
     traffic: TrafficConfig,
+    mut pending_replay: Option<PendingReplayEntry>,
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
     handshake.session_keys.protect_secret_memory();
@@ -731,6 +734,10 @@ async fn run_authenticated_data_mode(
                 match client_open.open(&client_record) {
                     Ok(first_payload) => {
                         let pq_rekey = PqRekeyRequest::decode(&first_payload)?;
+                        if !commit_pending_replay_entry(&mut pending_replay).await? {
+                            tracing::warn!(cid, "closing on replayed ClientHello after data proof");
+                            return Ok(());
+                        }
                         let server_ephemeral = X25519KeyPair::generate();
                         crate::process_hardening::protect_secret_bytes(
                             "pq_rekey.server_x25519_private",
@@ -1010,6 +1017,15 @@ async fn insert_replay_entry_blocking(
             .insert_new(entry, now)
     })
     .await??)
+}
+
+async fn commit_pending_replay_entry(
+    pending_replay: &mut Option<PendingReplayEntry>,
+) -> Result<bool, HandshakeServerError> {
+    let Some(pending) = pending_replay.take() else {
+        return Ok(true);
+    };
+    insert_replay_entry_blocking(pending.cache, pending.entry).await
 }
 
 fn apply_server_pq_rekey(
@@ -1596,6 +1612,29 @@ mod tests {
             read,
             FirstClientRead::FallbackPrefix(vec![0x16, 0x03, 0x03, 0xff, 0xff])
         );
+    }
+
+    #[tokio::test]
+    async fn pending_replay_entry_commits_once_after_data_proof() {
+        let cache = Arc::new(Mutex::new(ReplayCache::new(8)));
+        let entry = ReplayEntry {
+            timestamp: current_unix_timestamp().unwrap(),
+            nonce: [7; 8],
+            transcript_fingerprint: [8; 32],
+        };
+        let mut first = Some(PendingReplayEntry {
+            cache: Arc::clone(&cache),
+            entry: entry.clone(),
+        });
+        let mut replayed = Some(PendingReplayEntry {
+            cache: Arc::clone(&cache),
+            entry,
+        });
+
+        assert!(commit_pending_replay_entry(&mut first).await.unwrap());
+        assert!(first.is_none());
+        assert!(!commit_pending_replay_entry(&mut replayed).await.unwrap());
+        assert!(replayed.is_none());
     }
 
     #[test]
