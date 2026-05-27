@@ -105,7 +105,6 @@ impl ReplayCache {
             cache.insert_loaded(entry);
         }
         cache.prune_expired(current_unix_timestamp()?);
-        cache.prune_capacity();
         Ok(cache)
     }
 
@@ -137,7 +136,6 @@ impl ReplayCache {
             cache.insert_loaded(entry);
         }
         cache.prune_expired(current_unix_timestamp()?);
-        cache.prune_capacity();
         Ok(cache)
     }
 
@@ -158,9 +156,13 @@ impl ReplayCache {
             self.nonces.remove(&entry.nonce);
             return Ok(false);
         }
+        if self.order.len() >= self.capacity {
+            self.nonces.remove(&entry.nonce);
+            self.transcripts.remove(&entry.transcript_fingerprint);
+            return Ok(false);
+        }
 
         self.push_loaded_entry(entry);
-        self.prune_capacity();
         self.persist()?;
         Ok(true)
     }
@@ -190,16 +192,6 @@ impl ReplayCache {
             if self.is_fresh(entry.timestamp, now) {
                 break;
             }
-            if let Some(old) = self.order.pop_front() {
-                let _ = self.encoded_entries.pop_front();
-                self.nonces.remove(&old.nonce);
-                self.transcripts.remove(&old.transcript_fingerprint);
-            }
-        }
-    }
-
-    fn prune_capacity(&mut self) {
-        while self.order.len() > self.capacity {
             if let Some(old) = self.order.pop_front() {
                 let _ = self.encoded_entries.pop_front();
                 self.nonces.remove(&old.nonce);
@@ -694,6 +686,31 @@ mod tests {
     }
 
     #[test]
+    fn fresh_entry_survives_capacity_pressure() {
+        let mut cache = ReplayCache::new(2);
+        let first = ReplayEntry {
+            timestamp: 100,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: 100,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+        let third = ReplayEntry {
+            timestamp: 100,
+            nonce: [5; 8],
+            transcript_fingerprint: [6; 32],
+        };
+
+        assert!(cache.insert_new(first.clone(), 100).unwrap());
+        assert!(cache.insert_new(second, 100).unwrap());
+        assert!(!cache.insert_new(third, 100).unwrap());
+        assert!(!cache.insert_new(first, 100).unwrap());
+    }
+
+    #[test]
     fn in_memory_cache_skips_plain_journal_encoding() {
         let mut cache = ReplayCache::new(8);
 
@@ -818,9 +835,9 @@ mod tests {
     }
 
     #[test]
-    fn persisted_cache_tracks_capacity_pruning() {
+    fn full_fresh_cache_rejects_new_entries_without_evicting_old_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("replay-prune.cache");
+        let path = dir.path().join("replay-full.cache");
         let key = b"0123456789abcdef0123456789abcdef";
         let now = current_unix_timestamp().unwrap();
         let first = ReplayEntry {
@@ -835,16 +852,17 @@ mod tests {
         };
 
         let mut cache = ReplayCache::load_or_create_authenticated(&path, 1, key).unwrap();
-        assert!(cache.insert_new(first, now).unwrap());
-        assert!(cache.insert_new(second.clone(), now).unwrap());
+        assert!(cache.insert_new(first.clone(), now).unwrap());
+        assert!(!cache.insert_new(second, now).unwrap());
+        assert!(!cache.insert_new(first.clone(), now).unwrap());
 
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.starts_with(AUTH_JOURNAL_VERSION));
         assert!(raw.contains("0101010101010101"));
-        assert!(raw.contains("0303030303030303"));
+        assert!(!raw.contains("0303030303030303"));
 
         let mut loaded = ReplayCache::load_or_create_authenticated(&path, 1, key).unwrap();
-        assert!(!loaded.insert_new(second, now).unwrap());
+        assert!(!loaded.insert_new(first, now).unwrap());
     }
 
     #[test]
