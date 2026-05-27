@@ -12,7 +12,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{copy_bidirectional, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
@@ -67,12 +67,6 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
-const FALLBACK_MIN_RECORDS: usize = 2;
-const FALLBACK_MAX_RECORDS: usize = 4;
-const FALLBACK_MIN_BYTES: usize = 8 * 1024;
-const FALLBACK_MAX_BYTES: usize = 16 * 1024;
-const FALLBACK_MIN_IDLE_TIMEOUT_MS: u64 = 800;
-const FALLBACK_MAX_IDLE_TIMEOUT_MS: u64 = 2200;
 const SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
@@ -557,29 +551,7 @@ pub async fn relay_fallback(
     let mut fallback = connect_tcp_with_timeout(fallback_addr).await?;
     tune_tcp_stream(&fallback)?;
     fallback.write_all(&first_client_record).await?;
-    let mut rng = StdRng::from_entropy();
-    let max_records = rng.gen_range(FALLBACK_MIN_RECORDS..=FALLBACK_MAX_RECORDS);
-    let max_bytes = rng.gen_range(FALLBACK_MIN_BYTES..=FALLBACK_MAX_BYTES);
-    let idle_timeout = Duration::from_millis(
-        rng.gen_range(FALLBACK_MIN_IDLE_TIMEOUT_MS..=FALLBACK_MAX_IDLE_TIMEOUT_MS),
-    );
-    let mut forwarded_records = 0;
-    let mut forwarded_bytes = 0;
-    while forwarded_records < max_records && forwarded_bytes < max_bytes {
-        let record = match timeout(idle_timeout, read_record(&mut fallback)).await {
-            Ok(Ok(record)) => record,
-            Ok(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => break,
-            Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
-            Err(_) => break,
-        };
-        if forwarded_bytes + record.len() > max_bytes {
-            break;
-        }
-        client.write_all(&record).await?;
-        forwarded_records += 1;
-        forwarded_bytes += record.len();
-    }
-    client.shutdown().await?;
+    copy_bidirectional(&mut client, &mut fallback).await?;
     Ok(())
 }
 
@@ -1844,6 +1816,54 @@ mod tests {
             resolve_connect_target(&mut encoded, Some("target.example:443")).unwrap_err(),
             HandshakeServerError::ConnectRequest(ConnectRequestError::EmptyHost)
         ));
+    }
+
+    #[tokio::test]
+    async fn fallback_relay_forwards_client_records_after_origin_flight() {
+        let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let second_client_record = crate::tls::record::wrap_application_data(b"client-finished")
+            .expect("test client record fits");
+        let first_origin_record = crate::tls::record::wrap_application_data(b"server-flight")
+            .expect("test origin record fits");
+        let second_origin_record = crate::tls::record::wrap_application_data(b"origin-reply")
+            .expect("test origin reply fits");
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let expected_first = first_client_record.clone();
+        let expected_second = second_client_record.clone();
+        let origin_first = first_origin_record.clone();
+        let origin_second = second_origin_record.clone();
+        let origin_task = tokio::spawn(async move {
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            let relayed_first = read_record(&mut origin).await.unwrap();
+            assert_eq!(relayed_first, expected_first);
+            origin.write_all(&origin_first).await.unwrap();
+
+            let relayed_second = read_record(&mut origin).await.unwrap();
+            assert_eq!(relayed_second, expected_second);
+            origin.write_all(&origin_second).await.unwrap();
+        });
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            relay_fallback(server_side, &origin_addr.to_string(), first_client_record)
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        let relayed_origin_first = read_record(&mut client).await.unwrap();
+        assert_eq!(relayed_origin_first, first_origin_record);
+        client.write_all(&second_client_record).await.unwrap();
+        let relayed_origin_second = read_record(&mut client).await.unwrap();
+        assert_eq!(relayed_origin_second, second_origin_record);
+        drop(client);
+
+        origin_task.await.unwrap();
+        relay_task.await.unwrap();
     }
 
     #[tokio::test]
