@@ -12,7 +12,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::{copy_bidirectional, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
@@ -57,7 +57,7 @@ use crate::{
     },
     tls::{
         client_hello::parse_client_hello,
-        record::{log_record_read, read_record, TlsRecordReader},
+        record::{log_record_read, parse_header, read_record, TlsRecordReader, TLS_HEADER_LEN},
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
@@ -172,6 +172,12 @@ struct AuthenticatedInbound {
 enum ConnectionDecision {
     Authenticated(AuthenticatedInbound),
     Fallback(FallbackReason),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FirstClientRead {
+    Record(Vec<u8>),
+    FallbackPrefix(Vec<u8>),
 }
 
 pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
@@ -305,7 +311,18 @@ async fn handle_connection_inner(
     );
     let server_private = secrets.private_key();
     let server_public_key = secrets.server_public_key();
-    let first_record = read_first_record(&mut client).await?;
+    let first_record = match read_first_client_record(&mut client).await? {
+        FirstClientRead::Record(record) => record,
+        FirstClientRead::FallbackPrefix(prefix) => {
+            tracing::info!(
+                cid,
+                prefix_len = prefix.len(),
+                "falling back to camouflage origin before a complete ClientHello"
+            );
+            relay_fallback(client, &config.fallback_addr, prefix).await?;
+            return Ok(());
+        }
+    };
     match decide_connection_inbound(&first_record, psk, &config.authorized_sni, server_private)? {
         ConnectionDecision::Fallback(reason) => {
             tracing::info!(cid, ?reason, "falling back to camouflage origin");
@@ -568,6 +585,67 @@ async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeS
         .await
         .map_err(|_| HandshakeServerError::Timeout)?
         .map_err(HandshakeServerError::Io)
+}
+
+async fn read_first_client_record(
+    stream: &mut TcpStream,
+) -> Result<FirstClientRead, HandshakeServerError> {
+    read_first_client_record_with_timeout(stream, HANDSHAKE_TIMEOUT).await
+}
+
+async fn read_first_client_record_with_timeout<R>(
+    stream: &mut R,
+    read_timeout: Duration,
+) -> Result<FirstClientRead, HandshakeServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; TLS_HEADER_LEN];
+    let mut header_pos = 0;
+    while header_pos < TLS_HEADER_LEN {
+        let read = timeout(read_timeout, stream.read(&mut header[header_pos..])).await;
+        match read {
+            Ok(Ok(0)) if header_pos == 0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TLS record header ended early",
+                )
+                .into());
+            }
+            Ok(Ok(0)) => {
+                return Ok(FirstClientRead::FallbackPrefix(
+                    header[..header_pos].to_vec(),
+                ));
+            }
+            Ok(Ok(n)) => header_pos += n,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => {
+                return Ok(FirstClientRead::FallbackPrefix(
+                    header[..header_pos].to_vec(),
+                ));
+            }
+        }
+    }
+
+    let parsed = match parse_header(&header) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(FirstClientRead::FallbackPrefix(header.to_vec())),
+    };
+
+    let mut record = vec![0_u8; parsed.total_len];
+    record[..TLS_HEADER_LEN].copy_from_slice(&header);
+    let mut record_pos = TLS_HEADER_LEN;
+    while record_pos < parsed.total_len {
+        let read = timeout(read_timeout, stream.read(&mut record[record_pos..])).await;
+        match read {
+            Ok(Ok(0)) => return Ok(FirstClientRead::FallbackPrefix(record[..record_pos].to_vec())),
+            Ok(Ok(n)) => record_pos += n,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => return Ok(FirstClientRead::FallbackPrefix(record[..record_pos].to_vec())),
+        }
+    }
+
+    Ok(FirstClientRead::Record(record))
 }
 
 async fn connect_tcp_with_timeout(addr: &str) -> Result<TcpStream, HandshakeServerError> {
@@ -1487,6 +1565,37 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, HandshakeServerError::OutboundConnectTimeout));
+    }
+
+    #[tokio::test]
+    async fn first_client_record_timeout_enters_fallback_without_close() {
+        let (_client, mut server_side) = tokio::io::duplex(8);
+
+        let read =
+            read_first_client_record_with_timeout(&mut server_side, Duration::from_millis(1))
+                .await
+                .unwrap();
+
+        assert_eq!(read, FirstClientRead::FallbackPrefix(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn first_client_record_invalid_header_preserves_probe_prefix() {
+        let (mut client, mut server_side) = tokio::io::duplex(8);
+        client
+            .write_all(&[0x16, 0x03, 0x03, 0xff, 0xff])
+            .await
+            .unwrap();
+
+        let read =
+            read_first_client_record_with_timeout(&mut server_side, Duration::from_millis(50))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            read,
+            FirstClientRead::FallbackPrefix(vec![0x16, 0x03, 0x03, 0xff, 0xff])
+        );
     }
 
     #[test]
