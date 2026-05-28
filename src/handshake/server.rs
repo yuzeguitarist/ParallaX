@@ -13,7 +13,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -69,6 +69,7 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const FALLBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
 const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
@@ -572,14 +573,63 @@ pub async fn accept_authenticated(
 }
 
 pub async fn relay_fallback(
-    mut client: TcpStream,
+    client: TcpStream,
     fallback_addr: &str,
     first_client_record: Vec<u8>,
 ) -> Result<(), HandshakeServerError> {
     let mut fallback = connect_tcp_with_timeout(fallback_addr).await?;
     tune_tcp_stream(&fallback)?;
     fallback.write_all(&first_client_record).await?;
-    copy_bidirectional(&mut client, &mut fallback).await?;
+    relay_fallback_with_idle_timeout(client, fallback, FALLBACK_IDLE_TIMEOUT).await
+}
+
+async fn relay_fallback_with_idle_timeout(
+    client: TcpStream,
+    fallback: TcpStream,
+    idle_timeout: Duration,
+) -> Result<(), HandshakeServerError> {
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut fallback_read, mut fallback_write) = fallback.into_split();
+    let fallback_buffer_len = relay_read_buffer_len(max_plaintext_len(0));
+    let mut client_buf = vec![0_u8; fallback_buffer_len];
+    let mut fallback_buf = vec![0_u8; fallback_buffer_len];
+    let idle_sleep = sleep(idle_timeout);
+    tokio::pin!(idle_sleep);
+    let mut client_closed = false;
+    let mut fallback_closed = false;
+
+    loop {
+        if client_closed && fallback_closed {
+            break;
+        }
+
+        tokio::select! {
+            _ = &mut idle_sleep => {
+                break;
+            }
+            read = client_read.read(&mut client_buf), if !client_closed => {
+                let n = read?;
+                if n == 0 {
+                    client_closed = true;
+                    fallback_write.shutdown().await?;
+                } else {
+                    fallback_write.write_all(&client_buf[..n]).await?;
+                    idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
+                }
+            }
+            read = fallback_read.read(&mut fallback_buf), if !fallback_closed => {
+                let n = read?;
+                if n == 0 {
+                    fallback_closed = true;
+                    client_write.shutdown().await?;
+                } else {
+                    client_write.write_all(&fallback_buf[..n]).await?;
+                    idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2261,6 +2311,38 @@ mod tests {
         drop(client);
 
         origin_task.await.unwrap();
+        relay_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_relay_idle_timeout_closes_empty_probe() {
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            let mut one = [0_u8; 1];
+            origin.read(&mut one).await.unwrap()
+        });
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            let fallback = TcpStream::connect(origin_addr).await.unwrap();
+            relay_fallback_with_idle_timeout(server_side, fallback, Duration::from_millis(30))
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        let mut one = [0_u8; 1];
+        let client_read = timeout(Duration::from_millis(500), client.read(&mut one))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(client_read, 0);
+        assert_eq!(origin_task.await.unwrap(), 0);
         relay_task.await.unwrap();
     }
 
