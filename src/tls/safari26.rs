@@ -26,7 +26,8 @@ use rustls::{
     },
     pki_types::{CertificateDer, ServerName, UnixTime},
     CipherSuite, CipherSuiteCommon, ConnectionTrafficSecrets, DigitallySignedStruct,
-    Error as RustlsError, NamedGroup, SignatureScheme, SupportedCipherSuite, Tls13CipherSuite,
+    Error as RustlsError, NamedGroup, RootCertStore, SignatureScheme, SupportedCipherSuite,
+    Tls13CipherSuite,
 };
 use thiserror::Error;
 use tokio::{
@@ -459,12 +460,14 @@ fn build_client_config() -> Result<rustls::ClientConfig, Safari26TlsError> {
     shape_safari_cipher_suites(&mut provider, cipher_grease);
     shape_safari_key_exchange_groups(&mut provider, group_grease);
     provider.secure_random = &PARALLAX_RANDOM;
+    let provider = Arc::new(provider);
+    let verifier = CamouflageVerifier::new(Arc::clone(&provider))?;
 
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|err| Safari26TlsError::RustlsConfig(err.to_string()))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(CamouflageVerifier))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     // A fresh, non-shared cache lets rustls emit an empty TLS 1.2
@@ -782,36 +785,68 @@ impl SecureRandom for ParallaxSecureRandom {
 }
 
 #[derive(Debug)]
-struct CamouflageVerifier;
+struct CamouflageVerifier {
+    verifier: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+impl CamouflageVerifier {
+    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Result<Self, Safari26TlsError> {
+        let roots = Arc::new(native_root_store()?);
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider)
+            .build()
+            .map_err(|err| Safari26TlsError::RustlsConfig(err.to_string()))?;
+        Ok(Self { verifier })
+    }
+}
+
+fn native_root_store() -> Result<RootCertStore, Safari26TlsError> {
+    let loaded = rustls_native_certs::load_native_certs();
+    let mut roots = RootCertStore::empty();
+    for cert in loaded.certs {
+        roots
+            .add(cert)
+            .map_err(|err| Safari26TlsError::RustlsConfig(err.to_string()))?;
+    }
+    if roots.is_empty() {
+        let detail = loaded
+            .errors
+            .first()
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "platform root store returned no certificates".to_owned());
+        return Err(Safari26TlsError::RustlsConfig(detail));
+    }
+    Ok(roots)
+}
 
 impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, RustlsError> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        self.verifier
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        self.verifier.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        self.verifier.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -883,6 +918,25 @@ mod tests {
         assert_eq!(auth.sni.as_deref(), Some("example.com"));
         assert_eq!(auth.x25519_key_share, Some(session.x25519.public));
         assert!(session.connection.is_handshaking());
+    }
+
+    #[test]
+    fn camouflage_verifier_rejects_invalid_certificate() {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = CamouflageVerifier::new(provider).unwrap();
+        let server_name = ServerName::try_from("example.com").unwrap();
+        let invalid_cert = CertificateDer::from(vec![0_u8]);
+
+        let result = rustls::client::danger::ServerCertVerifier::verify_server_cert(
+            &verifier,
+            &invalid_cert,
+            &[],
+            &server_name,
+            &[],
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000)),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
