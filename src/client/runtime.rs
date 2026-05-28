@@ -33,7 +33,9 @@ use crate::{
     },
     crypto::{auth::AuthError, identity, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
-    protocol::command::{ConnectRequest, ServerIdentityChunk, ServerIdentityProof},
+    protocol::command::{
+        ConnectRequest, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
+    },
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
     },
@@ -431,7 +433,10 @@ async fn apply_server_key_exchange_record_blocking(
     pending_rekey: &PendingPqRekey,
     psk: &[u8],
 ) -> Result<(), ClientRuntimeError> {
-    let exchange = data_session.open_server_key_exchange_record(record)?;
+    let exchange_payload = data_session.open_server_record(record)?;
+    let exchange =
+        ServerKeyExchange::decode(&exchange_payload).map_err(ClientHandshakeError::from)?;
+    let pq_identity_binding = pending_rekey.identity_binding(&exchange_payload);
     let x25519_shared = pending_rekey.x25519_shared_secret(&exchange.server_x25519_public);
     let ciphertext = exchange.mlkem_ciphertext;
     let secret_key = zeroize::Zeroizing::new(pending_rekey.mlkem_secret_key().to_vec());
@@ -439,7 +444,12 @@ async fn apply_server_key_exchange_record_blocking(
         tokio::task::spawn_blocking(move || pq::decapsulate(&ciphertext, secret_key.as_slice()))
             .await?
             .map_err(ClientHandshakeError::from)?;
-    data_session.apply_pq_rekey_shared(&x25519_shared, &pq_shared, psk)?;
+    data_session.apply_pq_rekey_shared_with_identity_binding(
+        &x25519_shared,
+        &pq_shared,
+        psk,
+        pq_identity_binding,
+    )?;
     Ok(())
 }
 
@@ -451,6 +461,7 @@ async fn verify_server_identity_payload_blocking(
 ) -> Result<(), ClientRuntimeError> {
     let transcript_hash = data_session.transcript_hash();
     let server_x25519_public_key = *server_x25519_public_key;
+    let pq_identity_binding = data_session.pq_identity_binding()?;
     let epoch = data_session.epoch();
     tokio::task::spawn_blocking(move || {
         let signature =
@@ -460,6 +471,7 @@ async fn verify_server_identity_payload_blocking(
             signature,
             &transcript_hash,
             &server_x25519_public_key,
+            &pq_identity_binding,
             epoch,
         )
         .map_err(ClientHandshakeError::from)

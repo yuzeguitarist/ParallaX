@@ -505,14 +505,20 @@ fn bench_mldsa_sign(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let keys = identity::keypair();
     let transcript = [0x33_u8; KEY_LEN];
     let server_x25519 = X25519KeyPair::generate().public;
+    let pq_binding = identity::pq_rekey_binding(b"bench client pq", b"bench server kex");
     run_case(
         BenchGroup::HandshakeCrypto,
         "mldsa.sign",
         TIER_SLOW,
         options,
         || {
-            let signature =
-                identity::sign_server_identity(&keys.secret, &transcript, &server_x25519, 0)?;
+            let signature = identity::sign_server_identity(
+                &keys.secret,
+                &transcript,
+                &server_x25519,
+                &pq_binding,
+                0,
+            )?;
             Ok(black_box(signature.len() as u64))
         },
     )
@@ -522,7 +528,9 @@ fn bench_mldsa_verify(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let keys = identity::keypair();
     let transcript = [0x33_u8; KEY_LEN];
     let server_x25519 = X25519KeyPair::generate().public;
-    let signature = identity::sign_server_identity(&keys.secret, &transcript, &server_x25519, 0)?;
+    let pq_binding = identity::pq_rekey_binding(b"bench client pq", b"bench server kex");
+    let signature =
+        identity::sign_server_identity(&keys.secret, &transcript, &server_x25519, &pq_binding, 0)?;
     run_case(
         BenchGroup::HandshakeCrypto,
         "mldsa.verify",
@@ -534,6 +542,7 @@ fn bench_mldsa_verify(options: BenchmarkOptions) -> Result<BenchmarkCase> {
                 &signature,
                 &transcript,
                 &server_x25519,
+                &pq_binding,
                 0,
             )?;
             Ok(black_box(signature.len() as u64))
@@ -965,8 +974,14 @@ fn server_identity_payload_fixture() -> Result<Vec<u8>> {
     let identity_keys = identity::keypair();
     let server = X25519KeyPair::generate();
     let transcript = [0x33_u8; KEY_LEN];
-    let signature =
-        identity::sign_server_identity(&identity_keys.secret, &transcript, &server.public, 0)?;
+    let pq_binding = identity::pq_rekey_binding(b"bench client pq", b"bench server kex");
+    let signature = identity::sign_server_identity(
+        &identity_keys.secret,
+        &transcript,
+        &server.public,
+        &pq_binding,
+        0,
+    )?;
     Ok(ServerIdentityProof { signature }.encode()?)
 }
 
@@ -982,6 +997,7 @@ fn bench_server_identity_build_decode_each_time(
     let server_private = STANDARD.encode(server.private);
     let identity_secret = STANDARD.encode(&identity_keys.secret);
     let context = [0x51_u8; KEY_LEN];
+    let pq_binding = identity::pq_rekey_binding(b"bench client pq", b"bench server kex");
 
     run_case(
         BenchGroup::HandshakeProtocol,
@@ -993,8 +1009,13 @@ fn bench_server_identity_build_decode_each_time(
             let server_public = x25519_public_from_private(&private);
             let identity_secret =
                 decode_base64_secret("server.identity_secret_key", &identity_secret)?;
-            let signature =
-                identity::sign_server_identity(&identity_secret, &context, &server_public, 0)?;
+            let signature = identity::sign_server_identity(
+                &identity_secret,
+                &context,
+                &server_public,
+                &pq_binding,
+                0,
+            )?;
             let frame = ServerIdentityProof { signature }.encode()?;
             Ok(black_box(frame.len() as u64))
         },
@@ -1005,6 +1026,7 @@ fn bench_server_identity_build_cached(options: BenchmarkOptions) -> Result<Bench
     let server = X25519KeyPair::generate();
     let identity_keys = identity::keypair();
     let context = [0x51_u8; KEY_LEN];
+    let pq_binding = identity::pq_rekey_binding(b"bench client pq", b"bench server kex");
 
     run_case(
         BenchGroup::HandshakeProtocol,
@@ -1012,8 +1034,13 @@ fn bench_server_identity_build_cached(options: BenchmarkOptions) -> Result<Bench
         TIER_SLOW,
         options,
         || {
-            let signature =
-                identity::sign_server_identity(&identity_keys.secret, &context, &server.public, 0)?;
+            let signature = identity::sign_server_identity(
+                &identity_keys.secret,
+                &context,
+                &server.public,
+                &pq_binding,
+                0,
+            )?;
             let frame = ServerIdentityProof { signature }.encode()?;
             Ok(black_box(frame.len() as u64))
         },
@@ -1026,8 +1053,14 @@ fn bench_client_identity_verify_decode_each_time(
     let server = X25519KeyPair::generate();
     let identity_keys = identity::keypair();
     let context = [0x51_u8; KEY_LEN];
-    let signature =
-        identity::sign_server_identity(&identity_keys.secret, &context, &server.public, 0)?;
+    let pq_binding = identity::pq_rekey_binding(b"bench client pq", b"bench server kex");
+    let signature = identity::sign_server_identity(
+        &identity_keys.secret,
+        &context,
+        &server.public,
+        &pq_binding,
+        0,
+    )?;
     let frame = ServerIdentityProof { signature }.encode()?;
     let server_public = STANDARD.encode(server.public);
     let identity_public = STANDARD.encode(&identity_keys.public);
@@ -1047,6 +1080,7 @@ fn bench_client_identity_verify_decode_each_time(
                 &proof.signature,
                 &context,
                 &server_public,
+                &pq_binding,
                 0,
             )?;
             Ok(black_box(proof.signature.len() as u64))
@@ -1058,8 +1092,14 @@ fn bench_client_identity_verify_cached(options: BenchmarkOptions) -> Result<Benc
     let server = X25519KeyPair::generate();
     let identity_keys = identity::keypair();
     let context = [0x51_u8; KEY_LEN];
-    let signature =
-        identity::sign_server_identity(&identity_keys.secret, &context, &server.public, 0)?;
+    let pq_binding = identity::pq_rekey_binding(b"bench client pq", b"bench server kex");
+    let signature = identity::sign_server_identity(
+        &identity_keys.secret,
+        &context,
+        &server.public,
+        &pq_binding,
+        0,
+    )?;
     let frame = ServerIdentityProof { signature }.encode()?;
 
     run_case(
@@ -1074,6 +1114,7 @@ fn bench_client_identity_verify_cached(options: BenchmarkOptions) -> Result<Benc
                 &proof.signature,
                 &context,
                 &server.public,
+                &pq_binding,
                 0,
             )?;
             Ok(black_box(proof.signature.len() as u64))

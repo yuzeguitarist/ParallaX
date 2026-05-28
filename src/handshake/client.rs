@@ -50,6 +50,8 @@ pub enum ClientHandshakeError {
     ServerIdentityChunk(#[from] ServerIdentityChunkError),
     #[error("server identity verification failed: {0}")]
     Identity(#[from] IdentityError),
+    #[error("server identity proof arrived before a bound PQ rekey exchange")]
+    MissingPqIdentityBinding,
 }
 
 pub fn derive_session_keys(
@@ -100,11 +102,13 @@ pub struct ClientDataSession {
     seal_to_server: DataRecordCodec,
     open_from_server: DataRecordCodec,
     keys: SessionKeys,
+    pq_identity_binding: Option<[u8; 32]>,
 }
 
 pub struct PendingPqRekey {
     x25519: X25519KeyPair,
     mlkem: pq::MlKemKeyPair,
+    request_payload: Vec<u8>,
 }
 
 impl PendingPqRekey {
@@ -115,6 +119,10 @@ impl PendingPqRekey {
     pub fn mlkem_secret_key(&self) -> &[u8] {
         &self.mlkem.secret
     }
+
+    pub fn identity_binding(&self, server_key_exchange_payload: &[u8]) -> [u8; 32] {
+        identity::pq_rekey_binding(&self.request_payload, server_key_exchange_payload)
+    }
 }
 
 impl ClientDataSession {
@@ -124,6 +132,7 @@ impl ClientDataSession {
             seal_to_server,
             open_from_server,
             keys,
+            pq_identity_binding: None,
         };
         session.keys.protect_secret_memory();
         session.seal_to_server.protect_secret_memory();
@@ -144,7 +153,14 @@ impl ClientDataSession {
         crate::process_hardening::protect_secret_bytes("pq_rekey.mlkem_secret", &mlkem.secret);
         let request = PqRekeyRequest::encode_borrowed(&x25519.public, &mlkem.public)?;
         let record = self.seal_to_server.seal(&request, rng)?;
-        Ok((record, PendingPqRekey { x25519, mlkem }))
+        Ok((
+            record,
+            PendingPqRekey {
+                x25519,
+                mlkem,
+                request_payload: request,
+            },
+        ))
     }
 
     pub fn apply_server_key_exchange_record(
@@ -153,10 +169,17 @@ impl ClientDataSession {
         pending: &PendingPqRekey,
         sandwich_secret: &[u8],
     ) -> Result<(), ClientHandshakeError> {
-        let exchange = self.open_server_key_exchange_record(record)?;
+        let exchange_payload = self.open_from_server.open(record)?;
+        let exchange = ServerKeyExchange::decode(&exchange_payload)?;
+        let pq_identity_binding = pending.identity_binding(&exchange_payload);
         let x25519_shared = pending.x25519_shared_secret(&exchange.server_x25519_public);
         let pq_shared = pq::decapsulate(&exchange.mlkem_ciphertext, &pending.mlkem.secret)?;
-        self.apply_pq_rekey_shared(&x25519_shared, &pq_shared, sandwich_secret)?;
+        self.apply_pq_rekey_shared_with_identity_binding(
+            &x25519_shared,
+            &pq_shared,
+            sandwich_secret,
+            pq_identity_binding,
+        )?;
         Ok(())
     }
 
@@ -307,11 +330,15 @@ impl ClientDataSession {
         server_x25519_public_key: &[u8; 32],
     ) -> Result<(), ClientHandshakeError> {
         let proof = ServerIdentityProof::decode(payload)?;
+        let pq_identity_binding = self
+            .pq_identity_binding
+            .ok_or(ClientHandshakeError::MissingPqIdentityBinding)?;
         identity::verify_server_identity(
             server_identity_public_key,
             &proof.signature,
             &self.keys.transcript_hash,
             server_x25519_public_key,
+            &pq_identity_binding,
             self.keys.epoch,
         )?;
         Ok(())
@@ -330,6 +357,11 @@ impl ClientDataSession {
 
     pub fn epoch(&self) -> u64 {
         self.keys.epoch
+    }
+
+    pub fn pq_identity_binding(&self) -> Result<[u8; 32], ClientHandshakeError> {
+        self.pq_identity_binding
+            .ok_or(ClientHandshakeError::MissingPqIdentityBinding)
     }
 
     pub fn apply_pq_rekey_shared(
@@ -360,6 +392,18 @@ impl ClientDataSession {
         self.keys.protect_secret_memory();
         self.seal_to_server.protect_secret_memory();
         self.open_from_server.protect_secret_memory();
+        Ok(())
+    }
+
+    pub fn apply_pq_rekey_shared_with_identity_binding(
+        &mut self,
+        x25519_shared_secret: &[u8; 32],
+        pq_shared_secret: &[u8; 32],
+        sandwich_secret: &[u8],
+        pq_identity_binding: [u8; 32],
+    ) -> Result<(), ClientHandshakeError> {
+        self.apply_pq_rekey_shared(x25519_shared_secret, pq_shared_secret, sandwich_secret)?;
+        self.pq_identity_binding = Some(pq_identity_binding);
         Ok(())
     }
 }
@@ -512,6 +556,42 @@ mod tests {
         assert_eq!(session.keys.client_nonce, next_keys.client_nonce);
     }
 
+    #[test]
+    fn server_identity_rejects_proof_from_different_pq_rekey() {
+        let keys = SessionKeys {
+            client_key: [9_u8; 32],
+            server_key: [8_u8; 32],
+            client_nonce: [7_u8; NONCE_LEN],
+            server_nonce: [6_u8; NONCE_LEN],
+            chain_secret: [5_u8; 32],
+            epoch: 0,
+            transcript_hash: [4_u8; 32],
+            x25519_shared_secret: [3_u8; 32],
+        };
+        let traffic = TrafficConfig::default();
+        let server_static = X25519KeyPair::generate();
+        let identity_keys = identity::keypair();
+        let mut rng = StdRng::seed_from_u64(66);
+        let (first_session, first_binding) = apply_test_pq_rekey(keys.clone(), traffic, &mut rng);
+        let (second_session, _) = apply_test_pq_rekey(keys, traffic, &mut rng);
+        let signature = identity::sign_server_identity(
+            &identity_keys.secret,
+            &first_session.transcript_hash(),
+            &server_static.public,
+            &first_binding,
+            first_session.epoch(),
+        )
+        .unwrap();
+        let proof = ServerIdentityProof { signature }.encode().unwrap();
+
+        first_session
+            .verify_server_identity_payload(&proof, &identity_keys.public, &server_static.public)
+            .unwrap();
+        assert!(second_session
+            .verify_server_identity_payload(&proof, &identity_keys.public, &server_static.public)
+            .is_err());
+    }
+
     fn test_session_keys() -> SessionKeys {
         SessionKeys {
             client_key: [9_u8; 32],
@@ -523,6 +603,47 @@ mod tests {
             transcript_hash: [4_u8; 32],
             x25519_shared_secret: [3_u8; 32],
         }
+    }
+
+    fn apply_test_pq_rekey(
+        keys: SessionKeys,
+        traffic: TrafficConfig,
+        rng: &mut StdRng,
+    ) -> (ClientDataSession, [u8; 32]) {
+        let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let (_record, pending) = session.build_pq_rekey_record(rng).unwrap();
+        let (_server_open, mut server_seal) = data_codecs(&keys, traffic).unwrap();
+        let server_x25519 = X25519KeyPair::generate();
+        let x25519_shared = pending.x25519_shared_secret(&server_x25519.public);
+        let encapsulation = pq::encapsulate(&pending.mlkem.public).unwrap();
+        let exchange_payload = ServerKeyExchange {
+            server_x25519_public: server_x25519.public,
+            mlkem_ciphertext: encapsulation.ciphertext,
+        }
+        .encode()
+        .unwrap();
+        let binding = pending.identity_binding(&exchange_payload);
+        let exchange_record = server_seal.seal(&exchange_payload, rng).unwrap();
+
+        session
+            .apply_server_key_exchange_record(&exchange_record, &pending, b"test-psk")
+            .unwrap();
+        let chain_secret = pq::hybrid_sandwich_rekey(
+            &keys.chain_secret,
+            &x25519_shared,
+            &encapsulation.shared_secret,
+            b"test-psk",
+        )
+        .unwrap();
+        let next_keys = expand_epoch_keys(
+            chain_secret,
+            keys.epoch + 1,
+            keys.transcript_hash,
+            x25519_shared,
+        )
+        .unwrap();
+        assert_eq!(session.keys.client_key, next_keys.client_key);
+        (session, binding)
     }
 
     #[test]

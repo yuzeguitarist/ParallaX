@@ -640,10 +640,18 @@ where
     while record_pos < parsed.total_len {
         let read = timeout(read_timeout, stream.read(&mut record[record_pos..])).await;
         match read {
-            Ok(Ok(0)) => return Ok(FirstClientRead::FallbackPrefix(record[..record_pos].to_vec())),
+            Ok(Ok(0)) => {
+                return Ok(FirstClientRead::FallbackPrefix(
+                    record[..record_pos].to_vec(),
+                ))
+            }
             Ok(Ok(n)) => record_pos += n,
             Ok(Err(err)) => return Err(err.into()),
-            Err(_) => return Ok(FirstClientRead::FallbackPrefix(record[..record_pos].to_vec())),
+            Err(_) => {
+                return Ok(FirstClientRead::FallbackPrefix(
+                    record[..record_pos].to_vec(),
+                ))
+            }
         }
     }
 
@@ -754,6 +762,8 @@ async fn run_authenticated_data_mode(
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
                         }
                         .encode()?;
+                        let pq_identity_binding =
+                            identity::pq_rekey_binding(&first_payload, &key_exchange_payload);
                         crate::process_hardening::protect_secret_bytes(
                             "pq_rekey.mlkem_shared_secret",
                             &pq_encapsulation.shared_secret,
@@ -791,6 +801,7 @@ async fn run_authenticated_data_mode(
                             identity_secret_key,
                             rekeyed_keys.transcript_hash,
                             handshake.server_public_key,
+                            pq_identity_binding,
                             rekeyed_keys.epoch,
                         )
                         .await?;
@@ -992,6 +1003,7 @@ async fn sign_server_identity_blocking(
     identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
     transcript_hash: [u8; 32],
     server_public_key: [u8; 32],
+    pq_rekey_binding: [u8; 32],
     epoch: u64,
 ) -> Result<Vec<u8>, HandshakeServerError> {
     Ok(tokio::task::spawn_blocking(move || {
@@ -999,6 +1011,7 @@ async fn sign_server_identity_blocking(
             identity_secret_key.as_slice(),
             &transcript_hash,
             &server_public_key,
+            &pq_rekey_binding,
             epoch,
         )
     })
