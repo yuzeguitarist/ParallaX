@@ -1,82 +1,81 @@
 # ParallaX Overview
-Relevant source files
 
-- [README.md](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1)
-- [src/cli.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs)
-- [src/lib.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs)
+> Navigation: [Index](README.md) | [Core Architecture](Core-Architecture.md) | [Getting Started](Getting-Started-&-CLI-Reference.md)
 
-ParallaX is a high-performance, censorship-resistant proxy protocol written in Rust. Its primary design goal is to bypass advanced traffic analysis by mimicking legitimate browser-based TLS 1.3 traffic while providing a secure, authenticated tunnel for proxied data [README.md#3-12](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1#L3-L12)
+## One-sentence summary
 
-The system operates as a client-server architecture where the client exposes a local SOCKS5 interface and tunnels traffic to a remote server. The server acts as a dual-purpose listener: it provides proxy services to authenticated clients and transparently falls back to a legitimate "camouflage" website for unauthenticated or suspicious probes [README.md#6-12](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1#L6-L12)
+ParallaX is a single-binary Rust proxy that accepts local SOCKS5 traffic,
+connects to a ParallaX server through a browser-shaped TLS 1.3 flow, hides
+authentication inside ClientHello entropy fields, falls back to a real TLS
+origin for unauthenticated traffic, and rekeys the encrypted data plane with a
+hybrid post-quantum exchange.
 
-### Design Goals
+## Current product boundary
 
-- Mimicry: Constructing TLS 1.3 `ClientHello` messages that are indistinguishable from real browsers (Chrome, Safari) [README.md#6-7](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1#L6-L7)
-- Probing Resistance: Using a fallback mechanism to redirect unauthorized scanners to a legitimate backend, such as `cloudflare.com` or `example.com`[README.md#8](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1#L8-L8)
-- Security: Leveraging modern cryptographic primitives including X25519 for key exchange, XChaCha20-Poly1305 for data protection, and Post-Quantum (PQ) algorithms for long-term forward secrecy [src/cli.rs#16-19](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L16-L19)[src/lib.rs#5](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs#L5-L5)
-- Analysis Resistance: Implementing traffic shaping through padding, timing delays, and cover traffic to defeat packet-length and timing-based analysis [src/lib.rs#11](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs#L11-L11)
+| In scope on current `main` | Out of scope / research-only |
+|---|---|
+| TCP transport carrying TLS records | Shipped QUIC/UDP product transport |
+| Safari-shaped TLS 1.3 camouflage | Generic "random bytes" obfuscation |
+| Local unauthenticated SOCKS5 bound to loopback | Public SOCKS5 listener |
+| Fallback passthrough for unauthenticated/probe traffic | Dropping scanners with proxy-shaped errors |
+| ML-KEM-1024 rekey and ML-DSA-87 server identity | CA-based server authentication for the ParallaX identity |
+| Source-level GFW simulator tests | Claiming the simulator proves universal bypass |
 
-### System Components
+The removed QUIC runtime is intentionally not documented as an operator mode.
+QUIC remains relevant in this repository only through research notes and
+detectors inside the simulator; see [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 
-The ParallaX codebase is organized into several major subsystems that handle different stages of the proxy lifecycle:
+## Main components
 
-| Subsystem | Responsibility | Key Entities |
-| --- | --- | --- |
-| CLI (`plx`) | Entry point for management and execution. | `Cli`, `Command`[src/cli.rs#25-34](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L25-L34) |
-| Handshake | Handles the initial TLS camouflage and authentication. | `server::run`, `client::runtime`[src/cli.rs#149-160](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L149-L160) |
-| Crypto | Manages session keys, PQ rekeying, and identity. | `AeadCodec`, `X25519KeyPair`[src/cli.rs#137-138](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L137-L138) |
-| Transport | Manages raw TCP or QUIC/UDP data movement. | `quic_runtime`, `server::run`[src/cli.rs#147-151](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L147-L151) |
-| Traffic | Applies padding and cover traffic profiles. | `PaddingProfile`, `CoverTrafficProfile`[src/lib.rs#11](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs#L11-L11) |
+| Component | Role | Code |
+|---|---|---|
+| CLI | User-facing commands, config generation, benchmark/speed entry points. | `src/cli.rs` |
+| Config loader | TOML schema, validation, secret-file permission checks, relative replay-cache paths. | `src/config.rs` |
+| Client runtime | Loopback SOCKS5, server dial, TLS camouflage, PQ rekey, identity check, relay. | `src/client/runtime.rs` |
+| Server runtime | First-record classification, replay check, fallback passthrough, authenticated relay. | `src/handshake/server.rs` |
+| TLS camouflage | Real `rustls` state machine with Safari-shaped ClientHello and HTTP/2 preface support. | `src/tls/safari26.rs`, `src/fingerprint/http2.rs` |
+| Cryptography | PSK/X25519 auth, AEAD session keys, ML-KEM, ML-DSA, replay cache. | `src/crypto/` |
+| Wire protocol | Binary control commands and encrypted TLS ApplicationData records. | `src/protocol/` |
+| Operations | Local-build VPS deploy/uninstall, systemd hardening, BBR/fq setup. | `scripts/` |
+| Validation | Unit tests, integration tests, simulator, fixtures, benchmark suite. | `tests/`, `src/bench.rs` |
 
-### Bridge: Natural Language to Code Space
+## Data flow at a glance
 
-The following diagrams illustrate how high-level protocol concepts map to specific modules and functions within the `parallax` codebase.
+```text
+SOCKS app
+  │
+  ▼
+plx client
+  ├─ accepts loopback SOCKS5 CONNECT
+  ├─ starts Safari-shaped TLS camouflage to server_addr
+  ├─ sends authenticated ClientHello fields
+  ├─ performs ML-KEM/X25519/PSK rekey
+  ├─ verifies ML-DSA server identity proof
+  └─ relays encrypted data records
+        │
+        ▼
+plx serve
+  ├─ authenticates the first ClientHello record
+  ├─ falls back to fallback_addr on probe/unauthorized input
+  ├─ resolves fixed or client-requested target
+  └─ relays application data over TCP
+```
 
-#### Diagram 1: Execution Flow and CLI Mapping
+## Design principles
 
-This diagram shows how the `plx` CLI commands trigger specific runtime behaviors.
+1. **Use real protocol machinery where possible.** The camouflage path starts
+   from `rustls`, not a handwritten fake TLS transcript.
+2. **Make denial indistinguishable from an ordinary website path.** Probe and
+   auth failures are forwarded to the fallback origin.
+3. **Keep operational defaults speed-first.** Generated traffic shaping is zero
+   padding, zero delay, zero cover traffic, and one stream until multiplexing
+   can be scheduled safely.
+4. **Prefer measured evidence over claims.** `plx probe`, `plx speed`,
+   `plx bench`, fixtures, and simulator tests all produce repeatable evidence.
 
-[Flowchart Diagram]
+## Where to go next
 
-Sources:[src/cli.rs#36-109](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L36-L109)[src/cli.rs#144-161](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L144-L161)[src/lib.rs#1-12](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs#L1-L12)
-
-#### Diagram 2: Cryptographic and Protocol Entities
-
-This diagram maps the protocol's security layers to the internal library modules.
-
-[Flowchart Diagram]
-
-Sources:[src/cli.rs#16-19](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L16-L19)[src/lib.rs#5-9](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs#L5-L9)
-
-### Major Subsystems
-
-#### CLI and Configuration
-
-The `plx` utility is the primary interface for interacting with the protocol. It supports generating keys (`keygen`), initializing configuration files (`init`), and validating settings (`check`) [src/cli.rs#37-46](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L37-L46)
-For details, see [Getting Started & CLI Reference](#1.1).
-
-#### TLS Camouflage
-
-ParallaX does not just use TLS; it "camouflages" its traffic within a handshake that looks like a standard web browser [README.md#6](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1#L6-L6) This involves hijacking fields like the `session_id` to carry encrypted authentication tags without breaking the TLS 1.3 state machine [README.md#7](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1#L7-L7)
-For details, see [TLS Camouflage Layer](#4).
-
-#### Transport Modes
-
-ParallaX supports two primary transport methods:
-
-1. TCP Camouflage: The default mode, mimicking standard HTTPS traffic [README.md#3-4](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1#L3-L4)
-2. QUIC/UDP: A performance-oriented mode that uses the QUIC protocol for lower latency and better congestion control [src/cli.rs#51-53](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L51-L53)
-For details, see [Transport Layer](#6).
-
-#### Traffic Obfuscation
-
-To counter traffic analysis, ParallaX uses `PaddingProfile` and `CoverTrafficProfile` to modify the size and timing of packets, ensuring that the proxy stream does not exhibit "unnatural" patterns typical of encrypted tunnels [src/lib.rs#11](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs#L11-L11)
-For details, see [Traffic Obfuscation](#5).
-
-### Next Steps
-
-- To set up your first server, refer to [Getting Started & CLI Reference](#1.1).
-- To understand the cryptographic handshake, see [Core Architecture](#2).
-- To learn about the configuration fields, see [Configuration Reference](#1.2).
-
-Sources:[src/cli.rs#1-189](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L1-L189)[README.md#1-104](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1#L1-L104)[src/lib.rs#1-16](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs#L1-L16)
+- Operators: [Getting Started & CLI Reference](Getting-Started-&-CLI-Reference.md)
+- Maintainers: [Core Architecture](Core-Architecture.md)
+- Security reviewers: [Cryptographic Subsystems](Cryptographic-Subsystems.md)
+- Deployment owners: [Deployment](Deployment.md)

@@ -1,70 +1,92 @@
 # Core Architecture
-Relevant source files
 
-- [README.md](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/README.md?plain=1)
-- [src/client/runtime.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/client/runtime.rs)
-- [src/handshake/server.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/server.rs)
-- [src/lib.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/lib.rs)
+> Navigation: [Index](README.md) | [Overview](ParallaX-Overview.md) | [Protocol](Protocol-Commands-&-Data-Records.md)
 
-ParallaX is designed as a censorship-resistant transport protocol that achieves unobservability by mimicking legitimate HTTPS traffic. It employs a client-server topology where the "stealth" server acts as a transparent proxy for authorized clients while masquerading as a standard web server (the "fallback") to unauthorized probers.
+## System topology
 
-## System Topology
+```text
+┌─────────────┐   SOCKS5 CONNECT   ┌────────────┐
+│ application │ ─────────────────► │ plx client │
+└─────────────┘                    └─────┬──────┘
+                                         │ TLS 1.3 camouflage
+                                         │ authenticated ClientHello
+                                         │ ML-KEM/X25519/PSK rekey
+                                         ▼
+                                   ┌────────────┐
+                                   │ plx serve  │
+                                   └─────┬──────┘
+                      authenticated      │      unauthenticated/probe
+                      data records       │
+                                         ▼
+                              ┌────────────────────┐
+                              │ target or fallback │
+                              └────────────────────┘
+```
 
-The architecture consists of three primary entities: the ParallaX Client, the ParallaX Server, and a Camouflage Target (a legitimate web server).
+The product transport is TCP. TLS records are the outer wire shape; ParallaX
+data records are encrypted payloads carried as TLS `ApplicationData`.
 
-### Communication Flow
+## Startup flow
 
-1. SOCKS5 Inbound: The client receives local application traffic via a SOCKS5 interface.
-2. Camouflage Handshake: The client initiates a TCP connection to the ParallaX server, sending a TLS 1.3 `ClientHello` that contains embedded authentication tags.
-3. Inbound Decision: The server inspects the `ClientHello`.
+1. `src/main.rs` or `src/bin/plx.rs` enters `src/cli.rs`.
+2. Long-lived commands call `process_hardening::harden_current_process()`.
+3. Config is loaded and validated by `src/config.rs`.
+4. `serve` enters `handshake::server::run`.
+5. `client` enters `client::runtime::run`.
+6. `speed` enters `speed::run` after acquiring the speed runtime guard.
 
-- Authorized: The server completes a hybrid cryptographic handshake and transitions to data relay mode.
-- Unauthorized: The server transparently pipes the connection to the configured `fallback_addr`, appearing as a standard TLS endpoint.
-4. Data Relay: Once authenticated, traffic is encapsulated in `ApplicationData` records with randomized padding and timing to defeat traffic analysis.
+## Client connection flow
 
-### Code-to-Entity Mapping
+1. The SOCKS5 parser accepts only CONNECT requests.
+2. The client opens a TCP connection to `client.server_addr`.
+3. `Safari26TlsCamouflage::start` builds a real TLS ClientHello and embeds
+   ParallaX authentication material.
+4. The server key-exchange record is applied after skipping bounded residual
+   fallback camouflage records.
+5. The client verifies ML-DSA identity proof chunks.
+6. Data is relayed through `DataRecordCodec` in both directions.
 
-The following diagram maps the high-level architecture to the primary modules and functions in the codebase.
+Details: [Client Runtime & SOCKS5 Proxy](Client-Runtime-&-SOCKS5-Proxy.md).
 
-Diagram: Architectural Component Mapping
+## Server connection flow
 
-## Camouflage TLS Model
+1. The server reads the first TLS record or partial probe prefix.
+2. `decide_connection_inbound` parses ClientHello and verifies SNI/auth/replay.
+3. Failure paths forward to `server.fallback_addr`.
+4. Success paths temporarily continue the fallback TLS flow as camouflage until
+   the ParallaX PQ rekey arrives.
+5. The server sends key-exchange and identity records.
+6. The server resolves the fixed or client-requested target and relays data.
 
-ParallaX does not merely wrap traffic in TLS; it hijacks the TLS handshake fields to perform out-of-band authentication and key exchange.
+Details: [Server Runtime & Probing Resistance](Server-Runtime-&-Probing-Resistance.md).
 
-- ClientHello Hijacking: The client's ephemeral X25519 public key is placed in the `random` field of the `ClientHello`, and an authentication tag (derived from a Pre-Shared Key) is embedded in the `session_id` field. [src/tls/stateful.rs#185-188](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/stateful.rs#L185-L188)
-- Stateful Backend: The `StatefulRustlsCamouflageBackend` manages a real `rustls` instance to ensure the handshake follows the state machine of a legitimate browser (e.g., Chrome or Safari). [src/tls/stateful.rs#30-31](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/stateful.rs#L30-L31)
-- Probing Resistance: If the server detects a replay or an invalid signature in the `session_id`, it yields control to `relay_fallback`, which establishes a connection to a legitimate site and copies bytes bidirectionally. [src/handshake/server.rs#203-207](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/server.rs#L203-L207)
+## Layer boundaries
 
-For details, see [Server Runtime & Probing Resistance](#2.2).
+| Layer | Responsibility | Does not own |
+|---|---|---|
+| CLI/config | Command parsing, generated templates, validation. | Wire protocol semantics. |
+| TLS camouflage | Browser-shaped TLS handshake and fallback-origin interaction. | ParallaX data-plane encryption. |
+| Handshake | Authentication, transcript binding, rekey, identity proof. | Local SOCKS parsing. |
+| Protocol | Binary control messages and AEAD record format. | Target selection policy. |
+| Transport | TCP socket tuning and relay limits. | QUIC/UDP runtime. |
+| Operations | Deployment and service hardening. | Protocol negotiation. |
 
-## Layered Cryptographic Handshake
+## Key invariants
 
-The protocol uses a "sandwich" approach to security, layering standard TLS, symmetric PSK authentication, and Post-Quantum (PQ) primitives.
+- The client SOCKS listener must remain loopback-only.
+- Server SNI allowlist must not be empty.
+- A malformed or unauthorized first record must not produce a distinct proxy
+  failure on the wire.
+- `max_concurrent_streams` remains `1` until scheduling has a fingerprint-safe
+  design.
+- Generated secret configs must not be group/world-readable.
+- Benchmarks are fixed-parameter; adding/removing cases changes the baseline.
 
-| Layer | Primitive | Purpose |
-| --- | --- | --- |
-| Authentication | HKDF-SHA256 + PSK | Authenticates the `ClientHello` before the server allocates resources. |
-| Key Exchange | X25519 | Establishes the initial transport keys via `ClientHello.random`. |
-| PQ Security | ML-KEM-1024 | Hybrid rekeying immediately after the TLS handshake to ensure quantum resistance. |
-| Identity Proof | ML-DSA-87 | The server proves its identity to the client using a PQ-secure signature. |
+## Subsystem index
 
-Diagram: Handshake Sequence & Code Entities
-
-## Data Relay Model
-
-Once the handshake is complete, the connection enters a data relay phase. ParallaX treats the underlying TCP stream as a sequence of TLS `ApplicationData` records.
-
-- Encapsulation: Every packet is wrapped in a `DataRecordCodec` which handles AEAD (XChaCha20-Poly1305) encryption and padding. [src/protocol/data.rs#38-42](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/protocol/data.rs#L38-L42)
-- Traffic Shaping: The `PaddingProfile` and `TimingProfile` inject randomized delays and dummy bytes to mask the packet length and frequency distributions of the inner protocol. [src/traffic/mod.rs#48](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/traffic/mod.rs#L48-L48)
-- Cover Traffic: To defeat long-term statistical analysis, the `CoverTrafficProfile` generates "empty" encrypted records during periods of inactivity. [src/client/runtime.rs#214-217](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/client/runtime.rs#L214-L217)
-
-For details, see [Client Runtime & SOCKS5 Proxy](#2.1) and [Protocol Commands & Data Records](#2.3).
-
-## Subsystem Index
-
-- [Client Runtime & SOCKS5 Proxy](#2.1): Local proxy handling and handshake initiation.
-- [Server Runtime & Probing Resistance](#2.2): Inbound decision logic and fallback mechanics.
-- [Protocol Commands & Data Records](#2.3): Wire format, binary layout, and record-layer encryption.
-
-Sources: [src/client/runtime.rs#1-210](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/client/runtime.rs#L1-L210)[src/handshake/server.rs#1-250](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/server.rs#L1-L250)[src/protocol/data.rs#1-50](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/protocol/data.rs#L1-L50)[src/tls/stateful.rs#1-100](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/tls/stateful.rs#L1-L100)
+- [TLS Camouflage Layer](TLS-Camouflage-Layer.md)
+- [Cryptographic Subsystems](Cryptographic-Subsystems.md)
+- [Protocol Commands & Data Records](Protocol-Commands-&-Data-Records.md)
+- [Traffic Obfuscation](Traffic-Obfuscation.md)
+- [Transport Layer](Transport-Layer.md)
+- [Probing & Benchmarking](<Probing-&-Benchmarking.md>)

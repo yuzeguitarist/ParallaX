@@ -1,119 +1,101 @@
 # Getting Started & CLI Reference
-Relevant source files
 
-- [src/bin/plx.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/bin/plx.rs)
-- [src/cli.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs)
-- [src/config.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs)
-- [src/main.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/main.rs)
+> Navigation: [Index](README.md) | [Configuration](Configuration-Reference.md) | [Deployment](Deployment.md)
 
-The `plx` command-line interface is the primary entry point for interacting with the ParallaX proxy system. It provides utilities for environment initialization, cryptographic key generation, camouflage target evaluation, and running the core proxy runtimes.
+## Requirements
 
-## Installation and Quick Start
+- Rust `1.80+`
+- `cargo`
+- A fallback TLS origin that is reachable from the VPS
+- A VPS that can listen on the configured TCP port, usually `443`
 
-ParallaX is built using Rust and requires the `tokio` runtime [src/main.rs#1-4](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/main.rs#L1-L4) The CLI entry point is defined in `src/cli.rs`.
+Build locally:
 
-### Basic Workflow
+```bash
+cargo build --release
+```
 
-1. Initialize: Find a suitable camouflage target (e.g., a website with TLS 1.3 support) and generate a configuration.
-2. Keygen: Generate X25519 and Post-Quantum keys for secure communication.
-3. Deploy: Transfer the server configuration to a VPS and start the server.
-4. Connect: Start the local client to establish a SOCKS5 proxy.
+Install locally:
 
-Sources: [src/cli.rs#111-203](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L111-L203)[src/main.rs#1-4](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/main.rs#L1-L4)
+```bash
+cargo install --path .
+```
 
----
+## Beginner workflow
 
-## CLI Command Reference
+```bash
+# 1. Check a camouflage/fallback origin.
+plx probe cloudflare.com
 
-The `plx` tool uses a subcommand-based interface [src/cli.rs#36-109](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L36-L109)
+# 2. Generate paired config files in the current directory.
+plx init cloudflare.com --server-addr YOUR_VPS_IP:443
+
+# 3. Deploy with the guided wizard.
+bash scripts/deploy-vps.sh
+
+# 4. Run the local client and browse through SOCKS5.
+plx client -c target/parallax-deploy/<host>/parallax.client.toml
+curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
+```
+
+`plx init` writes `parallax.server.toml` and `parallax.client.toml` with mode
+`0600` on Unix and refuses to overwrite either file.
+
+## Command summary
+
+| Command | Purpose | Notes |
+|---|---|---|
+| `plx check [-c FILE]` | Validate TOML, keys, traffic bounds, client bind address, server SNI allowlist, and Unix secret-file permissions. | Defaults to `parallax.toml`. |
+| `plx keygen` | Print a fresh X25519 key pair. | Useful for manual config work. |
+| `plx crypto-self-test` | Run a local AEAD derivation/seal/open sanity check. | Does not contact the network. |
+| `plx serve [-c FILE]` | Start the server listener. | Long-lived process hardening runs before config use. |
+| `plx client [-c FILE]` | Start the loopback SOCKS5 client. | Uses a runtime guard to avoid conflicts with `plx speed`. |
+| `plx speed [-c FILE] [--json]` | Run one network speed evidence test against the configured server. | Fixed warmup + three samples per direction. |
+| `plx bench [--quick] [--json]` | Run the fixed CPU benchmark suite. | `--quick` is a smoke profile, not a custom benchmark knob. |
+| `plx config-template ...` | Print paired server/client TOML templates to stdout. | Advanced mode; no file writes. |
+| `plx probe [DEST] [-c FILE]` | Probe an explicit or config-derived camouflage target. | Accepts `domain`, `domain:port`, or `https://domain`. |
+| `plx init <DEST> ...` | Generate paired config files with fresh key material. | Use `-o DIR` to choose the output directory. |
+
+There is no `--quic` option on current `main`.
+
+## Important options
 
 ### `plx init`
 
-Automates the creation of `parallax.client.toml` and `parallax.server.toml`. It performs a probe of the destination domain to ensure it is a viable camouflage target [src/cli.rs#96-108](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L96-L108)
-
-- Usage: `plx init <DOMAIN> --server-addr <VPS_IP:PORT>`
-- Effect: Generates fresh X25519, ML-KEM, and ML-DSA keys and populates templates with the probed SNI and fallback settings.
+```text
+plx init <DEST>
+  --server-addr <HOST:PORT>      client-visible server address
+  --server-listen <ADDR:PORT>    server bind address, default 0.0.0.0:443
+  --client-listen <ADDR:PORT>    local SOCKS address, default 127.0.0.1:1080
+  -o, --output <DIR>             output directory, default .
+```
 
 ### `plx probe`
 
-Evaluates a domain's suitability as a camouflage target [src/cli.rs#89-94](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L89-L94)
+```text
+plx probe [DEST] -c parallax.toml
+```
 
-- Logic: It checks for TLS 1.3 support, ALPN (h2/http1.1), and measures latency.
-- Output: A `ProbeReport` with a `ProbeVerdict` (Good, Usable, or Bad).
+When `DEST` is omitted, `probe` infers a target from config:
 
-### `plx keygen`
+- server mode: `server.fallback_addr` and the first `server.authorized_sni`
+- client mode: `client.sni`
 
-Generates a standalone X25519 key pair [src/cli.rs#43-44](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L43-L44)
+### `plx speed`
 
-- Output: Base64-encoded private and public keys [src/cli.rs#127-131](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L127-L131)
+`plx speed` reads a client config, performs a real ParallaX handshake, and emits
+either text or JSON. The JSON schema is `parallax.speed.evidence.v1`.
 
-### `plx serve` & `plx client`
+## Verification commands
 
-Runs the ParallaX runtime in either server or client mode [src/cli.rs#48-62](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L48-L62)
+```bash
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked --no-fail-fast
+cargo test --locked -- --ignored --test-threads=1
+cargo test --test gfw_simulator
+```
 
-- `--quic`: Optional flag to use the UDP/QUIC transport instead of the default TCP camouflage transport [src/cli.rs#52-60](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L52-L60)
-- Config: Defaults to loading `parallax.toml` in the current directory [src/cli.rs#40](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L40-L40)
-
-### `plx check`
-
-Validates a configuration file without starting the runtime [src/cli.rs#39-42](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L39-L42) It verifies:
-
-- Base64 encoding of keys [src/config.rs#161-166](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L161-L166)
-- Socket address formats [src/config.rs#159-173](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L159-L173)
-- Traffic padding constraints [src/config.rs#192-197](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L192-L197)
-
-### `plx bench`
-
-Runs local CPU-only benchmarks for performance evaluation [src/cli.rs#65-74](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L65-L74)
-
-- Metrics: Measures throughput and latency for `DataRecordCodec` (seal/open) and Post-Quantum (ML-KEM) operations [src/cli.rs#162-175](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L162-L175)
-
-Sources: [src/cli.rs#36-109](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L36-L109)[src/cli.rs#116-203](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L116-L203)[src/config.rs#152-187](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L152-L187)
-
----
-
-## Configuration File Format
-
-ParallaX uses TOML for configuration. The file is structured into global settings (`mode`, `crypto`, `traffic`) and mode-specific sections (`client`, `server`) [src/config.rs#51-59](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L51-L59)
-
-### Core Structure
-
-| Section | Field | Description |
-| --- | --- | --- |
-| `[crypto]` | `psk` | Base64 pre-shared key (min 32 bytes) [src/config.rs#78-81](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L78-L81) |
-| `[traffic]` | `min_padding` | Minimum bytes added to every data record [src/config.rs#115](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L115-L115) |
-| `[traffic]` | `max_delay_ms` | Maximum jitter delay for packet transmission [src/config.rs#121](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L121-L121) |
-| `[client]` | `server_addr` | The IP/Port of your ParallaX server [src/config.rs#86](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L86-L86) |
-| `[server]` | `fallback_addr` | Where to redirect unauthenticated probes [src/config.rs#98](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L98-L98) |
-
-### Configuration Validation Logic
-
-The `Config::validate` function ensures that the system does not start with insecure or impossible parameters.
-
-Title: Configuration Validation Data Flow
-
-[Flowchart Diagram]
-
-Sources: [src/config.rs#51-128](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L51-L128)[src/config.rs#152-205](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L152-L205)
-
----
-
-## CLI Execution Flow
-
-When a user runs `plx`, the `cli::run()` function initializes logging and dispatches the command to the appropriate module.
-
-Title: CLI Command Dispatch to Code Entities
-
-[Flowchart Diagram]
-
-Sources: [src/cli.rs#111-203](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L111-L203)[src/bin/plx.rs#1-4](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/bin/plx.rs#L1-L4)[src/config.rs#63-66](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L63-L66)
-
-### Key Code Entities
-
-- `Cli` Struct: Defines the `clap` interface [src/cli.rs#25-34](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L25-L34)
-- `Config` Struct: The central data structure for all settings [src/config.rs#52-59](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L52-L59)
-- `server::run`: The entry point for the TCP-based server runtime [src/cli.rs#150](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L150-L150)
-- `runtime::run`: The entry point for the TCP-based client runtime [src/cli.rs#159](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L159-L159)
-- `quic_runtime`: Handles UDP-based transport when the `--quic` flag is used [src/cli.rs#148-157](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L148-L157)
-
-Sources: [src/cli.rs#25-109](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/cli.rs#L25-L109)[src/config.rs#51-128](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/config.rs#L51-L128)
+Use [Protocol Benchmarks](Protocol-Benchmarks.md) for local CPU timing and
+[Camouflage Target Probe](Camouflage-Target-Probe.md) for fallback-origin
+selection details.

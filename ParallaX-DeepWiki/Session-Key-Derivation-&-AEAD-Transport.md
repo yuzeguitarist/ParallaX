@@ -1,120 +1,78 @@
 # Session Key Derivation & AEAD Transport
-Relevant source files
 
-- [src/crypto/session.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs)
-- [src/handshake/client.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/client.rs)
-- [src/handshake/transcript.rs](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/transcript.rs)
+> Navigation: [Index](README.md) | [Protocol](Protocol-Commands-&-Data-Records.md) | [PQ & Identity](<Post-Quantum-Cryptography-(ML-KEM-&-ML-DSA).md>)
 
-This page describes the cryptographic mechanisms used to secure the ParallaX data session after the initial TLS-mimicking handshake. It covers the derivation of symmetric keys from X25519 Diffie-Hellman exchanges, the management of these keys through an epoch-based rotation system, and the AEAD (Authenticated Encryption with Associated Data) transport layer.
+## Initial session keys
 
-## Overview
+`src/crypto/session.rs` derives directional keys after the authenticated TLS
+camouflage handshake. Inputs include:
 
-ParallaX uses XChaCha20-Poly1305 for symmetric encryption of all application data and protocol commands. This choice provides a 192-bit nonce, which is essential for security in high-volume traffic environments where nonce collision must be avoided. The system derives a set of directional keys (Client-to-Server and Server-to-Client) bound to the specific handshake transcript.
+- client/server X25519 shared secret
+- transcript hash
+- protocol labels
 
-### Key Components
+The output contains separate client-to-server and server-to-client key/nonce
+material plus a chain secret that can be ratcheted by rekey events.
 
-- X25519 DH: Used to establish a shared secret between the client and server [src/crypto/session.rs#108-109](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L108-L109)
-- HKDF (SHA-256): Used for key expansion and extraction [src/crypto/session.rs#120](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L120-L120)
-- Chain Secret: A rolling secret used to derive keys for successive epochs [src/crypto/session.rs#110](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L110-L110)
-- AeadCodec: A stateful wrapper around the AEAD primitive that manages nonces and sequence numbers [src/crypto/session.rs#201-205](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L201-L205)
+## AEAD codec
 
----
+ParallaX uses an AEAD codec with:
 
-## Session Key Derivation
+- fixed key length
+- fixed nonce base length
+- monotonically advancing per-record nonce state
+- direction-specific additional authenticated data
 
-The derivation process begins after the client and server have exchanged TLS records. ParallaX extracts the X25519 public keys from the TLS `random` fields and combines them with a hash of the handshake transcript.
+`DataRecordCodec` wraps this codec with padding and TLS ApplicationData framing.
 
-### Transcript Hashing
+## Rekey model
 
-The `transcript_hash` binds the session keys to the exact bytes of the `ClientHello` and `ServerHello` records, preventing man-in-the-middle attacks from tampering with the handshake without breaking key derivation [src/handshake/transcript.rs#5-11](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/transcript.rs#L5-L11)
+The data session tracks an epoch. Rekeying:
 
-### Derivation Flow
+1. computes a new chain secret from old chain secret + X25519 + ML-KEM + PSK
+2. expands new directional AEAD keys/nonces
+3. increments the epoch
+4. updates both send and receive codecs
 
-1. Shared Secret: Perform X25519 DH between the client's ephemeral private key and the server's public key [src/crypto/session.rs#106-109](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L106-L109)
-2. Initial Chain Secret: Use HKDF-Extract with a salt (`"ParallaX v1 initial x25519 chain"`) and the shared secret [src/crypto/session.rs#169-172](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L169-L172)
-3. Key Expansion: Derive four distinct values for the current epoch using HKDF-Expand [src/crypto/session.rs#133-160](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L133-L160):
+The server identity proof is bound to the same PQ rekey exchange so a signature
+from one rekey cannot be replayed onto another.
 
-- `client_key` (32 bytes)
-- `server_key` (32 bytes)
-- `client_nonce` (24 bytes)
-- `server_nonce` (24 bytes)
+## Record lifecycle
 
-### Derivation Logic Entity Map
+```text
+plaintext
+  ├─ append padding and 2-byte padding length
+  ├─ seal in place with AEAD
+  ├─ append tag
+  └─ wrap as TLS ApplicationData
+```
 
-The following diagram maps the mathematical derivation flow to the specific functions in the codebase.
+Open path:
 
-Key Derivation Sequence
+```text
+TLS ApplicationData record
+  ├─ validate header and length
+  ├─ split ciphertext/tag
+  ├─ AEAD open in place
+  ├─ remove padding trailer
+  └─ return plaintext
+```
 
-[Flowchart Diagram]
+## Chunking and limits
 
-Sources:[src/crypto/session.rs#85-112](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L85-L112)[src/handshake/transcript.rs#5-11](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/transcript.rs#L5-L11)
+Large relay payloads are split so each encrypted TLS record stays within the
+outer TLS payload limit. The maximum plaintext chunk size depends on the
+configured maximum padding length.
 
----
+## Error classes
 
-## AEAD Transport & Nonce Management
+- malformed TLS record
+- non-ApplicationData content type
+- truncated record
+- AEAD failure
+- invalid padding trailer
+- payload too large for the configured padding profile
 
-Once keys are derived, they are encapsulated in the `SessionKeys` struct [src/crypto/session.rs#49-58](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L49-L58) These keys are then used to initialize the `AeadCodec`.
-
-### The `AeadCodec` Struct
-
-The `AeadCodec` handles the low-level encryption and decryption. It maintains an internal `sequence` number to ensure that nonces are never reused for the same key [src/crypto/session.rs#201-205](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L201-L205)
-
-- Seal (Encrypt): Increments the sequence number after every successful encryption [src/crypto/session.rs#224-238](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L224-L238)
-- Open (Decrypt): Increments the sequence number after every successful decryption [src/crypto/session.rs#240-254](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L240-L254)
-- Nonce Generation: The effective nonce is generated by XORing the `nonce_base` (derived from HKDF) with the current `sequence` number [src/crypto/session.rs#260-265](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L260-L265)
-
-### AEAD Transport Entity Map
-
-This diagram shows how `AeadCodec` interacts with the `DataRecordCodec` to provide the transport layer.
-
-AEAD Transport Layer
-
-[Flowchart Diagram]
-
-Sources:[src/crypto/session.rs#201-265](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L201-L265)[src/handshake/client.rs#62-71](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/client.rs#L62-L71)
-
----
-
-## Epochs and Key Rotation
-
-ParallaX supports forward-secret key rotation through "epochs." The `chain_secret` is used to derive the next set of keys when a rekey event occurs (e.g., during a Post-Quantum rekey).
-
-### Rekeying Process
-
-When a rekey is triggered (such as via `apply_pq_rekey` in the client), the system performs the following steps:
-
-1. Calculates a new `chain_secret` using the `hybrid_sandwich_rekey` construction [src/handshake/client.rs#159-164](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/client.rs#L159-L164)
-2. Increments the `epoch` counter [src/handshake/client.rs#167](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/client.rs#L167-L167)
-3. Calls `expand_epoch_keys` to generate a fresh set of symmetric keys and nonces from the new chain secret [src/handshake/client.rs#165-170](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/client.rs#L165-L170)
-4. Updates the `AeadCodec` instances via the `rekey()` method, which resets the internal sequence counter to zero [src/crypto/session.rs#217-222](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L217-L222)
-
-### Epoch Data Structure
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `chain_secret` | `[u8; 32]` | The master secret for the current epoch. |
-| `epoch` | `u64` | Monotonically increasing counter. |
-| `client_key` | `[u8; 32]` | Symmetric key for Client -> Server traffic. |
-| `server_key` | `[u8; 32]` | Symmetric key for Server -> Client traffic. |
-
-Sources:[src/crypto/session.rs#49-58](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L49-L58)[src/handshake/client.rs#154-178](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/client.rs#L154-L178)
-
----
-
-## Implementation Details
-
-### Security Properties
-
-- Zeroization: Both `X25519KeyPair` and `SessionKeys` implement `ZeroizeOnDrop` to ensure sensitive key material is wiped from memory when no longer needed [src/crypto/session.rs#17-21](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L17-L21)[src/crypto/session.rs#48-58](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L48-L58)
-- Transcript Binding: The HKDF info string includes the `transcript_hash`, ensuring that keys are unique to the handshake [src/crypto/session.rs#191-198](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L191-L198)
-- Domain Separation: Labels such as `"client appdata key"` and `"server appdata nonce"` are used during HKDF expansion to prevent key-stream reuse across different directions or purposes [src/crypto/session.rs#133-160](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L133-L160)
-
-### Error Handling
-
-The `SessionError` enum covers failures in the cryptographic pipeline:
-
-- `Hkdf`: Failures during expansion or extraction [src/crypto/session.rs#77-78](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L77-L78)
-- `Aead`: Failures during encryption (seal) or decryption (open), typically indicating authentication failure or corrupted records [src/crypto/session.rs#79-80](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L79-L80)
-- `NonceExhausted`: Triggered if the 64-bit sequence number overflows, necessitating a rekey [src/crypto/session.rs#81-82](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L81-L82)
-
-Sources:[src/crypto/session.rs#1-83](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/crypto/session.rs#L1-L83)[src/handshake/client.rs#23-41](https://github.com/yuzeguitarist/ParallaX/blob/77045cea/src/handshake/client.rs#L23-L41)
+Related pages: [Protocol Commands & Data Records](Protocol-Commands-&-Data-Records.md),
+[Padding & Timing Profiles](<Padding-&-Timing-Profiles.md>), and
+[Protocol Benchmarks](Protocol-Benchmarks.md).
