@@ -801,19 +801,35 @@ impl CamouflageVerifier {
 
 fn native_root_store() -> Result<RootCertStore, Safari26TlsError> {
     let loaded = rustls_native_certs::load_native_certs();
+    let load_error_detail = loaded.errors.first().map(ToString::to_string);
+    root_store_from_certificates(loaded.certs, load_error_detail)
+}
+
+fn root_store_from_certificates(
+    certs: Vec<CertificateDer<'static>>,
+    load_error_detail: Option<String>,
+) -> Result<RootCertStore, Safari26TlsError> {
     let mut roots = RootCertStore::empty();
-    for cert in loaded.certs {
-        roots
-            .add(cert)
-            .map_err(|err| Safari26TlsError::RustlsConfig(err.to_string()))?;
-    }
+    let (valid_count, invalid_count) = roots.add_parsable_certificates(certs);
     if roots.is_empty() {
-        let detail = loaded
-            .errors
-            .first()
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "platform root store returned no certificates".to_owned());
+        let detail = load_error_detail.unwrap_or_else(|| {
+            if invalid_count == 0 {
+                "platform root store returned no certificates".to_owned()
+            } else {
+                format!(
+                    "platform root store returned {invalid_count} unparsable certificates and no \
+                     usable roots"
+                )
+            }
+        });
         return Err(Safari26TlsError::RustlsConfig(detail));
+    }
+    if invalid_count > 0 {
+        tracing::debug!(
+            valid_count,
+            invalid_count,
+            "ignored unparsable native root certificates"
+        );
     }
     Ok(roots)
 }
@@ -937,6 +953,16 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_root_store_ignores_unparsable_certificates_when_usable_roots_exist() {
+        let mut certs = rustls_native_certs::load_native_certs().certs;
+        certs.push(CertificateDer::from(vec![0_u8]));
+
+        let roots = root_store_from_certificates(certs, None).unwrap();
+
+        assert!(!roots.is_empty());
     }
 
     #[test]
