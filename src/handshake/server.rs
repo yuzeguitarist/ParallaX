@@ -20,7 +20,7 @@ use tokio::{
         TcpListener, TcpStream,
     },
     sync::{Semaphore, TryAcquireError},
-    time::{sleep, timeout, Instant},
+    time::{sleep, timeout, timeout_at, Instant},
 };
 use zeroize::Zeroize;
 
@@ -611,30 +611,31 @@ async fn read_first_client_record_with_timeout<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let deadline = Instant::now() + read_timeout;
     let mut header = [0_u8; TLS_HEADER_LEN];
     let mut header_pos = 0;
     while header_pos < TLS_HEADER_LEN {
-        let read = timeout(read_timeout, stream.read(&mut header[header_pos..])).await;
+        let read = read_before_deadline(stream, &mut header[header_pos..], deadline).await;
         match read {
-            Ok(Ok(0)) if header_pos == 0 => {
+            Ok(Some(0)) if header_pos == 0 => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "TLS record header ended early",
                 )
                 .into());
             }
-            Ok(Ok(0)) => {
+            Ok(Some(0)) => {
                 return Ok(FirstClientRead::FallbackPrefix(
                     header[..header_pos].to_vec(),
                 ));
             }
-            Ok(Ok(n)) => header_pos += n,
-            Ok(Err(err)) => return Err(err.into()),
-            Err(_) => {
+            Ok(Some(n)) => header_pos += n,
+            Ok(None) => {
                 return Ok(FirstClientRead::FallbackPrefix(
                     header[..header_pos].to_vec(),
                 ));
             }
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -647,24 +648,38 @@ where
     record[..TLS_HEADER_LEN].copy_from_slice(&header);
     let mut record_pos = TLS_HEADER_LEN;
     while record_pos < parsed.total_len {
-        let read = timeout(read_timeout, stream.read(&mut record[record_pos..])).await;
+        let read = read_before_deadline(stream, &mut record[record_pos..], deadline).await;
         match read {
-            Ok(Ok(0)) => {
+            Ok(Some(0)) => {
                 return Ok(FirstClientRead::FallbackPrefix(
                     record[..record_pos].to_vec(),
                 ))
             }
-            Ok(Ok(n)) => record_pos += n,
-            Ok(Err(err)) => return Err(err.into()),
-            Err(_) => {
+            Ok(Some(n)) => record_pos += n,
+            Ok(None) => {
                 return Ok(FirstClientRead::FallbackPrefix(
                     record[..record_pos].to_vec(),
                 ))
             }
+            Err(err) => return Err(err.into()),
         }
     }
 
     Ok(FirstClientRead::Record(record))
+}
+
+async fn read_before_deadline<R>(
+    stream: &mut R,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<Option<usize>, io::Error>
+where
+    R: AsyncRead + Unpin,
+{
+    match timeout_at(deadline, stream.read(buf)).await {
+        Ok(read) => read.map(Some),
+        Err(_) => Ok(None),
+    }
 }
 
 async fn connect_tcp_with_timeout(addr: &str) -> Result<TcpStream, HandshakeServerError> {
@@ -1712,6 +1727,31 @@ mod tests {
             read,
             FirstClientRead::FallbackPrefix(vec![0x16, 0x03, 0x03, 0xff, 0xff])
         );
+    }
+
+    #[tokio::test]
+    async fn first_client_record_timeout_is_total_not_per_read() {
+        let (mut client, mut server_side) = tokio::io::duplex(8);
+        client.write_all(&[0x16]).await.unwrap();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(30)).await;
+            let _ = client.write_all(&[0x03]).await;
+            sleep(Duration::from_millis(30)).await;
+            let _ = client.write_all(&[0x03]).await;
+        });
+
+        let started = Instant::now();
+        let read =
+            read_first_client_record_with_timeout(&mut server_side, Duration::from_millis(50))
+                .await
+                .unwrap();
+
+        let FirstClientRead::FallbackPrefix(prefix) = read else {
+            panic!("slow first record should fall back");
+        };
+        assert!(!prefix.is_empty());
+        assert!(prefix.len() < TLS_HEADER_LEN);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 
     #[tokio::test]
