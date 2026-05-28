@@ -448,6 +448,9 @@ fn decide_connection_inbound(
         Ok(parsed) => parsed,
         Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
     };
+    if !parsed.tls13_supported {
+        return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
+    }
     if let Some(material) =
         recover_stateful_auth_material_from_parsed(first_client_record, psk, &parsed)?
     {
@@ -549,6 +552,7 @@ pub async fn accept_authenticated(
 
     let forwarded = read_forwarded_server_hello(&mut fallback).await?;
     if config.strict_tls13 && !forwarded.parsed.tls13_selected {
+        client.write_all(&forwarded.raw_record).await?;
         return Err(HandshakeServerError::Tls13Required);
     }
     client.write_all(&forwarded.raw_record).await?;
@@ -1931,6 +1935,49 @@ mod tests {
     }
 
     #[test]
+    fn masked_stateful_without_tls13_support_falls_back() {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let mut record = client_hello_fixture_with_random_and_key_share(
+            "example.com",
+            &client.public,
+            &[0x44_u8; 32],
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let mut rng = StdRng::seed_from_u64(3);
+        let tail = build_auth_tail_at(1_700_000_001, &mut rng);
+        let encoded_random =
+            build_masked_stateful_client_random(PSK, "example.com", &client.public, &tail).unwrap();
+        let session_id = build_masked_stateful_auth_session_id(
+            PSK,
+            &auth_key,
+            "example.com",
+            &client.public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        record[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        record[parsed.session_id_range].copy_from_slice(&session_id);
+        replace_tls13_supported_version_with_tls12(&mut record);
+
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            InboundDecision::Fallback(FallbackReason::AuthFailed)
+        );
+    }
+
+    #[test]
     fn falls_back_on_bad_auth() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
@@ -2178,6 +2225,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_tls13_rejection_relays_origin_server_hello_first() {
+        let tls12_server_hello = server_hello_fixture_with_tls12_selected();
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let expected_first_client_record =
+            client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let origin_record = tls12_server_hello.clone();
+        let fallback_task = tokio::spawn(async move {
+            let (mut origin, _) = fallback_listener.accept().await.unwrap();
+            let relayed_first = read_record(&mut origin).await.unwrap();
+            assert_eq!(relayed_first, expected_first_client_record);
+            origin.write_all(&origin_record).await.unwrap();
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_dir.path().join("parallax-replay.cache"),
+        );
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let accepted = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            accept_authenticated(
+                server_side,
+                &config,
+                server_keys.public,
+                [0_u8; 32],
+                first_client_record,
+                AuthenticatedHello {
+                    sni: String::from("example.com"),
+                    x25519_key_share: [0x22; 32],
+                    timestamp: 1_700_000_001,
+                    nonce: [7; 8],
+                    transcript_fingerprint: [8; 32],
+                },
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        let relayed = read_record(&mut client).await.unwrap();
+        assert_eq!(relayed, tls12_server_hello);
+
+        let err = accepted.await.unwrap().unwrap_err();
+        assert!(matches!(err, HandshakeServerError::Tls13Required));
+        fallback_task.await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn authenticated_connection_switches_to_data_mode() {
         let (fallback_addr, fallback_task) = spawn_server_hello_fallback().await;
@@ -2330,6 +2434,28 @@ mod tests {
             .unwrap();
 
         (client, data_session, rng)
+    }
+
+    fn replace_tls13_supported_version_with_tls12(record: &mut [u8]) {
+        let needle = [0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04];
+        let offset = record
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("ClientHello fixture carries supported_versions TLS 1.3");
+        record[offset + needle.len() - 1] = 0x03;
+        assert!(!parse_client_hello(record).unwrap().tls13_supported);
+    }
+
+    fn server_hello_fixture_with_tls12_selected() -> Vec<u8> {
+        let mut record = server_hello_fixture();
+        let needle = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        let offset = record
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("ServerHello fixture carries supported_versions TLS 1.3");
+        record[offset + needle.len() - 1] = 0x03;
+        assert!(!parse_server_hello(&record).unwrap().tls13_selected);
+        record
     }
 
     async fn send_ping_connect(
