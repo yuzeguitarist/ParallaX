@@ -1123,6 +1123,9 @@ fn is_denied_outbound_ip(ip: IpAddr) -> bool {
                 || ip.is_multicast()
                 || is_ipv6_unique_local(ip)
                 || is_ipv6_unicast_link_local(ip)
+                || is_ipv6_documentation(ip)
+                || is_ipv6_teredo(ip)
+                || is_ipv6_6to4(ip)
         }
     }
 }
@@ -1135,7 +1138,14 @@ fn is_denied_outbound_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()
         || ip.is_multicast()
         || ip.is_broadcast()
+        || octets[0] == 0
+        || octets[0] >= 240
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
 
 fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
@@ -1144,6 +1154,20 @@ fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
 
 fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
+}
+
+fn is_ipv6_teredo(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0
+}
+
+fn is_ipv6_6to4(ip: Ipv6Addr) -> bool {
+    ip.segments()[0] == 0x2002
 }
 
 async fn encapsulate_mlkem_blocking(
@@ -2229,9 +2253,15 @@ mod tests {
     fn client_selected_egress_policy_denies_private_addresses() {
         let denied = [
             "127.0.0.1:80",
+            "0.1.2.3:80",
             "10.0.0.1:80",
             "172.16.0.1:80",
             "192.168.0.1:80",
+            "192.0.2.1:80",
+            "198.18.0.1:80",
+            "198.51.100.1:80",
+            "203.0.113.1:80",
+            "240.0.0.1:80",
             "169.254.169.254:80",
             "100.64.0.1:80",
             "[::1]:80",
@@ -2239,6 +2269,9 @@ mod tests {
             "[fd00::1]:80",
             "[fe80::1]:80",
             "[febf::1]:80",
+            "[2001:db8::1]:80",
+            "[2001::1]:80",
+            "[2002:c000:0201::1]:80",
         ];
 
         for target in denied {
