@@ -69,7 +69,8 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
-const SERVER_IDENTITY_CHUNK_PLAINTEXT: usize = 1180;
+const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
+const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
 const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET / 2;
@@ -813,10 +814,10 @@ async fn run_authenticated_data_mode(
                             signature: identity_signature,
                         }
                         .encode()?;
-                        let identity_chunks = ServerIdentityChunk::encode_all(
-                            &identity_payload,
-                            SERVER_IDENTITY_CHUNK_PLAINTEXT,
-                        )?;
+                        let identity_chunk_plaintext =
+                            server_identity_chunk_plaintext_len(&mut rng);
+                        let identity_chunks =
+                            ServerIdentityChunk::encode_all(&identity_payload, identity_chunk_plaintext)?;
                         write_server_identity_chunks(
                             &mut client_write,
                             &mut server_seal,
@@ -1153,6 +1154,13 @@ where
     } else {
         Duration::ZERO
     }
+}
+
+fn server_identity_chunk_plaintext_len<R>(rng: &mut R) -> usize
+where
+    R: Rng + ?Sized,
+{
+    rng.gen_range(SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT..=SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT)
 }
 
 async fn write_server_identity_chunks<W, R>(
@@ -1751,6 +1759,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identity_chunk_plaintext_len_jitters_without_timing_delay() {
+        let mut rng = StdRng::seed_from_u64(104);
+        let mut saw_different = false;
+        let first = server_identity_chunk_plaintext_len(&mut rng);
+
+        for _ in 0..64 {
+            let len = server_identity_chunk_plaintext_len(&mut rng);
+            assert!(
+                (SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT..=SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT)
+                    .contains(&len)
+            );
+            saw_different |= len != first;
+        }
+
+        assert!(saw_different);
+    }
+
     #[tokio::test]
     async fn speed_first_identity_writer_batches_chunks_into_one_write() {
         let traffic = TrafficConfig::default();
@@ -1766,9 +1792,9 @@ mod tests {
             padding,
             SERVER_TO_CLIENT_AAD,
         );
-        let payload = vec![0x42_u8; SERVER_IDENTITY_CHUNK_PLAINTEXT * 2 + 1];
+        let payload = vec![0x42_u8; SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT * 2 + 1];
         let chunks =
-            ServerIdentityChunk::encode_all(&payload, SERVER_IDENTITY_CHUNK_PLAINTEXT).unwrap();
+            ServerIdentityChunk::encode_all(&payload, SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT).unwrap();
         let expected_chunks = chunks.clone();
         let mut rng = StdRng::seed_from_u64(103);
         let mut writer = CountingWriter::default();
