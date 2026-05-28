@@ -791,7 +791,7 @@ struct CamouflageVerifier {
 
 impl CamouflageVerifier {
     fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Result<Self, Safari26TlsError> {
-        let roots = Arc::new(native_root_store()?);
+        let roots = native_root_store()?;
         let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider)
             .build()
             .map_err(|err| Safari26TlsError::RustlsConfig(err.to_string()))?;
@@ -799,7 +799,15 @@ impl CamouflageVerifier {
     }
 }
 
-fn native_root_store() -> Result<RootCertStore, Safari26TlsError> {
+fn native_root_store() -> Result<Arc<RootCertStore>, Safari26TlsError> {
+    static ROOTS: OnceLock<Result<Arc<RootCertStore>, String>> = OnceLock::new();
+    match ROOTS.get_or_init(|| load_native_root_store().map(Arc::new)) {
+        Ok(roots) => Ok(Arc::clone(roots)),
+        Err(err) => Err(Safari26TlsError::RustlsConfig(err.clone())),
+    }
+}
+
+fn load_native_root_store() -> Result<RootCertStore, String> {
     let loaded = rustls_native_certs::load_native_certs();
     let load_error_detail = loaded.errors.first().map(ToString::to_string);
     root_store_from_certificates(loaded.certs, load_error_detail)
@@ -808,7 +816,7 @@ fn native_root_store() -> Result<RootCertStore, Safari26TlsError> {
 fn root_store_from_certificates(
     certs: Vec<CertificateDer<'static>>,
     load_error_detail: Option<String>,
-) -> Result<RootCertStore, Safari26TlsError> {
+) -> Result<RootCertStore, String> {
     let mut roots = RootCertStore::empty();
     let (valid_count, invalid_count) = roots.add_parsable_certificates(certs);
     if roots.is_empty() {
@@ -822,7 +830,7 @@ fn root_store_from_certificates(
                 )
             }
         });
-        return Err(Safari26TlsError::RustlsConfig(detail));
+        return Err(detail);
     }
     if invalid_count > 0 {
         tracing::debug!(
@@ -963,6 +971,14 @@ mod tests {
         let roots = root_store_from_certificates(certs, None).unwrap();
 
         assert!(!roots.is_empty());
+    }
+
+    #[test]
+    fn native_root_store_is_cached_after_first_load() {
+        let first = native_root_store().unwrap();
+        let second = native_root_store().unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
