@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -14,6 +15,7 @@ use thiserror::Error;
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
+        lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
@@ -120,6 +122,8 @@ pub enum HandshakeServerError {
     ReplayCache(#[from] ReplayCacheError),
     #[error("missing encrypted connect request and no fixed server.data_target configured")]
     MissingConnectTarget,
+    #[error("client-selected outbound target is denied by server egress policy: {0}")]
+    OutboundTargetDenied(String),
     #[error("blocking crypto task failed: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
 }
@@ -857,7 +861,9 @@ async fn run_authenticated_data_mode(
 
                         let (target_addr, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
-                        let mut target = connect_tcp_with_timeout(&target_addr).await?;
+                        let mut target =
+                            connect_outbound_target(&target_addr, fixed_data_target.is_some())
+                                .await?;
                         tune_tcp_stream(&target)?;
                         if !initial_payload.is_empty() {
                             target.write_all(initial_payload).await?;
@@ -991,6 +997,75 @@ fn resolve_connect_target<'a>(
         }
         Err(err) => Err(HandshakeServerError::ConnectRequest(err)),
     }
+}
+
+async fn connect_outbound_target(
+    target_addr: &str,
+    allow_private: bool,
+) -> Result<TcpStream, HandshakeServerError> {
+    if allow_private {
+        return connect_tcp_with_timeout(target_addr).await;
+    }
+
+    let addrs = resolve_public_target_addrs(target_addr).await?;
+    connect_future_with_timeout(TcpStream::connect(addrs.as_slice()), HANDSHAKE_TIMEOUT).await
+}
+
+async fn resolve_public_target_addrs(
+    target_addr: &str,
+) -> Result<Vec<SocketAddr>, HandshakeServerError> {
+    let addrs: Vec<SocketAddr> = lookup_host(target_addr).await?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("client-selected target did not resolve: {target_addr}"),
+        )
+        .into());
+    }
+    validate_public_target_addrs(target_addr, &addrs)?;
+    Ok(addrs)
+}
+
+fn validate_public_target_addrs(
+    target_addr: &str,
+    addrs: &[SocketAddr],
+) -> Result<(), HandshakeServerError> {
+    for addr in addrs {
+        if is_denied_outbound_ip(addr.ip()) {
+            return Err(HandshakeServerError::OutboundTargetDenied(format!(
+                "{target_addr} resolved to {}",
+                addr.ip()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_denied_outbound_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_denied_outbound_ipv4(ip),
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_denied_outbound_ipv4(mapped);
+            }
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_denied_outbound_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
 }
 
 async fn encapsulate_mlkem_blocking(
@@ -1976,6 +2051,55 @@ mod tests {
         assert!(matches!(
             resolve_connect_target(&mut encoded, Some("target.example:443")).unwrap_err(),
             HandshakeServerError::ConnectRequest(ConnectRequestError::EmptyHost)
+        ));
+    }
+
+    #[test]
+    fn client_selected_egress_policy_denies_private_addresses() {
+        let denied = [
+            "127.0.0.1:80",
+            "10.0.0.1:80",
+            "172.16.0.1:80",
+            "192.168.0.1:80",
+            "169.254.169.254:80",
+            "100.64.0.1:80",
+            "[::1]:80",
+            "[fc00::1]:80",
+            "[fe80::1]:80",
+        ];
+
+        for target in denied {
+            let addr: SocketAddr = target.parse().unwrap();
+            assert!(
+                validate_public_target_addrs(target, &[addr]).is_err(),
+                "{target} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn client_selected_egress_policy_allows_public_addresses() {
+        let allowed = [
+            "93.184.216.34:443",
+            "[2606:2800:220:1:248:1893:25c8:1946]:443",
+        ];
+
+        for target in allowed {
+            let addr: SocketAddr = target.parse().unwrap();
+            validate_public_target_addrs(target, &[addr]).unwrap();
+        }
+    }
+
+    #[test]
+    fn client_selected_egress_policy_rejects_any_denied_dns_result() {
+        let addrs = [
+            "93.184.216.34:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+
+        assert!(matches!(
+            validate_public_target_addrs("example.test:443", &addrs).unwrap_err(),
+            HandshakeServerError::OutboundTargetDenied(_)
         ));
     }
 
