@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -1121,8 +1121,8 @@ fn is_denied_outbound_ip(ip: IpAddr) -> bool {
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
+                || is_ipv6_unique_local(ip)
+                || is_ipv6_unicast_link_local(ip)
         }
     }
 }
@@ -1136,6 +1136,14 @@ fn is_denied_outbound_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()
         || ip.is_broadcast()
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+}
+
+fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
 async fn encapsulate_mlkem_blocking(
@@ -2228,7 +2236,9 @@ mod tests {
             "100.64.0.1:80",
             "[::1]:80",
             "[fc00::1]:80",
+            "[fd00::1]:80",
             "[fe80::1]:80",
+            "[febf::1]:80",
         ];
 
         for target in denied {
