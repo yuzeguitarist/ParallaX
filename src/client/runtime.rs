@@ -934,6 +934,7 @@ mod tests {
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
         let server_config = large_payload_server_config(
             fallback_addr,
+            target_addr,
             &server_keys,
             &server_pq_keys,
             &server_identity_keys,
@@ -970,6 +971,7 @@ mod tests {
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
         let server_config = large_payload_server_config(
             fallback_addr,
+            target_addr,
             &server_keys,
             &server_pq_keys,
             &server_identity_keys,
@@ -1047,6 +1049,7 @@ mod tests {
 
     fn large_payload_server_config(
         fallback_addr: SocketAddr,
+        target_addr: SocketAddr,
         server_keys: &X25519KeyPair,
         server_pq_keys: &pq::MlKemKeyPair,
         server_identity_keys: &identity::MlDsaKeyPair,
@@ -1055,7 +1058,7 @@ mod tests {
         ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
-            data_target: None,
+            data_target: Some(target_addr.to_string()),
             private_key: STANDARD.encode(server_keys.private),
             pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
             identity_secret_key: STANDARD.encode(&server_identity_keys.secret),

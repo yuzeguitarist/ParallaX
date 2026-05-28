@@ -29,6 +29,8 @@ use rustls::{
     Error as RustlsError, NamedGroup, RootCertStore, SignatureScheme, SupportedCipherSuite,
     Tls13CipherSuite,
 };
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt,
@@ -56,6 +58,11 @@ const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
 const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const H2_OPEN_HEADERS_DELAY: Duration = Duration::from_millis(12);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
+#[cfg(test)]
+const LOOPBACK_CAMOUFLAGE_CERT_SHA256: [u8; 32] = [
+    0x2b, 0x05, 0xc7, 0x0a, 0x17, 0x2e, 0xe9, 0x87, 0x32, 0xd1, 0xf5, 0xd0, 0x49, 0x48, 0xa2, 0x46,
+    0xa8, 0xf7, 0x33, 0xa8, 0x48, 0x04, 0x64, 0xa5, 0x35, 0x42, 0xd2, 0x72, 0x03, 0x92, 0xa1, 0xc0,
+];
 /// Standard GREASE values from RFC 8701. Browsers sample from this set when
 /// injecting GREASE into ClientHello.
 const BROWSER_GREASE_VALUES: [u16; 16] = [
@@ -851,8 +858,18 @@ impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, RustlsError> {
-        self.verifier
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        let result = self.verifier.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        );
+        #[cfg(test)]
+        if result.is_err() && is_loopback_camouflage_fixture(end_entity, server_name) {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        result
     }
 
     fn verify_tls12_signature(
@@ -896,6 +913,17 @@ impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
             SignatureScheme::RSA_PKCS1_SHA1,
         ]
     }
+}
+
+#[cfg(test)]
+fn is_loopback_camouflage_fixture(
+    end_entity: &CertificateDer<'_>,
+    server_name: &ServerName<'_>,
+) -> bool {
+    // The ignored loopback relay tests use one fixed self-signed camouflage
+    // endpoint; production builds still rely only on WebPKI above.
+    server_name.to_str() == "example.com"
+        && Sha256::digest(end_entity.as_ref())[..] == LOOPBACK_CAMOUFLAGE_CERT_SHA256
 }
 
 fn is_clean_close(err: &std::io::Error) -> bool {

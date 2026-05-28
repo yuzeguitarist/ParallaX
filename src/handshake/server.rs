@@ -2459,13 +2459,14 @@ mod tests {
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
         let traffic = TrafficConfig::default();
-        let config = authenticated_server_config(
+        let mut config = authenticated_server_config(
             fallback_addr,
             &server_keys,
             &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
+        config.data_target = Some(target_addr.to_string());
         let (parallax_addr, server_task) = spawn_authenticated_server(config, traffic).await;
         let (mut client, mut data_session, mut rng) = open_authenticated_data_session(
             parallax_addr,
