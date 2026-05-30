@@ -7,6 +7,8 @@ const FDS_PER_RELAY_CONNECTION: usize = 2;
 const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
 #[cfg(target_os = "linux")]
 const TCP_NOTSENT_LOWAT_BYTES: libc::c_uint = 256 * 1024;
+#[cfg(target_os = "linux")]
+const SOCKET_BUSY_POLL_MICROS: libc::c_int = 50;
 
 pub async fn connect_tuned_tcp_host(addr: &str) -> io::Result<TcpStream> {
     let addrs: Vec<SocketAddr> = lookup_host(addr).await?.collect();
@@ -56,6 +58,8 @@ pub fn tune_tcp_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     set_low_latency_congestion(stream);
     set_notsent_lowat(stream);
+    set_busy_poll(stream);
+    set_incoming_cpu(stream);
     set_quick_ack(stream);
     Ok(())
 }
@@ -189,6 +193,8 @@ fn set_low_latency_congestion(_stream: &TcpStream) {}
 fn tune_tcp_socket_before_connect(socket: &TcpSocket) {
     set_fastopen_connect(socket);
     set_notsent_lowat(socket);
+    set_busy_poll(socket);
+    set_incoming_cpu(socket);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -247,6 +253,47 @@ fn set_notsent_lowat_fd(fd: std::os::fd::RawFd) {
 fn set_notsent_lowat<S>(_socket: &S) {}
 
 #[cfg(target_os = "linux")]
+fn set_busy_poll<S>(socket: &S)
+where
+    S: std::os::fd::AsRawFd,
+{
+    set_busy_poll_fd(socket.as_raw_fd());
+}
+
+#[cfg(target_os = "linux")]
+fn set_busy_poll_fd(fd: std::os::fd::RawFd) {
+    set_socket_int_option_fd(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_BUSY_POLL,
+        SOCKET_BUSY_POLL_MICROS,
+    );
+    set_socket_int_option_fd(fd, libc::SOL_SOCKET, libc::SO_PREFER_BUSY_POLL, 1);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_busy_poll<S>(_socket: &S) {}
+
+#[cfg(target_os = "linux")]
+fn set_incoming_cpu<S>(socket: &S)
+where
+    S: std::os::fd::AsRawFd,
+{
+    set_incoming_cpu_fd(socket.as_raw_fd());
+}
+
+#[cfg(target_os = "linux")]
+fn set_incoming_cpu_fd(fd: std::os::fd::RawFd) {
+    let cpu = unsafe { libc::sched_getcpu() };
+    if cpu >= 0 {
+        set_socket_int_option_fd(fd, libc::SOL_SOCKET, libc::SO_INCOMING_CPU, cpu);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_incoming_cpu<S>(_socket: &S) {}
+
+#[cfg(target_os = "linux")]
 async fn connect_mptcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
     use std::os::fd::{FromRawFd, RawFd};
 
@@ -270,6 +317,8 @@ async fn connect_mptcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
     set_socket_int_option_fd(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
     set_fastopen_connect_fd(fd);
     set_notsent_lowat_fd(fd);
+    set_busy_poll_fd(fd);
+    set_incoming_cpu_fd(fd);
 
     let (storage, len) = socket_addr_storage(addr);
     let rc = unsafe { libc::connect(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
