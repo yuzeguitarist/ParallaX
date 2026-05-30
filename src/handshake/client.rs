@@ -390,8 +390,6 @@ impl ClientDataSession {
             .rekey(next_keys.server_key, next_keys.server_nonce);
         self.keys = next_keys;
         self.keys.protect_secret_memory();
-        self.seal_to_server.protect_secret_memory();
-        self.open_from_server.protect_secret_memory();
         Ok(())
     }
 

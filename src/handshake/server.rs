@@ -1241,8 +1241,6 @@ fn apply_server_pq_rekey(
     next_keys.protect_secret_memory();
     client_open.rekey(next_keys.client_key, next_keys.client_nonce);
     server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
-    client_open.protect_secret_memory();
-    server_seal.protect_secret_memory();
     Ok(next_keys)
 }
 
