@@ -1201,16 +1201,16 @@ fn bench_client_identity_verify_cached(options: BenchmarkOptions) -> Result<Benc
         TIER_SLOW,
         options,
         || {
-            let proof = ServerIdentityProof::decode(&frame)?;
+            let signature = ServerIdentityProof::signature(black_box(frame.as_slice()))?;
             identity::verify_server_identity(
                 &identity_keys.public,
-                &proof.signature,
+                signature,
                 &context,
                 &server.public,
                 &pq_binding,
                 0,
             )?;
-            Ok(black_box(proof.signature.len() as u64))
+            Ok(black_box(signature.len() as u64))
         },
     )
 }
