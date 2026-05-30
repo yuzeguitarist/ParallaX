@@ -33,7 +33,7 @@ detectors inside the simulator; see [GFW Simulator & QUIC Research](<GFW-Simulat
 | Config loader | TOML schema, validation, secret-file permission checks, relative replay-cache paths. | `src/config.rs` |
 | Client runtime | Loopback SOCKS5, server dial, TLS camouflage, PQ rekey, identity check, relay. | `src/client/runtime.rs` |
 | Server runtime | First-record classification, replay check, fallback passthrough, authenticated relay. | `src/handshake/server.rs` |
-| TLS camouflage | Real `rustls` state machine with Safari-shaped ClientHello and HTTP/2 preface support. | `src/tls/safari26.rs`, `src/fingerprint/http2.rs` |
+| TLS camouflage | Handwritten Safari 26 TLS 1.3 state machine with Safari-shaped ClientHello and HTTP/2 preface support. | `src/tls/safari26.rs`, `src/fingerprint/http2.rs` |
 | Cryptography | PSK/X25519 auth, AEAD session keys, ML-KEM, ML-DSA, replay cache. | `src/crypto/` |
 | Wire protocol | Binary control commands and encrypted TLS ApplicationData records. | `src/protocol/` |
 | Operations | Local-build VPS deploy/uninstall, systemd hardening, BBR/fq setup. | `scripts/` |
@@ -63,8 +63,9 @@ plx serve
 
 ## Design principles
 
-1. **Use real protocol machinery where possible.** The camouflage path starts
-   from `rustls`, not a handwritten fake TLS transcript.
+1. **Keep one real Safari-shaped protocol path.** The camouflage path is the
+   handwritten Safari 26 TLS 1.3 implementation in `src/tls/safari26.rs`, not
+   a configurable set of browser profiles.
 2. **Make denial indistinguishable from an ordinary website path.** Probe and
    auth failures are forwarded to the fallback origin.
 3. **Keep operational defaults speed-first.** Generated traffic shaping is zero

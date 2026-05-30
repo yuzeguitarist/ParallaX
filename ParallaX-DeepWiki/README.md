@@ -47,7 +47,7 @@
 
 1. [TLS Camouflage Layer](TLS-Camouflage-Layer.md)
 2. [ClientHello Builder & Browser Profiles](ClientHello-Builder-&-Browser-Profiles.md)
-3. [Stateful Rustls Camouflage Backend](Stateful-Rustls-Camouflage-Backend.md)
+3. [Stateful Safari TLS Camouflage Backend](Stateful-Safari-TLS-Camouflage-Backend.md)
 4. [HTTP/2 Fingerprinting](HTTP-2-Fingerprinting.md)
 5. [Traffic Obfuscation](Traffic-Obfuscation.md)
 6. [Padding & Timing Profiles](<Padding-&-Timing-Profiles.md>)
@@ -76,7 +76,7 @@
 - [Replay Protection](Replay-Protection.md)
 - [TLS Camouflage Layer](TLS-Camouflage-Layer.md)
 - [ClientHello Builder & Browser Profiles](ClientHello-Builder-&-Browser-Profiles.md)
-- [Stateful Rustls Camouflage Backend](Stateful-Rustls-Camouflage-Backend.md)
+- [Stateful Safari TLS Camouflage Backend](Stateful-Safari-TLS-Camouflage-Backend.md)
 - [HTTP/2 Fingerprinting](HTTP-2-Fingerprinting.md)
 - [Traffic Obfuscation](Traffic-Obfuscation.md)
 - [Padding & Timing Profiles](<Padding-&-Timing-Profiles.md>)

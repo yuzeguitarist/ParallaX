@@ -1,7 +1,7 @@
 //! Test-only wire fixtures for the GFW simulator.
 //!
 //! These helpers deliberately live under `tests/` so the production TLS stack
-//! stays focused on the real Safari 26 rustls camouflage path.
+//! stays focused on the real Safari 26 camouflage path.
 
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 

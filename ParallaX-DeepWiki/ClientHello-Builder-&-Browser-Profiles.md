@@ -20,8 +20,9 @@ The Safari backend shapes or verifies:
 - compatibility SessionID handling
 - post-handshake HTTP/2 behavior
 
-`rustls` still owns the actual TLS state machine. ParallaX shapes provider
-ordering and entropy generation rather than replacing the whole handshake.
+The Safari backend owns the TLS 1.3 state machine for this profile. ParallaX
+serializes the visible ClientHello directly, including Safari extension order
+and the authenticated entropy fields.
 
 ## Auth-owned fields
 
@@ -39,12 +40,11 @@ noise.
 
 ```text
 profile config
-  ├─ select Safari-shaped crypto provider order
-  ├─ create rustls ClientConnection
-  ├─ let rustls emit a real ClientHello
-  ├─ patch entropy with auth context
+  ├─ select Safari cipher/group/extension order
+  ├─ generate TLS X25519MLKEM768 and X25519 key shares
+  ├─ patch ClientHello.random and SessionID with auth context
   ├─ expose ClientHello bytes for first-record send
-  └─ continue the TLS state machine against the fallback origin
+  └─ continue the handwritten TLS 1.3 state machine against the fallback origin
 ```
 
 ## Drift management
@@ -53,10 +53,10 @@ Browser TLS profiles drift over time. ParallaX keeps drift visible by:
 
 - storing capture fixtures under `tests/fixtures/`
 - running Safari parity tests
-- pinning `rustls` while profile-sensitive behavior is verified
+- keeping the single Safari TLS path covered by ClientHello and H2 parity tests
 - documenting current behavior here instead of preserving stale line-number
   links to old commits
 
-Related pages: [Stateful Rustls Camouflage Backend](Stateful-Rustls-Camouflage-Backend.md),
+Related pages: [Stateful Safari TLS Camouflage Backend](Stateful-Safari-TLS-Camouflage-Backend.md),
 [HTTP/2 Fingerprinting](HTTP-2-Fingerprinting.md), and
 [Camouflage Target Probe](Camouflage-Target-Probe.md).

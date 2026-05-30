@@ -1,31 +1,20 @@
-use std::{
-    fmt,
-    io::{Cursor, Read},
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt, time::Duration};
 
-use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, ServerName, UnixTime},
-    DigitallySignedStruct, ProtocolVersion, SignatureScheme,
-};
 use thiserror::Error;
 use tokio::{
-    io::AsyncWriteExt,
     net::TcpStream,
     time::{timeout, Instant},
 };
 
 use crate::{
     config::{Config, Mode},
-    tls::record::read_record,
+    crypto::session::X25519KeyPair,
+    tls::safari26::Safari26TlsCamouflage,
 };
 
 const DEFAULT_PORT: u16 = 443;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const POST_HANDSHAKE_DRAIN_LIMIT: usize = 3;
-const POST_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(220);
+const PROBE_PSK: &[u8] = b"ParallaX probe Safari TLS path";
 
 #[derive(Debug, Error)]
 pub enum ProbeError {
@@ -339,163 +328,26 @@ async fn complete_tls_probe(
     sni: &str,
     deadline: Duration,
 ) -> Result<TlsProbeResult, String> {
-    let config = probe_client_config();
-    let server_name = ServerName::try_from(sni.to_owned())
-        .map_err(|_| ProbeError::InvalidServerName(sni.to_owned()).to_string())?;
-    let mut connection = rustls::ClientConnection::new(Arc::new(config), server_name)
-        .map_err(|err| format!("TLS client init failed: {err}"))?;
-
+    let server = X25519KeyPair::generate();
+    let session = Safari26TlsCamouflage
+        .start(sni.to_owned(), PROBE_PSK, &server.public)
+        .map_err(|err| format!("Safari TLS client init failed: {err}"))?;
     let started = Instant::now();
-    while connection.is_handshaking() {
-        flush_tls(&mut connection, stream, deadline).await?;
-        if connection.is_handshaking() {
-            let record = read_tls_record(stream, deadline).await?;
-            feed_tls_record(&mut connection, &record)?;
-        }
-    }
-    flush_tls(&mut connection, stream, deadline).await?;
-
-    let post_handshake_records =
-        drain_post_handshake_records(&mut connection, stream, POST_HANDSHAKE_DRAIN_LIMIT).await?;
-    let tls13 = connection.protocol_version() == Some(ProtocolVersion::TLSv1_3);
-    let alpn = connection
-        .alpn_protocol()
+    let completed = timeout(deadline, session.complete(stream))
+        .await
+        .map_err(|_| "timed out completing Safari TLS handshake.".to_owned())?
+        .map_err(|err| format!("Safari TLS handshake failed: {err}"))?;
+    let alpn = completed
+        .negotiated_alpn
+        .as_deref()
         .map(|protocol| String::from_utf8_lossy(protocol).to_string());
 
     Ok(TlsProbeResult {
         handshake_latency: started.elapsed(),
-        tls13,
+        tls13: true,
         alpn,
-        post_handshake_records,
+        post_handshake_records: completed.post_handshake_records,
     })
-}
-
-fn probe_client_config() -> rustls::ClientConfig {
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("aws_lc_rs provider supports rustls default protocol versions")
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(ProbeServerCertVerifier))
-    .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    config.enable_early_data = false;
-    config
-}
-
-async fn flush_tls(
-    connection: &mut rustls::ClientConnection,
-    stream: &mut TcpStream,
-    deadline: Duration,
-) -> Result<(), String> {
-    while connection.wants_write() {
-        let mut out = Vec::new();
-        let written = connection
-            .write_tls(&mut out)
-            .map_err(|err| format!("TLS write_tls failed: {err}"))?;
-        if written == 0 || out.is_empty() {
-            break;
-        }
-        timeout(deadline, stream.write_all(&out))
-            .await
-            .map_err(|_| "timed out writing TLS buffers; target may be unstable.".to_owned())?
-            .map_err(|err| format!("TCP write after TLS framing failed: {err}"))?;
-    }
-    Ok(())
-}
-
-async fn read_tls_record(stream: &mut TcpStream, deadline: Duration) -> Result<Vec<u8>, String> {
-    timeout(deadline, read_record(stream))
-        .await
-        .map_err(|_| {
-            "timed out waiting for TLS ciphertext; try a more stable upstream.".to_owned()
-        })?
-        .map_err(|err| format!("TLS record read failed: {err}"))
-}
-
-fn feed_tls_record(connection: &mut rustls::ClientConnection, record: &[u8]) -> Result<(), String> {
-    let mut cursor = Cursor::new(record);
-    connection
-        .read_tls(&mut cursor)
-        .map_err(|err| format!("TLS read_tls failed: {err}"))?;
-    connection
-        .process_new_packets()
-        .map_err(|err| format!("TLS handshake failed: {err}"))?;
-
-    let mut plaintext = Vec::new();
-    match connection.reader().read_to_end(&mut plaintext) {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-        Err(err) => return Err(format!("TLS plaintext read failed: {err}")),
-    }
-    Ok(())
-}
-
-async fn drain_post_handshake_records(
-    connection: &mut rustls::ClientConnection,
-    stream: &mut TcpStream,
-    limit: usize,
-) -> Result<usize, String> {
-    let mut observed = 0;
-    for _ in 0..limit {
-        let record = match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, read_record(stream)).await {
-            Ok(Ok(record)) => record,
-            Ok(Err(_)) | Err(_) => break,
-        };
-        feed_tls_record(connection, &record)?;
-        observed += 1;
-        flush_tls(connection, stream, POST_HANDSHAKE_DRAIN_TIMEOUT).await?;
-    }
-    Ok(observed)
-}
-
-#[derive(Debug)]
-struct ProbeServerCertVerifier;
-
-impl ServerCertVerifier for ProbeServerCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
-    }
 }
 
 fn split_host_port(authority: &str) -> Result<(String, u16), ProbeError> {

@@ -24,10 +24,10 @@ transport. There is no shipped `--quic` product mode on current `main`.
 
 ## What ParallaX optimizes for
 
-1. **Browser-shaped ingress to the server.** The client drives a real `rustls`
-   TLS 1.3 state machine and patches only the entropy fields that ParallaX
-   needs for authentication. The visible handshake is shaped around the Safari
-   26 / macOS Tahoe profile implemented in `src/tls/safari26.rs`.
+1. **Browser-shaped ingress to the server.** The client drives ParallaX's
+   single Safari 26 TLS 1.3 state machine and patches only the entropy fields
+   needed for authentication. The visible handshake is shaped around the
+   Safari 26 / macOS Tahoe profile implemented in `src/tls/safari26.rs`.
 2. **Probe-safe failure behavior.** If the first record is malformed,
    unauthenticated, unauthorized for SNI, or only a partial probe prefix, the
    server relays traffic to a configured fallback TLS origin instead of
@@ -51,7 +51,7 @@ transport. There is no shipped `--quic` product mode on current `main`.
 | CLI and config | `check`, `keygen`, `crypto-self-test`, `serve`, `client`, `speed`, `bench`, `config-template`, `probe`, `init`; TOML config with secret-permission checks. | `src/cli.rs`, `src/config.rs` |
 | Client runtime | Loopback-only SOCKS5 listener, authenticated server connection, PQ rekey, ML-DSA identity verification, bidirectional relay. | `src/client/runtime.rs`, `src/client/socks.rs` |
 | Server runtime | First-record classification, authorized-SNI check, fallback passthrough, authenticated data relay, fixed `server.data_target` support. | `src/handshake/server.rs` |
-| TLS camouflage | Real `rustls` TLS 1.3 client state machine with Safari-shaped cipher/group ordering, GREASE, ALPN, ClientHello authentication fields, and HTTP/2 preface support. | `src/tls/safari26.rs`, `src/tls/client_hello.rs`, `src/fingerprint/http2.rs` |
+| TLS camouflage | Handwritten Safari 26 TLS 1.3 client state machine with Safari cipher/group/extension ordering, GREASE, ALPN, ClientHello authentication fields, certificate verification, and HTTP/2 preface support. | `src/tls/safari26.rs`, `src/tls/client_hello.rs`, `src/fingerprint/http2.rs` |
 | Handshake authentication | PSK + X25519 material embedded into `ClientHello.random` and compatibility `SessionID`; replay cache gates authenticated handshakes. | `src/crypto/auth.rs`, `src/crypto/replay.rs` |
 | PQ and identity | ML-KEM-1024 rekey, transcript-bound server key exchange, ML-DSA-87 identity proof over the rekey binding. | `src/crypto/pq.rs`, `src/crypto/identity.rs`, `src/protocol/command.rs` |
 | Data plane | XChaCha20-Poly1305 records carried inside TLS `ApplicationData` frames, per-direction nonce ratchets, optional padding/timing/cover traffic. | `src/crypto/session.rs`, `src/protocol/data.rs`, `src/traffic.rs` |
@@ -337,7 +337,7 @@ src/
   client/                 SOCKS5 parser and client relay runtime
   handshake/              Client/server handshake and data-session state
   crypto/                 X25519, AEAD, ML-KEM, ML-DSA, replay cache
-  tls/                    Safari-shaped rustls camouflage and TLS records
+  tls/                    Safari-shaped TLS camouflage and TLS records
   fingerprint/            HTTP/2 Safari preface and header helpers
   protocol/               Binary commands and encrypted data records
   transport/              TCP transport helpers

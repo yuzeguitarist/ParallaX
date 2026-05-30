@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn verifies_stateful_rustls_session_id_auth() {
+    fn verifies_stateful_session_id_auth() {
         let mut hello = client_hello_fixture("example.com");
         let parsed = parse_client_hello(&hello).unwrap();
         let key_share = parsed.client_random;

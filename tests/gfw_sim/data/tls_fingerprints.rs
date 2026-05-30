@@ -117,7 +117,7 @@ pub const KNOWN_PROXY_FINGERPRINTS: &[BrowserFingerprintEntry] = &[
         ja4: "t13d301400_8daaf6152771_43c4ff36b8c1",
     },
     BrowserFingerprintEntry {
-        label: "parallax-rustls-current",
+        label: "parallax-safari-current",
         ja3_md5: "0e5e9c70cb3e75b8c8c9d76c2c3afdb6",
         ja4: "t13d1010h2_61a7ad8aa9b6_4989b96115f4",
     },

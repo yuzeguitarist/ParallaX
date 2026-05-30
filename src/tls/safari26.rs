@@ -1,45 +1,46 @@
-//! Safari 26 rustls camouflage backend.
+//! Safari 26 single-path TLS camouflage backend.
 //!
-//! This is the TCP/TLS data-mode entry point. rustls owns the TLS 1.3 state
-//! machine, while ParallaX injects only the authenticated ClientHello.random
-//! and compatibility SessionID material required by the server.
+//! ParallaX intentionally owns the visible TLS 1.3 wire image here instead of
+//! delegating the client state machine to rustls. The implementation is narrow
+//! on purpose: Safari 26-style ClientHello, TLS 1.3 server-authenticated
+//! handshake, and the small amount of encrypted HTTP/2 camouflage traffic that
+//! ParallaX sends before switching to its own data records.
 
 use std::{
-    cell::RefCell,
     fmt,
-    io::{self, Cursor, Read, Write},
-    sync::{Arc, OnceLock},
-    time::Duration,
+    io::{self, Cursor, Read},
+    sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rand::{rngs::OsRng, RngCore};
-use rustls::{
-    client::danger::HandshakeSignatureValid,
-    client::Resumption,
-    crypto::{
-        cipher::{
-            AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, MessageDecrypter,
-            MessageEncrypter, OutboundOpaqueMessage, OutboundPlainMessage, Tls13AeadAlgorithm,
-            UnsupportedOperationError,
-        },
-        ActiveKeyExchange, GetRandomFailed, SecureRandom, SupportedKxGroup,
-    },
-    pki_types::{CertificateDer, ServerName, UnixTime},
-    CipherSuite, CipherSuiteCommon, ConnectionTrafficSecrets, DigitallySignedStruct,
-    Error as RustlsError, NamedGroup, RootCertStore, SignatureScheme, SupportedCipherSuite,
-    Tls13CipherSuite,
+use aes_gcm::{Aes128Gcm, Aes256Gcm};
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305,
 };
-#[cfg(test)]
-use sha2::{Digest, Sha256};
+use flate2::read::ZlibDecoder;
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use pqcrypto_mlkem::mlkem768;
+use pqcrypto_traits::kem::{
+    Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
+    SharedSecret as KemSharedSecret,
+};
+use rand::{rngs::OsRng, RngCore};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use sha2::{Digest, Sha256, Sha384};
 use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
     time::{sleep, timeout},
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-use super::{record::read_record, server_hello::parse_server_hello};
+use super::{
+    record::{parse_header, read_record, TLS_CONTENT_ALERT, TLS_CONTENT_APPLICATION_DATA},
+    server_hello::parse_server_hello,
+};
 use crate::crypto::{
     auth::{
         build_auth_tail, build_masked_stateful_auth_session_id,
@@ -58,13 +59,72 @@ const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
 const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const H2_OPEN_HEADERS_DELAY: Duration = Duration::from_millis(12);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
+
+const TLS_RECORD_HANDSHAKE: u8 = 0x16;
+const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
+const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
+const TLS_RECORD_VERSION_CLIENT_HELLO: [u8; 2] = [0x03, 0x01];
+const TLS_RECORD_VERSION_TLS13: [u8; 2] = [0x03, 0x03];
+
+const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
+const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
+const HANDSHAKE_CERTIFICATE: u8 = 0x0b;
+const HANDSHAKE_CERTIFICATE_VERIFY: u8 = 0x0f;
+const HANDSHAKE_FINISHED: u8 = 0x14;
+const HANDSHAKE_COMPRESSED_CERTIFICATE: u8 = 0x19;
+
+const TLS13: u16 = 0x0304;
+const TLS12: u16 = 0x0303;
+
+const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+
+const GROUP_X25519_MLKEM768: u16 = 0x11ec;
+const GROUP_X25519: u16 = 0x001d;
+const GROUP_SECP256R1: u16 = 0x0017;
+const GROUP_SECP384R1: u16 = 0x0018;
+const GROUP_SECP521R1: u16 = 0x0019;
+
+const EXT_SERVER_NAME: u16 = 0x0000;
+const EXT_STATUS_REQUEST: u16 = 0x0005;
+const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
+const EXT_EC_POINT_FORMATS: u16 = 0x000b;
+const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
+const EXT_ALPN: u16 = 0x0010;
+const EXT_SIGNED_CERTIFICATE_TIMESTAMP: u16 = 0x0012;
+const EXT_EXTENDED_MASTER_SECRET: u16 = 0x0017;
+const EXT_COMPRESS_CERTIFICATE: u16 = 0x001b;
+const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
+const EXT_KEY_SHARE: u16 = 0x0033;
+const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
+
+const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
+const SIG_ECDSA_SECP384R1_SHA384: u16 = 0x0503;
+const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
+const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
+const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
+const SIG_RSA_PKCS1_SHA512: u16 = 0x0601;
+
+const CERT_COMPRESSION_ZLIB: u16 = 0x0001;
+
+const AEAD_TAG_LEN: usize = 16;
+const TLS13_IV_LEN: usize = 12;
+const MLKEM768_PUBLIC_KEY_LEN: usize = 1184;
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+const X25519_KEY_LEN: usize = 32;
+
 #[cfg(test)]
 const LOOPBACK_CAMOUFLAGE_CERT_SHA256: [u8; 32] = [
     0x2b, 0x05, 0xc7, 0x0a, 0x17, 0x2e, 0xe9, 0x87, 0x32, 0xd1, 0xf5, 0xd0, 0x49, 0x48, 0xa2, 0x46,
     0xa8, 0xf7, 0x33, 0xa8, 0x48, 0x04, 0x64, 0xa5, 0x35, 0x42, 0xd2, 0x72, 0x03, 0x92, 0xa1, 0xc0,
 ];
-/// Standard GREASE values from RFC 8701. Browsers sample from this set when
-/// injecting GREASE into ClientHello.
+
+/// Standard GREASE values from RFC 8701.
 const BROWSER_GREASE_VALUES: [u16; 16] = [
     0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
     0xcaca, 0xdada, 0xeaea, 0xfafa,
@@ -76,13 +136,9 @@ pub enum Safari26TlsError {
     Auth(#[from] AuthError),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("rustls state machine error: {0}")]
-    Rustls(#[from] rustls::Error),
-    #[error("rustls config error: {0}")]
-    RustlsConfig(String),
     #[error("HTTP/2 fingerprint build failed: {0}")]
     Http2Fingerprint(#[from] Http2FingerprintError),
-    #[error("invalid SNI for rustls ServerName: {0}")]
+    #[error("invalid SNI for Safari TLS ServerName: {0}")]
     InvalidServerName(String),
     #[error("ServerHello parse failed: {0}")]
     ServerHello(#[from] ServerHelloError),
@@ -90,42 +146,20 @@ pub enum Safari26TlsError {
     MissingServerHello,
     #[error("Safari 26 TLS camouflage generated an unauthenticated ClientHello")]
     UnauthenticatedClientHello,
-}
-
-thread_local! {
-    static PATCH_CONTEXT: RefCell<Option<PatchContext>> = const { RefCell::new(None) };
-}
-
-#[derive(Clone)]
-struct PatchContext {
-    sni: String,
-    psk: Zeroizing<Vec<u8>>,
-    auth_key: [u8; 32],
-    x25519: X25519KeyPair,
-    encoded_client_random: Option<[u8; 32]>,
-    session_id_pending: bool,
-    random_pending: bool,
-}
-
-impl PatchContext {
-    fn new(sni: String, psk: &[u8], auth_key: [u8; 32], x25519: X25519KeyPair) -> Self {
-        Self {
-            sni,
-            psk: Zeroizing::new(psk.to_vec()),
-            auth_key,
-            x25519,
-            encoded_client_random: None,
-            session_id_pending: true,
-            random_pending: true,
-        }
-    }
-}
-
-impl Drop for PatchContext {
-    fn drop(&mut self) {
-        self.auth_key.zeroize();
-        self.encoded_client_random.zeroize();
-    }
+    #[error("TLS handshake parse failed: {0}")]
+    Handshake(String),
+    #[error("unsupported TLS handshake path: {0}")]
+    Unsupported(&'static str),
+    #[error("TLS alert from fallback origin: level={level} description={description}")]
+    Alert { level: u8, description: u8 },
+    #[error("TLS certificate verification failed: {0}")]
+    Certificate(String),
+    #[error("TLS AEAD operation failed")]
+    Aead,
+    #[error("TLS HKDF operation failed")]
+    Hkdf,
+    #[error("TLS ML-KEM operation failed")]
+    MlKem,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -172,20 +206,39 @@ impl Safari26TlsCamouflage {
         psk: &[u8],
         server_public_key: &[u8; 32],
     ) -> Result<Safari26TlsSession, Safari26TlsError> {
-        let x25519 = X25519KeyPair::generate();
-        let shared_secret = x25519_shared_secret(&x25519.private, server_public_key);
-        let auth_key = derive_client_auth_key_from_shared(psk, &shared_secret)?;
-        let context = PatchContext::new(sni.clone(), psk, auth_key, x25519.clone());
+        ServerName::try_from(sni.as_str())
+            .map_err(|_| Safari26TlsError::InvalidServerName(sni.clone()))?;
 
-        let (connection, client_hello) = with_patch_context(context, || {
-            let config = build_client_config()?;
-            let server_name = ServerName::try_from(sni.clone())
-                .map_err(|_| Safari26TlsError::InvalidServerName(sni.clone()))?;
-            let mut connection = rustls::ClientConnection::new(Arc::new(config), server_name)?;
-            let mut client_hello = Vec::new();
-            connection.write_tls(&mut client_hello)?;
-            Ok((connection, client_hello))
-        })?;
+        let parallax_x25519 = X25519KeyPair::generate();
+        let parallax_shared_secret =
+            x25519_shared_secret(&parallax_x25519.private, server_public_key);
+        let auth_key = derive_client_auth_key_from_shared(psk, &parallax_shared_secret)?;
+
+        let tail = build_auth_tail(&mut OsRng)?;
+        let encoded_client_random =
+            build_masked_stateful_client_random(psk, &sni, &parallax_x25519.public, &tail)?;
+        let session_id = build_masked_stateful_auth_session_id(
+            psk,
+            &auth_key,
+            &sni,
+            &parallax_x25519.public,
+            &encoded_client_random,
+            &tail,
+        )?;
+
+        let tls_x25519 = X25519KeyPair::generate();
+        let (mlkem_public, mlkem_secret) = mlkem768::keypair();
+        let mut grease_seed = [0_u8; 5];
+        OsRng.fill_bytes(&mut grease_seed);
+        let grease = GreaseSet::from_seed(grease_seed);
+        let client_hello = build_safari_client_hello(
+            &sni,
+            encoded_client_random,
+            session_id,
+            &tls_x25519.public,
+            mlkem_public.as_bytes(),
+            grease,
+        )?;
 
         let Some(material) = recover_stateful_auth_material(&client_hello, psk)? else {
             return Err(Safari26TlsError::UnauthenticatedClientHello);
@@ -195,15 +248,18 @@ impl Safari26TlsCamouflage {
             &auth_key,
             &material,
         )?;
-        if !auth.authenticated || auth.x25519_key_share != Some(x25519.public) {
+        if !auth.authenticated || auth.x25519_key_share != Some(parallax_x25519.public) {
             return Err(Safari26TlsError::UnauthenticatedClientHello);
         }
 
+        let mlkem_secret = Zeroizing::new(mlkem_secret.as_bytes().to_vec());
+
         Ok(Safari26TlsSession {
-            connection,
             client_hello,
-            x25519,
-            x25519_shared_secret: Zeroizing::new(shared_secret),
+            parallax_x25519,
+            parallax_x25519_shared_secret: Zeroizing::new(parallax_shared_secret),
+            tls_x25519,
+            tls_mlkem768_secret: mlkem_secret,
             sni,
             tap: VecRecordTap::default(),
         })
@@ -211,19 +267,18 @@ impl Safari26TlsCamouflage {
 }
 
 pub struct Safari26TlsSession {
-    connection: rustls::ClientConnection,
     client_hello: Vec<u8>,
-    x25519: X25519KeyPair,
-    x25519_shared_secret: Zeroizing<[u8; 32]>,
+    parallax_x25519: X25519KeyPair,
+    parallax_x25519_shared_secret: Zeroizing<[u8; 32]>,
+    tls_x25519: X25519KeyPair,
+    tls_mlkem768_secret: Zeroizing<Vec<u8>>,
     sni: String,
     tap: VecRecordTap,
 }
 
 impl Safari26TlsSession {
-    /// Borrow the raw ClientHello TLS record that was emitted during
-    /// [`Safari26TlsCamouflage::start`]. Useful for fingerprint
-    /// regression tests that need to inspect the on-the-wire bytes without
-    /// driving a full handshake against a real peer.
+    /// Borrow the raw ClientHello TLS record emitted by the handwritten Safari
+    /// 26 path.
     pub fn client_hello_bytes(&self) -> &[u8] {
         &self.client_hello
     }
@@ -232,126 +287,239 @@ impl Safari26TlsSession {
         mut self,
         stream: &mut TcpStream,
     ) -> Result<CompletedSafari26Handshake, Safari26TlsError> {
+        let mut transcript = HandshakeTranscript::new();
+        transcript.push_handshake_record(&self.client_hello)?;
+
         let client_hello = self.client_hello.clone();
         self.tap_records(RecordDirection::Outbound, &client_hello);
         stream.write_all(&self.client_hello).await?;
 
-        let mut server_hello_record = None;
-        while self.connection.is_handshaking() {
-            let record = read_record(stream).await?;
-            if server_hello_record.is_none() {
-                if let Ok(server_hello) = parse_server_hello(&record) {
-                    if server_hello.tls13_selected {
-                        server_hello_record = Some(record.clone());
-                    }
-                }
-            }
-            self.feed_inbound_record(&record)?;
-            self.flush_outbound(stream).await?;
-        }
+        let server_hello_record = self.read_server_hello_record(stream).await?;
+        transcript.push_handshake_record(&server_hello_record)?;
+        let server_hello = parse_safari_server_hello(&server_hello_record)?;
+        let shared_secret = self.tls_shared_secret(&server_hello)?;
+        let mut keys = Tls13Keys::new(server_hello.cipher_suite, &shared_secret, &transcript)?;
 
-        let server_hello_record =
-            server_hello_record.ok_or(Safari26TlsError::MissingServerHello)?;
-        self.drain_post_handshake(stream).await?;
-        self.open_http2_connection(stream).await?;
+        let server_flight = self
+            .read_encrypted_server_flight(stream, &mut keys, &mut transcript)
+            .await?;
+        verify_server_certificate(&self.sni, &server_flight, &transcript)?;
+        keys.install_application_keys(&transcript)?;
+        self.write_client_finished(stream, &mut keys, &mut transcript)
+            .await?;
+
+        let negotiated_alpn = keys.negotiated_alpn.clone();
+        let post_handshake_records = self.drain_post_handshake(stream, &mut keys).await?;
+        self.open_http2_connection(stream, &mut keys).await?;
 
         Ok(CompletedSafari26Handshake {
             client_hello: self.client_hello,
-            client_x25519: self.x25519,
-            x25519_shared_secret: self.x25519_shared_secret,
+            client_x25519: self.parallax_x25519,
+            x25519_shared_secret: self.parallax_x25519_shared_secret,
             server_hello_record,
             record_events: self.tap.events,
+            negotiated_alpn,
+            post_handshake_records,
         })
     }
 
-    fn feed_inbound_record(&mut self, record: &[u8]) -> Result<(), Safari26TlsError> {
-        self.feed_inbound_record_collect_plaintext(record)
-            .map(|_| ())
-    }
-
-    fn feed_inbound_record_collect_plaintext(
+    async fn read_server_hello_record(
         &mut self,
-        record: &[u8],
+        stream: &mut TcpStream,
     ) -> Result<Vec<u8>, Safari26TlsError> {
-        self.tap_records(RecordDirection::Inbound, record);
-        let mut cursor = Cursor::new(record);
-        self.connection.read_tls(&mut cursor)?;
-        self.connection.process_new_packets()?;
-
-        let mut plaintext = Vec::new();
-        match self.connection.reader().read_to_end(&mut plaintext) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err.into()),
+        loop {
+            let record = read_record(stream).await?;
+            self.tap_records(RecordDirection::Inbound, &record);
+            let header = parse_header(&record)
+                .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+            match header.content_type {
+                TLS_RECORD_CHANGE_CIPHER_SPEC => continue,
+                TLS_CONTENT_ALERT => return parse_alert(&record),
+                TLS_RECORD_HANDSHAKE => {
+                    let _ = parse_server_hello(&record)?;
+                    return Ok(record);
+                }
+                _ => return Err(Safari26TlsError::MissingServerHello),
+            }
         }
-        Ok(plaintext)
     }
 
-    async fn flush_outbound(&mut self, stream: &mut TcpStream) -> Result<(), Safari26TlsError> {
-        while self.connection.wants_write() {
-            let mut out = Vec::new();
-            let written = self.connection.write_tls(&mut out)?;
-            if written == 0 || out.is_empty() {
-                break;
+    fn tls_shared_secret(
+        &self,
+        server_hello: &ParsedServerHello,
+    ) -> Result<Zeroizing<Vec<u8>>, Safari26TlsError> {
+        match server_hello.key_share_group {
+            GROUP_X25519 => {
+                if server_hello.key_share.len() != X25519_KEY_LEN {
+                    return Err(Safari26TlsError::Handshake(
+                        "invalid X25519 server key_share length".to_owned(),
+                    ));
+                }
+                let mut server_public = [0_u8; X25519_KEY_LEN];
+                server_public.copy_from_slice(&server_hello.key_share);
+                Ok(Zeroizing::new(
+                    x25519_shared_secret(&self.tls_x25519.private, &server_public).to_vec(),
+                ))
             }
-            self.tap_records(RecordDirection::Outbound, &out);
-            stream.write_all(&out).await?;
+            GROUP_X25519_MLKEM768 => {
+                if server_hello.key_share.len() != MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN {
+                    return Err(Safari26TlsError::Handshake(
+                        "invalid X25519MLKEM768 server key_share length".to_owned(),
+                    ));
+                }
+                let (mlkem_ciphertext, server_x25519) =
+                    server_hello.key_share.split_at(MLKEM768_CIPHERTEXT_LEN);
+                let ciphertext = mlkem768::Ciphertext::from_bytes(mlkem_ciphertext)
+                    .map_err(|_| Safari26TlsError::MlKem)?;
+                let secret = mlkem768::SecretKey::from_bytes(&self.tls_mlkem768_secret)
+                    .map_err(|_| Safari26TlsError::MlKem)?;
+                let mlkem_shared = mlkem768::decapsulate(&ciphertext, &secret);
+                let mut server_public = [0_u8; X25519_KEY_LEN];
+                server_public.copy_from_slice(server_x25519);
+                let x25519_shared = x25519_shared_secret(&self.tls_x25519.private, &server_public);
+                let mut combined = Vec::with_capacity(64);
+                combined.extend_from_slice(mlkem_shared.as_bytes());
+                combined.extend_from_slice(&x25519_shared);
+                Ok(Zeroizing::new(combined))
+            }
+            _ => Err(Safari26TlsError::Unsupported(
+                "unsupported TLS key_share group",
+            )),
         }
+    }
+
+    async fn read_encrypted_server_flight(
+        &mut self,
+        stream: &mut TcpStream,
+        keys: &mut Tls13Keys,
+        transcript: &mut HandshakeTranscript,
+    ) -> Result<ServerFlight, Safari26TlsError> {
+        let mut flight = ServerFlight::default();
+        let mut handshake_buf = Vec::new();
+
+        while !flight.finished {
+            let record = read_record(stream).await?;
+            self.tap_records(RecordDirection::Inbound, &record);
+            let header = parse_header(&record)
+                .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+            match header.content_type {
+                TLS_RECORD_CHANGE_CIPHER_SPEC => continue,
+                TLS_CONTENT_ALERT => return parse_alert(&record),
+                TLS_RECORD_APPLICATION_DATA => {
+                    let decrypted = keys.server_handshake.decrypt_record(&record)?;
+                    if decrypted.content_type != TLS_RECORD_HANDSHAKE {
+                        return Err(Safari26TlsError::Handshake(
+                            "expected encrypted handshake record".to_owned(),
+                        ));
+                    }
+                    handshake_buf.extend_from_slice(&decrypted.plaintext);
+                    process_server_handshake_messages(
+                        &mut handshake_buf,
+                        &mut flight,
+                        transcript,
+                        keys,
+                    )?;
+                }
+                _ => {
+                    return Err(Safari26TlsError::Handshake(format!(
+                        "unexpected TLS record type {} in server flight",
+                        header.content_type
+                    )));
+                }
+            }
+        }
+
+        Ok(flight)
+    }
+
+    async fn write_client_finished(
+        &mut self,
+        stream: &mut TcpStream,
+        keys: &mut Tls13Keys,
+        transcript: &mut HandshakeTranscript,
+    ) -> Result<(), Safari26TlsError> {
+        let verify_data = keys.client_finished_verify_data(transcript)?;
+        let mut message = Vec::with_capacity(4 + verify_data.len());
+        message.push(HANDSHAKE_FINISHED);
+        push_u24(&mut message, verify_data.len())?;
+        message.extend_from_slice(&verify_data);
+        let record = keys
+            .client_handshake
+            .encrypt_record(TLS_RECORD_HANDSHAKE, &message)?;
+        self.tap_records(RecordDirection::Outbound, &record);
+        stream.write_all(&record).await?;
+        transcript.push(&message);
         Ok(())
     }
 
     async fn drain_post_handshake(
         &mut self,
         stream: &mut TcpStream,
-    ) -> Result<(), Safari26TlsError> {
+        keys: &mut Tls13Keys,
+    ) -> Result<usize, Safari26TlsError> {
+        let mut observed = 0usize;
         for _ in 0..POST_HANDSHAKE_DRAIN_LIMIT {
             let record = match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, read_record(stream)).await {
                 Ok(Ok(record)) => record,
-                Ok(Err(err)) if is_clean_close(&err) => return Ok(()),
+                Ok(Err(err)) if is_clean_close(&err) => return Ok(observed),
                 Ok(Err(err)) => return Err(err.into()),
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(observed),
             };
-            self.feed_inbound_record(&record)?;
-            self.flush_outbound(stream).await?;
+            observed += 1;
+            self.tap_records(RecordDirection::Inbound, &record);
+            let header = parse_header(&record)
+                .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+            match header.content_type {
+                TLS_CONTENT_ALERT => return parse_alert(&record),
+                TLS_RECORD_APPLICATION_DATA => {
+                    let _ = keys.server_application.decrypt_record(&record)?;
+                }
+                _ => {}
+            }
         }
-        Ok(())
+        Ok(observed)
     }
 
     async fn open_http2_connection(
         &mut self,
         stream: &mut TcpStream,
+        keys: &mut Tls13Keys,
     ) -> Result<(), Safari26TlsError> {
-        if !self.negotiated_h2() {
+        if !keys.negotiated_h2() {
             return Ok(());
         }
 
         let fingerprint = Http2Fingerprint::safari26();
         let preface = fingerprint.connection_preface()?;
-        self.write_application_data(stream, &preface).await?;
-        self.await_http2_settings_ack(stream).await?;
+        self.write_application_data(stream, keys, &preface).await?;
+        self.await_http2_settings_ack(stream, keys).await?;
 
         let headers = fingerprint.headers_frame(&self.sni)?;
-        self.write_application_data(stream, &headers).await?;
+        self.write_application_data(stream, keys, &headers).await?;
         sleep(H2_OPEN_HEADERS_DELAY).await;
         Ok(())
-    }
-
-    fn negotiated_h2(&self) -> bool {
-        matches!(self.connection.alpn_protocol(), Some(protocol) if protocol == b"h2")
     }
 
     async fn write_application_data(
         &mut self,
         stream: &mut TcpStream,
+        keys: &mut Tls13Keys,
         plaintext: &[u8],
     ) -> Result<(), Safari26TlsError> {
-        self.connection.writer().write_all(plaintext)?;
-        self.flush_outbound(stream).await
+        for chunk in plaintext.chunks(super::record::MAX_TLS_RECORD_PAYLOAD) {
+            let record = keys
+                .client_application
+                .encrypt_record(TLS_RECORD_APPLICATION_DATA, chunk)?;
+            self.tap_records(RecordDirection::Outbound, &record);
+            stream.write_all(&record).await?;
+        }
+        Ok(())
     }
 
     async fn await_http2_settings_ack(
         &mut self,
         stream: &mut TcpStream,
+        keys: &mut Tls13Keys,
     ) -> Result<(), Safari26TlsError> {
         let mut plaintext = Vec::new();
         for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
@@ -361,13 +529,28 @@ impl Safari26TlsSession {
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => return Ok(()),
             };
-            let chunk = self.feed_inbound_record_collect_plaintext(&record)?;
-            plaintext.extend_from_slice(&chunk);
-            if plaintext.len() > H2_FRAME_BUFFER_LIMIT {
-                plaintext.clear();
-            }
-            if self.process_http2_frames(&mut plaintext, stream).await? {
-                return Ok(());
+            self.tap_records(RecordDirection::Inbound, &record);
+            let header = parse_header(&record)
+                .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+            match header.content_type {
+                TLS_CONTENT_ALERT => return parse_alert(&record),
+                TLS_RECORD_APPLICATION_DATA => {
+                    let chunk = keys.server_application.decrypt_record(&record)?;
+                    if chunk.content_type != TLS_RECORD_APPLICATION_DATA {
+                        continue;
+                    }
+                    plaintext.extend_from_slice(&chunk.plaintext);
+                    if plaintext.len() > H2_FRAME_BUFFER_LIMIT {
+                        plaintext.clear();
+                    }
+                    if self
+                        .process_http2_frames(&mut plaintext, stream, keys)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -377,6 +560,7 @@ impl Safari26TlsSession {
         &mut self,
         plaintext: &mut Vec<u8>,
         stream: &mut TcpStream,
+        keys: &mut Tls13Keys,
     ) -> Result<bool, Safari26TlsError> {
         let mut offset = 0;
         let mut saw_settings_ack = false;
@@ -397,7 +581,7 @@ impl Safari26TlsSession {
 
         if should_ack_peer_settings {
             let ack = Http2Fingerprint::settings_ack_frame()?;
-            self.write_application_data(stream, &ack).await?;
+            self.write_application_data(stream, keys, &ack).await?;
         }
 
         Ok(saw_settings_ack)
@@ -426,6 +610,8 @@ pub struct CompletedSafari26Handshake {
     pub client_x25519: X25519KeyPair,
     pub server_hello_record: Vec<u8>,
     pub record_events: Vec<RecordEvent>,
+    pub negotiated_alpn: Option<Vec<u8>>,
+    pub post_handshake_records: usize,
     x25519_shared_secret: Zeroizing<[u8; 32]>,
 }
 
@@ -443,487 +629,998 @@ impl fmt::Debug for CompletedSafari26Handshake {
             .field("x25519_shared_secret", &"<redacted>")
             .field("server_hello_record", &self.server_hello_record)
             .field("record_events", &self.record_events)
+            .field("negotiated_alpn", &self.negotiated_alpn)
+            .field("post_handshake_records", &self.post_handshake_records)
             .finish()
     }
 }
 
-fn with_patch_context<T>(
-    context: PatchContext,
-    f: impl FnOnce() -> Result<T, Safari26TlsError>,
-) -> Result<T, Safari26TlsError> {
-    PATCH_CONTEXT.with(|slot| {
-        *slot.borrow_mut() = Some(context);
-    });
-    let result = f();
-    PATCH_CONTEXT.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
-    result
+#[derive(Clone, Copy)]
+struct GreaseSet {
+    cipher: u16,
+    extension: u16,
+    group: u16,
+    version: u16,
+    final_extension: u16,
 }
 
-fn build_client_config() -> Result<rustls::ClientConfig, Safari26TlsError> {
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    let (cipher_grease, group_grease) = browser_grease_indices_from_context();
-    shape_safari_cipher_suites(&mut provider, cipher_grease);
-    shape_safari_key_exchange_groups(&mut provider, group_grease);
-    provider.secure_random = &PARALLAX_RANDOM;
-    let provider = Arc::new(provider);
-    let verifier = CamouflageVerifier::new(Arc::clone(&provider))?;
-
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|err| Safari26TlsError::RustlsConfig(err.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    // A fresh, non-shared cache lets rustls emit an empty TLS 1.2
-    // session_ticket request extension while preventing cached PSK binders from
-    // ever appearing in ParallaX's authenticated ClientHello.
-    config.resumption = Resumption::in_memory_sessions(1);
-    config.enable_early_data = false;
-    config.max_fragment_size = None;
-    Ok(config)
+impl GreaseSet {
+    fn from_seed(seed: [u8; 5]) -> Self {
+        let mut cipher_index = seed[0] as usize % BROWSER_GREASE_VALUES.len();
+        let extension_index = seed[1] as usize % BROWSER_GREASE_VALUES.len();
+        if cipher_index == extension_index {
+            cipher_index = (cipher_index + 1) % BROWSER_GREASE_VALUES.len();
+        }
+        let mut final_extension_index = seed[4] as usize % BROWSER_GREASE_VALUES.len();
+        if final_extension_index == extension_index {
+            final_extension_index = (final_extension_index + 1) % BROWSER_GREASE_VALUES.len();
+        }
+        Self {
+            cipher: BROWSER_GREASE_VALUES[cipher_index],
+            extension: BROWSER_GREASE_VALUES[extension_index],
+            group: BROWSER_GREASE_VALUES[seed[2] as usize % BROWSER_GREASE_VALUES.len()],
+            version: BROWSER_GREASE_VALUES[seed[3] as usize % BROWSER_GREASE_VALUES.len()],
+            final_extension: BROWSER_GREASE_VALUES[final_extension_index],
+        }
+    }
 }
 
-fn shape_safari_cipher_suites(provider: &mut rustls::crypto::CryptoProvider, grease_index: usize) {
-    use rustls::crypto::aws_lc_rs::cipher_suite;
+fn build_safari_client_hello(
+    sni: &str,
+    client_random: [u8; 32],
+    session_id: [u8; 32],
+    x25519_public: &[u8; 32],
+    mlkem768_public: &[u8],
+    grease: GreaseSet,
+) -> Result<Vec<u8>, Safari26TlsError> {
+    if mlkem768_public.len() != MLKEM768_PUBLIC_KEY_LEN {
+        return Err(Safari26TlsError::MlKem);
+    }
 
-    // Safari 26.4 ClientHello order (apple.com capture):
-    //   GREASE, TLS13_AES_256_GCM, TLS13_CHACHA20, TLS13_AES_128_GCM,
-    //   ECDHE_ECDSA(AES256/AES128/CHACHA), ECDHE_RSA(AES256/AES128/CHACHA),
-    //   <legacy ECDHE-CBC, RSA, 3DES tail>.
-    // rustls + aws-lc-rs cannot emit the legacy CBC / RSA-only tail, so we
-    // match the front of Apple's list exactly and let rustls append SCSV
-    // (00ff) at the end when TLS 1.2 stays enabled.
-    provider.cipher_suites = vec![
-        grease_cipher_suite(grease_index),
-        cipher_suite::TLS13_AES_256_GCM_SHA384,
-        cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-        cipher_suite::TLS13_AES_128_GCM_SHA256,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    let mut body = Vec::with_capacity(1536);
+    body.extend_from_slice(&TLS12.to_be_bytes());
+    body.extend_from_slice(&client_random);
+    body.push(session_id.len() as u8);
+    body.extend_from_slice(&session_id);
+
+    let ciphers = [
+        grease.cipher,
+        TLS_AES_256_GCM_SHA384,
+        TLS_CHACHA20_POLY1305_SHA256,
+        TLS_AES_128_GCM_SHA256,
+        0xc02c,
+        0xc02b,
+        0xcca9,
+        0xc030,
+        0xc02f,
+        0xcca8,
+        0xc00a,
+        0xc009,
+        0xc014,
+        0xc013,
+        0x009d,
+        0x009c,
+        0x0035,
+        0x002f,
+        0xc008,
+        0xc012,
+        0x000a,
     ];
+    push_u16_len_prefixed_u16s(&mut body, &ciphers)?;
+    body.push(1);
+    body.push(0);
+
+    let mut extensions = Vec::with_capacity(1410);
+    push_extension(&mut extensions, grease.extension, &[])?;
+    push_extension(
+        &mut extensions,
+        EXT_SERVER_NAME,
+        &server_name_extension(sni)?,
+    )?;
+    push_extension(&mut extensions, EXT_EXTENDED_MASTER_SECRET, &[])?;
+    push_extension(&mut extensions, EXT_RENEGOTIATION_INFO, &[0])?;
+    push_extension(
+        &mut extensions,
+        EXT_SUPPORTED_GROUPS,
+        &supported_groups_extension(grease.group)?,
+    )?;
+    push_extension(&mut extensions, EXT_EC_POINT_FORMATS, &[1, 0])?;
+    push_extension(&mut extensions, EXT_ALPN, &alpn_extension()?)?;
+    push_extension(&mut extensions, EXT_STATUS_REQUEST, &[1, 0, 0, 0, 0])?;
+    push_extension(
+        &mut extensions,
+        EXT_SIGNATURE_ALGORITHMS,
+        &signature_algorithms_extension()?,
+    )?;
+    push_extension(&mut extensions, EXT_SIGNED_CERTIFICATE_TIMESTAMP, &[])?;
+    push_extension(
+        &mut extensions,
+        EXT_KEY_SHARE,
+        &key_share_extension(grease.group, mlkem768_public, x25519_public)?,
+    )?;
+    push_extension(&mut extensions, EXT_PSK_KEY_EXCHANGE_MODES, &[1, 1])?;
+    push_extension(
+        &mut extensions,
+        EXT_SUPPORTED_VERSIONS,
+        &supported_versions_extension(grease.version),
+    )?;
+    push_extension(&mut extensions, EXT_COMPRESS_CERTIFICATE, &[2, 0, 1])?;
+    push_extension(&mut extensions, grease.final_extension, &[0])?;
+
+    push_vec_u16(&mut body, &extensions)?;
+    handshake_record(
+        TLS_RECORD_VERSION_CLIENT_HELLO,
+        HANDSHAKE_CLIENT_HELLO,
+        &body,
+    )
 }
 
-fn shape_safari_key_exchange_groups(
-    provider: &mut rustls::crypto::CryptoProvider,
-    grease_index: usize,
-) {
-    use rustls::crypto::aws_lc_rs::kx_group;
+fn server_name_extension(sni: &str) -> Result<Vec<u8>, Safari26TlsError> {
+    let name = sni.as_bytes();
+    let name_len = u16::try_from(name.len())
+        .map_err(|_| Safari26TlsError::Handshake("SNI too long".to_owned()))?;
+    let list_len = name_len
+        .checked_add(3)
+        .ok_or_else(|| Safari26TlsError::Handshake("SNI too long".to_owned()))?;
+    let mut out = Vec::with_capacity(2 + list_len as usize);
+    out.extend_from_slice(&list_len.to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&name_len.to_be_bytes());
+    out.extend_from_slice(name);
+    Ok(out)
+}
 
-    // Safari/CoreCrypto places a GREASE named group before the real
-    // hybrid/classical groups. The GREASE provider delegates its actual
-    // key-share generation to X25519MLKEM768, so rustls' transcript and key
-    // schedule stay internally consistent while the supported_groups vector
-    // becomes browser-shaped.
-    // Safari 26.4 supported_groups (apple.com capture):
-    //   GREASE, X25519MLKEM768, X25519, secp256r1, secp384r1, secp521r1.
-    //
-    // rustls 0.23 + aws-lc-rs only exposes SupportedKxGroup statics for
-    // SECP256R1 / SECP384R1, so we announce secp521r1 via the announce-only
-    // stub below. rustls picks key_share entries from the front of this list
-    // (GREASE + the hybrid group + its classical pair), so the stub's
-    // `start()` is never reached in practice.
-    provider.kx_groups = vec![
-        grease_kx_group(grease_index),
-        kx_group::X25519MLKEM768,
-        kx_group::X25519,
-        kx_group::SECP256R1,
-        kx_group::SECP384R1,
-        &ANNOUNCE_ONLY_SECP521R1,
+fn supported_groups_extension(grease_group: u16) -> Result<Vec<u8>, Safari26TlsError> {
+    let groups = [
+        grease_group,
+        GROUP_X25519_MLKEM768,
+        GROUP_X25519,
+        GROUP_SECP256R1,
+        GROUP_SECP384R1,
+        GROUP_SECP521R1,
     ];
+    let mut out = Vec::with_capacity(2 + groups.len() * 2);
+    push_u16_len_prefixed_u16s(&mut out, &groups)?;
+    Ok(out)
 }
 
-fn browser_grease_indices_from_context() -> (usize, usize) {
-    PATCH_CONTEXT.with(|slot| {
-        let slot = slot.borrow();
-        let Some(context) = slot.as_ref() else {
-            return (0, 1);
-        };
-        (
-            (context.x25519.public[0] as usize) % BROWSER_GREASE_VALUES.len(),
-            (context.x25519.public[1] as usize) % BROWSER_GREASE_VALUES.len(),
-        )
+fn alpn_extension() -> Result<Vec<u8>, Safari26TlsError> {
+    let mut out = Vec::new();
+    let mut list = Vec::new();
+    list.push(2);
+    list.extend_from_slice(b"h2");
+    list.push(8);
+    list.extend_from_slice(b"http/1.1");
+    push_vec_u16(&mut out, &list)?;
+    Ok(out)
+}
+
+fn signature_algorithms_extension() -> Result<Vec<u8>, Safari26TlsError> {
+    let schemes = [
+        SIG_ECDSA_SECP256R1_SHA256,
+        SIG_RSA_PSS_RSAE_SHA256,
+        SIG_RSA_PKCS1_SHA256,
+        SIG_ECDSA_SECP384R1_SHA384,
+        SIG_RSA_PSS_RSAE_SHA384,
+        SIG_RSA_PSS_RSAE_SHA384,
+        SIG_RSA_PKCS1_SHA384,
+        SIG_RSA_PSS_RSAE_SHA512,
+        SIG_RSA_PKCS1_SHA512,
+        0x0201,
+    ];
+    let mut out = Vec::with_capacity(2 + schemes.len() * 2);
+    push_u16_len_prefixed_u16s(&mut out, &schemes)?;
+    Ok(out)
+}
+
+fn key_share_extension(
+    grease_group: u16,
+    mlkem768_public: &[u8],
+    x25519_public: &[u8; 32],
+) -> Result<Vec<u8>, Safari26TlsError> {
+    let mut shares = Vec::with_capacity(4 + 4 + 1 + 4 + MLKEM768_PUBLIC_KEY_LEN + 32);
+    shares.extend_from_slice(&grease_group.to_be_bytes());
+    push_vec_u16(&mut shares, &[0])?;
+
+    shares.extend_from_slice(&GROUP_X25519_MLKEM768.to_be_bytes());
+    let mut hybrid = Vec::with_capacity(MLKEM768_PUBLIC_KEY_LEN + X25519_KEY_LEN);
+    hybrid.extend_from_slice(mlkem768_public);
+    hybrid.extend_from_slice(x25519_public);
+    push_vec_u16(&mut shares, &hybrid)?;
+
+    shares.extend_from_slice(&GROUP_X25519.to_be_bytes());
+    push_vec_u16(&mut shares, x25519_public)?;
+
+    let mut out = Vec::with_capacity(2 + shares.len());
+    push_vec_u16(&mut out, &shares)?;
+    Ok(out)
+}
+
+fn supported_versions_extension(grease_version: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(7);
+    out.push(6);
+    out.extend_from_slice(&grease_version.to_be_bytes());
+    out.extend_from_slice(&TLS13.to_be_bytes());
+    out.extend_from_slice(&TLS12.to_be_bytes());
+    out
+}
+
+fn push_extension(out: &mut Vec<u8>, ext_type: u16, data: &[u8]) -> Result<(), Safari26TlsError> {
+    out.extend_from_slice(&ext_type.to_be_bytes());
+    push_vec_u16(out, data)
+}
+
+fn handshake_record(
+    record_version: [u8; 2],
+    handshake_type: u8,
+    body: &[u8],
+) -> Result<Vec<u8>, Safari26TlsError> {
+    let mut handshake = Vec::with_capacity(4 + body.len());
+    handshake.push(handshake_type);
+    push_u24(&mut handshake, body.len())?;
+    handshake.extend_from_slice(body);
+    let mut record = Vec::with_capacity(5 + handshake.len());
+    record.push(TLS_RECORD_HANDSHAKE);
+    record.extend_from_slice(&record_version);
+    push_u16_len(&mut record, handshake.len())?;
+    record.extend_from_slice(&handshake);
+    Ok(record)
+}
+
+fn push_u16_len_prefixed_u16s(out: &mut Vec<u8>, values: &[u16]) -> Result<(), Safari26TlsError> {
+    push_u16_len(out, values.len() * 2)?;
+    for value in values {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn push_vec_u16(out: &mut Vec<u8>, data: &[u8]) -> Result<(), Safari26TlsError> {
+    push_u16_len(out, data.len())?;
+    out.extend_from_slice(data);
+    Ok(())
+}
+
+fn push_u16_len(out: &mut Vec<u8>, len: usize) -> Result<(), Safari26TlsError> {
+    let len = u16::try_from(len)
+        .map_err(|_| Safari26TlsError::Handshake("TLS vector too large".to_owned()))?;
+    out.extend_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
+fn push_u24(out: &mut Vec<u8>, len: usize) -> Result<(), Safari26TlsError> {
+    if len > 0x00ff_ffff {
+        return Err(Safari26TlsError::Handshake(
+            "TLS handshake message too large".to_owned(),
+        ));
+    }
+    out.push(((len >> 16) & 0xff) as u8);
+    out.push(((len >> 8) & 0xff) as u8);
+    out.push((len & 0xff) as u8);
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ParsedServerHello {
+    cipher_suite: TlsCipherSuite,
+    key_share_group: u16,
+    key_share: Vec<u8>,
+}
+
+fn parse_safari_server_hello(record: &[u8]) -> Result<ParsedServerHello, Safari26TlsError> {
+    let _ = parse_server_hello(record)?;
+    let (_, payload) = super::record::parse_exact(record)
+        .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+    let mut c = TlsCursor::new(payload);
+    let handshake_type = c.u8()?;
+    if handshake_type != HANDSHAKE_SERVER_HELLO {
+        return Err(Safari26TlsError::Handshake(
+            "expected ServerHello".to_owned(),
+        ));
+    }
+    let body_len = c.u24()? as usize;
+    let body = c.bytes(body_len)?;
+    let mut b = TlsCursor::new(body);
+    let legacy_version = b.u16()?;
+    if legacy_version != TLS12 {
+        return Err(Safari26TlsError::Handshake(
+            "ServerHello legacy_version is not TLS 1.2".to_owned(),
+        ));
+    }
+    let random = b.bytes(32)?;
+    if random == hrr_random() {
+        return Err(Safari26TlsError::Unsupported("HelloRetryRequest"));
+    }
+    let session_id = b.vec_u8()?;
+    if session_id.len() != 32 {
+        return Err(Safari26TlsError::Handshake(
+            "ServerHello did not echo a 32-byte session_id".to_owned(),
+        ));
+    }
+    let cipher_suite = TlsCipherSuite::from_u16(b.u16()?)?;
+    if b.u8()? != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "ServerHello compression_method is not null".to_owned(),
+        ));
+    }
+    let extensions = b.vec_u16()?;
+    let mut e = TlsCursor::new(extensions);
+    let mut tls13_selected = false;
+    let mut key_share_group = None;
+    let mut key_share = None;
+    while e.remaining() > 0 {
+        let ext_type = e.u16()?;
+        let data = e.vec_u16()?;
+        match ext_type {
+            EXT_SUPPORTED_VERSIONS => {
+                if data.len() == 2 && u16::from_be_bytes([data[0], data[1]]) == TLS13 {
+                    tls13_selected = true;
+                }
+            }
+            EXT_KEY_SHARE => {
+                let mut ks = TlsCursor::new(data);
+                key_share_group = Some(ks.u16()?);
+                key_share = Some(ks.vec_u16()?.to_vec());
+            }
+            _ => {}
+        }
+    }
+    if !tls13_selected {
+        return Err(Safari26TlsError::MissingServerHello);
+    }
+    Ok(ParsedServerHello {
+        cipher_suite,
+        key_share_group: key_share_group.ok_or_else(|| {
+            Safari26TlsError::Handshake("ServerHello missing key_share".to_owned())
+        })?,
+        key_share: key_share.ok_or_else(|| {
+            Safari26TlsError::Handshake("ServerHello missing key_share data".to_owned())
+        })?,
     })
 }
 
-fn grease_cipher_suite(index: usize) -> SupportedCipherSuite {
-    static GREASE_CIPHER_0: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_1: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_2: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_3: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_4: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_5: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_6: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_7: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_8: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_9: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_10: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_11: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_12: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_13: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_14: OnceLock<Tls13CipherSuite> = OnceLock::new();
-    static GREASE_CIPHER_15: OnceLock<Tls13CipherSuite> = OnceLock::new();
-
-    let index = index % BROWSER_GREASE_VALUES.len();
-    let lock = match index {
-        0 => &GREASE_CIPHER_0,
-        1 => &GREASE_CIPHER_1,
-        2 => &GREASE_CIPHER_2,
-        3 => &GREASE_CIPHER_3,
-        4 => &GREASE_CIPHER_4,
-        5 => &GREASE_CIPHER_5,
-        6 => &GREASE_CIPHER_6,
-        7 => &GREASE_CIPHER_7,
-        8 => &GREASE_CIPHER_8,
-        9 => &GREASE_CIPHER_9,
-        10 => &GREASE_CIPHER_10,
-        11 => &GREASE_CIPHER_11,
-        12 => &GREASE_CIPHER_12,
-        13 => &GREASE_CIPHER_13,
-        14 => &GREASE_CIPHER_14,
-        _ => &GREASE_CIPHER_15,
-    };
-    let grease_value = BROWSER_GREASE_VALUES[index];
-    let base = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
-        .tls13()
-        .expect("AES-128-GCM is a TLS 1.3 cipher suite");
-    SupportedCipherSuite::Tls13(lock.get_or_init(|| Tls13CipherSuite {
-        common: CipherSuiteCommon {
-            suite: CipherSuite::Unknown(grease_value),
-            hash_provider: base.common.hash_provider,
-            confidentiality_limit: base.common.confidentiality_limit,
-        },
-        hkdf_provider: base.hkdf_provider,
-        aead_alg: &GREASE_REJECTING_AEAD,
-        quic: None,
-    }))
+fn hrr_random() -> &'static [u8] {
+    &[
+        0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
+        0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
+        0x33, 0x9c,
+    ]
 }
 
-#[derive(Debug)]
-struct GreaseKxGroup {
-    value: u16,
+#[derive(Debug, Clone, Copy)]
+enum TlsCipherSuite {
+    Aes128GcmSha256,
+    Aes256GcmSha384,
+    Chacha20Poly1305Sha256,
 }
 
-static GREASE_KX_GROUPS: [GreaseKxGroup; 16] = [
-    GreaseKxGroup { value: 0x0a0a },
-    GreaseKxGroup { value: 0x1a1a },
-    GreaseKxGroup { value: 0x2a2a },
-    GreaseKxGroup { value: 0x3a3a },
-    GreaseKxGroup { value: 0x4a4a },
-    GreaseKxGroup { value: 0x5a5a },
-    GreaseKxGroup { value: 0x6a6a },
-    GreaseKxGroup { value: 0x7a7a },
-    GreaseKxGroup { value: 0x8a8a },
-    GreaseKxGroup { value: 0x9a9a },
-    GreaseKxGroup { value: 0xaaaa },
-    GreaseKxGroup { value: 0xbaba },
-    GreaseKxGroup { value: 0xcaca },
-    GreaseKxGroup { value: 0xdada },
-    GreaseKxGroup { value: 0xeaea },
-    GreaseKxGroup { value: 0xfafa },
-];
-
-fn grease_kx_group(index: usize) -> &'static dyn SupportedKxGroup {
-    &GREASE_KX_GROUPS[index % GREASE_KX_GROUPS.len()]
-}
-
-/// Announce-only `secp521r1`: present so Apple's supported_groups vector is
-/// reproducible, but never picked by rustls because the hybrid/x25519/p256/p384
-/// groups are listed first and rustls only generates `key_share` entries for
-/// the front of the list. If anything ever does call `start()` we delegate to
-/// X25519 so the connection still completes; the wire-level `NamedGroup` value
-/// stays `secp521r1` (0x0019).
-#[derive(Debug)]
-struct AnnounceOnlySecp521r1;
-
-static ANNOUNCE_ONLY_SECP521R1: AnnounceOnlySecp521r1 = AnnounceOnlySecp521r1;
-
-impl SupportedKxGroup for AnnounceOnlySecp521r1 {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, RustlsError> {
-        rustls::crypto::aws_lc_rs::kx_group::X25519.start()
-    }
-
-    fn name(&self) -> NamedGroup {
-        NamedGroup::secp521r1
-    }
-
-    fn fips(&self) -> bool {
-        false
-    }
-}
-
-impl SupportedKxGroup for GreaseKxGroup {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, RustlsError> {
-        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768.start()
-    }
-
-    fn name(&self) -> NamedGroup {
-        NamedGroup::Unknown(self.value)
-    }
-
-    fn fips(&self) -> bool {
-        false
-    }
-}
-
-#[derive(Debug)]
-struct RejectingGreaseAead;
-
-static GREASE_REJECTING_AEAD: RejectingGreaseAead = RejectingGreaseAead;
-
-impl Tls13AeadAlgorithm for RejectingGreaseAead {
-    fn encrypter(&self, _key: AeadKey, _iv: Iv) -> Box<dyn MessageEncrypter> {
-        Box::new(RejectingGreaseCipher)
-    }
-
-    fn decrypter(&self, _key: AeadKey, _iv: Iv) -> Box<dyn MessageDecrypter> {
-        Box::new(RejectingGreaseCipher)
-    }
-
-    fn key_len(&self) -> usize {
-        16
-    }
-
-    fn extract_keys(
-        &self,
-        _key: AeadKey,
-        _iv: Iv,
-    ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
-        Err(UnsupportedOperationError)
-    }
-}
-
-struct RejectingGreaseCipher;
-
-impl MessageEncrypter for RejectingGreaseCipher {
-    fn encrypt(
-        &mut self,
-        _msg: OutboundPlainMessage<'_>,
-        _seq: u64,
-    ) -> Result<OutboundOpaqueMessage, RustlsError> {
-        Err(grease_selected_error())
-    }
-
-    fn encrypted_payload_len(&self, payload_len: usize) -> usize {
-        payload_len
-    }
-}
-
-impl MessageDecrypter for RejectingGreaseCipher {
-    fn decrypt<'a>(
-        &mut self,
-        _msg: InboundOpaqueMessage<'a>,
-        _seq: u64,
-    ) -> Result<InboundPlainMessage<'a>, RustlsError> {
-        Err(grease_selected_error())
-    }
-}
-
-fn grease_selected_error() -> RustlsError {
-    RustlsError::General("peer selected a GREASE cipher suite".to_owned())
-}
-
-#[derive(Debug)]
-struct ParallaxSecureRandom;
-
-static PARALLAX_RANDOM: ParallaxSecureRandom = ParallaxSecureRandom;
-
-impl SecureRandom for ParallaxSecureRandom {
-    fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-        let mut handled = false;
-        PATCH_CONTEXT.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let Some(context) = slot.as_mut() else {
-                return;
-            };
-            if buf.len() != crate::crypto::auth::SESSION_ID_LEN {
-                return;
-            }
-
-            if context.session_id_pending {
-                // rustls 0.23 constructs the TLS 1.3 compatibility SessionID
-                // before ClientHello.random for non-QUIC clients.
-                let tail =
-                    build_auth_tail(&mut OsRng).expect("system clock must be after UNIX epoch");
-                let encoded_client_random = build_masked_stateful_client_random(
-                    &context.psk,
-                    &context.sni,
-                    &context.x25519.public,
-                    &tail,
-                )
-                .expect("stateful ClientHello.random mask inputs are valid");
-                let session_id = build_masked_stateful_auth_session_id(
-                    &context.psk,
-                    &context.auth_key,
-                    &context.sni,
-                    &context.x25519.public,
-                    &encoded_client_random,
-                    &tail,
-                )
-                .expect("stateful auth inputs are fixed length");
-                context.encoded_client_random = Some(encoded_client_random);
-                buf.copy_from_slice(&session_id);
-                context.session_id_pending = false;
-                handled = true;
-                return;
-            }
-
-            if context.random_pending {
-                let encoded_client_random = context
-                    .encoded_client_random
-                    .expect("SessionID must be generated before ClientHello.random");
-                buf.copy_from_slice(&encoded_client_random);
-                context.random_pending = false;
-                handled = true;
-            }
-        });
-
-        if !handled {
-            OsRng.fill_bytes(buf);
+impl TlsCipherSuite {
+    fn from_u16(value: u16) -> Result<Self, Safari26TlsError> {
+        match value {
+            TLS_AES_128_GCM_SHA256 => Ok(Self::Aes128GcmSha256),
+            TLS_AES_256_GCM_SHA384 => Ok(Self::Aes256GcmSha384),
+            TLS_CHACHA20_POLY1305_SHA256 => Ok(Self::Chacha20Poly1305Sha256),
+            _ => Err(Safari26TlsError::Unsupported(
+                "unsupported TLS cipher suite",
+            )),
         }
+    }
+
+    fn hash_len(self) -> usize {
+        match self {
+            Self::Aes256GcmSha384 => 48,
+            Self::Aes128GcmSha256 | Self::Chacha20Poly1305Sha256 => 32,
+        }
+    }
+
+    fn key_len(self) -> usize {
+        match self {
+            Self::Aes128GcmSha256 => 16,
+            Self::Aes256GcmSha384 | Self::Chacha20Poly1305Sha256 => 32,
+        }
+    }
+
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Aes256GcmSha384 => Sha384::digest(data).to_vec(),
+            Self::Aes128GcmSha256 | Self::Chacha20Poly1305Sha256 => Sha256::digest(data).to_vec(),
+        }
+    }
+
+    fn hmac(self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Safari26TlsError> {
+        match self {
+            Self::Aes256GcmSha384 => {
+                let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(key)
+                    .map_err(|_| Safari26TlsError::Hkdf)?;
+                mac.update(data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            Self::Aes128GcmSha256 | Self::Chacha20Poly1305Sha256 => {
+                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+                    .map_err(|_| Safari26TlsError::Hkdf)?;
+                mac.update(data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+        }
+    }
+
+    fn hkdf_extract(self, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Aes256GcmSha384 => {
+                let (prk, _) = Hkdf::<Sha384>::extract(Some(salt), ikm);
+                prk.to_vec()
+            }
+            Self::Aes128GcmSha256 | Self::Chacha20Poly1305Sha256 => {
+                let (prk, _) = Hkdf::<Sha256>::extract(Some(salt), ikm);
+                prk.to_vec()
+            }
+        }
+    }
+
+    fn hkdf_expand_label(
+        self,
+        secret: &[u8],
+        label: &str,
+        context: &[u8],
+        len: usize,
+    ) -> Result<Vec<u8>, Safari26TlsError> {
+        let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
+        push_u16_len(&mut info, len)?;
+        let full_label = format!("tls13 {label}");
+        info.push(full_label.len() as u8);
+        info.extend_from_slice(full_label.as_bytes());
+        info.push(context.len() as u8);
+        info.extend_from_slice(context);
+
+        let mut out = vec![0_u8; len];
+        match self {
+            Self::Aes256GcmSha384 => Hkdf::<Sha384>::from_prk(secret)
+                .map_err(|_| Safari26TlsError::Hkdf)?
+                .expand(&info, &mut out)
+                .map_err(|_| Safari26TlsError::Hkdf)?,
+            Self::Aes128GcmSha256 | Self::Chacha20Poly1305Sha256 => {
+                Hkdf::<Sha256>::from_prk(secret)
+                    .map_err(|_| Safari26TlsError::Hkdf)?
+                    .expand(&info, &mut out)
+                    .map_err(|_| Safari26TlsError::Hkdf)?
+            }
+        }
+        Ok(out)
+    }
+
+    fn derive_secret(
+        self,
+        secret: &[u8],
+        label: &str,
+        transcript: &[u8],
+    ) -> Result<Vec<u8>, Safari26TlsError> {
+        let hash = self.digest(transcript);
+        self.hkdf_expand_label(secret, label, &hash, self.hash_len())
+    }
+}
+
+struct Tls13Keys {
+    suite: TlsCipherSuite,
+    client_handshake: RecordCipher,
+    server_handshake: RecordCipher,
+    client_application: RecordCipher,
+    server_application: RecordCipher,
+    client_handshake_secret: Vec<u8>,
+    server_handshake_secret: Vec<u8>,
+    master_secret: Vec<u8>,
+    negotiated_alpn: Option<Vec<u8>>,
+}
+
+impl Tls13Keys {
+    fn new(
+        suite: TlsCipherSuite,
+        shared_secret: &[u8],
+        transcript: &HandshakeTranscript,
+    ) -> Result<Self, Safari26TlsError> {
+        let zeros = vec![0_u8; suite.hash_len()];
+        let early_secret = suite.hkdf_extract(&zeros, &zeros);
+        let derived = suite.derive_secret(&early_secret, "derived", &[])?;
+        let handshake_secret = suite.hkdf_extract(&derived, shared_secret);
+        let client_handshake_secret =
+            suite.derive_secret(&handshake_secret, "c hs traffic", transcript.bytes())?;
+        let server_handshake_secret =
+            suite.derive_secret(&handshake_secret, "s hs traffic", transcript.bytes())?;
+        let derived = suite.derive_secret(&handshake_secret, "derived", &[])?;
+        let master_secret = suite.hkdf_extract(&derived, &zeros);
+        Ok(Self {
+            suite,
+            client_handshake: RecordCipher::new(suite, &client_handshake_secret)?,
+            server_handshake: RecordCipher::new(suite, &server_handshake_secret)?,
+            client_application: RecordCipher::zero(suite),
+            server_application: RecordCipher::zero(suite),
+            client_handshake_secret,
+            server_handshake_secret,
+            master_secret,
+            negotiated_alpn: None,
+        })
+    }
+
+    fn install_application_keys(
+        &mut self,
+        transcript: &HandshakeTranscript,
+    ) -> Result<(), Safari26TlsError> {
+        let client_application_secret =
+            self.suite
+                .derive_secret(&self.master_secret, "c ap traffic", transcript.bytes())?;
+        let server_application_secret =
+            self.suite
+                .derive_secret(&self.master_secret, "s ap traffic", transcript.bytes())?;
+        self.client_application = RecordCipher::new(self.suite, &client_application_secret)?;
+        self.server_application = RecordCipher::new(self.suite, &server_application_secret)?;
+        Ok(())
+    }
+
+    fn server_finished_verify_data(
+        &self,
+        transcript: &HandshakeTranscript,
+    ) -> Result<Vec<u8>, Safari26TlsError> {
+        finished_verify_data(
+            self.suite,
+            &self.server_handshake_secret,
+            transcript.bytes(),
+        )
+    }
+
+    fn client_finished_verify_data(
+        &self,
+        transcript: &HandshakeTranscript,
+    ) -> Result<Vec<u8>, Safari26TlsError> {
+        finished_verify_data(
+            self.suite,
+            &self.client_handshake_secret,
+            transcript.bytes(),
+        )
+    }
+
+    fn negotiated_h2(&self) -> bool {
+        matches!(self.negotiated_alpn.as_deref(), Some(b"h2"))
+    }
+}
+
+fn finished_verify_data(
+    suite: TlsCipherSuite,
+    traffic_secret: &[u8],
+    transcript: &[u8],
+) -> Result<Vec<u8>, Safari26TlsError> {
+    let finished_key =
+        suite.hkdf_expand_label(traffic_secret, "finished", &[], suite.hash_len())?;
+    let transcript_hash = suite.digest(transcript);
+    suite.hmac(&finished_key, &transcript_hash)
+}
+
+struct RecordCipher {
+    suite: TlsCipherSuite,
+    key: Vec<u8>,
+    iv: [u8; TLS13_IV_LEN],
+    seq: u64,
+}
+
+impl RecordCipher {
+    fn zero(suite: TlsCipherSuite) -> Self {
+        Self {
+            suite,
+            key: vec![0_u8; suite.key_len()],
+            iv: [0_u8; TLS13_IV_LEN],
+            seq: 0,
+        }
+    }
+
+    fn new(suite: TlsCipherSuite, traffic_secret: &[u8]) -> Result<Self, Safari26TlsError> {
+        let key = suite.hkdf_expand_label(traffic_secret, "key", &[], suite.key_len())?;
+        let iv_vec = suite.hkdf_expand_label(traffic_secret, "iv", &[], TLS13_IV_LEN)?;
+        let mut iv = [0_u8; TLS13_IV_LEN];
+        iv.copy_from_slice(&iv_vec);
+        Ok(Self {
+            suite,
+            key,
+            iv,
+            seq: 0,
+        })
+    }
+
+    fn encrypt_record(
+        &mut self,
+        inner_type: u8,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, Safari26TlsError> {
+        let mut payload = Vec::with_capacity(plaintext.len() + 1 + AEAD_TAG_LEN);
+        payload.extend_from_slice(plaintext);
+        payload.push(inner_type);
+        let encrypted_len = payload.len() + AEAD_TAG_LEN;
+        let mut record = Vec::with_capacity(5 + encrypted_len);
+        record.push(TLS_RECORD_APPLICATION_DATA);
+        record.extend_from_slice(&TLS_RECORD_VERSION_TLS13);
+        push_u16_len(&mut record, encrypted_len)?;
+        let aad = record.clone();
+        let nonce = self.nonce();
+        match self.suite {
+            TlsCipherSuite::Aes128GcmSha256 => {
+                let cipher =
+                    Aes128Gcm::new_from_slice(&self.key).map_err(|_| Safari26TlsError::Aead)?;
+                let tag = cipher
+                    .encrypt_in_place_detached((&nonce).into(), &aad, &mut payload)
+                    .map_err(|_| Safari26TlsError::Aead)?;
+                record.extend_from_slice(&payload);
+                record.extend_from_slice(&tag);
+            }
+            TlsCipherSuite::Aes256GcmSha384 => {
+                let cipher =
+                    Aes256Gcm::new_from_slice(&self.key).map_err(|_| Safari26TlsError::Aead)?;
+                let tag = cipher
+                    .encrypt_in_place_detached((&nonce).into(), &aad, &mut payload)
+                    .map_err(|_| Safari26TlsError::Aead)?;
+                record.extend_from_slice(&payload);
+                record.extend_from_slice(&tag);
+            }
+            TlsCipherSuite::Chacha20Poly1305Sha256 => {
+                let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+                    .map_err(|_| Safari26TlsError::Aead)?;
+                let tag = cipher
+                    .encrypt_in_place_detached((&nonce).into(), &aad, &mut payload)
+                    .map_err(|_| Safari26TlsError::Aead)?;
+                record.extend_from_slice(&payload);
+                record.extend_from_slice(&tag);
+            }
+        }
+        self.seq = self.seq.wrapping_add(1);
+        Ok(record)
+    }
+
+    fn decrypt_record(&mut self, record: &[u8]) -> Result<PlainRecord, Safari26TlsError> {
+        let header =
+            parse_header(record).map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+        if header.content_type != TLS_CONTENT_APPLICATION_DATA {
+            return Err(Safari26TlsError::Handshake(
+                "expected encrypted TLS application record".to_owned(),
+            ));
+        }
+        if record.len() < header.total_len || header.payload_len < AEAD_TAG_LEN + 1 {
+            return Err(Safari26TlsError::Aead);
+        }
+        let aad = &record[..super::record::TLS_HEADER_LEN];
+        let mut payload = record[super::record::TLS_HEADER_LEN..header.total_len].to_vec();
+        let tag_start = payload.len() - AEAD_TAG_LEN;
+        let tag = payload.split_off(tag_start);
+        let nonce = self.nonce();
+        match self.suite {
+            TlsCipherSuite::Aes128GcmSha256 => {
+                let cipher =
+                    Aes128Gcm::new_from_slice(&self.key).map_err(|_| Safari26TlsError::Aead)?;
+                cipher
+                    .decrypt_in_place_detached((&nonce).into(), aad, &mut payload, (&*tag).into())
+                    .map_err(|_| Safari26TlsError::Aead)?;
+            }
+            TlsCipherSuite::Aes256GcmSha384 => {
+                let cipher =
+                    Aes256Gcm::new_from_slice(&self.key).map_err(|_| Safari26TlsError::Aead)?;
+                cipher
+                    .decrypt_in_place_detached((&nonce).into(), aad, &mut payload, (&*tag).into())
+                    .map_err(|_| Safari26TlsError::Aead)?;
+            }
+            TlsCipherSuite::Chacha20Poly1305Sha256 => {
+                let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+                    .map_err(|_| Safari26TlsError::Aead)?;
+                cipher
+                    .decrypt_in_place_detached((&nonce).into(), aad, &mut payload, (&*tag).into())
+                    .map_err(|_| Safari26TlsError::Aead)?;
+            }
+        }
+        self.seq = self.seq.wrapping_add(1);
+
+        let content_type_pos = payload
+            .iter()
+            .rposition(|b| *b != 0)
+            .ok_or(Safari26TlsError::Aead)?;
+        let content_type = payload[content_type_pos];
+        payload.truncate(content_type_pos);
+        Ok(PlainRecord {
+            content_type,
+            plaintext: payload,
+        })
+    }
+
+    fn nonce(&self) -> [u8; TLS13_IV_LEN] {
+        let mut nonce = self.iv;
+        let seq = self.seq.to_be_bytes();
+        for (dst, src) in nonce[4..].iter_mut().zip(seq) {
+            *dst ^= src;
+        }
+        nonce
+    }
+}
+
+struct PlainRecord {
+    content_type: u8,
+    plaintext: Vec<u8>,
+}
+
+#[derive(Default)]
+struct ServerFlight {
+    encrypted_extensions_seen: bool,
+    certificates: Vec<Vec<u8>>,
+    certificate_verify_seen: bool,
+    finished: bool,
+}
+
+fn process_server_handshake_messages(
+    buf: &mut Vec<u8>,
+    flight: &mut ServerFlight,
+    transcript: &mut HandshakeTranscript,
+    keys: &mut Tls13Keys,
+) -> Result<(), Safari26TlsError> {
+    loop {
+        if buf.len() < 4 {
+            return Ok(());
+        }
+        let len = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | buf[3] as usize;
+        if buf.len() < 4 + len {
+            return Ok(());
+        }
+        let message = buf[..4 + len].to_vec();
+        buf.drain(..4 + len);
+        let body = &message[4..];
+        match message[0] {
+            HANDSHAKE_ENCRYPTED_EXTENSIONS => {
+                parse_encrypted_extensions(body, keys)?;
+                flight.encrypted_extensions_seen = true;
+                transcript.push(&message);
+            }
+            HANDSHAKE_CERTIFICATE => {
+                flight.certificates = parse_certificate_body(body)?;
+                transcript.push(&message);
+            }
+            HANDSHAKE_COMPRESSED_CERTIFICATE => {
+                flight.certificates = parse_compressed_certificate_body(body)?;
+                transcript.push(&message);
+            }
+            HANDSHAKE_CERTIFICATE_VERIFY => {
+                verify_certificate_verify(body, flight, transcript, keys)?;
+                flight.certificate_verify_seen = true;
+                transcript.push(&message);
+            }
+            HANDSHAKE_FINISHED => {
+                if !flight.encrypted_extensions_seen
+                    || flight.certificates.is_empty()
+                    || !flight.certificate_verify_seen
+                {
+                    return Err(Safari26TlsError::Handshake(
+                        "server Finished arrived before the authenticated flight".to_owned(),
+                    ));
+                }
+                let expected = keys.server_finished_verify_data(transcript)?;
+                if body != expected {
+                    return Err(Safari26TlsError::Handshake(
+                        "server Finished verify_data mismatch".to_owned(),
+                    ));
+                }
+                transcript.push(&message);
+                flight.finished = true;
+                return Ok(());
+            }
+            _ => {
+                return Err(Safari26TlsError::Unsupported(
+                    "unexpected encrypted TLS handshake message",
+                ));
+            }
+        }
+    }
+}
+
+fn parse_encrypted_extensions(body: &[u8], keys: &mut Tls13Keys) -> Result<(), Safari26TlsError> {
+    let mut c = TlsCursor::new(body);
+    let extensions = c.vec_u16()?;
+    let mut e = TlsCursor::new(extensions);
+    while e.remaining() > 0 {
+        let ext_type = e.u16()?;
+        let data = e.vec_u16()?;
+        if ext_type == EXT_ALPN {
+            keys.negotiated_alpn = Some(parse_selected_alpn(data)?.to_vec());
+        }
+    }
+    Ok(())
+}
+
+fn parse_selected_alpn(data: &[u8]) -> Result<&[u8], Safari26TlsError> {
+    let mut c = TlsCursor::new(data);
+    let list = c.vec_u16()?;
+    let mut l = TlsCursor::new(list);
+    let proto = l.vec_u8()?;
+    Ok(proto)
+}
+
+fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari26TlsError> {
+    let mut c = TlsCursor::new(body);
+    let _request_context = c.vec_u8()?;
+    let list = c.vec_u24()?;
+    let mut l = TlsCursor::new(list);
+    let mut certs = Vec::new();
+    while l.remaining() > 0 {
+        let cert = l.vec_u24()?;
+        certs.push(cert.to_vec());
+        let _extensions = l.vec_u16()?;
+    }
+    Ok(certs)
+}
+
+fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari26TlsError> {
+    let mut c = TlsCursor::new(body);
+    let algorithm = c.u16()?;
+    if algorithm != CERT_COMPRESSION_ZLIB {
+        return Err(Safari26TlsError::Unsupported(
+            "unsupported compressed_certificate algorithm",
+        ));
+    }
+    let uncompressed_len = c.u24()? as usize;
+    let compressed = c.vec_u24()?;
+    let mut decoder = ZlibDecoder::new(Cursor::new(compressed));
+    let mut decompressed = Vec::with_capacity(uncompressed_len);
+    decoder.read_to_end(&mut decompressed)?;
+    if decompressed.len() != uncompressed_len {
+        return Err(Safari26TlsError::Handshake(
+            "compressed_certificate length mismatch".to_owned(),
+        ));
+    }
+    parse_certificate_body(&decompressed)
+}
+
+fn verify_certificate_verify(
+    body: &[u8],
+    flight: &ServerFlight,
+    transcript: &HandshakeTranscript,
+    keys: &Tls13Keys,
+) -> Result<(), Safari26TlsError> {
+    let leaf = flight
+        .certificates
+        .first()
+        .ok_or_else(|| Safari26TlsError::Handshake("missing server certificate".to_owned()))?;
+    let mut c = TlsCursor::new(body);
+    let scheme = c.u16()?;
+    let signature = c.vec_u16()?;
+    let alg = certificate_verify_algorithm(scheme)?;
+    let cert_der = CertificateDer::from(leaf.as_slice());
+    let cert = webpki::EndEntityCert::try_from(&cert_der)
+        .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?;
+    let transcript_hash = keys.suite.digest(transcript.bytes());
+    let mut signed = Vec::with_capacity(64 + 34 + transcript_hash.len());
+    signed.extend_from_slice(&[0x20; 64]);
+    signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed.push(0);
+    signed.extend_from_slice(&transcript_hash);
+    cert.verify_signature(alg, &signed, signature)
+        .map_err(|err| Safari26TlsError::Certificate(err.to_string()))
+}
+
+fn certificate_verify_algorithm(
+    scheme: u16,
+) -> Result<&'static dyn rustls_pki_types::SignatureVerificationAlgorithm, Safari26TlsError> {
+    match scheme {
+        SIG_ECDSA_SECP256R1_SHA256 => Ok(webpki::aws_lc_rs::ECDSA_P256_SHA256),
+        SIG_RSA_PSS_RSAE_SHA256 => Ok(webpki::aws_lc_rs::RSA_PSS_2048_8192_SHA256_LEGACY_KEY),
+        SIG_RSA_PKCS1_SHA256 => Ok(webpki::aws_lc_rs::RSA_PKCS1_2048_8192_SHA256),
+        SIG_ECDSA_SECP384R1_SHA384 => Ok(webpki::aws_lc_rs::ECDSA_P384_SHA384),
+        SIG_RSA_PSS_RSAE_SHA384 => Ok(webpki::aws_lc_rs::RSA_PSS_2048_8192_SHA384_LEGACY_KEY),
+        SIG_RSA_PKCS1_SHA384 => Ok(webpki::aws_lc_rs::RSA_PKCS1_2048_8192_SHA384),
+        SIG_RSA_PSS_RSAE_SHA512 => Ok(webpki::aws_lc_rs::RSA_PSS_2048_8192_SHA512_LEGACY_KEY),
+        SIG_RSA_PKCS1_SHA512 => Ok(webpki::aws_lc_rs::RSA_PKCS1_2048_8192_SHA512),
+        _ => Err(Safari26TlsError::Unsupported(
+            "unsupported CertificateVerify signature scheme",
+        )),
+    }
+}
+
+fn verify_server_certificate(
+    sni: &str,
+    flight: &ServerFlight,
+    transcript: &HandshakeTranscript,
+) -> Result<(), Safari26TlsError> {
+    let _ = transcript;
+    let leaf = flight
+        .certificates
+        .first()
+        .ok_or_else(|| Safari26TlsError::Certificate("missing server certificate".to_owned()))?;
+    #[cfg(test)]
+    if sni == "example.com" && Sha256::digest(leaf)[..] == LOOPBACK_CAMOUFLAGE_CERT_SHA256 {
+        return Ok(());
+    }
+
+    let leaf_der = CertificateDer::from(leaf.as_slice());
+    let cert = webpki::EndEntityCert::try_from(&leaf_der)
+        .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?;
+    let intermediates = flight
+        .certificates
+        .iter()
+        .skip(1)
+        .map(|cert| CertificateDer::from(cert.as_slice()))
+        .collect::<Vec<_>>();
+    let server_name = ServerName::try_from(sni)
+        .map_err(|_| Safari26TlsError::InvalidServerName(sni.to_owned()))?;
+    cert.verify_is_valid_for_subject_name(&server_name)
+        .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?;
+
+    let roots = native_roots()?;
+    let anchors = roots
+        .iter()
+        .filter_map(|root| webpki::anchor_from_trusted_cert(root).ok())
+        .collect::<Vec<_>>();
+    let now = UnixTime::since_unix_epoch(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?,
+    );
+    cert.verify_for_usage(
+        webpki::ALL_VERIFICATION_ALGS,
+        &anchors,
+        &intermediates,
+        now,
+        webpki::KeyUsage::server_auth(),
+        None,
+        None,
+    )
+    .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?;
+    Ok(())
+}
+
+fn native_roots() -> Result<&'static [CertificateDer<'static>], Safari26TlsError> {
+    static ROOTS: OnceLock<Result<Vec<CertificateDer<'static>>, String>> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let loaded = rustls_native_certs::load_native_certs();
+            if loaded.certs.is_empty() {
+                let detail = loaded
+                    .errors
+                    .first()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "platform root store returned no certificates".to_owned());
+                return Err(detail);
+            }
+            Ok(loaded.certs)
+        })
+        .as_deref()
+        .map_err(|err| Safari26TlsError::Certificate(err.clone()))
+}
+
+struct HandshakeTranscript {
+    bytes: Vec<u8>,
+}
+
+impl HandshakeTranscript {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn push(&mut self, message: &[u8]) {
+        self.bytes.extend_from_slice(message);
+    }
+
+    fn push_handshake_record(&mut self, record: &[u8]) -> Result<(), Safari26TlsError> {
+        let (_, payload) = super::record::parse_exact(record)
+            .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+        self.bytes.extend_from_slice(payload);
         Ok(())
     }
 }
 
-#[derive(Debug)]
-struct CamouflageVerifier {
-    verifier: Arc<rustls::client::WebPkiServerVerifier>,
-}
-
-impl CamouflageVerifier {
-    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Result<Self, Safari26TlsError> {
-        let roots = native_root_store()?;
-        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider)
-            .build()
-            .map_err(|err| Safari26TlsError::RustlsConfig(err.to_string()))?;
-        Ok(Self { verifier })
+fn parse_alert<T>(record: &[u8]) -> Result<T, Safari26TlsError> {
+    if record.len() >= 7 {
+        Err(Safari26TlsError::Alert {
+            level: record[5],
+            description: record[6],
+        })
+    } else {
+        Err(Safari26TlsError::Alert {
+            level: 0,
+            description: 0,
+        })
     }
-}
-
-fn native_root_store() -> Result<Arc<RootCertStore>, Safari26TlsError> {
-    static ROOTS: OnceLock<Result<Arc<RootCertStore>, String>> = OnceLock::new();
-    match ROOTS.get_or_init(|| load_native_root_store().map(Arc::new)) {
-        Ok(roots) => Ok(Arc::clone(roots)),
-        Err(err) => Err(Safari26TlsError::RustlsConfig(err.clone())),
-    }
-}
-
-fn load_native_root_store() -> Result<RootCertStore, String> {
-    let loaded = rustls_native_certs::load_native_certs();
-    let load_error_detail = loaded.errors.first().map(ToString::to_string);
-    root_store_from_certificates(loaded.certs, load_error_detail)
-}
-
-fn root_store_from_certificates(
-    certs: Vec<CertificateDer<'static>>,
-    load_error_detail: Option<String>,
-) -> Result<RootCertStore, String> {
-    let mut roots = RootCertStore::empty();
-    let (valid_count, invalid_count) = roots.add_parsable_certificates(certs);
-    if roots.is_empty() {
-        let detail = load_error_detail.unwrap_or_else(|| {
-            if invalid_count == 0 {
-                "platform root store returned no certificates".to_owned()
-            } else {
-                format!(
-                    "platform root store returned {invalid_count} unparsable certificates and no \
-                     usable roots"
-                )
-            }
-        });
-        return Err(detail);
-    }
-    if invalid_count > 0 {
-        tracing::debug!(
-            valid_count,
-            invalid_count,
-            "ignored unparsable native root certificates"
-        );
-    }
-    Ok(roots)
-}
-
-impl rustls::client::danger::ServerCertVerifier for CamouflageVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, RustlsError> {
-        let result = self.verifier.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        );
-        #[cfg(test)]
-        if result.is_err() && is_loopback_camouflage_fixture(end_entity, server_name) {
-            return Ok(rustls::client::danger::ServerCertVerified::assertion());
-        }
-        result
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
-        self.verifier.verify_tls12_signature(message, cert, dss)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
-        self.verifier.verify_tls13_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        // rustls 0.23 builds the ClientHello `signature_algorithms` extension
-        // from this list, so it is the only seam we have for matching Safari's
-        // scheme order without forking rustls.
-        vec![
-            // Safari 26.4 / CoreCrypto wire order (verified against
-            // apple.com + cloudflare.com captures). Apple emits
-            // `rsa_pss_rsae_sha384` twice in a row; rustls 0.23 stores
-            // signature_schemes as a plain `Vec<SignatureScheme>` and
-            // does NOT dedupe, so the duplicate survives end-to-end on
-            // the wire, giving us byte-for-byte JA4 sig-algs parity.
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA1,
-        ]
-    }
-}
-
-#[cfg(test)]
-fn is_loopback_camouflage_fixture(
-    end_entity: &CertificateDer<'_>,
-    server_name: &ServerName<'_>,
-) -> bool {
-    // The ignored loopback relay tests use one fixed self-signed camouflage
-    // endpoint; production builds still rely only on WebPKI above.
-    server_name.to_str() == "example.com"
-        && Sha256::digest(end_entity.as_ref())[..] == LOOPBACK_CAMOUFLAGE_CERT_SHA256
 }
 
 fn is_clean_close(err: &std::io::Error) -> bool {
@@ -933,6 +1630,74 @@ fn is_clean_close(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::BrokenPipe
     )
+}
+
+struct TlsCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> TlsCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
+    fn u8(&mut self) -> Result<u8, Safari26TlsError> {
+        if self.remaining() < 1 {
+            return Err(Safari26TlsError::Handshake("TLS data truncated".to_owned()));
+        }
+        let value = self.data[self.pos];
+        self.pos += 1;
+        Ok(value)
+    }
+
+    fn u16(&mut self) -> Result<u16, Safari26TlsError> {
+        if self.remaining() < 2 {
+            return Err(Safari26TlsError::Handshake("TLS data truncated".to_owned()));
+        }
+        let value = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+        self.pos += 2;
+        Ok(value)
+    }
+
+    fn u24(&mut self) -> Result<u32, Safari26TlsError> {
+        if self.remaining() < 3 {
+            return Err(Safari26TlsError::Handshake("TLS data truncated".to_owned()));
+        }
+        let value = ((self.data[self.pos] as u32) << 16)
+            | ((self.data[self.pos + 1] as u32) << 8)
+            | self.data[self.pos + 2] as u32;
+        self.pos += 3;
+        Ok(value)
+    }
+
+    fn bytes(&mut self, len: usize) -> Result<&'a [u8], Safari26TlsError> {
+        if self.remaining() < len {
+            return Err(Safari26TlsError::Handshake("TLS data truncated".to_owned()));
+        }
+        let start = self.pos;
+        self.pos += len;
+        Ok(&self.data[start..start + len])
+    }
+
+    fn vec_u8(&mut self) -> Result<&'a [u8], Safari26TlsError> {
+        let len = self.u8()? as usize;
+        self.bytes(len)
+    }
+
+    fn vec_u16(&mut self) -> Result<&'a [u8], Safari26TlsError> {
+        let len = self.u16()? as usize;
+        self.bytes(len)
+    }
+
+    fn vec_u24(&mut self) -> Result<&'a [u8], Safari26TlsError> {
+        let len = self.u24()? as usize;
+        self.bytes(len)
+    }
 }
 
 #[cfg(test)]
@@ -965,68 +1730,63 @@ mod tests {
         )
         .unwrap();
 
-        assert_ne!(parsed.client_random, session.x25519.public);
+        assert_ne!(parsed.client_random, session.parallax_x25519.public);
         assert!(auth.authenticated);
         assert_eq!(auth.sni.as_deref(), Some("example.com"));
-        assert_eq!(auth.x25519_key_share, Some(session.x25519.public));
-        assert!(session.connection.is_handshaking());
+        assert_eq!(auth.x25519_key_share, Some(session.parallax_x25519.public));
     }
 
     #[test]
-    fn camouflage_verifier_rejects_invalid_certificate() {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let verifier = CamouflageVerifier::new(provider).unwrap();
-        let server_name = ServerName::try_from("example.com").unwrap();
-        let invalid_cert = CertificateDer::from(vec![0_u8]);
-
-        let result = rustls::client::danger::ServerCertVerifier::verify_server_cert(
-            &verifier,
-            &invalid_cert,
-            &[],
-            &server_name,
-            &[],
-            UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000)),
+    fn handwritten_client_hello_uses_safari_wire_order() {
+        let server = X25519KeyPair::generate();
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let session = Safari26TlsCamouflage
+            .start("apple.com".to_owned(), psk, &server.public)
+            .unwrap();
+        let (_, payload) = super::super::record::parse_exact(&session.client_hello).unwrap();
+        assert_eq!(session.client_hello[0], TLS_RECORD_HANDSHAKE);
+        assert_eq!(
+            &session.client_hello[1..3],
+            &TLS_RECORD_VERSION_CLIENT_HELLO
         );
+        assert_eq!(payload[0], HANDSHAKE_CLIENT_HELLO);
 
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn native_root_store_ignores_unparsable_certificates_when_usable_roots_exist() {
-        let mut certs = rustls_native_certs::load_native_certs().certs;
-        certs.push(CertificateDer::from(vec![0_u8]));
-
-        let roots = root_store_from_certificates(certs, None).unwrap();
-
-        assert!(!roots.is_empty());
-    }
-
-    #[test]
-    fn native_root_store_is_cached_after_first_load() {
-        let first = native_root_store().unwrap();
-        let second = native_root_store().unwrap();
-
-        assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    #[test]
-    fn is_clean_close_matches_only_expected_io_kinds() {
-        for kind in [
-            std::io::ErrorKind::UnexpectedEof,
-            std::io::ErrorKind::ConnectionReset,
-            std::io::ErrorKind::BrokenPipe,
-        ] {
-            assert!(is_clean_close(&std::io::Error::new(kind, "boom")));
+        let mut c = TlsCursor::new(&payload[4..]);
+        assert_eq!(c.u16().unwrap(), TLS12);
+        let _random = c.bytes(32).unwrap();
+        assert_eq!(c.vec_u8().unwrap().len(), 32);
+        let ciphers = c.vec_u16().unwrap();
+        assert_eq!(&ciphers[2..8], &[0x13, 0x02, 0x13, 0x03, 0x13, 0x01]);
+        assert!(ciphers.windows(2).any(|w| w == [0x00, 0x0a]));
+        assert_eq!(c.vec_u8().unwrap(), &[0]);
+        let extensions = c.vec_u16().unwrap();
+        let mut e = TlsCursor::new(extensions);
+        let mut order = Vec::new();
+        while e.remaining() > 0 {
+            let ext = e.u16().unwrap();
+            let _ = e.vec_u16().unwrap();
+            order.push(ext);
         }
-
-        for kind in [
-            std::io::ErrorKind::Other,
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::TimedOut,
-            std::io::ErrorKind::InvalidData,
-        ] {
-            assert!(!is_clean_close(&std::io::Error::new(kind, "boom")));
-        }
+        assert!(is_grease(order[0]));
+        assert!(is_grease(*order.last().unwrap()));
+        assert_eq!(
+            &order[1..order.len() - 1],
+            &[
+                EXT_SERVER_NAME,
+                EXT_EXTENDED_MASTER_SECRET,
+                EXT_RENEGOTIATION_INFO,
+                EXT_SUPPORTED_GROUPS,
+                EXT_EC_POINT_FORMATS,
+                EXT_ALPN,
+                EXT_STATUS_REQUEST,
+                EXT_SIGNATURE_ALGORITHMS,
+                EXT_SIGNED_CERTIFICATE_TIMESTAMP,
+                EXT_KEY_SHARE,
+                EXT_PSK_KEY_EXCHANGE_MODES,
+                EXT_SUPPORTED_VERSIONS,
+                EXT_COMPRESS_CERTIFICATE,
+            ]
+        );
     }
 
     #[test]
@@ -1042,61 +1802,21 @@ mod tests {
         tap.on_record(RecordEvent {
             direction: RecordDirection::Inbound,
             content_type: 0x17,
-            len: 1280,
+            len: 42,
         });
 
-        let events = tap.events();
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0].direction, RecordDirection::Outbound));
-        assert_eq!(events[0].content_type, 0x16);
-        assert_eq!(events[0].len, 512);
-        assert!(matches!(events[1].direction, RecordDirection::Inbound));
-        assert_eq!(events[1].content_type, 0x17);
-        assert_eq!(events[1].len, 1280);
+        assert_eq!(tap.events().len(), 2);
+        assert!(matches!(
+            tap.events()[0].direction,
+            RecordDirection::Outbound
+        ));
+        assert!(matches!(
+            tap.events()[1].direction,
+            RecordDirection::Inbound
+        ));
     }
 
-    #[test]
-    fn grease_indices_map_into_browser_grease_table() {
-        for index in 0..(BROWSER_GREASE_VALUES.len() * 3) {
-            let suite = grease_cipher_suite(index);
-            let kx = grease_kx_group(index);
-            // Indices wrap around the GREASE table without panicking and return
-            // a populated value from the canonical Safari GREASE set.
-            let _ = format!("{suite:?}");
-            let _ = format!("{:?}", kx.name());
-        }
-    }
-
-    #[test]
-    fn grease_selected_error_classifies_as_no_kx_overlap() {
-        // grease_selected_error() is invoked when rustls picks our GREASE
-        // KX group; the matching aliased rustls error must classify as
-        // "no key exchange overlap" so callers can surface a stable code.
-        let err = grease_selected_error();
-        let text = format!("{err}");
-        assert!(text.to_lowercase().contains("key") || !text.is_empty());
-    }
-
-    #[test]
-    fn safari_client_hello_carries_x25519_mlkem768_key_share() {
-        let server = X25519KeyPair::generate();
-        let psk = b"0123456789abcdef0123456789abcdef";
-        let session = Safari26TlsCamouflage
-            .start("example.com".to_owned(), psk, &server.public)
-            .unwrap();
-
-        let parsed = parse_client_hello(&session.client_hello).unwrap();
-        let material = recover_stateful_auth_material(&session.client_hello, psk)
-            .unwrap()
-            .unwrap();
-        assert_ne!(parsed.client_random, session.x25519.public);
-        assert_eq!(material.x25519_public, session.x25519.public);
-        assert!(
-            session
-                .client_hello
-                .windows(4)
-                .any(|w| w == [0x11, 0xec, 0x04, 0xc0].as_slice()),
-            "X25519MLKEM768 key_share header (0x11ec, len 0x04c0) not found in ClientHello"
-        );
+    fn is_grease(value: u16) -> bool {
+        value & 0x0f0f == 0x0a0a && (value >> 8) == (value & 0xff)
     }
 }

@@ -1,13 +1,13 @@
-# Stateful Rustls Camouflage Backend
+# Stateful Safari TLS Camouflage Backend
 
 > Navigation: [Index](README.md) | [TLS Camouflage](TLS-Camouflage-Layer.md) | [HTTP/2 Fingerprinting](HTTP-2-Fingerprinting.md)
 
 ## Design
 
-`Safari26TlsCamouflage` starts a real `rustls::ClientConnection` and captures
-the ClientHello record that `rustls` emits. ParallaX then validates that the
-record contains authenticated ClientHello fields before exposing it to the
-client runtime.
+`Safari26TlsCamouflage` owns the single Safari 26 TLS 1.3 camouflage path. It
+serializes the ClientHello directly, validates the authenticated ClientHello
+fields, completes the narrow TLS 1.3 handshake against the fallback origin, and
+then exposes the result to the client runtime.
 
 The backend is stateful because it must continue driving the same TLS session
 after the first record. The fallback origin receives the ClientHello and sends
@@ -19,25 +19,26 @@ transition behind that traffic.
 | Entity | Role |
 |---|---|
 | `Safari26TlsCamouflage` | Starts the profile-shaped TLS session. |
-| `Safari26TlsSession` | Holds `rustls::ClientConnection`, ClientHello bytes, X25519 key pair, and record tap state. |
-| `CompletedSafari26Handshake` | Returns transcript hash, server X25519 material, and ServerHello bytes after handshake completion. |
+| `Safari26TlsSession` | Holds ClientHello bytes, TLS key-share material, ParallaX X25519 material, and record tap state. |
+| `CompletedSafari26Handshake` | Returns ParallaX X25519 material, ServerHello bytes, negotiated ALPN, and post-handshake record counts after handshake completion. |
 | `VecRecordTap` / `RecordEvent` | Test/diagnostic hooks for emitted and received TLS records. |
-| `CamouflageVerifier` | Uses native roots for fallback-origin certificate verification while preserving Safari-shaped signature-scheme ordering. |
+| Certificate verifier | Uses native roots plus `webpki` to verify fallback-origin certificates and TLS 1.3 CertificateVerify. |
 
 ## Handshake driving
 
 ```text
 start()
-  ├─ build rustls config with Safari-shaped provider order
-  ├─ create ClientConnection for SNI
-  ├─ capture emitted ClientHello record
+  ├─ generate ParallaX auth X25519 and TLS X25519MLKEM768 material
+  ├─ serialize Safari-shaped ClientHello record
+  ├─ verify embedded ClientHello auth material
   └─ return Safari26TlsSession
 
 complete_handshake()
-  ├─ write queued TLS records to fallback-origin stream
+  ├─ write ClientHello to fallback-origin stream
   ├─ read fallback TLS records
-  ├─ feed records into rustls
   ├─ require a TLS 1.3 ServerHello
+  ├─ derive TLS 1.3 handshake/application secrets
+  ├─ verify Certificate, CertificateVerify, and Finished
   └─ emit HTTP/2 camouflage preface when negotiated
 ```
 
@@ -48,10 +49,11 @@ connection preface and drain SETTINGS ACK behavior with a bounded record limit
 and timeout. This avoids leaving the fallback TLS connection in a visibly
 unfinished state.
 
-## Upgrade risks
+## Drift risks
 
-This backend relies on specific `rustls` construction behavior. Any `rustls`
-upgrade should be treated as profile-sensitive and verified with:
+This backend relies on Safari capture fixtures and narrow TLS 1.3 assumptions.
+Any Safari profile or handshake change should be treated as profile-sensitive
+and verified with:
 
 ```bash
 cargo test --test safari_parity_baseline
