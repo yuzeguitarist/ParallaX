@@ -28,6 +28,14 @@ pub async fn connect_tuned_tcp_any(addrs: &[SocketAddr]) -> io::Result<TcpStream
 }
 
 pub async fn connect_tuned_tcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
+    #[cfg(target_os = "linux")]
+    match connect_mptcp_addr(addr).await {
+        Ok(stream) => return Ok(stream),
+        Err(err) => {
+            tracing::trace!(error = %err, "MPTCP connect failed; falling back to TCP");
+        }
+    }
+
     let socket = tuned_tcp_socket(addr)?;
     socket.connect(addr).await
 }
@@ -190,10 +198,15 @@ fn tune_tcp_socket_before_connect(_socket: &TcpSocket) {}
 fn set_fastopen_connect(socket: &TcpSocket) {
     use std::os::fd::AsRawFd;
 
+    set_fastopen_connect_fd(socket.as_raw_fd());
+}
+
+#[cfg(target_os = "linux")]
+fn set_fastopen_connect_fd(fd: std::os::fd::RawFd) {
     let enabled: libc::c_int = 1;
     let rc = unsafe {
         libc::setsockopt(
-            socket.as_raw_fd(),
+            fd,
             libc::IPPROTO_TCP,
             libc::TCP_FASTOPEN_CONNECT,
             (&enabled as *const libc::c_int).cast(),
@@ -210,10 +223,15 @@ fn set_notsent_lowat<S>(socket: &S)
 where
     S: std::os::fd::AsRawFd,
 {
+    set_notsent_lowat_fd(socket.as_raw_fd());
+}
+
+#[cfg(target_os = "linux")]
+fn set_notsent_lowat_fd(fd: std::os::fd::RawFd) {
     let lowat = TCP_NOTSENT_LOWAT_BYTES;
     let rc = unsafe {
         libc::setsockopt(
-            socket.as_raw_fd(),
+            fd,
             libc::IPPROTO_TCP,
             libc::TCP_NOTSENT_LOWAT,
             (&lowat as *const libc::c_uint).cast(),
@@ -227,6 +245,133 @@ where
 
 #[cfg(not(target_os = "linux"))]
 fn set_notsent_lowat<S>(_socket: &S) {}
+
+#[cfg(target_os = "linux")]
+async fn connect_mptcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
+    use std::os::fd::{FromRawFd, RawFd};
+
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    let fd = unsafe {
+        libc::socket(
+            domain,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_MPTCP,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    set_socket_int_option_fd(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set_socket_int_option_fd(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+    set_fastopen_connect_fd(fd);
+    set_notsent_lowat_fd(fd);
+
+    let (storage, len) = socket_addr_storage(addr);
+    let rc = unsafe { libc::connect(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            close_raw_fd(fd);
+            return Err(err);
+        }
+    }
+
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd as RawFd) };
+    std_stream.set_nonblocking(true)?;
+    let stream = TcpStream::from_std(std_stream)?;
+    if rc != 0 {
+        stream.writable().await?;
+        if let Some(err) = stream.take_error()? {
+            return Err(err);
+        }
+    }
+    Ok(stream)
+}
+
+#[cfg(target_os = "linux")]
+fn set_socket_int_option_fd(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    optname: libc::c_int,
+    value: libc::c_int,
+) {
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::trace!(
+            error = %io::Error::last_os_error(),
+            optname,
+            "socket option unavailable; keeping kernel default"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_addr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    match addr {
+        SocketAddr::V4(addr) => {
+            let sockaddr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: addr.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(addr.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                storage
+                    .as_mut_ptr()
+                    .cast::<libc::sockaddr_in>()
+                    .write(sockaddr);
+            }
+            (
+                unsafe { storage.assume_init() },
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(addr) => {
+            let sockaddr = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: addr.port().to_be(),
+                sin6_flowinfo: addr.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: addr.ip().octets(),
+                },
+                sin6_scope_id: addr.scope_id(),
+            };
+            unsafe {
+                storage
+                    .as_mut_ptr()
+                    .cast::<libc::sockaddr_in6>()
+                    .write(sockaddr);
+            }
+            (
+                unsafe { storage.assume_init() },
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn close_raw_fd(fd: std::os::fd::RawFd) {
+    unsafe {
+        libc::close(fd);
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn set_quick_ack(stream: &TcpStream) {
