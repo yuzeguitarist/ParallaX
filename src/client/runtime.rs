@@ -215,7 +215,32 @@ async fn handle_local_connection_with_cid(
         task_name = "client-connection",
         "accepted SOCKS connection"
     );
-    let request = socks::accept_connect(&mut local).await?;
+    // Browser SOCKS clients normally send CONNECT immediately after opening the
+    // local TCP socket, so pre-establish the upstream ParallaX session while the
+    // local SOCKS request is still arriving.
+    let speculative_config = config.clone();
+    let speculative_server_addr = server_addr.clone();
+    let speculative_psk = Arc::<[u8]>::from(psk.to_vec().into_boxed_slice());
+    let speculative_server_public = *server_public;
+    let speculative_server_identity_public = server_identity_public.clone();
+    let server_session_task = tokio::spawn(async move {
+        establish_authenticated_data_session_with_resolver(
+            &speculative_server_addr,
+            &speculative_config,
+            traffic,
+            speculative_psk.as_ref(),
+            &speculative_server_public,
+            speculative_server_identity_public,
+        )
+        .await
+    });
+    let request = match socks::accept_connect(&mut local).await {
+        Ok(request) => request,
+        Err(err) => {
+            server_session_task.abort();
+            return Err(err.into());
+        }
+    };
     let chunk_size = max_plaintext_len(traffic.max_padding);
     let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
     // Keep the zero-RTT-style initial payload capture, but hide its small wait
@@ -225,14 +250,11 @@ async fn handle_local_connection_with_cid(
             .await
             .map_err(ClientRuntimeError::Io)
     };
-    let server_session_fut = establish_authenticated_data_session_with_resolver(
-        &server_addr,
-        config,
-        traffic,
-        psk,
-        server_public,
-        server_identity_public,
-    );
+    let server_session_fut = async {
+        server_session_task
+            .await
+            .map_err(ClientRuntimeError::BlockingTask)?
+    };
     let (initial_payload, (mut server, mut data_session)) =
         tokio::try_join!(initial_payload_fut, server_session_fut)?;
     let connect_request = ConnectRequest {
