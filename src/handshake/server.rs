@@ -64,7 +64,8 @@ use crate::{
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
     transport::tcp::{
-        drain_ready_tcp_read, is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+        connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
+        is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
     },
 };
 
@@ -733,7 +734,7 @@ where
 }
 
 async fn connect_tcp_with_timeout(addr: &str) -> Result<TcpStream, HandshakeServerError> {
-    connect_future_with_timeout(TcpStream::connect(addr), HANDSHAKE_TIMEOUT).await
+    connect_future_with_timeout(connect_tuned_tcp_host(addr), HANDSHAKE_TIMEOUT).await
 }
 
 async fn connect_future_with_timeout<F>(
@@ -1080,7 +1081,7 @@ async fn connect_outbound_target(
     }
 
     let addrs = resolve_public_target_addrs(target_addr).await?;
-    connect_future_with_timeout(TcpStream::connect(addrs.as_slice()), HANDSHAKE_TIMEOUT).await
+    connect_future_with_timeout(connect_tuned_tcp_any(addrs.as_slice()), HANDSHAKE_TIMEOUT).await
 }
 
 async fn resolve_public_target_addrs(

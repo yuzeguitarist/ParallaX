@@ -45,7 +45,8 @@ use crate::{
     },
     traffic::CoverTrafficProfile,
     transport::tcp::{
-        drain_ready_tcp_read, is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+        connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
+        relay_connection_limit, tune_tcp_stream,
     },
 };
 
@@ -336,7 +337,7 @@ impl ServerAddrResolver {
 
     async fn connect(&self) -> Result<TcpStream, ClientRuntimeError> {
         let cached = *self.cached.lock().await;
-        match TcpStream::connect(cached).await {
+        match connect_tuned_tcp_addr(cached).await {
             Ok(stream) => Ok(stream),
             Err(err) if self.literal => Err(err.into()),
             Err(first_err) => {
@@ -345,7 +346,7 @@ impl ServerAddrResolver {
                 if refreshed == cached {
                     return Err(first_err.into());
                 }
-                Ok(TcpStream::connect(refreshed).await?)
+                Ok(connect_tuned_tcp_addr(refreshed).await?)
             }
         }
     }

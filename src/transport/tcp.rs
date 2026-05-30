@@ -1,14 +1,53 @@
-use std::io;
+use std::{io, net::SocketAddr};
 
-use tokio::net::{tcp::OwnedReadHalf, TcpStream};
+use tokio::net::{lookup_host, tcp::OwnedReadHalf, TcpSocket, TcpStream};
 
 const RESERVED_PROCESS_FDS: usize = 64;
 const FDS_PER_RELAY_CONNECTION: usize = 2;
 const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
+#[cfg(target_os = "linux")]
+const TCP_NOTSENT_LOWAT_BYTES: libc::c_uint = 256 * 1024;
+
+pub async fn connect_tuned_tcp_host(addr: &str) -> io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = lookup_host(addr).await?.collect();
+    connect_tuned_tcp_any(&addrs).await
+}
+
+pub async fn connect_tuned_tcp_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in addrs {
+        match connect_tuned_tcp_addr(*addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "no socket addresses resolved")
+    }))
+}
+
+pub async fn connect_tuned_tcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
+    let socket = tuned_tcp_socket(addr)?;
+    socket.connect(addr).await
+}
+
+fn tuned_tcp_socket(addr: SocketAddr) -> io::Result<TcpSocket> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_nodelay(true)?;
+    socket.set_keepalive(true)?;
+    tune_tcp_socket_before_connect(&socket);
+    Ok(socket)
+}
 
 pub fn tune_tcp_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     set_low_latency_congestion(stream);
+    set_notsent_lowat(stream);
     set_quick_ack(stream);
     Ok(())
 }
@@ -139,6 +178,57 @@ fn set_low_latency_congestion(stream: &TcpStream) {
 fn set_low_latency_congestion(_stream: &TcpStream) {}
 
 #[cfg(target_os = "linux")]
+fn tune_tcp_socket_before_connect(socket: &TcpSocket) {
+    set_fastopen_connect(socket);
+    set_notsent_lowat(socket);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_tcp_socket_before_connect(_socket: &TcpSocket) {}
+
+#[cfg(target_os = "linux")]
+fn set_fastopen_connect(socket: &TcpSocket) {
+    use std::os::fd::AsRawFd;
+
+    let enabled: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_FASTOPEN_CONNECT,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::trace!("TCP_FASTOPEN_CONNECT is unavailable; using normal TCP connect");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_notsent_lowat<S>(socket: &S)
+where
+    S: std::os::fd::AsRawFd,
+{
+    let lowat = TCP_NOTSENT_LOWAT_BYTES;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            (&lowat as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&lowat) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::trace!("TCP_NOTSENT_LOWAT is unavailable; keeping kernel send queue defaults");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_notsent_lowat<S>(_socket: &S) {}
+
+#[cfg(target_os = "linux")]
 fn set_quick_ack(stream: &TcpStream) {
     use std::os::fd::AsRawFd;
 
@@ -177,5 +267,11 @@ mod tests {
             relay_connection_limit_from_nofile(usize::MAX),
             Some(MAX_RELAY_CONNECTION_LIMIT)
         );
+    }
+
+    #[tokio::test]
+    async fn tuned_connect_rejects_empty_addr_list() {
+        let err = connect_tuned_tcp_any(&[]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
