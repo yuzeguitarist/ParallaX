@@ -435,15 +435,17 @@ async fn apply_server_key_exchange_record_blocking(
 ) -> Result<(), ClientRuntimeError> {
     let exchange_payload = data_session.open_server_record(record)?;
     let exchange =
-        ServerKeyExchange::decode(&exchange_payload).map_err(ClientHandshakeError::from)?;
+        ServerKeyExchange::decode_ref(&exchange_payload).map_err(ClientHandshakeError::from)?;
     let pq_identity_binding = pending_rekey.identity_binding(&exchange_payload);
     let x25519_shared = pending_rekey.x25519_shared_secret(&exchange.server_x25519_public);
-    let ciphertext = exchange.mlkem_ciphertext;
     let secret_key = zeroize::Zeroizing::new(pending_rekey.mlkem_secret_key().to_vec());
-    let pq_shared =
-        tokio::task::spawn_blocking(move || pq::decapsulate(&ciphertext, secret_key.as_slice()))
-            .await?
-            .map_err(ClientHandshakeError::from)?;
+    let pq_shared = tokio::task::spawn_blocking(move || {
+        let exchange =
+            ServerKeyExchange::decode_ref(&exchange_payload).map_err(ClientHandshakeError::from)?;
+        pq::decapsulate(exchange.mlkem_ciphertext, secret_key.as_slice())
+            .map_err(ClientHandshakeError::from)
+    })
+    .await??;
     data_session.apply_pq_rekey_shared_with_identity_binding(
         &x25519_shared,
         &pq_shared,

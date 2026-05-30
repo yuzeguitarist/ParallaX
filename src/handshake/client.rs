@@ -170,10 +170,10 @@ impl ClientDataSession {
         sandwich_secret: &[u8],
     ) -> Result<(), ClientHandshakeError> {
         let exchange_payload = self.open_from_server.open(record)?;
-        let exchange = ServerKeyExchange::decode(&exchange_payload)?;
+        let exchange = ServerKeyExchange::decode_ref(&exchange_payload)?;
         let pq_identity_binding = pending.identity_binding(&exchange_payload);
         let x25519_shared = pending.x25519_shared_secret(&exchange.server_x25519_public);
-        let pq_shared = pq::decapsulate(&exchange.mlkem_ciphertext, &pending.mlkem.secret)?;
+        let pq_shared = pq::decapsulate(exchange.mlkem_ciphertext, &pending.mlkem.secret)?;
         self.apply_pq_rekey_shared_with_identity_binding(
             &x25519_shared,
             &pq_shared,
@@ -329,13 +329,13 @@ impl ClientDataSession {
         server_identity_public_key: &[u8],
         server_x25519_public_key: &[u8; 32],
     ) -> Result<(), ClientHandshakeError> {
-        let proof = ServerIdentityProof::decode(payload)?;
+        let signature = ServerIdentityProof::signature(payload)?;
         let pq_identity_binding = self
             .pq_identity_binding
             .ok_or(ClientHandshakeError::MissingPqIdentityBinding)?;
         identity::verify_server_identity(
             server_identity_public_key,
-            &proof.signature,
+            signature,
             &self.keys.transcript_hash,
             server_x25519_public_key,
             &pq_identity_binding,

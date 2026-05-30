@@ -815,7 +815,9 @@ async fn run_authenticated_data_mode(
 
                 match client_open.open(&client_record) {
                     Ok(first_payload) => {
-                        let pq_rekey = PqRekeyRequest::decode(&first_payload)?;
+                        let pq_rekey = PqRekeyRequest::decode_ref(first_payload.as_slice())?;
+                        let client_x25519_public = pq_rekey.client_x25519_public;
+                        let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
                         if !commit_pending_replay_entry(&mut pending_replay).await? {
                             tracing::warn!(cid, "closing on replayed ClientHello after data proof");
                             return Ok(());
@@ -827,17 +829,17 @@ async fn run_authenticated_data_mode(
                         );
                         let x25519_ephemeral_shared = x25519_shared_secret(
                             &server_ephemeral.private,
-                            &pq_rekey.client_x25519_public,
+                            &client_x25519_public,
                         );
                         let pq_encapsulation =
-                            encapsulate_mlkem_blocking(pq_rekey.client_mlkem_public_key).await?;
+                            encapsulate_mlkem_blocking(client_mlkem_public_key).await?;
                         let key_exchange_payload = ServerKeyExchange {
                             server_x25519_public: server_ephemeral.public,
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
                         }
                         .encode()?;
                         let pq_identity_binding =
-                            identity::pq_rekey_binding(&first_payload, &key_exchange_payload);
+                            identity::pq_rekey_binding(first_payload.as_slice(), &key_exchange_payload);
                         crate::process_hardening::protect_secret_bytes(
                             "pq_rekey.mlkem_shared_secret",
                             &pq_encapsulation.shared_secret,
