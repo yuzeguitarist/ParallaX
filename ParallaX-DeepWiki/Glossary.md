@@ -59,3 +59,13 @@
 | GFW simulator | Source-level test model of censorship/DPI behaviors under `tests/gfw_sim/`. |
 | QUIC research | Research-only material and simulator detection logic; not an active product transport. |
 | JA3/JA4 | TLS fingerprinting families modeled by simulator detectors. |
+
+## Documentation metadata terms
+
+| Term | Meaning |
+|---|---|
+| `doc-id` | Stable search handle used by [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md), for example `doc-id:runtime.server`. |
+| Source of truth | Code, script, test, or command output that documentation must be checked against before wording is changed. |
+| Source-to-document ownership | Mapping from implementation files to the pages that must be updated when those files change. |
+| Search tag | Alias, command name, protocol token, or error-domain phrase added so readers can find the right page quickly. |
+| Freshness check | Verification command or stale-reference search used to catch docs drifting away from current code. |

@@ -313,18 +313,32 @@ a speed run do not accidentally compete against the same configured server.
 ## Documentation map
 
 The maintained technical knowledge base lives in
-[`ParallaX-DeepWiki/`](./ParallaX-DeepWiki/). Start with:
+[`ParallaX-DeepWiki/`](./ParallaX-DeepWiki/). It is organized as a graph:
+operator docs, architecture docs, cryptography docs, camouflage docs,
+validation docs, and a metadata/search layer that maps pages back to source
+files.
+
+Start with:
 
 - [Knowledge Base Index](./ParallaX-DeepWiki/README.md)
+- [Documentation Metadata & Search Graph](./ParallaX-DeepWiki/Documentation-Metadata-Search-Graph.md)
 - [ParallaX Overview](./ParallaX-DeepWiki/ParallaX-Overview.md)
 - [Getting Started & CLI Reference](./ParallaX-DeepWiki/Getting-Started-&-CLI-Reference.md)
 - [Core Architecture](./ParallaX-DeepWiki/Core-Architecture.md)
 - [Deployment](./ParallaX-DeepWiki/Deployment.md)
 - [Glossary](./ParallaX-DeepWiki/Glossary.md)
 
-The `docs/` directory contains research notes and source material about
-censorship behavior. It is useful background, but the authoritative product
-documentation is the DeepWiki plus this README.
+Useful searches:
+
+| Search intent | Query terms | Start here |
+|---|---|---|
+| Source file to documentation owner | `source-to-document ownership`, `doc-id`, a path like `src/handshake/server.rs` | [Documentation Metadata & Search Graph](./ParallaX-DeepWiki/Documentation-Metadata-Search-Graph.md) |
+| Operator rollout | `plx init`, `plx probe`, `deploy-vps`, `systemd`, `BBR` | [Getting Started & CLI Reference](./ParallaX-DeepWiki/Getting-Started-&-CLI-Reference.md), [Deployment](./ParallaX-DeepWiki/Deployment.md) |
+| Current product boundary | `product path`, `TCP/TLS`, `no --quic`, `research-only` | [ParallaX Overview](./ParallaX-DeepWiki/ParallaX-Overview.md), [Transport Layer](./ParallaX-DeepWiki/Transport-Layer.md) |
+| Validation evidence | `plx speed`, `plx bench`, `gfw_simulator`, `runtime guard` | [Probing & Benchmarking](<./ParallaX-DeepWiki/Probing-&-Benchmarking.md>) |
+
+The source-level censorship research model lives under `tests/gfw_sim/` and is
+documented through [GFW Simulator & QUIC Research](<./ParallaX-DeepWiki/GFW-Simulator-&-QUIC-Research.md>).
 
 ---
 
@@ -356,7 +370,6 @@ tests/
   fixtures/               Safari/TLS/HTTP2 baseline captures
 
 ParallaX-DeepWiki/        Interlinked English technical knowledge base
-docs/                     Research notes and censorship background
 ```
 
 ---
