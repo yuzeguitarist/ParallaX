@@ -136,14 +136,16 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         None
     };
     let mux_sessions = if config.traffic.max_concurrent_streams > 1 {
-        Some(ClientMuxPool::new(
+        let mux_sessions = ClientMuxPool::new(
             Arc::clone(&client),
             server_addr.clone(),
             config.traffic,
             Arc::clone(&psk),
             server_public,
             Arc::clone(&server_identity_public),
-        ))
+        );
+        mux_sessions.ensure_started();
+        Some(mux_sessions)
     } else {
         None
     };
@@ -378,6 +380,15 @@ impl ClientMuxPool {
         let handle = self.start_session().await?;
         *mux = Some(handle.clone());
         Ok(handle)
+    }
+
+    fn ensure_started(&self) {
+        let mux_pool = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = mux_pool.handle().await {
+                tracing::debug!(error = %err, "client mux warm session startup failed");
+            }
+        });
     }
 
     async fn start_session(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
