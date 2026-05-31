@@ -8,7 +8,7 @@
 //!
 //! Design notes:
 //!
-//! * 51 cases across six groups exercise the asymmetric primitives, KDFs,
+//! * 57 cases across six groups exercise the asymmetric primitives, KDFs,
 //!   handshake composition, application-data AEAD pipeline, traffic shaping,
 //!   and replay-cache bookkeeping that dominate ParallaX's wall-clock cost.
 //! * Each case declares an iteration [`Tier`]. Tiers are static constants so
@@ -51,7 +51,10 @@ use crate::{
     handshake::client::ClientDataSession,
     handshake::server::{decide_inbound, InboundDecision},
     protocol::{
-        command::{ConnectRequest, ServerIdentityChunk, ServerIdentityProof},
+        command::{
+            ConnectRequest, PqRekeyRequest, ServerIdentityChunk, ServerIdentityProof,
+            ServerKeyExchange,
+        },
         data::SERVER_TO_CLIENT_AAD,
         data::{DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD},
     },
@@ -355,6 +358,10 @@ const CASES: &[CaseRunner] = &[
     bench_clienthello_verify_auth,
     bench_server_decide_inbound,
     bench_client_pq_rekey_record,
+    bench_pq_rekey_decode_owned,
+    bench_pq_rekey_decode_borrowed,
+    bench_server_key_exchange_decode_owned,
+    bench_server_key_exchange_decode_borrowed,
     bench_client_connect_record_1k,
     bench_client_speed_upload_seal_1mb,
     bench_client_speed_download_open_1mb,
@@ -718,6 +725,92 @@ fn bench_client_pq_rekey_record(options: BenchmarkOptions) -> Result<BenchmarkCa
             let (record, pending) = session.build_pq_rekey_record(&mut rng)?;
             Ok(black_box(
                 (record.len() + pending.mlkem_secret_key().len()) as u64,
+            ))
+        },
+    )
+}
+
+fn bench_pq_rekey_decode_owned(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let x25519 = X25519KeyPair::generate();
+    let mlkem = pq::keypair();
+    let encoded = PqRekeyRequest::encode_borrowed(&x25519.public, &mlkem.public)?;
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "pq_rekey.decode_owned",
+        TIER_FAST,
+        options,
+        || {
+            let decoded = PqRekeyRequest::decode(black_box(encoded.as_slice()))?;
+            Ok(black_box(
+                (decoded.client_x25519_public.len() + decoded.client_mlkem_public_key.len()) as u64,
+            ))
+        },
+    )
+}
+
+fn bench_pq_rekey_decode_borrowed(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let x25519 = X25519KeyPair::generate();
+    let mlkem = pq::keypair();
+    let encoded = PqRekeyRequest::encode_borrowed(&x25519.public, &mlkem.public)?;
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "pq_rekey.decode_borrowed",
+        TIER_FAST,
+        options,
+        || {
+            let decoded = PqRekeyRequest::decode_ref(black_box(encoded.as_slice()))?;
+            Ok(black_box(
+                (decoded.client_x25519_public.len() + decoded.client_mlkem_public_key.len()) as u64,
+            ))
+        },
+    )
+}
+
+fn bench_server_key_exchange_decode_owned(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let server = X25519KeyPair::generate();
+    let mlkem = pq::keypair();
+    let encapsulation = pq::encapsulate(&mlkem.public)?;
+    let encoded = ServerKeyExchange {
+        server_x25519_public: server.public,
+        mlkem_ciphertext: encapsulation.ciphertext,
+    }
+    .encode()?;
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "server_key_exchange.decode_owned",
+        TIER_FAST,
+        options,
+        || {
+            let decoded = ServerKeyExchange::decode(black_box(encoded.as_slice()))?;
+            Ok(black_box(
+                (decoded.server_x25519_public.len() + decoded.mlkem_ciphertext.len()) as u64,
+            ))
+        },
+    )
+}
+
+fn bench_server_key_exchange_decode_borrowed(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let server = X25519KeyPair::generate();
+    let mlkem = pq::keypair();
+    let encapsulation = pq::encapsulate(&mlkem.public)?;
+    let encoded = ServerKeyExchange {
+        server_x25519_public: server.public,
+        mlkem_ciphertext: encapsulation.ciphertext,
+    }
+    .encode()?;
+
+    run_case(
+        BenchGroup::HandshakeProtocol,
+        "server_key_exchange.decode_borrowed",
+        TIER_FAST,
+        options,
+        || {
+            let decoded = ServerKeyExchange::decode_ref(black_box(encoded.as_slice()))?;
+            Ok(black_box(
+                (decoded.server_x25519_public.len() + decoded.mlkem_ciphertext.len()) as u64,
             ))
         },
     )
@@ -1108,16 +1201,16 @@ fn bench_client_identity_verify_cached(options: BenchmarkOptions) -> Result<Benc
         TIER_SLOW,
         options,
         || {
-            let proof = ServerIdentityProof::decode(&frame)?;
+            let signature = ServerIdentityProof::signature(black_box(frame.as_slice()))?;
             identity::verify_server_identity(
                 &identity_keys.public,
-                &proof.signature,
+                signature,
                 &context,
                 &server.public,
                 &pq_binding,
                 0,
             )?;
-            Ok(black_box(proof.signature.len() as u64))
+            Ok(black_box(signature.len() as u64))
         },
     )
 }

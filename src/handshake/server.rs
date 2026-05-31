@@ -64,7 +64,8 @@ use crate::{
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
     transport::tcp::{
-        drain_ready_tcp_read, is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+        connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
+        is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
     },
 };
 
@@ -733,7 +734,7 @@ where
 }
 
 async fn connect_tcp_with_timeout(addr: &str) -> Result<TcpStream, HandshakeServerError> {
-    connect_future_with_timeout(TcpStream::connect(addr), HANDSHAKE_TIMEOUT).await
+    connect_future_with_timeout(connect_tuned_tcp_host(addr), HANDSHAKE_TIMEOUT).await
 }
 
 async fn connect_future_with_timeout<F>(
@@ -815,7 +816,9 @@ async fn run_authenticated_data_mode(
 
                 match client_open.open(&client_record) {
                     Ok(first_payload) => {
-                        let pq_rekey = PqRekeyRequest::decode(&first_payload)?;
+                        let pq_rekey = PqRekeyRequest::decode_ref(first_payload.as_slice())?;
+                        let client_x25519_public = pq_rekey.client_x25519_public;
+                        let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
                         if !commit_pending_replay_entry(&mut pending_replay).await? {
                             tracing::warn!(cid, "closing on replayed ClientHello after data proof");
                             return Ok(());
@@ -827,17 +830,17 @@ async fn run_authenticated_data_mode(
                         );
                         let x25519_ephemeral_shared = x25519_shared_secret(
                             &server_ephemeral.private,
-                            &pq_rekey.client_x25519_public,
+                            &client_x25519_public,
                         );
                         let pq_encapsulation =
-                            encapsulate_mlkem_blocking(pq_rekey.client_mlkem_public_key).await?;
+                            encapsulate_mlkem_blocking(client_mlkem_public_key).await?;
                         let key_exchange_payload = ServerKeyExchange {
                             server_x25519_public: server_ephemeral.public,
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
                         }
                         .encode()?;
                         let pq_identity_binding =
-                            identity::pq_rekey_binding(&first_payload, &key_exchange_payload);
+                            identity::pq_rekey_binding(first_payload.as_slice(), &key_exchange_payload);
                         crate::process_hardening::protect_secret_bytes(
                             "pq_rekey.mlkem_shared_secret",
                             &pq_encapsulation.shared_secret,
@@ -1078,7 +1081,7 @@ async fn connect_outbound_target(
     }
 
     let addrs = resolve_public_target_addrs(target_addr).await?;
-    connect_future_with_timeout(TcpStream::connect(addrs.as_slice()), HANDSHAKE_TIMEOUT).await
+    connect_future_with_timeout(connect_tuned_tcp_any(addrs.as_slice()), HANDSHAKE_TIMEOUT).await
 }
 
 async fn resolve_public_target_addrs(
@@ -1241,8 +1244,6 @@ fn apply_server_pq_rekey(
     next_keys.protect_secret_memory();
     client_open.rekey(next_keys.client_key, next_keys.client_nonce);
     server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
-    client_open.protect_secret_memory();
-    server_seal.protect_secret_memory();
     Ok(next_keys)
 }
 

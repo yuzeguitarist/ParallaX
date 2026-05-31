@@ -52,10 +52,22 @@ pub struct PqRekeyRequest {
     pub client_mlkem_public_key: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PqRekeyRequestRef<'a> {
+    pub client_x25519_public: [u8; 32],
+    pub client_mlkem_public_key: &'a [u8],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerKeyExchange {
     pub server_x25519_public: [u8; 32],
     pub mlkem_ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerKeyExchangeRef<'a> {
+    pub server_x25519_public: [u8; 32],
+    pub mlkem_ciphertext: &'a [u8],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +326,14 @@ impl PqRekeyRequest {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, PqRekeyError> {
+        let request = Self::decode_ref(input)?;
+        Ok(Self {
+            client_x25519_public: request.client_x25519_public,
+            client_mlkem_public_key: request.client_mlkem_public_key.to_vec(),
+        })
+    }
+
+    pub fn decode_ref(input: &[u8]) -> Result<PqRekeyRequestRef<'_>, PqRekeyError> {
         if input.len() < 4 {
             return Err(PqRekeyError::Truncated);
         }
@@ -332,9 +352,9 @@ impl PqRekeyRequest {
         if input.len() != 40 + len {
             return Err(PqRekeyError::InvalidPublicKeyLength);
         }
-        Ok(Self {
+        Ok(PqRekeyRequestRef {
             client_x25519_public,
-            client_mlkem_public_key: input[40..].to_vec(),
+            client_mlkem_public_key: &input[40..],
         })
     }
 }
@@ -353,6 +373,14 @@ impl ServerKeyExchange {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, ServerKeyExchangeError> {
+        let exchange = Self::decode_ref(input)?;
+        Ok(Self {
+            server_x25519_public: exchange.server_x25519_public,
+            mlkem_ciphertext: exchange.mlkem_ciphertext.to_vec(),
+        })
+    }
+
+    pub fn decode_ref(input: &[u8]) -> Result<ServerKeyExchangeRef<'_>, ServerKeyExchangeError> {
         if input.len() < 4 {
             return Err(ServerKeyExchangeError::Truncated);
         }
@@ -371,9 +399,9 @@ impl ServerKeyExchange {
         if input.len() != 40 + len {
             return Err(ServerKeyExchangeError::InvalidCiphertextLength);
         }
-        Ok(Self {
+        Ok(ServerKeyExchangeRef {
             server_x25519_public,
-            mlkem_ciphertext: input[40..].to_vec(),
+            mlkem_ciphertext: &input[40..],
         })
     }
 }
@@ -801,6 +829,23 @@ mod tests {
     }
 
     #[test]
+    fn pq_rekey_decode_ref_borrows_public_key() {
+        let request = PqRekeyRequest {
+            client_x25519_public: [9_u8; 32],
+            client_mlkem_public_key: vec![1, 2, 3],
+        };
+
+        let encoded = request.encode().unwrap();
+        let decoded = PqRekeyRequest::decode_ref(&encoded).unwrap();
+
+        assert_eq!(decoded.client_x25519_public, request.client_x25519_public);
+        assert_eq!(
+            decoded.client_mlkem_public_key,
+            request.client_mlkem_public_key
+        );
+    }
+
+    #[test]
     fn pq_rekey_borrowed_encode_matches_owned_request() {
         let request = PqRekeyRequest {
             client_x25519_public: [9_u8; 32],
@@ -825,6 +870,20 @@ mod tests {
         };
         let encoded = exchange.encode().unwrap();
         assert_eq!(ServerKeyExchange::decode(&encoded).unwrap(), exchange);
+    }
+
+    #[test]
+    fn server_key_exchange_decode_ref_borrows_ciphertext() {
+        let exchange = ServerKeyExchange {
+            server_x25519_public: [7_u8; 32],
+            mlkem_ciphertext: vec![1, 2, 3],
+        };
+
+        let encoded = exchange.encode().unwrap();
+        let decoded = ServerKeyExchange::decode_ref(&encoded).unwrap();
+
+        assert_eq!(decoded.server_x25519_public, exchange.server_x25519_public);
+        assert_eq!(decoded.mlkem_ciphertext, exchange.mlkem_ciphertext);
     }
 
     #[test]

@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use zeroize::Zeroizing;
+
 use rand::{
     rngs::{OsRng, StdRng},
     SeedableRng,
@@ -45,7 +47,8 @@ use crate::{
     },
     traffic::CoverTrafficProfile,
     transport::tcp::{
-        drain_ready_tcp_read, is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+        connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
+        relay_connection_limit, tune_tcp_stream,
     },
 };
 
@@ -82,6 +85,9 @@ pub enum ClientRuntimeError {
     BlockingTask(#[from] tokio::task::JoinError),
 }
 
+type ClientSession = (TcpStream, ClientDataSession);
+type ClientSessionTask = tokio::task::JoinHandle<Result<ClientSession, ClientRuntimeError>>;
+
 pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     if config.mode != Mode::Client {
         return Err(ClientRuntimeError::WrongMode);
@@ -104,6 +110,15 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     );
     let listener = TcpListener::bind(client.listen).await?;
     let server_addr = ServerAddrResolver::new(&client.server_addr).await?;
+    let warm_sessions = WarmSessionPool::new(
+        Arc::new(client.clone()),
+        server_addr.clone(),
+        config.traffic,
+        Arc::clone(&psk),
+        server_public,
+        Arc::clone(&server_identity_public),
+    );
+    warm_sessions.ensure_started().await;
     let connection_limit = relay_connection_limit()?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
     tracing::info!(
@@ -146,6 +161,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
         let server_addr = server_addr.clone();
+        let warm_sessions = warm_sessions.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
             let context = ClientConnectionContext {
@@ -155,6 +171,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                 psk: psk.as_ref().as_slice(),
                 server_public: &server_public,
                 server_identity_public,
+                warm_sessions: Some(warm_sessions),
             };
             if let Err(err) = handle_local_connection_with_cid(local, context, cid).await {
                 tracing::debug!(cid, %peer, error = %err, "client connection closed");
@@ -182,6 +199,7 @@ pub async fn handle_local_connection(
         psk,
         server_public,
         server_identity_public,
+        warm_sessions: None,
     };
     handle_local_connection_with_cid(local, context, cid).await
 }
@@ -193,6 +211,73 @@ struct ClientConnectionContext<'a> {
     psk: &'a [u8],
     server_public: &'a [u8; 32],
     server_identity_public: Arc<[u8]>,
+    warm_sessions: Option<WarmSessionPool>,
+}
+
+#[derive(Clone)]
+struct WarmSessionPool {
+    inner: Arc<Mutex<Option<ClientSessionTask>>>,
+    config: Arc<ClientConfig>,
+    server_addr: ServerAddrResolver,
+    traffic: TrafficConfig,
+    psk: Arc<Zeroizing<Vec<u8>>>,
+    server_public: [u8; 32],
+    server_identity_public: Arc<[u8]>,
+}
+
+impl WarmSessionPool {
+    fn new(
+        config: Arc<ClientConfig>,
+        server_addr: ServerAddrResolver,
+        traffic: TrafficConfig,
+        psk: Arc<Zeroizing<Vec<u8>>>,
+        server_public: [u8; 32],
+        server_identity_public: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            config,
+            server_addr,
+            traffic,
+            psk,
+            server_public,
+            server_identity_public,
+        }
+    }
+
+    async fn ensure_started(&self) {
+        let mut warm = self.inner.lock().await;
+        if warm.is_none() {
+            *warm = Some(self.spawn_session());
+        }
+    }
+
+    async fn take_or_start(&self) -> ClientSessionTask {
+        let mut warm = self.inner.lock().await;
+        let session = warm.take().unwrap_or_else(|| self.spawn_session());
+        *warm = Some(self.spawn_session());
+        session
+    }
+
+    fn spawn_session(&self) -> ClientSessionTask {
+        let config = Arc::clone(&self.config);
+        let server_addr = self.server_addr.clone();
+        let traffic = self.traffic;
+        let psk = Arc::clone(&self.psk);
+        let server_public = self.server_public;
+        let server_identity_public = Arc::clone(&self.server_identity_public);
+        tokio::spawn(async move {
+            establish_authenticated_data_session_with_resolver(
+                &server_addr,
+                &config,
+                traffic,
+                psk.as_ref().as_slice(),
+                &server_public,
+                server_identity_public,
+            )
+            .await
+        })
+    }
 }
 
 async fn handle_local_connection_with_cid(
@@ -207,6 +292,7 @@ async fn handle_local_connection_with_cid(
         psk,
         server_public,
         server_identity_public,
+        warm_sessions,
     } = context;
     tune_tcp_stream(&local)?;
     tracing::debug!(
@@ -214,7 +300,36 @@ async fn handle_local_connection_with_cid(
         task_name = "client-connection",
         "accepted SOCKS connection"
     );
-    let request = socks::accept_connect(&mut local).await?;
+    // Browser SOCKS clients normally send CONNECT immediately after opening the
+    // local TCP socket, so pre-establish the upstream ParallaX session while the
+    // local SOCKS request is still arriving.
+    let server_session_task = if let Some(warm_sessions) = &warm_sessions {
+        warm_sessions.take_or_start().await
+    } else {
+        let speculative_config = config.clone();
+        let speculative_server_addr = server_addr.clone();
+        let speculative_psk = Arc::<[u8]>::from(psk.to_vec().into_boxed_slice());
+        let speculative_server_public = *server_public;
+        let speculative_server_identity_public = server_identity_public.clone();
+        tokio::spawn(async move {
+            establish_authenticated_data_session_with_resolver(
+                &speculative_server_addr,
+                &speculative_config,
+                traffic,
+                speculative_psk.as_ref(),
+                &speculative_server_public,
+                speculative_server_identity_public,
+            )
+            .await
+        })
+    };
+    let request = match socks::accept_connect(&mut local).await {
+        Ok(request) => request,
+        Err(err) => {
+            server_session_task.abort();
+            return Err(err.into());
+        }
+    };
     let chunk_size = max_plaintext_len(traffic.max_padding);
     let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
     // Keep the zero-RTT-style initial payload capture, but hide its small wait
@@ -224,14 +339,11 @@ async fn handle_local_connection_with_cid(
             .await
             .map_err(ClientRuntimeError::Io)
     };
-    let server_session_fut = establish_authenticated_data_session_with_resolver(
-        &server_addr,
-        config,
-        traffic,
-        psk,
-        server_public,
-        server_identity_public,
-    );
+    let server_session_fut = async {
+        server_session_task
+            .await
+            .map_err(ClientRuntimeError::BlockingTask)?
+    };
     let (initial_payload, (mut server, mut data_session)) =
         tokio::try_join!(initial_payload_fut, server_session_fut)?;
     let connect_request = ConnectRequest {
@@ -336,7 +448,7 @@ impl ServerAddrResolver {
 
     async fn connect(&self) -> Result<TcpStream, ClientRuntimeError> {
         let cached = *self.cached.lock().await;
-        match TcpStream::connect(cached).await {
+        match connect_tuned_tcp_addr(cached).await {
             Ok(stream) => Ok(stream),
             Err(err) if self.literal => Err(err.into()),
             Err(first_err) => {
@@ -345,7 +457,7 @@ impl ServerAddrResolver {
                 if refreshed == cached {
                     return Err(first_err.into());
                 }
-                Ok(TcpStream::connect(refreshed).await?)
+                Ok(connect_tuned_tcp_addr(refreshed).await?)
             }
         }
     }
@@ -435,15 +547,17 @@ async fn apply_server_key_exchange_record_blocking(
 ) -> Result<(), ClientRuntimeError> {
     let exchange_payload = data_session.open_server_record(record)?;
     let exchange =
-        ServerKeyExchange::decode(&exchange_payload).map_err(ClientHandshakeError::from)?;
+        ServerKeyExchange::decode_ref(&exchange_payload).map_err(ClientHandshakeError::from)?;
     let pq_identity_binding = pending_rekey.identity_binding(&exchange_payload);
     let x25519_shared = pending_rekey.x25519_shared_secret(&exchange.server_x25519_public);
-    let ciphertext = exchange.mlkem_ciphertext;
     let secret_key = zeroize::Zeroizing::new(pending_rekey.mlkem_secret_key().to_vec());
-    let pq_shared =
-        tokio::task::spawn_blocking(move || pq::decapsulate(&ciphertext, secret_key.as_slice()))
-            .await?
-            .map_err(ClientHandshakeError::from)?;
+    let pq_shared = tokio::task::spawn_blocking(move || {
+        let exchange =
+            ServerKeyExchange::decode_ref(&exchange_payload).map_err(ClientHandshakeError::from)?;
+        pq::decapsulate(exchange.mlkem_ciphertext, secret_key.as_slice())
+            .map_err(ClientHandshakeError::from)
+    })
+    .await??;
     data_session.apply_pq_rekey_shared_with_identity_binding(
         &x25519_shared,
         &pq_shared,

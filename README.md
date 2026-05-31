@@ -58,7 +58,7 @@ transport. There is no shipped `--quic` product mode on current `main`.
 | TCP transport | TCP-only product transport with `TCP_NODELAY`, Linux keepalive tuning, fd-limit based relay concurrency, and 64 KiB relay buffers. | `src/transport/tcp.rs` |
 | Process hardening | Best-effort no-core-dump setup, non-dumpable process flag, `mlock`, `MADV_DONTDUMP`, and strict config file ownership/mode checks. | `src/process_hardening.rs`, `src/config.rs` |
 | Operations | Local build, binary-only VPS upload, hardened systemd unit, optional BBR/fq setup, optional Polar Signals / parca-agent profiling. | `scripts/deploy-vps.sh`, `scripts/uninstall-vps.sh` |
-| Validation | Unit/integration tests, Safari parity fixtures, ignored loopback tests, GFW simulator, fixed 53-case benchmark suite, speed evidence report. | `tests/`, `src/bench.rs`, `src/speed.rs` |
+| Validation | Unit/integration tests, Safari parity fixtures, ignored loopback tests, GFW simulator, fixed 57-case benchmark suite, speed evidence report. | `tests/`, `src/bench.rs`, `src/speed.rs` |
 
 ---
 
@@ -289,7 +289,7 @@ plx bench --json
 ```
 
 The benchmark suite is intentionally fixed-parameter. Current `main` runs
-53 cases across six groups: `handshake.crypto`, `handshake.protocol`,
+57 cases across six groups: `handshake.crypto`, `handshake.protocol`,
 `record.aead`, `record.pipeline`, `traffic`, and `state`.
 
 Network speed evidence test:

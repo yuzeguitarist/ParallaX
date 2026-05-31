@@ -22,12 +22,12 @@ which cases exist.
 
 ## Current suite
 
-Current `main` runs 53 cases across six groups:
+Current `main` runs 57 cases across six groups:
 
 | Group | Examples |
 |---|---|
 | `handshake.crypto` | X25519 keygen/DH, ML-KEM keygen/encap/decap, ML-DSA sign/verify, HKDF rekeys. |
-| `handshake.protocol` | Safari ClientHello start, ClientHello parse/auth verify, server inbound decision, PQ rekey records, identity chunk encode/decode/verify. |
+| `handshake.protocol` | Safari ClientHello start, ClientHello parse/auth verify, server inbound decision, PQ rekey records, borrowed/owned command decode, identity chunk encode/decode/verify. |
 | `record.aead` | Raw AEAD seal/open at fixed payload sizes. |
 | `record.pipeline` | Full TLS ApplicationData record pipeline, chunking, in-place open, 1 MiB bulk paths, TLS record reader. |
 | `traffic` | Padding apply/remove with default and configured profiles. |
