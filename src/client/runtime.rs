@@ -42,7 +42,7 @@ use crate::{
         max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
     },
     tls::{
-        record::{log_record_read, read_record, TlsRecordError, TlsRecordReader},
+        record::{log_record_read, TlsRecordError, TlsRecordReader},
         safari26::{Safari26TlsCamouflage, Safari26TlsError},
     },
     traffic::CoverTrafficProfile,
@@ -486,11 +486,18 @@ async fn apply_server_key_exchange_after_residuals<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let mut server_records = TlsRecordReader::new(server);
+    let mut record = Vec::new();
     let mut skipped = 0;
     loop {
-        let record = read_record(server).await?;
-        match apply_server_key_exchange_record_blocking(data_session, &record, pending_rekey, psk)
-            .await
+        server_records.read_record_into(&mut record).await?;
+        match apply_server_key_exchange_record_blocking(
+            data_session,
+            &mut record,
+            pending_rekey,
+            psk,
+        )
+        .await
         {
             Ok(()) => {
                 if skipped > 0 {
@@ -541,20 +548,20 @@ where
 
 async fn apply_server_key_exchange_record_blocking(
     data_session: &mut ClientDataSession,
-    record: &[u8],
+    record: &mut Vec<u8>,
     pending_rekey: &PendingPqRekey,
     psk: &[u8],
 ) -> Result<(), ClientRuntimeError> {
-    let exchange_payload = data_session.open_server_record(record)?;
+    let exchange_payload_range = data_session.open_server_record_in_place_payload_range(record)?;
+    let exchange_payload = &record[exchange_payload_range];
     let exchange =
-        ServerKeyExchange::decode_ref(&exchange_payload).map_err(ClientHandshakeError::from)?;
-    let pq_identity_binding = pending_rekey.identity_binding(&exchange_payload);
+        ServerKeyExchange::decode_ref(exchange_payload).map_err(ClientHandshakeError::from)?;
+    let pq_identity_binding = pending_rekey.identity_binding(exchange_payload);
     let x25519_shared = pending_rekey.x25519_shared_secret(&exchange.server_x25519_public);
+    let mlkem_ciphertext = exchange.mlkem_ciphertext.to_vec();
     let secret_key = zeroize::Zeroizing::new(pending_rekey.mlkem_secret_key().to_vec());
     let pq_shared = tokio::task::spawn_blocking(move || {
-        let exchange =
-            ServerKeyExchange::decode_ref(&exchange_payload).map_err(ClientHandshakeError::from)?;
-        pq::decapsulate(exchange.mlkem_ciphertext, secret_key.as_slice())
+        pq::decapsulate(&mlkem_ciphertext, secret_key.as_slice())
             .map_err(ClientHandshakeError::from)
     })
     .await??;
