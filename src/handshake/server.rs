@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -19,7 +20,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{Semaphore, TryAcquireError},
+    sync::{mpsc, Semaphore, TryAcquireError},
     time::{sleep, timeout, timeout_at, Instant},
 };
 use zeroize::Zeroize;
@@ -47,10 +48,10 @@ use crate::{
     },
     protocol::{
         command::{
-            ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
-            ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
-            ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest,
-            SpeedTestRequestError,
+            ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind,
+            PqRekeyError, PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError,
+            ServerIdentityProof, ServerIdentityProofError, ServerKeyExchange,
+            ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest, SpeedTestRequestError,
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError,
@@ -76,6 +77,7 @@ const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
 const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET / 2;
+const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -109,6 +111,8 @@ pub enum HandshakeServerError {
     ConnectRequest(#[from] ConnectRequestError),
     #[error("speed test request error: {0}")]
     SpeedTestRequest(#[from] SpeedTestRequestError),
+    #[error("mux frame error: {0}")]
+    MuxFrame(#[from] MuxFrameError),
     #[error("PQ rekey command error: {0}")]
     PqRekey(#[from] PqRekeyError),
     #[error("server key exchange command error: {0}")]
@@ -589,6 +593,20 @@ async fn relay_fallback_with_idle_timeout(
     fallback: TcpStream,
     idle_timeout: Duration,
 ) -> Result<(), HandshakeServerError> {
+    #[cfg(target_os = "linux")]
+    {
+        if crate::transport::tcp::kernel_splice_available() {
+            tracing::debug!("using Linux splice(2) kernel relay for fallback TCP tunnel");
+            return crate::transport::tcp::relay_kernel_splice_bidirectional_with_idle_timeout(
+                client,
+                fallback,
+                idle_timeout,
+            )
+            .await
+            .map_err(HandshakeServerError::Io);
+        }
+    }
+
     let (mut client_read, mut client_write) = client.into_split();
     let (mut fallback_read, mut fallback_write) = fallback.into_split();
     let fallback_buffer_len = relay_read_buffer_len(max_plaintext_len(0));
@@ -928,6 +946,25 @@ async fn run_authenticated_data_mode(
                                 request,
                                 max_plaintext_len(traffic.max_padding),
                                 cid,
+                            )
+                            .await;
+                        }
+
+                        if MuxFrame::has_magic(first_payload) {
+                            let first_frame = MuxFrame::decode(first_payload)?;
+                            return run_authenticated_mux_data_mode(
+                                client_records,
+                                client_write,
+                                client_open,
+                                server_seal,
+                                first_frame,
+                                ServerMuxContext {
+                                    fixed_data_target,
+                                    timing,
+                                    cover,
+                                    chunk_size: max_plaintext_len(traffic.max_padding),
+                                    cid,
+                                },
                             )
                             .await;
                         }
@@ -1331,6 +1368,15 @@ struct DataRelay {
     cid: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ServerMuxContext<'a> {
+    fixed_data_target: Option<&'a str>,
+    timing: TimingProfile,
+    cover: CoverTrafficProfile,
+    chunk_size: usize,
+    cid: u64,
+}
+
 impl DataRelay {
     async fn run(self) -> Result<(), HandshakeServerError> {
         let DataRelay {
@@ -1360,6 +1406,263 @@ impl DataRelay {
         let ((), ()) = tokio::try_join!(upload, download)?;
         Ok(())
     }
+}
+
+async fn run_authenticated_mux_data_mode(
+    client_records: TlsRecordReader<OwnedReadHalf>,
+    client_write: OwnedWriteHalf,
+    client_open: DataRecordCodec,
+    server_seal: DataRecordCodec,
+    first_frame: MuxFrame,
+    context: ServerMuxContext<'_>,
+) -> Result<(), HandshakeServerError> {
+    tracing::info!(cid = context.cid, "ParallaX mux data mode started");
+    let (frame_tx, frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+    let reader =
+        server_mux_client_reader_loop(client_records, client_open, frame_tx, first_frame, context);
+    let writer = server_mux_writer_loop(
+        client_write,
+        server_seal,
+        frame_rx,
+        context.cover,
+        context.cid,
+    );
+    let ((), ()) = tokio::try_join!(reader, writer)?;
+    Ok(())
+}
+
+async fn server_mux_client_reader_loop(
+    mut client_records: TlsRecordReader<OwnedReadHalf>,
+    mut client_open: DataRecordCodec,
+    frame_tx: mpsc::Sender<MuxFrame>,
+    first_frame: MuxFrame,
+    context: ServerMuxContext<'_>,
+) -> Result<(), HandshakeServerError> {
+    let mut target_writes = HashMap::<u32, OwnedWriteHalf>::new();
+    process_server_mux_frame(first_frame, &mut target_writes, &frame_tx, context).await?;
+
+    let mut client_record = Vec::new();
+    loop {
+        match client_records.read_record_into(&mut client_record).await {
+            Ok(()) => {}
+            Err(err) if is_clean_close(&err) => {
+                for (_, mut target_write) in target_writes {
+                    let _ = target_write.shutdown().await;
+                }
+                return Ok(());
+            }
+            Err(err) => return Err(HandshakeServerError::Io(err)),
+        };
+        log_record_read(
+            context.cid,
+            "client->server",
+            "server-mux-client-reader",
+            &client_record,
+        );
+        let payload = client_open.open_in_place_payload_range(&mut client_record)?;
+        let frame = MuxFrame::decode(&client_record[payload])?;
+        process_server_mux_frame(frame, &mut target_writes, &frame_tx, context).await?;
+    }
+}
+
+async fn process_server_mux_frame(
+    frame: MuxFrame,
+    target_writes: &mut HashMap<u32, OwnedWriteHalf>,
+    frame_tx: &mpsc::Sender<MuxFrame>,
+    context: ServerMuxContext<'_>,
+) -> Result<(), HandshakeServerError> {
+    match frame.kind {
+        MuxFrameKind::Open => {
+            if target_writes.contains_key(&frame.stream_id) {
+                send_server_mux_frame(frame_tx, frame.stream_id, MuxFrameKind::Reset, Vec::new())
+                    .await?;
+                return Ok(());
+            }
+            let mut payload = frame.payload;
+            let (target_addr, initial_payload) = {
+                let (target_addr, initial_payload) =
+                    resolve_connect_target(payload.as_mut_slice(), context.fixed_data_target)?;
+                (target_addr, initial_payload.to_vec())
+            };
+            let mut target =
+                connect_outbound_target(&target_addr, context.fixed_data_target.is_some()).await?;
+            tune_tcp_stream(&target)?;
+            if !initial_payload.is_empty() {
+                target.write_all(&initial_payload).await?;
+                let mut initial_payload = initial_payload;
+                initial_payload.zeroize();
+            }
+            let (target_read, target_write) = target.into_split();
+            target_writes.insert(frame.stream_id, target_write);
+            let stream_id = frame.stream_id;
+            let target_frame_tx = frame_tx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = server_mux_target_reader_loop(
+                    target_read,
+                    target_frame_tx,
+                    stream_id,
+                    context.timing,
+                    context.chunk_size,
+                    context.cid,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        cid = context.cid,
+                        stream_id,
+                        error = %err,
+                        "server mux target reader stopped"
+                    );
+                }
+            });
+        }
+        MuxFrameKind::Data => {
+            if let Some(target_write) = target_writes.get_mut(&frame.stream_id) {
+                if !frame.payload.is_empty() {
+                    target_write.write_all(&frame.payload).await?;
+                }
+            }
+        }
+        MuxFrameKind::Fin => {
+            if let Some(mut target_write) = target_writes.remove(&frame.stream_id) {
+                let _ = target_write.shutdown().await;
+            }
+        }
+        MuxFrameKind::Reset => {
+            if let Some(mut target_write) = target_writes.remove(&frame.stream_id) {
+                let _ = target_write.shutdown().await;
+            }
+        }
+        MuxFrameKind::Cover => {}
+    }
+    Ok(())
+}
+
+async fn server_mux_target_reader_loop(
+    mut target_read: OwnedReadHalf,
+    frame_tx: mpsc::Sender<MuxFrame>,
+    stream_id: u32,
+    timing: TimingProfile,
+    chunk_size: usize,
+    cid: u64,
+) -> Result<(), HandshakeServerError> {
+    let max_payload_len = MuxFrame::max_payload_len(chunk_size);
+    if max_payload_len == 0 {
+        return Err(HandshakeServerError::DataRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(0).into(),
+        ));
+    }
+    let mut target_buf = vec![0_u8; relay_read_buffer_len(max_payload_len)];
+    let mut rng = StdRng::from_entropy();
+
+    loop {
+        let n = target_read.read(&mut target_buf).await?;
+        if n == 0 {
+            send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
+            return Ok(());
+        }
+        let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
+        let delay = timing.sample_delay(&mut rng);
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        for chunk in target_buf[..n].chunks(max_payload_len) {
+            send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Data, chunk.to_vec()).await?;
+        }
+        tracing::trace!(
+            cid,
+            stream_id,
+            bytes = n,
+            "queued server mux download payload"
+        );
+    }
+}
+
+async fn server_mux_writer_loop(
+    mut client_write: OwnedWriteHalf,
+    mut server_seal: DataRecordCodec,
+    mut frame_rx: mpsc::Receiver<MuxFrame>,
+    cover: CoverTrafficProfile,
+    cid: u64,
+) -> Result<(), HandshakeServerError> {
+    let mut seal_scratch = RelaySealScratch::with_payload_capacity(server_seal.max_plaintext_len());
+    let mut rng = StdRng::from_entropy();
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+
+    loop {
+        tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                write_server_mux_frame(
+                    &mut client_write,
+                    &mut server_seal,
+                    MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
+                    &mut rng,
+                    &mut seal_scratch,
+                    cid,
+                    "server-mux-cover-writer",
+                )
+                .await?;
+                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
+            }
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else {
+                    let _ = client_write.shutdown().await;
+                    return Ok(());
+                };
+                write_server_mux_frame(
+                    &mut client_write,
+                    &mut server_seal,
+                    frame,
+                    &mut rng,
+                    &mut seal_scratch,
+                    cid,
+                    "server-mux-writer",
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+async fn write_server_mux_frame<W, R>(
+    writer: &mut W,
+    codec: &mut DataRecordCodec,
+    frame: MuxFrame,
+    rng: &mut R,
+    scratch: &mut RelaySealScratch,
+    cid: u64,
+    task_name: &'static str,
+) -> Result<(), HandshakeServerError>
+where
+    W: AsyncWrite + Unpin,
+    R: Rng + rand::RngCore + ?Sized,
+{
+    let frame_payload = frame.encode()?;
+    write_server_data_records_chunked(
+        writer,
+        codec,
+        &frame_payload,
+        rng,
+        scratch,
+        RelayWriteLog::new(cid, "server->client", task_name),
+    )
+    .await
+}
+
+async fn send_server_mux_frame(
+    frame_tx: &mpsc::Sender<MuxFrame>,
+    stream_id: u32,
+    kind: MuxFrameKind,
+    payload: Vec<u8>,
+) -> Result<(), HandshakeServerError> {
+    frame_tx
+        .send(MuxFrame {
+            stream_id,
+            kind,
+            payload,
+        })
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into())
 }
 
 async fn run_authenticated_speed_test_mode(

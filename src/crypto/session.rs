@@ -5,7 +5,6 @@ use chacha20poly1305::{
     Tag, XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use sha2::Sha256;
 use thiserror::Error;
@@ -16,12 +15,6 @@ pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
 pub const AEAD_TAG_LEN: usize = 16;
 
-type HmacSha256 = Hmac<Sha256>;
-
-const RECORD_RATCHET_INIT_LABEL: &[u8] = b"ParallaX v2 record ratchet init";
-const RECORD_RATCHET_KEY_LABEL: &[u8] = b"ParallaX v2 record ratchet key";
-const RECORD_RATCHET_NONCE_LABEL: &[u8] = b"ParallaX v2 record ratchet nonce";
-const RECORD_RATCHET_ADVANCE_LABEL: &[u8] = b"ParallaX v2 record ratchet advance";
 const HKDF_INFO_STACK_LEN: usize = 128;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -276,14 +269,16 @@ fn write_epoch_hkdf_info(
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AeadCodec {
-    root_secret: [u8; KEY_LEN],
+    key: [u8; KEY_LEN],
+    nonce_base: [u8; NONCE_LEN],
     sequence: u64,
 }
 
 impl AeadCodec {
     pub fn new(key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) -> Self {
         let codec = Self {
-            root_secret: initial_record_root(&key, &nonce_base),
+            key,
+            nonce_base,
             sequence: 0,
         };
         codec.protect_secret_memory();
@@ -291,13 +286,15 @@ impl AeadCodec {
     }
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
-        self.root_secret = initial_record_root(&key, &nonce_base);
+        self.key = key;
+        self.nonce_base = nonce_base;
         self.sequence = 0;
         self.protect_secret_memory();
     }
 
     pub fn protect_secret_memory(&self) {
-        crate::process_hardening::protect_secret_bytes("aead.root_secret", &self.root_secret);
+        crate::process_hardening::protect_secret_bytes("aead.key", &self.key);
+        crate::process_hardening::protect_secret_bytes("aead.nonce_base", &self.nonce_base);
     }
 
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {
@@ -314,16 +311,16 @@ impl AeadCodec {
         aad: &[u8],
     ) -> Result<[u8; AEAD_TAG_LEN], SessionError> {
         self.ensure_can_process_next_record()?;
-        let material = self.derive_record_material(aad)?;
-        let cipher = XChaCha20Poly1305::new_from_slice(&material.key)
+        let nonce = self.record_nonce();
+        let cipher = XChaCha20Poly1305::new_from_slice(&self.key)
             .expect("XChaCha20-Poly1305 key length is fixed");
         let tag = cipher
-            .encrypt_in_place_detached(XNonce::from_slice(&material.nonce), aad, plaintext)
+            .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, plaintext)
             .map_err(|_| SessionError::Aead)?;
 
         let mut out = [0_u8; AEAD_TAG_LEN];
         out.copy_from_slice(tag.as_slice());
-        self.advance_record_ratchet(aad, plaintext, &out)?;
+        self.sequence += 1;
         Ok(out)
     }
 
@@ -361,19 +358,17 @@ impl AeadCodec {
             return Err(SessionError::Aead);
         }
         self.ensure_can_process_next_record()?;
-        let material = self.derive_record_material(aad)?;
-        let next_root = self.next_record_root(aad, ciphertext_without_tag, tag)?;
-        let cipher = XChaCha20Poly1305::new_from_slice(&material.key)
+        let nonce = self.record_nonce();
+        let cipher = XChaCha20Poly1305::new_from_slice(&self.key)
             .expect("XChaCha20-Poly1305 key length is fixed");
         cipher
             .decrypt_in_place_detached(
-                XNonce::from_slice(&material.nonce),
+                XNonce::from_slice(&nonce),
                 aad,
                 ciphertext_without_tag,
                 Tag::from_slice(tag),
             )
             .map_err(|_| SessionError::Aead)?;
-        self.root_secret = next_root;
         self.sequence += 1;
         Ok(())
     }
@@ -385,116 +380,16 @@ impl AeadCodec {
         Ok(())
     }
 
-    fn derive_record_material(&self, aad: &[u8]) -> Result<RecordMaterial, SessionError> {
-        let hk = Hkdf::<Sha256>::from_prk(&self.root_secret).map_err(|_| SessionError::Hkdf)?;
-        let mut material = RecordMaterial {
-            key: [0; KEY_LEN],
-            nonce: [0; NONCE_LEN],
-        };
-        expand_record_secret(
-            &hk,
-            RECORD_RATCHET_KEY_LABEL,
-            self.sequence,
-            aad,
-            &mut material.key,
-        )?;
-        expand_record_secret(
-            &hk,
-            RECORD_RATCHET_NONCE_LABEL,
-            self.sequence,
-            aad,
-            &mut material.nonce,
-        )?;
-        Ok(material)
+    fn record_nonce(&self) -> [u8; NONCE_LEN] {
+        let mut nonce = self.nonce_base;
+        for (dst, src) in nonce[NONCE_LEN - 8..]
+            .iter_mut()
+            .zip(self.sequence.to_be_bytes())
+        {
+            *dst ^= src;
+        }
+        nonce
     }
-
-    fn advance_record_ratchet(
-        &mut self,
-        aad: &[u8],
-        ciphertext_without_tag: &[u8],
-        tag: &[u8],
-    ) -> Result<(), SessionError> {
-        self.root_secret = self.next_record_root(aad, ciphertext_without_tag, tag)?;
-        self.sequence += 1;
-        Ok(())
-    }
-
-    fn next_record_root(
-        &self,
-        aad: &[u8],
-        ciphertext_without_tag: &[u8],
-        tag: &[u8],
-    ) -> Result<[u8; KEY_LEN], SessionError> {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.root_secret)
-            .map_err(|_| SessionError::Hkdf)?;
-        mac.update(RECORD_RATCHET_ADVANCE_LABEL);
-        mac.update(&self.sequence.to_be_bytes());
-        mac.update(&(aad.len() as u64).to_be_bytes());
-        mac.update(aad);
-        mac.update(&(ciphertext_without_tag.len() as u64).to_be_bytes());
-        mac.update(ciphertext_without_tag);
-        mac.update(tag);
-        let digest = mac.finalize().into_bytes();
-        let mut next_root = [0_u8; KEY_LEN];
-        next_root.copy_from_slice(&digest[..KEY_LEN]);
-        Ok(next_root)
-    }
-}
-
-#[derive(Zeroize, ZeroizeOnDrop)]
-struct RecordMaterial {
-    key: [u8; KEY_LEN],
-    nonce: [u8; NONCE_LEN],
-}
-
-fn initial_record_root(key: &[u8; KEY_LEN], nonce_base: &[u8; NONCE_LEN]) -> [u8; KEY_LEN] {
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key length is unrestricted");
-    mac.update(RECORD_RATCHET_INIT_LABEL);
-    mac.update(nonce_base);
-    let digest = mac.finalize().into_bytes();
-    let mut out = [0_u8; KEY_LEN];
-    out.copy_from_slice(&digest[..KEY_LEN]);
-    out
-}
-
-fn expand_record_secret(
-    hk: &Hkdf<Sha256>,
-    label: &[u8],
-    sequence: u64,
-    aad: &[u8],
-    out: &mut [u8],
-) -> Result<(), SessionError> {
-    let info_len = 2 + label.len() + 8 + 8 + aad.len();
-    if info_len <= HKDF_INFO_STACK_LEN {
-        let mut info = [0_u8; HKDF_INFO_STACK_LEN];
-        let used = write_record_hkdf_info(&mut info, label, sequence, aad);
-        hk.expand(&info[..used], out)
-            .map_err(|_| SessionError::Hkdf)
-    } else {
-        let mut info = Vec::with_capacity(info_len);
-        info.extend_from_slice(&(label.len() as u16).to_be_bytes());
-        info.extend_from_slice(label);
-        info.extend_from_slice(&sequence.to_be_bytes());
-        info.extend_from_slice(&(aad.len() as u64).to_be_bytes());
-        info.extend_from_slice(aad);
-        hk.expand(&info, out).map_err(|_| SessionError::Hkdf)
-    }
-}
-
-fn write_record_hkdf_info(
-    out: &mut [u8; HKDF_INFO_STACK_LEN],
-    label: &[u8],
-    sequence: u64,
-    aad: &[u8],
-) -> usize {
-    let mut offset = 0;
-    write_bytes(out, &mut offset, &(label.len() as u16).to_be_bytes());
-    write_bytes(out, &mut offset, label);
-    write_bytes(out, &mut offset, &sequence.to_be_bytes());
-    write_bytes(out, &mut offset, &(aad.len() as u64).to_be_bytes());
-    write_bytes(out, &mut offset, aad);
-    offset
 }
 
 fn write_bytes(out: &mut [u8; HKDF_INFO_STACK_LEN], offset: &mut usize, bytes: &[u8]) {

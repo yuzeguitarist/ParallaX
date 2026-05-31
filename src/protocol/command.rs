@@ -11,8 +11,10 @@ const SPEED_WARMUP_DOWNLOAD_DONE_MAGIC: &[u8; 4] = b"PX1W";
 const SPEED_WARMUP_UPLOAD_DONE_MAGIC: &[u8; 4] = b"PX1V";
 const SPEED_DOWNLOAD_DONE_MAGIC: &[u8; 4] = b"PX1D";
 const SPEED_UPLOAD_DONE_MAGIC: &[u8; 4] = b"PX1U";
+const MUX_FRAME_MAGIC: &[u8; 4] = b"PX1M";
 const MAX_HOST_LEN: usize = 255;
 const CONNECT_FIXED_LEN: usize = 4 + 2 + 2 + 4;
+const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct ConnectRequest {
@@ -111,6 +113,29 @@ pub struct SpeedTestAck {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxFrameKind {
+    Open,
+    Data,
+    Fin,
+    Reset,
+    Cover,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxFrame {
+    pub stream_id: u32,
+    pub kind: MuxFrameKind,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxFrameRef<'a> {
+    pub stream_id: u32,
+    pub kind: MuxFrameKind,
+    pub payload: &'a [u8],
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PqRekeyError {
     #[error("PQ rekey request is truncated")]
@@ -183,6 +208,22 @@ pub enum SpeedTestAckError {
     BadMagic,
     #[error("speed test ack length is invalid")]
     InvalidLength,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum MuxFrameError {
+    #[error("mux frame is truncated")]
+    Truncated,
+    #[error("mux frame magic mismatch")]
+    BadMagic,
+    #[error("mux frame kind is invalid")]
+    InvalidKind,
+    #[error("mux frame stream id is invalid")]
+    InvalidStreamId,
+    #[error("mux frame payload is too long")]
+    PayloadTooLong,
+    #[error("mux frame payload length is invalid")]
+    InvalidPayloadLength,
 }
 
 impl ConnectRequest {
@@ -663,6 +704,113 @@ impl SpeedTestAck {
     }
 }
 
+impl MuxFrameKind {
+    fn to_wire(self) -> u8 {
+        match self {
+            Self::Open => 1,
+            Self::Data => 2,
+            Self::Fin => 3,
+            Self::Reset => 4,
+            Self::Cover => 5,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self, MuxFrameError> {
+        match value {
+            1 => Ok(Self::Open),
+            2 => Ok(Self::Data),
+            3 => Ok(Self::Fin),
+            4 => Ok(Self::Reset),
+            5 => Ok(Self::Cover),
+            _ => Err(MuxFrameError::InvalidKind),
+        }
+    }
+}
+
+impl MuxFrame {
+    pub fn has_magic(input: &[u8]) -> bool {
+        input.len() >= 4 && &input[..4] == MUX_FRAME_MAGIC
+    }
+
+    pub fn max_payload_len(max_encoded_len: usize) -> usize {
+        max_encoded_len.saturating_sub(MUX_FRAME_FIXED_LEN)
+    }
+
+    pub fn max_open_initial_payload_len(host: &str, max_encoded_len: usize) -> usize {
+        ConnectRequest::max_initial_payload_len(host, Self::max_payload_len(max_encoded_len))
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, MuxFrameError> {
+        Self::encode_borrowed(self.stream_id, self.kind, &self.payload)
+    }
+
+    pub fn encode_borrowed(
+        stream_id: u32,
+        kind: MuxFrameKind,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, MuxFrameError> {
+        validate_mux_stream(kind, stream_id)?;
+        if payload.len() > u32::MAX as usize {
+            return Err(MuxFrameError::PayloadTooLong);
+        }
+
+        let mut out = Vec::with_capacity(MUX_FRAME_FIXED_LEN + payload.len());
+        out.extend_from_slice(MUX_FRAME_MAGIC);
+        out.extend_from_slice(&stream_id.to_be_bytes());
+        out.push(kind.to_wire());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        crate::process_hardening::exclude_transient_from_core_dump("mux_frame.payload", &out);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, MuxFrameError> {
+        let frame = Self::decode_ref(input)?;
+        Ok(Self {
+            stream_id: frame.stream_id,
+            kind: frame.kind,
+            payload: frame.payload.to_vec(),
+        })
+    }
+
+    pub fn decode_ref(input: &[u8]) -> Result<MuxFrameRef<'_>, MuxFrameError> {
+        if input.len() < 4 {
+            return Err(MuxFrameError::Truncated);
+        }
+        if &input[..4] != MUX_FRAME_MAGIC {
+            return Err(MuxFrameError::BadMagic);
+        }
+        if input.len() < MUX_FRAME_FIXED_LEN {
+            return Err(MuxFrameError::Truncated);
+        }
+
+        let stream_id = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
+        let kind = MuxFrameKind::from_wire(input[8])?;
+        validate_mux_stream(kind, stream_id)?;
+        let len = u32::from_be_bytes([input[9], input[10], input[11], input[12]]) as usize;
+        if input.len() != MUX_FRAME_FIXED_LEN + len {
+            return Err(MuxFrameError::InvalidPayloadLength);
+        }
+        Ok(MuxFrameRef {
+            stream_id,
+            kind,
+            payload: &input[MUX_FRAME_FIXED_LEN..],
+        })
+    }
+}
+
+fn validate_mux_stream(kind: MuxFrameKind, stream_id: u32) -> Result<(), MuxFrameError> {
+    match kind {
+        MuxFrameKind::Cover if stream_id == 0 => Ok(()),
+        MuxFrameKind::Open | MuxFrameKind::Data | MuxFrameKind::Fin | MuxFrameKind::Reset
+            if stream_id != 0 =>
+        {
+            Ok(())
+        }
+        _ => Err(MuxFrameError::InvalidStreamId),
+    }
+}
+
 struct Cursor<'a> {
     input: &'a [u8],
     pos: usize,
@@ -947,6 +1095,46 @@ mod tests {
         );
         assert_eq!(SpeedTestAck::decode(&download.encode()).unwrap(), download);
         assert_eq!(SpeedTestAck::decode(&upload.encode()).unwrap(), upload);
+    }
+
+    #[test]
+    fn mux_frame_round_trip() {
+        let connect = ConnectRequest {
+            host: "example.com".to_owned(),
+            port: 443,
+            initial_payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        let encoded = MuxFrame::encode_borrowed(7, MuxFrameKind::Open, &connect).unwrap();
+
+        let borrowed = MuxFrame::decode_ref(&encoded).unwrap();
+        assert_eq!(borrowed.stream_id, 7);
+        assert_eq!(borrowed.kind, MuxFrameKind::Open);
+        assert_eq!(
+            ConnectRequest::decode_ref(borrowed.payload).unwrap().host,
+            "example.com"
+        );
+        assert_eq!(MuxFrame::decode(&encoded).unwrap().payload, connect);
+    }
+
+    #[test]
+    fn mux_frame_rejects_bad_stream_ids_and_lengths() {
+        assert_eq!(
+            MuxFrame::encode_borrowed(0, MuxFrameKind::Data, b"x").unwrap_err(),
+            MuxFrameError::InvalidStreamId
+        );
+        assert_eq!(
+            MuxFrame::encode_borrowed(1, MuxFrameKind::Cover, b"").unwrap_err(),
+            MuxFrameError::InvalidStreamId
+        );
+
+        let mut encoded = MuxFrame::encode_borrowed(1, MuxFrameKind::Fin, b"").unwrap();
+        encoded.push(0);
+        assert_eq!(
+            MuxFrame::decode_ref(&encoded).unwrap_err(),
+            MuxFrameError::InvalidPayloadLength
+        );
     }
 
     #[test]

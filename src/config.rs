@@ -50,11 +50,8 @@ pub enum ConfigError {
     InvalidDelayRange,
     #[error("traffic.cover_max_interval_ms must be >= traffic.cover_min_interval_ms")]
     InvalidCoverIntervalRange,
-    #[error(
-        "traffic.max_concurrent_streams must be 1 until multiplexing has \
-         fingerprint-safe scheduling"
-    )]
-    UnsupportedMultiplexing,
+    #[error("traffic.max_concurrent_streams must be at least 1")]
+    InvalidMaxConcurrentStreams,
     #[error(
         "client.listen must bind to a loopback address because SOCKS5 has no authentication: {0}"
     )]
@@ -316,8 +313,8 @@ impl TrafficConfig {
         if self.cover_max_interval_ms < self.cover_min_interval_ms {
             return Err(ConfigError::InvalidCoverIntervalRange);
         }
-        if self.max_concurrent_streams != 1 {
-            return Err(ConfigError::UnsupportedMultiplexing);
+        if self.max_concurrent_streams == 0 {
+            return Err(ConfigError::InvalidMaxConcurrentStreams);
         }
         Ok(())
     }
@@ -631,14 +628,23 @@ server_identity_public_key = "{KEY}"
     }
 
     #[test]
-    fn rejects_multiplexing_until_safe() {
+    fn accepts_multiplexing_stream_count() {
         let traffic = TrafficConfig {
             max_concurrent_streams: 2,
             ..TrafficConfig::default()
         };
+        traffic.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_multiplexing_stream_count() {
+        let traffic = TrafficConfig {
+            max_concurrent_streams: 0,
+            ..TrafficConfig::default()
+        };
         assert!(matches!(
             traffic.validate().unwrap_err(),
-            ConfigError::UnsupportedMultiplexing
+            ConfigError::InvalidMaxConcurrentStreams
         ));
     }
 

@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use std::{io, net::SocketAddr};
 
 use tokio::net::{lookup_host, tcp::OwnedReadHalf, TcpSocket, TcpStream};
@@ -78,6 +80,25 @@ pub fn drain_ready_tcp_read(
         }
     }
     Ok(filled)
+}
+
+pub fn kernel_splice_available() -> bool {
+    cfg!(target_os = "linux")
+}
+
+#[cfg(target_os = "linux")]
+pub async fn relay_kernel_splice_bidirectional_with_idle_timeout(
+    left: TcpStream,
+    right: TcpStream,
+    idle_timeout: Duration,
+) -> io::Result<()> {
+    let left = left.into_std()?;
+    let right = right.into_std()?;
+    tokio::task::spawn_blocking(move || {
+        kernel_splice::splice_bidirectional_with_idle_timeout(left, right, idle_timeout)
+    })
+    .await
+    .map_err(|err| io::Error::other(err.to_string()))?
 }
 
 #[cfg(unix)]
@@ -444,6 +465,213 @@ fn set_quick_ack(stream: &TcpStream) {
 #[cfg(not(target_os = "linux"))]
 fn set_quick_ack(_stream: &TcpStream) {}
 
+#[cfg(target_os = "linux")]
+mod kernel_splice {
+    use std::{
+        io,
+        net::{Shutdown, TcpStream as StdTcpStream},
+        os::fd::{AsRawFd, RawFd},
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const SPLICE_CHUNK: usize = 256 * 1024;
+
+    pub(super) fn splice_bidirectional_with_idle_timeout(
+        left: StdTcpStream,
+        right: StdTcpStream,
+        idle_timeout: Duration,
+    ) -> io::Result<()> {
+        left.set_nonblocking(true)?;
+        right.set_nonblocking(true)?;
+        let left_to_right_read = left.try_clone()?;
+        let left_to_right_write = right.try_clone()?;
+        let right_to_left_read = right;
+        let right_to_left_write = left;
+        let last_progress = Arc::new(Mutex::new(Instant::now()));
+        let left_progress = Arc::clone(&last_progress);
+        let right_progress = Arc::clone(&last_progress);
+
+        let left_to_right = thread::spawn(move || {
+            splice_one_direction(
+                left_to_right_read,
+                left_to_right_write,
+                idle_timeout,
+                left_progress,
+            )
+        });
+        let right_to_left = thread::spawn(move || {
+            splice_one_direction(
+                right_to_left_read,
+                right_to_left_write,
+                idle_timeout,
+                right_progress,
+            )
+        });
+
+        join_splice_thread(left_to_right)?;
+        join_splice_thread(right_to_left)
+    }
+
+    fn join_splice_thread(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
+        handle
+            .join()
+            .map_err(|_| io::Error::other("kernel splice relay thread panicked"))?
+    }
+
+    fn splice_one_direction(
+        read_stream: StdTcpStream,
+        write_stream: StdTcpStream,
+        idle_timeout: Duration,
+        last_progress: Arc<Mutex<Instant>>,
+    ) -> io::Result<()> {
+        let pipe = Pipe::new()?;
+        loop {
+            if !poll_fd_until_progress(
+                read_stream.as_raw_fd(),
+                libc::POLLIN,
+                idle_timeout,
+                &last_progress,
+            )? {
+                return Ok(());
+            }
+            let Some(moved) = splice_fd(read_stream.as_raw_fd(), pipe.write_fd, SPLICE_CHUNK)?
+            else {
+                continue;
+            };
+            if moved == 0 {
+                let _ = write_stream.shutdown(Shutdown::Write);
+                return Ok(());
+            }
+            *last_progress
+                .lock()
+                .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))? =
+                Instant::now();
+
+            let mut remaining = moved;
+            while remaining > 0 {
+                if !poll_fd_until_progress(
+                    write_stream.as_raw_fd(),
+                    libc::POLLOUT,
+                    idle_timeout,
+                    &last_progress,
+                )? {
+                    return Ok(());
+                }
+                let Some(written) = splice_fd(pipe.read_fd, write_stream.as_raw_fd(), remaining)?
+                else {
+                    continue;
+                };
+                if written == 0 {
+                    return Ok(());
+                }
+                remaining -= written;
+                *last_progress
+                    .lock()
+                    .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))? =
+                    Instant::now();
+            }
+        }
+    }
+
+    fn poll_fd_until_progress(
+        fd: RawFd,
+        events: libc::c_short,
+        idle_timeout: Duration,
+        last_progress: &Mutex<Instant>,
+    ) -> io::Result<bool> {
+        loop {
+            let timeout = poll_timeout_ms(idle_timeout, last_progress)?;
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
+            if rc > 0 {
+                return Ok(true);
+            }
+            if rc == 0 {
+                return Ok(false);
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+
+    fn poll_timeout_ms(
+        idle_timeout: Duration,
+        last_progress: &Mutex<Instant>,
+    ) -> io::Result<libc::c_int> {
+        let elapsed = last_progress
+            .lock()
+            .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))?
+            .elapsed();
+        let remaining = idle_timeout.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            Ok(0)
+        } else {
+            Ok(remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int)
+        }
+    }
+
+    fn splice_fd(read_fd: RawFd, write_fd: RawFd, len: usize) -> io::Result<Option<usize>> {
+        loop {
+            let moved = unsafe {
+                libc::splice(
+                    read_fd,
+                    std::ptr::null_mut(),
+                    write_fd,
+                    std::ptr::null_mut(),
+                    len,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            if moved >= 0 {
+                return Ok(Some(moved as usize));
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => return Ok(None),
+                _ => return Err(err),
+            }
+        }
+    }
+
+    struct Pipe {
+        read_fd: RawFd,
+        write_fd: RawFd,
+    }
+
+    impl Pipe {
+        fn new() -> io::Result<Self> {
+            let mut fds = [0; 2];
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                read_fd: fds[0],
+                write_fd: fds[1],
+            })
+        }
+    }
+
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.read_fd);
+                libc::close(self.write_fd);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +695,10 @@ mod tests {
     async fn tuned_connect_rejects_empty_addr_list() {
         let err = connect_tuned_tcp_any(&[]).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn kernel_splice_availability_matches_target() {
+        assert_eq!(kernel_splice_available(), cfg!(target_os = "linux"));
     }
 }

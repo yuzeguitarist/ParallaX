@@ -98,7 +98,7 @@ impl DataRecordCodec {
             return Err(record::TlsRecordError::PayloadTooLarge(padded_len + AEAD_TAG_LEN).into());
         }
 
-        crate::process_hardening::exclude_from_core_dump(
+        crate::process_hardening::exclude_transient_from_core_dump(
             "data_record.seal_plaintext",
             &out[ciphertext_start..],
         );
@@ -246,7 +246,10 @@ impl DataRecordCodec {
         let payload = &record[record::TLS_HEADER_LEN..header.total_len];
         let (ciphertext, tag) = payload.split_at(payload.len() - AEAD_TAG_LEN);
         let mut padded = ciphertext.to_vec();
-        crate::process_hardening::exclude_from_core_dump("data_record.open_plaintext", &padded);
+        crate::process_hardening::exclude_transient_from_core_dump(
+            "data_record.open_plaintext",
+            &padded,
+        );
         if let Err(err) = self.aead.open_in_place_detached(&mut padded, tag, self.aad) {
             padded.zeroize();
             return Err(err.into());
@@ -291,7 +294,7 @@ impl DataRecordCodec {
         let plaintext_len = {
             let payload = &mut record[ciphertext_start..header.total_len];
             let (ciphertext, tag) = payload.split_at_mut(tag_start - ciphertext_start);
-            crate::process_hardening::exclude_from_core_dump(
+            crate::process_hardening::exclude_transient_from_core_dump(
                 "data_record.open_in_place_plaintext",
                 ciphertext,
             );
