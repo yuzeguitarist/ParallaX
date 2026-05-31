@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, sync::OnceLock};
 
 /// Apply process-local hardening for long-running ParallaX runtimes.
 ///
@@ -41,6 +41,34 @@ pub fn exclude_from_core_dump(label: &'static str, bytes: &[u8]) {
             "failed to exclude sensitive memory from core dumps"
         );
     }
+}
+
+/// Exclude hot-path transient plaintext only when explicitly requested.
+///
+/// Long-lived secrets are always protected through [`protect_secret_bytes`].
+/// Per-record relay plaintext would otherwise issue a Linux `madvise` syscall
+/// for every sealed/opened record, which dominates high-throughput data-plane
+/// traffic. Operators that prefer this extra transient-buffer hardening can set
+/// `PARALLAX_HARDEN_TRANSIENT_PLAINTEXT=1`.
+pub fn exclude_transient_from_core_dump(label: &'static str, bytes: &[u8]) {
+    if transient_plaintext_hardening_enabled() {
+        exclude_from_core_dump(label, bytes);
+    }
+}
+
+fn transient_plaintext_hardening_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PARALLAX_HARDEN_TRANSIENT_PLAINTEXT")
+            .is_ok_and(|value| transient_plaintext_setting_enabled(&value))
+    })
+}
+
+fn transient_plaintext_setting_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(unix)]
@@ -158,7 +186,7 @@ fn page_aligned_range_with_size(
 
 #[cfg(test)]
 mod tests {
-    use super::page_aligned_range_with_size;
+    use super::{page_aligned_range_with_size, transient_plaintext_setting_enabled};
 
     #[test]
     fn page_range_covers_unaligned_buffer() {
@@ -179,5 +207,15 @@ mod tests {
     #[test]
     fn empty_range_needs_no_syscall() {
         assert_eq!(page_aligned_range_with_size(0x1000, 0, 4096), None);
+    }
+
+    #[test]
+    fn transient_plaintext_setting_requires_explicit_enable() {
+        for enabled in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(transient_plaintext_setting_enabled(enabled));
+        }
+        for disabled in ["", "0", "false", "off", "no", "random"] {
+            assert!(!transient_plaintext_setting_enabled(disabled));
+        }
     }
 }
