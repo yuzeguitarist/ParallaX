@@ -362,7 +362,7 @@ impl AeadCodec {
         }
         self.ensure_can_process_next_record()?;
         let material = self.derive_record_material(aad)?;
-        let next_root = self.next_record_root(aad, ciphertext_without_tag, tag)?;
+        let next_root = self.next_record_root(aad, ciphertext_without_tag.len(), tag)?;
         let cipher = XChaCha20Poly1305::new_from_slice(&material.key)
             .expect("XChaCha20-Poly1305 key length is fixed");
         cipher
@@ -414,7 +414,7 @@ impl AeadCodec {
         ciphertext_without_tag: &[u8],
         tag: &[u8],
     ) -> Result<(), SessionError> {
-        self.root_secret = self.next_record_root(aad, ciphertext_without_tag, tag)?;
+        self.root_secret = self.next_record_root(aad, ciphertext_without_tag.len(), tag)?;
         self.sequence += 1;
         Ok(())
     }
@@ -422,7 +422,7 @@ impl AeadCodec {
     fn next_record_root(
         &self,
         aad: &[u8],
-        ciphertext_without_tag: &[u8],
+        ciphertext_len: usize,
         tag: &[u8],
     ) -> Result<[u8; KEY_LEN], SessionError> {
         let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.root_secret)
@@ -431,8 +431,7 @@ impl AeadCodec {
         mac.update(&self.sequence.to_be_bytes());
         mac.update(&(aad.len() as u64).to_be_bytes());
         mac.update(aad);
-        mac.update(&(ciphertext_without_tag.len() as u64).to_be_bytes());
-        mac.update(ciphertext_without_tag);
+        mac.update(&(ciphertext_len as u64).to_be_bytes());
         mac.update(tag);
         let digest = mac.finalize().into_bytes();
         let mut next_root = [0_u8; KEY_LEN];
