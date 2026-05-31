@@ -37,7 +37,7 @@ use crate::{
     crypto::{auth::AuthError, identity, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::{
-        ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind,
+        ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind, MuxFrameRef,
         ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
     },
     protocol::data::{
@@ -59,6 +59,7 @@ const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
 const WARM_SESSION_POOL_TARGET: usize = 4;
 const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
 const CLIENT_MUX_STREAM_CHANNEL: usize = 32;
+const MUX_FRAME_BATCH_LIMIT: usize = 32;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1108,34 +1109,53 @@ async fn client_mux_reader_loop(
         let payload = open_from_server
             .open_in_place_payload_range(&mut server_record)
             .map_err(ClientHandshakeError::from)?;
-        let frame = MuxFrame::decode_ref(&server_record[payload])?;
-        match frame.kind {
-            MuxFrameKind::Data => {
-                let sender = streams.lock().await.get(&frame.stream_id).cloned();
-                if let Some(sender) = sender {
-                    let _ = sender
-                        .send(ClientMuxEvent::Data(frame.payload.to_vec()))
-                        .await;
-                }
-            }
-            MuxFrameKind::Fin => {
-                let sender = streams.lock().await.remove(&frame.stream_id);
-                if let Some(sender) = sender {
-                    let _ = sender.send(ClientMuxEvent::Fin).await;
-                }
-            }
-            MuxFrameKind::Reset => {
-                let sender = streams.lock().await.remove(&frame.stream_id);
-                if let Some(sender) = sender {
-                    let _ = sender.send(ClientMuxEvent::Reset).await;
-                }
-            }
-            MuxFrameKind::Cover => {}
-            MuxFrameKind::Open => {
-                return Err(MuxFrameError::InvalidKind.into());
-            }
+        let mut frames = &server_record[payload];
+        while !frames.is_empty() {
+            let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
+            process_client_mux_frame(frame, &streams, cid).await?;
+            frames = &frames[used..];
         }
     }
+}
+
+async fn process_client_mux_frame(
+    frame: MuxFrameRef<'_>,
+    streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<ClientMuxEvent>>>>,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    match frame.kind {
+        MuxFrameKind::Data => {
+            let sender = streams.lock().await.get(&frame.stream_id).cloned();
+            if let Some(sender) = sender {
+                let _ = sender
+                    .send(ClientMuxEvent::Data(frame.payload.to_vec()))
+                    .await;
+            }
+        }
+        MuxFrameKind::Fin => {
+            let sender = streams.lock().await.remove(&frame.stream_id);
+            if let Some(sender) = sender {
+                let _ = sender.send(ClientMuxEvent::Fin).await;
+            }
+        }
+        MuxFrameKind::Reset => {
+            let sender = streams.lock().await.remove(&frame.stream_id);
+            if let Some(sender) = sender {
+                let _ = sender.send(ClientMuxEvent::Reset).await;
+            }
+        }
+        MuxFrameKind::Cover => {}
+        MuxFrameKind::Open => {
+            return Err(MuxFrameError::InvalidKind.into());
+        }
+    }
+    tracing::trace!(
+        cid,
+        stream_id = frame.stream_id,
+        kind = ?frame.kind,
+        "processed client mux frame"
+    );
+    Ok(())
 }
 
 async fn client_mux_writer_loop(
@@ -1147,6 +1167,7 @@ async fn client_mux_writer_loop(
 ) -> Result<(), ClientRuntimeError> {
     let mut seal_scratch =
         RelaySealScratch::with_payload_capacity(seal_to_server.max_plaintext_len());
+    let mut mux_payload_buf = Vec::with_capacity(seal_to_server.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
@@ -1170,14 +1191,17 @@ async fn client_mux_writer_loop(
                     let _ = server_write.shutdown().await;
                     return Ok(());
                 };
-                write_client_mux_frame(
+                write_client_mux_frames_batched(
                     &mut server_write,
                     &mut seal_to_server,
                     frame,
+                    ClientMuxBatchState {
+                        frame_rx: &mut frame_rx,
+                        payload_buf: &mut mux_payload_buf,
+                    },
                     &mut rng,
                     &mut seal_scratch,
-                    cid,
-                    "client-mux-writer",
+                    RelayWriteLog::new(cid, "client->server", "client-mux-writer"),
                 )
                 .await?;
             }
@@ -1208,6 +1232,88 @@ where
         RelayWriteLog::new(cid, "client->server", task_name),
     )
     .await
+}
+
+struct ClientMuxBatchState<'a> {
+    frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
+    payload_buf: &'a mut Vec<u8>,
+}
+
+async fn write_client_mux_frames_batched<W, R>(
+    writer: &mut W,
+    codec: &mut DataRecordCodec,
+    first_frame: MuxFrame,
+    batch: ClientMuxBatchState<'_>,
+    rng: &mut R,
+    scratch: &mut RelaySealScratch,
+    log: RelayWriteLog,
+) -> Result<(), ClientRuntimeError>
+where
+    W: AsyncWrite + Unpin,
+    R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
+{
+    let max_plaintext_len = codec.max_plaintext_len();
+    if max_plaintext_len == 0 {
+        return Err(ClientRuntimeError::TlsRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(0),
+        ));
+    }
+
+    batch.payload_buf.clear();
+    append_client_mux_frame(batch.payload_buf, first_frame, max_plaintext_len)?;
+    let mut drained = 0;
+    while drained < MUX_FRAME_BATCH_LIMIT {
+        let frame = match batch.frame_rx.try_recv() {
+            Ok(frame) => frame,
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        };
+        let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
+        if !batch.payload_buf.is_empty() && batch.payload_buf.len() + frame_len > max_plaintext_len
+        {
+            write_client_data_records_chunked(
+                writer,
+                codec,
+                batch.payload_buf.as_slice(),
+                rng,
+                scratch,
+                log,
+            )
+            .await?;
+            batch.payload_buf.clear();
+        }
+        append_client_mux_frame(batch.payload_buf, frame, max_plaintext_len)?;
+        drained += 1;
+    }
+
+    if !batch.payload_buf.is_empty() {
+        write_client_data_records_chunked(
+            writer,
+            codec,
+            batch.payload_buf.as_slice(),
+            rng,
+            scratch,
+            log,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn append_client_mux_frame(
+    mux_payload_buf: &mut Vec<u8>,
+    frame: MuxFrame,
+    max_plaintext_len: usize,
+) -> Result<(), ClientRuntimeError> {
+    let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
+    if frame_len > max_plaintext_len {
+        return Err(ClientRuntimeError::TlsRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(frame_len),
+        ));
+    }
+    frame.encode_into(mux_payload_buf)?;
+    Ok(())
 }
 
 async fn send_mux_frame(

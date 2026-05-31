@@ -744,24 +744,47 @@ impl MuxFrame {
         Self::encode_borrowed(self.stream_id, self.kind, &self.payload)
     }
 
+    pub fn encoded_len(payload_len: usize) -> Result<usize, MuxFrameError> {
+        MUX_FRAME_FIXED_LEN
+            .checked_add(payload_len)
+            .ok_or(MuxFrameError::PayloadTooLong)
+    }
+
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), MuxFrameError> {
+        Self::encode_borrowed_into(self.stream_id, self.kind, &self.payload, out)
+    }
+
     pub fn encode_borrowed(
         stream_id: u32,
         kind: MuxFrameKind,
         payload: &[u8],
     ) -> Result<Vec<u8>, MuxFrameError> {
+        let mut out = Vec::with_capacity(Self::encoded_len(payload.len())?);
+        Self::encode_borrowed_into(stream_id, kind, payload, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn encode_borrowed_into(
+        stream_id: u32,
+        kind: MuxFrameKind,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), MuxFrameError> {
         validate_mux_stream(kind, stream_id)?;
         if payload.len() > u32::MAX as usize {
             return Err(MuxFrameError::PayloadTooLong);
         }
 
-        let mut out = Vec::with_capacity(MUX_FRAME_FIXED_LEN + payload.len());
         out.extend_from_slice(MUX_FRAME_MAGIC);
         out.extend_from_slice(&stream_id.to_be_bytes());
         out.push(kind.to_wire());
         out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         out.extend_from_slice(payload);
-        crate::process_hardening::exclude_transient_from_core_dump("mux_frame.payload", &out);
-        Ok(out)
+        crate::process_hardening::exclude_transient_from_core_dump(
+            "mux_frame.payload",
+            out.as_slice(),
+        );
+        Ok(())
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, MuxFrameError> {
@@ -774,6 +797,26 @@ impl MuxFrame {
     }
 
     pub fn decode_ref(input: &[u8]) -> Result<MuxFrameRef<'_>, MuxFrameError> {
+        let (frame, used) = Self::decode_ref_prefix(input)?;
+        if input.len() != used {
+            return Err(MuxFrameError::InvalidPayloadLength);
+        }
+        Ok(frame)
+    }
+
+    pub fn decode_prefix(input: &[u8]) -> Result<(Self, usize), MuxFrameError> {
+        let (frame, used) = Self::decode_ref_prefix(input)?;
+        Ok((
+            Self {
+                stream_id: frame.stream_id,
+                kind: frame.kind,
+                payload: frame.payload.to_vec(),
+            },
+            used,
+        ))
+    }
+
+    pub fn decode_ref_prefix(input: &[u8]) -> Result<(MuxFrameRef<'_>, usize), MuxFrameError> {
         if input.len() < 4 {
             return Err(MuxFrameError::Truncated);
         }
@@ -788,14 +831,29 @@ impl MuxFrame {
         let kind = MuxFrameKind::from_wire(input[8])?;
         validate_mux_stream(kind, stream_id)?;
         let len = u32::from_be_bytes([input[9], input[10], input[11], input[12]]) as usize;
-        if input.len() != MUX_FRAME_FIXED_LEN + len {
+        let used = Self::encoded_len(len)?;
+        if input.len() < used {
             return Err(MuxFrameError::InvalidPayloadLength);
         }
-        Ok(MuxFrameRef {
-            stream_id,
-            kind,
-            payload: &input[MUX_FRAME_FIXED_LEN..],
-        })
+        Ok((
+            MuxFrameRef {
+                stream_id,
+                kind,
+                payload: &input[MUX_FRAME_FIXED_LEN..used],
+            },
+            used,
+        ))
+    }
+
+    pub fn decode_all(input: &[u8]) -> Result<Vec<Self>, MuxFrameError> {
+        let mut frames = Vec::new();
+        let mut rest = input;
+        while !rest.is_empty() {
+            let (frame, used) = Self::decode_prefix(rest)?;
+            frames.push(frame);
+            rest = &rest[used..];
+        }
+        Ok(frames)
     }
 }
 
@@ -1116,6 +1174,35 @@ mod tests {
             "example.com"
         );
         assert_eq!(MuxFrame::decode(&encoded).unwrap().payload, connect);
+    }
+
+    #[test]
+    fn mux_frame_prefix_decode_supports_batched_records() {
+        let first = MuxFrame {
+            stream_id: 1,
+            kind: MuxFrameKind::Data,
+            payload: b"one".to_vec(),
+        };
+        let second = MuxFrame {
+            stream_id: 3,
+            kind: MuxFrameKind::Fin,
+            payload: Vec::new(),
+        };
+        let mut encoded = Vec::new();
+        first.encode_into(&mut encoded).unwrap();
+        second.encode_into(&mut encoded).unwrap();
+
+        let (borrowed, used) = MuxFrame::decode_ref_prefix(&encoded).unwrap();
+        assert_eq!(borrowed.stream_id, 1);
+        assert_eq!(borrowed.payload, b"one");
+        assert_eq!(used, first.encode().unwrap().len());
+        assert_eq!(
+            MuxFrame::decode(&encoded).unwrap_err(),
+            MuxFrameError::InvalidPayloadLength
+        );
+
+        let decoded = MuxFrame::decode_all(&encoded).unwrap();
+        assert_eq!(decoded, vec![first, second]);
     }
 
     #[test]

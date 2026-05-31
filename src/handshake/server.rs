@@ -78,6 +78,7 @@ const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
 const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET / 2;
 const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
+const SERVER_MUX_FRAME_BATCH_LIMIT: usize = 32;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -951,13 +952,13 @@ async fn run_authenticated_data_mode(
                         }
 
                         if MuxFrame::has_magic(first_payload) {
-                            let first_frame = MuxFrame::decode(first_payload)?;
+                            let first_frames = MuxFrame::decode_all(first_payload)?;
                             return run_authenticated_mux_data_mode(
                                 client_records,
                                 client_write,
                                 client_open,
                                 server_seal,
-                                first_frame,
+                                first_frames,
                                 ServerMuxContext {
                                     fixed_data_target,
                                     timing,
@@ -1413,13 +1414,13 @@ async fn run_authenticated_mux_data_mode(
     client_write: OwnedWriteHalf,
     client_open: DataRecordCodec,
     server_seal: DataRecordCodec,
-    first_frame: MuxFrame,
+    first_frames: Vec<MuxFrame>,
     context: ServerMuxContext<'_>,
 ) -> Result<(), HandshakeServerError> {
     tracing::info!(cid = context.cid, "ParallaX mux data mode started");
     let (frame_tx, frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
     let reader =
-        server_mux_client_reader_loop(client_records, client_open, frame_tx, first_frame, context);
+        server_mux_client_reader_loop(client_records, client_open, frame_tx, first_frames, context);
     let writer = server_mux_writer_loop(
         client_write,
         server_seal,
@@ -1435,11 +1436,13 @@ async fn server_mux_client_reader_loop(
     mut client_records: TlsRecordReader<OwnedReadHalf>,
     mut client_open: DataRecordCodec,
     frame_tx: mpsc::Sender<MuxFrame>,
-    first_frame: MuxFrame,
+    first_frames: Vec<MuxFrame>,
     context: ServerMuxContext<'_>,
 ) -> Result<(), HandshakeServerError> {
     let mut target_writes = HashMap::<u32, OwnedWriteHalf>::new();
-    process_server_mux_frame(first_frame, &mut target_writes, &frame_tx, context).await?;
+    for frame in first_frames {
+        process_server_mux_frame(frame, &mut target_writes, &frame_tx, context).await?;
+    }
 
     let mut client_record = Vec::new();
     loop {
@@ -1460,8 +1463,9 @@ async fn server_mux_client_reader_loop(
             &client_record,
         );
         let payload = client_open.open_in_place_payload_range(&mut client_record)?;
-        let frame = MuxFrame::decode(&client_record[payload])?;
-        process_server_mux_frame(frame, &mut target_writes, &frame_tx, context).await?;
+        for frame in MuxFrame::decode_all(&client_record[payload])? {
+            process_server_mux_frame(frame, &mut target_writes, &frame_tx, context).await?;
+        }
     }
 }
 
@@ -1586,6 +1590,7 @@ async fn server_mux_writer_loop(
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(server_seal.max_plaintext_len());
+    let mut mux_payload_buf = Vec::with_capacity(server_seal.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
@@ -1609,14 +1614,17 @@ async fn server_mux_writer_loop(
                     let _ = client_write.shutdown().await;
                     return Ok(());
                 };
-                write_server_mux_frame(
+                write_server_mux_frames_batched(
                     &mut client_write,
                     &mut server_seal,
                     frame,
+                    ServerMuxBatchState {
+                        frame_rx: &mut frame_rx,
+                        payload_buf: &mut mux_payload_buf,
+                    },
                     &mut rng,
                     &mut seal_scratch,
-                    cid,
-                    "server-mux-writer",
+                    RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
                 )
                 .await?;
             }
@@ -1647,6 +1655,88 @@ where
         RelayWriteLog::new(cid, "server->client", task_name),
     )
     .await
+}
+
+struct ServerMuxBatchState<'a> {
+    frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
+    payload_buf: &'a mut Vec<u8>,
+}
+
+async fn write_server_mux_frames_batched<W, R>(
+    writer: &mut W,
+    codec: &mut DataRecordCodec,
+    first_frame: MuxFrame,
+    batch: ServerMuxBatchState<'_>,
+    rng: &mut R,
+    scratch: &mut RelaySealScratch,
+    log: RelayWriteLog,
+) -> Result<(), HandshakeServerError>
+where
+    W: AsyncWrite + Unpin,
+    R: Rng + rand::RngCore + ?Sized,
+{
+    let max_plaintext_len = codec.max_plaintext_len();
+    if max_plaintext_len == 0 {
+        return Err(HandshakeServerError::DataRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(0).into(),
+        ));
+    }
+
+    batch.payload_buf.clear();
+    append_server_mux_frame(batch.payload_buf, first_frame, max_plaintext_len)?;
+    let mut drained = 0;
+    while drained < SERVER_MUX_FRAME_BATCH_LIMIT {
+        let frame = match batch.frame_rx.try_recv() {
+            Ok(frame) => frame,
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        };
+        let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
+        if !batch.payload_buf.is_empty() && batch.payload_buf.len() + frame_len > max_plaintext_len
+        {
+            write_server_data_records_chunked(
+                writer,
+                codec,
+                batch.payload_buf.as_slice(),
+                rng,
+                scratch,
+                log,
+            )
+            .await?;
+            batch.payload_buf.clear();
+        }
+        append_server_mux_frame(batch.payload_buf, frame, max_plaintext_len)?;
+        drained += 1;
+    }
+
+    if !batch.payload_buf.is_empty() {
+        write_server_data_records_chunked(
+            writer,
+            codec,
+            batch.payload_buf.as_slice(),
+            rng,
+            scratch,
+            log,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn append_server_mux_frame(
+    mux_payload_buf: &mut Vec<u8>,
+    frame: MuxFrame,
+    max_plaintext_len: usize,
+) -> Result<(), HandshakeServerError> {
+    let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
+    if frame_len > max_plaintext_len {
+        return Err(HandshakeServerError::DataRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(frame_len).into(),
+        ));
+    }
+    frame.encode_into(mux_payload_buf)?;
+    Ok(())
 }
 
 async fn send_server_mux_frame(
