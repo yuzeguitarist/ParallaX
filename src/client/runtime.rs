@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     net::SocketAddr,
     sync::{
@@ -54,6 +55,7 @@ use crate::{
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
+const WARM_SESSION_POOL_TARGET: usize = 4;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -216,7 +218,7 @@ struct ClientConnectionContext<'a> {
 
 #[derive(Clone)]
 struct WarmSessionPool {
-    inner: Arc<Mutex<Option<ClientSessionTask>>>,
+    inner: Arc<Mutex<VecDeque<ClientSessionTask>>>,
     config: Arc<ClientConfig>,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
@@ -235,7 +237,7 @@ impl WarmSessionPool {
         server_identity_public: Arc<[u8]>,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(None)),
+            inner: Arc::new(Mutex::new(VecDeque::new())),
             config,
             server_addr,
             traffic,
@@ -247,16 +249,20 @@ impl WarmSessionPool {
 
     async fn ensure_started(&self) {
         let mut warm = self.inner.lock().await;
-        if warm.is_none() {
-            *warm = Some(self.spawn_session());
-        }
+        self.fill_locked(&mut warm);
     }
 
     async fn take_or_start(&self) -> ClientSessionTask {
         let mut warm = self.inner.lock().await;
-        let session = warm.take().unwrap_or_else(|| self.spawn_session());
-        *warm = Some(self.spawn_session());
+        let session = warm.pop_front().unwrap_or_else(|| self.spawn_session());
+        self.fill_locked(&mut warm);
         session
+    }
+
+    fn fill_locked(&self, warm: &mut VecDeque<ClientSessionTask>) {
+        while warm.len() < WARM_SESSION_POOL_TARGET {
+            warm.push_back(self.spawn_session());
+        }
     }
 
     fn spawn_session(&self) -> ClientSessionTask {
