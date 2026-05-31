@@ -12,6 +12,7 @@
 | How to build, generate configs, run, and verify | [Getting Started & CLI Reference](Getting-Started-&-CLI-Reference.md) |
 | How the client, server, TLS camouflage, crypto, and relay fit together | [Core Architecture](Core-Architecture.md) |
 | What every TOML field means | [Configuration Reference](Configuration-Reference.md) |
+| How pages, concepts, source files, and search terms relate | [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md) |
 | How VPS deployment works | [Deployment](Deployment.md) and [VPS Deployment Script](VPS-Deployment-Script.md) |
 | Definitions for project-specific vocabulary | [Glossary](Glossary.md) |
 
@@ -29,11 +30,12 @@
 ### Architecture path
 
 1. [Core Architecture](Core-Architecture.md)
-2. [Client Runtime & SOCKS5 Proxy](Client-Runtime-&-SOCKS5-Proxy.md)
-3. [Server Runtime & Probing Resistance](Server-Runtime-&-Probing-Resistance.md)
-4. [TLS Camouflage Layer](TLS-Camouflage-Layer.md)
-5. [Protocol Commands & Data Records](Protocol-Commands-&-Data-Records.md)
-6. [Transport Layer](Transport-Layer.md)
+2. [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md)
+3. [Client Runtime & SOCKS5 Proxy](Client-Runtime-&-SOCKS5-Proxy.md)
+4. [Server Runtime & Probing Resistance](Server-Runtime-&-Probing-Resistance.md)
+5. [TLS Camouflage Layer](TLS-Camouflage-Layer.md)
+6. [Protocol Commands & Data Records](Protocol-Commands-&-Data-Records.md)
+7. [Transport Layer](Transport-Layer.md)
 
 ### Cryptography path
 
@@ -58,11 +60,22 @@
 1. [Probing & Benchmarking](<Probing-&-Benchmarking.md>)
 2. [Protocol Benchmarks](Protocol-Benchmarks.md)
 3. [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>)
-4. Research notes in [`../docs/`](../docs/)
+4. Source-level simulator fixtures and detectors under [`../tests/gfw_sim/`](../tests/gfw_sim/)
+
+## Search-first entry points
+
+| Query / intent | Search terms | Best starting page |
+|---|---|---|
+| "How do I deploy this without copying source to the VPS?" | `binary-only`, `deploy-vps`, `systemd`, `BBR`, `Polar Signals` | [Deployment](Deployment.md) |
+| "Which docs must change if a source file changes?" | `doc-id`, `source-to-document ownership`, source path | [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md) |
+| "Where is the TCP-only product path documented?" | `product path`, `TCP/TLS`, `no --quic`, `research-only` | [ParallaX Overview](ParallaX-Overview.md), [Transport Layer](Transport-Layer.md) |
+| "Where are config validation rules documented?" | `authorized_sni`, `strict_tls13`, `replay_cache_path`, `loopback` | [Configuration Reference](Configuration-Reference.md) |
+| "What proves this still works?" | `plx check`, `plx speed`, `plx bench`, `gfw_simulator` | [Probing & Benchmarking](<Probing-&-Benchmarking.md>) |
 
 ## Complete page index
 
 - [ParallaX Overview](ParallaX-Overview.md)
+- [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md)
 - [Getting Started & CLI Reference](Getting-Started-&-CLI-Reference.md)
 - [Configuration Reference](Configuration-Reference.md)
 - [Core Architecture](Core-Architecture.md)
@@ -95,6 +108,8 @@
 ## Maintenance rules
 
 - Prefer relative links to pages and source paths; avoid stale GitHub line links.
+- Update [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md)
+  whenever a page, source owner, command, or validation hook changes.
 - When a code path is removed, update or delete the page instead of leaving a
   historical transport as if it were still active.
 - Keep command references aligned with `plx --help`.

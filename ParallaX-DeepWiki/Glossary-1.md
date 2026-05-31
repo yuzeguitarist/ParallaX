@@ -6,3 +6,4 @@ Use the maintained glossary instead:
 
 - [Glossary](Glossary.md)
 - [DeepWiki Index](README.md)
+- [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md)
