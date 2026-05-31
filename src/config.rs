@@ -475,7 +475,7 @@ const fn default_cover_max_interval_ms() -> u16 {
 }
 
 const fn default_max_concurrent_streams() -> u8 {
-    1
+    4
 }
 
 fn default_replay_cache_path() -> PathBuf {
@@ -567,7 +567,7 @@ authorized_sni = ["example.com"]
         assert_eq!(traffic.max_delay_ms, 0);
         assert_eq!(traffic.cover_min_interval_ms, 0);
         assert_eq!(traffic.cover_max_interval_ms, 0);
-        assert_eq!(traffic.max_concurrent_streams, 1);
+        assert_eq!(traffic.max_concurrent_streams, 4);
     }
 
     #[test]

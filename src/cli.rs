@@ -373,7 +373,7 @@ min_delay_ms = 0
 max_delay_ms = 0
 cover_min_interval_ms = 0
 cover_max_interval_ms = 0
-max_concurrent_streams = 1
+max_concurrent_streams = 4
 
 [server]
 listen = {}
@@ -409,7 +409,7 @@ min_delay_ms = 0
 max_delay_ms = 0
 cover_min_interval_ms = 0
 cover_max_interval_ms = 0
-max_concurrent_streams = 1
+max_concurrent_streams = 4
 
 [client]
 listen = {}

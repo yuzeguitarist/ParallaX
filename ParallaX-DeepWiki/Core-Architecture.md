@@ -77,8 +77,8 @@ Details: [Server Runtime & Probing Resistance](Server-Runtime-&-Probing-Resistan
 - Server SNI allowlist must not be empty.
 - A malformed or unauthorized first record must not produce a distinct proxy
   failure on the wire.
-- `max_concurrent_streams` remains `1` until scheduling has a fingerprint-safe
-  design.
+- `max_concurrent_streams` must stay at least `1`; values above `1` share one
+  authenticated session across multiple SOCKS streams.
 - Generated secret configs must not be group/world-readable.
 - Benchmarks are fixed-parameter; adding/removing cases changes the baseline.
 
