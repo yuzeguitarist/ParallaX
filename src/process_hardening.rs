@@ -1,5 +1,7 @@
 use std::{io, sync::OnceLock};
 
+const HARDEN_TRANSIENT_ENV: &str = "PARALLAX_HARDEN_TRANSIENT_PLAINTEXT";
+
 /// Apply process-local hardening for long-running ParallaX runtimes.
 ///
 /// These settings are best-effort and intentionally do not fail startup: a
@@ -59,7 +61,7 @@ pub fn exclude_transient_from_core_dump(label: &'static str, bytes: &[u8]) {
 fn transient_plaintext_hardening_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("PARALLAX_HARDEN_TRANSIENT_PLAINTEXT")
+        std::env::var(HARDEN_TRANSIENT_ENV)
             .is_ok_and(|value| transient_plaintext_setting_enabled(&value))
     })
 }
@@ -70,7 +72,6 @@ fn transient_plaintext_setting_enabled(value: &str) -> bool {
         "1" | "true" | "yes" | "on"
     )
 }
-
 #[cfg(unix)]
 fn disable_core_dumps() -> io::Result<()> {
     let limit = libc::rlimit {
@@ -186,7 +187,10 @@ fn page_aligned_range_with_size(
 
 #[cfg(test)]
 mod tests {
-    use super::{page_aligned_range_with_size, transient_plaintext_setting_enabled};
+    use super::{
+        page_aligned_range_with_size, transient_plaintext_hardening_enabled,
+        transient_plaintext_setting_enabled,
+    };
 
     #[test]
     fn page_range_covers_unaligned_buffer() {
@@ -217,5 +221,10 @@ mod tests {
         for disabled in ["", "0", "false", "off", "no", "random"] {
             assert!(!transient_plaintext_setting_enabled(disabled));
         }
+    }
+
+    #[test]
+    fn transient_plaintext_setting_defaults_off() {
+        assert!(!transient_plaintext_hardening_enabled());
     }
 }

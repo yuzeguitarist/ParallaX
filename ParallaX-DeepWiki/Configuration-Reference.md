@@ -35,11 +35,12 @@ authentication and the hybrid rekey sandwich input.
 | `max_delay_ms` | `0` | `0` disables timing jitter. |
 | `cover_min_interval_ms` | `0` | `cover_max_interval_ms >= cover_min_interval_ms` |
 | `cover_max_interval_ms` | `0` | `0` disables cover traffic. |
-| `max_concurrent_streams` | `1` | Must remain `1` until multiplexing has fingerprint-safe scheduling. |
+| `max_concurrent_streams` | `4` | Must be at least `1`; values above `1` enable authenticated session multiplexing. |
 
 Generated configs set every traffic-shaping value to `0` except
-`max_concurrent_streams = 1`. This keeps the default path speed-first and avoids
-claiming unvalidated traffic-shaping behavior.
+`max_concurrent_streams = 4`. This keeps the default path speed-first while
+allowing several browser-originated SOCKS streams to share one authenticated
+ParallaX session.
 
 ## `[client]`
 
@@ -81,7 +82,7 @@ min_delay_ms = 0
 max_delay_ms = 0
 cover_min_interval_ms = 0
 cover_max_interval_ms = 0
-max_concurrent_streams = 1
+max_concurrent_streams = 4
 
 [server]
 listen = "0.0.0.0:443"
@@ -109,7 +110,7 @@ min_delay_ms = 0
 max_delay_ms = 0
 cover_min_interval_ms = 0
 cover_max_interval_ms = 0
-max_concurrent_streams = 1
+max_concurrent_streams = 4
 
 [client]
 listen = "127.0.0.1:1080"

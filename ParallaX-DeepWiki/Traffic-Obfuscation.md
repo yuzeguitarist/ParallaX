@@ -23,11 +23,11 @@ min_delay_ms = 0
 max_delay_ms = 0
 cover_min_interval_ms = 0
 cover_max_interval_ms = 0
-max_concurrent_streams = 1
+max_concurrent_streams = 4
 ```
 
-`max_concurrent_streams` is intentionally constrained to `1` until a
-fingerprint-safe multiplexing scheduler exists.
+`max_concurrent_streams > 1` enables authenticated session multiplexing so
+several browser-originated SOCKS streams can share one ParallaX data session.
 
 ## Integration points
 

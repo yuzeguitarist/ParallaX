@@ -209,7 +209,7 @@ min_delay_ms = 0
 max_delay_ms = 0
 cover_min_interval_ms = 0
 cover_max_interval_ms = 0
-max_concurrent_streams = 1
+max_concurrent_streams = 4
 
 [server]
 listen = "0.0.0.0:443"
@@ -237,7 +237,7 @@ min_delay_ms = 0
 max_delay_ms = 0
 cover_min_interval_ms = 0
 cover_max_interval_ms = 0
-max_concurrent_streams = 1
+max_concurrent_streams = 4
 
 [client]
 listen = "127.0.0.1:1080"

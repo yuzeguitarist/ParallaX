@@ -1,9 +1,9 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{Mutex, Semaphore, TryAcquireError},
+    sync::{mpsc, Mutex, Semaphore, TryAcquireError},
     time::{sleep, Instant},
 };
 
@@ -37,7 +37,8 @@ use crate::{
     crypto::{auth::AuthError, identity, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::{
-        ConnectRequest, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
+        ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind,
+        ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
     },
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
@@ -56,6 +57,8 @@ use crate::{
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
 const WARM_SESSION_POOL_TARGET: usize = 4;
+const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
+const CLIENT_MUX_STREAM_CHANNEL: usize = 32;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -71,6 +74,8 @@ pub enum ClientRuntimeError {
     Io(#[from] io::Error),
     #[error("SOCKS error: {0}")]
     Socks(#[from] SocksError),
+    #[error("connect request error: {0}")]
+    ConnectRequest(#[from] ConnectRequestError),
     #[error("Safari 26 TLS camouflage error: {0}")]
     Safari26Tls(#[from] Safari26TlsError),
     #[error("ClientHello auth error: {0}")]
@@ -83,6 +88,8 @@ pub enum ClientRuntimeError {
     ServerIdentityTooLarge,
     #[error("TLS record error: {0}")]
     TlsRecord(#[from] TlsRecordError),
+    #[error("mux frame error: {0}")]
+    MuxFrame(#[from] MuxFrameError),
     #[error("blocking crypto task failed: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
 }
@@ -112,15 +119,33 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     );
     let listener = TcpListener::bind(client.listen).await?;
     let server_addr = ServerAddrResolver::new(&client.server_addr).await?;
-    let warm_sessions = WarmSessionPool::new(
-        Arc::new(client.clone()),
-        server_addr.clone(),
-        config.traffic,
-        Arc::clone(&psk),
-        server_public,
-        Arc::clone(&server_identity_public),
-    );
-    warm_sessions.ensure_started().await;
+    let client = Arc::new(client);
+    let warm_sessions = if config.traffic.max_concurrent_streams == 1 {
+        let warm_sessions = WarmSessionPool::new(
+            Arc::clone(&client),
+            server_addr.clone(),
+            config.traffic,
+            Arc::clone(&psk),
+            server_public,
+            Arc::clone(&server_identity_public),
+        );
+        warm_sessions.ensure_started().await;
+        Some(warm_sessions)
+    } else {
+        None
+    };
+    let mux_sessions = if config.traffic.max_concurrent_streams > 1 {
+        Some(ClientMuxPool::new(
+            Arc::clone(&client),
+            server_addr.clone(),
+            config.traffic,
+            Arc::clone(&psk),
+            server_public,
+            Arc::clone(&server_identity_public),
+        ))
+    } else {
+        None
+    };
     let connection_limit = relay_connection_limit()?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
     tracing::info!(
@@ -158,22 +183,31 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             }
         };
         let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-        let client = client.clone();
+        let client = Arc::clone(&client);
         let psk = Arc::clone(&psk);
         let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
         let server_addr = server_addr.clone();
         let warm_sessions = warm_sessions.clone();
+        let mux_sessions = mux_sessions.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
+            if let Some(mux_sessions) = mux_sessions {
+                if let Err(err) =
+                    handle_local_mux_connection_with_cid(local, mux_sessions, cid).await
+                {
+                    tracing::debug!(cid, %peer, error = %err, "client mux connection closed");
+                }
+                return;
+            }
             let context = ClientConnectionContext {
-                config: &client,
+                config: client.as_ref(),
                 server_addr,
                 traffic,
                 psk: psk.as_ref().as_slice(),
                 server_public: &server_public,
                 server_identity_public,
-                warm_sessions: Some(warm_sessions),
+                warm_sessions,
             };
             if let Err(err) = handle_local_connection_with_cid(local, context, cid).await {
                 tracing::debug!(cid, %peer, error = %err, "client connection closed");
@@ -283,6 +317,178 @@ impl WarmSessionPool {
             )
             .await
         })
+    }
+}
+
+#[derive(Clone)]
+struct ClientMuxPool {
+    inner: Arc<Mutex<Option<ClientMuxHandle>>>,
+    config: Arc<ClientConfig>,
+    server_addr: ServerAddrResolver,
+    traffic: TrafficConfig,
+    psk: Arc<Zeroizing<Vec<u8>>>,
+    server_public: [u8; 32],
+    server_identity_public: Arc<[u8]>,
+}
+
+#[derive(Clone)]
+struct ClientMuxHandle {
+    frame_tx: mpsc::Sender<MuxFrame>,
+    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<ClientMuxEvent>>>>,
+    next_stream_id: Arc<AtomicU32>,
+    stream_slots: Arc<Semaphore>,
+    chunk_size: usize,
+}
+
+enum ClientMuxEvent {
+    Data(Vec<u8>),
+    Fin,
+    Reset,
+}
+
+impl ClientMuxPool {
+    fn new(
+        config: Arc<ClientConfig>,
+        server_addr: ServerAddrResolver,
+        traffic: TrafficConfig,
+        psk: Arc<Zeroizing<Vec<u8>>>,
+        server_public: [u8; 32],
+        server_identity_public: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            config,
+            server_addr,
+            traffic,
+            psk,
+            server_public,
+            server_identity_public,
+        }
+    }
+
+    async fn handle(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
+        let mut mux = self.inner.lock().await;
+        if let Some(handle) = mux.as_ref() {
+            if !handle.frame_tx.is_closed() {
+                return Ok(handle.clone());
+            }
+        }
+
+        let handle = self.start_session().await?;
+        *mux = Some(handle.clone());
+        Ok(handle)
+    }
+
+    async fn start_session(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
+        let (server, data_session) = establish_authenticated_data_session_with_resolver(
+            &self.server_addr,
+            self.config.as_ref(),
+            self.traffic,
+            self.psk.as_ref().as_slice(),
+            &self.server_public,
+            Arc::clone(&self.server_identity_public),
+        )
+        .await?;
+        let (server_read, server_write) = server.into_split();
+        let (seal_to_server, open_from_server) = data_session.into_data_codecs();
+        let stream_limit = self.traffic.max_concurrent_streams as usize;
+        let channel_capacity = stream_limit
+            .saturating_mul(MUX_FRAME_CHANNEL_PER_STREAM)
+            .max(1);
+        let (frame_tx, frame_rx) = mpsc::channel(channel_capacity);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let session_cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let reader_streams = Arc::clone(&streams);
+        tokio::spawn(async move {
+            if let Err(err) =
+                client_mux_reader_loop(server_read, open_from_server, reader_streams, session_cid)
+                    .await
+            {
+                tracing::debug!(cid = session_cid, error = %err, "client mux reader stopped");
+            }
+        });
+        let cover = CoverTrafficProfile::from_config(self.traffic);
+        tokio::spawn(async move {
+            if let Err(err) =
+                client_mux_writer_loop(server_write, seal_to_server, frame_rx, cover, session_cid)
+                    .await
+            {
+                tracing::debug!(cid = session_cid, error = %err, "client mux writer stopped");
+            }
+        });
+
+        Ok(ClientMuxHandle {
+            frame_tx,
+            streams,
+            next_stream_id: Arc::new(AtomicU32::new(1)),
+            stream_slots: Arc::new(Semaphore::new(stream_limit)),
+            chunk_size: max_plaintext_len(self.traffic.max_padding),
+        })
+    }
+}
+
+async fn handle_local_mux_connection_with_cid(
+    mut local: TcpStream,
+    mux_pool: ClientMuxPool,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    tune_tcp_stream(&local)?;
+    tracing::debug!(
+        cid,
+        task_name = "client-mux-connection",
+        "accepted SOCKS connection for mux session"
+    );
+
+    let request = socks::accept_connect(&mut local).await?;
+    let mux = mux_pool.handle().await?;
+    let _stream_permit = Arc::clone(&mux.stream_slots)
+        .acquire_owned()
+        .await
+        .map_err(|_| io::Error::other("client mux stream limiter was closed"))?;
+    let stream_id = next_mux_stream_id(&mux.next_stream_id);
+    let initial_payload_cap = MuxFrame::max_open_initial_payload_len(&request.host, mux.chunk_size);
+    let initial_payload = initial_payload::read_initial_payload(&mut local, initial_payload_cap)
+        .await
+        .map_err(ClientRuntimeError::Io)?;
+    let connect_request = ConnectRequest {
+        host: request.host,
+        port: request.port,
+        initial_payload,
+    };
+    let connect_payload = connect_request.encode()?;
+    let open_frame = MuxFrame {
+        stream_id,
+        kind: MuxFrameKind::Open,
+        payload: connect_payload,
+    };
+
+    let (event_tx, event_rx) = mpsc::channel(CLIENT_MUX_STREAM_CHANNEL);
+    mux.streams.lock().await.insert(stream_id, event_tx);
+    if let Err(err) = mux.frame_tx.send(open_frame).await {
+        mux.streams.lock().await.remove(&stream_id);
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into());
+    }
+
+    let (local_read, local_write) = local.into_split();
+    let upload = client_mux_upload_loop(
+        local_read,
+        mux.frame_tx.clone(),
+        stream_id,
+        mux.chunk_size,
+        cid,
+    );
+    let download = client_mux_download_loop(local_write, event_rx, cid);
+    let result = tokio::try_join!(upload, download).map(|_| ());
+    mux.streams.lock().await.remove(&stream_id);
+    result
+}
+
+fn next_mux_stream_id(next: &AtomicU32) -> u32 {
+    loop {
+        let id = next.fetch_add(2, Ordering::Relaxed) | 1;
+        if id != 0 {
+            return id;
+        }
     }
 }
 
@@ -809,6 +1015,217 @@ async fn client_download_loop(
     }
 }
 
+async fn client_mux_upload_loop(
+    mut local_read: OwnedReadHalf,
+    frame_tx: mpsc::Sender<MuxFrame>,
+    stream_id: u32,
+    chunk_size: usize,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    let mut local_buf = vec![0_u8; relay_read_buffer_len(MuxFrame::max_payload_len(chunk_size))];
+    let max_payload_len = MuxFrame::max_payload_len(chunk_size);
+    if max_payload_len == 0 {
+        return Err(ClientRuntimeError::TlsRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(0),
+        ));
+    }
+
+    loop {
+        let n = local_read.read(&mut local_buf).await?;
+        if n == 0 {
+            send_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
+            return Ok(());
+        }
+        let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+        for chunk in local_buf[..n].chunks(max_payload_len) {
+            send_mux_frame(&frame_tx, stream_id, MuxFrameKind::Data, chunk.to_vec()).await?;
+        }
+        tracing::trace!(
+            cid,
+            stream_id,
+            bytes = n,
+            "queued client mux upload payload"
+        );
+    }
+}
+
+async fn client_mux_download_loop(
+    mut local_write: OwnedWriteHalf,
+    mut event_rx: mpsc::Receiver<ClientMuxEvent>,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            ClientMuxEvent::Data(payload) => {
+                if !payload.is_empty() {
+                    local_write.write_all(&payload).await?;
+                }
+            }
+            ClientMuxEvent::Fin => {
+                let _ = local_write.shutdown().await;
+                return Ok(());
+            }
+            ClientMuxEvent::Reset => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("server reset mux stream for cid {cid}"),
+                )
+                .into());
+            }
+        }
+    }
+    let _ = local_write.shutdown().await;
+    Ok(())
+}
+
+async fn client_mux_reader_loop(
+    server_read: OwnedReadHalf,
+    mut open_from_server: DataRecordCodec,
+    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<ClientMuxEvent>>>>,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    let mut server_records = TlsRecordReader::new(server_read);
+    let mut server_record = Vec::new();
+
+    loop {
+        match server_records.read_record_into(&mut server_record).await {
+            Ok(()) => {}
+            Err(err) if is_clean_close(&err) => {
+                streams.lock().await.clear();
+                return Ok(());
+            }
+            Err(err) => {
+                streams.lock().await.clear();
+                return Err(ClientRuntimeError::Io(err));
+            }
+        };
+        log_record_read(
+            cid,
+            "server->client",
+            "client-mux-outer-reader",
+            &server_record,
+        );
+        let payload = open_from_server
+            .open_in_place_payload_range(&mut server_record)
+            .map_err(ClientHandshakeError::from)?;
+        let frame = MuxFrame::decode_ref(&server_record[payload])?;
+        match frame.kind {
+            MuxFrameKind::Data => {
+                let sender = streams.lock().await.get(&frame.stream_id).cloned();
+                if let Some(sender) = sender {
+                    let _ = sender
+                        .send(ClientMuxEvent::Data(frame.payload.to_vec()))
+                        .await;
+                }
+            }
+            MuxFrameKind::Fin => {
+                let sender = streams.lock().await.remove(&frame.stream_id);
+                if let Some(sender) = sender {
+                    let _ = sender.send(ClientMuxEvent::Fin).await;
+                }
+            }
+            MuxFrameKind::Reset => {
+                let sender = streams.lock().await.remove(&frame.stream_id);
+                if let Some(sender) = sender {
+                    let _ = sender.send(ClientMuxEvent::Reset).await;
+                }
+            }
+            MuxFrameKind::Cover => {}
+            MuxFrameKind::Open => {
+                return Err(MuxFrameError::InvalidKind.into());
+            }
+        }
+    }
+}
+
+async fn client_mux_writer_loop(
+    mut server_write: OwnedWriteHalf,
+    mut seal_to_server: DataRecordCodec,
+    mut frame_rx: mpsc::Receiver<MuxFrame>,
+    cover: CoverTrafficProfile,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    let mut seal_scratch =
+        RelaySealScratch::with_payload_capacity(seal_to_server.max_plaintext_len());
+    let mut rng = StdRng::from_entropy();
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+
+    loop {
+        tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                write_client_mux_frame(
+                    &mut server_write,
+                    &mut seal_to_server,
+                    MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
+                    &mut rng,
+                    &mut seal_scratch,
+                    cid,
+                    "client-mux-cover-writer",
+                )
+                .await?;
+                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
+            }
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else {
+                    let _ = server_write.shutdown().await;
+                    return Ok(());
+                };
+                write_client_mux_frame(
+                    &mut server_write,
+                    &mut seal_to_server,
+                    frame,
+                    &mut rng,
+                    &mut seal_scratch,
+                    cid,
+                    "client-mux-writer",
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+async fn write_client_mux_frame<W, R>(
+    writer: &mut W,
+    codec: &mut DataRecordCodec,
+    frame: MuxFrame,
+    rng: &mut R,
+    scratch: &mut RelaySealScratch,
+    cid: u64,
+    task_name: &'static str,
+) -> Result<(), ClientRuntimeError>
+where
+    W: AsyncWrite + Unpin,
+    R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
+{
+    let frame_payload = frame.encode()?;
+    write_client_data_records_chunked(
+        writer,
+        codec,
+        &frame_payload,
+        rng,
+        scratch,
+        RelayWriteLog::new(cid, "client->server", task_name),
+    )
+    .await
+}
+
+async fn send_mux_frame(
+    frame_tx: &mpsc::Sender<MuxFrame>,
+    stream_id: u32,
+    kind: MuxFrameKind,
+    payload: Vec<u8>,
+) -> Result<(), ClientRuntimeError> {
+    frame_tx
+        .send(MuxFrame {
+            stream_id,
+            kind,
+            payload,
+        })
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into())
+}
+
 async fn write_client_data_records_chunked<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,
@@ -933,7 +1350,7 @@ mod tests {
     use crate::{
         config::ServerConfig,
         crypto::{
-            pq,
+            identity, pq,
             session::{derive_client_keys, expand_epoch_keys, X25519KeyPair},
         },
         handshake::{client::data_codecs, server},
@@ -1130,12 +1547,83 @@ mod tests {
         wait_for_task("fallback", fallback_task).await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_client_reaches_two_targets_over_one_authenticated_session() {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_multi_echo_target(2).await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let mux_traffic = TrafficConfig {
+            max_concurrent_streams: 2,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_with_traffic(server_config, mux_traffic).await;
+        let (local_addr, client_task) = spawn_mux_local_client(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            2,
+        )
+        .await;
+
+        let app_one = connect_socks_target(local_addr, target_addr).await;
+        let app_two = connect_socks_target(local_addr, target_addr).await;
+        let first = assert_payload_round_trip(app_one, b"mux-stream-one".to_vec());
+        let second = assert_payload_round_trip(app_two, b"mux-stream-two".to_vec());
+        let ((), ()) = tokio::join!(first, second);
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
     async fn spawn_camouflage_fallback() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             run_camouflage_tls_server(stream).await;
+        });
+        (addr, task)
+    }
+
+    async fn spawn_multi_echo_target(count: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut tasks = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tasks.push(tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 64 * 1024];
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        stream.write_all(&buf[..n]).await.unwrap();
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
         });
         (addr, task)
     }
@@ -1198,13 +1686,71 @@ mod tests {
     async fn spawn_parallax_server(
         server_config: ServerConfig,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_parallax_server_with_traffic(server_config, TrafficConfig::default()).await
+    }
+
+    async fn spawn_parallax_server_with_traffic(
+        server_config: ServerConfig,
+        traffic: TrafficConfig,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            server::handle_connection(stream, &server_config, TrafficConfig::default(), PSK)
+            server::handle_connection(stream, &server_config, traffic, PSK)
                 .await
                 .unwrap();
+        });
+        (addr, task)
+    }
+
+    async fn spawn_mux_local_client(
+        parallax_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_pq_keys: &pq::MlKemKeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+        stream_count: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_config = Arc::new(ClientConfig {
+            listen: addr,
+            server_addr: parallax_addr.to_string(),
+            sni: "example.com".to_owned(),
+            server_public_key: STANDARD.encode(server_keys.public),
+            server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
+            server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+        });
+        let traffic = TrafficConfig {
+            max_concurrent_streams: stream_count as u8,
+            ..TrafficConfig::default()
+        };
+        let server_addr = ServerAddrResolver::new(&client_config.server_addr)
+            .await
+            .unwrap();
+        let mux_pool = ClientMuxPool::new(
+            Arc::clone(&client_config),
+            server_addr,
+            traffic,
+            Arc::new(zeroize::Zeroizing::new(PSK.to_vec())),
+            server_keys.public,
+            Arc::from(server_identity_keys.public.clone().into_boxed_slice()),
+        );
+        let task = tokio::spawn(async move {
+            let mut tasks = Vec::with_capacity(stream_count);
+            for _ in 0..stream_count {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mux_pool = mux_pool.clone();
+                let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                tasks.push(tokio::spawn(async move {
+                    handle_local_mux_connection_with_cid(stream, mux_pool, cid)
+                        .await
+                        .unwrap();
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
         });
         (addr, task)
     }
@@ -1292,6 +1838,17 @@ mod tests {
 
         drop(app_read);
         drop(app_write);
+    }
+
+    async fn assert_payload_round_trip(mut app: TcpStream, payload: Vec<u8>) {
+        app.write_all(&payload).await.unwrap();
+        let mut response = vec![0_u8; payload.len()];
+        timeout(Duration::from_secs(10), app.read_exact(&mut response))
+            .await
+            .unwrap_or_else(|_| panic!("mux payload round trip timed out"))
+            .unwrap();
+        assert_eq!(response, payload);
+        app.shutdown().await.unwrap();
     }
 
     async fn wait_for_task(name: &str, task: tokio::task::JoinHandle<()>) {
