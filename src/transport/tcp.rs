@@ -1,10 +1,14 @@
 use std::{io, net::SocketAddr};
 
-use tokio::net::{lookup_host, tcp::OwnedReadHalf, TcpSocket, TcpStream};
+use tokio::{
+    net::{lookup_host, tcp::OwnedReadHalf, TcpSocket, TcpStream},
+    task::JoinSet,
+};
 
 const RESERVED_PROCESS_FDS: usize = 64;
 const FDS_PER_RELAY_CONNECTION: usize = 2;
 const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
+const MAX_PARALLEL_CONNECT_ATTEMPTS: usize = 4;
 #[cfg(target_os = "linux")]
 const TCP_NOTSENT_LOWAT_BYTES: libc::c_uint = 256 * 1024;
 #[cfg(target_os = "linux")]
@@ -16,17 +20,36 @@ pub async fn connect_tuned_tcp_host(addr: &str) -> io::Result<TcpStream> {
 }
 
 pub async fn connect_tuned_tcp_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    match addrs {
+        [] => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no socket addresses resolved",
+        )),
+        [addr] => connect_tuned_tcp_addr(*addr).await,
+        _ => connect_tuned_tcp_race(addrs).await,
+    }
+}
+
+async fn connect_tuned_tcp_race(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut attempts = JoinSet::new();
+    for addr in addrs.iter().copied().take(MAX_PARALLEL_CONNECT_ATTEMPTS) {
+        attempts.spawn(async move { connect_tuned_tcp_addr(addr).await });
+    }
+
     let mut last_err = None;
-    for addr in addrs {
-        match connect_tuned_tcp_addr(*addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(err) => last_err = Some(err),
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok(Ok(stream)) => {
+                attempts.abort_all();
+                return Ok(stream);
+            }
+            Ok(Err(err)) => last_err = Some(err),
+            Err(err) => last_err = Some(io::Error::other(err)),
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "no socket addresses resolved")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| io::Error::other("all parallel TCP connect attempts were cancelled")))
 }
 
 pub async fn connect_tuned_tcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
@@ -467,5 +490,24 @@ mod tests {
     async fn tuned_connect_rejects_empty_addr_list() {
         let err = connect_tuned_tcp_any(&[]).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn tuned_connect_races_to_reachable_addr() {
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_addr = unused.local_addr().unwrap();
+        drop(unused);
+
+        let reachable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable_addr = reachable.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let _ = reachable.accept().await.unwrap();
+        });
+
+        let stream = connect_tuned_tcp_any(&[refused_addr, reachable_addr])
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable_addr);
+        accept.await.unwrap();
     }
 }
