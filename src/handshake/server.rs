@@ -1280,7 +1280,6 @@ fn apply_server_pq_rekey(
         keys.transcript_hash,
         *x25519_shared_secret,
     )?;
-    next_keys.protect_secret_memory();
     client_open.rekey(next_keys.client_key, next_keys.client_nonce);
     server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
     Ok(next_keys)

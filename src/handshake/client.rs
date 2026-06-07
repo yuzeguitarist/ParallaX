@@ -382,7 +382,6 @@ impl ClientDataSession {
             self.keys.transcript_hash,
             *x25519_shared_secret,
         )?;
-        next_keys.protect_secret_memory();
 
         self.seal_to_server
             .rekey(next_keys.client_key, next_keys.client_nonce);
