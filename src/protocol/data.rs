@@ -152,21 +152,23 @@ impl DataRecordCodec {
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
+        let max_padding = self.padding.max_len();
+        if payload.len() <= max_chunk_len {
+            out.reserve(record_capacity(payload.len(), max_padding));
+            let range = self.seal_into_reserved(payload, rng, out, false)?;
+            records.push(SealedRecord {
+                range,
+                plaintext_len: payload.len(),
+            });
+            return Ok(());
+        }
         let chunk_count = chunk_count(payload.len(), max_chunk_len);
         records.reserve(chunk_count);
         out.reserve(chunked_records_capacity(
             payload.len(),
             chunk_count,
-            self.padding.max_len(),
+            max_padding,
         ));
-        if payload.is_empty() {
-            let range = self.seal_into_reserved(payload, rng, out, false)?;
-            records.push(SealedRecord {
-                range,
-                plaintext_len: 0,
-            });
-            return Ok(());
-        }
 
         for chunk in payload.chunks(max_chunk_len) {
             let range = self.seal_into_reserved(chunk, rng, out, false)?;
@@ -191,16 +193,18 @@ impl DataRecordCodec {
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
+        let max_padding = self.padding.max_len();
+        if payload.len() <= max_chunk_len {
+            out.reserve(record_capacity(payload.len(), max_padding));
+            self.seal_into_reserved(payload, rng, out, false)?;
+            return Ok(());
+        }
         let chunk_count = chunk_count(payload.len(), max_chunk_len);
         out.reserve(chunked_records_capacity(
             payload.len(),
             chunk_count,
-            self.padding.max_len(),
+            max_padding,
         ));
-        if payload.is_empty() {
-            self.seal_into_reserved(payload, rng, out, false)?;
-            return Ok(());
-        }
 
         for chunk in payload.chunks(max_chunk_len) {
             self.seal_into_reserved(chunk, rng, out, false)?;
@@ -561,6 +565,26 @@ mod tests {
             offset = end;
         }
         assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn seal_chunks_into_untracked_single_record_keeps_wire_format() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(23);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut out = Vec::new();
+
+        enc.seal_chunks_into_untracked(b"hello", &mut rng, &mut out)
+            .unwrap();
+
+        let header = record::parse_header(&out).unwrap();
+        assert_eq!(header.total_len, out.len());
+        assert_eq!(dec.open(&out).unwrap(), b"hello");
     }
 
     #[test]
