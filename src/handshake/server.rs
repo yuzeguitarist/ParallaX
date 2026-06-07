@@ -49,9 +49,10 @@ use crate::{
     protocol::{
         command::{
             ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind,
-            PqRekeyError, PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError,
-            ServerIdentityProof, ServerIdentityProofError, ServerKeyExchange,
-            ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest, SpeedTestRequestError,
+            MuxFrameRef, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
+            ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
+            ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest,
+            SpeedTestRequestError,
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError,
@@ -1441,7 +1442,17 @@ async fn server_mux_client_reader_loop(
 ) -> Result<(), HandshakeServerError> {
     let mut target_writes = HashMap::<u32, OwnedWriteHalf>::new();
     for frame in first_frames {
-        process_server_mux_frame(frame, &mut target_writes, &frame_tx, context).await?;
+        process_server_mux_frame(
+            MuxFrameRef {
+                stream_id: frame.stream_id,
+                kind: frame.kind,
+                payload: &frame.payload,
+            },
+            &mut target_writes,
+            &frame_tx,
+            context,
+        )
+        .await?;
     }
 
     let mut client_record = Vec::new();
@@ -1463,14 +1474,17 @@ async fn server_mux_client_reader_loop(
             &client_record,
         );
         let payload = client_open.open_in_place_payload_range(&mut client_record)?;
-        for frame in MuxFrame::decode_all(&client_record[payload])? {
+        let mut frames = &client_record[payload];
+        while !frames.is_empty() {
+            let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
             process_server_mux_frame(frame, &mut target_writes, &frame_tx, context).await?;
+            frames = &frames[used..];
         }
     }
 }
 
 async fn process_server_mux_frame(
-    frame: MuxFrame,
+    frame: MuxFrameRef<'_>,
     target_writes: &mut HashMap<u32, OwnedWriteHalf>,
     frame_tx: &mpsc::Sender<MuxFrame>,
     context: ServerMuxContext<'_>,
@@ -1482,7 +1496,7 @@ async fn process_server_mux_frame(
                     .await?;
                 return Ok(());
             }
-            let mut payload = frame.payload;
+            let mut payload = frame.payload.to_vec();
             let (target_addr, initial_payload) = {
                 let (target_addr, initial_payload) =
                     resolve_connect_target(payload.as_mut_slice(), context.fixed_data_target)?;
