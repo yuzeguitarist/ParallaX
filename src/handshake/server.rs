@@ -1606,6 +1606,28 @@ async fn server_mux_writer_loop(
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(server_seal.max_plaintext_len());
     let mut mux_payload_buf = Vec::with_capacity(server_seal.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
+    if !cover.is_enabled() {
+        loop {
+            let Some(frame) = frame_rx.recv().await else {
+                let _ = client_write.shutdown().await;
+                return Ok(());
+            };
+            write_server_mux_frames_batched(
+                &mut client_write,
+                &mut server_seal,
+                frame,
+                ServerMuxBatchState {
+                    frame_rx: &mut frame_rx,
+                    payload_buf: &mut mux_payload_buf,
+                },
+                &mut rng,
+                &mut seal_scratch,
+                RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
+            )
+            .await?;
+        }
+    }
+
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
     loop {
