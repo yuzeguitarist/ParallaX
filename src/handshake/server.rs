@@ -1984,6 +1984,32 @@ async fn server_download_loop(
 ) -> Result<(), HandshakeServerError> {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
     let mut rng = StdRng::from_entropy();
+    if !cover.is_enabled() {
+        loop {
+            let n = target_read.read(&mut target_buf).await?;
+            if n == 0 {
+                let _ = client_write.shutdown().await;
+                return Ok(());
+            }
+            let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
+
+            let delay = timing.sample_delay(&mut rng);
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+
+            write_server_data_records_chunked(
+                &mut client_write,
+                &mut server_seal,
+                &target_buf[..n],
+                &mut rng,
+                &mut seal_scratch,
+                RelayWriteLog::new(cid, "server->client", "server-download-writer"),
+            )
+            .await?;
+        }
+    }
+
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
     loop {
