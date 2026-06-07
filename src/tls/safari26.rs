@@ -785,13 +785,12 @@ fn supported_groups_extension(grease_group: u16) -> Result<Vec<u8>, Safari26TlsE
 }
 
 fn alpn_extension() -> Result<Vec<u8>, Safari26TlsError> {
-    let mut out = Vec::new();
-    let mut list = Vec::new();
-    list.push(2);
-    list.extend_from_slice(b"h2");
-    list.push(8);
-    list.extend_from_slice(b"http/1.1");
-    push_vec_u16(&mut out, &list)?;
+    let mut out = Vec::with_capacity(14);
+    push_u16_len(&mut out, 12)?;
+    out.push(2);
+    out.extend_from_slice(b"h2");
+    out.push(8);
+    out.extend_from_slice(b"http/1.1");
     Ok(out)
 }
 
@@ -818,20 +817,21 @@ fn key_share_extension(
     mlkem768_public: &[u8],
     x25519_public: &[u8; 32],
 ) -> Result<Vec<u8>, Safari26TlsError> {
-    let mut shares = Vec::with_capacity(4 + 4 + 1 + 4 + MLKEM768_PUBLIC_KEY_LEN + 32);
+    let hybrid_len = MLKEM768_PUBLIC_KEY_LEN + X25519_KEY_LEN;
+    let shares_len = (2 + 2 + 1) + (2 + 2 + hybrid_len) + (2 + 2 + X25519_KEY_LEN);
+    let mut shares = Vec::with_capacity(shares_len);
     shares.extend_from_slice(&grease_group.to_be_bytes());
     push_vec_u16(&mut shares, &[0])?;
 
     shares.extend_from_slice(&GROUP_X25519_MLKEM768.to_be_bytes());
-    let mut hybrid = Vec::with_capacity(MLKEM768_PUBLIC_KEY_LEN + X25519_KEY_LEN);
-    hybrid.extend_from_slice(mlkem768_public);
-    hybrid.extend_from_slice(x25519_public);
-    push_vec_u16(&mut shares, &hybrid)?;
+    push_u16_len(&mut shares, hybrid_len)?;
+    shares.extend_from_slice(mlkem768_public);
+    shares.extend_from_slice(x25519_public);
 
     shares.extend_from_slice(&GROUP_X25519.to_be_bytes());
     push_vec_u16(&mut shares, x25519_public)?;
 
-    let mut out = Vec::with_capacity(2 + shares.len());
+    let mut out = Vec::with_capacity(2 + shares_len);
     push_vec_u16(&mut out, &shares)?;
     Ok(out)
 }
@@ -855,15 +855,14 @@ fn handshake_record(
     handshake_type: u8,
     body: &[u8],
 ) -> Result<Vec<u8>, Safari26TlsError> {
-    let mut handshake = Vec::with_capacity(4 + body.len());
-    handshake.push(handshake_type);
-    push_u24(&mut handshake, body.len())?;
-    handshake.extend_from_slice(body);
-    let mut record = Vec::with_capacity(5 + handshake.len());
+    let handshake_len = 4 + body.len();
+    let mut record = Vec::with_capacity(5 + handshake_len);
     record.push(TLS_RECORD_HANDSHAKE);
     record.extend_from_slice(&record_version);
-    push_u16_len(&mut record, handshake.len())?;
-    record.extend_from_slice(&handshake);
+    push_u16_len(&mut record, handshake_len)?;
+    record.push(handshake_type);
+    push_u24(&mut record, body.len())?;
+    record.extend_from_slice(body);
     Ok(record)
 }
 
