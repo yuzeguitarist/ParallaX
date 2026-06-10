@@ -1055,7 +1055,7 @@ install_remote() {
 
   run "${scp_args[@]}" "${scp_payload[@]}" "$SSH_TARGET:$remote_tmp/"
 
-  local q_tmp q_remote_bin q_remote_config q_service q_service_path q_remote_bin_dir q_remote_config_dir q_parca_agent_channel
+  local q_tmp q_remote_bin q_remote_config q_service q_service_path q_remote_bin_dir q_remote_config_dir q_remote_replay_cache q_parca_agent_channel
   q_tmp=$(shell_quote "$remote_tmp")
   q_remote_bin=$(shell_quote "$REMOTE_BIN")
   q_remote_config=$(shell_quote "$REMOTE_CONFIG")
@@ -1063,9 +1063,18 @@ install_remote() {
   q_service_path=$(shell_quote "/etc/systemd/system/$SERVICE_NAME.service")
   q_remote_bin_dir=$(shell_quote "$(dirname "$REMOTE_BIN")")
   q_remote_config_dir=$(shell_quote "$(dirname "$REMOTE_CONFIG")")
+  q_remote_replay_cache=$(shell_quote "/var/lib/parallax/parallax-replay.cache")
   q_parca_agent_channel=$(shell_quote "$PARCA_AGENT_CHANNEL")
 
   local sudo_prefix=$REMOTE_SUDO
+  local replay_cache_reset_script=""
+  if [[ "$REUSE_CONFIG" != "1" ]]; then
+    replay_cache_reset_script=$(cat <<REMOTE_REPLAY_CACHE_RESET
+echo "Rotating ParallaX replay cache for fresh generated config."
+$sudo_prefix rm -f $q_remote_replay_cache
+REMOTE_REPLAY_CACHE_RESET
+)
+  fi
   local bbr_install_script=""
   if [[ "$ENABLE_BBR" == "1" ]]; then
     bbr_install_script=$(cat <<REMOTE_BBR
@@ -1200,6 +1209,7 @@ $bbr_install_script
 $sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir /var/lib/parallax
 $sudo_prefix install -m 0755 $q_tmp/plx $q_remote_bin
 $sudo_prefix install -m 0600 $q_tmp/parallax.server.toml $q_remote_config
+$replay_cache_reset_script
 $sudo_prefix install -m 0644 $q_tmp/parallax.service $q_service_path
 if command -v systemctl >/dev/null 2>&1; then
   $sudo_prefix systemctl daemon-reload
