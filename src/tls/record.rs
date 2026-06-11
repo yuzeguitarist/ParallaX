@@ -89,6 +89,15 @@ pub struct TlsRecordReader<R> {
     payload_pos: usize,
 }
 
+/// Read-side buffer capacity for long-lived data-phase record readers.
+pub const BUFFERED_READ_CAPACITY: usize = 64 * 1024;
+
+/// A [`TlsRecordReader`] that amortizes socket reads through an internal
+/// buffer. Only safe for readers that own the read half for the rest of the
+/// connection: buffered bytes are lost if the underlying stream is reused
+/// for raw reads afterwards.
+pub type BufferedTlsRecordReader<R> = TlsRecordReader<tokio::io::BufReader<R>>;
+
 impl<R> TlsRecordReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
@@ -103,6 +112,18 @@ impl<R> TlsRecordReader<R> {
 
     pub fn into_inner(self) -> R {
         self.reader
+    }
+}
+
+impl<R> BufferedTlsRecordReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    pub fn buffered(reader: R) -> Self {
+        Self::new(tokio::io::BufReader::with_capacity(
+            BUFFERED_READ_CAPACITY,
+            reader,
+        ))
     }
 }
 
@@ -369,5 +390,54 @@ mod tests {
         reader.read_record_into(&mut out).await.unwrap();
 
         assert_eq!(&out[TLS_HEADER_LEN..], b"fragmented payload");
+    }
+
+    #[tokio::test]
+    async fn buffered_record_reader_matches_unbuffered_across_fragmented_stream() {
+        let payloads: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            vec![0x42; 700],
+            Vec::new(),
+            vec![0x07; MAX_TLS_RECORD_PAYLOAD],
+            b"tail".to_vec(),
+        ];
+        let mut stream = Vec::new();
+        for payload in &payloads {
+            stream.extend_from_slice(&wrap_application_data(payload).unwrap());
+        }
+
+        for chunk_len in [1_usize, 3, 5, 64, 1024, stream.len()] {
+            let stream = stream.clone();
+            let (mut writer, reader) = tokio::io::duplex(256);
+            tokio::spawn(async move {
+                for chunk in stream.chunks(chunk_len) {
+                    writer.write_all(chunk).await.unwrap();
+                }
+            });
+            let mut reader = TlsRecordReader::buffered(reader);
+            let mut out = Vec::new();
+            for payload in &payloads {
+                reader.read_record_into(&mut out).await.unwrap();
+                assert_eq!(&out[TLS_HEADER_LEN..], payload.as_slice());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_record_reader_reports_eof_after_last_record() {
+        let record = wrap_application_data(b"only").unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            writer.write_all(&record).await.unwrap();
+            drop(writer);
+        });
+        let mut reader = TlsRecordReader::buffered(reader);
+        let mut out = Vec::new();
+
+        reader.read_record_into(&mut out).await.unwrap();
+        assert_eq!(&out[TLS_HEADER_LEN..], b"only");
+
+        let err = reader.read_record_into(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

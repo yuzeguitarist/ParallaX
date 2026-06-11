@@ -61,7 +61,10 @@ use crate::{
     },
     tls::{
         client_hello::parse_client_hello,
-        record::{log_record_read, parse_header, read_record, TlsRecordReader, TLS_HEADER_LEN},
+        record::{
+            log_record_read, parse_header, read_record, BufferedTlsRecordReader, TlsRecordReader,
+            TLS_HEADER_LEN,
+        },
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
@@ -804,8 +807,8 @@ async fn run_authenticated_data_mode(
 
     let (client_read, mut client_write) = handshake.client.into_split();
     let (fallback_read, mut fallback_write) = handshake.fallback.into_split();
-    let mut client_records = TlsRecordReader::new(client_read);
-    let mut fallback_records = TlsRecordReader::new(fallback_read);
+    let mut client_records = TlsRecordReader::buffered(client_read);
+    let mut fallback_records = TlsRecordReader::buffered(fallback_read);
     let mut client_record = Vec::new();
     let mut fallback_record = Vec::new();
     let mut client_camouflage_records_before_pq = 0usize;
@@ -1357,7 +1360,7 @@ where
 }
 
 struct DataRelay {
-    client_records: TlsRecordReader<OwnedReadHalf>,
+    client_records: BufferedTlsRecordReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     target_read: OwnedReadHalf,
     target_write: OwnedWriteHalf,
@@ -1410,7 +1413,7 @@ impl DataRelay {
 }
 
 async fn run_authenticated_mux_data_mode(
-    client_records: TlsRecordReader<OwnedReadHalf>,
+    client_records: BufferedTlsRecordReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     client_open: DataRecordCodec,
     server_seal: DataRecordCodec,
@@ -1433,7 +1436,7 @@ async fn run_authenticated_mux_data_mode(
 }
 
 async fn server_mux_client_reader_loop(
-    mut client_records: TlsRecordReader<OwnedReadHalf>,
+    mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
     mut client_open: DataRecordCodec,
     frame_tx: mpsc::Sender<MuxFrame>,
     first_frames: Vec<MuxFrame>,
@@ -1791,7 +1794,7 @@ async fn send_server_mux_frame(
 }
 
 async fn run_authenticated_speed_test_mode(
-    mut client_records: TlsRecordReader<OwnedReadHalf>,
+    mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
     mut client_write: OwnedWriteHalf,
     mut client_open: DataRecordCodec,
     mut server_seal: DataRecordCodec,
@@ -1864,7 +1867,7 @@ async fn run_authenticated_speed_test_mode(
 }
 
 struct SpeedServerIo<'a, R: ?Sized> {
-    client_records: &'a mut TlsRecordReader<OwnedReadHalf>,
+    client_records: &'a mut BufferedTlsRecordReader<OwnedReadHalf>,
     client_write: &'a mut OwnedWriteHalf,
     client_open: &'a mut DataRecordCodec,
     server_seal: &'a mut DataRecordCodec,
@@ -1959,7 +1962,7 @@ where
 }
 
 async fn server_upload_loop(
-    mut client_records: TlsRecordReader<OwnedReadHalf>,
+    mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
     mut target_write: OwnedWriteHalf,
     mut client_open: DataRecordCodec,
     cid: u64,

@@ -1020,7 +1020,7 @@ async fn client_download_loop(
     mut open_from_server: DataRecordCodec,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
-    let mut server_records = TlsRecordReader::new(server_read);
+    let mut server_records = TlsRecordReader::buffered(server_read);
     let mut server_record = Vec::new();
 
     loop {
@@ -1116,7 +1116,7 @@ async fn client_mux_reader_loop(
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<ClientMuxEvent>>>>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
-    let mut server_records = TlsRecordReader::new(server_read);
+    let mut server_records = TlsRecordReader::buffered(server_read);
     let mut server_record = Vec::new();
 
     loop {
