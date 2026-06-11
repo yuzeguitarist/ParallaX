@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, Mutex, Semaphore, TryAcquireError},
+    sync::{mpsc, oneshot, Mutex, Semaphore, TryAcquireError},
     time::{sleep, Instant},
 };
 
@@ -58,7 +58,6 @@ const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
 const WARM_SESSION_POOL_TARGET: usize = 4;
 const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
-const CLIENT_MUX_STREAM_CHANNEL: usize = 32;
 const MUX_FRAME_BATCH_LIMIT: usize = 32;
 /// Flush accumulated sealed records once the batch buffer reaches this size,
 /// bounding per-connection scratch memory while still coalescing writes.
@@ -340,15 +339,25 @@ struct ClientMuxPool {
 #[derive(Clone)]
 struct ClientMuxHandle {
     frame_tx: mpsc::Sender<MuxFrame>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<ClientMuxEvent>>>>,
+    register_tx: mpsc::Sender<ClientStreamRegistration>,
     next_stream_id: Arc<AtomicU32>,
     stream_slots: Arc<Semaphore>,
     chunk_size: usize,
     payload_pool: MuxPayloadPool,
 }
 
-enum ClientMuxEvent {
-    Data(Vec<u8>),
+/// Hands a freshly opened stream's local write half to the single mux reader
+/// loop, which owns every download half and writes decrypted payloads inline
+/// (mirroring the server's upload path). `outcome_tx` lets the reader report
+/// stream completion back to the per-connection task that holds the slot
+/// permit, so the download direction no longer needs a per-stream task.
+struct ClientStreamRegistration {
+    stream_id: u32,
+    local_write: OwnedWriteHalf,
+    outcome_tx: oneshot::Sender<DownloadOutcome>,
+}
+
+enum DownloadOutcome {
     Fin,
     Reset,
 }
@@ -412,14 +421,13 @@ impl ClientMuxPool {
             .saturating_mul(MUX_FRAME_CHANNEL_PER_STREAM)
             .max(1);
         let (frame_tx, frame_rx) = mpsc::channel(channel_capacity);
-        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (register_tx, register_rx) = mpsc::channel(stream_limit.max(1));
         let session_cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let chunk_size = max_plaintext_len(self.traffic.max_padding);
         let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
-        let reader_streams = Arc::clone(&streams);
         tokio::spawn(async move {
             if let Err(err) =
-                client_mux_reader_loop(server_read, open_from_server, reader_streams, session_cid)
+                client_mux_reader_loop(server_read, open_from_server, register_rx, session_cid)
                     .await
             {
                 tracing::debug!(cid = session_cid, error = %err, "client mux reader stopped");
@@ -444,7 +452,7 @@ impl ClientMuxPool {
 
         Ok(ClientMuxHandle {
             frame_tx,
-            streams,
+            register_tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),
             stream_slots: Arc::new(Semaphore::new(stream_limit)),
             chunk_size,
@@ -488,14 +496,30 @@ async fn handle_local_mux_connection_with_cid(
         payload: connect_payload,
     };
 
-    let (event_tx, event_rx) = mpsc::channel(CLIENT_MUX_STREAM_CHANNEL);
-    mux.streams.lock().await.insert(stream_id, event_tx);
+    let (local_read, local_write) = local.into_split();
+    let (outcome_tx, outcome_rx) = oneshot::channel();
+    // Register the download half with the reader before announcing the stream,
+    // so an immediate server response can never race ahead of the write half.
+    if mux
+        .register_tx
+        .send(ClientStreamRegistration {
+            stream_id,
+            local_write,
+            outcome_tx,
+        })
+        .await
+        .is_err()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "client mux reader is gone",
+        )
+        .into());
+    }
     if let Err(err) = mux.frame_tx.send(open_frame).await {
-        mux.streams.lock().await.remove(&stream_id);
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into());
     }
 
-    let (local_read, local_write) = local.into_split();
     let upload = client_mux_upload_loop(
         local_read,
         mux.frame_tx.clone(),
@@ -504,10 +528,8 @@ async fn handle_local_mux_connection_with_cid(
         cid,
         mux.payload_pool.clone(),
     );
-    let download = client_mux_download_loop(local_write, event_rx, cid);
-    let result = tokio::try_join!(upload, download).map(|_| ());
-    mux.streams.lock().await.remove(&stream_id);
-    result
+    let download = client_mux_await_download(outcome_rx, cid);
+    tokio::try_join!(upload, download).map(|_| ())
 }
 
 fn next_mux_stream_id(next: &AtomicU32) -> u32 {
@@ -1103,98 +1125,129 @@ async fn client_mux_upload_loop(
     }
 }
 
-async fn client_mux_download_loop(
-    mut local_write: OwnedWriteHalf,
-    mut event_rx: mpsc::Receiver<ClientMuxEvent>,
+/// A mux stream's local socket write half, owned by the reader loop, plus a
+/// one-shot used to report the download direction's completion back to the
+/// per-connection task that holds the stream's slot permit.
+struct ClientDownloadStream {
+    write: OwnedWriteHalf,
+    outcome_tx: oneshot::Sender<DownloadOutcome>,
+}
+
+/// Resolves once the reader loop reports the download direction is done: a
+/// server `Fin` (or the reader exiting) ends cleanly; a `Reset` surfaces as a
+/// connection-reset error, matching the previous per-stream download task.
+async fn client_mux_await_download(
+    outcome_rx: oneshot::Receiver<DownloadOutcome>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            ClientMuxEvent::Data(payload) => {
-                if !payload.is_empty() {
-                    local_write.write_all(&payload).await?;
-                }
-            }
-            ClientMuxEvent::Fin => {
-                let _ = local_write.shutdown().await;
-                return Ok(());
-            }
-            ClientMuxEvent::Reset => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    format!("server reset mux stream for cid {cid}"),
-                )
-                .into());
-            }
-        }
+    match outcome_rx.await {
+        Ok(DownloadOutcome::Fin) | Err(_) => Ok(()),
+        Ok(DownloadOutcome::Reset) => Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            format!("server reset mux stream for cid {cid}"),
+        )
+        .into()),
     }
-    let _ = local_write.shutdown().await;
-    Ok(())
 }
 
 async fn client_mux_reader_loop(
     server_read: OwnedReadHalf,
     mut open_from_server: DataRecordCodec,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<ClientMuxEvent>>>>,
+    mut register_rx: mpsc::Receiver<ClientStreamRegistration>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
     let mut server_records = TlsRecordReader::buffered(server_read);
     let mut server_record = Vec::new();
+    let mut local_writes: HashMap<u32, ClientDownloadStream> = HashMap::new();
+    let mut register_open = true;
 
     loop {
-        match server_records.read_record_into(&mut server_record).await {
-            Ok(()) => {}
-            Err(err) if is_clean_close(&err) => {
-                streams.lock().await.clear();
-                return Ok(());
+        tokio::select! {
+            biased;
+            registration = register_rx.recv(), if register_open => {
+                match registration {
+                    Some(reg) => {
+                        local_writes.insert(
+                            reg.stream_id,
+                            ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
+                        );
+                    }
+                    None => register_open = false,
+                }
             }
-            Err(err) => {
-                streams.lock().await.clear();
-                return Err(ClientRuntimeError::Io(err));
+            result = server_records.read_record_into(&mut server_record) => {
+                match result {
+                    Ok(()) => {}
+                    Err(err) if is_clean_close(&err) => {
+                        shutdown_client_download_streams(&mut local_writes).await;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        shutdown_client_download_streams(&mut local_writes).await;
+                        return Err(ClientRuntimeError::Io(err));
+                    }
+                }
+                // Absorb any registrations queued alongside this record so a
+                // stream's write half is always present before its first Data.
+                while let Ok(reg) = register_rx.try_recv() {
+                    local_writes.insert(
+                        reg.stream_id,
+                        ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
+                    );
+                }
+                log_record_read(cid, "server->client", "client-mux-outer-reader", &server_record);
+                let payload = open_from_server
+                    .open_in_place_payload_range(&mut server_record)
+                    .map_err(ClientHandshakeError::from)?;
+                let mut frames = &server_record[payload];
+                while !frames.is_empty() {
+                    let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
+                    dispatch_client_mux_frame(&mut local_writes, frame, cid).await?;
+                    frames = &frames[used..];
+                }
             }
-        };
-        log_record_read(
-            cid,
-            "server->client",
-            "client-mux-outer-reader",
-            &server_record,
-        );
-        let payload = open_from_server
-            .open_in_place_payload_range(&mut server_record)
-            .map_err(ClientHandshakeError::from)?;
-        let mut frames = &server_record[payload];
-        while !frames.is_empty() {
-            let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-            process_client_mux_frame(frame, &streams, cid).await?;
-            frames = &frames[used..];
         }
     }
 }
 
-async fn process_client_mux_frame(
+/// Writes a decrypted download frame straight to its local socket. The payload
+/// borrows the already-decrypted record buffer, so the relay hot path no longer
+/// allocates or hops through a per-stream channel. A failing local write tears
+/// down only that stream and keeps relaying the others.
+async fn dispatch_client_mux_frame(
+    local_writes: &mut HashMap<u32, ClientDownloadStream>,
     frame: MuxFrameRef<'_>,
-    streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<ClientMuxEvent>>>>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
     match frame.kind {
         MuxFrameKind::Data => {
-            let sender = streams.lock().await.get(&frame.stream_id).cloned();
-            if let Some(sender) = sender {
-                let _ = sender
-                    .send(ClientMuxEvent::Data(frame.payload.to_vec()))
-                    .await;
+            let write_failed = match local_writes.get_mut(&frame.stream_id) {
+                Some(stream) if !frame.payload.is_empty() => {
+                    stream.write.write_all(frame.payload).await.is_err()
+                }
+                _ => false,
+            };
+            if write_failed {
+                if let Some(stream) = local_writes.remove(&frame.stream_id) {
+                    tracing::debug!(
+                        cid,
+                        stream_id = frame.stream_id,
+                        "client mux local write failed; dropping stream"
+                    );
+                    let _ = stream.outcome_tx.send(DownloadOutcome::Reset);
+                }
             }
         }
         MuxFrameKind::Fin => {
-            let sender = streams.lock().await.remove(&frame.stream_id);
-            if let Some(sender) = sender {
-                let _ = sender.send(ClientMuxEvent::Fin).await;
+            if let Some(mut stream) = local_writes.remove(&frame.stream_id) {
+                let _ = stream.write.shutdown().await;
+                let _ = stream.outcome_tx.send(DownloadOutcome::Fin);
             }
         }
         MuxFrameKind::Reset => {
-            let sender = streams.lock().await.remove(&frame.stream_id);
-            if let Some(sender) = sender {
-                let _ = sender.send(ClientMuxEvent::Reset).await;
+            if let Some(mut stream) = local_writes.remove(&frame.stream_id) {
+                let _ = stream.write.shutdown().await;
+                let _ = stream.outcome_tx.send(DownloadOutcome::Reset);
             }
         }
         MuxFrameKind::Cover => {}
@@ -1202,13 +1255,15 @@ async fn process_client_mux_frame(
             return Err(MuxFrameError::InvalidKind.into());
         }
     }
-    tracing::trace!(
-        cid,
-        stream_id = frame.stream_id,
-        kind = ?frame.kind,
-        "processed client mux frame"
-    );
     Ok(())
+}
+
+/// Closes every download half when the session ends. Dropping each one-shot
+/// sender signals the waiting per-connection task that the download finished.
+async fn shutdown_client_download_streams(local_writes: &mut HashMap<u32, ClientDownloadStream>) {
+    for (_, mut stream) in local_writes.drain() {
+        let _ = stream.write.shutdown().await;
+    }
 }
 
 async fn client_mux_writer_loop(
