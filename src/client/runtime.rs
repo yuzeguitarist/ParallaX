@@ -34,14 +34,15 @@ use crate::{
         decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
         TrafficConfig,
     },
-    crypto::{auth::AuthError, identity, pq},
+    crypto::{auth::AuthError, identity, parallel, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::{
         ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind, MuxFrameRef,
         MuxPayloadPool, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
     },
     protocol::data::{
-        max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
+        max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
+        DataRecordError, SealedRecord,
     },
     tls::{
         record::{log_record_read, TlsRecordError, TlsRecordReader},
@@ -58,10 +59,10 @@ const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
 const WARM_SESSION_POOL_TARGET: usize = 4;
 const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
-const MUX_FRAME_BATCH_LIMIT: usize = 32;
-/// Flush accumulated sealed records once the batch buffer reaches this size,
-/// bounding per-connection scratch memory while still coalescing writes.
-const MUX_BATCH_WRITE_THRESHOLD: usize = 64 * 1024;
+const MUX_FRAME_BATCH_LIMIT: usize = 64;
+/// Cap on the ciphertext bytes batched per mux read before opening, bounding
+/// scratch memory while leaving enough records for the crypto pool to fan out.
+const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1158,54 +1159,113 @@ async fn client_mux_reader_loop(
 ) -> Result<(), ClientRuntimeError> {
     let mut server_records = TlsRecordReader::buffered(server_read);
     let mut server_record = Vec::new();
+    let mut extra_record = Vec::new();
+    let mut batch_records = Vec::new();
+    let mut batch_plaintext = Vec::new();
+    let mut deferred_read_error: Option<io::Error> = None;
     let mut local_writes: HashMap<u32, ClientDownloadStream> = HashMap::new();
     let mut register_open = true;
 
     loop {
-        tokio::select! {
-            biased;
-            registration = register_rx.recv(), if register_open => {
-                match registration {
-                    Some(reg) => {
-                        local_writes.insert(
-                            reg.stream_id,
-                            ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
-                        );
+        let read_result = if let Some(err) = deferred_read_error.take() {
+            Err(err)
+        } else {
+            tokio::select! {
+                biased;
+                registration = register_rx.recv(), if register_open => {
+                    match registration {
+                        Some(reg) => {
+                            local_writes.insert(
+                                reg.stream_id,
+                                ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
+                            );
+                        }
+                        None => register_open = false,
                     }
-                    None => register_open = false,
+                    continue;
+                }
+                result = server_records.read_record_into(&mut server_record) => result,
+            }
+        };
+        match read_result {
+            Ok(()) => {}
+            Err(err) if is_clean_close(&err) => {
+                shutdown_client_download_streams(&mut local_writes).await;
+                return Ok(());
+            }
+            Err(err) => {
+                shutdown_client_download_streams(&mut local_writes).await;
+                return Err(ClientRuntimeError::Io(err));
+            }
+        }
+        log_record_read(cid, "server->client", "client-mux-outer-reader", &server_record);
+
+        // Opportunistically grab any records that are already buffered so a
+        // bulk burst can be opened across the crypto pool instead of pinning
+        // every open on this task. A would-block leaves partial reader state
+        // intact; a read error is surfaced on the next iteration, after the
+        // records that did arrive have been relayed.
+        let mut record_count = 1_usize;
+        batch_records.clear();
+        while batch_records.len() + server_record.len() < MUX_OPEN_BATCH_BYTES {
+            match server_records.try_read_record_into(&mut extra_record).await {
+                None => break,
+                Some(Ok(())) => {
+                    log_record_read(cid, "server->client", "client-mux-outer-reader", &extra_record);
+                    if record_count == 1 {
+                        batch_records.extend_from_slice(&server_record);
+                    }
+                    batch_records.extend_from_slice(&extra_record);
+                    record_count += 1;
+                }
+                Some(Err(err)) => {
+                    deferred_read_error = Some(err);
+                    break;
                 }
             }
-            result = server_records.read_record_into(&mut server_record) => {
-                match result {
-                    Ok(()) => {}
-                    Err(err) if is_clean_close(&err) => {
-                        shutdown_client_download_streams(&mut local_writes).await;
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        shutdown_client_download_streams(&mut local_writes).await;
-                        return Err(ClientRuntimeError::Io(err));
-                    }
-                }
-                // Absorb any registrations queued alongside this record so a
-                // stream's write half is always present before its first Data.
-                while let Ok(reg) = register_rx.try_recv() {
-                    local_writes.insert(
-                        reg.stream_id,
-                        ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
-                    );
-                }
-                log_record_read(cid, "server->client", "client-mux-outer-reader", &server_record);
-                let payload = open_from_server
-                    .open_in_place_payload_range(&mut server_record)
+        }
+
+        // Absorb any registrations queued alongside these records so a
+        // stream's write half is always present before its first Data.
+        while let Ok(reg) = register_rx.try_recv() {
+            local_writes.insert(
+                reg.stream_id,
+                ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
+            );
+        }
+
+        let frames_payload: &[u8] = if record_count == 1 {
+            let payload = open_from_server
+                .open_in_place_payload_range(&mut server_record)
+                .map_err(ClientHandshakeError::from)?;
+            &server_record[payload]
+        } else {
+            // Frames never span records (the sender keeps records
+            // frame-aligned), so decoding the concatenated plaintext is
+            // equivalent to decoding each record's plaintext in order.
+            batch_plaintext.clear();
+            let payload_bytes =
+                batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
+            if should_parallelize_aead(record_count, payload_bytes) {
+                open_from_server
+                    .open_concat_records_parallel(
+                        parallel::global(),
+                        &batch_records,
+                        &mut batch_plaintext,
+                    )
                     .map_err(ClientHandshakeError::from)?;
-                let mut frames = &server_record[payload];
-                while !frames.is_empty() {
-                    let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-                    dispatch_client_mux_frame(&mut local_writes, frame, cid).await?;
-                    frames = &frames[used..];
-                }
+            } else {
+                open_from_server
+                    .open_concat_records(&mut batch_records, &mut batch_plaintext)
+                    .map_err(ClientHandshakeError::from)?;
             }
+            batch_plaintext.as_slice()
+        };
+        let mut frames = frames_payload;
+        while !frames.is_empty() {
+            let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
+            dispatch_client_mux_frame(&mut local_writes, frame, cid).await?;
+            frames = &frames[used..];
         }
     }
 }
@@ -1368,9 +1428,11 @@ struct ClientMuxBatchState<'a> {
     frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
 }
 
-/// Encodes the first frame plus any immediately available frames directly
-/// into the seal buffer (one record per `max_plaintext_len` window) and
-/// flushes the accumulated records with as few writes as possible.
+/// Encodes the first frame plus any immediately available frames into
+/// frame-aligned plaintext records (one record per `max_plaintext_len`
+/// window), then seals the whole batch — inline for small batches, fanned out
+/// across the shared crypto pool for bulk — and writes the records in order
+/// with a single socket write.
 async fn write_client_mux_frames_batched<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,
@@ -1392,10 +1454,12 @@ where
         ));
     }
 
-    scratch.records_buf.clear();
-    let mut builder = codec.begin_record(&mut scratch.records_buf);
+    // Phase A: drain frames into frame-aligned plaintext records, tracking
+    // each record's length so the record boundaries are fixed before sealing.
+    scratch.plaintext_buf.clear();
+    scratch.record_lens.clear();
     let mut record_plaintext_len = encode_client_mux_frame(
-        &mut scratch.records_buf,
+        &mut scratch.plaintext_buf,
         first_frame,
         max_plaintext_len,
         payload_pool,
@@ -1411,45 +1475,68 @@ where
         };
         let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
         if record_plaintext_len + frame_len > max_plaintext_len {
-            let range = codec
-                .finish_record(builder, rng, &mut scratch.records_buf)
-                .map_err(ClientHandshakeError::from)?;
-            log_outer_write(
-                log.cid,
-                log.direction,
-                log.task_name,
-                record_plaintext_len,
-                &scratch.records_buf[range],
-            );
-            if scratch.records_buf.len() >= MUX_BATCH_WRITE_THRESHOLD {
-                writer.write_all(scratch.records_buf.as_slice()).await?;
-                scratch.records_buf.clear();
-            }
-            builder = codec.begin_record(&mut scratch.records_buf);
+            scratch.record_lens.push(record_plaintext_len);
             record_plaintext_len = 0;
         }
         record_plaintext_len += encode_client_mux_frame(
-            &mut scratch.records_buf,
+            &mut scratch.plaintext_buf,
             frame,
             max_plaintext_len,
             payload_pool,
         )?;
         drained += 1;
     }
+    scratch.record_lens.push(record_plaintext_len);
 
-    let range = codec
-        .finish_record(builder, rng, &mut scratch.records_buf)
-        .map_err(ClientHandshakeError::from)?;
-    log_outer_write(
-        log.cid,
-        log.direction,
-        log.task_name,
-        record_plaintext_len,
-        &scratch.records_buf[range],
-    );
+    // Phase B: seal every record with unchanged boundaries and sequence
+    // order; only the bulk path pays the crypto-pool dispatch cost.
+    scratch.records_buf.clear();
+    if should_parallelize_aead(scratch.record_lens.len(), scratch.plaintext_buf.len()) {
+        codec
+            .seal_records_into_parallel(
+                parallel::global(),
+                &scratch.plaintext_buf,
+                &scratch.record_lens,
+                rng,
+                &mut scratch.records_buf,
+            )
+            .map_err(ClientHandshakeError::from)?;
+    } else {
+        codec
+            .seal_records_into(
+                &scratch.plaintext_buf,
+                &scratch.record_lens,
+                rng,
+                &mut scratch.records_buf,
+            )
+            .map_err(ClientHandshakeError::from)?;
+    }
+    log_outer_write_batch(log, &scratch.record_lens, &scratch.records_buf);
     writer.write_all(scratch.records_buf.as_slice()).await?;
     scratch.records_buf.clear();
     Ok(())
+}
+
+/// Debug-logs each sealed record of a batch, mirroring the per-record
+/// [`log_outer_write`] calls the serial writer used to make.
+fn log_outer_write_batch(log: RelayWriteLog, record_lens: &[usize], records_buf: &[u8]) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let mut offset = 0;
+    for &plaintext_len in record_lens {
+        let Ok(header) = crate::tls::record::parse_header(&records_buf[offset..]) else {
+            return;
+        };
+        log_outer_write(
+            log.cid,
+            log.direction,
+            log.task_name,
+            plaintext_len,
+            &records_buf[offset..offset + header.total_len],
+        );
+        offset += header.total_len;
+    }
 }
 
 fn encode_client_mux_frame(
@@ -1530,6 +1617,11 @@ where
 struct RelaySealScratch {
     records_buf: Vec<u8>,
     records: Vec<SealedRecord>,
+    /// Frame-aligned record plaintext accumulated before sealing, so the seal
+    /// can be fanned out across the crypto pool without changing record
+    /// boundaries.
+    plaintext_buf: Vec<u8>,
+    record_lens: Vec<usize>,
 }
 
 impl RelaySealScratch {
@@ -1537,6 +1629,8 @@ impl RelaySealScratch {
         Self {
             records_buf: Vec::with_capacity(capacity + crate::tls::record::TLS_HEADER_LEN),
             records: Vec::new(),
+            plaintext_buf: Vec::with_capacity(capacity),
+            record_lens: Vec::new(),
         }
     }
 }

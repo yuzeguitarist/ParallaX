@@ -39,6 +39,7 @@ use crate::{
             verify_masked_stateful_client_hello_auth_with_parsed_material, AuthError, ClientAuth,
         },
         identity::{self, IdentityError},
+        parallel,
         pq::{self, PqError},
         replay::{current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry},
         session::{
@@ -55,8 +56,8 @@ use crate::{
             SpeedTestRequestError,
         },
         data::{
-            max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError,
-            SealedRecord, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD,
+            max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
+            DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD,
         },
     },
     tls::{
@@ -82,10 +83,10 @@ const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
 const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET / 2;
 const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
-const SERVER_MUX_FRAME_BATCH_LIMIT: usize = 32;
-/// Flush accumulated sealed records once the batch buffer reaches this size,
-/// bounding per-connection scratch memory while still coalescing writes.
-const MUX_BATCH_WRITE_THRESHOLD: usize = 64 * 1024;
+const SERVER_MUX_FRAME_BATCH_LIMIT: usize = 64;
+/// Cap on the ciphertext bytes batched per mux read before opening, bounding
+/// scratch memory while leaving enough records for the crypto pool to fan out.
+const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1471,8 +1472,16 @@ async fn server_mux_client_reader_loop(
     }
 
     let mut client_record = Vec::new();
+    let mut extra_record = Vec::new();
+    let mut batch_records = Vec::new();
+    let mut batch_plaintext = Vec::new();
+    let mut deferred_read_error: Option<io::Error> = None;
     loop {
-        match client_records.read_record_into(&mut client_record).await {
+        let read_result = match deferred_read_error.take() {
+            Some(err) => Err(err),
+            None => client_records.read_record_into(&mut client_record).await,
+        };
+        match read_result {
             Ok(()) => {}
             Err(err) if is_clean_close(&err) => {
                 for (_, mut target_write) in target_writes {
@@ -1488,8 +1497,59 @@ async fn server_mux_client_reader_loop(
             "server-mux-client-reader",
             &client_record,
         );
-        let payload = client_open.open_in_place_payload_range(&mut client_record)?;
-        let mut frames = &client_record[payload];
+
+        // Opportunistically grab any records that are already buffered so a
+        // bulk burst can be opened across the crypto pool instead of pinning
+        // every open on this task. A would-block leaves partial reader state
+        // intact; a read error is surfaced on the next iteration, after the
+        // records that did arrive have been relayed.
+        let mut record_count = 1_usize;
+        batch_records.clear();
+        while batch_records.len() + client_record.len() < MUX_OPEN_BATCH_BYTES {
+            match client_records.try_read_record_into(&mut extra_record).await {
+                None => break,
+                Some(Ok(())) => {
+                    log_record_read(
+                        context.cid,
+                        "client->server",
+                        "server-mux-client-reader",
+                        &extra_record,
+                    );
+                    if record_count == 1 {
+                        batch_records.extend_from_slice(&client_record);
+                    }
+                    batch_records.extend_from_slice(&extra_record);
+                    record_count += 1;
+                }
+                Some(Err(err)) => {
+                    deferred_read_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let frames_payload: &[u8] = if record_count == 1 {
+            let payload = client_open.open_in_place_payload_range(&mut client_record)?;
+            &client_record[payload]
+        } else {
+            // Frames never span records (the sender keeps records
+            // frame-aligned), so decoding the concatenated plaintext is
+            // equivalent to decoding each record's plaintext in order.
+            batch_plaintext.clear();
+            let payload_bytes =
+                batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
+            if should_parallelize_aead(record_count, payload_bytes) {
+                client_open.open_concat_records_parallel(
+                    parallel::global(),
+                    &batch_records,
+                    &mut batch_plaintext,
+                )?;
+            } else {
+                client_open.open_concat_records(&mut batch_records, &mut batch_plaintext)?;
+            }
+            batch_plaintext.as_slice()
+        };
+        let mut frames = frames_payload;
         while !frames.is_empty() {
             let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
             process_server_mux_frame(
@@ -1729,9 +1789,11 @@ pub(crate) struct ServerMuxBatchState<'a> {
     pub(crate) frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
 }
 
-/// Encodes the first frame plus any immediately available frames directly
-/// into the seal buffer (one record per `max_plaintext_len` window) and
-/// flushes the accumulated records with as few writes as possible.
+/// Encodes the first frame plus any immediately available frames into
+/// frame-aligned plaintext records (one record per `max_plaintext_len`
+/// window), then seals the whole batch — inline for small batches, fanned out
+/// across the shared crypto pool for bulk — and writes the records in order
+/// with a single socket write.
 pub(crate) async fn write_server_mux_frames_batched<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,
@@ -1753,10 +1815,12 @@ where
         ));
     }
 
-    scratch.records_buf.clear();
-    let mut builder = codec.begin_record(&mut scratch.records_buf);
+    // Phase A: drain frames into frame-aligned plaintext records, tracking
+    // each record's length so the record boundaries are fixed before sealing.
+    scratch.plaintext_buf.clear();
+    scratch.record_lens.clear();
     let mut record_plaintext_len = encode_server_mux_frame(
-        &mut scratch.records_buf,
+        &mut scratch.plaintext_buf,
         first_frame,
         max_plaintext_len,
         payload_pool,
@@ -1772,41 +1836,64 @@ where
         };
         let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
         if record_plaintext_len + frame_len > max_plaintext_len {
-            let range = codec.finish_record(builder, rng, &mut scratch.records_buf)?;
-            log_outer_write(
-                log.cid,
-                log.direction,
-                log.task_name,
-                record_plaintext_len,
-                &scratch.records_buf[range],
-            );
-            if scratch.records_buf.len() >= MUX_BATCH_WRITE_THRESHOLD {
-                writer.write_all(scratch.records_buf.as_slice()).await?;
-                scratch.records_buf.clear();
-            }
-            builder = codec.begin_record(&mut scratch.records_buf);
+            scratch.record_lens.push(record_plaintext_len);
             record_plaintext_len = 0;
         }
         record_plaintext_len += encode_server_mux_frame(
-            &mut scratch.records_buf,
+            &mut scratch.plaintext_buf,
             frame,
             max_plaintext_len,
             payload_pool,
         )?;
         drained += 1;
     }
+    scratch.record_lens.push(record_plaintext_len);
 
-    let range = codec.finish_record(builder, rng, &mut scratch.records_buf)?;
-    log_outer_write(
-        log.cid,
-        log.direction,
-        log.task_name,
-        record_plaintext_len,
-        &scratch.records_buf[range],
-    );
+    // Phase B: seal every record with unchanged boundaries and sequence
+    // order; only the bulk path pays the crypto-pool dispatch cost.
+    scratch.records_buf.clear();
+    if should_parallelize_aead(scratch.record_lens.len(), scratch.plaintext_buf.len()) {
+        codec.seal_records_into_parallel(
+            parallel::global(),
+            &scratch.plaintext_buf,
+            &scratch.record_lens,
+            rng,
+            &mut scratch.records_buf,
+        )?;
+    } else {
+        codec.seal_records_into(
+            &scratch.plaintext_buf,
+            &scratch.record_lens,
+            rng,
+            &mut scratch.records_buf,
+        )?;
+    }
+    log_outer_write_batch(log, &scratch.record_lens, &scratch.records_buf);
     writer.write_all(scratch.records_buf.as_slice()).await?;
     scratch.records_buf.clear();
     Ok(())
+}
+
+/// Debug-logs each sealed record of a batch, mirroring the per-record
+/// [`log_outer_write`] calls the serial writer used to make.
+fn log_outer_write_batch(log: RelayWriteLog, record_lens: &[usize], records_buf: &[u8]) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let mut offset = 0;
+    for &plaintext_len in record_lens {
+        let Ok(header) = crate::tls::record::parse_header(&records_buf[offset..]) else {
+            return;
+        };
+        log_outer_write(
+            log.cid,
+            log.direction,
+            log.task_name,
+            plaintext_len,
+            &records_buf[offset..offset + header.total_len],
+        );
+        offset += header.total_len;
+    }
 }
 
 fn encode_server_mux_frame(
@@ -2174,6 +2261,11 @@ where
 pub(crate) struct RelaySealScratch {
     records_buf: Vec<u8>,
     records: Vec<SealedRecord>,
+    /// Frame-aligned record plaintext accumulated before sealing, so the seal
+    /// can be fanned out across the crypto pool without changing record
+    /// boundaries.
+    plaintext_buf: Vec<u8>,
+    record_lens: Vec<usize>,
 }
 
 impl RelaySealScratch {
@@ -2181,6 +2273,8 @@ impl RelaySealScratch {
         Self {
             records_buf: Vec::with_capacity(capacity + crate::tls::record::TLS_HEADER_LEN),
             records: Vec::new(),
+            plaintext_buf: Vec::with_capacity(capacity),
+            record_lens: Vec::new(),
         }
     }
 }
