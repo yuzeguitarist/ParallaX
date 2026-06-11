@@ -248,15 +248,17 @@ impl DataRecordCodec {
         }
 
         let payload = &record[record::TLS_HEADER_LEN..header.total_len];
-        let (ciphertext, tag) = payload.split_at(payload.len() - AEAD_TAG_LEN);
-        let mut padded = ciphertext.to_vec();
+        let mut padded = payload.to_vec();
         crate::process_hardening::exclude_transient_from_core_dump(
             "data_record.open_plaintext",
             &padded,
         );
-        if let Err(err) = self.aead.open_in_place_detached(&mut padded, tag, self.aad) {
-            padded.zeroize();
-            return Err(err.into());
+        match self.aead.open_in_place_split(&mut padded, self.aad) {
+            Ok(plaintext_len) => padded.truncate(plaintext_len),
+            Err(err) => {
+                padded.zeroize();
+                return Err(err.into());
+            }
         }
         if let Err(err) = PaddingProfile::remove_in_place(&mut padded) {
             padded.zeroize();
@@ -294,22 +296,23 @@ impl DataRecordCodec {
 
         record.truncate(header.total_len);
         let ciphertext_start = record::TLS_HEADER_LEN;
-        let tag_start = header.total_len - AEAD_TAG_LEN;
         let plaintext_len = {
             let payload = &mut record[ciphertext_start..header.total_len];
-            let (ciphertext, tag) = payload.split_at_mut(tag_start - ciphertext_start);
             crate::process_hardening::exclude_transient_from_core_dump(
                 "data_record.open_in_place_plaintext",
-                ciphertext,
+                payload,
             );
-            if let Err(err) = self.aead.open_in_place_detached(ciphertext, tag, self.aad) {
-                ciphertext.zeroize();
-                return Err(err.into());
-            }
-            match PaddingProfile::unpadded_len(ciphertext) {
+            let padded_len = match self.aead.open_in_place_split(payload, self.aad) {
                 Ok(len) => len,
                 Err(err) => {
-                    ciphertext.zeroize();
+                    payload.zeroize();
+                    return Err(err.into());
+                }
+            };
+            match PaddingProfile::unpadded_len(&payload[..padded_len]) {
+                Ok(len) => len,
+                Err(err) => {
+                    payload.zeroize();
                     return Err(err.into());
                 }
             }

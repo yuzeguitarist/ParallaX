@@ -2364,12 +2364,12 @@ mod tests {
         let padding = PaddingProfile::from_config(traffic).unwrap();
         let timing = TimingProfile::from_config(traffic);
         let mut server_seal = DataRecordCodec::new(
-            AeadCodec::new([3_u8; 32], [4_u8; 24]),
+            AeadCodec::new([3_u8; 32], [4_u8; crate::crypto::session::NONCE_LEN]),
             padding,
             SERVER_TO_CLIENT_AAD,
         );
         let mut client_open = DataRecordCodec::new(
-            AeadCodec::new([3_u8; 32], [4_u8; 24]),
+            AeadCodec::new([3_u8; 32], [4_u8; crate::crypto::session::NONCE_LEN]),
             padding,
             SERVER_TO_CLIENT_AAD,
         );

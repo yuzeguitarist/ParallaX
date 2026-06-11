@@ -1,9 +1,6 @@
 use std::fmt;
 
-use chacha20poly1305::{
-    aead::{AeadInPlace, KeyInit},
-    Tag, XChaCha20Poly1305, XNonce,
-};
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use sha2::Sha256;
@@ -12,7 +9,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const KEY_LEN: usize = 32;
-pub const NONCE_LEN: usize = 24;
+pub const NONCE_LEN: usize = 12;
 pub const AEAD_TAG_LEN: usize = 16;
 
 const HKDF_INFO_STACK_LEN: usize = 128;
@@ -267,11 +264,24 @@ fn write_epoch_hkdf_info(
     offset
 }
 
-#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AeadCodec {
     key: [u8; KEY_LEN],
     nonce_base: [u8; NONCE_LEN],
     sequence: u64,
+    cipher: LessSafeKey,
+}
+
+impl Drop for AeadCodec {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.nonce_base.zeroize();
+    }
+}
+
+fn chacha20_poly1305_key(key: &[u8; KEY_LEN]) -> LessSafeKey {
+    LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, key).expect("ChaCha20-Poly1305 key length is fixed"),
+    )
 }
 
 impl AeadCodec {
@@ -280,15 +290,19 @@ impl AeadCodec {
             key,
             nonce_base,
             sequence: 0,
+            cipher: chacha20_poly1305_key(&key),
         };
         codec.protect_secret_memory();
         codec
     }
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
+        self.key.zeroize();
+        self.nonce_base.zeroize();
         self.key = key;
         self.nonce_base = nonce_base;
         self.sequence = 0;
+        self.cipher = chacha20_poly1305_key(&key);
         self.protect_secret_memory();
     }
 
@@ -311,15 +325,14 @@ impl AeadCodec {
         aad: &[u8],
     ) -> Result<[u8; AEAD_TAG_LEN], SessionError> {
         self.ensure_can_process_next_record()?;
-        let nonce = self.record_nonce();
-        let cipher = XChaCha20Poly1305::new_from_slice(&self.key)
-            .expect("XChaCha20-Poly1305 key length is fixed");
-        let tag = cipher
-            .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, plaintext)
+        let nonce = Nonce::assume_unique_for_key(self.record_nonce());
+        let tag = self
+            .cipher
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), plaintext)
             .map_err(|_| SessionError::Aead)?;
 
         let mut out = [0_u8; AEAD_TAG_LEN];
-        out.copy_from_slice(tag.as_slice());
+        out.copy_from_slice(tag.as_ref());
         self.sequence += 1;
         Ok(out)
     }
@@ -338,39 +351,30 @@ impl AeadCodec {
         ciphertext_with_tag: &mut Vec<u8>,
         aad: &[u8],
     ) -> Result<(), SessionError> {
-        if ciphertext_with_tag.len() < AEAD_TAG_LEN {
-            return Err(SessionError::Aead);
-        }
-        let tag_start = ciphertext_with_tag.len() - AEAD_TAG_LEN;
-        let (ciphertext_without_tag, tag) = ciphertext_with_tag.split_at_mut(tag_start);
-        self.open_in_place_detached(ciphertext_without_tag, tag, aad)?;
-        ciphertext_with_tag.truncate(tag_start);
+        let plaintext_len = self.open_in_place_split(ciphertext_with_tag.as_mut_slice(), aad)?;
+        ciphertext_with_tag.truncate(plaintext_len);
         Ok(())
     }
 
-    pub(crate) fn open_in_place_detached(
+    /// Opens a contiguous `ciphertext || tag` slice in place and returns the
+    /// plaintext length (`input.len() - AEAD_TAG_LEN`).
+    pub(crate) fn open_in_place_split(
         &mut self,
-        ciphertext_without_tag: &mut [u8],
-        tag: &[u8],
+        ciphertext_with_tag: &mut [u8],
         aad: &[u8],
-    ) -> Result<(), SessionError> {
-        if tag.len() != AEAD_TAG_LEN {
+    ) -> Result<usize, SessionError> {
+        if ciphertext_with_tag.len() < AEAD_TAG_LEN {
             return Err(SessionError::Aead);
         }
         self.ensure_can_process_next_record()?;
-        let nonce = self.record_nonce();
-        let cipher = XChaCha20Poly1305::new_from_slice(&self.key)
-            .expect("XChaCha20-Poly1305 key length is fixed");
-        cipher
-            .decrypt_in_place_detached(
-                XNonce::from_slice(&nonce),
-                aad,
-                ciphertext_without_tag,
-                Tag::from_slice(tag),
-            )
+        let nonce = Nonce::assume_unique_for_key(self.record_nonce());
+        let plaintext = self
+            .cipher
+            .open_in_place(nonce, Aad::from(aad), ciphertext_with_tag)
             .map_err(|_| SessionError::Aead)?;
+        let plaintext_len = plaintext.len();
         self.sequence += 1;
-        Ok(())
+        Ok(plaintext_len)
     }
 
     fn ensure_can_process_next_record(&self) -> Result<(), SessionError> {
