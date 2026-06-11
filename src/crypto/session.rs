@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use hkdf::Hkdf;
@@ -264,11 +264,16 @@ fn write_epoch_hkdf_info(
     offset
 }
 
+/// A ChaCha20-Poly1305 key shared (immutably) across the parallel crypto
+/// workers. Sealing/opening only needs `&LessSafeKey`, so one session key can
+/// drive several records concurrently as long as each uses a distinct nonce.
+pub type SharedCipher = Arc<LessSafeKey>;
+
 pub struct AeadCodec {
     key: [u8; KEY_LEN],
     nonce_base: [u8; NONCE_LEN],
     sequence: u64,
-    cipher: LessSafeKey,
+    cipher: SharedCipher,
 }
 
 impl Drop for AeadCodec {
@@ -278,10 +283,70 @@ impl Drop for AeadCodec {
     }
 }
 
-fn chacha20_poly1305_key(key: &[u8; KEY_LEN]) -> LessSafeKey {
-    LessSafeKey::new(
+fn chacha20_poly1305_key(key: &[u8; KEY_LEN]) -> SharedCipher {
+    Arc::new(LessSafeKey::new(
         UnboundKey::new(&CHACHA20_POLY1305, key).expect("ChaCha20-Poly1305 key length is fixed"),
-    )
+    ))
+}
+
+/// Derives the per-record nonce by XOR-ing the big-endian sequence number into
+/// the low 8 bytes of the session nonce base. Pure function of its inputs, so
+/// it is safe to call from the parallel crypto workers.
+pub(crate) fn record_nonce_from(nonce_base: &[u8; NONCE_LEN], sequence: u64) -> [u8; NONCE_LEN] {
+    let mut nonce = *nonce_base;
+    for (dst, src) in nonce[NONCE_LEN - 8..]
+        .iter_mut()
+        .zip(sequence.to_be_bytes())
+    {
+        *dst ^= src;
+    }
+    nonce
+}
+
+/// Seals `plaintext` in place with an explicit sequence number using a shared
+/// cipher. Stateless: it neither reads nor advances any sequence counter, so
+/// multiple records can be sealed concurrently on different threads provided
+/// each is given a unique `sequence`.
+pub(crate) fn seal_in_place_detached_with(
+    cipher: &LessSafeKey,
+    nonce_base: &[u8; NONCE_LEN],
+    sequence: u64,
+    plaintext: &mut [u8],
+    aad: &[u8],
+) -> Result<[u8; AEAD_TAG_LEN], SessionError> {
+    if sequence == u64::MAX {
+        return Err(SessionError::NonceExhausted);
+    }
+    let nonce = Nonce::assume_unique_for_key(record_nonce_from(nonce_base, sequence));
+    let tag = cipher
+        .seal_in_place_separate_tag(nonce, Aad::from(aad), plaintext)
+        .map_err(|_| SessionError::Aead)?;
+    let mut out = [0_u8; AEAD_TAG_LEN];
+    out.copy_from_slice(tag.as_ref());
+    Ok(out)
+}
+
+/// Opens a contiguous `ciphertext || tag` slice in place with an explicit
+/// sequence number using a shared cipher, returning the plaintext length.
+/// Stateless counterpart of [`seal_in_place_detached_with`].
+pub(crate) fn open_in_place_split_with(
+    cipher: &LessSafeKey,
+    nonce_base: &[u8; NONCE_LEN],
+    sequence: u64,
+    ciphertext_with_tag: &mut [u8],
+    aad: &[u8],
+) -> Result<usize, SessionError> {
+    if ciphertext_with_tag.len() < AEAD_TAG_LEN {
+        return Err(SessionError::Aead);
+    }
+    if sequence == u64::MAX {
+        return Err(SessionError::NonceExhausted);
+    }
+    let nonce = Nonce::assume_unique_for_key(record_nonce_from(nonce_base, sequence));
+    let plaintext = cipher
+        .open_in_place(nonce, Aad::from(aad), ciphertext_with_tag)
+        .map_err(|_| SessionError::Aead)?;
+    Ok(plaintext.len())
 }
 
 impl AeadCodec {
@@ -306,6 +371,28 @@ impl AeadCodec {
         self.protect_secret_memory();
     }
 
+    /// Shared handle to the session cipher for the parallel crypto workers.
+    pub(crate) fn cipher(&self) -> SharedCipher {
+        Arc::clone(&self.cipher)
+    }
+
+    /// Current per-direction record sequence number (the next nonce to use).
+    pub(crate) fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Session nonce base; combine with a sequence number via
+    /// [`record_nonce_from`] to reproduce a record's nonce off-thread.
+    pub(crate) fn nonce_base(&self) -> [u8; NONCE_LEN] {
+        self.nonce_base
+    }
+
+    /// Advances the sequence counter by `count` after a batch of records was
+    /// sealed/opened off-thread with explicit sequence numbers.
+    pub(crate) fn advance_sequence(&mut self, count: u64) {
+        self.sequence = self.sequence.saturating_add(count);
+    }
+
     pub fn protect_secret_memory(&self) {
         crate::process_hardening::protect_secret_bytes("aead.key", &self.key);
         crate::process_hardening::protect_secret_bytes("aead.nonce_base", &self.nonce_base);
@@ -324,17 +411,15 @@ impl AeadCodec {
         plaintext: &mut [u8],
         aad: &[u8],
     ) -> Result<[u8; AEAD_TAG_LEN], SessionError> {
-        self.ensure_can_process_next_record()?;
-        let nonce = Nonce::assume_unique_for_key(self.record_nonce());
-        let tag = self
-            .cipher
-            .seal_in_place_separate_tag(nonce, Aad::from(aad), plaintext)
-            .map_err(|_| SessionError::Aead)?;
-
-        let mut out = [0_u8; AEAD_TAG_LEN];
-        out.copy_from_slice(tag.as_ref());
+        let tag = seal_in_place_detached_with(
+            &self.cipher,
+            &self.nonce_base,
+            self.sequence,
+            plaintext,
+            aad,
+        )?;
         self.sequence += 1;
-        Ok(out)
+        Ok(tag)
     }
 
     pub fn open(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {
@@ -363,36 +448,15 @@ impl AeadCodec {
         ciphertext_with_tag: &mut [u8],
         aad: &[u8],
     ) -> Result<usize, SessionError> {
-        if ciphertext_with_tag.len() < AEAD_TAG_LEN {
-            return Err(SessionError::Aead);
-        }
-        self.ensure_can_process_next_record()?;
-        let nonce = Nonce::assume_unique_for_key(self.record_nonce());
-        let plaintext = self
-            .cipher
-            .open_in_place(nonce, Aad::from(aad), ciphertext_with_tag)
-            .map_err(|_| SessionError::Aead)?;
-        let plaintext_len = plaintext.len();
+        let plaintext_len = open_in_place_split_with(
+            &self.cipher,
+            &self.nonce_base,
+            self.sequence,
+            ciphertext_with_tag,
+            aad,
+        )?;
         self.sequence += 1;
         Ok(plaintext_len)
-    }
-
-    fn ensure_can_process_next_record(&self) -> Result<(), SessionError> {
-        if self.sequence == u64::MAX {
-            return Err(SessionError::NonceExhausted);
-        }
-        Ok(())
-    }
-
-    fn record_nonce(&self) -> [u8; NONCE_LEN] {
-        let mut nonce = self.nonce_base;
-        for (dst, src) in nonce[NONCE_LEN - 8..]
-            .iter_mut()
-            .zip(self.sequence.to_be_bytes())
-        {
-            *dst ^= src;
-        }
-        nonce
     }
 }
 

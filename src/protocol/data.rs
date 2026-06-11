@@ -1,10 +1,17 @@
 use std::ops::Range;
 
+use aws_lc_rs::aead::LessSafeKey;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use thiserror::Error;
 use zeroize::Zeroize;
 
 use crate::{
-    crypto::session::{AeadCodec, SessionError, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN},
+    crypto::{
+        parallel::{self, CryptoPool},
+        session::{
+            self, AeadCodec, SessionError, SharedCipher, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN,
+        },
+    },
     tls::record::{self, TLS_CONTENT_APPLICATION_DATA, TLS_LEGACY_VERSION},
     traffic::{PaddingProfile, TrafficError},
 };
@@ -367,6 +374,297 @@ impl DataRecordCodec {
     pub(crate) fn max_sealed_len(&self, payload_len: usize) -> usize {
         record_capacity(payload_len, self.padding.max_len())
     }
+
+    /// Parallel counterpart of [`Self::seal_chunks_into_untracked`]: splits
+    /// `payload` into `max_plaintext_len`-sized records and seals them across
+    /// `pool`'s worker threads, appending the records to `out` in order. The
+    /// wire output is byte-identical to the serial path for a given padding
+    /// stream, and the per-direction sequence counter advances by the same
+    /// number of records, so the two paths are interchangeable mid-stream.
+    pub fn seal_chunks_into_parallel<R>(
+        &mut self,
+        pool: &CryptoPool,
+        payload: &[u8],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError>
+    where
+        R: Rng + rand::RngCore + ?Sized,
+    {
+        let max_chunk_len = self.max_plaintext_len();
+        if max_chunk_len == 0 {
+            return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
+        }
+        let record_count = chunk_count(payload.len(), max_chunk_len);
+        let group_count = pool.width().max(1).min(record_count);
+
+        let cipher = self.aead.cipher();
+        let nonce_base = self.aead.nonce_base();
+        let base_sequence = self.aead.sequence();
+        let aad = self.aad;
+        let padding = self.padding;
+
+        let mut jobs = Vec::with_capacity(group_count);
+        let mut next_chunk = 0;
+        for group in 0..group_count {
+            let chunks_here = (record_count - next_chunk).div_ceil(group_count - group);
+            let chunk_end = next_chunk + chunks_here;
+            let byte_start = next_chunk * max_chunk_len;
+            let byte_end = (chunk_end * max_chunk_len).min(payload.len());
+            let group_plaintext = payload[byte_start..byte_end].to_vec();
+            let group_base_sequence = base_sequence + next_chunk as u64;
+            let seed = rng.gen::<u64>();
+            let cipher = SharedCipher::clone(&cipher);
+            jobs.push(move || {
+                seal_record_group(
+                    &cipher,
+                    &nonce_base,
+                    aad,
+                    &padding,
+                    max_chunk_len,
+                    group_base_sequence,
+                    &group_plaintext,
+                    seed,
+                )
+            });
+            next_chunk = chunk_end;
+        }
+
+        let segments = parallel::dispatch_blocking(|| pool.run_ordered(jobs));
+        let mut sealed = Vec::with_capacity(segments.len());
+        for segment in segments {
+            sealed.push(segment?);
+        }
+        out.reserve(sealed.iter().map(Vec::len).sum());
+        for segment in &sealed {
+            out.extend_from_slice(segment);
+        }
+        self.aead.advance_sequence(record_count as u64);
+        Ok(())
+    }
+
+    /// Opens a buffer of consecutive sealed TLS records in parallel across
+    /// `pool`, appending the concatenated plaintext to `out`. The records must
+    /// be exactly those produced for this direction in order; the sequence
+    /// counter advances by the number of records opened. On any AEAD failure
+    /// the counter is left untouched (mirroring the serial `open*` methods, so
+    /// a rejected record cannot silently desynchronize the stream).
+    pub fn open_concat_records_parallel(
+        &mut self,
+        pool: &CryptoPool,
+        records: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError> {
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
+        let mut offset = 0;
+        while offset < records.len() {
+            let header = record::parse_header(&records[offset..])?;
+            if header.content_type != TLS_CONTENT_APPLICATION_DATA {
+                return Err(DataRecordError::NotApplicationData);
+            }
+            if records.len() < offset + header.total_len {
+                return Err(record::TlsRecordError::IncompletePayload.into());
+            }
+            if header.payload_len < AEAD_TAG_LEN {
+                return Err(SessionError::Aead.into());
+            }
+            bounds.push((offset, header.total_len));
+            offset += header.total_len;
+        }
+
+        let record_count = bounds.len();
+        if record_count == 0 {
+            return Ok(());
+        }
+        let group_count = pool.width().max(1).min(record_count);
+
+        let cipher = self.aead.cipher();
+        let nonce_base = self.aead.nonce_base();
+        let base_sequence = self.aead.sequence();
+        let aad = self.aad;
+
+        let mut jobs = Vec::with_capacity(group_count);
+        let mut next_record = 0;
+        for group in 0..group_count {
+            let records_here = (record_count - next_record).div_ceil(group_count - group);
+            let record_end = next_record + records_here;
+            let byte_start = bounds[next_record].0;
+            let (last_start, last_len) = bounds[record_end - 1];
+            let byte_end = last_start + last_len;
+            let group_bytes = records[byte_start..byte_end].to_vec();
+            let group_bounds: Vec<(usize, usize)> = bounds[next_record..record_end]
+                .iter()
+                .map(|(record_offset, total_len)| (record_offset - byte_start, *total_len))
+                .collect();
+            let group_base_sequence = base_sequence + next_record as u64;
+            let cipher = SharedCipher::clone(&cipher);
+            jobs.push(move || {
+                open_record_group(
+                    &cipher,
+                    &nonce_base,
+                    aad,
+                    group_base_sequence,
+                    group_bytes,
+                    &group_bounds,
+                )
+            });
+            next_record = record_end;
+        }
+
+        let segments = parallel::dispatch_blocking(|| pool.run_ordered(jobs));
+        let mut plaintexts = Vec::with_capacity(segments.len());
+        for segment in segments {
+            plaintexts.push(segment?);
+        }
+        out.reserve(plaintexts.iter().map(Vec::len).sum());
+        for plaintext in &plaintexts {
+            out.extend_from_slice(plaintext);
+        }
+        self.aead.advance_sequence(record_count as u64);
+        Ok(())
+    }
+}
+
+/// Seals one record into `out`: frames the header, copies `plaintext`, applies
+/// the padding suffix, encrypts in place with the explicit `sequence`, and
+/// fixes up the length field. Stateless mirror of
+/// [`DataRecordCodec::begin_record`]/[`DataRecordCodec::finish_record`] used by
+/// the parallel crypto workers.
+#[allow(clippy::too_many_arguments)]
+fn seal_one_record_into<R>(
+    cipher: &LessSafeKey,
+    nonce_base: &[u8; NONCE_LEN],
+    sequence: u64,
+    padding: &PaddingProfile,
+    aad: &[u8],
+    plaintext: &[u8],
+    rng: &mut R,
+    out: &mut Vec<u8>,
+) -> Result<(), DataRecordError>
+where
+    R: Rng + rand::RngCore + ?Sized,
+{
+    let record_start = out.len();
+    out.extend_from_slice(&[
+        TLS_CONTENT_APPLICATION_DATA,
+        TLS_LEGACY_VERSION[0],
+        TLS_LEGACY_VERSION[1],
+        0,
+        0,
+    ]);
+    let ciphertext_start = record_start + record::TLS_HEADER_LEN;
+    out.extend_from_slice(plaintext);
+    padding.apply_suffix_into(plaintext.len(), rng, out);
+    let padded_len = out.len() - ciphertext_start;
+    if padded_len + AEAD_TAG_LEN > OUTER_TLS_RECORD_LIMIT {
+        out[ciphertext_start..].zeroize();
+        out.truncate(record_start);
+        return Err(record::TlsRecordError::PayloadTooLarge(padded_len + AEAD_TAG_LEN).into());
+    }
+    crate::process_hardening::exclude_transient_from_core_dump(
+        "data_record.seal_plaintext",
+        &out[ciphertext_start..],
+    );
+    let tag = match session::seal_in_place_detached_with(
+        cipher,
+        nonce_base,
+        sequence,
+        &mut out[ciphertext_start..],
+        aad,
+    ) {
+        Ok(tag) => tag,
+        Err(err) => {
+            out[ciphertext_start..].zeroize();
+            out.truncate(record_start);
+            return Err(err.into());
+        }
+    };
+    out.extend_from_slice(&tag);
+    let tls_payload_len = out.len() - ciphertext_start;
+    let len = (tls_payload_len as u16).to_be_bytes();
+    out[record_start + 3] = len[0];
+    out[record_start + 4] = len[1];
+    Ok(())
+}
+
+/// Seals a contiguous run of records (one worker's share) into a fresh buffer.
+#[allow(clippy::too_many_arguments)]
+fn seal_record_group(
+    cipher: &LessSafeKey,
+    nonce_base: &[u8; NONCE_LEN],
+    aad: &'static [u8],
+    padding: &PaddingProfile,
+    max_chunk_len: usize,
+    base_sequence: u64,
+    plaintext: &[u8],
+    seed: u64,
+) -> Result<Vec<u8>, DataRecordError> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(
+        plaintext.len() + chunk_count(plaintext.len(), max_chunk_len) * record_overhead(padding),
+    );
+    if plaintext.is_empty() {
+        seal_one_record_into(cipher, nonce_base, base_sequence, padding, aad, &[], &mut rng, &mut out)?;
+        return Ok(out);
+    }
+    for (index, chunk) in plaintext.chunks(max_chunk_len).enumerate() {
+        seal_one_record_into(
+            cipher,
+            nonce_base,
+            base_sequence + index as u64,
+            padding,
+            aad,
+            chunk,
+            &mut rng,
+            &mut out,
+        )?;
+    }
+    Ok(out)
+}
+
+/// Opens a contiguous run of records (one worker's share) in place, returning
+/// the concatenated, unpadded plaintext.
+fn open_record_group(
+    cipher: &LessSafeKey,
+    nonce_base: &[u8; NONCE_LEN],
+    aad: &'static [u8],
+    base_sequence: u64,
+    mut bytes: Vec<u8>,
+    bounds: &[(usize, usize)],
+) -> Result<Vec<u8>, DataRecordError> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for (index, &(record_offset, total_len)) in bounds.iter().enumerate() {
+        let sequence = base_sequence + index as u64;
+        let ciphertext_start = record_offset + record::TLS_HEADER_LEN;
+        let ciphertext_end = record_offset + total_len;
+        let plaintext_len = match session::open_in_place_split_with(
+            cipher,
+            nonce_base,
+            sequence,
+            &mut bytes[ciphertext_start..ciphertext_end],
+            aad,
+        ) {
+            Ok(len) => len,
+            Err(err) => {
+                bytes[ciphertext_start..ciphertext_end].zeroize();
+                return Err(err.into());
+            }
+        };
+        let padded = &bytes[ciphertext_start..ciphertext_start + plaintext_len];
+        let unpadded_len = match PaddingProfile::unpadded_len(padded) {
+            Ok(len) => len,
+            Err(err) => {
+                bytes[ciphertext_start..ciphertext_end].zeroize();
+                return Err(err.into());
+            }
+        };
+        out.extend_from_slice(&bytes[ciphertext_start..ciphertext_start + unpadded_len]);
+    }
+    Ok(out)
+}
+
+fn record_overhead(padding: &PaddingProfile) -> usize {
+    record::TLS_HEADER_LEN + padding.max_len() as usize + PADDING_LEN_FIELD + AEAD_TAG_LEN
 }
 
 pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";
@@ -751,6 +1049,178 @@ mod tests {
         let mut good = enc.seal(b"hello", &mut rng).unwrap();
         dec.open_in_place(&mut good).unwrap();
         assert_eq!(good, b"hello");
+    }
+
+    fn test_pool() -> CryptoPool {
+        CryptoPool::new(4)
+    }
+
+    #[test]
+    fn parallel_seal_matches_serial_byte_for_byte_without_padding() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let payload = (0..200 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let mut serial = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut serial_rng = StdRng::seed_from_u64(101);
+        let mut serial_out = Vec::new();
+        serial
+            .seal_chunks_into_untracked(&payload, &mut serial_rng, &mut serial_out)
+            .unwrap();
+
+        let mut parallel = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut parallel_rng = StdRng::seed_from_u64(202);
+        let mut parallel_out = Vec::new();
+        parallel
+            .seal_chunks_into_parallel(&test_pool(), &payload, &mut parallel_rng, &mut parallel_out)
+            .unwrap();
+
+        // With zero padding no rng is consumed, so output is fully deterministic
+        // and the parallel path must match the serial wire bytes exactly.
+        assert_eq!(parallel_out, serial_out);
+    }
+
+    #[test]
+    fn parallel_seal_round_trips_through_serial_open_with_padding() {
+        let key = [3_u8; KEY_LEN];
+        let nonce = [4_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 256).unwrap();
+        let payload = (0..300 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut sealed = Vec::new();
+        enc.seal_chunks_into_parallel(&test_pool(), &payload, &mut rng, &mut sealed)
+            .unwrap();
+
+        let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let mut offset = 0;
+        let mut opened = Vec::with_capacity(payload.len());
+        while offset < sealed.len() {
+            let header = record::parse_header(&sealed[offset..]).unwrap();
+            let end = offset + header.total_len;
+            opened.extend_from_slice(&dec.open(&sealed[offset..end]).unwrap());
+            offset = end;
+        }
+        assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn parallel_open_matches_serial_open_across_many_records() {
+        let key = [5_u8; KEY_LEN];
+        let nonce = [6_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 200).unwrap();
+        let payload = (0..400 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut rng = StdRng::seed_from_u64(31);
+        let mut sealed = Vec::new();
+        enc.seal_chunks_into_untracked(&payload, &mut rng, &mut sealed)
+            .unwrap();
+
+        let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut opened = Vec::new();
+        dec.open_concat_records_parallel(&test_pool(), &sealed, &mut opened)
+            .unwrap();
+        assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn parallel_seal_then_parallel_open_round_trips_both_directions() {
+        let pool = test_pool();
+        for (aad, key, nonce) in [
+            (CLIENT_TO_SERVER_AAD, [1_u8; KEY_LEN], [2_u8; NONCE_LEN]),
+            (SERVER_TO_CLIENT_AAD, [9_u8; KEY_LEN], [8_u8; NONCE_LEN]),
+        ] {
+            let padding = PaddingProfile::new(0, 128).unwrap();
+            let payload = (0..(1024 * 1024 + 7))
+                .map(|idx| (idx % 251) as u8)
+                .collect::<Vec<_>>();
+            let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, aad);
+            let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, aad);
+            let mut rng = StdRng::seed_from_u64(55);
+
+            let mut sealed = Vec::new();
+            enc.seal_chunks_into_parallel(&pool, &payload, &mut rng, &mut sealed)
+                .unwrap();
+            let mut opened = Vec::new();
+            dec.open_concat_records_parallel(&pool, &sealed, &mut opened)
+                .unwrap();
+            assert_eq!(opened, payload);
+        }
+    }
+
+    #[test]
+    fn parallel_seal_advances_sequence_like_serial() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let payload = vec![0x33_u8; 70 * 1024];
+
+        // After sealing the same payload, a follow-up single record must use the
+        // same nonce in both paths, so the serial decoder accepts both streams.
+        let mut serial = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut serial_rng = StdRng::seed_from_u64(1);
+        let mut serial_out = Vec::new();
+        serial.seal_chunks_into_untracked(&payload, &mut serial_rng, &mut serial_out).unwrap();
+        let serial_tail = serial.seal(b"tail", &mut serial_rng).unwrap();
+
+        let mut parallel = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut parallel_rng = StdRng::seed_from_u64(2);
+        let mut parallel_out = Vec::new();
+        parallel.seal_chunks_into_parallel(&test_pool(), &payload, &mut parallel_rng, &mut parallel_out).unwrap();
+        let parallel_tail = parallel.seal(b"tail", &mut parallel_rng).unwrap();
+
+        assert_eq!(serial_tail, parallel_tail);
+    }
+
+    #[test]
+    fn parallel_open_rejects_tampered_record() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let payload = vec![0x44_u8; 80 * 1024];
+
+        let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut sealed = Vec::new();
+        enc.seal_chunks_into_untracked(&payload, &mut rng, &mut sealed).unwrap();
+        let flip = sealed.len() / 2;
+        sealed[flip] ^= 0x01;
+
+        let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut opened = Vec::new();
+        assert!(matches!(
+            dec.open_concat_records_parallel(&test_pool(), &sealed, &mut opened),
+            Err(DataRecordError::Aead(_))
+        ));
+    }
+
+    #[test]
+    fn parallel_seal_handles_empty_and_tiny_payloads() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let pool = test_pool();
+
+        for payload in [Vec::new(), b"x".to_vec(), b"short payload".to_vec()] {
+            let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+            let mut rng = StdRng::seed_from_u64(3);
+            let mut sealed = Vec::new();
+            enc.seal_chunks_into_parallel(&pool, &payload, &mut rng, &mut sealed).unwrap();
+
+            let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+            let mut opened = Vec::new();
+            dec.open_concat_records_parallel(&pool, &sealed, &mut opened).unwrap();
+            assert_eq!(opened, payload);
+        }
     }
 
     #[test]
