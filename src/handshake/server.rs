@@ -49,9 +49,10 @@ use crate::{
     protocol::{
         command::{
             ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind,
-            PqRekeyError, PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError,
-            ServerIdentityProof, ServerIdentityProofError, ServerKeyExchange,
-            ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest, SpeedTestRequestError,
+            MuxFrameRef, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
+            ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
+            ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest,
+            SpeedTestRequestError,
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError,
@@ -1279,7 +1280,6 @@ fn apply_server_pq_rekey(
         keys.transcript_hash,
         *x25519_shared_secret,
     )?;
-    next_keys.protect_secret_memory();
     client_open.rekey(next_keys.client_key, next_keys.client_nonce);
     server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
     Ok(next_keys)
@@ -1441,7 +1441,17 @@ async fn server_mux_client_reader_loop(
 ) -> Result<(), HandshakeServerError> {
     let mut target_writes = HashMap::<u32, OwnedWriteHalf>::new();
     for frame in first_frames {
-        process_server_mux_frame(frame, &mut target_writes, &frame_tx, context).await?;
+        process_server_mux_frame(
+            MuxFrameRef {
+                stream_id: frame.stream_id,
+                kind: frame.kind,
+                payload: &frame.payload,
+            },
+            &mut target_writes,
+            &frame_tx,
+            context,
+        )
+        .await?;
     }
 
     let mut client_record = Vec::new();
@@ -1463,14 +1473,17 @@ async fn server_mux_client_reader_loop(
             &client_record,
         );
         let payload = client_open.open_in_place_payload_range(&mut client_record)?;
-        for frame in MuxFrame::decode_all(&client_record[payload])? {
+        let mut frames = &client_record[payload];
+        while !frames.is_empty() {
+            let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
             process_server_mux_frame(frame, &mut target_writes, &frame_tx, context).await?;
+            frames = &frames[used..];
         }
     }
 }
 
 async fn process_server_mux_frame(
-    frame: MuxFrame,
+    frame: MuxFrameRef<'_>,
     target_writes: &mut HashMap<u32, OwnedWriteHalf>,
     frame_tx: &mpsc::Sender<MuxFrame>,
     context: ServerMuxContext<'_>,
@@ -1482,7 +1495,7 @@ async fn process_server_mux_frame(
                     .await?;
                 return Ok(());
             }
-            let mut payload = frame.payload;
+            let mut payload = frame.payload.to_vec();
             let (target_addr, initial_payload) = {
                 let (target_addr, initial_payload) =
                     resolve_connect_target(payload.as_mut_slice(), context.fixed_data_target)?;
@@ -1523,7 +1536,7 @@ async fn process_server_mux_frame(
         MuxFrameKind::Data => {
             if let Some(target_write) = target_writes.get_mut(&frame.stream_id) {
                 if !frame.payload.is_empty() {
-                    target_write.write_all(&frame.payload).await?;
+                    target_write.write_all(frame.payload).await?;
                 }
             }
         }
@@ -1592,6 +1605,28 @@ async fn server_mux_writer_loop(
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(server_seal.max_plaintext_len());
     let mut mux_payload_buf = Vec::with_capacity(server_seal.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
+    if !cover.is_enabled() {
+        loop {
+            let Some(frame) = frame_rx.recv().await else {
+                let _ = client_write.shutdown().await;
+                return Ok(());
+            };
+            write_server_mux_frames_batched(
+                &mut client_write,
+                &mut server_seal,
+                frame,
+                ServerMuxBatchState {
+                    frame_rx: &mut frame_rx,
+                    payload_buf: &mut mux_payload_buf,
+                },
+                &mut rng,
+                &mut seal_scratch,
+                RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
+            )
+            .await?;
+        }
+    }
+
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
     loop {
@@ -1970,6 +2005,32 @@ async fn server_download_loop(
 ) -> Result<(), HandshakeServerError> {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
     let mut rng = StdRng::from_entropy();
+    if !cover.is_enabled() {
+        loop {
+            let n = target_read.read(&mut target_buf).await?;
+            if n == 0 {
+                let _ = client_write.shutdown().await;
+                return Ok(());
+            }
+            let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
+
+            let delay = timing.sample_delay(&mut rng);
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+
+            write_server_data_records_chunked(
+                &mut client_write,
+                &mut server_seal,
+                &target_buf[..n],
+                &mut rng,
+                &mut seal_scratch,
+                RelayWriteLog::new(cid, "server->client", "server-download-writer"),
+            )
+            .await?;
+        }
+    }
+
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
     loop {

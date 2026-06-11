@@ -957,6 +957,26 @@ async fn client_upload_loop(
 ) -> Result<(), ClientRuntimeError> {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
     let mut rng = StdRng::from_entropy();
+    if !cover.is_enabled() {
+        loop {
+            let n = local_read.read(&mut local_buf).await?;
+            if n == 0 {
+                let _ = server_write.shutdown().await;
+                return Ok(());
+            }
+            let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+            write_client_data_records_chunked(
+                &mut server_write,
+                &mut seal_to_server,
+                &local_buf[..n],
+                &mut rng,
+                &mut seal_scratch,
+                RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
+            )
+            .await?;
+        }
+    }
+
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
     loop {
@@ -1180,6 +1200,28 @@ async fn client_mux_writer_loop(
         RelaySealScratch::with_payload_capacity(seal_to_server.max_plaintext_len());
     let mut mux_payload_buf = Vec::with_capacity(seal_to_server.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
+    if !cover.is_enabled() {
+        loop {
+            let Some(frame) = frame_rx.recv().await else {
+                let _ = server_write.shutdown().await;
+                return Ok(());
+            };
+            write_client_mux_frames_batched(
+                &mut server_write,
+                &mut seal_to_server,
+                frame,
+                ClientMuxBatchState {
+                    frame_rx: &mut frame_rx,
+                    payload_buf: &mut mux_payload_buf,
+                },
+                &mut rng,
+                &mut seal_scratch,
+                RelayWriteLog::new(cid, "client->server", "client-mux-writer"),
+            )
+            .await?;
+        }
+    }
+
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
 
     loop {
