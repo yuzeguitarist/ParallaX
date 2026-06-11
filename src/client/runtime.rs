@@ -1956,6 +1956,165 @@ mod tests {
         wait_for_task("fallback", fallback_task).await;
     }
 
+    /// Regression cover for the mux data path: one stream carrying many small,
+    /// consecutive payloads must deliver every byte in order in both directions,
+    /// and a half-close FIN must never overtake queued DATA. This drives the
+    /// batched mux writers/readers and the AEAD record batching end to end, so a
+    /// reorder, drop, duplication, or premature FIN shows up as a byte mismatch
+    /// or a timeout. The byte pattern is position-encoded so any such defect is
+    /// detectable rather than masked by repeated bytes.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_single_stream_small_consecutive_payloads_preserve_order_and_fin() {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_echo_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        // Force the mux data path; the reported regression only appears with
+        // max_concurrent_streams > 1 (max_concurrent_streams == 1 is non-mux).
+        let mux_traffic = TrafficConfig {
+            max_concurrent_streams: 4,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_with_traffic(server_config, mux_traffic).await;
+        let (local_addr, client_task) = spawn_mux_local_client(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            1,
+        )
+        .await;
+
+        let app = connect_socks_target(local_addr, target_addr).await;
+        let (mut app_read, mut app_write) = app.into_split();
+
+        const CHUNKS: usize = 4096;
+        const CHUNK_LEN: usize = 13;
+        let mut expected = Vec::with_capacity(CHUNKS * CHUNK_LEN);
+        for i in 0..CHUNKS {
+            for b in 0..CHUNK_LEN {
+                expected.push((i.wrapping_mul(31).wrapping_add(b.wrapping_mul(7)) % 251) as u8);
+            }
+        }
+        let total = expected.len();
+
+        let writer_expected = expected.clone();
+        let writer = async move {
+            for chunk in writer_expected.chunks(CHUNK_LEN) {
+                app_write.write_all(chunk).await.unwrap();
+            }
+            // Half-close the upload: the FIN must land after every queued DATA
+            // frame so the echo target still sees and echoes all bytes.
+            app_write.shutdown().await.unwrap();
+        };
+        let reader = async move {
+            let mut got = vec![0_u8; total];
+            app_read.read_exact(&mut got).await.unwrap();
+            // Every echoed byte arrived; the stream must now cleanly reach EOF.
+            let mut tail = [0_u8; 1];
+            let extra = app_read.read(&mut tail).await.unwrap();
+            (got, extra)
+        };
+
+        let (_, (got, extra)) = timeout(Duration::from_secs(20), async {
+            tokio::join!(writer, reader)
+        })
+        .await
+        .expect("mux small-payload round trip timed out");
+
+        assert_eq!(
+            extra, 0,
+            "stream must EOF only after all echoed bytes (FIN overtook queued DATA)"
+        );
+        assert_eq!(
+            got, expected,
+            "echoed bytes must match byte-for-byte and in order"
+        );
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
+    /// Regression cover for global mux ordering: with several streams active at
+    /// once, each stream must receive its own bytes in order with no cross-stream
+    /// mixing, even though the batched writer interleaves frames from every
+    /// stream into shared sealed records. Each stream uses a distinct payload
+    /// pattern so any cross-stream contamination is caught.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_concurrent_streams_keep_per_stream_payload_order() {
+        const STREAMS: usize = 4;
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_multi_echo_target(STREAMS).await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let mux_traffic = TrafficConfig {
+            max_concurrent_streams: STREAMS as u8,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_with_traffic(server_config, mux_traffic).await;
+        let (local_addr, client_task) = spawn_mux_local_client(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            STREAMS,
+        )
+        .await;
+
+        let mut apps = Vec::with_capacity(STREAMS);
+        for _ in 0..STREAMS {
+            apps.push(connect_socks_target(local_addr, target_addr).await);
+        }
+        let mut tasks = Vec::with_capacity(STREAMS);
+        for (idx, app) in apps.into_iter().enumerate() {
+            let payload: Vec<u8> = (0..8192)
+                .map(|b| (idx as u8).wrapping_mul(101).wrapping_add((b % 251) as u8))
+                .collect();
+            tasks.push(tokio::spawn(assert_payload_round_trip(app, payload)));
+        }
+        for task in tasks {
+            timeout(Duration::from_secs(20), task)
+                .await
+                .expect("mux concurrent stream round trip timed out")
+                .unwrap();
+        }
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
     /// Tunables for one loopback mux benchmark run.
     struct MuxBenchParams {
         streams: usize,
