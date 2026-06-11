@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -869,6 +871,76 @@ fn validate_mux_stream(kind: MuxFrameKind, stream_id: u32) -> Result<(), MuxFram
     }
 }
 
+/// Default retention cap for a [`MuxPayloadPool`] freelist.
+///
+/// Steady-state relays keep only a handful of recycled buffers alive at once
+/// (one producer hands a buffer back as the writer drains it), so a small cap
+/// is plenty while bounding idle memory well below the in-flight channel depth.
+pub const MUX_PAYLOAD_POOL_DEFAULT_MAX: usize = 64;
+
+/// Recycles `MuxFrame` `Data` payload buffers between the relay's per-stream
+/// producer tasks and the single fan-in writer task.
+///
+/// The relay hot path reads a TCP chunk, wraps it in a [`MuxFrame`], ships it
+/// across an mpsc channel to the writer, and the writer copies the payload into
+/// the seal buffer before dropping the frame. Without recycling that is one
+/// heap allocation and one free per chunk on both the client upload and server
+/// download paths. The pool turns that churn into a bounded freelist guarded by
+/// a briefly-held mutex (no `.await` is ever held across the lock).
+#[derive(Clone)]
+pub struct MuxPayloadPool {
+    free: Arc<Mutex<Vec<Vec<u8>>>>,
+    buffer_capacity: usize,
+    max_buffers: usize,
+}
+
+impl MuxPayloadPool {
+    pub fn new(buffer_capacity: usize, max_buffers: usize) -> Self {
+        Self {
+            free: Arc::new(Mutex::new(Vec::new())),
+            buffer_capacity: buffer_capacity.max(1),
+            max_buffers: max_buffers.max(1),
+        }
+    }
+
+    /// Builds a pool whose buffers hold one max-sized mux `Data` payload.
+    pub fn with_capacity(buffer_capacity: usize) -> Self {
+        Self::new(buffer_capacity, MUX_PAYLOAD_POOL_DEFAULT_MAX)
+    }
+
+    /// Returns an empty buffer, reusing a recycled allocation when available.
+    pub fn take(&self) -> Vec<u8> {
+        if let Ok(mut free) = self.free.lock() {
+            if let Some(buf) = free.pop() {
+                return buf;
+            }
+        }
+        Vec::with_capacity(self.buffer_capacity)
+    }
+
+    /// Returns a buffer pre-filled with `chunk`, reusing a recycled allocation.
+    pub fn take_filled(&self, chunk: &[u8]) -> Vec<u8> {
+        let mut buf = self.take();
+        buf.extend_from_slice(chunk);
+        buf
+    }
+
+    /// Returns a buffer for reuse. Buffers smaller than one full payload slot,
+    /// or those that would exceed the retention cap, are dropped instead of
+    /// being hoarded so the freelist never grows without bound.
+    pub fn put(&self, mut buf: Vec<u8>) {
+        if buf.capacity() < self.buffer_capacity {
+            return;
+        }
+        buf.clear();
+        if let Ok(mut free) = self.free.lock() {
+            if free.len() < self.max_buffers {
+                free.push(buf);
+            }
+        }
+    }
+}
+
 struct Cursor<'a> {
     input: &'a [u8],
     pos: usize,
@@ -1306,6 +1378,38 @@ mod tests {
             ServerIdentityProof::decode(&proof).unwrap_err(),
             ServerIdentityProofError::InvalidSignatureLength
         );
+    }
+
+    #[test]
+    fn mux_payload_pool_recycles_buffer_allocations() {
+        let pool = MuxPayloadPool::new(16 * 1024, 4);
+        let first = pool.take_filled(b"hello");
+        assert_eq!(first.as_slice(), b"hello");
+        let ptr = first.as_ptr();
+        let cap = first.capacity();
+        pool.put(first);
+
+        let reused = pool.take();
+        assert!(reused.is_empty());
+        assert_eq!(reused.as_ptr(), ptr, "freed buffer should be handed back");
+        assert_eq!(reused.capacity(), cap);
+    }
+
+    #[test]
+    fn mux_payload_pool_drops_undersized_and_overflow_buffers() {
+        let pool = MuxPayloadPool::new(16 * 1024, 1);
+
+        // Undersized buffers are never retained.
+        pool.put(Vec::with_capacity(8));
+        let fresh = pool.take();
+        assert!(fresh.capacity() >= 16 * 1024);
+
+        // The freelist respects its retention cap.
+        pool.put(Vec::with_capacity(16 * 1024));
+        pool.put(Vec::with_capacity(16 * 1024));
+        let _first = pool.take();
+        let second = pool.take();
+        assert!(second.is_empty());
     }
 
     #[test]

@@ -38,7 +38,7 @@ use crate::{
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::{
         ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind, MuxFrameRef,
-        ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
+        MuxPayloadPool, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
     },
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, DataRecordCodec, DataRecordError, SealedRecord,
@@ -344,6 +344,7 @@ struct ClientMuxHandle {
     next_stream_id: Arc<AtomicU32>,
     stream_slots: Arc<Semaphore>,
     chunk_size: usize,
+    payload_pool: MuxPayloadPool,
 }
 
 enum ClientMuxEvent {
@@ -413,6 +414,8 @@ impl ClientMuxPool {
         let (frame_tx, frame_rx) = mpsc::channel(channel_capacity);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let session_cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let chunk_size = max_plaintext_len(self.traffic.max_padding);
+        let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
         let reader_streams = Arc::clone(&streams);
         tokio::spawn(async move {
             if let Err(err) =
@@ -423,10 +426,17 @@ impl ClientMuxPool {
             }
         });
         let cover = CoverTrafficProfile::from_config(self.traffic);
+        let writer_pool = payload_pool.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                client_mux_writer_loop(server_write, seal_to_server, frame_rx, cover, session_cid)
-                    .await
+            if let Err(err) = client_mux_writer_loop(
+                server_write,
+                seal_to_server,
+                frame_rx,
+                cover,
+                session_cid,
+                writer_pool,
+            )
+            .await
             {
                 tracing::debug!(cid = session_cid, error = %err, "client mux writer stopped");
             }
@@ -437,7 +447,8 @@ impl ClientMuxPool {
             streams,
             next_stream_id: Arc::new(AtomicU32::new(1)),
             stream_slots: Arc::new(Semaphore::new(stream_limit)),
-            chunk_size: max_plaintext_len(self.traffic.max_padding),
+            chunk_size,
+            payload_pool,
         })
     }
 }
@@ -491,6 +502,7 @@ async fn handle_local_mux_connection_with_cid(
         stream_id,
         mux.chunk_size,
         cid,
+        mux.payload_pool.clone(),
     );
     let download = client_mux_download_loop(local_write, event_rx, cid);
     let result = tokio::try_join!(upload, download).map(|_| ());
@@ -1056,6 +1068,7 @@ async fn client_mux_upload_loop(
     stream_id: u32,
     chunk_size: usize,
     cid: u64,
+    payload_pool: MuxPayloadPool,
 ) -> Result<(), ClientRuntimeError> {
     let mut local_buf = vec![0_u8; relay_read_buffer_len(MuxFrame::max_payload_len(chunk_size))];
     let max_payload_len = MuxFrame::max_payload_len(chunk_size);
@@ -1073,7 +1086,13 @@ async fn client_mux_upload_loop(
         }
         let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
         for chunk in local_buf[..n].chunks(max_payload_len) {
-            send_mux_frame(&frame_tx, stream_id, MuxFrameKind::Data, chunk.to_vec()).await?;
+            send_mux_frame(
+                &frame_tx,
+                stream_id,
+                MuxFrameKind::Data,
+                payload_pool.take_filled(chunk),
+            )
+            .await?;
         }
         tracing::trace!(
             cid,
@@ -1198,6 +1217,7 @@ async fn client_mux_writer_loop(
     mut frame_rx: mpsc::Receiver<MuxFrame>,
     cover: CoverTrafficProfile,
     cid: u64,
+    payload_pool: MuxPayloadPool,
 ) -> Result<(), ClientRuntimeError> {
     let mut seal_scratch =
         RelaySealScratch::with_payload_capacity(seal_to_server.max_plaintext_len());
@@ -1218,6 +1238,7 @@ async fn client_mux_writer_loop(
                 &mut rng,
                 &mut seal_scratch,
                 RelayWriteLog::new(cid, "client->server", "client-mux-writer"),
+                &payload_pool,
             )
             .await?;
         }
@@ -1255,6 +1276,7 @@ async fn client_mux_writer_loop(
                     &mut rng,
                     &mut seal_scratch,
                     RelayWriteLog::new(cid, "client->server", "client-mux-writer"),
+                    &payload_pool,
                 )
                 .await?;
             }
@@ -1302,6 +1324,7 @@ async fn write_client_mux_frames_batched<W, R>(
     rng: &mut R,
     scratch: &mut RelaySealScratch,
     log: RelayWriteLog,
+    payload_pool: &MuxPayloadPool,
 ) -> Result<(), ClientRuntimeError>
 where
     W: AsyncWrite + Unpin,
@@ -1316,8 +1339,12 @@ where
 
     scratch.records_buf.clear();
     let mut builder = codec.begin_record(&mut scratch.records_buf);
-    let mut record_plaintext_len =
-        encode_client_mux_frame(&mut scratch.records_buf, first_frame, max_plaintext_len)?;
+    let mut record_plaintext_len = encode_client_mux_frame(
+        &mut scratch.records_buf,
+        first_frame,
+        max_plaintext_len,
+        payload_pool,
+    )?;
 
     let mut drained = 0;
     while drained < MUX_FRAME_BATCH_LIMIT {
@@ -1346,8 +1373,12 @@ where
             builder = codec.begin_record(&mut scratch.records_buf);
             record_plaintext_len = 0;
         }
-        record_plaintext_len +=
-            encode_client_mux_frame(&mut scratch.records_buf, frame, max_plaintext_len)?;
+        record_plaintext_len += encode_client_mux_frame(
+            &mut scratch.records_buf,
+            frame,
+            max_plaintext_len,
+            payload_pool,
+        )?;
         drained += 1;
     }
 
@@ -1370,6 +1401,7 @@ fn encode_client_mux_frame(
     out: &mut Vec<u8>,
     frame: MuxFrame,
     max_plaintext_len: usize,
+    payload_pool: &MuxPayloadPool,
 ) -> Result<usize, ClientRuntimeError> {
     let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
     if frame_len > max_plaintext_len {
@@ -1378,6 +1410,7 @@ fn encode_client_mux_frame(
         ));
     }
     frame.encode_into(out)?;
+    payload_pool.put(frame.payload);
     Ok(frame_len)
 }
 

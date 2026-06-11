@@ -55,8 +55,8 @@ use crate::{
     },
     protocol::{
         command::{
-            ConnectRequest, MuxFrame, MuxFrameKind, PqRekeyRequest, ServerIdentityChunk,
-            ServerIdentityProof, ServerKeyExchange,
+            ConnectRequest, MuxFrame, MuxFrameKind, MuxPayloadPool, PqRekeyRequest,
+            ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
         },
         data::SERVER_TO_CLIENT_AAD,
         data::{DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD},
@@ -1494,6 +1494,7 @@ fn bench_mux_batch_seal_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> 
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut scratch = RelaySealScratch::with_payload_capacity(SIZE_64K);
     let mut out: Vec<u8> = Vec::with_capacity(SIZE_64K + 16 * 1024);
+    let pool = MuxPayloadPool::with_capacity(frame_payload_len);
 
     run_case(
         BenchGroup::RecordPipeline,
@@ -1507,6 +1508,7 @@ fn bench_mux_batch_seal_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> 
                 &mut rng,
                 &mut scratch,
                 &mut out,
+                &pool,
             )
         },
     )
@@ -1518,6 +1520,7 @@ fn mux_batch_seal_blocking(
     rng: &mut StdRng,
     scratch: &mut RelaySealScratch,
     out: &mut Vec<u8>,
+    pool: &MuxPayloadPool,
 ) -> Result<u64> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| {
@@ -1527,6 +1530,7 @@ fn mux_batch_seal_blocking(
                 rng,
                 scratch,
                 out,
+                pool,
             ))
         }),
         Err(_) => tokio::runtime::Builder::new_current_thread()
@@ -1537,6 +1541,7 @@ fn mux_batch_seal_blocking(
                 rng,
                 scratch,
                 out,
+                pool,
             )),
     }
 }
@@ -1549,6 +1554,7 @@ async fn mux_batch_seal_once(
     rng: &mut StdRng,
     scratch: &mut RelaySealScratch,
     out: &mut Vec<u8>,
+    pool: &MuxPayloadPool,
 ) -> Result<u64> {
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<MuxFrame>(8);
     let mut first_frame = None;
@@ -1580,6 +1586,7 @@ async fn mux_batch_seal_once(
         rng,
         scratch,
         RelayWriteLog::new(0, "server->client", "bench-mux-writer"),
+        pool,
     )
     .await?;
     Ok(black_box(out.len() as u64))
