@@ -9,6 +9,7 @@
 | ClientHello authentication | `src/crypto/auth.rs` | Hide authentication material in ClientHello entropy fields. |
 | X25519/session keys | `src/crypto/session.rs` | Derive initial directional AEAD keys and nonce bases. |
 | AEAD transport | `src/crypto/session.rs`, `src/protocol/data.rs` | Seal/open framed data records. |
+| Parallel AEAD pool | `src/crypto/parallel.rs` | Process-wide worker pool that fans bulk seal/open across cores. |
 | ML-KEM-1024 | `src/crypto/pq.rs` | Post-quantum shared secret for rekeying. |
 | ML-DSA-87 | `src/crypto/identity.rs` | Server identity proof pinned by client config. |
 | Replay cache | `src/crypto/replay.rs` | Reject captured/replayed authenticated handshakes. |

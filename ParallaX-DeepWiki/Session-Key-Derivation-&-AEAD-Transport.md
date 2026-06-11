@@ -64,6 +64,32 @@ Large relay payloads are split so each encrypted TLS record stays within the
 outer TLS payload limit. The maximum plaintext chunk size depends on the
 configured maximum padding length.
 
+## Multi-core AEAD fan-out
+
+A single connection's seal/open work used to be pinned to one task and
+therefore one core, which capped per-tunnel throughput at one core's
+ChaCha20-Poly1305 rate. `src/crypto/parallel.rs` provides a process-wide
+`CryptoPool` (sized to available parallelism and shared by every connection so
+tunnels do not oversubscribe the machine) that the data path uses for bulk
+batches:
+
+- The serial caller assigns sequence numbers and record boundaries; workers
+  receive explicit sequences and a shared cipher handle, and never touch the
+  per-direction counter.
+- Worker results are reassembled in record order, so the wire bytes are
+  identical to the serial path for the same padding stream.
+- `should_parallelize_aead` gates the fan-out: small batches (interactive
+  traffic, control frames) seal and open inline to avoid cross-thread dispatch
+  latency; only bulk batches pay for the pool.
+- Any AEAD failure inside a batch fails the whole session closed, matching the
+  serial open path.
+- Rekeying stays serial: a batch fully completes before the codec can be
+  rekeyed, so in-flight jobs never cross an epoch change.
+
+The mux relay writers batch frames into frame-aligned records and seal the
+batch through this pool; the mux readers opportunistically collect
+already-buffered records and open them the same way.
+
 ## Error classes
 
 - malformed TLS record

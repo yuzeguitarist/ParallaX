@@ -69,6 +69,9 @@ After the handshake:
 - server-to-client records are opened with the server direction key
 - large payloads are chunked to fit TLS record limits
 - the relay uses 64 KiB target buffers from `src/protocol/data.rs`
+- the mux writer batches frames into frame-aligned records and the mux reader
+  batches already-buffered records; bulk batches seal/open across the shared
+  crypto pool while small batches stay inline to keep RTT low
 - cover traffic is enabled only when the config interval is non-zero
 
 ## Failure behavior

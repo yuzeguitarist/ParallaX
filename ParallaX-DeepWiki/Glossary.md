@@ -23,6 +23,7 @@
 | ML-KEM-1024 | Post-quantum KEM used for the data-plane rekey. |
 | ML-DSA-87 | Post-quantum signature algorithm used for pinned server identity. |
 | AEAD | Authenticated encryption with associated data for ParallaX records. |
+| Crypto pool | Process-wide worker pool that fans bulk AEAD seal/open across cores while sequence assignment stays serial. |
 | Chain secret | Ratcheted session secret used to derive directional data keys. |
 | Sandwich rekey | Hybrid rekey that binds old chain secret, X25519, ML-KEM, and PSK/symmetric material. |
 | Replay cache | Persistent server-side cache rejecting reused authenticated handshakes. |

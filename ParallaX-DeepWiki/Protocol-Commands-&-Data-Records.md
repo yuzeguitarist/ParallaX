@@ -64,6 +64,15 @@ The relay path uses chunking helpers that can:
 - reuse output buffers
 - avoid tracking ranges for hot relay writes
 
+Batch helpers additionally accept an explicit per-record length list
+(`record_lens`) so the mux writers can keep records frame-aligned, with a
+serial path and a crypto-pool parallel path that produce identical record
+boundaries and sequence numbers. A matching pair of concat-open helpers opens
+a run of consecutive records (serially or across the pool) and returns the
+concatenated plaintext in record order. See
+[Session Key Derivation & AEAD Transport](Session-Key-Derivation-&-AEAD-Transport.md)
+for the fan-out rules.
+
 ## Speed-test protocol
 
 `plx speed` is built on protocol commands rather than ad hoc text. The request
