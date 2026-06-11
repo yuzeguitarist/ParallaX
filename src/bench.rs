@@ -8,7 +8,7 @@
 //!
 //! Design notes:
 //!
-//! * 57 cases across six groups exercise the asymmetric primitives, KDFs,
+//! * 58 cases across six groups exercise the asymmetric primitives, KDFs,
 //!   handshake composition, application-data AEAD pipeline, traffic shaping,
 //!   and replay-cache bookkeeping that dominate ParallaX's wall-clock cost.
 //! * Each case declares an iteration [`Tier`]. Tiers are static constants so
@@ -49,11 +49,14 @@ use crate::{
         },
     },
     handshake::client::ClientDataSession,
-    handshake::server::{decide_inbound, InboundDecision},
+    handshake::server::{
+        decide_inbound, write_server_mux_frames_batched, InboundDecision, RelaySealScratch,
+        RelayWriteLog, ServerMuxBatchState,
+    },
     protocol::{
         command::{
-            ConnectRequest, PqRekeyRequest, ServerIdentityChunk, ServerIdentityProof,
-            ServerKeyExchange,
+            ConnectRequest, MuxFrame, MuxFrameKind, PqRekeyRequest, ServerIdentityChunk,
+            ServerIdentityProof, ServerKeyExchange,
         },
         data::SERVER_TO_CLIENT_AAD,
         data::{DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD},
@@ -387,6 +390,7 @@ const CASES: &[CaseRunner] = &[
     bench_record_round_trip_default_1k,
     bench_record_relay_seal_tracked_64k,
     bench_record_relay_seal_untracked_64k,
+    bench_mux_batch_seal_64k,
     bench_record_bulk_1mb,
     bench_record_bulk_1mb_in_place_open,
     bench_record_bulk_1mb_payload_range,
@@ -1477,6 +1481,115 @@ fn bench_record_relay_seal_untracked_64k(options: BenchmarkOptions) -> Result<Be
             Ok(black_box(buf.len() as u64))
         },
     )
+}
+
+fn bench_mux_batch_seal_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut codec = DataRecordCodec::new(
+        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
+        padding,
+        SERVER_TO_CLIENT_AAD,
+    );
+    let frame_payload_len = codec.max_plaintext_len() - MuxFrame::encoded_len(0)?;
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let mut scratch = RelaySealScratch::with_payload_capacity(SIZE_64K);
+    let mut payload_buf: Vec<u8> = Vec::with_capacity(codec.max_plaintext_len());
+    let mut out: Vec<u8> = Vec::with_capacity(SIZE_64K + 16 * 1024);
+
+    run_case(
+        BenchGroup::RecordPipeline,
+        "mux.batch_seal_64k",
+        TIER_MEDIUM,
+        options,
+        || {
+            mux_batch_seal_blocking(
+                &mut codec,
+                frame_payload_len,
+                &mut rng,
+                &mut scratch,
+                &mut payload_buf,
+                &mut out,
+            )
+        },
+    )
+}
+
+fn mux_batch_seal_blocking(
+    codec: &mut DataRecordCodec,
+    frame_payload_len: usize,
+    rng: &mut StdRng,
+    scratch: &mut RelaySealScratch,
+    payload_buf: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> Result<u64> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(mux_batch_seal_once(
+                codec,
+                frame_payload_len,
+                rng,
+                scratch,
+                payload_buf,
+                out,
+            ))
+        }),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(mux_batch_seal_once(
+                codec,
+                frame_payload_len,
+                rng,
+                scratch,
+                payload_buf,
+                out,
+            )),
+    }
+}
+
+/// Drives the real server mux batch writer over four full-record Data frames
+/// (~64 KiB of mux plaintext) into an in-memory sink.
+async fn mux_batch_seal_once(
+    codec: &mut DataRecordCodec,
+    frame_payload_len: usize,
+    rng: &mut StdRng,
+    scratch: &mut RelaySealScratch,
+    payload_buf: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> Result<u64> {
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<MuxFrame>(8);
+    let mut first_frame = None;
+    for index in 0..4 {
+        let frame = MuxFrame {
+            stream_id: 7,
+            kind: MuxFrameKind::Data,
+            payload: vec![0x42_u8; frame_payload_len],
+        };
+        if index == 0 {
+            first_frame = Some(frame);
+        } else {
+            frame_tx
+                .try_send(frame)
+                .map_err(|err| anyhow::anyhow!("bench mux channel full: {err}"))?;
+        }
+    }
+    drop(frame_tx);
+    let first_frame = first_frame.expect("first frame is always created");
+
+    out.clear();
+    write_server_mux_frames_batched(
+        out,
+        codec,
+        first_frame,
+        ServerMuxBatchState {
+            frame_rx: &mut frame_rx,
+            payload_buf,
+        },
+        rng,
+        scratch,
+        RelayWriteLog::new(0, "server->client", "bench-mux-writer"),
+    )
+    .await?;
+    Ok(black_box(out.len() as u64))
 }
 
 fn bench_record_bulk_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {

@@ -1695,12 +1695,12 @@ where
     .await
 }
 
-struct ServerMuxBatchState<'a> {
-    frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
-    payload_buf: &'a mut Vec<u8>,
+pub(crate) struct ServerMuxBatchState<'a> {
+    pub(crate) frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
+    pub(crate) payload_buf: &'a mut Vec<u8>,
 }
 
-async fn write_server_mux_frames_batched<W, R>(
+pub(crate) async fn write_server_mux_frames_batched<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,
     first_frame: MuxFrame,
@@ -2122,13 +2122,13 @@ where
     Ok(())
 }
 
-struct RelaySealScratch {
+pub(crate) struct RelaySealScratch {
     records_buf: Vec<u8>,
     records: Vec<SealedRecord>,
 }
 
 impl RelaySealScratch {
-    fn with_payload_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_payload_capacity(capacity: usize) -> Self {
         Self {
             records_buf: Vec::with_capacity(capacity + crate::tls::record::TLS_HEADER_LEN),
             records: Vec::new(),
@@ -2137,14 +2137,14 @@ impl RelaySealScratch {
 }
 
 #[derive(Clone, Copy)]
-struct RelayWriteLog {
+pub(crate) struct RelayWriteLog {
     cid: u64,
     direction: &'static str,
     task_name: &'static str,
 }
 
 impl RelayWriteLog {
-    fn new(cid: u64, direction: &'static str, task_name: &'static str) -> Self {
+    pub(crate) fn new(cid: u64, direction: &'static str, task_name: &'static str) -> Self {
         Self {
             cid,
             direction,
