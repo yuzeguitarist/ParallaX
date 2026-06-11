@@ -274,6 +274,11 @@ pub struct AeadCodec {
     nonce_base: [u8; NONCE_LEN],
     sequence: u64,
     cipher: SharedCipher,
+    /// Set when a batch open/seal left the sequence counter in an indeterminate
+    /// state. Once poisoned, every seal/open entry point refuses to operate so
+    /// the session can only fail-close, never silently desynchronize its nonce
+    /// stream. Single-record opens never poison the codec.
+    poisoned: bool,
 }
 
 impl Drop for AeadCodec {
@@ -356,6 +361,7 @@ impl AeadCodec {
             nonce_base,
             sequence: 0,
             cipher: chacha20_poly1305_key(&key),
+            poisoned: false,
         };
         codec.protect_secret_memory();
         codec
@@ -393,6 +399,23 @@ impl AeadCodec {
         self.sequence = self.sequence.saturating_add(count);
     }
 
+    /// Permanently marks the codec unusable. Called by the batch open paths
+    /// when a partial failure may have advanced the sequence counter, turning
+    /// the "any failure must fail-close" caller convention into a type-enforced
+    /// guarantee.
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Returns an error if the codec has been poisoned by a prior batch
+    /// failure. Checked at every seal/open entry point.
+    pub(crate) fn ensure_usable(&self) -> Result<(), SessionError> {
+        if self.poisoned {
+            return Err(SessionError::Aead);
+        }
+        Ok(())
+    }
+
     pub fn protect_secret_memory(&self) {
         crate::process_hardening::protect_secret_bytes("aead.key", &self.key);
         crate::process_hardening::protect_secret_bytes("aead.nonce_base", &self.nonce_base);
@@ -411,6 +434,7 @@ impl AeadCodec {
         plaintext: &mut [u8],
         aad: &[u8],
     ) -> Result<[u8; AEAD_TAG_LEN], SessionError> {
+        self.ensure_usable()?;
         let tag = seal_in_place_detached_with(
             &self.cipher,
             &self.nonce_base,
@@ -448,6 +472,7 @@ impl AeadCodec {
         ciphertext_with_tag: &mut [u8],
         aad: &[u8],
     ) -> Result<usize, SessionError> {
+        self.ensure_usable()?;
         let plaintext_len = open_in_place_split_with(
             &self.cipher,
             &self.nonce_base,

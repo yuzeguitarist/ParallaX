@@ -450,12 +450,18 @@ impl DataRecordCodec {
         if record_count == 0 {
             return Ok(());
         }
+        self.aead.ensure_usable()?;
         debug_assert_eq!(record_lens.iter().sum::<usize>(), plaintext.len());
         let group_count = pool.width().max(1).min(record_count);
 
         let cipher = self.aead.cipher();
         let nonce_base = self.aead.nonce_base();
         let base_sequence = self.aead.sequence();
+        // Defense in depth: reject a batch that would wrap the per-direction
+        // sequence counter past u64::MAX before any record is sealed.
+        if base_sequence.checked_add(record_count as u64).is_none() {
+            return Err(SessionError::NonceExhausted.into());
+        }
         let aad = self.aad;
         let padding = self.padding;
 
@@ -511,6 +517,19 @@ impl DataRecordCodec {
         records: &mut [u8],
         out: &mut Vec<u8>,
     ) -> Result<(), DataRecordError> {
+        self.aead.ensure_usable()?;
+        let result = self.open_concat_records_inner(records, out);
+        if result.is_err() {
+            self.aead.poison();
+        }
+        result
+    }
+
+    fn open_concat_records_inner(
+        &mut self,
+        records: &mut [u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError> {
         let mut offset = 0;
         while offset < records.len() {
             let header = record::parse_header(&records[offset..])?;
@@ -556,6 +575,20 @@ impl DataRecordCodec {
     /// the counter is left untouched (mirroring the serial `open*` methods, so
     /// a rejected record cannot silently desynchronize the stream).
     pub fn open_concat_records_parallel(
+        &mut self,
+        pool: &CryptoPool,
+        records: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError> {
+        self.aead.ensure_usable()?;
+        let result = self.open_concat_records_parallel_inner(pool, records, out);
+        if result.is_err() {
+            self.aead.poison();
+        }
+        result
+    }
+
+    fn open_concat_records_parallel_inner(
         &mut self,
         pool: &CryptoPool,
         records: &[u8],
@@ -1480,6 +1513,54 @@ mod tests {
         assert!(matches!(
             dec.open_concat_records(&mut sealed, &mut opened),
             Err(DataRecordError::Aead(_))
+        ));
+    }
+
+    #[test]
+    fn batch_open_failure_poisons_codec() {
+        let key = [9_u8; KEY_LEN];
+        let nonce = [10_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut rng = StdRng::seed_from_u64(81);
+        // Record sealed at sequence 0; keep a pristine copy.
+        let good = enc.seal(b"first", &mut rng).unwrap();
+
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut tampered = good.clone();
+        let flip = tampered.len() - 1;
+        tampered[flip] ^= 0x01;
+        let mut opened = Vec::new();
+        // Batch open of the tampered (first) record fails without advancing the
+        // sequence counter, so the failure is only detectable as a poison.
+        assert!(matches!(
+            dec.open_concat_records(&mut tampered, &mut opened),
+            Err(DataRecordError::Aead(_))
+        ));
+        // The pristine record still matches sequence 0, so without poisoning the
+        // codec this open would succeed. Poisoning makes every later op fail-close.
+        assert!(matches!(dec.open(&good), Err(DataRecordError::Aead(_))));
+    }
+
+    #[test]
+    fn parallel_seal_rejects_sequence_overflow() {
+        let key = [11_u8; KEY_LEN];
+        let nonce = [12_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        // Drive the per-direction sequence counter to the edge so a 2-record
+        // batch would wrap past u64::MAX.
+        enc.aead.advance_sequence(u64::MAX - 1);
+        let payload = vec![0_u8; 8];
+        let lens = vec![4_usize, 4_usize];
+        let mut rng = StdRng::seed_from_u64(91);
+        let mut out = Vec::new();
+        assert!(matches!(
+            enc.seal_records_into_parallel(&test_pool(), &payload, &lens, &mut rng, &mut out),
+            Err(DataRecordError::Aead(SessionError::NonceExhausted))
         ));
     }
 

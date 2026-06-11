@@ -12,6 +12,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub(crate) const DEFAULT_REPLAY_CACHE_PATH: &str = "/var/lib/parallax/parallax-replay.cache";
+pub(crate) const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 8192;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -58,6 +59,8 @@ pub enum ConfigError {
     UnsafeClientListen(SocketAddr),
     #[error("server.authorized_sni must not be empty")]
     EmptyAuthorizedSni,
+    #[error("server.replay_cache_capacity must be at least 1")]
+    InvalidReplayCacheCapacity,
     #[cfg(unix)]
     #[error(
         "config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, \
@@ -126,6 +129,8 @@ pub struct ServerConfig {
     pub identity_secret_key: String,
     #[serde(default = "default_replay_cache_path")]
     pub replay_cache_path: PathBuf,
+    #[serde(default = "default_replay_cache_capacity")]
+    pub replay_cache_capacity: usize,
     #[serde(default)]
     pub authorized_sni: Vec<String>,
     #[serde(default = "default_true")]
@@ -248,6 +253,9 @@ impl Config {
                 }
                 for sni in &server.authorized_sni {
                     require_non_empty("server.authorized_sni", sni)?;
+                }
+                if server.replay_cache_capacity == 0 {
+                    return Err(ConfigError::InvalidReplayCacheCapacity);
                 }
             }
         }
@@ -480,6 +488,10 @@ const fn default_max_concurrent_streams() -> u8 {
 
 fn default_replay_cache_path() -> PathBuf {
     PathBuf::from(DEFAULT_REPLAY_CACHE_PATH)
+}
+
+const fn default_replay_cache_capacity() -> usize {
+    DEFAULT_REPLAY_CACHE_CAPACITY
 }
 
 #[cfg(test)]
@@ -973,6 +985,82 @@ authorized_sni = ["  "]
         assert!(matches!(
             cfg.validate().unwrap_err(),
             ConfigError::InvalidSocket { .. }
+        ));
+    }
+
+    #[test]
+    fn server_replay_cache_capacity_defaults_when_omitted() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.server.unwrap().replay_cache_capacity,
+            DEFAULT_REPLAY_CACHE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn server_replay_cache_capacity_parses_override() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+replay_cache_capacity = 65536
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.unwrap().replay_cache_capacity, 65536);
+    }
+
+    #[test]
+    fn server_validate_rejects_zero_replay_cache_capacity() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+replay_cache_capacity = 0
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidReplayCacheCapacity
         ));
     }
 
