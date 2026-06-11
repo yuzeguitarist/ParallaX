@@ -1852,6 +1852,225 @@ mod tests {
         wait_for_task("fallback", fallback_task).await;
     }
 
+    /// Tunables for one loopback mux benchmark run.
+    struct MuxBenchParams {
+        streams: usize,
+        latency_round_trips: usize,
+        latency_payload: usize,
+        warmup_bytes_per_stream: u64,
+        measure_bytes_per_stream: u64,
+    }
+
+    struct LatencyStats {
+        samples: usize,
+        min: Duration,
+        median: Duration,
+        p99: Duration,
+    }
+
+    struct MuxBenchResult {
+        streams: usize,
+        measure_bytes_per_stream: u64,
+        elapsed: Duration,
+        latency: Option<LatencyStats>,
+    }
+
+    impl MuxBenchResult {
+        /// Bytes moved in one direction (echo doubles total work) per second.
+        fn per_direction_mib_s(&self) -> f64 {
+            let total = (self.measure_bytes_per_stream * self.streams as u64) as f64;
+            (total / (1024.0 * 1024.0)) / self.elapsed.as_secs_f64()
+        }
+
+        fn report(&self, label: &str) {
+            println!("---- mux loopback benchmark: {label} ----");
+            println!("  streams                : {}", self.streams);
+            if let Some(latency) = &self.latency {
+                println!(
+                    "  ping-pong RTT (n={})  : min={:?} median={:?} p99={:?}",
+                    latency.samples, latency.min, latency.median, latency.p99
+                );
+            }
+            println!(
+                "  payload per stream     : {:.1} MiB",
+                self.measure_bytes_per_stream as f64 / (1024.0 * 1024.0)
+            );
+            println!("  full-duplex elapsed    : {:?}", self.elapsed);
+            println!(
+                "  throughput/direction   : {:.1} MiB/s ({:.2} Gbps)",
+                self.per_direction_mib_s(),
+                self.per_direction_mib_s() * 8.0 / 1024.0
+            );
+        }
+    }
+
+    /// Sequentially ping-pongs `round_trips` small payloads through one stream
+    /// and reports min/median/p99 RTT after a short warmup.
+    async fn measure_mux_latency(
+        app: &mut TcpStream,
+        round_trips: usize,
+        payload: usize,
+    ) -> LatencyStats {
+        let out = vec![0x5A_u8; payload];
+        let mut back = vec![0_u8; payload];
+        for _ in 0..16 {
+            app.write_all(&out).await.unwrap();
+            app.read_exact(&mut back).await.unwrap();
+        }
+        let mut samples = Vec::with_capacity(round_trips);
+        for _ in 0..round_trips {
+            let start = Instant::now();
+            app.write_all(&out).await.unwrap();
+            app.read_exact(&mut back).await.unwrap();
+            samples.push(start.elapsed());
+        }
+        samples.sort_unstable();
+        LatencyStats {
+            samples: samples.len(),
+            min: samples[0],
+            median: samples[samples.len() / 2],
+            p99: samples[(samples.len() * 99 / 100).min(samples.len() - 1)],
+        }
+    }
+
+    /// Drives `bytes` of full-duplex echo traffic over one already-open stream,
+    /// reading and writing concurrently on the same task. Echo guarantees every
+    /// byte written returns, so reading exactly `bytes` drains the direction.
+    async fn full_duplex_pump(r: &mut OwnedReadHalf, w: &mut OwnedWriteHalf, bytes: u64) {
+        let write_fut = async {
+            let chunk = vec![0xAB_u8; 64 * 1024];
+            let mut remaining = bytes;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len() as u64) as usize;
+                w.write_all(&chunk[..n]).await.unwrap();
+                remaining -= n as u64;
+            }
+            w.flush().await.unwrap();
+        };
+        let read_fut = async {
+            let mut buf = vec![0_u8; 64 * 1024];
+            let mut remaining = bytes;
+            while remaining > 0 {
+                let n = r.read(&mut buf).await.unwrap();
+                assert!(n > 0, "unexpected EOF during throughput pump");
+                remaining = remaining.saturating_sub(n as u64);
+            }
+        };
+        tokio::join!(write_fut, read_fut);
+    }
+
+    async fn run_mux_loopback_benchmark(params: MuxBenchParams) -> MuxBenchResult {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_multi_echo_target(params.streams).await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let mux_traffic = TrafficConfig {
+            max_concurrent_streams: params.streams as u8,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_with_traffic(server_config, mux_traffic).await;
+        let (local_addr, client_task) = spawn_mux_local_client(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            params.streams,
+        )
+        .await;
+
+        let mut apps = Vec::with_capacity(params.streams);
+        for _ in 0..params.streams {
+            apps.push(connect_socks_target(local_addr, target_addr).await);
+        }
+
+        let latency = if params.latency_round_trips > 0 {
+            Some(
+                measure_mux_latency(
+                    &mut apps[0],
+                    params.latency_round_trips,
+                    params.latency_payload,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(params.streams + 1));
+        let mut pump_handles = Vec::with_capacity(params.streams);
+        for app in apps {
+            let (mut r, mut w) = app.into_split();
+            let barrier = Arc::clone(&barrier);
+            let warmup = params.warmup_bytes_per_stream;
+            let measure = params.measure_bytes_per_stream;
+            pump_handles.push(tokio::spawn(async move {
+                full_duplex_pump(&mut r, &mut w, warmup).await;
+                barrier.wait().await;
+                full_duplex_pump(&mut r, &mut w, measure).await;
+                let _ = w.shutdown().await;
+            }));
+        }
+        barrier.wait().await;
+        let start = Instant::now();
+        for handle in pump_handles {
+            handle.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+
+        MuxBenchResult {
+            streams: params.streams,
+            measure_bytes_per_stream: params.measure_bytes_per_stream,
+            elapsed,
+            latency,
+        }
+    }
+
+    /// Loopback latency (ping-pong RTT) and steady-state throughput benchmark
+    /// for the mux data path. Ignored by default: it needs loopback sockets and
+    /// prints timing evidence rather than asserting fixed numbers. Run with:
+    ///   cargo test --lib -- --ignored --nocapture mux_loopback_benchmark
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "loopback latency/throughput benchmark; run with --ignored --nocapture"]
+    async fn mux_loopback_benchmark() {
+        let single = run_mux_loopback_benchmark(MuxBenchParams {
+            streams: 1,
+            latency_round_trips: 200,
+            latency_payload: 64,
+            warmup_bytes_per_stream: 4 * 1024 * 1024,
+            measure_bytes_per_stream: 64 * 1024 * 1024,
+        })
+        .await;
+        single.report("single-stream");
+
+        let concurrent = run_mux_loopback_benchmark(MuxBenchParams {
+            streams: 8,
+            latency_round_trips: 0,
+            latency_payload: 0,
+            warmup_bytes_per_stream: 1024 * 1024,
+            measure_bytes_per_stream: 8 * 1024 * 1024,
+        })
+        .await;
+        concurrent.report("8-stream-concurrent");
+    }
+
     async fn spawn_camouflage_fallback() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
