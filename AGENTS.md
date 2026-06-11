@@ -71,3 +71,13 @@ When the user says not to keep doing something, not to continue optimizing, or n
 ## 6. Use Patch Tools for File Edits
 
 When changing source code, configuration, documentation, or any repository file content, use the dedicated patch/edit tool instead of writing file changes through shell scripts, inline Python, sed/perl replacement commands, heredocs, or shell redirection. Terminal commands are acceptable for inspection, tests, benchmarks, formatting checks, and git operations, but content edits must go through the patch/edit tool unless the user explicitly authorizes another method.
+
+## Cursor Cloud specific instructions
+
+Single-binary Rust proxy (`parallax` / `plx` alias). No databases or external services to run.
+
+- **Toolchain:** Despite `rust-version = "1.80"` in `Cargo.toml`, the pinned `Cargo.lock` includes crates that need Cargo's `edition2024` feature (e.g. `clap_lex 1.1.0`), so builds require recent **stable** Rust (Cargo ≥ 1.85), matching CI's `dtolnay/rust-toolchain@stable`. The update script runs `rustup default stable`; do not pin to 1.80/1.83.
+- **Always pass `--locked`** for build/clippy/test, as CI does.
+- **Standard commands** are already documented: build/install in `README.md` "Build"; lint/test in `README.md` "Verification" (`cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked --no-fail-fast`); ignored loopback tests run serially with `-- --ignored --test-threads=1`; `cargo test --test gfw_simulator`. CI jobs are in `.github/workflows/`.
+- **Running the proxy end-to-end needs outbound internet.** For an authenticated session the server splices the camouflage TLS handshake through to the real `fallback_addr` origin (e.g. `cloudflare.com:443`) and the client verifies that origin's cert against `sni`, so a fully local run still requires the fallback host to be reachable.
+- **Local loopback run:** `plx init <domain> --server-addr 127.0.0.1:8443 --server-listen 127.0.0.1:8443` writes paired configs with matching keys. Two gotchas: the generated server `replay_cache_path` is `/var/lib/parallax/...` (not writable in the VM — point it at a writable path), and config files must be mode `0600` (`init` sets this; `plx check` enforces it). With `data_target` unset the server relays to the client's SOCKS5-requested target, so `curl --socks5-hostname 127.0.0.1:1080 <url>` proxies normally.
