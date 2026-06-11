@@ -38,6 +38,14 @@ pub struct SealedRecord {
     pub plaintext_len: usize,
 }
 
+/// Token returned by [`DataRecordCodec::begin_record`]; consumed by
+/// [`DataRecordCodec::finish_record`].
+#[derive(Debug)]
+#[must_use = "an unfinished record leaves a dangling TLS header in the output buffer"]
+pub struct RecordBuilder {
+    record_start: usize,
+}
+
 impl DataRecordCodec {
     pub fn new(aead: AeadCodec, padding: PaddingProfile, aad: &'static [u8]) -> Self {
         Self { aead, padding, aad }
@@ -78,10 +86,19 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
-        let record_start = out.len();
         if reserve_capacity {
             out.reserve(record_capacity(payload.len(), self.padding.max_len()));
         }
+        let builder = self.begin_record(out);
+        out.extend_from_slice(payload);
+        self.finish_record(builder, rng, out)
+    }
+
+    /// Starts a record in `out` and returns a builder token. The caller
+    /// appends plaintext directly to `out` and then seals it with
+    /// [`Self::finish_record`], avoiding an intermediate plaintext buffer.
+    pub fn begin_record(&self, out: &mut Vec<u8>) -> RecordBuilder {
+        let record_start = out.len();
         out.extend_from_slice(&[
             TLS_CONTENT_APPLICATION_DATA,
             TLS_LEGACY_VERSION[0],
@@ -89,11 +106,28 @@ impl DataRecordCodec {
             0,
             0,
         ]);
+        RecordBuilder { record_start }
+    }
 
-        let ciphertext_start = out.len();
-        self.padding.apply_into(payload, rng, out);
+    /// Pads, encrypts, and frames the plaintext appended to `out` since the
+    /// matching [`Self::begin_record`] call. On error the record bytes are
+    /// removed from `out` and any written plaintext is zeroized.
+    pub fn finish_record<R>(
+        &mut self,
+        builder: RecordBuilder,
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        let record_start = builder.record_start;
+        let ciphertext_start = record_start + record::TLS_HEADER_LEN;
+        let payload_len = out.len() - ciphertext_start;
+        self.padding.apply_suffix_into(payload_len, rng, out);
         let padded_len = out.len() - ciphertext_start;
         if padded_len + AEAD_TAG_LEN > OUTER_TLS_RECORD_LIMIT {
+            out[ciphertext_start..].zeroize();
             out.truncate(record_start);
             return Err(record::TlsRecordError::PayloadTooLarge(padded_len + AEAD_TAG_LEN).into());
         }
@@ -568,6 +602,67 @@ mod tests {
             offset = end;
         }
         assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn record_builder_matches_seal_into_byte_for_byte() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(3, 900).unwrap();
+        let payload = b"builder parity payload";
+
+        let mut seal_rng = StdRng::seed_from_u64(77);
+        let mut enc_seal =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut sealed = Vec::new();
+        enc_seal
+            .seal_into(payload, &mut seal_rng, &mut sealed)
+            .unwrap();
+
+        let mut builder_rng = StdRng::seed_from_u64(77);
+        let mut enc_builder =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut built = Vec::new();
+        let builder = enc_builder.begin_record(&mut built);
+        built.extend_from_slice(payload);
+        let range = enc_builder
+            .finish_record(builder, &mut builder_rng, &mut built)
+            .unwrap();
+
+        assert_eq!(range, 0..built.len());
+        assert_eq!(sealed, built);
+
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        assert_eq!(dec.open(&built).unwrap(), payload);
+    }
+
+    #[test]
+    fn record_builder_rejects_oversized_plaintext_and_resets_buffer() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+
+        let mut out = vec![0xAA_u8; 7];
+        let builder = enc.begin_record(&mut out);
+        out.resize(7 + OUTER_TLS_RECORD_LIMIT + 1, 0x42);
+        let err = enc.finish_record(builder, &mut rng, &mut out).unwrap_err();
+        assert!(matches!(
+            err,
+            DataRecordError::TlsRecord(record::TlsRecordError::PayloadTooLarge(_))
+        ));
+        assert_eq!(out.len(), 7);
+        assert!(out.iter().all(|&b| b == 0xAA));
+
+        let builder = enc.begin_record(&mut out);
+        out.extend_from_slice(b"recovers");
+        let range = enc.finish_record(builder, &mut rng, &mut out).unwrap();
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        assert_eq!(dec.open(&out[range]).unwrap(), b"recovers");
     }
 
     #[test]

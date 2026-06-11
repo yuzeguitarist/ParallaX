@@ -60,6 +60,9 @@ const WARM_SESSION_POOL_TARGET: usize = 4;
 const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
 const CLIENT_MUX_STREAM_CHANNEL: usize = 32;
 const MUX_FRAME_BATCH_LIMIT: usize = 32;
+/// Flush accumulated sealed records once the batch buffer reaches this size,
+/// bounding per-connection scratch memory while still coalescing writes.
+const MUX_BATCH_WRITE_THRESHOLD: usize = 64 * 1024;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1198,7 +1201,6 @@ async fn client_mux_writer_loop(
 ) -> Result<(), ClientRuntimeError> {
     let mut seal_scratch =
         RelaySealScratch::with_payload_capacity(seal_to_server.max_plaintext_len());
-    let mut mux_payload_buf = Vec::with_capacity(seal_to_server.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
     if !cover.is_enabled() {
         loop {
@@ -1212,7 +1214,6 @@ async fn client_mux_writer_loop(
                 frame,
                 ClientMuxBatchState {
                     frame_rx: &mut frame_rx,
-                    payload_buf: &mut mux_payload_buf,
                 },
                 &mut rng,
                 &mut seal_scratch,
@@ -1250,7 +1251,6 @@ async fn client_mux_writer_loop(
                     frame,
                     ClientMuxBatchState {
                         frame_rx: &mut frame_rx,
-                        payload_buf: &mut mux_payload_buf,
                     },
                     &mut rng,
                     &mut seal_scratch,
@@ -1289,9 +1289,11 @@ where
 
 struct ClientMuxBatchState<'a> {
     frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
-    payload_buf: &'a mut Vec<u8>,
 }
 
+/// Encodes the first frame plus any immediately available frames directly
+/// into the seal buffer (one record per `max_plaintext_len` window) and
+/// flushes the accumulated records with as few writes as possible.
 async fn write_client_mux_frames_batched<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,
@@ -1312,8 +1314,11 @@ where
         ));
     }
 
-    batch.payload_buf.clear();
-    append_client_mux_frame(batch.payload_buf, first_frame, max_plaintext_len)?;
+    scratch.records_buf.clear();
+    let mut builder = codec.begin_record(&mut scratch.records_buf);
+    let mut record_plaintext_len =
+        encode_client_mux_frame(&mut scratch.records_buf, first_frame, max_plaintext_len)?;
+
     let mut drained = 0;
     while drained < MUX_FRAME_BATCH_LIMIT {
         let frame = match batch.frame_rx.try_recv() {
@@ -1323,50 +1328,57 @@ where
             }
         };
         let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
-        if !batch.payload_buf.is_empty() && batch.payload_buf.len() + frame_len > max_plaintext_len
-        {
-            write_client_data_records_chunked(
-                writer,
-                codec,
-                batch.payload_buf.as_slice(),
-                rng,
-                scratch,
-                log,
-            )
-            .await?;
-            batch.payload_buf.clear();
+        if record_plaintext_len + frame_len > max_plaintext_len {
+            let range = codec
+                .finish_record(builder, rng, &mut scratch.records_buf)
+                .map_err(ClientHandshakeError::from)?;
+            log_outer_write(
+                log.cid,
+                log.direction,
+                log.task_name,
+                record_plaintext_len,
+                &scratch.records_buf[range],
+            );
+            if scratch.records_buf.len() >= MUX_BATCH_WRITE_THRESHOLD {
+                writer.write_all(scratch.records_buf.as_slice()).await?;
+                scratch.records_buf.clear();
+            }
+            builder = codec.begin_record(&mut scratch.records_buf);
+            record_plaintext_len = 0;
         }
-        append_client_mux_frame(batch.payload_buf, frame, max_plaintext_len)?;
+        record_plaintext_len +=
+            encode_client_mux_frame(&mut scratch.records_buf, frame, max_plaintext_len)?;
         drained += 1;
     }
 
-    if !batch.payload_buf.is_empty() {
-        write_client_data_records_chunked(
-            writer,
-            codec,
-            batch.payload_buf.as_slice(),
-            rng,
-            scratch,
-            log,
-        )
-        .await?;
-    }
+    let range = codec
+        .finish_record(builder, rng, &mut scratch.records_buf)
+        .map_err(ClientHandshakeError::from)?;
+    log_outer_write(
+        log.cid,
+        log.direction,
+        log.task_name,
+        record_plaintext_len,
+        &scratch.records_buf[range],
+    );
+    writer.write_all(scratch.records_buf.as_slice()).await?;
+    scratch.records_buf.clear();
     Ok(())
 }
 
-fn append_client_mux_frame(
-    mux_payload_buf: &mut Vec<u8>,
+fn encode_client_mux_frame(
+    out: &mut Vec<u8>,
     frame: MuxFrame,
     max_plaintext_len: usize,
-) -> Result<(), ClientRuntimeError> {
+) -> Result<usize, ClientRuntimeError> {
     let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
     if frame_len > max_plaintext_len {
         return Err(ClientRuntimeError::TlsRecord(
             crate::tls::record::TlsRecordError::PayloadTooLarge(frame_len),
         ));
     }
-    frame.encode_into(mux_payload_buf)?;
-    Ok(())
+    frame.encode_into(out)?;
+    Ok(frame_len)
 }
 
 async fn send_mux_frame(

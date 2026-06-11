@@ -70,7 +70,23 @@ impl PaddingProfile {
     {
         let pad_len = self.sample_padding_len(payload.len(), rng) as usize;
         out.extend_from_slice(payload);
+        self.write_padding_suffix(pad_len, rng, out);
+    }
 
+    /// Appends the padding suffix (pad bytes + length field) for a payload of
+    /// `payload_len` bytes that the caller already wrote into `out`.
+    pub fn apply_suffix_into<R>(&self, payload_len: usize, rng: &mut R, out: &mut Vec<u8>)
+    where
+        R: Rng + RngCore + ?Sized,
+    {
+        let pad_len = self.sample_padding_len(payload_len, rng) as usize;
+        self.write_padding_suffix(pad_len, rng, out);
+    }
+
+    fn write_padding_suffix<R>(&self, pad_len: usize, rng: &mut R, out: &mut Vec<u8>)
+    where
+        R: Rng + RngCore + ?Sized,
+    {
         if pad_len != 0 {
             let start = out.len();
             out.resize(start + pad_len, 0);

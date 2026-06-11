@@ -1493,7 +1493,6 @@ fn bench_mux_batch_seal_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> 
     let frame_payload_len = codec.max_plaintext_len() - MuxFrame::encoded_len(0)?;
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut scratch = RelaySealScratch::with_payload_capacity(SIZE_64K);
-    let mut payload_buf: Vec<u8> = Vec::with_capacity(codec.max_plaintext_len());
     let mut out: Vec<u8> = Vec::with_capacity(SIZE_64K + 16 * 1024);
 
     run_case(
@@ -1507,7 +1506,6 @@ fn bench_mux_batch_seal_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> 
                 frame_payload_len,
                 &mut rng,
                 &mut scratch,
-                &mut payload_buf,
                 &mut out,
             )
         },
@@ -1519,7 +1517,6 @@ fn mux_batch_seal_blocking(
     frame_payload_len: usize,
     rng: &mut StdRng,
     scratch: &mut RelaySealScratch,
-    payload_buf: &mut Vec<u8>,
     out: &mut Vec<u8>,
 ) -> Result<u64> {
     match tokio::runtime::Handle::try_current() {
@@ -1529,7 +1526,6 @@ fn mux_batch_seal_blocking(
                 frame_payload_len,
                 rng,
                 scratch,
-                payload_buf,
                 out,
             ))
         }),
@@ -1540,7 +1536,6 @@ fn mux_batch_seal_blocking(
                 frame_payload_len,
                 rng,
                 scratch,
-                payload_buf,
                 out,
             )),
     }
@@ -1553,7 +1548,6 @@ async fn mux_batch_seal_once(
     frame_payload_len: usize,
     rng: &mut StdRng,
     scratch: &mut RelaySealScratch,
-    payload_buf: &mut Vec<u8>,
     out: &mut Vec<u8>,
 ) -> Result<u64> {
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<MuxFrame>(8);
@@ -1582,7 +1576,6 @@ async fn mux_batch_seal_once(
         first_frame,
         ServerMuxBatchState {
             frame_rx: &mut frame_rx,
-            payload_buf,
         },
         rng,
         scratch,
