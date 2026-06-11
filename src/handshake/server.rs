@@ -1536,7 +1536,7 @@ async fn process_server_mux_frame(
         MuxFrameKind::Data => {
             if let Some(target_write) = target_writes.get_mut(&frame.stream_id) {
                 if !frame.payload.is_empty() {
-                    target_write.write_all(&frame.payload).await?;
+                    target_write.write_all(frame.payload).await?;
                 }
             }
         }
