@@ -228,7 +228,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     let psk = Arc::new(psk);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create_authenticated(
         &server.replay_cache_path,
-        8192,
+        server.replay_cache_capacity,
         &psk,
     )?));
     let secrets = ServerRuntimeSecrets::decode(&server)?;
@@ -3231,6 +3231,7 @@ mod tests {
             pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
             identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
             replay_cache_path,
+            replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
         }

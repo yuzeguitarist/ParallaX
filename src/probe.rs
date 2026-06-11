@@ -682,6 +682,7 @@ mod tests {
                 pq_secret_key: String::new(),
                 identity_secret_key: STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]),
                 replay_cache_path: PathBuf::from("/tmp/parallax-test-replay.cache"),
+                replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni,
                 strict_tls13: true,
             }),
