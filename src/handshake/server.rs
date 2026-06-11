@@ -84,6 +84,13 @@ const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
 const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET / 2;
 const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
 const SERVER_MUX_FRAME_BATCH_LIMIT: usize = 64;
+/// Hard cap on concurrent mux substreams per authenticated connection. Excess
+/// `Open` frames are answered with `Reset` and never establish an outbound
+/// connection, so an authenticated client cannot use substreams to bypass the
+/// fd-based connection limit (which budgets ~2 fds per connection). Enforced by
+/// the server on its own terms rather than trusting the client's advertised
+/// `max_concurrent_streams`.
+const SERVER_MUX_MAX_STREAMS: usize = 256;
 /// Cap on the ciphertext bytes batched per mux read before opening, bounding
 /// scratch memory while leaving enough records for the crypto pool to fan out.
 const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
@@ -972,6 +979,11 @@ async fn run_authenticated_data_mode(
                                     timing,
                                     cover,
                                     chunk_size: max_plaintext_len(traffic.max_padding),
+                                    // Use the server's own stream ceiling, clamped
+                                    // to an absolute hard cap so a large configured
+                                    // value can't inflate per-connection fd usage.
+                                    max_streams: (traffic.max_concurrent_streams as usize)
+                                        .min(SERVER_MUX_MAX_STREAMS),
                                     cid,
                                 },
                             )
@@ -1164,7 +1176,11 @@ fn is_denied_outbound_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_denied_outbound_ipv4(ip),
         IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
+            // `to_ipv4` covers both v4-mapped (::ffff:a.b.c.d) and the deprecated
+            // v4-compatible (::a.b.c.d) embeddings, so an embedded private/special
+            // IPv4 is screened by the IPv4 policy. (::1 maps to 0.0.0.1, which the
+            // IPv4 policy denies via the octets[0]==0 rule.)
+            if let Some(mapped) = ip.to_ipv4() {
                 return is_denied_outbound_ipv4(mapped);
             }
             ip.is_loopback()
@@ -1175,6 +1191,7 @@ fn is_denied_outbound_ip(ip: IpAddr) -> bool {
                 || is_ipv6_documentation(ip)
                 || is_ipv6_teredo(ip)
                 || is_ipv6_6to4(ip)
+                || is_ipv6_nat64(ip)
         }
     }
 }
@@ -1217,6 +1234,14 @@ fn is_ipv6_teredo(ip: Ipv6Addr) -> bool {
 
 fn is_ipv6_6to4(ip: Ipv6Addr) -> bool {
     ip.segments()[0] == 0x2002
+}
+
+/// NAT64 well-known prefix `64:ff9b::/96` (RFC 6052), which embeds an IPv4
+/// address in its low 32 bits and would otherwise tunnel to an arbitrary IPv4
+/// destination without passing through the IPv4 egress policy.
+fn is_ipv6_nat64(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x0064 && segments[1] == 0xff9b
 }
 
 async fn encapsulate_mlkem_blocking(
@@ -1382,6 +1407,8 @@ struct ServerMuxContext<'a> {
     timing: TimingProfile,
     cover: CoverTrafficProfile,
     chunk_size: usize,
+    /// Server-enforced ceiling on concurrent substreams for this connection.
+    max_streams: usize,
     cid: u64,
 }
 
@@ -1569,6 +1596,20 @@ async fn process_server_mux_frame(
     match frame.kind {
         MuxFrameKind::Open => {
             if target_writes.contains_key(&frame.stream_id) {
+                send_server_mux_frame(frame_tx, frame.stream_id, MuxFrameKind::Reset, Vec::new())
+                    .await?;
+                return Ok(());
+            }
+            if target_writes.len() >= context.max_streams {
+                // Per-connection substream ceiling reached: refuse the new stream
+                // and do not open an outbound connection. The client maps Reset
+                // to a ConnectionReset on that stream.
+                tracing::debug!(
+                    cid = context.cid,
+                    stream_id = frame.stream_id,
+                    max_streams = context.max_streams,
+                    "mux stream cap reached; resetting"
+                );
                 send_server_mux_frame(frame_tx, frame.stream_id, MuxFrameKind::Reset, Vec::new())
                     .await?;
                 return Ok(());
@@ -2903,6 +2944,73 @@ mod tests {
             validate_public_target_addrs("example.test:443", &addrs).unwrap_err(),
             HandshakeServerError::OutboundTargetDenied(_)
         ));
+    }
+
+    #[test]
+    fn egress_policy_denies_embedded_and_nat64_ipv6() {
+        // v4-mapped private (::ffff:10.0.0.1)
+        let v4_mapped_private = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001));
+        // v4-compatible private (::10.0.0.1) — only caught by to_ipv4(), not to_ipv4_mapped()
+        let v4_compatible_private = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001));
+        // NAT64 well-known prefix wrapping 8.8.8.8 (64:ff9b::808:808)
+        let nat64 = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808));
+        for denied in [
+            v4_mapped_private,
+            v4_compatible_private,
+            nat64,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert!(
+                is_denied_outbound_ip(denied),
+                "expected {denied} to be denied"
+            );
+        }
+
+        // A global unicast IPv6 address must still be allowed.
+        let public_v6 = IpAddr::V6(Ipv6Addr::new(
+            0x2606, 0x2800, 0x0220, 0x0001, 0x0248, 0x1893, 0x25c8, 0x1946,
+        ));
+        assert!(!is_denied_outbound_ip(public_v6));
+    }
+
+    #[tokio::test]
+    async fn mux_open_beyond_stream_cap_is_reset_without_outbound() {
+        let traffic = TrafficConfig::default();
+        // max_streams = 0 exercises the cap branch on the very first Open, so no
+        // live outbound target is needed to prove the refusal path.
+        let context = ServerMuxContext {
+            fixed_data_target: None,
+            timing: TimingProfile::from_config(traffic),
+            cover: CoverTrafficProfile::from_config(traffic),
+            chunk_size: max_plaintext_len(traffic.max_padding),
+            max_streams: 0,
+            cid: 1,
+        };
+        let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+        let payload_pool =
+            MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
+        let mut target_writes = HashMap::new();
+
+        process_server_mux_frame(
+            MuxFrameRef {
+                stream_id: 7,
+                kind: MuxFrameKind::Open,
+                payload: &[],
+            },
+            &mut target_writes,
+            &frame_tx,
+            context,
+            &payload_pool,
+        )
+        .await
+        .unwrap();
+
+        // No outbound connection was established for the over-cap stream.
+        assert!(target_writes.is_empty());
+        // The client receives a Reset for that stream id.
+        let reset = frame_rx.try_recv().unwrap();
+        assert_eq!(reset.stream_id, 7);
+        assert_eq!(reset.kind, MuxFrameKind::Reset);
     }
 
     #[tokio::test]
