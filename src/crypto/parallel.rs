@@ -14,9 +14,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::{
-        mpsc, Arc, Condvar, Mutex, OnceLock,
-    },
+    sync::{mpsc, Arc, Condvar, Mutex, OnceLock},
     thread::{self, JoinHandle},
 };
 
@@ -68,7 +66,11 @@ impl CryptoPool {
     }
 
     fn submit(&self, job: Job) {
-        let mut state = self.shared.state.lock().expect("crypto pool mutex poisoned");
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("crypto pool mutex poisoned");
         state.jobs.push_back(job);
         drop(state);
         self.shared.available.notify_one();
@@ -125,7 +127,11 @@ impl CryptoPool {
 impl Drop for CryptoPool {
     fn drop(&mut self) {
         {
-            let mut state = self.shared.state.lock().expect("crypto pool mutex poisoned");
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("crypto pool mutex poisoned");
             state.shutdown = true;
         }
         self.shared.available.notify_all();
@@ -193,9 +199,7 @@ mod tests {
     #[test]
     fn run_ordered_preserves_order() {
         let pool = CryptoPool::new(4);
-        let jobs: Vec<_> = (0..64usize)
-            .map(|i| move || i * 2)
-            .collect();
+        let jobs: Vec<_> = (0..64usize).map(|i| move || i * 2).collect();
         let results = pool.run_ordered(jobs);
         assert_eq!(results, (0..64).map(|i| i * 2).collect::<Vec<_>>());
     }

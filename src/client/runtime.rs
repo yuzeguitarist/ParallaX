@@ -511,11 +511,7 @@ async fn handle_local_mux_connection_with_cid(
         .await
         .is_err()
     {
-        return Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "client mux reader is gone",
-        )
-        .into());
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client mux reader is gone").into());
     }
     if let Err(err) = mux.frame_tx.send(open_frame).await {
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into());
@@ -1198,7 +1194,12 @@ async fn client_mux_reader_loop(
                 return Err(ClientRuntimeError::Io(err));
             }
         }
-        log_record_read(cid, "server->client", "client-mux-outer-reader", &server_record);
+        log_record_read(
+            cid,
+            "server->client",
+            "client-mux-outer-reader",
+            &server_record,
+        );
 
         // Opportunistically grab any records that are already buffered so a
         // bulk burst can be opened across the crypto pool instead of pinning
@@ -1211,7 +1212,12 @@ async fn client_mux_reader_loop(
             match server_records.try_read_record_into(&mut extra_record).await {
                 None => break,
                 Some(Ok(())) => {
-                    log_record_read(cid, "server->client", "client-mux-outer-reader", &extra_record);
+                    log_record_read(
+                        cid,
+                        "server->client",
+                        "client-mux-outer-reader",
+                        &extra_record,
+                    );
                     if record_count == 1 {
                         batch_records.extend_from_slice(&server_record);
                     }
@@ -1230,7 +1236,10 @@ async fn client_mux_reader_loop(
         while let Ok(reg) = register_rx.try_recv() {
             local_writes.insert(
                 reg.stream_id,
-                ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
+                ClientDownloadStream {
+                    write: reg.local_write,
+                    outcome_tx: reg.outcome_tx,
+                },
             );
         }
 
@@ -1433,6 +1442,7 @@ struct ClientMuxBatchState<'a> {
 /// window), then seals the whole batch — inline for small batches, fanned out
 /// across the shared crypto pool for bulk — and writes the records in order
 /// with a single socket write.
+#[allow(clippy::too_many_arguments)]
 async fn write_client_mux_frames_batched<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,

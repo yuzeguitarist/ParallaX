@@ -8,9 +8,7 @@ use zeroize::Zeroize;
 use crate::{
     crypto::{
         parallel::{self, CryptoPool},
-        session::{
-            self, AeadCodec, SessionError, SharedCipher, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN,
-        },
+        session::{self, AeadCodec, SessionError, SharedCipher, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN},
     },
     tls::record::{self, TLS_CONTENT_APPLICATION_DATA, TLS_LEGACY_VERSION},
     traffic::{PaddingProfile, TrafficError},
@@ -1188,14 +1186,16 @@ mod tests {
             .map(|idx| (idx % 251) as u8)
             .collect::<Vec<_>>();
 
-        let mut serial = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut serial =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
         let mut serial_rng = StdRng::seed_from_u64(101);
         let mut serial_out = Vec::new();
         serial
             .seal_chunks_into_untracked(&payload, &mut serial_rng, &mut serial_out)
             .unwrap();
 
-        let mut parallel = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut parallel =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
         let mut parallel_rng = StdRng::seed_from_u64(202);
         let mut parallel_out = Vec::new();
         parallel
@@ -1216,13 +1216,15 @@ mod tests {
             .map(|idx| (idx % 251) as u8)
             .collect::<Vec<_>>();
 
-        let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
         let mut rng = StdRng::seed_from_u64(7);
         let mut sealed = Vec::new();
         enc.seal_chunks_into_parallel(&test_pool(), &payload, &mut rng, &mut sealed)
             .unwrap();
 
-        let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
         let mut offset = 0;
         let mut opened = Vec::with_capacity(payload.len());
         while offset < sealed.len() {
@@ -1243,13 +1245,15 @@ mod tests {
             .map(|idx| (idx % 251) as u8)
             .collect::<Vec<_>>();
 
-        let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
         let mut rng = StdRng::seed_from_u64(31);
         let mut sealed = Vec::new();
         enc.seal_chunks_into_untracked(&payload, &mut rng, &mut sealed)
             .unwrap();
 
-        let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
         let mut opened = Vec::new();
         dec.open_concat_records_parallel(&test_pool(), &sealed, &mut opened)
             .unwrap();
@@ -1290,16 +1294,22 @@ mod tests {
 
         // After sealing the same payload, a follow-up single record must use the
         // same nonce in both paths, so the serial decoder accepts both streams.
-        let mut serial = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut serial =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
         let mut serial_rng = StdRng::seed_from_u64(1);
         let mut serial_out = Vec::new();
-        serial.seal_chunks_into_untracked(&payload, &mut serial_rng, &mut serial_out).unwrap();
+        serial
+            .seal_chunks_into_untracked(&payload, &mut serial_rng, &mut serial_out)
+            .unwrap();
         let serial_tail = serial.seal(b"tail", &mut serial_rng).unwrap();
 
-        let mut parallel = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut parallel =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
         let mut parallel_rng = StdRng::seed_from_u64(2);
         let mut parallel_out = Vec::new();
-        parallel.seal_chunks_into_parallel(&test_pool(), &payload, &mut parallel_rng, &mut parallel_out).unwrap();
+        parallel
+            .seal_chunks_into_parallel(&test_pool(), &payload, &mut parallel_rng, &mut parallel_out)
+            .unwrap();
         let parallel_tail = parallel.seal(b"tail", &mut parallel_rng).unwrap();
 
         assert_eq!(serial_tail, parallel_tail);
@@ -1312,14 +1322,17 @@ mod tests {
         let padding = PaddingProfile::new(0, 0).unwrap();
         let payload = vec![0x44_u8; 80 * 1024];
 
-        let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
         let mut rng = StdRng::seed_from_u64(9);
         let mut sealed = Vec::new();
-        enc.seal_chunks_into_untracked(&payload, &mut rng, &mut sealed).unwrap();
+        enc.seal_chunks_into_untracked(&payload, &mut rng, &mut sealed)
+            .unwrap();
         let flip = sealed.len() / 2;
         sealed[flip] ^= 0x01;
 
-        let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
         let mut opened = Vec::new();
         assert!(matches!(
             dec.open_concat_records_parallel(&test_pool(), &sealed, &mut opened),
@@ -1352,7 +1365,11 @@ mod tests {
         let mut offset = 0;
         for &len in &lens {
             reference
-                .seal_into(&payload[offset..offset + len], &mut reference_rng, &mut reference_out)
+                .seal_into(
+                    &payload[offset..offset + len],
+                    &mut reference_rng,
+                    &mut reference_out,
+                )
                 .unwrap();
             offset += len;
         }
@@ -1391,7 +1408,13 @@ mod tests {
         let mut parallel_rng = StdRng::seed_from_u64(52);
         let mut parallel_out = Vec::new();
         parallel
-            .seal_records_into_parallel(&test_pool(), &payload, &lens, &mut parallel_rng, &mut parallel_out)
+            .seal_records_into_parallel(
+                &test_pool(),
+                &payload,
+                &lens,
+                &mut parallel_rng,
+                &mut parallel_out,
+            )
             .unwrap();
         let parallel_tail = parallel.seal(b"tail", &mut parallel_rng).unwrap();
 
@@ -1486,14 +1509,18 @@ mod tests {
         let pool = test_pool();
 
         for payload in [Vec::new(), b"x".to_vec(), b"short payload".to_vec()] {
-            let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+            let mut enc =
+                DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
             let mut rng = StdRng::seed_from_u64(3);
             let mut sealed = Vec::new();
-            enc.seal_chunks_into_parallel(&pool, &payload, &mut rng, &mut sealed).unwrap();
+            enc.seal_chunks_into_parallel(&pool, &payload, &mut rng, &mut sealed)
+                .unwrap();
 
-            let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+            let mut dec =
+                DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
             let mut opened = Vec::new();
-            dec.open_concat_records_parallel(&pool, &sealed, &mut opened).unwrap();
+            dec.open_concat_records_parallel(&pool, &sealed, &mut opened)
+                .unwrap();
             assert_eq!(opened, payload);
         }
     }

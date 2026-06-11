@@ -1552,14 +1552,8 @@ async fn server_mux_client_reader_loop(
         let mut frames = frames_payload;
         while !frames.is_empty() {
             let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-            process_server_mux_frame(
-                frame,
-                &mut target_writes,
-                &frame_tx,
-                context,
-                &payload_pool,
-            )
-            .await?;
+            process_server_mux_frame(frame, &mut target_writes, &frame_tx, context, &payload_pool)
+                .await?;
             frames = &frames[used..];
         }
     }
@@ -1794,6 +1788,7 @@ pub(crate) struct ServerMuxBatchState<'a> {
 /// window), then seals the whole batch — inline for small batches, fanned out
 /// across the shared crypto pool for bulk — and writes the records in order
 /// with a single socket write.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_server_mux_frames_batched<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,

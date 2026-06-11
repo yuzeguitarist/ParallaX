@@ -458,13 +458,19 @@ mod tests {
 
         // A partial record (header + part of the payload) is consumed into the
         // reader's state but no record is produced.
-        writer.write_all(&record[..TLS_HEADER_LEN + 4]).await.unwrap();
+        writer
+            .write_all(&record[..TLS_HEADER_LEN + 4])
+            .await
+            .unwrap();
         assert!(reader.try_read_record_into(&mut out).await.is_none());
         assert!(out.is_empty());
 
         // The blocking read resumes from the partial state and the record
         // comes out intact.
-        writer.write_all(&record[TLS_HEADER_LEN + 4..]).await.unwrap();
+        writer
+            .write_all(&record[TLS_HEADER_LEN + 4..])
+            .await
+            .unwrap();
         writer.write_all(&second).await.unwrap();
         reader.read_record_into(&mut out).await.unwrap();
         assert_eq!(out, record);
