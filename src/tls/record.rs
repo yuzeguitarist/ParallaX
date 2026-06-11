@@ -191,6 +191,28 @@ where
         std::mem::swap(out, &mut self.record);
         Ok(())
     }
+
+    /// Attempts to read the next complete record using only data that is
+    /// already available (buffered or immediately readable), without waiting.
+    /// Returns `None` when the read would block before a full record is
+    /// buffered; any partially consumed header/payload bytes remain in the
+    /// reader's state, so a subsequent [`Self::read_record_into`] (or another
+    /// call to this method) resumes exactly where this one left off.
+    pub async fn try_read_record_into(&mut self, out: &mut Vec<u8>) -> Option<std::io::Result<()>> {
+        use std::{
+            future::{poll_fn, Future},
+            pin::pin,
+            task::Poll,
+        };
+        let mut read = pin!(self.read_record_into(out));
+        poll_fn(move |cx| {
+            Poll::Ready(match read.as_mut().poll(cx) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await
+    }
 }
 
 pub fn log_record_read(cid: u64, direction: &'static str, task_name: &'static str, record: &[u8]) {
@@ -420,6 +442,44 @@ mod tests {
                 reader.read_record_into(&mut out).await.unwrap();
                 assert_eq!(&out[TLS_HEADER_LEN..], payload.as_slice());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn try_read_record_preserves_partial_state_across_would_block() {
+        let record = wrap_application_data(b"hello world").unwrap();
+        let second = wrap_application_data(b"second").unwrap();
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let mut reader = TlsRecordReader::buffered(reader);
+        let mut out = Vec::new();
+
+        // Nothing available: must report would-block, not error or hang.
+        assert!(reader.try_read_record_into(&mut out).await.is_none());
+
+        // A partial record (header + part of the payload) is consumed into the
+        // reader's state but no record is produced.
+        writer.write_all(&record[..TLS_HEADER_LEN + 4]).await.unwrap();
+        assert!(reader.try_read_record_into(&mut out).await.is_none());
+        assert!(out.is_empty());
+
+        // The blocking read resumes from the partial state and the record
+        // comes out intact.
+        writer.write_all(&record[TLS_HEADER_LEN + 4..]).await.unwrap();
+        writer.write_all(&second).await.unwrap();
+        reader.read_record_into(&mut out).await.unwrap();
+        assert_eq!(out, record);
+
+        // A complete buffered record is returned without waiting.
+        match reader.try_read_record_into(&mut out).await {
+            Some(Ok(())) => assert_eq!(out, second),
+            other => panic!("expected buffered record, got {other:?}"),
+        }
+
+        // EOF surfaces through the non-blocking path as an error, not a hang.
+        drop(writer);
+        match reader.try_read_record_into(&mut out).await {
+            Some(Err(err)) => assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("expected EOF error, got {other:?}"),
         }
     }
 

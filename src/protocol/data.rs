@@ -375,6 +375,29 @@ impl DataRecordCodec {
         record_capacity(payload_len, self.padding.max_len())
     }
 
+    /// Serial seal for a pre-framed plaintext partitioned into `record_lens`
+    /// (which must sum to `plaintext.len()`). Byte-identical to sealing each
+    /// record slice with [`Self::seal_into`] in order; this is the low-latency
+    /// path for small batches and the reference the parallel path matches.
+    pub fn seal_records_into<R>(
+        &mut self,
+        plaintext: &[u8],
+        record_lens: &[usize],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError>
+    where
+        R: Rng + rand::RngCore + ?Sized,
+    {
+        debug_assert_eq!(record_lens.iter().sum::<usize>(), plaintext.len());
+        let mut offset = 0;
+        for &len in record_lens {
+            self.seal_into(&plaintext[offset..offset + len], rng, out)?;
+            offset += len;
+        }
+        Ok(())
+    }
+
     /// Parallel counterpart of [`Self::seal_chunks_into_untracked`]: splits
     /// `payload` into `max_plaintext_len`-sized records and seals them across
     /// `pool`'s worker threads, appending the records to `out` in order. The
@@ -395,7 +418,41 @@ impl DataRecordCodec {
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
-        let record_count = chunk_count(payload.len(), max_chunk_len);
+        let mut record_lens = Vec::with_capacity(chunk_count(payload.len(), max_chunk_len));
+        if payload.is_empty() {
+            record_lens.push(0);
+        } else {
+            let mut remaining = payload.len();
+            while remaining > 0 {
+                let len = remaining.min(max_chunk_len);
+                record_lens.push(len);
+                remaining -= len;
+            }
+        }
+        self.seal_records_into_parallel(pool, payload, &record_lens, rng, out)
+    }
+
+    /// Parallel seal for a pre-framed plaintext partitioned into records of the
+    /// given lengths (`record_lens` must sum to `plaintext.len()`). The mux
+    /// writers use this to keep each record frame-aligned — identical record
+    /// boundaries to the serial path — while still spreading the AEAD work
+    /// across `pool`. Records map to sequence numbers `base..base+n` in order.
+    pub fn seal_records_into_parallel<R>(
+        &mut self,
+        pool: &CryptoPool,
+        plaintext: &[u8],
+        record_lens: &[usize],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError>
+    where
+        R: Rng + rand::RngCore + ?Sized,
+    {
+        let record_count = record_lens.len();
+        if record_count == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(record_lens.iter().sum::<usize>(), plaintext.len());
         let group_count = pool.width().max(1).min(record_count);
 
         let cipher = self.aead.cipher();
@@ -405,29 +462,31 @@ impl DataRecordCodec {
         let padding = self.padding;
 
         let mut jobs = Vec::with_capacity(group_count);
-        let mut next_chunk = 0;
+        let mut next_record = 0;
+        let mut byte_offset = 0;
         for group in 0..group_count {
-            let chunks_here = (record_count - next_chunk).div_ceil(group_count - group);
-            let chunk_end = next_chunk + chunks_here;
-            let byte_start = next_chunk * max_chunk_len;
-            let byte_end = (chunk_end * max_chunk_len).min(payload.len());
-            let group_plaintext = payload[byte_start..byte_end].to_vec();
-            let group_base_sequence = base_sequence + next_chunk as u64;
+            let records_here = (record_count - next_record).div_ceil(group_count - group);
+            let record_end = next_record + records_here;
+            let lens = record_lens[next_record..record_end].to_vec();
+            let span: usize = lens.iter().sum();
+            let group_plaintext = plaintext[byte_offset..byte_offset + span].to_vec();
+            let group_base_sequence = base_sequence + next_record as u64;
             let seed = rng.gen::<u64>();
             let cipher = SharedCipher::clone(&cipher);
             jobs.push(move || {
-                seal_record_group(
+                seal_records_segment(
                     &cipher,
                     &nonce_base,
                     aad,
                     &padding,
-                    max_chunk_len,
                     group_base_sequence,
                     &group_plaintext,
+                    &lens,
                     seed,
                 )
             });
-            next_chunk = chunk_end;
+            next_record = record_end;
+            byte_offset += span;
         }
 
         let segments = parallel::dispatch_blocking(|| pool.run_ordered(jobs));
@@ -440,6 +499,55 @@ impl DataRecordCodec {
             out.extend_from_slice(segment);
         }
         self.aead.advance_sequence(record_count as u64);
+        Ok(())
+    }
+
+    /// Serial counterpart of [`Self::open_concat_records_parallel`]: opens a
+    /// buffer of consecutive sealed TLS records in place, appending the
+    /// concatenated plaintext to `out`. Identical validation and AEAD checks
+    /// to the per-record `open*` methods; any failure must fail-close the
+    /// session, as the sequence counter has already advanced past the records
+    /// opened before the failure.
+    pub fn open_concat_records(
+        &mut self,
+        records: &mut [u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError> {
+        let mut offset = 0;
+        while offset < records.len() {
+            let header = record::parse_header(&records[offset..])?;
+            if header.content_type != TLS_CONTENT_APPLICATION_DATA {
+                return Err(DataRecordError::NotApplicationData);
+            }
+            if records.len() < offset + header.total_len {
+                return Err(record::TlsRecordError::IncompletePayload.into());
+            }
+            if header.payload_len < AEAD_TAG_LEN {
+                return Err(SessionError::Aead.into());
+            }
+            let ciphertext =
+                &mut records[offset + record::TLS_HEADER_LEN..offset + header.total_len];
+            crate::process_hardening::exclude_transient_from_core_dump(
+                "data_record.open_concat_plaintext",
+                ciphertext,
+            );
+            let padded_len = match self.aead.open_in_place_split(ciphertext, self.aad) {
+                Ok(len) => len,
+                Err(err) => {
+                    ciphertext.zeroize();
+                    return Err(err.into());
+                }
+            };
+            let unpadded_len = match PaddingProfile::unpadded_len(&ciphertext[..padded_len]) {
+                Ok(len) => len,
+                Err(err) => {
+                    ciphertext.zeroize();
+                    return Err(err.into());
+                }
+            };
+            out.extend_from_slice(&ciphertext[..unpadded_len]);
+            offset += header.total_len;
+        }
         Ok(())
     }
 
@@ -587,37 +695,35 @@ where
     Ok(())
 }
 
-/// Seals a contiguous run of records (one worker's share) into a fresh buffer.
+/// Seals a contiguous run of records (one worker's share) into a fresh buffer,
+/// slicing `plaintext` by the supplied per-record lengths.
 #[allow(clippy::too_many_arguments)]
-fn seal_record_group(
+fn seal_records_segment(
     cipher: &LessSafeKey,
     nonce_base: &[u8; NONCE_LEN],
     aad: &'static [u8],
     padding: &PaddingProfile,
-    max_chunk_len: usize,
     base_sequence: u64,
     plaintext: &[u8],
+    record_lens: &[usize],
     seed: u64,
 ) -> Result<Vec<u8>, DataRecordError> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut out = Vec::with_capacity(
-        plaintext.len() + chunk_count(plaintext.len(), max_chunk_len) * record_overhead(padding),
-    );
-    if plaintext.is_empty() {
-        seal_one_record_into(cipher, nonce_base, base_sequence, padding, aad, &[], &mut rng, &mut out)?;
-        return Ok(out);
-    }
-    for (index, chunk) in plaintext.chunks(max_chunk_len).enumerate() {
+    let mut out =
+        Vec::with_capacity(plaintext.len() + record_lens.len() * record_overhead(padding));
+    let mut offset = 0;
+    for (index, &len) in record_lens.iter().enumerate() {
         seal_one_record_into(
             cipher,
             nonce_base,
             base_sequence + index as u64,
             padding,
             aad,
-            chunk,
+            &plaintext[offset..offset + len],
             &mut rng,
             &mut out,
         )?;
+        offset += len;
     }
     Ok(out)
 }
@@ -637,6 +743,10 @@ fn open_record_group(
         let sequence = base_sequence + index as u64;
         let ciphertext_start = record_offset + record::TLS_HEADER_LEN;
         let ciphertext_end = record_offset + total_len;
+        crate::process_hardening::exclude_transient_from_core_dump(
+            "data_record.open_concat_plaintext",
+            &bytes[ciphertext_start..ciphertext_end],
+        );
         let plaintext_len = match session::open_in_place_split_with(
             cipher,
             nonce_base,
@@ -665,6 +775,20 @@ fn open_record_group(
 
 fn record_overhead(padding: &PaddingProfile) -> usize {
     record::TLS_HEADER_LEN + padding.max_len() as usize + PADDING_LEN_FIELD + AEAD_TAG_LEN
+}
+
+/// A batch must clear both thresholds before the AEAD work is fanned out across
+/// the crypto pool. Smaller batches (interactive traffic, control frames) seal
+/// and open inline so they never pay the cross-thread dispatch latency; only
+/// bulk transfers — where a single core's AEAD throughput is the ceiling — go
+/// parallel. Tuned against the loopback throughput/latency benchmark.
+pub const PARALLEL_AEAD_MIN_RECORDS: usize = 3;
+pub const PARALLEL_AEAD_MIN_BYTES: usize = 48 * 1024;
+
+/// Whether a batch of `record_count` records totalling `total_bytes` of payload
+/// is large enough to seal/open across the crypto pool rather than inline.
+pub fn should_parallelize_aead(record_count: usize, total_bytes: usize) -> bool {
+    record_count >= PARALLEL_AEAD_MIN_RECORDS && total_bytes >= PARALLEL_AEAD_MIN_BYTES
 }
 
 pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";
@@ -1201,6 +1325,157 @@ mod tests {
             dec.open_concat_records_parallel(&test_pool(), &sealed, &mut opened),
             Err(DataRecordError::Aead(_))
         ));
+    }
+
+    /// Frame-aligned style record partition: mixed sizes, including one
+    /// maximum-length record, mirroring what the mux writers produce.
+    fn variable_record_lens(max_len: usize) -> Vec<usize> {
+        vec![5, max_len, 1, 700, max_len / 2, 13, 4096]
+    }
+
+    fn patterned_payload(len: usize) -> Vec<u8> {
+        (0..len).map(|idx| (idx % 251) as u8).collect()
+    }
+
+    #[test]
+    fn seal_records_into_matches_per_record_seal_into() {
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut reference =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let lens = variable_record_lens(reference.max_plaintext_len());
+        let payload = patterned_payload(lens.iter().sum());
+
+        let mut reference_rng = StdRng::seed_from_u64(41);
+        let mut reference_out = Vec::new();
+        let mut offset = 0;
+        for &len in &lens {
+            reference
+                .seal_into(&payload[offset..offset + len], &mut reference_rng, &mut reference_out)
+                .unwrap();
+            offset += len;
+        }
+
+        let mut batched =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut batched_rng = StdRng::seed_from_u64(42);
+        let mut batched_out = Vec::new();
+        batched
+            .seal_records_into(&payload, &lens, &mut batched_rng, &mut batched_out)
+            .unwrap();
+
+        // Zero padding consumes no rng, so the wire bytes are deterministic.
+        assert_eq!(batched_out, reference_out);
+    }
+
+    #[test]
+    fn record_lens_parallel_seal_matches_serial_and_advances_sequence() {
+        let key = [3_u8; KEY_LEN];
+        let nonce = [4_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut serial =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let lens = variable_record_lens(serial.max_plaintext_len());
+        let payload = patterned_payload(lens.iter().sum());
+
+        let mut serial_rng = StdRng::seed_from_u64(51);
+        let mut serial_out = Vec::new();
+        serial
+            .seal_records_into(&payload, &lens, &mut serial_rng, &mut serial_out)
+            .unwrap();
+        let serial_tail = serial.seal(b"tail", &mut serial_rng).unwrap();
+
+        let mut parallel =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let mut parallel_rng = StdRng::seed_from_u64(52);
+        let mut parallel_out = Vec::new();
+        parallel
+            .seal_records_into_parallel(&test_pool(), &payload, &lens, &mut parallel_rng, &mut parallel_out)
+            .unwrap();
+        let parallel_tail = parallel.seal(b"tail", &mut parallel_rng).unwrap();
+
+        assert_eq!(parallel_out, serial_out);
+        // Identical follow-up record proves both paths advanced the sequence
+        // counter by the same number of records.
+        assert_eq!(parallel_tail, serial_tail);
+    }
+
+    #[test]
+    fn open_concat_records_serial_matches_parallel_round_trip() {
+        let key = [5_u8; KEY_LEN];
+        let nonce = [6_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 128).unwrap();
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let lens = variable_record_lens(enc.max_plaintext_len());
+        let payload = patterned_payload(lens.iter().sum());
+        let mut rng = StdRng::seed_from_u64(61);
+        let mut sealed = Vec::new();
+        enc.seal_records_into(&payload, &lens, &mut rng, &mut sealed)
+            .unwrap();
+        let tail = enc.seal(b"tail", &mut rng).unwrap();
+
+        let mut serial_dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut serial_sealed = sealed.clone();
+        let mut serial_opened = Vec::new();
+        serial_dec
+            .open_concat_records(&mut serial_sealed, &mut serial_opened)
+            .unwrap();
+        assert_eq!(serial_opened, payload);
+        // The serial concat open advanced the sequence once per record.
+        assert_eq!(serial_dec.open(&tail).unwrap(), b"tail");
+
+        let mut parallel_dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut parallel_opened = Vec::new();
+        parallel_dec
+            .open_concat_records_parallel(&test_pool(), &sealed, &mut parallel_opened)
+            .unwrap();
+        assert_eq!(parallel_opened, payload);
+        assert_eq!(parallel_dec.open(&tail).unwrap(), b"tail");
+    }
+
+    #[test]
+    fn open_concat_records_rejects_tampered_record() {
+        let key = [7_u8; KEY_LEN];
+        let nonce = [8_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut rng = StdRng::seed_from_u64(71);
+        let mut sealed = Vec::new();
+        enc.seal_chunks_into_untracked(&vec![0x55_u8; 80 * 1024], &mut rng, &mut sealed)
+            .unwrap();
+        let flip = sealed.len() / 2;
+        sealed[flip] ^= 0x01;
+
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut opened = Vec::new();
+        assert!(matches!(
+            dec.open_concat_records(&mut sealed, &mut opened),
+            Err(DataRecordError::Aead(_))
+        ));
+    }
+
+    #[test]
+    fn should_parallelize_aead_requires_both_thresholds() {
+        assert!(should_parallelize_aead(
+            PARALLEL_AEAD_MIN_RECORDS,
+            PARALLEL_AEAD_MIN_BYTES
+        ));
+        assert!(!should_parallelize_aead(
+            PARALLEL_AEAD_MIN_RECORDS - 1,
+            PARALLEL_AEAD_MIN_BYTES
+        ));
+        assert!(!should_parallelize_aead(
+            PARALLEL_AEAD_MIN_RECORDS,
+            PARALLEL_AEAD_MIN_BYTES - 1
+        ));
+        // One full-size record alone must stay inline regardless of bytes.
+        assert!(!should_parallelize_aead(1, 1024 * 1024));
     }
 
     #[test]
