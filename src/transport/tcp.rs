@@ -549,27 +549,41 @@ mod kernel_splice {
         idle_timeout: Duration,
         last_progress: Arc<Mutex<Instant>>,
     ) -> io::Result<()> {
+        let result = splice_pump(&read_stream, &write_stream, idle_timeout, &last_progress);
+        // FIN on EVERY exit (idle timeout, EOF, or any error): drain bytes still
+        // queued on the read socket so its drop does not RST, then half-close the
+        // write socket so the downstream peer sees a graceful FIN. shutdown (not a
+        // bare drop) is required because the sibling direction still holds the
+        // other clone of this socket. Mirrors the userspace graceful_close path.
+        drain_std_recv(&read_stream);
+        let _ = write_stream.shutdown(Shutdown::Write);
+        result
+    }
+
+    /// Pumps one direction (read -> pipe -> write) until idle timeout, EOF, or
+    /// error. Never shuts the socket down itself; the caller FINs on every exit.
+    fn splice_pump(
+        read_stream: &StdTcpStream,
+        write_stream: &StdTcpStream,
+        idle_timeout: Duration,
+        last_progress: &Arc<Mutex<Instant>>,
+    ) -> io::Result<()> {
         let pipe = Pipe::new()?;
         loop {
             if !poll_fd_until_progress(
                 read_stream.as_raw_fd(),
                 libc::POLLIN,
                 idle_timeout,
-                &last_progress,
+                last_progress,
             )? {
-                // Idle timeout on the read side: signal the peer with a FIN
-                // instead of dropping the socket, which would RST if bytes are
-                // still queued and reveal this is not an ordinary origin.
-                let _ = write_stream.shutdown(Shutdown::Write);
-                return Ok(());
+                return Ok(()); // read-side idle timeout
             }
             let Some(moved) = splice_fd(read_stream.as_raw_fd(), pipe.write_fd, SPLICE_CHUNK)?
             else {
                 continue;
             };
             if moved == 0 {
-                let _ = write_stream.shutdown(Shutdown::Write);
-                return Ok(());
+                return Ok(()); // read EOF (peer half-closed)
             }
             *last_progress
                 .lock()
@@ -582,12 +596,9 @@ mod kernel_splice {
                     write_stream.as_raw_fd(),
                     libc::POLLOUT,
                     idle_timeout,
-                    &last_progress,
+                    last_progress,
                 )? {
-                    // Idle timeout while waiting to write: close with a FIN for
-                    // the same reason as the read-side timeout above.
-                    let _ = write_stream.shutdown(Shutdown::Write);
-                    return Ok(());
+                    return Ok(()); // write-side idle timeout
                 }
                 let Some(written) = splice_fd(pipe.read_fd, write_stream.as_raw_fd(), remaining)?
                 else {
@@ -601,6 +612,23 @@ mod kernel_splice {
                     .lock()
                     .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))? =
                     Instant::now();
+            }
+        }
+    }
+
+    /// Best-effort, bounded, non-blocking drain of a socket's receive buffer so
+    /// that closing it emits a FIN rather than a RST. The stream is already
+    /// nonblocking (set in `splice_bidirectional_with_idle_timeout`).
+    fn drain_std_recv(stream: &StdTcpStream) {
+        use std::io::Read;
+        let mut reader: &StdTcpStream = stream;
+        let mut scratch = [0_u8; 16 * 1024];
+        for _ in 0..16 {
+            match reader.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
             }
         }
     }
@@ -749,5 +777,54 @@ mod tests {
     #[test]
     fn kernel_splice_availability_matches_target() {
         assert_eq!(kernel_splice_available(), cfg!(target_os = "linux"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn splice_relay_idle_timeout_closes_client_with_fin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Origin accepts, reads whatever is relayed, then stays idle.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            let mut buf = [0_u8; 64];
+            let _ = origin.read(&mut buf).await; // forwarded client bytes
+            let _ = origin.read(&mut buf).await; // blocks until the relay FINs
+        });
+
+        // The relay splices the client side to a freshly dialed origin side.
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (client_side, _) = relay_listener.accept().await.unwrap();
+            let origin_side = TcpStream::connect(origin_addr).await.unwrap();
+            relay_kernel_splice_bidirectional_with_idle_timeout(
+                client_side,
+                origin_side,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        // Carry real bytes so the close is non-trivial, then go idle.
+        client.write_all(b"hello-through-splice").await.unwrap();
+
+        // After the idle timeout the relay tears down. The client MUST observe a
+        // graceful FIN (read == Ok(0)); a RST would surface as a ConnectionReset
+        // error and fail the inner expect.
+        let mut buf = [0_u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("relay should close promptly after idle timeout")
+            .expect("splice teardown must be a graceful FIN, not a RST");
+        assert_eq!(n, 0, "client must see EOF (FIN) after splice idle teardown");
+
+        relay_task.await.unwrap();
+        origin_task.abort();
     }
 }

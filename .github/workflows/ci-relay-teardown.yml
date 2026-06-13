@@ -1,0 +1,100 @@
+name: ci-relay-teardown
+
+# Asserts the camouflage relay tears down with a graceful FIN, never a RST, on
+# BOTH the Linux splice fast-path and the userspace fallback path. A RST at
+# teardown is an observable "this is not an ordinary origin" tell that active
+# probing keys on, so this gate captures loopback with tcpdump while exercising
+# every teardown class and fails if any RST segment appears.
+#
+# The functional tests already assert FIN at the application layer (a RST
+# surfaces as a ConnectionReset error and fails the test); this job is the
+# independent packet-level confirmation, and the one place the Linux splice
+# close behavior is exercised under capture.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'ParallaX-DeepWiki/**'
+      - 'DEPLOYMENT.md'
+      - 'AGENTS.md'
+      - 'README.md'
+      - '.gitignore'
+      - 'LICENSE*'
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'ParallaX-DeepWiki/**'
+      - 'DEPLOYMENT.md'
+      - 'AGENTS.md'
+      - 'README.md'
+      - '.gitignore'
+      - 'LICENSE*'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-relay-teardown-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  no-rst:
+    name: relay-teardown-no-rst
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: parallax-ci
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: install tcpdump
+        run: sudo apt-get update && sudo apt-get install -y tcpdump
+
+      # Pre-build so the capture window is the teardown traffic, not compilation.
+      - name: build tests
+        run: cargo build --locked --tests
+
+      - name: relay teardown emits FIN, never RST
+        run: |
+          set -euo pipefail
+          sudo tcpdump -i lo -nn -w /tmp/cap.pcap tcp >/tmp/tcpdump.log 2>&1 &
+          TD=$!
+          sleep 3
+          # Exercise the Linux splice teardown and both userspace fallback close
+          # paths repeatedly. Each test also asserts FIN at the app layer.
+          for _ in 1 2 3 4 5; do
+            cargo test --lib --locked splice_relay_idle_timeout_closes_client_with_fin
+            cargo test --lib --locked fallback_relay_idle_timeout_closes_empty_probe
+            cargo test --lib --locked fallback_relay_connect_failure_closes_client_with_fin
+          done
+          sleep 3
+          sudo kill -INT "$TD" || true
+          sleep 1
+          rst=$(sudo tcpdump -nn -r /tmp/cap.pcap 'tcp[tcpflags] & tcp-rst != 0' 2>/dev/null | wc -l)
+          fin=$(sudo tcpdump -nn -r /tmp/cap.pcap 'tcp[tcpflags] & tcp-fin != 0' 2>/dev/null | wc -l)
+          echo "loopback teardown summary: RST=$rst FIN=$fin"
+          if [ "$rst" -ne 0 ]; then
+            echo "::error::relay teardown emitted $rst RST segment(s); expected 0 (FIN-only close)"
+            sudo tcpdump -nn -r /tmp/cap.pcap 'tcp[tcpflags] & tcp-rst != 0' || true
+            exit 1
+          fi
+          # Guard against a silent false pass where the capture missed the
+          # teardown entirely (then RST would also be 0).
+          if [ "$fin" -eq 0 ]; then
+            echo "::error::no FIN segments captured; the gate did not observe any teardown"
+            exit 1
+          fi
