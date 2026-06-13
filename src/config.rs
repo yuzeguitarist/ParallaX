@@ -53,6 +53,13 @@ pub enum ConfigError {
     InvalidCoverIntervalRange,
     #[error("traffic.max_concurrent_streams must be at least 1")]
     InvalidMaxConcurrentStreams,
+    #[error("udp.probe_timeout_ms must be at least 1")]
+    InvalidUdpProbeTimeout,
+    #[error(
+        "udp.cc = \"brutal\" requires udp.brutal_up_mbps and udp.brutal_down_mbps > 0 \
+         unless udp.ignore_client_bandwidth is set"
+    )]
+    UdpBrutalMissingBandwidth,
     #[error(
         "client.listen must bind to a loopback address because SOCKS5 has no authentication: {0}"
     )]
@@ -80,6 +87,8 @@ pub struct Config {
     pub crypto: CryptoConfig,
     #[serde(default)]
     pub traffic: TrafficConfig,
+    #[serde(default)]
+    pub udp: UdpConfig,
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
 }
@@ -169,6 +178,97 @@ impl Default for TrafficConfig {
     }
 }
 
+/// User-space congestion controller for the UDP fast plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UdpCongestionControl {
+    /// BBRv3-style controller: blends in with ordinary traffic; the safe default.
+    #[default]
+    Bbr,
+    /// Hysteria-style brute-force rate controller; opt-in only (detectable, unfair).
+    Brutal,
+}
+
+/// Forward-error-correction profile for the unreliable datagram fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UdpFecProfile {
+    /// No FEC.
+    Off,
+    /// Sliding-window FEC, gated on measured loss x RTT.
+    #[default]
+    Adaptive,
+    /// Reed-Solomon block codes for a bulk / high-loss profile.
+    Rs,
+}
+
+/// UDP fast-plane configuration. Disabled by default: with `enabled = false`
+/// the runtime behaves exactly like today's TCP-only transport. All knobs have
+/// safe defaults so an operator never has to choose TCP vs UDP.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UdpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cc: UdpCongestionControl,
+    /// Declared uplink bandwidth (Mbps) for Brutal; 0 means unset.
+    #[serde(default)]
+    pub brutal_up_mbps: u32,
+    /// Declared downlink bandwidth (Mbps) for Brutal; 0 means unset.
+    #[serde(default)]
+    pub brutal_down_mbps: u32,
+    /// Let the server override the client-declared Brutal bandwidth.
+    #[serde(default)]
+    pub ignore_client_bandwidth: bool,
+    #[serde(default)]
+    pub fec_profile: UdpFecProfile,
+    /// Happy-Eyeballs UDP probe timeout before committing to TCP-only.
+    #[serde(default = "default_udp_probe_timeout_ms")]
+    pub probe_timeout_ms: u16,
+    #[serde(default)]
+    pub port_hop: bool,
+    /// SNI/host to front the masquerading HTTP/3 face on; `None` keeps the TCP `sni`.
+    #[serde(default)]
+    pub masque_front: Option<String>,
+    #[serde(default)]
+    pub ech: bool,
+}
+
+impl Default for UdpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cc: UdpCongestionControl::Bbr,
+            brutal_up_mbps: 0,
+            brutal_down_mbps: 0,
+            ignore_client_bandwidth: false,
+            fec_profile: UdpFecProfile::Adaptive,
+            probe_timeout_ms: default_udp_probe_timeout_ms(),
+            port_hop: false,
+            masque_front: None,
+            ech: false,
+        }
+    }
+}
+
+impl UdpConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.probe_timeout_ms == 0 {
+            return Err(ConfigError::InvalidUdpProbeTimeout);
+        }
+        if self.cc == UdpCongestionControl::Brutal
+            && !self.ignore_client_bandwidth
+            && (self.brutal_up_mbps == 0 || self.brutal_down_mbps == 0)
+        {
+            return Err(ConfigError::UdpBrutalMissingBandwidth);
+        }
+        if let Some(front) = &self.masque_front {
+            require_non_empty("udp.masque_front", front)?;
+        }
+        Ok(())
+    }
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -206,6 +306,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         decode_psk(&self.crypto.psk)?;
         self.traffic.validate()?;
+        self.udp.validate()?;
 
         match self.mode {
             Mode::Client => {
@@ -486,6 +587,10 @@ const fn default_max_concurrent_streams() -> u8 {
     4
 }
 
+const fn default_udp_probe_timeout_ms() -> u16 {
+    300
+}
+
 fn default_replay_cache_path() -> PathBuf {
     PathBuf::from(DEFAULT_REPLAY_CACHE_PATH)
 }
@@ -580,6 +685,255 @@ authorized_sni = ["example.com"]
         assert_eq!(traffic.cover_min_interval_ms, 0);
         assert_eq!(traffic.cover_max_interval_ms, 0);
         assert_eq!(traffic.max_concurrent_streams, 4);
+    }
+
+    #[test]
+    fn udp_defaults_are_disabled_and_safe() {
+        let udp = UdpConfig::default();
+        assert!(!udp.enabled);
+        assert_eq!(udp.cc, UdpCongestionControl::Bbr);
+        assert_eq!(udp.fec_profile, UdpFecProfile::Adaptive);
+        assert_eq!(udp.probe_timeout_ms, 300);
+        assert_eq!(udp.brutal_up_mbps, 0);
+        assert_eq!(udp.brutal_down_mbps, 0);
+        assert!(!udp.ignore_client_bandwidth);
+        assert!(!udp.port_hop);
+        assert!(udp.masque_front.is_none());
+        assert!(!udp.ech);
+        udp.validate().unwrap();
+    }
+
+    #[test]
+    fn config_without_udp_section_defaults_to_disabled() {
+        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.udp.enabled);
+        assert_eq!(cfg.udp, UdpConfig::default());
+    }
+
+    #[test]
+    fn udp_section_parses_overrides() {
+        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+
+[udp]
+enabled = true
+cc = "brutal"
+brutal_up_mbps = 50
+brutal_down_mbps = 200
+fec_profile = "rs"
+probe_timeout_ms = 250
+port_hop = true
+masque_front = "cdn.example.com"
+ech = true
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.udp.enabled);
+        assert_eq!(cfg.udp.cc, UdpCongestionControl::Brutal);
+        assert_eq!(cfg.udp.brutal_up_mbps, 50);
+        assert_eq!(cfg.udp.brutal_down_mbps, 200);
+        assert_eq!(cfg.udp.fec_profile, UdpFecProfile::Rs);
+        assert_eq!(cfg.udp.probe_timeout_ms, 250);
+        assert!(cfg.udp.port_hop);
+        assert_eq!(cfg.udp.masque_front.as_deref(), Some("cdn.example.com"));
+        assert!(cfg.udp.ech);
+    }
+
+    #[test]
+    fn rejects_zero_udp_probe_timeout() {
+        let udp = UdpConfig {
+            probe_timeout_ms: 0,
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            udp.validate().unwrap_err(),
+            ConfigError::InvalidUdpProbeTimeout
+        ));
+    }
+
+    #[test]
+    fn rejects_brutal_without_declared_bandwidth() {
+        let udp = UdpConfig {
+            cc: UdpCongestionControl::Brutal,
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            udp.validate().unwrap_err(),
+            ConfigError::UdpBrutalMissingBandwidth
+        ));
+    }
+
+    #[test]
+    fn accepts_brutal_with_declared_bandwidth() {
+        let udp = UdpConfig {
+            cc: UdpCongestionControl::Brutal,
+            brutal_up_mbps: 50,
+            brutal_down_mbps: 200,
+            ..UdpConfig::default()
+        };
+        udp.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_brutal_when_ignoring_client_bandwidth() {
+        let udp = UdpConfig {
+            cc: UdpCongestionControl::Brutal,
+            ignore_client_bandwidth: true,
+            ..UdpConfig::default()
+        };
+        udp.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_brutal_with_partial_bandwidth() {
+        let up_only = UdpConfig {
+            cc: UdpCongestionControl::Brutal,
+            brutal_up_mbps: 50,
+            brutal_down_mbps: 0,
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            up_only.validate().unwrap_err(),
+            ConfigError::UdpBrutalMissingBandwidth
+        ));
+        let down_only = UdpConfig {
+            cc: UdpCongestionControl::Brutal,
+            brutal_up_mbps: 0,
+            brutal_down_mbps: 200,
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            down_only.validate().unwrap_err(),
+            ConfigError::UdpBrutalMissingBandwidth
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_masque_front() {
+        let udp = UdpConfig {
+            masque_front: Some("  ".to_owned()),
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            udp.validate().unwrap_err(),
+            ConfigError::InvalidSocket { .. }
+        ));
+    }
+
+    #[test]
+    fn udp_partial_section_uses_field_defaults() {
+        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+
+[udp]
+enabled = true
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.udp,
+            UdpConfig {
+                enabled: true,
+                ..UdpConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn udp_enum_wire_spellings_round_trip() {
+        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+
+[udp]
+cc = "bbr"
+fec_profile = "off"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.udp.cc, UdpCongestionControl::Bbr);
+        assert_eq!(cfg.udp.fec_profile, UdpFecProfile::Off);
+    }
+
+    #[test]
+    fn server_mode_accepts_udp_section() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+
+[udp]
+enabled = true
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.udp.enabled);
     }
 
     #[test]

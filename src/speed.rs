@@ -855,7 +855,7 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClientConfig, CryptoConfig, ServerConfig, TrafficConfig};
+    use crate::config::{ClientConfig, CryptoConfig, ServerConfig, TrafficConfig, UdpConfig};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use pqcrypto_mldsa::mldsa87;
     use std::net::SocketAddr;
@@ -986,6 +986,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: None,
             server: Some(ServerConfig {
                 listen: "127.0.0.1:8443".parse::<SocketAddr>().unwrap(),
@@ -1009,6 +1010,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: None,
             server: None,
         }
