@@ -84,8 +84,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 /// connection) ever reaches this; the floor matches the previous fixed value so
 /// no legitimate client is given less time than before.
 const FIRST_RECORD_WAIT_FLOOR: Duration = Duration::from_secs(8);
-/// Upward jitter added to [`FIRST_RECORD_WAIT_FLOOR`] per connection so a prober
-/// cannot read a fixed give-up constant. Only ever extends the wait.
+/// Upward jitter added to [`FIRST_RECORD_WAIT_FLOOR`] per connection. This does
+/// not hide the give-up entirely -- the 8s floor is still the minimum a patient
+/// prober converges to over many silent probes -- but it raises measuring the
+/// wait from a single shot to a multi-sample minimum. Only ever extends the wait.
 const FIRST_RECORD_WAIT_JITTER: Duration = Duration::from_secs(7);
 /// Pure resource backstop for the camouflage relay idle cap -- NOT an
 /// anti-probing measure. A legitimate relay resets it on every byte and a real
@@ -94,8 +96,10 @@ const FIRST_RECORD_WAIT_JITTER: Duration = Duration::from_secs(7);
 /// ceiling, is the value a silent prober converges to, and a uniform band is
 /// itself a synthetic signature no real origin produces. It is set high so
 /// ParallaX rarely originates the close at all; genuinely matching an origin's
-/// idle policy is an operational/Phase-3 concern. Sized purely by the
-/// per-connection fd budget (bounded by `relay_connection_limit`).
+/// idle policy is an operational/Phase-3 concern. The *number* of concurrent
+/// holds at this length is bounded by `relay_connection_limit`; the 600s length
+/// itself is a deliberate fixed backstop -- a 5x raise from the prior 120s that
+/// trades a longer fd hold on silent probes for fewer ParallaX-originated closes.
 const FALLBACK_IDLE_TIMEOUT_FLOOR: Duration = Duration::from_secs(600);
 /// No jitter on the idle backstop: see [`FALLBACK_IDLE_TIMEOUT_FLOOR`]. Kept as
 /// a named constant so the helper plumbing and tests stay uniform with the
@@ -286,7 +290,12 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                     connection_limit,
                     "server connection limit reached; closing accepted socket"
                 );
-                drop(client);
+                // FIN, don't bare-drop: the client's ClientHello is already
+                // queued in the recv buffer, so dropping the socket would emit a
+                // RST -- the observable tell every other close path here avoids.
+                // Detached so a connection flood at the limit cannot stall the
+                // accept loop on the drain+shutdown.
+                tokio::spawn(graceful_close_tcp_stream(client));
                 continue;
             }
             Err(TryAcquireError::Closed) => {
@@ -786,10 +795,14 @@ async fn read_forwarded_server_hello(
 /// previous behavior. Per-connection randomness (real thread RNG, not a seeded
 /// stream) so the value is independent across connections.
 fn jittered_timeout(floor: Duration, jitter: Duration) -> Duration {
-    if jitter.is_zero() {
+    // Guard on the millisecond value actually used below, not on Duration::is_zero:
+    // a sub-millisecond jitter is non-zero yet as_millis() == 0, which would make
+    // gen_range(0..=0) silently return the bare floor while claiming to jitter.
+    let jitter_ms = jitter.as_millis() as u64;
+    if jitter_ms == 0 {
         return floor;
     }
-    let extra = rand::thread_rng().gen_range(0..=jitter.as_millis() as u64);
+    let extra = rand::thread_rng().gen_range(0..=jitter_ms);
     floor + Duration::from_millis(extra)
 }
 
@@ -3259,7 +3272,11 @@ mod tests {
         // would only add latency to legit clients), and the client-facing floor
         // must equal the pre-jitter fixed value so no client gets less time.
         assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(8));
-        assert_eq!(FIRST_RECORD_WAIT_FLOOR, HANDSHAKE_TIMEOUT);
+        // Anchor the client-facing floor to the pre-jitter legacy value (8s)
+        // directly, NOT to HANDSHAKE_TIMEOUT: the two are now deliberately
+        // independent (origin-facing vs client-facing), so coupling them would
+        // make an origin-side change spuriously break this client-side test.
+        assert_eq!(FIRST_RECORD_WAIT_FLOOR, Duration::from_secs(8));
         assert!(FIRST_RECORD_WAIT_JITTER > Duration::from_secs(0));
         assert!(FALLBACK_IDLE_TIMEOUT_JITTER.is_zero());
     }
