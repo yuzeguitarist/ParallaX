@@ -557,6 +557,10 @@ mod kernel_splice {
                 idle_timeout,
                 &last_progress,
             )? {
+                // Idle timeout on the read side: signal the peer with a FIN
+                // instead of dropping the socket, which would RST if bytes are
+                // still queued and reveal this is not an ordinary origin.
+                let _ = write_stream.shutdown(Shutdown::Write);
                 return Ok(());
             }
             let Some(moved) = splice_fd(read_stream.as_raw_fd(), pipe.write_fd, SPLICE_CHUNK)?
@@ -580,6 +584,9 @@ mod kernel_splice {
                     idle_timeout,
                     &last_progress,
                 )? {
+                    // Idle timeout while waiting to write: close with a FIN for
+                    // the same reason as the read-side timeout above.
+                    let _ = write_stream.shutdown(Shutdown::Write);
                     return Ok(());
                 }
                 let Some(written) = splice_fd(pipe.read_fd, write_stream.as_raw_fd(), remaining)?

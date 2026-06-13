@@ -598,10 +598,41 @@ pub async fn relay_fallback(
     fallback_addr: &str,
     first_client_record: Vec<u8>,
 ) -> Result<(), HandshakeServerError> {
+    // Acquire the camouflage origin and replay the bytes we already read. If any
+    // of this fails we must not just drop `client`: a bare drop with bytes still
+    // queued in its receive buffer makes the kernel emit a RST, which is an
+    // observable difference from an ordinary origin. Drain and FIN it instead,
+    // exactly like the relay teardown, so both fallback exits behave the same.
+    let fallback = match connect_and_forward_to_fallback(fallback_addr, &first_client_record).await
+    {
+        Ok(fallback) => fallback,
+        Err(err) => {
+            graceful_close_tcp_stream(client).await;
+            return Err(err);
+        }
+    };
+    relay_fallback_with_idle_timeout(client, fallback, FALLBACK_IDLE_TIMEOUT).await
+}
+
+async fn connect_and_forward_to_fallback(
+    fallback_addr: &str,
+    first_client_record: &[u8],
+) -> Result<TcpStream, HandshakeServerError> {
     let mut fallback = connect_tcp_with_timeout(fallback_addr).await?;
     tune_tcp_stream(&fallback)?;
-    fallback.write_all(&first_client_record).await?;
-    relay_fallback_with_idle_timeout(client, fallback, FALLBACK_IDLE_TIMEOUT).await
+    fallback.write_all(first_client_record).await?;
+    Ok(fallback)
+}
+
+/// Drains any ready receive bytes and then half-closes the write side so the
+/// peer sees a graceful FIN. Dropping a socket with unread bytes still queued
+/// makes the kernel emit a RST, an observable tell a real origin would not
+/// produce; this keeps the close indistinguishable from an ordinary teardown.
+async fn graceful_close_tcp_stream(stream: TcpStream) {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut scratch = [0_u8; 4096];
+    let _ = drain_ready_tcp_read(&read_half, &mut scratch, 0);
+    let _ = write_half.shutdown().await;
 }
 
 async fn relay_fallback_with_idle_timeout(
@@ -625,6 +656,40 @@ async fn relay_fallback_with_idle_timeout(
 
     let (mut client_read, mut client_write) = client.into_split();
     let (mut fallback_read, mut fallback_write) = fallback.into_split();
+
+    let outcome = relay_fallback_userspace_loop(
+        &mut client_read,
+        &mut client_write,
+        &mut fallback_read,
+        &mut fallback_write,
+        idle_timeout,
+    )
+    .await;
+
+    // Whatever ended the relay -- the idle timeout, a clean half-close, or an
+    // I/O error mid-stream -- tear both directions down with a graceful FIN
+    // rather than letting the split halves drop. Dropping a socket that still
+    // holds unread bytes makes the kernel send a RST, an observable tell a real
+    // origin would not produce. Drain any ready bytes first so the close stays a
+    // FIN even if a stray record arrived right before teardown.
+    graceful_close_fallback_halves(
+        &client_read,
+        &mut client_write,
+        &fallback_read,
+        &mut fallback_write,
+    )
+    .await;
+
+    outcome
+}
+
+async fn relay_fallback_userspace_loop(
+    client_read: &mut OwnedReadHalf,
+    client_write: &mut OwnedWriteHalf,
+    fallback_read: &mut OwnedReadHalf,
+    fallback_write: &mut OwnedWriteHalf,
+    idle_timeout: Duration,
+) -> Result<(), HandshakeServerError> {
     let fallback_buffer_len = relay_read_buffer_len(max_plaintext_len(0));
     let mut client_buf = vec![0_u8; fallback_buffer_len];
     let mut fallback_buf = vec![0_u8; fallback_buffer_len];
@@ -646,7 +711,9 @@ async fn relay_fallback_with_idle_timeout(
                 let n = read?;
                 if n == 0 {
                     client_closed = true;
-                    fallback_write.shutdown().await?;
+                    // Propagate the half-close promptly; best-effort so a
+                    // shutdown error never skips the final graceful teardown.
+                    let _ = fallback_write.shutdown().await;
                 } else {
                     fallback_write.write_all(&client_buf[..n]).await?;
                     idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
@@ -656,7 +723,7 @@ async fn relay_fallback_with_idle_timeout(
                 let n = read?;
                 if n == 0 {
                     fallback_closed = true;
-                    client_write.shutdown().await?;
+                    let _ = client_write.shutdown().await;
                 } else {
                     client_write.write_all(&fallback_buf[..n]).await?;
                     idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
@@ -666,6 +733,19 @@ async fn relay_fallback_with_idle_timeout(
     }
 
     Ok(())
+}
+
+async fn graceful_close_fallback_halves(
+    client_read: &OwnedReadHalf,
+    client_write: &mut OwnedWriteHalf,
+    fallback_read: &OwnedReadHalf,
+    fallback_write: &mut OwnedWriteHalf,
+) {
+    let mut scratch = [0_u8; 4096];
+    let _ = drain_ready_tcp_read(client_read, &mut scratch, 0);
+    let _ = drain_ready_tcp_read(fallback_read, &mut scratch, 0);
+    let _ = client_write.shutdown().await;
+    let _ = fallback_write.shutdown().await;
 }
 
 async fn read_forwarded_server_hello(
@@ -3091,6 +3171,46 @@ mod tests {
         assert_eq!(client_read, 0);
         assert_eq!(origin_task.await.unwrap(), 0);
         relay_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_relay_connect_failure_closes_client_with_fin() {
+        // Reserve a port and immediately release it so the camouflage-origin
+        // dial is refused deterministically.
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            relay_fallback(
+                server_side,
+                &dead_addr.to_string(),
+                b"probe-prefix".to_vec(),
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        let mut buf = [0_u8; 16];
+        // The client must observe a prompt, graceful close (EOF / FIN). A reset
+        // would surface here as an Err, failing the inner expect.
+        let n = timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("client should observe a prompt close, not hang")
+            .expect("fallback connect failure must close the client with a FIN, not a RST");
+        assert_eq!(
+            n, 0,
+            "client must see EOF (FIN) after an origin dial failure"
+        );
+
+        let relay_result = relay_task.await.unwrap();
+        assert!(
+            relay_result.is_err(),
+            "relay_fallback must surface the origin dial failure"
+        );
     }
 
     #[tokio::test]
