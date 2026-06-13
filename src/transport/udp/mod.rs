@@ -12,6 +12,7 @@
 //! unifies this with the TCP carrier is extracted once both legs exist.
 
 pub mod auth;
+pub mod probe;
 
 use std::sync::Arc;
 
@@ -80,26 +81,23 @@ pub fn client_config(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
+pub(crate) mod test_support {
+    use std::sync::Arc;
 
-    use bytes::Bytes;
-    use quinn::Endpoint;
+    use quinn::{Connection, Endpoint};
     use rustls::{
         client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
         DigitallySignedStruct, SignatureScheme,
     };
 
-    use super::*;
-
-    /// Non-empty PSK for the exporter-bound auth-token round-trip assertions.
-    const TEST_PSK: &[u8] = b"parallax-tudp-loopback-psk-012345";
+    use super::{client_config, server_config};
 
     /// Test-only verifier that accepts any certificate. Mirrors REALITY's posture
-    /// (cert is camouflage, not the trust anchor); real auth lands in a later slice.
+    /// (the cert is camouflage, not the trust anchor); real authenticity is the
+    /// exporter-bound auth token.
     #[derive(Debug)]
-    struct AcceptAnyServerCert;
+    pub(crate) struct AcceptAnyServerCert;
 
     impl ServerCertVerifier for AcceptAnyServerCert {
         fn verify_server_cert(
@@ -141,13 +139,63 @@ mod tests {
         }
     }
 
-    fn self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    pub(crate) fn self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("generate self-signed cert");
         let cert = certified.cert.der().clone();
         let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
         (cert, key)
     }
+
+    /// Establish a connected loopback QUIC client/server pair. Returns both
+    /// endpoints (keep them alive for the connections' lifetime) and the two
+    /// connection handles (client, server).
+    pub(crate) async fn loopback_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        let (cert, key) = self_signed_cert();
+        let server_endpoint = Endpoint::server(
+            server_config(cert, key).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint
+            .set_default_client_config(client_config(Arc::new(AcceptAnyServerCert)).unwrap());
+
+        let acceptor = {
+            let server_endpoint = server_endpoint.clone();
+            tokio::spawn(async move {
+                server_endpoint
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("server-side connection")
+            })
+        };
+        let client_conn = client_endpoint
+            .connect(server_addr, "localhost")
+            .expect("start connect")
+            .await
+            .expect("client-side connection");
+        let server_conn = acceptor.await.expect("accept task");
+        (server_endpoint, client_endpoint, client_conn, server_conn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use quinn::Endpoint;
+
+    use super::test_support::{self_signed_cert, AcceptAnyServerCert};
+    use super::*;
+
+    /// Non-empty PSK for the exporter-bound auth-token round-trip assertions.
+    const TEST_PSK: &[u8] = b"parallax-tudp-loopback-psk-012345";
 
     /// Proves the QUIC fast-plane plumbing on loopback: connection establishment,
     /// bidirectional unreliable datagrams, and that the RFC 5705 keying-material
