@@ -76,6 +76,9 @@ jobs:
           sleep 3
           # Exercise the Linux splice teardown and the userspace fallback idle
           # teardown repeatedly. Both relay live traffic and must close FIN-only.
+          # Each invocation asserts it ran exactly one test, so a rename/removal
+          # fails the gate instead of silently matching zero tests (cargo test
+          # with a zero-match filter exits 0).
           #
           # NOTE: fallback_relay_connect_failure_closes_client_with_fin is
           # deliberately NOT captured here: it dials a closed port, so the kernel
@@ -83,8 +86,15 @@ jobs:
           # RST is normal OS behavior, not ParallaX resetting a peer, and its
           # client-facing FIN is already asserted at the application layer.
           for _ in 1 2 3 4 5; do
-            cargo test --lib --locked splice_relay_idle_timeout_closes_client_with_fin
-            cargo test --lib --locked fallback_relay_idle_timeout_closes_empty_probe
+            for t in splice_relay_idle_timeout_closes_client_with_fin \
+                     fallback_relay_idle_timeout_closes_empty_probe; do
+              out=$(cargo test --lib --locked "$t" 2>&1)
+              echo "$out"
+              echo "$out" | grep -qE "test result: ok\. 1 passed" || {
+                echo "::error::teardown test '$t' did not run as exactly one test (renamed or removed?)"
+                exit 1
+              }
+            done
           done
           sleep 3
           sudo kill -INT "$TD" || true

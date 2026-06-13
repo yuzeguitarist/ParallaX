@@ -218,7 +218,9 @@ static CONGESTION_OVERRIDE: std::sync::OnceLock<Option<std::ffi::CString>> =
 /// containing a NUL) keeps the built-in default ("bbr" on Linux).
 pub fn configure_congestion_control(algorithm: Option<&str>) {
     let value = algorithm.and_then(|name| std::ffi::CString::new(name).ok());
-    let _ = CONGESTION_OVERRIDE.set(value);
+    if CONGESTION_OVERRIDE.set(value).is_err() {
+        tracing::debug!("congestion control override already set; keeping the first value");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -703,7 +705,16 @@ mod kernel_splice {
                 return Ok(true);
             }
             if rc == 0 {
-                return Ok(false);
+                // Poll timed out. The sibling direction shares last_progress and
+                // may have bumped it while we waited, so only give up if the
+                // shared idle deadline has truly elapsed; otherwise re-poll with
+                // the refreshed remaining. This keeps the idle timer a single
+                // shared deadline rather than letting a quiet direction tear down
+                // a connection the other direction is actively pumping.
+                if poll_timeout_ms(idle_timeout, last_progress)? == 0 {
+                    return Ok(false);
+                }
+                continue;
             }
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {

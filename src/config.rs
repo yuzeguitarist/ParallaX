@@ -69,6 +69,8 @@ pub enum ConfigError {
     InvalidTimeoutFloor,
     #[error("server.fallback_idle_floor_ms must be at least 5000ms (it resets on every byte; a tiny value closes active relays)")]
     InvalidIdleBackstop,
+    #[error("server timeout jitter must not exceed 300000ms")]
+    InvalidTimeoutJitter,
     #[error("server.tcp_congestion must be a short alphanumeric algorithm name (e.g. \"bbr\")")]
     InvalidCongestionControl,
     #[cfg(unix)]
@@ -326,6 +328,14 @@ impl Config {
                 if server.fallback_idle_floor_ms < 5_000 {
                     return Err(ConfigError::InvalidIdleBackstop);
                 }
+                // Cap jitter so a fat-fingered value cannot extend a relay's
+                // fd-hold unboundedly (or, on the idle path, paint a very wide
+                // synthetic close band).
+                if server.first_record_wait_jitter_ms > 300_000
+                    || server.fallback_idle_jitter_ms > 300_000
+                {
+                    return Err(ConfigError::InvalidTimeoutJitter);
+                }
                 if let Some(algorithm) = &server.tcp_congestion {
                     let valid = !algorithm.is_empty()
                         && algorithm.len() <= 15
@@ -574,6 +584,10 @@ const fn default_replay_cache_capacity() -> usize {
 }
 
 const fn default_max_concurrent_per_source() -> u32 {
+    // Shared v4/v6 starting point on purpose: 256 is generous enough not to
+    // throttle real shared/CGNAT sources while still bounding single-source
+    // monopolization (the global limit is the real backstop). Operators behind
+    // heavy carrier-NAT or running /64-per-VM fleets can raise the v6 cap.
     256
 }
 
@@ -1194,6 +1208,32 @@ fallback_idle_floor_ms = 1000
         assert!(matches!(
             cfg.validate().unwrap_err(),
             ConfigError::InvalidIdleBackstop
+        ));
+    }
+
+    #[test]
+    fn server_validate_rejects_excessive_timeout_jitter() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+fallback_idle_jitter_ms = 999999999
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidTimeoutJitter
         ));
     }
 

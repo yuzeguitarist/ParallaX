@@ -251,8 +251,14 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .clone()
         .ok_or(HandshakeServerError::MissingServer)?;
     let server = Arc::new(server);
-    // Install deployment-wide tuning before accepting any connection.
-    let _ = TIMEOUT_TUNING.set(TimeoutTuning::from_server_config(&server));
+    // Install deployment-wide tuning before accepting any connection. First call
+    // wins (run() is one-per-process); log if a second run somehow re-sets it.
+    if TIMEOUT_TUNING
+        .set(TimeoutTuning::from_server_config(&server))
+        .is_err()
+    {
+        tracing::debug!("timeout tuning already set; keeping the first configuration");
+    }
     crate::transport::tcp::configure_congestion_control(server.tcp_congestion.as_deref());
     let traffic = config.traffic;
     let psk = decode_psk(&config.crypto.psk)?;
