@@ -11,6 +11,8 @@
 //! runtime and a no-op for every existing code path. The `Leg` abstraction that
 //! unifies this with the TCP carrier is extracted once both legs exist.
 
+pub mod auth;
+
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -90,6 +92,9 @@ mod tests {
     };
 
     use super::*;
+
+    /// Non-empty PSK for the exporter-bound auth-token round-trip assertions.
+    const TEST_PSK: &[u8] = b"parallax-tudp-loopback-psk-012345";
 
     /// Test-only verifier that accepts any certificate. Mirrors REALITY's posture
     /// (cert is camouflage, not the trust anchor); real auth lands in a later slice.
@@ -173,9 +178,11 @@ mod tests {
             let mut ekm = [0_u8; 32];
             conn.export_keying_material(&mut ekm, b"tudp-loopback", b"context")
                 .expect("server export_keying_material");
+            let token = auth::export_udp_auth_token(&conn, TEST_PSK, b"offer-context")
+                .expect("server auth token");
             // Hold the connection open long enough for the client to read the echo.
             tokio::time::sleep(Duration::from_millis(200)).await;
-            ekm
+            (ekm, token)
         });
 
         let conn = client_endpoint
@@ -195,11 +202,24 @@ mod tests {
         let mut client_ekm = [0_u8; 32];
         conn.export_keying_material(&mut client_ekm, b"tudp-loopback", b"context")
             .expect("client export_keying_material");
+        let client_token = auth::export_udp_auth_token(&conn, TEST_PSK, b"offer-context")
+            .expect("client auth token");
+        let other_context_token =
+            auth::export_udp_auth_token(&conn, TEST_PSK, b"different-context")
+                .expect("client auth token (other context)");
 
-        let server_ekm = server_task.await.unwrap();
+        let (server_ekm, server_token) = server_task.await.unwrap();
         assert_eq!(
             client_ekm, server_ekm,
             "RFC 5705 exporter output must match on both ends",
+        );
+        assert_eq!(
+            client_token, server_token,
+            "exporter-bound UDP auth token must match on both ends",
+        );
+        assert_ne!(
+            client_token, other_context_token,
+            "the exporter-bound auth token must be bound to its context",
         );
     }
 }
