@@ -74,12 +74,17 @@ jobs:
           sudo tcpdump -i lo -nn -w /tmp/cap.pcap tcp >/tmp/tcpdump.log 2>&1 &
           TD=$!
           sleep 3
-          # Exercise the Linux splice teardown and both userspace fallback close
-          # paths repeatedly. Each test also asserts FIN at the app layer.
+          # Exercise the Linux splice teardown and the userspace fallback idle
+          # teardown repeatedly. Both relay live traffic and must close FIN-only.
+          #
+          # NOTE: fallback_relay_connect_failure_closes_client_with_fin is
+          # deliberately NOT captured here: it dials a closed port, so the kernel
+          # answers with a "connection refused" RST on the origin-dial side. That
+          # RST is normal OS behavior, not ParallaX resetting a peer, and its
+          # client-facing FIN is already asserted at the application layer.
           for _ in 1 2 3 4 5; do
             cargo test --lib --locked splice_relay_idle_timeout_closes_client_with_fin
             cargo test --lib --locked fallback_relay_idle_timeout_closes_empty_probe
-            cargo test --lib --locked fallback_relay_connect_failure_closes_client_with_fin
           done
           sleep 3
           sudo kill -INT "$TD" || true
