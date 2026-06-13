@@ -75,8 +75,32 @@ use crate::{
     },
 };
 
+/// Fixed timeout for origin-facing handshake operations (dialing the camouflage
+/// origin and reading its ServerHello). These gate genuine origin work, so they
+/// stay constant -- jittering them would only add latency to legitimate clients.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
-const FALLBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Floor for the client-facing wait on the first record. A real client sends its
+/// ClientHello immediately, so only a slow/absent client (a probe or a broken
+/// connection) ever reaches this; the floor matches the previous fixed value so
+/// no legitimate client is given less time than before.
+const FIRST_RECORD_WAIT_FLOOR: Duration = Duration::from_secs(8);
+/// Upward jitter added to [`FIRST_RECORD_WAIT_FLOOR`] per connection so a prober
+/// cannot read a fixed give-up constant. Only ever extends the wait.
+const FIRST_RECORD_WAIT_JITTER: Duration = Duration::from_secs(7);
+/// Pure resource backstop for the camouflage relay idle cap -- NOT an
+/// anti-probing measure. A legitimate relay resets it on every byte and a real
+/// origin/client drives the close first, so this fires only on a deliberately
+/// silent connection (a probe). Jittering it was theater: the floor, not the
+/// ceiling, is the value a silent prober converges to, and a uniform band is
+/// itself a synthetic signature no real origin produces. It is set high so
+/// ParallaX rarely originates the close at all; genuinely matching an origin's
+/// idle policy is an operational/Phase-3 concern. Sized purely by the
+/// per-connection fd budget (bounded by `relay_connection_limit`).
+const FALLBACK_IDLE_TIMEOUT_FLOOR: Duration = Duration::from_secs(600);
+/// No jitter on the idle backstop: see [`FALLBACK_IDLE_TIMEOUT_FLOOR`]. Kept as
+/// a named constant so the helper plumbing and tests stay uniform with the
+/// first-record path; `jittered_timeout` returns the bare floor when this is 0.
+const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(0);
 const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
 const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
@@ -611,7 +635,7 @@ pub async fn relay_fallback(
             return Err(err);
         }
     };
-    relay_fallback_with_idle_timeout(client, fallback, FALLBACK_IDLE_TIMEOUT).await
+    relay_fallback_with_idle_timeout(client, fallback, fallback_idle_timeout()).await
 }
 
 async fn connect_and_forward_to_fallback(
@@ -756,6 +780,29 @@ async fn read_forwarded_server_hello(
     Ok(ForwardedServerHello { raw_record, parsed })
 }
 
+/// Adds a uniform `[0, jitter]` upward grace to `floor`. The floor is never
+/// reduced, so this only ever extends a timeout: it removes the fixed constant a
+/// prober could measure without ever giving a legitimate peer less time than the
+/// previous behavior. Per-connection randomness (real thread RNG, not a seeded
+/// stream) so the value is independent across connections.
+fn jittered_timeout(floor: Duration, jitter: Duration) -> Duration {
+    if jitter.is_zero() {
+        return floor;
+    }
+    let extra = rand::thread_rng().gen_range(0..=jitter.as_millis() as u64);
+    floor + Duration::from_millis(extra)
+}
+
+/// Client-facing first-record wait: floor + jitter. See [`FIRST_RECORD_WAIT_FLOOR`].
+fn first_record_wait_timeout() -> Duration {
+    jittered_timeout(FIRST_RECORD_WAIT_FLOOR, FIRST_RECORD_WAIT_JITTER)
+}
+
+/// Camouflage relay idle backstop: floor + jitter. See [`FALLBACK_IDLE_TIMEOUT_FLOOR`].
+fn fallback_idle_timeout() -> Duration {
+    jittered_timeout(FALLBACK_IDLE_TIMEOUT_FLOOR, FALLBACK_IDLE_TIMEOUT_JITTER)
+}
+
 async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeServerError> {
     timeout(HANDSHAKE_TIMEOUT, read_record(stream))
         .await
@@ -766,7 +813,7 @@ async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeS
 async fn read_first_client_record(
     stream: &mut TcpStream,
 ) -> Result<FirstClientRead, HandshakeServerError> {
-    read_first_client_record_with_timeout(stream, HANDSHAKE_TIMEOUT).await
+    read_first_client_record_with_timeout(stream, first_record_wait_timeout()).await
 }
 
 async fn read_first_client_record_with_timeout<R>(
@@ -3171,6 +3218,50 @@ mod tests {
         assert_eq!(client_read, 0);
         assert_eq!(origin_task.await.unwrap(), 0);
         relay_task.await.unwrap();
+    }
+
+    #[test]
+    fn first_record_wait_jitters_above_floor_idle_is_fixed_backstop() {
+        // Helper-level test (does not assert the production call-site wiring; the
+        // wiring is exercised by the relay/handshake integration tests).
+        let mut first_record_values = std::collections::HashSet::new();
+        for _ in 0..128 {
+            let wait = first_record_wait_timeout();
+            assert!(
+                wait >= FIRST_RECORD_WAIT_FLOOR,
+                "first-record wait must never drop below the floor"
+            );
+            assert!(
+                wait <= FIRST_RECORD_WAIT_FLOOR + FIRST_RECORD_WAIT_JITTER,
+                "first-record wait must stay within floor + jitter"
+            );
+            first_record_values.insert(wait.as_millis());
+
+            // The idle cap is a fixed resource backstop (jitter == 0), not an
+            // anti-probing measure, so it must be exactly the floor every time.
+            assert_eq!(
+                fallback_idle_timeout(),
+                FALLBACK_IDLE_TIMEOUT_FLOOR,
+                "idle cap is a fixed backstop; it must not vary"
+            );
+        }
+        // The first-record give-up must be randomized so a prober cannot read a
+        // fixed constant off the client-facing wait.
+        assert!(
+            first_record_values.len() > 1,
+            "first-record wait must be randomized, not a fixed constant"
+        );
+    }
+
+    #[test]
+    fn origin_facing_timeout_stays_fixed_and_first_record_floor_matches_legacy() {
+        // Origin-facing operations must keep the fixed timeout (jittering them
+        // would only add latency to legit clients), and the client-facing floor
+        // must equal the pre-jitter fixed value so no client gets less time.
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(8));
+        assert_eq!(FIRST_RECORD_WAIT_FLOOR, HANDSHAKE_TIMEOUT);
+        assert!(FIRST_RECORD_WAIT_JITTER > Duration::from_secs(0));
+        assert!(FALLBACK_IDLE_TIMEOUT_JITTER.is_zero());
     }
 
     #[tokio::test]
