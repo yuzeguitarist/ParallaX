@@ -209,24 +209,64 @@ fn nofile_soft_limit() -> io::Result<usize> {
     Ok(512)
 }
 
+/// Process-wide TCP congestion-control override, set once at startup.
+static CONGESTION_OVERRIDE: std::sync::OnceLock<Option<std::ffi::CString>> =
+    std::sync::OnceLock::new();
+
+/// Sets the congestion-control algorithm requested on relay sockets, process
+/// wide. Call once at startup before any socket is tuned. `None` (or a name
+/// containing a NUL) keeps the built-in default ("bbr" on Linux).
+pub fn configure_congestion_control(algorithm: Option<&str>) {
+    let value = algorithm.and_then(|name| std::ffi::CString::new(name).ok());
+    let _ = CONGESTION_OVERRIDE.set(value);
+}
+
 #[cfg(target_os = "linux")]
 fn set_low_latency_congestion(stream: &TcpStream) {
     use std::{ffi::CString, os::fd::AsRawFd};
 
-    let Ok(algorithm) = CString::new("bbr") else {
+    let default = CString::new("bbr").ok();
+    let configured = CONGESTION_OVERRIDE.get().and_then(|opt| opt.clone());
+    let Some(algorithm) = configured.or(default) else {
         return;
     };
+    let fd = stream.as_raw_fd();
     let rc = unsafe {
         libc::setsockopt(
-            stream.as_raw_fd(),
+            fd,
             libc::IPPROTO_TCP,
             libc::TCP_CONGESTION,
             algorithm.as_ptr().cast(),
-            algorithm.as_bytes_with_nul().len() as libc::socklen_t,
+            algorithm.as_bytes().len() as libc::socklen_t,
         )
     };
     if rc != 0 {
-        tracing::trace!("TCP BBR congestion control is unavailable; keeping kernel default");
+        tracing::trace!(
+            algorithm = ?algorithm,
+            "TCP congestion control request failed; keeping kernel default"
+        );
+        return;
+    }
+    // Read back: the kernel silently ignores an unknown/unloaded algorithm, so a
+    // zero setsockopt return does not mean it was applied. Warn on mismatch so a
+    // configured algorithm the kernel dropped does not silently lie.
+    let mut current = [0_u8; 32];
+    let mut len = current.len() as libc::socklen_t;
+    let rrc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            current.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rrc == 0 && current[..len as usize] != *algorithm.as_bytes() {
+        tracing::warn!(
+            requested = ?algorithm,
+            applied = %String::from_utf8_lossy(&current[..len as usize]),
+            "kernel did not apply the requested TCP congestion control (algorithm not loaded?)"
+        );
     }
 }
 

@@ -65,6 +65,8 @@ pub enum ConfigError {
     InvalidSourceConcurrencyLimit,
     #[error("server.source_ipv6_prefix_len must be between 1 and 128")]
     InvalidSourceIpv6Prefix,
+    #[error("server timeout floors must be at least 250ms")]
+    InvalidTimeoutFloor,
     #[cfg(unix)]
     #[error(
         "config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, \
@@ -152,6 +154,28 @@ pub struct ServerConfig {
     /// IPv6 prefix length used to group sources for the per-source cap.
     #[serde(default = "default_source_ipv6_prefix_len")]
     pub source_ipv6_prefix_len: u8,
+    /// Floor (ms) for the client-facing first-record wait. Default 8000.
+    #[serde(default = "default_first_record_wait_floor_ms")]
+    pub first_record_wait_floor_ms: u64,
+    /// Upward jitter (ms) added to the first-record wait floor. Default 7000.
+    #[serde(default = "default_first_record_wait_jitter_ms")]
+    pub first_record_wait_jitter_ms: u64,
+    /// Floor (ms) for the camouflage relay idle backstop. A resource backstop,
+    /// not a behavioral policy; raise/lower to trade fd-hold against how often
+    /// ParallaX originates the close. Default 600000 (10 min).
+    #[serde(default = "default_fallback_idle_floor_ms")]
+    pub fallback_idle_floor_ms: u64,
+    /// Upward jitter (ms) on the idle backstop. Default 0 and discouraged: a
+    /// uniform idle-close band is itself a synthetic signature no real origin
+    /// produces (the floor, not the ceiling, is what a prober converges to).
+    #[serde(default = "default_fallback_idle_jitter_ms")]
+    pub fallback_idle_jitter_ms: u64,
+    /// Optional TCP congestion-control algorithm to request on relay sockets, to
+    /// match the camouflage origin's CDN (e.g. "bbr", "cubic"). `None` keeps the
+    /// built-in default. The kernel must have the algorithm available or the
+    /// request is logged and ignored (verified via getsockopt read-back).
+    #[serde(default)]
+    pub tcp_congestion: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -281,6 +305,9 @@ impl Config {
                 }
                 if server.source_ipv6_prefix_len == 0 || server.source_ipv6_prefix_len > 128 {
                     return Err(ConfigError::InvalidSourceIpv6Prefix);
+                }
+                if server.first_record_wait_floor_ms < 250 || server.fallback_idle_floor_ms < 250 {
+                    return Err(ConfigError::InvalidTimeoutFloor);
                 }
             }
         }
@@ -525,6 +552,22 @@ const fn default_max_concurrent_per_source() -> u32 {
 
 const fn default_source_ipv6_prefix_len() -> u8 {
     64
+}
+
+const fn default_first_record_wait_floor_ms() -> u64 {
+    8_000
+}
+
+const fn default_first_record_wait_jitter_ms() -> u64 {
+    7_000
+}
+
+const fn default_fallback_idle_floor_ms() -> u64 {
+    600_000
+}
+
+const fn default_fallback_idle_jitter_ms() -> u64 {
+    0
 }
 
 #[cfg(test)]
@@ -1045,6 +1088,60 @@ authorized_sni = ["example.com"]
             cfg.server.unwrap().replay_cache_capacity,
             DEFAULT_REPLAY_CACHE_CAPACITY
         );
+    }
+
+    #[test]
+    fn server_timeout_fields_default_when_omitted() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        let server = cfg.server.unwrap();
+        assert_eq!(server.first_record_wait_floor_ms, 8_000);
+        assert_eq!(server.first_record_wait_jitter_ms, 7_000);
+        assert_eq!(server.fallback_idle_floor_ms, 600_000);
+        assert_eq!(server.fallback_idle_jitter_ms, 0);
+        assert!(server.tcp_congestion.is_none());
+    }
+
+    #[test]
+    fn server_validate_rejects_sub_minimum_timeout_floor() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+first_record_wait_floor_ms = 100
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidTimeoutFloor
+        ));
     }
 
     #[test]

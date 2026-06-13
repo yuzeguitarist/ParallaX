@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -251,6 +251,9 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         .clone()
         .ok_or(HandshakeServerError::MissingServer)?;
     let server = Arc::new(server);
+    // Install deployment-wide tuning before accepting any connection.
+    let _ = TIMEOUT_TUNING.set(TimeoutTuning::from_server_config(&server));
+    crate::transport::tcp::configure_congestion_control(server.tcp_congestion.as_deref());
     let traffic = config.traffic;
     let psk = decode_psk(&config.crypto.psk)?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
@@ -830,12 +833,53 @@ fn jittered_timeout(floor: Duration, jitter: Duration) -> Duration {
 
 /// Client-facing first-record wait: floor + jitter. See [`FIRST_RECORD_WAIT_FLOOR`].
 fn first_record_wait_timeout() -> Duration {
-    jittered_timeout(FIRST_RECORD_WAIT_FLOOR, FIRST_RECORD_WAIT_JITTER)
+    let t = timeout_tuning();
+    jittered_timeout(t.first_record_floor, t.first_record_jitter)
 }
 
 /// Camouflage relay idle backstop: floor + jitter. See [`FALLBACK_IDLE_TIMEOUT_FLOOR`].
 fn fallback_idle_timeout() -> Duration {
-    jittered_timeout(FALLBACK_IDLE_TIMEOUT_FLOOR, FALLBACK_IDLE_TIMEOUT_JITTER)
+    let t = timeout_tuning();
+    jittered_timeout(t.fallback_idle_floor, t.fallback_idle_jitter)
+}
+
+/// Deployment-wide timeout tuning, set once at server startup from config.
+/// Tests and any non-`run` caller fall back to the built-in constants.
+#[derive(Clone, Copy)]
+struct TimeoutTuning {
+    first_record_floor: Duration,
+    first_record_jitter: Duration,
+    fallback_idle_floor: Duration,
+    fallback_idle_jitter: Duration,
+}
+
+impl TimeoutTuning {
+    fn defaults() -> Self {
+        Self {
+            first_record_floor: FIRST_RECORD_WAIT_FLOOR,
+            first_record_jitter: FIRST_RECORD_WAIT_JITTER,
+            fallback_idle_floor: FALLBACK_IDLE_TIMEOUT_FLOOR,
+            fallback_idle_jitter: FALLBACK_IDLE_TIMEOUT_JITTER,
+        }
+    }
+
+    fn from_server_config(config: &ServerConfig) -> Self {
+        Self {
+            first_record_floor: Duration::from_millis(config.first_record_wait_floor_ms),
+            first_record_jitter: Duration::from_millis(config.first_record_wait_jitter_ms),
+            fallback_idle_floor: Duration::from_millis(config.fallback_idle_floor_ms),
+            fallback_idle_jitter: Duration::from_millis(config.fallback_idle_jitter_ms),
+        }
+    }
+}
+
+static TIMEOUT_TUNING: OnceLock<TimeoutTuning> = OnceLock::new();
+
+fn timeout_tuning() -> TimeoutTuning {
+    TIMEOUT_TUNING
+        .get()
+        .copied()
+        .unwrap_or_else(TimeoutTuning::defaults)
 }
 
 async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeServerError> {
@@ -3301,6 +3345,15 @@ mod tests {
         assert_eq!(FIRST_RECORD_WAIT_FLOOR, Duration::from_secs(8));
         assert!(FIRST_RECORD_WAIT_JITTER > Duration::from_secs(0));
         assert!(FALLBACK_IDLE_TIMEOUT_JITTER.is_zero());
+        // The constants are the defaults when no config override is installed,
+        // and must match the config default_*_ms values (config.rs): 8000 / 7000
+        // / 600000 / 0. Pin the idle floor here so the two cannot drift apart.
+        assert_eq!(FALLBACK_IDLE_TIMEOUT_FLOOR, Duration::from_secs(600));
+        let defaults = TimeoutTuning::defaults();
+        assert_eq!(defaults.first_record_floor, FIRST_RECORD_WAIT_FLOOR);
+        assert_eq!(defaults.first_record_jitter, FIRST_RECORD_WAIT_JITTER);
+        assert_eq!(defaults.fallback_idle_floor, FALLBACK_IDLE_TIMEOUT_FLOOR);
+        assert_eq!(defaults.fallback_idle_jitter, FALLBACK_IDLE_TIMEOUT_JITTER);
     }
 
     #[tokio::test]
@@ -3487,6 +3540,11 @@ mod tests {
             max_concurrent_per_source_v4: 256,
             max_concurrent_per_source_v6: 256,
             source_ipv6_prefix_len: 64,
+            first_record_wait_floor_ms: 8_000,
+            first_record_wait_jitter_ms: 7_000,
+            fallback_idle_floor_ms: 600_000,
+            fallback_idle_jitter_ms: 0,
+            tcp_congestion: None,
         }
     }
 
