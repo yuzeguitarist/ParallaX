@@ -534,3 +534,198 @@ fn scenario_9_permissive_policy_disables_all_enforcement() {
         "permissive policy must not emit egress actions"
     );
 }
+
+// --------------------- UDP fast-plane (TUDP) QUIC Initial gate ---------------------
+//
+// These tests feed the REAL quinn QUIC Initial produced by ParallaX's UDP-leg
+// client config (`parallax::transport::udp::client_config`) into the GFW QUIC
+// Initial detector, grounding the camouflage "gate" in actual on-wire bytes
+// rather than synthetic packets. Today they CHARACTERIZE the un-hardened leg:
+// the Initial is a standard, decryptable v1 Initial whose SNI is readable from a
+// single datagram. When a later camouflage slice adds SNI-slicing across CRYPTO
+// frames/datagrams and a browser-matched JA4q, the first assertion flips (SNI no
+// longer extractable from the first datagram) and a JA4q-match assertion is
+// added — that is when this becomes a hard pass/fail gate.
+
+/// Drive ParallaX's UDP-leg quinn client far enough to emit its QUIC Initial and
+/// capture that first datagram off a plain UDP socket standing in for the server.
+async fn capture_udp_leg_initial(server_name: &str) -> Vec<u8> {
+    use std::sync::Arc;
+
+    use parallax::transport::udp::client_config;
+    use quinn::Endpoint;
+    use rustls::{
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        DigitallySignedStruct, SignatureScheme,
+    };
+
+    // The Initial is sent before any ServerHello arrives, so the cert verifier is
+    // never invoked; a never-called accept-any verifier is enough to build the
+    // client config for capture.
+    #[derive(Debug)]
+    struct NeverCalled;
+    impl ServerCertVerifier for NeverCalled {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(client_config(Arc::new(NeverCalled)).unwrap());
+
+    // Registering the connection makes quinn's driver transmit the Initial; it
+    // never completes (no real QUIC server replies), so hold it on a task while
+    // we capture the first datagram.
+    let connecting = endpoint.connect(server_addr, server_name).unwrap();
+    let drive = tokio::spawn(async move {
+        let _ = connecting.await;
+    });
+
+    let mut buf = vec![0_u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), listener.recv_from(&mut buf))
+        .await
+        .expect("UDP-leg QUIC Initial captured within 5s")
+        .expect("recv_from the captured Initial");
+    buf.truncate(n);
+    drive.abort();
+    buf
+}
+
+#[tokio::test]
+async fn udp_leg_initial_is_standard_decryptable_quic_v1() {
+    use crate::gfw_sim::detection::quic_initial::{
+        decrypt_payload, derive_client_initial_keys_v2, parse_initial_frames,
+        parse_protected_long_header, reassemble_crypto_stream, unprotect_header,
+    };
+
+    // The UDP face does NOT obfuscate the QUIC header/Initial: an on-path GFW can
+    // derive the Initial keys from the cleartext DCID and decrypt it, exactly like
+    // a browser HTTP/3 flow. Camouflage comes from looking like real H3, not from
+    // hiding that it is QUIC, so this asserts the realistic baseline (the adversary
+    // CAN decrypt) and that what is carried is a TLS ClientHello.
+    let initial = capture_udp_leg_initial("cloudflare.com").await;
+    let mut pkt = initial.clone();
+    let mut hdr = parse_protected_long_header(&pkt).expect("v1 long header parses");
+    let keys = derive_client_initial_keys_v2(&hdr.dcid).expect("v1 Initial keys derive from DCID");
+    unprotect_header(&mut pkt, &mut hdr, &keys).expect("header protection removed");
+    let payload = decrypt_payload(&pkt, &hdr, &keys).expect("Initial payload decrypts");
+    let frames = parse_initial_frames(&payload).expect("Initial frames parse");
+    let crypto = reassemble_crypto_stream(&frames);
+    assert_eq!(
+        crypto.first(),
+        Some(&0x01_u8),
+        "the QUIC Initial carries a TLS ClientHello (handshake type 0x01)"
+    );
+}
+
+#[tokio::test]
+async fn udp_leg_initial_first_datagram_holds_only_partial_clienthello() {
+    use crate::gfw_sim::detection::quic_initial::{
+        decrypt_payload, derive_client_initial_keys_v2, parse_initial_frames,
+        parse_protected_long_header, reassemble_crypto_stream, unprotect_header,
+        QuicInitialDetector, QuicInitialVerdict,
+    };
+
+    // ParallaX's UDP-leg ClientHello carries the post-quantum hybrid key share
+    // (X25519MLKEM768, ~1.2 KB), pushing it past 1200 bytes so quinn fragments it
+    // across multiple QUIC Initial datagrams — the same mechanism that incidentally
+    // defeats the GFW's single-datagram SNI extraction for Chrome's HTTP/3.
+    //
+    // IMPORTANT (do not over-read this test): the SNI is NOT hidden. It is present
+    // in cleartext across the full multi-datagram ClientHello and, because rustls
+    // randomizes order-insensitive extension order per connection, may even sit in
+    // this first datagram. What is proven is narrower: a GFW model that buffers the
+    // WHOLE declared ClientHello before parsing (as the in-repo detector does, and
+    // as the live GFW reportedly does — it does not reassemble across datagrams)
+    // extracts nothing from a single datagram. A streaming SNI extractor, or a
+    // censor that buffers a flow's Initial datagrams by 5-tuple, WOULD reassemble
+    // the CH and read the SNI (note reassemble_crypto_stream already stitches CRYPTO
+    // frames WITHIN a packet). Treat this as a decaying external blind spot, not a
+    // hardened ParallaX property. The real SNI-slice camouflage slice must make the
+    // fragmentation a deliberate, asserted invariant rather than an incidental side
+    // effect of the key-share size; if a quinn/rustls change ever shrinks the
+    // ClientHello back under one datagram, this test flips and flags the regression.
+    let detector = QuicInitialDetector::default();
+    for sni in ["cloudflare.com", "blocked.example"] {
+        // Loopback + quinn emit the offset-0 Initial datagram first; assertion (a)
+        // below relies on that (out-of-order delivery would zero-pad the gap).
+        let initial = capture_udp_leg_initial(sni).await;
+
+        // (a) Prove the captured datagram holds only a PARTIAL ClientHello: the
+        // declared handshake length must exceed the bytes present in this datagram.
+        // This ties the no-SNI result below to genuine multi-datagram fragmentation,
+        // not to some unrelated decode failure.
+        let mut pkt = initial.clone();
+        let mut hdr = parse_protected_long_header(&pkt).expect("v1 long header");
+        let keys = derive_client_initial_keys_v2(&hdr.dcid).expect("Initial keys");
+        unprotect_header(&mut pkt, &mut hdr, &keys).expect("unprotect header");
+        let payload = decrypt_payload(&pkt, &hdr, &keys).expect("decrypt payload");
+        let crypto = reassemble_crypto_stream(&parse_initial_frames(&payload).expect("frames"));
+        assert!(
+            crypto.len() >= 4 && crypto[0] == 0x01,
+            "first datagram starts a TLS ClientHello"
+        );
+        let declared_ch_len =
+            4 + (((crypto[1] as usize) << 16) | ((crypto[2] as usize) << 8) | (crypto[3] as usize));
+        assert!(
+            declared_ch_len > crypto.len(),
+            "ClientHello ({declared_ch_len} B) must span beyond this single datagram ({} B)",
+            crypto.len()
+        );
+
+        // (b) Therefore a whole-CH-buffering GFW filter extracts no SNI / fires no
+        // rule from this single datagram. Pin the expected outcome to the partial-CH
+        // reassembly failure so a future decrypt/framing regression cannot pass here.
+        match detector.inspect(&initial, None) {
+            QuicInitialVerdict::AllowSni { sni: got, .. }
+            | QuicInitialVerdict::BlockSni { sni: got, .. } => panic!(
+                "GFW model extracted SNI {got:?} from a single datagram for {sni:?}; \
+                 multi-datagram ClientHello fragmentation no longer protects the SNI"
+            ),
+            // IncompleteClientHello's Display is "could not reassemble a complete
+            // ClientHello from crypto frames"; match on the stable "reassemble"
+            // substring (the complete-CH parse-failure variant also says "ClientHello").
+            QuicInitialVerdict::Failed(msg) if msg.contains("reassemble") => {}
+            QuicInitialVerdict::NoSni { .. } => {
+                // A complete CH with no server_name; unreachable for this partial-CH
+                // input, but harmless — still means no SNI was extracted.
+            }
+            QuicInitialVerdict::Failed(other) => {
+                panic!("unexpected decrypt/parse failure (not SNI fragmentation): {other}")
+            }
+        }
+    }
+}
