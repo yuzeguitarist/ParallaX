@@ -61,6 +61,10 @@ pub enum ConfigError {
     EmptyAuthorizedSni,
     #[error("server.replay_cache_capacity must be at least 1")]
     InvalidReplayCacheCapacity,
+    #[error("server.max_concurrent_per_source_v4/v6 must be at least 1")]
+    InvalidSourceConcurrencyLimit,
+    #[error("server.source_ipv6_prefix_len must be between 1 and 128")]
+    InvalidSourceIpv6Prefix,
     #[cfg(unix)]
     #[error(
         "config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, \
@@ -135,6 +139,19 @@ pub struct ServerConfig {
     pub authorized_sni: Vec<String>,
     #[serde(default = "default_true")]
     pub strict_tls13: bool,
+    /// Max concurrent connections from one IPv4 /32 source. A concurrency cap,
+    /// not a rate limit; defaults high so legitimate shared/CGNAT addresses are
+    /// not throttled (the global limit is the real backstop).
+    #[serde(default = "default_max_concurrent_per_source")]
+    pub max_concurrent_per_source_v4: u32,
+    /// Max concurrent connections from one IPv6 prefix (see
+    /// `source_ipv6_prefix_len`). Independent of the v4 cap because a prefix
+    /// aggregates many more endpoints (carrier NAT64/464XLAT, /64-per-VM).
+    #[serde(default = "default_max_concurrent_per_source")]
+    pub max_concurrent_per_source_v6: u32,
+    /// IPv6 prefix length used to group sources for the per-source cap.
+    #[serde(default = "default_source_ipv6_prefix_len")]
+    pub source_ipv6_prefix_len: u8,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -256,6 +273,14 @@ impl Config {
                 }
                 if server.replay_cache_capacity == 0 {
                     return Err(ConfigError::InvalidReplayCacheCapacity);
+                }
+                if server.max_concurrent_per_source_v4 == 0
+                    || server.max_concurrent_per_source_v6 == 0
+                {
+                    return Err(ConfigError::InvalidSourceConcurrencyLimit);
+                }
+                if server.source_ipv6_prefix_len == 0 || server.source_ipv6_prefix_len > 128 {
+                    return Err(ConfigError::InvalidSourceIpv6Prefix);
                 }
             }
         }
@@ -492,6 +517,14 @@ fn default_replay_cache_path() -> PathBuf {
 
 const fn default_replay_cache_capacity() -> usize {
     DEFAULT_REPLAY_CACHE_CAPACITY
+}
+
+const fn default_max_concurrent_per_source() -> u32 {
+    256
+}
+
+const fn default_source_ipv6_prefix_len() -> u8 {
+    64
 }
 
 #[cfg(test)]

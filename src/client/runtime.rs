@@ -2263,6 +2263,9 @@ mod tests {
             replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
+            max_concurrent_per_source_v4: 256,
+            max_concurrent_per_source_v6: 256,
+            source_ipv6_prefix_len: 64,
         }
     }
 

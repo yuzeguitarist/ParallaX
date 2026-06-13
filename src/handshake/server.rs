@@ -25,6 +25,7 @@ use tokio::{
 };
 use zeroize::Zeroize;
 
+use super::source_limit::SourceLimiter;
 use super::transcript::transcript_hash;
 
 use crate::{
@@ -263,6 +264,12 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     let listener = TcpListener::bind(server.listen).await?;
     let connection_limit = relay_connection_limit()?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
+    let source_limiter = SourceLimiter::new(
+        server.max_concurrent_per_source_v4,
+        server.max_concurrent_per_source_v6,
+        server.source_ipv6_prefix_len,
+        connection_limit,
+    );
     tracing::info!(
         connection_limit,
         "ParallaX server listening on {}",
@@ -281,6 +288,20 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 continue;
             }
             Err(err) => return Err(err.into()),
+        };
+        // Per-source admission first, so a single source flooding the box is shed
+        // before it can burn a global permit. Rejects FIN (detached) like every
+        // other close path.
+        let source_permit = match Arc::clone(&source_limiter).try_admit(peer.ip()) {
+            Some(permit) => permit,
+            None => {
+                tracing::warn!(
+                    %peer,
+                    "per-source connection limit reached; closing accepted socket"
+                );
+                tokio::spawn(graceful_close_tcp_stream(client));
+                continue;
+            }
         };
         let connection_permit = match Arc::clone(&connection_slots).try_acquire_owned() {
             Ok(permit) => permit,
@@ -310,6 +331,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         let secrets = secrets.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
+            let _source_permit = source_permit;
             if let Err(err) = handle_connection_with_replay(
                 client,
                 &server,
@@ -3462,6 +3484,9 @@ mod tests {
             replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
+            max_concurrent_per_source_v4: 256,
+            max_concurrent_per_source_v6: 256,
+            source_ipv6_prefix_len: 64,
         }
     }
 
