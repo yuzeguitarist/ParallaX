@@ -67,6 +67,10 @@ pub enum ConfigError {
     InvalidSourceIpv6Prefix,
     #[error("server timeout floors must be at least 250ms")]
     InvalidTimeoutFloor,
+    #[error("server.fallback_idle_floor_ms must be at least 5000ms (it resets on every byte; a tiny value closes active relays)")]
+    InvalidIdleBackstop,
+    #[error("server.tcp_congestion must be a short alphanumeric algorithm name (e.g. \"bbr\")")]
+    InvalidCongestionControl,
     #[cfg(unix)]
     #[error(
         "config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, \
@@ -161,8 +165,12 @@ pub struct ServerConfig {
     #[serde(default = "default_first_record_wait_jitter_ms")]
     pub first_record_wait_jitter_ms: u64,
     /// Floor (ms) for the camouflage relay idle backstop. A resource backstop,
-    /// not a behavioral policy; raise/lower to trade fd-hold against how often
-    /// ParallaX originates the close. Default 600000 (10 min).
+    /// not a behavioral policy. NOTE: the idle timer RESETS on every byte in
+    /// either direction, so this is a per-gap cap, not a total-session cap -- it
+    /// only fires on a connection that goes fully silent. Keep it well above any
+    /// plausible inter-packet gap of a real relay (min enforced 5000ms) so
+    /// ParallaX does not originate closes on active-but-bursty connections.
+    /// Default 600000 (10 min).
     #[serde(default = "default_fallback_idle_floor_ms")]
     pub fallback_idle_floor_ms: u64,
     /// Upward jitter (ms) on the idle backstop. Default 0 and discouraged: a
@@ -171,9 +179,10 @@ pub struct ServerConfig {
     #[serde(default = "default_fallback_idle_jitter_ms")]
     pub fallback_idle_jitter_ms: u64,
     /// Optional TCP congestion-control algorithm to request on relay sockets, to
-    /// match the camouflage origin's CDN (e.g. "bbr", "cubic"). `None` keeps the
-    /// built-in default. The kernel must have the algorithm available or the
-    /// request is logged and ignored (verified via getsockopt read-back).
+    /// match the camouflage origin's CDN (e.g. "bbr", "cubic"). Linux only; a
+    /// no-op on other platforms. `None` keeps the built-in default. The kernel
+    /// must have the algorithm available or the request is logged and ignored
+    /// (verified via getsockopt read-back).
     #[serde(default)]
     pub tcp_congestion: Option<String>,
 }
@@ -306,8 +315,26 @@ impl Config {
                 if server.source_ipv6_prefix_len == 0 || server.source_ipv6_prefix_len > 128 {
                     return Err(ConfigError::InvalidSourceIpv6Prefix);
                 }
-                if server.first_record_wait_floor_ms < 250 || server.fallback_idle_floor_ms < 250 {
+                // The first-record wait is a one-shot give-up; 250ms is a safe
+                // lower bound. The idle backstop resets on every byte, so a tiny
+                // value would close active-but-bursty relays on any short gap --
+                // ParallaX originating the close is exactly the tell we avoid --
+                // hence a much higher minimum.
+                if server.first_record_wait_floor_ms < 250 {
                     return Err(ConfigError::InvalidTimeoutFloor);
+                }
+                if server.fallback_idle_floor_ms < 5_000 {
+                    return Err(ConfigError::InvalidIdleBackstop);
+                }
+                if let Some(algorithm) = &server.tcp_congestion {
+                    let valid = !algorithm.is_empty()
+                        && algorithm.len() <= 15
+                        && algorithm
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                    if !valid {
+                        return Err(ConfigError::InvalidCongestionControl);
+                    }
                 }
             }
         }
@@ -1142,6 +1169,87 @@ first_record_wait_floor_ms = 100
             cfg.validate().unwrap_err(),
             ConfigError::InvalidTimeoutFloor
         ));
+    }
+
+    #[test]
+    fn server_validate_rejects_tiny_idle_backstop() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+fallback_idle_floor_ms = 1000
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidIdleBackstop
+        ));
+    }
+
+    #[test]
+    fn server_validate_rejects_bogus_tcp_congestion() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        for bogus in ["\"\"", "\"bbr xtls\"", "\"a;b\""] {
+            let raw = format!(
+                r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+tcp_congestion = {bogus}
+"#
+            );
+            let cfg = toml::from_str::<Config>(&raw).unwrap();
+            assert!(
+                matches!(
+                    cfg.validate().unwrap_err(),
+                    ConfigError::InvalidCongestionControl
+                ),
+                "expected rejection for tcp_congestion = {bogus}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_validate_accepts_plausible_tcp_congestion() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+tcp_congestion = "cubic"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.unwrap().tcp_congestion.as_deref(), Some("cubic"));
     }
 
     #[test]

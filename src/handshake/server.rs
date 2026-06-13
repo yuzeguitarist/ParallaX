@@ -686,10 +686,23 @@ async fn connect_and_forward_to_fallback(
 /// peer sees a graceful FIN. Dropping a socket with unread bytes still queued
 /// makes the kernel emit a RST, an observable tell a real origin would not
 /// produce; this keeps the close indistinguishable from an ordinary teardown.
+/// Drains a read half to `WouldBlock` (bounded) so the eventual close is a FIN,
+/// not a RST, even when more than one bufferful is queued. A single small pass
+/// could leave a backlog that RSTs on drop; this mirrors the splice path's
+/// multi-pass drain (capped at 16 x 16 KiB = 256 KiB).
+fn drain_read_half_to_block(reader: &OwnedReadHalf) {
+    let mut scratch = [0_u8; 16 * 1024];
+    for _ in 0..16 {
+        match drain_ready_tcp_read(reader, &mut scratch, 0) {
+            Ok(n) if n == scratch.len() => continue,
+            _ => break,
+        }
+    }
+}
+
 async fn graceful_close_tcp_stream(stream: TcpStream) {
     let (read_half, mut write_half) = stream.into_split();
-    let mut scratch = [0_u8; 4096];
-    let _ = drain_ready_tcp_read(&read_half, &mut scratch, 0);
+    drain_read_half_to_block(&read_half);
     let _ = write_half.shutdown().await;
 }
 
@@ -799,9 +812,8 @@ async fn graceful_close_fallback_halves(
     fallback_read: &OwnedReadHalf,
     fallback_write: &mut OwnedWriteHalf,
 ) {
-    let mut scratch = [0_u8; 4096];
-    let _ = drain_ready_tcp_read(client_read, &mut scratch, 0);
-    let _ = drain_ready_tcp_read(fallback_read, &mut scratch, 0);
+    drain_read_half_to_block(client_read);
+    drain_read_half_to_block(fallback_read);
     let _ = client_write.shutdown().await;
     let _ = fallback_write.shutdown().await;
 }

@@ -261,10 +261,22 @@ fn set_low_latency_congestion(stream: &TcpStream) {
             &mut len,
         )
     };
-    if rrc == 0 && current[..len as usize] != *algorithm.as_bytes() {
+    if rrc != 0 {
+        return;
+    }
+    // getsockopt(TCP_CONGESTION) returns min(buf, TCP_CA_NAME_MAX) bytes with the
+    // name NUL-padded, so trim at the first NUL before comparing to the requested
+    // name (which carries no NUL). Clamp len defensively against the buffer.
+    let len = (len as usize).min(current.len());
+    let applied = &current[..len];
+    let applied = &applied[..applied
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(applied.len())];
+    if applied != algorithm.as_bytes() {
         tracing::warn!(
             requested = ?algorithm,
-            applied = %String::from_utf8_lossy(&current[..len as usize]),
+            applied = %String::from_utf8_lossy(applied),
             "kernel did not apply the requested TCP congestion control (algorithm not loaded?)"
         );
     }
