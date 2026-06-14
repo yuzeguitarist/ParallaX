@@ -1,0 +1,49 @@
+name: claude
+
+# AI coding agent. Mention @claude in an issue or a PR/review comment (or open an
+# issue whose body contains @claude) and it will read the repo, make changes, and
+# open or update a pull request.
+#
+# The model endpoint and key are read entirely from repository secrets — nothing
+# sensitive is committed here:
+#   ANTHROPIC_API_KEY   – the API key
+#   ANTHROPIC_BASE_URL  – the API endpoint
+# Set both under: Settings → Secrets and variables → Actions.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 200
