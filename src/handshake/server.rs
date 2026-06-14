@@ -239,13 +239,23 @@ enum FirstClientRead {
 pub(crate) static SERVER_UDP_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Process-wide server UDP probe budget (ms): how long the server waits to
+/// accept the client's QUIC connection and answer one probe. Set once at
+/// startup; defaults to the config default so paths that don't call `run()`
+/// (tests) still get a sane bound.
+pub(crate) static SERVER_UDP_PROBE_TIMEOUT_MS: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(300);
+
 pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     if config.mode != Mode::Server {
         return Err(HandshakeServerError::WrongMode);
     }
-    // Process-wide server UDP-offer flag, read in run_authenticated_data_mode to
-    // decide whether to offer the UDP fast plane (vs decline). Set once at startup.
+    // Process-wide server UDP-offer parameters, read in run_authenticated_data_mode
+    // to decide whether to offer the UDP fast plane (vs decline) and how long to
+    // wait on the probe. Set once at startup.
     SERVER_UDP_ENABLED.store(config.udp.enabled, std::sync::atomic::Ordering::Relaxed);
+    SERVER_UDP_PROBE_TIMEOUT_MS
+        .store(config.udp.probe_timeout_ms, std::sync::atomic::Ordering::Relaxed);
 
     let server = config
         .server
@@ -1150,7 +1160,13 @@ async fn run_authenticated_data_mode(
                                 // stream (PX1P + the real command stay unread). A timeout
                                 // here does NOT desync: the client always sends PX1P next
                                 // and we always read it below.
-                                let probe_timeout = std::time::Duration::from_secs(5);
+                                let probe_timeout = std::time::Duration::from_millis(
+                                    u64::from(
+                                        SERVER_UDP_PROBE_TIMEOUT_MS
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                            .max(1),
+                                    ),
+                                );
                                 let _ = tokio::time::timeout(probe_timeout, async {
                                     if let Some(incoming) = udp_ep.accept().await {
                                         if let Ok(conn) = incoming.await {

@@ -104,13 +104,30 @@ type ClientSessionTask = tokio::task::JoinHandle<Result<ClientSession, ClientRun
 static CLIENT_UDP_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Process-wide client UDP probe budget (ms): the Happy-Eyeballs window for the
+/// QUIC connect and the probe round-trip. Set once at startup; defaults to the
+/// config default so paths that don't call `run()` (tests) still get a sane
+/// bound.
+static CLIENT_UDP_PROBE_TIMEOUT_MS: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(300);
+
+/// Stores the process-wide client UDP-negotiation runtime parameters, read at
+/// the data-session seam. Called by both `run()` and the `speed` subcommand so
+/// the two client entry points negotiate the UDP fast plane identically.
+pub(crate) fn configure_udp_runtime(udp: &crate::config::UdpConfig) {
+    CLIENT_UDP_ENABLED.store(udp.enabled, std::sync::atomic::Ordering::Relaxed);
+    CLIENT_UDP_PROBE_TIMEOUT_MS
+        .store(udp.probe_timeout_ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     if config.mode != Mode::Client {
         return Err(ClientRuntimeError::WrongMode);
     }
-    // Process-wide client UDP-negotiation flag, read at the data-session seam to
-    // decide whether to open a PX1G UdpRequest. Set once at startup.
-    CLIENT_UDP_ENABLED.store(config.udp.enabled, std::sync::atomic::Ordering::Relaxed);
+    // Process-wide client UDP-negotiation parameters, read at the data-session
+    // seam to decide whether to open a PX1G UdpRequest and how long to probe.
+    // Set once at startup.
+    configure_udp_runtime(&config.udp);
 
     let client = config
         .client
@@ -675,6 +692,7 @@ async fn run_client_udp_probe(
     offer: &crate::protocol::command::UdpOffer,
     psk: &[u8],
     sni: &str,
+    probe_timeout: std::time::Duration,
 ) -> crate::transport::udp::probe::ProbeOutcome {
     use crate::transport::udp::probe::ProbeOutcome;
     let Ok(peer) = server.peer_addr() else {
@@ -694,18 +712,13 @@ async fn run_client_udp_probe(
     let Ok(connecting) = endpoint.connect(udp_addr, sni) else {
         return ProbeOutcome::Failed;
     };
-    let conn = match tokio::time::timeout(std::time::Duration::from_secs(5), connecting).await {
+    let conn = match tokio::time::timeout(probe_timeout, connecting).await {
         Ok(Ok(conn)) => conn,
         _ => return ProbeOutcome::Unreachable,
     };
-    crate::transport::udp::probe::probe_client(
-        &conn,
-        psk,
-        &offer.offer_id,
-        std::time::Duration::from_secs(5),
-    )
-    .await
-    .unwrap_or(ProbeOutcome::Failed)
+    crate::transport::udp::probe::probe_client(&conn, psk, &offer.offer_id, probe_timeout)
+        .await
+        .unwrap_or(ProbeOutcome::Failed)
 }
 
 async fn establish_authenticated_data_session_with_resolver(
@@ -764,7 +777,14 @@ async fn establish_authenticated_data_session_with_resolver(
             // stream stays aligned regardless of the probe result.
             let (offer_id, outcome) = match UdpOffer::decode(&response) {
                 Ok(offer) => {
-                    let outcome = run_client_udp_probe(&server, &offer, psk, &config.sni).await;
+                    let probe_timeout = std::time::Duration::from_millis(u64::from(
+                        CLIENT_UDP_PROBE_TIMEOUT_MS
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .max(1),
+                    ));
+                    let outcome =
+                        run_client_udp_probe(&server, &offer, psk, &config.sni, probe_timeout)
+                            .await;
                     (offer.offer_id, outcome)
                 }
                 Err(err) => {
