@@ -173,3 +173,19 @@ mod tests {
         assert_eq!(request.target(), "[::1]:443");
     }
 }
+
+/// Fuzz-only sync driver for the private async SOCKS5 CONNECT parser. Compiled
+/// ONLY under `--cfg fuzzing` (which cargo-fuzz sets); absent from normal
+/// `cargo build` / `cargo test` and CI, so it adds no production API surface.
+#[cfg(fuzzing)]
+pub mod fuzz {
+    use super::{read_connect_request, SocksRequest};
+
+    pub fn read_connect_request_sync(mut data: &[u8]) -> Result<SocksRequest, ()> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|_| ())?;
+        rt.block_on(async move { read_connect_request(&mut data).await })
+            .map_err(|_| ())
+    }
+}

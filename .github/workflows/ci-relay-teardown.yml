@@ -17,13 +17,14 @@ on:
       - main
       - master
     paths:
-      # Only the code that can affect TCP relay teardown (FIN-vs-RST). Changes to
-      # crypto/tls/fingerprint/cli/etc. cannot alter TCP close semantics, so they
-      # skip this heavy capture job. workflow_dispatch is always available.
+      # Code that can affect TCP relay teardown (FIN-vs-RST): the splice fast path
+      # (src/transport/tcp.rs) and the userspace fallback teardown + graceful-close
+      # (src/handshake/server.rs), plus the relay loop and idle-timeout config.
+      # crypto/tls/fingerprint/cli/protocol-framing do not change TCP close.
       - 'src/transport/**'
       - 'src/client/**'
+      - 'src/handshake/**'
       - 'src/config.rs'
-      - 'src/protocol/**'
       - 'Cargo.lock'
       - '.github/workflows/ci-relay-teardown.yml'
   push:
@@ -31,13 +32,14 @@ on:
       - main
       - master
     paths:
-      # Only the code that can affect TCP relay teardown (FIN-vs-RST). Changes to
-      # crypto/tls/fingerprint/cli/etc. cannot alter TCP close semantics, so they
-      # skip this heavy capture job. workflow_dispatch is always available.
+      # Code that can affect TCP relay teardown (FIN-vs-RST): the splice fast path
+      # (src/transport/tcp.rs) and the userspace fallback teardown + graceful-close
+      # (src/handshake/server.rs), plus the relay loop and idle-timeout config.
+      # crypto/tls/fingerprint/cli/protocol-framing do not change TCP close.
       - 'src/transport/**'
       - 'src/client/**'
+      - 'src/handshake/**'
       - 'src/config.rs'
-      - 'src/protocol/**'
       - 'Cargo.lock'
       - '.github/workflows/ci-relay-teardown.yml'
   workflow_dispatch:

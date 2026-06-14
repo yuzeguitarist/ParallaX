@@ -4,7 +4,8 @@ name: claude-audit
 # 14 days (1st and 15th). Opens a tracking issue with findings and, for
 # high-confidence low-risk fixes, individual PRs (the hook blocks writes to main).
 #
-# Cost guard: skipped if 25 or fewer commits landed in the last 14 days.
+# Cost guard: skipped unless more than 25 commits landed in the last 18 days (18
+# covers the 15th->1st gap, which is 16-17 days in most months).
 
 on:
   schedule:
@@ -36,14 +37,14 @@ jobs:
           fetch-depth: 0
 
       - id: gate
-        name: Skip if the repo was quiet (<= 25 commits in 14 days)
+        name: Skip if the repo was quiet (<= 25 commits in 18 days)
         env:
           FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
-          N="$(git rev-list --count --since='14 days ago' HEAD)"
+          N="$(git rev-list --count --since='18 days ago' HEAD)"
           case "${N}" in ''|*[!0-9]*) echo "::error::unexpected commit count '${N}'"; exit 1;; esac
-          echo "Commits in the last 14 days: ${N}"
+          echo "Commits in the last 18 days: ${N}"
           if [ "${FORCE:-false}" != "true" ] && [ "${N}" -le 25 ]; then
             echo "Quiet period — skipping the audit."
             echo "run=false" >> "$GITHUB_OUTPUT"
