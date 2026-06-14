@@ -1,6 +1,10 @@
 #[cfg(target_os = "linux")]
 use std::time::Duration;
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use tokio::{
     net::{lookup_host, tcp::OwnedReadHalf, TcpSocket, TcpStream},
@@ -11,6 +15,72 @@ const RESERVED_PROCESS_FDS: usize = 64;
 const FDS_PER_RELAY_CONNECTION: usize = 2;
 const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
 const MAX_PARALLEL_CONNECT_ATTEMPTS: usize = 4;
+/// Aggregate cap on the *extra* (beyond the first) parallel connect sockets held
+/// across all in-flight multi-address races. The per-relay fd budget counts a
+/// settled relay's single outbound socket, not the connect-race fan-out, so a
+/// burst of multi-address fallback dials could transiently over-commit fds. This
+/// bounds that fan-out process-wide: the always-allowed first attempt preserves
+/// connectivity, extra racers degrade gracefully under pressure rather than
+/// exhausting RLIMIT_NOFILE.
+const MAX_INFLIGHT_EXTRA_CONNECT_ATTEMPTS: usize = 256;
+static INFLIGHT_EXTRA_CONNECTS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII reservation for one extra (non-first) parallel connect attempt. Held for
+/// the lifetime of the connect task and released on completion or abort.
+struct ExtraConnectGuard;
+
+impl ExtraConnectGuard {
+    fn try_acquire() -> Option<Self> {
+        let prev = INFLIGHT_EXTRA_CONNECTS.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_INFLIGHT_EXTRA_CONNECT_ATTEMPTS {
+            INFLIGHT_EXTRA_CONNECTS.fetch_sub(1, Ordering::AcqRel);
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for ExtraConnectGuard {
+    fn drop(&mut self) {
+        INFLIGHT_EXTRA_CONNECTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Bounds concurrent Linux kernel-splice fallback relays. Each splice relay holds
+/// ~8 fds (2 sockets + 2 clones + 2 pipes) and 2 native OS threads, far more than
+/// the 2 fds the admission semaphore budgets per connection, so unauthenticated
+/// fallback traffic could drive fd/thread exhaustion before the connection limit
+/// is reached. Beyond this cap, callers fall back to the userspace async relay
+/// (2 fds, no native threads), which scales without per-relay threads.
+#[cfg(target_os = "linux")]
+const MAX_CONCURRENT_KERNEL_SPLICE_RELAYS: usize = 256;
+#[cfg(target_os = "linux")]
+static ACTIVE_KERNEL_SPLICE_RELAYS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII slot for a kernel-splice relay; releases the slot on drop.
+#[cfg(target_os = "linux")]
+pub struct KernelSpliceSlot(());
+
+#[cfg(target_os = "linux")]
+impl Drop for KernelSpliceSlot {
+    fn drop(&mut self) {
+        ACTIVE_KERNEL_SPLICE_RELAYS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Reserves a kernel-splice relay slot, or returns `None` when the cap is reached
+/// (signalling the caller to use the userspace relay instead).
+#[cfg(target_os = "linux")]
+pub fn try_enter_kernel_splice_relay() -> Option<KernelSpliceSlot> {
+    let prev = ACTIVE_KERNEL_SPLICE_RELAYS.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_CONCURRENT_KERNEL_SPLICE_RELAYS {
+        ACTIVE_KERNEL_SPLICE_RELAYS.fetch_sub(1, Ordering::AcqRel);
+        None
+    } else {
+        Some(KernelSpliceSlot(()))
+    }
+}
 #[cfg(target_os = "linux")]
 const TCP_NOTSENT_LOWAT_BYTES: libc::c_uint = 256 * 1024;
 #[cfg(target_os = "linux")]
@@ -34,8 +104,23 @@ pub async fn connect_tuned_tcp_any(addrs: &[SocketAddr]) -> io::Result<TcpStream
 
 async fn connect_tuned_tcp_race(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     let mut attempts = JoinSet::new();
-    for addr in addrs.iter().copied().take(MAX_PARALLEL_CONNECT_ATTEMPTS) {
-        attempts.spawn(async move { connect_tuned_tcp_addr(addr).await });
+    let mut addr_iter = addrs.iter().copied().take(MAX_PARALLEL_CONNECT_ATTEMPTS);
+
+    // The first attempt is always raced: its outbound fd is covered by the
+    // per-relay budget. Extra attempts only spawn while the process-wide
+    // connect-race budget has room, so a burst of multi-address dials cannot
+    // over-commit fds beyond what the connection limit assumes.
+    if let Some(first) = addr_iter.next() {
+        attempts.spawn(async move { connect_tuned_tcp_addr(first).await });
+    }
+    for addr in addr_iter {
+        let Some(guard) = ExtraConnectGuard::try_acquire() else {
+            break;
+        };
+        attempts.spawn(async move {
+            let _guard = guard;
+            connect_tuned_tcp_addr(addr).await
+        });
     }
 
     let mut last_err = None;
@@ -55,14 +140,6 @@ async fn connect_tuned_tcp_race(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
 }
 
 pub async fn connect_tuned_tcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
-    #[cfg(target_os = "linux")]
-    match connect_mptcp_addr(addr).await {
-        Ok(stream) => return Ok(stream),
-        Err(err) => {
-            tracing::trace!(error = %err, "MPTCP connect failed; falling back to TCP");
-        }
-    }
-
     let socket = tuned_tcp_socket(addr)?;
     socket.connect(addr).await
 }
@@ -289,7 +366,10 @@ fn set_low_latency_congestion(_stream: &TcpStream) {}
 
 #[cfg(target_os = "linux")]
 fn tune_tcp_socket_before_connect(socket: &TcpSocket) {
-    set_fastopen_connect(socket);
+    // NB: TCP Fast Open (TCP_FASTOPEN_CONNECT) is deliberately NOT enabled here.
+    // It advertises a TFO option in the SYN (and can send data in the SYN on
+    // cached-cookie paths), a stable TCP-layer distinguisher outside the TLS
+    // ClientHello camouflage that modern desktop browsers do not exhibit.
     set_notsent_lowat(socket);
     set_busy_poll(socket);
     set_incoming_cpu(socket);
@@ -297,30 +377,6 @@ fn tune_tcp_socket_before_connect(socket: &TcpSocket) {
 
 #[cfg(not(target_os = "linux"))]
 fn tune_tcp_socket_before_connect(_socket: &TcpSocket) {}
-
-#[cfg(target_os = "linux")]
-fn set_fastopen_connect(socket: &TcpSocket) {
-    use std::os::fd::AsRawFd;
-
-    set_fastopen_connect_fd(socket.as_raw_fd());
-}
-
-#[cfg(target_os = "linux")]
-fn set_fastopen_connect_fd(fd: std::os::fd::RawFd) {
-    let enabled: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_FASTOPEN_CONNECT,
-            (&enabled as *const libc::c_int).cast(),
-            std::mem::size_of_val(&enabled) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        tracing::trace!("TCP_FASTOPEN_CONNECT is unavailable; using normal TCP connect");
-    }
-}
 
 #[cfg(target_os = "linux")]
 fn set_notsent_lowat<S>(socket: &S)
@@ -392,55 +448,6 @@ fn set_incoming_cpu_fd(fd: std::os::fd::RawFd) {
 fn set_incoming_cpu<S>(_socket: &S) {}
 
 #[cfg(target_os = "linux")]
-async fn connect_mptcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
-    use std::os::fd::{FromRawFd, RawFd};
-
-    let domain = if addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
-    let fd = unsafe {
-        libc::socket(
-            domain,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            libc::IPPROTO_MPTCP,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    set_socket_int_option_fd(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
-    set_socket_int_option_fd(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-    set_fastopen_connect_fd(fd);
-    set_notsent_lowat_fd(fd);
-    set_busy_poll_fd(fd);
-    set_incoming_cpu_fd(fd);
-
-    let (storage, len) = socket_addr_storage(addr);
-    let rc = unsafe { libc::connect(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINPROGRESS) {
-            close_raw_fd(fd);
-            return Err(err);
-        }
-    }
-
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd as RawFd) };
-    std_stream.set_nonblocking(true)?;
-    let stream = TcpStream::from_std(std_stream)?;
-    if rc != 0 {
-        stream.writable().await?;
-        if let Some(err) = stream.take_error()? {
-            return Err(err);
-        }
-    }
-    Ok(stream)
-}
-
-#[cfg(target_os = "linux")]
 fn set_socket_int_option_fd(
     fd: std::os::fd::RawFd,
     level: libc::c_int,
@@ -462,61 +469,6 @@ fn set_socket_int_option_fd(
             optname,
             "socket option unavailable; keeping kernel default"
         );
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn socket_addr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    match addr {
-        SocketAddr::V4(addr) => {
-            let sockaddr = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: addr.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(addr.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            unsafe {
-                storage
-                    .as_mut_ptr()
-                    .cast::<libc::sockaddr_in>()
-                    .write(sockaddr);
-            }
-            (
-                unsafe { storage.assume_init() },
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        }
-        SocketAddr::V6(addr) => {
-            let sockaddr = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: addr.port().to_be(),
-                sin6_flowinfo: addr.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: addr.ip().octets(),
-                },
-                sin6_scope_id: addr.scope_id(),
-            };
-            unsafe {
-                storage
-                    .as_mut_ptr()
-                    .cast::<libc::sockaddr_in6>()
-                    .write(sockaddr);
-            }
-            (
-                unsafe { storage.assume_init() },
-                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            )
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn close_raw_fd(fd: std::os::fd::RawFd) {
-    unsafe {
-        libc::close(fd);
     }
 }
 

@@ -110,8 +110,28 @@ const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
 const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
-const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET / 2;
+/// Cap on fallback-origin records forwarded to the client before the ParallaX PQ
+/// rekey arrives. This must comfortably cover a *full* fragmented TLS 1.3 server
+/// handshake flight (ServerHello + EncryptedExtensions + a possibly large,
+/// heavily fragmented Certificate chain + CertificateVerify + Finished): the
+/// client only sends its PQ record once that flight completes its Safari TLS
+/// camouflage, so a limit smaller than the origin's record count deadlocks the
+/// session (the server stops forwarding, the client keeps waiting). 64 records
+/// (~1 MiB) is far above any real handshake flight while still bounding forwarding.
+const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = 64;
 const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
+/// Server-side ceilings on an authenticated speed-test request. The on-wire
+/// format permits arbitrary u64 byte counts and a u16 sample count; without a
+/// server-enforced bound a malicious authenticated client can request terabytes
+/// of generated download or a never-ending upload, pinning bandwidth/CPU and a
+/// connection slot. The CLI's own requests are orders of magnitude below these.
+const MAX_SPEED_TEST_BYTES_PER_PHASE: u64 = 1024 * 1024 * 1024; // 1 GiB
+const MAX_SPEED_TEST_SAMPLES: u16 = 32;
+/// Aggregate ceiling across all phases (2x warmup + sample_count x (download +
+/// upload)). The per-phase caps alone still permit tens of GiB of generated +
+/// decrypt work per request; this bounds the whole request. The legitimate CLI
+/// totals well under 30 MiB, far below this.
+const MAX_SPEED_TEST_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 const SERVER_MUX_FRAME_BATCH_LIMIT: usize = 64;
 /// Hard cap on concurrent mux substreams per authenticated connection. Excess
 /// `Open` frames are answered with `Reset` and never establish an outbound
@@ -720,14 +740,24 @@ async fn relay_fallback_with_idle_timeout(
     #[cfg(target_os = "linux")]
     {
         if crate::transport::tcp::kernel_splice_available() {
-            tracing::debug!("using Linux splice(2) kernel relay for fallback TCP tunnel");
-            return crate::transport::tcp::relay_kernel_splice_bidirectional_with_idle_timeout(
-                client,
-                fallback,
-                idle_timeout,
-            )
-            .await
-            .map_err(HandshakeServerError::Io);
+            // Bound concurrent kernel-splice relays: each holds ~8 fds + 2 native
+            // threads, far above the 2 fds the admission semaphore budgets, so
+            // unauthenticated fallback floods could exhaust fds/threads first.
+            // Beyond the cap, fall through to the userspace relay (2 fds, no
+            // native threads), which scales without per-relay threads.
+            if let Some(_splice_slot) = crate::transport::tcp::try_enter_kernel_splice_relay() {
+                tracing::debug!("using Linux splice(2) kernel relay for fallback TCP tunnel");
+                return crate::transport::tcp::relay_kernel_splice_bidirectional_with_idle_timeout(
+                    client,
+                    fallback,
+                    idle_timeout,
+                )
+                .await
+                .map_err(HandshakeServerError::Io);
+            }
+            tracing::debug!(
+                "kernel splice relay cap reached; using userspace fallback relay instead"
+            );
         }
     }
 
@@ -1159,6 +1189,13 @@ async fn run_authenticated_data_mode(
                         .await?;
 
                         drop(fallback_write);
+                        // Release the fallback read half too: it owns the
+                        // fallback origin's read-side fd, which is no longer
+                        // needed once the client has switched to ParallaX data
+                        // mode. Without this, the fd lingers for the entire
+                        // proxied session (one extra fd per authenticated relay,
+                        // beyond the 2 the connection limit budgets).
+                        drop(fallback_records);
                         client_records.read_record_into(&mut client_record).await?;
                         log_record_read(
                             cid,
@@ -1636,6 +1673,38 @@ struct ServerMuxContext<'a> {
     cid: u64,
 }
 
+/// Shared last-activity clock for an authenticated relay, reset on every byte
+/// moved in either direction.
+type RelayActivity = Arc<Mutex<Instant>>;
+
+fn bump_relay_activity(activity: &RelayActivity) {
+    if let Ok(mut last) = activity.lock() {
+        *last = Instant::now();
+    }
+}
+
+/// Resolves once the relay has been idle (no bytes either direction) for
+/// `idle_timeout`. Without this, a `try_join!` relay where the client has gone
+/// but the target stays open and silent (e.g. a malicious PSK holder dialing an
+/// attacker target that holds the socket after EOF) would block on the target
+/// read forever, pinning a connection slot, both fds, and the per-source/global
+/// permits indefinitely. Reusing the configurable fallback idle backstop keeps a
+/// generous, operator-tunable grace. Only real payload bytes (either direction)
+/// reset the clock; server-generated cover records deliberately do NOT, so the
+/// backstop still fires on a genuinely-idle relay even when cover traffic is on.
+async fn relay_idle_watchdog(activity: RelayActivity, idle_timeout: Duration) {
+    loop {
+        let elapsed = activity
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or(idle_timeout);
+        if elapsed >= idle_timeout {
+            return;
+        }
+        sleep(idle_timeout - elapsed).await;
+    }
+}
+
 impl DataRelay {
     async fn run(self) -> Result<(), HandshakeServerError> {
         let DataRelay {
@@ -1651,7 +1720,15 @@ impl DataRelay {
             cid,
         } = self;
         let target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
-        let upload = server_upload_loop(client_records, target_write, client_open, cid);
+        let activity: RelayActivity = Arc::new(Mutex::new(Instant::now()));
+        let idle_timeout = fallback_idle_timeout();
+        let upload = server_upload_loop(
+            client_records,
+            target_write,
+            client_open,
+            activity.clone(),
+            cid,
+        );
         let download = server_download_loop(
             target_read,
             client_write,
@@ -1659,11 +1736,17 @@ impl DataRelay {
             target_buf,
             timing,
             cover,
+            activity.clone(),
             cid,
         );
 
-        let ((), ()) = tokio::try_join!(upload, download)?;
-        Ok(())
+        tokio::select! {
+            result = async { tokio::try_join!(upload, download).map(|_| ()) } => result,
+            _ = relay_idle_watchdog(activity, idle_timeout) => {
+                tracing::debug!(cid, "authenticated relay idle backstop reached; tearing down");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -2211,6 +2294,45 @@ async fn run_authenticated_speed_test_mode(
             crate::tls::record::TlsRecordError::PayloadTooLarge(0).into(),
         ));
     }
+    // Reject requests beyond the server's ceilings. The wire format allows any
+    // non-zero u64/u16 values; a malicious authenticated client could otherwise
+    // request unbounded generated download or a never-ending upload to pin a
+    // connection slot and bandwidth/CPU.
+    if request.warmup_bytes > MAX_SPEED_TEST_BYTES_PER_PHASE
+        || request.download_bytes > MAX_SPEED_TEST_BYTES_PER_PHASE
+        || request.upload_bytes > MAX_SPEED_TEST_BYTES_PER_PHASE
+        || request.sample_count > MAX_SPEED_TEST_SAMPLES
+    {
+        tracing::warn!(
+            cid,
+            warmup_bytes = request.warmup_bytes,
+            download_bytes = request.download_bytes,
+            upload_bytes = request.upload_bytes,
+            sample_count = request.sample_count,
+            "rejecting speed test request that exceeds server limits"
+        );
+        return Err(HandshakeServerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "speed test request exceeds server limits",
+        )));
+    }
+    // Aggregate ceiling: bound total generated + decrypted work per request, which
+    // the individual per-phase caps do not (2x warmup + sample_count x (down+up)).
+    let total_bytes = request.warmup_bytes.saturating_mul(2).saturating_add(
+        (request.sample_count as u64)
+            .saturating_mul(request.download_bytes.saturating_add(request.upload_bytes)),
+    );
+    if total_bytes > MAX_SPEED_TEST_TOTAL_BYTES {
+        tracing::warn!(
+            cid,
+            total_bytes,
+            "rejecting speed test request whose aggregate work exceeds the server limit"
+        );
+        return Err(HandshakeServerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "speed test request exceeds server aggregate limit",
+        )));
+    }
 
     let mut rng = StdRng::from_entropy();
     let mut scratch = RelaySealScratch::with_payload_capacity(chunk_size);
@@ -2317,8 +2439,12 @@ where
 {
     let mut uploaded = 0_u64;
     let mut client_record = Vec::new();
+    let idle = fallback_idle_timeout();
     while uploaded < bytes {
-        match io.client_records.read_record_into(&mut client_record).await {
+        let read = timeout(idle, io.client_records.read_record_into(&mut client_record))
+            .await
+            .map_err(|_| HandshakeServerError::Timeout)?;
+        match read {
             Ok(()) => {}
             Err(err) if is_clean_close(&err) => return Ok(()),
             Err(err) => return Err(HandshakeServerError::Io(err)),
@@ -2361,6 +2487,7 @@ async fn server_upload_loop(
     mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
     mut target_write: OwnedWriteHalf,
     mut client_open: DataRecordCodec,
+    activity: RelayActivity,
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
     let mut client_record = Vec::new();
@@ -2384,6 +2511,7 @@ async fn server_upload_loop(
             Ok(plaintext) => {
                 if !plaintext.is_empty() {
                     target_write.write_all(&client_record[plaintext]).await?;
+                    bump_relay_activity(&activity);
                 }
             }
             Err(err) => {
@@ -2393,6 +2521,7 @@ async fn server_upload_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn server_download_loop(
     mut target_read: OwnedReadHalf,
     mut client_write: OwnedWriteHalf,
@@ -2400,6 +2529,7 @@ async fn server_download_loop(
     mut target_buf: Vec<u8>,
     timing: TimingProfile,
     cover: CoverTrafficProfile,
+    activity: RelayActivity,
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
@@ -2411,6 +2541,7 @@ async fn server_download_loop(
                 let _ = client_write.shutdown().await;
                 return Ok(());
             }
+            bump_relay_activity(&activity);
             let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
 
             let delay = timing.sample_delay(&mut rng);
@@ -2454,6 +2585,7 @@ async fn server_download_loop(
                     let _ = client_write.shutdown().await;
                     return Ok(());
                 }
+                bump_relay_activity(&activity);
                 let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
 
                 let delay = timing.sample_delay(&mut rng);

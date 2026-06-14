@@ -45,9 +45,9 @@ Options:
   --enable-bbr                 Configure VPS tcp_bbr + fq during deploy. Default.
   --no-enable-bbr              Skip remote BBR/fq sysctl configuration.
   --profile-mode <mode>        Profiling integration: none or polar-cloud. Defaults to none.
-  --polar-bearer-token <token> Bearer token text (Polar Signals Cloud). Alternative to token file.
   --polar-token-file <path>    Read Polar Signals token from this local file instead of prompting.
-                               Useful for CI; mutually exclusive with --polar-bearer-token.
+                               Useful for CI. (An inline token argument is intentionally NOT
+                               supported: argv is visible in /proc/<pid>/cmdline and CI logs.)
   --polar-project-id <uuid>    Polar Signals project UUID. Required for polar-cloud.
   --polar-store-address <addr> Polar Signals gRPC endpoint. Defaults to grpc.polarsignals.com:443.
   --polar-node <name>          Node label for Polar Signals. Defaults to the SSH host.
@@ -84,6 +84,13 @@ warn() {
 # Guided mode ("no args" wizard): richer terminal UX + quieter tool output unless something breaks.
 DEPLOY_GUIDED_UI="${DEPLOY_GUIDED_UI:-0}"
 DEPLOY_GUIDED_SILENT_TOOLS="${DEPLOY_GUIDED_SILENT_TOOLS:-0}"
+
+# Pinned cargo-zigbuild version for auto-install. `cargo install` compiles and
+# runs build scripts with the operator's privileges (and the deploy generates the
+# PSK/private config before building), so the build helper must be a specific,
+# auditable published version rather than whatever "latest" resolves to. Bump
+# this deliberately when upgrading. Override only if you know what you're doing.
+CARGO_ZIGBUILD_VERSION="${CARGO_ZIGBUILD_VERSION:-0.22.3}"
 
 C_GUIDE_PURPLE='\033[95m'
 C_GREEN='\033[1;32m'
@@ -748,13 +755,13 @@ build_host_tools_and_configs() {
       erc=$?
       set -e
       if [[ "$erc" != "0" ]]; then
-        warn "probe failed; deploy can continue, but verify your camouflage host before prod."
+        warn "probe failed or rated the camouflage target Not recommended; review below and pick a reachable TLS 1.3 origin before prod."
         tail -n 80 "$plf" >&2 || cat "$plf" >&2
       fi
       rm -f "$plf"
     else
       cargo run --locked --quiet --bin plx -- probe "$DEST" || \
-        warn "probe failed; deploy can continue, but choose a better camouflage target before production"
+        warn "probe failed or rated the camouflage target Not recommended; choose a better camouflage target before production"
     fi
   else
     log "$(quote_cmd cargo run --locked --quiet --bin plx -- probe "$DEST")"
@@ -854,8 +861,8 @@ maybe_install_build_tool() {
     run brew install zig
   elif [[ "$tool" == "cargo-zigbuild" ]]; then
     need_cmd cargo
-    deploy_info_log "installing local build helper: cargo-zigbuild"
-    run cargo install cargo-zigbuild --locked
+    deploy_info_log "installing local build helper: cargo-zigbuild $CARGO_ZIGBUILD_VERSION"
+    run cargo install cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION" --locked
   else
     die "unsupported build helper: $tool"
   fi
@@ -863,7 +870,7 @@ maybe_install_build_tool() {
 
 ensure_zigbuild_tools() {
   maybe_install_build_tool "zig" "brew install zig"
-  maybe_install_build_tool "cargo-zigbuild" "cargo install cargo-zigbuild --locked"
+  maybe_install_build_tool "cargo-zigbuild" "cargo install cargo-zigbuild --version $CARGO_ZIGBUILD_VERSION --locked"
 }
 
 write_unit_file() {
@@ -927,7 +934,7 @@ validate_profile_options() {
     die "--polar-project-id must be a UUID, not a project name: $POLAR_PROJECT_ID"
 
   if [[ -n "$POLAR_TOKEN_FILE" && -n "$POLAR_BEARER_TOKEN" ]]; then
-    die "use either --polar-token-file or an inline bearer token (--polar-bearer-token / guided paste), not both"
+    die "use either --polar-token-file or the interactive token paste, not both"
   fi
 
   local token_normalized=""
@@ -942,7 +949,7 @@ validate_profile_options() {
   elif [[ -n "$POLAR_BEARER_TOKEN" ]]; then
     token_normalized="$(printf '%s' "$POLAR_BEARER_TOKEN" | tr -d '\r\n[:space:]')"
   else
-    die "Polar Signals Cloud needs a bearer token (interactive paste, --polar-bearer-token, or --polar-token-file)"
+    die "Polar Signals Cloud needs a bearer token (interactive paste or --polar-token-file)"
   fi
 
   if [[ -n "$token_normalized" ]]; then
@@ -1001,6 +1008,11 @@ prepare_polar_token_file() {
       token="$(printf '%s' "$POLAR_BEARER_TOKEN" | tr -d '\r\n[:space:]')"
     fi
     [[ -n "$token" ]] || die "Polar Signals bearer token resolved empty"
+    # Create the file with 0600 BEFORE writing the secret: a plain `>` redirect
+    # creates it at 0644 under the common umask, leaving a window in which a
+    # co-located user can open it (chmod afterwards cannot revoke an already-open
+    # fd). Creating it restricted first closes that window.
+    ( umask 077; : >"$token_file" ) || die "failed to create Polar Signals token file"
     printf '%s' "$token" >"$token_file"
     chmod 600 "$token_file"
   else
@@ -1015,12 +1027,41 @@ cleanup_polar_token_upload_file() {
   fi
 }
 
+# Single EXIT handler so cleanup runs on ALL exit paths, including `die` and
+# `set -e` aborts (a function RETURN trap does NOT fire on those). Tears down the
+# SSH ControlMaster and removes its private socket dir, and removes the staged
+# Polar token. Idempotent and guarded so it is safe to run when nothing was set.
+cleanup_on_exit() {
+  if [[ -n "${SSH_CONTROL_DIR:-}" ]]; then
+    if [[ -n "${SSH_CONTROL_PATH:-}" ]]; then
+      ssh -O exit -o "ControlPath=$SSH_CONTROL_PATH" -p "$SSH_PORT" "$SSH_TARGET" 2>/dev/null || true
+    fi
+    rm -rf "$SSH_CONTROL_DIR"
+    SSH_CONTROL_DIR=""
+  fi
+  cleanup_polar_token_upload_file
+}
+
 install_remote() {
   local deploy_dir=$1
   local server_cfg=$2
   local unit_file=$3
 
-  local control_path="/tmp/parallax-ssh-$(safe_name "$SSH_TARGET")-$SSH_PORT"
+  # Place the SSH ControlMaster socket in a private, non-guessable, 0700
+  # directory we own — NOT a predictable /tmp path. A deterministic world-writable
+  # path lets a local attacker pre-create a socket there and, with
+  # ControlMaster=auto, hijack the deploy's ssh/scp (which carry the PSK and
+  # private keys). The random mktemp -d dir cannot be pre-created.
+  local control_dir
+  control_dir="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/parallax-ssh.XXXXXX")" \
+    || die "failed to create private SSH control directory"
+  local control_path="$control_dir/cm.sock"
+  # Publish to globals so the top-level EXIT handler tears the master down and
+  # removes this dir on ALL exit paths (a RETURN trap would miss die/set-e
+  # failures, which are the common case and would otherwise leak the dir and a
+  # live authenticated SSH master socket for ControlPersist=5m).
+  SSH_CONTROL_DIR="$control_dir"
+  SSH_CONTROL_PATH="$control_path"
   local ssh_common_opts=(
     -o ServerAliveInterval=10
     -o ServerAliveCountMax=3
@@ -1071,6 +1112,13 @@ install_remote() {
   if [[ "$REUSE_CONFIG" != "1" ]]; then
     replay_cache_reset_script=$(cat <<REMOTE_REPLAY_CACHE_RESET
 echo "Rotating ParallaX replay cache for fresh generated config."
+# Stop the old service BEFORE deleting the cache: otherwise the still-running old
+# server (with the old PSK-derived MAC key) can recreate the cache during the
+# window before restart, and the new server then fails to load it with a MAC
+# mismatch, crash-looping the deploy.
+if command -v systemctl >/dev/null 2>&1; then
+  $sudo_prefix systemctl stop $q_service 2>/dev/null || true
+fi
 $sudo_prefix rm -f $q_remote_replay_cache
 REMOTE_REPLAY_CACHE_RESET
 )
@@ -1156,6 +1204,31 @@ if [[ -z "\$agent_cmd" ]]; then
   echo "parca-agent was installed but no executable was found in PATH or /snap/bin" >&2
   exit 1
 fi
+# The parca-agent service runs as root (no User= in the unit) and execs
+# /snap/bin/parca-agent. Before linking a PATH-resolved binary into root-run
+# locations, verify it lives in a trusted system directory, is owned by root, and
+# is not group/world-writable — otherwise a non-root sudo deploy account whose
+# PATH resolves parca-agent to a planted/writable binary could obtain root code
+# execution via the root service.
+resolved_agent="\$(readlink -f "\$agent_cmd" 2>/dev/null || echo "\$agent_cmd")"
+case "\$resolved_agent" in
+  /snap/*|/usr/bin/*|/usr/sbin/*|/usr/local/bin/*|/usr/local/sbin/*|/bin/*|/sbin/*) ;;
+  *)
+    echo "refusing to link parca-agent from untrusted path: \$resolved_agent" >&2
+    exit 1
+    ;;
+esac
+agent_owner="\$(stat -c '%u' "\$resolved_agent" 2>/dev/null || echo 1)"
+agent_perms="\$(stat -c '%a' "\$resolved_agent" 2>/dev/null || echo 777)"
+if [[ "\$agent_owner" != "0" ]]; then
+  echo "refusing to link parca-agent not owned by root: \$resolved_agent" >&2
+  exit 1
+fi
+if (( 0\$agent_perms & 022 )); then
+  echo "refusing to link group/world-writable parca-agent: \$resolved_agent" >&2
+  exit 1
+fi
+agent_cmd="\$resolved_agent"
 if [[ "\$agent_cmd" != "/usr/local/bin/parca-agent" ]]; then
   $sudo_prefix ln -sf "\$agent_cmd" /usr/local/bin/parca-agent
 fi
@@ -1272,6 +1345,10 @@ PROFILE_MODE="none"
 POLAR_TOKEN_FILE=""
 POLAR_PROJECT_ID=""
 POLAR_TOKEN_UPLOAD_FILE=""
+# Private SSH ControlMaster socket dir, published by install_remote and cleaned by
+# cleanup_on_exit on every exit path.
+SSH_CONTROL_DIR=""
+SSH_CONTROL_PATH=""
 POLAR_STORE_ADDRESS="grpc.polarsignals.com:443"
 POLAR_NODE=""
 POLAR_LABELS=""
@@ -1305,7 +1382,9 @@ while [[ $# -gt 0 ]]; do
     --enable-bbr) ENABLE_BBR="1"; shift ;;
     --no-enable-bbr) ENABLE_BBR="0"; shift ;;
     --profile-mode) PROFILE_MODE=${2:-}; shift 2 ;;
-    --polar-bearer-token) POLAR_BEARER_TOKEN=${2:-}; shift 2 ;;
+    --polar-bearer-token)
+      die "--polar-bearer-token is no longer supported: an argv token leaks via /proc/<pid>/cmdline, ps, and CI logs. Use --polar-token-file or the interactive hidden prompt."
+      ;;
     --polar-token-file) POLAR_TOKEN_FILE=${2:-}; shift 2 ;;
     --polar-project-id) POLAR_PROJECT_ID=${2:-}; shift 2 ;;
     --polar-store-address) POLAR_STORE_ADDRESS=${2:-}; shift 2 ;;
@@ -1415,8 +1494,10 @@ build_host_tools_and_configs "$DEPLOY_DIR" "$SERVER_CFG" "$CLIENT_CFG"
 build_linux_binary "$ROOT"
 verify_profiling_binary_symbols
 write_unit_file "$UNIT_FILE"
+# Register cleanup before any remote work / secret staging so it fires on every
+# exit path (success, die, or set -e abort).
+trap cleanup_on_exit EXIT
 if profiling_enabled; then
-  trap cleanup_polar_token_upload_file EXIT
   write_parca_agent_unit_file "$PARCA_UNIT_FILE"
   write_polar_env_file "$POLAR_ENV_FILE"
   prepare_polar_token_file "$POLAR_TOKEN_UPLOAD_FILE"

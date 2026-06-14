@@ -240,6 +240,16 @@ async fn run_probe(dest: Option<String>, config: PathBuf) -> anyhow::Result<()> 
     let (target, sni) = probe_target(dest, &config)?;
     let report = probe::probe(target, sni).await?;
     print!("{}", report.summary());
+    // Exit non-zero on a "Not recommended" verdict (including TCP/TLS connection
+    // failures, which score as Bad). This lets callers — notably the guided
+    // deploy, which only surfaces probe output on a non-zero exit — detect an
+    // unsuitable camouflage target instead of silently deploying it.
+    if matches!(report.verdict, probe::ProbeVerdict::Bad) {
+        anyhow::bail!(
+            "camouflage target is Not recommended (score {}/100); pick a reachable TLS 1.3 origin",
+            report.score
+        );
+    }
     Ok(())
 }
 

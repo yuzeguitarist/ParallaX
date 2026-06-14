@@ -1346,6 +1346,22 @@ struct ServerFlight {
     finished: bool,
 }
 
+/// Rejects a Certificate/CompressedCertificate that is a duplicate or arrives
+/// after CertificateVerify. This binds the leaf that CertificateVerify proves
+/// possession of to the leaf that is finally validated: without it, a second
+/// Certificate could overwrite `flight.certificates` while `certificate_verify_seen`
+/// stays true, letting an active MITM prove possession of an attacker key
+/// (Certificate#1 + CV) and then present the real chain (Certificate#2) before
+/// Finished — defeating the cover-origin TLS authentication.
+fn reject_out_of_order_certificate(flight: &ServerFlight) -> Result<(), Safari26TlsError> {
+    if !flight.certificates.is_empty() || flight.certificate_verify_seen {
+        return Err(Safari26TlsError::Handshake(
+            "duplicate or out-of-order Certificate message in server flight".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn process_server_handshake_messages(
     buf: &mut Vec<u8>,
     flight: &mut ServerFlight,
@@ -1365,19 +1381,31 @@ fn process_server_handshake_messages(
         let body = &message[4..];
         match message[0] {
             HANDSHAKE_ENCRYPTED_EXTENSIONS => {
+                if flight.encrypted_extensions_seen {
+                    return Err(Safari26TlsError::Handshake(
+                        "duplicate EncryptedExtensions in server flight".to_owned(),
+                    ));
+                }
                 parse_encrypted_extensions(body, keys)?;
                 flight.encrypted_extensions_seen = true;
                 transcript.push(&message);
             }
             HANDSHAKE_CERTIFICATE => {
+                reject_out_of_order_certificate(flight)?;
                 flight.certificates = parse_certificate_body(body)?;
                 transcript.push(&message);
             }
             HANDSHAKE_COMPRESSED_CERTIFICATE => {
+                reject_out_of_order_certificate(flight)?;
                 flight.certificates = parse_compressed_certificate_body(body)?;
                 transcript.push(&message);
             }
             HANDSHAKE_CERTIFICATE_VERIFY => {
+                if flight.certificate_verify_seen {
+                    return Err(Safari26TlsError::Handshake(
+                        "duplicate CertificateVerify in server flight".to_owned(),
+                    ));
+                }
                 verify_certificate_verify(body, flight, transcript, keys)?;
                 flight.certificate_verify_seen = true;
                 transcript.push(&message);
