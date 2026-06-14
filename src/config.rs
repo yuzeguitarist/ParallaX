@@ -202,34 +202,52 @@ pub enum UdpFecProfile {
     Rs,
 }
 
-/// UDP fast-plane configuration. Disabled by default: with `enabled = false`
-/// the runtime behaves exactly like today's TCP-only transport. All knobs have
-/// safe defaults so an operator never has to choose TCP vs UDP.
+/// UDP fast-plane configuration. **Experimental, disabled by default**: with
+/// `enabled = false` the runtime behaves exactly like today's TCP-only transport
+/// (byte-identical). All knobs have safe defaults so an operator never has to
+/// choose TCP vs UDP.
+///
+/// LIVE knobs in this version (QUIC reliable-stream fast plane for the
+/// single-Connect relay path): `enabled` and `probe_timeout_ms`. Enabling
+/// requires matched binaries on both ends.
+///
+/// RESERVED knobs (parsed + validated for forward-compatibility but NOT yet
+/// honored — they take effect in later slices): `cc` / `brutal_*` /
+/// `ignore_client_bandwidth` (congestion control — Phase 3), `fec_profile` (FEC —
+/// Phase 3), `port_hop` / `masque_front` / `ech` (camouflage — Phase 2). Setting
+/// one today is a no-op; the runtime logs a warning at startup so it is not
+/// mistaken for active.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct UdpConfig {
+    /// LIVE. Turn the experimental UDP/QUIC fast plane on (default off).
     #[serde(default)]
     pub enabled: bool,
+    /// RESERVED (congestion control, Phase 3) — not yet honored.
     #[serde(default)]
     pub cc: UdpCongestionControl,
-    /// Declared uplink bandwidth (Mbps) for Brutal; 0 means unset.
+    /// RESERVED. Declared uplink bandwidth (Mbps) for Brutal; 0 means unset.
     #[serde(default)]
     pub brutal_up_mbps: u32,
-    /// Declared downlink bandwidth (Mbps) for Brutal; 0 means unset.
+    /// RESERVED. Declared downlink bandwidth (Mbps) for Brutal; 0 means unset.
     #[serde(default)]
     pub brutal_down_mbps: u32,
-    /// Let the server override the client-declared Brutal bandwidth.
+    /// RESERVED. Let the server override the client-declared Brutal bandwidth.
     #[serde(default)]
     pub ignore_client_bandwidth: bool,
+    /// RESERVED (forward error correction, Phase 3) — not yet honored.
     #[serde(default)]
     pub fec_profile: UdpFecProfile,
-    /// Happy-Eyeballs UDP probe timeout before committing to TCP-only.
+    /// LIVE. Happy-Eyeballs UDP probe timeout before committing to TCP-only.
     #[serde(default = "default_udp_probe_timeout_ms")]
     pub probe_timeout_ms: u16,
+    /// RESERVED (UDP port hopping, Phase 2 camouflage) — not yet honored.
     #[serde(default)]
     pub port_hop: bool,
-    /// SNI/host to front the masquerading HTTP/3 face on; `None` keeps the TCP `sni`.
+    /// RESERVED (Phase 2 camouflage). SNI/host to front the masquerading HTTP/3
+    /// face on; `None` keeps the TCP `sni`. Not yet honored.
     #[serde(default)]
     pub masque_front: Option<String>,
+    /// RESERVED (Encrypted ClientHello, Phase 2 camouflage) — not yet honored.
     #[serde(default)]
     pub ech: bool,
 }
@@ -266,6 +284,36 @@ impl UdpConfig {
             require_non_empty("udp.masque_front", front)?;
         }
         Ok(())
+    }
+
+    /// Names of RESERVED knobs (see the struct docs) that an operator has set away
+    /// from their default but which this version does NOT yet honor. The runtime
+    /// logs these at startup so a no-op setting is not mistaken for an active one.
+    pub fn reserved_knobs_in_use(&self) -> Vec<&'static str> {
+        let d = Self::default();
+        let mut set = Vec::new();
+        if self.cc != d.cc {
+            set.push("cc");
+        }
+        if self.brutal_up_mbps != d.brutal_up_mbps || self.brutal_down_mbps != d.brutal_down_mbps {
+            set.push("brutal_up_mbps/brutal_down_mbps");
+        }
+        if self.ignore_client_bandwidth != d.ignore_client_bandwidth {
+            set.push("ignore_client_bandwidth");
+        }
+        if self.fec_profile != d.fec_profile {
+            set.push("fec_profile");
+        }
+        if self.port_hop != d.port_hop {
+            set.push("port_hop");
+        }
+        if self.masque_front != d.masque_front {
+            set.push("masque_front");
+        }
+        if self.ech != d.ech {
+            set.push("ech");
+        }
+        set
     }
 }
 
@@ -848,6 +896,34 @@ ech = true
             udp.validate().unwrap_err(),
             ConfigError::InvalidSocket { .. }
         ));
+    }
+
+    #[test]
+    fn reserved_knobs_in_use_flags_only_non_default_reserved_fields() {
+        // Default + the two LIVE knobs flipped => nothing reserved is in use.
+        let live = UdpConfig {
+            enabled: true,
+            probe_timeout_ms: 250,
+            ..UdpConfig::default()
+        };
+        assert!(live.reserved_knobs_in_use().is_empty());
+
+        // A reserved knob set away from default IS flagged.
+        let reserved = UdpConfig {
+            enabled: true,
+            port_hop: true,
+            fec_profile: UdpFecProfile::Rs,
+            masque_front: Some("cdn.example.com".to_owned()),
+            ..UdpConfig::default()
+        };
+        let flagged = reserved.reserved_knobs_in_use();
+        assert!(flagged.contains(&"port_hop"));
+        assert!(flagged.contains(&"fec_profile"));
+        assert!(flagged.contains(&"masque_front"));
+        // LIVE knobs never appear.
+        assert!(!flagged
+            .iter()
+            .any(|k| k.contains("probe") || k.contains("enabled")));
     }
 
     #[test]

@@ -267,6 +267,20 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     // probe. Threaded as a cheap-to-clone Arc, mirroring how `traffic` flows down
     // the connection chain.
     let udp = Arc::new(config.udp.clone());
+    if udp.enabled {
+        tracing::info!(
+            probe_timeout_ms = udp.probe_timeout_ms,
+            "UDP fast plane ENABLED (experimental): offers a QUIC reliable-stream carrier \
+             for the single-Connect relay; requires matched binaries on both ends"
+        );
+        let reserved = udp.reserved_knobs_in_use();
+        if !reserved.is_empty() {
+            tracing::warn!(
+                reserved = ?reserved,
+                "udp config sets RESERVED knobs that this version does not yet honor (no-op)"
+            );
+        }
+    }
 
     let server = config
         .server
