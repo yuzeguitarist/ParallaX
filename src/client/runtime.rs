@@ -17,7 +17,7 @@ use rand::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{
         lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -49,9 +49,12 @@ use crate::{
         safari26::{Safari26TlsCamouflage, Safari26TlsError},
     },
     traffic::CoverTrafficProfile,
-    transport::tcp::{
-        connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
-        relay_connection_limit, tune_tcp_stream,
+    transport::{
+        leg::{LegReader, LegWriter, TcpLegReader, TcpLegWriter},
+        tcp::{
+            connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
+            relay_connection_limit, tune_tcp_stream,
+        },
     },
 };
 
@@ -447,9 +450,13 @@ impl ClientMuxPool {
         let chunk_size = max_plaintext_len(self.traffic.max_padding);
         let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
         tokio::spawn(async move {
-            if let Err(err) =
-                client_mux_reader_loop(server_read, open_from_server, register_rx, session_cid)
-                    .await
+            if let Err(err) = client_mux_reader_loop(
+                TcpLegReader::buffered(server_read),
+                open_from_server,
+                register_rx,
+                session_cid,
+            )
+            .await
             {
                 tracing::debug!(cid = session_cid, error = %err, "client mux reader stopped");
             }
@@ -458,7 +465,7 @@ impl ClientMuxPool {
         let writer_pool = payload_pool.clone();
         tokio::spawn(async move {
             if let Err(err) = client_mux_writer_loop(
-                server_write,
+                TcpLegWriter(server_write),
                 seal_to_server,
                 frame_rx,
                 cover,
@@ -1105,27 +1112,35 @@ impl ClientRelay {
         let (seal_to_server, open_from_server) = data_session.into_data_codecs();
         let upload = client_upload_loop(
             local_read,
-            server_write,
+            TcpLegWriter(server_write),
             seal_to_server,
             local_buf,
             cover,
             cid,
         );
-        let download = client_download_loop(server_read, local_write, open_from_server, cid);
+        let download = client_download_loop(
+            TcpLegReader::buffered(server_read),
+            local_write,
+            open_from_server,
+            cid,
+        );
 
         let ((), ()) = tokio::try_join!(upload, download)?;
         Ok(())
     }
 }
 
-async fn client_upload_loop(
+async fn client_upload_loop<W>(
     mut local_read: OwnedReadHalf,
-    mut server_write: OwnedWriteHalf,
+    mut server_write: W,
     mut seal_to_server: DataRecordCodec,
     mut local_buf: Vec<u8>,
     cover: CoverTrafficProfile,
     cid: u64,
-) -> Result<(), ClientRuntimeError> {
+) -> Result<(), ClientRuntimeError>
+where
+    W: LegWriter,
+{
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
     let mut rng = StdRng::from_entropy();
     if !cover.is_enabled() {
@@ -1185,13 +1200,15 @@ async fn client_upload_loop(
     }
 }
 
-async fn client_download_loop(
-    server_read: OwnedReadHalf,
+async fn client_download_loop<R>(
+    mut server_records: R,
     mut local_write: OwnedWriteHalf,
     mut open_from_server: DataRecordCodec,
     cid: u64,
-) -> Result<(), ClientRuntimeError> {
-    let mut server_records = TlsRecordReader::buffered(server_read);
+) -> Result<(), ClientRuntimeError>
+where
+    R: LegReader,
+{
     let mut server_record = Vec::new();
 
     loop {
@@ -1284,13 +1301,15 @@ async fn client_mux_await_download(
     }
 }
 
-async fn client_mux_reader_loop(
-    server_read: OwnedReadHalf,
+async fn client_mux_reader_loop<R>(
+    mut server_records: R,
     mut open_from_server: DataRecordCodec,
     mut register_rx: mpsc::Receiver<ClientStreamRegistration>,
     cid: u64,
-) -> Result<(), ClientRuntimeError> {
-    let mut server_records = TlsRecordReader::buffered(server_read);
+) -> Result<(), ClientRuntimeError>
+where
+    R: LegReader,
+{
     let mut server_record = Vec::new();
     let mut extra_record = Vec::new();
     let mut batch_records = Vec::new();
@@ -1472,14 +1491,17 @@ async fn shutdown_client_download_streams(local_writes: &mut HashMap<u32, Client
     }
 }
 
-async fn client_mux_writer_loop(
-    mut server_write: OwnedWriteHalf,
+async fn client_mux_writer_loop<W>(
+    mut server_write: W,
     mut seal_to_server: DataRecordCodec,
     mut frame_rx: mpsc::Receiver<MuxFrame>,
     cover: CoverTrafficProfile,
     cid: u64,
     payload_pool: MuxPayloadPool,
-) -> Result<(), ClientRuntimeError> {
+) -> Result<(), ClientRuntimeError>
+where
+    W: LegWriter,
+{
     let mut seal_scratch =
         RelaySealScratch::with_payload_capacity(seal_to_server.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
@@ -1555,7 +1577,7 @@ async fn write_client_mux_frame<W, R>(
     task_name: &'static str,
 ) -> Result<(), ClientRuntimeError>
 where
-    W: AsyncWrite + Unpin,
+    W: LegWriter,
     R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
 {
     let frame_payload = frame.encode()?;
@@ -1591,7 +1613,7 @@ async fn write_client_mux_frames_batched<W, R>(
     payload_pool: &MuxPayloadPool,
 ) -> Result<(), ClientRuntimeError>
 where
-    W: AsyncWrite + Unpin,
+    W: LegWriter,
     R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
 {
     let max_plaintext_len = codec.max_plaintext_len();
@@ -1659,7 +1681,7 @@ where
             .map_err(ClientHandshakeError::from)?;
     }
     log_outer_write_batch(log, &scratch.record_lens, &scratch.records_buf);
-    writer.write_all(scratch.records_buf.as_slice()).await?;
+    writer.write_records(scratch.records_buf.as_slice()).await?;
     scratch.records_buf.clear();
     Ok(())
 }
@@ -1728,7 +1750,7 @@ async fn write_client_data_records_chunked<W, R>(
     log: RelayWriteLog,
 ) -> Result<(), ClientRuntimeError>
 where
-    W: AsyncWrite + Unpin,
+    W: LegWriter,
     R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
 {
     let max_chunk_len = codec.max_plaintext_len();
@@ -1757,7 +1779,7 @@ where
             .seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)
             .map_err(ClientHandshakeError::from)?;
     }
-    writer.write_all(scratch.records_buf.as_slice()).await?;
+    writer.write_records(scratch.records_buf.as_slice()).await?;
     Ok(())
 }
 

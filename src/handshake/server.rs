@@ -69,9 +69,12 @@ use crate::{
         server_hello::{parse_server_hello, ServerHello, ServerHelloError},
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
-    transport::tcp::{
-        connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
-        is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+    transport::{
+        leg::{LegReader, LegWriter, TcpLegReader, TcpLegWriter},
+        tcp::{
+            connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
+            is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+        },
     },
 };
 
@@ -1703,10 +1706,11 @@ impl DataRelay {
             cid,
         } = self;
         let target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
-        let upload = server_upload_loop(client_records, target_write, client_open, cid);
+        let upload =
+            server_upload_loop(TcpLegReader(client_records), target_write, client_open, cid);
         let download = server_download_loop(
             target_read,
-            client_write,
+            TcpLegWriter(client_write),
             server_seal,
             target_buf,
             timing,
@@ -1731,7 +1735,7 @@ async fn run_authenticated_mux_data_mode(
     let (frame_tx, frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
     let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
     let reader = server_mux_client_reader_loop(
-        client_records,
+        TcpLegReader(client_records),
         client_open,
         frame_tx,
         first_frames,
@@ -1739,7 +1743,7 @@ async fn run_authenticated_mux_data_mode(
         payload_pool.clone(),
     );
     let writer = server_mux_writer_loop(
-        client_write,
+        TcpLegWriter(client_write),
         server_seal,
         frame_rx,
         context.cover,
@@ -1750,14 +1754,17 @@ async fn run_authenticated_mux_data_mode(
     Ok(())
 }
 
-async fn server_mux_client_reader_loop(
-    mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
+async fn server_mux_client_reader_loop<R>(
+    mut client_records: R,
     mut client_open: DataRecordCodec,
     frame_tx: mpsc::Sender<MuxFrame>,
     first_frames: Vec<MuxFrame>,
     context: ServerMuxContext<'_>,
     payload_pool: MuxPayloadPool,
-) -> Result<(), HandshakeServerError> {
+) -> Result<(), HandshakeServerError>
+where
+    R: LegReader,
+{
     let mut target_writes = HashMap::<u32, OwnedWriteHalf>::new();
     for frame in first_frames {
         process_server_mux_frame(
@@ -1999,14 +2006,17 @@ async fn server_mux_target_reader_loop(
     }
 }
 
-async fn server_mux_writer_loop(
-    mut client_write: OwnedWriteHalf,
+async fn server_mux_writer_loop<W>(
+    mut client_write: W,
     mut server_seal: DataRecordCodec,
     mut frame_rx: mpsc::Receiver<MuxFrame>,
     cover: CoverTrafficProfile,
     cid: u64,
     payload_pool: MuxPayloadPool,
-) -> Result<(), HandshakeServerError> {
+) -> Result<(), HandshakeServerError>
+where
+    W: LegWriter,
+{
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(server_seal.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
     if !cover.is_enabled() {
@@ -2081,7 +2091,7 @@ async fn write_server_mux_frame<W, R>(
     task_name: &'static str,
 ) -> Result<(), HandshakeServerError>
 where
-    W: AsyncWrite + Unpin,
+    W: LegWriter,
     R: Rng + rand::RngCore + ?Sized,
 {
     let frame_payload = frame.encode()?;
@@ -2117,7 +2127,7 @@ pub(crate) async fn write_server_mux_frames_batched<W, R>(
     payload_pool: &MuxPayloadPool,
 ) -> Result<(), HandshakeServerError>
 where
-    W: AsyncWrite + Unpin,
+    W: LegWriter,
     R: Rng + rand::RngCore + ?Sized,
 {
     let max_plaintext_len = codec.max_plaintext_len();
@@ -2181,7 +2191,7 @@ where
         )?;
     }
     log_outer_write_batch(log, &scratch.record_lens, &scratch.records_buf);
-    writer.write_all(scratch.records_buf.as_slice()).await?;
+    writer.write_records(scratch.records_buf.as_slice()).await?;
     scratch.records_buf.clear();
     Ok(())
 }
@@ -2243,7 +2253,7 @@ async fn send_server_mux_frame(
 
 async fn run_authenticated_speed_test_mode(
     mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
-    mut client_write: OwnedWriteHalf,
+    client_write: OwnedWriteHalf,
     mut client_open: DataRecordCodec,
     mut server_seal: DataRecordCodec,
     request: SpeedTestRequest,
@@ -2268,6 +2278,7 @@ async fn run_authenticated_speed_test_mode(
     let mut scratch = RelaySealScratch::with_payload_capacity(chunk_size);
     let batch_len = relay_read_buffer_len(chunk_size);
     let payload = vec![0xA5; batch_len];
+    let mut client_write = TcpLegWriter(client_write);
     let mut io = SpeedServerIo {
         client_records: &mut client_records,
         client_write: &mut client_write,
@@ -2316,7 +2327,7 @@ async fn run_authenticated_speed_test_mode(
 
 struct SpeedServerIo<'a, R: ?Sized> {
     client_records: &'a mut BufferedTlsRecordReader<OwnedReadHalf>,
-    client_write: &'a mut OwnedWriteHalf,
+    client_write: &'a mut TcpLegWriter,
     client_open: &'a mut DataRecordCodec,
     server_seal: &'a mut DataRecordCodec,
     rng: &'a mut R,
@@ -2409,12 +2420,15 @@ where
     .await
 }
 
-async fn server_upload_loop(
-    mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
+async fn server_upload_loop<R>(
+    mut client_records: R,
     mut target_write: OwnedWriteHalf,
     mut client_open: DataRecordCodec,
     cid: u64,
-) -> Result<(), HandshakeServerError> {
+) -> Result<(), HandshakeServerError>
+where
+    R: LegReader,
+{
     let mut client_record = Vec::new();
 
     loop {
@@ -2445,15 +2459,18 @@ async fn server_upload_loop(
     }
 }
 
-async fn server_download_loop(
+async fn server_download_loop<W>(
     mut target_read: OwnedReadHalf,
-    mut client_write: OwnedWriteHalf,
+    mut client_write: W,
     mut server_seal: DataRecordCodec,
     mut target_buf: Vec<u8>,
     timing: TimingProfile,
     cover: CoverTrafficProfile,
     cid: u64,
-) -> Result<(), HandshakeServerError> {
+) -> Result<(), HandshakeServerError>
+where
+    W: LegWriter,
+{
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
     let mut rng = StdRng::from_entropy();
     if !cover.is_enabled() {
@@ -2536,7 +2553,7 @@ async fn write_server_data_records_chunked<W, R>(
     log: RelayWriteLog,
 ) -> Result<(), HandshakeServerError>
 where
-    W: AsyncWrite + Unpin,
+    W: LegWriter,
     R: rand::Rng + rand::RngCore + ?Sized,
 {
     let max_chunk_len = codec.max_plaintext_len();
@@ -2566,7 +2583,7 @@ where
     } else {
         codec.seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)?;
     }
-    writer.write_all(scratch.records_buf.as_slice()).await?;
+    writer.write_records(scratch.records_buf.as_slice()).await?;
     Ok(())
 }
 
