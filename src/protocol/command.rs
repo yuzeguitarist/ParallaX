@@ -22,9 +22,19 @@ const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
 // alongside the other PX1* commands. Fixed-length wire formats.
 const UDP_OFFER_MAGIC: &[u8; 4] = b"PX1O";
 const UDP_PROBE_ACK_MAGIC: &[u8; 4] = b"PX1P";
+const UDP_REQUEST_MAGIC: &[u8; 4] = b"PX1G";
+const UDP_DECLINE_MAGIC: &[u8; 4] = b"PX1N";
 const UDP_OFFER_ID_LEN: usize = 16;
 const UDP_OFFER_LEN: usize = 4 + UDP_OFFER_ID_LEN + 2 + 8 + 1 + 1 + 1;
 const UDP_PROBE_ACK_LEN: usize = 4 + UDP_OFFER_ID_LEN + 1 + 4;
+const UDP_REQUEST_LEN: usize = 4 + 1;
+const UDP_DECLINE_LEN: usize = 4 + 1;
+
+/// Version byte for the client-initiated UDP negotiation (see [`UdpRequest`]).
+pub const UDP_NEGOTIATION_VERSION: u8 = 1;
+/// Decline reason codes carried in a [`UdpDecline`] (raw codes for forward-compat).
+pub const UDP_DECLINE_DISABLED: u8 = 0;
+pub const UDP_DECLINE_UNSUPPORTED: u8 = 1;
 
 /// Congestion-control selector codes carried in a [`UdpOffer`] (kept as raw codes
 /// so unknown future controllers round-trip; the runtime maps them to its config).
@@ -1175,6 +1185,100 @@ impl UdpProbeAck {
     }
 }
 
+/// `PX1G` UDP request: the client opens the client-initiated, fail-soft UDP
+/// negotiation. The server replies with [`UdpOffer`] (if it offers the UDP fast
+/// plane) or [`UdpDecline`]; the server never sends an offer unsolicited, so a
+/// peer with UDP disabled never desyncs the control stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpRequest {
+    pub version: u8,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum UdpRequestError {
+    #[error("UDP request is truncated")]
+    Truncated,
+    #[error("UDP request magic mismatch")]
+    BadMagic,
+    #[error("UDP request has an invalid length")]
+    InvalidLength,
+}
+
+impl UdpRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(UDP_REQUEST_LEN);
+        out.extend_from_slice(UDP_REQUEST_MAGIC);
+        out.push(self.version);
+        out
+    }
+
+    pub fn has_magic(input: &[u8]) -> bool {
+        input.len() >= 4 && &input[..4] == UDP_REQUEST_MAGIC
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, UdpRequestError> {
+        if input.len() < 4 {
+            return Err(UdpRequestError::Truncated);
+        }
+        if &input[..4] != UDP_REQUEST_MAGIC {
+            return Err(UdpRequestError::BadMagic);
+        }
+        if input.len() < UDP_REQUEST_LEN {
+            return Err(UdpRequestError::Truncated);
+        }
+        if input.len() != UDP_REQUEST_LEN {
+            return Err(UdpRequestError::InvalidLength);
+        }
+        Ok(Self { version: input[4] })
+    }
+}
+
+/// `PX1N` UDP decline: the server's fail-soft response to a [`UdpRequest`] when
+/// it will not offer the UDP fast plane. The client then proceeds on TCP only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpDecline {
+    pub reason: u8,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum UdpDeclineError {
+    #[error("UDP decline is truncated")]
+    Truncated,
+    #[error("UDP decline magic mismatch")]
+    BadMagic,
+    #[error("UDP decline has an invalid length")]
+    InvalidLength,
+}
+
+impl UdpDecline {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(UDP_DECLINE_LEN);
+        out.extend_from_slice(UDP_DECLINE_MAGIC);
+        out.push(self.reason);
+        out
+    }
+
+    pub fn has_magic(input: &[u8]) -> bool {
+        input.len() >= 4 && &input[..4] == UDP_DECLINE_MAGIC
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, UdpDeclineError> {
+        if input.len() < 4 {
+            return Err(UdpDeclineError::Truncated);
+        }
+        if &input[..4] != UDP_DECLINE_MAGIC {
+            return Err(UdpDeclineError::BadMagic);
+        }
+        if input.len() < UDP_DECLINE_LEN {
+            return Err(UdpDeclineError::Truncated);
+        }
+        if input.len() != UDP_DECLINE_LEN {
+            return Err(UdpDeclineError::InvalidLength);
+        }
+        Ok(Self { reason: input[4] })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1768,6 +1872,69 @@ mod tests {
         assert_eq!(
             UdpProbeAck::decode(&too_long).unwrap_err(),
             UdpProbeAckError::InvalidLength
+        );
+    }
+
+    #[test]
+    fn udp_request_round_trips_and_rejects_malformed() {
+        let request = UdpRequest {
+            version: UDP_NEGOTIATION_VERSION,
+        };
+        let encoded = request.encode();
+        assert_eq!(encoded.len(), UDP_REQUEST_LEN);
+        assert_eq!(&encoded[..4], UDP_REQUEST_MAGIC);
+        assert!(UdpRequest::has_magic(&encoded));
+        assert!(!UdpRequest::has_magic(MUX_FRAME_MAGIC));
+        assert_eq!(UdpRequest::decode(&encoded).unwrap(), request);
+
+        assert_eq!(
+            UdpRequest::decode(&encoded[..4]).unwrap_err(),
+            UdpRequestError::Truncated
+        );
+        let mut too_long = encoded.clone();
+        too_long.push(0);
+        assert_eq!(
+            UdpRequest::decode(&too_long).unwrap_err(),
+            UdpRequestError::InvalidLength
+        );
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] = b'X';
+        assert_eq!(
+            UdpRequest::decode(&bad_magic).unwrap_err(),
+            UdpRequestError::BadMagic
+        );
+    }
+
+    #[test]
+    fn udp_decline_round_trips_and_rejects_malformed() {
+        for reason in [UDP_DECLINE_DISABLED, UDP_DECLINE_UNSUPPORTED] {
+            let decline = UdpDecline { reason };
+            let encoded = decline.encode();
+            assert_eq!(encoded.len(), UDP_DECLINE_LEN);
+            assert_eq!(&encoded[..4], UDP_DECLINE_MAGIC);
+            assert!(UdpDecline::has_magic(&encoded));
+            assert_eq!(UdpDecline::decode(&encoded).unwrap(), decline);
+        }
+
+        let encoded = UdpDecline {
+            reason: UDP_DECLINE_DISABLED,
+        }
+        .encode();
+        assert_eq!(
+            UdpDecline::decode(&encoded[..4]).unwrap_err(),
+            UdpDeclineError::Truncated
+        );
+        let mut too_long = encoded.clone();
+        too_long.push(0);
+        assert_eq!(
+            UdpDecline::decode(&too_long).unwrap_err(),
+            UdpDeclineError::InvalidLength
+        );
+        let mut bad_magic = encoded;
+        bad_magic[0] = b'X';
+        assert_eq!(
+            UdpDecline::decode(&bad_magic).unwrap_err(),
+            UdpDeclineError::BadMagic
         );
     }
 }
