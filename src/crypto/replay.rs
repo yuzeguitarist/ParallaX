@@ -43,6 +43,22 @@ pub enum ReplayCacheError {
     Clock,
 }
 
+/// Outcome of attempting to record an authenticated handshake in the replay
+/// cache. Lets callers distinguish a genuine replay from operational conditions
+/// (stale timestamp, capacity exhaustion) so the two are not conflated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayInsertOutcome {
+    /// Recorded; this handshake is fresh and unseen (or replay protection is off).
+    Inserted,
+    /// The nonce or transcript fingerprint was already present — a real replay.
+    Replayed,
+    /// The timestamp falls outside the freshness window (stale or future-skewed).
+    Stale,
+    /// The cache is full of still-fresh entries; nothing was evicted (evicting a
+    /// fresh entry would re-open it to replay). A load-shed, not an attack.
+    CacheFull,
+}
+
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct CacheMacKey([u8; 32]);
 
@@ -147,31 +163,49 @@ impl ReplayCache {
     }
 
     pub fn insert_new(&mut self, entry: ReplayEntry, now: u64) -> Result<bool, ReplayCacheError> {
+        Ok(self.insert_new_outcome(entry, now)? == ReplayInsertOutcome::Inserted)
+    }
+
+    /// Like [`insert_new`] but distinguishes WHY an entry was not inserted.
+    ///
+    /// The boolean [`insert_new`] collapses four very different conditions —
+    /// a genuine replay (nonce/transcript seen), a stale/out-of-window
+    /// timestamp, and the cache being full of still-fresh entries — into a
+    /// single `false`. Callers that gate a connection on the result must be able
+    /// to tell a real replay (close, it is an attack/duplicate) from capacity
+    /// exhaustion (a load-shed/operational condition), otherwise once the cache
+    /// fills with fresh entries every legitimate handshake is logged and dropped
+    /// as a "replay".
+    pub fn insert_new_outcome(
+        &mut self,
+        entry: ReplayEntry,
+        now: u64,
+    ) -> Result<ReplayInsertOutcome, ReplayCacheError> {
         if self.capacity == 0 {
-            return Ok(true);
+            return Ok(ReplayInsertOutcome::Inserted);
         }
 
         self.prune_expired(now);
         if !self.is_fresh(entry.timestamp, now) {
-            return Ok(false);
+            return Ok(ReplayInsertOutcome::Stale);
         }
 
         if !self.nonces.insert(entry.nonce) {
-            return Ok(false);
+            return Ok(ReplayInsertOutcome::Replayed);
         }
         if !self.transcripts.insert(entry.transcript_fingerprint) {
             self.nonces.remove(&entry.nonce);
-            return Ok(false);
+            return Ok(ReplayInsertOutcome::Replayed);
         }
         if self.order.len() >= self.capacity {
             self.nonces.remove(&entry.nonce);
             self.transcripts.remove(&entry.transcript_fingerprint);
-            return Ok(false);
+            return Ok(ReplayInsertOutcome::CacheFull);
         }
 
         self.push_loaded_entry(entry);
         self.persist()?;
-        Ok(true)
+        Ok(ReplayInsertOutcome::Inserted)
     }
 
     fn is_fresh(&self, timestamp: u64, now: u64) -> bool {
@@ -727,6 +761,50 @@ mod tests {
                 102,
             )
             .unwrap());
+    }
+
+    #[test]
+    fn insert_outcome_distinguishes_replay_stale_and_capacity_full() {
+        let mut cache = ReplayCache::new(1);
+        let first = ReplayEntry {
+            timestamp: 100,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        // Fresh insert.
+        assert_eq!(
+            cache.insert_new_outcome(first.clone(), 100).unwrap(),
+            ReplayInsertOutcome::Inserted
+        );
+        // Same entry again -> genuine replay (nonce + transcript already seen).
+        assert_eq!(
+            cache.insert_new_outcome(first, 100).unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+        // A distinct fresh entry while the cache is full -> CacheFull, NOT Replayed.
+        // This is the crucial distinction: a full cache must not mislabel every new
+        // session as a replay (which would fail-close all clients).
+        let second = ReplayEntry {
+            timestamp: 100,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(second, 100).unwrap(),
+            ReplayInsertOutcome::CacheFull
+        );
+        // A timestamp far outside the freshness window -> Stale.
+        let stale = ReplayEntry {
+            timestamp: 100,
+            nonce: [5; 8],
+            transcript_fingerprint: [6; 32],
+        };
+        assert_eq!(
+            cache
+                .insert_new_outcome(stale, 100 + DEFAULT_REPLAY_WINDOW_SECS + 10)
+                .unwrap(),
+            ReplayInsertOutcome::Stale
+        );
     }
 
     #[test]

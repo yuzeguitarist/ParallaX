@@ -42,7 +42,9 @@ use crate::{
         identity::{self, IdentityError},
         parallel,
         pq::{self, PqError},
-        replay::{current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry},
+        replay::{
+            current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry, ReplayInsertOutcome,
+        },
         session::{
             derive_server_keys_from_shared, expand_epoch_keys, x25519_public_from_private,
             x25519_shared_secret, AeadCodec, SessionError, SessionKeys, X25519KeyPair,
@@ -498,18 +500,32 @@ struct ServerRuntimeSecrets {
 impl ServerRuntimeSecrets {
     fn decode(config: &ServerConfig) -> Result<Self, ConfigError> {
         let private_key = decode_key32_secret("server.private_key", &config.private_key)?;
-        crate::process_hardening::protect_secret_bytes("runtime.server.private_key", &*private_key);
         let server_public_key = x25519_public_from_private(&private_key);
         let identity_secret_key =
             decode_base64_secret("server.identity_secret_key", &config.identity_secret_key)?;
+
+        // Pin the secrets at their FINAL, stable addresses. private_key is an
+        // inline [u8;32]: protecting it before the Arc::new below would mlock the
+        // stack local, which is then copied into the Arc's heap allocation by the
+        // move — leaving the live key at a new, unpinned, dumpable address. Wrap
+        // first, then protect through the Arc so the lock lands on the bytes that
+        // actually persist. (identity_secret_key is a Vec whose heap buffer is
+        // stable across the move, but we protect it after the wrap too for
+        // consistency.)
+        let private_key = Arc::new(private_key);
+        crate::process_hardening::protect_secret_bytes(
+            "runtime.server.private_key",
+            &**private_key,
+        );
+        let identity_secret_key = Arc::new(identity_secret_key);
         crate::process_hardening::protect_secret_bytes(
             "runtime.server.identity_secret_key",
             identity_secret_key.as_slice(),
         );
         Ok(Self {
-            private_key: Arc::new(private_key),
+            private_key,
             server_public_key,
-            identity_secret_key: Arc::new(identity_secret_key),
+            identity_secret_key,
         })
     }
 
@@ -557,30 +573,44 @@ fn decide_connection_inbound(
     if !parsed.tls13_supported {
         return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
     }
-    if let Some(material) =
-        recover_stateful_auth_material_from_parsed(first_client_record, psk, &parsed)?
-    {
-        let x25519_key_share = material.x25519_public;
-        let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
-        let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
-        let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
+    // v4 masked-stateful path. The carrier masks are keyed by
+    // mask_ecdh = X25519(server_static, tls_ephemeral); the TLS ephemeral is the
+    // unmasked standalone X25519 key_share. A non-ParallaX hello without that
+    // share cannot be a v4 ParallaX client, so fall through to the legacy path
+    // (which ends in Fallback for genuine non-ParallaX traffic). NB: this DH is
+    // distinct from the auth DH below — mask uses the TLS key share, auth uses
+    // the recovered ParallaX ephemeral.
+    if let Some(tls_key_share) = parsed.x25519_key_share {
+        let mask_ecdh =
+            zeroize::Zeroizing::new(x25519_shared_secret(server_private, &tls_key_share));
+        if let Some(material) = recover_stateful_auth_material_from_parsed(
             first_client_record,
-            &auth_key,
-            &material,
+            psk,
+            &mask_ecdh,
             &parsed,
-        ) {
-            Ok(auth) => auth,
-            Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
-            Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
-        };
-        if auth.authenticated {
-            return authenticated_decision(
+        )? {
+            let x25519_key_share = material.x25519_public;
+            let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
+            let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
+            let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
                 first_client_record,
-                auth,
-                authorized_sni,
-                x25519_key_share,
-                x25519_shared_secret,
-            );
+                &auth_key,
+                &material,
+                &parsed,
+            ) {
+                Ok(auth) => auth,
+                Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
+                Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
+            };
+            if auth.authenticated {
+                return authenticated_decision(
+                    first_client_record,
+                    auth,
+                    authorized_sni,
+                    x25519_key_share,
+                    x25519_shared_secret,
+                );
+            }
         }
     }
 
@@ -1087,8 +1117,41 @@ async fn run_authenticated_data_mode(
         "authenticated pre-data mode started; waiting for client PQ rekey"
     );
 
+    // Hard deadline for the whole pre-PQ phase. A client that completes the
+    // camouflage handshake (passing PSK/X25519 auth) must send its PQ rekey
+    // record promptly (legitimately within milliseconds). This deadline is NOT
+    // reset by incoming records: otherwise a malicious authenticated client could
+    // trickle one camouflage record just under the timeout forever — never
+    // sending the PQ rekey — pinning the global connection slot, the per-source
+    // permit, and both fds, and forwarding each record to the fallback origin
+    // unbounded. A fixed, generous deadline bounds the entire phase regardless.
+    let pre_pq_idle_timeout = fallback_idle_timeout();
+    let pre_pq_idle = sleep(pre_pq_idle_timeout);
+    tokio::pin!(pre_pq_idle);
+
     loop {
         tokio::select! {
+            _ = &mut pre_pq_idle => {
+                tracing::debug!(
+                    cid,
+                    "pre-PQ deadline reached before client PQ rekey; tearing down"
+                );
+                // Close both halves with a graceful drain->FIN, not a bare drop.
+                // The pre-PQ phase is still forwarding camouflage records to the
+                // fallback origin, so a stalled-but-trickling client may have
+                // unread RX buffered; dropping the sockets would make close() emit
+                // a RST — exactly the FIN/RST tell the relay-teardown gate forbids.
+                let client_read = client_records.into_inner().into_inner();
+                let fallback_read = fallback_records.into_inner().into_inner();
+                graceful_close_fallback_halves(
+                    &client_read,
+                    &mut client_write,
+                    &fallback_read,
+                    &mut fallback_write,
+                )
+                .await;
+                return Ok(());
+            }
             read = client_records.read_record_into(&mut client_record) => {
                 match read {
                     Ok(()) => {}
@@ -1196,7 +1259,33 @@ async fn run_authenticated_data_mode(
                         // proxied session (one extra fd per authenticated relay,
                         // beyond the 2 the connection limit budgets).
                         drop(fallback_records);
-                        client_records.read_record_into(&mut client_record).await?;
+                        // Bound the wait for the first data-mode record. Without a
+                        // deadline, an authenticated client that completes the PQ
+                        // rekey but never sends a CONNECT/data record pins this
+                        // connection's slot, per-source permit, and both fds
+                        // indefinitely (the post-CONNECT relay watchdog is only
+                        // reached after this read returns).
+                        match timeout(
+                            fallback_idle_timeout(),
+                            client_records.read_record_into(&mut client_record),
+                        )
+                        .await
+                        {
+                            Ok(result) => result?,
+                            Err(_) => {
+                                tracing::debug!(
+                                    cid,
+                                    "no data-mode record before idle backstop; tearing down"
+                                );
+                                // Graceful drain->FIN on the client (the fallback
+                                // halves were already dropped above): avoid a RST
+                                // if the client left unread bytes buffered.
+                                let client_read = client_records.into_inner().into_inner();
+                                drain_read_half_to_block(&client_read);
+                                let _ = client_write.shutdown().await;
+                                return Ok(());
+                            }
+                        }
                         log_record_read(
                             cid,
                             "client->server",
@@ -1534,14 +1623,34 @@ async fn insert_replay_entry_blocking(
     replay_cache: Arc<Mutex<ReplayCache>>,
     entry: ReplayEntry,
 ) -> Result<bool, HandshakeServerError> {
-    Ok(tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || {
         let now = current_unix_timestamp()?;
+        // Recover from a poisoned lock rather than panicking the task: a prior
+        // panic while holding the cache lock must not take down every subsequent
+        // authenticated handshake. The cache invariants are restored on each
+        // insert, so proceeding on the recovered guard is safe.
         replay_cache
             .lock()
-            .expect("replay cache poisoned")
-            .insert_new(entry, now)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert_new_outcome(entry, now)
     })
-    .await??)
+    .await??;
+    Ok(match outcome {
+        ReplayInsertOutcome::Inserted => true,
+        ReplayInsertOutcome::Replayed | ReplayInsertOutcome::Stale => false,
+        ReplayInsertOutcome::CacheFull => {
+            // Capacity exhaustion is an operational load-shed, NOT a replay. We
+            // still close this connection (we cannot prove it is not a replay
+            // without evicting a fresh entry), but we surface it distinctly so it
+            // is not misdiagnosed as an attack and so operators can raise
+            // replay_cache capacity if it recurs.
+            tracing::warn!(
+                "replay cache at capacity with fresh entries; shedding handshake \
+                 (raise replay cache capacity if persistent)"
+            );
+            false
+        }
+    })
 }
 
 async fn commit_pending_replay_entry(
@@ -1673,6 +1782,82 @@ struct ServerMuxContext<'a> {
     cid: u64,
 }
 
+/// Tracks the live substreams of one authenticated mux connection.
+///
+/// `writes` holds the client->target write halves; `readers` holds the abort
+/// handles of the spawned target->client reader tasks. The two are tracked
+/// separately so that:
+///   - admission is gated on the count of *live readers* (a stream is alive as
+///     long as its target->client direction is), not on the write-half count —
+///     otherwise a client could `Fin` each stream (dropping the write half while
+///     the reader/fd lives) to open unboundedly many target sockets past
+///     `max_streams`;
+///   - a `Fin` (client done sending) closes only the write half, preserving the
+///     target's ability to keep streaming back (half-close), while a `Reset` or
+///     a connection teardown aborts the reader task too so no target fd/task is
+///     orphaned.
+struct ServerMuxStreams {
+    writes: HashMap<u32, OwnedWriteHalf>,
+    readers: HashMap<u32, tokio::task::JoinHandle<()>>,
+}
+
+impl ServerMuxStreams {
+    fn new() -> Self {
+        Self {
+            writes: HashMap::new(),
+            readers: HashMap::new(),
+        }
+    }
+
+    /// Drop the handles of readers that have already finished so `live_count`
+    /// reflects only streams still doing work.
+    fn prune_finished(&mut self) {
+        self.readers.retain(|_, h| !h.is_finished());
+    }
+
+    /// Number of substreams still holding a file descriptor (used for the
+    /// `max_streams` admission gate). A stream occupies a slot while EITHER half
+    /// is open: its client->target write half, or its (unfinished) target->client
+    /// reader. Counting the UNION bounds the per-connection fd footprint to
+    /// `max_streams` across half-closes — a client `Fin` drops the write half but
+    /// the reader lives (the target may still stream back), and a target EOF
+    /// finishes the reader but the write half lives until the client `Fin`s.
+    /// Gating on either side alone lets the other accumulate unbounded.
+    fn live_count(&mut self) -> usize {
+        self.prune_finished();
+        let readers_without_write = self
+            .readers
+            .keys()
+            .filter(|id| !self.writes.contains_key(id))
+            .count();
+        self.writes.len() + readers_without_write
+    }
+
+    /// Tear down every substream: abort all reader tasks (closing the target
+    /// read fds) and shut down every client->target write half.
+    async fn teardown(&mut self) {
+        for (_, handle) in self.readers.drain() {
+            handle.abort();
+        }
+        let writes = std::mem::take(&mut self.writes);
+        for (_, mut write) in writes {
+            let _ = write.shutdown().await;
+        }
+    }
+}
+
+impl Drop for ServerMuxStreams {
+    /// Backstop against orphaned target readers: a `JoinHandle` dropped without
+    /// `abort()` leaves its task (and the target fd it holds) running. Aborting
+    /// on drop guarantees that any return path out of the reader loop — including
+    /// `?` error propagation — reclaims every spawned reader.
+    fn drop(&mut self) {
+        for (_, handle) in self.readers.drain() {
+            handle.abort();
+        }
+    }
+}
+
 /// Shared last-activity clock for an authenticated relay, reset on every byte
 /// moved in either direction.
 type RelayActivity = Arc<Mutex<Instant>>;
@@ -1789,7 +1974,7 @@ async fn server_mux_client_reader_loop(
     context: ServerMuxContext<'_>,
     payload_pool: MuxPayloadPool,
 ) -> Result<(), HandshakeServerError> {
-    let mut target_writes = HashMap::<u32, OwnedWriteHalf>::new();
+    let mut streams = ServerMuxStreams::new();
     for frame in first_frames {
         process_server_mux_frame(
             MuxFrameRef {
@@ -1797,7 +1982,7 @@ async fn server_mux_client_reader_loop(
                 kind: frame.kind,
                 payload: &frame.payload,
             },
-            &mut target_writes,
+            &mut streams,
             &frame_tx,
             context,
             &payload_pool,
@@ -1810,20 +1995,41 @@ async fn server_mux_client_reader_loop(
     let mut batch_records = Vec::new();
     let mut batch_plaintext = Vec::new();
     let mut deferred_read_error: Option<io::Error> = None;
+    // Idle backstop for the whole mux session. Without it, a client that goes
+    // silent (while its target readers also idle out) would leave this loop
+    // blocked on read forever, holding the connection slot, permits, and every
+    // target fd. A real record resets the clock implicitly (the read returns).
+    let mux_idle_timeout = fallback_idle_timeout();
     loop {
         let read_result = match deferred_read_error.take() {
             Some(err) => Err(err),
-            None => client_records.read_record_into(&mut client_record).await,
+            None => match timeout(
+                mux_idle_timeout,
+                client_records.read_record_into(&mut client_record),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::debug!(
+                        cid = context.cid,
+                        "mux client idle backstop reached; tearing down session"
+                    );
+                    streams.teardown().await;
+                    return Ok(());
+                }
+            },
         };
         match read_result {
             Ok(()) => {}
             Err(err) if is_clean_close(&err) => {
-                for (_, mut target_write) in target_writes {
-                    let _ = target_write.shutdown().await;
-                }
+                streams.teardown().await;
                 return Ok(());
             }
-            Err(err) => return Err(HandshakeServerError::Io(err)),
+            Err(err) => {
+                streams.teardown().await;
+                return Err(HandshakeServerError::Io(err));
+            }
         };
         log_record_read(
             context.cid,
@@ -1886,7 +2092,7 @@ async fn server_mux_client_reader_loop(
         let mut frames = frames_payload;
         while !frames.is_empty() {
             let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-            process_server_mux_frame(frame, &mut target_writes, &frame_tx, context, &payload_pool)
+            process_server_mux_frame(frame, &mut streams, &frame_tx, context, &payload_pool)
                 .await?;
             frames = &frames[used..];
         }
@@ -1895,22 +2101,30 @@ async fn server_mux_client_reader_loop(
 
 async fn process_server_mux_frame(
     frame: MuxFrameRef<'_>,
-    target_writes: &mut HashMap<u32, OwnedWriteHalf>,
+    streams: &mut ServerMuxStreams,
     frame_tx: &mpsc::Sender<MuxFrame>,
     context: ServerMuxContext<'_>,
     payload_pool: &MuxPayloadPool,
 ) -> Result<(), HandshakeServerError> {
     match frame.kind {
         MuxFrameKind::Open => {
-            if target_writes.contains_key(&frame.stream_id) {
+            // Drop handles of readers that have already finished so a stream_id
+            // whose reader just exited (target EOF / idle) is not treated as a
+            // live duplicate below.
+            streams.prune_finished();
+            if streams.writes.contains_key(&frame.stream_id)
+                || streams.readers.contains_key(&frame.stream_id)
+            {
                 send_server_mux_frame(frame_tx, frame.stream_id, MuxFrameKind::Reset, Vec::new())
                     .await?;
                 return Ok(());
             }
-            if target_writes.len() >= context.max_streams {
+            if streams.live_count() >= context.max_streams {
                 // Per-connection substream ceiling reached: refuse the new stream
                 // and do not open an outbound connection. The client maps Reset
-                // to a ConnectionReset on that stream.
+                // to a ConnectionReset on that stream. Gating on live readers (not
+                // write halves) prevents a Fin-then-Open loop from opening more
+                // than `max_streams` concurrent target sockets.
                 tracing::debug!(
                     cid = context.cid,
                     stream_id = frame.stream_id,
@@ -1936,11 +2150,11 @@ async fn process_server_mux_frame(
                 initial_payload.zeroize();
             }
             let (target_read, target_write) = target.into_split();
-            target_writes.insert(frame.stream_id, target_write);
+            streams.writes.insert(frame.stream_id, target_write);
             let stream_id = frame.stream_id;
             let target_frame_tx = frame_tx.clone();
             let target_pool = payload_pool.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 if let Err(err) = server_mux_target_reader_loop(
                     target_read,
                     target_frame_tx,
@@ -1960,22 +2174,31 @@ async fn process_server_mux_frame(
                     );
                 }
             });
+            streams.readers.insert(frame.stream_id, handle);
         }
         MuxFrameKind::Data => {
-            if let Some(target_write) = target_writes.get_mut(&frame.stream_id) {
+            if let Some(target_write) = streams.writes.get_mut(&frame.stream_id) {
                 if !frame.payload.is_empty() {
                     target_write.write_all(frame.payload).await?;
                 }
             }
         }
         MuxFrameKind::Fin => {
-            if let Some(mut target_write) = target_writes.remove(&frame.stream_id) {
+            // Client is done sending on this stream: close only the write half so
+            // the target can keep streaming back (half-close). The reader task is
+            // left running and will exit on target EOF or its own idle backstop.
+            if let Some(mut target_write) = streams.writes.remove(&frame.stream_id) {
                 let _ = target_write.shutdown().await;
             }
         }
         MuxFrameKind::Reset => {
-            if let Some(mut target_write) = target_writes.remove(&frame.stream_id) {
+            // Full stream teardown: close the write half AND abort the reader so
+            // the target read fd/task is reclaimed immediately.
+            if let Some(mut target_write) = streams.writes.remove(&frame.stream_id) {
                 let _ = target_write.shutdown().await;
+            }
+            if let Some(handle) = streams.readers.remove(&frame.stream_id) {
+                handle.abort();
             }
         }
         MuxFrameKind::Cover => {}
@@ -2000,9 +2223,22 @@ async fn server_mux_target_reader_loop(
     }
     let mut target_buf = vec![0_u8; relay_read_buffer_len(max_payload_len)];
     let mut rng = StdRng::from_entropy();
+    // Per-read idle backstop: a target that connects then stays silent (after the
+    // client Fin'd its write half, or an attacker-controlled target deliberately
+    // holding the socket) must not pin this reader — and therefore its frame_tx
+    // clone and target fd — forever. On idle, send Fin and exit so the slot is
+    // reclaimed and the writer can drain.
+    let read_idle_timeout = fallback_idle_timeout();
 
     loop {
-        let n = target_read.read(&mut target_buf).await?;
+        let n = match timeout(read_idle_timeout, target_read.read(&mut target_buf)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::debug!(cid, stream_id, "mux target reader idle backstop reached");
+                send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
+                return Ok(());
+            }
+        };
         if n == 0 {
             send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
             return Ok(());
@@ -3016,10 +3252,21 @@ mod tests {
         let parsed = parse_client_hello(&record).unwrap();
         let mut rng = StdRng::seed_from_u64(3);
         let tail = build_auth_tail_at(1_700_000_001, &mut rng);
-        let encoded_random =
-            build_masked_stateful_client_random(PSK, "example.com", &client.public, &tail).unwrap();
+        // The fixture's standalone X25519 key_share is [0x44; 32]; the server
+        // derives mask_ecdh = X25519(server.private, [0x44;32]), so build the
+        // masks with the same value.
+        let mask_ecdh = x25519_shared_secret(&server.private, &[0x44_u8; 32]);
+        let encoded_random = build_masked_stateful_client_random(
+            PSK,
+            &mask_ecdh,
+            "example.com",
+            &client.public,
+            &tail,
+        )
+        .unwrap();
         let session_id = build_masked_stateful_auth_session_id(
             PSK,
+            &mask_ecdh,
             &auth_key,
             "example.com",
             &client.public,
@@ -3062,10 +3309,18 @@ mod tests {
         let parsed = parse_client_hello(&record).unwrap();
         let mut rng = StdRng::seed_from_u64(3);
         let tail = build_auth_tail_at(1_700_000_001, &mut rng);
-        let encoded_random =
-            build_masked_stateful_client_random(PSK, "example.com", &client.public, &tail).unwrap();
+        let mask_ecdh = x25519_shared_secret(&server.private, &[0x44_u8; 32]);
+        let encoded_random = build_masked_stateful_client_random(
+            PSK,
+            &mask_ecdh,
+            "example.com",
+            &client.public,
+            &tail,
+        )
+        .unwrap();
         let session_id = build_masked_stateful_auth_session_id(
             PSK,
+            &mask_ecdh,
             &auth_key,
             "example.com",
             &client.public,
@@ -3089,6 +3344,83 @@ mod tests {
         assert_eq!(
             decision,
             InboundDecision::Fallback(FallbackReason::AuthFailed)
+        );
+    }
+
+    #[test]
+    fn v4_real_start_authenticates_against_decide_inbound() {
+        // End-to-end agreement across the REAL client start() and the REAL server
+        // decide path: proves the client mask_key = X25519(tls.private, server.pub)
+        // equals the server mask_key = X25519(server.private, tls.pub), so the v4
+        // carrier masks round-trip.
+        let server = X25519KeyPair::generate();
+        let session = crate::tls::safari26::Safari26TlsCamouflage
+            .start("example.com".to_owned(), PSK, &server.public)
+            .unwrap();
+        let record = session.client_hello_bytes().to_vec();
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+        assert!(
+            matches!(decision, InboundDecision::Authenticated(_)),
+            "a real v4 client must authenticate, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn v4_mask_ecdh_mismatch_falls_back_not_authenticated() {
+        // Simulates a version/peer mismatch (e.g. v3 client ↔ v4 server): masks
+        // built with a mask_ecdh the server will not derive yield garbage material
+        // → tag mismatch → Fallback, never Authenticated (fail-closed).
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let mut record = client_hello_fixture_with_random_and_key_share(
+            "example.com",
+            &client.public,
+            &[0x44_u8; 32],
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let mut rng = StdRng::seed_from_u64(3);
+        let tail = build_auth_tail_at(1_700_000_001, &mut rng);
+        // != X25519(server.private, [0x44;32]) that decide_inbound will derive.
+        let wrong_mask_ecdh = [0x99_u8; 32];
+        let encoded_random = build_masked_stateful_client_random(
+            PSK,
+            &wrong_mask_ecdh,
+            "example.com",
+            &client.public,
+            &tail,
+        )
+        .unwrap();
+        let session_id = build_masked_stateful_auth_session_id(
+            PSK,
+            &wrong_mask_ecdh,
+            &auth_key,
+            "example.com",
+            &client.public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        record[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        record[parsed.session_id_range].copy_from_slice(&session_id);
+
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+        assert!(
+            matches!(decision, InboundDecision::Fallback(_)),
+            "mask_ecdh mismatch must fall back, got {decision:?}"
         );
     }
 
@@ -3345,7 +3677,7 @@ mod tests {
         let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
         let payload_pool =
             MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
-        let mut target_writes = HashMap::new();
+        let mut streams = ServerMuxStreams::new();
 
         process_server_mux_frame(
             MuxFrameRef {
@@ -3353,7 +3685,7 @@ mod tests {
                 kind: MuxFrameKind::Open,
                 payload: &[],
             },
-            &mut target_writes,
+            &mut streams,
             &frame_tx,
             context,
             &payload_pool,
@@ -3362,7 +3694,8 @@ mod tests {
         .unwrap();
 
         // No outbound connection was established for the over-cap stream.
-        assert!(target_writes.is_empty());
+        assert!(streams.writes.is_empty());
+        assert!(streams.readers.is_empty());
         // The client receives a Reset for that stream id.
         let reset = frame_rx.try_recv().unwrap();
         assert_eq!(reset.stream_id, 7);

@@ -51,6 +51,12 @@ pub enum ConfigError {
     InvalidDelayRange,
     #[error("traffic.cover_max_interval_ms must be >= traffic.cover_min_interval_ms")]
     InvalidCoverIntervalRange,
+    #[error(
+        "traffic cover traffic requires a non-degenerate padding range \
+         (max_padding > min_padding) so cover records vary in size; otherwise \
+         every cover record is an identical-length beacon"
+    )]
+    CoverRequiresVariablePadding,
     #[error("traffic.max_concurrent_streams must be at least 1")]
     InvalidMaxConcurrentStreams,
     #[error(
@@ -224,11 +230,14 @@ impl Default for TrafficConfig {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let raw = Zeroizing::new(fs::read_to_string(path)?);
+        // Read the secret config through a single opened fd whose permissions are
+        // verified on the fd itself (fstat), before parsing. This closes the
+        // symlink / TOCTOU window that exists when a path-based permission check
+        // and a separate path-based read can resolve to different inodes.
+        let raw = read_secret_config_file(path)?;
         let mut cfg = toml::from_str::<Self>(raw.as_str())?;
         cfg.resolve_paths_relative_to(path);
         cfg.validate()?;
-        cfg.validate_file_permissions(path)?;
         Ok(cfg)
     }
 
@@ -259,14 +268,14 @@ impl Config {
         let psk = decode_psk(&self.crypto.psk)?;
         if psk_looks_low_entropy(&psk) {
             // Not fatal (and the auto-generated PSK is always random), but warn:
-            // the stateful ClientHello masks are HMAC-keyed by the raw PSK over
-            // observable inputs, so a low-entropy / human-chosen PSK is open to an
-            // offline single-capture guessing oracle. Only a CSPRNG-generated key
-            // resists it.
+            // the PSK is one of the two secrets the whole auth scheme rests on
+            // (it salts the carrier-mask and auth-key HKDFs and keys replay/AEAD
+            // derivation). The v4 masks are no longer a raw-PSK offline oracle,
+            // but a low-entropy / human-chosen PSK still weakens auth against an
+            // attacker who can guess it. Only a CSPRNG-generated key is safe.
             tracing::warn!(
                 "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
-                 (e.g. `plx init` / `openssl rand -base64 32`) — low-entropy PSKs are open to \
-                 an offline guessing oracle"
+                 (e.g. `plx init` / `openssl rand -base64 32`)"
             );
         }
         self.traffic.validate()?;
@@ -378,17 +387,25 @@ impl Config {
             .unwrap_or_else(|| Path::new("."));
         server.replay_cache_path = config_dir.join(&server.replay_cache_path);
     }
-
-    fn validate_file_permissions(&self, path: &Path) -> Result<(), ConfigError> {
-        validate_secret_config_file_permissions(path)
-    }
 }
 
 #[cfg(unix)]
-fn validate_secret_config_file_permissions(path: &Path) -> Result<(), ConfigError> {
-    use std::os::unix::fs::MetadataExt;
+fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let metadata = fs::metadata(path)?;
+    // O_NOFOLLOW: refuse to open the config if its final path component is a
+    // symlink (a classic way to aim a privileged reader at another file). It
+    // guards only the last component, but together with the fd-based permission
+    // check below it removes the path-vs-read race.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+
+    // fstat the OPEN fd, not the path, so the inode whose permissions we approve
+    // is exactly the inode we then read — no TOCTOU between check and read.
+    let metadata = file.metadata()?;
     let mode = metadata.mode() & 0o777;
     let uid = metadata.uid();
     let euid = unsafe { libc::geteuid() };
@@ -400,12 +417,15 @@ fn validate_secret_config_file_permissions(path: &Path) -> Result<(), ConfigErro
             euid,
         });
     }
-    Ok(())
+
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    Ok(Zeroizing::new(raw))
 }
 
 #[cfg(not(unix))]
-fn validate_secret_config_file_permissions(_path: &Path) -> Result<(), ConfigError> {
-    Ok(())
+fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
+    Ok(Zeroizing::new(fs::read_to_string(path)?))
 }
 
 impl TrafficConfig {
@@ -423,6 +443,16 @@ impl TrafficConfig {
         }
         if self.cover_max_interval_ms < self.cover_min_interval_ms {
             return Err(ConfigError::InvalidCoverIntervalRange);
+        }
+        // If cover traffic is enabled it seals empty payloads whose record size
+        // is driven entirely by the padding sampler. With a degenerate padding
+        // range (max_padding == min_padding, e.g. padding disabled) every cover
+        // record is an identical-length record emitted at quasi-periodic
+        // intervals — a constant-size beacon a censor can fingerprint, which is
+        // worse than sending no cover at all. Require variable padding so cover
+        // record sizes are randomized.
+        if self.cover_max_interval_ms > 0 && self.max_padding <= self.min_padding {
+            return Err(ConfigError::CoverRequiresVariablePadding);
         }
         if self.max_concurrent_streams == 0 {
             return Err(ConfigError::InvalidMaxConcurrentStreams);
@@ -847,6 +877,34 @@ server_identity_public_key = "{KEY}"
             traffic.validate().unwrap_err(),
             ConfigError::InvalidCoverIntervalRange
         ));
+    }
+
+    #[test]
+    fn rejects_cover_traffic_with_degenerate_padding() {
+        // Cover traffic enabled but padding is degenerate (max == min == 0):
+        // every cover record would be an identical-length beacon. Validation must
+        // reject this combination.
+        let traffic = TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 200,
+            min_padding: 0,
+            max_padding: 0,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            traffic.validate().unwrap_err(),
+            ConfigError::CoverRequiresVariablePadding
+        ));
+
+        // The same cover config with a non-degenerate padding range is accepted.
+        let ok = TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 200,
+            min_padding: 0,
+            max_padding: 256,
+            ..TrafficConfig::default()
+        };
+        ok.validate().unwrap();
     }
 
     #[cfg(unix)]
