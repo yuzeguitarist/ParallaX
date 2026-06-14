@@ -33,10 +33,13 @@ concurrency:
 
 jobs:
   security-review:
-    # Skip draft PRs and bot-authored PRs (e.g. Claude's own / dependabot).
+    # Skip draft PRs, bot-authored PRs, and PRs from untrusted authors. The
+    # author_association check matters only if the repo becomes public (on a
+    # private repo every author is already a collaborator).
     if: >-
       github.event.pull_request.draft == false &&
-      github.event.pull_request.user.type != 'Bot'
+      github.event.pull_request.user.type != 'Bot' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
