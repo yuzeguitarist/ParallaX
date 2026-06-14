@@ -78,12 +78,14 @@ jobs:
             Then:
             - If a safe fix exists, apply the minimal change (`cargo update -p
               <crate>`, or a bounded version bump in Cargo.toml if required),
-              verify with `cargo check --locked`, and open ONE PR from a
-              `claude/dep-audit-${{ github.run_id }}` branch via `gh pr create`,
-              summarizing each advisory and the fix.
-            - If there is no safe upgrade (or the risk is not reachable), open or
-              update an issue summarizing the advisory, real-world impact, and
-              options. Keep changes minimal; NEVER commit to main directly.
+              verify with `cargo check --locked`, push to a STABLE branch named
+              `claude/dep-audit`, and create a PR with `gh pr create` ONLY if
+              `gh pr list --head claude/dep-audit --state open` shows none —
+              otherwise your push already updated the existing PR (this is what
+              stops the daily run from piling up duplicate PRs).
+            - If there is no safe upgrade (or the risk is not reachable on current
+              main), open or update a SINGLE tracking issue — never a duplicate.
+              Keep changes minimal; NEVER commit to main directly.
           claude_args: |
             --model claude-opus-4-8
             --max-turns 40

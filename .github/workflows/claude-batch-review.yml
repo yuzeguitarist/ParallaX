@@ -116,11 +116,14 @@ jobs:
               unbounded buffers.
 
             If — and only if — you find REAL, high-confidence issues:
-              1. Fix them with surgical changes (follow CLAUDE.md / AGENTS.md).
-              2. Create a new branch `claude/batch-review-${{ github.run_id }}`,
+              1. Check `gh pr list --state open` first; skip any finding already
+                 covered by an open Claude PR so you don't duplicate it. Also skip
+                 anything already fixed in current main.
+              2. Fix them with surgical changes (follow CLAUDE.md / AGENTS.md).
+              3. Create a new branch `claude/batch-review-${{ github.run_id }}`,
                  commit, push, and open ONE pull request targeting main via
                  `gh pr create`, with a body that lists each finding and its fix.
-              3. Optionally run `cargo check --locked` to sanity-check; CI will do
+              4. Optionally run `cargo check --locked` to sanity-check; CI will do
                  the full validation.
             If you find nothing actionable, do NOT open a PR — just print a short
             summary line. NEVER commit to main directly.

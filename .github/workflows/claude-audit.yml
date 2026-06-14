@@ -86,8 +86,11 @@ jobs:
                  recommended fixes. Add label "security" if it exists.
               2. For high-confidence, LOW-RISK fixes only, open individual PRs from
                  `claude/audit-<short-description>` branches via `gh pr create`,
-                 each linking back to the audit issue. Leave risky or ambiguous
-                 items as issue findings for human decision.
+                 each linking back to the audit issue. Before opening any fix PR,
+                 run `gh pr list --state open` and skip anything already covered by
+                 an open Claude PR (e.g. from batch review) or already fixed on
+                 current main. Leave risky or ambiguous items as issue findings for
+                 human decision.
             Make surgical changes (follow CLAUDE.md / AGENTS.md). NEVER commit to
             main directly.
           claude_args: |
