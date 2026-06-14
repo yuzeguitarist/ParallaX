@@ -1226,6 +1226,16 @@ struct ClientRelay {
 /// waits on. Sized to match the server's accept timeout family.
 const QUIC_RELAY_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Generous backstop on the teardown DONE read. The read is PRIMARILY bounded on
+/// connection liveness (`conn.closed()`), but the 15s keep-alive masks the ~60s
+/// idle timeout for a peer that is alive-but-stuck (e.g. a target that responds
+/// then stops reading the request body, blocking the server's upload drain
+/// forever). Without a backstop the completed side would park in the DONE
+/// handshake indefinitely, pinning the QUIC connection + endpoint + TCP control
+/// connection. This bound resets such a stuck teardown; it is deliberately large
+/// so a legitimately slow-but-progressing drain is not cut.
+const QUIC_RELAY_DONE_BACKSTOP: Duration = Duration::from_secs(120);
+
 impl ClientRelay {
     async fn run(self) -> Result<(), ClientRuntimeError> {
         let ClientRelay {
@@ -1419,22 +1429,31 @@ async fn client_exchange_quic_done(
     // require the server's explicit DONE record.
     let mut reader = TlsRecordReader::new(server_read);
     let mut record = Vec::new();
-    tokio::select! {
-        // `biased`: always poll the DONE read FIRST. The peer sends its DONE over
-        // the reliable TCP control stream and then closes the QUIC connection, so
-        // both arms can become ready together; without bias the `select!` could
-        // pick `conn.closed()` and wrongly report a fully successful relay as a
-        // failure. Polling the read first delivers an already-arrived DONE; only a
-        // genuinely-absent DONE (peer vanished) falls through to `conn.closed()`.
-        biased;
-        res = reader.read_record_into(&mut record) => {
-            res.map_err(ClientRuntimeError::Io)?;
-        }
-        _ = conn.closed() => {
-            tracing::warn!(cid, "QUIC connection closed before peer DONE");
-            return Err(ClientRuntimeError::Io(io::Error::new(
+    // PRIMARY bound: connection liveness (`conn.closed()`), so a slow-but-alive
+    // drain is never cut. BACKSTOP: a generous wall-clock timeout, because the 15s
+    // keep-alive masks the idle timeout for an alive-but-stuck peer -- without it a
+    // completed side would park here forever pinning the connection.
+    let read_done = async {
+        tokio::select! {
+            // `biased`: poll the DONE read FIRST so an already-arrived peer DONE
+            // (sent over TCP before the peer closes QUIC) wins over a concurrently-
+            // ready `conn.closed()`; otherwise a fully successful relay could be
+            // reported as a failure.
+            biased;
+            res = reader.read_record_into(&mut record) => res.map_err(ClientRuntimeError::Io),
+            _ = conn.closed() => Err(ClientRuntimeError::Io(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "QUIC connection closed before peer DONE",
+            ))),
+        }
+    };
+    match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, read_done).await {
+        Ok(res) => res?,
+        Err(_) => {
+            tracing::warn!(cid, "QUIC fast-plane teardown DONE backstop elapsed");
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC fast-plane teardown DONE backstop elapsed",
             )));
         }
     }

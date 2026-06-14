@@ -1791,6 +1791,12 @@ fn drop_retained_quic(retained: Option<(quinn::Endpoint, quinn::Connection)>) {
 /// rather than silently splitting the two directions across TCP and QUIC.
 const QUIC_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Generous backstop on the teardown DONE read (see the client-side twin). The
+/// read is primarily bounded on connection liveness, but the 15s keep-alive masks
+/// the idle timeout for an alive-but-stuck peer, so without a backstop a completed
+/// side could park in the DONE handshake indefinitely, pinning the connection.
+const QUIC_RELAY_DONE_BACKSTOP: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Copy)]
 struct ServerMuxContext<'a> {
     fixed_data_target: Option<&'a str>,
@@ -2000,20 +2006,28 @@ async fn server_exchange_quic_done(
     // yielding a clean Err. EOF on the TCP read is likewise NOT a clean close: we
     // require the client's explicit DONE record.
     let mut record = Vec::new();
-    tokio::select! {
-        // `biased`: poll the DONE read FIRST so an already-arrived peer DONE wins
-        // over a concurrently-ready `conn.closed()` (the client sends its DONE over
-        // TCP then closes the QUIC connection); only a genuinely-absent DONE falls
-        // through to `conn.closed()`.
-        biased;
-        res = client_records.read_record_into(&mut record) => {
-            res.map_err(HandshakeServerError::Io)?;
-        }
-        _ = conn.closed() => {
-            tracing::warn!(cid, "QUIC connection closed before peer DONE");
-            return Err(HandshakeServerError::Io(io::Error::new(
+    // PRIMARY bound: connection liveness; BACKSTOP: generous wall-clock timeout
+    // (the keep-alive masks the idle timeout for an alive-but-stuck peer).
+    let read_done = async {
+        tokio::select! {
+            // `biased`: poll the DONE read FIRST so an already-arrived peer DONE wins
+            // over a concurrently-ready `conn.closed()` (the client sends its DONE
+            // over TCP then closes the QUIC connection).
+            biased;
+            res = client_records.read_record_into(&mut record) => res.map_err(HandshakeServerError::Io),
+            _ = conn.closed() => Err(HandshakeServerError::Io(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "QUIC connection closed before peer DONE",
+            ))),
+        }
+    };
+    match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, read_done).await {
+        Ok(res) => res?,
+        Err(_) => {
+            tracing::warn!(cid, "QUIC fast-plane teardown DONE backstop elapsed");
+            return Err(HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC fast-plane teardown DONE backstop elapsed",
             )));
         }
     }
