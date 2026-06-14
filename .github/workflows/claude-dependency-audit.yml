@@ -44,17 +44,16 @@ jobs:
         name: cargo audit
         run: |
           set -uo pipefail
-          cargo audit --json > audit.json 2>/dev/null || true
-          cargo audit > cargo-audit.txt 2>&1 || true
+          # cargo audit exits non-zero when VULNERABILITIES are found (plain
+          # warnings like unmaintained/yanked do not), which is exactly the
+          # high-signal trigger we want for invoking Claude.
+          if cargo audit > cargo-audit.txt 2>&1; then
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          fi
           echo '----- cargo audit report -----'
           cat cargo-audit.txt || true
-          VULNS="$(jq -r '.vulnerabilities.count // 0' audit.json 2>/dev/null || echo 0)"
-          echo "Vulnerability count: ${VULNS}"
-          if [ "${VULNS}" -gt 0 ]; then
-            echo "has_findings=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_findings=false" >> "$GITHUB_OUTPUT"
-          fi
 
       # Only when a real vulnerability exists. No github_token → Claude GitHub App
       # token, so its PR/issue triggers CI and is attributed to claude[bot].
@@ -67,7 +66,7 @@ jobs:
           prompt: |
             `cargo audit` found one or more dependency vulnerabilities in ParallaX
             (a Rust censorship-resistance proxy). Read the report in
-            `cargo-audit.txt` (and `audit.json` for structured detail).
+            `cargo-audit.txt`.
 
             For each advisory:
             - Assess the REAL impact on this project (is the vulnerable code path
