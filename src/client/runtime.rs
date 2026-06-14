@@ -652,6 +652,11 @@ async fn handle_local_connection_with_cid(
             .await
         })
     };
+    // Abort handle for the speculative/warm session task: if the local SOCKS
+    // request errors out below, we must ABORT the spawned task (not just drop its
+    // JoinHandle, which detaches it and lets it run a full handshake + QUIC connect
+    // to completion, transiently holding a retained QUIC connection when udp is on).
+    let session_abort = server_session_task.abort_handle();
     let request = match socks::accept_connect(&mut local).await {
         Ok(request) => request,
         Err(err) => {
@@ -674,7 +679,16 @@ async fn handle_local_connection_with_cid(
             .map_err(ClientRuntimeError::BlockingTask)?
     };
     let (initial_payload, (mut server, mut data_session, retained_quic)) =
-        tokio::try_join!(initial_payload_fut, server_session_fut)?;
+        match tokio::try_join!(initial_payload_fut, server_session_fut) {
+            Ok(joined) => joined,
+            Err(err) => {
+                // The local initial-payload read failed (or the session task did):
+                // abort the speculative session task so it does not run a full
+                // handshake + QUIC connect to completion behind our back.
+                session_abort.abort();
+                return Err(err);
+            }
+        };
     let connect_request = ConnectRequest {
         host: request.host,
         port: request.port,
