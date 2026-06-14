@@ -8,18 +8,25 @@ use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf};
 
 use crate::tls::record::{BufferedTlsRecordReader, TlsRecordReader};
 
-/// A source of in-order AEAD records. Semantics MUST match
-/// `BufferedTlsRecordReader::read_record_into` (it APPENDS one record's bytes
-/// to `buf`; callers clear() between reads as they already do today).
+/// A source of in-order AEAD records. Each read yields exactly one record.
 pub(crate) trait LegReader: Send {
+    /// Reads exactly one record, REPLACING the contents of `buf`: the
+    /// implementation clears `buf` and then fills it with the record's bytes, so
+    /// callers may reuse the same buffer across reads without clearing it
+    /// themselves (the mux batch-drain loops rely on this — they reuse one
+    /// scratch buffer per read). Semantics MUST match
+    /// `BufferedTlsRecordReader::read_record_into` (clear + swap). A future
+    /// non-TCP `LegReader` MUST also replace, not append, or the batch-drain
+    /// loops would accumulate stale bytes and desync the record stream.
     fn read_record_into(
         &mut self,
         buf: &mut Vec<u8>,
     ) -> impl Future<Output = io::Result<()>> + Send;
 
     /// Reads the next complete record using only data that is already available
-    /// (buffered or immediately readable), without waiting. Returns `None` when
-    /// a full record is not yet available; any partial reader state is
+    /// (buffered or immediately readable), without waiting. On success it
+    /// REPLACES `buf` exactly like [`Self::read_record_into`]. Returns `None`
+    /// when a full record is not yet available; any partial reader state is
     /// preserved so a subsequent read resumes exactly where this left off.
     /// Semantics MUST match `BufferedTlsRecordReader::try_read_record_into`.
     ///
