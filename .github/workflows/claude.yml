@@ -70,11 +70,17 @@ jobs:
         run: |
           set -uo pipefail
           s="not a pull request"
-          if [ -n "${PR:-}" ] && gh pr view "$PR" --json number >/dev/null 2>&1; then
-            if s="$(gh pr view "$PR" --json statusCheckRollup --jq '[.statusCheckRollup[]? | "\(.name // .context)=\(.conclusion // .state // "PENDING")"] | join(", ")')"; then
-              [ -z "$s" ] && s="no checks reported yet"
-            else
-              s="unavailable (could not read checks)"
+          if [ -n "${PR:-}" ]; then
+            sha="$(gh pr view "$PR" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+            if [ -n "$sha" ]; then
+              # Use REST check-runs: it works with GITHUB_TOKEN + checks:read.
+              # (GraphQL statusCheckRollup does NOT — it traverses
+              # checkSuite.workflowRun, which the integration token cannot access.)
+              if s="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" --jq '[.check_runs[]? | "\(.name)=\(.conclusion // .status)"] | join(", ")')"; then
+                [ -z "$s" ] && s="no checks reported yet"
+              else
+                s="unavailable (could not read checks)"
+              fi
             fi
           fi
           echo "Injecting CI summary: ${s}"
