@@ -35,9 +35,12 @@ permissions:
   pull-requests: write
   id-token: write          # required: the v1 action mints the App token via GitHub OIDC
 
-# One run per issue/PR thread; a newer @claude supersedes an in-flight one.
+# One run per issue/PR thread PER ACTOR. Including github.actor keeps Claude's
+# own progress comment (an issue_comment by claude[bot]) in a different group so
+# it cannot cancel the user's running job; two rapid @claude comments from the
+# same user still supersede.
 concurrency:
-  group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+  group: claude-${{ github.event.issue.number || github.event.pull_request.number }}-${{ github.actor }}
   cancel-in-progress: true
 
 jobs:
