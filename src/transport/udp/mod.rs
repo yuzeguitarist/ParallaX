@@ -12,6 +12,7 @@
 //! unifies this with the TCP carrier is extracted once both legs exist.
 
 pub mod auth;
+pub mod endpoint;
 pub mod probe;
 
 use std::sync::Arc;
@@ -30,6 +31,8 @@ pub const UDP_ALPN: &[u8] = b"h3";
 pub enum UdpTransportError {
     #[error("QUIC TLS configuration failed: {0}")]
     TlsConfig(String),
+    #[error("UDP endpoint I/O failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Build a quinn server config from a DER certificate leaf + private key.

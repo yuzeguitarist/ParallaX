@@ -30,6 +30,7 @@ pqcrypto-traits = "0.3"
 # default, so every rustls config here MUST use builder_with_provider(aws_lc_rs).
 # rustls is pinned (=0.23.40) to stay in lockstep with quinn-proto's Quic*Config.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
+rcgen = "0.13"
 rustls = { version = "=0.23.40", features = ["std", "aws_lc_rs"] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1"
@@ -47,8 +48,6 @@ zeroize = { version = "1.7", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
-# Self-signed certificates for QUIC fast-plane loopback tests.
-rcgen = "0.13"
 # Crypto used exclusively by the GFW simulator (tests/gfw_sim/):
 # - aes: RFC 9001 QUIC Initial header protection
 # - cipher: shared trait crate
