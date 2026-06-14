@@ -1,0 +1,141 @@
+name: claude-batch-review
+
+# BATCH security + bug review, paced by development velocity: every time main
+# accumulates >= 25 new commits since the last review, Claude reviews that diff
+# and, if it finds real issues, opens a fix PR (never touches main directly).
+#
+# A daily cron runs a CHEAP gate: it counts commits since the `claude/last-batch-
+# review` tag and exits in seconds when < 25, so the only recurring cost is a
+# few seconds/day. The expensive Opus review runs only once per 25-commit batch.
+#
+# The marker tag is created/advanced via the GitHub API (`gh api`) using the
+# default token, so it never interferes with the Claude action's own app-token
+# git auth (which is what makes the fix PR trigger CI).
+
+on:
+  schedule:
+    - cron: '29 5 * * *'   # daily 05:29 UTC (off the :00 peak)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run the review now, ignoring the 25-commit threshold (for testing)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write          # create/move the marker tag + a claude/* fix branch (never main)
+  pull-requests: write
+  issues: write
+  id-token: write
+
+concurrency:
+  group: claude-batch-review
+  cancel-in-progress: false
+
+jobs:
+  batch-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Cheap gate: decide whether enough has changed to warrant a review.
+      - id: gate
+        name: Count commits since last batch review
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MARKER="claude/last-batch-review"
+          REF="refs/tags/${MARKER}"
+
+          have_marker() { git rev-parse -q --verify "${REF}" >/dev/null; }
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            if have_marker; then
+              RANGE="${MARKER}..HEAD"
+            else
+              # No marker yet: review roughly the last 25 commits.
+              BASE="$(git rev-list --max-count=1 --skip=25 HEAD 2>/dev/null || true)"
+              [ -z "${BASE}" ] && BASE="$(git rev-list --max-parents=0 HEAD | tail -1)"
+              RANGE="${BASE}..HEAD"
+            fi
+            echo "Forced run over range ${RANGE}"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "range=${RANGE}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! have_marker; then
+            echo "Marker tag missing — creating it at HEAD and waiting for the next 25 commits."
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="${REF}" -f sha="$(git rev-parse HEAD)"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          N="$(git rev-list --count "${MARKER}..HEAD")"
+          echo "Commits on main since last batch review: ${N}"
+          if [ "${N}" -lt 25 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "range=${MARKER}..HEAD" >> "$GITHUB_OUTPUT"
+
+      # Expensive part: runs only when the gate says so.
+      # No github_token → authenticates as the Claude GitHub App, so any PR it
+      # opens triggers CI and is attributed to claude[bot].
+      - if: steps.gate.outputs.run == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review the changes that landed on main in this range:
+            `${{ steps.gate.outputs.range }}` — for ParallaX, a Rust
+            censorship-resistance proxy. Inspect the diff with
+            `git diff ${{ steps.gate.outputs.range }}` and read surrounding code
+            as needed.
+
+            Hunt for SECURITY vulnerabilities and correctness BUGS that CI cannot
+            catch (do not restate fmt/clippy/test results):
+            - Detectability / GFW fingerprint regressions (TLS + HTTP/2 Safari
+              parity, timing/padding/cover-traffic, FIN-not-RST teardown).
+            - Crypto correctness: nonce/IV uniqueness & ratchets, key zeroization,
+              constant-time comparisons, replay cache, PSK handling, PQ hybrid
+              (ML-KEM-1024 + X25519, ML-DSA-87); downgrade/replay/key-reuse risk.
+            - Memory safety in `unsafe`, panics on hostile input, wire length/int
+              handling.
+            - async/tokio: cancellation safety, blocking in async, deadlocks,
+              unbounded buffers.
+
+            If — and only if — you find REAL, high-confidence issues:
+              1. Fix them with surgical changes (follow CLAUDE.md / AGENTS.md).
+              2. Create a new branch `claude/batch-review-${{ github.run_id }}`,
+                 commit, push, and open ONE pull request targeting main via
+                 `gh pr create`, with a body that lists each finding and its fix.
+              3. Optionally run `cargo check --locked` to sanity-check; CI will do
+                 the full validation.
+            If you find nothing actionable, do NOT open a PR — just print a short
+            summary line. NEVER commit to main directly.
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 60
+            --allowedTools "Read,Grep,Glob,Edit,Write,MultiEdit,Bash(git:*),Bash(gh:*),Bash(cargo check:*),Bash(cargo fmt:*)"
+
+      # Advance the marker so the next 25 commits are measured from here. Runs
+      # whenever the gate fired on a real (non-forced) schedule.
+      - if: steps.gate.outputs.run == 'true' && github.event.inputs.force != 'true'
+        name: Advance review marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/claude/last-batch-review" \
+            -f sha="$(git rev-parse HEAD)" -F force=true

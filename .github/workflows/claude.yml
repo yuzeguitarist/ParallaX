@@ -1,14 +1,21 @@
 name: claude
 
-# AI coding agent. Mention @claude in an issue or a PR/review comment (or open an
-# issue whose body contains @claude) and it will read the repo, make changes, and
-# open or update a pull request.
+# Interactive AI coding agent. Mention @claude in an issue or a PR/review comment
+# (or open an issue whose body contains @claude) and it will read the repo, make
+# changes on a `claude/*` branch, and open a pull request. It NEVER pushes to
+# main — branch protection + the PR flow keep merging a human (you) decision.
 #
-# The model endpoint and key are read entirely from repository secrets — nothing
-# sensitive is committed here:
+# Auth & endpoint come entirely from repository secrets:
 #   ANTHROPIC_API_KEY   – the API key
 #   ANTHROPIC_BASE_URL  – the API endpoint
 # Set both under: Settings → Secrets and variables → Actions.
+#
+# NOTE: we deliberately DO NOT pass `github_token`. With the Claude GitHub App
+# installed, omitting it makes the action authenticate as the App, so the PRs
+# Claude opens are attributed to claude[bot] and DO trigger the CI workflows
+# (PRs opened with the default GITHUB_TOKEN do not trigger other workflows).
+# If GitHub auth ever fails, mint an App token via actions/create-github-app-token
+# (APP_ID + APP_PRIVATE_KEY secrets) and pass it as `github_token` instead.
 
 on:
   issue_comment:
@@ -21,22 +28,33 @@ on:
     types: [opened, assigned]
 
 permissions:
-  contents: write
+  contents: write          # commit to a claude/* branch (never main)
   issues: write
   pull-requests: write
   id-token: write
 
+# One run per issue/PR thread; a newer @claude supersedes an in-flight one
+# (it re-reads the whole thread anyway). Saves Actions minutes on rapid pings.
+concurrency:
+  group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   claude:
+    # Only run when @claude is actually mentioned. The action additionally
+    # restricts triggering to users with write access, so outsiders can't burn
+    # minutes or drive the agent.
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
       (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # Hard cost ceiling per run (was 360). The agent is human-invoked and rare;
+    # 60 min is plenty and caps a runaway run.
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -45,7 +63,6 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ github.token }}
           claude_args: |
             --model claude-opus-4-8
-            --max-turns 200
+            --max-turns 150

@@ -1,0 +1,88 @@
+name: claude-security-review
+
+# Pre-merge DEEP SECURITY REVIEW for the security-critical core. Triggers only
+# when a PR to main touches crypto / handshake / TLS-camouflage / protocol /
+# transport / fingerprint code (or Cargo.lock). Rare → cheap, high value for a
+# censorship-resistance proxy.
+#
+# COMMENT-ONLY / PHYSICALLY READ-ONLY: we pass the default GITHUB_TOKEN
+# explicitly (with `contents: read`) so even though the Claude GitHub App is
+# installed, this job CANNOT push code — it can only post PR comments. The tool
+# allow-list also omits Edit/Write as a second layer. This is advisory; it never
+# blocks the merge (only the deterministic CI checks do).
+
+on:
+  pull_request:
+    branches: [main, master]
+    types: [opened, ready_for_review, reopened]
+    paths:
+      - 'src/crypto/**'
+      - 'src/handshake/**'
+      - 'src/tls/**'
+      - 'src/protocol/**'
+      - 'src/transport/**'
+      - 'src/fingerprint/**'
+      - 'src/traffic.rs'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read           # read-only: cannot push code
+  pull-requests: write     # can post review comments
+  id-token: write
+
+concurrency:
+  group: sec-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  security-review:
+    # Skip draft PRs and bot-authored PRs (e.g. Claude's own / dependabot).
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Explicit default token = read-only code access (cannot push).
+          github_token: ${{ github.token }}
+          prompt: |
+            You are doing a focused SECURITY review of pull request
+            #${{ github.event.pull_request.number }} in ${{ github.repository }},
+            a Rust censorship-resistance proxy (ParallaX). Review ONLY the PR diff
+            (`gh pr diff ${{ github.event.pull_request.number }}`), reading
+            surrounding code as needed for context.
+
+            Prioritize issues CI cannot catch (do NOT restate fmt/clippy/test):
+            - Detectability / GFW fingerprint regressions: anything that drifts
+              the TLS or HTTP/2 shape away from Safari parity, timing/padding/
+              cover-traffic tells, and especially teardown that could emit a RST
+              instead of a graceful FIN (an active-probing tell).
+            - Cryptographic correctness: nonce/IV uniqueness & ratchets, key
+              zeroization, constant-time comparisons, replay-cache correctness,
+              PSK handling, and the post-quantum hybrid (ML-KEM-1024 + X25519,
+              ML-DSA-87) usage. Look for downgrade, replay, and key-reuse risks.
+            - Memory safety in any `unsafe` blocks; panics on attacker-influenced
+              input; integer/length handling on the wire.
+            - async/tokio pitfalls: cancellation safety, blocking in async,
+              deadlocks, unbounded buffers.
+            - If Cargo.lock changed: flag risky/yanked/over-broad dependency bumps.
+
+            Post your findings as a SINGLE PR review comment via
+            `gh pr comment ${{ github.event.pull_request.number }} --body "..."`,
+            grouped by severity (Critical / High / Medium / Low / Nit) with
+            `file:line` references and concrete remediation. If you find nothing
+            significant, post a short note saying the security-critical diff looks
+            clean and why. You have READ-ONLY access: do not modify code.
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 40
+            --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*)"

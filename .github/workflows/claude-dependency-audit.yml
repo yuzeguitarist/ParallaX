@@ -1,0 +1,91 @@
+name: claude-dependency-audit
+
+# Daily dependency vulnerability scan. The scan itself is deterministic and cheap
+# (`cargo audit`); Claude is only invoked when a real VULNERABILITY is found, to
+# assess impact and either open an upgrade PR or an explanatory issue. Warnings
+# (unmaintained/yanked) are shown in the log but don't spawn Claude, to avoid
+# burning minutes re-triaging the same advisory every day.
+
+on:
+  schedule:
+    - cron: '41 4 * * *'   # daily 04:41 UTC
+  push:
+    branches: [main, master]
+    paths: ['Cargo.lock', 'Cargo.toml']
+  pull_request:
+    branches: [main, master]
+    paths: ['Cargo.lock', 'Cargo.toml']
+  workflow_dispatch:
+
+permissions:
+  contents: write          # claude/* dependency-bump branch (never main)
+  pull-requests: write
+  issues: write
+  id-token: write
+
+concurrency:
+  group: claude-dependency-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - id: scan
+        name: cargo audit
+        run: |
+          set -uo pipefail
+          cargo audit --json > audit.json 2>/dev/null || true
+          cargo audit > cargo-audit.txt 2>&1 || true
+          echo '----- cargo audit report -----'
+          cat cargo-audit.txt || true
+          VULNS="$(jq -r '.vulnerabilities.count // 0' audit.json 2>/dev/null || echo 0)"
+          echo "Vulnerability count: ${VULNS}"
+          if [ "${VULNS}" -gt 0 ]; then
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only when a real vulnerability exists. No github_token → Claude GitHub App
+      # token, so its PR/issue triggers CI and is attributed to claude[bot].
+      - if: steps.scan.outputs.has_findings == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            `cargo audit` found one or more dependency vulnerabilities in ParallaX
+            (a Rust censorship-resistance proxy). Read the report in
+            `cargo-audit.txt` (and `audit.json` for structured detail).
+
+            For each advisory:
+            - Assess the REAL impact on this project (is the vulnerable code path
+              actually reachable here? crypto/parsing/network exposure matters
+              most).
+            - First check for an already-open PR or issue covering it with
+              `gh pr list` / `gh issue list` — do NOT create duplicates.
+
+            Then:
+            - If a safe fix exists, apply the minimal change (`cargo update -p
+              <crate>`, or a bounded version bump in Cargo.toml if required),
+              verify with `cargo check --locked`, and open ONE PR from a
+              `claude/dep-audit-${{ github.run_id }}` branch via `gh pr create`,
+              summarizing each advisory and the fix.
+            - If there is no safe upgrade (or the risk is not reachable), open or
+              update an issue summarizing the advisory, real-world impact, and
+              options. Keep changes minimal; NEVER commit to main directly.
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 40
+            --allowedTools "Read,Grep,Glob,Edit,Write,Bash(git:*),Bash(gh:*),Bash(cargo update:*),Bash(cargo check:*),Bash(cargo audit:*)"

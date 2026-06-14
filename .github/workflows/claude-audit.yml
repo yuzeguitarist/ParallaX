@@ -1,0 +1,96 @@
+name: claude-audit
+
+# Periodic WHOLE-REPOSITORY security audit + bug hunt against main, roughly every
+# 14 days (on the 1st and 15th). Opens a tracking issue with findings and, for
+# high-confidence low-risk fixes, individual PRs. Never touches main directly.
+#
+# Cost guard: if fewer than 26 commits landed in the last 14 days, the audit is
+# skipped — no point re-auditing a quiet repo.
+
+on:
+  schedule:
+    - cron: '17 3 1,15 * *'   # 03:17 UTC on the 1st and 15th
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run the audit now, ignoring the commit-activity gate (for testing)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write          # claude/* fix branches (never main)
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: claude-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - id: gate
+        name: Skip if the repo was quiet (<= 25 commits in 14 days)
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          N="$(git rev-list --count --since='14 days ago' HEAD)"
+          echo "Commits in the last 14 days: ${N}"
+          if [ "${FORCE:-false}" != "true" ] && [ "${N}" -le 25 ]; then
+            echo "Quiet period — skipping the audit."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      # No github_token → authenticates as the Claude GitHub App so its issue /
+      # PRs trigger CI and are attributed to claude[bot].
+      - if: steps.gate.outputs.run == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Perform a full-repository SECURITY AUDIT and BUG review of ParallaX
+            (a Rust censorship-resistance proxy) at the current state of main.
+            Explore the codebase under `src/` and `tests/` thoroughly.
+
+            Threat model to cover:
+            - Detectability by a GFW-class adversary: TLS ClientHello + HTTP/2
+              Safari parity, timing/padding/cover-traffic tells, and teardown that
+              must be a graceful FIN, never a RST.
+            - Active probing / replay / downgrade resistance; PSK and handshake
+              state machine soundness.
+            - Cryptography: nonce/IV uniqueness & ratchets, key zeroization,
+              constant-time comparisons, replay cache, AEAD usage, and the
+              post-quantum hybrid (ML-KEM-1024 + X25519, ML-DSA-87).
+            - Memory safety (`unsafe`), panics on hostile input, wire parsing,
+              resource exhaustion / unbounded buffers.
+            - async/tokio correctness; process hardening; supply-chain risk.
+
+            Output:
+              1. Open ONE tracking issue titled
+                 "Security & bug audit ${{ steps.gate.outputs.date }}" via
+                 `gh issue create`, summarizing findings grouped by severity
+                 (Critical / High / Medium / Low) with `file:line` references and
+                 recommended fixes. Add label "security" if it exists.
+              2. For high-confidence, LOW-RISK fixes only, open individual PRs from
+                 `claude/audit-<short-description>` branches via `gh pr create`,
+                 each linking back to the audit issue. Leave risky or ambiguous
+                 items as issue findings for human decision.
+            Make surgical changes (follow CLAUDE.md / AGENTS.md). NEVER commit to
+            main directly.
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 120
+            --allowedTools "Read,Grep,Glob,Edit,Write,MultiEdit,Bash(git:*),Bash(gh:*),Bash(cargo check:*),Bash(cargo fmt:*)"
