@@ -116,8 +116,7 @@ static CLIENT_UDP_PROBE_TIMEOUT_MS: std::sync::atomic::AtomicU16 =
 /// the two client entry points negotiate the UDP fast plane identically.
 pub(crate) fn configure_udp_runtime(udp: &crate::config::UdpConfig) {
     CLIENT_UDP_ENABLED.store(udp.enabled, std::sync::atomic::Ordering::Relaxed);
-    CLIENT_UDP_PROBE_TIMEOUT_MS
-        .store(udp.probe_timeout_ms, std::sync::atomic::Ordering::Relaxed);
+    CLIENT_UDP_PROBE_TIMEOUT_MS.store(udp.probe_timeout_ms, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
@@ -1859,6 +1858,13 @@ mod tests {
     };
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    /// Serializes the tests that mutate the process-wide UDP-negotiation flags
+    /// (CLIENT_UDP_ENABLED / SERVER_UDP_ENABLED). Under a parallel `--ignored`
+    /// run these globals would otherwise leak across tests — e.g. the
+    /// full-negotiation test's SERVER_UDP_ENABLED=true bleeding into the
+    /// decline-path test and silently changing the path it claims to exercise.
+    static UDP_NEGOTIATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
         "MIIC9jCCAd6gAwIBAgIJAPNzR81y9p7pMA0GCSqGSIb3DQEBCwUAMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4X",
         "DTI2MDUxNjEyNDA0NloXDTI2MDUxNzEyNDA0NlowFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wggEiMA0GCSqGSIb3",
@@ -2050,6 +2056,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_relay_succeeds_with_client_udp_negotiation_enabled() {
+        // Hold the serial lock for the whole test so a concurrent --ignored run
+        // cannot leak the other test's SERVER_UDP_ENABLED into this one.
+        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         // Turn on client-initiated UDP negotiation process-wide for this test;
         // the server replies PX1N (decline). The relay must still succeed,
         // proving the PX1G/PX1N control-plane exchange keeps the AEAD record
@@ -2108,6 +2117,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_relay_succeeds_with_full_udp_negotiation() {
+        // Hold the serial lock for the whole test so a concurrent --ignored run
+        // cannot leak this test's SERVER_UDP_ENABLED into the decline-path test.
+        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         // Both sides enabled: the server offers the UDP fast plane (PX1O), the
         // client probes it over QUIC and reports PX1P; the SOCKS relay must still
         // complete, proving the full offer/probe/ack exchange keeps the control

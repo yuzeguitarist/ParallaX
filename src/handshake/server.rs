@@ -254,8 +254,10 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     // to decide whether to offer the UDP fast plane (vs decline) and how long to
     // wait on the probe. Set once at startup.
     SERVER_UDP_ENABLED.store(config.udp.enabled, std::sync::atomic::Ordering::Relaxed);
-    SERVER_UDP_PROBE_TIMEOUT_MS
-        .store(config.udp.probe_timeout_ms, std::sync::atomic::Ordering::Relaxed);
+    SERVER_UDP_PROBE_TIMEOUT_MS.store(
+        config.udp.probe_timeout_ms,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let server = config
         .server
