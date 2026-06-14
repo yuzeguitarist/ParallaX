@@ -1,8 +1,10 @@
 name: ci-pr
 
 # Full CI tier: runs on every PR to main and on pushes to main (post-merge
-# safety net). Splits work into parallel jobs so failures are localized and
-# `test` / `gfw-sim` can be set as separate required status checks.
+# safety net). `lint` (fmt + clippy), `test`, and `gfw-sim` run as separate jobs
+# so failures stay localized and test / gfw-sim can be separate required checks.
+# fmt is folded into the `lint` job (shares the same runner/checkout/toolchain),
+# saving a whole rounded-up job-minute on every run.
 
 on:
   pull_request:
@@ -48,22 +50,8 @@ env:
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
-  fmt:
-    name: fmt
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
-  clippy:
-    name: clippy
+  lint:
+    name: lint (fmt + clippy)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -72,11 +60,16 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: parallax-ci
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      # fmt is cheap (~seconds) and rides on this job's already-paid checkout +
+      # toolchain rather than spending a separate rounded-up job-minute.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets --locked -- -D warnings
 

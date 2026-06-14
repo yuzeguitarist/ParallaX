@@ -16,26 +16,30 @@ on:
     branches:
       - main
       - master
-    paths-ignore:
-      - '**.md'
-      - 'ParallaX-DeepWiki/**'
-      - 'DEPLOYMENT.md'
-      - 'AGENTS.md'
-      - 'README.md'
-      - '.gitignore'
-      - 'LICENSE*'
+    paths:
+      # Only the code that can affect TCP relay teardown (FIN-vs-RST). Changes to
+      # crypto/tls/fingerprint/cli/etc. cannot alter TCP close semantics, so they
+      # skip this heavy capture job. workflow_dispatch is always available.
+      - 'src/transport/**'
+      - 'src/client/**'
+      - 'src/config.rs'
+      - 'src/protocol/**'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-relay-teardown.yml'
   push:
     branches:
       - main
       - master
-    paths-ignore:
-      - '**.md'
-      - 'ParallaX-DeepWiki/**'
-      - 'DEPLOYMENT.md'
-      - 'AGENTS.md'
-      - 'README.md'
-      - '.gitignore'
-      - 'LICENSE*'
+    paths:
+      # Only the code that can affect TCP relay teardown (FIN-vs-RST). Changes to
+      # crypto/tls/fingerprint/cli/etc. cannot alter TCP close semantics, so they
+      # skip this heavy capture job. workflow_dispatch is always available.
+      - 'src/transport/**'
+      - 'src/client/**'
+      - 'src/config.rs'
+      - 'src/protocol/**'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-relay-teardown.yml'
   workflow_dispatch:
 
 concurrency:
