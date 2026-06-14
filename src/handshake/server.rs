@@ -2001,6 +2001,11 @@ async fn server_exchange_quic_done(
     // require the client's explicit DONE record.
     let mut record = Vec::new();
     tokio::select! {
+        // `biased`: poll the DONE read FIRST so an already-arrived peer DONE wins
+        // over a concurrently-ready `conn.closed()` (the client sends its DONE over
+        // TCP then closes the QUIC connection); only a genuinely-absent DONE falls
+        // through to `conn.closed()`.
+        biased;
         res = client_records.read_record_into(&mut record) => {
             res.map_err(HandshakeServerError::Io)?;
         }
