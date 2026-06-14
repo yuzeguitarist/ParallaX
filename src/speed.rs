@@ -271,9 +271,9 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     if config.mode != Mode::Client {
         return Err(SpeedError::WrongMode);
     }
-    // Mirror `client` run(): set the process-wide UDP-negotiation parameters so
-    // `parallax speed` exercises the UDP fast plane identically when enabled.
-    runtime::configure_udp_runtime(&config.udp);
+    // Mirror `client` run(): the UDP-negotiation parameters live on `config.udp`
+    // and are threaded into the data-session seam so `parallax speed` exercises
+    // the UDP fast plane identically when enabled.
     let client = config.client.clone().ok_or(SpeedError::MissingClient)?;
     let psk = decode_psk(&config.crypto.psk)?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
@@ -288,6 +288,7 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     let (mut server, mut data_session) = runtime::establish_authenticated_data_session(
         &client,
         config.traffic,
+        &config.udp,
         psk.as_slice(),
         &server_public,
         &server_identity_public,

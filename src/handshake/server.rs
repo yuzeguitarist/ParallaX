@@ -30,7 +30,7 @@ use super::transcript::transcript_hash;
 use crate::{
     config::{
         decode_base64_secret, decode_key32_secret, decode_psk, Config, ConfigError, Mode,
-        ServerConfig, TrafficConfig,
+        ServerConfig, TrafficConfig, UdpConfig,
     },
     crypto::{
         auth::{
@@ -236,28 +236,15 @@ enum FirstClientRead {
     FallbackPrefix(Vec<u8>),
 }
 
-pub(crate) static SERVER_UDP_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Process-wide server UDP probe budget (ms): how long the server waits to
-/// accept the client's QUIC connection and answer one probe. Set once at
-/// startup; defaults to the config default so paths that don't call `run()`
-/// (tests) still get a sane bound.
-pub(crate) static SERVER_UDP_PROBE_TIMEOUT_MS: std::sync::atomic::AtomicU16 =
-    std::sync::atomic::AtomicU16::new(300);
-
 pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     if config.mode != Mode::Server {
         return Err(HandshakeServerError::WrongMode);
     }
-    // Process-wide server UDP-offer parameters, read in run_authenticated_data_mode
-    // to decide whether to offer the UDP fast plane (vs decline) and how long to
-    // wait on the probe. Set once at startup.
-    SERVER_UDP_ENABLED.store(config.udp.enabled, std::sync::atomic::Ordering::Relaxed);
-    SERVER_UDP_PROBE_TIMEOUT_MS.store(
-        config.udp.probe_timeout_ms,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // Server UDP-offer parameters, read in run_authenticated_data_mode to decide
+    // whether to offer the UDP fast plane (vs decline) and how long to wait on the
+    // probe. Threaded as a cheap-to-clone Arc, mirroring how `traffic` flows down
+    // the connection chain.
+    let udp = Arc::new(config.udp.clone());
 
     let server = config
         .server
@@ -314,6 +301,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let server = Arc::clone(&server);
         let connection_traffic = traffic;
+        let connection_udp = Arc::clone(&udp);
         let psk = Arc::clone(&psk);
         let replay_cache = Arc::clone(&replay_cache);
         let secrets = secrets.clone();
@@ -323,6 +311,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 client,
                 &server,
                 connection_traffic,
+                &connection_udp,
                 &psk,
                 replay_cache,
                 &secrets,
@@ -340,17 +329,20 @@ pub async fn handle_connection(
     client: TcpStream,
     config: &ServerConfig,
     traffic: TrafficConfig,
+    udp: &UdpConfig,
     psk: &[u8],
 ) -> Result<(), HandshakeServerError> {
     let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let secrets = ServerRuntimeSecrets::decode(config)?;
-    handle_connection_inner(client, config, traffic, psk, None, &secrets, cid).await
+    handle_connection_inner(client, config, traffic, udp, psk, None, &secrets, cid).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_with_replay(
     client: TcpStream,
     config: &ServerConfig,
     traffic: TrafficConfig,
+    udp: &UdpConfig,
     psk: &[u8],
     replay_cache: Arc<Mutex<ReplayCache>>,
     secrets: &ServerRuntimeSecrets,
@@ -360,6 +352,7 @@ async fn handle_connection_with_replay(
         client,
         config,
         traffic,
+        udp,
         psk,
         Some(replay_cache),
         secrets,
@@ -368,10 +361,12 @@ async fn handle_connection_with_replay(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_inner(
     mut client: TcpStream,
     config: &ServerConfig,
     traffic: TrafficConfig,
+    udp: &UdpConfig,
     psk: &[u8],
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
     secrets: &ServerRuntimeSecrets,
@@ -436,6 +431,7 @@ async fn handle_connection_inner(
                 secrets.identity_secret_key(),
                 psk,
                 traffic,
+                udp,
                 pending_replay,
                 cid,
             )
@@ -929,12 +925,14 @@ where
         .map_err(HandshakeServerError::Io)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_authenticated_data_mode(
     handshake: AuthenticatedHandshake,
     fixed_data_target: Option<&str>,
     identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
     sandwich_secret: &[u8],
     traffic: TrafficConfig,
+    udp: &UdpConfig,
     mut pending_replay: Option<PendingReplayEntry>,
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
@@ -1112,9 +1110,7 @@ async fn run_authenticated_data_mode(
                                 endpoint::bind_server_endpoint, probe::serve_probe,
                             };
 
-                            let offered = if SERVER_UDP_ENABLED
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                            {
+                            let offered = if udp.enabled {
                                 // Bind the probe endpoint on the same interface and
                                 // address family the client reached us on (the TCP
                                 // connection's local address), not the IPv4 wildcard:
@@ -1186,11 +1182,7 @@ async fn run_authenticated_data_mode(
                                 // window let a real handshake consume the whole budget
                                 // and misreport a healthy path as Unreachable.
                                 let probe_budget = std::time::Duration::from_millis(
-                                    u64::from(
-                                        SERVER_UDP_PROBE_TIMEOUT_MS
-                                            .load(std::sync::atomic::Ordering::Relaxed)
-                                            .max(1),
-                                    ),
+                                    u64::from(udp.probe_timeout_ms.max(1)),
                                 )
                                 .saturating_mul(2);
                                 let _ = tokio::time::timeout(probe_budget, async {
@@ -3613,7 +3605,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, &config, traffic, PSK)
+            handle_connection(stream, &config, traffic, &UdpConfig::default(), PSK)
                 .await
                 .unwrap();
         });

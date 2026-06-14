@@ -32,7 +32,7 @@ use crate::{
     client::socks::{self, SocksError, SocksRequest},
     config::{
         decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
-        TrafficConfig,
+        TrafficConfig, UdpConfig,
     },
     crypto::{auth::AuthError, identity, parallel, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
@@ -101,32 +101,14 @@ pub enum ClientRuntimeError {
 type ClientSession = (TcpStream, ClientDataSession);
 type ClientSessionTask = tokio::task::JoinHandle<Result<ClientSession, ClientRuntimeError>>;
 
-static CLIENT_UDP_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Process-wide client UDP probe budget (ms): the Happy-Eyeballs window for the
-/// QUIC connect and the probe round-trip. Set once at startup; defaults to the
-/// config default so paths that don't call `run()` (tests) still get a sane
-/// bound.
-static CLIENT_UDP_PROBE_TIMEOUT_MS: std::sync::atomic::AtomicU16 =
-    std::sync::atomic::AtomicU16::new(300);
-
-/// Stores the process-wide client UDP-negotiation runtime parameters, read at
-/// the data-session seam. Called by both `run()` and the `speed` subcommand so
-/// the two client entry points negotiate the UDP fast plane identically.
-pub(crate) fn configure_udp_runtime(udp: &crate::config::UdpConfig) {
-    CLIENT_UDP_ENABLED.store(udp.enabled, std::sync::atomic::Ordering::Relaxed);
-    CLIENT_UDP_PROBE_TIMEOUT_MS.store(udp.probe_timeout_ms, std::sync::atomic::Ordering::Relaxed);
-}
-
 pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     if config.mode != Mode::Client {
         return Err(ClientRuntimeError::WrongMode);
     }
-    // Process-wide client UDP-negotiation parameters, read at the data-session
-    // seam to decide whether to open a PX1G UdpRequest and how long to probe.
-    // Set once at startup.
-    configure_udp_runtime(&config.udp);
+    // Client UDP-negotiation parameters, read at the data-session seam to decide
+    // whether to open a PX1G UdpRequest and how long to probe. Threaded as a
+    // cheap-to-clone Arc, mirroring how `traffic` flows into the pools.
+    let udp = Arc::new(config.udp.clone());
 
     let client = config
         .client
@@ -151,6 +133,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             Arc::clone(&client),
             server_addr.clone(),
             config.traffic,
+            Arc::clone(&udp),
             Arc::clone(&psk),
             server_public,
             Arc::clone(&server_identity_public),
@@ -165,6 +148,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             Arc::clone(&client),
             server_addr.clone(),
             config.traffic,
+            Arc::clone(&udp),
             Arc::clone(&psk),
             server_public,
             Arc::clone(&server_identity_public),
@@ -215,6 +199,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         let psk = Arc::clone(&psk);
         let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
+        let udp = Arc::clone(&udp);
         let server_addr = server_addr.clone();
         let warm_sessions = warm_sessions.clone();
         let mux_sessions = mux_sessions.clone();
@@ -232,6 +217,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                 config: client.as_ref(),
                 server_addr,
                 traffic,
+                udp: udp.as_ref(),
                 psk: psk.as_ref().as_slice(),
                 server_public: &server_public,
                 server_identity_public,
@@ -248,6 +234,7 @@ pub async fn handle_local_connection(
     local: TcpStream,
     config: &ClientConfig,
     traffic: TrafficConfig,
+    udp: &UdpConfig,
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: &[u8],
@@ -260,6 +247,7 @@ pub async fn handle_local_connection(
         config,
         server_addr,
         traffic,
+        udp,
         psk,
         server_public,
         server_identity_public,
@@ -272,6 +260,7 @@ struct ClientConnectionContext<'a> {
     config: &'a ClientConfig,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
+    udp: &'a UdpConfig,
     psk: &'a [u8],
     server_public: &'a [u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -284,6 +273,7 @@ struct WarmSessionPool {
     config: Arc<ClientConfig>,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
+    udp: Arc<UdpConfig>,
     psk: Arc<Zeroizing<Vec<u8>>>,
     server_public: [u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -294,6 +284,7 @@ impl WarmSessionPool {
         config: Arc<ClientConfig>,
         server_addr: ServerAddrResolver,
         traffic: TrafficConfig,
+        udp: Arc<UdpConfig>,
         psk: Arc<Zeroizing<Vec<u8>>>,
         server_public: [u8; 32],
         server_identity_public: Arc<[u8]>,
@@ -303,6 +294,7 @@ impl WarmSessionPool {
             config,
             server_addr,
             traffic,
+            udp,
             psk,
             server_public,
             server_identity_public,
@@ -331,6 +323,7 @@ impl WarmSessionPool {
         let config = Arc::clone(&self.config);
         let server_addr = self.server_addr.clone();
         let traffic = self.traffic;
+        let udp = Arc::clone(&self.udp);
         let psk = Arc::clone(&self.psk);
         let server_public = self.server_public;
         let server_identity_public = Arc::clone(&self.server_identity_public);
@@ -339,6 +332,7 @@ impl WarmSessionPool {
                 &server_addr,
                 &config,
                 traffic,
+                &udp,
                 psk.as_ref().as_slice(),
                 &server_public,
                 server_identity_public,
@@ -354,6 +348,7 @@ struct ClientMuxPool {
     config: Arc<ClientConfig>,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
+    udp: Arc<UdpConfig>,
     psk: Arc<Zeroizing<Vec<u8>>>,
     server_public: [u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -390,6 +385,7 @@ impl ClientMuxPool {
         config: Arc<ClientConfig>,
         server_addr: ServerAddrResolver,
         traffic: TrafficConfig,
+        udp: Arc<UdpConfig>,
         psk: Arc<Zeroizing<Vec<u8>>>,
         server_public: [u8; 32],
         server_identity_public: Arc<[u8]>,
@@ -399,6 +395,7 @@ impl ClientMuxPool {
             config,
             server_addr,
             traffic,
+            udp,
             psk,
             server_public,
             server_identity_public,
@@ -432,6 +429,7 @@ impl ClientMuxPool {
             &self.server_addr,
             self.config.as_ref(),
             self.traffic,
+            &self.udp,
             self.psk.as_ref().as_slice(),
             &self.server_public,
             Arc::clone(&self.server_identity_public),
@@ -569,6 +567,7 @@ async fn handle_local_connection_with_cid(
         config,
         server_addr,
         traffic,
+        udp,
         psk,
         server_public,
         server_identity_public,
@@ -588,6 +587,7 @@ async fn handle_local_connection_with_cid(
     } else {
         let speculative_config = config.clone();
         let speculative_server_addr = server_addr.clone();
+        let speculative_udp = udp.clone();
         let speculative_psk = Arc::<[u8]>::from(psk.to_vec().into_boxed_slice());
         let speculative_server_public = *server_public;
         let speculative_server_identity_public = server_identity_public.clone();
@@ -596,6 +596,7 @@ async fn handle_local_connection_with_cid(
                 &speculative_server_addr,
                 &speculative_config,
                 traffic,
+                &speculative_udp,
                 speculative_psk.as_ref(),
                 &speculative_server_public,
                 speculative_server_identity_public,
@@ -661,6 +662,7 @@ async fn handle_local_connection_with_cid(
 pub(crate) async fn establish_authenticated_data_session(
     config: &ClientConfig,
     traffic: TrafficConfig,
+    udp: &UdpConfig,
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: &[u8],
@@ -672,6 +674,7 @@ pub(crate) async fn establish_authenticated_data_session(
         &server_addr,
         config,
         traffic,
+        udp,
         psk,
         server_public,
         server_identity_public,
@@ -724,6 +727,7 @@ async fn establish_authenticated_data_session_with_resolver(
     server_addr: &ServerAddrResolver,
     config: &ClientConfig,
     traffic: TrafficConfig,
+    udp: &UdpConfig,
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -744,13 +748,13 @@ async fn establish_authenticated_data_session_with_resolver(
     )
     .await?;
 
-    // Client-initiated, fail-soft UDP negotiation. Gated on the process-wide
+    // Client-initiated, fail-soft UDP negotiation. Gated on the threaded
     // udp.enabled flag. The client offers to use the UDP fast plane; the server
     // replies PX1N (decline) until the UDP datapath is wired. This runs strictly
     // before the first Connect/Mux command, so it occupies record #1 in each AEAD
     // direction with no reordering risk. An error here fails the connection (the
     // record stream would be desynced), which is the correct outcome.
-    if CLIENT_UDP_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    if udp.enabled {
         use crate::protocol::command::{
             UdpDecline, UdpOffer, UdpProbeAck, UdpProbeStatus, UdpRequest, UDP_NEGOTIATION_VERSION,
         };
@@ -776,11 +780,8 @@ async fn establish_authenticated_data_session_with_resolver(
             // stream stays aligned regardless of the probe result.
             let (offer_id, outcome) = match UdpOffer::decode(&response) {
                 Ok(offer) => {
-                    let probe_timeout = std::time::Duration::from_millis(u64::from(
-                        CLIENT_UDP_PROBE_TIMEOUT_MS
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                            .max(1),
-                    ));
+                    let probe_timeout =
+                        std::time::Duration::from_millis(u64::from(udp.probe_timeout_ms.max(1)));
                     let outcome =
                         run_client_udp_probe(&server, &offer, psk, &config.sni, probe_timeout)
                             .await;
@@ -1859,15 +1860,6 @@ mod tests {
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
 
-    /// Serializes ALL loopback e2e tests that read the process-wide
-    /// UDP-negotiation flags (CLIENT_UDP_ENABLED / SERVER_UDP_ENABLED). Under a
-    /// parallel `--ignored` run these globals would otherwise leak across tests
-    /// — e.g. the full-negotiation test's flags=true bleeding into a no-UDP relay
-    /// test and silently re-routing it through the PX1G/PX1O/probe exchange it was
-    /// written to exclude. Every test that brings up a client+server here must
-    /// hold this lock so the flag-setting tests are mutually exclusive with the
-    /// flag-reading ones.
-    static UDP_NEGOTIATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
         "MIIC9jCCAd6gAwIBAgIJAPNzR81y9p7pMA0GCSqGSIb3DQEBCwUAMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4X",
         "DTI2MDUxNjEyNDA0NloXDTI2MDUxNzEyNDA0NlowFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wggEiMA0GCSqGSIb3",
@@ -1977,9 +1969,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_client_reaches_target_through_parallax_server_with_large_payloads() {
-        // Serialize against the UDP-negotiation tests: a parallel --ignored run
-        // must not leak their CLIENT/SERVER_UDP_ENABLED into this no-UDP path.
-        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_echo_target().await;
 
@@ -2017,9 +2006,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_client_receives_response_after_local_write_half_close() {
-        // Serialize against the UDP-negotiation tests: a parallel --ignored run
-        // must not leak their CLIENT/SERVER_UDP_ENABLED into this no-UDP path.
-        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_eof_response_target().await;
 
@@ -2065,21 +2051,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_relay_succeeds_with_client_udp_negotiation_enabled() {
-        // Hold the serial lock for the whole test so a concurrent --ignored run
-        // cannot leak the other test's SERVER_UDP_ENABLED into this one.
-        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
-        // Turn on client-initiated UDP negotiation process-wide for this test;
-        // the server replies PX1N (decline). The relay must still succeed,
-        // proving the PX1G/PX1N control-plane exchange keeps the AEAD record
-        // stream in sync (record #1 each direction) before the real command.
-        struct UdpFlagGuard;
-        impl Drop for UdpFlagGuard {
-            fn drop(&mut self) {
-                CLIENT_UDP_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        CLIENT_UDP_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _udp_guard = UdpFlagGuard;
+        // Turn on client-initiated UDP negotiation for this test's client only;
+        // the server stays default (declines with PX1N). The relay must still
+        // succeed, proving the PX1G/PX1N control-plane exchange keeps the AEAD
+        // record stream in sync (record #1 each direction) before the real
+        // command. Each test carries its own config, so no serial lock is needed.
+        let client_udp = UdpConfig {
+            enabled: true,
+            ..UdpConfig::default()
+        };
 
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_eof_response_target().await;
@@ -2098,11 +2078,12 @@ mod tests {
             replay_cache_path,
         );
         let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
-        let (local_addr, client_task) = spawn_local_client(
+        let (local_addr, client_task) = spawn_local_client_with_udp(
             parallax_addr,
             &server_keys,
             &server_pq_keys,
             &server_identity_keys,
+            client_udp,
         )
         .await;
 
@@ -2126,25 +2107,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_relay_succeeds_with_full_udp_negotiation() {
-        // Hold the serial lock for the whole test so a concurrent --ignored run
-        // cannot leak this test's SERVER_UDP_ENABLED into the decline-path test.
-        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         // Both sides enabled: the server offers the UDP fast plane (PX1O), the
         // client probes it over QUIC and reports PX1P; the SOCKS relay must still
         // complete, proving the full offer/probe/ack exchange keeps the control
-        // stream aligned end to end.
-        struct UdpFlagGuard;
-        impl Drop for UdpFlagGuard {
-            fn drop(&mut self) {
-                CLIENT_UDP_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-                crate::handshake::server::SERVER_UDP_ENABLED
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        CLIENT_UDP_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::handshake::server::SERVER_UDP_ENABLED
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let _udp_guard = UdpFlagGuard;
+        // stream aligned end to end. Each test carries its own config, so no
+        // serial lock is needed.
+        let enabled_udp = UdpConfig {
+            enabled: true,
+            ..UdpConfig::default()
+        };
 
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_eof_response_target().await;
@@ -2162,12 +2133,18 @@ mod tests {
             &server_identity_keys,
             replay_cache_path,
         );
-        let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
-        let (local_addr, client_task) = spawn_local_client(
+        let (parallax_addr, server_task) = spawn_parallax_server_with_traffic_and_udp(
+            server_config,
+            TrafficConfig::default(),
+            enabled_udp.clone(),
+        )
+        .await;
+        let (local_addr, client_task) = spawn_local_client_with_udp(
             parallax_addr,
             &server_keys,
             &server_pq_keys,
             &server_identity_keys,
+            enabled_udp,
         )
         .await;
 
@@ -2191,9 +2168,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn mux_client_reaches_two_targets_over_one_authenticated_session() {
-        // Serialize against the UDP-negotiation tests: a parallel --ignored run
-        // must not leak their CLIENT/SERVER_UDP_ENABLED into this no-UDP path.
-        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_multi_echo_target(2).await;
 
@@ -2435,9 +2409,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "loopback latency/throughput benchmark; run with --ignored --nocapture"]
     async fn mux_loopback_benchmark() {
-        // Serialize against the UDP-negotiation tests: a parallel --ignored run
-        // must not leak their CLIENT/SERVER_UDP_ENABLED into this no-UDP path.
-        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         let single = run_mux_loopback_benchmark(MuxBenchParams {
             streams: 1,
             latency_round_trips: 200,
@@ -2560,11 +2531,20 @@ mod tests {
         server_config: ServerConfig,
         traffic: TrafficConfig,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_parallax_server_with_traffic_and_udp(server_config, traffic, UdpConfig::default())
+            .await
+    }
+
+    async fn spawn_parallax_server_with_traffic_and_udp(
+        server_config: ServerConfig,
+        traffic: TrafficConfig,
+        udp: UdpConfig,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            server::handle_connection(stream, &server_config, traffic, PSK)
+            server::handle_connection(stream, &server_config, traffic, &udp, PSK)
                 .await
                 .unwrap();
         });
@@ -2599,6 +2579,7 @@ mod tests {
             Arc::clone(&client_config),
             server_addr,
             traffic,
+            Arc::new(UdpConfig::default()),
             Arc::new(zeroize::Zeroizing::new(PSK.to_vec())),
             server_keys.public,
             Arc::from(server_identity_keys.public.clone().into_boxed_slice()),
@@ -2628,6 +2609,23 @@ mod tests {
         server_pq_keys: &pq::MlKemKeyPair,
         server_identity_keys: &identity::MlDsaKeyPair,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_local_client_with_udp(
+            parallax_addr,
+            server_keys,
+            server_pq_keys,
+            server_identity_keys,
+            UdpConfig::default(),
+        )
+        .await
+    }
+
+    async fn spawn_local_client_with_udp(
+        parallax_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_pq_keys: &pq::MlKemKeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+        udp: UdpConfig,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let client_config = ClientConfig {
@@ -2646,6 +2644,7 @@ mod tests {
                 stream,
                 &client_config,
                 TrafficConfig::default(),
+                &udp,
                 PSK,
                 &server_public_key,
                 &server_identity_public_key,
