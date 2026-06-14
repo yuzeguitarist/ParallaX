@@ -1113,13 +1113,25 @@ async fn run_authenticated_data_mode(
                             let offered = if SERVER_UDP_ENABLED
                                 .load(std::sync::atomic::Ordering::Relaxed)
                             {
+                                // Bind the probe endpoint on the same interface and
+                                // address family the client reached us on (the TCP
+                                // connection's local address), not the IPv4 wildcard:
+                                // a 0.0.0.0 bind is unreachable for any client that
+                                // arrived over IPv6, and it ignores an operator's
+                                // interface-scoped listen address.
+                                let bind_ip = client_write
+                                    .local_addr()
+                                    .map(|addr| addr.ip())
+                                    .unwrap_or(std::net::IpAddr::V4(
+                                        std::net::Ipv4Addr::UNSPECIFIED,
+                                    ));
                                 // Present the ephemeral cert under the same front
                                 // domain this connection is camouflaged as (the REALITY
                                 // ClientHello SNI), never the literal "localhost" — a
                                 // QUIC Initial carrying SNI=localhost to a public IP is
                                 // a zero-false-positive censorship signature.
                                 bind_server_endpoint(
-                                    "0.0.0.0:0".parse().unwrap(),
+                                    std::net::SocketAddr::new(bind_ip, 0),
                                     &handshake.client_hello.sni,
                                 )
                                     .ok()
