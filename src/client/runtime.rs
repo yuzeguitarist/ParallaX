@@ -1946,6 +1946,64 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
+    async fn socks_relay_succeeds_with_client_udp_negotiation_enabled() {
+        // Turn on client-initiated UDP negotiation process-wide for this test;
+        // the server replies PX1N (decline). The relay must still succeed,
+        // proving the PX1G/PX1N control-plane exchange keeps the AEAD record
+        // stream in sync (record #1 each direction) before the real command.
+        struct UdpFlagGuard;
+        impl Drop for UdpFlagGuard {
+            fn drop(&mut self) {
+                CLIENT_UDP_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        CLIENT_UDP_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _udp_guard = UdpFlagGuard;
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_eof_response_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
+        let (local_addr, client_task) = spawn_local_client(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+        )
+        .await;
+
+        let mut app = connect_socks_target(local_addr, target_addr).await;
+        app.write_all(b"request-before-half-close").await.unwrap();
+        app.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), app.read_to_end(&mut response))
+            .await
+            .unwrap_or_else(|_| panic!("relay response timed out with UDP negotiation enabled"))
+            .unwrap();
+        assert_eq!(response, b"response-after-half-close");
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
     async fn mux_client_reaches_two_targets_over_one_authenticated_session() {
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_multi_echo_target(2).await;
