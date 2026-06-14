@@ -1174,14 +1174,26 @@ async fn run_authenticated_data_mode(
                                 // stream (PX1P + the real command stay unread). A timeout
                                 // here does NOT desync: the client always sends PX1P next
                                 // and we always read it below.
-                                let probe_timeout = std::time::Duration::from_millis(
+                                // The server's probe budget must comfortably exceed
+                                // the client's TOTAL patience (connect window + probe
+                                // window = 2x probe_timeout), because the server's
+                                // clock starts when it writes the offer — one offer
+                                // propagation ahead of the client's connect clock. Use
+                                // 2x the configured timeout: large enough that a real-
+                                // RTT QUIC handshake + probe round-trip finishes before
+                                // the endpoint is closed, yet still far below quinn's
+                                // ~30s idle pin (the H1 anti-stall goal). A single 1x
+                                // window let a real handshake consume the whole budget
+                                // and misreport a healthy path as Unreachable.
+                                let probe_budget = std::time::Duration::from_millis(
                                     u64::from(
                                         SERVER_UDP_PROBE_TIMEOUT_MS
                                             .load(std::sync::atomic::Ordering::Relaxed)
                                             .max(1),
                                     ),
-                                );
-                                let _ = tokio::time::timeout(probe_timeout, async {
+                                )
+                                .saturating_mul(2);
+                                let _ = tokio::time::timeout(probe_budget, async {
                                     if let Some(incoming) = udp_ep.accept().await {
                                         if let Ok(conn) = incoming.await {
                                             if let Err(err) =
