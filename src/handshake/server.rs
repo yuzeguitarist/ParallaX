@@ -1131,24 +1131,30 @@ async fn run_authenticated_data_mode(
                                 let offer_record = server_seal.seal(&offer, &mut rng)?;
                                 client_write.write_all(&offer_record).await?;
 
-                                // Best-effort: accept the client's QUIC connection and
-                                // answer one probe. Failure here does NOT desync the
-                                // control stream — the client always sends PX1P next,
+                                // Best-effort, fully time-bounded: accept the client's
+                                // QUIC connection and answer one probe. The QUIC
+                                // handshake (`incoming.await`) and the datagram read
+                                // inside `serve_probe` MUST be bounded too — a peer that
+                                // completes the handshake then goes silent on datagrams
+                                // (a black-holed/throttled UDP path, exactly what this
+                                // probe exists to detect) would otherwise pin this task
+                                // on quinn's ~30s idle timeout and stall the TCP control
+                                // stream (PX1P + the real command stay unread). A timeout
+                                // here does NOT desync: the client always sends PX1P next
                                 // and we always read it below.
-                                if let Ok(Some(incoming)) = tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
-                                    udp_ep.accept(),
-                                )
-                                .await
-                                {
-                                    if let Ok(conn) = incoming.await {
-                                        if let Err(err) =
-                                            serve_probe(&conn, sandwich_secret, &offer_id).await
-                                        {
-                                            tracing::debug!(cid, error = %err, "udp serve_probe failed");
+                                let probe_timeout = std::time::Duration::from_secs(5);
+                                let _ = tokio::time::timeout(probe_timeout, async {
+                                    if let Some(incoming) = udp_ep.accept().await {
+                                        if let Ok(conn) = incoming.await {
+                                            if let Err(err) =
+                                                serve_probe(&conn, sandwich_secret, &offer_id).await
+                                            {
+                                                tracing::debug!(cid, error = %err, "udp serve_probe failed");
+                                            }
                                         }
                                     }
-                                }
+                                })
+                                .await;
                                 udp_ep.close(0u32.into(), b"done");
 
                                 client_record.clear();
