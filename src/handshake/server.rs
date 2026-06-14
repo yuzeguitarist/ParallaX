@@ -500,18 +500,32 @@ struct ServerRuntimeSecrets {
 impl ServerRuntimeSecrets {
     fn decode(config: &ServerConfig) -> Result<Self, ConfigError> {
         let private_key = decode_key32_secret("server.private_key", &config.private_key)?;
-        crate::process_hardening::protect_secret_bytes("runtime.server.private_key", &*private_key);
         let server_public_key = x25519_public_from_private(&private_key);
         let identity_secret_key =
             decode_base64_secret("server.identity_secret_key", &config.identity_secret_key)?;
+
+        // Pin the secrets at their FINAL, stable addresses. private_key is an
+        // inline [u8;32]: protecting it before the Arc::new below would mlock the
+        // stack local, which is then copied into the Arc's heap allocation by the
+        // move — leaving the live key at a new, unpinned, dumpable address. Wrap
+        // first, then protect through the Arc so the lock lands on the bytes that
+        // actually persist. (identity_secret_key is a Vec whose heap buffer is
+        // stable across the move, but we protect it after the wrap too for
+        // consistency.)
+        let private_key = Arc::new(private_key);
+        crate::process_hardening::protect_secret_bytes(
+            "runtime.server.private_key",
+            &**private_key,
+        );
+        let identity_secret_key = Arc::new(identity_secret_key);
         crate::process_hardening::protect_secret_bytes(
             "runtime.server.identity_secret_key",
             identity_secret_key.as_slice(),
         );
         Ok(Self {
-            private_key: Arc::new(private_key),
+            private_key,
             server_public_key,
-            identity_secret_key: Arc::new(identity_secret_key),
+            identity_secret_key,
         })
     }
 

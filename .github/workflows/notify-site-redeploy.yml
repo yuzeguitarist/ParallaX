@@ -17,6 +17,9 @@ on:
       - "ParallaX-DeepWiki/**"
   workflow_dispatch: {}
 
+# This job only POSTs to an external deploy hook; it needs no repo token scopes.
+permissions: {}
+
 # Don't pile up redeploys if several doc commits land quickly.
 concurrency:
   group: redeploy-docs-site

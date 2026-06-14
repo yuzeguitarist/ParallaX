@@ -230,11 +230,14 @@ impl Default for TrafficConfig {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let raw = Zeroizing::new(fs::read_to_string(path)?);
+        // Read the secret config through a single opened fd whose permissions are
+        // verified on the fd itself (fstat), before parsing. This closes the
+        // symlink / TOCTOU window that exists when a path-based permission check
+        // and a separate path-based read can resolve to different inodes.
+        let raw = read_secret_config_file(path)?;
         let mut cfg = toml::from_str::<Self>(raw.as_str())?;
         cfg.resolve_paths_relative_to(path);
         cfg.validate()?;
-        cfg.validate_file_permissions(path)?;
         Ok(cfg)
     }
 
@@ -384,17 +387,25 @@ impl Config {
             .unwrap_or_else(|| Path::new("."));
         server.replay_cache_path = config_dir.join(&server.replay_cache_path);
     }
-
-    fn validate_file_permissions(&self, path: &Path) -> Result<(), ConfigError> {
-        validate_secret_config_file_permissions(path)
-    }
 }
 
 #[cfg(unix)]
-fn validate_secret_config_file_permissions(path: &Path) -> Result<(), ConfigError> {
-    use std::os::unix::fs::MetadataExt;
+fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let metadata = fs::metadata(path)?;
+    // O_NOFOLLOW: refuse to open the config if its final path component is a
+    // symlink (a classic way to aim a privileged reader at another file). It
+    // guards only the last component, but together with the fd-based permission
+    // check below it removes the path-vs-read race.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+
+    // fstat the OPEN fd, not the path, so the inode whose permissions we approve
+    // is exactly the inode we then read — no TOCTOU between check and read.
+    let metadata = file.metadata()?;
     let mode = metadata.mode() & 0o777;
     let uid = metadata.uid();
     let euid = unsafe { libc::geteuid() };
@@ -406,12 +417,15 @@ fn validate_secret_config_file_permissions(path: &Path) -> Result<(), ConfigErro
             euid,
         });
     }
-    Ok(())
+
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    Ok(Zeroizing::new(raw))
 }
 
 #[cfg(not(unix))]
-fn validate_secret_config_file_permissions(_path: &Path) -> Result<(), ConfigError> {
-    Ok(())
+fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
+    Ok(Zeroizing::new(fs::read_to_string(path)?))
 }
 
 impl TrafficConfig {
