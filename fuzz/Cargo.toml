@@ -13,6 +13,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+rand = "0.8"
 
 [dependencies.parallax]
 path = ".."
@@ -20,7 +21,7 @@ path = ".."
 # --- Targets -----------------------------------------------------------------
 # All targets take raw &[u8] (attacker-influenced bytes). cargo-fuzz compiles
 # the parallax crate with `--cfg fuzzing`, which is what makes the
-# `tls::safari26::fuzz` re-export module below visible.
+# `tls::safari26::fuzz` / `client::socks::fuzz` re-export modules visible.
 
 [[bin]]
 name = "tls_client_hello"
@@ -60,6 +61,41 @@ bench = false
 [[bin]]
 name = "client_hello_auth"
 path = "fuzz_targets/client_hello_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "command_codecs"
+path = "fuzz_targets/command_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http2_frame_header"
+path = "fuzz_targets/http2_frame_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "data_record_open"
+path = "fuzz_targets/data_record_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replay_journal"
+path = "fuzz_targets/replay_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socks_connect_request"
+path = "fuzz_targets/socks_connect_request.rs"
 test = false
 doc = false
 bench = false
