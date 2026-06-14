@@ -101,10 +101,16 @@ pub enum ClientRuntimeError {
 type ClientSession = (TcpStream, ClientDataSession);
 type ClientSessionTask = tokio::task::JoinHandle<Result<ClientSession, ClientRuntimeError>>;
 
+static CLIENT_UDP_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     if config.mode != Mode::Client {
         return Err(ClientRuntimeError::WrongMode);
     }
+    // Process-wide client UDP-negotiation flag, read at the data-session seam to
+    // decide whether to open a PX1G UdpRequest. Set once at startup.
+    CLIENT_UDP_ENABLED.store(config.udp.enabled, std::sync::atomic::Ordering::Relaxed);
 
     let client = config
         .client
@@ -680,6 +686,34 @@ async fn establish_authenticated_data_session_with_resolver(
         server_public,
     )
     .await?;
+
+    // Client-initiated, fail-soft UDP negotiation. Gated on the process-wide
+    // udp.enabled flag. The client offers to use the UDP fast plane; the server
+    // replies PX1N (decline) until the UDP datapath is wired. This runs strictly
+    // before the first Connect/Mux command, so it occupies record #1 in each AEAD
+    // direction with no reordering risk. An error here fails the connection (the
+    // record stream would be desynced), which is the correct outcome.
+    if CLIENT_UDP_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        let request = crate::protocol::command::UdpRequest {
+            version: crate::protocol::command::UDP_NEGOTIATION_VERSION,
+        }
+        .encode();
+        let request_record = data_session.seal_payload(&request, &mut OsRng)?;
+        server.write_all(&request_record).await?;
+
+        let mut response = Vec::new();
+        {
+            let mut reader = crate::tls::record::TlsRecordReader::new(&mut server);
+            reader.read_record_into(&mut response).await?;
+        }
+        data_session.open_server_record_in_place(&mut response)?;
+        if crate::protocol::command::UdpDecline::has_magic(&response) {
+            tracing::info!("UDP fast plane declined by server; continuing on TCP");
+        } else {
+            tracing::info!("UDP negotiation: unrecognized response; continuing on TCP");
+        }
+    }
+
     Ok((server, data_session))
 }
 
