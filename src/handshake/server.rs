@@ -236,10 +236,16 @@ enum FirstClientRead {
     FallbackPrefix(Vec<u8>),
 }
 
+pub(crate) static SERVER_UDP_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     if config.mode != Mode::Server {
         return Err(HandshakeServerError::WrongMode);
     }
+    // Process-wide server UDP-offer flag, read in run_authenticated_data_mode to
+    // decide whether to offer the UDP fast plane (vs decline). Set once at startup.
+    SERVER_UDP_ENABLED.store(config.udp.enabled, std::sync::atomic::Ordering::Relaxed);
 
     let server = config
         .server
@@ -1086,12 +1092,87 @@ async fn run_authenticated_data_mode(
                         if crate::protocol::command::UdpRequest::has_magic(
                             &client_record[first_payload_range.clone()],
                         ) {
-                            let decline = crate::protocol::command::UdpDecline {
-                                reason: crate::protocol::command::UDP_DECLINE_UNSUPPORTED,
+                            use crate::protocol::command::{
+                                UdpDecline, UdpOffer, UdpProbeAck, UDP_CC_BBR, UDP_DECLINE_DISABLED,
+                                UDP_FEC_ADAPTIVE,
+                            };
+                            use crate::transport::udp::{
+                                endpoint::bind_server_endpoint, probe::serve_probe,
+                            };
+
+                            let offered = if SERVER_UDP_ENABLED
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                bind_server_endpoint("0.0.0.0:0".parse().unwrap(), "localhost")
+                                    .ok()
+                                    .and_then(|ep| {
+                                        let port = ep.local_addr().ok()?.port();
+                                        if port == 0 {
+                                            return None;
+                                        }
+                                        let offer_id: [u8; 16] = rand::random();
+                                        Some((ep, offer_id, port))
+                                    })
+                            } else {
+                                None
+                            };
+
+                            if let Some((udp_ep, offer_id, port)) = offered {
+                                let offer = UdpOffer {
+                                    offer_id,
+                                    udp_port: port,
+                                    port_hop_seed: 0,
+                                    cc: UDP_CC_BBR,
+                                    fec_profile: UDP_FEC_ADAPTIVE,
+                                    ignore_client_bandwidth: false,
+                                }
+                                .encode()
+                                .expect("valid udp offer");
+                                let offer_record = server_seal.seal(&offer, &mut rng)?;
+                                client_write.write_all(&offer_record).await?;
+
+                                // Best-effort: accept the client's QUIC connection and
+                                // answer one probe. Failure here does NOT desync the
+                                // control stream — the client always sends PX1P next,
+                                // and we always read it below.
+                                if let Ok(Some(incoming)) = tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    udp_ep.accept(),
+                                )
+                                .await
+                                {
+                                    if let Ok(conn) = incoming.await {
+                                        if let Err(err) =
+                                            serve_probe(&conn, sandwich_secret, &offer_id).await
+                                        {
+                                            tracing::debug!(cid, error = %err, "udp serve_probe failed");
+                                        }
+                                    }
+                                }
+                                udp_ep.close(0u32.into(), b"done");
+
+                                client_record.clear();
+                                client_records.read_record_into(&mut client_record).await?;
+                                let ack_range =
+                                    client_open.open_in_place_payload_range(&mut client_record)?;
+                                match UdpProbeAck::decode(&client_record[ack_range]) {
+                                    Ok(ack) => {
+                                        tracing::info!(cid, status = ?ack.status, "udp probe ack")
+                                    }
+                                    Err(err) => {
+                                        tracing::debug!(cid, error = %err, "udp probe ack decode failed")
+                                    }
+                                }
+                            } else {
+                                let decline = UdpDecline {
+                                    reason: UDP_DECLINE_DISABLED,
+                                }
+                                .encode();
+                                let decline_record = server_seal.seal(&decline, &mut rng)?;
+                                client_write.write_all(&decline_record).await?;
                             }
-                            .encode();
-                            let decline_record = server_seal.seal(&decline, &mut rng)?;
-                            client_write.write_all(&decline_record).await?;
+
+                            // Read the client's real first command.
                             client_record.clear();
                             client_records.read_record_into(&mut client_record).await?;
                             first_payload_range =

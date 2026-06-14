@@ -1047,6 +1047,10 @@ impl UdpOffer {
         Ok(out)
     }
 
+    pub fn has_magic(input: &[u8]) -> bool {
+        input.len() >= 4 && &input[..4] == UDP_OFFER_MAGIC
+    }
+
     pub fn decode(input: &[u8]) -> Result<Self, UdpOfferError> {
         if input.len() < 4 {
             return Err(UdpOfferError::Truncated);

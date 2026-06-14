@@ -663,6 +663,46 @@ pub(crate) async fn establish_authenticated_data_session(
     .await
 }
 
+/// Probe the offered UDP fast plane over a fresh QUIC connection to the server's
+/// IP and the offered port. Never errors — failures map to Unreachable/Failed so
+/// the caller can always report a PX1P and keep the control stream aligned.
+async fn run_client_udp_probe(
+    server: &TcpStream,
+    offer: &crate::protocol::command::UdpOffer,
+    psk: &[u8],
+) -> crate::transport::udp::probe::ProbeOutcome {
+    use crate::transport::udp::probe::ProbeOutcome;
+    let Ok(peer) = server.peer_addr() else {
+        return ProbeOutcome::Failed;
+    };
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let Ok(endpoint) = crate::transport::udp::endpoint::bind_client_endpoint_accept_any(
+        bind.parse().expect("valid wildcard bind address"),
+    ) else {
+        return ProbeOutcome::Failed;
+    };
+    let udp_addr = std::net::SocketAddr::new(peer.ip(), offer.udp_port);
+    let Ok(connecting) = endpoint.connect(udp_addr, "localhost") else {
+        return ProbeOutcome::Failed;
+    };
+    let conn = match tokio::time::timeout(std::time::Duration::from_secs(5), connecting).await {
+        Ok(Ok(conn)) => conn,
+        _ => return ProbeOutcome::Unreachable,
+    };
+    crate::transport::udp::probe::probe_client(
+        &conn,
+        psk,
+        &offer.offer_id,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or(ProbeOutcome::Failed)
+}
+
 async fn establish_authenticated_data_session_with_resolver(
     server_addr: &ServerAddrResolver,
     config: &ClientConfig,
@@ -694,8 +734,13 @@ async fn establish_authenticated_data_session_with_resolver(
     // direction with no reordering risk. An error here fails the connection (the
     // record stream would be desynced), which is the correct outcome.
     if CLIENT_UDP_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        let request = crate::protocol::command::UdpRequest {
-            version: crate::protocol::command::UDP_NEGOTIATION_VERSION,
+        use crate::protocol::command::{
+            UdpDecline, UdpOffer, UdpProbeAck, UdpProbeStatus, UdpRequest, UDP_NEGOTIATION_VERSION,
+        };
+        use crate::transport::udp::probe::ProbeOutcome;
+
+        let request = UdpRequest {
+            version: UDP_NEGOTIATION_VERSION,
         }
         .encode();
         let request_record = data_session.seal_payload(&request, &mut OsRng)?;
@@ -707,7 +752,40 @@ async fn establish_authenticated_data_session_with_resolver(
             reader.read_record_into(&mut response).await?;
         }
         data_session.open_server_record_in_place(&mut response)?;
-        if crate::protocol::command::UdpDecline::has_magic(&response) {
+
+        if UdpOffer::has_magic(&response) {
+            // The server offered the UDP fast plane: probe it, then ALWAYS report
+            // the outcome with PX1P (the server always reads it) so the control
+            // stream stays aligned regardless of the probe result.
+            let (offer_id, outcome) = match UdpOffer::decode(&response) {
+                Ok(offer) => {
+                    let outcome = run_client_udp_probe(&server, &offer, psk).await;
+                    (offer.offer_id, outcome)
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, "udp offer decode failed");
+                    ([0_u8; 16], ProbeOutcome::Failed)
+                }
+            };
+            let status = match outcome {
+                ProbeOutcome::Verified { .. } => UdpProbeStatus::Verified,
+                ProbeOutcome::Unreachable => UdpProbeStatus::Unreachable,
+                ProbeOutcome::Failed => UdpProbeStatus::Failed,
+            };
+            let rtt_micros = match outcome {
+                ProbeOutcome::Verified { rtt } => rtt.as_micros().min(u128::from(u32::MAX)) as u32,
+                _ => 0,
+            };
+            tracing::info!(?status, "UDP fast-plane probe outcome");
+            let ack = UdpProbeAck {
+                offer_id,
+                status,
+                rtt_micros,
+            }
+            .encode();
+            let ack_record = data_session.seal_payload(&ack, &mut OsRng)?;
+            server.write_all(&ack_record).await?;
+        } else if UdpDecline::has_magic(&response) {
             tracing::info!("UDP fast plane declined by server; continuing on TCP");
         } else {
             tracing::info!("UDP negotiation: unrecognized response; continuing on TCP");
@@ -1993,6 +2071,68 @@ mod tests {
         timeout(Duration::from_secs(5), app.read_to_end(&mut response))
             .await
             .unwrap_or_else(|_| panic!("relay response timed out with UDP negotiation enabled"))
+            .unwrap();
+        assert_eq!(response, b"response-after-half-close");
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn socks_relay_succeeds_with_full_udp_negotiation() {
+        // Both sides enabled: the server offers the UDP fast plane (PX1O), the
+        // client probes it over QUIC and reports PX1P; the SOCKS relay must still
+        // complete, proving the full offer/probe/ack exchange keeps the control
+        // stream aligned end to end.
+        struct UdpFlagGuard;
+        impl Drop for UdpFlagGuard {
+            fn drop(&mut self) {
+                CLIENT_UDP_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+                crate::handshake::server::SERVER_UDP_ENABLED
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        CLIENT_UDP_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::handshake::server::SERVER_UDP_ENABLED
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _udp_guard = UdpFlagGuard;
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_eof_response_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
+        let (local_addr, client_task) = spawn_local_client(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+        )
+        .await;
+
+        let mut app = connect_socks_target(local_addr, target_addr).await;
+        app.write_all(b"request-before-half-close").await.unwrap();
+        app.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(10), app.read_to_end(&mut response))
+            .await
+            .unwrap_or_else(|_| panic!("relay response timed out with full UDP negotiation"))
             .unwrap();
         assert_eq!(response, b"response-after-half-close");
 
