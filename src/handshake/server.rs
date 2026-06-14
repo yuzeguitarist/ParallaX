@@ -1244,14 +1244,59 @@ async fn run_authenticated_data_mode(
                                     .flatten();
 
                                 client_record.clear();
-                                client_records.read_record_into(&mut client_record).await?;
+                                // BOUNDED read: we are holding the ephemeral QUIC
+                                // endpoint (a live UDP-socket fd) and the accepted
+                                // connection (`probed_conn`) while waiting for the
+                                // client's PX1P ack. A misbehaving client that
+                                // withholds PX1P here would otherwise pin both
+                                // indefinitely (the keep-alive masks quinn's idle
+                                // timeout). On timeout, eagerly close both so the
+                                // UDP fd is released promptly, then fail the
+                                // connection. A real client always sends PX1P next.
+                                match tokio::time::timeout(
+                                    PX1_CONTROL_READ_TIMEOUT,
+                                    client_records.read_record_into(&mut client_record),
+                                )
+                                .await
+                                {
+                                    Ok(res) => res?,
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            cid,
+                                            "udp PX1P ack read timed out; releasing QUIC endpoint"
+                                        );
+                                        if let Some(conn) = probed_conn {
+                                            conn.close(0u32.into(), b"px1p-timeout");
+                                        }
+                                        udp_ep.close(0u32.into(), b"px1p-timeout");
+                                        return Err(HandshakeServerError::Io(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            "udp PX1P ack read timed out",
+                                        )));
+                                    }
+                                }
                                 let ack_range =
                                     client_open.open_in_place_payload_range(&mut client_record)?;
                                 let ack_status = match UdpProbeAck::decode(&client_record[ack_range])
                                 {
-                                    Ok(ack) => {
+                                    Ok(ack) if ack.offer_id == offer_id => {
                                         tracing::info!(cid, status = ?ack.status, "udp probe ack");
                                         Some(ack.status)
+                                    }
+                                    Ok(ack) => {
+                                        // The ack echoed a DIFFERENT offer_id than the
+                                        // one we generated for this session. It is
+                                        // AEAD-authenticated, so this is defense-in-
+                                        // depth, but a mismatched offer_id is never a
+                                        // valid response to THIS offer: treat it as a
+                                        // declined probe (do NOT retain QUIC) and fall
+                                        // through to the TCP path.
+                                        tracing::debug!(
+                                            cid,
+                                            status = ?ack.status,
+                                            "udp probe ack offer_id mismatch; declining"
+                                        );
+                                        None
                                     }
                                     Err(err) => {
                                         tracing::debug!(cid, error = %err, "udp probe ack decode failed");
@@ -1302,7 +1347,33 @@ async fn run_authenticated_data_mode(
 
                             // Read the client's real first command.
                             client_record.clear();
-                            client_records.read_record_into(&mut client_record).await?;
+                            // BOUNDED read: on the Verified path we are now holding
+                            // the retained QUIC endpoint + connection in
+                            // `retained_quic` (and on the non-Verified path the
+                            // endpoint was already closed above). A misbehaving
+                            // client that sent a Verified PX1P but then withholds the
+                            // real command would pin the retained UDP fd + connection
+                            // indefinitely; bound the read and, on timeout, eagerly
+                            // release whatever is held before failing.
+                            match tokio::time::timeout(
+                                PX1_CONTROL_READ_TIMEOUT,
+                                client_records.read_record_into(&mut client_record),
+                            )
+                            .await
+                            {
+                                Ok(res) => res?,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        cid,
+                                        "udp real first-command read timed out; releasing QUIC"
+                                    );
+                                    drop_retained_quic(retained_quic.take());
+                                    return Err(HandshakeServerError::Io(io::Error::new(
+                                        io::ErrorKind::TimedOut,
+                                        "udp real first-command read timed out",
+                                    )));
+                                }
+                            }
                             first_payload_range =
                                 client_open.open_in_place_payload_range(&mut client_record)?;
                         }
@@ -1791,6 +1862,30 @@ fn drop_retained_quic(retained: Option<(quinn::Endpoint, quinn::Connection)>) {
 /// rather than silently splitting the two directions across TCP and QUIC.
 const QUIC_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on the two PX1G control-plane reads (the PX1P probe-ack and the real
+/// first-command re-read) that run WHILE the server is holding the ephemeral QUIC
+/// endpoint (a live UDP-socket fd) and the accepted `quinn::Connection`. These
+/// reads are reached ONLY on the UDP-negotiated path; without a bound a
+/// misbehaving authenticated client that sends PX1G, lets the server bind+offer+
+/// accept, then withholds PX1P (or the real command) would pin the UDP fd +
+/// connection indefinitely (quinn's keep-alive masks the idle timeout, so the
+/// connection would not self-collect). On timeout the server eagerly closes
+/// whatever QUIC resources it holds (releasing the UDP fd promptly) and fails the
+/// connection. A real client always sends both records immediately, so this never
+/// trips a legitimate peer. The non-PX1G first-command read elsewhere is NOT
+/// affected, so the udp-off baseline is byte-identical.
+const PX1_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Brief grace, applied AFTER the teardown DONE `select!` returns its
+/// `conn.closed()` sentinel, for the reliable TCP DONE to arrive. The peer sends
+/// its DONE over the TCP control stream and THEN closes the QUIC connection; the
+/// CONNECTION_CLOSE can reorder ahead of the already-sent TCP DONE bytes, so the
+/// biased select can take the `conn.closed()` arm even though a fully-successful
+/// relay's DONE is in flight. No data is lost (the app already has everything),
+/// but it would spuriously error without this grace. Small: the DONE was sent
+/// before the peer closed, so it is at most one TCP delivery away.
+const QUIC_RELAY_DONE_GRACE: Duration = Duration::from_secs(2);
+
 /// Generous backstop on the teardown DONE read (see the client-side twin). The
 /// read is primarily bounded on connection liveness, but the 15s keep-alive masks
 /// the idle timeout for an alive-but-stuck peer, so without a backstop a completed
@@ -2008,20 +2103,27 @@ async fn server_exchange_quic_done(
     let mut record = Vec::new();
     // PRIMARY bound: connection liveness; BACKSTOP: generous wall-clock timeout
     // (the keep-alive masks the idle timeout for an alive-but-stuck peer).
+    //
+    // The inner select yields a SENTINEL rather than concluding: `Ok(true)` means
+    // the DONE record was read into `record`; `Ok(false)` means `conn.closed()`
+    // fired first. The grace read runs AFTER the select returns (so the
+    // `client_records`/`record` borrows the select held are released -- no double-
+    // mutable borrow) to absorb a teardown reorder: the client sends its DONE over
+    // the reliable TCP control stream and THEN closes the QUIC connection, so the
+    // CONNECTION_CLOSE can reorder ahead of the already-sent TCP DONE bytes and
+    // trip the `conn.closed()` arm even on a fully-successful relay. No data is
+    // lost; the grace just lets the in-flight DONE land before concluding failure.
     let read_done = async {
         tokio::select! {
             // `biased`: poll the DONE read FIRST so an already-arrived peer DONE wins
             // over a concurrently-ready `conn.closed()` (the client sends its DONE
             // over TCP then closes the QUIC connection).
             biased;
-            res = client_records.read_record_into(&mut record) => res.map_err(HandshakeServerError::Io),
-            _ = conn.closed() => Err(HandshakeServerError::Io(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "QUIC connection closed before peer DONE",
-            ))),
+            res = client_records.read_record_into(&mut record) => res.map(|()| true).map_err(HandshakeServerError::Io),
+            _ = conn.closed() => Ok(false),
         }
     };
-    match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, read_done).await {
+    let done_read = match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, read_done).await {
         Ok(res) => res?,
         Err(_) => {
             tracing::warn!(cid, "QUIC fast-plane teardown DONE backstop elapsed");
@@ -2029,6 +2131,26 @@ async fn server_exchange_quic_done(
                 io::ErrorKind::TimedOut,
                 "QUIC fast-plane teardown DONE backstop elapsed",
             )));
+        }
+    };
+    if !done_read {
+        // `conn.closed()` won the select. The peer's TCP DONE was sent BEFORE it
+        // closed the QUIC connection, so give it a brief grace to arrive over the
+        // reliable control stream before concluding failure. This read runs after
+        // the select returned, so the `client_records`/`record` borrows are free.
+        match tokio::time::timeout(
+            QUIC_RELAY_DONE_GRACE,
+            client_records.read_record_into(&mut record),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            _ => {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "QUIC connection closed before peer DONE",
+                )));
+            }
         }
     }
     let plaintext = client_open.open_in_place_payload_range(&mut record)?;

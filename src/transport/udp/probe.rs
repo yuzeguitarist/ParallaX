@@ -183,4 +183,34 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, ProbeOutcome::Unreachable);
     }
+
+    #[tokio::test]
+    async fn probe_with_wrong_token_is_failed_not_verified() {
+        // An on-path echo / replayed Initial can return a well-FORMED response
+        // (correct magic + length) but cannot hold the exporter-bound token, so
+        // its HMAC over the nonce will not match. Model that by serving the probe
+        // with a DIFFERENT PSK than the client uses: both derive a token from the
+        // same live exporter, but the differing PSK yields differing tokens, so
+        // the server's response MAC fails the client's constant-time compare. The
+        // client must classify this as `Failed` (authentication rejected), NOT
+        // `Verified` -- this is the captured-Initial-replay / on-path-echo defense
+        // and guards against a regression that makes the HMAC compare always-
+        // accept.
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+        const WRONG_PSK: &[u8] = b"a-completely-different-psk-value!";
+        // Drive both sides with join!: serve_probe only QUEUES its reply, so
+        // server_conn must stay alive until the client has read it.
+        let server = serve_probe(&server_conn, WRONG_PSK, CTX);
+        let client = probe_client(&client_conn, PSK, CTX, Duration::from_secs(5));
+        let (server_res, client_res) = tokio::join!(server, client);
+        // The server happily answers (it cannot tell its token is "wrong"); the
+        // mismatch is detected only on the client's authenticated compare.
+        server_res.expect("server serve_probe");
+        let outcome = client_res.expect("client probe");
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Failed,
+            "a response that fails the exporter-bound HMAC must be Failed, not Verified"
+        );
+    }
 }

@@ -1250,6 +1250,16 @@ const QUIC_RELAY_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// so a legitimately slow-but-progressing drain is not cut.
 const QUIC_RELAY_DONE_BACKSTOP: Duration = Duration::from_secs(120);
 
+/// Brief grace, applied AFTER the teardown DONE `select!` takes its
+/// `conn.closed()` arm, for the reliable TCP DONE to arrive. The peer sends its
+/// DONE over the TCP control stream and THEN closes the QUIC connection, so the
+/// CONNECTION_CLOSE can reorder ahead of the already-sent TCP DONE bytes and trip
+/// the biased select's `conn.closed()` arm even on a fully-successful relay. No
+/// data is lost (the app already has everything); without this grace the relay
+/// would spuriously error. Small: the DONE was sent before the peer closed, so it
+/// is at most one TCP delivery away.
+const QUIC_RELAY_DONE_GRACE: Duration = Duration::from_secs(2);
+
 impl ClientRelay {
     async fn run(self) -> Result<(), ClientRuntimeError> {
         let ClientRelay {
@@ -1319,13 +1329,22 @@ impl ClientRelay {
             // codec; the server reads it on the same codec at #N+1 and skips it.
             // Real relay data continues at #N+2 on the SAME SendStream.
             let mut server_write_leg = QuicStreamLegWriter(send);
-            let trigger = seal_to_server
-                .seal(&[], &mut OsRng)
-                .map_err(ClientHandshakeError::from)?;
-            server_write_leg
-                .write_records(&trigger)
-                .await
-                .map_err(ClientRuntimeError::Io)?;
+            // The server's `accept_bi` is already waiting on this trigger. If we
+            // fail to seal or write it, close the connection EXPLICITLY (parity
+            // with the open_bi error arms above, which do not rely on Drop) so the
+            // server's `accept_bi` unblocks promptly with a CONNECTION_CLOSE rather
+            // than parking until its accept timeout.
+            let trigger = match seal_to_server.seal(&[], &mut OsRng) {
+                Ok(trigger) => trigger,
+                Err(err) => {
+                    conn.close(0u32.into(), b"trigger-failed");
+                    return Err(ClientRuntimeError::Handshake(err.into()));
+                }
+            };
+            if let Err(err) = server_write_leg.write_records(&trigger).await {
+                conn.close(0u32.into(), b"trigger-failed");
+                return Err(ClientRuntimeError::Io(err));
+            }
 
             let upload = client_upload_loop(
                 local_read,
@@ -1447,6 +1466,17 @@ async fn client_exchange_quic_done(
     // drain is never cut. BACKSTOP: a generous wall-clock timeout, because the 15s
     // keep-alive masks the idle timeout for an alive-but-stuck peer -- without it a
     // completed side would park here forever pinning the connection.
+    //
+    // The inner select yields a SENTINEL rather than concluding: `Ok(true)` means
+    // the DONE record was read into `record`; `Ok(false)` means `conn.closed()`
+    // fired first. The grace read runs AFTER the select returns (so the `reader`/
+    // `record` borrows the select held are released -- no double-mutable borrow)
+    // to absorb a teardown reorder: the peer sends its DONE over the reliable TCP
+    // control stream and THEN closes the QUIC connection, so the CONNECTION_CLOSE
+    // can reorder ahead of the already-sent TCP DONE bytes and trip the
+    // `conn.closed()` arm even on a fully-successful relay. No data is lost (the
+    // app already has everything); the grace just lets the in-flight DONE land
+    // before we conclude failure.
     let read_done = async {
         tokio::select! {
             // `biased`: poll the DONE read FIRST so an already-arrived peer DONE
@@ -1454,14 +1484,11 @@ async fn client_exchange_quic_done(
             // ready `conn.closed()`; otherwise a fully successful relay could be
             // reported as a failure.
             biased;
-            res = reader.read_record_into(&mut record) => res.map_err(ClientRuntimeError::Io),
-            _ = conn.closed() => Err(ClientRuntimeError::Io(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "QUIC connection closed before peer DONE",
-            ))),
+            res = reader.read_record_into(&mut record) => res.map(|()| true).map_err(ClientRuntimeError::Io),
+            _ = conn.closed() => Ok(false),
         }
     };
-    match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, read_done).await {
+    let done_read = match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, read_done).await {
         Ok(res) => res?,
         Err(_) => {
             tracing::warn!(cid, "QUIC fast-plane teardown DONE backstop elapsed");
@@ -1469,6 +1496,23 @@ async fn client_exchange_quic_done(
                 io::ErrorKind::TimedOut,
                 "QUIC fast-plane teardown DONE backstop elapsed",
             )));
+        }
+    };
+    if !done_read {
+        // `conn.closed()` won the select. The peer's TCP DONE was sent BEFORE it
+        // closed the QUIC connection, so give it a brief grace to arrive over the
+        // reliable control stream before concluding failure. This read runs after
+        // the select returned, so the `reader`/`record` borrows are free.
+        match tokio::time::timeout(QUIC_RELAY_DONE_GRACE, reader.read_record_into(&mut record))
+            .await
+        {
+            Ok(Ok(())) => {}
+            _ => {
+                return Err(ClientRuntimeError::Io(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "QUIC connection closed before peer DONE",
+                )));
+            }
         }
     }
     let plaintext = open_from_server
@@ -2770,6 +2814,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback UDP+TCP sockets"]
     async fn quic_relay_asymmetric_slow_upload_is_not_truncated() {
+        use crate::transport::leg::QUIC_LEG_BYTES_WRITTEN;
+        use std::sync::atomic::Ordering;
+
         // Serialize against the other QUIC fast-plane e2e tests (shared globals).
         let _serial = quic_e2e_guard().await;
 
@@ -2813,6 +2860,7 @@ mod tests {
         )
         .await;
 
+        let before = QUIC_LEG_BYTES_WRITTEN.load(Ordering::Relaxed);
         let app = connect_socks_target(local_addr, target_addr).await;
         let (mut app_read, mut app_write) = app.into_split();
 
@@ -2841,6 +2889,15 @@ mod tests {
             response.len()
         );
         writer.await.unwrap();
+
+        // The relay must have run over the QUIC fast plane, not silently fallen
+        // back to TCP: the upload bytes traverse the client's QUIC stream leg, so
+        // the instrument must have advanced. A silent TCP fallback leaves it flat.
+        let after = QUIC_LEG_BYTES_WRITTEN.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "expected relay bytes to traverse the QUIC stream (before={before}, after={after})"
+        );
 
         // The proxied connection must have completed successfully on BOTH ends.
         // The relay tasks legitimately run for several seconds here (the target
@@ -2896,6 +2953,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback UDP+TCP sockets"]
     async fn quic_relay_asymmetric_slow_download_is_not_truncated() {
+        use crate::transport::leg::QUIC_LEG_BYTES_WRITTEN;
+        use std::sync::atomic::Ordering;
+
         // Serialize against the other QUIC fast-plane e2e tests (shared globals).
         let _serial = quic_e2e_guard().await;
 
@@ -2941,6 +3001,7 @@ mod tests {
         )
         .await;
 
+        let before = QUIC_LEG_BYTES_WRITTEN.load(Ordering::Relaxed);
         let app = connect_socks_target(local_addr, target_addr).await;
         let (mut app_read, mut app_write) = app.into_split();
 
@@ -2975,6 +3036,16 @@ mod tests {
         assert_eq!(
             response, expected,
             "downloaded bytes must round-trip byte-exact"
+        );
+
+        // The relay must have run over the QUIC fast plane, not silently fallen
+        // back to TCP: even this small upload (the request + the rendezvous
+        // trigger record) traverses the client's QUIC stream leg, so the
+        // instrument must have advanced. A silent TCP fallback leaves it flat.
+        let after = QUIC_LEG_BYTES_WRITTEN.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "expected relay bytes to traverse the QUIC stream (before={before}, after={after})"
         );
 
         // The relay tasks legitimately run for several seconds here (the local app

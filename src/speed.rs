@@ -271,9 +271,12 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     if config.mode != Mode::Client {
         return Err(SpeedError::WrongMode);
     }
-    // Mirror `client` run(): the UDP-negotiation parameters live on `config.udp`
-    // and are threaded into the data-session seam so `parallax speed` exercises
-    // the UDP fast plane identically when enabled.
+    // The UDP-negotiation parameters live on `config.udp` and are threaded into
+    // the data-session seam so `parallax speed` runs the SAME UDP probe/offer
+    // negotiation as `client` when enabled. The speed test itself, however,
+    // measures the TCP plane: `establish_authenticated_data_session` closes any
+    // retained QUIC fast-plane connection (the speed path stays on TCP in this
+    // slice), so the UDP probe runs but the measured data transfer is over TCP.
     let client = config.client.clone().ok_or(SpeedError::MissingClient)?;
     let psk = decode_psk(&config.crypto.psk)?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
