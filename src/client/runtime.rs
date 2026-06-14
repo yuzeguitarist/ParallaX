@@ -666,10 +666,15 @@ pub(crate) async fn establish_authenticated_data_session(
 /// Probe the offered UDP fast plane over a fresh QUIC connection to the server's
 /// IP and the offered port. Never errors — failures map to Unreachable/Failed so
 /// the caller can always report a PX1P and keep the control stream aligned.
+///
+/// `sni` is the camouflage front domain (the client's REALITY SNI), used as the
+/// QUIC ClientHello server name; it is never the literal "localhost", which would
+/// be a zero-false-positive censorship signature on the wire.
 async fn run_client_udp_probe(
     server: &TcpStream,
     offer: &crate::protocol::command::UdpOffer,
     psk: &[u8],
+    sni: &str,
 ) -> crate::transport::udp::probe::ProbeOutcome {
     use crate::transport::udp::probe::ProbeOutcome;
     let Ok(peer) = server.peer_addr() else {
@@ -686,7 +691,7 @@ async fn run_client_udp_probe(
         return ProbeOutcome::Failed;
     };
     let udp_addr = std::net::SocketAddr::new(peer.ip(), offer.udp_port);
-    let Ok(connecting) = endpoint.connect(udp_addr, "localhost") else {
+    let Ok(connecting) = endpoint.connect(udp_addr, sni) else {
         return ProbeOutcome::Failed;
     };
     let conn = match tokio::time::timeout(std::time::Duration::from_secs(5), connecting).await {
@@ -759,7 +764,7 @@ async fn establish_authenticated_data_session_with_resolver(
             // stream stays aligned regardless of the probe result.
             let (offer_id, outcome) = match UdpOffer::decode(&response) {
                 Ok(offer) => {
-                    let outcome = run_client_udp_probe(&server, &offer, psk).await;
+                    let outcome = run_client_udp_probe(&server, &offer, psk, &config.sni).await;
                     (offer.offer_id, outcome)
                 }
                 Err(err) => {

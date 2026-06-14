@@ -1103,7 +1103,15 @@ async fn run_authenticated_data_mode(
                             let offered = if SERVER_UDP_ENABLED
                                 .load(std::sync::atomic::Ordering::Relaxed)
                             {
-                                bind_server_endpoint("0.0.0.0:0".parse().unwrap(), "localhost")
+                                // Present the ephemeral cert under the same front
+                                // domain this connection is camouflaged as (the REALITY
+                                // ClientHello SNI), never the literal "localhost" — a
+                                // QUIC Initial carrying SNI=localhost to a public IP is
+                                // a zero-false-positive censorship signature.
+                                bind_server_endpoint(
+                                    "0.0.0.0:0".parse().unwrap(),
+                                    &handshake.client_hello.sni,
+                                )
                                     .ok()
                                     .and_then(|ep| {
                                         let port = ep.local_addr().ok()?.port();
