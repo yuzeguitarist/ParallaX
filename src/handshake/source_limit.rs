@@ -97,6 +97,28 @@ impl Drop for SourcePermit {
         };
         if became_idle {
             inner.idle_log.push_back((self.key, now));
+            // Hard-bound the idle log. The grace-based prune in `try_admit` only
+            // drains records older than the grace window, and under sustained
+            // high-churn from a small number of sources (too few to trip the
+            // over-capacity path) the drain rate equals the fill rate, so the
+            // deque would otherwise grow to accept_rate x grace without limit.
+            // Capping it here keeps memory bounded regardless of churn pattern.
+            while inner.idle_log.len() > self.limiter.max_entries {
+                drain_front_idle_record(&mut inner);
+            }
+        }
+    }
+}
+
+/// Pops the oldest idle-log record and evicts its map entry if that entry is
+/// still the idle entry the record refers to (a re-activated-then-re-idled entry
+/// has a newer `idle_since`, so a stale record only drops the log line).
+fn drain_front_idle_record(inner: &mut Inner) {
+    if let Some((key, logged)) = inner.idle_log.pop_front() {
+        if let Some(entry) = inner.map.get(&key) {
+            if entry.active == 0 && entry.idle_since == Some(logged) {
+                inner.map.remove(&key);
+            }
         }
     }
 }
@@ -185,7 +207,7 @@ impl SourceLimiter {
     fn prune_locked(&self, inner: &mut Inner) {
         let now = Instant::now();
         for _ in 0..PRUNE_BUDGET {
-            let Some(&(key, logged)) = inner.idle_log.front() else {
+            let Some(&(_, logged)) = inner.idle_log.front() else {
                 break;
             };
             let over_capacity = inner.map.len() > self.max_entries;
@@ -193,12 +215,7 @@ impl SourceLimiter {
             if !expired && !over_capacity {
                 break;
             }
-            inner.idle_log.pop_front();
-            if let Some(entry) = inner.map.get(&key) {
-                if entry.active == 0 && entry.idle_since == Some(logged) {
-                    inner.map.remove(&key);
-                }
-            }
+            drain_front_idle_record(inner);
         }
     }
 
@@ -208,6 +225,15 @@ impl SourceLimiter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .map
+            .len()
+    }
+
+    #[cfg(test)]
+    fn idle_log_len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .idle_log
             .len()
     }
 }
@@ -330,6 +356,26 @@ mod tests {
             limiter.entry_count() <= 2 + PRUNE_BUDGET,
             "idle map must stay bounded, got {}",
             limiter.entry_count()
+        );
+    }
+
+    #[test]
+    fn idle_log_stays_bounded_under_single_source_high_churn() {
+        // A single source churning connect->drop indefinitely pushes one idle-log
+        // record per cycle. With far too few sources to trip the over-capacity
+        // path, the grace-based prune never fires during a fast burst, so without
+        // the hard cap the deque would grow unbounded. Assert it stays bounded by
+        // max_entries (here 64) no matter how many cycles run.
+        let limiter = SourceLimiter::with_params(4, 4, 64, 64, Duration::from_secs(120));
+        let ip = v4(203, 0, 113, 7);
+        for _ in 0..10_000 {
+            let permit = Arc::clone(&limiter).try_admit(ip);
+            drop(permit);
+        }
+        assert!(
+            limiter.idle_log_len() <= 64,
+            "idle_log must stay bounded by max_entries, got {}",
+            limiter.idle_log_len()
         );
     }
 

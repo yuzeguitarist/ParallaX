@@ -18,6 +18,10 @@ on:
       - 'LICENSE*'
   workflow_dispatch:
 
+# Least-privilege default token: these jobs only read the repo to build/test.
+permissions:
+  contents: read
+
 # Cancel any in-flight run on the same branch when a new commit is pushed.
 concurrency:
   group: ci-quick-${{ github.ref }}
@@ -36,6 +40,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

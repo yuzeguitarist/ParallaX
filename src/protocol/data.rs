@@ -829,6 +829,15 @@ pub fn max_plaintext_len(max_padding: u16) -> usize {
     OUTER_TLS_RECORD_LIMIT.saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }
 
+/// Minimum plaintext bytes that must remain per record after padding overhead.
+/// Configs whose `max_padding` drives `max_plaintext_len` below this are rejected
+/// at validation: a near-record-sized padding (e.g. leaving 1 plaintext byte)
+/// makes a single 64 KiB relay read split into tens of thousands of records, and
+/// the up-front `out.reserve(...)` for that would attempt a ~1 GiB allocation
+/// (an availability footgun). 1 KiB still permits very heavy padding (>90% of the
+/// record) while bounding worst-case buffering to a few MiB per relay read.
+pub const MIN_USABLE_PLAINTEXT_LEN: usize = 1024;
+
 pub fn relay_read_buffer_len(max_payload_chunk_len: usize) -> usize {
     if max_payload_chunk_len == 0 {
         0

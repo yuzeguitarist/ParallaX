@@ -45,7 +45,7 @@ pub enum ConfigError {
     WeakPsk,
     #[error("traffic.max_padding must be >= traffic.min_padding")]
     InvalidPaddingRange,
-    #[error("traffic.max_padding leaves no room for encrypted payload")]
+    #[error("traffic.max_padding leaves too little room for encrypted payload")]
     ExcessivePadding,
     #[error("traffic.max_delay_ms must be >= traffic.min_delay_ms")]
     InvalidDelayRange,
@@ -256,7 +256,19 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        decode_psk(&self.crypto.psk)?;
+        let psk = decode_psk(&self.crypto.psk)?;
+        if psk_looks_low_entropy(&psk) {
+            // Not fatal (and the auto-generated PSK is always random), but warn:
+            // the stateful ClientHello masks are HMAC-keyed by the raw PSK over
+            // observable inputs, so a low-entropy / human-chosen PSK is open to an
+            // offline single-capture guessing oracle. Only a CSPRNG-generated key
+            // resists it.
+            tracing::warn!(
+                "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
+                 (e.g. `plx init` / `openssl rand -base64 32`) — low-entropy PSKs are open to \
+                 an offline guessing oracle"
+            );
+        }
         self.traffic.validate()?;
 
         match self.mode {
@@ -401,7 +413,9 @@ impl TrafficConfig {
         if self.max_padding < self.min_padding {
             return Err(ConfigError::InvalidPaddingRange);
         }
-        if crate::protocol::data::max_plaintext_len(self.max_padding) == 0 {
+        if crate::protocol::data::max_plaintext_len(self.max_padding)
+            < crate::protocol::data::MIN_USABLE_PLAINTEXT_LEN
+        {
             return Err(ConfigError::ExcessivePadding);
         }
         if self.max_delay_ms < self.min_delay_ms {
@@ -428,6 +442,23 @@ pub fn decode_psk(value: &str) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
         return Err(ConfigError::WeakPsk);
     }
     Ok(Zeroizing::new(decoded))
+}
+
+/// Heuristic, conservative low-entropy check for a decoded PSK. A CSPRNG-derived
+/// 32-byte key spans ~30 distinct byte values, so requiring at least 16 distinct
+/// values flags only obviously weak keys (repeated characters, short passphrases)
+/// with no false positives for random keys. Used to warn, never to reject.
+fn psk_looks_low_entropy(decoded: &[u8]) -> bool {
+    const MIN_DISTINCT_BYTES: usize = 16;
+    let mut seen = [false; 256];
+    let mut distinct = 0_usize;
+    for &b in decoded {
+        if !seen[b as usize] {
+            seen[b as usize] = true;
+            distinct += 1;
+        }
+    }
+    distinct < MIN_DISTINCT_BYTES
 }
 
 pub fn decode_key32(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {
@@ -754,6 +785,34 @@ server_identity_public_key = "{KEY}"
             traffic.validate().unwrap_err(),
             ConfigError::ExcessivePadding
         ));
+    }
+
+    #[test]
+    fn rejects_padding_below_min_usable_plaintext_floor() {
+        use crate::protocol::data::{max_plaintext_len, MIN_USABLE_PLAINTEXT_LEN};
+        // The first max_padding that pushes usable plaintext under the floor: a
+        // config there would let a single relay read explode into tens of
+        // thousands of records and reserve ~1 GiB, so it must be rejected even
+        // though it leaves a few non-zero plaintext bytes.
+        let below = (0..=u16::MAX)
+            .find(|&p| max_plaintext_len(p) < MIN_USABLE_PLAINTEXT_LEN)
+            .expect("some padding drops plaintext below the floor");
+        assert!(below > 0);
+        let bad = TrafficConfig {
+            max_padding: below,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            bad.validate().unwrap_err(),
+            ConfigError::ExcessivePadding
+        ));
+        // One less padding stays at/above the floor and validates.
+        assert!(max_plaintext_len(below - 1) >= MIN_USABLE_PLAINTEXT_LEN);
+        let ok = TrafficConfig {
+            max_padding: below - 1,
+            ..TrafficConfig::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

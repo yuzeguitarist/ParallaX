@@ -340,7 +340,7 @@ struct ClientMuxPool {
 #[derive(Clone)]
 struct ClientMuxHandle {
     frame_tx: mpsc::Sender<MuxFrame>,
-    register_tx: mpsc::Sender<ClientStreamRegistration>,
+    register_tx: mpsc::Sender<ClientStreamControl>,
     next_stream_id: Arc<AtomicU32>,
     stream_slots: Arc<Semaphore>,
     chunk_size: usize,
@@ -356,6 +356,18 @@ struct ClientStreamRegistration {
     stream_id: u32,
     local_write: OwnedWriteHalf,
     outcome_tx: oneshot::Sender<DownloadOutcome>,
+}
+
+/// Control messages a per-connection task sends to the single mux reader loop.
+enum ClientStreamControl {
+    /// Hand a newly opened stream's download half to the reader.
+    Register(ClientStreamRegistration),
+    /// Drop a stream's download half because its per-connection task has exited.
+    /// Sent after the per-connection `try_join!` returns so the reader-owned
+    /// `OwnedWriteHalf` cannot leak when the stream ends without a server
+    /// `Fin`/`Reset` (e.g. the local upload half errored). Idempotent: a no-op if
+    /// the reader already removed the stream on a server `Fin`/`Reset`.
+    Deregister(u32),
 }
 
 enum DownloadOutcome {
@@ -503,11 +515,11 @@ async fn handle_local_mux_connection_with_cid(
     // so an immediate server response can never race ahead of the write half.
     if mux
         .register_tx
-        .send(ClientStreamRegistration {
+        .send(ClientStreamControl::Register(ClientStreamRegistration {
             stream_id,
             local_write,
             outcome_tx,
-        })
+        }))
         .await
         .is_err()
     {
@@ -526,7 +538,28 @@ async fn handle_local_mux_connection_with_cid(
         mux.payload_pool.clone(),
     );
     let download = client_mux_await_download(outcome_rx, cid);
-    tokio::try_join!(upload, download).map(|_| ())
+    let result = tokio::try_join!(upload, download).map(|_| ());
+
+    // Tear the stream down on both ends so it cannot leak when it ended without a
+    // server Fin/Reset (e.g. the local upload half errored before a clean Fin).
+    // On an abnormal end, reset the server side so its target socket is released;
+    // always deregister so the reader drops the local write half. Both are
+    // idempotent no-ops if the stream was already removed via a server Fin/Reset.
+    if result.is_err() {
+        let _ = mux
+            .frame_tx
+            .send(MuxFrame {
+                stream_id,
+                kind: MuxFrameKind::Reset,
+                payload: Vec::new(),
+            })
+            .await;
+    }
+    let _ = mux
+        .register_tx
+        .send(ClientStreamControl::Deregister(stream_id))
+        .await;
+    result
 }
 
 fn next_mux_stream_id(next: &AtomicU32) -> u32 {
@@ -588,6 +621,9 @@ async fn handle_local_connection_with_cid(
             return Err(err.into());
         }
     };
+    // Handle to abort the speculative upstream session if the subsequent
+    // initial-payload read fails (see the try_join error arm below).
+    let speculative_abort = server_session_task.abort_handle();
     let chunk_size = max_plaintext_len(traffic.max_padding);
     let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
     // Keep the zero-RTT-style initial payload capture, but hide its small wait
@@ -603,7 +639,20 @@ async fn handle_local_connection_with_cid(
             .map_err(ClientRuntimeError::BlockingTask)?
     };
     let (initial_payload, (mut server, mut data_session)) =
-        tokio::try_join!(initial_payload_fut, server_session_fut)?;
+        match tokio::try_join!(initial_payload_fut, server_session_fut) {
+            Ok(joined) => joined,
+            Err(err) => {
+                // The upstream session task lives inside `server_session_fut`. If
+                // `try_join!` short-circuited on the initial-payload read error,
+                // dropping that future does NOT abort the task (Tokio detaches a
+                // dropped JoinHandle), so the speculative authenticated upstream
+                // session would keep running and hold a server connection slot.
+                // Abort it explicitly so a stalled/failed local SOCKS exchange
+                // cannot orphan an upstream session.
+                speculative_abort.abort();
+                return Err(err);
+            }
+        };
     let connect_request = ConnectRequest {
         host: request.host,
         port: request.port,
@@ -1147,10 +1196,36 @@ async fn client_mux_await_download(
     }
 }
 
+/// Applies a control message to the reader-owned download-stream map. Register
+/// inserts the stream's write half; Deregister removes and FIN-closes it. Keeping
+/// this in one place ensures both the select arm and the opportunistic drain
+/// handle deregistration identically.
+async fn apply_client_stream_control(
+    local_writes: &mut HashMap<u32, ClientDownloadStream>,
+    control: ClientStreamControl,
+) {
+    match control {
+        ClientStreamControl::Register(reg) => {
+            local_writes.insert(
+                reg.stream_id,
+                ClientDownloadStream {
+                    write: reg.local_write,
+                    outcome_tx: reg.outcome_tx,
+                },
+            );
+        }
+        ClientStreamControl::Deregister(stream_id) => {
+            if let Some(mut stream) = local_writes.remove(&stream_id) {
+                let _ = stream.write.shutdown().await;
+            }
+        }
+    }
+}
+
 async fn client_mux_reader_loop(
     server_read: OwnedReadHalf,
     mut open_from_server: DataRecordCodec,
-    mut register_rx: mpsc::Receiver<ClientStreamRegistration>,
+    mut register_rx: mpsc::Receiver<ClientStreamControl>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
     let mut server_records = TlsRecordReader::buffered(server_read);
@@ -1170,11 +1245,8 @@ async fn client_mux_reader_loop(
                 biased;
                 registration = register_rx.recv(), if register_open => {
                     match registration {
-                        Some(reg) => {
-                            local_writes.insert(
-                                reg.stream_id,
-                                ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
-                            );
+                        Some(control) => {
+                            apply_client_stream_control(&mut local_writes, control).await;
                         }
                         None => register_open = false,
                     }
@@ -1231,16 +1303,11 @@ async fn client_mux_reader_loop(
             }
         }
 
-        // Absorb any registrations queued alongside these records so a
-        // stream's write half is always present before its first Data.
-        while let Ok(reg) = register_rx.try_recv() {
-            local_writes.insert(
-                reg.stream_id,
-                ClientDownloadStream {
-                    write: reg.local_write,
-                    outcome_tx: reg.outcome_tx,
-                },
-            );
+        // Absorb any control messages queued alongside these records so a
+        // stream's write half is always present before its first Data, and a
+        // deregister from an exited per-connection task is applied promptly.
+        while let Ok(control) = register_rx.try_recv() {
+            apply_client_stream_control(&mut local_writes, control).await;
         }
 
         let frames_payload: &[u8] = if record_count == 1 {
