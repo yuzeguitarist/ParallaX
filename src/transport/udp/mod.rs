@@ -13,7 +13,9 @@
 
 pub mod auth;
 pub mod endpoint;
+pub(crate) mod envelope;
 pub mod probe;
+pub(crate) mod reorder;
 
 use std::sync::Arc;
 
