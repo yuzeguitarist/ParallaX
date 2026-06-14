@@ -1,0 +1,10 @@
+# socks_connect_request: SOCKS5 CONNECT = ver(0x05) cmd(0x01) rsv(0x00) atyp addr port
+ver5="\x05"
+cmd_connect="\x01"
+atyp_ipv4="\x01"
+atyp_domain="\x03"
+atyp_ipv6="\x04"
+# full CONNECT to 1.2.3.4:443 (ipv4):
+connect_ipv4="\x05\x01\x00\x01\x01\x02\x03\x04\x01\xbb"
+# CONNECT to a 1-byte domain ":443":
+connect_domain="\x05\x01\x00\x03\x01a\x01\xbb"

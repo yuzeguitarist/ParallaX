@@ -1,0 +1,7 @@
+# replay_journal: authenticated journal header version (src/crypto/replay.rs:17)
+# plus the plain-journal line shape "<decimal ts> <16 hex> <64 hex>".
+auth_version="parallax-replay-cache-v3"
+space=" "
+newline="\x0a"
+hex16_zero="0000000000000000"
+hex64_zero="0000000000000000000000000000000000000000000000000000000000000000"

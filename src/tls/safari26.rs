@@ -1733,6 +1733,7 @@ impl<'a> TlsCursor<'a> {
 /// production API surface. These are thin wrappers (not `pub use`, which would
 /// hit E0364 on the private fns) and erase the crate-internal error type.
 #[cfg(fuzzing)]
+#[allow(clippy::result_unit_err)] // fuzz-only wrappers intentionally erase the crate error type
 pub mod fuzz {
     pub fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         super::parse_compressed_certificate_body(body).map_err(|_| ())

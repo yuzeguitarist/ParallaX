@@ -178,6 +178,7 @@ mod tests {
 /// ONLY under `--cfg fuzzing` (which cargo-fuzz sets); absent from normal
 /// `cargo build` / `cargo test` and CI, so it adds no production API surface.
 #[cfg(fuzzing)]
+#[allow(clippy::result_unit_err)] // fuzz-only wrapper intentionally erases the error type
 pub mod fuzz {
     use super::{read_connect_request, SocksRequest};
 

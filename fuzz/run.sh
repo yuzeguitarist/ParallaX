@@ -65,15 +65,17 @@ EOF
   local x; x="$(extra_args "$t")"
   local cargs; cargs="$(corpus_args "$t")"
   echo "=================================================================="
-  echo ">> [$t] max_total_time=${maxtime}s rss=${RSS}MB timeout=${TMO}s workers=${WK} ${x}"
+  echo ">> [$t] max_total_time=${maxtime}s rss=${RSS}MB timeout=${TMO}s ${x} (single in-process)"
   echo "=================================================================="
+  # Run ONE in-process fuzzer (no -jobs/-workers) so libFuzzer's parent exit code
+  # and -print_final_stats authoritatively reflect a crash. Under -jobs the
+  # launcher can exit 0 even when a worker process crashed, hiding the crash.
   # shellcheck disable=SC2086
   $FUZZ run "$t" $cargs -- \
       ${d} ${x} \
       -rss_limit_mb="$RSS" \
       -timeout="$TMO" \
       -max_total_time="$maxtime" \
-      -jobs="$WK" -workers="$WK" \
       -print_final_stats=1
   local rc=$?
   if [ "$rc" -ne 0 ]; then
