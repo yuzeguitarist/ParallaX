@@ -70,7 +70,10 @@ use crate::{
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
     transport::{
-        leg::{LegReader, LegWriter, TcpLegReader, TcpLegWriter},
+        leg::{
+            LegReader, LegWriter, QuicStreamLegReader, QuicStreamLegWriter, TcpLegReader,
+            TcpLegWriter,
+        },
         tcp::{
             connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
             is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
@@ -123,6 +126,21 @@ const SERVER_MUX_MAX_STREAMS: usize = 256;
 const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Test-only publication of the server's retained QUIC connection so a mid-relay
+/// reset test can kill the fast plane in flight and assert a clean teardown. Set
+/// to the accepted `quinn::Connection` on the Verified+enabled retain path. Not
+/// compiled in release.
+#[cfg(test)]
+static RETAINED_QUIC_CONN_FOR_TEST: Mutex<Option<quinn::Connection>> = Mutex::new(None);
+
+/// Test accessor for [`RETAINED_QUIC_CONN_FOR_TEST`] so the mid-relay reset e2e
+/// (in the client runtime test module) can grab and kill the server's retained
+/// QUIC connection in flight.
+#[cfg(test)]
+pub(crate) fn retained_quic_conn_for_test() -> &'static Mutex<Option<quinn::Connection>> {
+    &RETAINED_QUIC_CONN_FOR_TEST
+}
 
 #[derive(Debug, Error)]
 pub enum HandshakeServerError {
@@ -1097,17 +1115,29 @@ async fn run_authenticated_data_mode(
                             "ParallaX data mode switch confirmed"
                         );
 
+                        // Set on the Verified+enabled path only: the retained
+                        // ephemeral QUIC endpoint and the accepted connection,
+                        // kept alive so the single-Connect relay can carry data
+                        // over a reliable bidi stream. `None` on every other path
+                        // (declined, probe not Verified, or udp.enabled=false), in
+                        // which case the relay stays byte-identical on TCP.
+                        let mut retained_quic: Option<(
+                            quinn::Endpoint,
+                            quinn::Connection,
+                        )> = None;
+
                         // Client-initiated, fail-soft UDP negotiation (PX1G). The
-                        // server NEVER offers UDP unsolicited; until the UDP
-                        // datapath is wired it always declines, then reads the
-                        // client's real first command and dispatches it normally.
-                        // This keeps every config/version combination desync-free.
+                        // server NEVER offers UDP unsolicited. When udp.enabled it
+                        // offers, probes, and -- only if the client reports the
+                        // probe Verified (PX1P) -- RETAINS the QUIC connection for
+                        // the single-Connect data relay. This keeps every
+                        // config/version combination desync-free.
                         if crate::protocol::command::UdpRequest::has_magic(
                             &client_record[first_payload_range.clone()],
                         ) {
                             use crate::protocol::command::{
-                                UdpDecline, UdpOffer, UdpProbeAck, UDP_CC_BBR, UDP_DECLINE_DISABLED,
-                                UDP_FEC_ADAPTIVE,
+                                UdpDecline, UdpOffer, UdpProbeAck, UdpProbeStatus, UDP_CC_BBR,
+                                UDP_DECLINE_DISABLED, UDP_FEC_ADAPTIVE,
                             };
                             use crate::transport::udp::{
                                 endpoint::bind_server_endpoint, probe::serve_probe,
@@ -1188,30 +1218,76 @@ async fn run_authenticated_data_mode(
                                     u64::from(udp.probe_timeout_ms.max(1)),
                                 )
                                 .saturating_mul(2);
-                                let _ = tokio::time::timeout(probe_budget, async {
-                                    if let Some(incoming) = udp_ep.accept().await {
-                                        if let Ok(conn) = incoming.await {
-                                            if let Err(err) =
-                                                serve_probe(&conn, sandwich_secret, &offer_id).await
-                                            {
-                                                tracing::debug!(cid, error = %err, "udp serve_probe failed");
-                                            }
+                                // Lift the accepted connection OUT of the timeout
+                                // scope so it can outlive the probe. quinn
+                                // application-closes a connection when its last
+                                // `Connection` handle drops, so we must hold it
+                                // (and the endpoint) for the relay's whole life.
+                                // `serve_probe` only QUEUES its reply, so the
+                                // connection must stay alive past the probe
+                                // regardless; here we additionally keep it for the
+                                // data path when the client confirms Verified.
+                                let probed_conn: Option<quinn::Connection> =
+                                    tokio::time::timeout(probe_budget, async {
+                                        let incoming = udp_ep.accept().await?;
+                                        let conn = incoming.await.ok()?;
+                                        if let Err(err) =
+                                            serve_probe(&conn, sandwich_secret, &offer_id).await
+                                        {
+                                            tracing::debug!(cid, error = %err, "udp serve_probe failed");
                                         }
-                                    }
-                                })
-                                .await;
-                                udp_ep.close(0u32.into(), b"done");
+                                        Some(conn)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten();
 
                                 client_record.clear();
                                 client_records.read_record_into(&mut client_record).await?;
                                 let ack_range =
                                     client_open.open_in_place_payload_range(&mut client_record)?;
-                                match UdpProbeAck::decode(&client_record[ack_range]) {
+                                let ack_status = match UdpProbeAck::decode(&client_record[ack_range])
+                                {
                                     Ok(ack) => {
-                                        tracing::info!(cid, status = ?ack.status, "udp probe ack")
+                                        tracing::info!(cid, status = ?ack.status, "udp probe ack");
+                                        Some(ack.status)
                                     }
                                     Err(err) => {
-                                        tracing::debug!(cid, error = %err, "udp probe ack decode failed")
+                                        tracing::debug!(cid, error = %err, "udp probe ack decode failed");
+                                        None
+                                    }
+                                };
+
+                                // Retain the QUIC connection for the data relay
+                                // ONLY when the client reported the probe Verified.
+                                // The PX1P status is the single authoritative
+                                // cross-side fact (the server cannot otherwise
+                                // observe whether its queued echo reached the
+                                // client), so both ends gate on the SAME signal:
+                                // the client commits its relay to QUIC iff its probe
+                                // was Verified, and the server retains iff the ack
+                                // says Verified. Any other outcome -> drop the conn
+                                // and close the endpoint, staying on TCP.
+                                match (ack_status, probed_conn) {
+                                    (Some(UdpProbeStatus::Verified), Some(conn)) => {
+                                        tracing::info!(
+                                            cid,
+                                            "retaining QUIC fast-plane connection for data relay"
+                                        );
+                                        #[cfg(test)]
+                                        {
+                                            *RETAINED_QUIC_CONN_FOR_TEST
+                                                .lock()
+                                                .expect("retained quic test hook poisoned") =
+                                                Some(conn.clone());
+                                        }
+                                        retained_quic = Some((udp_ep, conn));
+                                    }
+                                    (_, _maybe_conn) => {
+                                        // Drop any accepted connection and close the
+                                        // endpoint exactly as before the retain path
+                                        // existed.
+                                        udp_ep.close(0u32.into(), b"done");
                                     }
                                 }
                             } else {
@@ -1232,6 +1308,10 @@ async fn run_authenticated_data_mode(
 
                         let first_payload = &mut client_record[first_payload_range];
                         if SpeedTestRequest::has_magic(first_payload) {
+                            // Speed test stays on TCP in this slice; release any
+                            // retained QUIC connection so no idle fast-plane
+                            // connection lingers.
+                            drop_retained_quic(retained_quic);
                             let request = SpeedTestRequest::decode(first_payload)?;
                             return run_authenticated_speed_test_mode(
                                 client_records,
@@ -1246,6 +1326,9 @@ async fn run_authenticated_data_mode(
                         }
 
                         if MuxFrame::has_magic(first_payload) {
+                            // Mux stays on TCP in this slice; release any retained
+                            // QUIC connection.
+                            drop_retained_quic(retained_quic);
                             let first_frames = MuxFrame::decode_all(first_payload)?;
                             return run_authenticated_mux_data_mode(
                                 client_records,
@@ -1290,6 +1373,7 @@ async fn run_authenticated_data_mode(
                             timing,
                             cover,
                             chunk_size: max_plaintext_len(traffic.max_padding),
+                            retained_quic,
                             cid,
                         }
                         .run()
@@ -1677,8 +1761,41 @@ struct DataRelay {
     timing: TimingProfile,
     cover: CoverTrafficProfile,
     chunk_size: usize,
+    /// Retained QUIC fast-plane endpoint + connection when the client's probe was
+    /// Verified. `Some` => carry the relay over a reliable bidi stream; `None` =>
+    /// the relay stays on the TCP record legs exactly as before this slice.
+    retained_quic: Option<(quinn::Endpoint, quinn::Connection)>,
     cid: u64,
 }
+
+/// Drops a retained QUIC endpoint + connection, application-closing the
+/// connection promptly so no idle fast-plane connection lingers when a dispatch
+/// path (Mux/SpeedTest) stays on TCP. A bare drop would also close it, but the
+/// explicit close gives the peer an immediate CONNECTION_CLOSE rather than
+/// waiting for an idle timeout.
+fn drop_retained_quic(retained: Option<(quinn::Endpoint, quinn::Connection)>) {
+    if let Some((endpoint, conn)) = retained {
+        conn.close(0u32.into(), b"tcp-path");
+        endpoint.close(0u32.into(), b"tcp-path");
+    }
+}
+
+/// Short bound on the server's `accept_bi` rendezvous with the client's
+/// `open_bi`. The client opens the bidi stream and immediately writes a one-record
+/// trigger, so this resolves within ~1 RTT on a live path. If it does not, the
+/// fast-plane stream never materialized even though both ends agreed (Verified) to
+/// use it: that is a genuine fast-plane failure, and -- because the client has
+/// already committed its relay to the QUIC stream -- the relay returns Err so the
+/// whole connection tears down cleanly (the accepted failure mode for this slice),
+/// rather than silently splitting the two directions across TCP and QUIC.
+const QUIC_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bounded grace, after both relay directions finish, to let quinn flush and have
+/// the peer acknowledge the final stream data before the connection handle drops.
+/// quinn keeps retransmitting finished-stream data while a `Connection` handle is
+/// alive, so this window lets the last relay bytes land; it is bounded so a peer
+/// that vanishes cannot pin the task.
+const QUIC_RELAY_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 struct ServerMuxContext<'a> {
@@ -1703,9 +1820,87 @@ impl DataRelay {
             timing,
             cover,
             chunk_size,
+            retained_quic,
             cid,
         } = self;
         let target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+
+        // QUIC fast-plane path: the client (the bidi opener) has already committed
+        // its relay to a reliable bidi stream, so accept that stream and carry both
+        // directions over it. The endpoint + connection are held alive for the
+        // whole relay (dropping the last `Connection` handle would tear the stream
+        // down). Direction mapping: accept_bi gives (send = server->client,
+        // recv = client->server), so server_download (server->client) writes the
+        // SendStream and server_upload (client->server) reads the RecvStream.
+        if let Some((udp_ep, conn)) = retained_quic {
+            // Hold the endpoint + connection alive across the relay by keeping
+            // them in locals owned by this future. `_udp_ep` must not be dropped
+            // early.
+            let _udp_ep = udp_ep;
+            // Keep the TCP control halves alive for the relay's duration so the
+            // outer TCP connection stays open (the client likewise holds its TCP
+            // halves). They carry no relay bytes on the QUIC path.
+            let _client_records = client_records;
+            let _client_write = client_write;
+            match tokio::time::timeout(QUIC_RELAY_ACCEPT_TIMEOUT, conn.accept_bi()).await {
+                Ok(Ok((send, recv))) => {
+                    tracing::info!(
+                        cid,
+                        "QUIC fast-plane bidi stream accepted; relaying over UDP"
+                    );
+                    let upload = server_upload_loop(
+                        QuicStreamLegReader::buffered(recv),
+                        target_write,
+                        client_open,
+                        cid,
+                    );
+                    let download = server_download_loop(
+                        target_read,
+                        QuicStreamLegWriter(send),
+                        server_seal,
+                        target_buf,
+                        timing,
+                        cover,
+                        cid,
+                    );
+                    let result = tokio::try_join!(upload, download).map(|((), ())| ());
+                    // Graceful QUIC teardown. The CLIENT is the designated closer
+                    // (see client side). On success the server does NOT close
+                    // first: it waits, bounded, for the client's CONNECTION_CLOSE
+                    // so the server's finished download-stream data is fully
+                    // delivered and acknowledged before the connection goes away.
+                    // quinn retransmits that finished data while this handle is
+                    // alive. On timeout (client vanished) or error, the handle drop
+                    // / explicit close tears it down without pinning the task.
+                    if result.is_ok() {
+                        let _ = tokio::time::timeout(QUIC_RELAY_DRAIN_GRACE, conn.closed()).await;
+                    } else {
+                        conn.close(0u32.into(), b"relay-error");
+                    }
+                    return result;
+                }
+                Ok(Err(err)) => {
+                    // The connection died before the stream rendezvous. The client
+                    // already committed its relay to QUIC, so there is no safe TCP
+                    // fallback (that would split the directions). Fail cleanly.
+                    tracing::warn!(cid, error = %err, "QUIC fast-plane accept_bi failed");
+                    return Err(HandshakeServerError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("QUIC fast-plane accept_bi failed: {err}"),
+                    )));
+                }
+                Err(_) => {
+                    tracing::warn!(cid, "QUIC fast-plane accept_bi timed out");
+                    return Err(HandshakeServerError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "QUIC fast-plane accept_bi timed out",
+                    )));
+                }
+            }
+        }
+
+        // No retained QUIC connection: TCP record legs, byte-identical to before
+        // this slice.
         let upload =
             server_upload_loop(TcpLegReader(client_records), target_write, client_open, cid);
         let download = server_download_loop(

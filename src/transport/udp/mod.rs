@@ -1,15 +1,16 @@
 //! UDP fast-plane transport (the "U" in TUDP).
 //!
-//! Phase 1 scaffolding. This module currently provides only the QUIC endpoint
-//! building blocks for the masquerading HTTP/3 face on UDP, and a loopback test
-//! that proves the plumbing: a QUIC connection, bidirectional unreliable
-//! datagrams (RFC 9221), and RFC 5705 keying-material export (which the
-//! exporter-bound UDP auth token in a later slice depends on).
+//! Provides the QUIC endpoint building blocks for the masquerading HTTP/3 face on
+//! UDP: a QUIC connection, bidirectional unreliable datagrams (RFC 9221) used by
+//! the reachability probe, and RFC 5705 keying-material export backing the
+//! exporter-bound UDP auth token.
 //!
-//! It is deliberately NOT wired into the client/server runtimes yet; the
-//! `[udp]` config section defaults to disabled, so today this is dead weight at
-//! runtime and a no-op for every existing code path. The `Leg` abstraction that
-//! unifies this with the TCP carrier is extracted once both legs exist.
+//! Wired into the client/server runtimes for the single-Connect data relay: when
+//! `[udp].enabled` is set on both ends and the client's probe is Verified, the
+//! relay is carried over a reliable bidi QUIC stream through the `Leg`
+//! abstraction (which unifies it with the TCP carrier). With `enabled = false`
+//! (the default) this is a no-op for every existing code path and the relay stays
+//! byte-identical on TCP. Mux and speed-test paths remain on TCP.
 
 pub mod auth;
 pub mod endpoint;
@@ -28,6 +29,34 @@ use thiserror::Error;
 
 /// ALPN for the masquerading HTTP/3 face: the UDP leg presents itself as h3.
 pub const UDP_ALPN: &[u8] = b"h3";
+
+/// Maximum idle time before quinn tears the connection down. quinn's default is
+/// 30s, but the fast-plane connection is retained across the probe and then sits
+/// idle through the TCP control exchange (PX1P) and the outbound target connect
+/// before the relay's first stream byte. A slow outbound connect can exceed 30s,
+/// which would silently kill the retained connection and force a desync-prone
+/// fallback. Raise the ceiling and pair it with an active keep-alive so the
+/// connection survives the probe -> accept_bi/open_bi gap without traffic.
+const UDP_MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Active keep-alive interval, comfortably below [`UDP_MAX_IDLE_TIMEOUT`] so a
+/// fully idle retained connection is kept alive by PING frames rather than
+/// timing out. quinn defaults keep-alive to None (off).
+const UDP_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Shared QUIC transport tuning applied to both the server and client endpoints
+/// so the two ends agree on idle/keep-alive behavior. The effective idle timeout
+/// is the minimum of the two peers' values, so configuring both keeps it
+/// deterministic.
+fn udp_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        UDP_MAX_IDLE_TIMEOUT
+            .try_into()
+            .expect("60s is a valid quinn idle timeout"),
+    ));
+    transport.keep_alive_interval(Some(UDP_KEEP_ALIVE_INTERVAL));
+    Arc::new(transport)
+}
 
 #[derive(Debug, Error)]
 pub enum UdpTransportError {
@@ -57,7 +86,9 @@ pub fn server_config(
 
     let crypto = QuicServerConfig::try_from(Arc::new(tls))
         .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(udp_transport_config());
+    Ok(config)
 }
 
 /// Build a quinn client config with a caller-supplied certificate verifier.
@@ -82,7 +113,9 @@ pub fn client_config(
 
     let crypto = QuicClientConfig::try_from(Arc::new(tls))
         .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?;
-    Ok(quinn::ClientConfig::new(Arc::new(crypto)))
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(udp_transport_config());
+    Ok(config)
 }
 
 #[cfg(test)]

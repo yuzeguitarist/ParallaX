@@ -96,9 +96,14 @@ impl LegWriter for TcpLegWriter {
 /// `tokio::io::AsyncRead` (and is `Unpin + Send`) in quinn 0.11. This alias just
 /// names that instantiation; `read_record_into` / `try_read_record_into` keep
 /// their exact `BufferedTlsRecordReader` semantics over the QUIC stream.
-// Wired into the QUIC datapath in a later slice; exercised by tests now.
-#[allow(dead_code)]
 pub(crate) type QuicStreamLegReader = TcpLegReader<quinn::RecvStream>;
+
+/// Test-only counter of record bytes written through [`QuicStreamLegWriter`].
+/// Lets the relay e2e tests prove application data actually traversed the QUIC
+/// stream (rather than silently falling back to TCP). Not compiled in release.
+#[cfg(test)]
+pub(crate) static QUIC_LEG_BYTES_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// QUIC-stream record-writer leg: writes sealed record bytes straight to a
 /// reliable bidi `quinn::SendStream`. A thin 1:1 wrapper mirroring
@@ -106,8 +111,6 @@ pub(crate) type QuicStreamLegReader = TcpLegReader<quinn::RecvStream>;
 /// `AsyncWriteExt::write_all`/`shutdown` already yield `io::Result` (the
 /// `AsyncWrite` impl converts quinn's `WriteError` to `io::Error` internally),
 /// and `shutdown` issues the stream's QUIC finish via `poll_shutdown`.
-// Wired into the QUIC datapath in a later slice; exercised by tests now.
-#[allow(dead_code)]
 pub(crate) struct QuicStreamLegWriter(pub quinn::SendStream);
 
 impl LegWriter for QuicStreamLegWriter {
@@ -117,7 +120,10 @@ impl LegWriter for QuicStreamLegWriter {
         // so call the trait method explicitly to get the `io::Result` (the
         // `AsyncWrite` impl converts `WriteError` -> `io::Error` internally),
         // mirroring `TcpLegWriter` exactly.
-        AsyncWriteExt::write_all(&mut self.0, bytes).await
+        AsyncWriteExt::write_all(&mut self.0, bytes).await?;
+        #[cfg(test)]
+        QUIC_LEG_BYTES_WRITTEN.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {

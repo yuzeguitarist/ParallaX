@@ -3,8 +3,9 @@
 //! The server presents an ephemeral self-signed certificate; the client does not
 //! validate it — authenticity is the exporter-bound auth token (REALITY-style),
 //! so a self-signed cert is sufficient until a real masquerade cert / CDN front
-//! is wired in a later slice. Not yet called by the runtime; the server-side
-//! offer (PX1O) and the client-side connect/probe consume these next.
+//! is wired in a later slice. The server-side offer (PX1O) and the client-side
+//! connect/probe consume these, and on a Verified probe the same connection
+//! carries the single-Connect data relay over a reliable bidi stream.
 
 use std::{net::SocketAddr, sync::Arc};
 

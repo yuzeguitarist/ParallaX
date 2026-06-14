@@ -9,8 +9,11 @@
 //! error), so detection is ACTIVE: no verified echo within the Happy-Eyeballs
 //! window means treat the UDP leg as unreachable and stay on TCP.
 //!
-//! Not wired into the client/server runtimes yet; the control-plane exchange and
-//! the demote/promote scheduler are later slices.
+//! Wired into the client/server runtimes: a Verified probe causes both ends to
+//! retain the QUIC connection and carry the single-Connect data relay over a
+//! reliable bidi stream. The demote/promote scheduler (switching transports
+//! mid-session) is a later slice; for now a Verified probe commits the relay to
+//! QUIC, and a mid-relay failure is a clean connection reset.
 
 use std::time::{Duration, Instant};
 
