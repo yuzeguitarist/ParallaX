@@ -30,6 +30,7 @@ permissions:
   contents: write
   issues: write
   pull-requests: write
+  checks: read             # so the cistatus step can read the PR's check rollup
   id-token: write
 
 # One run per issue/PR thread PER ACTOR. Including github.actor keeps Claude's own
@@ -70,11 +71,13 @@ jobs:
           set -uo pipefail
           s="not a pull request"
           if [ -n "${PR:-}" ] && gh pr view "$PR" --json number >/dev/null 2>&1; then
-            s="$(gh pr view "$PR" --json statusCheckRollup \
-                  --jq '[.statusCheckRollup[]? | "\(.name // .context)=\(.conclusion // .state // "PENDING")"] | join(", ")' \
-                  2>/dev/null || echo "unavailable")"
-            [ -z "$s" ] && s="no checks reported yet"
+            if s="$(gh pr view "$PR" --json statusCheckRollup --jq '[.statusCheckRollup[]? | "\(.name // .context)=\(.conclusion // .state // "PENDING")"] | join(", ")')"; then
+              [ -z "$s" ] && s="no checks reported yet"
+            else
+              s="unavailable (could not read checks)"
+            fi
           fi
+          echo "Injecting CI summary: ${s}"
           echo "summary=${s}" >> "$GITHUB_OUTPUT"
 
       - uses: anthropics/claude-code-action@v1
