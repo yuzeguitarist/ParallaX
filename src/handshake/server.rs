@@ -1791,15 +1791,6 @@ fn drop_retained_quic(retained: Option<(quinn::Endpoint, quinn::Connection)>) {
 /// rather than silently splitting the two directions across TCP and QUIC.
 const QUIC_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Generous bound on reading the client's QUIC fast-plane teardown DONE marker
-/// over the TCP control stream. The server writes its own DONE (after fully
-/// draining both directions) BEFORE blocking on this read, so the client's DONE
-/// is already in-flight on the reliable TCP control stream; this window only
-/// guards against a client that has vanished. It is intentionally large relative
-/// to a round trip because the relay loops themselves are uncapped (data-driven),
-/// and the DONE is only exchanged after both sides' `try_join` completes.
-const QUIC_RELAY_DONE_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Clone, Copy)]
 struct ServerMuxContext<'a> {
     fixed_data_target: Option<&'a str>,
@@ -1886,21 +1877,29 @@ impl DataRelay {
                     //   2. We seal a DONE marker on the SAME server->client (send)
                     //      codec -- its next sequence number -- and write it over the
                     //      TCP control stream, then flush.
-                    //   3. We BLOCK (bounded) reading exactly one record over the
-                    //      TCP control stream and open it on the SAME client->server
-                    //      (recv) codec; that is the client's DONE. Because we have
-                    //      NOT closed the QUIC connection yet, it stays alive while
-                    //      we block, so the client keeps draining our download tail
-                    //      until ITS `try_join` completes and it sends its DONE.
+                    //   3. We BLOCK reading exactly one record over the TCP
+                    //      control stream and open it on the SAME client->server
+                    //      (recv) codec; that is the client's DONE. The read is
+                    //      bounded on CONNECTION LIVENESS, not a wall clock: we
+                    //      `select!` it against `conn.closed()`. Because we have NOT
+                    //      closed the QUIC connection yet, it stays alive while we
+                    //      block, so the client keeps draining our download tail
+                    //      (kept up by the 15s keep-alive PINGs) for as long as it
+                    //      legitimately needs -- a multi-minute drain is fine, with
+                    //      no fixed cap to truncate a slow-but-alive client. Only if
+                    //      the client genuinely vanishes does the QUIC connection
+                    //      idle-time-out (~60s, configured), resolving
+                    //      `conn.closed()` into a clean Err.
                     //   4. Receiving the client's DONE proves the client fully
                     //      drained every byte we sent, so nothing is in flight --
                     //      only THEN do we close.
-                    // On any relay error, or any DONE seal/write/read/timeout/open/
+                    // On any relay error, or any DONE seal/write/read/liveness/open/
                     // marker mismatch, we close and return Err: a clean, VISIBLE
                     // reset (the accepted v1 failure mode), never a silent success.
                     match tokio::try_join!(upload, download) {
                         Ok((mut client_open, mut server_seal)) => {
                             let result = server_exchange_quic_done(
+                                &conn,
                                 &mut client_write,
                                 &mut client_records,
                                 &mut server_seal,
@@ -1970,10 +1969,13 @@ impl DataRelay {
 /// Performs the server side of the QUIC fast-plane teardown DONE handshake over
 /// the held TCP control stream halves, using the SAME per-direction session
 /// codecs the relay used so the sequence numbers continue uninterrupted. It
-/// seals and writes our DONE, then reads, opens, and verifies the client's DONE
-/// (bounded). Returns Ok only when both DONEs are exchanged; the caller closes
+/// seals and writes our DONE, then reads, opens, and verifies the client's DONE.
+/// The DONE read is bounded on CONNECTION LIVENESS (`conn.closed()`), not a wall
+/// clock, so a slow-but-alive client draining a large download tail is never
+/// truncated. Returns Ok only when both DONEs are exchanged; the caller closes
 /// the QUIC connection afterward (on Ok) or eagerly (on Err).
 async fn server_exchange_quic_done(
+    conn: &quinn::Connection,
     client_write: &mut OwnedWriteHalf,
     client_records: &mut BufferedTlsRecordReader<OwnedReadHalf>,
     server_seal: &mut DataRecordCodec,
@@ -1987,23 +1989,26 @@ async fn server_exchange_quic_done(
     client_write.write_all(&done).await?;
     client_write.flush().await?;
 
-    // Read exactly ONE record (the client's DONE) over the TCP control stream,
-    // bounded so a vanished peer cannot pin this task. EOF here is NOT a clean
-    // close: we require the client's explicit DONE record.
+    // Read exactly ONE record (the client's DONE) over the TCP control stream.
+    // The read is bounded on CONNECTION LIVENESS, not a wall clock: we `select!`
+    // it against `conn.closed()`. While the client is alive (actively draining our
+    // download tail + the 15s keep-alive PINGs keeping the QUIC connection up),
+    // `conn.closed()` pends and this read blocks for as long as the client
+    // legitimately needs -- a multi-minute drain is fine, with no fixed cap to
+    // truncate a slow-but-alive peer. If the client genuinely vanishes, the QUIC
+    // connection idle-times-out (~60s, configured) and `conn.closed()` resolves,
+    // yielding a clean Err. EOF on the TCP read is likewise NOT a clean close: we
+    // require the client's explicit DONE record.
     let mut record = Vec::new();
-    match tokio::time::timeout(
-        QUIC_RELAY_DONE_TIMEOUT,
-        client_records.read_record_into(&mut record),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
-        Err(_) => {
-            tracing::warn!(cid, "QUIC fast-plane teardown DONE read timed out");
+    tokio::select! {
+        res = client_records.read_record_into(&mut record) => {
+            res.map_err(HandshakeServerError::Io)?;
+        }
+        _ = conn.closed() => {
+            tracing::warn!(cid, "QUIC connection closed before peer DONE");
             return Err(HandshakeServerError::Io(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "QUIC fast-plane teardown DONE read timed out",
+                io::ErrorKind::ConnectionAborted,
+                "QUIC connection closed before peer DONE",
             )));
         }
     }

@@ -144,7 +144,13 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             server_public,
             Arc::clone(&server_identity_public),
         );
-        warm_sessions.ensure_started().await;
+        // Pre-warm only when udp is off. With udp on the pool's warm target is 0
+        // (no parked idle retained QUIC), so single-connect sessions are
+        // established on demand "cold"; pre-warming would be a no-op anyway, so we
+        // skip it explicitly.
+        if !udp.enabled {
+            warm_sessions.ensure_started().await;
+        }
         Some(warm_sessions)
     } else {
         None
@@ -283,6 +289,16 @@ struct WarmSessionPool {
     psk: Arc<Zeroizing<Vec<u8>>>,
     server_public: [u8; 32],
     server_identity_public: Arc<[u8]>,
+    /// Number of pre-established idle sessions the pool keeps warm. This is
+    /// `WARM_SESSION_POOL_TARGET` by default, but 0 when `udp.enabled`: a warm
+    /// single-connect session retains a live QUIC connection (15s keep-alive
+    /// PINGs) and parks a matching server task blocked on the first-command read
+    /// holding its QUIC conn -- an idle footprint (resource + fingerprint) before
+    /// any traffic. With udp on we therefore establish single-connect sessions on
+    /// demand "cold" (no parked idle QUIC), trading away the warm-pool latency
+    /// benefit. With udp off this stays `WARM_SESSION_POOL_TARGET` and the pool is
+    /// byte-identical to before.
+    warm_target: usize,
 }
 
 impl WarmSessionPool {
@@ -295,6 +311,15 @@ impl WarmSessionPool {
         server_public: [u8; 32],
         server_identity_public: Arc<[u8]>,
     ) -> Self {
+        // With udp on, single-connect sessions are established on demand "cold"
+        // (target 0) so the pool never parks idle retained QUIC connections; with
+        // udp off the pool keeps `WARM_SESSION_POOL_TARGET` warm sessions exactly
+        // as before.
+        let warm_target = if udp.enabled {
+            0
+        } else {
+            WARM_SESSION_POOL_TARGET
+        };
         Self {
             inner: Arc::new(Mutex::new(VecDeque::new())),
             config,
@@ -304,6 +329,7 @@ impl WarmSessionPool {
             psk,
             server_public,
             server_identity_public,
+            warm_target,
         }
     }
 
@@ -320,17 +346,19 @@ impl WarmSessionPool {
     }
 
     fn fill_locked(&self, warm: &mut VecDeque<ClientSessionTask>) {
-        while warm.len() < WARM_SESSION_POOL_TARGET {
+        while warm.len() < self.warm_target {
             warm.push_back(self.spawn_session());
         }
     }
 
     fn spawn_session(&self) -> ClientSessionTask {
-        // TODO(review, data-slice-3a): the warm-session pool retains up to
-        // WARM_SESSION_POOL_TARGET (4) idle sessions, each of which may hold a
-        // retained QUIC connection alive (keep-alive footprint / idle resource
-        // cost). Revisit the pool sizing / idle-eviction policy if the fast-plane
-        // keep-alive footprint becomes a concern.
+        // The warm-session pool retains up to `self.warm_target` idle sessions,
+        // each of which (on the udp-on retain path) would hold a live QUIC
+        // connection alive (keep-alive footprint / idle resource cost). That is
+        // why `warm_target` is 0 when `udp.enabled`: udp-on single-connect
+        // sessions are established on demand "cold" so no idle retained QUIC is
+        // parked. With udp off the target stays `WARM_SESSION_POOL_TARGET` (4) and
+        // the pre-warm behavior is unchanged.
         let config = Arc::clone(&self.config);
         let server_addr = self.server_addr.clone();
         let traffic = self.traffic;
@@ -1198,15 +1226,6 @@ struct ClientRelay {
 /// waits on. Sized to match the server's accept timeout family.
 const QUIC_RELAY_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Generous bound on reading the peer's QUIC fast-plane teardown DONE marker over
-/// the TCP control stream. A side writes its own DONE (after fully draining both
-/// directions) BEFORE blocking on this read, so the peer's DONE is already
-/// in-flight on the reliable TCP control stream; this window only guards against
-/// a peer that has vanished. It is intentionally large relative to a round trip
-/// because the relay loops themselves are uncapped (data-driven), and the DONE is
-/// only exchanged after both sides' `try_join` completes.
-const QUIC_RELAY_DONE_TIMEOUT: Duration = Duration::from_secs(30);
-
 impl ClientRelay {
     async fn run(self) -> Result<(), ClientRuntimeError> {
         let ClientRelay {
@@ -1292,9 +1311,17 @@ impl ClientRelay {
                 cover,
                 cid,
             );
+            // The download loop BORROWS the local write half (it is owned by this
+            // scope) and never shuts it down itself: this scope decides, after the
+            // DONE handshake, whether the local app sees a clean EOF (success) or a
+            // RESET (failure). Owning it here -- rather than moving it into the
+            // download future -- means a `try_join!` short-circuit (which cancels
+            // and DROPS the other future) cannot silently FIN it: the half is still
+            // ours to reset on error.
+            let mut local_write = local_write;
             let download = client_download_loop(
                 QuicStreamLegReader::buffered(recv),
-                local_write,
+                &mut local_write,
                 open_from_server,
                 cid,
             );
@@ -1306,27 +1333,40 @@ impl ClientRelay {
             // actually consumed every byte. So closing the QUIC connection right
             // after our own `try_join` would silently truncate any upload tail the
             // server is still draining into a slow target. Instead:
-            //   1. Our `try_join` Ok means BOTH directions finished here -- we sent
-            //      our FIN (upload) AND fully drained the server->client stream to
-            //      the local app (download). The loops hand back their owned codecs.
+            //   1. `try_join!` Ok means BOTH directions finished here -- we sent our
+            //      FIN (upload) AND fully drained the server->client stream to the
+            //      local app (download). The loops hand back their owned codecs. We
+            //      have NOT signaled the local app a clean EOF yet (the download loop
+            //      left the borrowed write half open): the app's success signal is
+            //      deferred until the DONE handshake proves the server drained our
+            //      upload. `try_join!` keeps its cancel-on-error semantics so a
+            //      broken direction promptly tears the other down (no hang).
             //   2. We seal a DONE marker on the SAME client->server (send) codec --
             //      its next sequence number -- and write it over the TCP control
             //      stream, then flush.
-            //   3. We BLOCK (bounded) reading exactly one record over the TCP
-            //      control stream and open it on the SAME server->client (recv)
-            //      codec; that is the server's DONE. Because we have NOT closed the
-            //      QUIC connection yet, it stays alive while we block, so the server
-            //      keeps draining our upload tail until ITS `try_join` completes and
-            //      it sends its own DONE.
+            //   3. We BLOCK reading exactly one record over the TCP control stream
+            //      and open it on the SAME server->client (recv) codec; that is the
+            //      server's DONE. The read is bounded on CONNECTION LIVENESS, not a
+            //      wall clock: we `select!` it against `conn.closed()`. Because we
+            //      have NOT closed the QUIC connection yet, it stays alive while we
+            //      block, so the server keeps draining our upload tail (kept alive by
+            //      the 15s keep-alive PINGs) for as long as it legitimately needs --
+            //      a multi-minute drain is fine. Only if the peer genuinely vanishes
+            //      does the QUIC connection idle-time-out (~60s), resolving
+            //      `conn.closed()` and returning a clean Err.
             //   4. Receiving the server's DONE proves the server fully drained every
             //      byte we sent (it only sends DONE after its own `try_join` Ok), so
-            //      nothing is in flight -- only THEN do we close the connection.
-            // On any relay error, or any DONE seal/write/read/timeout/open/marker
-            // mismatch, we close the connection and return Err: a clean, VISIBLE
-            // reset (the accepted v1 failure mode), never a silent success.
+            //      nothing is in flight -- only THEN do we signal clean EOF to the
+            //      local app and close the connection.
+            // On ANY failure (a relay-direction error from `try_join!`, OR any DONE
+            // seal / write / read / liveness / open / marker mismatch) we RESET the
+            // local connection (so the app sees an error, not a clean EOF) and close
+            // the QUIC connection, returning Err: a clean, VISIBLE reset (the
+            // accepted v1 failure mode), never a silent success.
             match tokio::try_join!(upload, download) {
                 Ok((mut seal_to_server, mut open_from_server)) => {
                     let result = client_exchange_quic_done(
+                        &conn,
                         &mut server_write,
                         server_read,
                         &mut seal_to_server,
@@ -1336,16 +1376,30 @@ impl ClientRelay {
                     .await;
                     match result {
                         Ok(()) => {
+                            // The server drained our upload and acknowledged: NOW
+                            // signal the local app a clean EOF (success).
+                            let _ = local_write.shutdown().await;
                             conn.close(0u32.into(), b"relay-done");
                             Ok(())
                         }
                         Err(err) => {
+                            // Teardown failed AFTER both directions finished: the
+                            // upstream upload may be truncated, so the local app MUST
+                            // NOT see a clean EOF. RESET it (SO_LINGER=0 + suppress the
+                            // graceful shutdown-on-drop) so the OS sends an RST and the
+                            // app observes an error.
+                            reset_local_write(local_write);
                             conn.close(0u32.into(), b"relay-done-failed");
                             Err(err)
                         }
                     }
                 }
                 Err(err) => {
+                    // A relay direction errored (and `try_join!` cancelled the
+                    // other). We still OWN the local write half, so RESET it: the app
+                    // must see an error, not the clean EOF that dropping it would
+                    // imply (a silent success when the upload was truncated).
+                    reset_local_write(local_write);
                     conn.close(0u32.into(), b"relay-error");
                     Err(err)
                 }
@@ -1361,17 +1415,26 @@ impl ClientRelay {
                 cover,
                 cid,
             );
+            let mut local_write = local_write;
             let download = client_download_loop(
                 TcpLegReader::buffered(server_read),
-                local_write,
+                &mut local_write,
                 open_from_server,
                 cid,
             );
 
             // TCP teardown is unchanged: TCP is reliable and FIN/EOF is a clean,
-            // fully-delivered close, so the returned per-direction codecs are
-            // simply discarded (no DONE handshake is needed on the TCP path).
+            // fully-delivered close, so the returned per-direction codec is simply
+            // discarded (no DONE handshake is needed on the TCP path) and the local
+            // app is given its clean EOF immediately on the download's clean finish,
+            // exactly as before. `client_download_loop` no longer shuts the local
+            // write half down itself (the QUIC path defers that until DONE), so the
+            // TCP path shuts it down here on the clean finish. On a relay error the
+            // `?` short-circuits and `local_write` drops at scope end into a graceful
+            // FIN (shutdown-on-drop) -- byte-identical to the prior behavior where
+            // the download loop dropped its owned write half on error.
             let (_seal_to_server, _open_from_server) = tokio::try_join!(upload, download)?;
+            let _ = local_write.shutdown().await;
             Ok(())
         }
     }
@@ -1380,10 +1443,13 @@ impl ClientRelay {
 /// Performs the client side of the QUIC fast-plane teardown DONE handshake over
 /// the held TCP control stream halves, using the SAME per-direction session
 /// codecs the relay used so the sequence numbers continue uninterrupted. It
-/// seals and writes our DONE, then reads, opens, and verifies the server's DONE
-/// (bounded). Returns Ok only when both DONEs are exchanged; the caller closes
+/// seals and writes our DONE, then reads, opens, and verifies the server's DONE.
+/// The DONE read is bounded on CONNECTION LIVENESS (`conn.closed()`), not a wall
+/// clock, so a slow-but-alive server draining a large upload tail is never
+/// truncated. Returns Ok only when both DONEs are exchanged; the caller closes
 /// the QUIC connection afterward (on Ok) or eagerly (on Err).
 async fn client_exchange_quic_done(
+    conn: &quinn::Connection,
     server_write: &mut OwnedWriteHalf,
     server_read: OwnedReadHalf,
     seal_to_server: &mut DataRecordCodec,
@@ -1401,24 +1467,27 @@ async fn client_exchange_quic_done(
         .map_err(ClientRuntimeError::Io)?;
     server_write.flush().await.map_err(ClientRuntimeError::Io)?;
 
-    // Read exactly ONE record (the server's DONE) over the TCP control stream,
-    // bounded so a vanished peer cannot pin this task. EOF here is NOT a clean
-    // close: we require the server's explicit DONE record.
+    // Read exactly ONE record (the server's DONE) over the TCP control stream.
+    // The read is bounded on CONNECTION LIVENESS, not a wall clock: we `select!`
+    // it against `conn.closed()`. While the server is alive (actively draining our
+    // upload tail + the 15s keep-alive PINGs keeping the QUIC connection up),
+    // `conn.closed()` pends and this read blocks for as long as the server
+    // legitimately needs -- a multi-minute drain is fine, with no fixed cap to
+    // truncate a slow-but-alive peer. If the server genuinely vanishes, the QUIC
+    // connection idle-times-out (~60s, configured) and `conn.closed()` resolves,
+    // yielding a clean Err. EOF on the TCP read is likewise NOT a clean close: we
+    // require the server's explicit DONE record.
     let mut reader = TlsRecordReader::new(server_read);
     let mut record = Vec::new();
-    match tokio::time::timeout(
-        QUIC_RELAY_DONE_TIMEOUT,
-        reader.read_record_into(&mut record),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(ClientRuntimeError::Io(err)),
-        Err(_) => {
-            tracing::warn!(cid, "QUIC fast-plane teardown DONE read timed out");
+    tokio::select! {
+        res = reader.read_record_into(&mut record) => {
+            res.map_err(ClientRuntimeError::Io)?;
+        }
+        _ = conn.closed() => {
+            tracing::warn!(cid, "QUIC connection closed before peer DONE");
             return Err(ClientRuntimeError::Io(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "QUIC fast-plane teardown DONE read timed out",
+                io::ErrorKind::ConnectionAborted,
+                "QUIC connection closed before peer DONE",
             )));
         }
     }
@@ -1433,6 +1502,24 @@ async fn client_exchange_quic_done(
         )));
     }
     Ok(())
+}
+
+/// Forces an abortive (RST) close of the local app's connection instead of a
+/// clean FIN. Used by the QUIC fast-plane teardown when the DONE handshake fails
+/// AFTER the download already finished: the upstream upload may be truncated, so
+/// the local app must observe an ERROR, never a clean EOF that reads as success.
+/// `set_zero_linger()` sets `SO_LINGER` to zero so the OS sends an RST on close
+/// (the tokio-idiomatic abortive-close API; the deprecated `set_linger` is for
+/// non-zero durations that would block on drop), and `forget()` suppresses the
+/// write half's default graceful `shutdown(Write)`-on-drop (which would send a
+/// FIN). Dropping the (now sole) handle then closes the socket abortively. A
+/// failure to set the option is logged and ignored -- the connection is torn down
+/// either way.
+fn reset_local_write(local_write: OwnedWriteHalf) {
+    if let Err(err) = local_write.as_ref().set_zero_linger() {
+        tracing::debug!(error = %err, "failed to set zero linger for local reset");
+    }
+    local_write.forget();
 }
 
 /// Drains the local app -> server direction. Returns the owned `seal_to_server`
@@ -1509,13 +1596,21 @@ where
     }
 }
 
-/// Drains the server -> local app direction. Returns the owned `open_from_server`
-/// codec on a clean finish so the QUIC fast-plane teardown can open the peer's
-/// DONE marker on the SAME receive-direction codec (sequence continues
-/// uninterrupted). TCP-path callers discard the returned codec.
+/// Drains the server -> local app direction. On a clean finish returns the owned
+/// `open_from_server` codec (so the QUIC fast-plane teardown can open the peer's
+/// DONE marker on the SAME receive-direction codec, sequence uninterrupted). It
+/// BORROWS the local write half (`&mut`) and deliberately does NOT shut it down on
+/// the clean server EOF: the CALLER owns that half and decides when (and whether)
+/// the local app sees a clean EOF. The QUIC path defers the clean EOF until the
+/// DONE handshake confirms the server drained the upload (and RESETs the half on
+/// any failure -- including a `try_join!` short-circuit -- so the app never sees a
+/// silent success); the TCP path shuts it down immediately on the clean finish. On
+/// a mid-download ERROR this returns Err; the caller then decides the half's fate
+/// (the QUIC path resets it, the TCP path lets it drop into a graceful FIN as
+/// before -- a mid-download failure correctly breaks the app connection).
 async fn client_download_loop<R>(
     mut server_records: R,
-    mut local_write: OwnedWriteHalf,
+    local_write: &mut OwnedWriteHalf,
     mut open_from_server: DataRecordCodec,
     cid: u64,
 ) -> Result<DataRecordCodec, ClientRuntimeError>
@@ -1528,7 +1623,9 @@ where
         match server_records.read_record_into(&mut server_record).await {
             Ok(()) => {}
             Err(err) if is_clean_close(&err) => {
-                let _ = local_write.shutdown().await;
+                // Clean server EOF: leave the borrowed local write half OPEN. The
+                // caller gates the local app's clean-EOF (success) signal on the
+                // peer DONE.
                 return Ok(open_from_server);
             }
             Err(err) => return Err(ClientRuntimeError::Io(err)),
@@ -2699,6 +2796,159 @@ mod tests {
         fallback_task.abort();
     }
 
+    /// FIX B regression: the local app's success signal must be GATED on the peer
+    /// DONE. Full UDP negotiation, single-connect. The local app uploads a body
+    /// SMALLER than the QUIC per-stream receive window (~1.25 MB) to a STALLED
+    /// target. Because it fits the window, the client writes the WHOLE upload into
+    /// the QUIC SendStream and sends its FIN WITHOUT the server having drained it
+    /// (the client's upload direction finishes). The target half-closes its WRITE
+    /// side up front, so the client's DOWNLOAD direction reaches a clean EOF
+    /// promptly too. So the client's `try_join` completes and it enters the DONE
+    /// handshake -- but the target NEVER reads the upload, so the server's upload
+    /// drain fills the target socket buffer and then blocks forever; the server's
+    /// `try_join` never completes and it never sends its DONE. The client is
+    /// therefore deterministically parked in the DONE handshake (no drain race).
+    ///
+    /// With the deferral fix, the client did NOT shut its local write half down on
+    /// the download EOF; it is now blocked in the DONE handshake. We kill the
+    /// server's retained QUIC connection in THIS window -- AFTER the download
+    /// finished and the upload FIN was sent, BEFORE the DONE handshake completes.
+    /// On the pre-fix code the client had already cleanly `shutdown()` the local
+    /// write half on the download EOF, so the app would have observed a clean,
+    /// successful EOF even though the buffered-but-undrained upload was abandoned by
+    /// quinn's close -- a SILENT success. The fix instead RESETs the local
+    /// connection on the DONE failure, so the app's read MUST observe a non-clean
+    /// close (an error / connection reset), never a clean successful completion.
+    #[tokio::test]
+    #[ignore = "requires loopback UDP+TCP sockets"]
+    async fn quic_relay_done_failure_after_download_eof_resets_local_app() {
+        // Serialize against the other QUIC fast-plane e2e tests (shared globals).
+        let _serial = quic_e2e_guard().await;
+
+        let enabled_udp = UdpConfig {
+            enabled: true,
+            ..UdpConfig::default()
+        };
+
+        // Sub-window upload (< quinn's ~1.25 MB default per-stream receive window)
+        // so the client can buffer the WHOLE body into the SendStream and FIN
+        // without the server draining it -- the client's upload direction finishes
+        // while the server is still (and forever) mid-drain. Multi-record.
+        const UPLOAD_LEN: usize = 768 * 1024;
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        // Stalled target: prompt download EOF (write half-closed up front), then it
+        // never reads the upload -- the server's drain blocks forever, so it never
+        // sends its DONE and the client stays parked in the DONE handshake.
+        let (target_addr, target_task) = spawn_stalled_reader_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        // Reset the test hook so we observe THIS connection's retained conn.
+        *server::retained_quic_conn_for_test()
+            .lock()
+            .expect("retained quic test hook poisoned") = None;
+
+        let (parallax_addr, server_task) = spawn_parallax_server_with_traffic_and_udp_allow_err(
+            server_config,
+            TrafficConfig::default(),
+            enabled_udp.clone(),
+        )
+        .await;
+        let (local_addr, client_task) = spawn_local_client_with_udp_allow_err(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            enabled_udp,
+        )
+        .await;
+
+        let app = connect_socks_target(local_addr, target_addr).await;
+        let (mut app_read, mut app_write) = app.into_split();
+
+        // Upload the (sub-window) body and half-close: since it fits the QUIC
+        // receive window, the client writes it all into the SendStream and FINs
+        // (upload direction finishes) without waiting on the server. The download
+        // direction (empty response) reaches EOF promptly. The body is fully sent
+        // here (no backpressure), so the write completes before we kill the conn.
+        let payload = (0..UPLOAD_LEN)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        app_write
+            .write_all(&payload)
+            .await
+            .expect("sub-window upload should not backpressure");
+        app_write.shutdown().await.expect("local write shutdown");
+
+        // Grab the server's retained QUIC connection.
+        let conn = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(conn) = server::retained_quic_conn_for_test()
+                    .lock()
+                    .expect("retained quic test hook poisoned")
+                    .clone()
+                {
+                    break conn;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "server never retained a QUIC connection"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        // Give the client a moment to FIN the upload and reach the fast download
+        // EOF, so it is parked in the DONE handshake (the server's drain is blocked
+        // forever on the stalled target, so its DONE never comes). Then kill the
+        // QUIC connection -- AFTER the download EOF + upload FIN, BEFORE the DONE
+        // handshake completes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        conn.close(0u32.into(), b"test-done-failure-after-download-eof");
+
+        // The local app MUST observe a non-clean close (the client RESETs it on the
+        // DONE failure), NOT a clean successful EOF. A clean EOF (Ok) is exactly
+        // the SILENT success the pre-fix code produced and the fix removes.
+        let mut response = Vec::new();
+        let read_result = timeout(Duration::from_secs(15), app_read.read_to_end(&mut response))
+            .await
+            .expect("local app read hung after QUIC reset");
+        assert!(
+            read_result.is_err(),
+            "local app must see a RESET (read error), not a clean successful EOF; \
+             got Ok with {} response bytes",
+            response.len()
+        );
+
+        // The client relay task must terminate (it returns Err on the DONE failure);
+        // require that it does not hang.
+        let _ = timeout(Duration::from_secs(15), client_task)
+            .await
+            .expect("client task hung after QUIC reset");
+
+        // Aborting the stalled target closes its socket, which unblocks the server's
+        // upload-drain `write_all` (it was parked writing into the stalled target,
+        // not on the now-closed QUIC stream) so the server task can also terminate.
+        target_task.abort();
+        let _ = timeout(Duration::from_secs(15), server_task)
+            .await
+            .expect("server task hung after QUIC reset");
+        fallback_task.abort();
+    }
+
     /// ASYMMETRIC UPLOAD (the critical data-integrity repro). Full UDP
     /// negotiation, single-connect. The local app uploads a large (>=2 MiB,
     /// multi-record) body to a target that READS SLOWLY (throttled), while the
@@ -3338,6 +3588,26 @@ mod tests {
             let _ = received_tx.send(received);
         });
         (addr, task, received_rx)
+    }
+
+    /// A target that half-closes its WRITE side immediately (so the proxied
+    /// server->client direction reaches EOF promptly) and then NEVER reads its
+    /// upload, just parking until aborted. The server's upload drain fills the
+    /// target socket's buffer and then blocks indefinitely, so the server's
+    /// `try_join` never completes and it never sends its teardown DONE. Used by the
+    /// FIX B reset test to deterministically hold the client in the DONE handshake
+    /// (after its own download EOF + upload FIN) while we kill the QUIC connection.
+    async fn spawn_stalled_reader_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (_read_half, mut write_half) = stream.split();
+            // Prompt download EOF, then never read the upload: park forever.
+            let _ = write_half.shutdown().await;
+            std::future::pending::<()>().await;
+        });
+        (addr, task)
     }
 
     /// A target that reads the small request, then sends a large deterministic
