@@ -51,6 +51,12 @@ pub enum ConfigError {
     InvalidDelayRange,
     #[error("traffic.cover_max_interval_ms must be >= traffic.cover_min_interval_ms")]
     InvalidCoverIntervalRange,
+    #[error(
+        "traffic cover traffic requires a non-degenerate padding range \
+         (max_padding > min_padding) so cover records vary in size; otherwise \
+         every cover record is an identical-length beacon"
+    )]
+    CoverRequiresVariablePadding,
     #[error("traffic.max_concurrent_streams must be at least 1")]
     InvalidMaxConcurrentStreams,
     #[error(
@@ -423,6 +429,16 @@ impl TrafficConfig {
         }
         if self.cover_max_interval_ms < self.cover_min_interval_ms {
             return Err(ConfigError::InvalidCoverIntervalRange);
+        }
+        // If cover traffic is enabled it seals empty payloads whose record size
+        // is driven entirely by the padding sampler. With a degenerate padding
+        // range (max_padding == min_padding, e.g. padding disabled) every cover
+        // record is an identical-length record emitted at quasi-periodic
+        // intervals — a constant-size beacon a censor can fingerprint, which is
+        // worse than sending no cover at all. Require variable padding so cover
+        // record sizes are randomized.
+        if self.cover_max_interval_ms > 0 && self.max_padding <= self.min_padding {
+            return Err(ConfigError::CoverRequiresVariablePadding);
         }
         if self.max_concurrent_streams == 0 {
             return Err(ConfigError::InvalidMaxConcurrentStreams);
@@ -847,6 +863,34 @@ server_identity_public_key = "{KEY}"
             traffic.validate().unwrap_err(),
             ConfigError::InvalidCoverIntervalRange
         ));
+    }
+
+    #[test]
+    fn rejects_cover_traffic_with_degenerate_padding() {
+        // Cover traffic enabled but padding is degenerate (max == min == 0):
+        // every cover record would be an identical-length beacon. Validation must
+        // reject this combination.
+        let traffic = TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 200,
+            min_padding: 0,
+            max_padding: 0,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            traffic.validate().unwrap_err(),
+            ConfigError::CoverRequiresVariablePadding
+        ));
+
+        // The same cover config with a non-degenerate padding range is accepted.
+        let ok = TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 200,
+            min_padding: 0,
+            max_padding: 256,
+            ..TrafficConfig::default()
+        };
+        ok.validate().unwrap();
     }
 
     #[cfg(unix)]

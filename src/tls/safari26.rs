@@ -66,6 +66,17 @@ const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
 const TLS_RECORD_VERSION_CLIENT_HELLO: [u8; 2] = [0x03, 0x01];
 const TLS_RECORD_VERSION_TLS13: [u8; 2] = [0x03, 0x03];
 
+/// Upper bound on a decompressed server certificate chain (TLS 1.3 cert
+/// compression). Real chains are a few KiB; 256 KiB is generous headroom while
+/// bounding the memory an attacker-supplied CompressedCertificate can force.
+const MAX_DECOMPRESSED_CERT_CHAIN: usize = 256 * 1024;
+
+/// Maximum ChangeCipherSpec records tolerated across a handshake. RFC 8446 allows
+/// at most one (a middlebox-compatibility no-op); accepting unbounded CCS lets an
+/// on-path attacker (CCS is unauthenticated/pre-AEAD) trickle them to stall the
+/// client handshake indefinitely.
+const MAX_CHANGE_CIPHER_SPEC_RECORDS: usize = 2;
+
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
@@ -327,13 +338,22 @@ impl Safari26TlsSession {
         &mut self,
         stream: &mut TcpStream,
     ) -> Result<Vec<u8>, Safari26TlsError> {
+        let mut ccs_records = 0_usize;
         loop {
             let record = read_record(stream).await?;
             self.tap_records(RecordDirection::Inbound, &record);
             let header = parse_header(&record)
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
             match header.content_type {
-                TLS_RECORD_CHANGE_CIPHER_SPEC => continue,
+                TLS_RECORD_CHANGE_CIPHER_SPEC => {
+                    ccs_records += 1;
+                    if ccs_records > MAX_CHANGE_CIPHER_SPEC_RECORDS {
+                        return Err(Safari26TlsError::Handshake(
+                            "too many ChangeCipherSpec records before ServerHello".to_owned(),
+                        ));
+                    }
+                    continue;
+                }
                 TLS_CONTENT_ALERT => return parse_alert(&record),
                 TLS_RECORD_HANDSHAKE => {
                     let _ = parse_server_hello(&record)?;
@@ -396,6 +416,7 @@ impl Safari26TlsSession {
     ) -> Result<ServerFlight, Safari26TlsError> {
         let mut flight = ServerFlight::default();
         let mut handshake_buf = Vec::new();
+        let mut ccs_records = 0_usize;
 
         while !flight.finished {
             let record = read_record(stream).await?;
@@ -403,7 +424,15 @@ impl Safari26TlsSession {
             let header = parse_header(&record)
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
             match header.content_type {
-                TLS_RECORD_CHANGE_CIPHER_SPEC => continue,
+                TLS_RECORD_CHANGE_CIPHER_SPEC => {
+                    ccs_records += 1;
+                    if ccs_records > MAX_CHANGE_CIPHER_SPEC_RECORDS {
+                        return Err(Safari26TlsError::Handshake(
+                            "too many ChangeCipherSpec records in server flight".to_owned(),
+                        ));
+                    }
+                    continue;
+                }
                 TLS_CONTENT_ALERT => return parse_alert(&record),
                 TLS_RECORD_APPLICATION_DATA => {
                     let decrypted = keys.server_handshake.decrypt_record(&record)?;
@@ -1483,10 +1512,31 @@ fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari
         ));
     }
     let uncompressed_len = c.u24()? as usize;
+    // Reject an oversized declared length BEFORE allocating: a real server
+    // certificate chain is a few KiB, and zlib's ~1000:1 ratio means a tiny
+    // attacker-supplied blob can declare (and inflate to) gigabytes. Without this
+    // an on-path attacker — reachable here BEFORE certificate verification, since
+    // the handshake keys come from the still-unauthenticated server key_share —
+    // could OOM-kill the client/prober with one small CompressedCertificate.
+    if uncompressed_len > MAX_DECOMPRESSED_CERT_CHAIN {
+        return Err(Safari26TlsError::Handshake(
+            "compressed_certificate uncompressed_length exceeds maximum".to_owned(),
+        ));
+    }
     let compressed = c.vec_u24()?;
-    let mut decoder = ZlibDecoder::new(Cursor::new(compressed));
-    let mut decompressed = Vec::with_capacity(uncompressed_len);
-    decoder.read_to_end(&mut decompressed)?;
+    let decoder = ZlibDecoder::new(Cursor::new(compressed));
+    // Cap the actual inflation independently of the declared length so a lying
+    // header (small uncompressed_len, huge real output) cannot exhaust memory
+    // either. take() bounds the bytes pulled from the decoder; reading one extra
+    // byte past the cap lets us detect an over-cap stream.
+    let mut decompressed = Vec::with_capacity(uncompressed_len.min(MAX_DECOMPRESSED_CERT_CHAIN));
+    let mut limited = decoder.take((MAX_DECOMPRESSED_CERT_CHAIN as u64) + 1);
+    limited.read_to_end(&mut decompressed)?;
+    if decompressed.len() > MAX_DECOMPRESSED_CERT_CHAIN {
+        return Err(Safari26TlsError::Handshake(
+            "compressed_certificate inflates beyond maximum".to_owned(),
+        ));
+    }
     if decompressed.len() != uncompressed_len {
         return Err(Safari26TlsError::Handshake(
             "compressed_certificate length mismatch".to_owned(),
@@ -1735,6 +1785,46 @@ mod tests {
         session::X25519KeyPair,
     };
     use crate::tls::client_hello::parse_client_hello;
+
+    fn build_compressed_cert_body(declared_uncompressed_len: usize, plaintext: &[u8]) -> Vec<u8> {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(plaintext).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&CERT_COMPRESSION_ZLIB.to_be_bytes());
+        push_u24(&mut body, declared_uncompressed_len).unwrap();
+        push_u24(&mut body, compressed.len()).unwrap();
+        body.extend_from_slice(&compressed);
+        body
+    }
+
+    #[test]
+    fn compressed_certificate_rejects_oversized_declared_length_before_allocating() {
+        // A declared uncompressed length above the cap must be refused outright
+        // (no multi-GiB Vec::with_capacity), regardless of the compressed body.
+        let body = build_compressed_cert_body(MAX_DECOMPRESSED_CERT_CHAIN + 1, b"hi");
+        let err = parse_compressed_certificate_body(&body).unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("exceeds maximum")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn compressed_certificate_rejects_inflation_beyond_cap_with_lying_header() {
+        // Declared length is small (passes the pre-check), but the stream inflates
+        // far beyond the cap. The bounded reader must stop and reject rather than
+        // inflating gigabytes.
+        let plaintext = vec![0_u8; MAX_DECOMPRESSED_CERT_CHAIN + 4096];
+        let body = build_compressed_cert_body(64, &plaintext);
+        let err = parse_compressed_certificate_body(&body).unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("beyond maximum")),
+            "unexpected error: {err:?}"
+        );
+    }
 
     #[test]
     fn safari26_camouflage_emits_authenticated_client_hello() {

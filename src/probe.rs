@@ -1,10 +1,12 @@
 use std::{fmt, time::Duration};
 
+use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
     time::{timeout, Instant},
 };
+use zeroize::Zeroizing;
 
 use crate::{
     config::{Config, Mode},
@@ -15,7 +17,6 @@ use crate::{
 
 const DEFAULT_PORT: u16 = 443;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const PROBE_PSK: &[u8] = b"ParallaX probe Safari TLS path";
 
 #[derive(Debug, Error)]
 pub enum ProbeError {
@@ -330,8 +331,17 @@ async fn complete_tls_probe(
     deadline: Duration,
 ) -> Result<TlsProbeResult, String> {
     let server = X25519KeyPair::generate();
+    // Use a fresh RANDOM per-probe PSK, never a hard-coded constant. The Safari
+    // ClientHello masks (random + session_id) are HMAC-keyed by the PSK; a public
+    // constant baked into the binary lets a censor recover the masked tail — whose
+    // first 8 bytes are a current Unix timestamp — and reliably flag the host as
+    // ParallaX running a probe. A random PSK makes the masked fields look like
+    // ordinary entropy. The benign TLS origin we probe ignores these fields, so a
+    // random key does not affect the handshake we are measuring.
+    let mut probe_psk = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(probe_psk.as_mut_slice());
     let session = Safari26TlsCamouflage
-        .start(sni.to_owned(), PROBE_PSK, &server.public)
+        .start(sni.to_owned(), probe_psk.as_slice(), &server.public)
         .map_err(|err| format!("Safari TLS client init failed: {err}"))?;
     let started = Instant::now();
     let completed = timeout(deadline, session.complete(stream))
