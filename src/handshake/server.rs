@@ -1136,6 +1136,20 @@ async fn run_authenticated_data_mode(
                     cid,
                     "pre-PQ deadline reached before client PQ rekey; tearing down"
                 );
+                // Close both halves with a graceful drain->FIN, not a bare drop.
+                // The pre-PQ phase is still forwarding camouflage records to the
+                // fallback origin, so a stalled-but-trickling client may have
+                // unread RX buffered; dropping the sockets would make close() emit
+                // a RST — exactly the FIN/RST tell the relay-teardown gate forbids.
+                let client_read = client_records.into_inner().into_inner();
+                let fallback_read = fallback_records.into_inner().into_inner();
+                graceful_close_fallback_halves(
+                    &client_read,
+                    &mut client_write,
+                    &fallback_read,
+                    &mut fallback_write,
+                )
+                .await;
                 return Ok(());
             }
             read = client_records.read_record_into(&mut client_record) => {
@@ -1263,6 +1277,12 @@ async fn run_authenticated_data_mode(
                                     cid,
                                     "no data-mode record before idle backstop; tearing down"
                                 );
+                                // Graceful drain->FIN on the client (the fallback
+                                // halves were already dropped above): avoid a RST
+                                // if the client left unread bytes buffered.
+                                let client_read = client_records.into_inner().into_inner();
+                                drain_read_half_to_block(&client_read);
+                                let _ = client_write.shutdown().await;
                                 return Ok(());
                             }
                         }
