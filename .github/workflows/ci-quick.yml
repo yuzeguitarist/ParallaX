@@ -8,6 +8,7 @@ on:
     branches-ignore:
       - main
       - master
+      - 'claude/**'   # Claude's PR branches get the PR's full CI; skip the redundant quick run
     paths-ignore:
       - '**.md'
       - 'ParallaX-DeepWiki/**'
