@@ -1069,9 +1069,8 @@ async fn run_authenticated_data_mode(
                             "server-connect-reader",
                             &client_record,
                         );
-                        let first_payload_range =
+                        let mut first_payload_range =
                             client_open.open_in_place_payload_range(&mut client_record)?;
-                        let first_payload = &mut client_record[first_payload_range];
                         tracing::info!(
                             cid,
                             client_camouflage_records_before_pq,
@@ -1079,6 +1078,27 @@ async fn run_authenticated_data_mode(
                             "ParallaX data mode switch confirmed"
                         );
 
+                        // Client-initiated, fail-soft UDP negotiation (PX1G). The
+                        // server NEVER offers UDP unsolicited; until the UDP
+                        // datapath is wired it always declines, then reads the
+                        // client's real first command and dispatches it normally.
+                        // This keeps every config/version combination desync-free.
+                        if crate::protocol::command::UdpRequest::has_magic(
+                            &client_record[first_payload_range.clone()],
+                        ) {
+                            let decline = crate::protocol::command::UdpDecline {
+                                reason: crate::protocol::command::UDP_DECLINE_UNSUPPORTED,
+                            }
+                            .encode();
+                            let decline_record = server_seal.seal(&decline, &mut rng)?;
+                            client_write.write_all(&decline_record).await?;
+                            client_record.clear();
+                            client_records.read_record_into(&mut client_record).await?;
+                            first_payload_range =
+                                client_open.open_in_place_payload_range(&mut client_record)?;
+                        }
+
+                        let first_payload = &mut client_record[first_payload_range];
                         if SpeedTestRequest::has_magic(first_payload) {
                             let request = SpeedTestRequest::decode(first_payload)?;
                             return run_authenticated_speed_test_mode(
