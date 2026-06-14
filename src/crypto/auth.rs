@@ -7,6 +7,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 use crate::tls::client_hello::{parse_client_hello, ClientHello, ClientHelloError};
 
@@ -107,11 +108,13 @@ pub fn build_stateful_auth_session_id(
 
 pub fn build_masked_stateful_client_random(
     psk: &[u8],
+    mask_ecdh: &[u8; 32],
     sni: &str,
     parallax_x25519_public: &[u8; 32],
     tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
 ) -> Result<[u8; 32], AuthError> {
-    let mask = stateful_client_random_mask(psk, sni, tail)?;
+    let mask_key = derive_mask_key(psk, mask_ecdh)?;
+    let mask = stateful_client_random_mask(&mask_key, sni, tail)?;
     let mut encoded = [0_u8; 32];
     for (dst, (public, mask)) in encoded
         .iter_mut()
@@ -124,13 +127,15 @@ pub fn build_masked_stateful_client_random(
 
 pub fn build_masked_stateful_auth_session_id(
     psk: &[u8],
+    mask_ecdh: &[u8; 32],
     auth_key: &[u8],
     sni: &str,
     parallax_x25519_public: &[u8; 32],
     encoded_client_random: &[u8; 32],
     tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
 ) -> Result<[u8; SESSION_ID_LEN], AuthError> {
-    let encoded_tail = encode_stateful_auth_tail(psk, sni, encoded_client_random, tail)?;
+    let mask_key = derive_mask_key(psk, mask_ecdh)?;
+    let encoded_tail = encode_stateful_auth_tail(&mask_key, sni, encoded_client_random, tail)?;
     let tag = compute_masked_stateful_tag(
         auth_key,
         sni,
@@ -148,14 +153,16 @@ pub fn build_masked_stateful_auth_session_id(
 pub fn recover_stateful_auth_material(
     record: &[u8],
     psk: &[u8],
+    mask_ecdh: &[u8; 32],
 ) -> Result<Option<StatefulAuthMaterial>, AuthError> {
     let parsed = parse_client_hello(record)?;
-    recover_stateful_auth_material_from_parsed(record, psk, &parsed)
+    recover_stateful_auth_material_from_parsed(record, psk, mask_ecdh, &parsed)
 }
 
 pub(crate) fn recover_stateful_auth_material_from_parsed(
     record: &[u8],
     psk: &[u8],
+    mask_ecdh: &[u8; 32],
     parsed: &ClientHello,
 ) -> Result<Option<StatefulAuthMaterial>, AuthError> {
     if parsed.session_id_range.len() != SESSION_ID_LEN {
@@ -164,12 +171,13 @@ pub(crate) fn recover_stateful_auth_material_from_parsed(
     let Some(sni) = parsed.sni.as_deref() else {
         return Ok(None);
     };
+    let mask_key = derive_mask_key(psk, mask_ecdh)?;
     let mut encoded_tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
     encoded_tail.copy_from_slice(
         &record[parsed.session_id_range.start + AUTH_TAG_LEN..parsed.session_id_range.end],
     );
     Ok(Some(decode_stateful_auth_material(
-        psk,
+        &mask_key,
         sni,
         &parsed.client_random,
         &encoded_tail,
@@ -428,6 +436,26 @@ fn derive_auth_key_from_shared(
     Ok(out)
 }
 
+/// Derives the v4 carrier-mask key for the stateful ClientHello masks.
+///
+/// salt = psk, IKM = `mask_ecdh` = X25519(server_static, tls_ephemeral). Binding
+/// the PSK as the HKDF salt (NOT the IKM) preserves the two-secret property: a
+/// leaked server static private key ALONE does not reveal the masks, because the
+/// HKDF-Extract PRK is unknown without the PSK — both secrets are required, just
+/// as [`derive_auth_key_from_shared`] requires both for the auth tag. Do NOT
+/// swap salt and IKM.
+fn derive_mask_key(psk: &[u8], mask_ecdh: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, AuthError> {
+    if psk.is_empty() {
+        return Err(AuthError::EmptyPsk);
+    }
+
+    let hk = Hkdf::<Sha256>::new(Some(psk), mask_ecdh);
+    let mut out = Zeroizing::new([0_u8; 32]);
+    hk.expand(b"ParallaX v4 ClientHello carrier mask key", out.as_mut())
+        .map_err(|_| AuthError::Hkdf)?;
+    Ok(out)
+}
+
 fn compute_tag(
     record: &[u8],
     record_len: usize,
@@ -498,13 +526,13 @@ fn compute_masked_stateful_tag(
 }
 
 fn decode_stateful_auth_material(
-    psk: &[u8],
+    mask_key: &[u8; 32],
     sni: &str,
     encoded_client_random: &[u8; 32],
     encoded_tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
 ) -> Result<StatefulAuthMaterial, AuthError> {
-    let tail = decode_stateful_auth_tail(psk, sni, encoded_client_random, encoded_tail)?;
-    let mask = stateful_client_random_mask(psk, sni, &tail)?;
+    let tail = decode_stateful_auth_tail(mask_key, sni, encoded_client_random, encoded_tail)?;
+    let mask = stateful_client_random_mask(mask_key, sni, &tail)?;
     let mut x25519_public = [0_u8; 32];
     for (dst, (encoded, mask)) in x25519_public
         .iter_mut()
@@ -519,12 +547,12 @@ fn decode_stateful_auth_material(
 }
 
 fn encode_stateful_auth_tail(
-    psk: &[u8],
+    mask_key: &[u8; 32],
     sni: &str,
     encoded_client_random: &[u8; 32],
     tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
 ) -> Result<[u8; STATEFUL_AUTH_TAIL_LEN], AuthError> {
-    let mask = stateful_auth_tail_mask(psk, sni, encoded_client_random)?;
+    let mask = stateful_auth_tail_mask(mask_key, sni, encoded_client_random)?;
     let mut encoded = [0_u8; STATEFUL_AUTH_TAIL_LEN];
     for (dst, (plain, mask)) in encoded.iter_mut().zip(tail.iter().zip(mask)) {
         *dst = plain ^ mask;
@@ -533,12 +561,12 @@ fn encode_stateful_auth_tail(
 }
 
 fn decode_stateful_auth_tail(
-    psk: &[u8],
+    mask_key: &[u8; 32],
     sni: &str,
     encoded_client_random: &[u8; 32],
     encoded_tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
 ) -> Result<[u8; STATEFUL_AUTH_TAIL_LEN], AuthError> {
-    let mask = stateful_auth_tail_mask(psk, sni, encoded_client_random)?;
+    let mask = stateful_auth_tail_mask(mask_key, sni, encoded_client_random)?;
     let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
     for (dst, (encoded, mask)) in tail.iter_mut().zip(encoded_tail.iter().zip(mask)) {
         *dst = encoded ^ mask;
@@ -547,39 +575,51 @@ fn decode_stateful_auth_tail(
 }
 
 fn stateful_client_random_mask(
-    psk: &[u8],
+    mask_key: &[u8; 32],
     sni: &str,
     tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
 ) -> Result<[u8; 32], AuthError> {
-    stateful_mask(psk, b"ParallaX v3 ClientHello.random mask", sni, tail, &[])
+    stateful_mask(
+        mask_key,
+        b"ParallaX v4 ClientHello.random mask",
+        sni,
+        tail,
+        &[],
+    )
 }
 
 fn stateful_auth_tail_mask(
-    psk: &[u8],
+    mask_key: &[u8; 32],
     sni: &str,
     encoded_client_random: &[u8; 32],
 ) -> Result<[u8; 32], AuthError> {
     stateful_mask(
-        psk,
-        b"ParallaX v3 ClientHello session_id tail mask",
+        mask_key,
+        b"ParallaX v4 ClientHello session_id tail mask",
         sni,
         encoded_client_random,
         &[],
     )
 }
 
+/// Keystream for an XOR carrier mask.
+///
+/// v4: keyed by `mask_key` = HKDF(salt=psk, IKM=X25519(server_static,
+/// tls_ephemeral)) — see [`derive_mask_key`] — NOT the raw PSK. A passive
+/// observer who captures the ClientHello sees the unmasked TLS ephemeral key
+/// share and at most the server's static public key, but recovering the shared
+/// secret is the X25519 CDH problem, so the mask key (and therefore the masked
+/// carrier) is pseudorandom to them. This closes the v3 offline PSK-guessing
+/// oracle, where the mask was HMAC(raw psk, observable bytes).
 fn stateful_mask(
-    psk: &[u8],
+    mask_key: &[u8; 32],
     label: &[u8],
     sni: &str,
     first: &[u8],
     second: &[u8],
 ) -> Result<[u8; 32], AuthError> {
-    if psk.is_empty() {
-        return Err(AuthError::EmptyPsk);
-    }
-
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(psk).map_err(|_| AuthError::EmptyPsk)?;
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(mask_key).expect("HMAC accepts any key length");
     mac.update(label);
     mac.update(&(sni.len() as u16).to_be_bytes());
     mac.update(sni.as_bytes());
@@ -690,20 +730,85 @@ mod tests {
     }
 
     #[test]
+    fn wrong_mask_ecdh_cannot_recover_timestamp_oracle_closed() {
+        // Finding #10 regression: the v3 masks were HMAC(raw psk, observable),
+        // so a passive attacker could offline-guess the PSK by recomputing the
+        // mask and checking the recovered tail's leading-timestamp redundancy.
+        // v4 keys the mask on HKDF(psk, X25519(server_static, tls_ephemeral)); an
+        // attacker without the server static key cannot derive the mask key, so
+        // with ANY wrong mask_ecdh the recovered timestamp is not the real one and
+        // the oracle yields no PSK signal.
+        let mut hello = client_hello_fixture("example.com");
+        let parsed = parse_client_hello(&hello).unwrap();
+        let public = parsed.client_random;
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let auth_key = psk;
+        let real_mask_ecdh = [0x55_u8; 32];
+        let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+        tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&1_700_000_000_u64.to_be_bytes());
+        tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&[7_u8; AUTH_NONCE_LEN]);
+        let encoded_random = build_masked_stateful_client_random(
+            psk,
+            &real_mask_ecdh,
+            "example.com",
+            &public,
+            &tail,
+        )
+        .unwrap();
+        let session_id = build_masked_stateful_auth_session_id(
+            psk,
+            &real_mask_ecdh,
+            auth_key,
+            "example.com",
+            &public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        hello[parsed.session_id_range.clone()].copy_from_slice(&session_id);
+
+        for wrong in [[0_u8; 32], [0x11_u8; 32], [0xAB_u8; 32]] {
+            let material = recover_stateful_auth_material(&hello, psk, &wrong)
+                .unwrap()
+                .unwrap();
+            let recovered_ts =
+                u64::from_be_bytes(material.tail[..AUTH_TIMESTAMP_LEN].try_into().unwrap());
+            assert_ne!(
+                recovered_ts, 1_700_000_000,
+                "a wrong mask_ecdh must not recover the real timestamp"
+            );
+        }
+
+        // The correct mask_ecdh still recovers it (sanity).
+        let material = recover_stateful_auth_material(&hello, psk, &real_mask_ecdh)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            u64::from_be_bytes(material.tail[..AUTH_TIMESTAMP_LEN].try_into().unwrap()),
+            1_700_000_000
+        );
+    }
+
+    #[test]
     fn verifies_masked_stateful_client_random_and_tail() {
         let mut hello = client_hello_fixture("example.com");
         let parsed = parse_client_hello(&hello).unwrap();
         let public = parsed.client_random;
         let psk = b"0123456789abcdef0123456789abcdef";
         let auth_key = psk;
+        let mask_ecdh = [0x55_u8; 32];
         let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
         tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&1234_u64.to_be_bytes());
         tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&[7_u8; AUTH_NONCE_LEN]);
         let encoded_random =
-            build_masked_stateful_client_random(psk, "example.com", &public, &tail).unwrap();
+            build_masked_stateful_client_random(psk, &mask_ecdh, "example.com", &public, &tail)
+                .unwrap();
         assert_ne!(encoded_random, public);
         let session_id = build_masked_stateful_auth_session_id(
             psk,
+            &mask_ecdh,
             auth_key,
             "example.com",
             &public,
@@ -715,7 +820,7 @@ mod tests {
         hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
         hello[parsed.session_id_range].copy_from_slice(&session_id);
 
-        let material = recover_stateful_auth_material(&hello, psk)
+        let material = recover_stateful_auth_material(&hello, psk, &mask_ecdh)
             .unwrap()
             .unwrap();
         let auth =
@@ -734,13 +839,16 @@ mod tests {
         let public = parsed.client_random;
         let psk = b"0123456789abcdef0123456789abcdef";
         let auth_key = psk;
+        let mask_ecdh = [0x55_u8; 32];
         let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
         tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&1234_u64.to_be_bytes());
         tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&[7_u8; AUTH_NONCE_LEN]);
         let encoded_random =
-            build_masked_stateful_client_random(psk, "example.com", &public, &tail).unwrap();
+            build_masked_stateful_client_random(psk, &mask_ecdh, "example.com", &public, &tail)
+                .unwrap();
         let session_id = build_masked_stateful_auth_session_id(
             psk,
+            &mask_ecdh,
             auth_key,
             "example.com",
             &public,
@@ -751,7 +859,7 @@ mod tests {
         let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
         hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
         hello[parsed.session_id_range].copy_from_slice(&session_id);
-        let material = recover_stateful_auth_material(&hello, psk)
+        let material = recover_stateful_auth_material(&hello, psk, &mask_ecdh)
             .unwrap()
             .unwrap();
 

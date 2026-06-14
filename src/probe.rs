@@ -331,13 +331,13 @@ async fn complete_tls_probe(
     deadline: Duration,
 ) -> Result<TlsProbeResult, String> {
     let server = X25519KeyPair::generate();
-    // Use a fresh RANDOM per-probe PSK, never a hard-coded constant. The Safari
-    // ClientHello masks (random + session_id) are HMAC-keyed by the PSK; a public
-    // constant baked into the binary lets a censor recover the masked tail — whose
-    // first 8 bytes are a current Unix timestamp — and reliably flag the host as
-    // ParallaX running a probe. A random PSK makes the masked fields look like
-    // ordinary entropy. The benign TLS origin we probe ignores these fields, so a
-    // random key does not affect the handshake we are measuring.
+    // Use a fresh RANDOM per-probe PSK (and a throwaway server key), never a
+    // hard-coded constant. As of v4 the ClientHello carrier masks are keyed by
+    // HKDF(psk, X25519(server_static, tls_ephemeral)), so they no longer leak the
+    // PSK to a passive observer; but the probe still uses a random PSK so its
+    // ClientHello carries no fixed, binary-derivable structure a censor could
+    // match against to flag the host as ParallaX. The benign TLS origin we probe
+    // ignores these auth fields, so a random key does not affect what we measure.
     let mut probe_psk = Zeroizing::new([0_u8; 32]);
     OsRng.fill_bytes(probe_psk.as_mut_slice());
     let session = Safari26TlsCamouflage

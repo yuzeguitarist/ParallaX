@@ -225,11 +225,27 @@ impl Safari26TlsCamouflage {
             x25519_shared_secret(&parallax_x25519.private, server_public_key);
         let auth_key = derive_client_auth_key_from_shared(psk, &parallax_shared_secret)?;
 
+        // Generate the TLS handshake ephemeral up-front: its public half is
+        // carried UNMASKED in the key_share, and the v4 carrier-mask key is
+        // derived from X25519(server_static, this ephemeral) so a passive
+        // observer (who lacks the server static private key) cannot recompute the
+        // masks and therefore cannot run the v3 offline PSK-guessing oracle. This
+        // MUST precede the mask builds below.
+        let tls_x25519 = X25519KeyPair::generate();
+        let mask_ecdh =
+            Zeroizing::new(x25519_shared_secret(&tls_x25519.private, server_public_key));
+
         let tail = build_auth_tail(&mut OsRng)?;
-        let encoded_client_random =
-            build_masked_stateful_client_random(psk, &sni, &parallax_x25519.public, &tail)?;
+        let encoded_client_random = build_masked_stateful_client_random(
+            psk,
+            &mask_ecdh,
+            &sni,
+            &parallax_x25519.public,
+            &tail,
+        )?;
         let session_id = build_masked_stateful_auth_session_id(
             psk,
+            &mask_ecdh,
             &auth_key,
             &sni,
             &parallax_x25519.public,
@@ -237,7 +253,6 @@ impl Safari26TlsCamouflage {
             &tail,
         )?;
 
-        let tls_x25519 = X25519KeyPair::generate();
         let (mlkem_public, mlkem_secret) = mlkem768::keypair();
         let mut grease_seed = [0_u8; 5];
         OsRng.fill_bytes(&mut grease_seed);
@@ -251,7 +266,7 @@ impl Safari26TlsCamouflage {
             grease,
         )?;
 
-        let Some(material) = recover_stateful_auth_material(&client_hello, psk)? else {
+        let Some(material) = recover_stateful_auth_material(&client_hello, psk, &mask_ecdh)? else {
             return Err(Safari26TlsError::UnauthenticatedClientHello);
         };
         let auth = verify_masked_stateful_client_hello_auth_with_material(
@@ -1835,7 +1850,13 @@ mod tests {
             .unwrap();
 
         let parsed = parse_client_hello(&session.client_hello).unwrap();
-        let material = recover_stateful_auth_material(&session.client_hello, psk)
+        let mask_ecdh = x25519_shared_secret(
+            &server.private,
+            &parsed
+                .x25519_key_share
+                .expect("Safari26 carries a standalone X25519 key_share"),
+        );
+        let material = recover_stateful_auth_material(&session.client_hello, psk, &mask_ecdh)
             .unwrap()
             .unwrap();
         let auth_key =

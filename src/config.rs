@@ -268,14 +268,14 @@ impl Config {
         let psk = decode_psk(&self.crypto.psk)?;
         if psk_looks_low_entropy(&psk) {
             // Not fatal (and the auto-generated PSK is always random), but warn:
-            // the stateful ClientHello masks are HMAC-keyed by the raw PSK over
-            // observable inputs, so a low-entropy / human-chosen PSK is open to an
-            // offline single-capture guessing oracle. Only a CSPRNG-generated key
-            // resists it.
+            // the PSK is one of the two secrets the whole auth scheme rests on
+            // (it salts the carrier-mask and auth-key HKDFs and keys replay/AEAD
+            // derivation). The v4 masks are no longer a raw-PSK offline oracle,
+            // but a low-entropy / human-chosen PSK still weakens auth against an
+            // attacker who can guess it. Only a CSPRNG-generated key is safe.
             tracing::warn!(
                 "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
-                 (e.g. `plx init` / `openssl rand -base64 32`) — low-entropy PSKs are open to \
-                 an offline guessing oracle"
+                 (e.g. `plx init` / `openssl rand -base64 32`)"
             );
         }
         self.traffic.validate()?;

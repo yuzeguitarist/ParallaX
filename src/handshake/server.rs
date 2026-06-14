@@ -573,30 +573,44 @@ fn decide_connection_inbound(
     if !parsed.tls13_supported {
         return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
     }
-    if let Some(material) =
-        recover_stateful_auth_material_from_parsed(first_client_record, psk, &parsed)?
-    {
-        let x25519_key_share = material.x25519_public;
-        let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
-        let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
-        let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
+    // v4 masked-stateful path. The carrier masks are keyed by
+    // mask_ecdh = X25519(server_static, tls_ephemeral); the TLS ephemeral is the
+    // unmasked standalone X25519 key_share. A non-ParallaX hello without that
+    // share cannot be a v4 ParallaX client, so fall through to the legacy path
+    // (which ends in Fallback for genuine non-ParallaX traffic). NB: this DH is
+    // distinct from the auth DH below — mask uses the TLS key share, auth uses
+    // the recovered ParallaX ephemeral.
+    if let Some(tls_key_share) = parsed.x25519_key_share {
+        let mask_ecdh =
+            zeroize::Zeroizing::new(x25519_shared_secret(server_private, &tls_key_share));
+        if let Some(material) = recover_stateful_auth_material_from_parsed(
             first_client_record,
-            &auth_key,
-            &material,
+            psk,
+            &mask_ecdh,
             &parsed,
-        ) {
-            Ok(auth) => auth,
-            Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
-            Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
-        };
-        if auth.authenticated {
-            return authenticated_decision(
+        )? {
+            let x25519_key_share = material.x25519_public;
+            let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
+            let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
+            let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
                 first_client_record,
-                auth,
-                authorized_sni,
-                x25519_key_share,
-                x25519_shared_secret,
-            );
+                &auth_key,
+                &material,
+                &parsed,
+            ) {
+                Ok(auth) => auth,
+                Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
+                Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
+            };
+            if auth.authenticated {
+                return authenticated_decision(
+                    first_client_record,
+                    auth,
+                    authorized_sni,
+                    x25519_key_share,
+                    x25519_shared_secret,
+                );
+            }
         }
     }
 
@@ -3218,10 +3232,21 @@ mod tests {
         let parsed = parse_client_hello(&record).unwrap();
         let mut rng = StdRng::seed_from_u64(3);
         let tail = build_auth_tail_at(1_700_000_001, &mut rng);
-        let encoded_random =
-            build_masked_stateful_client_random(PSK, "example.com", &client.public, &tail).unwrap();
+        // The fixture's standalone X25519 key_share is [0x44; 32]; the server
+        // derives mask_ecdh = X25519(server.private, [0x44;32]), so build the
+        // masks with the same value.
+        let mask_ecdh = x25519_shared_secret(&server.private, &[0x44_u8; 32]);
+        let encoded_random = build_masked_stateful_client_random(
+            PSK,
+            &mask_ecdh,
+            "example.com",
+            &client.public,
+            &tail,
+        )
+        .unwrap();
         let session_id = build_masked_stateful_auth_session_id(
             PSK,
+            &mask_ecdh,
             &auth_key,
             "example.com",
             &client.public,
@@ -3264,10 +3289,18 @@ mod tests {
         let parsed = parse_client_hello(&record).unwrap();
         let mut rng = StdRng::seed_from_u64(3);
         let tail = build_auth_tail_at(1_700_000_001, &mut rng);
-        let encoded_random =
-            build_masked_stateful_client_random(PSK, "example.com", &client.public, &tail).unwrap();
+        let mask_ecdh = x25519_shared_secret(&server.private, &[0x44_u8; 32]);
+        let encoded_random = build_masked_stateful_client_random(
+            PSK,
+            &mask_ecdh,
+            "example.com",
+            &client.public,
+            &tail,
+        )
+        .unwrap();
         let session_id = build_masked_stateful_auth_session_id(
             PSK,
+            &mask_ecdh,
             &auth_key,
             "example.com",
             &client.public,
@@ -3291,6 +3324,83 @@ mod tests {
         assert_eq!(
             decision,
             InboundDecision::Fallback(FallbackReason::AuthFailed)
+        );
+    }
+
+    #[test]
+    fn v4_real_start_authenticates_against_decide_inbound() {
+        // End-to-end agreement across the REAL client start() and the REAL server
+        // decide path: proves the client mask_key = X25519(tls.private, server.pub)
+        // equals the server mask_key = X25519(server.private, tls.pub), so the v4
+        // carrier masks round-trip.
+        let server = X25519KeyPair::generate();
+        let session = crate::tls::safari26::Safari26TlsCamouflage
+            .start("example.com".to_owned(), PSK, &server.public)
+            .unwrap();
+        let record = session.client_hello_bytes().to_vec();
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+        assert!(
+            matches!(decision, InboundDecision::Authenticated(_)),
+            "a real v4 client must authenticate, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn v4_mask_ecdh_mismatch_falls_back_not_authenticated() {
+        // Simulates a version/peer mismatch (e.g. v3 client ↔ v4 server): masks
+        // built with a mask_ecdh the server will not derive yield garbage material
+        // → tag mismatch → Fallback, never Authenticated (fail-closed).
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let mut record = client_hello_fixture_with_random_and_key_share(
+            "example.com",
+            &client.public,
+            &[0x44_u8; 32],
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let mut rng = StdRng::seed_from_u64(3);
+        let tail = build_auth_tail_at(1_700_000_001, &mut rng);
+        // != X25519(server.private, [0x44;32]) that decide_inbound will derive.
+        let wrong_mask_ecdh = [0x99_u8; 32];
+        let encoded_random = build_masked_stateful_client_random(
+            PSK,
+            &wrong_mask_ecdh,
+            "example.com",
+            &client.public,
+            &tail,
+        )
+        .unwrap();
+        let session_id = build_masked_stateful_auth_session_id(
+            PSK,
+            &wrong_mask_ecdh,
+            &auth_key,
+            "example.com",
+            &client.public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        record[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        record[parsed.session_id_range].copy_from_slice(&session_id);
+
+        let decision = decide_inbound(
+            &record,
+            PSK,
+            &[String::from("example.com")],
+            &server.private,
+        )
+        .unwrap();
+        assert!(
+            matches!(decision, InboundDecision::Fallback(_)),
+            "mask_ecdh mismatch must fall back, got {decision:?}"
         );
     }
 
