@@ -57,7 +57,8 @@ use crate::{
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
-            DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD,
+            DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD, QUIC_RELAY_DONE_MARKER,
+            SERVER_TO_CLIENT_AAD,
         },
     },
     tls::{
@@ -1790,12 +1791,14 @@ fn drop_retained_quic(retained: Option<(quinn::Endpoint, quinn::Connection)>) {
 /// rather than silently splitting the two directions across TCP and QUIC.
 const QUIC_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bounded grace, after both relay directions finish, to let quinn flush and have
-/// the peer acknowledge the final stream data before the connection handle drops.
-/// quinn keeps retransmitting finished-stream data while a `Connection` handle is
-/// alive, so this window lets the last relay bytes land; it is bounded so a peer
-/// that vanishes cannot pin the task.
-const QUIC_RELAY_DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Generous bound on reading the client's QUIC fast-plane teardown DONE marker
+/// over the TCP control stream. The server writes its own DONE (after fully
+/// draining both directions) BEFORE blocking on this read, so the client's DONE
+/// is already in-flight on the reliable TCP control stream; this window only
+/// guards against a client that has vanished. It is intentionally large relative
+/// to a round trip because the relay loops themselves are uncapped (data-driven),
+/// and the DONE is only exchanged after both sides' `try_join` completes.
+const QUIC_RELAY_DONE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 struct ServerMuxContext<'a> {
@@ -1839,9 +1842,14 @@ impl DataRelay {
             let _udp_ep = udp_ep;
             // Keep the TCP control halves alive for the relay's duration so the
             // outer TCP connection stays open (the client likewise holds its TCP
-            // halves). They carry no relay bytes on the QUIC path.
-            let _client_records = client_records;
-            let _client_write = client_write;
+            // halves). They carry no relay DATA, but they DO carry the teardown
+            // DONE handshake: the TCP control stream is reliable and independent
+            // of the QUIC connection close, so it coordinates a safe,
+            // truncation-free teardown after the QUIC relay finishes.
+            // `client_records` is read for the client's DONE; `client_write`
+            // needs `mut` to write our DONE marker.
+            let mut client_records = client_records;
+            let mut client_write = client_write;
             match tokio::time::timeout(QUIC_RELAY_ACCEPT_TIMEOUT, conn.accept_bi()).await {
                 Ok(Ok((send, recv))) => {
                     tracing::info!(
@@ -1863,21 +1871,59 @@ impl DataRelay {
                         cover,
                         cid,
                     );
-                    let result = tokio::try_join!(upload, download).map(|((), ())| ());
-                    // Graceful QUIC teardown. The CLIENT is the designated closer
-                    // (see client side). On success the server does NOT close
-                    // first: it waits, bounded, for the client's CONNECTION_CLOSE
-                    // so the server's finished download-stream data is fully
-                    // delivered and acknowledged before the connection goes away.
-                    // quinn retransmits that finished data while this handle is
-                    // alive. On timeout (client vanished) or error, the handle drop
-                    // / explicit close tears it down without pinning the task.
-                    if result.is_ok() {
-                        let _ = tokio::time::timeout(QUIC_RELAY_DRAIN_GRACE, conn.closed()).await;
-                    } else {
-                        conn.close(0u32.into(), b"relay-error");
+                    // Application-level DONE handshake over the reliable TCP
+                    // control stream. quinn 0.11.9's `Connection::close` ABANDONS
+                    // undelivered stream data, and `finish`/`stopped` only signal
+                    // FIN / ack -- none prove the PEER's application consumed every
+                    // byte. The earlier fixed 5s `conn.closed()` grace was also
+                    // wrong: it dropped a HEALTHY large/slow server->client
+                    // download whose client took >5s to drain to a slow local app.
+                    // Instead:
+                    //   1. Our `try_join` Ok means BOTH directions finished here --
+                    //      we sent our FIN (download) AND fully drained the
+                    //      client->server stream to the target (upload). The loops
+                    //      hand back their owned codecs.
+                    //   2. We seal a DONE marker on the SAME server->client (send)
+                    //      codec -- its next sequence number -- and write it over the
+                    //      TCP control stream, then flush.
+                    //   3. We BLOCK (bounded) reading exactly one record over the
+                    //      TCP control stream and open it on the SAME client->server
+                    //      (recv) codec; that is the client's DONE. Because we have
+                    //      NOT closed the QUIC connection yet, it stays alive while
+                    //      we block, so the client keeps draining our download tail
+                    //      until ITS `try_join` completes and it sends its DONE.
+                    //   4. Receiving the client's DONE proves the client fully
+                    //      drained every byte we sent, so nothing is in flight --
+                    //      only THEN do we close.
+                    // On any relay error, or any DONE seal/write/read/timeout/open/
+                    // marker mismatch, we close and return Err: a clean, VISIBLE
+                    // reset (the accepted v1 failure mode), never a silent success.
+                    match tokio::try_join!(upload, download) {
+                        Ok((mut client_open, mut server_seal)) => {
+                            let result = server_exchange_quic_done(
+                                &mut client_write,
+                                &mut client_records,
+                                &mut server_seal,
+                                &mut client_open,
+                                cid,
+                            )
+                            .await;
+                            match result {
+                                Ok(()) => {
+                                    conn.close(0u32.into(), b"relay-done");
+                                    return Ok(());
+                                }
+                                Err(err) => {
+                                    conn.close(0u32.into(), b"relay-done-failed");
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            conn.close(0u32.into(), b"relay-error");
+                            return Err(err);
+                        }
                     }
-                    return result;
                 }
                 Ok(Err(err)) => {
                     // The connection died before the stream rendezvous. The client
@@ -1913,9 +1959,63 @@ impl DataRelay {
             cid,
         );
 
-        let ((), ()) = tokio::try_join!(upload, download)?;
+        // TCP teardown is unchanged: TCP is reliable and FIN/EOF is a clean,
+        // fully-delivered close, so the returned per-direction codecs are simply
+        // discarded (no DONE handshake is needed on the TCP path).
+        let (_client_open, _server_seal) = tokio::try_join!(upload, download)?;
         Ok(())
     }
+}
+
+/// Performs the server side of the QUIC fast-plane teardown DONE handshake over
+/// the held TCP control stream halves, using the SAME per-direction session
+/// codecs the relay used so the sequence numbers continue uninterrupted. It
+/// seals and writes our DONE, then reads, opens, and verifies the client's DONE
+/// (bounded). Returns Ok only when both DONEs are exchanged; the caller closes
+/// the QUIC connection afterward (on Ok) or eagerly (on Err).
+async fn server_exchange_quic_done(
+    client_write: &mut OwnedWriteHalf,
+    client_records: &mut BufferedTlsRecordReader<OwnedReadHalf>,
+    server_seal: &mut DataRecordCodec,
+    client_open: &mut DataRecordCodec,
+    cid: u64,
+) -> Result<(), HandshakeServerError> {
+    // Seal our DONE on the server->client (send) codec -- its next sequence
+    // number -- and write it over the reliable TCP control stream.
+    let mut rng = StdRng::from_entropy();
+    let done = server_seal.seal(QUIC_RELAY_DONE_MARKER, &mut rng)?;
+    client_write.write_all(&done).await?;
+    client_write.flush().await?;
+
+    // Read exactly ONE record (the client's DONE) over the TCP control stream,
+    // bounded so a vanished peer cannot pin this task. EOF here is NOT a clean
+    // close: we require the client's explicit DONE record.
+    let mut record = Vec::new();
+    match tokio::time::timeout(
+        QUIC_RELAY_DONE_TIMEOUT,
+        client_records.read_record_into(&mut record),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
+        Err(_) => {
+            tracing::warn!(cid, "QUIC fast-plane teardown DONE read timed out");
+            return Err(HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC fast-plane teardown DONE read timed out",
+            )));
+        }
+    }
+    let plaintext = client_open.open_in_place_payload_range(&mut record)?;
+    if &record[plaintext] != QUIC_RELAY_DONE_MARKER {
+        tracing::warn!(cid, "QUIC fast-plane teardown DONE marker mismatch");
+        return Err(HandshakeServerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "QUIC fast-plane teardown DONE marker mismatch",
+        )));
+    }
+    Ok(())
 }
 
 async fn run_authenticated_mux_data_mode(
@@ -2615,12 +2715,16 @@ where
     .await
 }
 
+/// Drains the client->server direction to the target. Returns the owned
+/// `client_open` codec on a clean finish so the QUIC fast-plane teardown can
+/// open the peer's DONE marker on the SAME receive-direction codec (sequence
+/// continues uninterrupted). TCP-path callers discard the returned codec.
 async fn server_upload_loop<R>(
     mut client_records: R,
     mut target_write: OwnedWriteHalf,
     mut client_open: DataRecordCodec,
     cid: u64,
-) -> Result<(), HandshakeServerError>
+) -> Result<DataRecordCodec, HandshakeServerError>
 where
     R: LegReader,
 {
@@ -2631,7 +2735,7 @@ where
             Ok(()) => {}
             Err(err) if is_clean_close(&err) => {
                 let _ = target_write.shutdown().await;
-                return Ok(());
+                return Ok(client_open);
             }
             Err(err) => return Err(HandshakeServerError::Io(err)),
         };
@@ -2654,6 +2758,10 @@ where
     }
 }
 
+/// Drains the server->client direction (target response) into the client leg.
+/// Returns the owned `server_seal` codec on a clean finish so the QUIC
+/// fast-plane teardown can seal the local DONE marker on the SAME send-direction
+/// codec (sequence continues uninterrupted). TCP-path callers discard it.
 async fn server_download_loop<W>(
     mut target_read: OwnedReadHalf,
     mut client_write: W,
@@ -2662,7 +2770,7 @@ async fn server_download_loop<W>(
     timing: TimingProfile,
     cover: CoverTrafficProfile,
     cid: u64,
-) -> Result<(), HandshakeServerError>
+) -> Result<DataRecordCodec, HandshakeServerError>
 where
     W: LegWriter,
 {
@@ -2673,7 +2781,7 @@ where
             let n = target_read.read(&mut target_buf).await?;
             if n == 0 {
                 let _ = client_write.shutdown().await;
-                return Ok(());
+                return Ok(server_seal);
             }
             let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
 
@@ -2716,7 +2824,7 @@ where
                 let n = read?;
                 if n == 0 {
                     let _ = client_write.shutdown().await;
-                    return Ok(());
+                    return Ok(server_seal);
                 }
                 let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
 
@@ -2844,6 +2952,10 @@ fn log_outer_write(
     }
 }
 
+// TODO(review, data-slice-3a): treating io::ErrorKind::ConnectionReset as a
+// clean close is wrong for a QUIC RecvStream RESET_STREAM (which surfaces as
+// ConnectionReset), but it is unreachable in this slice -- no code resets a relay
+// stream. Revisit if a future slice can RESET a relay stream mid-transfer.
 fn is_clean_close(err: &io::Error) -> bool {
     matches!(
         err.kind(),

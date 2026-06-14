@@ -42,7 +42,7 @@ use crate::{
     },
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
-        DataRecordError, SealedRecord,
+        DataRecordError, SealedRecord, QUIC_RELAY_DONE_MARKER,
     },
     tls::{
         record::{log_record_read, TlsRecordError, TlsRecordReader},
@@ -326,6 +326,11 @@ impl WarmSessionPool {
     }
 
     fn spawn_session(&self) -> ClientSessionTask {
+        // TODO(review, data-slice-3a): the warm-session pool retains up to
+        // WARM_SESSION_POOL_TARGET (4) idle sessions, each of which may hold a
+        // retained QUIC connection alive (keep-alive footprint / idle resource
+        // cost). Revisit the pool sizing / idle-eviction policy if the fast-plane
+        // keep-alive footprint becomes a concern.
         let config = Arc::clone(&self.config);
         let server_addr = self.server_addr.clone();
         let traffic = self.traffic;
@@ -1193,6 +1198,15 @@ struct ClientRelay {
 /// waits on. Sized to match the server's accept timeout family.
 const QUIC_RELAY_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Generous bound on reading the peer's QUIC fast-plane teardown DONE marker over
+/// the TCP control stream. A side writes its own DONE (after fully draining both
+/// directions) BEFORE blocking on this read, so the peer's DONE is already
+/// in-flight on the reliable TCP control stream; this window only guards against
+/// a peer that has vanished. It is intentionally large relative to a round trip
+/// because the relay loops themselves are uncapped (data-driven), and the DONE is
+/// only exchanged after both sides' `try_join` completes.
+const QUIC_RELAY_DONE_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl ClientRelay {
     async fn run(self) -> Result<(), ClientRuntimeError> {
         let ClientRelay {
@@ -1220,9 +1234,13 @@ impl ClientRelay {
             let _endpoint = endpoint;
             // Keep the TCP control halves alive too so the outer TCP connection
             // stays open for the relay's duration (the server likewise holds its
-            // TCP halves). They carry no relay bytes on the QUIC path.
-            let _server_read = server_read;
-            let _server_write = server_write;
+            // TCP halves). They carry no relay DATA, but they DO carry the
+            // teardown DONE handshake: the TCP control stream is reliable and
+            // independent of the QUIC connection close, so it can coordinate a
+            // safe, truncation-free teardown after the QUIC relay finishes.
+            // `server_read` is consumed by the DONE handshake; `server_write`
+            // needs `mut` to write our DONE marker.
+            let mut server_write = server_write;
 
             let (send, recv) =
                 match tokio::time::timeout(QUIC_RELAY_OPEN_TIMEOUT, conn.open_bi()).await {
@@ -1280,48 +1298,147 @@ impl ClientRelay {
                 open_from_server,
                 cid,
             );
-            let result = tokio::try_join!(upload, download).map(|((), ())| ());
-            // Graceful QUIC teardown. The CLIENT is the designated closer: once
-            // both relay directions have finished here, the client has read every
-            // server->client byte (its download loop hit a clean stream finish),
-            // so per quinn's close protocol it is safe for the client -- the side
-            // that last received application data in the common request/response
-            // shape -- to initiate the CONNECTION_CLOSE. quinn keeps retransmitting
-            // the client's own finished upload-stream data until it is acknowledged
-            // even as we close, and the server side does NOT close first (it waits
-            // for this close, bounded), so the close cannot truncate data the
-            // server has not yet read. On error, close promptly with a distinct
-            // reason.
-            if result.is_ok() {
-                conn.close(0u32.into(), b"relay-done");
-            } else {
-                conn.close(0u32.into(), b"relay-error");
+            // Application-level DONE handshake over the reliable TCP control
+            // stream. quinn 0.11.9's `Connection::close` ABANDONS undelivered
+            // stream data (the peer may drop received-but-not-yet-app-consumed
+            // bytes, including acknowledged data), and `finish`/`stopped` only
+            // signal FIN / ack -- none of them prove the PEER's application has
+            // actually consumed every byte. So closing the QUIC connection right
+            // after our own `try_join` would silently truncate any upload tail the
+            // server is still draining into a slow target. Instead:
+            //   1. Our `try_join` Ok means BOTH directions finished here -- we sent
+            //      our FIN (upload) AND fully drained the server->client stream to
+            //      the local app (download). The loops hand back their owned codecs.
+            //   2. We seal a DONE marker on the SAME client->server (send) codec --
+            //      its next sequence number -- and write it over the TCP control
+            //      stream, then flush.
+            //   3. We BLOCK (bounded) reading exactly one record over the TCP
+            //      control stream and open it on the SAME server->client (recv)
+            //      codec; that is the server's DONE. Because we have NOT closed the
+            //      QUIC connection yet, it stays alive while we block, so the server
+            //      keeps draining our upload tail until ITS `try_join` completes and
+            //      it sends its own DONE.
+            //   4. Receiving the server's DONE proves the server fully drained every
+            //      byte we sent (it only sends DONE after its own `try_join` Ok), so
+            //      nothing is in flight -- only THEN do we close the connection.
+            // On any relay error, or any DONE seal/write/read/timeout/open/marker
+            // mismatch, we close the connection and return Err: a clean, VISIBLE
+            // reset (the accepted v1 failure mode), never a silent success.
+            match tokio::try_join!(upload, download) {
+                Ok((mut seal_to_server, mut open_from_server)) => {
+                    let result = client_exchange_quic_done(
+                        &mut server_write,
+                        server_read,
+                        &mut seal_to_server,
+                        &mut open_from_server,
+                        cid,
+                    )
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            conn.close(0u32.into(), b"relay-done");
+                            Ok(())
+                        }
+                        Err(err) => {
+                            conn.close(0u32.into(), b"relay-done-failed");
+                            Err(err)
+                        }
+                    }
+                }
+                Err(err) => {
+                    conn.close(0u32.into(), b"relay-error");
+                    Err(err)
+                }
             }
-            return result;
+        } else {
+            // No retained QUIC connection: TCP record legs, byte-identical to
+            // before this slice.
+            let upload = client_upload_loop(
+                local_read,
+                TcpLegWriter(server_write),
+                seal_to_server,
+                local_buf,
+                cover,
+                cid,
+            );
+            let download = client_download_loop(
+                TcpLegReader::buffered(server_read),
+                local_write,
+                open_from_server,
+                cid,
+            );
+
+            // TCP teardown is unchanged: TCP is reliable and FIN/EOF is a clean,
+            // fully-delivered close, so the returned per-direction codecs are
+            // simply discarded (no DONE handshake is needed on the TCP path).
+            let (_seal_to_server, _open_from_server) = tokio::try_join!(upload, download)?;
+            Ok(())
         }
-
-        // No retained QUIC connection: TCP record legs, byte-identical to before
-        // this slice.
-        let upload = client_upload_loop(
-            local_read,
-            TcpLegWriter(server_write),
-            seal_to_server,
-            local_buf,
-            cover,
-            cid,
-        );
-        let download = client_download_loop(
-            TcpLegReader::buffered(server_read),
-            local_write,
-            open_from_server,
-            cid,
-        );
-
-        let ((), ()) = tokio::try_join!(upload, download)?;
-        Ok(())
     }
 }
 
+/// Performs the client side of the QUIC fast-plane teardown DONE handshake over
+/// the held TCP control stream halves, using the SAME per-direction session
+/// codecs the relay used so the sequence numbers continue uninterrupted. It
+/// seals and writes our DONE, then reads, opens, and verifies the server's DONE
+/// (bounded). Returns Ok only when both DONEs are exchanged; the caller closes
+/// the QUIC connection afterward (on Ok) or eagerly (on Err).
+async fn client_exchange_quic_done(
+    server_write: &mut OwnedWriteHalf,
+    server_read: OwnedReadHalf,
+    seal_to_server: &mut DataRecordCodec,
+    open_from_server: &mut DataRecordCodec,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    // Seal our DONE on the client->server (send) codec -- its next sequence
+    // number -- and write it over the reliable TCP control stream.
+    let done = seal_to_server
+        .seal(QUIC_RELAY_DONE_MARKER, &mut OsRng)
+        .map_err(ClientHandshakeError::from)?;
+    server_write
+        .write_all(&done)
+        .await
+        .map_err(ClientRuntimeError::Io)?;
+    server_write.flush().await.map_err(ClientRuntimeError::Io)?;
+
+    // Read exactly ONE record (the server's DONE) over the TCP control stream,
+    // bounded so a vanished peer cannot pin this task. EOF here is NOT a clean
+    // close: we require the server's explicit DONE record.
+    let mut reader = TlsRecordReader::new(server_read);
+    let mut record = Vec::new();
+    match tokio::time::timeout(
+        QUIC_RELAY_DONE_TIMEOUT,
+        reader.read_record_into(&mut record),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(ClientRuntimeError::Io(err)),
+        Err(_) => {
+            tracing::warn!(cid, "QUIC fast-plane teardown DONE read timed out");
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC fast-plane teardown DONE read timed out",
+            )));
+        }
+    }
+    let plaintext = open_from_server
+        .open_in_place_payload_range(&mut record)
+        .map_err(|err| ClientRuntimeError::Handshake(err.into()))?;
+    if &record[plaintext] != QUIC_RELAY_DONE_MARKER {
+        tracing::warn!(cid, "QUIC fast-plane teardown DONE marker mismatch");
+        return Err(ClientRuntimeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "QUIC fast-plane teardown DONE marker mismatch",
+        )));
+    }
+    Ok(())
+}
+
+/// Drains the local app -> server direction. Returns the owned `seal_to_server`
+/// codec on a clean finish so the QUIC fast-plane teardown can seal the local
+/// DONE marker on the SAME send-direction codec (sequence continues
+/// uninterrupted). TCP-path callers discard the returned codec.
 async fn client_upload_loop<W>(
     mut local_read: OwnedReadHalf,
     mut server_write: W,
@@ -1329,7 +1446,7 @@ async fn client_upload_loop<W>(
     mut local_buf: Vec<u8>,
     cover: CoverTrafficProfile,
     cid: u64,
-) -> Result<(), ClientRuntimeError>
+) -> Result<DataRecordCodec, ClientRuntimeError>
 where
     W: LegWriter,
 {
@@ -1340,7 +1457,7 @@ where
             let n = local_read.read(&mut local_buf).await?;
             if n == 0 {
                 let _ = server_write.shutdown().await;
-                return Ok(());
+                return Ok(seal_to_server);
             }
             let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
             write_client_data_records_chunked(
@@ -1375,7 +1492,7 @@ where
                 let n = read?;
                 if n == 0 {
                     let _ = server_write.shutdown().await;
-                    return Ok(());
+                    return Ok(seal_to_server);
                 }
                 let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
                 write_client_data_records_chunked(
@@ -1392,12 +1509,16 @@ where
     }
 }
 
+/// Drains the server -> local app direction. Returns the owned `open_from_server`
+/// codec on a clean finish so the QUIC fast-plane teardown can open the peer's
+/// DONE marker on the SAME receive-direction codec (sequence continues
+/// uninterrupted). TCP-path callers discard the returned codec.
 async fn client_download_loop<R>(
     mut server_records: R,
     mut local_write: OwnedWriteHalf,
     mut open_from_server: DataRecordCodec,
     cid: u64,
-) -> Result<(), ClientRuntimeError>
+) -> Result<DataRecordCodec, ClientRuntimeError>
 where
     R: LegReader,
 {
@@ -1408,7 +1529,7 @@ where
             Ok(()) => {}
             Err(err) if is_clean_close(&err) => {
                 let _ = local_write.shutdown().await;
-                return Ok(());
+                return Ok(open_from_server);
             }
             Err(err) => return Err(ClientRuntimeError::Io(err)),
         };
@@ -2037,6 +2158,10 @@ fn log_outer_write(
     }
 }
 
+// TODO(review, data-slice-3a): treating io::ErrorKind::ConnectionReset as a
+// clean close is wrong for a QUIC RecvStream RESET_STREAM (which surfaces as
+// ConnectionReset), but it is unreachable in this slice -- no code resets a relay
+// stream. Revisit if a future slice can RESET a relay stream mid-transfer.
 fn is_clean_close(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -2574,6 +2699,241 @@ mod tests {
         fallback_task.abort();
     }
 
+    /// ASYMMETRIC UPLOAD (the critical data-integrity repro). Full UDP
+    /// negotiation, single-connect. The local app uploads a large (>=2 MiB,
+    /// multi-record) body to a target that READS SLOWLY (throttled), while the
+    /// target's response is empty (it half-closes its write side immediately) so
+    /// the server->client direction finishes fast. The local app half-closes its
+    /// write side after sending. The TARGET must receive ALL upload bytes
+    /// byte-exact, and the proxied connection must complete successfully.
+    ///
+    /// On the pre-fix code the client closed the QUIC connection the instant its
+    /// own `try_join` returned Ok (upload FIN sent + small download drained),
+    /// while the server was still draining the upload tail into the slow target.
+    /// quinn's close ABANDONS that undelivered stream data, truncating the upload
+    /// yet returning a (silent) success to the local app. The DONE handshake
+    /// keeps the QUIC connection alive until the server has fully drained every
+    /// uploaded byte to the target and acknowledged with its own DONE, so the
+    /// upload cannot be truncated.
+    #[tokio::test]
+    #[ignore = "requires loopback UDP+TCP sockets"]
+    async fn quic_relay_asymmetric_slow_upload_is_not_truncated() {
+        // Serialize against the other QUIC fast-plane e2e tests (shared globals).
+        let _serial = quic_e2e_guard().await;
+
+        let enabled_udp = UdpConfig {
+            enabled: true,
+            ..UdpConfig::default()
+        };
+
+        // A multi-record upload, large enough that the tail is still mid-drain in
+        // the slow target when the client's directions finish.
+        const UPLOAD_LEN: usize = 4 * 1024 * 1024;
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task, received_rx) = spawn_slow_reader_target(UPLOAD_LEN).await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server_with_traffic_and_udp(
+            server_config,
+            TrafficConfig::default(),
+            enabled_udp.clone(),
+        )
+        .await;
+        let (local_addr, client_task) = spawn_local_client_with_udp(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            enabled_udp,
+        )
+        .await;
+
+        let app = connect_socks_target(local_addr, target_addr).await;
+        let (mut app_read, mut app_write) = app.into_split();
+
+        let payload = (0..UPLOAD_LEN)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        let upload_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            app_write.write_all(&upload_payload).await.unwrap();
+            // Half-close the write side: the local app is done sending. This is
+            // what makes the client's upload direction finish promptly while the
+            // slow target is still draining the bytes.
+            app_write.shutdown().await.unwrap();
+        });
+
+        // The target half-closed its write side immediately, so the local app
+        // sees a prompt clean EOF with no response bytes.
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(30), app_read.read_to_end(&mut response))
+            .await
+            .expect("download EOF timed out")
+            .expect("download read failed");
+        assert!(
+            response.is_empty(),
+            "target sent no response; got {} bytes",
+            response.len()
+        );
+        writer.await.unwrap();
+
+        // The proxied connection must have completed successfully on BOTH ends.
+        // The relay tasks legitimately run for several seconds here (the target
+        // drains slowly and the DONE handshake only completes once it has), so use
+        // a generous join window rather than the default 5s.
+        wait_for_task_within("client", client_task, Duration::from_secs(30)).await;
+        wait_for_task_within("server", server_task, Duration::from_secs(30)).await;
+
+        // And the target must have received EVERY uploaded byte, byte-exact.
+        let received = timeout(Duration::from_secs(30), received_rx)
+            .await
+            .expect("target receive report timed out")
+            .expect("target receive report dropped");
+        assert_eq!(
+            received.len(),
+            UPLOAD_LEN,
+            "target must receive the full upload (no truncation)"
+        );
+        assert_eq!(
+            received, payload,
+            "uploaded bytes must round-trip byte-exact"
+        );
+
+        wait_for_task_within("target", target_task, Duration::from_secs(30)).await;
+        fallback_task.abort();
+    }
+
+    /// ASYMMETRIC DOWNLOAD (slow local-app drain). Full UDP negotiation,
+    /// single-connect. The target sends a multi-record response fast and then
+    /// closes, while the LOCAL app reads SLOWLY (throttled) so draining the
+    /// response to it takes well over the old fixed 5s server grace. The local app
+    /// must receive ALL response bytes byte-exact, and the proxied connection must
+    /// complete successfully.
+    ///
+    /// This is the counterpart to the upload repro and the regression guard for
+    /// removing the server's fixed 5s `QUIC_RELAY_DRAIN_GRACE` cap: a healthy
+    /// download whose client takes >5s to drain to a slow local app must NOT be
+    /// time-capped. The DONE handshake keeps the QUIC connection alive (the server
+    /// blocks reading the client's DONE over the TCP control stream) until the
+    /// client has drained every downloaded byte and acknowledged with its own
+    /// DONE -- so wall-clock drain time no longer bounds correctness.
+    ///
+    /// Note: unlike the upload direction, this exact scenario does not *fail* on
+    /// the pre-fix code on loopback -- empirically quinn 0.11 lets the application
+    /// drain a FINISHED, fully-buffered RecvStream even after the peer's connection
+    /// close, and a slow client whose RecvStream buffer fills instead
+    /// backpressures the server so its `try_join` never completes early and the 5s
+    /// grace never fires. The download truncation the fix removes is real in
+    /// principle (quinn's close abandons undelivered stream data) but is not
+    /// deterministically loopback-reproducible; this test therefore asserts the
+    /// fixed behavior is correct and that the cap removal does not regress slow
+    /// downloads. The deterministic pre-fix repro is the upload test above.
+    #[tokio::test]
+    #[ignore = "requires loopback UDP+TCP sockets"]
+    async fn quic_relay_asymmetric_slow_download_is_not_truncated() {
+        // Serialize against the other QUIC fast-plane e2e tests (shared globals).
+        let _serial = quic_e2e_guard().await;
+
+        let enabled_udp = UdpConfig {
+            enabled: true,
+            ..UdpConfig::default()
+        };
+
+        // Under quinn's default ~1.25 MB per-stream receive window so the server
+        // sends the whole response without backpressure and the slow local-app
+        // drain (>5s) is what would have tripped the old fixed 5s server grace.
+        // Multi-record (64+ records of 16 KiB).
+        const DOWNLOAD_LEN: usize = 1024 * 1024;
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_fast_large_response_target(DOWNLOAD_LEN).await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server_with_traffic_and_udp(
+            server_config,
+            TrafficConfig::default(),
+            enabled_udp.clone(),
+        )
+        .await;
+        let (local_addr, client_task) = spawn_local_client_with_udp(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            enabled_udp,
+        )
+        .await;
+
+        let app = connect_socks_target(local_addr, target_addr).await;
+        let (mut app_read, mut app_write) = app.into_split();
+
+        // Small request, then half-close: the upload direction finishes promptly.
+        app_write.write_all(b"start").await.unwrap();
+        app_write.shutdown().await.unwrap();
+
+        // Drain the response SLOWLY: small chunks with a sleep between them so
+        // total drain time exceeds the old 5s grace by a wide margin.
+        let expected = (0..DOWNLOAD_LEN)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut response = Vec::with_capacity(DOWNLOAD_LEN);
+        let mut chunk = vec![0_u8; 8 * 1024];
+        loop {
+            let n = timeout(Duration::from_secs(30), app_read.read(&mut chunk))
+                .await
+                .expect("slow download read timed out")
+                .expect("slow download read failed");
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..n]);
+            // ~128 chunks * 50ms ~= 6.4s drain, comfortably beyond the old 5s cap.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            response.len(),
+            DOWNLOAD_LEN,
+            "local app must receive the full download (no 5s-cap truncation)"
+        );
+        assert_eq!(
+            response, expected,
+            "downloaded bytes must round-trip byte-exact"
+        );
+
+        // The relay tasks legitimately run for several seconds here (the local app
+        // drains slowly and the DONE handshake only completes once it has), so use
+        // a generous join window rather than the default 5s.
+        wait_for_task_within("client", client_task, Duration::from_secs(30)).await;
+        wait_for_task_within("server", server_task, Duration::from_secs(30)).await;
+        wait_for_task_within("target", target_task, Duration::from_secs(30)).await;
+        fallback_task.abort();
+    }
+
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn mux_client_reaches_two_targets_over_one_authenticated_session() {
@@ -2937,6 +3297,73 @@ mod tests {
         (addr, task)
     }
 
+    /// A target that half-closes its WRITE side immediately (so the proxied
+    /// server->client direction finishes promptly) and then READS its upload
+    /// SLOWLY in small chunks with a pause between reads, accumulating every
+    /// byte. The full received body is reported back over the returned oneshot
+    /// once the upload reaches a clean EOF. Used by the asymmetric-upload
+    /// truncation repro: the slow reads keep the upload tail mid-drain when the
+    /// client's own directions finish, so a premature QUIC close would truncate
+    /// it. `expected_len` only sizes the receive buffer; the target reads until
+    /// EOF and reports whatever it actually received.
+    async fn spawn_slow_reader_target(
+        expected_len: usize,
+    ) -> (
+        SocketAddr,
+        tokio::task::JoinHandle<()>,
+        oneshot::Receiver<Vec<u8>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = oneshot::channel::<Vec<u8>>();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut read_half, mut write_half) = stream.split();
+            // Half-close the response direction up front so the proxied
+            // server->client direction reaches EOF quickly.
+            write_half.shutdown().await.unwrap();
+
+            let mut received = Vec::with_capacity(expected_len);
+            let mut chunk = vec![0_u8; 16 * 1024];
+            loop {
+                let n = read_half.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+                // Throttle: keep the upload tail in flight while the client's
+                // directions finish. ~256 chunks * 25ms across 4 MiB.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let _ = received_tx.send(received);
+        });
+        (addr, task, received_rx)
+    }
+
+    /// A target that reads the small request, then sends a large deterministic
+    /// response (the `(idx % 251)` pattern) as fast as it can and closes. Used by
+    /// the asymmetric-download truncation repro, where the LOCAL app reads the
+    /// response slowly: a premature server-side connection drop would truncate
+    /// the in-flight download.
+    async fn spawn_fast_large_response_target(
+        total_len: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 5];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"start");
+            let response = (0..total_len)
+                .map(|idx| (idx % 251) as u8)
+                .collect::<Vec<_>>();
+            stream.write_all(&response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        (addr, task)
+    }
+
     fn large_payload_server_config(
         fallback_addr: SocketAddr,
         target_addr: SocketAddr,
@@ -3211,6 +3638,16 @@ mod tests {
 
     async fn wait_for_task(name: &str, task: tokio::task::JoinHandle<()>) {
         timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap_or_else(|_| panic!("{name} task timed out"))
+            .unwrap();
+    }
+
+    /// Like [`wait_for_task`] but with a caller-chosen timeout, for the slow
+    /// asymmetric e2e tests whose relay tasks legitimately run for several seconds
+    /// (throttled drains) and must not be bounded by the default 5s join window.
+    async fn wait_for_task_within(name: &str, task: tokio::task::JoinHandle<()>, within: Duration) {
+        timeout(within, task)
             .await
             .unwrap_or_else(|_| panic!("{name} task timed out"))
             .unwrap();
