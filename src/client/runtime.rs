@@ -1859,11 +1859,14 @@ mod tests {
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
 
-    /// Serializes the tests that mutate the process-wide UDP-negotiation flags
-    /// (CLIENT_UDP_ENABLED / SERVER_UDP_ENABLED). Under a parallel `--ignored`
-    /// run these globals would otherwise leak across tests — e.g. the
-    /// full-negotiation test's SERVER_UDP_ENABLED=true bleeding into the
-    /// decline-path test and silently changing the path it claims to exercise.
+    /// Serializes ALL loopback e2e tests that read the process-wide
+    /// UDP-negotiation flags (CLIENT_UDP_ENABLED / SERVER_UDP_ENABLED). Under a
+    /// parallel `--ignored` run these globals would otherwise leak across tests
+    /// — e.g. the full-negotiation test's flags=true bleeding into a no-UDP relay
+    /// test and silently re-routing it through the PX1G/PX1O/probe exchange it was
+    /// written to exclude. Every test that brings up a client+server here must
+    /// hold this lock so the flag-setting tests are mutually exclusive with the
+    /// flag-reading ones.
     static UDP_NEGOTIATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
         "MIIC9jCCAd6gAwIBAgIJAPNzR81y9p7pMA0GCSqGSIb3DQEBCwUAMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4X",
@@ -1974,6 +1977,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_client_reaches_target_through_parallax_server_with_large_payloads() {
+        // Serialize against the UDP-negotiation tests: a parallel --ignored run
+        // must not leak their CLIENT/SERVER_UDP_ENABLED into this no-UDP path.
+        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_echo_target().await;
 
@@ -2011,6 +2017,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_client_receives_response_after_local_write_half_close() {
+        // Serialize against the UDP-negotiation tests: a parallel --ignored run
+        // must not leak their CLIENT/SERVER_UDP_ENABLED into this no-UDP path.
+        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_eof_response_target().await;
 
@@ -2182,6 +2191,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn mux_client_reaches_two_targets_over_one_authenticated_session() {
+        // Serialize against the UDP-negotiation tests: a parallel --ignored run
+        // must not leak their CLIENT/SERVER_UDP_ENABLED into this no-UDP path.
+        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
         let (target_addr, target_task) = spawn_multi_echo_target(2).await;
 
@@ -2423,6 +2435,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "loopback latency/throughput benchmark; run with --ignored --nocapture"]
     async fn mux_loopback_benchmark() {
+        // Serialize against the UDP-negotiation tests: a parallel --ignored run
+        // must not leak their CLIENT/SERVER_UDP_ENABLED into this no-UDP path.
+        let _serial = UDP_NEGOTIATION_TEST_LOCK.lock().await;
         let single = run_mux_loopback_benchmark(MuxBenchParams {
             streams: 1,
             latency_round_trips: 200,
