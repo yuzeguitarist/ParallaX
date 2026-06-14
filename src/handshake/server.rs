@@ -688,10 +688,6 @@ async fn connect_and_forward_to_fallback(
     Ok(fallback)
 }
 
-/// Drains any ready receive bytes and then half-closes the write side so the
-/// peer sees a graceful FIN. Dropping a socket with unread bytes still queued
-/// makes the kernel emit a RST, an observable tell a real origin would not
-/// produce; this keeps the close indistinguishable from an ordinary teardown.
 /// Drains a read half to `WouldBlock` (bounded) so the eventual close is a FIN,
 /// not a RST, even when more than one bufferful is queued. A single small pass
 /// could leave a backlog that RSTs on drop; this mirrors the splice path's
@@ -706,6 +702,10 @@ fn drain_read_half_to_block(reader: &OwnedReadHalf) {
     }
 }
 
+/// Drains any ready receive bytes and then half-closes the write side so the
+/// peer sees a graceful FIN. Dropping a socket with unread bytes still queued
+/// makes the kernel emit a RST, an observable tell a real origin would not
+/// produce; this keeps the close indistinguishable from an ordinary teardown.
 async fn graceful_close_tcp_stream(stream: TcpStream) {
     let (read_half, mut write_half) = stream.into_split();
     drain_read_half_to_block(&read_half);

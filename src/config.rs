@@ -71,7 +71,7 @@ pub enum ConfigError {
     InvalidIdleBackstop,
     #[error("server timeout jitter must not exceed 300000ms")]
     InvalidTimeoutJitter,
-    #[error("server.tcp_congestion must be a short alphanumeric algorithm name (e.g. \"bbr\")")]
+    #[error("server.tcp_congestion must be a short algorithm name (letters, digits, '_' or '-'), e.g. \"bbr\"")]
     InvalidCongestionControl,
     #[cfg(unix)]
     #[error(

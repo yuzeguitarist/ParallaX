@@ -88,10 +88,14 @@ jobs:
           for _ in 1 2 3 4 5; do
             for t in splice_relay_idle_timeout_closes_client_with_fin \
                      fallback_relay_idle_timeout_closes_empty_probe; do
-              out=$(cargo test --lib --locked "$t" 2>&1)
+              # `|| true` so a genuine test failure does not abort the step at the
+              # assignment (set -e) before we echo the output -- we want the cargo
+              # failure detail in the log. The grep guard below then fails the
+              # step on any non-"1 passed" outcome (failure, rename, or removal).
+              out=$(cargo test --lib --locked "$t" 2>&1) || true
               echo "$out"
               echo "$out" | grep -qE "test result: ok\. 1 passed" || {
-                echo "::error::teardown test '$t' did not run as exactly one test (renamed or removed?)"
+                echo "::error::teardown test '$t' did not pass as exactly one test (failed, renamed, or removed?)"
                 exit 1
               }
             done
