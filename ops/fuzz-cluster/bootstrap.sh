@@ -102,6 +102,13 @@ if ! id "$FUZZ_USER" >/dev/null 2>&1; then
   useradd --system --create-home --home-dir "$HOME_DIR" --shell /usr/sbin/nologin "$FUZZ_USER" \
     || die "useradd $FUZZ_USER failed"
 fi
+# status.sh runs as $FUZZ_USER and reads each fuzz unit's journal for exec/s and
+# crash/oom counts; reading a *system* unit's journal requires membership in the
+# systemd-journal group. Without it those journal-derived metrics silently read
+# 0 (corpus/RSS still work, since they come from the FS + systemctl). Idempotent;
+# the next oneshot plx-status run picks up the new group automatically.
+usermod -aG systemd-journal "$FUZZ_USER" 2>/dev/null \
+  || warn "could not add $FUZZ_USER to systemd-journal; exec/s will read 0"
 install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$HOME_DIR" "$BIN" "$LOGS"
 
 # ---------------------------------------------------------------------------
