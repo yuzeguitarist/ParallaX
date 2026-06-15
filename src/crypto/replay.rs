@@ -112,6 +112,15 @@ impl ReplayCache {
         }
     }
 
+    /// Overrides the freshness/retention window (default
+    /// [`DEFAULT_REPLAY_WINDOW_SECS`]). The window both rejects out-of-window
+    /// ClientHello timestamps and bounds how long entries are retained for replay
+    /// detection (via `prune_expired`), so widening it is strictly safe.
+    pub fn with_window_secs(mut self, window_secs: u64) -> Self {
+        self.window_secs = window_secs;
+        self
+    }
+
     pub fn load_or_create(
         path: impl AsRef<Path>,
         capacity: usize,
@@ -862,6 +871,42 @@ mod tests {
                 .insert_new_outcome(stale, 100 + DEFAULT_REPLAY_WINDOW_SECS + 10)
                 .unwrap(),
             ReplayInsertOutcome::Stale
+        );
+    }
+
+    #[test]
+    fn fresh_within_widened_window_commits() {
+        // A widened window (as the server derives from the pre-PQ deadline) must
+        // accept a commit whose gap exceeds the default 120s but is within the
+        // window, and still retain the entry for replay detection.
+        let mut cache = ReplayCache::new(8).with_window_secs(720);
+        let entry = ReplayEntry {
+            timestamp: 100,
+            nonce: [7; 8],
+            transcript_fingerprint: [8; 32],
+        };
+        // Gap of 605s: well past the old 120s window, inside the 720s one.
+        let now = 100 + 600 + 5;
+        assert_eq!(
+            cache.insert_new_outcome(entry.clone(), now).unwrap(),
+            ReplayInsertOutcome::Inserted,
+        );
+        // The widened window retains the entry (does not prune it early), so a
+        // replay of the same nonce/transcript at the same instant is caught.
+        assert_eq!(
+            cache.insert_new_outcome(entry, now).unwrap(),
+            ReplayInsertOutcome::Replayed,
+        );
+        // Sanity: the default-window cache would have rejected the same gap.
+        let mut default_cache = ReplayCache::new(8);
+        let same = ReplayEntry {
+            timestamp: 100,
+            nonce: [9; 8],
+            transcript_fingerprint: [10; 32],
+        };
+        assert_eq!(
+            default_cache.insert_new_outcome(same, now).unwrap(),
+            ReplayInsertOutcome::Stale,
         );
     }
 

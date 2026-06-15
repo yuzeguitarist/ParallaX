@@ -43,7 +43,8 @@ use crate::{
         parallel,
         pq::{self, PqError},
         replay::{
-            current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry, ReplayInsertOutcome,
+            current_unix_timestamp, ReplayCache, ReplayCacheError, ReplayEntry,
+            ReplayInsertOutcome, DEFAULT_REPLAY_WINDOW_SECS,
         },
         session::{
             derive_server_keys_from_shared, expand_epoch_keys, x25519_public_from_private,
@@ -379,11 +380,14 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     let psk = decode_psk(&config.crypto.psk)?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
     let psk = Arc::new(psk);
-    let replay_cache = Arc::new(Mutex::new(ReplayCache::load_or_create_authenticated(
-        &server.replay_cache_path,
-        server.replay_cache_capacity,
-        &psk,
-    )?));
+    let replay_cache = Arc::new(Mutex::new(
+        ReplayCache::load_or_create_authenticated(
+            &server.replay_cache_path,
+            server.replay_cache_capacity,
+            &psk,
+        )?
+        .with_window_secs(replay_freshness_window_secs()),
+    ));
     let secrets = ServerRuntimeSecrets::decode(&server)?;
     let listener = TcpListener::bind(server.listen).await?;
     let connection_limit = relay_connection_limit()?;
@@ -1076,6 +1080,20 @@ fn first_record_wait_timeout() -> Duration {
 fn fallback_idle_timeout() -> Duration {
     let t = timeout_tuning();
     jittered_timeout(t.fallback_idle_floor, t.fallback_idle_jitter)
+}
+
+/// Replay freshness window sized to outlast the pre-PQ phase. The ClientHello
+/// timestamp is committed only AFTER the client's PQ rekey, up to the pre-PQ
+/// deadline (`fallback_idle_floor`) later, so the window must exceed that
+/// deadline or a slow-but-legitimate client is rejected as Stale after the
+/// server already did the full PQ exchange. `DEFAULT_REPLAY_WINDOW_SECS` is added
+/// on top as clock-skew slack, and the window tracks the floor automatically so
+/// the two budgets can never diverge.
+fn replay_freshness_window_secs() -> u64 {
+    timeout_tuning()
+        .fallback_idle_floor
+        .as_secs()
+        .saturating_add(DEFAULT_REPLAY_WINDOW_SECS)
 }
 
 /// Deployment-wide timeout tuning, set once at server startup from config.
