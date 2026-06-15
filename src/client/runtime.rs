@@ -549,7 +549,29 @@ impl ClientMuxPool {
                     *state = MuxState::Building(Arc::clone(&notify));
                     drop(state);
 
-                    let result = self.start_session().await;
+                    // Run establishment in a detached task and await its handle, so a
+                    // PANIC inside start_session() surfaces as Err(JoinError) and is
+                    // handled on the normal path below (reset Building->Idle + notify)
+                    // instead of unwinding past the reset and stranding every waiter
+                    // on a Notify that never fires. This restores the panic self-heal
+                    // the pre-single-flight lock-holding code had, WITHOUT a
+                    // try_lock-in-Drop guard (which could miss the reset under lock
+                    // contention). handle() callers run it in detached spawns, so the
+                    // future itself is never cancelled mid-await.
+                    let pool = self.clone();
+                    let result = match tokio::spawn(async move { pool.start_session().await }).await
+                    {
+                        Ok(r) => r,
+                        Err(join_err) => {
+                            tracing::warn!(
+                                error = %join_err,
+                                "client mux establishment task failed (panic); resetting"
+                            );
+                            Err(ClientRuntimeError::Io(io::Error::other(
+                                "client mux establishment task panicked",
+                            )))
+                        }
+                    };
                     let mut state = self.inner.lock().await;
                     let outcome = match result {
                         Ok(handle) => {

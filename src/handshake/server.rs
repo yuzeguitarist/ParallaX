@@ -135,6 +135,11 @@ const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
 /// bound instead of FALLBACK_IDLE_TIMEOUT_FLOOR (600s); this recycles the small
 /// budget in seconds even under slow/idle attackers.
 const CAP_SHED_FALLBACK_IDLE: Duration = Duration::from_secs(10);
+/// Small upward jitter on the cap-shed idle so a saturated-cap prober does not see
+/// a fixed, round 10.000s close on the cap-shed relay (the same fixed-constant tell
+/// M-3 removed from the main idle backstop). Kept tiny to preserve the tight
+/// anti-DoS-amplification bound.
+const CAP_SHED_FALLBACK_IDLE_JITTER: Duration = Duration::from_secs(2);
 
 static ACTIVE_CAP_SHED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
@@ -902,8 +907,12 @@ async fn cap_shed_fallback_or_fin(client: TcpStream, fallback_addr: String) {
     };
     match connect_and_forward_to_fallback(&fallback_addr, &[]).await {
         Ok(fallback) => {
-            let _ =
-                relay_fallback_with_idle_timeout(client, fallback, CAP_SHED_FALLBACK_IDLE).await;
+            let _ = relay_fallback_with_idle_timeout(
+                client,
+                fallback,
+                jittered_timeout(CAP_SHED_FALLBACK_IDLE, CAP_SHED_FALLBACK_IDLE_JITTER),
+            )
+            .await;
         }
         Err(_) => graceful_close_tcp_stream(client).await,
     }

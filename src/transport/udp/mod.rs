@@ -305,7 +305,7 @@ mod tests {
     use bytes::Bytes;
     use quinn::Endpoint;
 
-    use super::test_support::{self_signed_cert, loopback_pair, AcceptAnyServerCert};
+    use super::test_support::{loopback_pair, self_signed_cert, AcceptAnyServerCert};
     use super::*;
 
     /// Non-empty PSK for the exporter-bound auth-token round-trip assertions.
