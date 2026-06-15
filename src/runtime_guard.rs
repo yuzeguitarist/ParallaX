@@ -708,11 +708,11 @@ mod tests {
         // A live peer whose lock file carries a forward-incompatible extra key
         // (a newer plx version). Valid naming so it passes the directory filters.
         let peer_path = dir.path().join("client-999999-deadbeefcafe.lock");
-        let peer = open_lock_file(&peer_path).unwrap();
+        let mut peer = open_lock_file(&peer_path).unwrap();
         let contents = "role=client\npid=999999\nconfig_id=deadbeefcafe\n\
                         server_addr=203.0.113.9:443\nstarted_at=1234567890\n";
-        (&peer).write_all(contents.as_bytes()).unwrap();
-        (&peer).sync_data().unwrap();
+        peer.write_all(contents.as_bytes()).unwrap();
+        peer.sync_data().unwrap();
         // Hold an exclusive lock so active_instances sees a live peer it cannot
         // reclaim and must read+decode (decode rejects the unknown `started_at`).
         assert!(try_lock_file(&peer).unwrap());
