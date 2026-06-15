@@ -363,7 +363,13 @@ impl WarmSessionPool {
 
     async fn take_or_start(&self) -> ClientSessionTask {
         let mut warm = self.inner.lock().await;
-        let session = warm.pop_front().unwrap_or_else(|| self.spawn_session());
+        let session = match warm.pop_front() {
+            // A parked warm session may have died (RST / NAT blackhole) or its
+            // handshake may have failed while idle; validate it and transparently
+            // re-dial once if it is not a live, successful session.
+            Some(parked) => self.spawn_validated(parked),
+            None => self.spawn_session(),
+        };
         self.fill_locked(&mut warm);
         session
     }
@@ -402,6 +408,77 @@ impl WarmSessionPool {
             .await
         })
     }
+
+    /// Wraps a parked warm-session handle so the handle the caller awaits ALWAYS
+    /// resolves to a validated, live session or a genuinely-fresh dial. Fixes a
+    /// stale-cached handshake error (poison/abort -> re-dial) and a dead parked
+    /// socket (RST/blackhole -> re-dial) without changing the call site.
+    fn spawn_validated(&self, parked: ClientSessionTask) -> ClientSessionTask {
+        let config = Arc::clone(&self.config);
+        let server_addr = self.server_addr.clone();
+        let traffic = self.traffic;
+        let udp = Arc::clone(&self.udp);
+        let psk = Arc::clone(&self.psk);
+        let server_public = self.server_public;
+        let server_identity_public = Arc::clone(&self.server_identity_public);
+        tokio::spawn(async move {
+            match parked.await {
+                Ok(Ok(session)) if warm_session_is_live(&session.0) => Ok(session),
+                // Poisoned handshake error, aborted/panicked task, or a dead parked
+                // socket: dial a genuinely fresh session instead of returning stale.
+                _ => {
+                    establish_authenticated_data_session_with_resolver(
+                        &server_addr,
+                        &config,
+                        traffic,
+                        &udp,
+                        psk.as_ref().as_slice(),
+                        &server_public,
+                        server_identity_public,
+                    )
+                    .await
+                }
+            }
+        })
+    }
+}
+
+/// Non-destructively probes whether a parked warm TCP session is still alive via
+/// a 1-byte `MSG_PEEK`: a healthy idle session has no pending pre-Connect bytes,
+/// so this never consumes real data. `> 0` => live (bytes peeked); `0` => dead
+/// (clean EOF); `< 0` with `EWOULDBLOCK`/`EAGAIN` => live (idle, the normal warm
+/// case); any other errno (e.g. `ECONNRESET`) => dead.
+#[cfg(unix)]
+fn warm_session_is_live(stream: &TcpStream) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut byte = [0_u8; 1];
+    // SAFETY: recv with MSG_PEEK|MSG_DONTWAIT on a valid borrowed fd into a local
+    // buffer; non-destructive (peek) and non-blocking.
+    let rc = unsafe {
+        libc::recv(
+            fd,
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if rc > 0 {
+        return true;
+    }
+    if rc == 0 {
+        return false;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+    )
+}
+
+#[cfg(not(unix))]
+fn warm_session_is_live(_stream: &TcpStream) -> bool {
+    true
 }
 
 /// State of the shared mux session, used to single-flight establishment WITHOUT
@@ -477,6 +554,7 @@ enum ClientStreamControl {
     Deregister(u32),
 }
 
+#[derive(Clone, Copy)]
 enum DownloadOutcome {
     Fin,
     Reset,
@@ -722,6 +800,14 @@ async fn handle_local_mux_connection_with_cid(
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client mux reader is gone").into());
     }
     if let Err(err) = mux.frame_tx.send(open_frame).await {
+        // Register succeeded but the Open frame never reached the server:
+        // deregister the just-registered stream so the reader drops its cached
+        // write half + outcome_tx instead of leaking them (no Fin/Reset will ever
+        // arrive for a stream the server never saw).
+        let _ = mux
+            .register_tx
+            .send(ClientStreamControl::Deregister(stream_id))
+            .await;
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into());
     }
 
@@ -2071,7 +2157,8 @@ where
                     Ok(inner) => inner,
                     Err(_) => {
                         tracing::debug!(cid, "client mux idle backstop reached; tearing down session");
-                        shutdown_client_download_streams(&mut local_writes).await;
+                        shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin)
+                            .await;
                         return Ok(());
                     }
                 },
@@ -2080,11 +2167,11 @@ where
         match read_result {
             Ok(()) => {}
             Err(err) if server_records.is_clean_close(&err) => {
-                shutdown_client_download_streams(&mut local_writes).await;
+                shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin).await;
                 return Ok(());
             }
             Err(err) => {
-                shutdown_client_download_streams(&mut local_writes).await;
+                shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset).await;
                 return Err(ClientRuntimeError::Io(err));
             }
         }
@@ -2231,11 +2318,18 @@ async fn dispatch_client_mux_frame(
     Ok(())
 }
 
-/// Closes every download half when the session ends. Dropping each one-shot
-/// sender signals the waiting per-connection task that the download finished.
-async fn shutdown_client_download_streams(local_writes: &mut HashMap<u32, ClientDownloadStream>) {
+/// Closes every download half when the session ends, signaling each waiting
+/// per-connection task the REASON explicitly: a clean close sends Fin (graceful
+/// EOF) while a hard session error sends Reset, so the local app sees a
+/// connection error instead of a truncated response delivered as success. (The
+/// old behavior relied on dropping the sender, which always mapped to a clean Fin.)
+async fn shutdown_client_download_streams(
+    local_writes: &mut HashMap<u32, ClientDownloadStream>,
+    outcome: DownloadOutcome,
+) {
     for (_, mut stream) in local_writes.drain() {
         let _ = stream.write.shutdown().await;
+        let _ = stream.outcome_tx.send(outcome);
     }
 }
 
