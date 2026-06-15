@@ -38,6 +38,39 @@ pub mod fuzz {
     pub fn encode_envelope_into(seq: u64, record: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
         super::envelope::encode_into(seq, record, out).map_err(|_| ())
     }
+
+    /// Drive a bounded ReorderBuffer with an attacker-derived op stream and
+    /// assert its hard memory bounds always hold (the anti-exhaustion guarantee:
+    /// a peer must never be able to push pending state past max_records/max_bytes).
+    pub fn reorder_drive(data: &[u8]) {
+        if data.len() < 11 {
+            return;
+        }
+        let start_seq = u64::from_be_bytes(data[0..8].try_into().expect("8 bytes checked"));
+        let max_records = 1 + (data[8] as usize % 64);
+        let max_bytes = 1 + (u16::from_be_bytes([data[9], data[10]]) as usize % 65536);
+        let mut buf = super::reorder::ReorderBuffer::new(start_seq, max_records, max_bytes);
+        let mut rest = &data[11..];
+        while !rest.is_empty() {
+            let op = rest[0];
+            rest = &rest[1..];
+            if op & 1 == 0 {
+                if rest.len() < 9 {
+                    break;
+                }
+                let seq = u64::from_be_bytes(rest[0..8].try_into().expect("8 bytes checked"));
+                let len = rest[8] as usize;
+                let take = len.min(rest.len() - 9);
+                let record = rest[9..9 + take].to_vec();
+                rest = &rest[9 + take..];
+                let _ = buf.insert(seq, record);
+            } else {
+                let _ = buf.pop_next();
+            }
+            assert!(buf.pending_len() <= max_records, "reorder pending_len exceeded its bound");
+            assert!(buf.pending_bytes() <= max_bytes, "reorder pending_bytes exceeded its bound");
+        }
+    }
 }
 
 use std::sync::Arc;
