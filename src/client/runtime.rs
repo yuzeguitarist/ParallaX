@@ -42,7 +42,7 @@ use crate::{
     },
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
-        DataRecordError, SealedRecord, QUIC_RELAY_DONE_MARKER,
+        DataRecordError, SealedRecord, QUIC_RELAY_DONE_MARKER, RELAY_IDLE_CLOSE_CODE,
     },
     tls::{
         record::{log_record_read, TlsRecordError, TlsRecordReader},
@@ -1708,7 +1708,7 @@ impl ClientRelay {
             };
             match relay_outcome {
                 None => {
-                    conn.close(0u32.into(), b"relay-idle");
+                    conn.close(RELAY_IDLE_CLOSE_CODE.into(), b"relay-idle");
                     Ok(())
                 }
                 Some(Ok((mut seal_to_server, mut open_from_server))) => {
@@ -1725,6 +1725,15 @@ impl ClientRelay {
                     result
                 }
                 Some(Err(err)) => {
+                    // If the server's idle watchdog fired first, the relay error
+                    // here is a benign mutual idle teardown — recognize it and
+                    // return Ok instead of a spurious error, so an operator may
+                    // tighten the server idle floor without the client reporting a
+                    // failure. The close is an idempotent no-op (peer already closed).
+                    if is_peer_idle_close(&conn) {
+                        conn.close(RELAY_IDLE_CLOSE_CODE.into(), b"relay-idle");
+                        return Ok(());
+                    }
                     conn.close(0u32.into(), b"relay-error");
                     Err(err)
                 }
@@ -1812,11 +1821,28 @@ async fn client_exchange_quic_done(
     let done = seal_to_server
         .seal(QUIC_RELAY_DONE_MARKER, &mut OsRng)
         .map_err(ClientHandshakeError::from)?;
-    server_write
-        .write_all(&done)
-        .await
-        .map_err(ClientRuntimeError::Io)?;
-    server_write.flush().await.map_err(ClientRuntimeError::Io)?;
+    // Bound the DONE write+flush with the same backstop as the DONE read below: a
+    // peer that stops reading the reliable TCP control stream during teardown must
+    // not pin the slot/fds forever.
+    match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, async {
+        server_write
+            .write_all(&done)
+            .await
+            .map_err(ClientRuntimeError::Io)?;
+        server_write.flush().await.map_err(ClientRuntimeError::Io)?;
+        Ok::<(), ClientRuntimeError>(())
+    })
+    .await
+    {
+        Ok(res) => res?,
+        Err(_) => {
+            tracing::warn!(cid, "QUIC fast-plane teardown DONE write backstop elapsed");
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC fast-plane teardown DONE write backstop elapsed",
+            )));
+        }
+    }
 
     // Read exactly ONE record (the server's DONE) over the TCP control stream.
     // The read is bounded on CONNECTION LIVENESS, not a wall clock: we `select!`
@@ -2685,6 +2711,20 @@ fn log_outer_write(
             "outer TLS record write"
         );
     }
+}
+
+/// True iff the QUIC connection was closed by the peer with the agreed
+/// [`RELAY_IDLE_CLOSE_CODE`] (the server's idle watchdog fired first). Lets the
+/// client treat that as a benign mutual idle teardown (Ok) instead of a relay
+/// error, so a tightened server idle floor does not surface as client failures.
+fn is_peer_idle_close(conn: &quinn::Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code,
+            ..
+        })) if error_code == quinn::VarInt::from_u32(RELAY_IDLE_CLOSE_CODE)
+    )
 }
 
 #[allow(dead_code)]

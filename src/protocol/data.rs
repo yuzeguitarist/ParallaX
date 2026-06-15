@@ -839,6 +839,13 @@ pub const SERVER_TO_CLIENT_AAD: &[u8] = b"ParallaX v1 server appdata";
 /// skip). Follows the PX1* command convention used elsewhere on the wire.
 pub const QUIC_RELAY_DONE_MARKER: &[u8] = b"PX1Z-quic-relay-done";
 
+/// QUIC application close code for a graceful, mutually-recognized idle teardown
+/// of the fast-plane relay. Code 0 stays the generic/abrupt close; when one side's
+/// idle watchdog fires it closes the connection with this code so the peer can
+/// distinguish a benign idle teardown (return Ok) from a real relay error — making
+/// the outcome symmetric regardless of which side's watchdog fires first.
+pub const RELAY_IDLE_CLOSE_CODE: u32 = 1;
+
 pub fn max_plaintext_len(max_padding: u16) -> usize {
     OUTER_TLS_RECORD_LIMIT.saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }

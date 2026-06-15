@@ -62,7 +62,7 @@ use crate::{
         data::{
             max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
             DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD, QUIC_RELAY_DONE_MARKER,
-            SERVER_TO_CLIENT_AAD,
+            RELAY_IDLE_CLOSE_CODE, SERVER_TO_CLIENT_AAD,
         },
     },
     tls::{
@@ -2751,7 +2751,7 @@ impl DataRelay {
                     let join_result = match relay_outcome {
                         Some(joined) => joined,
                         None => {
-                            conn.close(0u32.into(), b"relay-idle");
+                            conn.close(RELAY_IDLE_CLOSE_CODE.into(), b"relay-idle");
                             return Ok(());
                         }
                     };
@@ -2778,6 +2778,14 @@ impl DataRelay {
                             }
                         }
                         Err(err) => {
+                            // If the peer's own idle watchdog fired first it
+                            // surfaces as a connection error here; recognize that
+                            // benign mutual idle teardown and return Ok rather than
+                            // a relay failure (symmetric outcome regardless of which
+                            // side's watchdog fires first).
+                            if is_peer_idle_close(&conn) {
+                                return Ok(());
+                            }
                             conn.close(0u32.into(), b"relay-error");
                             return Err(err);
                         }
@@ -2868,8 +2876,25 @@ async fn server_exchange_quic_done(
     // number -- and write it over the reliable TCP control stream.
     let mut rng = StdRng::from_entropy();
     let done = server_seal.seal(QUIC_RELAY_DONE_MARKER, &mut rng)?;
-    client_write.write_all(&done).await?;
-    client_write.flush().await?;
+    // Bound the DONE write+flush with the same backstop as the DONE read below: a
+    // peer that completes its data directions but then stops reading the TCP
+    // control stream must not pin the slot/fds/permits forever.
+    match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, async {
+        client_write.write_all(&done).await?;
+        client_write.flush().await?;
+        Ok::<(), HandshakeServerError>(())
+    })
+    .await
+    {
+        Ok(res) => res?,
+        Err(_) => {
+            tracing::warn!(cid, "QUIC fast-plane teardown DONE write backstop elapsed");
+            return Err(HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC fast-plane teardown DONE write backstop elapsed",
+            )));
+        }
+    }
 
     // Read exactly ONE record (the client's DONE) over the TCP control stream.
     // The read is bounded on CONNECTION LIVENESS, not a wall clock: we `select!`
@@ -4084,6 +4109,19 @@ fn is_write_peer_close(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    )
+}
+
+/// True iff the QUIC connection was closed by the peer with the agreed
+/// [`RELAY_IDLE_CLOSE_CODE`], i.e. the peer's idle watchdog fired first. Lets this
+/// side treat that as a benign mutual idle teardown (Ok) instead of a relay error.
+fn is_peer_idle_close(conn: &quinn::Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code,
+            ..
+        })) if error_code == quinn::VarInt::from_u32(RELAY_IDLE_CLOSE_CODE)
     )
 }
 
