@@ -92,30 +92,41 @@ to sync creates it race-safely (it ignores `already_exists`).
 
 ## Start the cluster (paste one line per box)
 
-Open three c-4 boxes. On each, paste its line **as root** and answer the PAT
-prompt. The **only** difference between boxes is the trailing node-id.
+Open three c-4 boxes. On each, paste **as root** the three-line block for that
+box. The first line reads the PAT (input hidden, kept out of shell history); it
+authenticates both the `bootstrap.sh` download **and** the private-repo clone.
+The **only** difference between boxes is the trailing node-id.
 
 ```bash
 # box-a
-curl -fsSL https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | bash -s -- box-a
+read -rsp 'GitHub PAT: ' T; echo
+curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-a
 ```
 ```bash
 # box-b
-curl -fsSL https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | bash -s -- box-b
+read -rsp 'GitHub PAT: ' T; echo
+curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-b
 ```
 ```bash
 # box-c
-curl -fsSL https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | bash -s -- box-c
+read -rsp 'GitHub PAT: ' T; echo
+curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-c
 ```
 
-`bootstrap.sh` **prompts for the PAT** (read from the terminal, never argv),
-stores it `0600` at `/etc/plxfuzz/pat`, then unattended: installs the pinned
-toolchain + build deps, clones `84c78add`, `gh auth login --with-token`, warm-
-builds the fuzzers, installs+enables the systemd units, and starts fuzzing. It
-is idempotent — re-pasting on a half-built box self-heals. When it prints
-`node box-a live`, walk away.
+> The repo is **private**, so the bootstrap download and the clone both need the
+> token — that's why the PAT rides in via `Authorization:` (for curl) and
+> `PLXFUZZ_PAT` (for the script) instead of an interactive prompt. The boxes are
+> disposable, single-user root; the token in the launch line's env is acceptable
+> there and never gets committed.
 
-> Paste the line over a fast connection if you can — step one is a one-time
+`bootstrap.sh` picks the PAT up from `PLXFUZZ_PAT`, stores it `0600` at
+`/etc/plxfuzz/pat`, then unattended: installs the pinned toolchain + build deps,
+clones `84c78add`, `gh auth login --with-token`, warm-builds the fuzzers,
+installs+enables the systemd units, and starts fuzzing. It is idempotent —
+re-pasting on a half-built box self-heals. When it prints `node box-a live`,
+walk away.
+
+> Paste the block over a fast connection if you can — step one is a one-time
 > multi-GB `cargo fuzz build`. Subsequent restarts reuse the build.
 
 ### What each box runs (for reference; you don't configure this)

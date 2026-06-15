@@ -132,14 +132,23 @@ fi
 # 4. Clone the pinned source (shallow) and check out the exact commit.
 # ---------------------------------------------------------------------------
 log "[4/11] clone + checkout $PINNED_COMMIT into $SRC"
+# The repo is PRIVATE, so the clone/fetch must be authenticated. When the box is
+# launched via the documented one-liner the PAT arrives in $PLXFUZZ_PAT; use the
+# x-access-token URL for the initial clone (step 7 later re-sets the same remote
+# for the long-lived units). Fall back to the bare URL only if no PAT is present
+# (e.g. a public-repo run), which preserves the previous behaviour there.
+CLONE_URL="$REPO_URL"
+if [ -n "${PLXFUZZ_PAT:-}" ]; then
+  CLONE_URL="https://x-access-token:${PLXFUZZ_PAT}@github.com/${REPO}.git"
+fi
 if [ ! -d "$SRC/.git" ]; then
   rm -rf "$SRC" 2>/dev/null || true
-  retry 3 10 sudo -u "$FUZZ_USER" -H git clone --depth 1 "$REPO_URL" "$SRC" \
+  retry 3 10 sudo -u "$FUZZ_USER" -H git clone --depth 1 "$CLONE_URL" "$SRC" \
     || die "git clone failed"
 fi
 # Fetch + checkout the exact commit (shallow clone may not contain it yet).
 if ! sudo -u "$FUZZ_USER" -H git -C "$SRC" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null; then
-  retry 3 10 sudo -u "$FUZZ_USER" -H git -C "$SRC" fetch --depth 1 origin "$PINNED_COMMIT" \
+  retry 3 10 sudo -u "$FUZZ_USER" -H git -C "$SRC" fetch --depth 1 "$CLONE_URL" "$PINNED_COMMIT" \
     || warn "fetch of $PINNED_COMMIT failed; will try checkout anyway"
 fi
 sudo -u "$FUZZ_USER" -H git -C "$SRC" checkout -q --detach "$PINNED_COMMIT" \
