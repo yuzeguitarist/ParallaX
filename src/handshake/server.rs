@@ -203,6 +203,12 @@ static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 static RETAINED_QUIC_CONN_FOR_TEST: Mutex<Option<quinn::Connection>> = Mutex::new(None);
 
+/// Test-only counter of X25519 DH ops performed on the inbound-decision path, used
+/// to assert the rejection path's DH count is input-independent (M-2). Not
+/// compiled in release.
+#[cfg(test)]
+static REJECT_DH_OPS: AtomicUsize = AtomicUsize::new(0);
+
 /// Test accessor for [`RETAINED_QUIC_CONN_FOR_TEST`] so the mid-relay reset e2e
 /// (in the client runtime test module) can grab and kill the server's retained
 /// QUIC connection in flight.
@@ -674,24 +680,39 @@ fn decide_connection_inbound(
     if !parsed.tls13_supported {
         return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
     }
-    // v4 masked-stateful path. The carrier masks are keyed by
-    // mask_ecdh = X25519(server_static, tls_ephemeral); the TLS ephemeral is the
-    // unmasked standalone X25519 key_share. A non-ParallaX hello without that
-    // share cannot be a v4 ParallaX client, so fall through to the legacy path
-    // (which ends in Fallback for genuine non-ParallaX traffic). NB: this DH is
-    // distinct from the auth DH below — mask uses the TLS key share, auth uses
-    // the recovered ParallaX ephemeral.
-    if let Some(tls_key_share) = parsed.x25519_key_share {
-        let mask_ecdh =
-            zeroize::Zeroizing::new(x25519_shared_secret(server_private, &tls_key_share));
+    // Constant-time-by-op-count DH (M-2): the auth-failing path must perform a
+    // FIXED number of X25519 ops regardless of ClientHello shape, else an off-path
+    // observer reads the per-DH latency step (no key_share=1, recover-None=2,
+    // auth-fail=3) as a distinguisher. Route every DH through this closure and pad
+    // with discarded ballast so EVERY path runs exactly 3 ops; ballast results are
+    // Zeroizing to match the real-DH zeroize discipline. Auth semantics unchanged.
+    let dh = |peer: &[u8; 32]| -> zeroize::Zeroizing<[u8; 32]> {
+        #[cfg(test)]
+        REJECT_DH_OPS.fetch_add(1, Ordering::Relaxed);
+        zeroize::Zeroizing::new(x25519_shared_secret(server_private, peer))
+    };
+
+    // v4 masked-stateful path. mask_ecdh = X25519(server_static, tls_ephemeral)
+    // (the unmasked standalone key_share); distinct from the auth DH below (the
+    // recovered ParallaX ephemeral). The mask-slot DH ALWAYS runs once — a real
+    // point when a key_share is present, else discarded ballast — so a hello with
+    // no key_share is not one DH cheaper than one with it.
+    let mask_ecdh = match parsed.x25519_key_share {
+        Some(tls_key_share) => Some(dh(&tls_key_share)),
+        None => {
+            let _ = dh(&parsed.client_random);
+            None
+        }
+    };
+    if let Some(mask_ecdh) = mask_ecdh.as_deref() {
         if let Some(material) = recover_stateful_auth_material_from_parsed(
             first_client_record,
             psk,
-            &mask_ecdh,
+            mask_ecdh,
             &parsed,
         )? {
             let x25519_key_share = material.x25519_public;
-            let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
+            let x25519_shared_secret = *dh(&x25519_key_share);
             let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
             let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
                 first_client_record,
@@ -712,11 +733,16 @@ fn decide_connection_inbound(
                     x25519_shared_secret,
                 );
             }
+            // v4 decoded but auth failed -> fall through to the legacy check below.
+        } else {
+            let _ = dh(&parsed.client_random); // ballast: v4 auth-slot, recover==None
         }
+    } else {
+        let _ = dh(&parsed.client_random); // ballast: v4 auth-slot, no key_share
     }
 
     let x25519_key_share = parsed.client_random;
-    let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
+    let x25519_shared_secret = *dh(&x25519_key_share);
     let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
     let auth =
         match verify_client_hello_auth_with_parsed(first_client_record, &auth_key, None, parsed) {
@@ -1296,6 +1322,22 @@ async fn run_authenticated_data_mode(
                         let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
                         if !commit_pending_replay_entry(&mut pending_replay).await? {
                             tracing::warn!(cid, "closing on replayed ClientHello after data proof");
+                            // Graceful drain->FIN instead of a bare drop (M-1). At
+                            // this point the fallback origin's read half (and any
+                            // client RX buffered in the record reader) may hold
+                            // unread bytes, so dropping the sockets would make
+                            // close() emit a RST -- the FIN/RST tell every other
+                            // teardown here avoids. Mirrors the pre-PQ-deadline
+                            // teardown above; covers Replayed/Stale/CacheFull.
+                            let client_read = client_records.into_inner().into_inner();
+                            let fallback_read = fallback_records.into_inner().into_inner();
+                            graceful_close_fallback_halves(
+                                &client_read,
+                                &mut client_write,
+                                &fallback_read,
+                                &mut fallback_write,
+                            )
+                            .await;
                             return Ok(());
                         }
                         let server_ephemeral = X25519KeyPair::generate();
@@ -1446,12 +1488,10 @@ async fn run_authenticated_data_mode(
                             &client_record[first_payload_range.clone()],
                         ) {
                             use crate::protocol::command::{
-                                UdpDecline, UdpOffer, UdpProbeAck, UdpProbeStatus, UDP_CC_BBR,
+                                UdpDecline, UdpOffer, UdpProbeAck, UDP_CC_BBR,
                                 UDP_DECLINE_DISABLED, UDP_FEC_ADAPTIVE,
                             };
-                            use crate::transport::udp::{
-                                endpoint::bind_server_endpoint, probe::serve_probe,
-                            };
+                            use crate::transport::udp::endpoint::bind_server_endpoint;
 
                             let offered = if udp.enabled {
                                 // Bind the probe endpoint on the same interface and
@@ -1537,20 +1577,27 @@ async fn run_authenticated_data_mode(
                                 // connection must stay alive past the probe
                                 // regardless; here we additionally keep it for the
                                 // data path when the client confirms Verified.
-                                let probed_conn: Option<quinn::Connection> =
-                                    tokio::time::timeout(probe_budget, async {
-                                        let incoming = udp_ep.accept().await?;
-                                        let conn = incoming.await.ok()?;
-                                        if let Err(err) =
-                                            serve_probe(&conn, sandwich_secret, &offer_id).await
-                                        {
-                                            tracing::debug!(cid, error = %err, "udp serve_probe failed");
-                                        }
-                                        Some(conn)
-                                    })
-                                    .await
-                                    .ok()
-                                    .flatten();
+                                // Accept the probe QUIC connection ONLY from the
+                                // authenticated TCP peer's source IP (L-6): the
+                                // ephemeral endpoint is reachable by anyone who
+                                // learns the port, so a racing/off-path connector
+                                // could otherwise steal the single accept slot and
+                                // force a TCP downgrade. peer_addr() reads it off
+                                // the live socket; None fails open to accept-any.
+                                let expect_ip = client_write.peer_addr().ok().map(|a| a.ip());
+                                let probed_conn: Option<quinn::Connection> = tokio::time::timeout(
+                                    probe_budget,
+                                    accept_probed_quic_from_peer(
+                                        &udp_ep,
+                                        expect_ip,
+                                        sandwich_secret,
+                                        &offer_id,
+                                        cid,
+                                    ),
+                                )
+                                .await
+                                .ok()
+                                .flatten();
 
                                 client_record.clear();
                                 // BOUNDED read: we are holding the ephemeral QUIC
@@ -1623,8 +1670,10 @@ async fn run_authenticated_data_mode(
                                 // was Verified, and the server retains iff the ack
                                 // says Verified. Any other outcome -> drop the conn
                                 // and close the endpoint, staying on TCP.
-                                match (ack_status, probed_conn) {
-                                    (Some(UdpProbeStatus::Verified), Some(conn)) => {
+                                match udp_retention_decision(ack_status, probed_conn.is_some()) {
+                                    UdpRetentionDecision::Retain => {
+                                        let conn = probed_conn
+                                            .expect("Retain implies a retained connection");
                                         tracing::info!(
                                             cid,
                                             "retaining QUIC fast-plane connection for data relay"
@@ -1638,10 +1687,30 @@ async fn run_authenticated_data_mode(
                                         }
                                         retained_quic = Some((udp_ep, conn));
                                     }
-                                    (_, _maybe_conn) => {
-                                        // Drop any accepted connection and close the
-                                        // endpoint exactly as before the retain path
-                                        // existed.
+                                    UdpRetentionDecision::HardFail => {
+                                        // Verified ack but we no longer hold the
+                                        // probed connection (the probe budget elapsed
+                                        // after serve_probe queued its echo). The
+                                        // client has committed its relay to QUIC and
+                                        // will reset, so close the endpoint and fail
+                                        // identically instead of silently diverging
+                                        // onto TCP. Same close-then-Err shape as the
+                                        // PX1P-ack / real-command timeouts. (L-7)
+                                        tracing::warn!(
+                                            cid,
+                                            "Verified PX1P ack but server lost the probed QUIC \
+                                             connection; resetting to stay aligned with the client"
+                                        );
+                                        udp_ep.close(0u32.into(), b"px1p-verified-no-conn");
+                                        return Err(HandshakeServerError::Io(io::Error::new(
+                                            io::ErrorKind::ConnectionAborted,
+                                            "Verified PX1P ack with no retained QUIC connection",
+                                        )));
+                                    }
+                                    UdpRetentionDecision::StayOnTcp => {
+                                        // Not Verified: the client also stays on TCP.
+                                        // Drop any accepted connection (closing it) and
+                                        // close the endpoint, exactly as before.
                                         udp_ep.close(0u32.into(), b"done");
                                     }
                                 }
@@ -2168,6 +2237,75 @@ struct DataRelay {
     /// the relay stays on the TCP record legs exactly as before this slice.
     retained_quic: Option<(quinn::Endpoint, quinn::Connection)>,
     cid: u64,
+}
+
+/// Cross-side carrier decision at the PX1P retention gate (L-7). Both ends gate
+/// the relay carrier on the SAME signal (the client's reported probe status), so
+/// the server's local view must agree. The one state that can DESYNC is a Verified
+/// ack with no retained connection: the client has already committed its relay to
+/// QUIC (and will hard-error if the stream never materializes), so the server must
+/// reset too rather than silently fall back to TCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpRetentionDecision {
+    /// Verified + we still hold the connection: carry the relay over QUIC.
+    Retain,
+    /// Verified but the probed connection was lost (probe budget elapsed after
+    /// serve_probe queued its echo): reset so both ends fail identically.
+    HardFail,
+    /// Not Verified: the client also stays on TCP. Drop the conn, close, continue.
+    StayOnTcp,
+}
+
+fn udp_retention_decision(
+    ack_status: Option<crate::protocol::command::UdpProbeStatus>,
+    have_probed_conn: bool,
+) -> UdpRetentionDecision {
+    use crate::protocol::command::UdpProbeStatus;
+    match (ack_status, have_probed_conn) {
+        (Some(UdpProbeStatus::Verified), true) => UdpRetentionDecision::Retain,
+        (Some(UdpProbeStatus::Verified), false) => UdpRetentionDecision::HardFail,
+        _ => UdpRetentionDecision::StayOnTcp,
+    }
+}
+
+/// Accept the QUIC connection for the fast-plane probe, but ONLY from the
+/// authenticated TCP peer's source IP (L-6). The ephemeral endpoint is reachable
+/// by anyone who learns the port, so a racing/off-path connector could otherwise
+/// steal the single accept slot and force a TCP downgrade. Connectors from a
+/// different source IP are `ignore()`d — dropped WITHOUT a response packet, so the
+/// "nothing here" probe-resistance posture is preserved (a `refuse()` would emit
+/// an observable CONNECTION_CLOSE). `serve_probe` still gates authenticity on the
+/// exporter-bound token, so a peer that spoofs the IP cannot pass; this only closes
+/// the free downgrade. `expect_ip == None` fails open to accept-any. The caller
+/// wraps this in the probe-budget timeout, which bounds the loop.
+async fn accept_probed_quic_from_peer(
+    udp_ep: &quinn::Endpoint,
+    expect_ip: Option<std::net::IpAddr>,
+    sandwich_secret: &[u8],
+    offer_id: &[u8; 16],
+    cid: u64,
+) -> Option<quinn::Connection> {
+    loop {
+        let incoming = udp_ep.accept().await?;
+        if let Some(ip) = expect_ip {
+            if incoming.remote_address().ip() != ip {
+                tracing::debug!(
+                    cid,
+                    src = %incoming.remote_address(),
+                    "ignoring fast-plane QUIC from non-authenticated source IP"
+                );
+                incoming.ignore();
+                continue;
+            }
+        }
+        let conn = incoming.await.ok()?;
+        if let Err(err) =
+            crate::transport::udp::probe::serve_probe(&conn, sandwich_secret, offer_id).await
+        {
+            tracing::debug!(cid, error = %err, "udp serve_probe failed");
+        }
+        return Some(conn);
+    }
 }
 
 /// Drops a retained QUIC endpoint + connection, application-closing the
@@ -3831,7 +3969,8 @@ mod tests {
         protocol::command::{ConnectRequest, ConnectRequestError},
         tls::{
             client_hello::tests::{
-                client_hello_fixture_with_key_share, client_hello_fixture_with_random_and_key_share,
+                client_hello_fixture_no_key_share, client_hello_fixture_with_key_share,
+                client_hello_fixture_with_random_and_key_share,
             },
             server_hello::{parse_server_hello, tests::server_hello_fixture},
         },
@@ -4286,6 +4425,125 @@ mod tests {
             decision,
             InboundDecision::Fallback(FallbackReason::AuthFailed)
         );
+    }
+
+    /// M-2: the inbound-decision rejection path must perform an input-INDEPENDENT
+    /// number of X25519 DH ops, else the per-DH latency step (no key_share = 1 vs
+    /// auth-fail = 3, pre-fix) is a timing distinguisher. Ignored + serial: it reads
+    /// the process-global REJECT_DH_OPS counter that parallel decide_* tests perturb.
+    #[test]
+    #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
+    fn rejection_path_x25519_count_is_input_independent() {
+        fn dh_ops_for(record: &[u8], server_priv: &[u8; 32]) -> usize {
+            REJECT_DH_OPS.store(0, Ordering::Relaxed);
+            let _ =
+                decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
+            REJECT_DH_OPS.load(Ordering::Relaxed)
+        }
+        let server = X25519KeyPair::generate();
+
+        // Shape B: no x25519 key_share -> pre-fix only the legacy DH (1).
+        let no_ks = client_hello_fixture_no_key_share("example.com");
+        // Shape D: key_share present, recover==Some, masked auth fails -> pre-fix 3.
+        let mut auth_fail = client_hello_fixture_with_key_share("example.com", &[0x66; 32]);
+        let mut rng = StdRng::seed_from_u64(7);
+        sign_client_hello_session_id(&mut auth_fail, b"wrong-auth-key", &mut rng).unwrap();
+
+        let b = dh_ops_for(&no_ks, &server.private);
+        let d = dh_ops_for(&auth_fail, &server.private);
+        assert_eq!(
+            b, d,
+            "no-key_share vs auth-fail DH count differs (timing distinguisher)"
+        );
+        assert_eq!(
+            b, 3,
+            "rejection path must perform a constant 3 X25519 DH ops"
+        );
+    }
+
+    /// L-7: a Verified PX1P ack with no retained connection must map to HardFail
+    /// (reset), not silently stay on TCP, so the carrier choice cannot desync from
+    /// the client (which has already committed its relay to QUIC).
+    #[test]
+    fn udp_retention_decision_verified_without_conn_is_hard_fail() {
+        use crate::protocol::command::UdpProbeStatus;
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Verified), true),
+            UdpRetentionDecision::Retain
+        );
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Verified), false),
+            UdpRetentionDecision::HardFail,
+        );
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Unreachable), false),
+            UdpRetentionDecision::StayOnTcp
+        );
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Unreachable), true),
+            UdpRetentionDecision::StayOnTcp
+        );
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Failed), true),
+            UdpRetentionDecision::StayOnTcp
+        );
+        assert_eq!(
+            udp_retention_decision(None, true),
+            UdpRetentionDecision::StayOnTcp
+        );
+        assert_eq!(
+            udp_retention_decision(None, false),
+            UdpRetentionDecision::StayOnTcp
+        );
+    }
+
+    /// L-6: the fast-plane probe endpoint must accept ONLY from the authenticated
+    /// peer's source IP — a connector from a different IP is ignore()d, so a racing
+    /// off-path connector cannot steal the single accept slot and force a TCP
+    /// downgrade. Ignored: loopback QUIC sockets.
+    #[tokio::test]
+    #[ignore = "requires loopback QUIC sockets"]
+    async fn accept_probed_quic_pins_to_authenticated_peer_ip() {
+        let server_ep = crate::transport::udp::endpoint::bind_server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            "localhost",
+        )
+        .expect("bind server endpoint");
+        let server_addr = server_ep.local_addr().unwrap();
+
+        // A loopback client connects (source IP 127.0.0.1).
+        let client_ep = crate::transport::udp::endpoint::bind_client_endpoint_accept_any(
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("bind client endpoint");
+        let connecting = tokio::spawn(async move {
+            if let Ok(c) = client_ep.connect(server_addr, "localhost") {
+                let _ = c.await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            client_ep // keep the endpoint alive for the test duration
+        });
+
+        // Expect a DIFFERENT source IP (TEST-NET-3) than the loopback connector, so
+        // the connector is ignored and NO connection is accepted within the budget.
+        let offer_id = [7_u8; 16];
+        let accepted = tokio::time::timeout(
+            Duration::from_millis(300),
+            accept_probed_quic_from_peer(
+                &server_ep,
+                Some("203.0.113.1".parse().unwrap()),
+                PSK,
+                &offer_id,
+                0,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(accepted, Err(_) | Ok(None)),
+            "a connector from a non-authenticated source IP must not be accepted",
+        );
+
+        connecting.abort();
     }
 
     #[test]
