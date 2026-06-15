@@ -1424,6 +1424,18 @@ async fn run_authenticated_data_mode(
                         ));
                         let mut pq_encapsulation =
                             encapsulate_mlkem_blocking(client_mlkem_public_key).await?;
+                        // Move the ML-KEM shared secret into a wipe-on-drop local and
+                        // clear the struct's own [u8;32] copy immediately. A struct-level
+                        // ZeroizeOnDrop can't help (`.ciphertext` is moved into the
+                        // key-exchange payload below, partially moving the struct so its
+                        // Drop glue can never run), and every `?` between here and the
+                        // rekey (encode / seal / write / rekey) would otherwise drop the
+                        // secret un-wiped — a path the new degenerate-X25519 rekey
+                        // rejection makes reachable. The Zeroizing local clears on ANY
+                        // return.
+                        let pq_shared_secret =
+                            zeroize::Zeroizing::new(pq_encapsulation.shared_secret);
+                        pq_encapsulation.shared_secret.zeroize();
                         let key_exchange_payload = ServerKeyExchange {
                             server_x25519_public: server_ephemeral.public,
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
@@ -1433,7 +1445,7 @@ async fn run_authenticated_data_mode(
                             identity::pq_rekey_binding(first_payload.as_slice(), &key_exchange_payload);
                         crate::process_hardening::protect_secret_bytes(
                             "pq_rekey.mlkem_shared_secret",
-                            &pq_encapsulation.shared_secret,
+                            &*pq_shared_secret,
                         );
                         let mut rng = StdRng::from_entropy();
                         let key_exchange_record =
@@ -1461,16 +1473,9 @@ async fn run_authenticated_data_mode(
                             &mut server_seal,
                             &handshake.session_keys,
                             &x25519_ephemeral_shared,
-                            &pq_encapsulation.shared_secret,
+                            &pq_shared_secret,
                             sandwich_secret,
                         )?;
-                        // The ML-KEM shared secret is a plain [u8;32] field of
-                        // pq_encapsulation. A struct-level ZeroizeOnDrop can't help
-                        // here: `.ciphertext` is moved into the key-exchange payload
-                        // above, partially moving the struct, so its Drop glue can
-                        // never run. Wipe the field explicitly now that the rekey
-                        // has consumed it.
-                        pq_encapsulation.shared_secret.zeroize();
                         rekeyed_keys.protect_secret_memory();
                         let identity_signature = sign_server_identity_blocking(
                             identity_secret_key,
