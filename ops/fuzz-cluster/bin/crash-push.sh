@@ -227,7 +227,12 @@ process_artifact() {  # <artifact_path>
     mkdir -p "$(dirname "$dst")"
     cp -p "$minf" "$dst" 2>/dev/null || true
     git -C "$WT" add "$committed_rel" >/dev/null 2>&1 || true
-    if git -C "$WT" commit -q -m "fuzz-crash: $TARGET $key12" >/dev/null 2>&1; then
+    # The plxfuzz system user has no git identity, so a bare `git commit` aborts
+    # with "Author identity unknown" -> the commit fails, filed stays 0, and the
+    # crash is silently never filed. Pass the identity inline (matches sync.sh /
+    # status.sh) so the commit always succeeds.
+    if git -C "$WT" -c user.email=plxfuzz@localhost -c user.name=plxfuzz \
+         commit -q -m "fuzz-crash: $TARGET $key12" >/dev/null 2>&1; then
       if retry git -C "$WT" push origin "HEAD:$CRASH_BRANCH" >/dev/null 2>&1; then
         filed=1
       else
