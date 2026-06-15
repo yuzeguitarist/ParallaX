@@ -176,10 +176,17 @@ pub enum UdpTransportError {
 fn camouflage_provider() -> rustls::crypto::CryptoProvider {
     use rustls::crypto::aws_lc_rs;
     rustls::crypto::CryptoProvider {
+        // Mirror aws-lc-rs's prefer-post-quantum DEFAULT_KX_GROUPS order EXACTLY
+        // (X25519MLKEM768, X25519, SECP256R1, SECP384R1). Pinning it makes the
+        // hybrid-leads property independent of the upstream feature flag WITHOUT
+        // changing the on-wire supported_groups vs the current default — dropping
+        // any of these (e.g. SECP384R1, which Chromium also offers) would itself be
+        // a fingerprint divergence.
         kx_groups: vec![
             aws_lc_rs::kx_group::X25519MLKEM768,
             aws_lc_rs::kx_group::X25519,
             aws_lc_rs::kx_group::SECP256R1,
+            aws_lc_rs::kx_group::SECP384R1,
         ],
         ..aws_lc_rs::default_provider()
     }
@@ -474,14 +481,21 @@ mod tests {
     #[test]
     fn camouflage_provider_leads_with_pq_hybrid_kx() {
         let provider = camouflage_provider();
-        assert_eq!(
-            provider.kx_groups.first().map(|kx| kx.name()),
-            Some(rustls::NamedGroup::X25519MLKEM768),
-            "the QUIC ClientHello's default key share must be the PQ hybrid",
-        );
-        // The classical fallbacks remain offered so a peer without ML-KEM can still
-        // negotiate (the hybrid is preferred, not exclusive).
+        // Assert the FULL ordered list, not just the leader: the hybrid must lead
+        // (so its key share inflates the Initial), AND the list must mirror
+        // aws-lc-rs's prefer-post-quantum DEFAULT_KX_GROUPS exactly so the on-wire
+        // supported_groups stays Chrome-like (dropping/reordering any of these is a
+        // fingerprint divergence the leader-only check would miss).
         let names: Vec<_> = provider.kx_groups.iter().map(|kx| kx.name()).collect();
-        assert!(names.contains(&rustls::NamedGroup::X25519));
+        assert_eq!(
+            names,
+            vec![
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::NamedGroup::X25519,
+                rustls::NamedGroup::secp256r1,
+                rustls::NamedGroup::secp384r1,
+            ],
+            "QUIC kx groups must mirror aws-lc-rs prefer-post-quantum default order",
+        );
     }
 }
