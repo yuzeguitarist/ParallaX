@@ -1439,7 +1439,8 @@ async fn run_authenticated_data_mode(
                             key_exchange_payload.len(),
                             &key_exchange_record,
                         );
-                        client_write.write_all(&key_exchange_record).await?;
+                        write_all_with_handshake_timeout(&mut client_write, &key_exchange_record)
+                            .await?;
                         tracing::info!(
                             cid,
                             client_camouflage_records_before_pq,
@@ -1611,7 +1612,8 @@ async fn run_authenticated_data_mode(
                                 .encode()
                                 .expect("valid udp offer");
                                 let offer_record = server_seal.seal(&offer, &mut rng)?;
-                                client_write.write_all(&offer_record).await?;
+                                write_all_with_handshake_timeout(&mut client_write, &offer_record)
+                                    .await?;
 
                                 // Best-effort, fully time-bounded: accept the client's
                                 // QUIC connection and answer one probe. The QUIC
@@ -1801,7 +1803,11 @@ async fn run_authenticated_data_mode(
                                 }
                                 .encode();
                                 let decline_record = server_seal.seal(&decline, &mut rng)?;
-                                client_write.write_all(&decline_record).await?;
+                                write_all_with_handshake_timeout(
+                                    &mut client_write,
+                                    &decline_record,
+                                )
+                                .await?;
                             }
 
                             // Read the client's real first command.
@@ -2321,7 +2327,7 @@ where
                 chunk.len(),
                 &identity_record,
             );
-            client_write.write_all(&identity_record).await?;
+            write_all_with_handshake_timeout(client_write, &identity_record).await?;
             if idx + 1 < identity_chunk_count {
                 let delay = server_identity_chunk_delay(timing, rng);
                 if !delay.is_zero() {
@@ -2347,7 +2353,7 @@ where
             &identity_records[range],
         );
     }
-    client_write.write_all(&identity_records).await?;
+    write_all_with_handshake_timeout(client_write, &identity_records).await?;
     Ok(())
 }
 
@@ -3870,10 +3876,20 @@ where
         match client_open.open_in_place_payload_range(&mut client_record) {
             Ok(plaintext) => {
                 if !plaintext.is_empty() {
-                    // Bound the target write so a stuck upstream that stops reading
-                    // makes the write fail visibly (Timeout) rather than blocking
-                    // until the relay idle-watchdog tears down with Ok(()) and
-                    // silently drops the in-flight upload bytes.
+                    // Bound the target write so a stuck upstream cannot pin this
+                    // relay indefinitely. NOTE: this per-write timeout reliably
+                    // fires only when the relay is otherwise progressing (the
+                    // download direction keeps bumping `activity`); in the pure
+                    // "client keeps sending, target accepts-then-stalls, no
+                    // download traffic" case the shared idle-watchdog (anchored to
+                    // the last activity bump, hence an equal-or-earlier deadline)
+                    // wins the race and tears the relay down at the idle backstop.
+                    // Either way the connection is reclaimed within ~idle_timeout
+                    // (the resource-pinning DoS is closed); the residual is that in
+                    // that narrow case the partial body is FIN'd to the target
+                    // rather than surfaced as a Timeout error — a pre-existing
+                    // behavior a fully deterministic fix would need to address by
+                    // distinguishing "stuck write" from "idle" in the watchdog.
                     timeout(
                         idle_timeout,
                         target_write.write_all(&client_record[plaintext]),
@@ -4116,13 +4132,7 @@ fn is_write_peer_close(err: &io::Error) -> bool {
 /// [`RELAY_IDLE_CLOSE_CODE`], i.e. the peer's idle watchdog fired first. Lets this
 /// side treat that as a benign mutual idle teardown (Ok) instead of a relay error.
 fn is_peer_idle_close(conn: &quinn::Connection) -> bool {
-    matches!(
-        conn.close_reason(),
-        Some(quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
-            error_code,
-            ..
-        })) if error_code == quinn::VarInt::from_u32(RELAY_IDLE_CLOSE_CODE)
-    )
+    crate::protocol::data::is_relay_idle_close_reason(conn.close_reason().as_ref())
 }
 
 fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {

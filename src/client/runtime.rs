@@ -422,6 +422,11 @@ impl WarmSessionPool {
         let server_public = self.server_public;
         let server_identity_public = Arc::clone(&self.server_identity_public);
         tokio::spawn(async move {
+            // Propagate cancellation to the inner establishment task: if THIS
+            // wrapper is aborted (e.g. the caller's session_abort fires), abort the
+            // parked handshake too. A bare JoinHandle drop only DETACHES the inner
+            // task, leaving the full handshake running uncancelled.
+            let _abort_inner = AbortOnDrop(parked.abort_handle());
             match parked.await {
                 Ok(Ok(session)) if warm_session_is_live(&session.0) => Ok(session),
                 // Poisoned handshake error, aborted/panicked task, or a dead parked
@@ -440,6 +445,16 @@ impl WarmSessionPool {
                 }
             }
         })
+    }
+}
+
+/// Aborts a tokio task when dropped, so cancelling a wrapper task propagates the
+/// cancellation to the task it is awaiting instead of detaching it.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -2245,38 +2260,52 @@ where
             apply_client_stream_control(&mut local_writes, control).await;
         }
 
-        let frames_payload: &[u8] = if record_count == 1 {
-            let payload = open_from_server
-                .open_in_place_payload_range(&mut server_record)
-                .map_err(ClientHandshakeError::from)?;
-            &server_record[payload]
-        } else {
-            // Frames never span records (the sender keeps records
-            // frame-aligned), so decoding the concatenated plaintext is
-            // equivalent to decoding each record's plaintext in order.
-            batch_plaintext.clear();
-            let payload_bytes =
-                batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
-            if should_parallelize_aead(record_count, payload_bytes) {
-                open_from_server
-                    .open_concat_records_parallel(
-                        parallel::global(),
-                        &batch_records,
-                        &mut batch_plaintext,
-                    )
+        // Open + dispatch the batch. Any AEAD-open, decode, or dispatch error
+        // here (e.g. an on-path byte-flip surfacing as DataRecordError::Aead, or a
+        // codec desync) must signal each in-flight stream a Reset, exactly like the
+        // hard read-error arm above — otherwise dropping `local_writes` drops every
+        // outcome_tx, which client_mux_await_download maps to Ok(()) and delivers a
+        // truncated download to the local app as a clean, complete response.
+        let processed: Result<(), ClientRuntimeError> = async {
+            let frames_payload: &[u8] = if record_count == 1 {
+                let payload = open_from_server
+                    .open_in_place_payload_range(&mut server_record)
                     .map_err(ClientHandshakeError::from)?;
+                &server_record[payload]
             } else {
-                open_from_server
-                    .open_concat_records(&mut batch_records, &mut batch_plaintext)
-                    .map_err(ClientHandshakeError::from)?;
+                // Frames never span records (the sender keeps records
+                // frame-aligned), so decoding the concatenated plaintext is
+                // equivalent to decoding each record's plaintext in order.
+                batch_plaintext.clear();
+                let payload_bytes =
+                    batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
+                if should_parallelize_aead(record_count, payload_bytes) {
+                    open_from_server
+                        .open_concat_records_parallel(
+                            parallel::global(),
+                            &batch_records,
+                            &mut batch_plaintext,
+                        )
+                        .map_err(ClientHandshakeError::from)?;
+                } else {
+                    open_from_server
+                        .open_concat_records(&mut batch_records, &mut batch_plaintext)
+                        .map_err(ClientHandshakeError::from)?;
+                }
+                batch_plaintext.as_slice()
+            };
+            let mut frames = frames_payload;
+            while !frames.is_empty() {
+                let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
+                dispatch_client_mux_frame(&mut local_writes, frame, cid).await?;
+                frames = &frames[used..];
             }
-            batch_plaintext.as_slice()
-        };
-        let mut frames = frames_payload;
-        while !frames.is_empty() {
-            let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-            dispatch_client_mux_frame(&mut local_writes, frame, cid).await?;
-            frames = &frames[used..];
+            Ok::<(), ClientRuntimeError>(())
+        }
+        .await;
+        if let Err(err) = processed {
+            shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset).await;
+            return Err(err);
         }
     }
 }
@@ -2718,13 +2747,7 @@ fn log_outer_write(
 /// client treat that as a benign mutual idle teardown (Ok) instead of a relay
 /// error, so a tightened server idle floor does not surface as client failures.
 fn is_peer_idle_close(conn: &quinn::Connection) -> bool {
-    matches!(
-        conn.close_reason(),
-        Some(quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
-            error_code,
-            ..
-        })) if error_code == quinn::VarInt::from_u32(RELAY_IDLE_CLOSE_CODE)
-    )
+    crate::protocol::data::is_relay_idle_close_reason(conn.close_reason().as_ref())
 }
 
 #[allow(dead_code)]

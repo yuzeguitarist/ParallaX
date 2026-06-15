@@ -343,12 +343,17 @@ impl ReplayCache {
             file.write_all(empty_header.as_bytes())?;
         }
         let committed_len = file.seek(SeekFrom::End(0))?;
-        // Append the entry and rewrite the header crash-atomically at the process
-        // level: if any step fails, truncate the file back to its last committed
-        // length so a half-written orphan line can never desync the journal (which
-        // would later brick load with MacMismatch). committed_len is the
-        // empty-header length for a fresh file or the prior committed length
-        // otherwise — both valid, loadable.
+        // Append the entry, then rewrite the header. On a failed APPEND (the common
+        // ENOSPC/EIO case) truncate the file back to its last committed length so a
+        // half-written orphan line cannot desync the journal. NOTE: this is NOT
+        // fully crash-atomic for the in-place header rewrite — if the process dies
+        // (or the disk errors) DURING the header `write_all`/`sync_data` at offset
+        // 0, set_len(committed_len) removes only the trailing line, not a partially
+        // overwritten header, so a subsequent restart can still hit a MacMismatch.
+        // The append-failure rollback below is the guarantee; a torn header rewrite
+        // is a narrower residual (a robust fix would write via tmp-file + rename,
+        // like compact_authenticated_journal). committed_len is the empty-header
+        // length for a fresh file or the prior committed length otherwise.
         let append_and_commit = |file: &mut fs::File| -> io::Result<()> {
             file.write_all(line.as_bytes())?;
             // Make the appended entry durable BEFORE the header that will advertise

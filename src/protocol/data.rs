@@ -846,6 +846,20 @@ pub const QUIC_RELAY_DONE_MARKER: &[u8] = b"PX1Z-quic-relay-done";
 /// the outcome symmetric regardless of which side's watchdog fires first.
 pub const RELAY_IDLE_CLOSE_CODE: u32 = 1;
 
+/// True iff a QUIC connection's close reason is the agreed relay idle teardown
+/// (`ApplicationClosed` carrying exactly [`RELAY_IDLE_CLOSE_CODE`]). A pure
+/// classifier so the client and server idle-close recognizers share one tested
+/// implementation; it must match ONLY the agreed code — never a generic code-0
+/// application close, a transport close, or the QUIC idle-timeout abort — so a
+/// real relay error is never mistaken for a benign idle teardown.
+pub(crate) fn is_relay_idle_close_reason(reason: Option<&quinn::ConnectionError>) -> bool {
+    matches!(
+        reason,
+        Some(quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose { error_code, .. }))
+            if *error_code == quinn::VarInt::from_u32(RELAY_IDLE_CLOSE_CODE)
+    )
+}
+
 pub fn max_plaintext_len(max_padding: u16) -> usize {
     OUTER_TLS_RECORD_LIMIT.saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }
@@ -1661,5 +1675,28 @@ mod tests {
             relay_read_buffer_len(RELAY_READ_BUFFER_TARGET + 1),
             RELAY_READ_BUFFER_TARGET + 1
         );
+    }
+
+    #[test]
+    fn relay_idle_close_reason_matches_only_the_agreed_code() {
+        use quinn::{ApplicationClose, ConnectionError, VarInt};
+
+        let idle = ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u32(RELAY_IDLE_CLOSE_CODE),
+            reason: bytes::Bytes::new(),
+        });
+        assert!(is_relay_idle_close_reason(Some(&idle)));
+
+        // A generic code-0 application close, a transport close, and "no reason
+        // yet" (live connection) must NOT be mistaken for the idle teardown.
+        let generic = ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u32(0),
+            reason: bytes::Bytes::new(),
+        });
+        assert!(!is_relay_idle_close_reason(Some(&generic)));
+        assert!(!is_relay_idle_close_reason(Some(
+            &ConnectionError::TimedOut
+        )));
+        assert!(!is_relay_idle_close_reason(None));
     }
 }
