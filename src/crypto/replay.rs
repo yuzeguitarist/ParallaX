@@ -112,10 +112,14 @@ impl ReplayCache {
         }
     }
 
-    /// Overrides the freshness/retention window (default
-    /// [`DEFAULT_REPLAY_WINDOW_SECS`]). The window both rejects out-of-window
-    /// ClientHello timestamps and bounds how long entries are retained for replay
-    /// detection (via `prune_expired`), so widening it is strictly safe.
+    /// Overrides the PAST/retention window (default [`DEFAULT_REPLAY_WINDOW_SECS`]).
+    /// This bound governs only how far in the PAST a ClientHello timestamp may be
+    /// and how long entries are retained for replay detection (via `prune_expired`);
+    /// the FUTURE bound is the fixed [`MAX_FUTURE_SKEW_SECS`] regardless of this
+    /// value (see `is_fresh`). Widening it is safe ONLY if the SAME window is also
+    /// used for the load-time prune — otherwise entries pruned at load would be
+    /// accepted at runtime, opening a post-restart replay gap; construct via
+    /// [`Self::load_or_create_authenticated_with_window`] to keep them consistent.
     pub fn with_window_secs(mut self, window_secs: u64) -> Self {
         self.window_secs = window_secs;
         self
@@ -148,6 +152,28 @@ impl ReplayCache {
         capacity: usize,
         key_material: &[u8],
     ) -> Result<Self, ReplayCacheError> {
+        Self::load_or_create_authenticated_with_window(
+            path,
+            capacity,
+            key_material,
+            DEFAULT_REPLAY_WINDOW_SECS,
+        )
+    }
+
+    /// Like [`load_or_create_authenticated`] but applies `window_secs` BEFORE the
+    /// load-time `prune_expired`. Critical: building the cache with the default
+    /// window and widening it afterwards prunes entries at load that the wider
+    /// runtime window would then ACCEPT — opening a replay-protection gap for the
+    /// `(now - window_secs, now - DEFAULT_REPLAY_WINDOW_SECS]` timestamp band
+    /// immediately after every restart (the persisted journal exists precisely to
+    /// survive restarts). Setting the window first keeps load-prune and runtime
+    /// retention consistent.
+    pub fn load_or_create_authenticated_with_window(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        key_material: &[u8],
+        window_secs: u64,
+    ) -> Result<Self, ReplayCacheError> {
         let path = path.as_ref().to_path_buf();
         let mac_key = cache_mac_key(key_material);
         let mut cache = Self {
@@ -158,7 +184,8 @@ impl ReplayCache {
                 tail_mac: [0_u8; 32],
             }),
             ..Self::new(capacity)
-        };
+        }
+        .with_window_secs(window_secs);
         if !path.exists() {
             return Ok(cache);
         }
@@ -1270,6 +1297,42 @@ mod tests {
         assert!(
             !loaded.insert_new(entry2, now).unwrap(),
             "entry2 recorded after retry"
+        );
+    }
+
+    #[test]
+    fn widened_window_retains_entries_across_reload_with_no_replay_gap() {
+        // Regression for the post-restart replay gap: building the cache with the
+        // default window and widening afterwards pruned entries at load that the
+        // wider runtime window then accepted. Loading WITH the wide window must
+        // retain them so a replay is still caught after a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-window-reload.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        // `now` from the real clock (prune uses the real clock internally). The
+        // entry is dated 300s in the past: inside a 720s window, outside the 120s
+        // default. 300s >> test runtime, so the few-ms drift is irrelevant.
+        let now = current_unix_timestamp().unwrap();
+        let entry = ReplayEntry {
+            timestamp: now - 300,
+            nonce: [9; 8],
+            transcript_fingerprint: [9; 32],
+        };
+
+        let mut cache =
+            ReplayCache::load_or_create_authenticated_with_window(&path, 8, key, 720).unwrap();
+        assert!(cache.insert_new(entry.clone(), now).unwrap());
+        drop(cache);
+
+        // Reload with the SAME wide window: the 300s-old entry must survive the
+        // load-time prune, so replaying it is caught as Replayed — not silently
+        // re-Inserted (which was the gap).
+        let mut reloaded =
+            ReplayCache::load_or_create_authenticated_with_window(&path, 8, key, 720).unwrap();
+        assert_eq!(
+            reloaded.insert_new_outcome(entry, now).unwrap(),
+            ReplayInsertOutcome::Replayed,
+            "a 300s-old entry must be retained by the wide-window load prune, not replayable",
         );
     }
 }

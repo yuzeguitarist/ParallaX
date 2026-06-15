@@ -381,12 +381,12 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
     let psk = Arc::new(psk);
     let replay_cache = Arc::new(Mutex::new(
-        ReplayCache::load_or_create_authenticated(
+        ReplayCache::load_or_create_authenticated_with_window(
             &server.replay_cache_path,
             server.replay_cache_capacity,
             &psk,
-        )?
-        .with_window_secs(replay_freshness_window_secs()),
+            replay_freshness_window_secs(),
+        )?,
     ));
     let secrets = ServerRuntimeSecrets::decode(&server)?;
     let listener = TcpListener::bind(server.listen).await?;
@@ -1945,7 +1945,22 @@ async fn run_authenticated_data_mode(
                         .await
                         {
                             Ok(Ok(())) => {}
-                            Ok(Err(err)) if is_write_peer_close(&err) => return Ok(()),
+                            Ok(Err(err)) if is_write_peer_close(&err) => {
+                                // The cover origin (fallback) closed; the client is
+                                // still live mid-camouflage and may have unread RX,
+                                // so drain->FIN both halves instead of a bare drop
+                                // (which would RST the client — the teardown tell we
+                                // avoid), matching the deadline arm below.
+                                let _ = err;
+                                graceful_close_pre_pq(
+                                    client_records,
+                                    client_write,
+                                    fallback_records,
+                                    fallback_write,
+                                )
+                                .await;
+                                return Ok(());
+                            }
                             Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
                             Err(_) => {
                                 tracing::debug!(
@@ -2022,7 +2037,20 @@ async fn run_authenticated_data_mode(
                 }
                 match timeout_at(pre_pq_deadline, client_write.write_all(&fallback_record)).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(err)) if is_write_peer_close(&err) => return Ok(()),
+                    Ok(Err(err)) if is_write_peer_close(&err) => {
+                        // The client closed; the fallback origin is still live, so
+                        // drain->FIN both halves instead of a bare drop (RST tell),
+                        // matching the deadline arm below.
+                        let _ = err;
+                        graceful_close_pre_pq(
+                            client_records,
+                            client_write,
+                            fallback_records,
+                            fallback_write,
+                        )
+                        .await;
+                        return Ok(());
+                    }
                     Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
                     Err(_) => {
                         tracing::debug!(
