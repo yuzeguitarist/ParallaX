@@ -143,16 +143,25 @@ if [ -n "${PLXFUZZ_PAT:-}" ]; then
 fi
 if [ ! -d "$SRC/.git" ]; then
   rm -rf "$SRC" 2>/dev/null || true
-  retry 3 10 sudo -u "$FUZZ_USER" -H git clone --depth 1 "$CLONE_URL" "$SRC" \
+  # Full single-branch clone (NOT --depth 1): the pinned commit is an ancestor
+  # of the default branch, and a shallow clone holds only the tip, so it could
+  # never check the pinned commit out. Single-branch keeps the unrelated codex/
+  # devin branches out while still carrying the default branch's full history.
+  retry 3 10 sudo -u "$FUZZ_USER" -H git clone --single-branch "$CLONE_URL" "$SRC" \
     || die "git clone failed"
 fi
-# Fetch + checkout the exact commit (shallow clone may not contain it yet).
+# Ensure the pinned commit is present. If $SRC is an older *shallow* clone from a
+# previous run, deepen it (--unshallow); a normal fetch covers the non-shallow
+# "object simply missing" case.
 if ! sudo -u "$FUZZ_USER" -H git -C "$SRC" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null; then
-  retry 3 10 sudo -u "$FUZZ_USER" -H git -C "$SRC" fetch --depth 1 "$CLONE_URL" "$PINNED_COMMIT" \
-    || warn "fetch of $PINNED_COMMIT failed; will try checkout anyway"
+  retry 3 10 sudo -u "$FUZZ_USER" -H git -C "$SRC" fetch --unshallow "$CLONE_URL" 2>/dev/null \
+    || retry 3 10 sudo -u "$FUZZ_USER" -H git -C "$SRC" fetch "$CLONE_URL" '+refs/heads/*:refs/remotes/origin/*' \
+    || warn "fetch to obtain $PINNED_COMMIT failed; checkout may fail"
 fi
+# Check out the exact pinned commit. git resolves the abbreviated SHA from local
+# objects once the history is present. No FETCH_HEAD fallback: that would risk
+# silently building a *different* commit than the campaign is pinned to.
 sudo -u "$FUZZ_USER" -H git -C "$SRC" checkout -q --detach "$PINNED_COMMIT" \
-  || sudo -u "$FUZZ_USER" -H git -C "$SRC" checkout -q --detach FETCH_HEAD \
   || die "could not check out $PINNED_COMMIT"
 ACTUAL="$(sudo -u "$FUZZ_USER" -H git -C "$SRC" rev-parse HEAD 2>/dev/null || true)"
 case "$ACTUAL" in
