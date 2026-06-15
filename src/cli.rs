@@ -126,6 +126,13 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 async fn handle_command(command: Command) -> anyhow::Result<()> {
+    // Disable core dumps / ptrace dumpability before any subcommand runs. The
+    // one-shot key-generating commands (Keygen, CryptoSelfTest, Init,
+    // ConfigTemplate) mint X25519/ML-KEM/ML-DSA secrets and a PSK; without this
+    // a crash mid-keygen could spill fresh private keys into a core file. The
+    // call is idempotent and best-effort, so the long-lived paths that also
+    // harden via prepare_long_lived_process() are unaffected.
+    process_hardening::harden_current_process();
     match command {
         Command::Check { config } => check_config(config)?,
         Command::Keygen => print_keypair(),
