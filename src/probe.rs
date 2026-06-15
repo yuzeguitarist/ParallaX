@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 use crate::{
     config::{Config, Mode},
     crypto::session::X25519KeyPair,
-    tls::safari26::Safari26TlsCamouflage,
+    tls::safari26::{Safari26TlsCamouflage, Safari26TlsError},
     transport::tcp::connect_tuned_tcp_host,
 };
 
@@ -180,7 +180,12 @@ pub fn target_from_config(config: &Config) -> Result<(ProbeTarget, String), Prob
                 .as_ref()
                 .ok_or(ProbeError::MissingConfigTarget)?;
             let target = ProbeTarget::parse(&client.sni)?;
-            Ok((target, client.sni.clone()))
+            // Use the parsed host (scheme/port/path stripped) as the TLS SNI,
+            // matching the Server arm. A `client.sni` of `host:port` would
+            // otherwise be handed verbatim to ServerName::try_from and rejected as
+            // invalid, producing a false TLS-FAIL verdict for a reachable host.
+            let sni = target.host.clone();
+            Ok((target, sni))
         }
     }
 }
@@ -342,7 +347,14 @@ async fn complete_tls_probe(
     OsRng.fill_bytes(probe_psk.as_mut_slice());
     let session = Safari26TlsCamouflage
         .start(sni.to_owned(), probe_psk.as_slice(), &server.public)
-        .map_err(|err| format!("Safari TLS client init failed: {err}"))?;
+        .map_err(|err| match err {
+            // Surface the dedicated, actionable SNI message instead of an opaque
+            // generic string (makes the otherwise-dead ProbeError variant reachable).
+            Safari26TlsError::InvalidServerName(name) => {
+                ProbeError::InvalidServerName(name).to_string()
+            }
+            other => format!("Safari TLS client init failed: {other}"),
+        })?;
     let started = Instant::now();
     let completed = timeout(deadline, session.complete(stream))
         .await
@@ -715,7 +727,9 @@ mod tests {
         let (target, sni) = target_from_config(&cfg).unwrap();
         assert_eq!(target.host, "camouflage.example");
         assert_eq!(target.port, 443);
-        assert_eq!(sni, "camouflage.example:443");
+        // The SNI is the parsed bare host, never the raw host:port (which rustls
+        // would reject as an invalid ServerName, yielding a false TLS-FAIL).
+        assert_eq!(sni, "camouflage.example");
     }
 
     #[test]

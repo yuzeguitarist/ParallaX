@@ -705,12 +705,12 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuth
     let session = Safari26TlsCamouflage.start(BENCH_SNI.to_owned(), BENCH_PSK, &server.public)?;
     let record = session.client_hello_bytes().to_vec();
     let parsed = parse_client_hello(&record)?;
-    let tls_key_share = parsed
-        .x25519_key_share
-        .expect("Safari26 ClientHello carries a standalone X25519 key_share");
+    let tls_key_share = parsed.x25519_key_share.ok_or_else(|| {
+        anyhow::anyhow!("Safari26 ClientHello carries a standalone X25519 key_share")
+    })?;
     let mask_ecdh = x25519_shared_secret(&server.private, &tls_key_share);
     let material = recover_stateful_auth_material(&record, BENCH_PSK, &mask_ecdh)?
-        .expect("Safari26 ClientHello must carry stateful auth material");
+        .ok_or_else(|| anyhow::anyhow!("Safari26 ClientHello must carry stateful auth material"))?;
     let server_auth = derive_server_auth_key(BENCH_PSK, &server.private, &material.x25519_public)?;
     Ok((record, server_auth, material))
 }
@@ -875,7 +875,10 @@ fn bench_client_speed_upload_seal_1mb(options: BenchmarkOptions) -> Result<Bench
                 written += sealed.len();
                 remaining -= len;
             }
-            Ok(black_box((written + SIZE_1M) as u64))
+            // Report the sealed wire bytes the seal actually produced (matching the
+            // other *_seal benches); do not also add the plaintext SIZE_1M, which
+            // double-counted the payload and made up/down throughput incomparable.
+            Ok(black_box(written as u64))
         },
     )
 }

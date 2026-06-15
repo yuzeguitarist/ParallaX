@@ -42,7 +42,7 @@ use crate::{
     },
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
-        DataRecordError, SealedRecord, QUIC_RELAY_DONE_MARKER,
+        DataRecordError, SealedRecord, QUIC_RELAY_DONE_MARKER, RELAY_IDLE_CLOSE_CODE,
     },
     tls::{
         record::{log_record_read, TlsRecordError, TlsRecordReader},
@@ -363,7 +363,13 @@ impl WarmSessionPool {
 
     async fn take_or_start(&self) -> ClientSessionTask {
         let mut warm = self.inner.lock().await;
-        let session = warm.pop_front().unwrap_or_else(|| self.spawn_session());
+        let session = match warm.pop_front() {
+            // A parked warm session may have died (RST / NAT blackhole) or its
+            // handshake may have failed while idle; validate it and transparently
+            // re-dial once if it is not a live, successful session.
+            Some(parked) => self.spawn_validated(parked),
+            None => self.spawn_session(),
+        };
         self.fill_locked(&mut warm);
         session
     }
@@ -402,6 +408,92 @@ impl WarmSessionPool {
             .await
         })
     }
+
+    /// Wraps a parked warm-session handle so the handle the caller awaits ALWAYS
+    /// resolves to a validated, live session or a genuinely-fresh dial. Fixes a
+    /// stale-cached handshake error (poison/abort -> re-dial) and a dead parked
+    /// socket (RST/blackhole -> re-dial) without changing the call site.
+    fn spawn_validated(&self, parked: ClientSessionTask) -> ClientSessionTask {
+        let config = Arc::clone(&self.config);
+        let server_addr = self.server_addr.clone();
+        let traffic = self.traffic;
+        let udp = Arc::clone(&self.udp);
+        let psk = Arc::clone(&self.psk);
+        let server_public = self.server_public;
+        let server_identity_public = Arc::clone(&self.server_identity_public);
+        tokio::spawn(async move {
+            // Propagate cancellation to the inner establishment task: if THIS
+            // wrapper is aborted (e.g. the caller's session_abort fires), abort the
+            // parked handshake too. A bare JoinHandle drop only DETACHES the inner
+            // task, leaving the full handshake running uncancelled.
+            let _abort_inner = AbortOnDrop(parked.abort_handle());
+            match parked.await {
+                Ok(Ok(session)) if warm_session_is_live(&session.0) => Ok(session),
+                // Poisoned handshake error, aborted/panicked task, or a dead parked
+                // socket: dial a genuinely fresh session instead of returning stale.
+                _ => {
+                    establish_authenticated_data_session_with_resolver(
+                        &server_addr,
+                        &config,
+                        traffic,
+                        &udp,
+                        psk.as_ref().as_slice(),
+                        &server_public,
+                        server_identity_public,
+                    )
+                    .await
+                }
+            }
+        })
+    }
+}
+
+/// Aborts a tokio task when dropped, so cancelling a wrapper task propagates the
+/// cancellation to the task it is awaiting instead of detaching it.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Non-destructively probes whether a parked warm TCP session is still alive via
+/// a 1-byte `MSG_PEEK`: a healthy idle session has no pending pre-Connect bytes,
+/// so this never consumes real data. `> 0` => live (bytes peeked); `0` => dead
+/// (clean EOF); `< 0` with `EWOULDBLOCK`/`EAGAIN` => live (idle, the normal warm
+/// case); any other errno (e.g. `ECONNRESET`) => dead.
+#[cfg(unix)]
+fn warm_session_is_live(stream: &TcpStream) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut byte = [0_u8; 1];
+    // SAFETY: recv with MSG_PEEK|MSG_DONTWAIT on a valid borrowed fd into a local
+    // buffer; non-destructive (peek) and non-blocking.
+    let rc = unsafe {
+        libc::recv(
+            fd,
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if rc > 0 {
+        return true;
+    }
+    if rc == 0 {
+        return false;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+    )
+}
+
+#[cfg(not(unix))]
+fn warm_session_is_live(_stream: &TcpStream) -> bool {
+    true
 }
 
 /// State of the shared mux session, used to single-flight establishment WITHOUT
@@ -477,6 +569,7 @@ enum ClientStreamControl {
     Deregister(u32),
 }
 
+#[derive(Clone, Copy)]
 enum DownloadOutcome {
     Fin,
     Reset,
@@ -722,6 +815,14 @@ async fn handle_local_mux_connection_with_cid(
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client mux reader is gone").into());
     }
     if let Err(err) = mux.frame_tx.send(open_frame).await {
+        // Register succeeded but the Open frame never reached the server:
+        // deregister the just-registered stream so the reader drops its cached
+        // write half + outcome_tx instead of leaking them (no Fin/Reset will ever
+        // arrive for a stream the server never saw).
+        let _ = mux
+            .register_tx
+            .send(ClientStreamControl::Deregister(stream_id))
+            .await;
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into());
     }
 
@@ -1622,7 +1723,7 @@ impl ClientRelay {
             };
             match relay_outcome {
                 None => {
-                    conn.close(0u32.into(), b"relay-idle");
+                    conn.close(RELAY_IDLE_CLOSE_CODE.into(), b"relay-idle");
                     Ok(())
                 }
                 Some(Ok((mut seal_to_server, mut open_from_server))) => {
@@ -1639,6 +1740,15 @@ impl ClientRelay {
                     result
                 }
                 Some(Err(err)) => {
+                    // If the server's idle watchdog fired first, the relay error
+                    // here is a benign mutual idle teardown — recognize it and
+                    // return Ok instead of a spurious error, so an operator may
+                    // tighten the server idle floor without the client reporting a
+                    // failure. The close is an idempotent no-op (peer already closed).
+                    if is_peer_idle_close(&conn) {
+                        conn.close(RELAY_IDLE_CLOSE_CODE.into(), b"relay-idle");
+                        return Ok(());
+                    }
                     conn.close(0u32.into(), b"relay-error");
                     Err(err)
                 }
@@ -1726,11 +1836,28 @@ async fn client_exchange_quic_done(
     let done = seal_to_server
         .seal(QUIC_RELAY_DONE_MARKER, &mut OsRng)
         .map_err(ClientHandshakeError::from)?;
-    server_write
-        .write_all(&done)
-        .await
-        .map_err(ClientRuntimeError::Io)?;
-    server_write.flush().await.map_err(ClientRuntimeError::Io)?;
+    // Bound the DONE write+flush with the same backstop as the DONE read below: a
+    // peer that stops reading the reliable TCP control stream during teardown must
+    // not pin the slot/fds forever.
+    match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, async {
+        server_write
+            .write_all(&done)
+            .await
+            .map_err(ClientRuntimeError::Io)?;
+        server_write.flush().await.map_err(ClientRuntimeError::Io)?;
+        Ok::<(), ClientRuntimeError>(())
+    })
+    .await
+    {
+        Ok(res) => res?,
+        Err(_) => {
+            tracing::warn!(cid, "QUIC fast-plane teardown DONE write backstop elapsed");
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC fast-plane teardown DONE write backstop elapsed",
+            )));
+        }
+    }
 
     // Read exactly ONE record (the server's DONE) over the TCP control stream.
     // The read is bounded on CONNECTION LIVENESS, not a wall clock: we `select!`
@@ -2071,7 +2198,8 @@ where
                     Ok(inner) => inner,
                     Err(_) => {
                         tracing::debug!(cid, "client mux idle backstop reached; tearing down session");
-                        shutdown_client_download_streams(&mut local_writes).await;
+                        shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin)
+                            .await;
                         return Ok(());
                     }
                 },
@@ -2080,11 +2208,11 @@ where
         match read_result {
             Ok(()) => {}
             Err(err) if server_records.is_clean_close(&err) => {
-                shutdown_client_download_streams(&mut local_writes).await;
+                shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin).await;
                 return Ok(());
             }
             Err(err) => {
-                shutdown_client_download_streams(&mut local_writes).await;
+                shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset).await;
                 return Err(ClientRuntimeError::Io(err));
             }
         }
@@ -2132,38 +2260,52 @@ where
             apply_client_stream_control(&mut local_writes, control).await;
         }
 
-        let frames_payload: &[u8] = if record_count == 1 {
-            let payload = open_from_server
-                .open_in_place_payload_range(&mut server_record)
-                .map_err(ClientHandshakeError::from)?;
-            &server_record[payload]
-        } else {
-            // Frames never span records (the sender keeps records
-            // frame-aligned), so decoding the concatenated plaintext is
-            // equivalent to decoding each record's plaintext in order.
-            batch_plaintext.clear();
-            let payload_bytes =
-                batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
-            if should_parallelize_aead(record_count, payload_bytes) {
-                open_from_server
-                    .open_concat_records_parallel(
-                        parallel::global(),
-                        &batch_records,
-                        &mut batch_plaintext,
-                    )
+        // Open + dispatch the batch. Any AEAD-open, decode, or dispatch error
+        // here (e.g. an on-path byte-flip surfacing as DataRecordError::Aead, or a
+        // codec desync) must signal each in-flight stream a Reset, exactly like the
+        // hard read-error arm above — otherwise dropping `local_writes` drops every
+        // outcome_tx, which client_mux_await_download maps to Ok(()) and delivers a
+        // truncated download to the local app as a clean, complete response.
+        let processed: Result<(), ClientRuntimeError> = async {
+            let frames_payload: &[u8] = if record_count == 1 {
+                let payload = open_from_server
+                    .open_in_place_payload_range(&mut server_record)
                     .map_err(ClientHandshakeError::from)?;
+                &server_record[payload]
             } else {
-                open_from_server
-                    .open_concat_records(&mut batch_records, &mut batch_plaintext)
-                    .map_err(ClientHandshakeError::from)?;
+                // Frames never span records (the sender keeps records
+                // frame-aligned), so decoding the concatenated plaintext is
+                // equivalent to decoding each record's plaintext in order.
+                batch_plaintext.clear();
+                let payload_bytes =
+                    batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
+                if should_parallelize_aead(record_count, payload_bytes) {
+                    open_from_server
+                        .open_concat_records_parallel(
+                            parallel::global(),
+                            &batch_records,
+                            &mut batch_plaintext,
+                        )
+                        .map_err(ClientHandshakeError::from)?;
+                } else {
+                    open_from_server
+                        .open_concat_records(&mut batch_records, &mut batch_plaintext)
+                        .map_err(ClientHandshakeError::from)?;
+                }
+                batch_plaintext.as_slice()
+            };
+            let mut frames = frames_payload;
+            while !frames.is_empty() {
+                let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
+                dispatch_client_mux_frame(&mut local_writes, frame, cid).await?;
+                frames = &frames[used..];
             }
-            batch_plaintext.as_slice()
-        };
-        let mut frames = frames_payload;
-        while !frames.is_empty() {
-            let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-            dispatch_client_mux_frame(&mut local_writes, frame, cid).await?;
-            frames = &frames[used..];
+            Ok::<(), ClientRuntimeError>(())
+        }
+        .await;
+        if let Err(err) = processed {
+            shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset).await;
+            return Err(err);
         }
     }
 }
@@ -2231,11 +2373,18 @@ async fn dispatch_client_mux_frame(
     Ok(())
 }
 
-/// Closes every download half when the session ends. Dropping each one-shot
-/// sender signals the waiting per-connection task that the download finished.
-async fn shutdown_client_download_streams(local_writes: &mut HashMap<u32, ClientDownloadStream>) {
+/// Closes every download half when the session ends, signaling each waiting
+/// per-connection task the REASON explicitly: a clean close sends Fin (graceful
+/// EOF) while a hard session error sends Reset, so the local app sees a
+/// connection error instead of a truncated response delivered as success. (The
+/// old behavior relied on dropping the sender, which always mapped to a clean Fin.)
+async fn shutdown_client_download_streams(
+    local_writes: &mut HashMap<u32, ClientDownloadStream>,
+    outcome: DownloadOutcome,
+) {
     for (_, mut stream) in local_writes.drain() {
         let _ = stream.write.shutdown().await;
+        let _ = stream.outcome_tx.send(outcome);
     }
 }
 
@@ -2591,6 +2740,14 @@ fn log_outer_write(
             "outer TLS record write"
         );
     }
+}
+
+/// True iff the QUIC connection was closed by the peer with the agreed
+/// [`RELAY_IDLE_CLOSE_CODE`] (the server's idle watchdog fired first). Lets the
+/// client treat that as a benign mutual idle teardown (Ok) instead of a relay
+/// error, so a tightened server idle floor does not surface as client failures.
+fn is_peer_idle_close(conn: &quinn::Connection) -> bool {
+    crate::protocol::data::is_relay_idle_close_reason(conn.close_reason().as_ref())
 }
 
 #[allow(dead_code)]

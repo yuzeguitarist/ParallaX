@@ -253,11 +253,10 @@ where
     ensure_state_dir(dir)?;
     let registry_path = dir.join("registry.lock");
     let registry = open_lock_file(&registry_path)?;
-    if !try_lock_file(&registry)? {
-        return Err(RuntimeGuardError::InvalidMetadata(
-            "runtime registry is locked by another process but did not block correctly".to_owned(),
-        ));
-    }
+    // Block on the registry mutex so concurrent `plx` launches serialize through
+    // the read-active / check-conflict / create-lock critical section instead of
+    // fail-fasting. The per-instance and liveness locks below stay non-blocking.
+    lock_file_blocking(&registry)?;
 
     let active = active_instances(dir)?;
     if let Some(conflict) = conflict(&active, &instance) {
@@ -300,14 +299,43 @@ fn active_instances(dir: &Path) -> Result<Vec<RuntimeInstance>, RuntimeGuardErro
         let mut file = open_lock_file(&path)?;
         if try_lock_file(&file)? {
             unlock_file(&file)?;
-            fs::remove_file(&path)?;
+            // Tolerate a concurrent reclaim/exit: another process's guard may have
+            // dropped (removing its own file) in the window between our try_lock and
+            // this remove. NotFound just means the reclaim already happened.
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
             continue;
         }
 
         let mut raw = String::new();
         file.seek(SeekFrom::Start(0))?;
-        file.read_to_string(&mut raw)?;
-        active.push(RuntimeInstance::decode(&raw)?);
+        // A LIVE peer whose lock file this binary cannot read/decode (a newer plx
+        // version with an extra field, or non-UTF-8) must not wedge every
+        // acquisition. Skip-and-warn instead: dropping one unrecognized peer from
+        // advisory conflict detection is safer than aborting startup — or than
+        // risking a wrong conflict from a partially-decoded forward-version peer.
+        if let Err(err) = file.read_to_string(&mut raw) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "skipping unreadable live runtime lock file"
+            );
+            continue;
+        }
+        match RuntimeInstance::decode(&raw) {
+            Ok(instance) => active.push(instance),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "skipping undecodable live runtime lock file"
+                );
+                continue;
+            }
+        }
     }
     Ok(active)
 }
@@ -378,6 +406,34 @@ fn try_lock_file(file: &File) -> io::Result<bool> {
 
 #[cfg(not(unix))]
 fn try_lock_file(_file: &File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "runtime guard requires Unix file locking",
+    ))
+}
+
+/// Blocking exclusive flock for the registry mutex: callers WAIT for the short
+/// critical section instead of fail-fasting on contention.
+#[cfg(unix)]
+fn lock_file_blocking(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        // SAFETY: flock only operates on the valid file descriptor borrowed from File.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file_blocking(_file: &File) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "runtime guard requires Unix file locking",
@@ -621,5 +677,69 @@ mod tests {
             client_config_fingerprint(alt.client.as_ref().unwrap()),
             base_id
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_blocks_then_serializes_instead_of_erroring() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Eight racing acquisitions of DISTINCT clients (which never conflict) into
+        // one shared state dir. The registry mutex must serialize them; none may
+        // fail with the old "did not block correctly" InvalidMetadata.
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let dir = Arc::clone(&dir);
+            handles.push(thread::spawn(move || {
+                let cfg = config(&format!("203.0.113.{i}:443"));
+                RuntimeGuard::acquire_client_in_dir(&cfg, dir.path())
+            }));
+        }
+        // Hold every guard until all threads have joined: distinct clients never
+        // conflict, so all eight coexisting proves the registry mutex serialized
+        // the critical sections, while keeping the guards alive avoids a guard's
+        // Drop-time lock-file removal racing another thread's reclaim.
+        let mut guards = Vec::new();
+        for handle in handles {
+            let result = handle.join().expect("acquire thread panicked");
+            assert!(
+                result.is_ok(),
+                "concurrent acquisition must serialize, got {result:?}"
+            );
+            guards.push(result.unwrap());
+        }
+        assert_eq!(guards.len(), 8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unparseable_live_peer_does_not_wedge_acquire() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        // A live peer whose lock file carries a forward-incompatible extra key
+        // (a newer plx version). Valid naming so it passes the directory filters.
+        let peer_path = dir.path().join("client-999999-deadbeefcafe.lock");
+        let mut peer = open_lock_file(&peer_path).unwrap();
+        let contents = "role=client\npid=999999\nconfig_id=deadbeefcafe\n\
+                        server_addr=203.0.113.9:443\nstarted_at=1234567890\n";
+        peer.write_all(contents.as_bytes()).unwrap();
+        peer.sync_data().unwrap();
+        // Hold an exclusive lock so active_instances sees a live peer it cannot
+        // reclaim and must read+decode (decode rejects the unknown `started_at`).
+        assert!(try_lock_file(&peer).unwrap());
+
+        // Acquisition must succeed by skipping the undecodable live peer rather
+        // than aborting every launch with InvalidMetadata.
+        let cfg = config("203.0.113.10:443");
+        let guard = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path());
+        assert!(
+            guard.is_ok(),
+            "an unparseable live peer must not wedge acquisition, got {guard:?}"
+        );
+
+        drop(peer);
     }
 }

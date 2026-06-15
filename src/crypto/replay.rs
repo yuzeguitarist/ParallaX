@@ -112,6 +112,19 @@ impl ReplayCache {
         }
     }
 
+    /// Overrides the PAST/retention window (default [`DEFAULT_REPLAY_WINDOW_SECS`]).
+    /// This bound governs only how far in the PAST a ClientHello timestamp may be
+    /// and how long entries are retained for replay detection (via `prune_expired`);
+    /// the FUTURE bound is the fixed [`MAX_FUTURE_SKEW_SECS`] regardless of this
+    /// value (see `is_fresh`). Widening it is safe ONLY if the SAME window is also
+    /// used for the load-time prune — otherwise entries pruned at load would be
+    /// accepted at runtime, opening a post-restart replay gap; construct via
+    /// [`Self::load_or_create_authenticated_with_window`] to keep them consistent.
+    pub fn with_window_secs(mut self, window_secs: u64) -> Self {
+        self.window_secs = window_secs;
+        self
+    }
+
     pub fn load_or_create(
         path: impl AsRef<Path>,
         capacity: usize,
@@ -139,6 +152,28 @@ impl ReplayCache {
         capacity: usize,
         key_material: &[u8],
     ) -> Result<Self, ReplayCacheError> {
+        Self::load_or_create_authenticated_with_window(
+            path,
+            capacity,
+            key_material,
+            DEFAULT_REPLAY_WINDOW_SECS,
+        )
+    }
+
+    /// Like [`load_or_create_authenticated`] but applies `window_secs` BEFORE the
+    /// load-time `prune_expired`. Critical: building the cache with the default
+    /// window and widening it afterwards prunes entries at load that the wider
+    /// runtime window would then ACCEPT — opening a replay-protection gap for the
+    /// `(now - window_secs, now - DEFAULT_REPLAY_WINDOW_SECS]` timestamp band
+    /// immediately after every restart (the persisted journal exists precisely to
+    /// survive restarts). Setting the window first keeps load-prune and runtime
+    /// retention consistent.
+    pub fn load_or_create_authenticated_with_window(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        key_material: &[u8],
+        window_secs: u64,
+    ) -> Result<Self, ReplayCacheError> {
         let path = path.as_ref().to_path_buf();
         let mac_key = cache_mac_key(key_material);
         let mut cache = Self {
@@ -149,12 +184,22 @@ impl ReplayCache {
                 tail_mac: [0_u8; 32],
             }),
             ..Self::new(capacity)
-        };
+        }
+        .with_window_secs(window_secs);
         if !path.exists() {
             return Ok(cache);
         }
 
         let raw = fs::read_to_string(&path)?;
+        // A crash during the FIRST append can materialize a 0-byte (or, via a
+        // partial write, whitespace-only) file before the empty header is written
+        // and synced. Treat that the same as "no file": a fresh, empty, loadable
+        // journal (auth_journal is already count=0). The header-only crash variant
+        // is healed by the count=0 parse below; this covers the pre-header window.
+        // The next insert_new -> persist_authenticated rewrites the empty header.
+        if raw.trim().is_empty() {
+            return Ok(cache);
+        }
         let mac_key_owned = cache.mac_key.clone().expect("authenticated cache has key");
         let (entries, journal, has_uncommitted_tail) =
             parse_authenticated_journal_entries(&raw, &mac_key_owned)?;
@@ -213,8 +258,19 @@ impl ReplayCache {
             return Ok(ReplayInsertOutcome::CacheFull);
         }
 
+        let nonce = entry.nonce;
+        let transcript = entry.transcript_fingerprint;
         self.push_loaded_entry(entry);
-        self.persist()?;
+        if let Err(err) = self.persist() {
+            // Roll back the in-memory mutation for THIS entry so memory tracks
+            // durable state exactly: a legitimate retry can re-insert (no false
+            // Replayed), and no later append skips an entry that was never written.
+            if self.pop_pushed_entry().is_some() {
+                self.nonces.remove(&nonce);
+                self.transcripts.remove(&transcript);
+            }
+            return Err(err);
+        }
         Ok(ReplayInsertOutcome::Inserted)
     }
 
@@ -239,6 +295,17 @@ impl ReplayCache {
         if let Some(encoded) = encoded {
             self.encoded_entries.push_back(encoded);
         }
+    }
+
+    /// Reverses exactly one [`push_loaded_entry`]: pops the just-pushed entry and,
+    /// in plain-on-disk mode, its encoded line. Used to roll back a staged insert
+    /// when `persist` fails so in-memory state never drifts ahead of the journal.
+    fn pop_pushed_entry(&mut self) -> Option<ReplayEntry> {
+        let entry = self.order.pop_back()?;
+        if self.path.is_some() && self.mac_key.is_none() {
+            self.encoded_entries.pop_back();
+        }
+        Some(entry)
     }
 
     fn prune_expired(&mut self, now: u64) {
@@ -302,17 +369,36 @@ impl ReplayCache {
             let empty_header = authenticated_journal_header(mac_key, 0, &[0_u8; 32]);
             file.write_all(empty_header.as_bytes())?;
         }
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(line.as_bytes())?;
-        // Make the appended entry durable BEFORE the header that will advertise
-        // it. Without this ordering a reordered/partial writeback could leave a
-        // header claiming count N+1 while entry N+1 is absent, which fails to load
-        // as a "truncated journal". The reverse (entry durable, header not) is
-        // healed on load by truncating the uncommitted tail.
-        file.sync_data()?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(next_header.as_bytes())?;
-        file.sync_data()?;
+        let committed_len = file.seek(SeekFrom::End(0))?;
+        // Append the entry, then rewrite the header. On a failed APPEND (the common
+        // ENOSPC/EIO case) truncate the file back to its last committed length so a
+        // half-written orphan line cannot desync the journal. NOTE: this is NOT
+        // fully crash-atomic for the in-place header rewrite — if the process dies
+        // (or the disk errors) DURING the header `write_all`/`sync_data` at offset
+        // 0, set_len(committed_len) removes only the trailing line, not a partially
+        // overwritten header, so a subsequent restart can still hit a MacMismatch.
+        // The append-failure rollback below is the guarantee; a torn header rewrite
+        // is a narrower residual (a robust fix would write via tmp-file + rename,
+        // like compact_authenticated_journal). committed_len is the empty-header
+        // length for a fresh file or the prior committed length otherwise.
+        let append_and_commit = |file: &mut fs::File| -> io::Result<()> {
+            file.write_all(line.as_bytes())?;
+            // Make the appended entry durable BEFORE the header that will advertise
+            // it. Without this ordering a reordered/partial writeback could leave a
+            // header claiming count N+1 while entry N+1 is absent, which fails to
+            // load as a "truncated journal". The reverse (entry durable, header
+            // not) is healed on load by truncating the uncommitted tail.
+            file.sync_data()?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(next_header.as_bytes())?;
+            file.sync_data()?;
+            Ok(())
+        };
+        if let Err(err) = append_and_commit(&mut file) {
+            let _ = file.set_len(committed_len);
+            let _ = file.sync_data();
+            return Err(err.into());
+        }
         self.auth_journal = Some(AuthJournalState {
             count: next_count,
             tail_mac: next_tail_mac,
@@ -821,6 +907,42 @@ mod tests {
     }
 
     #[test]
+    fn fresh_within_widened_window_commits() {
+        // A widened window (as the server derives from the pre-PQ deadline) must
+        // accept a commit whose gap exceeds the default 120s but is within the
+        // window, and still retain the entry for replay detection.
+        let mut cache = ReplayCache::new(8).with_window_secs(720);
+        let entry = ReplayEntry {
+            timestamp: 100,
+            nonce: [7; 8],
+            transcript_fingerprint: [8; 32],
+        };
+        // Gap of 605s: well past the old 120s window, inside the 720s one.
+        let now = 100 + 600 + 5;
+        assert_eq!(
+            cache.insert_new_outcome(entry.clone(), now).unwrap(),
+            ReplayInsertOutcome::Inserted,
+        );
+        // The widened window retains the entry (does not prune it early), so a
+        // replay of the same nonce/transcript at the same instant is caught.
+        assert_eq!(
+            cache.insert_new_outcome(entry, now).unwrap(),
+            ReplayInsertOutcome::Replayed,
+        );
+        // Sanity: the default-window cache would have rejected the same gap.
+        let mut default_cache = ReplayCache::new(8);
+        let same = ReplayEntry {
+            timestamp: 100,
+            nonce: [9; 8],
+            transcript_fingerprint: [10; 32],
+        };
+        assert_eq!(
+            default_cache.insert_new_outcome(same, now).unwrap(),
+            ReplayInsertOutcome::Stale,
+        );
+    }
+
+    #[test]
     fn fresh_entry_survives_capacity_pressure() {
         let mut cache = ReplayCache::new(2);
         let first = ReplayEntry {
@@ -1087,6 +1209,130 @@ mod tests {
         assert_eq!(
             cache.insert_new_outcome(skewed, now).unwrap(),
             ReplayInsertOutcome::Inserted,
+        );
+    }
+
+    #[test]
+    fn authenticated_cache_heals_empty_file_left_by_first_append_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-empty.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+
+        // A crash during the first append leaves the 0-byte file that create(true)
+        // materialized before the header was written. It must heal to a fresh
+        // journal, not refuse to load (pre-fix: MalformedLine "missing header").
+        fs::write(&path, b"").unwrap();
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key)
+            .expect("empty cache file must heal to a fresh journal, not error");
+
+        // The healed cache is functional and writes a valid header on first insert.
+        let entry = ReplayEntry {
+            timestamp: now,
+            nonce: [5; 8],
+            transcript_fingerprint: [6; 32],
+        };
+        assert!(cache.insert_new(entry.clone(), now).unwrap());
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with(AUTH_JOURNAL_VERSION));
+
+        // And it reloads cleanly with the entry recorded.
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!loaded.insert_new(entry, now).unwrap());
+
+        // A whitespace-only file (a partial write) heals the same way.
+        let ws_path = dir.path().join("replay-ws.cache");
+        fs::write(&ws_path, b"   \n").unwrap();
+        ReplayCache::load_or_create_authenticated(&ws_path, 8, key)
+            .expect("whitespace-only cache file must heal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_failure_rolls_back_in_memory_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-rollback.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let entry1 = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let entry2 = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(entry1.clone(), now).unwrap());
+
+        // Force the NEXT persist to fail at the OS level: make the journal file
+        // unwritable so open_cache_file_for_append(.write(true)) returns EACCES.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(matches!(
+            cache.insert_new_outcome(entry2.clone(), now),
+            Err(ReplayCacheError::Io(_))
+        ));
+
+        // Restore writability and retry the SAME entry. Pre-fix this returned
+        // Replayed (Ok(false)) because the nonce was left in memory after the
+        // failed persist; post-fix the rollback lets the legitimate retry insert.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            cache.insert_new(entry2.clone(), now).unwrap(),
+            "rolled-back entry must be re-insertable, not falsely Replayed"
+        );
+
+        // On-disk state is consistent: a fresh load sees both entries (no orphan,
+        // no lost entry), so the journal reloads cleanly with both recorded.
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(
+            !loaded.insert_new(entry1, now).unwrap(),
+            "entry1 still recorded"
+        );
+        assert!(
+            !loaded.insert_new(entry2, now).unwrap(),
+            "entry2 recorded after retry"
+        );
+    }
+
+    #[test]
+    fn widened_window_retains_entries_across_reload_with_no_replay_gap() {
+        // Regression for the post-restart replay gap: building the cache with the
+        // default window and widening afterwards pruned entries at load that the
+        // wider runtime window then accepted. Loading WITH the wide window must
+        // retain them so a replay is still caught after a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-window-reload.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        // `now` from the real clock (prune uses the real clock internally). The
+        // entry is dated 300s in the past: inside a 720s window, outside the 120s
+        // default. 300s >> test runtime, so the few-ms drift is irrelevant.
+        let now = current_unix_timestamp().unwrap();
+        let entry = ReplayEntry {
+            timestamp: now - 300,
+            nonce: [9; 8],
+            transcript_fingerprint: [9; 32],
+        };
+
+        let mut cache =
+            ReplayCache::load_or_create_authenticated_with_window(&path, 8, key, 720).unwrap();
+        assert!(cache.insert_new(entry.clone(), now).unwrap());
+        drop(cache);
+
+        // Reload with the SAME wide window: the 300s-old entry must survive the
+        // load-time prune, so replaying it is caught as Replayed — not silently
+        // re-Inserted (which was the gap).
+        let mut reloaded =
+            ReplayCache::load_or_create_authenticated_with_window(&path, 8, key, 720).unwrap();
+        assert_eq!(
+            reloaded.insert_new_outcome(entry, now).unwrap(),
+            ReplayInsertOutcome::Replayed,
+            "a 300s-old entry must be retained by the wide-window load prune, not replayable",
         );
     }
 }

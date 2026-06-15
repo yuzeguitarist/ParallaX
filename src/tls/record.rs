@@ -113,6 +113,13 @@ impl<R> TlsRecordReader<R> {
     pub fn into_inner(self) -> R {
         self.reader
     }
+
+    /// Mutable access to the underlying reader, for a caller that must interleave
+    /// a raw write on the same stream between record reads while holding this
+    /// long-lived reader. Bytes already buffered in the reader are preserved.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
 }
 
 impl<R> BufferedTlsRecordReader<R>
@@ -135,6 +142,16 @@ where
         let mut record = Vec::new();
         self.read_record_into(&mut record).await?;
         Ok(record)
+    }
+
+    /// True iff the reader has consumed zero bytes of a new record (no partial
+    /// header or payload buffered). A full record swap resets state to exactly
+    /// this with no await in between, so when a `read_record_into` future is
+    /// cancelled (e.g. by a timeout) this distinguishes a clean boundary — the
+    /// stream cursor is safe to hand off — from a half-read record that would
+    /// desync any subsequent reader.
+    pub fn at_record_boundary(&self) -> bool {
+        self.header_pos == 0 && self.payload_len.is_none()
     }
 
     pub async fn read_record_into(&mut self, out: &mut Vec<u8>) -> Result<(), std::io::Error> {
@@ -505,5 +522,74 @@ mod tests {
 
         let err = reader.read_record_into(&mut out).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn timeout_mid_record_preserves_buffered_bytes_on_reused_reader() {
+        use std::time::Duration;
+        // Regression for the cancel-safety bug: a timeout firing mid-record must
+        // NOT discard the bytes already pulled off the socket when the SAME reader
+        // is reused (the old throwaway-reader-per-call path lost them, desyncing
+        // the reused data-phase stream).
+        let first = wrap_application_data(b"hello world").unwrap();
+        let second = wrap_application_data(b"second").unwrap();
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let mut record_reader = TlsRecordReader::new(reader);
+        let mut out = Vec::new();
+
+        // Deliver only the header + a few payload bytes, then let a read consume
+        // them and block for the rest until the timeout fires.
+        writer.write_all(&first[..8]).await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            record_reader.read_record_into(&mut out),
+        )
+        .await
+        .is_err());
+        assert!(
+            !record_reader.at_record_boundary(),
+            "a timeout that consumed a partial record must report mid-record",
+        );
+
+        // Deliver the rest of the first record plus a full second record. The SAME
+        // reader resumes from its buffered state and yields the first record
+        // byte-for-byte — proving the pre-timeout bytes were preserved.
+        writer.write_all(&first[8..]).await.unwrap();
+        writer.write_all(&second).await.unwrap();
+        record_reader.read_record_into(&mut out).await.unwrap();
+        assert_eq!(
+            out, first,
+            "buffered bytes from before the timeout were lost"
+        );
+        assert!(record_reader.at_record_boundary());
+
+        // The stream is not desynced: the second record reads back intact.
+        record_reader.read_record_into(&mut out).await.unwrap();
+        assert_eq!(out, second);
+    }
+
+    #[tokio::test]
+    async fn timeout_at_boundary_reports_clean_boundary() {
+        use std::time::Duration;
+        // A fresh reader with nothing on the wire: a timeout leaves it exactly at
+        // a record boundary (the benign "no/slow record arrived" drain case), so
+        // the caller can safely stop without desyncing the stream.
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut record_reader = TlsRecordReader::new(reader);
+        let mut out = Vec::new();
+        assert!(record_reader.at_record_boundary());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            record_reader.read_record_into(&mut out),
+        )
+        .await
+        .is_err());
+        assert!(record_reader.at_record_boundary());
+
+        // And it still reads a subsequent record cleanly.
+        let rec = wrap_application_data(b"abc").unwrap();
+        writer.write_all(&rec).await.unwrap();
+        record_reader.read_record_into(&mut out).await.unwrap();
+        assert_eq!(out, rec);
     }
 }

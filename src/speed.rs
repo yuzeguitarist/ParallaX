@@ -420,7 +420,7 @@ async fn read_download_phase<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let start = Instant::now();
+    let mut start: Option<Instant> = None;
     let mut received = 0_u64;
     let mut record = Vec::new();
 
@@ -430,13 +430,17 @@ where
         if payload.is_empty() {
             continue;
         }
+        // Start the clock at the first real data byte, not before the request RTT,
+        // so the download window measures transfer time only (comparable to the
+        // upload window, which stops before its trailing ack RTT).
+        start.get_or_insert_with(Instant::now);
         let len = payload.len() as u64;
         if received + len > expected_bytes {
             return Err(SpeedError::TooManyBytes);
         }
         received += len;
     }
-    let elapsed = start.elapsed();
+    let elapsed = start.map(|s| s.elapsed()).unwrap_or_default();
 
     let ack = read_ack_from_records(records, data_session, expected_ack, expected_bytes).await?;
     if ack.bytes != received {
@@ -480,11 +484,14 @@ async fn write_upload_phase(
         remaining -= len as u64;
     }
     server.flush().await?;
+    // Stop the upload clock as soon as the last byte is on the wire — BEFORE the
+    // ack round-trip, which would otherwise count one RTT + ack decrypt as upload
+    // time and understate throughput.
+    let elapsed = start.elapsed();
 
     let mut ack_reader = TlsRecordReader::new(server);
     let ack =
         read_ack_from_records(&mut ack_reader, data_session, expected_ack, expected_bytes).await?;
-    let elapsed = start.elapsed();
     if ack.bytes != expected_bytes {
         return Err(SpeedError::ByteCountMismatch {
             expected: expected_bytes,

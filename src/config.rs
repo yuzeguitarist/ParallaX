@@ -12,7 +12,16 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub(crate) const DEFAULT_REPLAY_CACHE_PATH: &str = "/var/lib/parallax/parallax-replay.cache";
-pub(crate) const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 8192;
+/// Default authenticated-replay-cache capacity. Sized against the freshness
+/// window: entries are retained for `replay_freshness_window_secs()` (= the
+/// pre-PQ deadline + skew, ~720s with the default `fallback_idle_floor_ms`), so
+/// the cache fills at roughly `capacity / window` sustained handshakes/sec before
+/// it fail-CLOSES with `CacheFull` (sheds new handshakes — never a replay hole).
+/// 49152 / 720s ≈ 68 conn/s of headroom; this scales with the window so widening
+/// the pre-PQ deadline did not silently lower the throughput cliff. A busy shared
+/// bridge above that rate (or one that raises `fallback_idle_floor_ms` further)
+/// should raise `replay_cache_capacity` proportionally.
+pub(crate) const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 49152;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -57,6 +66,8 @@ pub enum ConfigError {
          every cover record is an identical-length beacon"
     )]
     CoverRequiresVariablePadding,
+    #[error("traffic.cover_min_interval_ms must be at least {min_ms} ms when cover traffic is enabled (cover_max_interval_ms > 0); near-zero intervals hot-spin the cover loop and emit a high-rate, fingerprintable beacon")]
+    CoverIntervalTooSmall { min_ms: u16 },
     #[error("traffic.max_concurrent_streams must be at least 1")]
     InvalidMaxConcurrentStreams,
     #[error("udp.probe_timeout_ms must be at least 1")]
@@ -80,6 +91,8 @@ pub enum ConfigError {
     InvalidSourceIpv6Prefix,
     #[error("server timeout floors must be at least 250ms")]
     InvalidTimeoutFloor,
+    #[error("server.first_record_wait_floor_ms must not exceed 300000ms (it is a short give-up backstop for the first client record, not the idle cap)")]
+    InvalidTimeoutCeiling,
     #[error("server.fallback_idle_floor_ms must be at least 5000ms (it resets on every byte; a tiny value closes active relays)")]
     InvalidIdleBackstop,
     #[error("server timeout jitter must not exceed 300000ms")]
@@ -100,6 +113,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub mode: Mode,
     pub crypto: CryptoConfig,
@@ -128,12 +142,14 @@ impl fmt::Display for Mode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CryptoConfig {
     /// Base64-encoded pre-shared secret. Require at least 32 bytes after decode.
     pub psk: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub listen: SocketAddr,
     pub server_addr: String,
@@ -145,6 +161,7 @@ pub struct ClientConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub fallback_addr: String,
@@ -205,6 +222,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TrafficConfig {
     #[serde(default)]
     pub min_padding: u16,
@@ -276,6 +294,7 @@ pub enum UdpFecProfile {
 /// one today is a no-op; the runtime logs a warning at startup so it is not
 /// mistaken for active.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UdpConfig {
     /// LIVE. Turn the experimental UDP/QUIC fast plane on (default off).
     #[serde(default)]
@@ -329,6 +348,14 @@ impl Default for UdpConfig {
 
 impl UdpConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // RESERVED/LIVE knobs only take effect when the plane is on; with
+        // `enabled = false` the runtime is byte-identical to TCP-only (see struct
+        // docs) and the startup reserved-knob warning is likewise gated on
+        // `enabled`, so skip validation entirely when off — a pre-staged but inert
+        // knob must not block startup.
+        if !self.enabled {
+            return Ok(());
+        }
         if self.probe_timeout_ms == 0 {
             return Err(ConfigError::InvalidUdpProbeTimeout);
         }
@@ -513,6 +540,14 @@ impl Config {
                 if server.first_record_wait_floor_ms < 250 {
                     return Err(ConfigError::InvalidTimeoutFloor);
                 }
+                // Cap the floor too: it is a short one-shot give-up for the first
+                // client record, not the idle backstop. 300000ms matches the jitter
+                // cap below, so floor + jitter stays within the deliberate 600s
+                // idle window and a fat-fingered value cannot pin a slot/fd for
+                // hours per silent connection.
+                if server.first_record_wait_floor_ms > 300_000 {
+                    return Err(ConfigError::InvalidTimeoutCeiling);
+                }
                 if server.fallback_idle_floor_ms < 5_000 {
                     return Err(ConfigError::InvalidIdleBackstop);
                 }
@@ -610,6 +645,20 @@ impl TrafficConfig {
         }
         if self.cover_max_interval_ms < self.cover_min_interval_ms {
             return Err(ConfigError::InvalidCoverIntervalRange);
+        }
+        // Floor the cover interval when cover is enabled. `sample_interval` draws
+        // `gen_range(min..=max)` ms and the loop re-arms a timer for that long, so
+        // a near-zero `cover_min_interval_ms` (e.g. 0) makes the cover loop spin at
+        // thousands of empty records/s — a CPU hog and a trivially fingerprintable
+        // high-rate beacon. 50ms caps the worst case at ~20 records/s, far below
+        // any realistic cover cadence. Bound the floor (`min`); the range check
+        // above then forces `max >= min >= 50` too. A fixed universal floor, no new
+        // knob.
+        const MIN_COVER_INTERVAL_MS: u16 = 50;
+        if self.cover_max_interval_ms > 0 && self.cover_min_interval_ms < MIN_COVER_INTERVAL_MS {
+            return Err(ConfigError::CoverIntervalTooSmall {
+                min_ms: MIN_COVER_INTERVAL_MS,
+            });
         }
         // If cover traffic is enabled it seals empty payloads whose record size
         // is driven entirely by the padding sampler. With a degenerate padding
@@ -1016,6 +1065,7 @@ ech = true
     #[test]
     fn rejects_zero_udp_probe_timeout() {
         let udp = UdpConfig {
+            enabled: true,
             probe_timeout_ms: 0,
             ..UdpConfig::default()
         };
@@ -1028,6 +1078,7 @@ ech = true
     #[test]
     fn rejects_brutal_without_declared_bandwidth() {
         let udp = UdpConfig {
+            enabled: true,
             cc: UdpCongestionControl::Brutal,
             ..UdpConfig::default()
         };
@@ -1040,6 +1091,7 @@ ech = true
     #[test]
     fn accepts_brutal_with_declared_bandwidth() {
         let udp = UdpConfig {
+            enabled: true,
             cc: UdpCongestionControl::Brutal,
             brutal_up_mbps: 50,
             brutal_down_mbps: 200,
@@ -1051,6 +1103,7 @@ ech = true
     #[test]
     fn accepts_brutal_when_ignoring_client_bandwidth() {
         let udp = UdpConfig {
+            enabled: true,
             cc: UdpCongestionControl::Brutal,
             ignore_client_bandwidth: true,
             ..UdpConfig::default()
@@ -1061,6 +1114,7 @@ ech = true
     #[test]
     fn rejects_brutal_with_partial_bandwidth() {
         let up_only = UdpConfig {
+            enabled: true,
             cc: UdpCongestionControl::Brutal,
             brutal_up_mbps: 50,
             brutal_down_mbps: 0,
@@ -1071,6 +1125,7 @@ ech = true
             ConfigError::UdpBrutalMissingBandwidth
         ));
         let down_only = UdpConfig {
+            enabled: true,
             cc: UdpCongestionControl::Brutal,
             brutal_up_mbps: 0,
             brutal_down_mbps: 200,
@@ -1085,6 +1140,7 @@ ech = true
     #[test]
     fn rejects_empty_masque_front() {
         let udp = UdpConfig {
+            enabled: true,
             masque_front: Some("  ".to_owned()),
             ..UdpConfig::default()
         };
@@ -1748,6 +1804,165 @@ first_record_wait_floor_ms = 100
             cfg.validate().unwrap_err(),
             ConfigError::InvalidTimeoutFloor
         ));
+    }
+
+    #[test]
+    fn server_validate_rejects_excessive_first_record_floor() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let make = |floor: u64| {
+            format!(
+                r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+first_record_wait_floor_ms = {floor}
+"#
+            )
+        };
+        // Above the 300_000ms ceiling: rejected.
+        let cfg = toml::from_str::<Config>(&make(400_000)).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidTimeoutCeiling
+        ));
+        // Exactly at the ceiling: accepted (guards > vs >=).
+        let cfg = toml::from_str::<Config>(&make(300_000)).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        // A misspelled safety key under [server] must now hard-fail at parse
+        // (deny_unknown_fields) instead of being silently dropped to the default.
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+max_pading = 1500
+"#
+        );
+        let err = toml::from_str::<Config>(&raw).unwrap_err();
+        assert!(
+            err.to_string().contains("max_pading"),
+            "error should name the unknown key, got: {err}"
+        );
+
+        // Same for the highest-stakes struct: a typo'd padding key under [traffic].
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{KEY}"
+
+[traffic]
+max_padd = 1500
+"#
+        );
+        let err = toml::from_str::<Config>(&raw).unwrap_err();
+        assert!(
+            err.to_string().contains("max_padd"),
+            "error should name the unknown traffic key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn udp_validate_skips_reserved_checks_when_disabled() {
+        // Every individual rule deliberately violated, but the plane is OFF: the
+        // disabled guard short-circuits all checks, matching the documented
+        // "byte-identical to TCP-only" contract.
+        let disabled = UdpConfig {
+            enabled: false,
+            cc: UdpCongestionControl::Brutal,
+            brutal_up_mbps: 0,
+            brutal_down_mbps: 0,
+            probe_timeout_ms: 0,
+            masque_front: Some("  ".to_owned()),
+            ..UdpConfig::default()
+        };
+        disabled.validate().unwrap();
+
+        // The same struct with the plane ON is rejected by the first check, proving
+        // the guard does not mask validation when UDP is live.
+        let enabled = UdpConfig {
+            enabled: true,
+            ..disabled
+        };
+        assert!(matches!(
+            enabled.validate().unwrap_err(),
+            ConfigError::InvalidUdpProbeTimeout
+        ));
+    }
+
+    #[test]
+    fn rejects_near_zero_cover_interval() {
+        // The exact footgun: cover enabled with a near-zero floor hot-spins the
+        // cover loop. Variable padding so it passes the CoverRequiresVariablePadding
+        // gate and reaches the interval-floor check.
+        let footgun = TrafficConfig {
+            cover_min_interval_ms: 0,
+            cover_max_interval_ms: 1,
+            min_padding: 0,
+            max_padding: 64,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            footgun.validate().unwrap_err(),
+            ConfigError::CoverIntervalTooSmall { .. }
+        ));
+        // Just below the 50ms floor is still rejected (pins the boundary).
+        let just_under = TrafficConfig {
+            cover_min_interval_ms: 49,
+            cover_max_interval_ms: 100,
+            min_padding: 0,
+            max_padding: 64,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            just_under.validate().unwrap_err(),
+            ConfigError::CoverIntervalTooSmall { .. }
+        ));
+        // Smallest accepted enabled config validates.
+        let ok = TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 200,
+            min_padding: 0,
+            max_padding: 256,
+            ..TrafficConfig::default()
+        };
+        ok.validate().unwrap();
+        // Disabled cover (both 0) is unaffected by the floor.
+        let disabled = TrafficConfig {
+            cover_min_interval_ms: 0,
+            cover_max_interval_ms: 0,
+            ..TrafficConfig::default()
+        };
+        disabled.validate().unwrap();
     }
 
     #[test]

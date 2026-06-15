@@ -60,10 +60,15 @@ pub fn exclude_transient_from_core_dump(label: &'static str, bytes: &[u8]) {
 
 fn transient_plaintext_hardening_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var(HARDEN_TRANSIENT_ENV)
-            .is_ok_and(|value| transient_plaintext_setting_enabled(&value))
-    })
+    *ENABLED
+        .get_or_init(|| transient_plaintext_setting_from_env(std::env::var(HARDEN_TRANSIENT_ENV)))
+}
+
+/// Pure decision for the transient-hardening toggle: an absent var is off, a
+/// present var is truthy per [`transient_plaintext_setting_enabled`]. Extracted
+/// so it can be tested with synthesized inputs (no ambient env / global state).
+fn transient_plaintext_setting_from_env(value: Result<String, std::env::VarError>) -> bool {
+    value.is_ok_and(|value| transient_plaintext_setting_enabled(&value))
 }
 
 fn transient_plaintext_setting_enabled(value: &str) -> bool {
@@ -188,8 +193,8 @@ fn page_aligned_range_with_size(
 #[cfg(test)]
 mod tests {
     use super::{
-        page_aligned_range_with_size, transient_plaintext_hardening_enabled,
-        transient_plaintext_setting_enabled,
+        page_aligned_range_with_size, transient_plaintext_setting_enabled,
+        transient_plaintext_setting_from_env,
     };
 
     #[test]
@@ -225,6 +230,11 @@ mod tests {
 
     #[test]
     fn transient_plaintext_setting_defaults_off() {
-        assert!(!transient_plaintext_hardening_enabled());
+        // Absent var (the real default) is off regardless of any ambient value; a
+        // present-but-empty var is off too. Pure inputs, no process-global state.
+        assert!(!transient_plaintext_setting_from_env(Err(
+            std::env::VarError::NotPresent
+        )));
+        assert!(!transient_plaintext_setting_from_env(Ok(String::new())));
     }
 }

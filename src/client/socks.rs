@@ -34,6 +34,8 @@ pub enum SocksError {
     UnsupportedAddressType(u8),
     #[error("SOCKS domain name is empty")]
     EmptyDomain,
+    #[error("SOCKS domain name is not valid UTF-8")]
+    InvalidDomain,
     #[error("SOCKS target port must not be zero")]
     ZeroPort,
 }
@@ -101,7 +103,10 @@ where
             }
             let mut domain = vec![0_u8; len];
             stream.read_exact(&mut domain).await?;
-            String::from_utf8_lossy(&domain).into_owned()
+            // Reject non-UTF-8 domains at the SOCKS boundary instead of lossily
+            // substituting U+FFFD: the server decodes the host strictly, so a
+            // lossy rewrite here would forward a different host than the app sent.
+            String::from_utf8(domain).map_err(|_| SocksError::InvalidDomain)?
         }
         4 => {
             let raw = stream.read_u128().await?;
@@ -160,6 +165,29 @@ mod tests {
                 host: "example.com".to_owned(),
                 port: 443
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_utf8_domain() {
+        let (mut client, mut server) = duplex(128);
+        let task = tokio::spawn(async move { accept_connect(&mut server).await });
+
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+
+        // ATYP=3, len=3, domain = 0xFF 0xFE 0xFD (not valid UTF-8), port 443.
+        client
+            .write_all(&[5, 1, 0, 3, 3, 0xFF, 0xFE, 0xFD, 1, 187])
+            .await
+            .unwrap();
+
+        let result = task.await.unwrap();
+        assert!(
+            matches!(result, Err(SocksError::InvalidDomain)),
+            "non-UTF-8 domain must be rejected at the SOCKS boundary, got {result:?}"
         );
     }
 
