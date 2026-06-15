@@ -60,6 +60,23 @@ pub(crate) trait LegReader: Send {
 /// them into datagrams.
 pub(crate) trait LegWriter: Send {
     fn write_records(&mut self, bytes: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Writes `bytes` (one or more concatenated sealed records) whose FIRST record
+    /// has sequence `base_seq`; the records that follow are `base_seq + 1, + 2, …`
+    /// in order. The default IGNORES `base_seq` and forwards to
+    /// [`Self::write_records`]: a byte-stream carrier (TCP, QUIC reliable stream) is
+    /// implicitly ordered, so it needs no per-record sequence. The datagram carrier
+    /// OVERRIDES this to envelope each record with its seq for reorder + FEC, where
+    /// order is not implicit. Relay write sites call this (not `write_records`) so
+    /// the datagram carrier can be dropped in without touching them.
+    fn write_records_seq(
+        &mut self,
+        _base_seq: u64,
+        bytes: &[u8],
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        self.write_records(bytes)
+    }
+
     fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 

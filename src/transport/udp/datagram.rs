@@ -26,8 +26,15 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
 
 use crate::tls::record;
+use crate::transport::leg::{LegReader, LegWriter};
 
 use super::envelope::{self, EnvelopeError};
 use super::fec::{FecError, RsFec};
@@ -109,6 +116,12 @@ impl DatagramSender {
         })
     }
 
+    /// One past the last seq pushed so far — the download-FIN count the writer
+    /// sends so the receiver knows when the stream is complete.
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
     /// Push one sealed record (its seq MUST be the sender's `next_seq`). Returns the
     /// datagrams to send: always the source datagram, plus `FEC_R` repair datagrams
     /// when this record completes a window.
@@ -173,6 +186,11 @@ pub(crate) struct DatagramReceiver {
     ready: VecDeque<Vec<u8>>,
     /// One past the highest source seq ever seen (drives unrecoverability).
     high_water: u64,
+    /// One past the last source seq the sender will ever send (the download-FIN
+    /// count), set via [`Self::set_final_seq`] once the reliable FIN arrives. While
+    /// `None`, every window is a full `FEC_K` window. Once set, the window that
+    /// would extend past it is the FINAL partial window (delivered without FEC).
+    final_seq: Option<u64>,
     max_pending_records: usize,
     max_pending_bytes: usize,
 }
@@ -200,6 +218,7 @@ impl DatagramReceiver {
             repairs: BTreeMap::new(),
             ready: VecDeque::new(),
             high_water: start_seq,
+            final_seq: None,
             max_pending_records,
             max_pending_bytes,
         })
@@ -280,6 +299,36 @@ impl DatagramReceiver {
     fn try_complete(&mut self) -> Result<(), DatagramError> {
         loop {
             let base = self.next_window_base;
+            // All sources delivered up to the (now-known) final count: done.
+            if self.final_seq.is_some_and(|fin| base >= fin) {
+                break;
+            }
+            // The FINAL partial window — the one that would extend strictly past the
+            // final count — carries < FEC_K sources and NO FEC (the sender only
+            // emits repairs for FULL windows). Deliver it only once every one of its
+            // sources is present; otherwise wait (the leg applies a post-FIN
+            // deadline and resets if a tail source never arrives). A full final
+            // window (base + K == fin) falls through to the normal FEC path.
+            if let Some(fin) = self.final_seq {
+                if base + FEC_K as u64 > fin {
+                    let expected = (fin - base) as usize;
+                    let present = (0..expected as u64)
+                        .filter(|j| self.pending.contains_key(&(base + j)))
+                        .count();
+                    if present == expected {
+                        for j in 0..expected as u64 {
+                            let rec = self.pending.remove(&(base + j)).expect("present checked");
+                            self.pending_bytes -= rec.len();
+                            self.ready.push_back(rec);
+                        }
+                        self.drop_window_repairs(base);
+                        self.next_window_base = fin;
+                        continue;
+                    }
+                    break; // tail not yet complete; leg's post-FIN deadline decides
+                }
+            }
+
             let present_sources = (0..FEC_K as u64)
                 .filter(|j| self.pending.contains_key(&(base + j)))
                 .count();
@@ -298,6 +347,22 @@ impl DatagramReceiver {
             }
         }
         Ok(())
+    }
+
+    /// Record the download-FIN count (one past the last source seq the sender will
+    /// send), then deliver any window that became completable. After this,
+    /// [`Self::is_done`] reports when every record has been delivered.
+    pub(crate) fn set_final_seq(&mut self, one_past_last: u64) -> Result<(), DatagramError> {
+        self.final_seq = Some(one_past_last);
+        self.try_complete()
+    }
+
+    /// Whether the final count is known AND every record up to it has been moved to
+    /// the ready queue. The leg drains `pop_ready` first and turns this into EOF
+    /// once nothing is left to pop.
+    pub(crate) fn is_done(&self) -> bool {
+        self.final_seq
+            .is_some_and(|fin| self.next_window_base >= fin)
     }
 
     /// All `FEC_K` sources of the window arrived: deliver them in order, no FEC.
@@ -378,6 +443,244 @@ fn trim_recovered(symbol: &[u8], symbol_len: usize) -> Result<Vec<u8>, DatagramE
         return Err(DatagramError::BadLength);
     }
     Ok(symbol[..header.total_len].to_vec())
+}
+
+/// Fixed FEC symbol length for the datagram carrier — both ends MUST agree (a
+/// repair symbol's length is matched-binary, not on the wire), so it is a constant
+/// rather than the per-connection `max_datagram_size`. Chosen to leave room for the
+/// datagram framing and QUIC overhead inside a conservative path MTU. The relay
+/// clamps its seal `max_plaintext_len` so every sealed record fits, and the leg
+/// refuses to select the datagram carrier unless `max_datagram_size` accommodates a
+/// symbol plus framing.
+pub(crate) const DATAGRAM_SYMBOL_LEN: usize = 1024;
+
+/// The largest datagram either kind (source or repair) can occupy on the wire.
+pub(crate) const MAX_CARRIER_DATAGRAM: usize =
+    1 + envelope::ENVELOPE_HEADER_LEN + DATAGRAM_SYMBOL_LEN;
+
+/// Pending reorder bounds for the receiver (anti-exhaustion).
+const RX_MAX_PENDING_RECORDS: usize = 8 * FEC_K;
+const RX_MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
+
+fn map_datagram_err(e: DatagramError) -> io::Error {
+    match e {
+        // An unrecoverable gap is a mid-transfer truncation of the relay: surface
+        // it as a non-clean error the relay turns into a reset (→ demote), NOT a
+        // clean EOF.
+        DatagramError::Unrecoverable(_) | DatagramError::CapacityExceeded => {
+            io::Error::new(io::ErrorKind::ConnectionReset, "datagram gap unrecoverable")
+        }
+        other => io::Error::new(io::ErrorKind::InvalidData, format!("datagram: {other:?}")),
+    }
+}
+
+/// QUIC-datagram record-writer leg (one direction). Frames each sealed record into
+/// a source datagram + periodic FEC repair datagrams, and on `shutdown` writes the
+/// download-FIN count over a reliable bidi stream so the reader knows the stream is
+/// complete. Implements [`LegWriter`] so the existing generic relay loops drive it.
+pub(crate) struct UdpDatagramLegWriter {
+    conn: quinn::Connection,
+    /// Reliable side-channel carrying only the 8-byte FIN count at teardown.
+    fin: quinn::SendStream,
+    sender: DatagramSender,
+}
+
+impl UdpDatagramLegWriter {
+    pub(crate) fn new(
+        conn: quinn::Connection,
+        fin: quinn::SendStream,
+        start_seq: u64,
+    ) -> Result<Self, io::Error> {
+        let sender =
+            DatagramSender::new(start_seq, DATAGRAM_SYMBOL_LEN).map_err(map_datagram_err)?;
+        Ok(Self { conn, fin, sender })
+    }
+
+    async fn send_all(&self, datagrams: Vec<Vec<u8>>) -> io::Result<()> {
+        for dg in datagrams {
+            // Wait for send-buffer space rather than letting quinn drop our own
+            // source/repair datagrams (drop-old-on-full would manufacture losses).
+            self.conn
+                .send_datagram_wait(Bytes::from(dg))
+                .await
+                .map_err(|e| io::Error::other(format!("send_datagram: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl LegWriter for UdpDatagramLegWriter {
+    async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // No explicit base: the sender's own next_seq is the base for this batch.
+        let base = self.sender.next_seq();
+        self.write_records_seq(base, bytes).await
+    }
+
+    async fn write_records_seq(&mut self, base_seq: u64, bytes: &[u8]) -> io::Result<()> {
+        debug_assert_eq!(
+            base_seq,
+            self.sender.next_seq(),
+            "datagram base_seq must match the codec sequence",
+        );
+        let mut off = 0usize;
+        let mut seq = base_seq;
+        while off < bytes.len() {
+            let header = record::parse_header(&bytes[off..]).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("tls record: {e}"))
+            })?;
+            let end = off
+                .checked_add(header.total_len)
+                .filter(|&e| e <= bytes.len())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "record runs past buffer")
+                })?;
+            let datagrams = self
+                .sender
+                .push(seq, &bytes[off..end])
+                .map_err(map_datagram_err)?;
+            self.send_all(datagrams).await?;
+            off = end;
+            seq = seq.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        // Reliable download-FIN: the one-past-last seq, so the reader knows exactly
+        // how many records to expect before declaring a clean end-of-download.
+        let fin_count = self.sender.next_seq();
+        AsyncWriteExt::write_all(&mut self.fin, &fin_count.to_be_bytes()).await?;
+        AsyncWriteExt::shutdown(&mut self.fin).await
+    }
+}
+
+/// QUIC-datagram record-reader leg (one direction): reassembles the datagram
+/// stream (reorder + FEC) and turns the reliable FIN into a clean EOF. A loss
+/// beyond the window's redundancy, or a lost tail after the FIN, surfaces as a
+/// non-clean error the relay turns into a reset (→ demote). Implements
+/// [`LegReader`].
+pub(crate) struct UdpDatagramLegReader {
+    conn: quinn::Connection,
+    receiver: DatagramReceiver,
+    /// Resolves to the FIN count once the reliable side-channel delivers it.
+    fin_rx: oneshot::Receiver<io::Result<u64>>,
+    fin_seen: bool,
+    /// After the FIN, the deadline by which the (possibly FEC-less) tail must
+    /// complete; if it does not, the tail was lost → reset.
+    fin_deadline: Option<Instant>,
+}
+
+impl UdpDatagramLegReader {
+    pub(crate) fn new(
+        conn: quinn::Connection,
+        mut fin: quinn::RecvStream,
+        start_seq: u64,
+    ) -> Result<Self, io::Error> {
+        let receiver = DatagramReceiver::new(
+            start_seq,
+            DATAGRAM_SYMBOL_LEN,
+            RX_MAX_PENDING_RECORDS,
+            RX_MAX_PENDING_BYTES,
+        )
+        .map_err(map_datagram_err)?;
+        let (tx, fin_rx) = oneshot::channel();
+        // Read the 8-byte FIN count off the reliable side-channel in the background
+        // so the main read loop can select between datagrams and the FIN.
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            let result = match fin.read_exact(&mut buf).await {
+                Ok(()) => Ok(u64::from_be_bytes(buf)),
+                Err(e) => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("fin: {e}"),
+                )),
+            };
+            let _ = tx.send(result);
+        });
+        Ok(Self {
+            conn,
+            receiver,
+            fin_rx,
+            fin_seen: false,
+            fin_deadline: None,
+        })
+    }
+
+    /// Grace after the FIN for an in-flight (FEC-less) tail to arrive before the
+    /// gap is declared lost. Scaled to the path RTT, floored for low-RTT links.
+    fn tail_grace(&self) -> Duration {
+        (self.conn.rtt() * 4).max(Duration::from_millis(200))
+    }
+}
+
+impl LegReader for UdpDatagramLegReader {
+    async fn read_record_into(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+        loop {
+            if let Some(rec) = self.receiver.pop_ready() {
+                buf.clear();
+                buf.extend_from_slice(&rec);
+                return Ok(());
+            }
+            if self.receiver.is_done() {
+                // Clean end-of-download: every record up to the FIN count delivered.
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            if let Some(deadline) = self.fin_deadline {
+                tokio::select! {
+                    biased;
+                    dg = self.conn.read_datagram() => {
+                        let bytes = dg.map_err(|e| {
+                            io::Error::new(io::ErrorKind::ConnectionReset, format!("read_datagram: {e}"))
+                        })?;
+                        self.receiver.ingest(&bytes).map_err(map_datagram_err)?;
+                    }
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        // Post-FIN grace expired with the tail still incomplete: the
+                        // missing (FEC-less) tail record is lost → reset.
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "datagram download tail lost after FIN",
+                        ));
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    fin = &mut self.fin_rx, if !self.fin_seen => {
+                        self.fin_seen = true;
+                        let count = fin
+                            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "fin channel closed"))??;
+                        self.receiver.set_final_seq(count).map_err(map_datagram_err)?;
+                        self.fin_deadline = Some(Instant::now() + self.tail_grace());
+                    }
+                    dg = self.conn.read_datagram() => {
+                        let bytes = dg.map_err(|e| {
+                            io::Error::new(io::ErrorKind::ConnectionReset, format!("read_datagram: {e}"))
+                        })?;
+                        self.receiver.ingest(&bytes).map_err(map_datagram_err)?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn try_read_record_into(&mut self, buf: &mut Vec<u8>) -> Option<io::Result<()>> {
+        // The single-Connect download path uses the blocking `read_record_into`;
+        // this opportunistic drain only ever returns an already-completed record (it
+        // never waits on a datagram). The mux batch-drain that relies on a richer
+        // try-read stays on the TCP/stream carrier.
+        self.receiver.pop_ready().map(|rec| {
+            buf.clear();
+            buf.extend_from_slice(&rec);
+            Ok(())
+        })
+    }
+
+    fn is_clean_close(&self, err: &io::Error) -> bool {
+        // Only the FIN-driven UnexpectedEof is clean; a ConnectionReset (gap/tail
+        // loss/connection error) is a truncation that must NOT be swallowed.
+        err.kind() == io::ErrorKind::UnexpectedEof
+    }
 }
 
 #[cfg(test)]
@@ -582,5 +885,136 @@ mod tests {
             }
         }
         assert_eq!(err, Some(DatagramError::CapacityExceeded));
+    }
+
+    /// A partial final window (records past the last full FEC window) is held back
+    /// until the download-FIN count is known, then delivered in full once all its
+    /// sources are present — and `is_done` flips only then.
+    #[test]
+    fn final_partial_window_delivers_on_fin() {
+        let n = FEC_K + 5; // one full window + a 5-record partial tail
+        let (start, sealed, plain) = seal_stream(n, 13);
+        let mut sender = DatagramSender::new(start, SYMBOL_LEN).unwrap();
+        let mut rx = DatagramReceiver::new(start, SYMBOL_LEN, MAX_REC, MAX_BYTES).unwrap();
+        let mut dgs = Vec::new();
+        for (i, rec) in sealed.iter().enumerate() {
+            dgs.extend(sender.push(start + i as u64, rec).unwrap());
+        }
+        for dg in &dgs {
+            rx.ingest(dg).unwrap();
+        }
+        // The partial tail is withheld until the FIN count is known.
+        assert!(!rx.is_done());
+        rx.set_final_seq(start + n as u64).unwrap();
+        assert!(rx.is_done());
+        let mut open = codec();
+        let mut got = Vec::new();
+        while let Some(rec) = rx.pop_ready() {
+            got.push(open.open(&rec).unwrap());
+        }
+        assert_eq!(got, plain);
+    }
+
+    /// A loss in the partial final window cannot be FEC-recovered (no repairs for a
+    /// partial window), so the receiver never reports done — the leg's post-FIN
+    /// deadline turns this into a reset rather than a silent truncation.
+    #[test]
+    fn final_partial_window_loss_is_not_deliverable() {
+        let n = FEC_K + 5;
+        let (start, sealed, _plain) = seal_stream(n, 17);
+        let mut sender = DatagramSender::new(start, SYMBOL_LEN).unwrap();
+        let mut rx = DatagramReceiver::new(start, SYMBOL_LEN, MAX_REC, MAX_BYTES).unwrap();
+        for (i, rec) in sealed.iter().enumerate() {
+            for dg in sender.push(start + i as u64, rec).unwrap() {
+                // Drop the source datagram of the first partial-window record.
+                if i == FEC_K && dg.first() == Some(&TAG_SOURCE) {
+                    continue;
+                }
+                rx.ingest(&dg).unwrap();
+            }
+        }
+        rx.set_final_seq(start + n as u64).unwrap();
+        assert!(
+            !rx.is_done(),
+            "a lost final-partial-window source has no FEC and must not be reported delivered",
+        );
+    }
+
+    /// End-to-end over a REAL quinn loopback connection: the download direction
+    /// (server→client) carries sealed records as datagrams + FEC, with the FIN on
+    /// the bidi stream's server→client half; the reader yields every record in order
+    /// and turns the FIN into a clean EOF. Loopback does not drop, so this proves
+    /// the quinn integration + FIN→EOF (loss recovery is covered deterministically
+    /// by the protocol tests above).
+    #[tokio::test]
+    async fn datagram_leg_round_trips_over_real_quinn() {
+        use crate::transport::leg::{LegReader, LegWriter};
+        use crate::transport::udp::test_support::loopback_pair;
+
+        let (_se, _ce, client_conn, server_conn) = loopback_pair().await;
+        let start = 0u64;
+
+        // Build the download payload: several full windows + a partial tail.
+        let n = FEC_K * 2 + 7;
+        let plaintexts: Vec<Vec<u8>> = {
+            let mut rng = StdRng::seed_from_u64(0xD06);
+            (0..n)
+                .map(|_| {
+                    let len = rng.gen_range(1..400);
+                    (0..len).map(|_| rng.gen()).collect()
+                })
+                .collect()
+        };
+
+        let server_pts = plaintexts.clone();
+        let server = tokio::spawn(async move {
+            // Rendezvous: open the bidi stream and write a trigger on the upload
+            // (server-recv) half so the client's accept_bi returns immediately; the
+            // server→client half is the FIN channel.
+            let (fin_send, mut up_recv) = server_conn.accept_bi().await.expect("accept_bi");
+            // Drain the client's rendezvous trigger (upload half is unused here).
+            let mut t = [0u8; 1];
+            let _ = up_recv.read_exact(&mut t).await;
+
+            let mut writer =
+                UdpDatagramLegWriter::new(server_conn.clone(), fin_send, start).unwrap();
+            let mut seal = codec();
+            let mut rng = StdRng::seed_from_u64(0xD06);
+            // Send in a few batches to exercise multi-batch base_seq handling.
+            let mut seq = start;
+            for chunk in server_pts.chunks(20) {
+                let mut buf = Vec::new();
+                for pt in chunk {
+                    buf.extend_from_slice(&seal.seal(pt, &mut rng).unwrap());
+                }
+                writer.write_records_seq(seq, &buf).await.unwrap();
+                seq += chunk.len() as u64;
+            }
+            writer.shutdown().await.unwrap();
+            server_conn // keep the connection alive until the client is done
+        });
+
+        // Client: open the bidi stream, write the rendezvous trigger, then read the
+        // download via the datagram leg.
+        let (mut up_send, fin_recv) = client_conn.open_bi().await.expect("open_bi");
+        tokio::io::AsyncWriteExt::write_all(&mut up_send, b"\x00")
+            .await
+            .unwrap();
+        let mut reader = UdpDatagramLegReader::new(client_conn.clone(), fin_recv, start).unwrap();
+        let mut open = codec();
+        let mut got = Vec::new();
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_record_into(&mut buf).await {
+                Ok(()) => got.push(open.open(&buf).unwrap()),
+                Err(e) if reader.is_clean_close(&e) => break,
+                Err(e) => panic!("unexpected leg error: {e}"),
+            }
+        }
+        assert_eq!(
+            got, plaintexts,
+            "datagram leg must deliver every record in order"
+        );
+        let _server_conn = server.await.unwrap();
     }
 }
