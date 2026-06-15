@@ -299,6 +299,13 @@ pub struct UdpConfig {
     /// LIVE. Turn the experimental UDP/QUIC fast plane on (default off).
     #[serde(default)]
     pub enabled: bool,
+    /// LIVE. Carry the DOWNLOAD direction over the unreliable datagram + FEC
+    /// carrier (instead of the reliable QUIC stream) when `enabled` and the probe
+    /// is Verified. Default off: the stream carrier is used. Requires matched
+    /// binaries on both ends; falls back to the stream carrier if the negotiated
+    /// path's `max_datagram_size` is too small.
+    #[serde(default)]
+    pub datagram: bool,
     /// RESERVED (congestion control, Phase 3) — not yet honored.
     #[serde(default)]
     pub cc: UdpCongestionControl,
@@ -333,6 +340,7 @@ impl Default for UdpConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            datagram: false,
             cc: UdpCongestionControl::Bbr,
             brutal_up_mbps: 0,
             brutal_down_mbps: 0,

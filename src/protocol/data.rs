@@ -369,6 +369,15 @@ impl DataRecordCodec {
         max_plaintext_len(self.padding.max_len())
     }
 
+    /// The codec's current record sequence number (the seq the NEXT sealed record
+    /// will use). The datagram carrier reads this before a seal batch to tag each
+    /// record's envelope with its real seq, and on the receive side to start the
+    /// reorder buffer at activation. Byte-stream carriers never need it (order is
+    /// implicit in the stream).
+    pub(crate) fn sequence(&self) -> u64 {
+        self.aead.sequence()
+    }
+
     pub(crate) fn max_sealed_len(&self, payload_len: usize) -> usize {
         record_capacity(payload_len, self.padding.max_len())
     }

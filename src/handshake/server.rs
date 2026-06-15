@@ -4052,6 +4052,10 @@ where
         ));
     }
     scratch.records_buf.clear();
+    // The seq of the FIRST record in this batch, captured BEFORE sealing advances
+    // the codec. Byte-stream carriers ignore it (write_records_seq forwards to
+    // write_records); the datagram carrier envelopes each record at base_seq + i.
+    let base_seq = codec.sequence();
     let debug_records = tracing::enabled!(tracing::Level::DEBUG);
     if debug_records {
         codec.seal_chunks_into_reusing(
@@ -4072,7 +4076,9 @@ where
     } else {
         codec.seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)?;
     }
-    writer.write_records(scratch.records_buf.as_slice()).await?;
+    writer
+        .write_records_seq(base_seq, scratch.records_buf.as_slice())
+        .await?;
     Ok(())
 }
 
