@@ -174,8 +174,10 @@ impl ClientDataSession {
         let pq_identity_binding = pending.identity_binding(&exchange_payload);
         let x25519_shared =
             Zeroizing::new(pending.x25519_shared_secret(&exchange.server_x25519_public));
-        let pq_shared =
-            Zeroizing::new(pq::decapsulate(exchange.mlkem_ciphertext, &pending.mlkem.secret)?);
+        let pq_shared = Zeroizing::new(pq::decapsulate(
+            exchange.mlkem_ciphertext,
+            &pending.mlkem.secret,
+        )?);
         self.apply_pq_rekey_shared_with_identity_binding(
             &x25519_shared,
             &pq_shared,
