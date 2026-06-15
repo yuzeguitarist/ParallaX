@@ -299,7 +299,14 @@ fn active_instances(dir: &Path) -> Result<Vec<RuntimeInstance>, RuntimeGuardErro
         let mut file = open_lock_file(&path)?;
         if try_lock_file(&file)? {
             unlock_file(&file)?;
-            fs::remove_file(&path)?;
+            // Tolerate a concurrent reclaim/exit: another process's guard may have
+            // dropped (removing its own file) in the window between our try_lock and
+            // this remove. NotFound just means the reclaim already happened.
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
             continue;
         }
 
@@ -687,16 +694,23 @@ mod tests {
             let dir = Arc::clone(&dir);
             handles.push(thread::spawn(move || {
                 let cfg = config(&format!("203.0.113.{i}:443"));
-                RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).map(|_g| ())
+                RuntimeGuard::acquire_client_in_dir(&cfg, dir.path())
             }));
         }
+        // Hold every guard until all threads have joined: distinct clients never
+        // conflict, so all eight coexisting proves the registry mutex serialized
+        // the critical sections, while keeping the guards alive avoids a guard's
+        // Drop-time lock-file removal racing another thread's reclaim.
+        let mut guards = Vec::new();
         for handle in handles {
             let result = handle.join().expect("acquire thread panicked");
             assert!(
                 result.is_ok(),
                 "concurrent acquisition must serialize, got {result:?}"
             );
+            guards.push(result.unwrap());
         }
+        assert_eq!(guards.len(), 8);
     }
 
     #[cfg(unix)]
