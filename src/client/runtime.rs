@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, oneshot, Mutex, Semaphore, TryAcquireError},
+    sync::{mpsc, oneshot, Mutex, Notify, Semaphore, TryAcquireError},
     time::{sleep, timeout, Instant},
 };
 
@@ -404,9 +404,23 @@ impl WarmSessionPool {
     }
 }
 
+/// State of the shared mux session, used to single-flight establishment WITHOUT
+/// holding the pool mutex across the (up to 15s) network handshake. `Building`
+/// carries a `Notify` the in-flight builder fires on completion (success or
+/// failure) so every concurrently-waiting connection shares the one attempt
+/// instead of serializing a fresh 15s handshake each behind the lock.
+enum MuxState {
+    /// No session and nobody building one.
+    Idle,
+    /// A build is in flight; waiters park on this `Notify`.
+    Building(Arc<Notify>),
+    /// A live (or possibly now-stale) session; reusability is re-checked.
+    Ready(ClientMuxHandle),
+}
+
 #[derive(Clone)]
 struct ClientMuxPool {
-    inner: Arc<Mutex<Option<ClientMuxHandle>>>,
+    inner: Arc<Mutex<MuxState>>,
     config: Arc<ClientConfig>,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
@@ -479,7 +493,7 @@ impl ClientMuxPool {
         server_identity_public: Arc<[u8]>,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(None)),
+            inner: Arc::new(Mutex::new(MuxState::Idle)),
             config,
             server_addr,
             traffic,
@@ -491,24 +505,70 @@ impl ClientMuxPool {
     }
 
     async fn handle(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
-        let mut mux = self.inner.lock().await;
-        if let Some(handle) = mux.as_ref() {
-            // A cached session is only reusable if BOTH of its tasks are alive
-            // (see ClientMuxHandle::is_reusable). The reader can exit independently
-            // of the writer — e.g. on a clean server->client half-close FIN the
-            // reader returns Ok while the cover-disabled writer blocks forever on
-            // frame_rx.recv(). Probing only the writer would keep handing out a
-            // half-dead handle whose register_tx is closed, and every new local
-            // connection would fail at register_tx.send. Replacing the cached
-            // handle drops the old frame_tx, letting a surviving writer shut down.
-            if handle.is_reusable() {
-                return Ok(handle.clone());
+        loop {
+            let mut state = self.inner.lock().await;
+            // Decide an action without awaiting under the lock. The match yields an
+            // OWNED value so its borrow of `state` ends before we touch the guard.
+            let waiting_notify: Option<Arc<Notify>> = match &*state {
+                // A cached session is only reusable if BOTH of its tasks are alive
+                // (see ClientMuxHandle::is_reusable). The reader can exit
+                // independently of the writer — e.g. on a clean server->client
+                // half-close FIN the reader returns Ok while the cover-disabled
+                // writer blocks forever on frame_rx.recv(). Probing only the writer
+                // would keep handing out a half-dead handle whose register_tx is
+                // closed, and every new local connection would fail at
+                // register_tx.send. A stale Ready falls through to a rebuild.
+                MuxState::Ready(handle) if handle.is_reusable() => {
+                    return Ok(handle.clone());
+                }
+                MuxState::Building(notify) => Some(notify.clone()),
+                // Idle, or a stale (non-reusable) Ready: we become the builder.
+                _ => None,
+            };
+
+            match waiting_notify {
+                Some(notify) => {
+                    // Another connection is establishing the session. Register for
+                    // its completion wakeup BEFORE dropping the lock (lost-wakeup
+                    // safety: a notify_waiters() racing our unlock is not missed),
+                    // then wait off-lock and re-check.
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    drop(state);
+                    notified.await;
+                    continue;
+                }
+                None => {
+                    // Sole builder: publish Building, release the lock, and run the
+                    // (up to CLIENT_ESTABLISH_TIMEOUT) handshake OFF-LOCK so a slow
+                    // or stalling server cannot block every other local connection
+                    // behind this mutex — the M-7 fix. Concurrent callers share
+                    // this single attempt instead of serializing a fresh handshake.
+                    let notify = Arc::new(Notify::new());
+                    *state = MuxState::Building(Arc::clone(&notify));
+                    drop(state);
+
+                    let result = self.start_session().await;
+                    let mut state = self.inner.lock().await;
+                    let outcome = match result {
+                        Ok(handle) => {
+                            *state = MuxState::Ready(handle.clone());
+                            Ok(handle)
+                        }
+                        Err(err) => {
+                            // Reset so a waiter re-loops and one becomes the next
+                            // builder (preserves the original retry-on-failure).
+                            *state = MuxState::Idle;
+                            Err(err)
+                        }
+                    };
+                    drop(state);
+                    notify.notify_waiters();
+                    return outcome;
+                }
             }
         }
-
-        let handle = self.start_session().await?;
-        *mux = Some(handle.clone());
-        Ok(handle)
     }
 
     fn ensure_started(&self) {
@@ -2572,6 +2632,74 @@ mod tests {
         drop(frame_rx);
         assert!(!handle.is_reusable());
         drop(register_rx);
+    }
+
+    /// M-7: ClientMuxPool::handle() must NOT hold the pool mutex across the (up to
+    /// CLIENT_ESTABLISH_TIMEOUT) network establishment, otherwise one stalling
+    /// server blocks every new local connection behind the lock. A stalling TCP
+    /// listener (accepts, never completes the camouflage handshake) keeps a
+    /// builder parked in start_session(); the pool mutex must remain acquirable
+    /// and show the in-flight `Building` state.
+    #[tokio::test]
+    async fn mux_handle_does_not_hold_lock_across_establishment() {
+        // Accept connections but never speak: the client's wait for the origin
+        // ServerHello stalls until the establish timeout (far longer than this test).
+        let stalling = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stall_addr = stalling.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = stalling.accept().await {
+                held.push(stream); // keep the connection open, send nothing
+            }
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_config = Arc::new(ClientConfig {
+            listen: local.local_addr().unwrap(),
+            server_addr: stall_addr.to_string(),
+            sni: "example.com".to_owned(),
+            server_public_key: STANDARD.encode(server_keys.public),
+            server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
+            server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+        });
+        let server_addr = ServerAddrResolver::new(&client_config.server_addr)
+            .await
+            .unwrap();
+        let pool = ClientMuxPool::new(
+            Arc::clone(&client_config),
+            server_addr,
+            TrafficConfig::default(),
+            Arc::new(UdpConfig::default()),
+            Arc::new(zeroize::Zeroizing::new(PSK.to_vec())),
+            server_keys.public,
+            Arc::from(server_identity_keys.public.clone().into_boxed_slice()),
+        );
+
+        // Kick off a builder; it parks in start_session() OFF-LOCK.
+        let builder_pool = pool.clone();
+        let builder = tokio::spawn(async move { builder_pool.handle().await });
+
+        // Let it publish Building and enter the stalled handshake.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // The pool mutex MUST be free (not held across establishment) and the
+        // state MUST be the in-flight Building — the M-7 guarantee.
+        {
+            let state = pool
+                .inner
+                .try_lock()
+                .expect("pool mutex must not be held across establishment");
+            assert!(
+                matches!(*state, MuxState::Building(_)),
+                "state must be Building while the single in-flight session establishes",
+            );
+        }
+
+        // End the test without waiting the full establish timeout.
+        builder.abort();
     }
 
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
