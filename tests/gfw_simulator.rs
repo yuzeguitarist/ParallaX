@@ -19,10 +19,12 @@ use std::time::{Duration, Instant};
 
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
+use parallax::crypto::session::X25519KeyPair;
+use parallax::tls::safari26::Safari26TlsCamouflage;
+
 use crate::gfw_sim::detection::active_prober::ProbeObservation;
 use crate::gfw_sim::detection::burst_statistics::LengthObservation;
 use crate::gfw_sim::detection::tcp_dual_mb::FlowKey;
-use crate::gfw_sim::fixtures::synthetic_tls13_client_hello;
 use crate::gfw_sim::injection::BlockingPolicy;
 use crate::gfw_sim::runtime::{
     middlebox::{ClientToServerEvent, ScenarioInputs, ServerToClientEvent},
@@ -32,8 +34,19 @@ use crate::gfw_sim::runtime::{
 
 // --------------------- helpers ---------------------
 
-fn build_parallax_tcp_client_hello(sni: &str, seed: u64) -> Vec<u8> {
-    synthetic_tls13_client_hello(sni, seed)
+/// Drive the REAL Safari 26 ParallaX camouflage emitter to produce the actual
+/// product ClientHello bytes the server sends on the wire — the same drive
+/// pattern as `safari_parity_baseline.rs`. The GFW simulator's detectors then
+/// judge the real 20-cipher/13-extension/GREASE product instead of a synthetic
+/// stand-in. `seed` is unused (the real path draws GREASE/randoms from OsRng).
+fn build_parallax_tcp_client_hello(sni: &str, _seed: u64) -> Vec<u8> {
+    let server = X25519KeyPair::generate();
+    let psk = b"0123456789abcdef0123456789abcdef";
+    Safari26TlsCamouflage
+        .start(sni.to_owned(), psk, &server.public)
+        .expect("start Safari 26 ParallaX TLS camouflage")
+        .client_hello_bytes()
+        .to_vec()
 }
 
 fn synthetic_random_payload(seed: u64, len: usize) -> Vec<u8> {
@@ -159,12 +172,27 @@ fn scenario_1_chrome_to_cloudflare_baseline_passes() {
     };
     let report = sim.run_scenario(scenario);
     print_report(&report);
-    // We allow Suspicious because parallax's mimicry leaves unknown JA4 in
-    // strict mode; in default config it should not be Block.
+    // Strong indistinguishability check (not just "did not get blocked"): the
+    // real ParallaX ClientHello must be fingerprinted as a genuine known browser
+    // (Safari). The tls_fingerprint layer maps KnownBrowser -> Allow, Unknown ->
+    // Suspicious, KnownProxy -> Block, so asserting Allow proves the product was
+    // positively recognized as Safari, not merely left unclassified. Before the
+    // Safari reference JA3/JA4 was corrected to the real first-party value this
+    // flow scored Unknown -> Suspicious and this assertion would have failed.
+    let tls_fp = report
+        .layer_verdicts
+        .iter()
+        .find(|v| v.layer == "tls_fingerprint")
+        .expect("tls_fingerprint layer must run on a ClientHello flow");
+    assert_eq!(
+        tls_fp.kind,
+        VerdictKind::Allow,
+        "real ParallaX must be recognized as a known browser (Safari), not just avoid Block"
+    );
     assert_ne!(
         report.final_verdict(),
         VerdictKind::Block,
-        "Chrome→Cloudflare baseline must not be blocked"
+        "a flow fingerprinted as real Safari must not be blocked"
     );
 }
 

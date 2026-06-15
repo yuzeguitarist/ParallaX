@@ -47,7 +47,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Advisory / best-effort: continue-on-error so a very large PR that exhausts
+      # the turn budget (or any action error) never red-X's the PR. This is not a
+      # required check; only the deterministic CI gates block merges.
       - uses: anthropics/claude-code-action@d5726de019ec4498aa667642bc3a80fca83aa102 # v1
+        continue-on-error: true
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
@@ -80,6 +84,10 @@ jobs:
               deadlocks, unbounded buffers.
             - If Cargo.lock/Cargo.toml changed: flag risky/yanked/over-broad deps.
 
+            Be efficient: on a very large diff, prioritize the highest-risk areas
+            (crypto, handshake, transport/teardown, wire parsing, `unsafe`) and
+            post your review within the turn budget rather than reading every file.
+
             Post your findings as a SINGLE PR review comment via
             `gh pr comment ${{ github.event.pull_request.number }} --body "..."`,
             grouped by severity (Critical / High / Medium / Low / Nit) with
@@ -88,5 +96,5 @@ jobs:
             modify code.
           claude_args: |
             --model claude-opus-4-8
-            --max-turns 40
+            --max-turns 80
             --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*)"
