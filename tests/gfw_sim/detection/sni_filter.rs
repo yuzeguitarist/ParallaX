@@ -113,6 +113,12 @@ pub fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello, ClientHello
     if bytes.len() < total {
         return Err(ClientHelloParseError::LengthMismatch);
     }
+    // The record must hold at least the 4-byte handshake header (type + 24-bit
+    // length); without this guard a record_len of 0..4 indexes bytes[5..9] out of
+    // bounds below.
+    if record_len < 4 {
+        return Err(ClientHelloParseError::LengthMismatch);
+    }
     if bytes[5] != HANDSHAKE_CLIENT_HELLO {
         return Err(ClientHelloParseError::NotClientHello(bytes[5]));
     }

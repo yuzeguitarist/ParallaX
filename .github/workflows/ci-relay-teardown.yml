@@ -1,0 +1,133 @@
+name: ci-relay-teardown
+
+# Asserts the camouflage relay tears down with a graceful FIN, never a RST, on
+# BOTH the Linux splice fast-path and the userspace fallback path. A RST at
+# teardown is an observable "this is not an ordinary origin" tell that active
+# probing keys on, so this gate captures loopback with tcpdump while exercising
+# every teardown class and fails if any RST segment appears.
+#
+# The functional tests already assert FIN at the application layer (a RST
+# surfaces as a ConnectionReset error and fails the test); this job is the
+# independent packet-level confirmation, and the one place the Linux splice
+# close behavior is exercised under capture.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      # Code that can affect TCP relay teardown (FIN-vs-RST): the splice fast path
+      # (src/transport/tcp.rs) and the userspace fallback teardown + graceful-close
+      # (src/handshake/server.rs), plus the relay loop and idle-timeout config.
+      # crypto/tls/fingerprint/cli/protocol-framing do not change TCP close.
+      - 'src/transport/**'
+      - 'src/client/**'
+      - 'src/handshake/**'
+      - 'src/config.rs'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-relay-teardown.yml'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      # Code that can affect TCP relay teardown (FIN-vs-RST): the splice fast path
+      # (src/transport/tcp.rs) and the userspace fallback teardown + graceful-close
+      # (src/handshake/server.rs), plus the relay loop and idle-timeout config.
+      # crypto/tls/fingerprint/cli/protocol-framing do not change TCP close.
+      - 'src/transport/**'
+      - 'src/client/**'
+      - 'src/handshake/**'
+      - 'src/config.rs'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-relay-teardown.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-relay-teardown-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this job only needs to read the repo. No write scopes.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  no-rst:
+    name: relay-teardown-no-rst
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-ci
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: install tcpdump
+        run: sudo apt-get update && sudo apt-get install -y tcpdump
+
+      # Pre-build so the capture window is the teardown traffic, not compilation.
+      - name: build tests
+        run: cargo build --locked --tests
+
+      - name: relay teardown emits FIN, never RST
+        run: |
+          set -euo pipefail
+          sudo tcpdump -i lo -nn -w /tmp/cap.pcap tcp >/tmp/tcpdump.log 2>&1 &
+          TD=$!
+          sleep 3
+          # Exercise the Linux splice teardown and the userspace fallback idle
+          # teardown repeatedly. Both relay live traffic and must close FIN-only.
+          # Each invocation asserts it ran exactly one test, so a rename/removal
+          # fails the gate instead of silently matching zero tests (cargo test
+          # with a zero-match filter exits 0).
+          #
+          # NOTE: fallback_relay_connect_failure_closes_client_with_fin is
+          # deliberately NOT captured here: it dials a closed port, so the kernel
+          # answers with a "connection refused" RST on the origin-dial side. That
+          # RST is normal OS behavior, not ParallaX resetting a peer, and its
+          # client-facing FIN is already asserted at the application layer.
+          for _ in 1 2 3 4 5; do
+            for t in splice_relay_idle_timeout_closes_client_with_fin \
+                     fallback_relay_idle_timeout_closes_empty_probe; do
+              # `|| true` so a genuine test failure does not abort the step at the
+              # assignment (set -e) before we echo the output -- we want the cargo
+              # failure detail in the log. The grep guard below then fails the
+              # step on any non-"1 passed" outcome (failure, rename, or removal).
+              out=$(cargo test --lib --locked "$t" 2>&1) || true
+              echo "$out"
+              echo "$out" | grep -qE "test result: ok\. 1 passed" || {
+                echo "::error::teardown test '$t' did not pass as exactly one test (failed, renamed, or removed?)"
+                exit 1
+              }
+            done
+          done
+          sleep 3
+          sudo kill -INT "$TD" || true
+          sleep 1
+          rst=$(sudo tcpdump -nn -r /tmp/cap.pcap 'tcp[tcpflags] & tcp-rst != 0' 2>/dev/null | wc -l)
+          fin=$(sudo tcpdump -nn -r /tmp/cap.pcap 'tcp[tcpflags] & tcp-fin != 0' 2>/dev/null | wc -l)
+          echo "loopback teardown summary: RST=$rst FIN=$fin"
+          if [ "$rst" -ne 0 ]; then
+            echo "::error::relay teardown emitted $rst RST segment(s); expected 0 (FIN-only close)"
+            sudo tcpdump -nn -r /tmp/cap.pcap 'tcp[tcpflags] & tcp-rst != 0' || true
+            exit 1
+          fi
+          # Guard against a silent false pass where the capture missed the
+          # teardown entirely (then RST would also be 0).
+          if [ "$fin" -eq 0 ]; then
+            echo "::error::no FIN segments captured; the gate did not observe any teardown"
+            exit 1
+          fi

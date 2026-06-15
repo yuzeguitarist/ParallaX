@@ -1,10 +1,12 @@
 use std::{fmt, time::Duration};
 
+use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
     time::{timeout, Instant},
 };
+use zeroize::Zeroizing;
 
 use crate::{
     config::{Config, Mode},
@@ -15,7 +17,6 @@ use crate::{
 
 const DEFAULT_PORT: u16 = 443;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const PROBE_PSK: &[u8] = b"ParallaX probe Safari TLS path";
 
 #[derive(Debug, Error)]
 pub enum ProbeError {
@@ -330,8 +331,17 @@ async fn complete_tls_probe(
     deadline: Duration,
 ) -> Result<TlsProbeResult, String> {
     let server = X25519KeyPair::generate();
+    // Use a fresh RANDOM per-probe PSK (and a throwaway server key), never a
+    // hard-coded constant. As of v4 the ClientHello carrier masks are keyed by
+    // HKDF(psk, X25519(server_static, tls_ephemeral)), so they no longer leak the
+    // PSK to a passive observer; but the probe still uses a random PSK so its
+    // ClientHello carries no fixed, binary-derivable structure a censor could
+    // match against to flag the host as ParallaX. The benign TLS origin we probe
+    // ignores these auth fields, so a random key does not affect what we measure.
+    let mut probe_psk = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(probe_psk.as_mut_slice());
     let session = Safari26TlsCamouflage
-        .start(sni.to_owned(), PROBE_PSK, &server.public)
+        .start(sni.to_owned(), probe_psk.as_slice(), &server.public)
         .map_err(|err| format!("Safari TLS client init failed: {err}"))?;
     let started = Instant::now();
     let completed = timeout(deadline, session.complete(stream))
@@ -687,6 +697,14 @@ mod tests {
                 replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni,
                 strict_tls13: true,
+                max_concurrent_per_source_v4: 256,
+                max_concurrent_per_source_v6: 256,
+                source_ipv6_prefix_len: 64,
+                first_record_wait_floor_ms: 8_000,
+                first_record_wait_jitter_ms: 7_000,
+                fallback_idle_floor_ms: 600_000,
+                fallback_idle_jitter_ms: 0,
+                tcp_congestion: None,
             }),
         }
     }

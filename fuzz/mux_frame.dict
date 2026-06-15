@@ -1,0 +1,13 @@
+# mux_frame: see src/protocol/command.rs decode_ref_prefix
+magic="PX1M"
+kind_open="\x01"
+kind_data="\x02"
+kind_fin="\x03"
+kind_reset="\x04"
+kind_cover="\x05"
+len_zero="\x00\x00\x00\x00"
+stream_one="\x00\x00\x00\x01"
+# a complete minimal Data frame on stream 1, empty payload (13 bytes):
+frame_data_empty="PX1M\x00\x00\x00\x01\x02\x00\x00\x00\x00"
+# a complete minimal Cover frame on stream 0, empty payload:
+frame_cover_empty="PX1M\x00\x00\x00\x00\x05\x00\x00\x00\x00"

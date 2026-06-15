@@ -1,0 +1,11 @@
+# http2_frame_header: 9-byte frame header = len(u24) type(u8) flags(u8) stream_id(u32)
+ftype_data="\x00"
+ftype_headers="\x01"
+ftype_settings="\x04"
+ftype_window_update="\x08"
+flag_end_stream="\x01"
+flag_end_headers="\x04"
+# a complete empty HEADERS frame on stream 1 (len=0, type=1, flags=0, stream=1):
+frame_headers_empty="\x00\x00\x00\x01\x00\x00\x00\x00\x01"
+# a SETTINGS frame header (len=6, type=4, stream 0):
+frame_settings="\x00\x00\x06\x04\x00\x00\x00\x00\x00"

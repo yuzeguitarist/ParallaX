@@ -1,0 +1,5 @@
+# data_record_open: outer TLS application_data record = type(0x17) version(0x0303) len(u16) ...
+rec_appdata="\x17\x03\x03"
+rec_handshake="\x16\x03\x03"
+len_small="\x00\x20"
+len_tag_only="\x00\x10"

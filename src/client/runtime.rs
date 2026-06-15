@@ -24,7 +24,7 @@ use tokio::{
         TcpListener, TcpStream,
     },
     sync::{mpsc, oneshot, Mutex, Semaphore, TryAcquireError},
-    time::{sleep, Instant},
+    time::{sleep, timeout, Instant},
 };
 
 use crate::{
@@ -63,6 +63,15 @@ use crate::{
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
+/// Hard deadline for the whole post-connect authenticated establishment
+/// (camouflage TLS handshake + PQ rekey + identity verify). Mirrors the server's
+/// HANDSHAKE_TIMEOUT so a stalling/impersonating upstream cannot pin an
+/// establishing task (and its permit/fds) indefinitely.
+const CLIENT_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Idle backstop for an established client relay/mux session: if neither
+/// direction moves real bytes for this long, tear the session down so a silent
+/// (e.g. MITM-held) upstream cannot pin a global connection slot and both fds.
+const CLIENT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const WARM_SESSION_POOL_TARGET: usize = 4;
 const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
 const MUX_FRAME_BATCH_LIMIT: usize = 64;
@@ -410,11 +419,25 @@ struct ClientMuxPool {
 #[derive(Clone)]
 struct ClientMuxHandle {
     frame_tx: mpsc::Sender<MuxFrame>,
-    register_tx: mpsc::Sender<ClientStreamRegistration>,
+    register_tx: mpsc::Sender<ClientStreamControl>,
     next_stream_id: Arc<AtomicU32>,
     stream_slots: Arc<Semaphore>,
     chunk_size: usize,
     payload_pool: MuxPayloadPool,
+}
+
+impl ClientMuxHandle {
+    /// A cached mux session may be reused only if BOTH of its background tasks
+    /// are still alive. `frame_tx`'s receiver (`frame_rx`) is owned by the WRITER
+    /// task; `register_tx`'s receiver (`register_rx`) is owned by the READER task.
+    /// Either task can exit independently (most importantly, the reader returns
+    /// `Ok` on a clean server->client half-close FIN while a cover-disabled writer
+    /// keeps blocking on `frame_rx.recv()`), so both channels must be checked —
+    /// otherwise a half-dead session is handed out and every new local connection
+    /// fails at `register_tx.send`.
+    fn is_reusable(&self) -> bool {
+        !self.frame_tx.is_closed() && !self.register_tx.is_closed()
+    }
 }
 
 /// Hands a freshly opened stream's local write half to the single mux reader
@@ -426,6 +449,18 @@ struct ClientStreamRegistration {
     stream_id: u32,
     local_write: OwnedWriteHalf,
     outcome_tx: oneshot::Sender<DownloadOutcome>,
+}
+
+/// Control messages a per-connection task sends to the single mux reader loop.
+enum ClientStreamControl {
+    /// Hand a newly opened stream's download half to the reader.
+    Register(ClientStreamRegistration),
+    /// Drop a stream's download half because its per-connection task has exited.
+    /// Sent after the per-connection `try_join!` returns so the reader-owned
+    /// `OwnedWriteHalf` cannot leak when the stream ends without a server
+    /// `Fin`/`Reset` (e.g. the local upload half errored). Idempotent: a no-op if
+    /// the reader already removed the stream on a server `Fin`/`Reset`.
+    Deregister(u32),
 }
 
 enum DownloadOutcome {
@@ -458,7 +493,15 @@ impl ClientMuxPool {
     async fn handle(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
         let mut mux = self.inner.lock().await;
         if let Some(handle) = mux.as_ref() {
-            if !handle.frame_tx.is_closed() {
+            // A cached session is only reusable if BOTH of its tasks are alive
+            // (see ClientMuxHandle::is_reusable). The reader can exit independently
+            // of the writer — e.g. on a clean server->client half-close FIN the
+            // reader returns Ok while the cover-disabled writer blocks forever on
+            // frame_rx.recv(). Probing only the writer would keep handing out a
+            // half-dead handle whose register_tx is closed, and every new local
+            // connection would fail at register_tx.send. Replacing the cached
+            // handle drops the old frame_tx, letting a surviving writer shut down.
+            if handle.is_reusable() {
                 return Ok(handle.clone());
             }
         }
@@ -585,11 +628,11 @@ async fn handle_local_mux_connection_with_cid(
     // so an immediate server response can never race ahead of the write half.
     if mux
         .register_tx
-        .send(ClientStreamRegistration {
+        .send(ClientStreamControl::Register(ClientStreamRegistration {
             stream_id,
             local_write,
             outcome_tx,
-        })
+        }))
         .await
         .is_err()
     {
@@ -608,7 +651,36 @@ async fn handle_local_mux_connection_with_cid(
         mux.payload_pool.clone(),
     );
     let download = client_mux_await_download(outcome_rx, cid);
-    tokio::try_join!(upload, download).map(|_| ())
+    // Wait for BOTH halves. A clean server Fin (DownloadOutcome::Fin -> Ok)
+    // resolves the download future but must NOT cancel the upload: the local app
+    // may still be sending (TCP half-close), and the server deliberately keeps
+    // its client->target write half open on Fin. try_join! keeps draining the
+    // upload until local EOF (which sends the upstream Fin), and short-circuits
+    // only on a Reset/error (DownloadOutcome::Reset -> Err), which the teardown
+    // below turns into an upstream Reset. Cancelling the upload here would
+    // silently drop in-flight client->server bytes and break half-close.
+    let result = tokio::try_join!(upload, download).map(|_| ());
+
+    // Tear the stream down on both ends so it cannot leak when it ended without a
+    // server Fin/Reset (e.g. the local upload half errored before a clean Fin).
+    // On an abnormal end, reset the server side so its target socket is released;
+    // always deregister so the reader drops the local write half. Both are
+    // idempotent no-ops if the stream was already removed via a server Fin/Reset.
+    if result.is_err() {
+        let _ = mux
+            .frame_tx
+            .send(MuxFrame {
+                stream_id,
+                kind: MuxFrameKind::Reset,
+                payload: Vec::new(),
+            })
+            .await;
+    }
+    let _ = mux
+        .register_tx
+        .send(ClientStreamControl::Deregister(stream_id))
+        .await;
+    result
 }
 
 fn next_mux_stream_id(next: &AtomicU32) -> u32 {
@@ -696,9 +768,14 @@ async fn handle_local_connection_with_cid(
         match tokio::try_join!(initial_payload_fut, server_session_fut) {
             Ok(joined) => joined,
             Err(err) => {
-                // The local initial-payload read failed (or the session task did):
-                // abort the speculative session task so it does not run a full
-                // handshake + QUIC connect to completion behind our back.
+                // The upstream session task lives inside `server_session_fut`. If
+                // `try_join!` short-circuited on the initial-payload read error,
+                // dropping that future does NOT abort the task (Tokio detaches a
+                // dropped JoinHandle), so the speculative authenticated upstream
+                // session would keep running -- completing a full handshake + QUIC
+                // connect and transiently holding a server connection slot and a
+                // retained QUIC connection (when udp is on). Abort it explicitly so
+                // a stalled/failed local SOCKS exchange cannot orphan it.
                 session_abort.abort();
                 return Err(err);
             }
@@ -863,6 +940,48 @@ async fn run_client_udp_probe(
 }
 
 async fn establish_authenticated_data_session_with_resolver(
+    server_addr: &ServerAddrResolver,
+    config: &ClientConfig,
+    traffic: TrafficConfig,
+    udp: &UdpConfig,
+    psk: &[u8],
+    server_public: &[u8; 32],
+    server_identity_public: Arc<[u8]>,
+) -> Result<(TcpStream, ClientDataSession, Option<RetainedClientQuic>), ClientRuntimeError> {
+    // Bound the entire post-connect establishment (camouflage TLS .complete(),
+    // PQ-rekey read, server-identity read/verify, AND the fail-soft UDP
+    // negotiation). Without a deadline an unresponsive or impersonating upstream —
+    // which any on-path adversary in front of the single configured server can be —
+    // that completes the cheap TCP+camouflage handshake then stalls would hang this
+    // task forever while it holds a global connection permit (relay path) or leaks
+    // an eagerly pre-established warm/mux session, letting the adversary exhaust
+    // client resources without authenticating. The server already bounds its
+    // symmetric handshake reads with HANDSHAKE_TIMEOUT; this is the client mirror.
+    // The UDP negotiation lives inside the inner fn so its record exchange + probe
+    // are covered by the same deadline.
+    match timeout(
+        CLIENT_ESTABLISH_TIMEOUT,
+        establish_authenticated_data_session_inner(
+            server_addr,
+            config,
+            traffic,
+            udp,
+            psk,
+            server_public,
+            server_identity_public,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ClientRuntimeError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "ParallaX server did not complete the authenticated establishment in time",
+        ))),
+    }
+}
+
+async fn establish_authenticated_data_session_inner(
     server_addr: &ServerAddrResolver,
     config: &ClientConfig,
     traffic: TrafficConfig,
@@ -1290,6 +1409,15 @@ impl ClientRelay {
         let local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
         let (mut seal_to_server, open_from_server) = data_session.into_data_codecs();
 
+        // Shared idle backstop for the relay (main's DoS hardening). Without it a
+        // server that goes silent (e.g. an on-path adversary holding the single
+        // configured server connection) keeps this relay's global connection permit
+        // and both fds pinned forever; after enough such sessions the client
+        // silently stops accepting new local SOCKS connections. Only real payload
+        // bytes in either direction reset the clock; cover records do not. The
+        // watchdog wraps BOTH relay paths (QUIC fast plane and TCP).
+        let activity: ClientRelayActivity = Arc::new(std::sync::Mutex::new(Instant::now()));
+
         // QUIC fast-plane path: the probe was Verified on BOTH ends, so the client
         // (the bidi opener) opens a reliable bidi stream and carries both relay
         // directions over it. Direction mapping: open_bi gives (send = client->
@@ -1366,6 +1494,7 @@ impl ClientRelay {
                 seal_to_server,
                 local_buf,
                 cover,
+                activity.clone(),
                 cid,
             );
             // The download loop shuts the local write half down on the server's
@@ -1375,6 +1504,7 @@ impl ClientRelay {
                 QuicStreamLegReader::buffered(recv),
                 local_write,
                 open_from_server,
+                activity.clone(),
                 cid,
             );
             // Application-level DONE handshake over the reliable TCP control stream.
@@ -1390,8 +1520,29 @@ impl ClientRelay {
             // loss after the download completed while the upload was still draining --
             // surfaces as Err here but the app has already moved on (documented
             // residual, ~TCP-equivalent: a mid-relay network failure).
-            match tokio::try_join!(upload, download) {
-                Ok((mut seal_to_server, mut open_from_server)) => {
+            //
+            // The relay is also bounded by the shared idle backstop: if neither
+            // direction moves a real payload byte for CLIENT_RELAY_IDLE_TIMEOUT, the
+            // watchdog fires, we close the QUIC connection, and return Ok WITHOUT the
+            // DONE handshake (a forced teardown of a genuinely-idle relay). A live-
+            // but-slow drain keeps bumping `activity`, so the backstop never cuts it.
+            let relay = async { tokio::try_join!(upload, download) };
+            let relay_outcome = tokio::select! {
+                joined = relay => Some(joined),
+                _ = client_relay_idle_watchdog(activity, CLIENT_RELAY_IDLE_TIMEOUT) => {
+                    tracing::debug!(
+                        cid,
+                        "client QUIC fast-plane relay idle backstop reached; tearing down"
+                    );
+                    None
+                }
+            };
+            match relay_outcome {
+                None => {
+                    conn.close(0u32.into(), b"relay-idle");
+                    Ok(())
+                }
+                Some(Ok((mut seal_to_server, mut open_from_server))) => {
                     let result = client_exchange_quic_done(
                         &conn,
                         &mut server_write,
@@ -1404,7 +1555,7 @@ impl ClientRelay {
                     conn.close(0u32.into(), b"relay-done");
                     result
                 }
-                Err(err) => {
+                Some(Err(err)) => {
                     conn.close(0u32.into(), b"relay-error");
                     Err(err)
                 }
@@ -1416,24 +1567,58 @@ impl ClientRelay {
             // direction -- so read-until-close apps get their response EOF and can
             // close); the per-direction codecs are discarded (no DONE handshake on
             // the TCP path -- TCP delivers reliably and FIN/EOF is a clean,
-            // fully-delivered close).
+            // fully-delivered close). The relay is bounded by the same idle backstop
+            // as the server's DataRelay.
             let upload = client_upload_loop(
                 local_read,
                 TcpLegWriter(server_write),
                 seal_to_server,
                 local_buf,
                 cover,
+                activity.clone(),
                 cid,
             );
             let download = client_download_loop(
                 TcpLegReader::buffered(server_read),
                 local_write,
                 open_from_server,
+                activity.clone(),
                 cid,
             );
-            let (_seal_to_server, _open_from_server) = tokio::try_join!(upload, download)?;
-            Ok(())
+            tokio::select! {
+                result = async {
+                    tokio::try_join!(upload, download)
+                        .map(|(_seal_to_server, _open_from_server)| ())
+                } => result,
+                _ = client_relay_idle_watchdog(activity, CLIENT_RELAY_IDLE_TIMEOUT) => {
+                    tracing::debug!(cid, "client relay idle backstop reached; tearing down");
+                    Ok(())
+                }
+            }
         }
+    }
+}
+
+/// Shared last-activity clock for a client relay, reset on every real payload
+/// byte moved in either direction (cover records excluded).
+type ClientRelayActivity = Arc<std::sync::Mutex<Instant>>;
+
+fn bump_client_relay_activity(activity: &ClientRelayActivity) {
+    if let Ok(mut last) = activity.lock() {
+        *last = Instant::now();
+    }
+}
+
+async fn client_relay_idle_watchdog(activity: ClientRelayActivity, idle_timeout: Duration) {
+    loop {
+        let elapsed = activity
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or(idle_timeout);
+        if elapsed >= idle_timeout {
+            return;
+        }
+        sleep(idle_timeout - elapsed).await;
     }
 }
 
@@ -1552,6 +1737,7 @@ async fn client_upload_loop<W>(
     mut seal_to_server: DataRecordCodec,
     mut local_buf: Vec<u8>,
     cover: CoverTrafficProfile,
+    activity: ClientRelayActivity,
     cid: u64,
 ) -> Result<DataRecordCodec, ClientRuntimeError>
 where
@@ -1566,6 +1752,7 @@ where
                 let _ = server_write.shutdown().await;
                 return Ok(seal_to_server);
             }
+            bump_client_relay_activity(&activity);
             let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
             write_client_data_records_chunked(
                 &mut server_write,
@@ -1601,6 +1788,7 @@ where
                     let _ = server_write.shutdown().await;
                     return Ok(seal_to_server);
                 }
+                bump_client_relay_activity(&activity);
                 let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
                 write_client_data_records_chunked(
                     &mut server_write,
@@ -1627,6 +1815,7 @@ async fn client_download_loop<R>(
     mut server_records: R,
     mut local_write: OwnedWriteHalf,
     mut open_from_server: DataRecordCodec,
+    activity: ClientRelayActivity,
     cid: u64,
 ) -> Result<DataRecordCodec, ClientRuntimeError>
 where
@@ -1648,6 +1837,7 @@ where
         match open_from_server.open_in_place_payload_range(&mut server_record) {
             Ok(plaintext) => {
                 if !plaintext.is_empty() {
+                    bump_client_relay_activity(&activity);
                     local_write.write_all(&server_record[plaintext]).await?;
                 }
             }
@@ -1724,10 +1914,36 @@ async fn client_mux_await_download(
     }
 }
 
+/// Applies a control message to the reader-owned download-stream map. Register
+/// inserts the stream's write half; Deregister removes and FIN-closes it. Keeping
+/// this in one place ensures both the select arm and the opportunistic drain
+/// handle deregistration identically.
+async fn apply_client_stream_control(
+    local_writes: &mut HashMap<u32, ClientDownloadStream>,
+    control: ClientStreamControl,
+) {
+    match control {
+        ClientStreamControl::Register(reg) => {
+            local_writes.insert(
+                reg.stream_id,
+                ClientDownloadStream {
+                    write: reg.local_write,
+                    outcome_tx: reg.outcome_tx,
+                },
+            );
+        }
+        ClientStreamControl::Deregister(stream_id) => {
+            if let Some(mut stream) = local_writes.remove(&stream_id) {
+                let _ = stream.write.shutdown().await;
+            }
+        }
+    }
+}
+
 async fn client_mux_reader_loop<R>(
     mut server_records: R,
     mut open_from_server: DataRecordCodec,
-    mut register_rx: mpsc::Receiver<ClientStreamRegistration>,
+    mut register_rx: mpsc::Receiver<ClientStreamControl>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError>
 where
@@ -1749,11 +1965,8 @@ where
                 biased;
                 registration = register_rx.recv(), if register_open => {
                     match registration {
-                        Some(reg) => {
-                            local_writes.insert(
-                                reg.stream_id,
-                                ClientDownloadStream { write: reg.local_write, outcome_tx: reg.outcome_tx },
-                            );
+                        Some(control) => {
+                            apply_client_stream_control(&mut local_writes, control).await;
                         }
                         None => register_open = false,
                     }
@@ -1810,16 +2023,11 @@ where
             }
         }
 
-        // Absorb any registrations queued alongside these records so a
-        // stream's write half is always present before its first Data.
-        while let Ok(reg) = register_rx.try_recv() {
-            local_writes.insert(
-                reg.stream_id,
-                ClientDownloadStream {
-                    write: reg.local_write,
-                    outcome_tx: reg.outcome_tx,
-                },
-            );
+        // Absorb any control messages queued alongside these records so a
+        // stream's write half is always present before its first Data, and a
+        // deregister from an exited per-connection task is applied promptly.
+        while let Ok(control) = register_rx.try_recv() {
+            apply_client_stream_control(&mut local_writes, control).await;
         }
 
         let frames_payload: &[u8] = if record_count == 1 {
@@ -1900,7 +2108,22 @@ async fn dispatch_client_mux_frame(
         }
         MuxFrameKind::Cover => {}
         MuxFrameKind::Open => {
-            return Err(MuxFrameError::InvalidKind.into());
+            // The server never legitimately opens a stream toward the client
+            // (the client is the mux initiator). Treat an unexpected Open as a
+            // single-stream anomaly: reset that stream id if we know it and
+            // otherwise ignore it. Crucially, do NOT propagate an error out of
+            // the shared reader loop — doing so would tear down every concurrent
+            // stream and (because the writer keeps the frame channel open) leave
+            // the whole client mux session permanently poisoned until restart.
+            tracing::debug!(
+                cid,
+                stream_id = frame.stream_id,
+                "ignoring unexpected server-originated mux Open frame"
+            );
+            if let Some(mut stream) = local_writes.remove(&frame.stream_id) {
+                let _ = stream.write.shutdown().await;
+                let _ = stream.outcome_tx.send(DownloadOutcome::Reset);
+            }
         }
     }
     Ok(())
@@ -2319,6 +2542,47 @@ mod tests {
     /// Acquires the QUIC e2e serial lock for the duration of a test.
     async fn quic_e2e_guard() -> tokio::sync::MutexGuard<'static, ()> {
         QUIC_E2E_SERIAL.lock().await
+    }
+
+    fn dummy_mux_handle() -> (
+        ClientMuxHandle,
+        mpsc::Receiver<MuxFrame>,
+        mpsc::Receiver<ClientStreamControl>,
+    ) {
+        let (frame_tx, frame_rx) = mpsc::channel(4);
+        let (register_tx, register_rx) = mpsc::channel(4);
+        let handle = ClientMuxHandle {
+            frame_tx,
+            register_tx,
+            next_stream_id: Arc::new(AtomicU32::new(1)),
+            stream_slots: Arc::new(Semaphore::new(4)),
+            chunk_size: 1024,
+            payload_pool: MuxPayloadPool::with_capacity(1024),
+        };
+        (handle, frame_rx, register_rx)
+    }
+
+    #[test]
+    fn mux_handle_reusable_only_while_both_tasks_alive() {
+        // Both background tasks alive -> reusable.
+        let (handle, frame_rx, register_rx) = dummy_mux_handle();
+        assert!(handle.is_reusable());
+
+        // Reader dead (its register_rx dropped) but writer alive: must NOT be
+        // reused. This is the clean server->client half-close FIN case that
+        // previously wedged the pool when only frame_tx was probed.
+        drop(register_rx);
+        assert!(
+            !handle.is_reusable(),
+            "a handle whose reader task has exited must not be reused"
+        );
+        drop(frame_rx);
+
+        // Writer dead (frame_rx dropped) is likewise not reusable.
+        let (handle, frame_rx, register_rx) = dummy_mux_handle();
+        drop(frame_rx);
+        assert!(!handle.is_reusable());
+        drop(register_rx);
     }
 
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
@@ -3520,6 +3784,14 @@ mod tests {
             replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
             authorized_sni: vec![String::from("example.com")],
             strict_tls13: true,
+            max_concurrent_per_source_v4: 256,
+            max_concurrent_per_source_v6: 256,
+            source_ipv6_prefix_len: 64,
+            first_record_wait_floor_ms: 8_000,
+            first_record_wait_jitter_ms: 7_000,
+            fallback_idle_floor_ms: 600_000,
+            fallback_idle_jitter_ms: 0,
+            tcp_congestion: None,
         }
     }
 

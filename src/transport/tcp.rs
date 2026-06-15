@@ -1,6 +1,10 @@
 #[cfg(target_os = "linux")]
 use std::time::Duration;
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use tokio::{
     net::{lookup_host, tcp::OwnedReadHalf, TcpSocket, TcpStream},
@@ -11,6 +15,72 @@ const RESERVED_PROCESS_FDS: usize = 64;
 const FDS_PER_RELAY_CONNECTION: usize = 2;
 const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
 const MAX_PARALLEL_CONNECT_ATTEMPTS: usize = 4;
+/// Aggregate cap on the *extra* (beyond the first) parallel connect sockets held
+/// across all in-flight multi-address races. The per-relay fd budget counts a
+/// settled relay's single outbound socket, not the connect-race fan-out, so a
+/// burst of multi-address fallback dials could transiently over-commit fds. This
+/// bounds that fan-out process-wide: the always-allowed first attempt preserves
+/// connectivity, extra racers degrade gracefully under pressure rather than
+/// exhausting RLIMIT_NOFILE.
+const MAX_INFLIGHT_EXTRA_CONNECT_ATTEMPTS: usize = 256;
+static INFLIGHT_EXTRA_CONNECTS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII reservation for one extra (non-first) parallel connect attempt. Held for
+/// the lifetime of the connect task and released on completion or abort.
+struct ExtraConnectGuard;
+
+impl ExtraConnectGuard {
+    fn try_acquire() -> Option<Self> {
+        let prev = INFLIGHT_EXTRA_CONNECTS.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_INFLIGHT_EXTRA_CONNECT_ATTEMPTS {
+            INFLIGHT_EXTRA_CONNECTS.fetch_sub(1, Ordering::AcqRel);
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for ExtraConnectGuard {
+    fn drop(&mut self) {
+        INFLIGHT_EXTRA_CONNECTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Bounds concurrent Linux kernel-splice fallback relays. Each splice relay holds
+/// ~8 fds (2 sockets + 2 clones + 2 pipes) and 2 native OS threads, far more than
+/// the 2 fds the admission semaphore budgets per connection, so unauthenticated
+/// fallback traffic could drive fd/thread exhaustion before the connection limit
+/// is reached. Beyond this cap, callers fall back to the userspace async relay
+/// (2 fds, no native threads), which scales without per-relay threads.
+#[cfg(target_os = "linux")]
+const MAX_CONCURRENT_KERNEL_SPLICE_RELAYS: usize = 256;
+#[cfg(target_os = "linux")]
+static ACTIVE_KERNEL_SPLICE_RELAYS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII slot for a kernel-splice relay; releases the slot on drop.
+#[cfg(target_os = "linux")]
+pub struct KernelSpliceSlot(());
+
+#[cfg(target_os = "linux")]
+impl Drop for KernelSpliceSlot {
+    fn drop(&mut self) {
+        ACTIVE_KERNEL_SPLICE_RELAYS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Reserves a kernel-splice relay slot, or returns `None` when the cap is reached
+/// (signalling the caller to use the userspace relay instead).
+#[cfg(target_os = "linux")]
+pub fn try_enter_kernel_splice_relay() -> Option<KernelSpliceSlot> {
+    let prev = ACTIVE_KERNEL_SPLICE_RELAYS.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_CONCURRENT_KERNEL_SPLICE_RELAYS {
+        ACTIVE_KERNEL_SPLICE_RELAYS.fetch_sub(1, Ordering::AcqRel);
+        None
+    } else {
+        Some(KernelSpliceSlot(()))
+    }
+}
 #[cfg(target_os = "linux")]
 const TCP_NOTSENT_LOWAT_BYTES: libc::c_uint = 256 * 1024;
 #[cfg(target_os = "linux")]
@@ -34,8 +104,23 @@ pub async fn connect_tuned_tcp_any(addrs: &[SocketAddr]) -> io::Result<TcpStream
 
 async fn connect_tuned_tcp_race(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     let mut attempts = JoinSet::new();
-    for addr in addrs.iter().copied().take(MAX_PARALLEL_CONNECT_ATTEMPTS) {
-        attempts.spawn(async move { connect_tuned_tcp_addr(addr).await });
+    let mut addr_iter = addrs.iter().copied().take(MAX_PARALLEL_CONNECT_ATTEMPTS);
+
+    // The first attempt is always raced: its outbound fd is covered by the
+    // per-relay budget. Extra attempts only spawn while the process-wide
+    // connect-race budget has room, so a burst of multi-address dials cannot
+    // over-commit fds beyond what the connection limit assumes.
+    if let Some(first) = addr_iter.next() {
+        attempts.spawn(async move { connect_tuned_tcp_addr(first).await });
+    }
+    for addr in addr_iter {
+        let Some(guard) = ExtraConnectGuard::try_acquire() else {
+            break;
+        };
+        attempts.spawn(async move {
+            let _guard = guard;
+            connect_tuned_tcp_addr(addr).await
+        });
     }
 
     let mut last_err = None;
@@ -55,14 +140,6 @@ async fn connect_tuned_tcp_race(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
 }
 
 pub async fn connect_tuned_tcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
-    #[cfg(target_os = "linux")]
-    match connect_mptcp_addr(addr).await {
-        Ok(stream) => return Ok(stream),
-        Err(err) => {
-            tracing::trace!(error = %err, "MPTCP connect failed; falling back to TCP");
-        }
-    }
-
     let socket = tuned_tcp_socket(addr)?;
     socket.connect(addr).await
 }
@@ -209,24 +286,78 @@ fn nofile_soft_limit() -> io::Result<usize> {
     Ok(512)
 }
 
+/// Process-wide TCP congestion-control override, set once at startup.
+static CONGESTION_OVERRIDE: std::sync::OnceLock<Option<std::ffi::CString>> =
+    std::sync::OnceLock::new();
+
+/// Sets the congestion-control algorithm requested on relay sockets, process
+/// wide. Call once at startup before any socket is tuned. `None` (or a name
+/// containing a NUL) keeps the built-in default ("bbr" on Linux).
+pub fn configure_congestion_control(algorithm: Option<&str>) {
+    let value = algorithm.and_then(|name| std::ffi::CString::new(name).ok());
+    if CONGESTION_OVERRIDE.set(value).is_err() {
+        tracing::debug!("congestion control override already set; keeping the first value");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn set_low_latency_congestion(stream: &TcpStream) {
     use std::{ffi::CString, os::fd::AsRawFd};
 
-    let Ok(algorithm) = CString::new("bbr") else {
+    let default = CString::new("bbr").ok();
+    let configured = CONGESTION_OVERRIDE.get().and_then(|opt| opt.clone());
+    let Some(algorithm) = configured.or(default) else {
         return;
     };
+    let fd = stream.as_raw_fd();
     let rc = unsafe {
         libc::setsockopt(
-            stream.as_raw_fd(),
+            fd,
             libc::IPPROTO_TCP,
             libc::TCP_CONGESTION,
             algorithm.as_ptr().cast(),
-            algorithm.as_bytes_with_nul().len() as libc::socklen_t,
+            algorithm.as_bytes().len() as libc::socklen_t,
         )
     };
     if rc != 0 {
-        tracing::trace!("TCP BBR congestion control is unavailable; keeping kernel default");
+        tracing::trace!(
+            algorithm = ?algorithm,
+            "TCP congestion control request failed; keeping kernel default"
+        );
+        return;
+    }
+    // Read back: the kernel silently ignores an unknown/unloaded algorithm, so a
+    // zero setsockopt return does not mean it was applied. Warn on mismatch so a
+    // configured algorithm the kernel dropped does not silently lie.
+    let mut current = [0_u8; 32];
+    let mut len = current.len() as libc::socklen_t;
+    let rrc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            current.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rrc != 0 {
+        return;
+    }
+    // getsockopt(TCP_CONGESTION) returns min(buf, TCP_CA_NAME_MAX) bytes with the
+    // name NUL-padded, so trim at the first NUL before comparing to the requested
+    // name (which carries no NUL). Clamp len defensively against the buffer.
+    let len = (len as usize).min(current.len());
+    let applied = &current[..len];
+    let applied = &applied[..applied
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(applied.len())];
+    if applied != algorithm.as_bytes() {
+        tracing::warn!(
+            requested = ?algorithm,
+            applied = %String::from_utf8_lossy(applied),
+            "kernel did not apply the requested TCP congestion control (algorithm not loaded?)"
+        );
     }
 }
 
@@ -235,7 +366,10 @@ fn set_low_latency_congestion(_stream: &TcpStream) {}
 
 #[cfg(target_os = "linux")]
 fn tune_tcp_socket_before_connect(socket: &TcpSocket) {
-    set_fastopen_connect(socket);
+    // NB: TCP Fast Open (TCP_FASTOPEN_CONNECT) is deliberately NOT enabled here.
+    // It advertises a TFO option in the SYN (and can send data in the SYN on
+    // cached-cookie paths), a stable TCP-layer distinguisher outside the TLS
+    // ClientHello camouflage that modern desktop browsers do not exhibit.
     set_notsent_lowat(socket);
     set_busy_poll(socket);
     set_incoming_cpu(socket);
@@ -243,30 +377,6 @@ fn tune_tcp_socket_before_connect(socket: &TcpSocket) {
 
 #[cfg(not(target_os = "linux"))]
 fn tune_tcp_socket_before_connect(_socket: &TcpSocket) {}
-
-#[cfg(target_os = "linux")]
-fn set_fastopen_connect(socket: &TcpSocket) {
-    use std::os::fd::AsRawFd;
-
-    set_fastopen_connect_fd(socket.as_raw_fd());
-}
-
-#[cfg(target_os = "linux")]
-fn set_fastopen_connect_fd(fd: std::os::fd::RawFd) {
-    let enabled: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_FASTOPEN_CONNECT,
-            (&enabled as *const libc::c_int).cast(),
-            std::mem::size_of_val(&enabled) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        tracing::trace!("TCP_FASTOPEN_CONNECT is unavailable; using normal TCP connect");
-    }
-}
 
 #[cfg(target_os = "linux")]
 fn set_notsent_lowat<S>(socket: &S)
@@ -338,55 +448,6 @@ fn set_incoming_cpu_fd(fd: std::os::fd::RawFd) {
 fn set_incoming_cpu<S>(_socket: &S) {}
 
 #[cfg(target_os = "linux")]
-async fn connect_mptcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
-    use std::os::fd::{FromRawFd, RawFd};
-
-    let domain = if addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
-    let fd = unsafe {
-        libc::socket(
-            domain,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            libc::IPPROTO_MPTCP,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    set_socket_int_option_fd(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
-    set_socket_int_option_fd(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-    set_fastopen_connect_fd(fd);
-    set_notsent_lowat_fd(fd);
-    set_busy_poll_fd(fd);
-    set_incoming_cpu_fd(fd);
-
-    let (storage, len) = socket_addr_storage(addr);
-    let rc = unsafe { libc::connect(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINPROGRESS) {
-            close_raw_fd(fd);
-            return Err(err);
-        }
-    }
-
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd as RawFd) };
-    std_stream.set_nonblocking(true)?;
-    let stream = TcpStream::from_std(std_stream)?;
-    if rc != 0 {
-        stream.writable().await?;
-        if let Some(err) = stream.take_error()? {
-            return Err(err);
-        }
-    }
-    Ok(stream)
-}
-
-#[cfg(target_os = "linux")]
 fn set_socket_int_option_fd(
     fd: std::os::fd::RawFd,
     level: libc::c_int,
@@ -408,61 +469,6 @@ fn set_socket_int_option_fd(
             optname,
             "socket option unavailable; keeping kernel default"
         );
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn socket_addr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    match addr {
-        SocketAddr::V4(addr) => {
-            let sockaddr = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: addr.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(addr.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            unsafe {
-                storage
-                    .as_mut_ptr()
-                    .cast::<libc::sockaddr_in>()
-                    .write(sockaddr);
-            }
-            (
-                unsafe { storage.assume_init() },
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        }
-        SocketAddr::V6(addr) => {
-            let sockaddr = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: addr.port().to_be(),
-                sin6_flowinfo: addr.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: addr.ip().octets(),
-                },
-                sin6_scope_id: addr.scope_id(),
-            };
-            unsafe {
-                storage
-                    .as_mut_ptr()
-                    .cast::<libc::sockaddr_in6>()
-                    .write(sockaddr);
-            }
-            (
-                unsafe { storage.assume_init() },
-                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            )
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn close_raw_fd(fd: std::os::fd::RawFd) {
-    unsafe {
-        libc::close(fd);
     }
 }
 
@@ -549,27 +555,41 @@ mod kernel_splice {
         idle_timeout: Duration,
         last_progress: Arc<Mutex<Instant>>,
     ) -> io::Result<()> {
+        let result = splice_pump(&read_stream, &write_stream, idle_timeout, &last_progress);
+        // FIN on EVERY exit (idle timeout, EOF, or any error): drain bytes still
+        // queued on the read socket so its drop does not RST, then half-close the
+        // write socket so the downstream peer sees a graceful FIN. shutdown (not a
+        // bare drop) is required because the sibling direction still holds the
+        // other clone of this socket. Mirrors the userspace graceful_close path.
+        drain_std_recv(&read_stream);
+        let _ = write_stream.shutdown(Shutdown::Write);
+        result
+    }
+
+    /// Pumps one direction (read -> pipe -> write) until idle timeout, EOF, or
+    /// error. Never shuts the socket down itself; the caller FINs on every exit.
+    fn splice_pump(
+        read_stream: &StdTcpStream,
+        write_stream: &StdTcpStream,
+        idle_timeout: Duration,
+        last_progress: &Arc<Mutex<Instant>>,
+    ) -> io::Result<()> {
         let pipe = Pipe::new()?;
         loop {
             if !poll_fd_until_progress(
                 read_stream.as_raw_fd(),
                 libc::POLLIN,
                 idle_timeout,
-                &last_progress,
+                last_progress,
             )? {
-                // Idle timeout on the read side: signal the peer with a FIN
-                // instead of dropping the socket, which would RST if bytes are
-                // still queued and reveal this is not an ordinary origin.
-                let _ = write_stream.shutdown(Shutdown::Write);
-                return Ok(());
+                return Ok(()); // read-side idle timeout
             }
             let Some(moved) = splice_fd(read_stream.as_raw_fd(), pipe.write_fd, SPLICE_CHUNK)?
             else {
                 continue;
             };
             if moved == 0 {
-                let _ = write_stream.shutdown(Shutdown::Write);
-                return Ok(());
+                return Ok(()); // read EOF (peer half-closed)
             }
             *last_progress
                 .lock()
@@ -582,12 +602,9 @@ mod kernel_splice {
                     write_stream.as_raw_fd(),
                     libc::POLLOUT,
                     idle_timeout,
-                    &last_progress,
+                    last_progress,
                 )? {
-                    // Idle timeout while waiting to write: close with a FIN for
-                    // the same reason as the read-side timeout above.
-                    let _ = write_stream.shutdown(Shutdown::Write);
-                    return Ok(());
+                    return Ok(()); // write-side idle timeout
                 }
                 let Some(written) = splice_fd(pipe.read_fd, write_stream.as_raw_fd(), remaining)?
                 else {
@@ -601,6 +618,23 @@ mod kernel_splice {
                     .lock()
                     .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))? =
                     Instant::now();
+            }
+        }
+    }
+
+    /// Best-effort, bounded, non-blocking drain of a socket's receive buffer so
+    /// that closing it emits a FIN rather than a RST. The stream is already
+    /// nonblocking (set in `splice_bidirectional_with_idle_timeout`).
+    fn drain_std_recv(stream: &StdTcpStream) {
+        use std::io::Read;
+        let mut reader: &StdTcpStream = stream;
+        let mut scratch = [0_u8; 16 * 1024];
+        for _ in 0..16 {
+            match reader.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
             }
         }
     }
@@ -623,7 +657,16 @@ mod kernel_splice {
                 return Ok(true);
             }
             if rc == 0 {
-                return Ok(false);
+                // Poll timed out. The sibling direction shares last_progress and
+                // may have bumped it while we waited, so only give up if the
+                // shared idle deadline has truly elapsed; otherwise re-poll with
+                // the refreshed remaining. This keeps the idle timer a single
+                // shared deadline rather than letting a quiet direction tear down
+                // a connection the other direction is actively pumping.
+                if poll_timeout_ms(idle_timeout, last_progress)? == 0 {
+                    return Ok(false);
+                }
+                continue;
             }
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -749,5 +792,54 @@ mod tests {
     #[test]
     fn kernel_splice_availability_matches_target() {
         assert_eq!(kernel_splice_available(), cfg!(target_os = "linux"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn splice_relay_idle_timeout_closes_client_with_fin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Origin accepts, reads whatever is relayed, then stays idle.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            let mut buf = [0_u8; 64];
+            let _ = origin.read(&mut buf).await; // forwarded client bytes
+            let _ = origin.read(&mut buf).await; // blocks until the relay FINs
+        });
+
+        // The relay splices the client side to a freshly dialed origin side.
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (client_side, _) = relay_listener.accept().await.unwrap();
+            let origin_side = TcpStream::connect(origin_addr).await.unwrap();
+            relay_kernel_splice_bidirectional_with_idle_timeout(
+                client_side,
+                origin_side,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        // Carry real bytes so the close is non-trivial, then go idle.
+        client.write_all(b"hello-through-splice").await.unwrap();
+
+        // After the idle timeout the relay tears down. The client MUST observe a
+        // graceful FIN (read == Ok(0)); a RST would surface as a ConnectionReset
+        // error and fail the inner expect.
+        let mut buf = [0_u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("relay should close promptly after idle timeout")
+            .expect("splice teardown must be a graceful FIN, not a RST");
+        assert_eq!(n, 0, "client must see EOF (FIN) after splice idle teardown");
+
+        relay_task.await.unwrap();
+        origin_task.abort();
     }
 }

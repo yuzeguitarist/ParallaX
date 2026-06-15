@@ -1,0 +1,9 @@
+# tls_compressed_cert: src/tls/safari26.rs parse_compressed_certificate_body
+alg_zlib="\x00\x01"
+zlib_hdr_default="\x78\xda"
+zlib_hdr_fast="\x78\x01"
+zlib_hdr_best="\x78\x9c"
+len_small="\x00\x00\xc8"
+len_huge="\xff\xff\xff"
+# empty-payload zlib stream (8 bytes), inflates to 0:
+zlib_empty="\x78\xda\x03\x00\x00\x00\x00\x01"

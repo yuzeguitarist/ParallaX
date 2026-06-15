@@ -14,6 +14,7 @@
 
 use std::{
     collections::VecDeque,
+    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     sync::{mpsc, Arc, Condvar, Mutex, OnceLock},
     thread::{self, JoinHandle},
 };
@@ -94,33 +95,66 @@ impl CryptoPool {
             return Vec::new();
         }
         if self.width <= 1 || n == 1 {
-            return jobs.into_iter().map(|job| job()).collect();
+            // Inline path. Catch each job so one panicking job cannot abort the
+            // batch mid-iteration; re-raise the first panic on the caller after
+            // running the rest (uniform with the parallel path below).
+            let mut first_panic = None;
+            let mut out = Vec::with_capacity(n);
+            for job in jobs {
+                match catch_unwind(AssertUnwindSafe(job)) {
+                    Ok(value) => out.push(value),
+                    Err(panic) => {
+                        first_panic.get_or_insert(panic);
+                    }
+                }
+            }
+            if let Some(panic) = first_panic {
+                resume_unwind(panic);
+            }
+            return out;
         }
 
-        let mut results: Vec<Option<T>> = Vec::with_capacity(n);
+        // Each job's result is captured as a `thread::Result` so a panicking job
+        // is contained on its worker thread: the worker catches the unwind,
+        // reports the panic over the channel, and stays alive to serve future
+        // jobs. Without this a single panicking job would kill a worker (and,
+        // cumulatively, the shared global pool, hanging all bulk AEAD). The
+        // first panic is re-raised on the caller so the failure is never masked.
+        let mut results: Vec<Option<thread::Result<T>>> = Vec::with_capacity(n);
         results.resize_with(n, || None);
 
-        let (tx, rx) = mpsc::channel::<(usize, T)>();
+        let (tx, rx) = mpsc::channel::<(usize, thread::Result<T>)>();
         let mut jobs = jobs.into_iter().enumerate();
         let (first_idx, first_job) = jobs.next().expect("n >= 1 checked above");
         for (idx, job) in jobs {
             let tx = tx.clone();
             self.submit(Box::new(move || {
-                let _ = tx.send((idx, job()));
+                let result = catch_unwind(AssertUnwindSafe(job));
+                let _ = tx.send((idx, result));
             }));
         }
         // Drop the caller's sender so `rx` closes once every worker sender has.
         drop(tx);
 
-        results[first_idx] = Some(first_job());
+        results[first_idx] = Some(catch_unwind(AssertUnwindSafe(first_job)));
         while let Ok((idx, value)) = rx.recv() {
             results[idx] = Some(value);
         }
 
-        results
-            .into_iter()
-            .map(|value| value.expect("every dispatched job reports a result"))
-            .collect()
+        let mut first_panic = None;
+        let mut out = Vec::with_capacity(n);
+        for slot in results {
+            match slot.expect("every dispatched job reports a result") {
+                Ok(value) => out.push(value),
+                Err(panic) => {
+                    first_panic.get_or_insert(panic);
+                }
+            }
+        }
+        if let Some(panic) = first_panic {
+            resume_unwind(panic);
+        }
+        out
     }
 }
 
@@ -232,5 +266,55 @@ mod tests {
         let pool = CryptoPool::new(1);
         let jobs: Vec<_> = (0..10usize).map(|i| move || i).collect();
         assert_eq!(pool.run_ordered(jobs), (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn run_ordered_survives_panicking_jobs_and_re_raises() {
+        let pool = CryptoPool::new(4);
+        // Silence the default panic printer for the deliberately-panicking jobs.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        for _ in 0..50 {
+            let jobs: Vec<_> = (0..3usize)
+                .map(|i| {
+                    move || {
+                        if i == 1 {
+                            panic!("boom")
+                        }
+                        i
+                    }
+                })
+                .collect();
+            let r = catch_unwind(AssertUnwindSafe(|| pool.run_ordered(jobs)));
+            assert!(r.is_err(), "a panicking job must re-raise on the caller");
+        }
+        std::panic::set_hook(prev);
+        // If any worker had died from the panics, the pool would be degraded or
+        // hang here; a correct, prompt result proves every worker survived.
+        let jobs: Vec<_> = (0..64usize).map(|i| move || i * 3).collect();
+        assert_eq!(
+            pool.run_ordered(jobs),
+            (0..64).map(|i| i * 3).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn run_ordered_inline_path_re_raises_panic() {
+        let pool = CryptoPool::new(1);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let jobs: Vec<_> = (0..3usize)
+            .map(|i| {
+                move || {
+                    if i == 1 {
+                        panic!("boom")
+                    }
+                    i
+                }
+            })
+            .collect();
+        let r = catch_unwind(AssertUnwindSafe(|| pool.run_ordered(jobs)));
+        std::panic::set_hook(prev);
+        assert!(r.is_err());
     }
 }

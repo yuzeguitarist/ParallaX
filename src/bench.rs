@@ -704,7 +704,12 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuth
     let server = X25519KeyPair::generate();
     let session = Safari26TlsCamouflage.start(BENCH_SNI.to_owned(), BENCH_PSK, &server.public)?;
     let record = session.client_hello_bytes().to_vec();
-    let material = recover_stateful_auth_material(&record, BENCH_PSK)?
+    let parsed = parse_client_hello(&record)?;
+    let tls_key_share = parsed
+        .x25519_key_share
+        .expect("Safari26 ClientHello carries a standalone X25519 key_share");
+    let mask_ecdh = x25519_shared_secret(&server.private, &tls_key_share);
+    let material = recover_stateful_auth_material(&record, BENCH_PSK, &mask_ecdh)?
         .expect("Safari26 ClientHello must carry stateful auth material");
     let server_auth = derive_server_auth_key(BENCH_PSK, &server.private, &material.x25519_public)?;
     Ok((record, server_auth, material))

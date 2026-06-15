@@ -43,6 +43,22 @@ pub enum ReplayCacheError {
     Clock,
 }
 
+/// Outcome of attempting to record an authenticated handshake in the replay
+/// cache. Lets callers distinguish a genuine replay from operational conditions
+/// (stale timestamp, capacity exhaustion) so the two are not conflated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayInsertOutcome {
+    /// Recorded; this handshake is fresh and unseen (or replay protection is off).
+    Inserted,
+    /// The nonce or transcript fingerprint was already present — a real replay.
+    Replayed,
+    /// The timestamp falls outside the freshness window (stale or future-skewed).
+    Stale,
+    /// The cache is full of still-fresh entries; nothing was evicted (evicting a
+    /// fresh entry would re-open it to replay). A load-shed, not an attack.
+    CacheFull,
+}
+
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct CacheMacKey([u8; 32]);
 
@@ -129,42 +145,67 @@ impl ReplayCache {
         }
 
         let raw = fs::read_to_string(&path)?;
-        let mac_key = cache.mac_key.as_ref().expect("authenticated cache has key");
-        let (entries, journal) = parse_authenticated_journal_entries(&raw, mac_key)?;
+        let mac_key_owned = cache.mac_key.clone().expect("authenticated cache has key");
+        let (entries, journal, has_uncommitted_tail) =
+            parse_authenticated_journal_entries(&raw, &mac_key_owned)?;
         cache.auth_journal = Some(journal);
         for entry in entries {
             cache.insert_loaded(entry);
         }
         cache.prune_expired(current_unix_timestamp()?);
+        // Heal an uncommitted trailing entry left by a crash mid-persist by
+        // rewriting the file to its committed state, so a later append starts at
+        // the correct offset and the cache stays loadable.
+        if has_uncommitted_tail {
+            cache.compact_authenticated_journal(&path, &mac_key_owned)?;
+        }
         Ok(cache)
     }
 
     pub fn insert_new(&mut self, entry: ReplayEntry, now: u64) -> Result<bool, ReplayCacheError> {
+        Ok(self.insert_new_outcome(entry, now)? == ReplayInsertOutcome::Inserted)
+    }
+
+    /// Like [`insert_new`] but distinguishes WHY an entry was not inserted.
+    ///
+    /// The boolean [`insert_new`] collapses four very different conditions —
+    /// a genuine replay (nonce/transcript seen), a stale/out-of-window
+    /// timestamp, and the cache being full of still-fresh entries — into a
+    /// single `false`. Callers that gate a connection on the result must be able
+    /// to tell a real replay (close, it is an attack/duplicate) from capacity
+    /// exhaustion (a load-shed/operational condition), otherwise once the cache
+    /// fills with fresh entries every legitimate handshake is logged and dropped
+    /// as a "replay".
+    pub fn insert_new_outcome(
+        &mut self,
+        entry: ReplayEntry,
+        now: u64,
+    ) -> Result<ReplayInsertOutcome, ReplayCacheError> {
         if self.capacity == 0 {
-            return Ok(true);
+            return Ok(ReplayInsertOutcome::Inserted);
         }
 
         self.prune_expired(now);
         if !self.is_fresh(entry.timestamp, now) {
-            return Ok(false);
+            return Ok(ReplayInsertOutcome::Stale);
         }
 
         if !self.nonces.insert(entry.nonce) {
-            return Ok(false);
+            return Ok(ReplayInsertOutcome::Replayed);
         }
         if !self.transcripts.insert(entry.transcript_fingerprint) {
             self.nonces.remove(&entry.nonce);
-            return Ok(false);
+            return Ok(ReplayInsertOutcome::Replayed);
         }
         if self.order.len() >= self.capacity {
             self.nonces.remove(&entry.nonce);
             self.transcripts.remove(&entry.transcript_fingerprint);
-            return Ok(false);
+            return Ok(ReplayInsertOutcome::CacheFull);
         }
 
         self.push_loaded_entry(entry);
         self.persist()?;
-        Ok(true)
+        Ok(ReplayInsertOutcome::Inserted)
     }
 
     fn is_fresh(&self, timestamp: u64, now: u64) -> bool {
@@ -250,9 +291,15 @@ impl ReplayCache {
         }
         file.seek(SeekFrom::End(0))?;
         file.write_all(line.as_bytes())?;
+        // Make the appended entry durable BEFORE the header that will advertise
+        // it. Without this ordering a reordered/partial writeback could leave a
+        // header claiming count N+1 while entry N+1 is absent, which fails to load
+        // as a "truncated journal". The reverse (entry durable, header not) is
+        // healed on load by truncating the uncommitted tail.
+        file.sync_data()?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(next_header.as_bytes())?;
-        file.flush()?;
+        file.sync_data()?;
         self.auth_journal = Some(AuthJournalState {
             count: next_count,
             tail_mac: next_tail_mac,
@@ -276,6 +323,9 @@ impl ReplayCache {
         let tmp = path.with_extension("tmp");
         write_cache_file(&tmp, raw.as_bytes())?;
         fs::rename(tmp, path)?;
+        // Make the rename itself durable so a crash right after compaction/heal
+        // cannot leave the directory entry pointing at the pre-rename state.
+        fsync_parent_dir(path);
         self.auth_journal = Some(journal);
         Ok(())
     }
@@ -303,8 +353,28 @@ fn write_cache_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
     let mut file = options.open(path)?;
     file.write_all(contents)?;
-    file.flush()
+    file.flush()?;
+    // Make the contents durable. This helper backs both the runtime journal
+    // compaction and the load-time self-heal, and compaction renames this file
+    // into place: without the fsync a crash can leave the renamed file empty or
+    // truncated (forcing a re-heal or, worse, an unloadable cache). `flush` alone
+    // only reaches the OS page cache.
+    file.sync_all()
 }
+
+/// Best-effort fsync of `path`'s parent directory so a preceding rename into it
+/// is durable. Errors are ignored (not all filesystems support directory fsync).
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = parent.unwrap_or_else(|| Path::new("."));
+    if let Ok(dir_file) = fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) {}
 
 pub fn current_unix_timestamp() -> Result<u64, ReplayCacheError> {
     Ok(SystemTime::now()
@@ -344,7 +414,7 @@ fn parse_entry(line: &str) -> Result<ReplayEntry, ReplayCacheError> {
 fn parse_authenticated_journal_entries(
     raw: &str,
     mac_key: &CacheMacKey,
-) -> Result<(Vec<ReplayEntry>, AuthJournalState), ReplayCacheError> {
+) -> Result<(Vec<ReplayEntry>, AuthJournalState, bool), ReplayCacheError> {
     let (header, body) = raw
         .split_once('\n')
         .ok_or_else(|| ReplayCacheError::MalformedLine("missing replay cache header".to_owned()))?;
@@ -364,7 +434,15 @@ fn parse_authenticated_journal_entries(
     if !bool::from(previous_mac.ct_eq(&journal.tail_mac)) {
         return Err(ReplayCacheError::MacMismatch);
     }
-    Ok((entries, journal))
+    // A crash between the durable entry append and the in-place header rewrite can
+    // leave one (or more) committed-looking lines beyond `count`. The header (and
+    // its validated tail MAC) is authoritative, so we accept the prefix but flag
+    // the uncommitted tail so the caller can rewrite the file to the committed
+    // length. Without this, the next append seeks past the stale line, and a later
+    // restart parses it as the committed next entry and fails with MacMismatch,
+    // blocking startup.
+    let has_uncommitted_tail = lines.next().is_some();
+    Ok((entries, journal, has_uncommitted_tail))
 }
 
 fn parse_authenticated_journal_header(
@@ -683,6 +761,50 @@ mod tests {
                 102,
             )
             .unwrap());
+    }
+
+    #[test]
+    fn insert_outcome_distinguishes_replay_stale_and_capacity_full() {
+        let mut cache = ReplayCache::new(1);
+        let first = ReplayEntry {
+            timestamp: 100,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        // Fresh insert.
+        assert_eq!(
+            cache.insert_new_outcome(first.clone(), 100).unwrap(),
+            ReplayInsertOutcome::Inserted
+        );
+        // Same entry again -> genuine replay (nonce + transcript already seen).
+        assert_eq!(
+            cache.insert_new_outcome(first, 100).unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+        // A distinct fresh entry while the cache is full -> CacheFull, NOT Replayed.
+        // This is the crucial distinction: a full cache must not mislabel every new
+        // session as a replay (which would fail-close all clients).
+        let second = ReplayEntry {
+            timestamp: 100,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(second, 100).unwrap(),
+            ReplayInsertOutcome::CacheFull
+        );
+        // A timestamp far outside the freshness window -> Stale.
+        let stale = ReplayEntry {
+            timestamp: 100,
+            nonce: [5; 8],
+            transcript_fingerprint: [6; 32],
+        };
+        assert_eq!(
+            cache
+                .insert_new_outcome(stale, 100 + DEFAULT_REPLAY_WINDOW_SECS + 10)
+                .unwrap(),
+            ReplayInsertOutcome::Stale
+        );
     }
 
     #[test]

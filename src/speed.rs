@@ -1006,6 +1006,14 @@ mod tests {
                 replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni: vec!["example.com".to_owned()],
                 strict_tls13: true,
+                max_concurrent_per_source_v4: 256,
+                max_concurrent_per_source_v6: 256,
+                source_ipv6_prefix_len: 64,
+                first_record_wait_floor_ms: 8_000,
+                first_record_wait_jitter_ms: 7_000,
+                fallback_idle_floor_ms: 600_000,
+                fallback_idle_jitter_ms: 0,
+                tcp_congestion: None,
             }),
         }
     }

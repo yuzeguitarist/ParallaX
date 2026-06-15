@@ -1,0 +1,13 @@
+# command_codecs: selector byte (data[0] % 7) + 4-byte type magic
+# (src/protocol/command.rs:6-15). Without these the 7 magic-gated decoders are
+# almost never reached from a cold start.
+sel0_connect="\x00PX1C"
+sel1_pq_rekey="\x01PX1Q"
+sel2_server_kex="\x02PX1K"
+sel3_identity="\x03PX1S"
+sel4_identity_chunk="\x04PX1I"
+sel5_speed_req="\x05PX1T"
+sel6_speed_ack_warmup_dl="\x06PX1W"
+sel6_speed_ack_warmup_ul="\x06PX1V"
+sel6_speed_ack_download="\x06PX1D"
+sel6_speed_ack_upload="\x06PX1U"

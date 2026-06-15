@@ -1,5 +1,7 @@
 .DS_Store
 .cursor/
+.claude/worktrees/
+.claude/
 target/
 docs/
 code_refs/

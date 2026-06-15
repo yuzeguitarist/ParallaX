@@ -1,0 +1,14 @@
+# client_hello_auth: parse_client_hello + HMAC auth path (ClientHello vocabulary)
+rec_hs="\x16\x03\x03"
+hs_client_hello="\x01"
+legacy_ver="\x03\x03"
+ext_server_name="\x00\x00"
+ext_supported_versions="\x00\x2b"
+ext_key_share="\x00\x33"
+tls13="\x03\x04"
+group_x25519="\x00\x1d"
+sni_host_type="\x00"
+example_host="example.com"
+supp_ver_body="\x02\x03\x04"
+session_id_len_32="\x20"
+# 32-byte session_id is where the stateful auth tag/timestamp/nonce ride

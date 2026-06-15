@@ -774,6 +774,13 @@ impl MuxFrame {
     }
 
     pub fn encoded_len(payload_len: usize) -> Result<usize, MuxFrameError> {
+        // Enforce the u32 wire limit BEFORE any caller uses this to size an
+        // allocation (e.g. `encode_borrowed`'s `Vec::with_capacity`). Checking
+        // only usize overflow here would let a payload in (u32::MAX, usize::MAX]
+        // trigger a multi-gigabyte reservation before the limit is checked.
+        if payload_len > u32::MAX as usize {
+            return Err(MuxFrameError::PayloadTooLong);
+        }
         MUX_FRAME_FIXED_LEN
             .checked_add(payload_len)
             .ok_or(MuxFrameError::PayloadTooLong)
@@ -1342,6 +1349,20 @@ mod tests {
             ConnectRequest::decode(b"BAD!").unwrap_err(),
             ConnectRequestError::BadMagic
         );
+    }
+
+    #[test]
+    fn mux_encoded_len_rejects_payload_over_u32_before_allocating() {
+        // The u32 wire-limit check must live in encoded_len so callers that size
+        // an allocation from it (encode_borrowed's Vec::with_capacity) reject an
+        // oversized payload instead of attempting a multi-gigabyte reservation.
+        let over = (u32::MAX as usize) + 1;
+        assert_eq!(
+            MuxFrame::encoded_len(over).unwrap_err(),
+            MuxFrameError::PayloadTooLong
+        );
+        // A payload at the limit still computes a length.
+        assert!(MuxFrame::encoded_len(u32::MAX as usize).is_ok());
     }
 
     #[test]

@@ -7,6 +7,12 @@ description = "ParallaX censorship-resistant proxy protocol core"
 license = "MIT"
 default-run = "parallax"
 
+# The `fuzzing` cfg is set automatically by cargo-fuzz. Declare it here so normal
+# and CI builds (which never set it) don't emit unexpected_cfgs warnings for the
+# #[cfg(fuzzing)] fuzz-only hooks — keeping `-D warnings` green.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"
