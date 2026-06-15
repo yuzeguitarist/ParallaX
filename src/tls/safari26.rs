@@ -38,7 +38,9 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use super::{
-    record::{parse_header, read_record, TLS_CONTENT_ALERT, TLS_CONTENT_APPLICATION_DATA},
+    record::{
+        parse_header, read_record, TlsRecordReader, TLS_CONTENT_ALERT, TLS_CONTENT_APPLICATION_DATA,
+    },
     server_hello::parse_server_hello,
 };
 use crate::crypto::{
@@ -76,6 +78,13 @@ const MAX_DECOMPRESSED_CERT_CHAIN: usize = 256 * 1024;
 /// on-path attacker (CCS is unauthenticated/pre-AEAD) trickle them to stall the
 /// client handshake indefinitely.
 const MAX_CHANGE_CIPHER_SPEC_RECORDS: usize = 2;
+
+/// Upper bound on a single encrypted handshake message length declared by the
+/// (still-unauthenticated, at this stage) server. Must exceed
+/// `MAX_DECOMPRESSED_CERT_CHAIN` (256 KiB) plus Certificate framing — the largest
+/// legitimate member of the flight — while killing the ~16 MiB memory-amplification
+/// vector a malicious cover origin could otherwise force via one length field.
+const MAX_ENCRYPTED_HANDSHAKE_MESSAGE: usize = 512 * 1024;
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
@@ -502,13 +511,33 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
     ) -> Result<usize, Safari26TlsError> {
         let mut observed = 0usize;
+        // One long-lived UNBUFFERED reader across the loop: a per-record timeout
+        // mid-read must NOT discard bytes already pulled off the socket. A
+        // throwaway reader (the old `read_record(stream)` per iteration) would
+        // drop the partially-read header/payload on timeout, desyncing the
+        // data-phase stream we hand off. On timeout we stop cleanly only when the
+        // reader is at a record boundary (the benign slow/absent NewSessionTicket
+        // case); a mid-record stall fails honestly so the connection is dropped
+        // rather than silently desynced.
+        let mut reader = TlsRecordReader::new(&mut *stream);
+        let mut record = Vec::new();
         for _ in 0..POST_HANDSHAKE_DRAIN_LIMIT {
-            let record = match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, read_record(stream)).await {
-                Ok(Ok(record)) => record,
+            match timeout(
+                POST_HANDSHAKE_DRAIN_TIMEOUT,
+                reader.read_record_into(&mut record),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
                 Ok(Err(err)) if is_clean_close(&err) => return Ok(observed),
                 Ok(Err(err)) => return Err(err.into()),
-                Err(_) => return Ok(observed),
-            };
+                Err(_) if reader.at_record_boundary() => return Ok(observed),
+                Err(_) => {
+                    return Err(Safari26TlsError::Handshake(
+                        "post-handshake drain timed out mid-record".to_owned(),
+                    ))
+                }
+            }
             observed += 1;
             self.tap_records(RecordDirection::Inbound, &record);
             let header = parse_header(&record)
@@ -566,13 +595,29 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
     ) -> Result<(), Safari26TlsError> {
         let mut plaintext = Vec::new();
+        // Long-lived UNBUFFERED reader (see drain_post_handshake): a mid-record
+        // timeout must not discard buffered bytes and desync the stream. The
+        // settings-ack write is routed through reader.get_mut() because the reader
+        // holds the stream borrow for the loop's lifetime.
+        let mut reader = TlsRecordReader::new(&mut *stream);
+        let mut record = Vec::new();
         for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
-            let record = match timeout(H2_SETTINGS_ACK_TIMEOUT, read_record(stream)).await {
-                Ok(Ok(record)) => record,
+            match timeout(
+                H2_SETTINGS_ACK_TIMEOUT,
+                reader.read_record_into(&mut record),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
                 Ok(Err(err)) if is_clean_close(&err) => return Ok(()),
                 Ok(Err(err)) => return Err(err.into()),
-                Err(_) => return Ok(()),
-            };
+                Err(_) if reader.at_record_boundary() => return Ok(()),
+                Err(_) => {
+                    return Err(Safari26TlsError::Handshake(
+                        "http/2 settings ack timed out mid-record".to_owned(),
+                    ))
+                }
+            }
             self.tap_records(RecordDirection::Inbound, &record);
             let header = parse_header(&record)
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
@@ -588,7 +633,7 @@ impl Safari26TlsSession {
                         plaintext.clear();
                     }
                     if self
-                        .process_http2_frames(&mut plaintext, stream, keys)
+                        .process_http2_frames(&mut plaintext, reader.get_mut(), keys)
                         .await?
                     {
                         return Ok(());
@@ -1417,6 +1462,16 @@ fn process_server_handshake_messages(
             return Ok(());
         }
         let len = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | buf[3] as usize;
+        // Reject on the FIRST record carrying an oversized length header, before
+        // the buffer can accumulate toward the declared target — this bounds the
+        // handshake buffer to ~MAX_ENCRYPTED_HANDSHAKE_MESSAGE plus one in-flight
+        // record, closing the memory-amplification vector from an unauthenticated
+        // cover origin.
+        if len > MAX_ENCRYPTED_HANDSHAKE_MESSAGE {
+            return Err(Safari26TlsError::Handshake(
+                "encrypted handshake message length exceeds maximum".to_owned(),
+            ));
+        }
         if buf.len() < 4 + len {
             return Ok(());
         }
@@ -1658,22 +1713,26 @@ fn verify_server_certificate(
 }
 
 fn native_roots() -> Result<&'static [CertificateDer<'static>], Safari26TlsError> {
-    static ROOTS: OnceLock<Result<Vec<CertificateDer<'static>>, String>> = OnceLock::new();
-    ROOTS
-        .get_or_init(|| {
-            let loaded = rustls_native_certs::load_native_certs();
-            if loaded.certs.is_empty() {
-                let detail = loaded
-                    .errors
-                    .first()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "platform root store returned no certificates".to_owned());
-                return Err(detail);
-            }
-            Ok(loaded.certs)
-        })
-        .as_deref()
-        .map_err(|err| Safari26TlsError::Certificate(err.clone()))
+    // Cache only the SUCCESS value: a transient empty/error load (boot-time
+    // trust-store rotation, a momentary sandbox denial) must NOT be memoized, or
+    // it would poison certificate verification for the whole process lifetime.
+    // Each failed load returns an error and the next handshake retries.
+    static ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
+    if let Some(roots) = ROOTS.get() {
+        return Ok(roots.as_slice());
+    }
+    let loaded = rustls_native_certs::load_native_certs();
+    if loaded.certs.is_empty() {
+        let detail = loaded
+            .errors
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "platform root store returned no certificates".to_owned());
+        return Err(Safari26TlsError::Certificate(detail));
+    }
+    // Another thread may win the init race; both then observe the winner's value.
+    let _ = ROOTS.set(loaded.certs);
+    Ok(ROOTS.get().expect("ROOTS populated above").as_slice())
 }
 
 struct HandshakeTranscript {
