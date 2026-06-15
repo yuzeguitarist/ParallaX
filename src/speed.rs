@@ -271,6 +271,12 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     if config.mode != Mode::Client {
         return Err(SpeedError::WrongMode);
     }
+    // The UDP-negotiation parameters live on `config.udp` and are threaded into
+    // the data-session seam so `parallax speed` runs the SAME UDP probe/offer
+    // negotiation as `client` when enabled. The speed test itself, however,
+    // measures the TCP plane: `establish_authenticated_data_session` closes any
+    // retained QUIC fast-plane connection (the speed path stays on TCP in this
+    // slice), so the UDP probe runs but the measured data transfer is over TCP.
     let client = config.client.clone().ok_or(SpeedError::MissingClient)?;
     let psk = decode_psk(&config.crypto.psk)?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
@@ -285,6 +291,7 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     let (mut server, mut data_session) = runtime::establish_authenticated_data_session(
         &client,
         config.traffic,
+        &config.udp,
         psk.as_slice(),
         &server_public,
         &server_identity_public,
@@ -855,7 +862,7 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClientConfig, CryptoConfig, ServerConfig, TrafficConfig};
+    use crate::config::{ClientConfig, CryptoConfig, ServerConfig, TrafficConfig, UdpConfig};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use pqcrypto_mldsa::mldsa87;
     use std::net::SocketAddr;
@@ -986,6 +993,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: None,
             server: Some(ServerConfig {
                 listen: "127.0.0.1:8443".parse::<SocketAddr>().unwrap(),
@@ -1017,6 +1025,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: None,
             server: None,
         }

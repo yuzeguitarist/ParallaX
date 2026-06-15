@@ -442,7 +442,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::config::{CryptoConfig, TrafficConfig};
+    use crate::config::{CryptoConfig, TrafficConfig, UdpConfig};
 
     fn config(server_addr: &str) -> Config {
         Config {
@@ -451,6 +451,7 @@ mod tests {
                 psk: "test-psk-not-read-by-runtime-guard".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: Some(ClientConfig {
                 listen: "127.0.0.1:1080".parse::<SocketAddr>().unwrap(),
                 server_addr: server_addr.to_owned(),

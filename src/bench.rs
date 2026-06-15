@@ -63,6 +63,7 @@ use crate::{
     },
     tls::{client_hello::parse_client_hello, safari26::Safari26TlsCamouflage},
     traffic::PaddingProfile,
+    transport::leg::LegWriter,
 };
 
 /// Pre-shared key used by every handshake-flavoured benchmark.
@@ -1551,6 +1552,23 @@ fn mux_batch_seal_blocking(
     }
 }
 
+/// In-memory [`LegWriter`] sink for the mux-batch benchmark: appends sealed
+/// record bytes to a borrowed `Vec` so the bench can measure the seal+write
+/// path without a socket. Mirrors the TCP leg's `write_all`/`shutdown`
+/// behaviour (append-all; shutdown is a no-op for a buffer).
+struct VecLegWriter<'a>(&'a mut Vec<u8>);
+
+impl LegWriter for VecLegWriter<'_> {
+    async fn write_records(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Drives the real server mux batch writer over four full-record Data frames
 /// (~64 KiB of mux plaintext) into an in-memory sink.
 async fn mux_batch_seal_once(
@@ -1582,7 +1600,7 @@ async fn mux_batch_seal_once(
 
     out.clear();
     write_server_mux_frames_batched(
-        out,
+        &mut VecLegWriter(out),
         codec,
         first_frame,
         ServerMuxBatchState {

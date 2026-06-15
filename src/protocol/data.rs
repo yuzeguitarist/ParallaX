@@ -825,6 +825,20 @@ pub fn should_parallelize_aead(record_count: usize, total_bytes: usize) -> bool 
 pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";
 pub const SERVER_TO_CLIENT_AAD: &[u8] = b"ParallaX v1 server appdata";
 
+/// Fixed plaintext payload of the QUIC fast-plane teardown DONE marker. After a
+/// side has fully drained both relay directions (its `try_join` is Ok), it seals
+/// exactly one record carrying this marker on its send-direction codec and
+/// writes it over the reliable TCP control stream; the peer opens one record on
+/// the matching receive-direction codec and verifies this payload. It is a
+/// normal sealed ApplicationData record on the wire (camouflage-consistent), and
+/// it consumes exactly the next per-direction sequence number — the codec
+/// continues monotonically (Connect rode TCP, the relay rode the QUIC stream,
+/// this DONE is the next record on each direction over TCP). The payload is a
+/// fixed, non-empty marker so it can never be confused with the empty
+/// cover/rendezvous records (whose plaintext is `&[]` and which the relay loops
+/// skip). Follows the PX1* command convention used elsewhere on the wire.
+pub const QUIC_RELAY_DONE_MARKER: &[u8] = b"PX1Z-quic-relay-done";
+
 pub fn max_plaintext_len(max_padding: u16) -> usize {
     OUTER_TLS_RECORD_LIMIT.saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }

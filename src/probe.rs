@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(report.verdict, ProbeVerdict::Good);
     }
 
-    use crate::config::{ClientConfig, CryptoConfig, Mode, ServerConfig, TrafficConfig};
+    use crate::config::{ClientConfig, CryptoConfig, Mode, ServerConfig, TrafficConfig, UdpConfig};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use pqcrypto_mldsa::mldsa87;
     use pqcrypto_mlkem::mlkem1024;
@@ -664,6 +664,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: Some(ClientConfig {
                 listen: "127.0.0.1:1080".parse().unwrap(),
                 server_addr: "example.com:443".to_owned(),
@@ -683,6 +684,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: None,
             server: Some(ServerConfig {
                 listen: "127.0.0.1:8443".parse().unwrap(),
