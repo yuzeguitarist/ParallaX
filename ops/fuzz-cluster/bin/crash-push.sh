@@ -110,7 +110,11 @@ normalize_frames() {  # stdin = repro log -> up to 3 normalized frame lines
 # detect the OOM (H1 zlib-bomb) class from a repro log or artifact name.
 is_oom() {  # <artifact_basename> <repro_log_file>
   case "$1" in oom-*) return 0 ;; esac
-  grep -aqiE 'out-of-memory|rss limit|malloc_limit|exceeds maximum supported size' "$2" 2>/dev/null
+  # Match only real OOM error signatures. Do NOT include 'malloc_limit'/'rss
+  # limit': libFuzzer echoes '-malloc_limit_mb=/-rss_limit_mb=' in its launch
+  # line, so those matched EVERY repro log and mis-classified all crashes as OOM
+  # -> all bugkeys collapsed to 'oom@rss=<cap>' and distinct bugs got deduped away.
+  grep -aqiE 'out-of-memory|exceeds maximum supported size' "$2" 2>/dev/null
 }
 
 # extract the sanitizer summary line for the issue body.
