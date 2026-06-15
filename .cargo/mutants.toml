@@ -1,0 +1,48 @@
+# cargo-mutants configuration — NON-GATING nightly indistinguishability/crypto report.
+#
+# This is NOT a PR gate. The `nightly-mutants` workflow runs cargo-mutants with
+# `continue-on-error: true`; no branch protection references it. Its only job is
+# to demonstrate that the camouflage + crypto tests are real oracles (they KILL
+# byte-flip and label-swap mutants) rather than self-referential checks.
+#
+# cargo-mutants reads its config ONLY from `.cargo/mutants.toml` (repo root is
+# NOT a config location), which is exactly where this file lives — so both the
+# nightly job and a plain local `cargo mutants` consume it.
+#
+# How to read survivors:
+#   - Run locally with:  cargo mutants   (loads this config) — or let the nightly
+#     job produce the `mutants-out` artifact.
+#   - Open mutants.out/outcomes.json (or mutants.out/*.txt). A "MISSED" / surviving
+#     mutant is a source change that NO test detected: cargo-mutants mutated a line
+#     in one of the files below and the suite still passed. Each survivor is a
+#     candidate for a new or strengthened test on the indistinguishability/crypto
+#     surface. "CAUGHT" mutants are the good case (a test failed, as intended).
+#   - The nightly workflow ALSO passes the same two files via explicit `-f` flags
+#     and `--config .cargo/mutants.toml`; the `-f` flags win over `examine_globs`
+#     below (CLI overrides config), so both are kept in sync and a plain local
+#     `cargo mutants` matches the nightly scope.
+
+# Mutate ONLY the two highest-signal files: the Safari 2.6 TLS fingerprint shape
+# and the handshake auth / MAC path.
+examine_globs = [
+    "src/tls/safari26.rs",
+    "src/crypto/auth.rs",
+]
+
+# Never mutate test or fuzz harness code — those are the oracles, not the target.
+exclude_globs = [
+    "tests/**",
+    "fuzz/**",
+]
+
+# Match the repo-wide `--locked` convention (CI always builds/tests `--locked`):
+# pass it to every Cargo invocation the mutation run makes (build + test).
+additional_cargo_args = ["--locked"]
+
+# Bound each mutant's test run relative to the baseline so the nightly job stays
+# within its timeout-minutes budget even if a mutant induces a near-hang.
+timeout_multiplier = 3.0
+
+# Floor for the per-mutant test timeout (seconds); guards against a too-fast
+# baseline making the multiplier above collapse to an unrealistically small bound.
+minimum_test_timeout = 60

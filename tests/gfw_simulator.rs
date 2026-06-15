@@ -19,8 +19,13 @@ use std::time::{Duration, Instant};
 
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
-use parallax::crypto::session::X25519KeyPair;
+use parallax::crypto::session::{AeadCodec, X25519KeyPair, AEAD_TAG_LEN};
+use parallax::crypto::{identity, pq};
+use parallax::protocol::command::{ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange};
+use parallax::protocol::data::{DataRecordCodec, SERVER_TO_CLIENT_AAD};
+use parallax::tls::record::TLS_HEADER_LEN;
 use parallax::tls::safari26::Safari26TlsCamouflage;
+use parallax::traffic::PaddingProfile;
 
 use crate::gfw_sim::detection::active_prober::ProbeObservation;
 use crate::gfw_sim::detection::burst_statistics::LengthObservation;
@@ -56,40 +61,140 @@ fn synthetic_random_payload(seed: u64, len: usize) -> Vec<u8> {
     bytes
 }
 
+/// Server-side identity-proof chunk plaintext size. The product server draws this
+/// per connection from `rng.gen_range(SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT
+/// ..=SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT)` (960..=1320) in `server.rs`. We pin the
+/// high end of that real range here so the reconstruction is deterministic while
+/// still being a value the server actually emits; it also matches the in-tree
+/// `server.rs` chunking test that exercises `SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT`.
+const IDENTITY_CHUNK_PLAINTEXT_LEN: usize = 1320;
+
+/// Reconstruct scenario_4's server->client length series from the REAL product
+/// encoders instead of hand-typed magic numbers.
+///
+/// The authenticated server (see `run_authenticated_data_mode` in
+/// `src/handshake/server.rs`) emits, after the client's PQ rekey, exactly:
+///   1. one sealed `ServerKeyExchange` record (X25519 pub + ML-KEM-1024
+///      ciphertext + framing), then
+///   2. the ML-DSA-87 identity proof, fragmented by
+///      `ServerIdentityChunk::encode_all` into browser-sized records sealed one at
+///      a time with >40 ms spacing.
+///
+/// We drive those same public encoders here, seal each frame with the real
+/// `DataRecordCodec` (default `TrafficConfig` padding: min=max=0), and report each
+/// record's on-wire length minus the TLS header and AEAD tag -- i.e. the
+/// padded-plaintext length the burst detector documents `LengthObservation.length`
+/// to be. Nothing is hardcoded: the ML-DSA-87 signature length (~4.6 KB) and the
+/// chunk count fall out of the encoders. Timestamps are SYNTHESIZED with fixed
+/// deltas (one ~8 ms intra-burst gap, then >`BURST_GAP` spacings) so the test stays
+/// deterministic while preserving scenario_4's "fragmentation spreads the records
+/// across bursts so no burst recreates the 2-record PqRekey/ServerIdentity spike".
 fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
-    // Current ParallaX sends an encrypted server key exchange, then fragments
-    // the ML-DSA identity proof into browser-sized records with >40 ms spacing.
-    // This keeps the largest post-handshake record below the old ~4.7 KB
-    // signature spike and prevents the signature chunks from aggregating into
-    // one ParallaX-specific burst.
+    // Real ML-KEM-1024 ciphertext + real ServerKeyExchange framing.
+    let mlkem = pq::keypair();
+    let encapsulation = pq::encapsulate(&mlkem.public).expect("ML-KEM-1024 encapsulation");
+    let server_ephemeral = X25519KeyPair::generate();
+    let key_exchange_payload = ServerKeyExchange {
+        server_x25519_public: server_ephemeral.public,
+        mlkem_ciphertext: encapsulation.ciphertext,
+    }
+    .encode()
+    .expect("encode ServerKeyExchange");
+
+    // Real ML-DSA-87 signature -> real ServerIdentityProof -> real chunking. The
+    // signing inputs are arbitrary fixed test vectors; only the signature's true
+    // length (and thus the chunk count) matters for the length series.
+    let identity_keys = identity::keypair();
+    let signature = identity::sign_server_identity(
+        &identity_keys.secret,
+        &[0x11_u8; 32], // transcript hash
+        &server_ephemeral.public,
+        &[0x22_u8; 32], // pq rekey binding
+        1,              // epoch
+    )
+    .expect("ML-DSA-87 sign_server_identity");
+    assert!(
+        signature.len() > 4000,
+        "ML-DSA-87 identity signature should be ~4.6 KB; got {} bytes",
+        signature.len()
+    );
+    let identity_payload = ServerIdentityProof {
+        signature: signature.clone(),
+    }
+    .encode()
+    .expect("encode ServerIdentityProof");
+    let identity_chunks =
+        ServerIdentityChunk::encode_all(&identity_payload, IDENTITY_CHUNK_PLAINTEXT_LEN)
+            .expect("chunk ServerIdentityProof");
+    let identity_chunk_count = identity_chunks.len();
+
+    // Real server->client record sealer with the default padding profile the
+    // product server uses (TrafficConfig::default => min=max=0). The AEAD key/nonce
+    // are irrelevant to the sealed *length*, so any value works.
+    let padding = PaddingProfile::new(0, 0).expect("zero padding profile");
+    let mut server_seal = DataRecordCodec::new(
+        AeadCodec::new([7_u8; 32], [9_u8; 12]),
+        padding,
+        SERVER_TO_CLIENT_AAD,
+    );
+    let mut rng = StdRng::seed_from_u64(0x5EA1);
+
+    // The detector defines `length` as the record length after the 5-byte TLS
+    // header is stripped and before the AEAD tag, i.e. the padded plaintext. Derive
+    // it from the REAL sealed record so a future framing/padding change is reflected.
+    let sealed_plaintext_len = |codec: &mut DataRecordCodec, payload: &[u8], rng: &mut StdRng| {
+        let record = codec
+            .seal(payload, rng)
+            .expect("seal server->client record");
+        record.len() - TLS_HEADER_LEN - AEAD_TAG_LEN
+    };
+
+    // Same wire order as the server: ServerKeyExchange first, then the identity
+    // chunks. Same direction (server->client) as the original.
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(1 + identity_chunk_count);
+    payloads.push(key_exchange_payload);
+    payloads.extend(identity_chunks);
+
+    // Synthesized deterministic arrival times: an ~8 ms intra-burst gap between the
+    // first two records, then >BURST_GAP (40 ms) spacing so each later chunk lands
+    // in its own burst -- the timing shape the original helper used.
+    let arrival_offsets_ms = |idx: usize| -> u64 {
+        match idx {
+            0 => 0,
+            1 => 8,
+            n => 8 + (n as u64 - 1) * 48,
+        }
+    };
+
     let start = Instant::now();
-    vec![
-        LengthObservation {
-            length: 1550,
-            at: start,
+    let series: Vec<LengthObservation> = payloads
+        .iter()
+        .enumerate()
+        .map(|(idx, payload)| LengthObservation {
+            length: sealed_plaintext_len(&mut server_seal, payload, &mut rng),
+            at: start + Duration::from_millis(arrival_offsets_ms(idx)),
             client_to_server: false,
-        },
-        LengthObservation {
-            length: 1320,
-            at: start + Duration::from_millis(8),
-            client_to_server: false,
-        },
-        LengthObservation {
-            length: 1310,
-            at: start + Duration::from_millis(55),
-            client_to_server: false,
-        },
-        LengthObservation {
-            length: 1290,
-            at: start + Duration::from_millis(103),
-            client_to_server: false,
-        },
-        LengthObservation {
-            length: 1250,
-            at: start + Duration::from_millis(151),
-            client_to_server: false,
-        },
-    ]
+        })
+        .collect();
+
+    // Anti-tautology guard: the series must come from the measured signature/chunk
+    // sizes, not a stale hardcoded shape. If a future change stops fragmenting the
+    // identity proof (or stops sending the key exchange), these break instead of
+    // silently keeping the old verdict.
+    assert!(!series.is_empty(), "length series must be non-empty");
+    assert!(
+        identity_chunk_count >= 2,
+        "ML-DSA-87 proof ({} B) must fragment into multiple records at chunk size {}; got {}",
+        identity_payload.len(),
+        IDENTITY_CHUNK_PLAINTEXT_LEN,
+        identity_chunk_count
+    );
+    assert_eq!(
+        series.len(),
+        1 + identity_chunk_count,
+        "series must be exactly one ServerKeyExchange record plus every identity chunk"
+    );
+    series
 }
 
 fn chrome_like_burst_lengths() -> Vec<LengthObservation> {
