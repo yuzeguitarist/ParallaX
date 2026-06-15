@@ -157,12 +157,17 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     let listener = TcpListener::bind(client.listen).await?;
     let server_addr = ServerAddrResolver::new(&client.server_addr).await?;
     let client = Arc::new(client);
+    // Process-shared UDP fast-plane circuit breaker. Created once and threaded
+    // alongside `udp` so a black-holed UDP path is probed at most once per
+    // `UDP_BLACKHOLE_TTL` instead of on every connection.
+    let udp_reachability = Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL));
     let warm_sessions = if config.traffic.max_concurrent_streams == 1 {
         let warm_sessions = WarmSessionPool::new(
             Arc::clone(&client),
             server_addr.clone(),
             config.traffic,
             Arc::clone(&udp),
+            Arc::clone(&udp_reachability),
             Arc::clone(&psk),
             server_public,
             Arc::clone(&server_identity_public),
@@ -184,6 +189,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             server_addr.clone(),
             config.traffic,
             Arc::clone(&udp),
+            Arc::clone(&udp_reachability),
             Arc::clone(&psk),
             server_public,
             Arc::clone(&server_identity_public),
@@ -235,6 +241,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         let server_identity_public = Arc::clone(&server_identity_public);
         let traffic = config.traffic;
         let udp = Arc::clone(&udp);
+        let reachability = Arc::clone(&udp_reachability);
         let server_addr = server_addr.clone();
         let warm_sessions = warm_sessions.clone();
         let mux_sessions = mux_sessions.clone();
@@ -253,6 +260,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                 server_addr,
                 traffic,
                 udp: udp.as_ref(),
+                reachability,
                 psk: psk.as_ref().as_slice(),
                 server_public: &server_public,
                 server_identity_public,
@@ -283,6 +291,7 @@ pub async fn handle_local_connection(
         server_addr,
         traffic,
         udp,
+        reachability: Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL)),
         psk,
         server_public,
         server_identity_public,
@@ -291,11 +300,85 @@ pub async fn handle_local_connection(
     handle_local_connection_with_cid(local, context, cid).await
 }
 
+/// Time the UDP fast-plane circuit breaker suppresses negotiation after a probe
+/// reports the path unusable. On a network that black-holes UDP (the common
+/// censored case the fast plane targets), re-probing every connection would add
+/// `probe_timeout_ms` of dead latency to each one — a regression below the
+/// TCP-only floor on exactly the networks this feature exists for. After a
+/// blocked probe the breaker skips negotiation for this window, then allows one
+/// half-open retry.
+const UDP_BLACKHOLE_TTL: Duration = Duration::from_secs(30);
+
+/// Client-side circuit breaker for the UDP fast plane (process-shared, one per
+/// runtime). It removes the probe from the connection critical path once UDP is
+/// known-unusable: while tripped, the client skips PX1G negotiation entirely, so
+/// the session is byte-identical to a TCP-only one (the server only ever reacts
+/// to PX1G being present, so suppressing it cannot desync). A Verified probe
+/// clears it; after [`UDP_BLACKHOLE_TTL`] it permits one more attempt.
+pub(crate) struct UdpReachability {
+    ttl: Duration,
+    /// `None` = not tripped; `Some(t)` = last marked unusable at `t`.
+    blocked_since: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl UdpReachability {
+    pub(crate) fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            blocked_since: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Whether this connection should attempt UDP negotiation — and, at the
+    /// half-open boundary, CLAIM the single trial probe. This mutates state: when
+    /// a tripped breaker's TTL has expired, the first caller re-stamps
+    /// `blocked_since` to now and returns `true`, so concurrent callers in the
+    /// same window see it as still tripped and skip. That keeps the trial to one
+    /// connection per TTL instead of a thundering herd of re-probes. If that
+    /// claiming connection dies without recording an outcome, the next TTL lets
+    /// another connection reclaim (self-healing); a Verified outcome clears the
+    /// breaker via `record_usable`, a failure re-trips it via `record_unusable`.
+    fn should_attempt_at(&self, now: std::time::Instant) -> bool {
+        let mut guard = self.blocked_since.lock().expect("reachability mutex");
+        match *guard {
+            // Usable (or never tripped): every connection negotiates so they all
+            // use the fast plane while it works — no claim, no state change.
+            None => true,
+            Some(t) => {
+                if now.saturating_duration_since(t) >= self.ttl {
+                    *guard = Some(now);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Whether to attempt UDP negotiation on a new connection (see
+    /// [`Self::should_attempt_at`] — this claims the half-open trial slot).
+    pub(crate) fn should_attempt(&self) -> bool {
+        self.should_attempt_at(std::time::Instant::now())
+    }
+
+    /// Record that the UDP path is unusable (probe Unreachable or Failed): trip
+    /// the breaker so subsequent connections skip negotiation for the TTL.
+    pub(crate) fn record_unusable(&self) {
+        *self.blocked_since.lock().expect("reachability mutex") = Some(std::time::Instant::now());
+    }
+
+    /// Record that the UDP path works (probe Verified): clear the breaker.
+    pub(crate) fn record_usable(&self) {
+        *self.blocked_since.lock().expect("reachability mutex") = None;
+    }
+}
+
 struct ClientConnectionContext<'a> {
     config: &'a ClientConfig,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
     udp: &'a UdpConfig,
+    reachability: Arc<UdpReachability>,
     psk: &'a [u8],
     server_public: &'a [u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -309,6 +392,7 @@ struct WarmSessionPool {
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
     udp: Arc<UdpConfig>,
+    reachability: Arc<UdpReachability>,
     psk: Arc<Zeroizing<Vec<u8>>>,
     server_public: [u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -325,11 +409,13 @@ struct WarmSessionPool {
 }
 
 impl WarmSessionPool {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: Arc<ClientConfig>,
         server_addr: ServerAddrResolver,
         traffic: TrafficConfig,
         udp: Arc<UdpConfig>,
+        reachability: Arc<UdpReachability>,
         psk: Arc<Zeroizing<Vec<u8>>>,
         server_public: [u8; 32],
         server_identity_public: Arc<[u8]>,
@@ -349,6 +435,7 @@ impl WarmSessionPool {
             server_addr,
             traffic,
             udp,
+            reachability,
             psk,
             server_public,
             server_identity_public,
@@ -392,6 +479,7 @@ impl WarmSessionPool {
         let server_addr = self.server_addr.clone();
         let traffic = self.traffic;
         let udp = Arc::clone(&self.udp);
+        let reachability = Arc::clone(&self.reachability);
         let psk = Arc::clone(&self.psk);
         let server_public = self.server_public;
         let server_identity_public = Arc::clone(&self.server_identity_public);
@@ -401,6 +489,7 @@ impl WarmSessionPool {
                 &config,
                 traffic,
                 &udp,
+                &reachability,
                 psk.as_ref().as_slice(),
                 &server_public,
                 server_identity_public,
@@ -418,6 +507,7 @@ impl WarmSessionPool {
         let server_addr = self.server_addr.clone();
         let traffic = self.traffic;
         let udp = Arc::clone(&self.udp);
+        let reachability = Arc::clone(&self.reachability);
         let psk = Arc::clone(&self.psk);
         let server_public = self.server_public;
         let server_identity_public = Arc::clone(&self.server_identity_public);
@@ -437,6 +527,7 @@ impl WarmSessionPool {
                         &config,
                         traffic,
                         &udp,
+                        &reachability,
                         psk.as_ref().as_slice(),
                         &server_public,
                         server_identity_public,
@@ -517,6 +608,7 @@ struct ClientMuxPool {
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
     udp: Arc<UdpConfig>,
+    reachability: Arc<UdpReachability>,
     psk: Arc<Zeroizing<Vec<u8>>>,
     server_public: [u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -576,11 +668,13 @@ enum DownloadOutcome {
 }
 
 impl ClientMuxPool {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: Arc<ClientConfig>,
         server_addr: ServerAddrResolver,
         traffic: TrafficConfig,
         udp: Arc<UdpConfig>,
+        reachability: Arc<UdpReachability>,
         psk: Arc<Zeroizing<Vec<u8>>>,
         server_public: [u8; 32],
         server_identity_public: Arc<[u8]>,
@@ -591,6 +685,7 @@ impl ClientMuxPool {
             server_addr,
             traffic,
             udp,
+            reachability,
             psk,
             server_public,
             server_identity_public,
@@ -702,6 +797,7 @@ impl ClientMuxPool {
                 self.config.as_ref(),
                 self.traffic,
                 &self.udp,
+                &self.reachability,
                 self.psk.as_ref().as_slice(),
                 &self.server_public,
                 Arc::clone(&self.server_identity_public),
@@ -886,6 +982,7 @@ async fn handle_local_connection_with_cid(
         server_addr,
         traffic,
         udp,
+        reachability,
         psk,
         server_public,
         server_identity_public,
@@ -906,6 +1003,7 @@ async fn handle_local_connection_with_cid(
         let speculative_config = config.clone();
         let speculative_server_addr = server_addr.clone();
         let speculative_udp = udp.clone();
+        let speculative_reachability = Arc::clone(&reachability);
         let speculative_psk = Arc::<[u8]>::from(psk.to_vec().into_boxed_slice());
         let speculative_server_public = *server_public;
         let speculative_server_identity_public = server_identity_public.clone();
@@ -915,6 +1013,7 @@ async fn handle_local_connection_with_cid(
                 &speculative_config,
                 traffic,
                 &speculative_udp,
+                &speculative_reachability,
                 speculative_psk.as_ref(),
                 &speculative_server_public,
                 speculative_server_identity_public,
@@ -1008,11 +1107,15 @@ pub(crate) async fn establish_authenticated_data_session(
     let server_addr = ServerAddrResolver::new(&config.server_addr).await?;
     let server_identity_public =
         Arc::<[u8]>::from(server_identity_public.to_vec().into_boxed_slice());
+    // One-shot seam (speed test): a fresh breaker just means this single
+    // establishment probes normally, exactly as before this slice.
+    let reachability = UdpReachability::new(UDP_BLACKHOLE_TTL);
     let (server, data_session, retained_quic) = establish_authenticated_data_session_with_resolver(
         &server_addr,
         config,
         traffic,
         udp,
+        &reachability,
         psk,
         server_public,
         server_identity_public,
@@ -1123,11 +1226,13 @@ async fn run_client_udp_probe(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn establish_authenticated_data_session_with_resolver(
     server_addr: &ServerAddrResolver,
     config: &ClientConfig,
     traffic: TrafficConfig,
     udp: &UdpConfig,
+    reachability: &UdpReachability,
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -1150,6 +1255,7 @@ async fn establish_authenticated_data_session_with_resolver(
             config,
             traffic,
             udp,
+            reachability,
             psk,
             server_public,
             server_identity_public,
@@ -1165,11 +1271,13 @@ async fn establish_authenticated_data_session_with_resolver(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn establish_authenticated_data_session_inner(
     server_addr: &ServerAddrResolver,
     config: &ClientConfig,
     traffic: TrafficConfig,
     udp: &UdpConfig,
+    reachability: &UdpReachability,
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: Arc<[u8]>,
@@ -1195,12 +1303,17 @@ async fn establish_authenticated_data_session_inner(
     let mut retained_quic: Option<RetainedClientQuic> = None;
 
     // Client-initiated, fail-soft UDP negotiation. Gated on the threaded
-    // udp.enabled flag. The client offers to use the UDP fast plane; the server
-    // either declines (PX1N) or offers (PX1O). This runs strictly before the first
-    // Connect/Mux command, so it occupies record #1 in each AEAD direction with no
-    // reordering risk. An error here fails the connection (the record stream would
-    // be desynced), which is the correct outcome.
-    if udp.enabled {
+    // udp.enabled flag AND the reachability circuit breaker: once a probe has
+    // found UDP unusable (black-holed, declined, or malformed), the breaker
+    // suppresses this whole block for UDP_BLACKHOLE_TTL so we neither pay the
+    // probe_timeout stall on every connection nor emit the PX1G/PX1N pair that
+    // would otherwise tell on a UDP-blocked or UDP-declining path. Suppressed, the
+    // session is byte-identical to a TCP-only one (the server only ever reacts to
+    // PX1G being present), so this cannot desync. When the breaker DOES allow a
+    // run, it occupies record #1 in each AEAD direction before the first
+    // Connect/Mux command, with no reordering risk; an error here fails the
+    // connection (the record stream would be desynced), which is correct.
+    if udp.enabled && reachability.should_attempt() {
         use crate::protocol::command::{
             UdpDecline, UdpOffer, UdpProbeAck, UdpProbeStatus, UdpRequest, UDP_NEGOTIATION_VERSION,
         };
@@ -1255,6 +1368,13 @@ async fn establish_authenticated_data_session_inner(
                 _ => 0,
             };
             tracing::info!(?status, "UDP fast-plane probe outcome");
+            // Drive the circuit breaker: a Verified path clears it; any unusable
+            // outcome trips it so subsequent connections skip negotiation for the
+            // TTL (removing the probe stall + the negotiation tell).
+            match outcome {
+                ProbeOutcome::Verified { .. } => reachability.record_usable(),
+                ProbeOutcome::Unreachable | ProbeOutcome::Failed => reachability.record_unusable(),
+            }
             let ack = UdpProbeAck {
                 offer_id,
                 status,
@@ -1268,8 +1388,13 @@ async fn establish_authenticated_data_session_inner(
             // agree on whether the relay will use the QUIC stream.
             retained_quic = retained;
         } else if UdpDecline::has_magic(&response) {
+            // The server declines UDP (config asymmetry): trip the breaker so we
+            // stop emitting the PX1G/PX1N pair on every connection to a server that
+            // will keep declining.
+            reachability.record_unusable();
             tracing::info!("UDP fast plane declined by server; continuing on TCP");
         } else {
+            reachability.record_unusable();
             tracing::info!("UDP negotiation: unrecognized response; continuing on TCP");
         }
     }
@@ -2780,6 +2905,44 @@ mod tests {
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
 
+    /// The UDP circuit breaker: starts closed, trips on an unusable outcome and
+    /// suppresses negotiation until the TTL elapses, then lets exactly ONE
+    /// connection claim the half-open trial (concurrent callers in that window
+    /// still skip); a usable outcome clears it. Driven via the `_at` time seam so
+    /// the TTL boundary is deterministic without sleeping.
+    #[test]
+    fn udp_reachability_circuit_breaker_trips_and_half_opens() {
+        let ttl = Duration::from_secs(30);
+        let breaker = UdpReachability::new(ttl);
+        let t0 = std::time::Instant::now();
+
+        // Closed initially: every connection may attempt UDP (no claim, repeatable).
+        assert!(breaker.should_attempt_at(t0));
+        assert!(breaker.should_attempt_at(t0));
+
+        // Trip it (probe found UDP unusable): suppressed for the whole TTL window.
+        breaker.record_unusable();
+        let tripped_at = std::time::Instant::now();
+        assert!(!breaker.should_attempt_at(tripped_at));
+        assert!(!breaker.should_attempt_at(tripped_at + ttl - Duration::from_millis(1)));
+
+        // Half-open: the FIRST caller at/after the TTL claims the single trial...
+        let claim_at = tripped_at + ttl;
+        assert!(breaker.should_attempt_at(claim_at));
+        // ...and concurrent callers in the same window now see it as re-stamped
+        // (still tripped) and skip — no thundering-herd re-probe.
+        assert!(!breaker.should_attempt_at(claim_at));
+        assert!(!breaker.should_attempt_at(claim_at + ttl - Duration::from_millis(1)));
+
+        // If the trial connection died without recording, the next TTL (measured
+        // from the claim) lets another connection reclaim — self-healing.
+        assert!(breaker.should_attempt_at(claim_at + ttl));
+
+        // A Verified outcome clears it immediately: back to attempting freely.
+        breaker.record_usable();
+        assert!(breaker.should_attempt_at(std::time::Instant::now()));
+    }
+
     /// Serializes the QUIC fast-plane e2e tests that share the process-global
     /// `RETAINED_QUIC_CONN_FOR_TEST` hook and the `QUIC_LEG_BYTES_WRITTEN`
     /// counter, so a parallel `--ignored` run cannot have one test grab/close the
@@ -2872,6 +3035,7 @@ mod tests {
             server_addr,
             TrafficConfig::default(),
             Arc::new(UdpConfig::default()),
+            Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL)),
             Arc::new(zeroize::Zeroizing::new(PSK.to_vec())),
             server_keys.public,
             Arc::from(server_identity_keys.public.clone().into_boxed_slice()),
@@ -4264,6 +4428,7 @@ mod tests {
             server_addr,
             traffic,
             Arc::new(UdpConfig::default()),
+            Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL)),
             Arc::new(zeroize::Zeroizing::new(PSK.to_vec())),
             server_keys.public,
             Arc::from(server_identity_keys.public.clone().into_boxed_slice()),
