@@ -132,10 +132,20 @@ sync_owned() {  # <target>
   local cdir="$SRC/fuzz/corpus/$t"
   mkdir -p "$cdir"
 
+  # C-1: SEED the live corpus from the durable canonical BEFORE merging/clobbering
+  # (exactly as sync_pull does). Without this, a fresh-disk boot re-tars the near-
+  # empty local dir over the multi-day canonical and destroys it. Single attempt:
+  # a missing asset is not transient, so don't burn the retry budget (L-1).
+  local seed="$WORK/seed/$t"; mkdir -p "$seed"
+  if gh release download "$TAG" --repo "$REPO" --pattern "corpus-$t.tar.zst" \
+        --dir "$seed" --clobber >/dev/null 2>&1 && [ -f "$seed/corpus-$t.tar.zst" ]; then
+    tar --use-compress-program=unzstd -xf "$seed/corpus-$t.tar.zst" -C "$cdir" 2>/dev/null || true
+  fi
+
   local cdir_contrib="$WORK/contrib/$t"
   mkdir -p "$cdir_contrib"
-  # pull every peer contribution for this target (best-effort).
-  retry gh release download "$TAG" --repo "$REPO" \
+  # pull every peer contribution for this target (best-effort, single attempt — L-1).
+  gh release download "$TAG" --repo "$REPO" \
       --pattern "contrib-$t-*.tar.zst" --dir "$cdir_contrib" --clobber \
       >/dev/null 2>&1 || true
 
@@ -161,11 +171,14 @@ sync_owned() {  # <target>
       -merge=1 -rss_limit_mb="$rss" -malloc_limit_mb="$rss" -max_len="$mlen" \
       >/dev/null 2>&1 || true
 
-  # re-tar the (now merged) canonical corpus and publish it.
+  # re-tar the (now merged) canonical corpus and publish it under a per-target
+  # flock so the owner's cmin (now owner-only) and sync never clobber each other
+  # mid-upload (L-5). The lock dir is shared with cmin.sh ($STATE/corpus-<t>.lock).
   local out="$WORK/corpus-$t.tar.zst"
   tar_corpus "$cdir" "$out" || return 0
   local nf; nf="$(find "$cdir" -type f 2>/dev/null | wc -l | tr -d ' ')"
-  if retry gh release upload "$TAG" "$out" --repo "$REPO" --clobber >/dev/null 2>&1; then
+  local lockdir=/var/lib/plxfuzz/state; mkdir -p "$lockdir" 2>/dev/null || true
+  if flock "$lockdir/corpus-$t.lock" gh release upload "$TAG" "$out" --repo "$REPO" --clobber >/dev/null 2>&1; then
     echo "sync: owned $t merged ($nf files) uploaded"
   else
     echo "sync: owned $t merged ($nf files) UPLOAD FAILED (will retry next tick)" >&2
@@ -184,8 +197,10 @@ sync_pull() {  # <target>
       | sort > "$before" || : > "$before"
 
   # pull the canonical asset and overlay it into our corpus so libFuzzer reloads.
+  # Single attempt: a missing asset (e.g. box-c-owned target, box-c absent) is not
+  # transient, so don't burn the 15s retry budget every tick (L-1).
   local dl="$WORK/dl/$t"; mkdir -p "$dl"
-  if retry gh release download "$TAG" --repo "$REPO" \
+  if gh release download "$TAG" --repo "$REPO" \
         --pattern "corpus-$t.tar.zst" --dir "$dl" --clobber >/dev/null 2>&1 \
      && [ -f "$dl/corpus-$t.tar.zst" ]; then
     tar --use-compress-program=unzstd -xf "$dl/corpus-$t.tar.zst" -C "$cdir" \

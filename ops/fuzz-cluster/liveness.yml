@@ -1,13 +1,15 @@
 # Optional. Copy to .github/workflows/ to enable; ~1 billed min/day; delete for zero Actions.
 #
-# Liveness watchdog for the ParallaX fuzz cluster. The three VPS boxes self-
-# publish status-<nodeid>.json to the 'fuzz-status' branch every ~1 min, so the
-# ONE thing they cannot report is their own death. This job (the only Action the
-# cluster needs) reads the three heartbeats once a day and opens/updates a single
-# '[fuzz-cluster] node down' issue if any heartbeat is stale or fewer than 3
-# nodes report. Everything else (corpus, crashes, dashboard) is done on the paid
-# boxes with zero Actions. If you want literally zero Actions, do not copy this —
-# the dashboard's stale "last seen" already reveals a dead box on a manual glance.
+# Liveness watchdog for the ParallaX fuzz cluster. The VPS boxes self-publish
+# status-<nodeid>.json to the 'fuzz-status' branch every ~1 min, so the ONE thing
+# they cannot report is their own death. This job (the only Action the cluster
+# needs) auto-discovers whichever nodes are publishing, reads their heartbeats
+# once a day, and opens/updates a single '[fuzz-cluster] node down' issue if any
+# discovered node is stale (or nothing is publishing at all). It does NOT assume a
+# fixed node count, so an intentionally-smaller fleet does not false-alarm.
+# Everything else (corpus, crashes, dashboard) is done on the paid boxes with zero
+# Actions. If you want literally zero Actions, do not copy this — the dashboard's
+# stale "last seen" already reveals a dead box on a manual glance.
 #
 # This file lives under ops/fuzz-cluster/ on purpose so it does NOT run from the
 # repo as-is; it only becomes active once copied into .github/workflows/.
@@ -37,7 +39,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           BRANCH: fuzz-status
-          NODES: "box-a box-b box-c"
           STALE_MIN: "90"          # heartbeat older than this => node considered down
           TITLE: "[fuzz-cluster] node down"
         shell: bash
@@ -45,24 +46,28 @@ jobs:
           set -uo pipefail
           now=$(date -u +%s)
           down=()
-          present=0
 
-          for node in $NODES; do
+          # M-4: auto-DISCOVER the nodes actually publishing, rather than a hardcoded
+          # "box-a box-b box-c" list. The old code treated present<3 as down, so with
+          # box-c not deployed it opened a permanent false node-down issue every day
+          # and buried real box deaths in the noise. A node is simply whatever has a
+          # status-<id>.json on the branch; we alert only if a discovered node goes
+          # stale (or if nothing is publishing at all).
+          nodes=$(gh api "repos/${REPO}/contents/fuzz/dashboard?ref=${BRANCH}" \
+                    --jq '.[].name | select(startswith("status-") and endswith(".json")) | ltrimstr("status-") | rtrimstr(".json")' \
+                    2>/dev/null || true)
+
+          present=0
+          for node in $nodes; do
             path="fuzz/dashboard/status-${node}.json"
-            # Read the file straight from the fuzz-status branch via the contents API
-            # (works on a private repo with the default token; no checkout needed).
             json=$(gh api "repos/${REPO}/contents/${path}?ref=${BRANCH}" \
                      -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
-            if [ -z "$json" ]; then
-              down+=("$node (no status file)")
+            ts=$(printf '%s' "$json" | jq -r '.ts // empty' 2>/dev/null || true)
+            if [ -z "$ts" ]; then
+              down+=("$node (status unreadable)")
               continue
             fi
             present=$((present + 1))
-            ts=$(printf '%s' "$json" | jq -r '.ts // empty' 2>/dev/null || true)
-            if [ -z "$ts" ]; then
-              down+=("$node (status has no ts)")
-              continue
-            fi
             # GNU date (ubuntu-latest) parses ISO8601 'Z' fine.
             hb=$(date -u -d "$ts" +%s 2>/dev/null || echo 0)
             age_min=$(( (now - hb) / 60 ))
@@ -71,9 +76,10 @@ jobs:
             fi
           done
 
-          node_count=$(printf '%s\n' $NODES | wc -l | tr -d ' ')
+          node_count=$(printf '%s\n' $nodes | grep -c . || true); [ -n "$node_count" ] || node_count=0
           healthy="yes"
-          if [ "${#down[@]}" -gt 0 ] || [ "$present" -lt "$node_count" ]; then
+          # Degraded if a discovered node is stale, OR nothing is publishing at all.
+          if [ "${#down[@]}" -gt 0 ] || [ "$node_count" -eq 0 ]; then
             healthy="no"
           fi
 
@@ -83,10 +89,10 @@ jobs:
                        "map(select(.title==\"$TITLE\")) | .[0].number // empty" 2>/dev/null || true)
 
           if [ "$healthy" = "yes" ]; then
-            echo "All $node_count nodes healthy; $present reporting."
+            echo "All $node_count discovered nodes healthy; $present reporting fresh."
             if [ -n "$existing" ]; then
               gh issue comment "$existing" --repo "$REPO" \
-                --body "Recovered: all ${node_count} nodes reporting fresh heartbeats as of $(date -u +%FT%TZ). Closing." || true
+                --body "Recovered: all ${node_count} reporting nodes have fresh heartbeats as of $(date -u +%FT%TZ). Closing." || true
               gh issue close "$existing" --repo "$REPO" || true
             fi
             exit 0
@@ -96,19 +102,21 @@ jobs:
           {
             echo "Liveness check at $(date -u +%FT%TZ) found the fuzz cluster degraded."
             echo
-            echo "- nodes reporting a status file: ${present}/${node_count}"
+            echo "- nodes discovered (publishing a status file): ${node_count}"
+            echo "- nodes with a fresh heartbeat: ${present}"
             echo "- staleness threshold: ${STALE_MIN} min"
             echo
-            echo "Down / stale:"
-            for d in "${down[@]}"; do echo "- ${d}"; done
-            if [ "$present" -lt "$node_count" ]; then
-              echo
-              echo "Fewer than ${node_count} nodes are publishing status at all."
+            if [ "$node_count" -eq 0 ]; then
+              echo "NO node is publishing any status at all (whole cluster down, or the"
+              echo "fuzz-status branch is empty)."
+            else
+              echo "Down / stale:"
+              for d in "${down[@]}"; do echo "- ${d}"; done
             fi
             echo
             echo "Fix: recreate the affected box and re-paste its bootstrap line with the SAME node-id"
             echo "(see ops/fuzz-cluster/README.md, '15-day swap'). This issue auto-closes when all"
-            echo "heartbeats are fresh again."
+            echo "discovered heartbeats are fresh again."
           } > /tmp/body.md
 
           if [ -n "$existing" ]; then

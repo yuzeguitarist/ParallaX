@@ -138,7 +138,15 @@ prepare_worktree() {
   # never filed. Fetch with an EXPLICIT refspec so the remote-tracking ref exists.
   local refspec="+refs/heads/$CRASH_BRANCH:refs/remotes/origin/$CRASH_BRANCH"
   retry git -C "$SRC" fetch origin "$refspec" >/dev/null 2>&1 || true
-  if [ ! -d "$WT/.git" ] && [ ! -f "$WT/.git" ]; then
+  if [ ! -e "$WT/.git" ]; then
+    # M-3: self-heal a corrupt/leftover worktree. If $WT was deleted out from under
+    # its admin metadata, `worktree add` fails forever with "'fuzz-crashes' is
+    # already used by worktree" and every crash is then silently dropped. Clear the
+    # dir + stale metadata + stale local branch first (mirrors status.sh's rm-before-
+    # reclone self-heal), so the add always succeeds.
+    rm -rf "$WT" 2>/dev/null || true
+    git -C "$SRC" worktree prune >/dev/null 2>&1 || true
+    git -C "$SRC" branch -D "$CRASH_BRANCH" >/dev/null 2>&1 || true
     mkdir -p "$(dirname "$WT")"
     if git -C "$SRC" show-ref --verify --quiet "refs/remotes/origin/$CRASH_BRANCH"; then
       git -C "$SRC" worktree add -B "$CRASH_BRANCH" "$WT" \
@@ -188,18 +196,33 @@ process_artifact() {  # <artifact_path>
   [ -n "$minf" ] && [ -f "$minf" ] || minf="$art"
 
   # 2. reproduce once to capture sanitizer + stack (single in-process run).
+  # -exact_artifact_path=/dev/null so a re-crash during replay does NOT deposit a
+  # fresh crash-* into ART_DIR that the next OnFailure tick would reprocess (L-3).
   local log="$ART_DIR/.repro-$base.log"
   cargo "+$NIGHTLY" fuzz run --sanitizer "$SAN" "$TARGET" "$minf" -- \
       -runs=1 -rss_limit_mb="$RSS_CAP" -malloc_limit_mb="$RSS_CAP" \
+      -exact_artifact_path=/dev/null \
       >"$log" 2>&1 || true
 
   # 3. bugkey.
   local bugkey
   if is_oom "$base" "$log"; then
-    bugkey="oom@rss=$RSS_CAP"
+    # H-1: include the target so a per-target OOM suppression (e.g. the H1 zlib
+    # bomb on tls_compressed_cert) cannot swallow a different same-rss-cap target's
+    # genuine OOM (e.g. data_record_open, also rss=2048 on box-b).
+    bugkey="oom@$TARGET@rss=$RSS_CAP"
   else
     local frames; frames="$(normalize_frames < "$log")"
-    bugkey="$(printf '%s\n%s\n%s\n' "$TARGET" "$SAN" "$frames" | sha256_of)"
+    if [ -z "$frames" ]; then
+      # H-2: a non-reproducing / timeout / SIGKILL replay yields no stack frames.
+      # Without this, every such crash collapses to ONE constant key per (target,
+      # sanitizer) and distinct bugs dedup away. Fold the per-input artifact name
+      # (libFuzzer's crash-<sha1-of-input>) so distinct inputs stay distinct while
+      # re-finds of the SAME input still dedup.
+      bugkey="$(printf '%s\n%s\n%s\n' "$TARGET" "$SAN" "nostack:$base" | sha256_of)"
+    else
+      bugkey="$(printf '%s\n%s\n%s\n' "$TARGET" "$SAN" "$frames" | sha256_of)"
+    fi
   fi
   local key12="${bugkey:0:12}"
 
@@ -218,7 +241,10 @@ process_artifact() {  # <artifact_path>
   fi
 
   # 5. commit the minimized input on fuzz-crashes — the push is the dedup lock.
-  local committed_rel="crashes/$TARGET/$key12-$base"
+  # M-2: key the path on the bugkey ONLY (not the per-input artifact name), so two
+  # different inputs of the SAME bug collide here and dedup to one issue. (Non-repro
+  # crashes already fold the input into key12 above, so they don't over-collapse.)
+  local committed_rel="crashes/$TARGET/$key12"
   local filed=0
   if prepare_worktree; then
     local dst="$WT/$committed_rel"
@@ -241,7 +267,10 @@ process_artifact() {  # <artifact_path>
         filed=1
       else
         # lost the race or transient failure: rebase, re-check existence.
-        git -C "$WT" fetch origin "$CRASH_BRANCH" >/dev/null 2>&1 || true
+        # Explicit refspec — the --single-branch clone has no fuzz-crashes tracking
+        # ref otherwise, so a bare fetch would leave origin/fuzz-crashes stale and
+        # the won-by-peer check below blind (L-2).
+        git -C "$WT" fetch origin "+refs/heads/$CRASH_BRANCH:refs/remotes/origin/$CRASH_BRANCH" >/dev/null 2>&1 || true
         if git -C "$WT" ls-tree -r --name-only "origin/$CRASH_BRANCH" 2>/dev/null \
              | grep -qxF "$committed_rel"; then
           echo "crash-push: $TARGET $key12 won by peer; skipping issue"
@@ -268,11 +297,19 @@ process_artifact() {  # <artifact_path>
         "$sanlines" "$b64" \
         "${PIN:-HEAD}" "$TARGET" "$TARGET" "$TARGET" \
         "$committed_rel" "$CRASH_BRANCH")"
-    gh issue create --repo "$REPO" \
-       --title "[fuzz-crash] $TARGET $key12" \
-       --label fuzz-crash \
-       --body "$body" >/dev/null 2>&1 || true
-    echo "crash-push: filed issue [fuzz-crash] $TARGET $key12"
+    # H-3: ensure the label exists first — `gh issue create --label <missing>` fails
+    # and does NOT create the issue, and the failure is || true-masked. Idempotent;
+    # a no-op if the label already exists.
+    gh label create fuzz-crash --repo "$REPO" --color B60205 \
+        --description "Crash found by the distributed fuzz cluster" >/dev/null 2>&1 || true
+    if gh issue create --repo "$REPO" \
+         --title "[fuzz-crash] $TARGET $key12" \
+         --label fuzz-crash \
+         --body "$body" >/dev/null 2>&1; then
+      echo "crash-push: filed issue [fuzz-crash] $TARGET $key12"
+    else
+      echo "crash-push: ISSUE CREATE FAILED [fuzz-crash] $TARGET $key12 (repro is on $CRASH_BRANCH)" >&2
+    fi
   fi
 
   # 7. move the artifact aside so the unit restarts and keeps fuzzing.

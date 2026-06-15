@@ -25,7 +25,8 @@ SRC=/var/lib/plxfuzz/src
 CORPUS_MB_MAX=512
 CORPUS_FILES_MAX=100000
 ROOT_PCT_MAX=85
-LOGDIR=/var/log/plxfuzz       # where logrotate (sibling config) parks rotated logs
+LOGDIR=/var/lib/plxfuzz/logs   # L-10: must match logrotate's path (was the wrong /var/log/plxfuzz)
+STATE=/var/lib/plxfuzz/state
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -53,9 +54,17 @@ corpus_tripwire() {
     n="$(find "$d" -type f 2>/dev/null | wc -l | tr -d ' ')"
     [ -n "$mb" ] || mb=0; [ -n "$n" ] || n=0
     if [ "$mb" -gt "$CORPUS_MB_MAX" ] || [ "$n" -gt "$CORPUS_FILES_MAX" ]; then
-      echo "disk-guard: corpus[$t] over tripwire (mb=$mb files=$n) -> early cmin"
-      if [ -n "$CMIN" ]; then
-        bash "$CMIN" "$t" || true
+      # L-8: cmin prunes the OFF-BOX canonical asset; it does NOT shrink this live
+      # dir (a running fuzzer holds it), so the tripwire stays tripped. Cooldown so
+      # the heavy cmin (download + 2x runs + cmin + upload) can't re-fire hourly for
+      # the rest of the campaign — at most once per 12h per target.
+      local marker="$STATE/diskguard-cmin-$t"
+      if [ -n "$(find "$marker" -mmin -720 2>/dev/null)" ]; then
+        echo "disk-guard: corpus[$t] over tripwire (mb=$mb files=$n) but cmin ran <12h ago; skip"
+      else
+        echo "disk-guard: corpus[$t] over tripwire (mb=$mb files=$n) -> early canonical cmin"
+        if [ -n "$CMIN" ]; then bash "$CMIN" "$t" || true; fi
+        mkdir -p "$STATE" 2>/dev/null || true; : > "$marker" 2>/dev/null || true
       fi
     fi
   done
@@ -82,8 +91,11 @@ root_tripwire() {
   [ "$p" -le "$ROOT_PCT_MAX" ] && return 0
   echo "disk-guard: root FS at ${p}% (> ${ROOT_PCT_MAX}%) -> reclaiming"
 
-  # 1. non-fuzz cargo artifacts (root target/, NOT fuzz/target/). Safe: the
-  #    instrumented fuzz binaries live under fuzz/target and are untouched.
+  # 1. non-fuzz cargo artifacts (root target/, NOT fuzz/target/). NOTE (L-9): on
+  #    these boxes the root `parallax` crate is never built (only `cargo fuzz` runs,
+  #    into fuzz/target), so $SRC/target is empty and this frees ~0 — it is a safe
+  #    no-op kept only for completeness. The real reclaim lever is the journald
+  #    vacuum in step 2 (journald is the dominant on-disk sink, hard-capped at 2G).
   if command -v cargo >/dev/null 2>&1; then
     ( cd "$SRC" 2>/dev/null && cargo clean -p parallax >/dev/null 2>&1 ) || true
   fi

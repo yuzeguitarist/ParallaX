@@ -5,6 +5,14 @@
 # shard role). bootstrap.sh enables one instance per target in
 # `shard_targets <node-id>`.
 Description=ParallaX fuzz worker for %i
+# M-5: quarantine a deterministic crash-on-load instead of respawning forever.
+# A crashing corpus input loops at ~(crash + RestartSec) ≈ 11s, which is below
+# systemd's default 5-starts/10s burst so the limit never trips. Widen the window
+# so ~5 crashes within 10 min land the unit in 'failed' (the crash is already
+# filed by OnFailure) instead of burning CPU + re-running tmin/reproduce for 15
+# days. Recover with `systemctl reset-failed plx-fuzz@<t>` after the fix.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 User=plxfuzz

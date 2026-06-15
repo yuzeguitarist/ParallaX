@@ -9,7 +9,8 @@ Unit=plx-sync.service
 OnBootSec=3min
 OnUnitActiveSec=10min
 RandomizedDelaySec=120
-Persistent=true
+# (L-11: no Persistent= — it only affects OnCalendar= timers; on a monotonic timer
+# it is silently ignored. A missed sync is covered by the next OnUnitActiveSec tick.)
 
 [Install]
 WantedBy=timers.target

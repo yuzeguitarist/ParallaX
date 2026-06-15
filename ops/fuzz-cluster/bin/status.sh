@@ -98,9 +98,11 @@ fi
 [ -n "${CORPUS_BYTES:-}" ] || CORPUS_BYTES=0
 
 # --- crash count (local view: committed repros + un-pushed artifacts) -------
+# L-7: count crash/oom/timeout artifacts but NOT the *.handled markers crash-push
+# leaves behind (else each filed crash is counted forever).
 CRASH_COUNT=0
 [ -d crashes ]        && CRASH_COUNT=$(( CRASH_COUNT + $(find crashes -type f 2>/dev/null | wc -l | tr -d ' ') ))
-[ -d fuzz/artifacts ] && CRASH_COUNT=$(( CRASH_COUNT + $(find fuzz/artifacts -type f -name 'crash-*' 2>/dev/null | wc -l | tr -d ' ') ))
+[ -d fuzz/artifacts ] && CRASH_COUNT=$(( CRASH_COUNT + $(find fuzz/artifacts -type f \( -name 'crash-*' -o -name 'oom-*' -o -name 'timeout-*' \) ! -name '*.handled' 2>/dev/null | wc -l | tr -d ' ') ))
 
 # NOTE: the OOM pattern must NOT include 'rss_limit' — that substring also occurs
 # in libFuzzer's own launch-command echo ("Running `... -rss_limit_mb=N ...`"),
@@ -117,10 +119,14 @@ DISK_FREE_PCT="$(df -P / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print 100-$5
 # box writes (canonical corpus-<owned> + contrib-*-<nodeid>) == the last time
 # our corpus actually landed off-box. Network call, best-effort. Falls back to a
 # $STATE/last-sync-ts stamp (if a future sync.sh writes one), else null.
+# L-6: scope the canonical match to the targets THIS box OWNS (and the .tar.zst$
+# anchor excludes the cmin .prev backups) — otherwise any box's upload kept this
+# green and masked a stuck per-box sync.
+owned_re="$(printf '%s|' "${OWNS[@]:-}")"; owned_re="${owned_re%|}"
 LAST_SYNC="null"
-if command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+if command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && [ -n "$owned_re" ]; then
   v="$(gh release view "$TAG" --json assets \
-        --jq "[.assets[] | select(.name|test(\"^corpus-.*\\\\.tar\\\\.zst$\") or test(\"-${NODE_ID}\\\\.tar\\\\.zst$\")) | .updatedAt] | max // empty" \
+        --jq "[.assets[] | select(.name|test(\"^corpus-(${owned_re})\\\\.tar\\\\.zst$\") or test(\"-${NODE_ID}\\\\.tar\\\\.zst$\")) | .updatedAt] | max // empty" \
         2>/dev/null || true)"
   [ -n "$v" ] && LAST_SYNC="$v"
 fi

@@ -153,8 +153,12 @@ prune_one() {
     [ -f "$c" ] && untar "$c" "$d/merged"
   done
 
-  # 2. re-inject crash repros FIRST so cmin can't drop them
-  fetch_crash_repros "$t" "$d/merged"
+  # L-4: do NOT inject crash repros into the corpus. libFuzzer corpus inputs must
+  # not crash on load — a re-injected repro would crash-loop any fuzzer that later
+  # pulls this canonical (the M-5 trigger), and -merge=1 is coverage-greedy so it
+  # drops coverage-redundant repros anyway (the old "cmin can't drop a known crash"
+  # guarantee was false). Crash repros live durably on the fuzz-crashes branch + as
+  # Issues — that is the system of record, not the corpus.
 
   # If we have nothing, there is nothing to prune.
   if [ -z "$(find "$d/merged" -type f -print -quit 2>/dev/null)" ]; then
@@ -202,9 +206,14 @@ prune_one() {
   fi
   mktar "$d/corpus-$t.tar.zst" "$d/merged"
   if [ -f "$d/corpus-$t.tar.zst" ]; then
-    gh release upload "$TAG" "$d/corpus-$t.tar.zst" --clobber 2>/dev/null \
-      && echo "cmin[$t]: published pruned canonical" \
-      || echo "cmin[$t]: upload failed (will retry next tick)"
+    # L-5: serialize with the owner's sync_owned upload via a per-target flock so
+    # the two never clobber each other mid-upload (same lock path as sync.sh).
+    mkdir -p "$STATE" 2>/dev/null || true
+    if flock "$STATE/corpus-$t.lock" gh release upload "$TAG" "$d/corpus-$t.tar.zst" --clobber 2>/dev/null; then
+      echo "cmin[$t]: published pruned canonical"
+    else
+      echo "cmin[$t]: upload failed (will retry next tick)"
+    fi
   fi
   rm -rf "$d" 2>/dev/null || true
 }
@@ -215,11 +224,15 @@ main() {
   if [ "$#" -gt 0 ]; then
     targets=("$@")                       # forced (disk-guard) — prune exactly these
   else
+    # M-1: prune only the targets THIS box OWNS, so the owner is the SINGLE writer
+    # of each canonical corpus-<t>.tar.zst (matches sync_owned's writer and the
+    # README one-writer-per-asset contract). The old assigned_today rotation let a
+    # NON-owner box clobber the canonical and race the owner's sync.
     for t in $ALL_TARGETS; do
-      assigned_today "$t" && targets+=("$t")
+      [ "$(owner_box "$t" 2>/dev/null)" = "$NODE_ID" ] && targets+=("$t")
     done
   fi
-  [ "${#targets[@]}" -gt 0 ] || { echo "cmin: nothing assigned today"; return 0; }
+  [ "${#targets[@]}" -gt 0 ] || { echo "cmin: nothing owned to prune"; return 0; }
   echo "cmin: node=$NODE_ID idx=$MY_IDX san=$SAN targets=${targets[*]}"
   for t in "${targets[@]}"; do
     prune_one "$t" || true

@@ -8,7 +8,7 @@
 #   <bugkey>
 # where bugkey is either
 #   sha256(target+sanitizer+normalized-top-3-frames)   (normal crash class), or
-#   oom@rss=<cap> <target>                              (the H1 OOM class)
+#   oom@<target>@rss=<cap>                              (the H1 OOM class)
 # Blank lines and lines starting with '#' are ignored.
 #
 # Remove a line to let that bug re-open an Issue (e.g. after you believe it is
@@ -18,4 +18,6 @@
 # the 2048 MB rss cap, so libFuzzer reports it as an OOM. This is the KNOWN
 # finding the campaign is meant to confirm/track, not re-discover; suppress it
 # so it never floods Issues. (Box-b runs this target under -rss_limit_mb=2048.)
-oom@rss=2048 tls_compressed_cert
+# Target-qualified so it cannot also swallow a genuine OOM in another same-cap
+# target (e.g. data_record_open, also rss=2048 on box-b).
+oom@tls_compressed_cert@rss=2048 tls_compressed_cert
