@@ -30,11 +30,7 @@ use rand::{rngs::OsRng, RngCore};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256, Sha384};
 use thiserror::Error;
-use tokio::{
-    io::AsyncWriteExt,
-    net::TcpStream,
-    time::{sleep, timeout},
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 use zeroize::Zeroizing;
 
 use super::{
@@ -59,7 +55,6 @@ const POST_HANDSHAKE_DRAIN_LIMIT: usize = 4;
 const POST_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(180);
 const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
 const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
-const H2_OPEN_HEADERS_DELAY: Duration = Duration::from_millis(12);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
 
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
@@ -562,14 +557,27 @@ impl Safari26TlsSession {
             return Ok(());
         }
 
+        // HTTP/2 clients send their opening request right after their own preface,
+        // without first waiting for the server's SETTINGS — the standard behavior
+        // that saves a round trip (a client may send requests as soon as it has
+        // sent its preface; the server buffers them). Writing the preface, blocking
+        // on the server's SETTINGS, then sending HEADERS made the first
+        // client->server flight preface-only and added a
+        // server-round-trip-before-request pattern no browser exhibits. Send the
+        // preface and the opening HEADERS back-to-back as one flight, then drain
+        // and ACK the server's SETTINGS afterward.
+        //
+        // Keep them as two separate writes (their existing record framing) rather
+        // than coalescing into one TLS record: no capture pins the real Safari
+        // opening-flight record boundary — the committed fixture is a plaintext
+        // reassembly that proves byte shape, not record count. Change only the
+        // proven tell (the wait), not the on-wire record framing.
         let fingerprint = Http2Fingerprint::safari26();
         let preface = fingerprint.connection_preface()?;
         self.write_application_data(stream, keys, &preface).await?;
-        self.await_http2_settings_ack(stream, keys).await?;
-
         let headers = fingerprint.headers_frame(&self.sni)?;
         self.write_application_data(stream, keys, &headers).await?;
-        sleep(H2_OPEN_HEADERS_DELAY).await;
+        self.await_http2_settings_ack(stream, keys).await?;
         Ok(())
     }
 

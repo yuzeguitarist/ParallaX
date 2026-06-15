@@ -382,7 +382,7 @@ impl ClientDataSession {
         )?;
         let next_keys = expand_epoch_keys(
             chain_secret,
-            self.keys.epoch + 1,
+            self.keys.epoch.saturating_add(1),
             self.keys.transcript_hash,
             *x25519_shared_secret,
         )?;

@@ -72,6 +72,12 @@ const CLIENT_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(15);
 /// direction moves real bytes for this long, tear the session down so a silent
 /// (e.g. MITM-held) upstream cannot pin a global connection slot and both fds.
 const CLIENT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Bound on the local SOCKS5 negotiation. A loopback client that opens the
+/// socket then stalls (or trickles bytes one at a time) would otherwise park the
+/// connection task forever, holding a connection slot — and on the non-mux path
+/// a speculative upstream session. An independent flat 10s bound on the loopback
+/// SOCKS side (not the GFW-facing server first-record wait, which is jittered).
+const SOCKS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const WARM_SESSION_POOL_TARGET: usize = 4;
 const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
 const MUX_FRAME_BATCH_LIMIT: usize = 64;
@@ -199,7 +205,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     } else {
         None
     };
-    let connection_limit = relay_connection_limit()?;
+    let connection_limit = relay_connection_limit(udp.enabled)?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
     tracing::info!(
         connection_limit,
@@ -871,7 +877,15 @@ async fn handle_local_mux_connection_with_cid(
         "accepted SOCKS connection for mux session"
     );
 
-    let request = socks::accept_connect(&mut local).await?;
+    let request =
+        match tokio::time::timeout(SOCKS_ACCEPT_TIMEOUT, socks::accept_connect(&mut local)).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(
+                    io::Error::new(io::ErrorKind::TimedOut, "SOCKS handshake timed out").into(),
+                );
+            }
+        };
     let mux = mux_pool.handle().await?;
     let _stream_permit = Arc::clone(&mux.stream_slots)
         .acquire_owned()
@@ -1026,13 +1040,20 @@ async fn handle_local_connection_with_cid(
     // JoinHandle, which detaches it and lets it run a full handshake + QUIC connect
     // to completion, transiently holding a retained QUIC connection when udp is on).
     let session_abort = server_session_task.abort_handle();
-    let request = match socks::accept_connect(&mut local).await {
-        Ok(request) => request,
-        Err(err) => {
-            server_session_task.abort();
-            return Err(err.into());
-        }
-    };
+    let request =
+        match tokio::time::timeout(SOCKS_ACCEPT_TIMEOUT, socks::accept_connect(&mut local)).await {
+            Ok(Ok(request)) => request,
+            Ok(Err(err)) => {
+                server_session_task.abort();
+                return Err(err.into());
+            }
+            Err(_elapsed) => {
+                server_session_task.abort();
+                return Err(
+                    io::Error::new(io::ErrorKind::TimedOut, "SOCKS handshake timed out").into(),
+                );
+            }
+        };
     let chunk_size = max_plaintext_len(traffic.max_padding);
     let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
     // Keep the zero-RTT-style initial payload capture, but hide its small wait

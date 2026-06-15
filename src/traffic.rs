@@ -105,11 +105,18 @@ impl PaddingProfile {
 
         if rng.gen_range(0..100) < 55 {
             let target = OBSERVED_PACKET_TARGETS[rng.gen_range(0..OBSERVED_PACKET_TARGETS.len())];
-            let overhead = 2_u16;
-            let needed = target
-                .saturating_sub(payload_len as u16)
-                .saturating_sub(overhead);
-            return needed.clamp(self.min, self.max);
+            let overhead = 2_usize;
+            // Only aim for an observed packet size when it leaves room to pad
+            // above the floor. Full-size relay chunks already have
+            // payload_len + overhead >= every observed target, so the old code
+            // collapsed to `self.min` here, spiking the padding distribution at a
+            // single value. Fall through to the random-span branch in that case.
+            if payload_len + overhead + (self.min as usize) < (target as usize) {
+                let needed = target
+                    .saturating_sub(payload_len as u16)
+                    .saturating_sub(overhead as u16);
+                return needed.clamp(self.min, self.max);
+            }
         }
 
         let span = self.max - self.min;

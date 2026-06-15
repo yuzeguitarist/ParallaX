@@ -248,8 +248,8 @@ pub fn is_fd_exhaustion_error(err: &io::Error) -> bool {
     }
 }
 
-pub fn relay_connection_limit() -> io::Result<usize> {
-    relay_connection_limit_from_nofile(nofile_soft_limit()?).ok_or_else(|| {
+pub fn relay_connection_limit(udp_enabled: bool) -> io::Result<usize> {
+    relay_connection_limit_from_nofile(nofile_soft_limit()?, udp_enabled).ok_or_else(|| {
         io::Error::other(format!(
             "RLIMIT_NOFILE soft limit is too low; need more than \
                  {RESERVED_PROCESS_FDS} file descriptors"
@@ -257,9 +257,21 @@ pub fn relay_connection_limit() -> io::Result<usize> {
     })
 }
 
-pub fn relay_connection_limit_from_nofile(nofile_soft_limit: usize) -> Option<usize> {
+pub fn relay_connection_limit_from_nofile(
+    nofile_soft_limit: usize,
+    udp_enabled: bool,
+) -> Option<usize> {
     let available = nofile_soft_limit.checked_sub(RESERVED_PROCESS_FDS)?;
-    let limit = available / FDS_PER_RELAY_CONNECTION;
+    // Each relay holds the TCP control pair (FDS_PER_RELAY_CONNECTION). With the
+    // UDP fast plane enabled, a Verified probe also retains a quinn::Endpoint (its
+    // own UDP-socket fd) for the relay's lifetime, so budget one extra fd per
+    // connection or the process can approach EMFILE before the semaphore blocks.
+    let fds_per_conn = if udp_enabled {
+        FDS_PER_RELAY_CONNECTION + 1
+    } else {
+        FDS_PER_RELAY_CONNECTION
+    };
+    let limit = available / fds_per_conn;
     if limit == 0 {
         None
     } else {
@@ -751,15 +763,18 @@ mod tests {
 
     #[test]
     fn relay_connection_limit_reserves_process_fds() {
-        assert_eq!(relay_connection_limit_from_nofile(64), None);
-        assert_eq!(relay_connection_limit_from_nofile(66), Some(1));
-        assert_eq!(relay_connection_limit_from_nofile(256), Some(96));
+        assert_eq!(relay_connection_limit_from_nofile(64, false), None);
+        assert_eq!(relay_connection_limit_from_nofile(66, false), Some(1));
+        assert_eq!(relay_connection_limit_from_nofile(256, false), Some(96));
+        // With the UDP fast plane on, each relay also retains a QUIC endpoint fd,
+        // so the per-connection budget is 3 and the limit drops accordingly.
+        assert_eq!(relay_connection_limit_from_nofile(256, true), Some(64));
     }
 
     #[test]
     fn relay_connection_limit_is_capped() {
         assert_eq!(
-            relay_connection_limit_from_nofile(usize::MAX),
+            relay_connection_limit_from_nofile(usize::MAX, false),
             Some(MAX_RELAY_CONNECTION_LIMIT)
         );
     }

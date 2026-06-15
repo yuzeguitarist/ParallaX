@@ -5,6 +5,7 @@ use pqcrypto_traits::kem::{
     SharedSecret as KemSharedSecret,
 };
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -21,6 +22,8 @@ pub enum PqError {
     InvalidCiphertext,
     #[error("HKDF expansion failed")]
     Hkdf,
+    #[error("degenerate (all-zero) X25519 shared secret")]
+    DegenerateSharedSecret,
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -81,6 +84,15 @@ pub fn hybrid_sandwich_rekey(
     pq_shared_secret: &[u8; 32],
     symmetric_secret: &[u8],
 ) -> Result<[u8; 32], PqError> {
+    // Reject a degenerate (all-zero) X25519 contribution, mirroring the initial
+    // handshake check in crypto/session.rs. The peer's ephemeral public is
+    // attacker-controllable on the rekey path; a small-order point can force the
+    // X25519 shared secret to zero, silently dropping that layer's contributory
+    // guarantee. Compared in constant time (subtle) for consistency with the
+    // session.rs check — the same constant-time-secret-handling hygiene.
+    if bool::from(x25519_shared_secret.ct_eq(&[0_u8; 32])) {
+        return Err(PqError::DegenerateSharedSecret);
+    }
     let mut chain_secret = [0_u8; 32];
     let ikm_len = HYBRID_REKEY_IKM_FIXED_LEN + symmetric_secret.len();
     if ikm_len <= HYBRID_REKEY_IKM_STACK_LEN {
@@ -210,6 +222,23 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_rekey_rejects_degenerate_x25519_shared_secret() {
+        // A small-order peer ephemeral can force the X25519 shared secret to all
+        // zero; the rekey combiner must reject it on both the PSK and non-PSK
+        // paths rather than silently dropping the X25519 contribution.
+        assert!(matches!(
+            hybrid_rekey(&[1; 32], &[0; 32], &[3; 32]),
+            Err(PqError::DegenerateSharedSecret)
+        ));
+        assert!(matches!(
+            hybrid_sandwich_rekey(&[1; 32], &[0; 32], &[3; 32], b"psk"),
+            Err(PqError::DegenerateSharedSecret)
+        ));
+        // A non-degenerate X25519 secret still rekeys successfully.
+        assert!(hybrid_rekey(&[1; 32], &[2; 32], &[3; 32]).is_ok());
+    }
+
+    #[test]
     fn hybrid_sandwich_rekey_uses_heap_path_for_large_symmetric_secrets() {
         let small = hybrid_sandwich_rekey(&[1; 32], &[2; 32], &[3; 32], b"small").unwrap();
         let big_secret = vec![0xAB; HYBRID_REKEY_IKM_STACK_LEN];
@@ -277,5 +306,9 @@ mod tests {
             "invalid ML-KEM ciphertext"
         );
         assert_eq!(PqError::Hkdf.to_string(), "HKDF expansion failed");
+        assert_eq!(
+            PqError::DegenerateSharedSecret.to_string(),
+            "degenerate (all-zero) X25519 shared secret"
+        );
     }
 }

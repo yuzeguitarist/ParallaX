@@ -390,7 +390,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     ));
     let secrets = ServerRuntimeSecrets::decode(&server)?;
     let listener = TcpListener::bind(server.listen).await?;
-    let connection_limit = relay_connection_limit()?;
+    let connection_limit = relay_connection_limit(udp.enabled)?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
     let source_limiter = SourceLimiter::new(
         server.max_concurrent_per_source_v4,
@@ -1422,8 +1422,20 @@ async fn run_authenticated_data_mode(
                             &server_ephemeral.private,
                             &client_x25519_public,
                         ));
-                        let pq_encapsulation =
+                        let mut pq_encapsulation =
                             encapsulate_mlkem_blocking(client_mlkem_public_key).await?;
+                        // Move the ML-KEM shared secret into a wipe-on-drop local and
+                        // clear the struct's own [u8;32] copy immediately. A struct-level
+                        // ZeroizeOnDrop can't help (`.ciphertext` is moved into the
+                        // key-exchange payload below, partially moving the struct so its
+                        // Drop glue can never run), and every `?` between here and the
+                        // rekey (encode / seal / write / rekey) would otherwise drop the
+                        // secret un-wiped — a path the new degenerate-X25519 rekey
+                        // rejection makes reachable. The Zeroizing local clears on ANY
+                        // return.
+                        let pq_shared_secret =
+                            zeroize::Zeroizing::new(pq_encapsulation.shared_secret);
+                        pq_encapsulation.shared_secret.zeroize();
                         let key_exchange_payload = ServerKeyExchange {
                             server_x25519_public: server_ephemeral.public,
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
@@ -1433,7 +1445,7 @@ async fn run_authenticated_data_mode(
                             identity::pq_rekey_binding(first_payload.as_slice(), &key_exchange_payload);
                         crate::process_hardening::protect_secret_bytes(
                             "pq_rekey.mlkem_shared_secret",
-                            &pq_encapsulation.shared_secret,
+                            &*pq_shared_secret,
                         );
                         let mut rng = StdRng::from_entropy();
                         let key_exchange_record =
@@ -1461,7 +1473,7 @@ async fn run_authenticated_data_mode(
                             &mut server_seal,
                             &handshake.session_keys,
                             &x25519_ephemeral_shared,
-                            &pq_encapsulation.shared_secret,
+                            &pq_shared_secret,
                             sandwich_secret,
                         )?;
                         rekeyed_keys.protect_secret_memory();
@@ -1662,7 +1674,8 @@ async fn run_authenticated_data_mode(
                                 // learns the port, so a racing/off-path connector
                                 // could otherwise steal the single accept slot and
                                 // force a TCP downgrade. peer_addr() reads it off
-                                // the live socket; None fails open to accept-any.
+                                // the live socket; None fails closed (the callee
+                                // declines QUIC and the session stays on TCP).
                                 let expect_ip = client_write.peer_addr().ok().map(|a| a.ip());
                                 let probed_conn: Option<quinn::Connection> = tokio::time::timeout(
                                     probe_budget,
@@ -1933,6 +1946,30 @@ async fn run_authenticated_data_mode(
                     Err(DataRecordError::Aead(_)) | Err(DataRecordError::NotApplicationData) => {
                         client_camouflage_records_before_pq += 1;
                         client_camouflage_bytes_before_pq += client_record.len();
+                        if client_camouflage_records_before_pq > PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT
+                        {
+                            // Same 64-record ceiling as the fallback->client cap
+                            // below (that direction pauses; this one tears down). A
+                            // legitimate client emits only a handful of camouflage
+                            // records before its PQ rekey, so an unbounded
+                            // client->fallback stream is abuse. Drain->FIN both
+                            // halves (never a bare drop, which would RST) and stop.
+                            tracing::debug!(
+                                cid,
+                                client_camouflage_records_before_pq,
+                                client_camouflage_bytes_before_pq,
+                                pre_pq_forward_limit = PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT,
+                                "client camouflage record cap reached before PQ rekey; tearing down"
+                            );
+                            graceful_close_pre_pq(
+                                client_records,
+                                client_write,
+                                fallback_records,
+                                fallback_write,
+                            )
+                            .await;
+                            return Ok(());
+                        }
                         if client_camouflage_records_before_pq == 1
                             || client_camouflage_records_before_pq == 8
                         {
@@ -2311,7 +2348,7 @@ fn apply_server_pq_rekey(
     )?;
     let next_keys = expand_epoch_keys(
         chain_secret,
-        keys.epoch + 1,
+        keys.epoch.saturating_add(1),
         keys.transcript_hash,
         *x25519_shared_secret,
     )?;
@@ -2445,8 +2482,9 @@ fn udp_retention_decision(
 /// "nothing here" probe-resistance posture is preserved (a `refuse()` would emit
 /// an observable CONNECTION_CLOSE). `serve_probe` still gates authenticity on the
 /// exporter-bound token, so a peer that spoofs the IP cannot pass; this only closes
-/// the free downgrade. `expect_ip == None` fails open to accept-any. The caller
-/// wraps this in the probe-budget timeout, which bounds the loop.
+/// the free downgrade. `expect_ip == None` fails closed (declines the QUIC offer;
+/// the session stays on TCP). The caller wraps this in the probe-budget timeout,
+/// which bounds the loop.
 async fn accept_probed_quic_from_peer(
     udp_ep: &quinn::Endpoint,
     expect_ip: Option<std::net::IpAddr>,
@@ -2454,18 +2492,27 @@ async fn accept_probed_quic_from_peer(
     offer_id: &[u8; 16],
     cid: u64,
 ) -> Option<quinn::Connection> {
+    // Fail closed: if the authenticated TCP peer IP could not be determined, do
+    // not accept a fast-plane QUIC connection from any source (which would let a
+    // racing off-path connector occupy the single accept slot and force a TCP
+    // downgrade). Staying on TCP is the safe fallback.
+    let Some(expect_ip) = expect_ip else {
+        tracing::warn!(
+            cid,
+            "peer IP unknown; declining fast-plane QUIC (fail closed)"
+        );
+        return None;
+    };
     loop {
         let incoming = udp_ep.accept().await?;
-        if let Some(ip) = expect_ip {
-            if incoming.remote_address().ip() != ip {
-                tracing::debug!(
-                    cid,
-                    src = %incoming.remote_address(),
-                    "ignoring fast-plane QUIC from non-authenticated source IP"
-                );
-                incoming.ignore();
-                continue;
-            }
+        if incoming.remote_address().ip() != expect_ip {
+            tracing::debug!(
+                cid,
+                src = %incoming.remote_address(),
+                "ignoring fast-plane QUIC from non-authenticated source IP"
+            );
+            incoming.ignore();
+            continue;
         }
         let conn = incoming.await.ok()?;
         if let Err(err) =

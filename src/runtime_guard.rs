@@ -344,9 +344,35 @@ fn ensure_state_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+
+        // The state dir path (/tmp/parallax-<euid>/runtime) is predictable, so on
+        // a shared host an attacker can pre-create it or plant a symlink before we
+        // do. Re-open the final directory with O_NOFOLLOW | O_DIRECTORY and fstat
+        // the fd: a symlinked final component fails open() with ELOOP (ENOTDIR on
+        // macOS), a non-dir with ENOTDIR, and a foreign owner is rejected here.
+        // Mirrors the fd-based ownership check in config.rs::read_secret_config_file.
+        // Like that check, O_NOFOLLOW only guards the FINAL component — the parent
+        // /tmp/parallax-<euid> is not validated; this raises the bar without fully
+        // closing a hostile-parent race on a shared host.
+        let dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)?;
+        let metadata = dir_file.metadata()?;
+        let uid = metadata.uid();
+        let euid = unsafe { libc::geteuid() };
+        if !metadata.is_dir() || uid != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "runtime state dir {} is not a euid-owned directory (uid={uid}, euid={euid})",
+                    dir.display()
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -356,12 +382,17 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
 
+        // O_NOFOLLOW: refuse to open through a symlinked final component so an
+        // attacker can't redirect our lock-file writes. O_EXCL is NOT usable here
+        // because lock files are intentionally reopened across runs (peer locks in
+        // active_instances), so it would break normal multi-instance operation.
         OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
     }
     #[cfg(not(unix))]
@@ -518,6 +549,28 @@ mod tests {
             }),
             server: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_accepts_owned_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("runtime");
+        ensure_state_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_rejects_symlinked_final_component() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real");
+        fs::create_dir_all(&target).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&target, &link).unwrap();
+        // O_NOFOLLOW must make the symlinked final component fail closed.
+        assert!(ensure_state_dir(&link).is_err());
     }
 
     #[test]
