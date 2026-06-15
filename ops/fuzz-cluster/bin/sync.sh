@@ -97,8 +97,11 @@ maxlen_for() {
 # tar a corpus dir excluding macOS cruft / dotfiles.
 tar_corpus() {  # <dir> <out.tar.zst>
   local dir="$1" out="$2"
+  # NOTE: do NOT add --exclude='.*' here. With `-C "$dir" .` every member is
+  # "./<sha1>", and the glob '.*' matches that leading "./" -> it excludes the
+  # ENTIRE corpus, producing a 21-byte empty archive. Only drop known cruft.
   tar --use-compress-program='zstd -19' \
-      --exclude='.DS_Store' --exclude='._*' --exclude='.*' \
+      --exclude='.DS_Store' --exclude='._*' \
       -cf "$out" -C "$dir" . 2>/dev/null
 }
 
