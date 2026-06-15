@@ -2,7 +2,7 @@
 # ParallaX distributed-fuzz cluster — corpus sync (GROUP 2).
 #
 # Runs every ~10 min from plx-sync.timer. The corpus store is a GitHub RELEASE
-# (tag from /etc/plxfuzz/campaign-tag, e.g. fuzz-corpus-fa6637d4), NOT a branch.
+# (tag from /etc/plxfuzz/campaign-tag, e.g. fuzz-corpus-84c78add), NOT a branch.
 #
 # For each target this box OWNS  (owner_box == this node-id):
 #   download every contrib-<target>-*.tar.zst, merge them + local finds with

@@ -5,7 +5,7 @@
 # root. Brings the box from bare image to a live fuzz node, unattended except
 # for ONE PAT prompt.
 #
-#   curl -fsSL https://raw.githubusercontent.com/yuzeguitarist/ParallaX/fa6637d4/ops/fuzz-cluster/bootstrap.sh \
+#   curl -fsSL https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh \
 #     | bash -s -- box-a
 #
 # The trailing arg is the node-id (box-a | box-b | box-c) and is the ONLY
@@ -22,8 +22,8 @@ set -uo pipefail
 # Locked campaign constants.
 # ---------------------------------------------------------------------------
 REPO="yuzeguitarist/ParallaX"
-PINNED_COMMIT="fa6637d4"
-CAMPAIGN_TAG="fuzz-corpus-fa6637d4"
+PINNED_COMMIT="84c78add"
+CAMPAIGN_TAG="fuzz-corpus-84c78add"
 NIGHTLY="nightly-2026-06-10"
 CARGO_FUZZ_VERSION="0.13.2"
 
