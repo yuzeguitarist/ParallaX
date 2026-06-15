@@ -102,7 +102,10 @@ CRASH_COUNT=0
 [ -d crashes ]        && CRASH_COUNT=$(( CRASH_COUNT + $(find crashes -type f 2>/dev/null | wc -l | tr -d ' ') ))
 [ -d fuzz/artifacts ] && CRASH_COUNT=$(( CRASH_COUNT + $(find fuzz/artifacts -type f -name 'crash-*' 2>/dev/null | wc -l | tr -d ' ') ))
 
-OOM_TIMEOUT=$(( $(count_journal 'out-of-memory|rss_limit|ERROR: libFuzzer: out-of-memory') + $(count_journal 'timeout after|libFuzzer: timeout') ))
+# NOTE: the OOM pattern must NOT include 'rss_limit' — that substring also occurs
+# in libFuzzer's own launch-command echo ("Running `... -rss_limit_mb=N ...`"),
+# which made every healthy boot count as N OOMs. Match only the real OOM error.
+OOM_TIMEOUT=$(( $(count_journal 'ERROR: libFuzzer: out-of-memory') + $(count_journal 'libFuzzer: timeout|timeout after') ))
 MAX_RSS="$(max_rss_mb)"
 
 # --- host metrics -----------------------------------------------------------
