@@ -15,6 +15,7 @@
 pub mod auth;
 pub mod endpoint;
 pub(crate) mod envelope;
+pub(crate) mod fec;
 pub mod probe;
 pub(crate) mod reorder;
 
