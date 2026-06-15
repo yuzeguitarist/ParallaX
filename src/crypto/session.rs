@@ -4,6 +4,7 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -101,6 +102,8 @@ pub enum SessionError {
     Aead,
     #[error("AEAD nonce sequence exhausted")]
     NonceExhausted,
+    #[error("degenerate (all-zero) X25519 shared secret")]
+    DegenerateSharedSecret,
 }
 
 pub fn derive_client_keys(
@@ -146,6 +149,17 @@ fn derive_keys_from_shared(
     x25519_shared_secret: [u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
+    // Defense-in-depth: reject a degenerate (all-zero) X25519 shared secret.
+    // x25519-dalek does not reject low-order/contributory base points (RFC 7748
+    // leaves the all-zero-output check to the caller), so a peer that supplies a
+    // small-order public key can force the shared secret to all-zero. This funnel
+    // is post-authentication (the peer already passed PSK/X25519 auth, which is
+    // what actually gates exploitability), so this only restores the X25519
+    // layer's contributory guarantee in the hybrid rather than fixing a break.
+    // Constant-time compare so the rejection itself is not a timing oracle.
+    if bool::from(x25519_shared_secret.ct_eq(&[0u8; KEY_LEN])) {
+        return Err(SessionError::DegenerateSharedSecret);
+    }
     let chain_secret = initial_chain_secret(&x25519_shared_secret, transcript_hash)?;
     expand_epoch_keys(chain_secret, 0, *transcript_hash, x25519_shared_secret)
 }
@@ -639,5 +653,36 @@ mod tests {
         let second = enc.seal(b"same payload", b"tls-appdata").unwrap();
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn derive_keys_rejects_all_zero_shared_secret() {
+        let transcript_hash = [7_u8; 32];
+        assert!(matches!(
+            derive_client_keys_from_shared(&[0_u8; KEY_LEN], &transcript_hash),
+            Err(SessionError::DegenerateSharedSecret)
+        ));
+        assert!(matches!(
+            derive_server_keys_from_shared(&[0_u8; KEY_LEN], &transcript_hash),
+            Err(SessionError::DegenerateSharedSecret)
+        ));
+    }
+
+    #[test]
+    fn low_order_x25519_public_yields_degenerate_shared_secret_rejected() {
+        // The all-zero X25519 public key is a small-order point: x25519-dalek does
+        // not reject it, and DH against it yields an all-zero shared secret, which
+        // the key-derivation funnel must now reject (L-1).
+        let kp = X25519KeyPair::generate();
+        let shared = x25519_shared_secret(&kp.private, &[0_u8; KEY_LEN]);
+        assert_eq!(
+            shared, [0_u8; KEY_LEN],
+            "all-zero public is a small-order point"
+        );
+        let transcript_hash = [9_u8; 32];
+        assert!(matches!(
+            derive_client_keys_from_shared(&shared, &transcript_hash),
+            Err(SessionError::DegenerateSharedSecret)
+        ));
     }
 }

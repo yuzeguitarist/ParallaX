@@ -18,8 +18,12 @@ pub(crate) const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 8192;
 pub enum ConfigError {
     #[error("failed to read config: {0}")]
     Read(#[from] std::io::Error),
-    #[error("failed to parse TOML: {0}")]
-    Toml(#[from] toml::de::Error),
+    #[error("failed to parse TOML at line {line}, column {column}: {message}")]
+    Toml {
+        line: usize,
+        column: usize,
+        message: String,
+    },
     #[error("missing [client] section for client mode")]
     MissingClient,
     #[error("missing [server] section for server mode")]
@@ -375,6 +379,24 @@ impl UdpConfig {
     }
 }
 
+/// Convert a TOML parse error into a sanitized `ConfigError` exposing ONLY the
+/// line/column/kind. We must not let `toml::de::Error`'s `Display` (which renders
+/// the offending source line via toml_edit) or its retained raw-document copy
+/// reach stderr/logs: config lines carry long-lived secrets (`crypto.psk`,
+/// `server.private_key`, `pq_secret_key`, `identity_secret_key`). `message()` is
+/// toml's value-free error kind, never the source content.
+fn toml_error(raw: &str, err: toml::de::Error) -> ConfigError {
+    let off = err.span().map(|s| s.start).unwrap_or(0).min(raw.len());
+    let line = raw[..off].bytes().filter(|&b| b == b'\n').count() + 1;
+    let line_start = raw[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = off - line_start + 1;
+    ConfigError::Toml {
+        line,
+        column,
+        message: err.message().to_string(),
+    }
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -383,7 +405,8 @@ impl Config {
         // symlink / TOCTOU window that exists when a path-based permission check
         // and a separate path-based read can resolve to different inodes.
         let raw = read_secret_config_file(path)?;
-        let mut cfg = toml::from_str::<Self>(raw.as_str())?;
+        let mut cfg =
+            toml::from_str::<Self>(raw.as_str()).map_err(|e| toml_error(raw.as_str(), e))?;
         cfg.resolve_paths_relative_to(path);
         cfg.validate()?;
         Ok(cfg)
@@ -1959,7 +1982,37 @@ psk = "{KEY}"
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
-        assert!(matches!(Config::load(&path), Err(ConfigError::Toml(_))));
+        assert!(matches!(Config::load(&path), Err(ConfigError::Toml { .. })));
+    }
+
+    /// M-12: a TOML syntax error on or near a secret line must NOT leak the
+    /// offending source line (which carries `crypto.psk` / `server.private_key`
+    /// etc.) through the error's Display or Debug — only line/column/kind.
+    #[test]
+    fn toml_parse_error_never_leaks_secret_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leaky.toml");
+        // Unterminated string on the psk line: a classic operator typo that makes
+        // toml_edit's Display render the whole line, secret included.
+        let secret = "S3CR3T-PSK-DO-NOT-LEAK-0123456789";
+        fs::write(
+            &path,
+            format!("mode = \"server\"\n[crypto]\npsk = \"{secret}\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let err = Config::load(&path).unwrap_err();
+        let rendered = format!("{err}");
+        let debugged = format!("{err:?}");
+        assert!(
+            !rendered.contains(secret) && !debugged.contains(secret),
+            "TOML parse error must not contain the secret (Display={rendered:?}, Debug={debugged:?})",
+        );
+        assert!(matches!(err, ConfigError::Toml { .. }));
     }
 
     #[test]
