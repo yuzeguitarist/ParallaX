@@ -557,19 +557,26 @@ impl Safari26TlsSession {
             return Ok(());
         }
 
-        // HTTP/2 clients send their opening request in the same flight as the
-        // connection preface, without first waiting for the server's SETTINGS —
-        // the standard behavior that saves a round trip (a client may send
-        // requests as soon as it has sent its own preface; the server buffers
-        // them). Writing the preface alone, blocking on the server's SETTINGS,
-        // then sending HEADERS made the first client->server application-data
-        // burst preface-only and added a server-round-trip-before-request pattern
-        // no browser exhibits. Coalesce the preface and the opening HEADERS into
-        // one outbound flight, then drain and ACK the server's SETTINGS afterward.
+        // HTTP/2 clients send their opening request right after their own preface,
+        // without first waiting for the server's SETTINGS — the standard behavior
+        // that saves a round trip (a client may send requests as soon as it has
+        // sent its preface; the server buffers them). Writing the preface, blocking
+        // on the server's SETTINGS, then sending HEADERS made the first
+        // client->server flight preface-only and added a
+        // server-round-trip-before-request pattern no browser exhibits. Send the
+        // preface and the opening HEADERS back-to-back as one flight, then drain
+        // and ACK the server's SETTINGS afterward.
+        //
+        // Keep them as two separate writes (their existing record framing) rather
+        // than coalescing into one TLS record: no capture pins the real Safari
+        // opening-flight record boundary — the committed fixture is a plaintext
+        // reassembly that proves byte shape, not record count. Change only the
+        // proven tell (the wait), not the on-wire record framing.
         let fingerprint = Http2Fingerprint::safari26();
-        let mut flight = fingerprint.connection_preface()?;
-        flight.extend_from_slice(&fingerprint.headers_frame(&self.sni)?);
-        self.write_application_data(stream, keys, &flight).await?;
+        let preface = fingerprint.connection_preface()?;
+        self.write_application_data(stream, keys, &preface).await?;
+        let headers = fingerprint.headers_frame(&self.sni)?;
+        self.write_application_data(stream, keys, &headers).await?;
         self.await_http2_settings_ack(stream, keys).await?;
         Ok(())
     }
