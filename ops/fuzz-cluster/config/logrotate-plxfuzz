@@ -1,0 +1,23 @@
+# plxfuzz per-unit stdout log rotation.
+# Install to: /etc/logrotate.d/plxfuzz
+#
+# Bounds any per-unit stdout/stderr files the fuzz units write under
+# /var/lib/plxfuzz/logs/. The journal itself is capped by the journald
+# drop-in (SystemMaxUse=2G); this covers the plain-file logs so 15 days of
+# fuzzing on a 50 GB box can never fill the disk from logs alone.
+#
+# size 200M   -> rotate as soon as a file crosses 200 MB (not date-based;
+#                a busy unit can blow past 200 MB in well under a day).
+# rotate 3    -> keep at most 3 old generations (~600 MB compressed-source).
+# compress    -> gzip rotated copies.
+# missingok   -> a unit that never wrote a log is not an error.
+# notifempty  -> do not rotate an empty file.
+/var/lib/plxfuzz/logs/*.log {
+    size 200M
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

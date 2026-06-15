@@ -1,0 +1,23 @@
+[Unit]
+# ParallaX distributed-fuzz — corpus sync to the GitHub Release store.
+# Triggered by plx-sync.timer (~every 10 min). Owner boxes merge+upload the
+# canonical corpus-<target>.tar.zst; non-owners pull it and ship contribs.
+Description=ParallaX fuzz corpus sync (GitHub Release)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=plxfuzz
+WorkingDirectory=/var/lib/plxfuzz/src
+Environment=RUST_BACKTRACE=1
+Environment=HOME=/var/lib/plxfuzz
+Environment=CARGO_HOME=/var/lib/plxfuzz/.cargo
+Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
+Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# sync.sh reads /etc/plxfuzz/{node-id,pat,repo,pinned-commit,campaign-tag} and
+# the shard table; the PAT is never passed as an argument.
+ExecStart=/var/lib/plxfuzz/bin/sync.sh
+# A merge can pull many contribs; give it room but cap it so a hung tick is
+# reaped before the next one fires.
+TimeoutStartSec=1800

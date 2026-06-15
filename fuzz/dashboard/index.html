@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<!--
+  ParallaX distributed-fuzz cluster dashboard.
+
+  Committed ONCE to the repo. No build step, no GitHub Action renders this — the
+  three VPS boxes are the renderers: each commits status-<nodeid>.json to the
+  'fuzz-status' branch every ~1 min, and this page fetches those three JSONs
+  client-side and draws a table.
+
+  View it via the GitHub web file preview of this file on the fuzz-status
+  branch, or open it locally — either way the JS below fetches the raw status
+  files over HTTPS. Because the repo is PRIVATE, raw.githubusercontent.com
+  requires your authenticated browser session (you must be logged in to GitHub
+  with access to yuzeguitarist/ParallaX); cross-origin reads use credentials.
+
+  Status JSON shape (written by bin/status.sh, last-writer-wins per box):
+    {
+      "node":   "box-a",
+      "commit": "fa6637d4...",
+      "ts":     "2026-06-15T12:34:56Z",          // UTC, when this box last wrote
+      "targets": [
+        { "target": "tls_client_hello",
+          "execs_per_sec": 1234,
+          "corpus_files":  87,
+          "crashes":       0 },
+        ...
+      ]
+    }
+  The renderer is tolerant: missing fields show as "-", and a box whose JSON
+  is absent/unfetchable is shown as DOWN so a dead box is obvious at a glance.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ParallaX fuzz cluster</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #c9d1d9; --muted: #8b949e;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .sub code { color: var(--accent); }
+  .boxes { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }
+  .box {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 16px; min-width: 220px;
+  }
+  .box h2 { font-size: 15px; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  .box .meta { color: var(--muted); font-size: 12px; }
+  .box .meta b { color: var(--fg); font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; background: var(--panel);
+          border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: #1c2128; color: var(--muted); font-weight: 600; font-size: 12px;
+       text-transform: uppercase; letter-spacing: .04em; position: sticky; top: 0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #1c2128; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
+  .crash-hot { color: var(--bad); font-weight: 700; }
+  .stale { color: var(--warn); } .down { color: var(--bad); }
+  footer { color: var(--muted); font-size: 12px; margin-top: 20px; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .refreshing { opacity: .55; transition: opacity .15s; }
+</style>
+</head>
+<body>
+  <h1>ParallaX fuzz cluster</h1>
+  <p class="sub">
+    Pinned commit <code id="pin">fa6637d4</code> ·
+    corpus in Release <code>fuzz-corpus-fa6637d4</code> ·
+    crashes in <a href="https://github.com/yuzeguitarist/ParallaX/issues?q=is%3Aissue+label%3Afuzz-crash" target="_blank" rel="noopener">Issues (label:fuzz-crash)</a>.
+    Auto-refreshes every 30 s.
+  </p>
+
+  <div class="boxes" id="boxes"></div>
+
+  <table id="grid" aria-label="per-target fuzzer status">
+    <thead>
+      <tr>
+        <th>Node</th>
+        <th>Target</th>
+        <th class="num">Exec/s</th>
+        <th class="num">Corpus files</th>
+        <th class="num">Crashes</th>
+        <th>Last seen</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <footer id="foot">Loading…</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  // The three boxes and where their heartbeat JSON lives on the fuzz-status branch.
+  var REPO    = "yuzeguitarist/ParallaX";
+  var BRANCH  = "fuzz-status";
+  var NODES   = ["box-a", "box-b", "box-c"];
+  var BASE    = "https://raw.githubusercontent.com/" + REPO + "/" + BRANCH + "/fuzz/dashboard/";
+
+  // A box is "stale" (likely struggling) past this, "down" past the hard limit.
+  var STALE_SEC = 5 * 60;      // > ~5 missed 1-min heartbeats
+  var DOWN_SEC  = 15 * 60;
+  var REFRESH_MS = 30 * 1000;
+
+  function statusUrl(node) {
+    // Cache-bust so the browser/CDN doesn't serve a stale heartbeat.
+    return BASE + "status-" + node + ".json?t=" + Date.now();
+  }
+
+  function fmtInt(n) {
+    if (n === null || n === undefined || isNaN(n)) return "-";
+    return Number(n).toLocaleString("en-US");
+  }
+
+  // Human "age" from an ISO8601 UTC timestamp; also returns severity class.
+  function ageOf(ts) {
+    if (!ts) return { text: "never", sec: Infinity, cls: "down" };
+    var t = Date.parse(ts);
+    if (isNaN(t)) return { text: "?", sec: Infinity, cls: "down" };
+    var sec = Math.max(0, Math.round((Date.now() - t) / 1000));
+    var text;
+    if (sec < 90) text = sec + "s ago";
+    else if (sec < 3600) text = Math.round(sec / 60) + "m ago";
+    else if (sec < 86400) text = (sec / 3600).toFixed(1) + "h ago";
+    else text = (sec / 86400).toFixed(1) + "d ago";
+    var cls = sec > DOWN_SEC ? "down" : (sec > STALE_SEC ? "stale" : "");
+    return { text: text, sec: sec, cls: cls };
+  }
+
+  // Normalize whatever the box wrote into an array of per-target rows.
+  // Accepts: data.targets as [{target,...}], or as {target: {...}} map.
+  function targetsOf(data) {
+    if (!data) return [];
+    var t = data.targets;
+    if (Array.isArray(t)) return t.slice();
+    if (t && typeof t === "object") {
+      return Object.keys(t).map(function (k) {
+        var v = t[k] || {};
+        return {
+          target: k,
+          execs_per_sec: v.execs_per_sec,
+          corpus_files: v.corpus_files,
+          crashes: v.crashes
+        };
+      });
+    }
+    return [];
+  }
+
+  function fetchNode(node) {
+    return fetch(statusUrl(node), { credentials: "include", cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (data) { return { node: node, ok: true, data: data }; })
+      .catch(function (err) { return { node: node, ok: false, error: String(err) }; });
+  }
+
+  function render(results) {
+    var boxesEl = document.getElementById("boxes");
+    var rowsEl  = document.getElementById("rows");
+    var footEl  = document.getElementById("foot");
+    boxesEl.innerHTML = "";
+    rowsEl.innerHTML  = "";
+
+    var reporting = 0;
+    var pinShown = false;
+
+    results.forEach(function (res) {
+      var data = res.ok ? (res.data || {}) : null;
+      var age  = ageOf(data && data.ts);
+      var live = res.ok && age.sec <= DOWN_SEC;
+      if (live) reporting++;
+
+      if (data && data.commit && !pinShown) {
+        document.getElementById("pin").textContent = String(data.commit).slice(0, 12);
+        pinShown = true;
+      }
+
+      // Box summary card.
+      var dotCls = !res.ok || age.sec > DOWN_SEC ? "bad" : (age.sec > STALE_SEC ? "warn" : "ok");
+      var stateTxt = !res.ok ? "DOWN (no status)"
+                   : age.sec > DOWN_SEC ? "DOWN"
+                   : age.sec > STALE_SEC ? "stale" : "live";
+      var rows = targetsOf(data);
+      var totExec = rows.reduce(function (s, r) { return s + (Number(r.execs_per_sec) || 0); }, 0);
+      var totCrash = rows.reduce(function (s, r) { return s + (Number(r.crashes) || 0); }, 0);
+
+      var card = document.createElement("div");
+      card.className = "box";
+      card.innerHTML =
+        '<h2><span class="dot ' + dotCls + '"></span>' + res.node +
+          ' <span class="tag">' + stateTxt + '</span></h2>' +
+        '<div class="meta">' +
+          'last seen <b class="' + age.cls + '">' + age.text + '</b> · ' +
+          'units <b>' + rows.length + '</b><br>' +
+          'aggregate <b>' + fmtInt(totExec) + '</b> exec/s · ' +
+          'crashes <b class="' + (totCrash > 0 ? "crash-hot" : "") + '">' + fmtInt(totCrash) + '</b>' +
+        '</div>';
+      boxesEl.appendChild(card);
+
+      // Per-target rows.
+      if (!res.ok || rows.length === 0) {
+        var tr = document.createElement("tr");
+        var msg = !res.ok ? ('no status file — node down? (' + (res.error || "") + ')')
+                          : 'reporting, no per-target data yet';
+        tr.innerHTML =
+          '<td>' + res.node + '</td>' +
+          '<td colspan="4" class="' + (res.ok ? "stale" : "down") + '">' + msg + '</td>' +
+          '<td class="' + age.cls + '">' + age.text + '</td>';
+        rowsEl.appendChild(tr);
+        return;
+      }
+
+      rows.sort(function (a, b) { return String(a.target).localeCompare(String(b.target)); });
+      rows.forEach(function (r) {
+        var crash = Number(r.crashes) || 0;
+        var tr = document.createElement("tr");
+        tr.innerHTML =
+          '<td>' + res.node + '</td>' +
+          '<td>' + (r.target || "-") + '</td>' +
+          '<td class="num">' + fmtInt(r.execs_per_sec) + '</td>' +
+          '<td class="num">' + fmtInt(r.corpus_files) + '</td>' +
+          '<td class="num ' + (crash > 0 ? "crash-hot" : "") + '">' + fmtInt(r.crashes) + '</td>' +
+          '<td class="' + age.cls + '">' + age.text + '</td>';
+        rowsEl.appendChild(tr);
+      });
+    });
+
+    var warn = reporting < NODES.length
+      ? ' — <span class="down">only ' + reporting + '/' + NODES.length + ' nodes reporting</span>'
+      : '';
+    footEl.innerHTML = 'Updated ' + new Date().toLocaleTimeString() +
+      ' · ' + reporting + '/' + NODES.length + ' nodes live' + warn;
+  }
+
+  function tick() {
+    document.body.classList.add("refreshing");
+    Promise.all(NODES.map(fetchNode))
+      .then(render)
+      .catch(function (e) {
+        document.getElementById("foot").textContent = "render error: " + e;
+      })
+      .then(function () { document.body.classList.remove("refreshing"); });
+  }
+
+  tick();
+  setInterval(tick, REFRESH_MS);
+})();
+</script>
+</body>
+</html>

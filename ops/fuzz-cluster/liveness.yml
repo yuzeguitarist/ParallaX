@@ -1,0 +1,122 @@
+# Optional. Copy to .github/workflows/ to enable; ~1 billed min/day; delete for zero Actions.
+#
+# Liveness watchdog for the ParallaX fuzz cluster. The three VPS boxes self-
+# publish status-<nodeid>.json to the 'fuzz-status' branch every ~1 min, so the
+# ONE thing they cannot report is their own death. This job (the only Action the
+# cluster needs) reads the three heartbeats once a day and opens/updates a single
+# '[fuzz-cluster] node down' issue if any heartbeat is stale or fewer than 3
+# nodes report. Everything else (corpus, crashes, dashboard) is done on the paid
+# boxes with zero Actions. If you want literally zero Actions, do not copy this —
+# the dashboard's stale "last seen" already reveals a dead box on a manual glance.
+#
+# This file lives under ops/fuzz-cluster/ on purpose so it does NOT run from the
+# repo as-is; it only becomes active once copied into .github/workflows/.
+
+name: fuzz-cluster-liveness
+
+on:
+  schedule:
+    # Daily at 06:37 UTC (off the :00/:30 herd). ~1 billed minute/day on a private repo.
+    - cron: "37 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read   # read status JSONs from the fuzz-status branch
+  issues: write    # open/update the single node-down issue
+
+concurrency:
+  group: fuzz-cluster-liveness
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate heartbeats and reconcile the node-down issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: fuzz-status
+          NODES: "box-a box-b box-c"
+          STALE_MIN: "90"          # heartbeat older than this => node considered down
+          TITLE: "[fuzz-cluster] node down"
+        shell: bash
+        run: |
+          set -uo pipefail
+          now=$(date -u +%s)
+          down=()
+          present=0
+
+          for node in $NODES; do
+            path="fuzz/dashboard/status-${node}.json"
+            # Read the file straight from the fuzz-status branch via the contents API
+            # (works on a private repo with the default token; no checkout needed).
+            json=$(gh api "repos/${REPO}/contents/${path}?ref=${BRANCH}" \
+                     -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
+            if [ -z "$json" ]; then
+              down+=("$node (no status file)")
+              continue
+            fi
+            present=$((present + 1))
+            ts=$(printf '%s' "$json" | jq -r '.ts // empty' 2>/dev/null || true)
+            if [ -z "$ts" ]; then
+              down+=("$node (status has no ts)")
+              continue
+            fi
+            # GNU date (ubuntu-latest) parses ISO8601 'Z' fine.
+            hb=$(date -u -d "$ts" +%s 2>/dev/null || echo 0)
+            age_min=$(( (now - hb) / 60 ))
+            if [ "$hb" -eq 0 ] || [ "$age_min" -gt "$STALE_MIN" ]; then
+              down+=("$node (last seen ${age_min}m ago)")
+            fi
+          done
+
+          node_count=$(printf '%s\n' $NODES | wc -l | tr -d ' ')
+          healthy="yes"
+          if [ "${#down[@]}" -gt 0 ] || [ "$present" -lt "$node_count" ]; then
+            healthy="no"
+          fi
+
+          # Find an existing open watchdog issue by exact title.
+          existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$TITLE\"" \
+                       --json number,title --jq \
+                       "map(select(.title==\"$TITLE\")) | .[0].number // empty" 2>/dev/null || true)
+
+          if [ "$healthy" = "yes" ]; then
+            echo "All $node_count nodes healthy; $present reporting."
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" \
+                --body "Recovered: all ${node_count} nodes reporting fresh heartbeats as of $(date -u +%FT%TZ). Closing." || true
+              gh issue close "$existing" --repo "$REPO" || true
+            fi
+            exit 0
+          fi
+
+          # Unhealthy: build the body and open or update the single issue.
+          {
+            echo "Liveness check at $(date -u +%FT%TZ) found the fuzz cluster degraded."
+            echo
+            echo "- nodes reporting a status file: ${present}/${node_count}"
+            echo "- staleness threshold: ${STALE_MIN} min"
+            echo
+            echo "Down / stale:"
+            for d in "${down[@]}"; do echo "- ${d}"; done
+            if [ "$present" -lt "$node_count" ]; then
+              echo
+              echo "Fewer than ${node_count} nodes are publishing status at all."
+            fi
+            echo
+            echo "Fix: recreate the affected box and re-paste its bootstrap line with the SAME node-id"
+            echo "(see ops/fuzz-cluster/README.md, '15-day swap'). This issue auto-closes when all"
+            echo "heartbeats are fresh again."
+          } > /tmp/body.md
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo "$REPO" --body-file /tmp/body.md || true
+            gh issue comment "$existing" --repo "$REPO" \
+              --body "Still degraded as of $(date -u +%FT%TZ)." || true
+            echo "Updated issue #${existing}."
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body-file /tmp/body.md || true
+            echo "Opened node-down issue."
+          fi

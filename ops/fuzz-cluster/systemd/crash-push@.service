@@ -1,0 +1,23 @@
+[Unit]
+# ParallaX distributed-fuzz — crash reporter, fired by OnFailure of
+# plx-fuzz@<target>.service. %i is the fuzz target name.
+Description=ParallaX fuzz crash reporter for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=plxfuzz
+WorkingDirectory=/var/lib/plxfuzz/src
+Environment=RUST_BACKTRACE=1
+Environment=HOME=/var/lib/plxfuzz
+Environment=CARGO_HOME=/var/lib/plxfuzz/.cargo
+Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
+Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# crash-push.sh reads /etc/plxfuzz/{node-id,pat,repo,pinned-commit,campaign-tag}
+# and the shard table itself; the PAT is never passed as an argument.
+ExecStart=/var/lib/plxfuzz/bin/crash-push.sh %i
+# crash-push.sh always exits 0 (best-effort): a transient gh/git failure must
+# never escalate; the artifact is left in place and retried on the next failure.
+# Cap a hung tmin/reproduce so the oneshot is reaped rather than wedging.
+TimeoutStartSec=1800

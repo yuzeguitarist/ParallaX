@@ -1,0 +1,16 @@
+[Unit]
+Description=ParallaX fuzz cluster — hourly disk guard (corpus tripwire + FS reclaim)
+Documentation=https://github.com/yuzeguitarist/ParallaX
+
+[Service]
+Type=oneshot
+User=plxfuzz
+WorkingDirectory=/var/lib/plxfuzz/src
+Environment=HOME=/var/lib/plxfuzz
+Environment=CARGO_HOME=/var/lib/plxfuzz/.cargo
+Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
+Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/var/lib/plxfuzz/bin/disk-guard.sh
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=1800

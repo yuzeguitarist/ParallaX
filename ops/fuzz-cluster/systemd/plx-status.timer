@@ -1,0 +1,14 @@
+[Unit]
+Description=ParallaX fuzz cluster — status heartbeat every ~1 min
+Documentation=https://github.com/yuzeguitarist/ParallaX
+
+[Timer]
+# First beat shortly after boot, then once a minute while the unit is active.
+OnBootSec=60
+OnUnitActiveSec=1min
+# Tiny spread so three boxes don't all push the fuzz-status branch in lockstep.
+RandomizedDelaySec=5
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
