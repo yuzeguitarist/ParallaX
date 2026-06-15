@@ -21,7 +21,7 @@ use tokio::{
         TcpListener, TcpStream,
     },
     sync::{mpsc, Semaphore, TryAcquireError},
-    time::{sleep, timeout, timeout_at, Instant},
+    time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
 use zeroize::Zeroize;
 
@@ -820,14 +820,19 @@ pub async fn accept_authenticated(
 ) -> Result<AuthenticatedHandshake, HandshakeServerError> {
     let mut fallback = connect_tcp_with_timeout(&config.fallback_addr).await?;
     tune_tcp_stream(&fallback)?;
-    fallback.write_all(&first_client_record).await?;
+    write_all_with_handshake_timeout(&mut fallback, &first_client_record).await?;
 
     let forwarded = read_forwarded_server_hello(&mut fallback).await?;
     if config.strict_tls13 && !forwarded.parsed.tls13_selected {
-        client.write_all(&forwarded.raw_record).await?;
+        // Mirror the origin's ServerHello to the client, then close it the same
+        // drain->FIN way every other exit does so a strict-TLS1.3 reject is a FIN,
+        // never a RST. Swallow a write error here: we tear the connection down
+        // regardless and must still FIN.
+        let _ = write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await;
+        graceful_close_tcp_stream(client).await;
         return Err(HandshakeServerError::Tls13Required);
     }
-    client.write_all(&forwarded.raw_record).await?;
+    write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await?;
 
     let context = transcript_hash(&first_client_record, &forwarded.raw_record);
     let session_keys = derive_server_keys_from_shared(&x25519_shared_secret, &context)?;
@@ -1045,6 +1050,27 @@ async fn graceful_close_fallback_halves(
     let _ = fallback_write.shutdown().await;
 }
 
+/// Pre-PQ teardown: consume the buffered readers to recover the raw read halves,
+/// then drain->FIN both directions (never a bare drop, which would RST). Used by
+/// the pre-PQ deadline arm and by both forward-write deadline/peer-close arms so a
+/// blocked forward write can no longer escape the phase deadline without a FIN.
+async fn graceful_close_pre_pq(
+    client_records: BufferedTlsRecordReader<OwnedReadHalf>,
+    mut client_write: OwnedWriteHalf,
+    fallback_records: BufferedTlsRecordReader<OwnedReadHalf>,
+    mut fallback_write: OwnedWriteHalf,
+) {
+    let client_read = client_records.into_inner().into_inner();
+    let fallback_read = fallback_records.into_inner().into_inner();
+    graceful_close_fallback_halves(
+        &client_read,
+        &mut client_write,
+        &fallback_read,
+        &mut fallback_write,
+    )
+    .await;
+}
+
 async fn read_forwarded_server_hello(
     fallback: &mut TcpStream,
 ) -> Result<ForwardedServerHello, HandshakeServerError> {
@@ -1137,6 +1163,22 @@ fn timeout_tuning() -> TimeoutTuning {
 
 async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeServerError> {
     timeout(HANDSHAKE_TIMEOUT, read_record(stream))
+        .await
+        .map_err(|_| HandshakeServerError::Timeout)?
+        .map_err(HandshakeServerError::Io)
+}
+
+/// Bounds a handshake-phase write so an authenticated peer that stops reading
+/// cannot stall it indefinitely (pinning the slot/permits/fds between auth and
+/// data mode). Reuses HANDSHAKE_TIMEOUT, the established handshake-phase bound.
+async fn write_all_with_handshake_timeout<W>(
+    stream: &mut W,
+    buf: &[u8],
+) -> Result<(), HandshakeServerError>
+where
+    W: AsyncWrite + Unpin,
+{
+    timeout(HANDSHAKE_TIMEOUT, stream.write_all(buf))
         .await
         .map_err(|_| HandshakeServerError::Timeout)?
         .map_err(HandshakeServerError::Io)
@@ -1302,13 +1344,13 @@ async fn run_authenticated_data_mode(
     // sending the PQ rekey — pinning the global connection slot, the per-source
     // permit, and both fds, and forwarding each record to the fallback origin
     // unbounded. A fixed, generous deadline bounds the entire phase regardless.
-    let pre_pq_idle_timeout = fallback_idle_timeout();
-    let pre_pq_idle = sleep(pre_pq_idle_timeout);
-    tokio::pin!(pre_pq_idle);
+    // Anchored as an absolute Instant so it also bounds a BLOCKED forward write
+    // (via timeout_at below), not only an idle wait inside the select.
+    let pre_pq_deadline = Instant::now() + fallback_idle_timeout();
 
     loop {
         tokio::select! {
-            _ = &mut pre_pq_idle => {
+            _ = sleep_until(pre_pq_deadline) => {
                 tracing::debug!(
                     cid,
                     "pre-PQ deadline reached before client PQ rekey; tearing down"
@@ -1318,13 +1360,11 @@ async fn run_authenticated_data_mode(
                 // fallback origin, so a stalled-but-trickling client may have
                 // unread RX buffered; dropping the sockets would make close() emit
                 // a RST — exactly the FIN/RST tell the relay-teardown gate forbids.
-                let client_read = client_records.into_inner().into_inner();
-                let fallback_read = fallback_records.into_inner().into_inner();
-                graceful_close_fallback_halves(
-                    &client_read,
-                    &mut client_write,
-                    &fallback_read,
-                    &mut fallback_write,
+                graceful_close_pre_pq(
+                    client_records,
+                    client_write,
+                    fallback_records,
+                    fallback_write,
                 )
                 .await;
                 return Ok(());
@@ -1464,7 +1504,11 @@ async fn run_authenticated_data_mode(
                         )
                         .await
                         {
-                            Ok(result) => result?,
+                            Ok(result) => match result {
+                                Ok(()) => {}
+                                Err(err) if is_clean_close(&err) => return Ok(()),
+                                Err(err) => return Err(HandshakeServerError::Io(err)),
+                            },
                             Err(_) => {
                                 tracing::debug!(
                                     cid,
@@ -1642,7 +1686,17 @@ async fn run_authenticated_data_mode(
                                 )
                                 .await
                                 {
-                                    Ok(res) => res?,
+                                    Ok(res) => match res {
+                                        Ok(()) => {}
+                                        Err(err) if is_clean_close(&err) => {
+                                            if let Some(conn) = probed_conn {
+                                                conn.close(0u32.into(), b"px1p-eof");
+                                            }
+                                            udp_ep.close(0u32.into(), b"px1p-eof");
+                                            return Ok(());
+                                        }
+                                        Err(err) => return Err(HandshakeServerError::Io(err)),
+                                    },
                                     Err(_) => {
                                         tracing::warn!(
                                             cid,
@@ -1766,7 +1820,14 @@ async fn run_authenticated_data_mode(
                             )
                             .await
                             {
-                                Ok(res) => res?,
+                                Ok(res) => match res {
+                                    Ok(()) => {}
+                                    Err(err) if is_clean_close(&err) => {
+                                        drop_retained_quic(retained_quic.take());
+                                        return Ok(());
+                                    }
+                                    Err(err) => return Err(HandshakeServerError::Io(err)),
+                                },
                                 Err(_) => {
                                     tracing::warn!(
                                         cid,
@@ -1871,7 +1932,30 @@ async fn run_authenticated_data_mode(
                                 "forwarding client camouflage record before ParallaX PQ rekey"
                             );
                         }
-                        fallback_write.write_all(&client_record).await?;
+                        match timeout_at(
+                            pre_pq_deadline,
+                            fallback_write.write_all(&client_record),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) if is_write_peer_close(&err) => return Ok(()),
+                            Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
+                            Err(_) => {
+                                tracing::debug!(
+                                    cid,
+                                    "pre-PQ deadline reached during client camouflage forward; tearing down"
+                                );
+                                graceful_close_pre_pq(
+                                    client_records,
+                                    client_write,
+                                    fallback_records,
+                                    fallback_write,
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                        }
                     }
                     Err(err) => return Err(HandshakeServerError::DataRecord(err)),
                 }
@@ -1930,7 +2014,25 @@ async fn run_authenticated_data_mode(
                          record; pausing fallback reads until ParallaX PQ rekey"
                     );
                 }
-                client_write.write_all(&fallback_record).await?;
+                match timeout_at(pre_pq_deadline, client_write.write_all(&fallback_record)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) if is_write_peer_close(&err) => return Ok(()),
+                    Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
+                    Err(_) => {
+                        tracing::debug!(
+                            cid,
+                            "pre-PQ deadline reached during fallback camouflage forward; tearing down"
+                        );
+                        graceful_close_pre_pq(
+                            client_records,
+                            client_write,
+                            fallback_records,
+                            fallback_write,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -2581,6 +2683,7 @@ impl DataRelay {
                         client_open,
                         activity.clone(),
                         cid,
+                        idle_timeout,
                     );
                     let download = server_download_loop(
                         target_read,
@@ -2712,6 +2815,7 @@ impl DataRelay {
             client_open,
             activity.clone(),
             cid,
+            idle_timeout,
         );
         let download = server_download_loop(
             target_read,
@@ -3716,6 +3820,7 @@ async fn server_upload_loop<R>(
     mut client_open: DataRecordCodec,
     activity: RelayActivity,
     cid: u64,
+    idle_timeout: Duration,
 ) -> Result<DataRecordCodec, HandshakeServerError>
 where
     R: LegReader,
@@ -3740,7 +3845,16 @@ where
         match client_open.open_in_place_payload_range(&mut client_record) {
             Ok(plaintext) => {
                 if !plaintext.is_empty() {
-                    target_write.write_all(&client_record[plaintext]).await?;
+                    // Bound the target write so a stuck upstream that stops reading
+                    // makes the write fail visibly (Timeout) rather than blocking
+                    // until the relay idle-watchdog tears down with Ok(()) and
+                    // silently drops the in-flight upload bytes.
+                    timeout(
+                        idle_timeout,
+                        target_write.write_all(&client_record[plaintext]),
+                    )
+                    .await
+                    .map_err(|_| HandshakeServerError::Timeout)??;
                     bump_relay_activity(&activity);
                 }
             }
@@ -3959,6 +4073,17 @@ fn is_clean_close(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+    )
+}
+
+/// True when a WRITE failed because the receiving peer has closed its end
+/// (BrokenPipe / ConnectionReset). Deliberately separate from `is_clean_close`
+/// (a read-side predicate): a normal peer close observed on a forward write
+/// should end the phase gracefully, not be reported as a hard I/O error.
+fn is_write_peer_close(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
     )
 }
 
