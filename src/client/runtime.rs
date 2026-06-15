@@ -329,15 +329,34 @@ impl UdpReachability {
         }
     }
 
+    /// Whether this connection should attempt UDP negotiation — and, at the
+    /// half-open boundary, CLAIM the single trial probe. This mutates state: when
+    /// a tripped breaker's TTL has expired, the first caller re-stamps
+    /// `blocked_since` to now and returns `true`, so concurrent callers in the
+    /// same window see it as still tripped and skip. That keeps the trial to one
+    /// connection per TTL instead of a thundering herd of re-probes. If that
+    /// claiming connection dies without recording an outcome, the next TTL lets
+    /// another connection reclaim (self-healing); a Verified outcome clears the
+    /// breaker via `record_usable`, a failure re-trips it via `record_unusable`.
     fn should_attempt_at(&self, now: std::time::Instant) -> bool {
-        match *self.blocked_since.lock().expect("reachability mutex") {
+        let mut guard = self.blocked_since.lock().expect("reachability mutex");
+        match *guard {
+            // Usable (or never tripped): every connection negotiates so they all
+            // use the fast plane while it works — no claim, no state change.
             None => true,
-            // Half-open: after the TTL, let one connection re-probe.
-            Some(t) => now.saturating_duration_since(t) >= self.ttl,
+            Some(t) => {
+                if now.saturating_duration_since(t) >= self.ttl {
+                    *guard = Some(now);
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
-    /// Whether to attempt UDP negotiation on a new connection.
+    /// Whether to attempt UDP negotiation on a new connection (see
+    /// [`Self::should_attempt_at`] — this claims the half-open trial slot).
     pub(crate) fn should_attempt(&self) -> bool {
         self.should_attempt_at(std::time::Instant::now())
     }
@@ -2887,8 +2906,9 @@ mod tests {
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
 
     /// The UDP circuit breaker: starts closed, trips on an unusable outcome and
-    /// suppresses negotiation until the TTL elapses (half-open), then re-permits
-    /// one attempt; a usable outcome clears it. Driven via the `_at` time seam so
+    /// suppresses negotiation until the TTL elapses, then lets exactly ONE
+    /// connection claim the half-open trial (concurrent callers in that window
+    /// still skip); a usable outcome clears it. Driven via the `_at` time seam so
     /// the TTL boundary is deterministic without sleeping.
     #[test]
     fn udp_reachability_circuit_breaker_trips_and_half_opens() {
@@ -2896,7 +2916,8 @@ mod tests {
         let breaker = UdpReachability::new(ttl);
         let t0 = std::time::Instant::now();
 
-        // Closed initially: every connection may attempt UDP.
+        // Closed initially: every connection may attempt UDP (no claim, repeatable).
+        assert!(breaker.should_attempt_at(t0));
         assert!(breaker.should_attempt_at(t0));
 
         // Trip it (probe found UDP unusable): suppressed for the whole TTL window.
@@ -2905,10 +2926,19 @@ mod tests {
         assert!(!breaker.should_attempt_at(tripped_at));
         assert!(!breaker.should_attempt_at(tripped_at + ttl - Duration::from_millis(1)));
 
-        // At/after the TTL it half-opens: one attempt is permitted again.
-        assert!(breaker.should_attempt_at(tripped_at + ttl));
+        // Half-open: the FIRST caller at/after the TTL claims the single trial...
+        let claim_at = tripped_at + ttl;
+        assert!(breaker.should_attempt_at(claim_at));
+        // ...and concurrent callers in the same window now see it as re-stamped
+        // (still tripped) and skip — no thundering-herd re-probe.
+        assert!(!breaker.should_attempt_at(claim_at));
+        assert!(!breaker.should_attempt_at(claim_at + ttl - Duration::from_millis(1)));
 
-        // A Verified outcome clears it immediately.
+        // If the trial connection died without recording, the next TTL (measured
+        // from the claim) lets another connection reclaim — self-healing.
+        assert!(breaker.should_attempt_at(claim_at + ttl));
+
+        // A Verified outcome clears it immediately: back to attempting freely.
         breaker.record_usable();
         assert!(breaker.should_attempt_at(std::time::Instant::now()));
     }
