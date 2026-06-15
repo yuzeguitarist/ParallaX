@@ -1418,10 +1418,10 @@ async fn run_authenticated_data_mode(
                             "pq_rekey.server_x25519_private",
                             &server_ephemeral.private,
                         );
-                        let x25519_ephemeral_shared = x25519_shared_secret(
+                        let x25519_ephemeral_shared = zeroize::Zeroizing::new(x25519_shared_secret(
                             &server_ephemeral.private,
                             &client_x25519_public,
-                        );
+                        ));
                         let pq_encapsulation =
                             encapsulate_mlkem_blocking(client_mlkem_public_key).await?;
                         let key_exchange_payload = ServerKeyExchange {
