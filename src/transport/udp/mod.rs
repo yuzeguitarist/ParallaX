@@ -13,6 +13,7 @@
 //! byte-identical on TCP. Mux and speed-test paths remain on TCP.
 
 pub mod auth;
+pub(crate) mod datagram;
 pub mod endpoint;
 pub(crate) mod envelope;
 pub(crate) mod fec;
