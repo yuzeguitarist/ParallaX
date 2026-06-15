@@ -111,10 +111,13 @@ const FIRST_RECORD_WAIT_JITTER: Duration = Duration::from_secs(7);
 /// itself is a deliberate fixed backstop -- a 5x raise from the prior 120s that
 /// trades a longer fd hold on silent probes for fewer ParallaX-originated closes.
 const FALLBACK_IDLE_TIMEOUT_FLOOR: Duration = Duration::from_secs(600);
-/// No jitter on the idle backstop: see [`FALLBACK_IDLE_TIMEOUT_FLOOR`]. Kept as
-/// a named constant so the helper plumbing and tests stay uniform with the
-/// first-record path; `jittered_timeout` returns the bare floor when this is 0.
-const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(0);
+/// Upward jitter on the idle backstop (M-3). In the all-silent corner case (the
+/// origin never closes first, so ParallaX is the side that originates the close),
+/// a fixed, round ~600.000s close is a synthetic signature no real origin
+/// produces and is observable by a single long-lived silent probe. Jittering the
+/// backstop into [600s, 660s] per connection removes that fixed tell;
+/// `jittered_timeout` adds a uniform [0, jitter] grace over the floor.
+const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(60);
 const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
 const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
@@ -4695,10 +4698,11 @@ mod tests {
     }
 
     #[test]
-    fn first_record_wait_jitters_above_floor_idle_is_fixed_backstop() {
+    fn first_record_wait_and_idle_backstop_both_jitter_within_band() {
         // Helper-level test (does not assert the production call-site wiring; the
         // wiring is exercised by the relay/handshake integration tests).
         let mut first_record_values = std::collections::HashSet::new();
+        let mut idle_values = std::collections::HashSet::new();
         for _ in 0..128 {
             let wait = first_record_wait_timeout();
             assert!(
@@ -4711,19 +4715,27 @@ mod tests {
             );
             first_record_values.insert(wait.as_millis());
 
-            // The idle cap is a fixed resource backstop (jitter == 0), not an
-            // anti-probing measure, so it must be exactly the floor every time.
-            assert_eq!(
-                fallback_idle_timeout(),
-                FALLBACK_IDLE_TIMEOUT_FLOOR,
-                "idle cap is a fixed backstop; it must not vary"
+            // The idle backstop is now jittered (M-3) so the all-silent close is not
+            // a fixed, round ~600s ParallaX signature: it stays within the band.
+            let idle = fallback_idle_timeout();
+            assert!(
+                idle >= FALLBACK_IDLE_TIMEOUT_FLOOR,
+                "idle backstop must never drop below the floor"
             );
+            assert!(
+                idle <= FALLBACK_IDLE_TIMEOUT_FLOOR + FALLBACK_IDLE_TIMEOUT_JITTER,
+                "idle backstop must stay within floor + jitter"
+            );
+            idle_values.insert(idle.as_millis());
         }
-        // The first-record give-up must be randomized so a prober cannot read a
-        // fixed constant off the client-facing wait.
+        // Both give-ups must be randomized so a prober cannot read a fixed constant.
         assert!(
             first_record_values.len() > 1,
             "first-record wait must be randomized, not a fixed constant"
+        );
+        assert!(
+            idle_values.len() > 1,
+            "idle backstop must be randomized, not a fixed 600s tell"
         );
     }
 
@@ -4739,10 +4751,10 @@ mod tests {
         // make an origin-side change spuriously break this client-side test.
         assert_eq!(FIRST_RECORD_WAIT_FLOOR, Duration::from_secs(8));
         assert!(FIRST_RECORD_WAIT_JITTER > Duration::from_secs(0));
-        assert!(FALLBACK_IDLE_TIMEOUT_JITTER.is_zero());
+        assert_eq!(FALLBACK_IDLE_TIMEOUT_JITTER, Duration::from_secs(60));
         // The constants are the defaults when no config override is installed,
         // and must match the config default_*_ms values (config.rs): 8000 / 7000
-        // / 600000 / 0. Pin the idle floor here so the two cannot drift apart.
+        // / 600000 / 60000. Pin the idle floor here so the two cannot drift apart.
         assert_eq!(FALLBACK_IDLE_TIMEOUT_FLOOR, Duration::from_secs(600));
         let defaults = TimeoutTuning::defaults();
         assert_eq!(defaults.first_record_floor, FIRST_RECORD_WAIT_FLOOR);

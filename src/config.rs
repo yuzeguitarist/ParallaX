@@ -845,7 +845,7 @@ const fn default_fallback_idle_floor_ms() -> u64 {
 }
 
 const fn default_fallback_idle_jitter_ms() -> u64 {
-    0
+    60_000
 }
 
 #[cfg(test)]
@@ -1725,7 +1725,7 @@ authorized_sni = ["example.com"]
         assert_eq!(server.first_record_wait_floor_ms, 8_000);
         assert_eq!(server.first_record_wait_jitter_ms, 7_000);
         assert_eq!(server.fallback_idle_floor_ms, 600_000);
-        assert_eq!(server.fallback_idle_jitter_ms, 0);
+        assert_eq!(server.fallback_idle_jitter_ms, 60_000);
         assert!(server.tcp_congestion.is_none());
     }
 
