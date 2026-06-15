@@ -154,6 +154,37 @@ pub enum UdpTransportError {
     Io(#[from] std::io::Error),
 }
 
+/// rustls crypto provider for the QUIC face with the key-exchange groups pinned
+/// so the post-quantum hybrid `X25519MLKEM768` is the default key share.
+///
+/// This is camouflage-critical, not a performance choice. The GFW passively
+/// decrypts the QUIC v1 Initial to read the SNI but does NOT reassemble a
+/// ClientHello that spans multiple datagrams. The first kx group is the default
+/// key-share algorithm (rustls sends a key share for it in the ClientHello), so
+/// leading with the ~1.2 KB `X25519MLKEM768` hybrid pushes the Initial past one
+/// datagram and the SNI is not single-packet-extractable. It also matches current
+/// Chromium, which leads with `X25519MLKEM768` on its own h3 flows.
+///
+/// aws-lc-rs's default order ALSO leads with the hybrid, but only while rustls's
+/// `prefer-post-quantum` default feature is active. Pinning the list here makes
+/// the property independent of that implicit upstream feature — a
+/// `default-features = false` on the rustls dependency would otherwise silently
+/// drop the hybrid to last, shrink the Initial below one datagram, and re-expose
+/// the SNI. The gfw_simulator
+/// `udp_leg_initial_first_datagram_holds_only_partial_clienthello` test guards
+/// the observable property.
+fn camouflage_provider() -> rustls::crypto::CryptoProvider {
+    use rustls::crypto::aws_lc_rs;
+    rustls::crypto::CryptoProvider {
+        kx_groups: vec![
+            aws_lc_rs::kx_group::X25519MLKEM768,
+            aws_lc_rs::kx_group::X25519,
+            aws_lc_rs::kx_group::SECP256R1,
+        ],
+        ..aws_lc_rs::default_provider()
+    }
+}
+
 /// Build a quinn server config from a DER certificate leaf + private key.
 ///
 /// TLS 1.3 only, aws-lc-rs provider (matching the rest of ParallaX), advertising
@@ -162,14 +193,12 @@ pub fn server_config(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig, UdpTransportError> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?
-    .with_no_client_auth()
-    .with_single_cert(vec![cert], key)
-    .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?;
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(camouflage_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?;
     tls.alpn_protocols = vec![UDP_ALPN.to_vec()];
 
     let crypto = QuicServerConfig::try_from(Arc::new(tls))
@@ -189,14 +218,12 @@ pub fn server_config(
 pub fn client_config(
     verifier: Arc<dyn ServerCertVerifier>,
 ) -> Result<quinn::ClientConfig, UdpTransportError> {
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?
-    .dangerous()
-    .with_custom_certificate_verifier(verifier)
-    .with_no_client_auth();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(camouflage_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
     tls.alpn_protocols = vec![UDP_ALPN.to_vec()];
 
     let crypto = QuicClientConfig::try_from(Arc::new(tls))
@@ -436,5 +463,25 @@ mod tests {
         );
 
         drop(s1);
+    }
+
+    /// Pins the camouflage-critical key-exchange ordering: the QUIC face MUST lead
+    /// with `X25519MLKEM768` so the post-quantum hybrid key share inflates the
+    /// ClientHello past one datagram (SNI not single-packet-extractable) and the
+    /// flow matches current Chromium. This guards the EXPLICIT intent at the unit
+    /// level, independent of rustls's `prefer-post-quantum` default feature — the
+    /// gfw_simulator test guards the resulting on-wire fragmentation.
+    #[test]
+    fn camouflage_provider_leads_with_pq_hybrid_kx() {
+        let provider = camouflage_provider();
+        assert_eq!(
+            provider.kx_groups.first().map(|kx| kx.name()),
+            Some(rustls::NamedGroup::X25519MLKEM768),
+            "the QUIC ClientHello's default key share must be the PQ hybrid",
+        );
+        // The classical fallbacks remain offered so a peer without ML-KEM can still
+        // negotiate (the hybrid is preferred, not exclusive).
+        let names: Vec<_> = provider.kx_groups.iter().map(|kx| kx.name()).collect();
+        assert!(names.contains(&rustls::NamedGroup::X25519));
     }
 }
