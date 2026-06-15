@@ -243,7 +243,12 @@ sudo -u "$FUZZ_USER" -H git -C "$SRC" remote set-url origin \
 #    sibling's shard-table / suppressions probe path resolves on the box.
 # ---------------------------------------------------------------------------
 log "[8/11] install scripts to $BIN"
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Under `curl | bash` the script has no backing file, so BASH_SOURCE[0] is unset
+# and `set -u` would abort here; fall back to $0 and never let a failed cd abort
+# — the pinned clone ($SRC/ops/fuzz-cluster) is the primary package source, this
+# is only a manual-local-run fallback.
+_self="${BASH_SOURCE[0]:-$0}"
+SELF_DIR="$(cd "$(dirname "$_self")" 2>/dev/null && pwd || true)"
 # Prefer files from the freshly-cloned, pinned source tree; fall back to the
 # directory this script was pasted from (e.g. a manual local run).
 PKG_DIR=""
@@ -264,7 +269,7 @@ fi
 #    restart). Built per-box because box-c uses a different sanitizer; we build
 #    the box's sanitizer here so `run-one.sh` starts fuzzing immediately.
 # ---------------------------------------------------------------------------
-log "[9/11] warm build (cargo +$NIGHTLY fuzz build --locked) — one-time, slow"
+log "[9/11] warm build (cargo +$NIGHTLY fuzz build -- --locked) — one-time, slow"
 # shellcheck source=/dev/null
 . "$PKG_DIR/lib/shard-table.sh" || die "could not source shard-table.sh"
 _shard_assert "$NODE_ID" || die "shard plan invariant violated for $NODE_ID"
@@ -277,12 +282,12 @@ if [ -n "$BUILD_RF" ]; then
   retry 2 5 sudo -u "$FUZZ_USER" -H env \
     PATH="$HOME_DIR/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
     RUSTFLAGS="$BUILD_RF" \
-    bash -c "cd '$SRC' && cargo '+$NIGHTLY' fuzz build --sanitizer '$BUILD_SAN' --locked" \
+    bash -c "cd '$SRC' && cargo '+$NIGHTLY' fuzz build --sanitizer '$BUILD_SAN' -- --locked" \
     || warn "warm fuzz build failed; units will build on first start"
 else
   retry 2 5 sudo -u "$FUZZ_USER" -H env \
     PATH="$HOME_DIR/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
-    bash -c "cd '$SRC' && cargo '+$NIGHTLY' fuzz build --sanitizer '$BUILD_SAN' --locked" \
+    bash -c "cd '$SRC' && cargo '+$NIGHTLY' fuzz build --sanitizer '$BUILD_SAN' -- --locked" \
     || warn "warm fuzz build failed; units will build on first start"
 fi
 
