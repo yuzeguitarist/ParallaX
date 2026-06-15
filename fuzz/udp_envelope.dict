@@ -1,0 +1,8 @@
+# udp_envelope: TUDP envelope = seq(u64 BE) + record_len(u16 BE) + record bytes
+# (src/transport/udp/envelope.rs, ENVELOPE_HEADER_LEN=10)
+# a complete empty-record envelope (seq=0, len=0):
+env_empty="\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+# a 4-byte-record envelope (seq=1, len=4):
+env_seq1_len4="\x00\x00\x00\x00\x00\x00\x00\x01\x00\x04abcd"
+len_small="\x00\x10"
+len_max="\xff\xff"

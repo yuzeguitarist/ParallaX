@@ -18,6 +18,28 @@ pub(crate) mod envelope;
 pub mod probe;
 pub(crate) mod reorder;
 
+/// Fuzz-only re-exports of the internal TUDP wire parsers. Compiled ONLY under
+/// `--cfg fuzzing` (which cargo-fuzz sets); absent from normal `cargo build` /
+/// `cargo test` / CI. Returns std types so the external fuzz crate needs no
+/// access to the pub(crate) envelope types.
+#[cfg(fuzzing)]
+#[allow(clippy::result_unit_err)]
+pub mod fuzz {
+    use std::ops::Range;
+
+    /// Decode one envelope prefix → (seq, record byte-range within `input`, bytes consumed).
+    pub fn decode_envelope_prefix(input: &[u8]) -> Result<(u64, Range<usize>, usize), ()> {
+        super::envelope::decode_prefix(input)
+            .map(|e| (e.seq, e.record, e.consumed))
+            .map_err(|_| ())
+    }
+
+    /// Append one enveloped record to `out`.
+    pub fn encode_envelope_into(seq: u64, record: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+        super::envelope::encode_into(seq, record, out).map_err(|_| ())
+    }
+}
+
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};

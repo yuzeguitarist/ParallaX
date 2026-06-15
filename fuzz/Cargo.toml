@@ -99,3 +99,10 @@ path = "fuzz_targets/socks_connect_request.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "udp_envelope"
+path = "fuzz_targets/udp_envelope.rs"
+test = false
+doc = false
+bench = false
