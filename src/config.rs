@@ -12,7 +12,16 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub(crate) const DEFAULT_REPLAY_CACHE_PATH: &str = "/var/lib/parallax/parallax-replay.cache";
-pub(crate) const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 8192;
+/// Default authenticated-replay-cache capacity. Sized against the freshness
+/// window: entries are retained for `replay_freshness_window_secs()` (= the
+/// pre-PQ deadline + skew, ~720s with the default `fallback_idle_floor_ms`), so
+/// the cache fills at roughly `capacity / window` sustained handshakes/sec before
+/// it fail-CLOSES with `CacheFull` (sheds new handshakes — never a replay hole).
+/// 49152 / 720s ≈ 68 conn/s of headroom; this scales with the window so widening
+/// the pre-PQ deadline did not silently lower the throughput cliff. A busy shared
+/// bridge above that rate (or one that raises `fallback_idle_floor_ms` further)
+/// should raise `replay_cache_capacity` proportionally.
+pub(crate) const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 49152;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {

@@ -1115,6 +1115,12 @@ fn fallback_idle_timeout() -> Duration {
 /// server already did the full PQ exchange. `DEFAULT_REPLAY_WINDOW_SECS` is added
 /// on top as clock-skew slack, and the window tracks the floor automatically so
 /// the two budgets can never diverge.
+///
+/// NOTE: this window also sets replay-cache retention, so the cache fills at
+/// `replay_cache_capacity / window` sustained handshakes/sec before fail-closing
+/// with `CacheFull`. `DEFAULT_REPLAY_CACHE_CAPACITY` is sized against this window;
+/// an operator who raises `fallback_idle_floor_ms` (widening the window) should
+/// raise `replay_cache_capacity` to keep the same throughput headroom.
 fn replay_freshness_window_secs() -> u64 {
     timeout_tuning()
         .fallback_idle_floor
