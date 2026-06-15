@@ -131,6 +131,18 @@ fn udp_transport_config() -> Arc<quinn::TransportConfig> {
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
     transport.receive_window(quinn::VarInt::from_u32(1_250_000));
 
+    // Congestion control: BBR, not quinn's default Cubic. The fast plane only
+    // earns its keep on lossy links, where Cubic's loss-as-congestion backoff
+    // collapses throughput but BBR's model-based send rate holds up — that is the
+    // entire reason this UDP leg exists. BBR is also the camouflage-safe choice:
+    // an aggressive flat loss-response (Brutal) is statistically classifiable,
+    // whereas BBR blends in with ordinary HTTP/3 traffic. This is endpoint-local
+    // (peers need not agree on a CC) and only affects the UDP-active data path, so
+    // the default-off TCP path stays byte-identical. Stock BBR with quinn's
+    // defaults needs no per-network tuning; a custom Brutal controller is a later,
+    // opt-in, real-network-tuned slice.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+
     Arc::new(transport)
 }
 
