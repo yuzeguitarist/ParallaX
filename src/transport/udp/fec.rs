@@ -72,10 +72,17 @@ fn gf_mul(a: u8, b: u8) -> u8 {
     exp[log[a as usize] as usize + log[b as usize] as usize]
 }
 
-/// Multiplicative inverse in GF(2^8). `a` must be non-zero.
+/// Multiplicative inverse in GF(2^8). `0` has no inverse; this returns `0` as a
+/// fail-closed sentinel so a future caller that inverts a zero (e.g. a zero pivot)
+/// gets a singular matrix -> `Insufficient`, never the table's bogus `exp[255]=1`
+/// ("0 is its own inverse") that would corrupt silently. The `debug_assert` still
+/// flags the contract violation in test/debug builds.
 #[inline]
 fn gf_inv(a: u8) -> u8 {
     debug_assert!(a != 0, "GF(2^8) inverse of zero is undefined");
+    if a == 0 {
+        return 0;
+    }
     let (exp, log) = &TABLES;
     // a^-1 = α^(255 - log a)
     exp[255 - log[a as usize] as usize]
@@ -522,5 +529,43 @@ mod tests {
             fec.encode(&refs, 30).unwrap(),
             fec.encode(&refs, 30).unwrap()
         );
+    }
+
+    /// Production parameters (k=32, r=4) are beyond the exhaustive test's k+r<=16
+    /// budget, so cover them with randomized r-erasure trials: any 4 lost symbols
+    /// out of 36 recover byte-exactly (the MDS property at the real window size).
+    #[test]
+    fn production_params_k32_r4_recover_random_r_erasures() {
+        let (k, r, len) = (32usize, 4usize, 1100usize); // ~one max-datagram symbol
+        let fec = RsFec::new(k, r).unwrap();
+        let mut rng = StdRng::seed_from_u64(0x32_04);
+        let sources: Vec<Vec<u8>> = (0..k)
+            .map(|_| (0..len).map(|_| rng.gen()).collect())
+            .collect();
+        let src_refs: Vec<&[u8]> = sources.iter().map(|s| s.as_slice()).collect();
+        let repair = fec.encode(&src_refs, len).unwrap();
+        let n = k + r;
+        for _ in 0..200 {
+            // Pick exactly r distinct symbols to lose.
+            let mut lost = Vec::with_capacity(r);
+            while lost.len() < r {
+                let idx = rng.gen_range(0..n);
+                if !lost.contains(&idx) {
+                    lost.push(idx);
+                }
+            }
+            let present: Vec<Option<&[u8]>> = (0..n)
+                .map(|idx| {
+                    if lost.contains(&idx) {
+                        None
+                    } else if idx < k {
+                        Some(sources[idx].as_slice())
+                    } else {
+                        Some(repair[idx - k].as_slice())
+                    }
+                })
+                .collect();
+            assert_eq!(fec.decode(&present, len).unwrap(), sources, "lost={lost:?}");
+        }
     }
 }
