@@ -107,8 +107,16 @@ ensure_release() {
   # If the release already exists this is a no-op. Concurrent first-boots race;
   # the loser's create fails with 'already_exists' which we swallow.
   if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    # target_commitish must be a FULL sha or a branch name — the abbreviated
+    # pinned-commit (e.g. 84c78add) is rejected by the Releases API, which made
+    # this create silently fail and no corpus ever uploaded. Resolve the full sha
+    # from the checked-out source tree; omit --target if it can't be resolved
+    # (the corpus release is just an asset bucket, the tag location is cosmetic).
+    local full=""
+    full="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || true)"
+    case "$full" in *[!0-9a-f]*|"") full="" ;; esac
     gh release create "$TAG" --repo "$REPO" \
-      ${PIN:+--target "$PIN"} \
+      ${full:+--target "$full"} \
       --title "fuzz corpus ${PIN:-$TAG}" \
       --notes "auto: distributed-fuzz corpus store" \
       --prerelease >/dev/null 2>&1 || true
@@ -153,9 +161,12 @@ sync_owned() {  # <target>
   # re-tar the (now merged) canonical corpus and publish it.
   local out="$WORK/corpus-$t.tar.zst"
   tar_corpus "$cdir" "$out" || return 0
-  retry gh release upload "$TAG" "$out" --repo "$REPO" --clobber \
-      >/dev/null 2>&1 || true
-  echo "sync: owned $t merged ($(find "$cdir" -type f 2>/dev/null | wc -l | tr -d ' ') files) uploaded"
+  local nf; nf="$(find "$cdir" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  if retry gh release upload "$TAG" "$out" --repo "$REPO" --clobber >/dev/null 2>&1; then
+    echo "sync: owned $t merged ($nf files) uploaded"
+  else
+    echo "sync: owned $t merged ($nf files) UPLOAD FAILED (will retry next tick)" >&2
+  fi
 }
 
 # --- non-owner path: pull canonical, ship net-new as a contrib ----------------
@@ -206,9 +217,12 @@ sync_pull() {  # <target>
 
   local out="$WORK/contrib-$t-$NODE_ID.tar.zst"
   tar_corpus "$stage" "$out" || return 0
-  retry gh release upload "$TAG" "$out" --repo "$REPO" --clobber \
-      >/dev/null 2>&1 || true
-  echo "sync: pull $t shipped $(wc -l < "$newlist" | tr -d ' ') net-new as contrib"
+  local nn; nn="$(wc -l < "$newlist" | tr -d ' ')"
+  if retry gh release upload "$TAG" "$out" --repo "$REPO" --clobber >/dev/null 2>&1; then
+    echo "sync: pull $t shipped $nn net-new as contrib"
+  else
+    echo "sync: pull $t shipped $nn net-new — CONTRIB UPLOAD FAILED (will retry next tick)" >&2
+  fi
 }
 
 # --- main ---------------------------------------------------------------------
