@@ -1656,6 +1656,7 @@ async fn run_authenticated_data_mode(
                                     max_streams: (traffic.max_concurrent_streams as usize)
                                         .min(SERVER_MUX_MAX_STREAMS),
                                     cid,
+                                    target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
                                 },
                             )
                             .await;
@@ -2133,6 +2134,17 @@ const QUIC_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// affected, so the udp-off baseline is byte-identical.
 const PX1_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on a single client->target mux write (H-3). The mux reader loop
+/// processes every substream's frames serially, so a wedged target — its kernel
+/// send buffer full because the peer advertises a zero receive window and never
+/// drains — blocking `write_all` would park the loop and pin the WHOLE
+/// connection: every other substream, all permits, every fd. A live target
+/// accepts one <=chunk_size (~16 KiB) frame far inside 30s, so this never trips a
+/// slow-but-draining peer; only a genuinely wedged stream is shed (with a Reset).
+/// Distinct from the 600s idle backstop, which bounds whole-relay SILENCE, not
+/// single-stream backpressure — using 600s here would still pin for ten minutes.
+const MUX_TARGET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Brief grace, applied AFTER the teardown DONE `select!` returns its
 /// `conn.closed()` sentinel, for the reliable TCP DONE to arrive. The peer sends
 /// its DONE over the TCP control stream and THEN closes the QUIC connection; the
@@ -2158,6 +2170,10 @@ struct ServerMuxContext<'a> {
     /// Server-enforced ceiling on concurrent substreams for this connection.
     max_streams: usize,
     cid: u64,
+    /// Per-write deadline on a client->target mux write (H-3): a wedged target
+    /// must not park the serial reader loop. Injectable so tests can use a short
+    /// value; production passes `MUX_TARGET_WRITE_TIMEOUT`.
+    target_write_timeout: Duration,
 }
 
 /// Tracks the live substreams of one authenticated mux connection.
@@ -2801,7 +2817,32 @@ async fn process_server_mux_frame(
                 connect_outbound_target(&target_addr, context.fixed_data_target.is_some()).await?;
             tune_tcp_stream(&target)?;
             if !initial_payload.is_empty() {
-                target.write_all(&initial_payload).await?;
+                // Bound the initial-payload write (H-3): a wedged target must not
+                // park the serial mux reader loop. Nothing is registered yet, so on
+                // stall just Reset the stream and drop `target` (both fds close).
+                match timeout(
+                    context.target_write_timeout,
+                    target.write_all(&initial_payload),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        tracing::debug!(
+                            cid = context.cid,
+                            stream_id = frame.stream_id,
+                            "mux target initial-payload write stalled; resetting stream"
+                        );
+                        send_server_mux_frame(
+                            frame_tx,
+                            frame.stream_id,
+                            MuxFrameKind::Reset,
+                            Vec::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
                 let mut initial_payload = initial_payload;
                 initial_payload.zeroize();
             }
@@ -2833,9 +2874,43 @@ async fn process_server_mux_frame(
             streams.readers.insert(frame.stream_id, handle);
         }
         MuxFrameKind::Data => {
-            if let Some(target_write) = streams.writes.get_mut(&frame.stream_id) {
-                if !frame.payload.is_empty() {
-                    target_write.write_all(frame.payload).await?;
+            if !frame.payload.is_empty() {
+                // Bound the target write (H-3) and shed ONLY this stream on stall,
+                // keeping the serial reader loop and every healthy substream alive.
+                // The get_mut borrow ends before we remove, so the outcome is owned.
+                let outcome = match streams.writes.get_mut(&frame.stream_id) {
+                    Some(target_write) => Some(
+                        timeout(
+                            context.target_write_timeout,
+                            target_write.write_all(frame.payload),
+                        )
+                        .await,
+                    ),
+                    None => None,
+                };
+                match outcome {
+                    Some(Ok(result)) => result?,
+                    Some(Err(_)) => {
+                        tracing::debug!(
+                            cid = context.cid,
+                            stream_id = frame.stream_id,
+                            "mux target write stalled; resetting stream"
+                        );
+                        if let Some(mut w) = streams.writes.remove(&frame.stream_id) {
+                            let _ = w.shutdown().await;
+                        }
+                        if let Some(h) = streams.readers.remove(&frame.stream_id) {
+                            h.abort();
+                        }
+                        send_server_mux_frame(
+                            frame_tx,
+                            frame.stream_id,
+                            MuxFrameKind::Reset,
+                            Vec::new(),
+                        )
+                        .await?;
+                    }
+                    None => {}
                 }
             }
         }
@@ -3249,6 +3324,7 @@ async fn run_authenticated_speed_test_mode(
         &payload,
         request.warmup_bytes,
         SpeedTestAck::warmup_download_done(request.warmup_bytes),
+        fallback_idle_timeout(),
     )
     .await?;
     read_speed_upload_phase(
@@ -3264,6 +3340,7 @@ async fn run_authenticated_speed_test_mode(
             &payload,
             request.download_bytes,
             SpeedTestAck::download_done(request.download_bytes),
+            fallback_idle_timeout(),
         )
         .await?;
     }
@@ -3295,6 +3372,7 @@ async fn write_speed_download_phase<R>(
     payload: &[u8],
     bytes: u64,
     ack: SpeedTestAck,
+    idle: Duration,
 ) -> Result<(), HandshakeServerError>
 where
     R: Rng + rand::RngCore + ?Sized,
@@ -3302,27 +3380,39 @@ where
     let mut remaining = bytes;
     while remaining > 0 {
         let len = remaining.min(payload.len() as u64) as usize;
-        write_server_data_records_chunked(
-            io.client_write,
-            io.server_seal,
-            &payload[..len],
-            io.rng,
-            io.scratch,
-            RelayWriteLog::new(io.cid, "server->client", "server-speed-download-writer"),
+        // Stall backstop (M-8): a client that advertises a zero receive window and
+        // stops draining would otherwise block this write forever, pinning the
+        // slot, both fds, and the per-source/global permits. Mirrors the upload
+        // phase's per-read idle timeout; reclaims the connection after `idle`.
+        timeout(
+            idle,
+            write_server_data_records_chunked(
+                io.client_write,
+                io.server_seal,
+                &payload[..len],
+                io.rng,
+                io.scratch,
+                RelayWriteLog::new(io.cid, "server->client", "server-speed-download-writer"),
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| HandshakeServerError::Timeout)??;
         remaining -= len as u64;
     }
     let ack = ack.encode();
-    write_server_data_records_chunked(
-        io.client_write,
-        io.server_seal,
-        &ack,
-        io.rng,
-        io.scratch,
-        RelayWriteLog::new(io.cid, "server->client", "server-speed-download-done"),
+    timeout(
+        idle,
+        write_server_data_records_chunked(
+            io.client_write,
+            io.server_seal,
+            &ack,
+            io.rng,
+            io.scratch,
+            RelayWriteLog::new(io.cid, "server->client", "server-speed-download-done"),
+        ),
     )
     .await
+    .map_err(|_| HandshakeServerError::Timeout)?
 }
 
 async fn read_speed_upload_phase<R>(
@@ -4353,6 +4443,7 @@ mod tests {
             chunk_size: max_plaintext_len(traffic.max_padding),
             max_streams: 0,
             cid: 1,
+            target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
         };
         let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
         let payload_pool =
@@ -4380,6 +4471,147 @@ mod tests {
         let reset = frame_rx.try_recv().unwrap();
         assert_eq!(reset.stream_id, 7);
         assert_eq!(reset.kind, MuxFrameKind::Reset);
+    }
+
+    /// H-3: a wedged target (peer never reads) must not park the serial mux reader
+    /// loop on a single stream's write — only that stream is shed (Reset + close),
+    /// keeping the connection and every healthy substream alive. Uses an injected
+    /// short write deadline + an oversized payload that reliably blocks once the
+    /// socket buffers fill, so the test runs in real time.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_wedged_target_data_write_sheds_only_that_stream() {
+        let traffic = TrafficConfig::default();
+        let context = ServerMuxContext {
+            fixed_data_target: None,
+            timing: TimingProfile::from_config(traffic),
+            cover: CoverTrafficProfile::from_config(traffic),
+            chunk_size: max_plaintext_len(traffic.max_padding),
+            max_streams: 8,
+            cid: 1,
+            target_write_timeout: Duration::from_millis(100),
+        };
+        let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+        let payload_pool =
+            MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
+
+        // A target that accepts but never reads: writes to it wedge once buffers fill.
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let acceptor = tokio::spawn(async move {
+            let (s, _) = target_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(s);
+        });
+        let target = TcpStream::connect(target_addr).await.unwrap();
+        let (_target_read, target_write) = target.into_split();
+
+        let mut streams = ServerMuxStreams::new();
+        streams.writes.insert(9, target_write);
+        // A live reader handle so the shed path's abort+remove is exercised.
+        streams
+            .readers
+            .insert(9, tokio::spawn(std::future::pending::<()>()));
+
+        // Oversized payload guarantees write_all blocks (exceeds any socket buffer).
+        let big = vec![0_u8; 4 * 1024 * 1024];
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_server_mux_frame(
+                MuxFrameRef {
+                    stream_id: 9,
+                    kind: MuxFrameKind::Data,
+                    payload: &big,
+                },
+                &mut streams,
+                &frame_tx,
+                context,
+                &payload_pool,
+            ),
+        )
+        .await
+        .expect("process_server_mux_frame must return within the wall budget");
+        result.expect("shedding a wedged stream must not error the connection");
+
+        // Only stream 9 is shed; the connection (and any other stream) survives.
+        assert!(
+            !streams.writes.contains_key(&9),
+            "wedged stream's write half removed"
+        );
+        assert!(
+            !streams.readers.contains_key(&9),
+            "wedged stream's reader aborted"
+        );
+        let reset = frame_rx.try_recv().unwrap();
+        assert_eq!(reset.stream_id, 9);
+        assert_eq!(reset.kind, MuxFrameKind::Reset);
+
+        acceptor.abort();
+    }
+
+    /// M-8: the speed-test DOWNLOAD phase must reclaim a zero-window stall as a
+    /// Timeout (the upload phase already did). A client that connects and never
+    /// reads drives the server's receive window to zero; once the send buffer
+    /// fills, the write would block forever without the per-write idle backstop.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn speed_download_phase_idle_timeout_reclaims_zero_window_stall() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Client connects and NEVER reads.
+        let client = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(stream);
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let (read_half, write_half) = server_stream.into_split();
+        let mut client_records = TlsRecordReader::buffered(read_half);
+        let mut client_write = TcpLegWriter(write_half);
+        let chunk = max_plaintext_len(0);
+        let mut server_seal = DataRecordCodec::new(
+            AeadCodec::new([0x11; 32], [0x22; 12]),
+            PaddingProfile::new(0, 0).unwrap(),
+            SERVER_TO_CLIENT_AAD,
+        );
+        let mut client_open = DataRecordCodec::new(
+            AeadCodec::new([0x33; 32], [0x44; 12]),
+            PaddingProfile::new(0, 0).unwrap(),
+            CLIENT_TO_SERVER_AAD,
+        );
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut scratch = RelaySealScratch::with_payload_capacity(chunk);
+        let mut io = SpeedServerIo {
+            client_records: &mut client_records,
+            client_write: &mut client_write,
+            client_open: &mut client_open,
+            server_seal: &mut server_seal,
+            rng: &mut rng,
+            scratch: &mut scratch,
+            cid: 1,
+        };
+        let payload = vec![0_u8; chunk];
+
+        // Inject a short idle; a zero-window stall must surface as Timeout, not hang.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_speed_download_phase(
+                &mut io,
+                &payload,
+                64 * 1024 * 1024, // far exceeds the socket buffers
+                SpeedTestAck::download_done(64 * 1024 * 1024),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("download phase must return within the wall budget (idle backstop fired)");
+        assert!(
+            matches!(result, Err(HandshakeServerError::Timeout)),
+            "a zero-window stall must surface as Timeout, got {result:?}",
+        );
+
+        client.abort();
     }
 
     #[tokio::test]

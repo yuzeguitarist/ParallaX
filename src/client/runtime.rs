@@ -613,6 +613,7 @@ impl ClientMuxPool {
                 open_from_server,
                 register_rx,
                 session_cid,
+                CLIENT_RELAY_IDLE_TIMEOUT,
             )
             .await
             {
@@ -2005,6 +2006,7 @@ async fn client_mux_reader_loop<R>(
     mut open_from_server: DataRecordCodec,
     mut register_rx: mpsc::Receiver<ClientStreamControl>,
     cid: u64,
+    idle: Duration,
 ) -> Result<(), ClientRuntimeError>
 where
     R: LegReader,
@@ -2032,7 +2034,25 @@ where
                     }
                     continue;
                 }
-                result = server_records.read_record_into(&mut server_record) => result,
+                // Idle backstop (H-2): without it, a server that goes silent parks
+                // this SHARED per-session reader on the read forever, pinning the
+                // connection permit, every per-connection task (each waiting on its
+                // outcome_rx) with its stream permit and local fd — until the client
+                // stops accepting new SOCKS connections. A real record resets the
+                // clock implicitly (the read returns and the loop re-arms). Mirrors
+                // the server's per-session mux backstop; the register arm stays
+                // outside the timeout (it is liveness, not relay activity).
+                result = timeout(
+                    idle,
+                    server_records.read_record_into(&mut server_record),
+                ) => match result {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        tracing::debug!(cid, "client mux idle backstop reached; tearing down session");
+                        shutdown_client_download_streams(&mut local_writes).await;
+                        return Ok(());
+                    }
+                },
             }
         };
         match read_result {
@@ -2700,6 +2720,83 @@ mod tests {
 
         // End the test without waiting the full establish timeout.
         builder.abort();
+    }
+
+    /// A LegReader that connected then went permanently silent: reads never
+    /// resolve. Models the H-2 threat (a server that completes establishment then
+    /// stops sending).
+    struct SilentLegReader;
+    impl LegReader for SilentLegReader {
+        async fn read_record_into(&mut self, _buf: &mut Vec<u8>) -> io::Result<()> {
+            std::future::pending().await
+        }
+        async fn try_read_record_into(&mut self, _buf: &mut Vec<u8>) -> Option<io::Result<()>> {
+            None
+        }
+    }
+
+    /// H-2: the SHARED per-session mux reader must tear down on an idle backstop, so
+    /// a silent server cannot pin the connection permit and every parked
+    /// per-connection task (each holding a stream permit + local fd) forever.
+    #[tokio::test]
+    async fn client_mux_reader_idle_backstop_tears_down_silent_session() {
+        let (register_tx, register_rx) = mpsc::channel::<ClientStreamControl>(4);
+
+        // A real OwnedWriteHalf for the registered download stream.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (_server_side, _) = listener.accept().await.unwrap();
+        let (_local_read, local_write) = connect.await.unwrap().into_split();
+
+        let (outcome_tx, outcome_rx) = oneshot::channel::<DownloadOutcome>();
+        register_tx
+            .send(ClientStreamControl::Register(ClientStreamRegistration {
+                stream_id: 1,
+                local_write,
+                outcome_tx,
+            }))
+            .await
+            .unwrap();
+        // Drop the sender so the register arm closes after delivering the buffered
+        // registration; only the (silent) read arm then remains.
+        drop(register_tx);
+
+        let session_keys = derive_client_keys(
+            &X25519KeyPair::generate().private,
+            &X25519KeyPair::generate().public,
+            &[7_u8; 32],
+        )
+        .unwrap();
+        let (open_from_server, _seal) =
+            data_codecs(&session_keys, TrafficConfig::default()).unwrap();
+
+        // A short injected idle so the per-session backstop fires in real time.
+        // Without the H-2 timeout the reader parks on the silent read forever, so
+        // the outer wall budget elapses — the fail-before signal.
+        let loop_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_mux_reader_loop(
+                SilentLegReader,
+                open_from_server,
+                register_rx,
+                1,
+                Duration::from_millis(80),
+            ),
+        )
+        .await
+        .expect("mux reader must return within the wall budget once the backstop fires");
+        assert!(
+            matches!(loop_result, Ok(())),
+            "mux reader must return Ok after the idle backstop, got {loop_result:?}",
+        );
+
+        // The parked per-connection download is released: the backstop teardown
+        // dropped the stream's outcome_tx, so await_download resolves Ok.
+        assert!(matches!(
+            client_mux_await_download(outcome_rx, 1).await,
+            Ok(())
+        ));
     }
 
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
