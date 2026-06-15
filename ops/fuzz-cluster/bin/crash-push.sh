@@ -127,7 +127,13 @@ retry() {
 
 # refresh (or create) the fuzz-crashes worktree pinned to origin's branch.
 prepare_worktree() {
-  retry git -C "$SRC" fetch origin "$CRASH_BRANCH" >/dev/null 2>&1 || true
+  # The source clone is --single-branch, so a bare `fetch origin fuzz-crashes`
+  # does NOT create refs/remotes/origin/fuzz-crashes — the show-ref check below
+  # then fails and we'd wrongly fork the branch off the detached pinned commit,
+  # making every crash push a non-fast-forward (rejected) -> crashes silently
+  # never filed. Fetch with an EXPLICIT refspec so the remote-tracking ref exists.
+  local refspec="+refs/heads/$CRASH_BRANCH:refs/remotes/origin/$CRASH_BRANCH"
+  retry git -C "$SRC" fetch origin "$refspec" >/dev/null 2>&1 || true
   if [ ! -d "$WT/.git" ] && [ ! -f "$WT/.git" ]; then
     mkdir -p "$(dirname "$WT")"
     if git -C "$SRC" show-ref --verify --quiet "refs/remotes/origin/$CRASH_BRANCH"; then
@@ -140,7 +146,7 @@ prepare_worktree() {
   fi
   [ -e "$WT/.git" ] || return 1
   # sync the worktree to the remote tip (additive, so safe to hard-reset).
-  git -C "$WT" fetch origin "$CRASH_BRANCH" >/dev/null 2>&1 || true
+  git -C "$WT" fetch origin "$refspec" >/dev/null 2>&1 || true
   git -C "$WT" reset --hard "origin/$CRASH_BRANCH" >/dev/null 2>&1 || true
   return 0
 }
