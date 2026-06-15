@@ -64,20 +64,21 @@ jobs:
           tool: cargo-mutants@27.1.0
 
       - name: Run cargo-mutants (scoped, bounded)
-        # Scope + timeouts live in .cargo/mutants.toml (the only path cargo-mutants
-        # reads config from). We pass `--config` explicitly for clarity and the
-        # same two files via `-f`; the `-f` flags win over the config's
-        # `examine_globs` (CLI overrides config), keeping the nightly run pinned to
-        # exactly these two files even if the config drifts. `--locked` comes from
-        # the config's `additional_cargo_args` so build + test match the repo-wide
-        # --locked convention.
+        # Scope, the per-mutant timeout, and --locked all live in
+        # .cargo/mutants.toml (the only path cargo-mutants reads config from); we
+        # pass --config explicitly for clarity. The per-mutant timeout is
+        # baseline-relative (timeout_multiplier x the unmutated test time, with a
+        # minimum_test_timeout floor) so it adapts to the runner instead of a
+        # brittle fixed wall-clock — do NOT add a CLI --timeout, which would
+        # override and silence the config. The two -f flags re-pin scope to
+        # exactly these files even if the config drifts (CLI overrides
+        # examine_globs).
         run: |
           cargo mutants \
             --config .cargo/mutants.toml \
             --no-shuffle \
             -f src/tls/safari26.rs \
-            -f src/crypto/auth.rs \
-            --timeout 120
+            -f src/crypto/auth.rs
 
       - name: Upload mutants.out report
         if: always()

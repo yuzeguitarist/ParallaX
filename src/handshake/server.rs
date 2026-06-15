@@ -4662,6 +4662,16 @@ mod tests {
         );
     }
 
+    /// Run `decide_connection_inbound` once and return how many X25519 DH ops it
+    /// performed (via the #[cfg(test)] REJECT_DH_OPS counter). Shared by the
+    /// constant-work / timing tests below, all #[ignore]d + serial because the
+    /// counter is process-global.
+    fn dh_ops_for(record: &[u8], server_priv: &[u8; 32]) -> usize {
+        REJECT_DH_OPS.store(0, Ordering::Relaxed);
+        let _ = decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
+        REJECT_DH_OPS.load(Ordering::Relaxed)
+    }
+
     /// M-2: the inbound-decision rejection path must perform an input-INDEPENDENT
     /// number of X25519 DH ops, else the per-DH latency step (no key_share = 1 vs
     /// auth-fail = 3, pre-fix) is a timing distinguisher. Ignored + serial: it reads
@@ -4669,12 +4679,6 @@ mod tests {
     #[test]
     #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
     fn rejection_path_x25519_count_is_input_independent() {
-        fn dh_ops_for(record: &[u8], server_priv: &[u8; 32]) -> usize {
-            REJECT_DH_OPS.store(0, Ordering::Relaxed);
-            let _ =
-                decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
-            REJECT_DH_OPS.load(Ordering::Relaxed)
-        }
         let server = X25519KeyPair::generate();
 
         // Shape B: no x25519 key_share -> pre-fix only the legacy DH (1).
@@ -4713,12 +4717,6 @@ mod tests {
     #[test]
     #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
     fn rejection_path_x25519_count_covers_recover_none_shape() {
-        fn dh_ops_for(record: &[u8], server_priv: &[u8; 32]) -> usize {
-            REJECT_DH_OPS.store(0, Ordering::Relaxed);
-            let _ =
-                decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
-            REJECT_DH_OPS.load(Ordering::Relaxed)
-        }
         let server = X25519KeyPair::generate();
         // key_share present, but NO SNI -> recover hits its missing-SNI early-None
         // gate and the code takes the `ballast: v4 auth-slot, recover==None` path.
@@ -4764,12 +4762,6 @@ mod tests {
     #[test]
     #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
     fn constant_work_counter_is_non_vacuous() {
-        fn dh_ops_for(record: &[u8], server_priv: &[u8; 32]) -> usize {
-            REJECT_DH_OPS.store(0, Ordering::Relaxed);
-            let _ =
-                decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
-            REJECT_DH_OPS.load(Ordering::Relaxed)
-        }
         let server = X25519KeyPair::generate();
         let unparseable = dh_ops_for(b"this is not a TLS ClientHello", &server.private);
         let valid_unauth = dh_ops_for(
