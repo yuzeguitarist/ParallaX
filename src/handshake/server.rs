@@ -3398,7 +3398,7 @@ where
     loop {
         match client_records.read_record_into(&mut client_record).await {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => {
+            Err(err) if client_records.is_clean_close(&err) => {
                 let _ = target_write.shutdown().await;
                 return Ok(client_open);
             }
@@ -3622,10 +3622,12 @@ fn log_outer_write(
     }
 }
 
-// TODO(review, data-slice-3a): treating io::ErrorKind::ConnectionReset as a
-// clean close is wrong for a QUIC RecvStream RESET_STREAM (which surfaces as
-// ConnectionReset), but it is unreachable in this slice -- no code resets a relay
-// stream. Revisit if a future slice can RESET a relay stream mid-transfer.
+// TCP-leg clean-close predicate: a peer FIN (`UnexpectedEof`), the proxy's
+// graceful-close RST convention (`ConnectionReset`), or `BrokenPipe`. Used by
+// the TCP-only fallback/relay/mux reader loops. The QUIC fast-plane legs do NOT
+// use this — they go through `LegReader::is_clean_close`, which (unlike TCP)
+// treats a `RESET_STREAM`-derived `ConnectionReset` as a truncation, not a clean
+// close. See `transport::leg`.
 fn is_clean_close(err: &io::Error) -> bool {
     matches!(
         err.kind(),

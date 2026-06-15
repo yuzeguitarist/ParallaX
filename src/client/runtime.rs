@@ -1826,7 +1826,7 @@ where
     loop {
         match server_records.read_record_into(&mut server_record).await {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => {
+            Err(err) if server_records.is_clean_close(&err) => {
                 let _ = local_write.shutdown().await;
                 return Ok(open_from_server);
             }
@@ -1977,7 +1977,7 @@ where
         };
         match read_result {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => {
+            Err(err) if server_records.is_clean_close(&err) => {
                 shutdown_client_download_streams(&mut local_writes).await;
                 return Ok(());
             }
@@ -2489,17 +2489,6 @@ fn log_outer_write(
             "outer TLS record write"
         );
     }
-}
-
-// TODO(review, data-slice-3a): treating io::ErrorKind::ConnectionReset as a
-// clean close is wrong for a QUIC RecvStream RESET_STREAM (which surfaces as
-// ConnectionReset), but it is unreachable in this slice -- no code resets a relay
-// stream. Revisit if a future slice can RESET a relay stream mid-transfer.
-fn is_clean_close(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-    )
 }
 
 #[allow(dead_code)]
