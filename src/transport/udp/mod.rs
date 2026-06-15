@@ -116,6 +116,21 @@ fn udp_transport_config() -> Arc<quinn::TransportConfig> {
             .expect("60s is a valid quinn idle timeout"),
     ));
     transport.keep_alive_interval(Some(UDP_KEEP_ALIVE_INTERVAL));
+
+    // The fast-plane relay multiplexes BOTH directions onto a SINGLE reliable
+    // bidi QUIC stream (client `open_bi` / server `accept_bi`) and never opens a
+    // uni stream; the reachability probe uses unreliable datagrams, governed
+    // separately by `datagram_receive_buffer_size`. quinn's defaults (100 bidi +
+    // 100 uni concurrent streams, connection `receive_window = VarInt::MAX`) let
+    // an authenticated peer pin hundreds of MB of un-drained receive buffers
+    // against this one-stream relay. Bound the flow-control envelope to the relay
+    // reality: at most one incoming bidi stream, no uni streams, and a finite
+    // connection-level receive window. `stream_receive_window` is left at quinn's
+    // tuned default so single-stream throughput is unchanged.
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    transport.receive_window(quinn::VarInt::from_u32(1_250_000));
+
     Arc::new(transport)
 }
 
@@ -290,7 +305,7 @@ mod tests {
     use bytes::Bytes;
     use quinn::Endpoint;
 
-    use super::test_support::{self_signed_cert, AcceptAnyServerCert};
+    use super::test_support::{loopback_pair, self_signed_cert, AcceptAnyServerCert};
     use super::*;
 
     /// Non-empty PSK for the exporter-bound auth-token round-trip assertions.
@@ -368,5 +383,46 @@ mod tests {
             client_token, other_context_token,
             "the exporter-bound auth token must be bound to its context",
         );
+    }
+
+    /// M-6: the relay endpoint's QUIC transport config bounds flow control to the
+    /// single-bidi-stream relay shape — uni streams are forbidden and at most one
+    /// concurrent bidi stream is granted — so an authenticated peer cannot pin
+    /// hundreds of MB of un-drained receive buffers by over-opening streams.
+    /// TransportConfig fields have no getters, so this drives a loopback pair and
+    /// observes the peer being denied stream credit.
+    #[tokio::test]
+    async fn quic_transport_config_bounds_streams_to_single_bidi_relay() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        // (1) The single-stream relay shape still works: one bidi stream opens
+        // and the server accepts it. Keep both ends' handles alive (dropping the
+        // send half would free the bidi credit and defeat assertion (3)).
+        let (mut s1, _r1) = client_conn.open_bi().await.expect("open_bi #1");
+        s1.write_all(b"x").await.expect("write stream #1");
+        let _srv1 = tokio::time::timeout(Duration::from_secs(2), server_conn.accept_bi())
+            .await
+            .expect("server must accept the first bidi stream")
+            .expect("accept_bi #1");
+
+        // (2) Uni streams are forbidden (max_concurrent_uni_streams = 0): the peer
+        // grants no uni credit, so open_uni never resolves.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), client_conn.open_uni())
+                .await
+                .is_err(),
+            "uni streams must be forbidden on the single-stream relay endpoint",
+        );
+
+        // (3) Bidi is capped at 1: stream #1 is still open, so a second open_bi
+        // gets no further credit and never resolves.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), client_conn.open_bi())
+                .await
+                .is_err(),
+            "a second concurrent bidi stream must not be granted (cap = 1)",
+        );
+
+        drop(s1);
     }
 }

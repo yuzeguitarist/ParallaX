@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, oneshot, Mutex, Semaphore, TryAcquireError},
+    sync::{mpsc, oneshot, Mutex, Notify, Semaphore, TryAcquireError},
     time::{sleep, timeout, Instant},
 };
 
@@ -404,9 +404,23 @@ impl WarmSessionPool {
     }
 }
 
+/// State of the shared mux session, used to single-flight establishment WITHOUT
+/// holding the pool mutex across the (up to 15s) network handshake. `Building`
+/// carries a `Notify` the in-flight builder fires on completion (success or
+/// failure) so every concurrently-waiting connection shares the one attempt
+/// instead of serializing a fresh 15s handshake each behind the lock.
+enum MuxState {
+    /// No session and nobody building one.
+    Idle,
+    /// A build is in flight; waiters park on this `Notify`.
+    Building(Arc<Notify>),
+    /// A live (or possibly now-stale) session; reusability is re-checked.
+    Ready(ClientMuxHandle),
+}
+
 #[derive(Clone)]
 struct ClientMuxPool {
-    inner: Arc<Mutex<Option<ClientMuxHandle>>>,
+    inner: Arc<Mutex<MuxState>>,
     config: Arc<ClientConfig>,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
@@ -479,7 +493,7 @@ impl ClientMuxPool {
         server_identity_public: Arc<[u8]>,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(None)),
+            inner: Arc::new(Mutex::new(MuxState::Idle)),
             config,
             server_addr,
             traffic,
@@ -491,24 +505,92 @@ impl ClientMuxPool {
     }
 
     async fn handle(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
-        let mut mux = self.inner.lock().await;
-        if let Some(handle) = mux.as_ref() {
-            // A cached session is only reusable if BOTH of its tasks are alive
-            // (see ClientMuxHandle::is_reusable). The reader can exit independently
-            // of the writer — e.g. on a clean server->client half-close FIN the
-            // reader returns Ok while the cover-disabled writer blocks forever on
-            // frame_rx.recv(). Probing only the writer would keep handing out a
-            // half-dead handle whose register_tx is closed, and every new local
-            // connection would fail at register_tx.send. Replacing the cached
-            // handle drops the old frame_tx, letting a surviving writer shut down.
-            if handle.is_reusable() {
-                return Ok(handle.clone());
+        loop {
+            let mut state = self.inner.lock().await;
+            // Decide an action without awaiting under the lock. The match yields an
+            // OWNED value so its borrow of `state` ends before we touch the guard.
+            let waiting_notify: Option<Arc<Notify>> = match &*state {
+                // A cached session is only reusable if BOTH of its tasks are alive
+                // (see ClientMuxHandle::is_reusable). The reader can exit
+                // independently of the writer — e.g. on a clean server->client
+                // half-close FIN the reader returns Ok while the cover-disabled
+                // writer blocks forever on frame_rx.recv(). Probing only the writer
+                // would keep handing out a half-dead handle whose register_tx is
+                // closed, and every new local connection would fail at
+                // register_tx.send. A stale Ready falls through to a rebuild.
+                MuxState::Ready(handle) if handle.is_reusable() => {
+                    return Ok(handle.clone());
+                }
+                MuxState::Building(notify) => Some(notify.clone()),
+                // Idle, or a stale (non-reusable) Ready: we become the builder.
+                _ => None,
+            };
+
+            match waiting_notify {
+                Some(notify) => {
+                    // Another connection is establishing the session. Register for
+                    // its completion wakeup BEFORE dropping the lock (lost-wakeup
+                    // safety: a notify_waiters() racing our unlock is not missed),
+                    // then wait off-lock and re-check.
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    drop(state);
+                    notified.await;
+                    continue;
+                }
+                None => {
+                    // Sole builder: publish Building, release the lock, and run the
+                    // (up to CLIENT_ESTABLISH_TIMEOUT) handshake OFF-LOCK so a slow
+                    // or stalling server cannot block every other local connection
+                    // behind this mutex — the M-7 fix. Concurrent callers share
+                    // this single attempt instead of serializing a fresh handshake.
+                    let notify = Arc::new(Notify::new());
+                    *state = MuxState::Building(Arc::clone(&notify));
+                    drop(state);
+
+                    // Run establishment in a detached task and await its handle, so a
+                    // PANIC inside start_session() surfaces as Err(JoinError) and is
+                    // handled on the normal path below (reset Building->Idle + notify)
+                    // instead of unwinding past the reset and stranding every waiter
+                    // on a Notify that never fires. This restores the panic self-heal
+                    // the pre-single-flight lock-holding code had, WITHOUT a
+                    // try_lock-in-Drop guard (which could miss the reset under lock
+                    // contention). handle() callers run it in detached spawns, so the
+                    // future itself is never cancelled mid-await.
+                    let pool = self.clone();
+                    let result = match tokio::spawn(async move { pool.start_session().await }).await
+                    {
+                        Ok(r) => r,
+                        Err(join_err) => {
+                            tracing::warn!(
+                                error = %join_err,
+                                "client mux establishment task failed (panic); resetting"
+                            );
+                            Err(ClientRuntimeError::Io(io::Error::other(
+                                "client mux establishment task panicked",
+                            )))
+                        }
+                    };
+                    let mut state = self.inner.lock().await;
+                    let outcome = match result {
+                        Ok(handle) => {
+                            *state = MuxState::Ready(handle.clone());
+                            Ok(handle)
+                        }
+                        Err(err) => {
+                            // Reset so a waiter re-loops and one becomes the next
+                            // builder (preserves the original retry-on-failure).
+                            *state = MuxState::Idle;
+                            Err(err)
+                        }
+                    };
+                    drop(state);
+                    notify.notify_waiters();
+                    return outcome;
+                }
             }
         }
-
-        let handle = self.start_session().await?;
-        *mux = Some(handle.clone());
-        Ok(handle)
     }
 
     fn ensure_started(&self) {
@@ -553,6 +635,7 @@ impl ClientMuxPool {
                 open_from_server,
                 register_rx,
                 session_cid,
+                CLIENT_RELAY_IDLE_TIMEOUT,
             )
             .await
             {
@@ -1826,7 +1909,7 @@ where
     loop {
         match server_records.read_record_into(&mut server_record).await {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => {
+            Err(err) if server_records.is_clean_close(&err) => {
                 let _ = local_write.shutdown().await;
                 return Ok(open_from_server);
             }
@@ -1945,6 +2028,7 @@ async fn client_mux_reader_loop<R>(
     mut open_from_server: DataRecordCodec,
     mut register_rx: mpsc::Receiver<ClientStreamControl>,
     cid: u64,
+    idle: Duration,
 ) -> Result<(), ClientRuntimeError>
 where
     R: LegReader,
@@ -1972,12 +2056,30 @@ where
                     }
                     continue;
                 }
-                result = server_records.read_record_into(&mut server_record) => result,
+                // Idle backstop (H-2): without it, a server that goes silent parks
+                // this SHARED per-session reader on the read forever, pinning the
+                // connection permit, every per-connection task (each waiting on its
+                // outcome_rx) with its stream permit and local fd — until the client
+                // stops accepting new SOCKS connections. A real record resets the
+                // clock implicitly (the read returns and the loop re-arms). Mirrors
+                // the server's per-session mux backstop; the register arm stays
+                // outside the timeout (it is liveness, not relay activity).
+                result = timeout(
+                    idle,
+                    server_records.read_record_into(&mut server_record),
+                ) => match result {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        tracing::debug!(cid, "client mux idle backstop reached; tearing down session");
+                        shutdown_client_download_streams(&mut local_writes).await;
+                        return Ok(());
+                    }
+                },
             }
         };
         match read_result {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => {
+            Err(err) if server_records.is_clean_close(&err) => {
                 shutdown_client_download_streams(&mut local_writes).await;
                 return Ok(());
             }
@@ -2491,17 +2593,6 @@ fn log_outer_write(
     }
 }
 
-// TODO(review, data-slice-3a): treating io::ErrorKind::ConnectionReset as a
-// clean close is wrong for a QUIC RecvStream RESET_STREAM (which surfaces as
-// ConnectionReset), but it is unreachable in this slice -- no code resets a relay
-// stream. Revisit if a future slice can RESET a relay stream mid-transfer.
-fn is_clean_close(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-    )
-}
-
 #[allow(dead_code)]
 fn _request_target(request: &SocksRequest) -> String {
     request.target()
@@ -2583,6 +2674,151 @@ mod tests {
         drop(frame_rx);
         assert!(!handle.is_reusable());
         drop(register_rx);
+    }
+
+    /// M-7: ClientMuxPool::handle() must NOT hold the pool mutex across the (up to
+    /// CLIENT_ESTABLISH_TIMEOUT) network establishment, otherwise one stalling
+    /// server blocks every new local connection behind the lock. A stalling TCP
+    /// listener (accepts, never completes the camouflage handshake) keeps a
+    /// builder parked in start_session(); the pool mutex must remain acquirable
+    /// and show the in-flight `Building` state.
+    #[tokio::test]
+    async fn mux_handle_does_not_hold_lock_across_establishment() {
+        // Accept connections but never speak: the client's wait for the origin
+        // ServerHello stalls until the establish timeout (far longer than this test).
+        let stalling = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stall_addr = stalling.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = stalling.accept().await {
+                held.push(stream); // keep the connection open, send nothing
+            }
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_config = Arc::new(ClientConfig {
+            listen: local.local_addr().unwrap(),
+            server_addr: stall_addr.to_string(),
+            sni: "example.com".to_owned(),
+            server_public_key: STANDARD.encode(server_keys.public),
+            server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
+            server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+        });
+        let server_addr = ServerAddrResolver::new(&client_config.server_addr)
+            .await
+            .unwrap();
+        let pool = ClientMuxPool::new(
+            Arc::clone(&client_config),
+            server_addr,
+            TrafficConfig::default(),
+            Arc::new(UdpConfig::default()),
+            Arc::new(zeroize::Zeroizing::new(PSK.to_vec())),
+            server_keys.public,
+            Arc::from(server_identity_keys.public.clone().into_boxed_slice()),
+        );
+
+        // Kick off a builder; it parks in start_session() OFF-LOCK.
+        let builder_pool = pool.clone();
+        let builder = tokio::spawn(async move { builder_pool.handle().await });
+
+        // Let it publish Building and enter the stalled handshake.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // The pool mutex MUST be free (not held across establishment) and the
+        // state MUST be the in-flight Building — the M-7 guarantee.
+        {
+            let state = pool
+                .inner
+                .try_lock()
+                .expect("pool mutex must not be held across establishment");
+            assert!(
+                matches!(*state, MuxState::Building(_)),
+                "state must be Building while the single in-flight session establishes",
+            );
+        }
+
+        // End the test without waiting the full establish timeout.
+        builder.abort();
+    }
+
+    /// A LegReader that connected then went permanently silent: reads never
+    /// resolve. Models the H-2 threat (a server that completes establishment then
+    /// stops sending).
+    struct SilentLegReader;
+    impl LegReader for SilentLegReader {
+        async fn read_record_into(&mut self, _buf: &mut Vec<u8>) -> io::Result<()> {
+            std::future::pending().await
+        }
+        async fn try_read_record_into(&mut self, _buf: &mut Vec<u8>) -> Option<io::Result<()>> {
+            None
+        }
+    }
+
+    /// H-2: the SHARED per-session mux reader must tear down on an idle backstop, so
+    /// a silent server cannot pin the connection permit and every parked
+    /// per-connection task (each holding a stream permit + local fd) forever.
+    #[tokio::test]
+    async fn client_mux_reader_idle_backstop_tears_down_silent_session() {
+        let (register_tx, register_rx) = mpsc::channel::<ClientStreamControl>(4);
+
+        // A real OwnedWriteHalf for the registered download stream.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (_server_side, _) = listener.accept().await.unwrap();
+        let (_local_read, local_write) = connect.await.unwrap().into_split();
+
+        let (outcome_tx, outcome_rx) = oneshot::channel::<DownloadOutcome>();
+        register_tx
+            .send(ClientStreamControl::Register(ClientStreamRegistration {
+                stream_id: 1,
+                local_write,
+                outcome_tx,
+            }))
+            .await
+            .unwrap();
+        // Drop the sender so the register arm closes after delivering the buffered
+        // registration; only the (silent) read arm then remains.
+        drop(register_tx);
+
+        let session_keys = derive_client_keys(
+            &X25519KeyPair::generate().private,
+            &X25519KeyPair::generate().public,
+            &[7_u8; 32],
+        )
+        .unwrap();
+        let (open_from_server, _seal) =
+            data_codecs(&session_keys, TrafficConfig::default()).unwrap();
+
+        // A short injected idle so the per-session backstop fires in real time.
+        // Without the H-2 timeout the reader parks on the silent read forever, so
+        // the outer wall budget elapses — the fail-before signal.
+        let loop_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_mux_reader_loop(
+                SilentLegReader,
+                open_from_server,
+                register_rx,
+                1,
+                Duration::from_millis(80),
+            ),
+        )
+        .await
+        .expect("mux reader must return within the wall budget once the backstop fires");
+        assert!(
+            matches!(loop_result, Ok(())),
+            "mux reader must return Ok after the idle backstop, got {loop_result:?}",
+        );
+
+        // The parked per-connection download is released: the backstop teardown
+        // dropped the stream's outcome_tx, so await_download resolves Ok.
+        assert!(matches!(
+            client_mux_await_download(outcome_rx, 1).await,
+            Ok(())
+        ));
     }
 
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(

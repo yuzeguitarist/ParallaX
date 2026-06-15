@@ -36,6 +36,23 @@ pub(crate) trait LegReader: Send {
         &mut self,
         buf: &mut Vec<u8>,
     ) -> impl Future<Output = Option<io::Result<()>>> + Send;
+
+    /// Whether a read error marks a clean end-of-leg under THIS transport's
+    /// teardown convention. TCP (the default): a peer FIN (`UnexpectedEof`), a
+    /// RST (`ConnectionReset`, the proxy's own graceful-close convention — see
+    /// `transport::tcp`), or a `BrokenPipe` are all treated as a clean close.
+    /// The QUIC leg OVERRIDES this: on a `quinn::RecvStream` a clean stream
+    /// finish surfaces as `UnexpectedEof`, whereas `ConnectionReset` means the
+    /// peer sent `RESET_STREAM` — a mid-transfer TRUNCATION of the relay that
+    /// MUST surface as an error, never be swallowed as a clean half-close.
+    fn is_clean_close(&self, err: &io::Error) -> bool {
+        matches!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+        )
+    }
 }
 
 /// A sink for sealed record bytes (one or more concatenated TLS records in one
@@ -90,13 +107,43 @@ impl LegWriter for TcpLegWriter {
 
 /// QUIC-stream record-reader leg over a reliable bidi `quinn::RecvStream`.
 ///
-/// A quinn reliable bidi stream carries the record byte-stream exactly like
-/// TCP, so no new reader is needed: [`TcpLegReader`] is already generic over any
-/// `R: AsyncRead + Unpin + Send`, and `quinn::RecvStream` implements
-/// `tokio::io::AsyncRead` (and is `Unpin + Send`) in quinn 0.11. This alias just
-/// names that instantiation; `read_record_into` / `try_read_record_into` keep
-/// their exact `BufferedTlsRecordReader` semantics over the QUIC stream.
-pub(crate) type QuicStreamLegReader = TcpLegReader<quinn::RecvStream>;
+/// A quinn reliable bidi stream carries the record byte-stream exactly like TCP,
+/// so reads delegate 1:1 to the inner [`TcpLegReader`] (which is already generic
+/// over any `R: AsyncRead + Unpin + Send`, and `quinn::RecvStream` is one in
+/// quinn 0.11). It is a NEWTYPE rather than a bare type alias because the QUIC
+/// leg must OVERRIDE [`LegReader::is_clean_close`]: quinn maps a peer
+/// `RESET_STREAM` to `io::ErrorKind::ConnectionReset`, which on a reliable relay
+/// stream is a mid-transfer truncation that must surface as an error — unlike a
+/// TCP RST, which is conventionally a clean half-close. `read_record_into` /
+/// `try_read_record_into` keep their exact `BufferedTlsRecordReader` semantics.
+pub(crate) struct QuicStreamLegReader(TcpLegReader<quinn::RecvStream>);
+
+impl QuicStreamLegReader {
+    /// Wraps a `quinn::RecvStream` in a buffered record reader, mirroring
+    /// [`TcpLegReader::buffered`].
+    pub(crate) fn buffered(reader: quinn::RecvStream) -> Self {
+        Self(TcpLegReader::buffered(reader))
+    }
+}
+
+impl LegReader for QuicStreamLegReader {
+    async fn read_record_into(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+        self.0.read_record_into(buf).await
+    }
+
+    async fn try_read_record_into(&mut self, buf: &mut Vec<u8>) -> Option<io::Result<()>> {
+        self.0.try_read_record_into(buf).await
+    }
+
+    /// A QUIC clean finish surfaces as `UnexpectedEof`; `ConnectionReset`
+    /// (`RESET_STREAM`) is a truncated relay and is therefore NOT a clean close.
+    fn is_clean_close(&self, err: &io::Error) -> bool {
+        matches!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
+        )
+    }
+}
 
 /// Test-only counter of record bytes written through [`QuicStreamLegWriter`].
 /// Lets the relay e2e tests prove application data actually traversed the QUIC
@@ -302,5 +349,78 @@ mod tests {
         let (writer_phase1, writer_phase2) = opener.await.expect("opener task");
         assert_eq!(writer_phase1, payloads_phase1);
         assert_eq!(writer_phase2, phase2_expected);
+    }
+
+    /// M-9/M-10: a QUIC `RESET_STREAM` (which quinn surfaces as
+    /// `io::ErrorKind::ConnectionReset`) is a mid-transfer TRUNCATION and MUST
+    /// surface as an error that `LegReader::is_clean_close` rejects — never be
+    /// swallowed as a clean EOF. The TCP leg keeps its conventional
+    /// RST-as-clean-half-close behavior (probe-resistance), proving the override
+    /// is QUIC-scoped; a clean QUIC finish (`UnexpectedEof`) stays clean too.
+    #[tokio::test]
+    async fn quic_leg_reset_stream_is_truncation_not_clean_close() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        // Gate the reset on the reader having consumed the one good record, so the
+        // record is delivered before the abort (deterministic, no data race).
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+        let opener = tokio::spawn(async move {
+            let (send, _recv) = client_conn.open_bi().await.expect("open_bi");
+            let mut writer = QuicStreamLegWriter(send);
+            let mut seal = data_codec();
+            let mut rng = StdRng::seed_from_u64(0x4E5E7);
+            let good = seal.seal(b"first-and-only-record", &mut rng).unwrap();
+            writer.write_records(&good).await.unwrap();
+            let _ = proceed_rx.await;
+            // Abort mid-transfer with RESET_STREAM instead of a clean finish.
+            writer
+                .0
+                .reset(quinn::VarInt::from_u32(0))
+                .expect("reset stream");
+            // Keep the connection (not just the stream) alive so the reader
+            // observes a stream RESET, not a connection close.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            client_conn
+        });
+
+        let (server_send, server_recv) = server_conn.accept_bi().await.expect("accept_bi");
+        let _server_send = server_send;
+        let mut reader = QuicStreamLegReader::buffered(server_recv);
+        let mut open = data_codec();
+        let mut buf = Vec::new();
+
+        // The one good record arrives intact.
+        reader
+            .read_record_into(&mut buf)
+            .await
+            .expect("first record");
+        assert_eq!(open.open(&buf).unwrap(), b"first-and-only-record");
+
+        // Now let the opener RESET_STREAM, and observe the truncation.
+        let _ = proceed_tx.send(());
+        let err = reader
+            .read_record_into(&mut buf)
+            .await
+            .expect_err("RESET_STREAM must surface as an error, not a clean EOF");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::ConnectionReset,
+            "quinn maps RESET_STREAM to ConnectionReset",
+        );
+        assert!(
+            !reader.is_clean_close(&err),
+            "the QUIC leg must NOT treat a RESET_STREAM as a clean close (would silently truncate)",
+        );
+        // No over-correction: a genuine clean finish stays clean on the QUIC leg.
+        assert!(reader.is_clean_close(&io::Error::from(io::ErrorKind::UnexpectedEof)));
+
+        // The TCP leg is unchanged: a RST is still a conventional clean half-close.
+        let tcp = TcpLegReader::buffered(tokio::io::duplex(64).0);
+        assert!(
+            tcp.is_clean_close(&io::Error::from(io::ErrorKind::ConnectionReset)),
+            "TCP leg must keep treating ConnectionReset as a clean half-close",
+        );
+
+        let _ = opener.await;
     }
 }

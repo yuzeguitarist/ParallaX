@@ -18,7 +18,16 @@ Application ──SOCKS5──► plx client ──TLS 1.3 / Safari-like ClientH
 
 The codebase also carries a source-level GFW simulator and censorship research
 notes. Those are validation and research assets, not a second production
-transport. There is no shipped `--quic` product mode on current `main`.
+transport.
+
+There is no `--quic` CLI flag, but an **experimental** UDP/QUIC fast plane (the
+"U" in TUDP) *is* wired into the client and server runtimes: setting
+`[udp].enabled = true` on **both** ends activates a masquerading-h3 QUIC carrier
+for the single-Connect data relay, authenticated by an exporter-bound probe token
+(the QUIC leg treats its server certificate as camouflage, not the trust anchor).
+It is **off by default**; while disabled, every path stays byte-identical on TCP.
+The QUIC handshake is not yet Safari-fingerprint-shaped, so enabling it is for
+experimentation, not censorship-resistant production use.
 
 ---
 
@@ -334,7 +343,7 @@ Useful searches:
 |---|---|---|
 | Source file to documentation owner | `source-to-document ownership`, `doc-id`, a path like `src/handshake/server.rs` | [Documentation Metadata & Search Graph](./ParallaX-DeepWiki/Documentation-Metadata-Search-Graph.md) |
 | Operator rollout | `plx init`, `plx probe`, `deploy-vps`, `systemd`, `BBR` | [Getting Started & CLI Reference](./ParallaX-DeepWiki/Getting-Started-&-CLI-Reference.md), [Deployment](./ParallaX-DeepWiki/Deployment.md) |
-| Current product boundary | `product path`, `TCP/TLS`, `no --quic`, `research-only` | [ParallaX Overview](./ParallaX-DeepWiki/ParallaX-Overview.md), [Transport Layer](./ParallaX-DeepWiki/Transport-Layer.md) |
+| Current product boundary | `product path`, `TCP/TLS`, `experimental [udp].enabled QUIC`, `off by default` | [ParallaX Overview](./ParallaX-DeepWiki/ParallaX-Overview.md), [Transport Layer](./ParallaX-DeepWiki/Transport-Layer.md) |
 | Validation evidence | `plx speed`, `plx bench`, `gfw_simulator`, `runtime guard` | [Probing & Benchmarking](<./ParallaX-DeepWiki/Probing-&-Benchmarking.md>) |
 
 The source-level censorship research model lives under `tests/gfw_sim/` and is

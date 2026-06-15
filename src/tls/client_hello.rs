@@ -340,6 +340,47 @@ pub mod tests {
         out.extend_from_slice(data);
     }
 
+    /// A TLS 1.3 ClientHello fixture with NO key_share extension, so the server's
+    /// inbound decision takes the no-X25519-key_share branch (M-2 shape B). Used to
+    /// assert the rejection path's DH count is input-independent.
+    pub fn client_hello_fixture_no_key_share(sni: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0x22; 32]); // client_random
+        body.push(32);
+        body.extend_from_slice(&[0_u8; 32]); // SessionID placeholder
+        body.extend_from_slice(&2_u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.push(1);
+        body.push(0);
+
+        let mut extensions = Vec::new();
+        let host = sni.as_bytes();
+        let mut sni_data = Vec::new();
+        sni_data.extend_from_slice(&((1 + 2 + host.len()) as u16).to_be_bytes());
+        sni_data.push(0);
+        sni_data.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        sni_data.extend_from_slice(host);
+        extension(&mut extensions, EXT_SERVER_NAME, &sni_data);
+        extension(&mut extensions, EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]);
+        // Deliberately NO key_share extension.
+
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = Vec::new();
+        handshake.push(HANDSHAKE_CLIENT_HELLO);
+        push_u24(&mut handshake, body.len() as u32);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(TLS_CONTENT_HANDSHAKE);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
     fn push_u24(out: &mut Vec<u8>, value: u32) {
         out.push(((value >> 16) & 0xff) as u8);
         out.push(((value >> 8) & 0xff) as u8);

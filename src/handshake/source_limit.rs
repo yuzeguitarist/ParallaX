@@ -34,6 +34,17 @@ const SOURCE_IDLE_GRACE: Duration = Duration::from_secs(120);
 const MIN_SOURCE_MAP_ENTRIES: usize = 4096;
 /// Max idle-log entries inspected per admission so the accept path stays cheap.
 const PRUNE_BUDGET: usize = 64;
+/// IPv6 aggregation prefix. A single routed allocation (commonly a /48 or /56 to
+/// one customer/VPS tenant) contains thousands of /64s, so the per-/64 cap alone
+/// lets one administrative entity rotate /64s to bypass it entirely. A coarser
+/// /48 rollup ceiling bounds the total one prefix-holder can hold across all its
+/// /64 buckets. Capped at the configured per-source prefix, so a coarser
+/// `v6_prefix_len` (e.g. /32) makes the rollup a no-op rather than finer-grained.
+const AGG_V6_PREFIX_LEN: u8 = 48;
+/// The /48 aggregate ceiling is `cap_v6 * AGG_V6_FANOUT`: one /48 may hold a
+/// small multiple of a single /64's cap (so a handful of legitimate /64s in one
+/// org still connect), but not unbounded /64 rotation.
+const AGG_V6_FANOUT: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum SourceKey {
@@ -56,6 +67,11 @@ struct Inner {
     /// `(key, time-it-went-idle)`. A key may appear several times; stale records
     /// are skipped on prune by comparing against the live `idle_since`.
     idle_log: VecDeque<(SourceKey, Instant)>,
+    /// Active-connection count per IPv6 /48 aggregate (summed across all its /64
+    /// buckets), to cap /64 rotation within one routed prefix. Self-cleaning: a
+    /// key is removed when its count returns to zero, so this map stays bounded by
+    /// the number of /48s with a live connection (<= the global connection limit).
+    agg_v6: HashMap<[u8; 16], u32>,
 }
 
 /// Caps concurrent connections per source. Cheap to clone via `Arc`.
@@ -95,6 +111,17 @@ impl Drop for SourcePermit {
             }
             None => false,
         };
+        // Decrement the IPv6 /48 aggregate for this connection (every permit drop
+        // = one fewer active connection in the prefix); self-clean the key when it
+        // reaches zero so the aggregate map stays bounded.
+        if let Some(agg_key) = self.limiter.agg_key_for(&self.key) {
+            if let Some(count) = inner.agg_v6.get_mut(&agg_key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    inner.agg_v6.remove(&agg_key);
+                }
+            }
+        }
         if became_idle {
             inner.idle_log.push_back((self.key, now));
             // Hard-bound the idle log. The grace-based prune in `try_admit` only
@@ -152,6 +179,7 @@ impl SourceLimiter {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
                 idle_log: VecDeque::new(),
+                agg_v6: HashMap::new(),
             }),
             cap_v4,
             cap_v6,
@@ -166,11 +194,20 @@ impl SourceLimiter {
     pub fn try_admit(self: Arc<Self>, ip: IpAddr) -> Option<SourcePermit> {
         let key = self.key_for(ip);
         let cap = self.cap_for(&key);
+        let agg_key = self.agg_key_for(&key);
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.prune_locked(&mut inner);
+        // IPv6 /48 aggregate ceiling, checked read-only BEFORE the per-/64 cap so
+        // a rejection never half-admits (no map entry created, no counts bumped).
+        if let Some(agg_key) = agg_key {
+            let agg_cap = self.cap_v6.saturating_mul(AGG_V6_FANOUT);
+            if inner.agg_v6.get(&agg_key).copied().unwrap_or(0) >= agg_cap {
+                return None;
+            }
+        }
         let entry = inner.map.entry(key).or_insert(Entry {
             active: 0,
             idle_since: None,
@@ -180,6 +217,9 @@ impl SourceLimiter {
         }
         entry.active += 1;
         entry.idle_since = None;
+        if let Some(agg_key) = agg_key {
+            *inner.agg_v6.entry(agg_key).or_insert(0) += 1;
+        }
         drop(inner);
         Some(SourcePermit { limiter: self, key })
     }
@@ -198,6 +238,21 @@ impl SourceLimiter {
         match key {
             SourceKey::V4(_) => self.cap_v4,
             SourceKey::V6(_) => self.cap_v6,
+        }
+    }
+
+    /// The IPv6 /48 aggregate key for a source key (None for V4). Re-masks the
+    /// already-/64-masked V6 key down to the aggregate prefix; the prefix is
+    /// capped at the configured per-source `v6_prefix_len` so a coarser config
+    /// (e.g. /32) makes the rollup a no-op rather than finer-grained than the
+    /// per-source key.
+    fn agg_key_for(&self, key: &SourceKey) -> Option<[u8; 16]> {
+        match key {
+            SourceKey::V6(bytes) => {
+                let prefix = AGG_V6_PREFIX_LEN.min(self.v6_prefix_len);
+                Some(masked_v6(Ipv6Addr::from(*bytes), prefix))
+            }
+            SourceKey::V4(_) => None,
         }
     }
 
@@ -234,6 +289,15 @@ impl SourceLimiter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .idle_log
+            .len()
+    }
+
+    #[cfg(test)]
+    fn agg_entry_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .agg_v6
             .len()
     }
 }
@@ -376,6 +440,101 @@ mod tests {
             limiter.idle_log_len() <= 64,
             "idle_log must stay bounded by max_entries, got {}",
             limiter.idle_log_len()
+        );
+    }
+
+    #[test]
+    fn v6_aggregate_cap_blocks_64_rotation_within_one_48() {
+        // cap_v6=2, aggregate = cap_v6 * AGG_V6_FANOUT = 8. Rotating /64s within
+        // ONE /48 can hold at most 8 total, not unbounded — the /64-rotation
+        // bypass the per-/64 cap alone allowed (M-5).
+        let limiter = SourceLimiter::with_params(4, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        let mut permits: Vec<SourcePermit> = (0..8u16)
+            .map(|i| {
+                // Vary hextet 3 (the /64 id) within the same /48 (hextets 0..3).
+                let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, i, 0, 0, 0, 1));
+                Arc::clone(&limiter)
+                    .try_admit(ip)
+                    .expect("each /64 within the aggregate cap must admit")
+            })
+            .collect();
+        // A 9th, empty /64 in the SAME /48 is rejected by the aggregate ceiling.
+        let ninth = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x99, 0, 0, 0, 1));
+        assert!(
+            Arc::clone(&limiter).try_admit(ninth).is_none(),
+            "/64 rotation within one /48 must be capped by the aggregate ceiling",
+        );
+        // A /64 in a DIFFERENT /48 is a separate aggregate and still admits.
+        let other_48 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xbeef, 0, 0, 0, 0, 1));
+        assert!(
+            Arc::clone(&limiter).try_admit(other_48).is_some(),
+            "a different /48 is a separate aggregate",
+        );
+        permits.clear();
+    }
+
+    #[test]
+    fn v6_per_64_cap_still_enforced_under_aggregate() {
+        // Within ONE /64 the per-/64 cap (2) binds before the aggregate (8).
+        let limiter = SourceLimiter::with_params(4, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x1, 0, 0, 0, 1));
+        let _a = Arc::clone(&limiter).try_admit(ip);
+        let _b = Arc::clone(&limiter).try_admit(ip);
+        assert!(_a.is_some() && _b.is_some());
+        assert!(
+            Arc::clone(&limiter).try_admit(ip).is_none(),
+            "per-/64 cap must still bind within a single /64",
+        );
+    }
+
+    #[test]
+    fn v6_aggregate_releases_and_self_cleans_on_drop() {
+        let limiter = SourceLimiter::with_params(4, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        let mut permits: Vec<SourcePermit> = (0..8u16)
+            .map(|i| {
+                let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, i, 0, 0, 0, 1));
+                Arc::clone(&limiter)
+                    .try_admit(ip)
+                    .expect("within aggregate")
+            })
+            .collect();
+        let ninth = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x99, 0, 0, 0, 1));
+        assert!(
+            Arc::clone(&limiter).try_admit(ninth).is_none(),
+            "aggregate full",
+        );
+        // Free one aggregate slot; a new /64 in the same /48 now admits.
+        let _ = permits.pop();
+        let reused = Arc::clone(&limiter).try_admit(ninth);
+        assert!(
+            reused.is_some(),
+            "freeing an aggregate slot must re-admit within the /48",
+        );
+        // Drop all permits; the /48 aggregate entry self-cleans to zero.
+        drop(permits);
+        drop(reused);
+        assert_eq!(
+            limiter.agg_entry_count(),
+            0,
+            "aggregate map must self-clean to zero when no connection is active",
+        );
+    }
+
+    #[test]
+    fn v4_admission_unaffected_by_aggregate() {
+        let limiter = SourceLimiter::with_params(1, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        // Many distinct V4 sources admit freely; no IPv6 aggregate applies to them.
+        let _permits: Vec<SourcePermit> = (0..50u8)
+            .map(|i| {
+                Arc::clone(&limiter)
+                    .try_admit(v4(203, 0, 113, i))
+                    .expect("v4 admit")
+            })
+            .collect();
+        assert_eq!(
+            limiter.agg_entry_count(),
+            0,
+            "v4 admissions must not populate the IPv6 aggregate map",
         );
     }
 

@@ -4,7 +4,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
@@ -111,10 +111,56 @@ const FIRST_RECORD_WAIT_JITTER: Duration = Duration::from_secs(7);
 /// itself is a deliberate fixed backstop -- a 5x raise from the prior 120s that
 /// trades a longer fd hold on silent probes for fewer ParallaX-originated closes.
 const FALLBACK_IDLE_TIMEOUT_FLOOR: Duration = Duration::from_secs(600);
-/// No jitter on the idle backstop: see [`FALLBACK_IDLE_TIMEOUT_FLOOR`]. Kept as
-/// a named constant so the helper plumbing and tests stay uniform with the
-/// first-record path; `jittered_timeout` returns the bare floor when this is 0.
-const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(0);
+/// Upward jitter on the idle backstop (M-3). In the all-silent corner case (the
+/// origin never closes first, so ParallaX is the side that originates the close),
+/// a fixed, round ~600.000s close is a synthetic signature no real origin
+/// produces and is observable by a single long-lived silent probe. Jittering the
+/// backstop into [600s, 660s] per connection removes that fixed tell;
+/// `jittered_timeout` adds a uniform [0, jitter] grace over the floor.
+const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(60);
+
+/// Bounds concurrent cap-shed fallback relays (H-1). When the per-source or global
+/// connection cap rejects a connection we must still look like the origin (relay
+/// its ServerHello) rather than emit a bare ServerHello-less FIN, which a prober
+/// could use to count our cap. But a cap-rejected connection that opened a full
+/// 600s relay would turn the cap into an origin-DoS amplifier, so cap-shed relays
+/// draw from this small SEPARATE budget (the main slots are already exhausted) and
+/// use a tight idle bound. 64 userspace relays ~= 128 fds: a fixed reservation
+/// that cannot itself exhaust fds. Past the budget we degrade to a graceful FIN —
+/// a casual prober always lands inside it; only a genuine flood sees FINs, which a
+/// real origin under flood also produces.
+const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
+/// Idle bound for cap-shed fallback relays (H-1). These exist only to return the
+/// origin ServerHello to a prober, not to serve a session, so they use a tight
+/// bound instead of FALLBACK_IDLE_TIMEOUT_FLOOR (600s); this recycles the small
+/// budget in seconds even under slow/idle attackers.
+const CAP_SHED_FALLBACK_IDLE: Duration = Duration::from_secs(10);
+/// Small upward jitter on the cap-shed idle so a saturated-cap prober does not see
+/// a fixed, round 10.000s close on the cap-shed relay (the same fixed-constant tell
+/// M-3 removed from the main idle backstop). Kept tiny to preserve the tight
+/// anti-DoS-amplification bound.
+const CAP_SHED_FALLBACK_IDLE_JITTER: Duration = Duration::from_secs(2);
+
+static ACTIVE_CAP_SHED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII slot for a cap-shed fallback relay; releases the budget on drop.
+struct CapShedFallbackSlot(());
+impl Drop for CapShedFallbackSlot {
+    fn drop(&mut self) {
+        ACTIVE_CAP_SHED_FALLBACKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Takes a cap-shed fallback slot if the budget allows, else `None`.
+fn try_enter_cap_shed_fallback() -> Option<CapShedFallbackSlot> {
+    let prev = ACTIVE_CAP_SHED_FALLBACKS.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_CONCURRENT_CAP_SHED_FALLBACKS {
+        ACTIVE_CAP_SHED_FALLBACKS.fetch_sub(1, Ordering::AcqRel);
+        None
+    } else {
+        Some(CapShedFallbackSlot(()))
+    }
+}
 const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
 const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
@@ -161,6 +207,12 @@ static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 /// compiled in release.
 #[cfg(test)]
 static RETAINED_QUIC_CONN_FOR_TEST: Mutex<Option<quinn::Connection>> = Mutex::new(None);
+
+/// Test-only counter of X25519 DH ops performed on the inbound-decision path, used
+/// to assert the rejection path's DH count is input-independent (M-2). Not
+/// compiled in release.
+#[cfg(test)]
+static REJECT_DH_OPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Test accessor for [`RETAINED_QUIC_CONN_FOR_TEST`] so the mid-relay reset e2e
 /// (in the client runtime test module) can grab and kill the server's retained
@@ -369,9 +421,16 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
             None => {
                 tracing::warn!(
                     %peer,
-                    "per-source connection limit reached; closing accepted socket"
+                    "per-source connection limit reached; cap-shedding to origin"
                 );
-                tokio::spawn(graceful_close_tcp_stream(client));
+                // Relay to the camouflage origin (H-1) so a prober still sees the
+                // origin ServerHello and cannot count our cap by the missing one;
+                // bounded budget + tight idle, degrading to a graceful FIN past the
+                // budget. Detached so a flood at the cap cannot stall the loop.
+                tokio::spawn(cap_shed_fallback_or_fin(
+                    client,
+                    server.fallback_addr.clone(),
+                ));
                 continue;
             }
         };
@@ -381,14 +440,17 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 tracing::warn!(
                     %peer,
                     connection_limit,
-                    "server connection limit reached; closing accepted socket"
+                    "server connection limit reached; cap-shedding to origin"
                 );
-                // FIN, don't bare-drop: the client's ClientHello is already
-                // queued in the recv buffer, so dropping the socket would emit a
-                // RST -- the observable tell every other close path here avoids.
-                // Detached so a connection flood at the limit cannot stall the
-                // accept loop on the drain+shutdown.
-                tokio::spawn(graceful_close_tcp_stream(client));
+                // Relay to the camouflage origin (H-1) so a prober still sees the
+                // origin ServerHello and cannot count our cap by the missing one.
+                // Bounded budget + tight idle (cap_shed_fallback_or_fin), degrading
+                // to a graceful FIN past the budget. Detached so a connection flood
+                // at the limit cannot stall the accept loop.
+                tokio::spawn(cap_shed_fallback_or_fin(
+                    client,
+                    server.fallback_addr.clone(),
+                ));
                 continue;
             }
             Err(TryAcquireError::Closed) => {
@@ -623,24 +685,39 @@ fn decide_connection_inbound(
     if !parsed.tls13_supported {
         return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
     }
-    // v4 masked-stateful path. The carrier masks are keyed by
-    // mask_ecdh = X25519(server_static, tls_ephemeral); the TLS ephemeral is the
-    // unmasked standalone X25519 key_share. A non-ParallaX hello without that
-    // share cannot be a v4 ParallaX client, so fall through to the legacy path
-    // (which ends in Fallback for genuine non-ParallaX traffic). NB: this DH is
-    // distinct from the auth DH below — mask uses the TLS key share, auth uses
-    // the recovered ParallaX ephemeral.
-    if let Some(tls_key_share) = parsed.x25519_key_share {
-        let mask_ecdh =
-            zeroize::Zeroizing::new(x25519_shared_secret(server_private, &tls_key_share));
+    // Constant-time-by-op-count DH (M-2): the auth-failing path must perform a
+    // FIXED number of X25519 ops regardless of ClientHello shape, else an off-path
+    // observer reads the per-DH latency step (no key_share=1, recover-None=2,
+    // auth-fail=3) as a distinguisher. Route every DH through this closure and pad
+    // with discarded ballast so EVERY path runs exactly 3 ops; ballast results are
+    // Zeroizing to match the real-DH zeroize discipline. Auth semantics unchanged.
+    let dh = |peer: &[u8; 32]| -> zeroize::Zeroizing<[u8; 32]> {
+        #[cfg(test)]
+        REJECT_DH_OPS.fetch_add(1, Ordering::Relaxed);
+        zeroize::Zeroizing::new(x25519_shared_secret(server_private, peer))
+    };
+
+    // v4 masked-stateful path. mask_ecdh = X25519(server_static, tls_ephemeral)
+    // (the unmasked standalone key_share); distinct from the auth DH below (the
+    // recovered ParallaX ephemeral). The mask-slot DH ALWAYS runs once — a real
+    // point when a key_share is present, else discarded ballast — so a hello with
+    // no key_share is not one DH cheaper than one with it.
+    let mask_ecdh = match parsed.x25519_key_share {
+        Some(tls_key_share) => Some(dh(&tls_key_share)),
+        None => {
+            let _ = dh(&parsed.client_random);
+            None
+        }
+    };
+    if let Some(mask_ecdh) = mask_ecdh.as_deref() {
         if let Some(material) = recover_stateful_auth_material_from_parsed(
             first_client_record,
             psk,
-            &mask_ecdh,
+            mask_ecdh,
             &parsed,
         )? {
             let x25519_key_share = material.x25519_public;
-            let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
+            let x25519_shared_secret = *dh(&x25519_key_share);
             let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
             let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
                 first_client_record,
@@ -661,11 +738,16 @@ fn decide_connection_inbound(
                     x25519_shared_secret,
                 );
             }
+            // v4 decoded but auth failed -> fall through to the legacy check below.
+        } else {
+            let _ = dh(&parsed.client_random); // ballast: v4 auth-slot, recover==None
         }
+    } else {
+        let _ = dh(&parsed.client_random); // ballast: v4 auth-slot, no key_share
     }
 
     let x25519_key_share = parsed.client_random;
-    let x25519_shared_secret = x25519_shared_secret(server_private, &x25519_key_share);
+    let x25519_shared_secret = *dh(&x25519_key_share);
     let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
     let auth =
         match verify_client_hello_auth_with_parsed(first_client_record, &auth_key, None, parsed) {
@@ -810,6 +892,31 @@ async fn graceful_close_tcp_stream(stream: TcpStream) {
     let (read_half, mut write_half) = stream.into_split();
     drain_read_half_to_block(&read_half);
     let _ = write_half.shutdown().await;
+}
+
+/// Cap-rejection close that stays indistinguishable from the origin (H-1): relay
+/// to the camouflage origin so the client still gets a real ServerHello, under a
+/// small bounded budget + tight idle bound; if the budget is full or the origin
+/// dial fails, fall back to a graceful FIN (the prior behavior). We never read the
+/// ClientHello at admission time, so the prefix is empty — the client's own
+/// ClientHello then splices straight through to the origin.
+async fn cap_shed_fallback_or_fin(client: TcpStream, fallback_addr: String) {
+    let Some(_slot) = try_enter_cap_shed_fallback() else {
+        graceful_close_tcp_stream(client).await;
+        return;
+    };
+    match connect_and_forward_to_fallback(&fallback_addr, &[]).await {
+        Ok(fallback) => {
+            let _ = relay_fallback_with_idle_timeout(
+                client,
+                fallback,
+                jittered_timeout(CAP_SHED_FALLBACK_IDLE, CAP_SHED_FALLBACK_IDLE_JITTER),
+            )
+            .await;
+        }
+        Err(_) => graceful_close_tcp_stream(client).await,
+    }
+    // `_slot` drops here, releasing the cap-shed budget.
 }
 
 async fn relay_fallback_with_idle_timeout(
@@ -1224,6 +1331,22 @@ async fn run_authenticated_data_mode(
                         let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
                         if !commit_pending_replay_entry(&mut pending_replay).await? {
                             tracing::warn!(cid, "closing on replayed ClientHello after data proof");
+                            // Graceful drain->FIN instead of a bare drop (M-1). At
+                            // this point the fallback origin's read half (and any
+                            // client RX buffered in the record reader) may hold
+                            // unread bytes, so dropping the sockets would make
+                            // close() emit a RST -- the FIN/RST tell every other
+                            // teardown here avoids. Mirrors the pre-PQ-deadline
+                            // teardown above; covers Replayed/Stale/CacheFull.
+                            let client_read = client_records.into_inner().into_inner();
+                            let fallback_read = fallback_records.into_inner().into_inner();
+                            graceful_close_fallback_halves(
+                                &client_read,
+                                &mut client_write,
+                                &fallback_read,
+                                &mut fallback_write,
+                            )
+                            .await;
                             return Ok(());
                         }
                         let server_ephemeral = X25519KeyPair::generate();
@@ -1374,12 +1497,10 @@ async fn run_authenticated_data_mode(
                             &client_record[first_payload_range.clone()],
                         ) {
                             use crate::protocol::command::{
-                                UdpDecline, UdpOffer, UdpProbeAck, UdpProbeStatus, UDP_CC_BBR,
+                                UdpDecline, UdpOffer, UdpProbeAck, UDP_CC_BBR,
                                 UDP_DECLINE_DISABLED, UDP_FEC_ADAPTIVE,
                             };
-                            use crate::transport::udp::{
-                                endpoint::bind_server_endpoint, probe::serve_probe,
-                            };
+                            use crate::transport::udp::endpoint::bind_server_endpoint;
 
                             let offered = if udp.enabled {
                                 // Bind the probe endpoint on the same interface and
@@ -1465,20 +1586,27 @@ async fn run_authenticated_data_mode(
                                 // connection must stay alive past the probe
                                 // regardless; here we additionally keep it for the
                                 // data path when the client confirms Verified.
-                                let probed_conn: Option<quinn::Connection> =
-                                    tokio::time::timeout(probe_budget, async {
-                                        let incoming = udp_ep.accept().await?;
-                                        let conn = incoming.await.ok()?;
-                                        if let Err(err) =
-                                            serve_probe(&conn, sandwich_secret, &offer_id).await
-                                        {
-                                            tracing::debug!(cid, error = %err, "udp serve_probe failed");
-                                        }
-                                        Some(conn)
-                                    })
-                                    .await
-                                    .ok()
-                                    .flatten();
+                                // Accept the probe QUIC connection ONLY from the
+                                // authenticated TCP peer's source IP (L-6): the
+                                // ephemeral endpoint is reachable by anyone who
+                                // learns the port, so a racing/off-path connector
+                                // could otherwise steal the single accept slot and
+                                // force a TCP downgrade. peer_addr() reads it off
+                                // the live socket; None fails open to accept-any.
+                                let expect_ip = client_write.peer_addr().ok().map(|a| a.ip());
+                                let probed_conn: Option<quinn::Connection> = tokio::time::timeout(
+                                    probe_budget,
+                                    accept_probed_quic_from_peer(
+                                        &udp_ep,
+                                        expect_ip,
+                                        sandwich_secret,
+                                        &offer_id,
+                                        cid,
+                                    ),
+                                )
+                                .await
+                                .ok()
+                                .flatten();
 
                                 client_record.clear();
                                 // BOUNDED read: we are holding the ephemeral QUIC
@@ -1551,8 +1679,10 @@ async fn run_authenticated_data_mode(
                                 // was Verified, and the server retains iff the ack
                                 // says Verified. Any other outcome -> drop the conn
                                 // and close the endpoint, staying on TCP.
-                                match (ack_status, probed_conn) {
-                                    (Some(UdpProbeStatus::Verified), Some(conn)) => {
+                                match udp_retention_decision(ack_status, probed_conn.is_some()) {
+                                    UdpRetentionDecision::Retain => {
+                                        let conn = probed_conn
+                                            .expect("Retain implies a retained connection");
                                         tracing::info!(
                                             cid,
                                             "retaining QUIC fast-plane connection for data relay"
@@ -1566,10 +1696,30 @@ async fn run_authenticated_data_mode(
                                         }
                                         retained_quic = Some((udp_ep, conn));
                                     }
-                                    (_, _maybe_conn) => {
-                                        // Drop any accepted connection and close the
-                                        // endpoint exactly as before the retain path
-                                        // existed.
+                                    UdpRetentionDecision::HardFail => {
+                                        // Verified ack but we no longer hold the
+                                        // probed connection (the probe budget elapsed
+                                        // after serve_probe queued its echo). The
+                                        // client has committed its relay to QUIC and
+                                        // will reset, so close the endpoint and fail
+                                        // identically instead of silently diverging
+                                        // onto TCP. Same close-then-Err shape as the
+                                        // PX1P-ack / real-command timeouts. (L-7)
+                                        tracing::warn!(
+                                            cid,
+                                            "Verified PX1P ack but server lost the probed QUIC \
+                                             connection; resetting to stay aligned with the client"
+                                        );
+                                        udp_ep.close(0u32.into(), b"px1p-verified-no-conn");
+                                        return Err(HandshakeServerError::Io(io::Error::new(
+                                            io::ErrorKind::ConnectionAborted,
+                                            "Verified PX1P ack with no retained QUIC connection",
+                                        )));
+                                    }
+                                    UdpRetentionDecision::StayOnTcp => {
+                                        // Not Verified: the client also stays on TCP.
+                                        // Drop any accepted connection (closing it) and
+                                        // close the endpoint, exactly as before.
                                         udp_ep.close(0u32.into(), b"done");
                                     }
                                 }
@@ -1656,6 +1806,7 @@ async fn run_authenticated_data_mode(
                                     max_streams: (traffic.max_concurrent_streams as usize)
                                         .min(SERVER_MUX_MAX_STREAMS),
                                     cid,
+                                    target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
                                 },
                             )
                             .await;
@@ -2097,6 +2248,75 @@ struct DataRelay {
     cid: u64,
 }
 
+/// Cross-side carrier decision at the PX1P retention gate (L-7). Both ends gate
+/// the relay carrier on the SAME signal (the client's reported probe status), so
+/// the server's local view must agree. The one state that can DESYNC is a Verified
+/// ack with no retained connection: the client has already committed its relay to
+/// QUIC (and will hard-error if the stream never materializes), so the server must
+/// reset too rather than silently fall back to TCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpRetentionDecision {
+    /// Verified + we still hold the connection: carry the relay over QUIC.
+    Retain,
+    /// Verified but the probed connection was lost (probe budget elapsed after
+    /// serve_probe queued its echo): reset so both ends fail identically.
+    HardFail,
+    /// Not Verified: the client also stays on TCP. Drop the conn, close, continue.
+    StayOnTcp,
+}
+
+fn udp_retention_decision(
+    ack_status: Option<crate::protocol::command::UdpProbeStatus>,
+    have_probed_conn: bool,
+) -> UdpRetentionDecision {
+    use crate::protocol::command::UdpProbeStatus;
+    match (ack_status, have_probed_conn) {
+        (Some(UdpProbeStatus::Verified), true) => UdpRetentionDecision::Retain,
+        (Some(UdpProbeStatus::Verified), false) => UdpRetentionDecision::HardFail,
+        _ => UdpRetentionDecision::StayOnTcp,
+    }
+}
+
+/// Accept the QUIC connection for the fast-plane probe, but ONLY from the
+/// authenticated TCP peer's source IP (L-6). The ephemeral endpoint is reachable
+/// by anyone who learns the port, so a racing/off-path connector could otherwise
+/// steal the single accept slot and force a TCP downgrade. Connectors from a
+/// different source IP are `ignore()`d — dropped WITHOUT a response packet, so the
+/// "nothing here" probe-resistance posture is preserved (a `refuse()` would emit
+/// an observable CONNECTION_CLOSE). `serve_probe` still gates authenticity on the
+/// exporter-bound token, so a peer that spoofs the IP cannot pass; this only closes
+/// the free downgrade. `expect_ip == None` fails open to accept-any. The caller
+/// wraps this in the probe-budget timeout, which bounds the loop.
+async fn accept_probed_quic_from_peer(
+    udp_ep: &quinn::Endpoint,
+    expect_ip: Option<std::net::IpAddr>,
+    sandwich_secret: &[u8],
+    offer_id: &[u8; 16],
+    cid: u64,
+) -> Option<quinn::Connection> {
+    loop {
+        let incoming = udp_ep.accept().await?;
+        if let Some(ip) = expect_ip {
+            if incoming.remote_address().ip() != ip {
+                tracing::debug!(
+                    cid,
+                    src = %incoming.remote_address(),
+                    "ignoring fast-plane QUIC from non-authenticated source IP"
+                );
+                incoming.ignore();
+                continue;
+            }
+        }
+        let conn = incoming.await.ok()?;
+        if let Err(err) =
+            crate::transport::udp::probe::serve_probe(&conn, sandwich_secret, offer_id).await
+        {
+            tracing::debug!(cid, error = %err, "udp serve_probe failed");
+        }
+        return Some(conn);
+    }
+}
+
 /// Drops a retained QUIC endpoint + connection, application-closing the
 /// connection promptly so no idle fast-plane connection lingers when a dispatch
 /// path (Mux/SpeedTest) stays on TCP. A bare drop would also close it, but the
@@ -2133,6 +2353,17 @@ const QUIC_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// affected, so the udp-off baseline is byte-identical.
 const PX1_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on a single client->target mux write (H-3). The mux reader loop
+/// processes every substream's frames serially, so a wedged target — its kernel
+/// send buffer full because the peer advertises a zero receive window and never
+/// drains — blocking `write_all` would park the loop and pin the WHOLE
+/// connection: every other substream, all permits, every fd. A live target
+/// accepts one <=chunk_size (~16 KiB) frame far inside 30s, so this never trips a
+/// slow-but-draining peer; only a genuinely wedged stream is shed (with a Reset).
+/// Distinct from the 600s idle backstop, which bounds whole-relay SILENCE, not
+/// single-stream backpressure — using 600s here would still pin for ten minutes.
+const MUX_TARGET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Brief grace, applied AFTER the teardown DONE `select!` returns its
 /// `conn.closed()` sentinel, for the reliable TCP DONE to arrive. The peer sends
 /// its DONE over the TCP control stream and THEN closes the QUIC connection; the
@@ -2158,6 +2389,10 @@ struct ServerMuxContext<'a> {
     /// Server-enforced ceiling on concurrent substreams for this connection.
     max_streams: usize,
     cid: u64,
+    /// Per-write deadline on a client->target mux write (H-3): a wedged target
+    /// must not park the serial reader loop. Injectable so tests can use a short
+    /// value; production passes `MUX_TARGET_WRITE_TIMEOUT`.
+    target_write_timeout: Duration,
 }
 
 /// Tracks the live substreams of one authenticated mux connection.
@@ -2801,7 +3036,32 @@ async fn process_server_mux_frame(
                 connect_outbound_target(&target_addr, context.fixed_data_target.is_some()).await?;
             tune_tcp_stream(&target)?;
             if !initial_payload.is_empty() {
-                target.write_all(&initial_payload).await?;
+                // Bound the initial-payload write (H-3): a wedged target must not
+                // park the serial mux reader loop. Nothing is registered yet, so on
+                // stall just Reset the stream and drop `target` (both fds close).
+                match timeout(
+                    context.target_write_timeout,
+                    target.write_all(&initial_payload),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        tracing::debug!(
+                            cid = context.cid,
+                            stream_id = frame.stream_id,
+                            "mux target initial-payload write stalled; resetting stream"
+                        );
+                        send_server_mux_frame(
+                            frame_tx,
+                            frame.stream_id,
+                            MuxFrameKind::Reset,
+                            Vec::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
                 let mut initial_payload = initial_payload;
                 initial_payload.zeroize();
             }
@@ -2833,9 +3093,43 @@ async fn process_server_mux_frame(
             streams.readers.insert(frame.stream_id, handle);
         }
         MuxFrameKind::Data => {
-            if let Some(target_write) = streams.writes.get_mut(&frame.stream_id) {
-                if !frame.payload.is_empty() {
-                    target_write.write_all(frame.payload).await?;
+            if !frame.payload.is_empty() {
+                // Bound the target write (H-3) and shed ONLY this stream on stall,
+                // keeping the serial reader loop and every healthy substream alive.
+                // The get_mut borrow ends before we remove, so the outcome is owned.
+                let outcome = match streams.writes.get_mut(&frame.stream_id) {
+                    Some(target_write) => Some(
+                        timeout(
+                            context.target_write_timeout,
+                            target_write.write_all(frame.payload),
+                        )
+                        .await,
+                    ),
+                    None => None,
+                };
+                match outcome {
+                    Some(Ok(result)) => result?,
+                    Some(Err(_)) => {
+                        tracing::debug!(
+                            cid = context.cid,
+                            stream_id = frame.stream_id,
+                            "mux target write stalled; resetting stream"
+                        );
+                        if let Some(mut w) = streams.writes.remove(&frame.stream_id) {
+                            let _ = w.shutdown().await;
+                        }
+                        if let Some(h) = streams.readers.remove(&frame.stream_id) {
+                            h.abort();
+                        }
+                        send_server_mux_frame(
+                            frame_tx,
+                            frame.stream_id,
+                            MuxFrameKind::Reset,
+                            Vec::new(),
+                        )
+                        .await?;
+                    }
+                    None => {}
                 }
             }
         }
@@ -3249,6 +3543,7 @@ async fn run_authenticated_speed_test_mode(
         &payload,
         request.warmup_bytes,
         SpeedTestAck::warmup_download_done(request.warmup_bytes),
+        fallback_idle_timeout(),
     )
     .await?;
     read_speed_upload_phase(
@@ -3264,6 +3559,7 @@ async fn run_authenticated_speed_test_mode(
             &payload,
             request.download_bytes,
             SpeedTestAck::download_done(request.download_bytes),
+            fallback_idle_timeout(),
         )
         .await?;
     }
@@ -3295,6 +3591,7 @@ async fn write_speed_download_phase<R>(
     payload: &[u8],
     bytes: u64,
     ack: SpeedTestAck,
+    idle: Duration,
 ) -> Result<(), HandshakeServerError>
 where
     R: Rng + rand::RngCore + ?Sized,
@@ -3302,27 +3599,39 @@ where
     let mut remaining = bytes;
     while remaining > 0 {
         let len = remaining.min(payload.len() as u64) as usize;
-        write_server_data_records_chunked(
-            io.client_write,
-            io.server_seal,
-            &payload[..len],
-            io.rng,
-            io.scratch,
-            RelayWriteLog::new(io.cid, "server->client", "server-speed-download-writer"),
+        // Stall backstop (M-8): a client that advertises a zero receive window and
+        // stops draining would otherwise block this write forever, pinning the
+        // slot, both fds, and the per-source/global permits. Mirrors the upload
+        // phase's per-read idle timeout; reclaims the connection after `idle`.
+        timeout(
+            idle,
+            write_server_data_records_chunked(
+                io.client_write,
+                io.server_seal,
+                &payload[..len],
+                io.rng,
+                io.scratch,
+                RelayWriteLog::new(io.cid, "server->client", "server-speed-download-writer"),
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| HandshakeServerError::Timeout)??;
         remaining -= len as u64;
     }
     let ack = ack.encode();
-    write_server_data_records_chunked(
-        io.client_write,
-        io.server_seal,
-        &ack,
-        io.rng,
-        io.scratch,
-        RelayWriteLog::new(io.cid, "server->client", "server-speed-download-done"),
+    timeout(
+        idle,
+        write_server_data_records_chunked(
+            io.client_write,
+            io.server_seal,
+            &ack,
+            io.rng,
+            io.scratch,
+            RelayWriteLog::new(io.cid, "server->client", "server-speed-download-done"),
+        ),
     )
     .await
+    .map_err(|_| HandshakeServerError::Timeout)?
 }
 
 async fn read_speed_upload_phase<R>(
@@ -3398,7 +3707,7 @@ where
     loop {
         match client_records.read_record_into(&mut client_record).await {
             Ok(()) => {}
-            Err(err) if is_clean_close(&err) => {
+            Err(err) if client_records.is_clean_close(&err) => {
                 let _ = target_write.shutdown().await;
                 return Ok(client_open);
             }
@@ -3622,10 +3931,12 @@ fn log_outer_write(
     }
 }
 
-// TODO(review, data-slice-3a): treating io::ErrorKind::ConnectionReset as a
-// clean close is wrong for a QUIC RecvStream RESET_STREAM (which surfaces as
-// ConnectionReset), but it is unreachable in this slice -- no code resets a relay
-// stream. Revisit if a future slice can RESET a relay stream mid-transfer.
+// TCP-leg clean-close predicate: a peer FIN (`UnexpectedEof`), the proxy's
+// graceful-close RST convention (`ConnectionReset`), or `BrokenPipe`. Used by
+// the TCP-only fallback/relay/mux reader loops. The QUIC fast-plane legs do NOT
+// use this — they go through `LegReader::is_clean_close`, which (unlike TCP)
+// treats a `RESET_STREAM`-derived `ConnectionReset` as a truncation, not a clean
+// close. See `transport::leg`.
 fn is_clean_close(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -3667,7 +3978,8 @@ mod tests {
         protocol::command::{ConnectRequest, ConnectRequestError},
         tls::{
             client_hello::tests::{
-                client_hello_fixture_with_key_share, client_hello_fixture_with_random_and_key_share,
+                client_hello_fixture_no_key_share, client_hello_fixture_with_key_share,
+                client_hello_fixture_with_random_and_key_share,
             },
             server_hello::{parse_server_hello, tests::server_hello_fixture},
         },
@@ -4124,6 +4436,125 @@ mod tests {
         );
     }
 
+    /// M-2: the inbound-decision rejection path must perform an input-INDEPENDENT
+    /// number of X25519 DH ops, else the per-DH latency step (no key_share = 1 vs
+    /// auth-fail = 3, pre-fix) is a timing distinguisher. Ignored + serial: it reads
+    /// the process-global REJECT_DH_OPS counter that parallel decide_* tests perturb.
+    #[test]
+    #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
+    fn rejection_path_x25519_count_is_input_independent() {
+        fn dh_ops_for(record: &[u8], server_priv: &[u8; 32]) -> usize {
+            REJECT_DH_OPS.store(0, Ordering::Relaxed);
+            let _ =
+                decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
+            REJECT_DH_OPS.load(Ordering::Relaxed)
+        }
+        let server = X25519KeyPair::generate();
+
+        // Shape B: no x25519 key_share -> pre-fix only the legacy DH (1).
+        let no_ks = client_hello_fixture_no_key_share("example.com");
+        // Shape D: key_share present, recover==Some, masked auth fails -> pre-fix 3.
+        let mut auth_fail = client_hello_fixture_with_key_share("example.com", &[0x66; 32]);
+        let mut rng = StdRng::seed_from_u64(7);
+        sign_client_hello_session_id(&mut auth_fail, b"wrong-auth-key", &mut rng).unwrap();
+
+        let b = dh_ops_for(&no_ks, &server.private);
+        let d = dh_ops_for(&auth_fail, &server.private);
+        assert_eq!(
+            b, d,
+            "no-key_share vs auth-fail DH count differs (timing distinguisher)"
+        );
+        assert_eq!(
+            b, 3,
+            "rejection path must perform a constant 3 X25519 DH ops"
+        );
+    }
+
+    /// L-7: a Verified PX1P ack with no retained connection must map to HardFail
+    /// (reset), not silently stay on TCP, so the carrier choice cannot desync from
+    /// the client (which has already committed its relay to QUIC).
+    #[test]
+    fn udp_retention_decision_verified_without_conn_is_hard_fail() {
+        use crate::protocol::command::UdpProbeStatus;
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Verified), true),
+            UdpRetentionDecision::Retain
+        );
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Verified), false),
+            UdpRetentionDecision::HardFail,
+        );
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Unreachable), false),
+            UdpRetentionDecision::StayOnTcp
+        );
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Unreachable), true),
+            UdpRetentionDecision::StayOnTcp
+        );
+        assert_eq!(
+            udp_retention_decision(Some(UdpProbeStatus::Failed), true),
+            UdpRetentionDecision::StayOnTcp
+        );
+        assert_eq!(
+            udp_retention_decision(None, true),
+            UdpRetentionDecision::StayOnTcp
+        );
+        assert_eq!(
+            udp_retention_decision(None, false),
+            UdpRetentionDecision::StayOnTcp
+        );
+    }
+
+    /// L-6: the fast-plane probe endpoint must accept ONLY from the authenticated
+    /// peer's source IP — a connector from a different IP is ignore()d, so a racing
+    /// off-path connector cannot steal the single accept slot and force a TCP
+    /// downgrade. Ignored: loopback QUIC sockets.
+    #[tokio::test]
+    #[ignore = "requires loopback QUIC sockets"]
+    async fn accept_probed_quic_pins_to_authenticated_peer_ip() {
+        let server_ep = crate::transport::udp::endpoint::bind_server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            "localhost",
+        )
+        .expect("bind server endpoint");
+        let server_addr = server_ep.local_addr().unwrap();
+
+        // A loopback client connects (source IP 127.0.0.1).
+        let client_ep = crate::transport::udp::endpoint::bind_client_endpoint_accept_any(
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("bind client endpoint");
+        let connecting = tokio::spawn(async move {
+            if let Ok(c) = client_ep.connect(server_addr, "localhost") {
+                let _ = c.await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            client_ep // keep the endpoint alive for the test duration
+        });
+
+        // Expect a DIFFERENT source IP (TEST-NET-3) than the loopback connector, so
+        // the connector is ignored and NO connection is accepted within the budget.
+        let offer_id = [7_u8; 16];
+        let accepted = tokio::time::timeout(
+            Duration::from_millis(300),
+            accept_probed_quic_from_peer(
+                &server_ep,
+                Some("203.0.113.1".parse().unwrap()),
+                PSK,
+                &offer_id,
+                0,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(accepted, Err(_) | Ok(None)),
+            "a connector from a non-authenticated source IP must not be accepted",
+        );
+
+        connecting.abort();
+    }
+
     #[test]
     fn falls_back_on_unauthorized_sni() {
         let client = X25519KeyPair::generate();
@@ -4351,6 +4782,7 @@ mod tests {
             chunk_size: max_plaintext_len(traffic.max_padding),
             max_streams: 0,
             cid: 1,
+            target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
         };
         let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
         let payload_pool =
@@ -4378,6 +4810,147 @@ mod tests {
         let reset = frame_rx.try_recv().unwrap();
         assert_eq!(reset.stream_id, 7);
         assert_eq!(reset.kind, MuxFrameKind::Reset);
+    }
+
+    /// H-3: a wedged target (peer never reads) must not park the serial mux reader
+    /// loop on a single stream's write — only that stream is shed (Reset + close),
+    /// keeping the connection and every healthy substream alive. Uses an injected
+    /// short write deadline + an oversized payload that reliably blocks once the
+    /// socket buffers fill, so the test runs in real time.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_wedged_target_data_write_sheds_only_that_stream() {
+        let traffic = TrafficConfig::default();
+        let context = ServerMuxContext {
+            fixed_data_target: None,
+            timing: TimingProfile::from_config(traffic),
+            cover: CoverTrafficProfile::from_config(traffic),
+            chunk_size: max_plaintext_len(traffic.max_padding),
+            max_streams: 8,
+            cid: 1,
+            target_write_timeout: Duration::from_millis(100),
+        };
+        let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+        let payload_pool =
+            MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
+
+        // A target that accepts but never reads: writes to it wedge once buffers fill.
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let acceptor = tokio::spawn(async move {
+            let (s, _) = target_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(s);
+        });
+        let target = TcpStream::connect(target_addr).await.unwrap();
+        let (_target_read, target_write) = target.into_split();
+
+        let mut streams = ServerMuxStreams::new();
+        streams.writes.insert(9, target_write);
+        // A live reader handle so the shed path's abort+remove is exercised.
+        streams
+            .readers
+            .insert(9, tokio::spawn(std::future::pending::<()>()));
+
+        // Oversized payload guarantees write_all blocks (exceeds any socket buffer).
+        let big = vec![0_u8; 4 * 1024 * 1024];
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_server_mux_frame(
+                MuxFrameRef {
+                    stream_id: 9,
+                    kind: MuxFrameKind::Data,
+                    payload: &big,
+                },
+                &mut streams,
+                &frame_tx,
+                context,
+                &payload_pool,
+            ),
+        )
+        .await
+        .expect("process_server_mux_frame must return within the wall budget");
+        result.expect("shedding a wedged stream must not error the connection");
+
+        // Only stream 9 is shed; the connection (and any other stream) survives.
+        assert!(
+            !streams.writes.contains_key(&9),
+            "wedged stream's write half removed"
+        );
+        assert!(
+            !streams.readers.contains_key(&9),
+            "wedged stream's reader aborted"
+        );
+        let reset = frame_rx.try_recv().unwrap();
+        assert_eq!(reset.stream_id, 9);
+        assert_eq!(reset.kind, MuxFrameKind::Reset);
+
+        acceptor.abort();
+    }
+
+    /// M-8: the speed-test DOWNLOAD phase must reclaim a zero-window stall as a
+    /// Timeout (the upload phase already did). A client that connects and never
+    /// reads drives the server's receive window to zero; once the send buffer
+    /// fills, the write would block forever without the per-write idle backstop.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn speed_download_phase_idle_timeout_reclaims_zero_window_stall() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Client connects and NEVER reads.
+        let client = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(stream);
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let (read_half, write_half) = server_stream.into_split();
+        let mut client_records = TlsRecordReader::buffered(read_half);
+        let mut client_write = TcpLegWriter(write_half);
+        let chunk = max_plaintext_len(0);
+        let mut server_seal = DataRecordCodec::new(
+            AeadCodec::new([0x11; 32], [0x22; 12]),
+            PaddingProfile::new(0, 0).unwrap(),
+            SERVER_TO_CLIENT_AAD,
+        );
+        let mut client_open = DataRecordCodec::new(
+            AeadCodec::new([0x33; 32], [0x44; 12]),
+            PaddingProfile::new(0, 0).unwrap(),
+            CLIENT_TO_SERVER_AAD,
+        );
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut scratch = RelaySealScratch::with_payload_capacity(chunk);
+        let mut io = SpeedServerIo {
+            client_records: &mut client_records,
+            client_write: &mut client_write,
+            client_open: &mut client_open,
+            server_seal: &mut server_seal,
+            rng: &mut rng,
+            scratch: &mut scratch,
+            cid: 1,
+        };
+        let payload = vec![0_u8; chunk];
+
+        // Inject a short idle; a zero-window stall must surface as Timeout, not hang.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_speed_download_phase(
+                &mut io,
+                &payload,
+                64 * 1024 * 1024, // far exceeds the socket buffers
+                SpeedTestAck::download_done(64 * 1024 * 1024),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("download phase must return within the wall budget (idle backstop fired)");
+        assert!(
+            matches!(result, Err(HandshakeServerError::Timeout)),
+            "a zero-window stall must surface as Timeout, got {result:?}",
+        );
+
+        client.abort();
     }
 
     #[tokio::test]
@@ -4428,6 +5001,103 @@ mod tests {
         relay_task.await.unwrap();
     }
 
+    /// H-1: a cap-rejected connection must still receive the origin ServerHello
+    /// (relayed), NOT a bare ServerHello-less FIN, so an active prober cannot count
+    /// the server's connection cap. Ignored + serial: it uses real sockets and
+    /// mutates the process-global cap-shed budget.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets + mutates the process-global cap-shed budget"]
+    async fn cap_shed_fallback_relays_serverhello_not_bare_fin() {
+        let client_hello = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let server_hello = crate::tls::record::wrap_application_data(b"origin-server-hello")
+            .expect("test ServerHello fits");
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let expected_client_hello = client_hello.clone();
+        let origin_hello = server_hello.clone();
+        let origin_task = tokio::spawn(async move {
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            let relayed = read_record(&mut origin).await.unwrap();
+            assert_eq!(relayed, expected_client_hello);
+            origin.write_all(&origin_hello).await.unwrap();
+        });
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let origin_addr_str = origin_addr.to_string();
+        let relay_task = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            cap_shed_fallback_or_fin(server_side, origin_addr_str).await;
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        client.write_all(&client_hello).await.unwrap();
+        let received = read_record(&mut client).await.unwrap();
+        assert_eq!(
+            received, server_hello,
+            "cap-shed must relay the origin ServerHello, not emit a bare FIN",
+        );
+        drop(client);
+        origin_task.await.unwrap();
+        relay_task.await.unwrap();
+    }
+
+    /// H-1: when the cap-shed budget is full, a cap-rejected connection degrades to
+    /// a graceful FIN (EOF), never a hang or RST. Ignored + serial: it saturates
+    /// the process-global budget.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets + mutates the process-global cap-shed budget"]
+    async fn cap_shed_fallback_budget_exhausted_falls_back_to_fin() {
+        // Saturate the cap-shed budget and hold the guards for the whole test.
+        let held: Vec<CapShedFallbackSlot> = (0..MAX_CONCURRENT_CAP_SHED_FALLBACKS)
+            .map(|_| try_enter_cap_shed_fallback().expect("within budget"))
+            .collect();
+        assert!(
+            try_enter_cap_shed_fallback().is_none(),
+            "budget exhausted must yield no further slot",
+        );
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            // The address is never dialed: the budget is full, so it FINs directly.
+            cap_shed_fallback_or_fin(server_side, "127.0.0.1:9".to_string()).await;
+        });
+
+        // Client connects and reads without writing: it must see a prompt graceful
+        // FIN (EOF), proving the budget-full path closes instead of relaying. (We
+        // deliberately do not write here — a client write that races the close is a
+        // harness artifact, not the production cap path where the ClientHello is
+        // already queued and drained before the FIN.)
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        let mut one = [0_u8; 1];
+        let n = timeout(Duration::from_secs(2), client.read(&mut one))
+            .await
+            .expect("budget-full cap-shed must close promptly, not hang")
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "budget-full cap-shed must be a graceful FIN (EOF), not a relay",
+        );
+        relay_task.await.unwrap();
+
+        // Restore the process-global budget for any other ignored/serial tests.
+        drop(held);
+    }
+
+    /// H-1: pins the tight cap-shed idle bound so a future edit cannot silently
+    /// raise it to the 600s legit backstop and re-open the cap-as-DoS-amplifier.
+    #[test]
+    fn cap_shed_fallback_idle_is_tight() {
+        assert_eq!(CAP_SHED_FALLBACK_IDLE, Duration::from_secs(10));
+        assert!(
+            CAP_SHED_FALLBACK_IDLE < FALLBACK_IDLE_TIMEOUT_FLOOR,
+            "cap-shed relays must use a tight idle bound, not the 600s legit backstop",
+        );
+    }
+
     #[tokio::test]
     async fn fallback_relay_idle_timeout_closes_empty_probe() {
         let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4461,10 +5131,11 @@ mod tests {
     }
 
     #[test]
-    fn first_record_wait_jitters_above_floor_idle_is_fixed_backstop() {
+    fn first_record_wait_and_idle_backstop_both_jitter_within_band() {
         // Helper-level test (does not assert the production call-site wiring; the
         // wiring is exercised by the relay/handshake integration tests).
         let mut first_record_values = std::collections::HashSet::new();
+        let mut idle_values = std::collections::HashSet::new();
         for _ in 0..128 {
             let wait = first_record_wait_timeout();
             assert!(
@@ -4477,19 +5148,27 @@ mod tests {
             );
             first_record_values.insert(wait.as_millis());
 
-            // The idle cap is a fixed resource backstop (jitter == 0), not an
-            // anti-probing measure, so it must be exactly the floor every time.
-            assert_eq!(
-                fallback_idle_timeout(),
-                FALLBACK_IDLE_TIMEOUT_FLOOR,
-                "idle cap is a fixed backstop; it must not vary"
+            // The idle backstop is now jittered (M-3) so the all-silent close is not
+            // a fixed, round ~600s ParallaX signature: it stays within the band.
+            let idle = fallback_idle_timeout();
+            assert!(
+                idle >= FALLBACK_IDLE_TIMEOUT_FLOOR,
+                "idle backstop must never drop below the floor"
             );
+            assert!(
+                idle <= FALLBACK_IDLE_TIMEOUT_FLOOR + FALLBACK_IDLE_TIMEOUT_JITTER,
+                "idle backstop must stay within floor + jitter"
+            );
+            idle_values.insert(idle.as_millis());
         }
-        // The first-record give-up must be randomized so a prober cannot read a
-        // fixed constant off the client-facing wait.
+        // Both give-ups must be randomized so a prober cannot read a fixed constant.
         assert!(
             first_record_values.len() > 1,
             "first-record wait must be randomized, not a fixed constant"
+        );
+        assert!(
+            idle_values.len() > 1,
+            "idle backstop must be randomized, not a fixed 600s tell"
         );
     }
 
@@ -4505,10 +5184,10 @@ mod tests {
         // make an origin-side change spuriously break this client-side test.
         assert_eq!(FIRST_RECORD_WAIT_FLOOR, Duration::from_secs(8));
         assert!(FIRST_RECORD_WAIT_JITTER > Duration::from_secs(0));
-        assert!(FALLBACK_IDLE_TIMEOUT_JITTER.is_zero());
+        assert_eq!(FALLBACK_IDLE_TIMEOUT_JITTER, Duration::from_secs(60));
         // The constants are the defaults when no config override is installed,
         // and must match the config default_*_ms values (config.rs): 8000 / 7000
-        // / 600000 / 0. Pin the idle floor here so the two cannot drift apart.
+        // / 600000 / 60000. Pin the idle floor here so the two cannot drift apart.
         assert_eq!(FALLBACK_IDLE_TIMEOUT_FLOOR, Duration::from_secs(600));
         let defaults = TimeoutTuning::defaults();
         assert_eq!(defaults.first_record_floor, FIRST_RECORD_WAIT_FLOOR);

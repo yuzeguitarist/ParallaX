@@ -14,6 +14,16 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 2 * 60;
+/// Maximum clock skew tolerated on a client-supplied (MAC-bound) handshake
+/// timestamp dated in the FUTURE. The past bound stays at `window_secs`, but the
+/// future bound is clamped tight: without this, a PSK-holding client could date
+/// an entry up to `now + window_secs` ahead, which both doubles that entry's
+/// lifetime AND lands it at the FRONT of the arrival-ordered `order` deque, so
+/// `prune_expired` (which assumes arrival order == expiry order and stops at the
+/// first still-fresh entry) returns early forever and never reaps the genuinely
+/// stale entries behind it — accelerating CacheFull fail-close. 5s covers real
+/// clock skew without giving an attacker a future-dating lever.
+const MAX_FUTURE_SKEW_SECS: u64 = 5;
 const AUTH_JOURNAL_VERSION: &str = "parallax-replay-cache-v3";
 const CACHE_KEY_LABEL: &[u8] = b"ParallaX v1 replay cache MAC key";
 const CACHE_JOURNAL_HEADER_MAC_LABEL: &[u8] = b"ParallaX v1 replay cache journal header MAC";
@@ -209,7 +219,10 @@ impl ReplayCache {
     }
 
     fn is_fresh(&self, timestamp: u64, now: u64) -> bool {
-        timestamp <= now.saturating_add(self.window_secs)
+        // Future bound clamped to MAX_FUTURE_SKEW_SECS (not window_secs) so a
+        // future-dated entry cannot linger at the front of `order` and starve
+        // prune_expired; past bound stays at the full replay window.
+        timestamp <= now.saturating_add(MAX_FUTURE_SKEW_SECS)
             && timestamp.saturating_add(self.window_secs) >= now
     }
 
@@ -1028,5 +1041,52 @@ mod tests {
             ReplayCache::load_or_create_authenticated(&path, 8, key),
             Err(ReplayCacheError::MalformedLine(_)) | Err(ReplayCacheError::MacMismatch)
         ));
+    }
+
+    #[test]
+    fn future_dated_entry_cannot_starve_pruning() {
+        // M-11: a PSK-holding client cannot park a far-future-dated entry at the
+        // front of `order` to starve prune_expired — anything more than
+        // MAX_FUTURE_SKEW_SECS ahead is rejected as Stale and never inserted, so a
+        // later legitimate (now-dated) handshake still inserts cleanly.
+        let mut cache = ReplayCache::new(8);
+        let now = 1_000_000_u64;
+        let future = ReplayEntry {
+            timestamp: now + DEFAULT_REPLAY_WINDOW_SECS,
+            nonce: [1_u8; 8],
+            transcript_fingerprint: [1_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(future, now).unwrap(),
+            ReplayInsertOutcome::Stale,
+            "a far-future-dated entry must be rejected, not parked at the prune front",
+        );
+        let fresh = ReplayEntry {
+            timestamp: now,
+            nonce: [2_u8; 8],
+            transcript_fingerprint: [2_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(fresh, now).unwrap(),
+            ReplayInsertOutcome::Inserted,
+        );
+    }
+
+    #[test]
+    fn accepts_small_future_clock_skew() {
+        // A few seconds of genuine future clock skew (<= MAX_FUTURE_SKEW_SECS) is
+        // still accepted, so honest clients with a slightly fast clock are not
+        // rejected.
+        let mut cache = ReplayCache::new(8);
+        let now = 2_000_000_u64;
+        let skewed = ReplayEntry {
+            timestamp: now + 3,
+            nonce: [3_u8; 8],
+            transcript_fingerprint: [3_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(skewed, now).unwrap(),
+            ReplayInsertOutcome::Inserted,
+        );
     }
 }
