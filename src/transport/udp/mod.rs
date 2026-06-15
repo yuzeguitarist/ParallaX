@@ -67,8 +67,14 @@ pub mod fuzz {
             } else {
                 let _ = buf.pop_next();
             }
-            assert!(buf.pending_len() <= max_records, "reorder pending_len exceeded its bound");
-            assert!(buf.pending_bytes() <= max_bytes, "reorder pending_bytes exceeded its bound");
+            assert!(
+                buf.pending_len() <= max_records,
+                "reorder pending_len exceeded its bound"
+            );
+            assert!(
+                buf.pending_bytes() <= max_bytes,
+                "reorder pending_bytes exceeded its bound"
+            );
         }
     }
 }
