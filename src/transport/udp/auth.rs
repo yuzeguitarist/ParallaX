@@ -14,8 +14,11 @@
 //! The derivation is split so the crypto is unit-testable without a live QUIC
 //! connection: [`derive_udp_auth_token`] is pure (exporter secret + PSK), and
 //! [`export_udp_auth_token`] is the thin quinn adapter that obtains the exporter
-//! secret bound to a caller-supplied context. Nothing calls these at runtime yet;
-//! they are wired into the `PX1O` UDP-offer control command in a later slice.
+//! secret bound to a caller-supplied context. These ARE called at runtime by the
+//! reachability probe ([`crate::transport::udp::probe`]): when `[udp].enabled` is
+//! set on both ends, the client and server each derive this exporter-bound token
+//! over the live QUIC connection to authenticate the fast-plane probe before the
+//! single-Connect data relay is committed to QUIC.
 
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
@@ -132,5 +135,25 @@ mod tests {
             derive_udp_auth_token(&[0_u8; 32], b""),
             Err(UdpAuthError::EmptyPsk)
         ));
+    }
+
+    /// M-15: guard against the stale "nothing calls these at runtime yet" doc
+    /// claim returning — it misled reviewers into under-estimating the live QUIC
+    /// attack surface (these helpers ARE driven by the runtime probe).
+    #[test]
+    fn module_doc_does_not_claim_helpers_are_unused_at_runtime() {
+        let src = include_str!("auth.rs");
+        // Build the phrases from fragments so THIS test's own source does not
+        // contain them verbatim (include_str! pulls in this file too).
+        let stale = format!("{} {}", "Nothing calls these", "at runtime yet");
+        assert!(
+            !src.contains(&stale),
+            "the stale 'unused at runtime' doc claim must not return",
+        );
+        let sentinel = format!("{} {}", "These ARE", "called at runtime");
+        assert!(
+            src.contains(&sentinel),
+            "the corrected runtime-usage doc sentinel must be present",
+        );
     }
 }
