@@ -4,7 +4,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
@@ -118,6 +118,44 @@ const FALLBACK_IDLE_TIMEOUT_FLOOR: Duration = Duration::from_secs(600);
 /// backstop into [600s, 660s] per connection removes that fixed tell;
 /// `jittered_timeout` adds a uniform [0, jitter] grace over the floor.
 const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(60);
+
+/// Bounds concurrent cap-shed fallback relays (H-1). When the per-source or global
+/// connection cap rejects a connection we must still look like the origin (relay
+/// its ServerHello) rather than emit a bare ServerHello-less FIN, which a prober
+/// could use to count our cap. But a cap-rejected connection that opened a full
+/// 600s relay would turn the cap into an origin-DoS amplifier, so cap-shed relays
+/// draw from this small SEPARATE budget (the main slots are already exhausted) and
+/// use a tight idle bound. 64 userspace relays ~= 128 fds: a fixed reservation
+/// that cannot itself exhaust fds. Past the budget we degrade to a graceful FIN —
+/// a casual prober always lands inside it; only a genuine flood sees FINs, which a
+/// real origin under flood also produces.
+const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
+/// Idle bound for cap-shed fallback relays (H-1). These exist only to return the
+/// origin ServerHello to a prober, not to serve a session, so they use a tight
+/// bound instead of FALLBACK_IDLE_TIMEOUT_FLOOR (600s); this recycles the small
+/// budget in seconds even under slow/idle attackers.
+const CAP_SHED_FALLBACK_IDLE: Duration = Duration::from_secs(10);
+
+static ACTIVE_CAP_SHED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII slot for a cap-shed fallback relay; releases the budget on drop.
+struct CapShedFallbackSlot(());
+impl Drop for CapShedFallbackSlot {
+    fn drop(&mut self) {
+        ACTIVE_CAP_SHED_FALLBACKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Takes a cap-shed fallback slot if the budget allows, else `None`.
+fn try_enter_cap_shed_fallback() -> Option<CapShedFallbackSlot> {
+    let prev = ACTIVE_CAP_SHED_FALLBACKS.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_CONCURRENT_CAP_SHED_FALLBACKS {
+        ACTIVE_CAP_SHED_FALLBACKS.fetch_sub(1, Ordering::AcqRel);
+        None
+    } else {
+        Some(CapShedFallbackSlot(()))
+    }
+}
 const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
 const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
@@ -372,9 +410,16 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
             None => {
                 tracing::warn!(
                     %peer,
-                    "per-source connection limit reached; closing accepted socket"
+                    "per-source connection limit reached; cap-shedding to origin"
                 );
-                tokio::spawn(graceful_close_tcp_stream(client));
+                // Relay to the camouflage origin (H-1) so a prober still sees the
+                // origin ServerHello and cannot count our cap by the missing one;
+                // bounded budget + tight idle, degrading to a graceful FIN past the
+                // budget. Detached so a flood at the cap cannot stall the loop.
+                tokio::spawn(cap_shed_fallback_or_fin(
+                    client,
+                    server.fallback_addr.clone(),
+                ));
                 continue;
             }
         };
@@ -384,14 +429,17 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 tracing::warn!(
                     %peer,
                     connection_limit,
-                    "server connection limit reached; closing accepted socket"
+                    "server connection limit reached; cap-shedding to origin"
                 );
-                // FIN, don't bare-drop: the client's ClientHello is already
-                // queued in the recv buffer, so dropping the socket would emit a
-                // RST -- the observable tell every other close path here avoids.
-                // Detached so a connection flood at the limit cannot stall the
-                // accept loop on the drain+shutdown.
-                tokio::spawn(graceful_close_tcp_stream(client));
+                // Relay to the camouflage origin (H-1) so a prober still sees the
+                // origin ServerHello and cannot count our cap by the missing one.
+                // Bounded budget + tight idle (cap_shed_fallback_or_fin), degrading
+                // to a graceful FIN past the budget. Detached so a connection flood
+                // at the limit cannot stall the accept loop.
+                tokio::spawn(cap_shed_fallback_or_fin(
+                    client,
+                    server.fallback_addr.clone(),
+                ));
                 continue;
             }
             Err(TryAcquireError::Closed) => {
@@ -813,6 +861,27 @@ async fn graceful_close_tcp_stream(stream: TcpStream) {
     let (read_half, mut write_half) = stream.into_split();
     drain_read_half_to_block(&read_half);
     let _ = write_half.shutdown().await;
+}
+
+/// Cap-rejection close that stays indistinguishable from the origin (H-1): relay
+/// to the camouflage origin so the client still gets a real ServerHello, under a
+/// small bounded budget + tight idle bound; if the budget is full or the origin
+/// dial fails, fall back to a graceful FIN (the prior behavior). We never read the
+/// ClientHello at admission time, so the prefix is empty — the client's own
+/// ClientHello then splices straight through to the origin.
+async fn cap_shed_fallback_or_fin(client: TcpStream, fallback_addr: String) {
+    let Some(_slot) = try_enter_cap_shed_fallback() else {
+        graceful_close_tcp_stream(client).await;
+        return;
+    };
+    match connect_and_forward_to_fallback(&fallback_addr, &[]).await {
+        Ok(fallback) => {
+            let _ =
+                relay_fallback_with_idle_timeout(client, fallback, CAP_SHED_FALLBACK_IDLE).await;
+        }
+        Err(_) => graceful_close_tcp_stream(client).await,
+    }
+    // `_slot` drops here, releasing the cap-shed budget.
 }
 
 async fn relay_fallback_with_idle_timeout(
@@ -4663,6 +4732,103 @@ mod tests {
 
         origin_task.await.unwrap();
         relay_task.await.unwrap();
+    }
+
+    /// H-1: a cap-rejected connection must still receive the origin ServerHello
+    /// (relayed), NOT a bare ServerHello-less FIN, so an active prober cannot count
+    /// the server's connection cap. Ignored + serial: it uses real sockets and
+    /// mutates the process-global cap-shed budget.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets + mutates the process-global cap-shed budget"]
+    async fn cap_shed_fallback_relays_serverhello_not_bare_fin() {
+        let client_hello = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let server_hello = crate::tls::record::wrap_application_data(b"origin-server-hello")
+            .expect("test ServerHello fits");
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let expected_client_hello = client_hello.clone();
+        let origin_hello = server_hello.clone();
+        let origin_task = tokio::spawn(async move {
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            let relayed = read_record(&mut origin).await.unwrap();
+            assert_eq!(relayed, expected_client_hello);
+            origin.write_all(&origin_hello).await.unwrap();
+        });
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let origin_addr_str = origin_addr.to_string();
+        let relay_task = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            cap_shed_fallback_or_fin(server_side, origin_addr_str).await;
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        client.write_all(&client_hello).await.unwrap();
+        let received = read_record(&mut client).await.unwrap();
+        assert_eq!(
+            received, server_hello,
+            "cap-shed must relay the origin ServerHello, not emit a bare FIN",
+        );
+        drop(client);
+        origin_task.await.unwrap();
+        relay_task.await.unwrap();
+    }
+
+    /// H-1: when the cap-shed budget is full, a cap-rejected connection degrades to
+    /// a graceful FIN (EOF), never a hang or RST. Ignored + serial: it saturates
+    /// the process-global budget.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets + mutates the process-global cap-shed budget"]
+    async fn cap_shed_fallback_budget_exhausted_falls_back_to_fin() {
+        // Saturate the cap-shed budget and hold the guards for the whole test.
+        let held: Vec<CapShedFallbackSlot> = (0..MAX_CONCURRENT_CAP_SHED_FALLBACKS)
+            .map(|_| try_enter_cap_shed_fallback().expect("within budget"))
+            .collect();
+        assert!(
+            try_enter_cap_shed_fallback().is_none(),
+            "budget exhausted must yield no further slot",
+        );
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            // The address is never dialed: the budget is full, so it FINs directly.
+            cap_shed_fallback_or_fin(server_side, "127.0.0.1:9".to_string()).await;
+        });
+
+        // Client connects and reads without writing: it must see a prompt graceful
+        // FIN (EOF), proving the budget-full path closes instead of relaying. (We
+        // deliberately do not write here — a client write that races the close is a
+        // harness artifact, not the production cap path where the ClientHello is
+        // already queued and drained before the FIN.)
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        let mut one = [0_u8; 1];
+        let n = timeout(Duration::from_secs(2), client.read(&mut one))
+            .await
+            .expect("budget-full cap-shed must close promptly, not hang")
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "budget-full cap-shed must be a graceful FIN (EOF), not a relay",
+        );
+        relay_task.await.unwrap();
+
+        // Restore the process-global budget for any other ignored/serial tests.
+        drop(held);
+    }
+
+    /// H-1: pins the tight cap-shed idle bound so a future edit cannot silently
+    /// raise it to the 600s legit backstop and re-open the cap-as-DoS-amplifier.
+    #[test]
+    fn cap_shed_fallback_idle_is_tight() {
+        assert_eq!(CAP_SHED_FALLBACK_IDLE, Duration::from_secs(10));
+        assert!(
+            CAP_SHED_FALLBACK_IDLE < FALLBACK_IDLE_TIMEOUT_FLOOR,
+            "cap-shed relays must use a tight idle bound, not the 600s legit backstop",
+        );
     }
 
     #[tokio::test]
