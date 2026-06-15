@@ -34,7 +34,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 
 use crate::tls::record;
-use crate::transport::leg::{LegReader, LegWriter};
+use crate::transport::leg::{LegReader, LegWriter, QuicStreamLegReader, QuicStreamLegWriter};
 
 use super::envelope::{self, EnvelopeError};
 use super::fec::{FecError, RsFec};
@@ -169,15 +169,22 @@ impl DatagramSender {
 }
 
 /// Reassembles datagrams back into the sealed-record stream, recovering losses via
-/// FEC and delivering each window's `FEC_K` records in seq order.
+/// FEC. Delivers the contiguous prefix as soon as it is available (so interactive /
+/// request-response flows are not held back), retaining each window's sources only
+/// long enough to FEC-recover a later gap in the SAME window, then freeing them once
+/// delivery has passed the window.
 pub(crate) struct DatagramReceiver {
     fec: RsFec,
     symbol_len: usize,
-    /// Base seq of the window currently being completed. Records below this have
-    /// been delivered; sources/repairs for windows below this are stale.
-    next_window_base: u64,
-    /// Buffered source records (unpadded sealed bytes) by seq, for seqs in the
-    /// current and look-ahead windows. Bounded by `max_pending_records`/`_bytes`.
+    /// The window base of the very first record (windows are
+    /// `[start_seq + nK, start_seq + (n+1)K)`).
+    start_seq: u64,
+    /// Next seq to deliver in order. Records below the CURRENT window's base have
+    /// been delivered and freed; records in `[window_base(deliver_seq), deliver_seq)`
+    /// are delivered but RETAINED in `pending` for FEC of a later gap in this window.
+    deliver_seq: u64,
+    /// Source records (unpadded sealed bytes) by seq: the current window's delivered
+    /// records (retained for FEC) + look-ahead records past a gap. Bounded.
     pending: BTreeMap<u64, Vec<u8>>,
     pending_bytes: usize,
     /// Repair symbols by `window_base -> repair_idx -> symbol` (each `symbol_len`).
@@ -187,9 +194,9 @@ pub(crate) struct DatagramReceiver {
     /// One past the highest source seq ever seen (drives unrecoverability).
     high_water: u64,
     /// One past the last source seq the sender will ever send (the download-FIN
-    /// count), set via [`Self::set_final_seq`] once the reliable FIN arrives. While
-    /// `None`, every window is a full `FEC_K` window. Once set, the window that
-    /// would extend past it is the FINAL partial window (delivered without FEC).
+    /// count), set via [`Self::set_final_seq`]. The window extending past it is the
+    /// FINAL partial window (delivered contiguously, no FEC — the sender emits
+    /// repairs only for full windows).
     final_seq: Option<u64>,
     max_pending_records: usize,
     max_pending_bytes: usize,
@@ -212,7 +219,8 @@ impl DatagramReceiver {
         Ok(Self {
             fec: RsFec::new(FEC_K, FEC_R)?,
             symbol_len,
-            next_window_base: start_seq,
+            start_seq,
+            deliver_seq: start_seq,
             pending: BTreeMap::new(),
             pending_bytes: 0,
             repairs: BTreeMap::new(),
@@ -224,9 +232,23 @@ impl DatagramReceiver {
         })
     }
 
-    /// Ingest one datagram. May complete one or more windows (pushing their records
-    /// onto the ready queue). Returns `Unrecoverable`/`CapacityExceeded` if the
-    /// stream can no longer be reassembled (the leg turns this into a reset).
+    /// The base seq of the window containing `seq`.
+    fn window_base(&self, seq: u64) -> u64 {
+        self.start_seq + ((seq - self.start_seq) / FEC_K as u64) * FEC_K as u64
+    }
+
+    /// The number of source records in the window at `base`: `FEC_K`, or the smaller
+    /// tail count once the final count is known and this is the final window.
+    fn window_k(&self, base: u64) -> usize {
+        match self.final_seq {
+            Some(fin) if base + FEC_K as u64 > fin => (fin - base) as usize,
+            _ => FEC_K,
+        }
+    }
+
+    /// Ingest one datagram, then deliver whatever became contiguously available.
+    /// Returns `Unrecoverable`/`CapacityExceeded` if the stream can no longer be
+    /// reassembled (the leg turns this into a reset).
     pub(crate) fn ingest(&mut self, datagram: &[u8]) -> Result<(), DatagramError> {
         let (&tag, rest) = datagram.split_first().ok_or(DatagramError::Truncated)?;
         match tag {
@@ -234,7 +256,7 @@ impl DatagramReceiver {
             TAG_REPAIR => self.ingest_repair(rest)?,
             other => return Err(DatagramError::BadTag(other)),
         }
-        self.try_complete()
+        self.try_deliver()
     }
 
     fn ingest_source(&mut self, body: &[u8]) -> Result<(), DatagramError> {
@@ -243,8 +265,8 @@ impl DatagramReceiver {
         if seq >= self.high_water {
             self.high_water = seq.wrapping_add(1);
         }
-        // Stale (already-delivered window) or duplicate: ignore.
-        if seq < self.next_window_base || self.pending.contains_key(&seq) {
+        // Stale (window already passed + freed) or duplicate (still retained): ignore.
+        if seq < self.window_base(self.deliver_seq) || self.pending.contains_key(&seq) {
             return Ok(());
         }
         let rec = body[env.record].to_vec();
@@ -271,8 +293,8 @@ impl DatagramReceiver {
         if symbol.len() != self.symbol_len || usize::from(idx) >= FEC_R {
             return Err(DatagramError::BadLength);
         }
-        // Stale window: ignore.
-        if base < self.next_window_base {
+        // Stale window (already delivered + freed): ignore.
+        if base < self.window_base(self.deliver_seq) {
             return Ok(());
         }
         // Bound the repair store too (one entry per (window, idx); cap windows).
@@ -295,93 +317,56 @@ impl DatagramReceiver {
         Ok(())
     }
 
-    /// Complete as many consecutive windows as possible from the current state.
-    fn try_complete(&mut self) -> Result<(), DatagramError> {
+    /// Deliver the contiguous prefix, FEC-filling a gap when its window has enough
+    /// symbols, until blocked (waiting for more) or done.
+    fn try_deliver(&mut self) -> Result<(), DatagramError> {
         loop {
-            let base = self.next_window_base;
-            // All sources delivered up to the (now-known) final count: done.
-            if self.final_seq.is_some_and(|fin| base >= fin) {
-                break;
+            // Deliver the contiguous prefix. Clone into `ready` but keep the record
+            // in `pending` so a later gap in this window can still be FEC-decoded.
+            while let Some(rec) = self.pending.get(&self.deliver_seq) {
+                self.ready.push_back(rec.clone());
+                self.deliver_seq += 1;
             }
-            // The FINAL partial window — the one that would extend strictly past the
-            // final count — carries < FEC_K sources and NO FEC (the sender only
-            // emits repairs for FULL windows). Deliver it only once every one of its
-            // sources is present; otherwise wait (the leg applies a post-FIN
-            // deadline and resets if a tail source never arrives). A full final
-            // window (base + K == fin) falls through to the normal FEC path.
-            if let Some(fin) = self.final_seq {
-                if base + FEC_K as u64 > fin {
-                    let expected = (fin - base) as usize;
-                    let present = (0..expected as u64)
-                        .filter(|j| self.pending.contains_key(&(base + j)))
-                        .count();
-                    if present == expected {
-                        for j in 0..expected as u64 {
-                            let rec = self.pending.remove(&(base + j)).expect("present checked");
-                            self.pending_bytes -= rec.len();
-                            self.ready.push_back(rec);
-                        }
-                        self.drop_window_repairs(base);
-                        self.next_window_base = fin;
-                        continue;
-                    }
-                    break; // tail not yet complete; leg's post-FIN deadline decides
-                }
+            self.free_passed_windows();
+
+            if self.final_seq.is_some_and(|fin| self.deliver_seq >= fin) {
+                break; // every record delivered
             }
 
-            let present_sources = (0..FEC_K as u64)
-                .filter(|j| self.pending.contains_key(&(base + j)))
-                .count();
-            let repair_count = self.repairs.get(&base).map_or(0, |m| m.len());
-
-            if present_sources == FEC_K {
-                self.deliver_all_present(base);
-            } else if present_sources + repair_count >= FEC_K {
-                self.decode_and_deliver(base)?;
-            } else if self.high_water >= base + FEC_K as u64 + REORDER_MARGIN {
-                // The window is closed (we've seen well past it) yet has < FEC_K
-                // symbols: its missing sources are lost for good.
+            // Gap at `deliver_seq`. Try to FEC-fill its window.
+            let base = self.window_base(self.deliver_seq);
+            let k = self.window_k(base);
+            if self.try_fec_fill(base, k)? {
+                continue; // filled — loop will deliver the now-contiguous run
+            }
+            // Cannot fill. A FULL window whose stragglers are lost beyond the reorder
+            // margin is unrecoverable; the FINAL window is bounded by the leg's
+            // post-FIN deadline instead (it has no FEC).
+            let is_final_window = self.final_seq.is_some_and(|fin| base + FEC_K as u64 > fin);
+            if !is_final_window && self.high_water >= base + FEC_K as u64 + REORDER_MARGIN {
                 return Err(DatagramError::Unrecoverable(base));
-            } else {
-                break; // not yet completable; wait for more datagrams
             }
+            break; // wait for more datagrams
         }
         Ok(())
     }
 
-    /// Record the download-FIN count (one past the last source seq the sender will
-    /// send), then deliver any window that became completable. After this,
-    /// [`Self::is_done`] reports when every record has been delivered.
-    pub(crate) fn set_final_seq(&mut self, one_past_last: u64) -> Result<(), DatagramError> {
-        self.final_seq = Some(one_past_last);
-        self.try_complete()
-    }
-
-    /// Whether the final count is known AND every record up to it has been moved to
-    /// the ready queue. The leg drains `pop_ready` first and turns this into EOF
-    /// once nothing is left to pop.
-    pub(crate) fn is_done(&self) -> bool {
-        self.final_seq
-            .is_some_and(|fin| self.next_window_base >= fin)
-    }
-
-    /// All `FEC_K` sources of the window arrived: deliver them in order, no FEC.
-    fn deliver_all_present(&mut self, base: u64) {
-        for j in 0..FEC_K as u64 {
-            let rec = self
-                .pending
-                .remove(&(base + j))
-                .expect("all present checked");
-            self.pending_bytes -= rec.len();
-            self.ready.push_back(rec);
+    /// If the window at `base` (with `k` sources) has `>= k` symbols, FEC-decode it
+    /// and insert the recovered sources into `pending`. Returns whether it filled.
+    /// A partial final window has no repairs, so this only fires for full windows.
+    fn try_fec_fill(&mut self, base: u64, k: usize) -> Result<bool, DatagramError> {
+        let present_sources = (0..k as u64)
+            .filter(|j| self.pending.contains_key(&(base + j)))
+            .count();
+        let repair_count = self.repairs.get(&base).map_or(0, |m| m.len());
+        if present_sources == k || present_sources + repair_count < k {
+            // Either nothing missing (the gap is elsewhere / not yet arrived) or not
+            // enough symbols to decode yet.
+            return Ok(false);
         }
-        self.drop_window_repairs(base);
-        self.next_window_base = base + FEC_K as u64;
-    }
-
-    /// `< FEC_K` sources but enough total symbols: FEC-decode the window, deliver.
-    fn decode_and_deliver(&mut self, base: u64) -> Result<(), DatagramError> {
-        // Build the K+R `present` array: sources (padded) then repairs.
+        // FEC operates on the fixed (FEC_K, FEC_R) code; a partial final window never
+        // reaches here (it has no repairs, so present + 0 < k unless all present).
+        debug_assert_eq!(k, FEC_K, "FEC fill only runs on full windows");
         let mut symbols: Vec<Option<Vec<u8>>> = Vec::with_capacity(FEC_K + FEC_R);
         for j in 0..FEC_K as u64 {
             match self.pending.get(&(base + j)) {
@@ -398,24 +383,49 @@ impl DatagramReceiver {
         }
         let refs: Vec<Option<&[u8]>> = symbols.iter().map(|o| o.as_deref()).collect();
         let recovered = self.fec.decode(&refs, self.symbol_len)?;
-
         for (j, sym) in recovered.into_iter().enumerate() {
             let seq = base + j as u64;
-            let rec = match self.pending.remove(&seq) {
-                // Prefer the original unpadded source if we had it.
-                Some(orig) => {
-                    self.pending_bytes -= orig.len();
-                    orig
-                }
-                // Recovered source: trim the padded symbol to its own TLS record
-                // length so FEC zero-padding never reaches the AEAD.
-                None => trim_recovered(&sym, self.symbol_len)?,
-            };
-            self.ready.push_back(rec);
+            if self.pending.contains_key(&seq) {
+                continue; // already had this source
+            }
+            // Recovered (lost) source: trim the padded symbol to its own TLS record
+            // length so FEC zero-padding never reaches the AEAD.
+            let rec = trim_recovered(&sym, self.symbol_len)?;
+            self.pending_bytes += rec.len();
+            self.pending.insert(seq, rec);
         }
-        self.drop_window_repairs(base);
-        self.next_window_base = base + FEC_K as u64;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Free sources + repairs of every window strictly below the current delivery
+    /// window (they are delivered and no longer needed for FEC).
+    fn free_passed_windows(&mut self) {
+        let floor = self.window_base(self.deliver_seq);
+        while let Some((&seq, _)) = self.pending.iter().next() {
+            if seq >= floor {
+                break;
+            }
+            let rec = self.pending.remove(&seq).expect("iterated key");
+            self.pending_bytes -= rec.len();
+        }
+        while let Some((&base, _)) = self.repairs.iter().next() {
+            if base >= floor {
+                break;
+            }
+            self.drop_window_repairs(base);
+        }
+    }
+
+    /// Record the download-FIN count (one past the last source seq the sender will
+    /// send), then deliver whatever the now-known final window makes deliverable.
+    pub(crate) fn set_final_seq(&mut self, one_past_last: u64) -> Result<(), DatagramError> {
+        self.final_seq = Some(one_past_last);
+        self.try_deliver()
+    }
+
+    /// Whether the final count is known AND every record up to it has been delivered.
+    pub(crate) fn is_done(&self) -> bool {
+        self.final_seq.is_some_and(|fin| self.deliver_seq >= fin)
     }
 
     fn drop_window_repairs(&mut self, base: u64) {
@@ -458,6 +468,22 @@ pub(crate) const DATAGRAM_SYMBOL_LEN: usize = 1024;
 pub(crate) const MAX_CARRIER_DATAGRAM: usize =
     1 + envelope::ENVELOPE_HEADER_LEN + DATAGRAM_SYMBOL_LEN;
 
+/// Download-carrier selector, written as the FIRST byte on the bidi download
+/// stream (server→client) so the SENDER (server) decides and the receiver (client)
+/// obeys — sidestepping any client/server disagreement over `max_datagram_size`.
+/// The reliable bidi stream then carries the records (stream carrier) or, for the
+/// datagram carrier, only the download-FIN count at teardown.
+pub(crate) const CARRIER_STREAM: u8 = 0;
+pub(crate) const CARRIER_DATAGRAM: u8 = 1;
+
+/// Whether this connection can carry the datagram download: datagrams must fit a
+/// full carrier datagram. (DATAGRAM_SYMBOL_LEN is sized to fit QUIC's minimum
+/// path MTU, so this normally holds whenever the probe Verified.)
+pub(crate) fn datagram_download_fits(conn: &quinn::Connection) -> bool {
+    conn.max_datagram_size()
+        .is_some_and(|m| m >= MAX_CARRIER_DATAGRAM)
+}
+
 /// Pending reorder bounds for the receiver (anti-exhaustion).
 const RX_MAX_PENDING_RECORDS: usize = 8 * FEC_K;
 const RX_MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
@@ -473,6 +499,13 @@ fn map_datagram_err(e: DatagramError) -> io::Error {
         other => io::Error::new(io::ErrorKind::InvalidData, format!("datagram: {other:?}")),
     }
 }
+
+/// Test-only counter of record bytes written through the datagram carrier. Lets
+/// the relay e2e tests prove the download actually traversed datagrams rather than
+/// silently falling back to the stream carrier. Not compiled in release.
+#[cfg(test)]
+pub(crate) static DATAGRAM_LEG_BYTES_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// QUIC-datagram record-writer leg (one direction). Frames each sealed record into
 /// a source datagram + periodic FEC repair datagrams, and on `shutdown` writes the
@@ -542,6 +575,9 @@ impl LegWriter for UdpDatagramLegWriter {
             off = end;
             seq = seq.wrapping_add(1);
         }
+        #[cfg(test)]
+        DATAGRAM_LEG_BYTES_WRITTEN
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -680,6 +716,69 @@ impl LegReader for UdpDatagramLegReader {
         // Only the FIN-driven UnexpectedEof is clean; a ConnectionReset (gap/tail
         // loss/connection error) is a truncation that must NOT be swallowed.
         err.kind() == io::ErrorKind::UnexpectedEof
+    }
+}
+
+/// The DOWNLOAD-direction writer the server picks once at relay setup, signaled to
+/// the client by the carrier byte. An enum (not a trait object) so the monomorphic
+/// generic relay loop has ONE concrete `LegWriter` type; this is a carrier
+/// SELECTION (fixed for the relay's life), not a mid-relay demote switch.
+pub(crate) enum DownloadWriter {
+    Stream(QuicStreamLegWriter),
+    Datagram(UdpDatagramLegWriter),
+}
+
+impl LegWriter for DownloadWriter {
+    async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            DownloadWriter::Stream(w) => w.write_records(bytes).await,
+            DownloadWriter::Datagram(w) => w.write_records(bytes).await,
+        }
+    }
+
+    async fn write_records_seq(&mut self, base_seq: u64, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            DownloadWriter::Stream(w) => w.write_records_seq(base_seq, bytes).await,
+            DownloadWriter::Datagram(w) => w.write_records_seq(base_seq, bytes).await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            DownloadWriter::Stream(w) => w.shutdown().await,
+            DownloadWriter::Datagram(w) => w.shutdown().await,
+        }
+    }
+}
+
+/// The DOWNLOAD-direction reader the client picks from the carrier byte. Mirror of
+/// [`DownloadWriter`]: a fixed carrier selection unifying the relay loop's reader
+/// type.
+pub(crate) enum DownloadReader {
+    Stream(QuicStreamLegReader),
+    Datagram(UdpDatagramLegReader),
+}
+
+impl LegReader for DownloadReader {
+    async fn read_record_into(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            DownloadReader::Stream(r) => r.read_record_into(buf).await,
+            DownloadReader::Datagram(r) => r.read_record_into(buf).await,
+        }
+    }
+
+    async fn try_read_record_into(&mut self, buf: &mut Vec<u8>) -> Option<io::Result<()>> {
+        match self {
+            DownloadReader::Stream(r) => r.try_read_record_into(buf).await,
+            DownloadReader::Datagram(r) => r.try_read_record_into(buf).await,
+        }
+    }
+
+    fn is_clean_close(&self, err: &io::Error) -> bool {
+        match self {
+            DownloadReader::Stream(r) => r.is_clean_close(err),
+            DownloadReader::Datagram(r) => r.is_clean_close(err),
+        }
     }
 }
 
@@ -887,9 +986,9 @@ mod tests {
         assert_eq!(err, Some(DatagramError::CapacityExceeded));
     }
 
-    /// A partial final window (records past the last full FEC window) is held back
-    /// until the download-FIN count is known, then delivered in full once all its
-    /// sources are present — and `is_done` flips only then.
+    /// The partial tail (records past the last full FEC window) delivers
+    /// contiguously as it arrives; `is_done` flips only once the FIN count is known
+    /// and every record up to it has been delivered.
     #[test]
     fn final_partial_window_delivers_on_fin() {
         let n = FEC_K + 5; // one full window + a 5-record partial tail
@@ -903,7 +1002,8 @@ mod tests {
         for dg in &dgs {
             rx.ingest(dg).unwrap();
         }
-        // The partial tail is withheld until the FIN count is known.
+        // Lossless + contiguous: every record (incl. the partial tail) is already
+        // delivered; the FIN only flips is_done.
         assert!(!rx.is_done());
         rx.set_final_seq(start + n as u64).unwrap();
         assert!(rx.is_done());

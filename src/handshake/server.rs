@@ -83,6 +83,10 @@ use crate::{
             connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
             is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
         },
+        udp::datagram::{
+            datagram_download_fits, DownloadWriter, UdpDatagramLegWriter, CARRIER_DATAGRAM,
+            CARRIER_STREAM, DATAGRAM_SYMBOL_LEN,
+        },
     },
 };
 
@@ -1925,6 +1929,7 @@ async fn run_authenticated_data_mode(
                             cover,
                             chunk_size: max_plaintext_len(traffic.max_padding),
                             retained_quic,
+                            datagram: udp.datagram,
                             cid,
                         }
                         .run()
@@ -2405,6 +2410,11 @@ struct DataRelay {
     /// Verified. `Some` => carry the relay over a reliable bidi stream; `None` =>
     /// the relay stays on the TCP record legs exactly as before this slice.
     retained_quic: Option<(quinn::Endpoint, quinn::Connection)>,
+    /// Whether the server is configured to carry the DOWNLOAD direction over the
+    /// datagram+FEC carrier (`udp.datagram`). The server is the download sender, so
+    /// it decides the carrier and signals it to the client on the bidi download
+    /// stream; only honored when a connection is retained and the path fits.
+    datagram: bool,
     cid: u64,
 }
 
@@ -2676,6 +2686,7 @@ impl DataRelay {
             cover,
             chunk_size,
             retained_quic,
+            datagram,
             cid,
         } = self;
         let target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
@@ -2717,6 +2728,45 @@ impl DataRelay {
                         cid,
                         "QUIC fast-plane bidi stream accepted; relaying over UDP"
                     );
+                    // The server is the download sender, so it picks the download
+                    // carrier and SIGNALS it as the first byte on the bidi
+                    // server->client stream — the client obeys, so there is no
+                    // client/server disagreement over max_datagram_size. Datagram is
+                    // used only when configured AND the path fits a full carrier
+                    // datagram; otherwise the reliable stream carries the records.
+                    let mut send = send;
+                    // Datagram needs the path to fit a full carrier datagram AND
+                    // room to clamp each sealed download record into one datagram
+                    // (DATAGRAM_SYMBOL_LEN minus this codec's per-record overhead —
+                    // a heavy padding profile can leave no room, in which case we
+                    // stay on the stream carrier).
+                    let dgram_chunk_cap = DATAGRAM_SYMBOL_LEN
+                        .checked_sub(server_seal.max_sealed_len(0))
+                        .filter(|&cap| cap > 0);
+                    let use_datagram =
+                        datagram && datagram_download_fits(&conn) && dgram_chunk_cap.is_some();
+                    let carrier = if use_datagram {
+                        CARRIER_DATAGRAM
+                    } else {
+                        CARRIER_STREAM
+                    };
+                    if let Err(err) = AsyncWriteExt::write_all(&mut send, &[carrier]).await {
+                        conn.close(0u32.into(), b"carrier-signal-failed");
+                        return Err(HandshakeServerError::Io(err));
+                    }
+                    let download_writer = if use_datagram {
+                        match UdpDatagramLegWriter::new(conn.clone(), send, server_seal.sequence())
+                        {
+                            Ok(w) => DownloadWriter::Datagram(w),
+                            Err(err) => {
+                                conn.close(0u32.into(), b"datagram-writer-failed");
+                                return Err(HandshakeServerError::Io(err));
+                            }
+                        }
+                    } else {
+                        DownloadWriter::Stream(QuicStreamLegWriter(send))
+                    };
+                    let download_chunk_cap = if use_datagram { dgram_chunk_cap } else { None };
                     let upload = server_upload_loop(
                         QuicStreamLegReader::buffered(recv),
                         target_write,
@@ -2727,13 +2777,14 @@ impl DataRelay {
                     );
                     let download = server_download_loop(
                         target_read,
-                        QuicStreamLegWriter(send),
+                        download_writer,
                         server_seal,
                         target_buf,
                         timing,
                         cover,
                         activity.clone(),
                         cid,
+                        download_chunk_cap,
                     );
                     // Application-level DONE handshake over the reliable TCP
                     // control stream. quinn 0.11.9's `Connection::close` ABANDONS
@@ -2874,6 +2925,7 @@ impl DataRelay {
             cover,
             activity.clone(),
             cid,
+            None,
         );
 
         // TCP teardown is unchanged: TCP is reliable and FIN/EOF is a clean,
@@ -3499,6 +3551,7 @@ where
         rng,
         scratch,
         RelayWriteLog::new(cid, "server->client", task_name),
+        None,
     )
     .await
 }
@@ -3799,6 +3852,7 @@ where
                 io.rng,
                 io.scratch,
                 RelayWriteLog::new(io.cid, "server->client", "server-speed-download-writer"),
+                None,
             ),
         )
         .await
@@ -3815,6 +3869,7 @@ where
             io.rng,
             io.scratch,
             RelayWriteLog::new(io.cid, "server->client", "server-speed-download-done"),
+            None,
         ),
     )
     .await
@@ -3871,6 +3926,7 @@ where
         io.rng,
         io.scratch,
         RelayWriteLog::new(io.cid, "server->client", "server-speed-upload-done"),
+        None,
     )
     .await
 }
@@ -3954,6 +4010,10 @@ async fn server_download_loop<W>(
     cover: CoverTrafficProfile,
     activity: RelayActivity,
     cid: u64,
+    // `Some(cap)` clamps each sealed download record's plaintext so it fits one
+    // datagram (the datagram carrier); `None` uses the codec's full chunk size
+    // (TCP / QUIC-stream carriers, byte-identical).
+    chunk_cap: Option<usize>,
 ) -> Result<DataRecordCodec, HandshakeServerError>
 where
     W: LegWriter,
@@ -3982,6 +4042,7 @@ where
                 &mut rng,
                 &mut seal_scratch,
                 RelayWriteLog::new(cid, "server->client", "server-download-writer"),
+                chunk_cap,
             )
             .await?;
         }
@@ -3999,6 +4060,7 @@ where
                     &mut rng,
                     &mut seal_scratch,
                     RelayWriteLog::new(cid, "server->client", "server-cover-writer"),
+                    chunk_cap,
                 )
                 .await?;
                 cover_sleep.as_mut().reset(
@@ -4026,6 +4088,7 @@ where
                     &mut rng,
                     &mut seal_scratch,
                     RelayWriteLog::new(cid, "server->client", "server-download-writer"),
+                    chunk_cap,
                 )
                 .await?;
             }
@@ -4040,12 +4103,16 @@ async fn write_server_data_records_chunked<W, R>(
     rng: &mut R,
     scratch: &mut RelaySealScratch,
     log: RelayWriteLog,
+    max_chunk_override: Option<usize>,
 ) -> Result<(), HandshakeServerError>
 where
     W: LegWriter,
     R: rand::Rng + rand::RngCore + ?Sized,
 {
-    let max_chunk_len = codec.max_plaintext_len();
+    let max_chunk_len = match max_chunk_override {
+        Some(cap) => codec.max_plaintext_len().min(cap),
+        None => codec.max_plaintext_len(),
+    };
     if max_chunk_len == 0 {
         return Err(HandshakeServerError::DataRecord(
             crate::tls::record::TlsRecordError::PayloadTooLarge(payload.len()).into(),
@@ -4056,25 +4123,44 @@ where
     // the codec. Byte-stream carriers ignore it (write_records_seq forwards to
     // write_records); the datagram carrier envelopes each record at base_seq + i.
     let base_seq = codec.sequence();
-    let debug_records = tracing::enabled!(tracing::Level::DEBUG);
-    if debug_records {
-        codec.seal_chunks_into_reusing(
-            payload,
-            rng,
-            &mut scratch.records_buf,
-            &mut scratch.records,
-        )?;
-        for record in scratch.records.iter() {
-            log_outer_write(
-                log.cid,
-                log.direction,
-                log.task_name,
-                record.plaintext_len,
-                &scratch.records_buf[record.range.clone()],
-            );
+    if let Some(_cap) = max_chunk_override {
+        // Datagram carrier: seal each chunk (<= the datagram budget) individually so
+        // every sealed record fits one datagram. Mirrors seal_chunks' record
+        // boundaries (one record when payload <= chunk, incl. the empty cover
+        // record) but with the clamped size; no parallel pool (the datagram path is
+        // experimental and chunks are small).
+        if payload.len() <= max_chunk_len {
+            scratch
+                .records_buf
+                .extend_from_slice(&codec.seal(payload, rng)?);
+        } else {
+            for chunk in payload.chunks(max_chunk_len) {
+                scratch
+                    .records_buf
+                    .extend_from_slice(&codec.seal(chunk, rng)?);
+            }
         }
     } else {
-        codec.seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)?;
+        let debug_records = tracing::enabled!(tracing::Level::DEBUG);
+        if debug_records {
+            codec.seal_chunks_into_reusing(
+                payload,
+                rng,
+                &mut scratch.records_buf,
+                &mut scratch.records,
+            )?;
+            for record in scratch.records.iter() {
+                log_outer_write(
+                    log.cid,
+                    log.direction,
+                    log.task_name,
+                    record.plaintext_len,
+                    &scratch.records_buf[record.range.clone()],
+                );
+            }
+        } else {
+            codec.seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)?;
+        }
     }
     writer
         .write_records_seq(base_seq, scratch.records_buf.as_slice())

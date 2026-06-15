@@ -58,6 +58,7 @@ use crate::{
             connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
             relay_connection_limit, tune_tcp_stream,
         },
+        udp::datagram::{DownloadReader, UdpDatagramLegReader, CARRIER_DATAGRAM},
     },
 };
 
@@ -1797,6 +1798,36 @@ impl ClientRelay {
                 return Err(ClientRuntimeError::Io(err));
             }
 
+            // The server (the download sender) wrote the download-carrier selector
+            // as the first byte of the bidi server->client stream. Read it and build
+            // the matching download reader: the datagram+FEC carrier, or the
+            // reliable stream carrier. We OBEY the server's choice, so the two ends
+            // never disagree over which carrier the download uses.
+            let mut recv = recv;
+            let mut carrier = [0u8; 1];
+            match tokio::time::timeout(QUIC_RELAY_OPEN_TIMEOUT, recv.read_exact(&mut carrier)).await
+            {
+                Ok(Ok(())) => {}
+                _ => {
+                    conn.close(0u32.into(), b"carrier-read-failed");
+                    return Err(ClientRuntimeError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "QUIC fast-plane download carrier byte not received",
+                    )));
+                }
+            }
+            let download_reader = if carrier[0] == CARRIER_DATAGRAM {
+                match UdpDatagramLegReader::new(conn.clone(), recv, open_from_server.sequence()) {
+                    Ok(r) => DownloadReader::Datagram(r),
+                    Err(err) => {
+                        conn.close(0u32.into(), b"datagram-reader-failed");
+                        return Err(ClientRuntimeError::Io(err));
+                    }
+                }
+            } else {
+                DownloadReader::Stream(QuicStreamLegReader::buffered(recv))
+            };
+
             let upload = client_upload_loop(
                 local_read,
                 server_write_leg,
@@ -1810,7 +1841,7 @@ impl ClientRelay {
             // clean EOF (the app sees its response EOF immediately, decoupled from
             // the upload direction -- read-until-close apps depend on this).
             let download = client_download_loop(
-                QuicStreamLegReader::buffered(recv),
+                download_reader,
                 local_write,
                 open_from_server,
                 activity.clone(),
@@ -3507,6 +3538,83 @@ mod tests {
         assert!(
             after > before,
             "expected relay bytes to traverse the QUIC stream (before={before}, after={after})"
+        );
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
+    /// Download over the unreliable DATAGRAM+FEC carrier (the server sets
+    /// `udp.datagram`): the server signals CARRIER_DATAGRAM and sends the download
+    /// as FEC-protected datagrams; the client reassembles them and the FIN turns
+    /// into a clean EOF. A 256 KiB payload spans many FEC windows + a partial tail.
+    /// `DATAGRAM_LEG_BYTES_WRITTEN` confirms the download actually traversed
+    /// datagrams (it would stay flat on a silent stream fallback). Loopback does not
+    /// drop packets, so loss recovery itself is covered by the deterministic
+    /// protocol tests; this proves the end-to-end relay integration.
+    #[tokio::test]
+    #[ignore = "requires loopback UDP+TCP sockets"]
+    async fn socks_relay_download_over_datagram_carrier() {
+        use crate::transport::udp::datagram::DATAGRAM_LEG_BYTES_WRITTEN;
+        use std::sync::atomic::Ordering;
+
+        let _serial = quic_e2e_guard().await;
+
+        // Server enables the datagram download carrier; the client just enables UDP
+        // (the server decides the download carrier and signals it).
+        let server_udp = UdpConfig {
+            enabled: true,
+            datagram: true,
+            ..UdpConfig::default()
+        };
+        let client_udp = UdpConfig {
+            enabled: true,
+            ..UdpConfig::default()
+        };
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_echo_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_pq_keys = pq::keypair();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server_with_traffic_and_udp(
+            server_config,
+            TrafficConfig::default(),
+            server_udp,
+        )
+        .await;
+        let (local_addr, client_task) = spawn_local_client_with_udp(
+            parallax_addr,
+            &server_keys,
+            &server_pq_keys,
+            &server_identity_keys,
+            client_udp,
+        )
+        .await;
+
+        let before = DATAGRAM_LEG_BYTES_WRITTEN.load(Ordering::Relaxed);
+        let app = connect_socks_target(local_addr, target_addr).await;
+        let payload = (0..256 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        assert_payload_round_trip(app, payload).await;
+        let after = DATAGRAM_LEG_BYTES_WRITTEN.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "download must traverse the datagram carrier (before={before}, after={after})"
         );
 
         wait_for_task("client", client_task).await;
