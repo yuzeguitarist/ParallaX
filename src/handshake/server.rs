@@ -2678,14 +2678,23 @@ impl Drop for ServerMuxStreams {
     }
 }
 
+/// Monotonic milliseconds since a process-local epoch, backing the lock-free
+/// relay activity clock. Coarse (ms) granularity is ample for the idle backstop
+/// (timeouts are whole seconds) and lets the clock live in a single atomic.
+fn relay_now_millis() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Shared last-activity clock for an authenticated relay, reset on every byte
-/// moved in either direction.
-type RelayActivity = Arc<Mutex<Instant>>;
+/// moved in either direction. Lock-free: both relay directions and the watchdog
+/// touch it with a single relaxed atomic, so the hot path never contends on a
+/// mutex (the previous `Arc<Mutex<Instant>>` bounced a cache line between the two
+/// relay tasks on every relayed chunk).
+type RelayActivity = Arc<AtomicU64>;
 
 fn bump_relay_activity(activity: &RelayActivity) {
-    if let Ok(mut last) = activity.lock() {
-        *last = Instant::now();
-    }
+    activity.store(relay_now_millis(), Ordering::Relaxed);
 }
 
 /// Resolves once the relay has been idle (no bytes either direction) for
@@ -2698,15 +2707,13 @@ fn bump_relay_activity(activity: &RelayActivity) {
 /// reset the clock; server-generated cover records deliberately do NOT, so the
 /// backstop still fires on a genuinely-idle relay even when cover traffic is on.
 async fn relay_idle_watchdog(activity: RelayActivity, idle_timeout: Duration) {
+    let timeout_ms = idle_timeout.as_millis() as u64;
     loop {
-        let elapsed = activity
-            .lock()
-            .map(|last| last.elapsed())
-            .unwrap_or(idle_timeout);
-        if elapsed >= idle_timeout {
+        let elapsed_ms = relay_now_millis().saturating_sub(activity.load(Ordering::Relaxed));
+        if elapsed_ms >= timeout_ms {
             return;
         }
-        sleep(idle_timeout - elapsed).await;
+        sleep(idle_timeout.saturating_sub(Duration::from_millis(elapsed_ms))).await;
     }
 }
 
@@ -2756,7 +2763,7 @@ impl DataRelay {
             // clock. The QUIC connection's own idle-timeout is a separate, coarser
             // bound; this is the operator-tunable backstop that matches the TCP
             // path's behavior.
-            let activity: RelayActivity = Arc::new(Mutex::new(Instant::now()));
+            let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
             let idle_timeout = fallback_idle_timeout();
             match tokio::time::timeout(QUIC_RELAY_ACCEPT_TIMEOUT, conn.accept_bi()).await {
                 Ok(Ok((send, recv))) => {
@@ -2902,7 +2909,7 @@ impl DataRelay {
         // this slice. The idle backstop (main's DoS hardening) bounds the relay so
         // a silent target cannot pin resources forever; only real payload bytes
         // (either direction) reset the clock.
-        let activity: RelayActivity = Arc::new(Mutex::new(Instant::now()));
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
         let idle_timeout = fallback_idle_timeout();
         let upload = server_upload_loop(
             TcpLegReader(client_records),
@@ -4236,6 +4243,59 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+
+    // --- Track A1: lock-free relay activity clock — watchdog semantics ---
+    // Below the `mod tests` boundary, so the no-timeout static ratchet (which
+    // scans the production region) is unaffected. Lock the preserved idle
+    // semantics so a future coarsening that broke the DoS backstop turns red.
+
+    #[tokio::test]
+    async fn relay_idle_watchdog_fires_after_idle_timeout() {
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let fired = tokio::time::timeout(
+            Duration::from_secs(2),
+            relay_idle_watchdog(activity, Duration::from_millis(20)),
+        )
+        .await;
+        assert!(fired.is_ok(), "watchdog must fire once the relay is idle");
+    }
+
+    #[tokio::test]
+    async fn relay_idle_watchdog_pending_before_idle_timeout() {
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let fired = tokio::time::timeout(
+            Duration::from_millis(50),
+            relay_idle_watchdog(activity, Duration::from_secs(30)),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "watchdog must not fire before the idle timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn bump_relay_activity_defers_watchdog() {
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let bumped = activity.clone();
+        let bumper = tokio::spawn(async move {
+            for _ in 0..10 {
+                sleep(Duration::from_millis(15)).await;
+                bump_relay_activity(&bumped);
+            }
+        });
+        let fired = tokio::time::timeout(
+            Duration::from_millis(100),
+            relay_idle_watchdog(activity, Duration::from_millis(60)),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "ongoing activity must defer the idle watchdog"
+        );
+        bumper.await.unwrap();
+    }
+
     use crate::{
         crypto::{
             auth::{
