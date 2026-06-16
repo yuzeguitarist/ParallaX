@@ -8,7 +8,7 @@
 #   - the per-box sanitizer and extra RUSTFLAGS,
 #   - the corpus-asset owner of each target (crc32(target) % 2).
 #
-# v2 (campaign 3b551fa): TWO boxes cover all 14 targets. The earlier 3-box plan
+# v2 (campaign 8b5985e): TWO boxes cover all 14 targets. The earlier 3-box plan
 # left box-c's 5 targets completely unrun whenever only box-a/box-b were actually
 # deployed (which is what happened); this plan is sized for the real 2-box fleet
 # so nothing is silently skipped, and `owner_box` is crc32%2 so every target's
