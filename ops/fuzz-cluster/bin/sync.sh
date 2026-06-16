@@ -2,7 +2,7 @@
 # ParallaX distributed-fuzz cluster — corpus sync (GROUP 2).
 #
 # Runs every ~10 min from plx-sync.timer. The corpus store is a GitHub RELEASE
-# (tag from /etc/plxfuzz/campaign-tag, e.g. fuzz-corpus-8b5985e), NOT a branch.
+# (tag from /etc/plxfuzz/campaign-tag, e.g. fuzz-corpus-e096fc8), NOT a branch.
 #
 # For each target this box OWNS  (owner_box == this node-id):
 #   download every contrib-<target>-*.tar.zst, merge them + local finds with
@@ -111,7 +111,7 @@ ensure_release() {
   # the loser's create fails with 'already_exists' which we swallow.
   if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
     # target_commitish must be a FULL sha or a branch name — the abbreviated
-    # pinned-commit (e.g. 8b5985e) is rejected by the Releases API, which made
+    # pinned-commit (e.g. e096fc8) is rejected by the Releases API, which made
     # this create silently fail and no corpus ever uploaded. Resolve the full sha
     # from the checked-out source tree; omit --target if it can't be resolved
     # (the corpus release is just an asset bucket, the tag location is cosmetic).

@@ -41,7 +41,7 @@ read_cfg() { [ -r "$ETC/$1" ] && tr -d ' \t\r\n' < "$ETC/$1" || true; }
 
 NODE_ID="$(read_cfg node-id)"
 REPO="$(read_cfg repo)";        REPO="${REPO:-yuzeguitarist/ParallaX}"
-TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-8b5985e}"
+TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-e096fc8}"
 export GH_REPO="$REPO"
 export GH_TOKEN="${GH_TOKEN:-$(read_cfg pat)}"   # env, never argv (matches sync.sh)
 

@@ -5,14 +5,14 @@ walk away. Crashes arrive as GitHub Issues on your phone; progress shows on a
 dashboard. No SSH, no professional knowledge, no per-box config.
 
 - **Repo:** `yuzeguitarist/ParallaX` (PRIVATE)
-- **Pinned commit (this campaign):** `8b5985e` — every box clones and checks out
+- **Pinned commit (this campaign):** `e096fc8` — every box clones and checks out
   exactly this commit and never moves. All corpus/crash assets are tagged to it.
 - **Boxes:** 2 × DigitalOcean **c-4** (4 vCPU / 8 GB / 50 GB, **dedicated**, no spot),
   Ubuntu 24.04, named by role: `box-a`, `box-b`.
 - **Toolchain (pinned, installed by bootstrap):** `nightly-2026-06-10` +
   `cargo-fuzz 0.13.2`.
 - **Where state lives (zero extra infra — the repo IS the backend):**
-  - **Corpus** → a GitHub **Release** `fuzz-corpus-8b5985e` (assets, not a branch).
+  - **Corpus** → a GitHub **Release** `fuzz-corpus-e096fc8` (assets, not a branch).
   - **Crashes** → GitHub **Issues** (label `fuzz-crash`) **+** committed repros on
     the `fuzz-crashes` branch.
   - **Status** → `status-<box>.json` committed to the `fuzz-status` branch every
@@ -24,7 +24,7 @@ dashboard. No SSH, no professional knowledge, no per-box config.
 
 ### 1. Pick the commit
 
-This campaign is pinned to **`8b5985e`** (current HEAD; full 14-target fuzz set
+This campaign is pinned to **`e096fc8`** (current HEAD; full 14-target fuzz set
 incl. the TUDP targets). To run a different commit, substitute its SHA
 everywhere below **and** in the paste line — the Release tag, the bootstrap URL,
 and every box's checkout all key off it.
@@ -70,7 +70,7 @@ git push -u origin fuzz-crashes
 # fuzz-status: holds status-<box>.json heartbeats + the committed dashboard
 git switch --orphan fuzz-status
 mkdir -p fuzz/dashboard
-git checkout 8b5985e -- fuzz/dashboard/index.html   # publish the dashboard here
+git checkout e096fc8 -- fuzz/dashboard/index.html   # publish the dashboard here
 git add fuzz/dashboard/index.html
 git commit -m "init fuzz-status (orphan; heartbeats + dashboard)"
 git push -u origin fuzz-status
@@ -78,7 +78,7 @@ git push -u origin fuzz-status
 git switch main   # back to where you were
 ```
 
-The Release `fuzz-corpus-8b5985e` does **not** need pre-creating: the first box
+The Release `fuzz-corpus-e096fc8` does **not** need pre-creating: the first box
 to sync creates it race-safely (it ignores `already_exists`).
 
 ### 4. Watch results on your phone (two clicks, once)
@@ -116,7 +116,7 @@ curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeg
 
 `bootstrap.sh` picks the PAT up from `PLXFUZZ_PAT`, stores it `0600` at
 `/etc/plxfuzz/pat`, then unattended: installs the pinned toolchain + build deps,
-clones `8b5985e`, `gh auth login --with-token`, warm-builds the fuzzers,
+clones `e096fc8`, `gh auth login --with-token`, warm-builds the fuzzers,
 installs+enables the systemd units, and starts fuzzing. It is idempotent —
 re-pasting on a half-built box self-heals. When it prints `node box-a live`,
 walk away.
@@ -208,7 +208,7 @@ entire procedure; no other coordination.
 ### Ending the campaign
 
 Day 15: destroy both boxes. The corpus survives in the Release
-`fuzz-corpus-8b5985e` and the crash repros in the `fuzz-crashes` branch. A new
+`fuzz-corpus-e096fc8` and the crash repros in the `fuzz-crashes` branch. A new
 campaign = a new commit SHA (new Release tag) + a fresh 16-day PAT; the old PAT
 expires on its own with the boxes.
 
