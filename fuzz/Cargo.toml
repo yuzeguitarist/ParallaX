@@ -113,3 +113,10 @@ path = "fuzz_targets/udp_reorder.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "replay_dedup"
+path = "fuzz_targets/replay_dedup.rs"
+test = false
+doc = false
+bench = false
