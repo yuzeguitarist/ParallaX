@@ -177,4 +177,57 @@ mod tests {
             "rejected insert must not change byte count"
         );
     }
+
+    /// Property test (seeded, no extra deps): for many random arrival orders —
+    /// shuffled, with duplicates sprinkled in — the buffer must reconstruct the
+    /// records in EXACT seq order, deliver each exactly once, and return its
+    /// accounting to zero. This is the fail-safe contract for untrusted,
+    /// reorderable, duplicating network input: never a wrong-but-accepted order.
+    #[test]
+    fn random_permutations_reconstruct_in_order() {
+        use rand::seq::SliceRandom;
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        for seed in 0..200u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let n: u64 = rng.gen_range(1..=64);
+            // Distinct, variable-length content per seq so any misorder, drop, or
+            // duplicate delivery is detectable in the reconstructed stream.
+            let records: Vec<Vec<u8>> = (0..n)
+                .map(|s| vec![(s & 0xff) as u8; (s as usize % 7) + 1])
+                .collect();
+
+            // Arrival order: a shuffle of 0..n with extra duplicate arrivals.
+            let mut arrivals: Vec<u64> = (0..n).collect();
+            arrivals.shuffle(&mut rng);
+            for _ in 0..rng.gen_range(0..=n) {
+                let dup = rng.gen_range(0..n);
+                let pos = rng.gen_range(0..=arrivals.len());
+                arrivals.insert(pos, dup);
+            }
+
+            // Bounds sized so the ordering property is isolated from the capacity
+            // path (capacity rejection is covered by its own test): peak pending
+            // is at most n when seq 0 arrives last.
+            let mut buf = ReorderBuffer::new(0, n as usize, 1 << 20);
+            let mut delivered: Vec<Vec<u8>> = Vec::new();
+            for seq in arrivals {
+                // Duplicates return Ok(false); a capacity error must never happen
+                // with these bounds, so unwrap is a real invariant check.
+                buf.insert(seq, records[seq as usize].clone()).unwrap();
+                while let Some(record) = buf.pop_next() {
+                    delivered.push(record);
+                }
+            }
+
+            assert_eq!(delivered, records, "seed {seed}: reconstruct 0..n in order");
+            assert_eq!(buf.next_seq(), n, "seed {seed}: next_seq advances to n");
+            assert_eq!(buf.pending_len(), 0, "seed {seed}: nothing left pending");
+            assert_eq!(
+                buf.pending_bytes(),
+                0,
+                "seed {seed}: byte accounting clears"
+            );
+        }
+    }
 }
