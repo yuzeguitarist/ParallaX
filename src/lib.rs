@@ -5,6 +5,7 @@ pub mod config;
 pub mod crypto;
 pub mod fingerprint;
 pub mod handshake;
+pub mod netmatrix;
 pub mod probe;
 pub mod process_hardening;
 pub mod protocol;

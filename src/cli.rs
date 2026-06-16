@@ -20,7 +20,7 @@ use crate::{
         session::{derive_client_keys, AeadCodec, X25519KeyPair},
     },
     handshake::server,
-    probe, process_hardening,
+    netmatrix, probe, process_hardening,
     runtime_guard::RuntimeGuard,
     speed,
     transport::tcp::bump_nofile_soft_limit,
@@ -63,6 +63,16 @@ enum Command {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
         /// Emit a machine-readable evidence report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a reproducible controlled-network (RTT/bandwidth) speed matrix
+    /// against the configured server, via an emulated loopback shaper.
+    #[command(name = "netmatrix")]
+    NetMatrix {
+        #[arg(short, long, default_value = "parallax.toml")]
+        config: PathBuf,
+        /// Emit a machine-readable JSON document instead of the text table.
         #[arg(long)]
         json: bool,
     },
@@ -140,6 +150,7 @@ async fn handle_command(command: Command) -> anyhow::Result<()> {
         Command::Serve { config } => run_server(config).await?,
         Command::Client { config } => run_client(config).await?,
         Command::Speed { config, json } => run_speed(config, json).await?,
+        Command::NetMatrix { config, json } => run_netmatrix(config, json).await?,
         Command::Benchmark { quick, json } => run_benchmark(quick, json)?,
         Command::ConfigTemplate {
             server_listen,
@@ -225,6 +236,15 @@ async fn run_speed(config: PathBuf, json: bool) -> anyhow::Result<()> {
     } else {
         print!("{}", report.to_text());
     }
+    Ok(())
+}
+
+async fn run_netmatrix(config: PathBuf, json: bool) -> anyhow::Result<()> {
+    prepare_long_lived_process();
+    let cfg = load_config(&config)?;
+    cfg.protect_secret_memory();
+    let _guard = RuntimeGuard::acquire_speed(&cfg)?;
+    netmatrix::run(cfg, json).await?;
     Ok(())
 }
 
