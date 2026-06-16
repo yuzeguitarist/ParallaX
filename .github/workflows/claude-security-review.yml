@@ -15,7 +15,13 @@ name: claude-security-review
 on:
   pull_request:
     branches: [main, master]
-    types: [opened, synchronize, ready_for_review, reopened]
+    # Cost control: run ONCE per PR (on open / ready-for-review / reopen), NOT on
+    # every push. `synchronize` (fires on each new commit) was the expensive path
+    # — iterating on a PR re-ran the full Claude review on every push. The single
+    # open-time pass, plus claude-batch-review (every 25 commits) and claude-audit
+    # (bi-monthly), keep coverage; force a fresh pass by closing + reopening the
+    # PR if one is wanted after later commits.
+    types: [opened, ready_for_review, reopened]
     paths:
       # Any Rust source (future-proof: new src/udp, src/quic, src/pq are covered
       # automatically) plus dependency manifests. tests/ and docs are excluded.
