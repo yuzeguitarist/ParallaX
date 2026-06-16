@@ -354,12 +354,6 @@ impl DatagramReceiver {
             if self.try_fec_fill(base, k)? {
                 continue; // filled — loop will deliver the now-contiguous run
             }
-            // Gap at `deliver_seq`. Try to FEC-fill its window.
-            let base = self.window_base(self.deliver_seq);
-            let k = self.window_k(base);
-            if self.try_fec_fill(base, k)? {
-                continue; // filled — loop will deliver the now-contiguous run
-            }
             // Cannot fill yet. Do NOT declare unrecoverable on a structural margin:
             // a window's repair datagrams are themselves paced/reorderable and may
             // still be in flight, so a margin check (`high_water` past the window)
@@ -1034,8 +1028,8 @@ mod tests {
         let cap = 4usize;
         let mut rx = DatagramReceiver::new(start, SYMBOL_LEN, cap, 1024 * 1024).unwrap();
         // Feed sources just ABOVE the first window (seq >= K) so window 0 never
-        // completes and they pile up in pending until the small cap trips — while
-        // high_water stays below the unrecoverability margin (2*K).
+        // completes and they pile up in pending behind the gap until the small cap
+        // trips (the memory backstop for a stalled stream).
         let mut c = codec();
         let mut rng = StdRng::seed_from_u64(11);
         let mut err = None;
@@ -1081,8 +1075,8 @@ mod tests {
     }
 
     /// A loss in the partial final window cannot be FEC-recovered (no repairs for a
-    /// partial window), so the receiver never reports done — the leg's post-FIN
-    /// deadline turns this into a reset rather than a silent truncation.
+    /// partial window), so the receiver never reports done — the leg's liveness stall
+    /// timer turns this into a reset rather than a silent truncation.
     #[test]
     fn final_partial_window_loss_is_not_deliverable() {
         let n = FEC_K + 5;
