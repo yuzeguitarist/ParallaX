@@ -1,21 +1,22 @@
 use std::{fmt, time::Duration};
 
+use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
     time::{timeout, Instant},
 };
+use zeroize::Zeroizing;
 
 use crate::{
     config::{Config, Mode},
     crypto::session::X25519KeyPair,
-    tls::safari26::Safari26TlsCamouflage,
+    tls::safari26::{Safari26TlsCamouflage, Safari26TlsError},
     transport::tcp::connect_tuned_tcp_host,
 };
 
 const DEFAULT_PORT: u16 = 443;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const PROBE_PSK: &[u8] = b"ParallaX probe Safari TLS path";
 
 #[derive(Debug, Error)]
 pub enum ProbeError {
@@ -179,7 +180,12 @@ pub fn target_from_config(config: &Config) -> Result<(ProbeTarget, String), Prob
                 .as_ref()
                 .ok_or(ProbeError::MissingConfigTarget)?;
             let target = ProbeTarget::parse(&client.sni)?;
-            Ok((target, client.sni.clone()))
+            // Use the parsed host (scheme/port/path stripped) as the TLS SNI,
+            // matching the Server arm. A `client.sni` of `host:port` would
+            // otherwise be handed verbatim to ServerName::try_from and rejected as
+            // invalid, producing a false TLS-FAIL verdict for a reachable host.
+            let sni = target.host.clone();
+            Ok((target, sni))
         }
     }
 }
@@ -330,9 +336,25 @@ async fn complete_tls_probe(
     deadline: Duration,
 ) -> Result<TlsProbeResult, String> {
     let server = X25519KeyPair::generate();
+    // Use a fresh RANDOM per-probe PSK (and a throwaway server key), never a
+    // hard-coded constant. As of v4 the ClientHello carrier masks are keyed by
+    // HKDF(psk, X25519(server_static, tls_ephemeral)), so they no longer leak the
+    // PSK to a passive observer; but the probe still uses a random PSK so its
+    // ClientHello carries no fixed, binary-derivable structure a censor could
+    // match against to flag the host as ParallaX. The benign TLS origin we probe
+    // ignores these auth fields, so a random key does not affect what we measure.
+    let mut probe_psk = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(probe_psk.as_mut_slice());
     let session = Safari26TlsCamouflage
-        .start(sni.to_owned(), PROBE_PSK, &server.public)
-        .map_err(|err| format!("Safari TLS client init failed: {err}"))?;
+        .start(sni.to_owned(), probe_psk.as_slice(), &server.public)
+        .map_err(|err| match err {
+            // Surface the dedicated, actionable SNI message instead of an opaque
+            // generic string (makes the otherwise-dead ProbeError variant reachable).
+            Safari26TlsError::InvalidServerName(name) => {
+                ProbeError::InvalidServerName(name).to_string()
+            }
+            other => format!("Safari TLS client init failed: {other}"),
+        })?;
     let started = Instant::now();
     let completed = timeout(deadline, session.complete(stream))
         .await
@@ -464,7 +486,7 @@ mod tests {
         assert_eq!(report.verdict, ProbeVerdict::Good);
     }
 
-    use crate::config::{ClientConfig, CryptoConfig, Mode, ServerConfig, TrafficConfig};
+    use crate::config::{ClientConfig, CryptoConfig, Mode, ServerConfig, TrafficConfig, UdpConfig};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use pqcrypto_mldsa::mldsa87;
     use pqcrypto_mlkem::mlkem1024;
@@ -654,6 +676,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: Some(ClientConfig {
                 listen: "127.0.0.1:1080".parse().unwrap(),
                 server_addr: "example.com:443".to_owned(),
@@ -673,6 +696,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: None,
             server: Some(ServerConfig {
                 listen: "127.0.0.1:8443".parse().unwrap(),
@@ -682,8 +706,17 @@ mod tests {
                 pq_secret_key: String::new(),
                 identity_secret_key: STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]),
                 replay_cache_path: PathBuf::from("/tmp/parallax-test-replay.cache"),
+                replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni,
                 strict_tls13: true,
+                max_concurrent_per_source_v4: 256,
+                max_concurrent_per_source_v6: 256,
+                source_ipv6_prefix_len: 64,
+                first_record_wait_floor_ms: 8_000,
+                first_record_wait_jitter_ms: 7_000,
+                fallback_idle_floor_ms: 600_000,
+                fallback_idle_jitter_ms: 0,
+                tcp_congestion: None,
             }),
         }
     }
@@ -694,7 +727,9 @@ mod tests {
         let (target, sni) = target_from_config(&cfg).unwrap();
         assert_eq!(target.host, "camouflage.example");
         assert_eq!(target.port, 443);
-        assert_eq!(sni, "camouflage.example:443");
+        // The SNI is the parsed bare host, never the raw host:port (which rustls
+        // would reject as an invalid ServerName, yielding a false TLS-FAIL).
+        assert_eq!(sni, "camouflage.example");
     }
 
     #[test]

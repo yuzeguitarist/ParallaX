@@ -19,10 +19,17 @@ use std::time::{Duration, Instant};
 
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
+use parallax::crypto::session::{AeadCodec, X25519KeyPair, AEAD_TAG_LEN};
+use parallax::crypto::{identity, pq};
+use parallax::protocol::command::{ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange};
+use parallax::protocol::data::{DataRecordCodec, SERVER_TO_CLIENT_AAD};
+use parallax::tls::record::TLS_HEADER_LEN;
+use parallax::tls::safari26::Safari26TlsCamouflage;
+use parallax::traffic::PaddingProfile;
+
 use crate::gfw_sim::detection::active_prober::ProbeObservation;
 use crate::gfw_sim::detection::burst_statistics::LengthObservation;
 use crate::gfw_sim::detection::tcp_dual_mb::FlowKey;
-use crate::gfw_sim::fixtures::synthetic_tls13_client_hello;
 use crate::gfw_sim::injection::BlockingPolicy;
 use crate::gfw_sim::runtime::{
     middlebox::{ClientToServerEvent, ScenarioInputs, ServerToClientEvent},
@@ -32,8 +39,19 @@ use crate::gfw_sim::runtime::{
 
 // --------------------- helpers ---------------------
 
-fn build_parallax_tcp_client_hello(sni: &str, seed: u64) -> Vec<u8> {
-    synthetic_tls13_client_hello(sni, seed)
+/// Drive the REAL Safari 26 ParallaX camouflage emitter to produce the actual
+/// product ClientHello bytes the server sends on the wire — the same drive
+/// pattern as `safari_parity_baseline.rs`. The GFW simulator's detectors then
+/// judge the real 20-cipher/13-extension/GREASE product instead of a synthetic
+/// stand-in. `seed` is unused (the real path draws GREASE/randoms from OsRng).
+fn build_parallax_tcp_client_hello(sni: &str, _seed: u64) -> Vec<u8> {
+    let server = X25519KeyPair::generate();
+    let psk = b"0123456789abcdef0123456789abcdef";
+    Safari26TlsCamouflage
+        .start(sni.to_owned(), psk, &server.public)
+        .expect("start Safari 26 ParallaX TLS camouflage")
+        .client_hello_bytes()
+        .to_vec()
 }
 
 fn synthetic_random_payload(seed: u64, len: usize) -> Vec<u8> {
@@ -43,40 +61,140 @@ fn synthetic_random_payload(seed: u64, len: usize) -> Vec<u8> {
     bytes
 }
 
+/// Server-side identity-proof chunk plaintext size. The product server draws this
+/// per connection from `rng.gen_range(SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT
+/// ..=SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT)` (960..=1320) in `server.rs`. We pin the
+/// high end of that real range here so the reconstruction is deterministic while
+/// still being a value the server actually emits; it also matches the in-tree
+/// `server.rs` chunking test that exercises `SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT`.
+const IDENTITY_CHUNK_PLAINTEXT_LEN: usize = 1320;
+
+/// Reconstruct scenario_4's server->client length series from the REAL product
+/// encoders instead of hand-typed magic numbers.
+///
+/// The authenticated server (see `run_authenticated_data_mode` in
+/// `src/handshake/server.rs`) emits, after the client's PQ rekey, exactly:
+///   1. one sealed `ServerKeyExchange` record (X25519 pub + ML-KEM-1024
+///      ciphertext + framing), then
+///   2. the ML-DSA-87 identity proof, fragmented by
+///      `ServerIdentityChunk::encode_all` into browser-sized records sealed one at
+///      a time with >40 ms spacing.
+///
+/// We drive those same public encoders here, seal each frame with the real
+/// `DataRecordCodec` (default `TrafficConfig` padding: min=max=0), and report each
+/// record's on-wire length minus the TLS header and AEAD tag -- i.e. the
+/// padded-plaintext length the burst detector documents `LengthObservation.length`
+/// to be. Nothing is hardcoded: the ML-DSA-87 signature length (~4.6 KB) and the
+/// chunk count fall out of the encoders. Timestamps are SYNTHESIZED with fixed
+/// deltas (one ~8 ms intra-burst gap, then >`BURST_GAP` spacings) so the test stays
+/// deterministic while preserving scenario_4's "fragmentation spreads the records
+/// across bursts so no burst recreates the 2-record PqRekey/ServerIdentity spike".
 fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
-    // Current ParallaX sends an encrypted server key exchange, then fragments
-    // the ML-DSA identity proof into browser-sized records with >40 ms spacing.
-    // This keeps the largest post-handshake record below the old ~4.7 KB
-    // signature spike and prevents the signature chunks from aggregating into
-    // one ParallaX-specific burst.
+    // Real ML-KEM-1024 ciphertext + real ServerKeyExchange framing.
+    let mlkem = pq::keypair();
+    let encapsulation = pq::encapsulate(&mlkem.public).expect("ML-KEM-1024 encapsulation");
+    let server_ephemeral = X25519KeyPair::generate();
+    let key_exchange_payload = ServerKeyExchange {
+        server_x25519_public: server_ephemeral.public,
+        mlkem_ciphertext: encapsulation.ciphertext,
+    }
+    .encode()
+    .expect("encode ServerKeyExchange");
+
+    // Real ML-DSA-87 signature -> real ServerIdentityProof -> real chunking. The
+    // signing inputs are arbitrary fixed test vectors; only the signature's true
+    // length (and thus the chunk count) matters for the length series.
+    let identity_keys = identity::keypair();
+    let signature = identity::sign_server_identity(
+        &identity_keys.secret,
+        &[0x11_u8; 32], // transcript hash
+        &server_ephemeral.public,
+        &[0x22_u8; 32], // pq rekey binding
+        1,              // epoch
+    )
+    .expect("ML-DSA-87 sign_server_identity");
+    assert!(
+        signature.len() > 4000,
+        "ML-DSA-87 identity signature should be ~4.6 KB; got {} bytes",
+        signature.len()
+    );
+    let identity_payload = ServerIdentityProof {
+        signature: signature.clone(),
+    }
+    .encode()
+    .expect("encode ServerIdentityProof");
+    let identity_chunks =
+        ServerIdentityChunk::encode_all(&identity_payload, IDENTITY_CHUNK_PLAINTEXT_LEN)
+            .expect("chunk ServerIdentityProof");
+    let identity_chunk_count = identity_chunks.len();
+
+    // Real server->client record sealer with the default padding profile the
+    // product server uses (TrafficConfig::default => min=max=0). The AEAD key/nonce
+    // are irrelevant to the sealed *length*, so any value works.
+    let padding = PaddingProfile::new(0, 0).expect("zero padding profile");
+    let mut server_seal = DataRecordCodec::new(
+        AeadCodec::new([7_u8; 32], [9_u8; 12]),
+        padding,
+        SERVER_TO_CLIENT_AAD,
+    );
+    let mut rng = StdRng::seed_from_u64(0x5EA1);
+
+    // The detector defines `length` as the record length after the 5-byte TLS
+    // header is stripped and before the AEAD tag, i.e. the padded plaintext. Derive
+    // it from the REAL sealed record so a future framing/padding change is reflected.
+    let sealed_plaintext_len = |codec: &mut DataRecordCodec, payload: &[u8], rng: &mut StdRng| {
+        let record = codec
+            .seal(payload, rng)
+            .expect("seal server->client record");
+        record.len() - TLS_HEADER_LEN - AEAD_TAG_LEN
+    };
+
+    // Same wire order as the server: ServerKeyExchange first, then the identity
+    // chunks. Same direction (server->client) as the original.
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(1 + identity_chunk_count);
+    payloads.push(key_exchange_payload);
+    payloads.extend(identity_chunks);
+
+    // Synthesized deterministic arrival times: an ~8 ms intra-burst gap between the
+    // first two records, then >BURST_GAP (40 ms) spacing so each later chunk lands
+    // in its own burst -- the timing shape the original helper used.
+    let arrival_offsets_ms = |idx: usize| -> u64 {
+        match idx {
+            0 => 0,
+            1 => 8,
+            n => 8 + (n as u64 - 1) * 48,
+        }
+    };
+
     let start = Instant::now();
-    vec![
-        LengthObservation {
-            length: 1550,
-            at: start,
+    let series: Vec<LengthObservation> = payloads
+        .iter()
+        .enumerate()
+        .map(|(idx, payload)| LengthObservation {
+            length: sealed_plaintext_len(&mut server_seal, payload, &mut rng),
+            at: start + Duration::from_millis(arrival_offsets_ms(idx)),
             client_to_server: false,
-        },
-        LengthObservation {
-            length: 1320,
-            at: start + Duration::from_millis(8),
-            client_to_server: false,
-        },
-        LengthObservation {
-            length: 1310,
-            at: start + Duration::from_millis(55),
-            client_to_server: false,
-        },
-        LengthObservation {
-            length: 1290,
-            at: start + Duration::from_millis(103),
-            client_to_server: false,
-        },
-        LengthObservation {
-            length: 1250,
-            at: start + Duration::from_millis(151),
-            client_to_server: false,
-        },
-    ]
+        })
+        .collect();
+
+    // Anti-tautology guard: the series must come from the measured signature/chunk
+    // sizes, not a stale hardcoded shape. If a future change stops fragmenting the
+    // identity proof (or stops sending the key exchange), these break instead of
+    // silently keeping the old verdict.
+    assert!(!series.is_empty(), "length series must be non-empty");
+    assert!(
+        identity_chunk_count >= 2,
+        "ML-DSA-87 proof ({} B) must fragment into multiple records at chunk size {}; got {}",
+        identity_payload.len(),
+        IDENTITY_CHUNK_PLAINTEXT_LEN,
+        identity_chunk_count
+    );
+    assert_eq!(
+        series.len(),
+        1 + identity_chunk_count,
+        "series must be exactly one ServerKeyExchange record plus every identity chunk"
+    );
+    series
 }
 
 fn chrome_like_burst_lengths() -> Vec<LengthObservation> {
@@ -159,12 +277,27 @@ fn scenario_1_chrome_to_cloudflare_baseline_passes() {
     };
     let report = sim.run_scenario(scenario);
     print_report(&report);
-    // We allow Suspicious because parallax's mimicry leaves unknown JA4 in
-    // strict mode; in default config it should not be Block.
+    // Strong indistinguishability check (not just "did not get blocked"): the
+    // real ParallaX ClientHello must be fingerprinted as a genuine known browser
+    // (Safari). The tls_fingerprint layer maps KnownBrowser -> Allow, Unknown ->
+    // Suspicious, KnownProxy -> Block, so asserting Allow proves the product was
+    // positively recognized as Safari, not merely left unclassified. Before the
+    // Safari reference JA3/JA4 was corrected to the real first-party value this
+    // flow scored Unknown -> Suspicious and this assertion would have failed.
+    let tls_fp = report
+        .layer_verdicts
+        .iter()
+        .find(|v| v.layer == "tls_fingerprint")
+        .expect("tls_fingerprint layer must run on a ClientHello flow");
+    assert_eq!(
+        tls_fp.kind,
+        VerdictKind::Allow,
+        "real ParallaX must be recognized as a known browser (Safari), not just avoid Block"
+    );
     assert_ne!(
         report.final_verdict(),
         VerdictKind::Block,
-        "Chrome→Cloudflare baseline must not be blocked"
+        "a flow fingerprinted as real Safari must not be blocked"
     );
 }
 
@@ -533,4 +666,199 @@ fn scenario_9_permissive_policy_disables_all_enforcement() {
         report.egress_actions.is_empty(),
         "permissive policy must not emit egress actions"
     );
+}
+
+// --------------------- UDP fast-plane (TUDP) QUIC Initial gate ---------------------
+//
+// These tests feed the REAL quinn QUIC Initial produced by ParallaX's UDP-leg
+// client config (`parallax::transport::udp::client_config`) into the GFW QUIC
+// Initial detector, grounding the camouflage "gate" in actual on-wire bytes
+// rather than synthetic packets. Today they CHARACTERIZE the un-hardened leg:
+// the Initial is a standard, decryptable v1 Initial whose SNI is readable from a
+// single datagram. When a later camouflage slice adds SNI-slicing across CRYPTO
+// frames/datagrams and a browser-matched JA4q, the first assertion flips (SNI no
+// longer extractable from the first datagram) and a JA4q-match assertion is
+// added — that is when this becomes a hard pass/fail gate.
+
+/// Drive ParallaX's UDP-leg quinn client far enough to emit its QUIC Initial and
+/// capture that first datagram off a plain UDP socket standing in for the server.
+async fn capture_udp_leg_initial(server_name: &str) -> Vec<u8> {
+    use std::sync::Arc;
+
+    use parallax::transport::udp::client_config;
+    use quinn::Endpoint;
+    use rustls::{
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        DigitallySignedStruct, SignatureScheme,
+    };
+
+    // The Initial is sent before any ServerHello arrives, so the cert verifier is
+    // never invoked; a never-called accept-any verifier is enough to build the
+    // client config for capture.
+    #[derive(Debug)]
+    struct NeverCalled;
+    impl ServerCertVerifier for NeverCalled {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(client_config(Arc::new(NeverCalled)).unwrap());
+
+    // Registering the connection makes quinn's driver transmit the Initial; it
+    // never completes (no real QUIC server replies), so hold it on a task while
+    // we capture the first datagram.
+    let connecting = endpoint.connect(server_addr, server_name).unwrap();
+    let drive = tokio::spawn(async move {
+        let _ = connecting.await;
+    });
+
+    let mut buf = vec![0_u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), listener.recv_from(&mut buf))
+        .await
+        .expect("UDP-leg QUIC Initial captured within 5s")
+        .expect("recv_from the captured Initial");
+    buf.truncate(n);
+    drive.abort();
+    buf
+}
+
+#[tokio::test]
+async fn udp_leg_initial_is_standard_decryptable_quic_v1() {
+    use crate::gfw_sim::detection::quic_initial::{
+        decrypt_payload, derive_client_initial_keys_v2, parse_initial_frames,
+        parse_protected_long_header, reassemble_crypto_stream, unprotect_header,
+    };
+
+    // The UDP face does NOT obfuscate the QUIC header/Initial: an on-path GFW can
+    // derive the Initial keys from the cleartext DCID and decrypt it, exactly like
+    // a browser HTTP/3 flow. Camouflage comes from looking like real H3, not from
+    // hiding that it is QUIC, so this asserts the realistic baseline (the adversary
+    // CAN decrypt) and that what is carried is a TLS ClientHello.
+    let initial = capture_udp_leg_initial("cloudflare.com").await;
+    let mut pkt = initial.clone();
+    let mut hdr = parse_protected_long_header(&pkt).expect("v1 long header parses");
+    let keys = derive_client_initial_keys_v2(&hdr.dcid).expect("v1 Initial keys derive from DCID");
+    unprotect_header(&mut pkt, &mut hdr, &keys).expect("header protection removed");
+    let payload = decrypt_payload(&pkt, &hdr, &keys).expect("Initial payload decrypts");
+    let frames = parse_initial_frames(&payload).expect("Initial frames parse");
+    let crypto = reassemble_crypto_stream(&frames);
+    assert_eq!(
+        crypto.first(),
+        Some(&0x01_u8),
+        "the QUIC Initial carries a TLS ClientHello (handshake type 0x01)"
+    );
+}
+
+#[tokio::test]
+async fn udp_leg_initial_first_datagram_holds_only_partial_clienthello() {
+    use crate::gfw_sim::detection::quic_initial::{
+        decrypt_payload, derive_client_initial_keys_v2, parse_initial_frames,
+        parse_protected_long_header, reassemble_crypto_stream, unprotect_header,
+        QuicInitialDetector, QuicInitialVerdict,
+    };
+
+    // ParallaX's UDP-leg ClientHello carries the post-quantum hybrid key share
+    // (X25519MLKEM768, ~1.2 KB), pushing it past 1200 bytes so quinn fragments it
+    // across multiple QUIC Initial datagrams — the same mechanism that incidentally
+    // defeats the GFW's single-datagram SNI extraction for Chrome's HTTP/3.
+    //
+    // IMPORTANT (do not over-read this test): the SNI is NOT hidden. It is present
+    // in cleartext across the full multi-datagram ClientHello and, because rustls
+    // randomizes order-insensitive extension order per connection, may even sit in
+    // this first datagram. What is proven is narrower: a GFW model that buffers the
+    // WHOLE declared ClientHello before parsing (as the in-repo detector does, and
+    // as the live GFW reportedly does — it does not reassemble across datagrams)
+    // extracts nothing from a single datagram. A streaming SNI extractor, or a
+    // censor that buffers a flow's Initial datagrams by 5-tuple, WOULD reassemble
+    // the CH and read the SNI (note reassemble_crypto_stream already stitches CRYPTO
+    // frames WITHIN a packet). Treat this as a decaying external blind spot, not a
+    // hardened ParallaX property. The real SNI-slice camouflage slice must make the
+    // fragmentation a deliberate, asserted invariant rather than an incidental side
+    // effect of the key-share size; if a quinn/rustls change ever shrinks the
+    // ClientHello back under one datagram, this test flips and flags the regression.
+    let detector = QuicInitialDetector::default();
+    for sni in ["cloudflare.com", "blocked.example"] {
+        // Loopback + quinn emit the offset-0 Initial datagram first; assertion (a)
+        // below relies on that (out-of-order delivery would zero-pad the gap).
+        let initial = capture_udp_leg_initial(sni).await;
+
+        // (a) Prove the captured datagram holds only a PARTIAL ClientHello: the
+        // declared handshake length must exceed the bytes present in this datagram.
+        // This ties the no-SNI result below to genuine multi-datagram fragmentation,
+        // not to some unrelated decode failure.
+        let mut pkt = initial.clone();
+        let mut hdr = parse_protected_long_header(&pkt).expect("v1 long header");
+        let keys = derive_client_initial_keys_v2(&hdr.dcid).expect("Initial keys");
+        unprotect_header(&mut pkt, &mut hdr, &keys).expect("unprotect header");
+        let payload = decrypt_payload(&pkt, &hdr, &keys).expect("decrypt payload");
+        let crypto = reassemble_crypto_stream(&parse_initial_frames(&payload).expect("frames"));
+        assert!(
+            crypto.len() >= 4 && crypto[0] == 0x01,
+            "first datagram starts a TLS ClientHello"
+        );
+        let declared_ch_len =
+            4 + (((crypto[1] as usize) << 16) | ((crypto[2] as usize) << 8) | (crypto[3] as usize));
+        assert!(
+            declared_ch_len > crypto.len(),
+            "ClientHello ({declared_ch_len} B) must span beyond this single datagram ({} B)",
+            crypto.len()
+        );
+
+        // (b) Therefore a whole-CH-buffering GFW filter extracts no SNI / fires no
+        // rule from this single datagram. Pin the expected outcome to the partial-CH
+        // reassembly failure so a future decrypt/framing regression cannot pass here.
+        match detector.inspect(&initial, None) {
+            QuicInitialVerdict::AllowSni { sni: got, .. }
+            | QuicInitialVerdict::BlockSni { sni: got, .. } => panic!(
+                "GFW model extracted SNI {got:?} from a single datagram for {sni:?}; \
+                 multi-datagram ClientHello fragmentation no longer protects the SNI"
+            ),
+            // IncompleteClientHello's Display is "could not reassemble a complete
+            // ClientHello from crypto frames"; match on the stable "reassemble"
+            // substring (the complete-CH parse-failure variant also says "ClientHello").
+            QuicInitialVerdict::Failed(msg) if msg.contains("reassemble") => {}
+            QuicInitialVerdict::NoSni { .. } => {
+                // A complete CH with no server_name; unreachable for this partial-CH
+                // input, but harmless — still means no SNI was extracted.
+            }
+            QuicInitialVerdict::Failed(other) => {
+                panic!("unexpected decrypt/parse failure (not SNI fragmentation): {other}")
+            }
+        }
+    }
 }

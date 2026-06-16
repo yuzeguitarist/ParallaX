@@ -273,7 +273,12 @@ pub fn unprotect_header(
     header.packet_number_full = pn_full;
     header.packet_number_length = pn_length;
     header.payload_offset = header.packet_number_offset + pn_length;
-    header.payload_len = (header.length_field as usize) - pn_length;
+    // The Length field covers the packet number plus payload, so it must be at
+    // least `pn_length`. A smaller declared length underflows this subtraction
+    // (debug panic / huge usize in release); reject it as a malformed length.
+    header.payload_len = (header.length_field as usize)
+        .checked_sub(pn_length)
+        .ok_or(QuicInitialError::BadLength)?;
     header.header_len_after_unprotection = header.payload_offset;
     Ok(())
 }

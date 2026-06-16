@@ -1,0 +1,7 @@
+# tls_server_hello: src/tls/server_hello.rs parse_server_hello
+rec_hs="\x16\x03\x03"
+hs_server_hello="\x02"
+legacy_ver="\x03\x03"
+ext_supported_versions="\x00\x2b"
+tls13="\x03\x04"
+supp_ver_selected="\x00\x02\x03\x04"

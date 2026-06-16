@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<!--
+  ParallaX distributed-fuzz cluster dashboard — Vercel-style UI.
+
+  Private repo, so heartbeats are read through the GitHub REST API with a token:
+    GET https://api.github.com/repos/<repo>/contents/<path>?ref=fuzz-status
+        Authorization: Bearer <fine-grained PAT, Contents:Read>
+        Accept: application/vnd.github.raw
+  api.github.com sends permissive CORS, so double-clicking this file from disk
+  (file://) works. The token is prompted once and kept in this browser's
+  localStorage only — never committed, never sent anywhere but api.github.com.
+
+  Stale-while-revalidate: the last successful snapshot (per-box JSON + the
+  throughput history) is cached in localStorage and re-rendered INSTANTLY on
+  load, so a refresh never flashes empty / reflows — fresh data updates in place.
+
+  status.sh schema (per box): { node, commit, ts, owns[],
+    execs_per_sec:{target:n}, total_execs_per_sec, corpus_files, corpus_bytes,
+    crash_count, oom_timeout_count, max_rss_mb, uptime_s, disk_free_pct }.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>ParallaX · fuzz cluster</title>
+<style>
+  :root {
+    --bg:        #000000;
+    --card:      #0a0a0a;
+    --card-hi:   #0f0f0f;
+    --border:    rgba(255,255,255,0.09);
+    --border-hi: rgba(255,255,255,0.18);
+    --fg:        #ededed;
+    --fg-2:      #a1a1a1;
+    --fg-3:      #6e6e6e;
+    --blue:      #0072f5;
+    --blue-2:    #3291ff;
+    --green:     #0cce6b;
+    --amber:     #f5a623;
+    --red:       #ff5a5f;
+    --green-bg:  rgba(12,206,107,0.12);
+    --red-bg:    rgba(255,90,95,0.12);
+    --amber-bg:  rgba(245,166,35,0.12);
+    --blue-bg:   rgba(0,114,245,0.16);
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); }
+  body {
+    margin: 0;
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI",
+                 Roboto, Inter, Helvetica, Arial, sans-serif;
+    font-size: 14px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    padding: 32px 24px 64px;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  a { color: var(--fg-2); text-decoration: none; }
+  a:hover { color: var(--fg); }
+
+  /* ---- header ---- */
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
+  h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
+  h1 .dim { color: var(--fg-3); font-weight: 500; }
+  .sub { margin: 6px 0 0; color: var(--fg-2); font-size: 13px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border: 1px solid var(--border);
+          border-radius: 999px; font-size: 12px; color: var(--fg-2); }
+  .chip.mono { letter-spacing: 0; }
+  .head-right { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; white-space: nowrap; }
+  .livepill { display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border: 1px solid var(--border);
+              border-radius: 999px; font-size: 13px; font-weight: 500; background: var(--card); }
+  .updated { color: var(--fg-3); font-size: 12px; }
+
+  /* ---- status dot ---- */
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+  .dot.ok   { background: var(--green); box-shadow: 0 0 0 3px rgba(12,206,107,0.18); }
+  .dot.warn { background: var(--amber); box-shadow: 0 0 0 3px rgba(245,166,35,0.18); }
+  .dot.bad  { background: var(--red);   box-shadow: 0 0 0 3px rgba(255,90,95,0.16); }
+
+  /* ---- KPI cards ---- */
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+  .kpi { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; transition: border-color .15s; min-height: 116px; }
+  .kpi:hover { border-color: var(--border-hi); }
+  .kpi-label { color: var(--fg-2); font-size: 13px; }
+  .kpi-value { font-size: 34px; font-weight: 600; letter-spacing: -0.02em; margin-top: 6px;
+               font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 10px; min-height: 41px; }
+  .kpi-value small { font-size: 13px; font-weight: 500; color: var(--fg-3); letter-spacing: 0; }
+  .kpi-sub { color: var(--fg-3); font-size: 12px; margin-top: 4px; }
+  .trend { font-size: 12px; font-weight: 600; padding: 2px 7px; border-radius: 999px; letter-spacing: 0; }
+  .trend.up   { color: var(--green); background: var(--green-bg); }
+  .trend.down { color: var(--red);   background: var(--red-bg); }
+  .trend.flat { color: var(--fg-3);  background: transparent; }
+
+  /* ---- chart card ---- */
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 24px; }
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
+  .panel-title { font-size: 14px; font-weight: 600; }
+  .panel-note { color: var(--fg-3); font-size: 12px; }
+  .chart { width: 100%; height: 132px; display: block; }
+
+  /* ---- section label ---- */
+  .section { font-size: 13px; font-weight: 600; color: var(--fg-2); margin: 0 0 12px; letter-spacing: .01em; }
+
+  /* ---- node cards ---- */
+  .nodes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 28px; min-height: 214px; }
+  .node { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; transition: border-color .15s; }
+  .node:hover { border-color: var(--border-hi); }
+  .node.down { opacity: .72; }
+  .node-head { display: flex; align-items: center; gap: 9px; }
+  .node-name { font-size: 15px; font-weight: 600; }
+  .badge { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; text-transform: lowercase; }
+  .badge.live { color: var(--green); background: var(--green-bg); }
+  .badge.warn { color: var(--amber); background: var(--amber-bg); }
+  .badge.down { color: var(--red);   background: var(--red-bg); }
+  .node-age { margin-left: auto; color: var(--fg-3); font-size: 12px; }
+  .node-exec { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; margin: 12px 0 2px; font-variant-numeric: tabular-nums; }
+  .node-exec small { font-size: 12px; font-weight: 500; color: var(--fg-3); margin-left: 6px; }
+  .node-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; margin-top: 12px;
+                border-top: 1px solid var(--border); padding-top: 12px; }
+  .stat { display: flex; justify-content: space-between; font-size: 12.5px; }
+  .stat .l { color: var(--fg-3); }
+  .stat .v { color: var(--fg); font-variant-numeric: tabular-nums; }
+  .node-empty { color: var(--fg-3); font-size: 13px; margin-top: 16px; }
+
+  /* ---- targets table ---- */
+  .table-wrap { min-height: 240px; }
+  table { border-collapse: collapse; width: 100%; background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  thead th { background: transparent; color: var(--fg-3); font-weight: 500; font-size: 11px; text-transform: uppercase;
+             letter-spacing: .06em; text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border); }
+  thead th.num { text-align: right; }
+  tbody td { padding: 0 16px; border-bottom: 1px solid var(--border); height: 44px; vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: var(--card-hi); }
+  .cell-node { display: inline-flex; align-items: center; gap: 8px; color: var(--fg-2); font-size: 13px; }
+  .cell-target { font-size: 13.5px; }
+  .exec-num { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .age { color: var(--fg-3); font-size: 12.5px; }
+  .age.stale { color: var(--amber); } .age.down { color: var(--red); }
+  .muted-row td { color: var(--fg-3); }
+
+  /* ---- footer ---- */
+  footer { color: var(--fg-3); font-size: 12px; margin-top: 22px; display: flex; gap: 10px; align-items: center; }
+  footer a { cursor: pointer; color: var(--blue-2); }
+  .err { color: var(--red); }
+  .refreshing #nodes, .refreshing .kpis, .refreshing .table-wrap { opacity: .96; }
+  .refreshing { transition: opacity .12s; }
+
+  @media (max-width: 880px) {
+    .kpis { grid-template-columns: repeat(2, 1fr); }
+    .nodes { grid-template-columns: 1fr; min-height: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>ParallaX <span class="dim">fuzz cluster</span></h1>
+      <p class="sub">
+        distributed libFuzzer
+        <span class="chip mono" id="pin">e409efa</span>
+        <a href="https://github.com/yuzeguitarist/ParallaX/issues?q=is%3Aissue+label%3Afuzz-crash" target="_blank" rel="noopener">crashes ↗</a>
+      </p>
+    </div>
+    <div class="head-right">
+      <span class="livepill"><span class="dot ok" id="liveDot"></span><span id="liveTxt">— / —</span></span>
+      <span class="updated" id="updated">loading…</span>
+    </div>
+  </header>
+
+  <section class="kpis">
+    <div class="kpi">
+      <div class="kpi-label">Throughput</div>
+      <div class="kpi-value"><span id="kExec">—</span> <small>exec/s</small> <span class="trend flat" id="kExecTrend"></span></div>
+      <div class="kpi-sub">across the cluster</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Corpus</div>
+      <div class="kpi-value"><span id="kCorpus">—</span> <span class="trend flat" id="kCorpusTrend"></span></div>
+      <div class="kpi-sub" id="kCorpusSub">inputs</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Crashes</div>
+      <div class="kpi-value"><span id="kCrash">—</span></div>
+      <div class="kpi-sub" id="kCrashSub">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Nodes live</div>
+      <div class="kpi-value"><span id="kNodes">—</span></div>
+      <div class="kpi-sub" id="kNodesSub">reporting heartbeats</div>
+    </div>
+  </section>
+
+  <div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">Cluster throughput</span>
+      <span class="panel-note"><span id="chartCur">—</span> exec/s · recent</span>
+    </div>
+    <svg class="chart" id="chart" preserveAspectRatio="none" viewBox="0 0 800 132"></svg>
+  </div>
+
+  <p class="section">Nodes</p>
+  <div class="nodes" id="nodes"></div>
+
+  <p class="section">Targets <span style="color:var(--fg-3);font-weight:400">· by throughput</span></p>
+  <div class="table-wrap">
+    <table aria-label="per-target fuzzer status">
+      <thead>
+        <tr>
+          <th style="width:110px">Node</th>
+          <th>Target</th>
+          <th class="num" style="width:140px">Exec/s</th>
+          <th style="width:110px">Last seen</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <footer id="foot">Loading…</footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var REPO = "yuzeguitarist/ParallaX";
+  var BRANCH = "fuzz-status";
+  var NODES = ["box-a", "box-b", "box-c"];
+  var DIR = "fuzz/dashboard/";
+  var TOKKEY = "plx_pat";
+  var SNAPKEY = "plx_snapshot_v1";
+
+  var STALE_SEC = 5 * 60, DOWN_SEC = 15 * 60, REFRESH_MS = 30 * 1000;
+  var MAXHIST = 80;
+
+  // ---- token ----
+  function getToken() {
+    var t = "";
+    try { t = window.localStorage.getItem(TOKKEY) || ""; } catch (e) {}
+    if (!t) {
+      t = (window.prompt("Paste a GitHub fine-grained PAT (Contents:Read on " + REPO +
+        ")\nStored only in THIS browser, never uploaded:") || "").trim();
+      if (t) { try { window.localStorage.setItem(TOKKEY, t); } catch (e) {} }
+    }
+    return t;
+  }
+  function clearToken() { try { window.localStorage.removeItem(TOKKEY); } catch (e) {} window.location.reload(); }
+  window.__plxResetToken = clearToken;
+
+  // ---- snapshot cache (stale-while-revalidate) ----
+  function loadSnap() { try { return JSON.parse(window.localStorage.getItem(SNAPKEY) || "null"); } catch (e) { return null; } }
+  function saveSnap(results) { try { window.localStorage.setItem(SNAPKEY, JSON.stringify({ results: results, hist: HIST })); } catch (e) {} }
+
+  // ---- fmt ----
+  function fmtInt(n) { if (n == null || isNaN(n)) return "-"; return Number(n).toLocaleString("en-US"); }
+  function fmtCompact(n) {
+    if (n == null || isNaN(n)) return "-";
+    n = Number(n);
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    if (n >= 1e4) return (n / 1e3).toFixed(0) + "K";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+    return String(n);
+  }
+  function fmtBytes(b) {
+    if (b == null || isNaN(b)) return "-";
+    b = Number(b);
+    if (b >= 1073741824) return (b / 1073741824).toFixed(1) + " GB";
+    if (b >= 1048576) return (b / 1048576).toFixed(1) + " MB";
+    if (b >= 1024) return (b / 1024).toFixed(0) + " KB";
+    return b + " B";
+  }
+  function fmtDur(s) {
+    if (s == null || isNaN(s)) return "-";
+    s = Math.floor(Number(s));
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m";
+    return s + "s";
+  }
+  function ageOf(ts) {
+    if (!ts) return { text: "never", sec: Infinity, cls: "down" };
+    var t = Date.parse(ts);
+    if (isNaN(t)) return { text: "?", sec: Infinity, cls: "down" };
+    var sec = Math.max(0, Math.round((Date.now() - t) / 1000)), text;
+    if (sec < 90) text = sec + "s ago";
+    else if (sec < 3600) text = Math.round(sec / 60) + "m ago";
+    else if (sec < 86400) text = (sec / 3600).toFixed(1) + "h ago";
+    else text = (sec / 86400).toFixed(1) + "d ago";
+    return { text: text, sec: sec, cls: sec > DOWN_SEC ? "down" : (sec > STALE_SEC ? "stale" : "") };
+  }
+  function trendPill(el, cur, prev, kind) {
+    if (prev == null) { el.className = "trend flat"; el.textContent = ""; return; }
+    var d = cur - prev;
+    if (kind === "abs") {
+      if (d === 0) { el.className = "trend flat"; el.textContent = ""; return; }
+      el.className = "trend " + (d > 0 ? "up" : "down");
+      el.textContent = (d > 0 ? "+" : "") + fmtInt(d);
+      return;
+    }
+    if (prev <= 0) { el.className = "trend flat"; el.textContent = ""; return; }
+    var pct = Math.round((d / prev) * 100);
+    if (pct === 0) { el.className = "trend flat"; el.textContent = ""; return; }
+    el.className = "trend " + (pct > 0 ? "up" : "down");
+    el.textContent = (pct > 0 ? "+" : "") + pct + "%";
+  }
+
+  function targetsOf(data) {
+    if (!data) return [];
+    if (Array.isArray(data.targets)) return data.targets.map(function (r) { return { target: r.target, eps: r.execs_per_sec }; });
+    var m = data.execs_per_sec;
+    if (m && typeof m === "object") return Object.keys(m).map(function (k) { return { target: k, eps: m[k] }; });
+    return [];
+  }
+
+  var AUTH_ERR = false;
+  function statusUrl(node) {
+    return "https://api.github.com/repos/" + REPO + "/contents/" + DIR + "status-" + node + ".json?ref=" + BRANCH + "&t=" + Date.now();
+  }
+  function fetchNode(node, token) {
+    return fetch(statusUrl(node), { cache: "no-store",
+        headers: { "Authorization": "Bearer " + token, "Accept": "application/vnd.github.raw" } })
+      .then(function (r) {
+        if (r.status === 401 || r.status === 403) { AUTH_ERR = true; throw new Error("HTTP " + r.status); }
+        if (r.status === 404) throw new Error("no status file");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (data) { return { node: node, ok: true, data: data }; })
+      .catch(function (err) { return { node: node, ok: false, error: String(err.message || err) }; });
+  }
+
+  // ---- area chart ----
+  var HIST = [];
+  var prevAgg = null;
+
+  function drawChart(vals) {
+    var W = 800, H = 132, pad = 12;
+    var svg = document.getElementById("chart");
+    if (!vals.length) { svg.innerHTML = ""; return; }
+    var data = vals.length === 1 ? [vals[0], vals[0]] : vals;
+    var n = data.length, max = Math.max.apply(null, data.concat([1])) * 1.15;
+    var xs = function (i) { return (i / (n - 1)) * W; };
+    var ys = function (v) { return H - pad - (v / max) * (H - pad * 2); };
+    var line = "";
+    for (var i = 0; i < n; i++) line += (i ? "L" : "M") + xs(i).toFixed(1) + " " + ys(data[i]).toFixed(1) + " ";
+    var area = line + "L" + W + " " + H + " L0 " + H + " Z";
+    svg.innerHTML =
+      '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">' +
+        '<stop offset="0%" stop-color="rgba(0,114,245,0.30)"/>' +
+        '<stop offset="100%" stop-color="rgba(0,114,245,0)"/>' +
+      '</linearGradient></defs>' +
+      '<path d="' + area + '" fill="url(#g)"/>' +
+      '<path d="' + line + '" fill="none" stroke="#3291ff" stroke-width="2" vector-effect="non-scaling-stroke"/>';
+  }
+
+  function stat(label, val) { return '<div class="stat"><span class="l">' + label + '</span><span class="v">' + val + '</span></div>'; }
+
+  // opts.cache = render from a stored snapshot (do not push history / save / show trend)
+  function render(results, opts) {
+    opts = opts || {};
+    var nodesEl = document.getElementById("nodes");
+    var rowsEl = document.getElementById("rows");
+    nodesEl.innerHTML = ""; rowsEl.innerHTML = "";
+
+    var aggExec = 0, aggCorpus = 0, aggBytes = 0, aggCrash = 0, live = 0, pinShown = false;
+    var allRows = [];
+
+    results.forEach(function (res) {
+      var data = res.ok ? (res.data || {}) : null;
+      var age = ageOf(data && data.ts);
+      var isLive = res.ok && age.sec <= DOWN_SEC;
+      if (isLive) live++;
+      if (data && data.commit && !pinShown) { document.getElementById("pin").textContent = String(data.commit).slice(0, 12); pinShown = true; }
+
+      var tlist = targetsOf(data);
+      var nExec = data && data.total_execs_per_sec != null ? Number(data.total_execs_per_sec)
+                  : tlist.reduce(function (s, r) { return s + (Number(r.eps) || 0); }, 0);
+      if (isLive) { aggExec += nExec; aggCorpus += Number((data && data.corpus_files) || 0);
+                    aggBytes += Number((data && data.corpus_bytes) || 0); aggCrash += Number((data && data.crash_count) || 0); }
+
+      var state = !res.ok || age.sec > DOWN_SEC ? "down" : (age.sec > STALE_SEC ? "warn" : "live");
+      var dotCls = state === "live" ? "ok" : (state === "warn" ? "warn" : "bad");
+      var card = document.createElement("div");
+      card.className = "node" + (state === "down" ? " down" : "");
+      if (!res.ok || tlist.length === 0) {
+        card.innerHTML =
+          '<div class="node-head"><span class="dot ' + dotCls + '"></span><span class="node-name">' + res.node +
+            '</span><span class="badge ' + (state === "down" ? "down" : "warn") + '">' + (state === "down" ? "down" : "no data") +
+            '</span><span class="node-age">' + age.text + '</span></div>' +
+          '<div class="node-empty">' + (res.ok ? "reporting, no per-target data yet" : "no status file — node not started?") + '</div>';
+      } else {
+        card.innerHTML =
+          '<div class="node-head"><span class="dot ' + dotCls + '"></span><span class="node-name">' + res.node +
+            '</span><span class="badge ' + (state === "live" ? "live" : "warn") + '">' + (state === "live" ? "live" : "stale") +
+            '</span><span class="node-age">' + age.text + '</span></div>' +
+          '<div class="node-exec">' + fmtInt(nExec) + '<small>exec/s</small></div>' +
+          '<div class="node-stats">' +
+            stat("targets", tlist.length) +
+            stat("corpus", fmtInt(data.corpus_files) + " · " + fmtBytes(data.corpus_bytes)) +
+            stat("crashes", Number(data.crash_count || 0)) +
+            stat("oom/timeout", Number(data.oom_timeout_count || 0)) +
+            stat("max rss", fmtInt(data.max_rss_mb) + " MB") +
+            stat("disk free", fmtInt(data.disk_free_pct) + "%") +
+            stat("uptime", fmtDur(data.uptime_s)) +
+            stat("commit", '<span class="mono">' + String(data.commit || "-").slice(0, 7) + "</span>") +
+          '</div>';
+      }
+      nodesEl.appendChild(card);
+
+      tlist.forEach(function (r) { allRows.push({ node: res.node, target: r.target, eps: Number(r.eps) || 0, age: age }); });
+    });
+
+    // KPIs
+    document.getElementById("kExec").textContent = fmtCompact(aggExec);
+    document.getElementById("kCorpus").textContent = fmtInt(aggCorpus);
+    document.getElementById("kCorpusSub").textContent = "inputs · " + fmtBytes(aggBytes);
+    var crashEl = document.getElementById("kCrash"), crashSub = document.getElementById("kCrashSub");
+    crashEl.textContent = fmtInt(aggCrash);
+    crashEl.style.color = aggCrash > 0 ? "var(--red)" : "var(--green)";
+    crashSub.textContent = aggCrash > 0 ? "needs triage — see Issues" : "clean";
+    crashSub.style.color = aggCrash > 0 ? "var(--red)" : "var(--fg-3)";
+    document.getElementById("kNodes").textContent = live + " / " + NODES.length;
+
+    if (!opts.cache) {
+      trendPill(document.getElementById("kExecTrend"), aggExec, prevAgg && prevAgg.exec, "pct");
+      trendPill(document.getElementById("kCorpusTrend"), aggCorpus, prevAgg && prevAgg.corpus, "abs");
+      prevAgg = { exec: aggExec, corpus: aggCorpus };
+      HIST.push(aggExec); if (HIST.length > MAXHIST) HIST.shift();
+      saveSnap(results);
+    }
+    drawChart(HIST);
+    document.getElementById("chartCur").textContent = fmtInt(HIST.length ? HIST[HIST.length - 1] : aggExec);
+
+    var ld = document.getElementById("liveDot");
+    ld.className = "dot " + (live === NODES.length ? "ok" : (live > 0 ? "warn" : "bad"));
+    document.getElementById("liveTxt").textContent = live + " / " + NODES.length + " live";
+
+    // targets table
+    allRows.sort(function (a, b) { return b.eps - a.eps; });
+    if (!allRows.length) {
+      rowsEl.innerHTML = '<tr class="muted-row"><td colspan="4" style="height:60px">no per-target data yet — boxes warming up</td></tr>';
+    } else {
+      allRows.forEach(function (r) {
+        var tr = document.createElement("tr");
+        tr.innerHTML =
+          '<td><span class="cell-node"><span class="dot ok" style="width:6px;height:6px;box-shadow:none"></span>' + r.node + '</span></td>' +
+          '<td class="cell-target mono">' + (r.target || "-") + '</td>' +
+          '<td class="exec-num">' + fmtInt(r.eps) + '</td>' +
+          '<td><span class="age ' + r.age.cls + '">' + r.age.text + '</span></td>';
+        rowsEl.appendChild(tr);
+      });
+    }
+
+    var stamp = opts.cache ? "cached" : new Date().toLocaleTimeString();
+    var auth = AUTH_ERR ? '<span class="err">token rejected</span> · <a onclick="__plxResetToken()">re-enter token</a>'
+                        : '<a onclick="__plxResetToken()">reset token</a>';
+    document.getElementById("foot").innerHTML = "Updated " + stamp + " · auto-refresh 30s · " + auth;
+    document.getElementById("updated").textContent = "updated " + stamp;
+  }
+
+  function tick() {
+    var token = getToken();
+    if (!token) { document.getElementById("foot").innerHTML = '<span class="err">no token</span> · <a onclick="__plxResetToken()">enter token</a>'; return; }
+    document.body.classList.add("refreshing");
+    Promise.all(NODES.map(function (n) { return fetchNode(n, token); }))
+      .then(function (results) { render(results); })
+      .catch(function (e) { document.getElementById("foot").textContent = "render error: " + e; })
+      .then(function () { document.body.classList.remove("refreshing"); });
+  }
+
+  // Instant paint from the last snapshot so a refresh never flashes empty.
+  var snap = loadSnap();
+  if (snap && snap.results) {
+    if (Array.isArray(snap.hist)) HIST = snap.hist.slice(-MAXHIST);
+    try { render(snap.results, { cache: true }); } catch (e) {}
+  }
+  tick();
+  setInterval(tick, REFRESH_MS);
+})();
+</script>
+</body>
+</html>

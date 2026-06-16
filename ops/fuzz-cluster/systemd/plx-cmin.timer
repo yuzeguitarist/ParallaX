@@ -1,0 +1,16 @@
+[Unit]
+Description=ParallaX fuzz cluster — daily corpus prune (fixed UTC minute)
+Documentation=https://github.com/yuzeguitarist/ParallaX
+
+[Timer]
+# Once per day at a fixed UTC minute, off the :00 mark so the three boxes and
+# the wider fleet don't all hit GitHub at the same instant. Each box only
+# prunes the targets sha256(date+target)%3 assigns to it, so same-time is fine.
+OnCalendar=*-*-* 03:17:00 UTC
+# Run a missed prune (box was down at 03:17) on the next boot.
+Persistent=true
+RandomizedDelaySec=300
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

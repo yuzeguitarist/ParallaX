@@ -1,8 +1,10 @@
 name: ci-pr
 
 # Full CI tier: runs on every PR to main and on pushes to main (post-merge
-# safety net). Splits work into parallel jobs so failures are localized and
-# `test` / `gfw-sim` can be set as separate required status checks.
+# safety net). `lint` (fmt + clippy), `test`, and `gfw-sim` run as separate jobs
+# so failures stay localized and test / gfw-sim can be separate required checks.
+# fmt is folded into the `lint` job (shares the same runner/checkout/toolchain),
+# saving a whole rounded-up job-minute on every run.
 
 on:
   pull_request:
@@ -31,6 +33,12 @@ on:
       - 'LICENSE*'
   workflow_dispatch:
 
+# Least-privilege default token: these jobs only read the repo to build/test.
+# (Uses pull_request, not pull_request_target, so fork PRs already get a
+# read-only token; this makes that explicit and covers push/dispatch runs.)
+permissions:
+  contents: read
+
 concurrency:
   group: ci-pr-${{ github.ref }}
   cancel-in-progress: true
@@ -42,31 +50,27 @@ env:
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
-  fmt:
-    name: fmt
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
-  clippy:
-    name: clippy
+  lint:
+    name: lint (fmt + clippy)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: parallax-ci
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      # fmt is cheap (~seconds) and rides on this job's already-paid checkout +
+      # toolchain rather than spending a separate rounded-up job-minute.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -75,9 +79,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: parallax-ci
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
@@ -103,9 +111,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: parallax-ci
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}

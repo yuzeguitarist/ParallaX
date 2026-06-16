@@ -1,0 +1,48 @@
+[Unit]
+# ParallaX distributed-fuzz — one in-process libFuzzer per target.
+# Template unit: %i is the fuzz target name (e.g. plx-fuzz@mux_frame.service).
+# Box-level parallelism = the set of @target units enabled on this box (its
+# shard role). bootstrap.sh enables one instance per target in
+# `shard_targets <node-id>`.
+Description=ParallaX fuzz worker for %i
+# M-5: quarantine a deterministic crash-on-load instead of respawning forever.
+# A crashing corpus input loops at ~(crash + RestartSec) ≈ 11s, which is below
+# systemd's default 5-starts/10s burst so the limit never trips. Widen the window
+# so ~5 crashes within 10 min land the unit in 'failed' (the crash is already
+# filed by OnFailure) instead of burning CPU + re-running tmin/reproduce for 15
+# days. Recover with `systemctl reset-failed plx-fuzz@<t>` after the fix.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+User=plxfuzz
+WorkingDirectory=/var/lib/plxfuzz/src
+Environment=RUST_BACKTRACE=1
+Environment=HOME=/var/lib/plxfuzz
+Environment=CARGO_HOME=/var/lib/plxfuzz/.cargo
+Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
+Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# run-one.sh looks up %i in the authoritative shard table for this box's
+# node-id and execs exactly ONE in-process `cargo fuzz run` (no -jobs/-workers:
+# that hides crashes and drops post-`--` flags). The libFuzzer exit code is
+# therefore this unit's exit code.
+ExecStart=/var/lib/plxfuzz/bin/run-one.sh %i
+
+# A crash/OOM makes libFuzzer exit non-zero -> OnFailure fires the crash
+# reporter the instant it happens (no polling).
+OnFailure=crash-push@%i.service
+
+# Self-heal: resume after any exit (a real crash, or benign corpus-reload churn).
+# The 10 s backoff lets crash-push@ run and avoids a tight respawn loop.
+Restart=always
+RestartSec=10
+
+# Kernel backstop only. The real per-unit memory ceiling is libFuzzer's
+# -rss_limit_mb (set from the shard table); MemoryMax stops a runaway process
+# from taking the whole box even if the in-process check is somehow bypassed.
+# 5G > any single unit's rss cap (max 4096 MB) and the box budget keeps the sum
+# of co-located units under the 8 GB host.
+MemoryMax=5G
+
+[Install]
+WantedBy=multi-user.target

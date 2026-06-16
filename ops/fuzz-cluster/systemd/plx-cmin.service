@@ -1,0 +1,21 @@
+[Unit]
+Description=ParallaX fuzz cluster — daily corpus pruner-of-the-day (cmin + coverage gate)
+Documentation=https://github.com/yuzeguitarist/ParallaX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=plxfuzz
+WorkingDirectory=/var/lib/plxfuzz/src
+Environment=HOME=/var/lib/plxfuzz
+Environment=CARGO_HOME=/var/lib/plxfuzz/.cargo
+Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
+Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# cmin downloads, minimizes, gates on >=99% retained coverage, and only then
+# uploads the canonical corpus asset. Long-running but bounded; never fatal.
+ExecStart=/var/lib/plxfuzz/bin/cmin.sh
+Nice=15
+IOSchedulingClass=idle
+# A prune can take a while on a large corpus; give it room but don't hang boot.
+TimeoutStartSec=3600

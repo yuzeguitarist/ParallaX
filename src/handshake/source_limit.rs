@@ -1,0 +1,563 @@
+//! Per-source admission control for the camouflage relay.
+//!
+//! The global connection semaphore caps the *total* number of concurrent
+//! relays, but with the fallback idle backstop raised to 600s a single source
+//! that triggers fallback can pin global slots for up to ten minutes. This
+//! limiter caps how many concurrent connections one source (an IPv4 /32 or an
+//! IPv6 prefix) may hold at once, so no single source can monopolize the global
+//! pool while the backstop is high.
+//!
+//! It is intentionally a *concurrency* cap, not a rate limiter: a per-second
+//! token bucket would falsely reject legitimate bursts from shared/CGNAT
+//! addresses (an office, a school, a mobile carrier behind one public IP) and,
+//! worse, the clean-close-without-ServerHello it would emit is itself an
+//! observable "this box rate-limits" tell. The concurrency cap plus the global
+//! semaphore already bound single-source slot monopolization, which is the only
+//! threat the 600s backstop introduces.
+//!
+//! Spoofed source IPs cannot reach this limiter: `accept()` returns only after
+//! the TCP handshake completes, so `peer.ip()` is return-routable. The bounded,
+//! self-expiring map defends against *many distinct real sources* (a botnet),
+//! not spoofing.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    net::{IpAddr, Ipv6Addr},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+/// Idle entries (no active connections) are evicted this long after going idle.
+const SOURCE_IDLE_GRACE: Duration = Duration::from_secs(120);
+/// Lower bound on the map size so a tiny `relay_connection_limit` still leaves
+/// headroom for idle entries before eviction kicks in.
+const MIN_SOURCE_MAP_ENTRIES: usize = 4096;
+/// Max idle-log entries inspected per admission so the accept path stays cheap.
+const PRUNE_BUDGET: usize = 64;
+/// IPv6 aggregation prefix. A single routed allocation (commonly a /48 or /56 to
+/// one customer/VPS tenant) contains thousands of /64s, so the per-/64 cap alone
+/// lets one administrative entity rotate /64s to bypass it entirely. A coarser
+/// /48 rollup ceiling bounds the total one prefix-holder can hold across all its
+/// /64 buckets. Capped at the configured per-source prefix, so a coarser
+/// `v6_prefix_len` (e.g. /32) makes the rollup a no-op rather than finer-grained.
+const AGG_V6_PREFIX_LEN: u8 = 48;
+/// The /48 aggregate ceiling is `cap_v6 * AGG_V6_FANOUT`: one /48 may hold a
+/// small multiple of a single /64's cap (so a handful of legitimate /64s in one
+/// org still connect), but not unbounded /64 rotation.
+const AGG_V6_FANOUT: u32 = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum SourceKey {
+    /// IPv4 /32 (also used for IPv4-mapped IPv6).
+    V4([u8; 4]),
+    /// IPv6 masked to the configured prefix (default /64).
+    V6([u8; 16]),
+}
+
+struct Entry {
+    active: u32,
+    /// `Some(t)` when `active == 0`, recording when it went idle. Compared
+    /// against the idle-log timestamp so a re-activated-then-re-idled entry is
+    /// not evicted by a stale log record.
+    idle_since: Option<Instant>,
+}
+
+struct Inner {
+    map: HashMap<SourceKey, Entry>,
+    /// `(key, time-it-went-idle)`. A key may appear several times; stale records
+    /// are skipped on prune by comparing against the live `idle_since`.
+    idle_log: VecDeque<(SourceKey, Instant)>,
+    /// Active-connection count per IPv6 /48 aggregate (summed across all its /64
+    /// buckets), to cap /64 rotation within one routed prefix. Self-cleaning: a
+    /// key is removed when its count returns to zero, so this map stays bounded by
+    /// the number of /48s with a live connection (<= the global connection limit).
+    agg_v6: HashMap<[u8; 16], u32>,
+}
+
+/// Caps concurrent connections per source. Cheap to clone via `Arc`.
+pub struct SourceLimiter {
+    inner: Mutex<Inner>,
+    cap_v4: u32,
+    cap_v6: u32,
+    v6_prefix_len: u8,
+    max_entries: usize,
+    idle_grace: Duration,
+}
+
+/// Held for the whole connection lifetime; decrements the source's active count
+/// on drop and stamps the entry idle when it reaches zero.
+pub struct SourcePermit {
+    limiter: Arc<SourceLimiter>,
+    key: SourceKey,
+}
+
+impl Drop for SourcePermit {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        let mut inner = self
+            .limiter
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let became_idle = match inner.map.get_mut(&self.key) {
+            Some(entry) => {
+                entry.active = entry.active.saturating_sub(1);
+                if entry.active == 0 {
+                    entry.idle_since = Some(now);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        // Decrement the IPv6 /48 aggregate for this connection (every permit drop
+        // = one fewer active connection in the prefix); self-clean the key when it
+        // reaches zero so the aggregate map stays bounded.
+        if let Some(agg_key) = self.limiter.agg_key_for(&self.key) {
+            if let Some(count) = inner.agg_v6.get_mut(&agg_key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    inner.agg_v6.remove(&agg_key);
+                }
+            }
+        }
+        if became_idle {
+            inner.idle_log.push_back((self.key, now));
+            // Hard-bound the idle log. The grace-based prune in `try_admit` only
+            // drains records older than the grace window, and under sustained
+            // high-churn from a small number of sources (too few to trip the
+            // over-capacity path) the drain rate equals the fill rate, so the
+            // deque would otherwise grow to accept_rate x grace without limit.
+            // Capping it here keeps memory bounded regardless of churn pattern.
+            while inner.idle_log.len() > self.limiter.max_entries {
+                drain_front_idle_record(&mut inner);
+            }
+        }
+    }
+}
+
+/// Pops the oldest idle-log record and evicts its map entry if that entry is
+/// still the idle entry the record refers to (a re-activated-then-re-idled entry
+/// has a newer `idle_since`, so a stale record only drops the log line).
+fn drain_front_idle_record(inner: &mut Inner) {
+    if let Some((key, logged)) = inner.idle_log.pop_front() {
+        if let Some(entry) = inner.map.get(&key) {
+            if entry.active == 0 && entry.idle_since == Some(logged) {
+                inner.map.remove(&key);
+            }
+        }
+    }
+}
+
+impl SourceLimiter {
+    /// Build a limiter sized against the global connection limit. `max_entries`
+    /// is kept comfortably above `connection_limit` so active entries (which can
+    /// never exceed the global limit) always fit and only idle entries are ever
+    /// evicted.
+    pub fn new(cap_v4: u32, cap_v6: u32, v6_prefix_len: u8, connection_limit: usize) -> Arc<Self> {
+        let max_entries = connection_limit
+            .saturating_mul(4)
+            .max(MIN_SOURCE_MAP_ENTRIES);
+        Self::with_params(
+            cap_v4,
+            cap_v6,
+            v6_prefix_len,
+            max_entries,
+            SOURCE_IDLE_GRACE,
+        )
+    }
+
+    fn with_params(
+        cap_v4: u32,
+        cap_v6: u32,
+        v6_prefix_len: u8,
+        max_entries: usize,
+        idle_grace: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Inner {
+                map: HashMap::new(),
+                idle_log: VecDeque::new(),
+                agg_v6: HashMap::new(),
+            }),
+            cap_v4,
+            cap_v6,
+            v6_prefix_len,
+            max_entries,
+            idle_grace,
+        })
+    }
+
+    /// Admit a connection from `ip`, returning a permit that must be held for the
+    /// connection's lifetime, or `None` if the source is at its concurrency cap.
+    pub fn try_admit(self: Arc<Self>, ip: IpAddr) -> Option<SourcePermit> {
+        let key = self.key_for(ip);
+        let cap = self.cap_for(&key);
+        let agg_key = self.agg_key_for(&key);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.prune_locked(&mut inner);
+        // IPv6 /48 aggregate ceiling, checked read-only BEFORE the per-/64 cap so
+        // a rejection never half-admits (no map entry created, no counts bumped).
+        if let Some(agg_key) = agg_key {
+            let agg_cap = self.cap_v6.saturating_mul(AGG_V6_FANOUT);
+            if inner.agg_v6.get(&agg_key).copied().unwrap_or(0) >= agg_cap {
+                return None;
+            }
+        }
+        let entry = inner.map.entry(key).or_insert(Entry {
+            active: 0,
+            idle_since: None,
+        });
+        if entry.active >= cap {
+            return None;
+        }
+        entry.active += 1;
+        entry.idle_since = None;
+        if let Some(agg_key) = agg_key {
+            *inner.agg_v6.entry(agg_key).or_insert(0) += 1;
+        }
+        drop(inner);
+        Some(SourcePermit { limiter: self, key })
+    }
+
+    fn key_for(&self, ip: IpAddr) -> SourceKey {
+        match ip {
+            IpAddr::V4(v4) => SourceKey::V4(v4.octets()),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => SourceKey::V4(v4.octets()),
+                None => SourceKey::V6(masked_v6(v6, self.v6_prefix_len)),
+            },
+        }
+    }
+
+    fn cap_for(&self, key: &SourceKey) -> u32 {
+        match key {
+            SourceKey::V4(_) => self.cap_v4,
+            SourceKey::V6(_) => self.cap_v6,
+        }
+    }
+
+    /// The IPv6 /48 aggregate key for a source key (None for V4). Re-masks the
+    /// already-/64-masked V6 key down to the aggregate prefix; the prefix is
+    /// capped at the configured per-source `v6_prefix_len` so a coarser config
+    /// (e.g. /32) makes the rollup a no-op rather than finer-grained than the
+    /// per-source key.
+    fn agg_key_for(&self, key: &SourceKey) -> Option<[u8; 16]> {
+        match key {
+            SourceKey::V6(bytes) => {
+                let prefix = AGG_V6_PREFIX_LEN.min(self.v6_prefix_len);
+                Some(masked_v6(Ipv6Addr::from(*bytes), prefix))
+            }
+            SourceKey::V4(_) => None,
+        }
+    }
+
+    /// Evicts idle entries past the grace period, plus -- when the map is over
+    /// its bound -- the oldest idle entries regardless of grace. Bounded work per
+    /// call; always makes progress (pops one log record per iteration).
+    fn prune_locked(&self, inner: &mut Inner) {
+        let now = Instant::now();
+        for _ in 0..PRUNE_BUDGET {
+            let Some(&(_, logged)) = inner.idle_log.front() else {
+                break;
+            };
+            let over_capacity = inner.map.len() > self.max_entries;
+            let expired = now.saturating_duration_since(logged) >= self.idle_grace;
+            if !expired && !over_capacity {
+                break;
+            }
+            drain_front_idle_record(inner);
+        }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map
+            .len()
+    }
+
+    #[cfg(test)]
+    fn idle_log_len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .idle_log
+            .len()
+    }
+
+    #[cfg(test)]
+    fn agg_entry_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .agg_v6
+            .len()
+    }
+}
+
+/// Masks an IPv6 address to `prefix_len` bits (host bits zeroed).
+fn masked_v6(addr: Ipv6Addr, prefix_len: u8) -> [u8; 16] {
+    let mut octets = addr.octets();
+    let prefix = prefix_len.min(128) as usize;
+    let full_bytes = prefix / 8;
+    let rem_bits = prefix % 8;
+    if rem_bits != 0 && full_bytes < 16 {
+        let mask = 0xFFu8 << (8 - rem_bits);
+        octets[full_bytes] &= mask;
+        for byte in octets.iter_mut().skip(full_bytes + 1) {
+            *byte = 0;
+        }
+    } else {
+        for byte in octets.iter_mut().skip(full_bytes) {
+            *byte = 0;
+        }
+    }
+    octets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn admits_up_to_cap_then_rejects() {
+        let limiter = SourceLimiter::with_params(2, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        let ip = v4(203, 0, 113, 7);
+        let p1 = Arc::clone(&limiter).try_admit(ip);
+        let p2 = Arc::clone(&limiter).try_admit(ip);
+        assert!(p1.is_some() && p2.is_some(), "within cap must admit");
+        assert!(
+            Arc::clone(&limiter).try_admit(ip).is_none(),
+            "over cap must reject"
+        );
+        // A different source is unaffected.
+        assert!(Arc::clone(&limiter)
+            .try_admit(v4(198, 51, 100, 1))
+            .is_some());
+    }
+
+    #[test]
+    fn permit_drop_frees_a_slot() {
+        let limiter = SourceLimiter::with_params(1, 1, 64, 4096, SOURCE_IDLE_GRACE);
+        let ip = v4(203, 0, 113, 9);
+        let p1 = Arc::clone(&limiter).try_admit(ip);
+        assert!(p1.is_some());
+        assert!(Arc::clone(&limiter).try_admit(ip).is_none(), "at cap");
+        drop(p1);
+        assert!(
+            Arc::clone(&limiter).try_admit(ip).is_some(),
+            "freed slot must re-admit"
+        );
+    }
+
+    #[test]
+    fn v4_and_v6_caps_are_independent() {
+        let limiter = SourceLimiter::with_params(1, 3, 64, 4096, SOURCE_IDLE_GRACE);
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 1, 2, 3, 4));
+        // v6 cap is 3, so three admits succeed regardless of the v4 cap of 1.
+        let _a = Arc::clone(&limiter).try_admit(v6);
+        let _b = Arc::clone(&limiter).try_admit(v6);
+        let _c = Arc::clone(&limiter).try_admit(v6);
+        assert!(_a.is_some() && _b.is_some() && _c.is_some());
+        assert!(Arc::clone(&limiter).try_admit(v6).is_none());
+    }
+
+    #[test]
+    fn v6_prefix_groups_addresses_in_the_same_block() {
+        // /64 prefix: two addresses sharing the first 64 bits are one source.
+        let limiter = SourceLimiter::with_params(8, 1, 64, 4096, SOURCE_IDLE_GRACE);
+        let a = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x1, 0, 0, 0, 1));
+        let b = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x1, 0xffff, 0, 0, 2));
+        let _a = Arc::clone(&limiter).try_admit(a);
+        assert!(_a.is_some());
+        assert!(
+            Arc::clone(&limiter).try_admit(b).is_none(),
+            "same /64 must share the cap"
+        );
+        // A different /64 is a different source.
+        let c = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x2, 0, 0, 0, 1));
+        assert!(Arc::clone(&limiter).try_admit(c).is_some());
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_is_treated_as_ipv4() {
+        let limiter = SourceLimiter::with_params(1, 9, 64, 4096, SOURCE_IDLE_GRACE);
+        let mapped = IpAddr::V6(Ipv4Addr::new(203, 0, 113, 5).to_ipv6_mapped());
+        let plain = v4(203, 0, 113, 5);
+        let _a = Arc::clone(&limiter).try_admit(mapped);
+        assert!(_a.is_some());
+        assert!(
+            Arc::clone(&limiter).try_admit(plain).is_none(),
+            "mapped and plain v4 must share the v4 cap"
+        );
+    }
+
+    #[test]
+    fn idle_entries_are_evicted_when_over_capacity() {
+        // Tiny map: 2 entries. Each admit-then-drop leaves an idle entry; the map
+        // must not grow without bound as distinct sources churn through.
+        let limiter = SourceLimiter::with_params(4, 4, 64, 2, Duration::from_secs(120));
+        for i in 0..200u32 {
+            let octet = (i % 251) as u8;
+            let permit = Arc::clone(&limiter).try_admit(v4(10, 0, (i / 251) as u8, octet));
+            drop(permit); // becomes idle immediately
+        }
+        // Over-capacity eviction keeps the map bounded near max_entries even
+        // though grace has not elapsed.
+        assert!(
+            limiter.entry_count() <= 2 + PRUNE_BUDGET,
+            "idle map must stay bounded, got {}",
+            limiter.entry_count()
+        );
+    }
+
+    #[test]
+    fn idle_log_stays_bounded_under_single_source_high_churn() {
+        // A single source churning connect->drop indefinitely pushes one idle-log
+        // record per cycle. With far too few sources to trip the over-capacity
+        // path, the grace-based prune never fires during a fast burst, so without
+        // the hard cap the deque would grow unbounded. Assert it stays bounded by
+        // max_entries (here 64) no matter how many cycles run.
+        let limiter = SourceLimiter::with_params(4, 4, 64, 64, Duration::from_secs(120));
+        let ip = v4(203, 0, 113, 7);
+        for _ in 0..10_000 {
+            let permit = Arc::clone(&limiter).try_admit(ip);
+            drop(permit);
+        }
+        assert!(
+            limiter.idle_log_len() <= 64,
+            "idle_log must stay bounded by max_entries, got {}",
+            limiter.idle_log_len()
+        );
+    }
+
+    #[test]
+    fn v6_aggregate_cap_blocks_64_rotation_within_one_48() {
+        // cap_v6=2, aggregate = cap_v6 * AGG_V6_FANOUT = 8. Rotating /64s within
+        // ONE /48 can hold at most 8 total, not unbounded — the /64-rotation
+        // bypass the per-/64 cap alone allowed (M-5).
+        let limiter = SourceLimiter::with_params(4, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        let mut permits: Vec<SourcePermit> = (0..8u16)
+            .map(|i| {
+                // Vary hextet 3 (the /64 id) within the same /48 (hextets 0..3).
+                let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, i, 0, 0, 0, 1));
+                Arc::clone(&limiter)
+                    .try_admit(ip)
+                    .expect("each /64 within the aggregate cap must admit")
+            })
+            .collect();
+        // A 9th, empty /64 in the SAME /48 is rejected by the aggregate ceiling.
+        let ninth = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x99, 0, 0, 0, 1));
+        assert!(
+            Arc::clone(&limiter).try_admit(ninth).is_none(),
+            "/64 rotation within one /48 must be capped by the aggregate ceiling",
+        );
+        // A /64 in a DIFFERENT /48 is a separate aggregate and still admits.
+        let other_48 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xbeef, 0, 0, 0, 0, 1));
+        assert!(
+            Arc::clone(&limiter).try_admit(other_48).is_some(),
+            "a different /48 is a separate aggregate",
+        );
+        permits.clear();
+    }
+
+    #[test]
+    fn v6_per_64_cap_still_enforced_under_aggregate() {
+        // Within ONE /64 the per-/64 cap (2) binds before the aggregate (8).
+        let limiter = SourceLimiter::with_params(4, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x1, 0, 0, 0, 1));
+        let _a = Arc::clone(&limiter).try_admit(ip);
+        let _b = Arc::clone(&limiter).try_admit(ip);
+        assert!(_a.is_some() && _b.is_some());
+        assert!(
+            Arc::clone(&limiter).try_admit(ip).is_none(),
+            "per-/64 cap must still bind within a single /64",
+        );
+    }
+
+    #[test]
+    fn v6_aggregate_releases_and_self_cleans_on_drop() {
+        let limiter = SourceLimiter::with_params(4, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        let mut permits: Vec<SourcePermit> = (0..8u16)
+            .map(|i| {
+                let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, i, 0, 0, 0, 1));
+                Arc::clone(&limiter)
+                    .try_admit(ip)
+                    .expect("within aggregate")
+            })
+            .collect();
+        let ninth = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x99, 0, 0, 0, 1));
+        assert!(
+            Arc::clone(&limiter).try_admit(ninth).is_none(),
+            "aggregate full",
+        );
+        // Free one aggregate slot; a new /64 in the same /48 now admits.
+        let _ = permits.pop();
+        let reused = Arc::clone(&limiter).try_admit(ninth);
+        assert!(
+            reused.is_some(),
+            "freeing an aggregate slot must re-admit within the /48",
+        );
+        // Drop all permits; the /48 aggregate entry self-cleans to zero.
+        drop(permits);
+        drop(reused);
+        assert_eq!(
+            limiter.agg_entry_count(),
+            0,
+            "aggregate map must self-clean to zero when no connection is active",
+        );
+    }
+
+    #[test]
+    fn v4_admission_unaffected_by_aggregate() {
+        let limiter = SourceLimiter::with_params(1, 2, 64, 4096, SOURCE_IDLE_GRACE);
+        // Many distinct V4 sources admit freely; no IPv6 aggregate applies to them.
+        let _permits: Vec<SourcePermit> = (0..50u8)
+            .map(|i| {
+                Arc::clone(&limiter)
+                    .try_admit(v4(203, 0, 113, i))
+                    .expect("v4 admit")
+            })
+            .collect();
+        assert_eq!(
+            limiter.agg_entry_count(),
+            0,
+            "v4 admissions must not populate the IPv6 aggregate map",
+        );
+    }
+
+    #[test]
+    fn masked_v6_zeroes_host_bits() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0xdead, 0xbeef, 0x1, 0x2, 0x3, 0x4);
+        let masked = masked_v6(addr, 64);
+        assert_eq!(
+            masked,
+            Ipv6Addr::new(0x2001, 0xdb8, 0xdead, 0xbeef, 0, 0, 0, 0).octets()
+        );
+        // /128 keeps the whole address; /0 zeroes everything.
+        assert_eq!(masked_v6(addr, 128), addr.octets());
+        assert_eq!(masked_v6(addr, 0), [0u8; 16]);
+        // /56 is byte-aligned: keep bytes 0..7, zero the rest. addr byte 6 is
+        // 0xbe (high byte of the 4th hextet 0xbeef), byte 7 is zeroed.
+        let masked56 = masked_v6(addr, 56);
+        assert_eq!(masked56[6], 0xbe);
+        assert_eq!(masked56[7], 0);
+        // /60 is NOT byte-aligned: byte 7 (0xef) keeps its top 4 bits -> 0xe0.
+        let masked60 = masked_v6(addr, 60);
+        assert_eq!(masked60[6], 0xbe);
+        assert_eq!(masked60[7], 0xe0);
+        assert_eq!(masked60[8], 0);
+    }
+}

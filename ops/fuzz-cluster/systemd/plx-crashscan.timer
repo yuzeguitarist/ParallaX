@@ -1,0 +1,14 @@
+[Unit]
+Description=ParallaX fuzz cluster — periodic crash-artifact sweep (reliable reporting)
+Documentation=https://github.com/yuzeguitarist/ParallaX
+
+[Timer]
+# First sweep shortly after boot, then every ~3 min measured from the END of the
+# previous run (OnUnitInactiveSec) so a long sweep never overlaps itself.
+OnBootSec=2min
+OnUnitInactiveSec=3min
+RandomizedDelaySec=30
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

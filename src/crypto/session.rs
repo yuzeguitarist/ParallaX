@@ -4,6 +4,7 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -101,6 +102,8 @@ pub enum SessionError {
     Aead,
     #[error("AEAD nonce sequence exhausted")]
     NonceExhausted,
+    #[error("degenerate (all-zero) X25519 shared secret")]
+    DegenerateSharedSecret,
 }
 
 pub fn derive_client_keys(
@@ -146,6 +149,17 @@ fn derive_keys_from_shared(
     x25519_shared_secret: [u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
+    // Defense-in-depth: reject a degenerate (all-zero) X25519 shared secret.
+    // x25519-dalek does not reject low-order/contributory base points (RFC 7748
+    // leaves the all-zero-output check to the caller), so a peer that supplies a
+    // small-order public key can force the shared secret to all-zero. This funnel
+    // is post-authentication (the peer already passed PSK/X25519 auth, which is
+    // what actually gates exploitability), so this only restores the X25519
+    // layer's contributory guarantee in the hybrid rather than fixing a break.
+    // Constant-time compare so the rejection itself is not a timing oracle.
+    if bool::from(x25519_shared_secret.ct_eq(&[0u8; KEY_LEN])) {
+        return Err(SessionError::DegenerateSharedSecret);
+    }
     let chain_secret = initial_chain_secret(&x25519_shared_secret, transcript_hash)?;
     expand_epoch_keys(chain_secret, 0, *transcript_hash, x25519_shared_secret)
 }
@@ -274,6 +288,11 @@ pub struct AeadCodec {
     nonce_base: [u8; NONCE_LEN],
     sequence: u64,
     cipher: SharedCipher,
+    /// Set when a batch open/seal left the sequence counter in an indeterminate
+    /// state. Once poisoned, every seal/open entry point refuses to operate so
+    /// the session can only fail-close, never silently desynchronize its nonce
+    /// stream. Single-record opens never poison the codec.
+    poisoned: bool,
 }
 
 impl Drop for AeadCodec {
@@ -356,6 +375,7 @@ impl AeadCodec {
             nonce_base,
             sequence: 0,
             cipher: chacha20_poly1305_key(&key),
+            poisoned: false,
         };
         codec.protect_secret_memory();
         codec
@@ -393,6 +413,23 @@ impl AeadCodec {
         self.sequence = self.sequence.saturating_add(count);
     }
 
+    /// Permanently marks the codec unusable. Called by the batch open paths
+    /// when a partial failure may have advanced the sequence counter, turning
+    /// the "any failure must fail-close" caller convention into a type-enforced
+    /// guarantee.
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Returns an error if the codec has been poisoned by a prior batch
+    /// failure. Checked at every seal/open entry point.
+    pub(crate) fn ensure_usable(&self) -> Result<(), SessionError> {
+        if self.poisoned {
+            return Err(SessionError::Aead);
+        }
+        Ok(())
+    }
+
     pub fn protect_secret_memory(&self) {
         crate::process_hardening::protect_secret_bytes("aead.key", &self.key);
         crate::process_hardening::protect_secret_bytes("aead.nonce_base", &self.nonce_base);
@@ -411,6 +448,7 @@ impl AeadCodec {
         plaintext: &mut [u8],
         aad: &[u8],
     ) -> Result<[u8; AEAD_TAG_LEN], SessionError> {
+        self.ensure_usable()?;
         let tag = seal_in_place_detached_with(
             &self.cipher,
             &self.nonce_base,
@@ -448,6 +486,7 @@ impl AeadCodec {
         ciphertext_with_tag: &mut [u8],
         aad: &[u8],
     ) -> Result<usize, SessionError> {
+        self.ensure_usable()?;
         let plaintext_len = open_in_place_split_with(
             &self.cipher,
             &self.nonce_base,
@@ -614,5 +653,36 @@ mod tests {
         let second = enc.seal(b"same payload", b"tls-appdata").unwrap();
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn derive_keys_rejects_all_zero_shared_secret() {
+        let transcript_hash = [7_u8; 32];
+        assert!(matches!(
+            derive_client_keys_from_shared(&[0_u8; KEY_LEN], &transcript_hash),
+            Err(SessionError::DegenerateSharedSecret)
+        ));
+        assert!(matches!(
+            derive_server_keys_from_shared(&[0_u8; KEY_LEN], &transcript_hash),
+            Err(SessionError::DegenerateSharedSecret)
+        ));
+    }
+
+    #[test]
+    fn low_order_x25519_public_yields_degenerate_shared_secret_rejected() {
+        // The all-zero X25519 public key is a small-order point: x25519-dalek does
+        // not reject it, and DH against it yields an all-zero shared secret, which
+        // the key-derivation funnel must now reject (L-1).
+        let kp = X25519KeyPair::generate();
+        let shared = x25519_shared_secret(&kp.private, &[0_u8; KEY_LEN]);
+        assert_eq!(
+            shared, [0_u8; KEY_LEN],
+            "all-zero public is a small-order point"
+        );
+        let transcript_hash = [9_u8; 32];
+        assert!(matches!(
+            derive_client_keys_from_shared(&shared, &transcript_hash),
+            Err(SessionError::DegenerateSharedSecret)
+        ));
     }
 }

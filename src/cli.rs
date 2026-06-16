@@ -126,6 +126,13 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 async fn handle_command(command: Command) -> anyhow::Result<()> {
+    // Disable core dumps / ptrace dumpability before any subcommand runs. The
+    // one-shot key-generating commands (Keygen, CryptoSelfTest, Init,
+    // ConfigTemplate) mint X25519/ML-KEM/ML-DSA secrets and a PSK; without this
+    // a crash mid-keygen could spill fresh private keys into a core file. The
+    // call is idempotent and best-effort, so the long-lived paths that also
+    // harden via prepare_long_lived_process() are unaffected.
+    process_hardening::harden_current_process();
     match command {
         Command::Check { config } => check_config(config)?,
         Command::Keygen => print_keypair(),
@@ -240,6 +247,16 @@ async fn run_probe(dest: Option<String>, config: PathBuf) -> anyhow::Result<()> 
     let (target, sni) = probe_target(dest, &config)?;
     let report = probe::probe(target, sni).await?;
     print!("{}", report.summary());
+    // Exit non-zero on a "Not recommended" verdict (including TCP/TLS connection
+    // failures, which score as Bad). This lets callers — notably the guided
+    // deploy, which only surfaces probe output on a non-zero exit — detect an
+    // unsuitable camouflage target instead of silently deploying it.
+    if matches!(report.verdict, probe::ProbeVerdict::Bad) {
+        anyhow::bail!(
+            "camouflage target is Not recommended (score {}/100); pick a reachable TLS 1.3 origin",
+            report.score
+        );
+    }
     Ok(())
 }
 

@@ -7,10 +7,17 @@ description = "ParallaX censorship-resistant proxy protocol core"
 license = "MIT"
 default-run = "parallax"
 
+# The `fuzzing` cfg is set automatically by cargo-fuzz. Declare it here so normal
+# and CI builds (which never set it) don't emit unexpected_cfgs warnings for the
+# #[cfg(fuzzing)] fuzz-only hooks — keeping `-D warnings` green.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"
 base64 = "0.22"
+bytes = "1"
 aes-gcm = "0.10"
 chacha20poly1305 = { version = "0.10", features = ["alloc"] }
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -22,6 +29,15 @@ rand = "0.8"
 pqcrypto-mlkem = "0.1"
 pqcrypto-mldsa = "0.1.2"
 pqcrypto-traits = "0.3"
+# QUIC fast-plane (TUDP) data path. quinn 0.11 exposes no aws-lc-rs backend for
+# quinn-proto's QUIC transport crypto, so `ring` is required there and is linked
+# unconditionally; the TLS handshake and all of ParallaX's other crypto stay on
+# aws-lc-rs. rustls therefore compiles with BOTH providers and installs no process
+# default, so every rustls config here MUST use builder_with_provider(aws_lc_rs).
+# rustls is pinned (=0.23.40) to stay in lockstep with quinn-proto's Quic*Config.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
+rcgen = "0.13"
+rustls = { version = "=0.23.40", features = ["std", "aws_lc_rs"] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "aws-lc-rs"] }
@@ -38,8 +54,6 @@ zeroize = { version = "1.7", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
-# Test-only loopback TLS origin used by ignored end-to-end client runtime tests.
-rustls = { version = "=0.23.40", features = ["std", "aws_lc_rs"] }
 # Crypto used exclusively by the GFW simulator (tests/gfw_sim/):
 # - aes: RFC 9001 QUIC Initial header protection
 # - cipher: shared trait crate

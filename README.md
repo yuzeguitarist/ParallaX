@@ -18,7 +18,16 @@ Application ──SOCKS5──► plx client ──TLS 1.3 / Safari-like ClientH
 
 The codebase also carries a source-level GFW simulator and censorship research
 notes. Those are validation and research assets, not a second production
-transport. There is no shipped `--quic` product mode on current `main`.
+transport.
+
+There is no `--quic` CLI flag, but an **experimental** UDP/QUIC fast plane (the
+"U" in TUDP) *is* wired into the client and server runtimes: setting
+`[udp].enabled = true` on **both** ends activates a masquerading-h3 QUIC carrier
+for the single-Connect data relay, authenticated by an exporter-bound probe token
+(the QUIC leg treats its server certificate as camouflage, not the trust anchor).
+It is **off by default**; while disabled, every path stays byte-identical on TCP.
+The QUIC handshake is not yet Safari-fingerprint-shaped, so enabling it is for
+experimentation, not censorship-resistant production use.
 
 ---
 
@@ -54,7 +63,7 @@ transport. There is no shipped `--quic` product mode on current `main`.
 | TLS camouflage | Handwritten Safari 26 TLS 1.3 client state machine with Safari cipher/group/extension ordering, GREASE, ALPN, ClientHello authentication fields, certificate verification, and HTTP/2 preface support. | `src/tls/safari26.rs`, `src/tls/client_hello.rs`, `src/fingerprint/http2.rs` |
 | Handshake authentication | PSK + X25519 material embedded into `ClientHello.random` and compatibility `SessionID`; replay cache gates authenticated handshakes. | `src/crypto/auth.rs`, `src/crypto/replay.rs` |
 | PQ and identity | ML-KEM-1024 rekey, transcript-bound server key exchange, ML-DSA-87 identity proof over the rekey binding. | `src/crypto/pq.rs`, `src/crypto/identity.rs`, `src/protocol/command.rs` |
-| Data plane | XChaCha20-Poly1305 records carried inside TLS `ApplicationData` frames, per-direction nonce ratchets, optional padding/timing/cover traffic; bulk batches seal/open across a shared multi-core crypto pool. | `src/crypto/session.rs`, `src/protocol/data.rs`, `src/crypto/parallel.rs`, `src/traffic.rs` |
+| Data plane | ChaCha20-Poly1305 records (96-bit per-record counter nonce) carried inside TLS `ApplicationData` frames, per-direction nonce ratchets, optional padding/timing/cover traffic; bulk batches seal/open across a shared multi-core crypto pool. | `src/crypto/session.rs`, `src/protocol/data.rs`, `src/crypto/parallel.rs`, `src/traffic.rs` |
 | TCP transport | TCP-only product transport with `TCP_NODELAY`, Linux keepalive tuning, fd-limit based relay concurrency, and 64 KiB relay buffers. | `src/transport/tcp.rs` |
 | Process hardening | Best-effort no-core-dump setup, non-dumpable process flag, `mlock`, `MADV_DONTDUMP`, and strict config file ownership/mode checks. | `src/process_hardening.rs`, `src/config.rs` |
 | Operations | Local build, binary-only VPS upload, hardened systemd unit, optional BBR/fq setup, optional Polar Signals / parca-agent profiling. | `scripts/deploy-vps.sh`, `scripts/uninstall-vps.sh` |
@@ -334,7 +343,7 @@ Useful searches:
 |---|---|---|
 | Source file to documentation owner | `source-to-document ownership`, `doc-id`, a path like `src/handshake/server.rs` | [Documentation Metadata & Search Graph](./ParallaX-DeepWiki/Documentation-Metadata-Search-Graph.md) |
 | Operator rollout | `plx init`, `plx probe`, `deploy-vps`, `systemd`, `BBR` | [Getting Started & CLI Reference](./ParallaX-DeepWiki/Getting-Started-&-CLI-Reference.md), [Deployment](./ParallaX-DeepWiki/Deployment.md) |
-| Current product boundary | `product path`, `TCP/TLS`, `no --quic`, `research-only` | [ParallaX Overview](./ParallaX-DeepWiki/ParallaX-Overview.md), [Transport Layer](./ParallaX-DeepWiki/Transport-Layer.md) |
+| Current product boundary | `product path`, `TCP/TLS`, `experimental [udp].enabled QUIC`, `off by default` | [ParallaX Overview](./ParallaX-DeepWiki/ParallaX-Overview.md), [Transport Layer](./ParallaX-DeepWiki/Transport-Layer.md) |
 | Validation evidence | `plx speed`, `plx bench`, `gfw_simulator`, `runtime guard` | [Probing & Benchmarking](<./ParallaX-DeepWiki/Probing-&-Benchmarking.md>) |
 
 The source-level censorship research model lives under `tests/gfw_sim/` and is

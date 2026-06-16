@@ -1,0 +1,153 @@
+# Optional. Copy to .github/workflows/ to enable; ~1 billed min/day; delete for zero Actions.
+#
+# Liveness watchdog for the ParallaX fuzz cluster. The VPS boxes self-publish
+# status-<nodeid>.json to the 'fuzz-status' branch every ~1 min, so the ONE thing
+# they cannot report is their own death. This job (the only Action the cluster
+# needs) auto-discovers whichever nodes are publishing, reads their heartbeats
+# once a day, and opens/updates a single '[fuzz-cluster] node down' issue if any
+# discovered node is stale (or nothing is publishing at all). It does NOT assume a
+# fixed node count, so an intentionally-smaller fleet does not false-alarm.
+# Everything else (corpus, crashes, dashboard) is done on the paid boxes with zero
+# Actions. If you want literally zero Actions, do not copy this — the dashboard's
+# stale "last seen" already reveals a dead box on a manual glance.
+#
+# Self-quieting: it can't tell "campaign stopped on purpose" from "boxes died",
+# so if the WHOLE fleet stays down past ENDED_MIN (48h) it assumes you ended the
+# campaign, closes the issue, and stands down (no more daily nags) — a later fresh
+# heartbeat re-arms it. An empty fuzz-status branch (no status files) is treated as
+# "nothing to watch", not an alarm. To disable entirely, just delete this file.
+#
+# This file lives under ops/fuzz-cluster/ on purpose so it does NOT run from the
+# repo as-is; it only becomes active once copied into .github/workflows/.
+
+name: fuzz-cluster-liveness
+
+on:
+  schedule:
+    # Daily at 06:37 UTC (off the :00/:30 herd). ~1 billed minute/day on a private repo.
+    - cron: "37 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read   # read status JSONs from the fuzz-status branch
+  issues: write    # open/update the single node-down issue
+
+concurrency:
+  group: fuzz-cluster-liveness
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate heartbeats and reconcile the node-down issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: fuzz-status
+          STALE_MIN: "90"          # heartbeat older than this => node considered down
+          ENDED_MIN: "2880"        # whole fleet stale longer than this (48h) => assume the
+                                   # campaign was stopped on purpose; stand down (no alerts)
+          TITLE: "[fuzz-cluster] node down"
+        shell: bash
+        run: |
+          set -uo pipefail
+          now=$(date -u +%s)
+          down=()
+
+          # M-4: auto-DISCOVER the nodes actually publishing, rather than a hardcoded
+          # "box-a box-b box-c" list. The old code treated present<3 as down, so with
+          # box-c not deployed it opened a permanent false node-down issue every day
+          # and buried real box deaths in the noise. A node is simply whatever has a
+          # status-<id>.json on the branch; we alert only if a discovered node goes
+          # stale (or if nothing is publishing at all).
+          nodes=$(gh api "repos/${REPO}/contents/fuzz/dashboard?ref=${BRANCH}" \
+                    --jq '.[].name | select(startswith("status-") and endswith(".json")) | ltrimstr("status-") | rtrimstr(".json")' \
+                    2>/dev/null || true)
+
+          present=0          # nodes with a readable heartbeat (any age)
+          fresh=0            # nodes whose heartbeat is within STALE_MIN
+          min_age=99999999   # youngest heartbeat age (min) among discovered nodes
+          for node in $nodes; do
+            path="fuzz/dashboard/status-${node}.json"
+            json=$(gh api "repos/${REPO}/contents/${path}?ref=${BRANCH}" \
+                     -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
+            ts=$(printf '%s' "$json" | jq -r '.ts // empty' 2>/dev/null || true)
+            if [ -z "$ts" ]; then
+              down+=("$node (status unreadable)")
+              continue
+            fi
+            present=$((present + 1))
+            # GNU date (ubuntu-latest) parses ISO8601 'Z' fine.
+            hb=$(date -u -d "$ts" +%s 2>/dev/null || echo 0)
+            age_min=$(( (now - hb) / 60 ))
+            [ "$hb" -ne 0 ] && [ "$age_min" -lt "$min_age" ] && min_age=$age_min
+            if [ "$hb" -eq 0 ] || [ "$age_min" -gt "$STALE_MIN" ]; then
+              down+=("$node (last seen ${age_min}m ago)")
+            else
+              fresh=$((fresh + 1))
+            fi
+          done
+
+          node_count=$(printf '%s\n' $nodes | grep -c . || true); [ -n "$node_count" ] || node_count=0
+
+          # Find an existing open watchdog issue by exact title.
+          existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$TITLE\"" \
+                       --json number,title --jq \
+                       "map(select(.title==\"$TITLE\")) | .[0].number // empty" 2>/dev/null || true)
+
+          close_issue() {  # <comment>
+            [ -n "$existing" ] || return 0
+            gh issue comment "$existing" --repo "$REPO" --body "$1" || true
+            gh issue close "$existing" --repo "$REPO" || true
+          }
+
+          # --- decide (self-quieting so an enabled-and-forgotten watchdog can't nag
+          #     forever after the campaign is intentionally stopped) ---
+          # (a) Nothing publishing at all => branch empty / never started / cleaned up
+          #     => nothing to watch; stay quiet.
+          if [ "$node_count" -eq 0 ]; then
+            echo "No status files on ${BRANCH}; nothing to watch."
+            close_issue "No nodes are publishing status; nothing to watch. Closing."
+            exit 0
+          fi
+          # (b) All discovered nodes fresh => healthy.
+          if [ "$fresh" -eq "$node_count" ]; then
+            echo "All $node_count discovered nodes fresh."
+            close_issue "Recovered: all ${node_count} nodes have fresh heartbeats as of $(date -u +%FT%TZ). Closing."
+            exit 0
+          fi
+          # (c) The WHOLE fleet has been stale longer than ENDED_MIN => the campaign
+          #     was almost certainly stopped on purpose (boxes destroyed). Stand down
+          #     instead of nagging daily forever; a fresh heartbeat later re-arms it.
+          if [ "$fresh" -eq 0 ] && [ "$min_age" -gt "$ENDED_MIN" ]; then
+            echo "Whole fleet stale > ${ENDED_MIN}m; assuming the campaign ended. Standing down."
+            close_issue "All ${node_count} nodes have been down for over $(( ENDED_MIN / 60 ))h — assuming the campaign was stopped intentionally. Standing down; this watchdog will re-alert only if a node publishes a fresh heartbeat again. (Delete the workflow to disable entirely.)"
+            exit 0
+          fi
+
+          # (d) Otherwise: genuinely degraded (a box died mid-campaign). Open/update.
+          {
+            echo "Liveness check at $(date -u +%FT%TZ) found the fuzz cluster degraded."
+            echo
+            echo "- nodes discovered (publishing a status file): ${node_count}"
+            echo "- nodes with a fresh heartbeat: ${fresh}"
+            echo "- staleness threshold: ${STALE_MIN} min"
+            echo
+            echo "Down / stale:"
+            for d in "${down[@]}"; do echo "- ${d}"; done
+            echo
+            echo "Fix: recreate the affected box and re-paste its bootstrap line with the SAME node-id"
+            echo "(see ops/fuzz-cluster/README.md, '15-day swap'). Auto-closes when all heartbeats are"
+            echo "fresh again, and stands down on its own if the whole fleet stays down past ${ENDED_MIN}m."
+          } > /tmp/body.md
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo "$REPO" --body-file /tmp/body.md || true
+            gh issue comment "$existing" --repo "$REPO" \
+              --body "Still degraded as of $(date -u +%FT%TZ)." || true
+            echo "Updated issue #${existing}."
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body-file /tmp/body.md || true
+            echo "Opened node-down issue."
+          fi

@@ -63,6 +63,7 @@ use crate::{
     },
     tls::{client_hello::parse_client_hello, safari26::Safari26TlsCamouflage},
     traffic::PaddingProfile,
+    transport::leg::LegWriter,
 };
 
 /// Pre-shared key used by every handshake-flavoured benchmark.
@@ -703,8 +704,13 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuth
     let server = X25519KeyPair::generate();
     let session = Safari26TlsCamouflage.start(BENCH_SNI.to_owned(), BENCH_PSK, &server.public)?;
     let record = session.client_hello_bytes().to_vec();
-    let material = recover_stateful_auth_material(&record, BENCH_PSK)?
-        .expect("Safari26 ClientHello must carry stateful auth material");
+    let parsed = parse_client_hello(&record)?;
+    let tls_key_share = parsed.x25519_key_share.ok_or_else(|| {
+        anyhow::anyhow!("Safari26 ClientHello carries a standalone X25519 key_share")
+    })?;
+    let mask_ecdh = x25519_shared_secret(&server.private, &tls_key_share);
+    let material = recover_stateful_auth_material(&record, BENCH_PSK, &mask_ecdh)?
+        .ok_or_else(|| anyhow::anyhow!("Safari26 ClientHello must carry stateful auth material"))?;
     let server_auth = derive_server_auth_key(BENCH_PSK, &server.private, &material.x25519_public)?;
     Ok((record, server_auth, material))
 }
@@ -869,7 +875,10 @@ fn bench_client_speed_upload_seal_1mb(options: BenchmarkOptions) -> Result<Bench
                 written += sealed.len();
                 remaining -= len;
             }
-            Ok(black_box((written + SIZE_1M) as u64))
+            // Report the sealed wire bytes the seal actually produced (matching the
+            // other *_seal benches); do not also add the plaintext SIZE_1M, which
+            // double-counted the payload and made up/down throughput incomparable.
+            Ok(black_box(written as u64))
         },
     )
 }
@@ -1546,6 +1555,23 @@ fn mux_batch_seal_blocking(
     }
 }
 
+/// In-memory [`LegWriter`] sink for the mux-batch benchmark: appends sealed
+/// record bytes to a borrowed `Vec` so the bench can measure the seal+write
+/// path without a socket. Mirrors the TCP leg's `write_all`/`shutdown`
+/// behaviour (append-all; shutdown is a no-op for a buffer).
+struct VecLegWriter<'a>(&'a mut Vec<u8>);
+
+impl LegWriter for VecLegWriter<'_> {
+    async fn write_records(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Drives the real server mux batch writer over four full-record Data frames
 /// (~64 KiB of mux plaintext) into an in-memory sink.
 async fn mux_batch_seal_once(
@@ -1577,7 +1603,7 @@ async fn mux_batch_seal_once(
 
     out.clear();
     write_server_mux_frames_batched(
-        out,
+        &mut VecLegWriter(out),
         codec,
         first_frame,
         ServerMuxBatchState {

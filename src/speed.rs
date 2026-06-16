@@ -271,6 +271,12 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     if config.mode != Mode::Client {
         return Err(SpeedError::WrongMode);
     }
+    // The UDP-negotiation parameters live on `config.udp` and are threaded into
+    // the data-session seam so `parallax speed` runs the SAME UDP probe/offer
+    // negotiation as `client` when enabled. The speed test itself, however,
+    // measures the TCP plane: `establish_authenticated_data_session` closes any
+    // retained QUIC fast-plane connection (the speed path stays on TCP in this
+    // slice), so the UDP probe runs but the measured data transfer is over TCP.
     let client = config.client.clone().ok_or(SpeedError::MissingClient)?;
     let psk = decode_psk(&config.crypto.psk)?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
@@ -285,6 +291,7 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     let (mut server, mut data_session) = runtime::establish_authenticated_data_session(
         &client,
         config.traffic,
+        &config.udp,
         psk.as_slice(),
         &server_public,
         &server_identity_public,
@@ -413,7 +420,7 @@ async fn read_download_phase<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let start = Instant::now();
+    let mut start: Option<Instant> = None;
     let mut received = 0_u64;
     let mut record = Vec::new();
 
@@ -423,13 +430,17 @@ where
         if payload.is_empty() {
             continue;
         }
+        // Start the clock at the first real data byte, not before the request RTT,
+        // so the download window measures transfer time only (comparable to the
+        // upload window, which stops before its trailing ack RTT).
+        start.get_or_insert_with(Instant::now);
         let len = payload.len() as u64;
         if received + len > expected_bytes {
             return Err(SpeedError::TooManyBytes);
         }
         received += len;
     }
-    let elapsed = start.elapsed();
+    let elapsed = start.map(|s| s.elapsed()).unwrap_or_default();
 
     let ack = read_ack_from_records(records, data_session, expected_ack, expected_bytes).await?;
     if ack.bytes != received {
@@ -473,11 +484,14 @@ async fn write_upload_phase(
         remaining -= len as u64;
     }
     server.flush().await?;
+    // Stop the upload clock as soon as the last byte is on the wire — BEFORE the
+    // ack round-trip, which would otherwise count one RTT + ack decrypt as upload
+    // time and understate throughput.
+    let elapsed = start.elapsed();
 
     let mut ack_reader = TlsRecordReader::new(server);
     let ack =
         read_ack_from_records(&mut ack_reader, data_session, expected_ack, expected_bytes).await?;
-    let elapsed = start.elapsed();
     if ack.bytes != expected_bytes {
         return Err(SpeedError::ByteCountMismatch {
             expected: expected_bytes,
@@ -855,7 +869,7 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClientConfig, CryptoConfig, ServerConfig, TrafficConfig};
+    use crate::config::{ClientConfig, CryptoConfig, ServerConfig, TrafficConfig, UdpConfig};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use pqcrypto_mldsa::mldsa87;
     use std::net::SocketAddr;
@@ -986,6 +1000,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: None,
             server: Some(ServerConfig {
                 listen: "127.0.0.1:8443".parse::<SocketAddr>().unwrap(),
@@ -995,8 +1010,17 @@ mod tests {
                 pq_secret_key: String::new(),
                 identity_secret_key: STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]),
                 replay_cache_path: PathBuf::from("/tmp/parallax-speed-test-replay.cache"),
+                replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni: vec!["example.com".to_owned()],
                 strict_tls13: true,
+                max_concurrent_per_source_v4: 256,
+                max_concurrent_per_source_v6: 256,
+                source_ipv6_prefix_len: 64,
+                first_record_wait_floor_ms: 8_000,
+                first_record_wait_jitter_ms: 7_000,
+                fallback_idle_floor_ms: 600_000,
+                fallback_idle_jitter_ms: 0,
+                tcp_congestion: None,
             }),
         }
     }
@@ -1008,6 +1032,7 @@ mod tests {
                 psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             },
             traffic: TrafficConfig::default(),
+            udp: UdpConfig::default(),
             client: None,
             server: None,
         }

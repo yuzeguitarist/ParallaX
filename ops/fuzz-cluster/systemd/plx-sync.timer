@@ -1,0 +1,16 @@
+[Unit]
+# ParallaX distributed-fuzz — drives plx-sync.service on a ~10 min cadence.
+# RandomizedDelaySec staggers the three boxes so their Release ops don't collide.
+Description=ParallaX fuzz corpus sync timer (~10 min)
+
+[Timer]
+Unit=plx-sync.service
+# First sync shortly after boot, then every 10 minutes of active time.
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=120
+# (L-11: no Persistent= — it only affects OnCalendar= timers; on a monotonic timer
+# it is silently ignored. A missed sync is covered by the next OnUnitActiveSec tick.)
+
+[Install]
+WantedBy=timers.target

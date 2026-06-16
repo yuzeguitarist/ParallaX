@@ -12,13 +12,23 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub(crate) const DEFAULT_REPLAY_CACHE_PATH: &str = "/var/lib/parallax/parallax-replay.cache";
+/// Default authenticated-replay-cache capacity. Sized against the freshness
+/// window: entries are retained for `replay_freshness_window_secs()` (= the
+/// pre-PQ deadline + skew, ~720s with the default `fallback_idle_floor_ms`), so
+/// the cache fills at roughly `capacity / window` sustained handshakes/sec before
+/// it fail-CLOSES with `CacheFull` (sheds new handshakes — never a replay hole).
+/// 49152 / 720s ≈ 68 conn/s of headroom; this scales with the window so widening
+/// the pre-PQ deadline did not silently lower the throughput cliff. A busy shared
+/// bridge above that rate (or one that raises `fallback_idle_floor_ms` further)
+/// should raise `replay_cache_capacity` proportionally.
+pub(crate) const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 49152;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config: {0}")]
     Read(#[from] std::io::Error),
-    #[error("failed to parse TOML: {0}")]
-    Toml(#[from] toml::de::Error),
+    #[error("failed to parse TOML at line {line}, column {column} (content redacted)")]
+    Toml { line: usize, column: usize },
     #[error("missing [client] section for client mode")]
     MissingClient,
     #[error("missing [server] section for server mode")]
@@ -44,20 +54,51 @@ pub enum ConfigError {
     WeakPsk,
     #[error("traffic.max_padding must be >= traffic.min_padding")]
     InvalidPaddingRange,
-    #[error("traffic.max_padding leaves no room for encrypted payload")]
+    #[error("traffic.max_padding leaves too little room for encrypted payload")]
     ExcessivePadding,
     #[error("traffic.max_delay_ms must be >= traffic.min_delay_ms")]
     InvalidDelayRange,
     #[error("traffic.cover_max_interval_ms must be >= traffic.cover_min_interval_ms")]
     InvalidCoverIntervalRange,
+    #[error(
+        "traffic cover traffic requires a non-degenerate padding range \
+         (max_padding > min_padding) so cover records vary in size; otherwise \
+         every cover record is an identical-length beacon"
+    )]
+    CoverRequiresVariablePadding,
+    #[error("traffic.cover_min_interval_ms must be at least {min_ms} ms when cover traffic is enabled (cover_max_interval_ms > 0); near-zero intervals hot-spin the cover loop and emit a high-rate, fingerprintable beacon")]
+    CoverIntervalTooSmall { min_ms: u16 },
     #[error("traffic.max_concurrent_streams must be at least 1")]
     InvalidMaxConcurrentStreams,
+    #[error("udp.probe_timeout_ms must be at least 1")]
+    InvalidUdpProbeTimeout,
+    #[error(
+        "udp.cc = \"brutal\" requires udp.brutal_up_mbps and udp.brutal_down_mbps > 0 \
+         unless udp.ignore_client_bandwidth is set"
+    )]
+    UdpBrutalMissingBandwidth,
     #[error(
         "client.listen must bind to a loopback address because SOCKS5 has no authentication: {0}"
     )]
     UnsafeClientListen(SocketAddr),
     #[error("server.authorized_sni must not be empty")]
     EmptyAuthorizedSni,
+    #[error("server.replay_cache_capacity must be at least 1")]
+    InvalidReplayCacheCapacity,
+    #[error("server.max_concurrent_per_source_v4/v6 must be at least 1")]
+    InvalidSourceConcurrencyLimit,
+    #[error("server.source_ipv6_prefix_len must be between 1 and 128")]
+    InvalidSourceIpv6Prefix,
+    #[error("server timeout floors must be at least 250ms")]
+    InvalidTimeoutFloor,
+    #[error("server.first_record_wait_floor_ms must not exceed 300000ms (it is a short give-up backstop for the first client record, not the idle cap)")]
+    InvalidTimeoutCeiling,
+    #[error("server.fallback_idle_floor_ms must be at least 5000ms (it resets on every byte; a tiny value closes active relays)")]
+    InvalidIdleBackstop,
+    #[error("server timeout jitter must not exceed 300000ms")]
+    InvalidTimeoutJitter,
+    #[error("server.tcp_congestion must be a short algorithm name (letters, digits, '_' or '-'), e.g. \"bbr\"")]
+    InvalidCongestionControl,
     #[cfg(unix)]
     #[error(
         "config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, \
@@ -72,11 +113,14 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub mode: Mode,
     pub crypto: CryptoConfig,
     #[serde(default)]
     pub traffic: TrafficConfig,
+    #[serde(default)]
+    pub udp: UdpConfig,
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
 }
@@ -98,12 +142,14 @@ impl fmt::Display for Mode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CryptoConfig {
     /// Base64-encoded pre-shared secret. Require at least 32 bytes after decode.
     pub psk: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub listen: SocketAddr,
     pub server_addr: String,
@@ -115,6 +161,7 @@ pub struct ClientConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub fallback_addr: String,
@@ -126,13 +173,56 @@ pub struct ServerConfig {
     pub identity_secret_key: String,
     #[serde(default = "default_replay_cache_path")]
     pub replay_cache_path: PathBuf,
+    #[serde(default = "default_replay_cache_capacity")]
+    pub replay_cache_capacity: usize,
     #[serde(default)]
     pub authorized_sni: Vec<String>,
     #[serde(default = "default_true")]
     pub strict_tls13: bool,
+    /// Max concurrent connections from one IPv4 /32 source. A concurrency cap,
+    /// not a rate limit; defaults high so legitimate shared/CGNAT addresses are
+    /// not throttled (the global limit is the real backstop).
+    #[serde(default = "default_max_concurrent_per_source")]
+    pub max_concurrent_per_source_v4: u32,
+    /// Max concurrent connections from one IPv6 prefix (see
+    /// `source_ipv6_prefix_len`). Independent of the v4 cap because a prefix
+    /// aggregates many more endpoints (carrier NAT64/464XLAT, /64-per-VM).
+    #[serde(default = "default_max_concurrent_per_source")]
+    pub max_concurrent_per_source_v6: u32,
+    /// IPv6 prefix length used to group sources for the per-source cap.
+    #[serde(default = "default_source_ipv6_prefix_len")]
+    pub source_ipv6_prefix_len: u8,
+    /// Floor (ms) for the client-facing first-record wait. Default 8000.
+    #[serde(default = "default_first_record_wait_floor_ms")]
+    pub first_record_wait_floor_ms: u64,
+    /// Upward jitter (ms) added to the first-record wait floor. Default 7000.
+    #[serde(default = "default_first_record_wait_jitter_ms")]
+    pub first_record_wait_jitter_ms: u64,
+    /// Floor (ms) for the camouflage relay idle backstop. A resource backstop,
+    /// not a behavioral policy. NOTE: the idle timer RESETS on every byte in
+    /// either direction, so this is a per-gap cap, not a total-session cap -- it
+    /// only fires on a connection that goes fully silent. Keep it well above any
+    /// plausible inter-packet gap of a real relay (min enforced 5000ms) so
+    /// ParallaX does not originate closes on active-but-bursty connections.
+    /// Default 600000 (10 min).
+    #[serde(default = "default_fallback_idle_floor_ms")]
+    pub fallback_idle_floor_ms: u64,
+    /// Upward jitter (ms) on the idle backstop. Default 0 and discouraged: a
+    /// uniform idle-close band is itself a synthetic signature no real origin
+    /// produces (the floor, not the ceiling, is what a prober converges to).
+    #[serde(default = "default_fallback_idle_jitter_ms")]
+    pub fallback_idle_jitter_ms: u64,
+    /// Optional TCP congestion-control algorithm to request on relay sockets, to
+    /// match the camouflage origin's CDN (e.g. "bbr", "cubic"). Linux only; a
+    /// no-op on other platforms. `None` keeps the built-in default. The kernel
+    /// must have the algorithm available or the request is logged and ignored
+    /// (verified via getsockopt read-back).
+    #[serde(default)]
+    pub tcp_congestion: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TrafficConfig {
     #[serde(default)]
     pub min_padding: u16,
@@ -164,14 +254,183 @@ impl Default for TrafficConfig {
     }
 }
 
+/// User-space congestion controller for the UDP fast plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UdpCongestionControl {
+    /// BBRv3-style controller: blends in with ordinary traffic; the safe default.
+    #[default]
+    Bbr,
+    /// Hysteria-style brute-force rate controller; opt-in only (detectable, unfair).
+    Brutal,
+}
+
+/// Forward-error-correction profile for the unreliable datagram fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UdpFecProfile {
+    /// No FEC.
+    Off,
+    /// Sliding-window FEC, gated on measured loss x RTT.
+    #[default]
+    Adaptive,
+    /// Reed-Solomon block codes for a bulk / high-loss profile.
+    Rs,
+}
+
+/// UDP fast-plane configuration. **Experimental, disabled by default**: with
+/// `enabled = false` the runtime behaves exactly like today's TCP-only transport
+/// (byte-identical). All knobs have safe defaults so an operator never has to
+/// choose TCP vs UDP.
+///
+/// LIVE knobs in this version (QUIC reliable-stream fast plane for the
+/// single-Connect relay path): `enabled` and `probe_timeout_ms`. Enabling
+/// requires matched binaries on both ends.
+///
+/// RESERVED knobs (parsed + validated for forward-compatibility but NOT yet
+/// honored — they take effect in later slices): `cc` / `brutal_*` /
+/// `ignore_client_bandwidth` (congestion control — Phase 3), `fec_profile` (FEC —
+/// Phase 3), `port_hop` / `masque_front` / `ech` (camouflage — Phase 2). Setting
+/// one today is a no-op; the runtime logs a warning at startup so it is not
+/// mistaken for active.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UdpConfig {
+    /// LIVE. Turn the experimental UDP/QUIC fast plane on (default off).
+    #[serde(default)]
+    pub enabled: bool,
+    /// RESERVED (congestion control, Phase 3) — not yet honored.
+    #[serde(default)]
+    pub cc: UdpCongestionControl,
+    /// RESERVED. Declared uplink bandwidth (Mbps) for Brutal; 0 means unset.
+    #[serde(default)]
+    pub brutal_up_mbps: u32,
+    /// RESERVED. Declared downlink bandwidth (Mbps) for Brutal; 0 means unset.
+    #[serde(default)]
+    pub brutal_down_mbps: u32,
+    /// RESERVED. Let the server override the client-declared Brutal bandwidth.
+    #[serde(default)]
+    pub ignore_client_bandwidth: bool,
+    /// RESERVED (forward error correction, Phase 3) — not yet honored.
+    #[serde(default)]
+    pub fec_profile: UdpFecProfile,
+    /// LIVE. Happy-Eyeballs UDP probe timeout before committing to TCP-only.
+    #[serde(default = "default_udp_probe_timeout_ms")]
+    pub probe_timeout_ms: u16,
+    /// RESERVED (UDP port hopping, Phase 2 camouflage) — not yet honored.
+    #[serde(default)]
+    pub port_hop: bool,
+    /// RESERVED (Phase 2 camouflage). SNI/host to front the masquerading HTTP/3
+    /// face on; `None` keeps the TCP `sni`. Not yet honored.
+    #[serde(default)]
+    pub masque_front: Option<String>,
+    /// RESERVED (Encrypted ClientHello, Phase 2 camouflage) — not yet honored.
+    #[serde(default)]
+    pub ech: bool,
+}
+
+impl Default for UdpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cc: UdpCongestionControl::Bbr,
+            brutal_up_mbps: 0,
+            brutal_down_mbps: 0,
+            ignore_client_bandwidth: false,
+            fec_profile: UdpFecProfile::Adaptive,
+            probe_timeout_ms: default_udp_probe_timeout_ms(),
+            port_hop: false,
+            masque_front: None,
+            ech: false,
+        }
+    }
+}
+
+impl UdpConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // RESERVED/LIVE knobs only take effect when the plane is on; with
+        // `enabled = false` the runtime is byte-identical to TCP-only (see struct
+        // docs) and the startup reserved-knob warning is likewise gated on
+        // `enabled`, so skip validation entirely when off — a pre-staged but inert
+        // knob must not block startup.
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.probe_timeout_ms == 0 {
+            return Err(ConfigError::InvalidUdpProbeTimeout);
+        }
+        if self.cc == UdpCongestionControl::Brutal
+            && !self.ignore_client_bandwidth
+            && (self.brutal_up_mbps == 0 || self.brutal_down_mbps == 0)
+        {
+            return Err(ConfigError::UdpBrutalMissingBandwidth);
+        }
+        if let Some(front) = &self.masque_front {
+            require_non_empty("udp.masque_front", front)?;
+        }
+        Ok(())
+    }
+
+    /// Names of RESERVED knobs (see the struct docs) that an operator has set away
+    /// from their default but which this version does NOT yet honor. The runtime
+    /// logs these at startup so a no-op setting is not mistaken for an active one.
+    pub fn reserved_knobs_in_use(&self) -> Vec<&'static str> {
+        let d = Self::default();
+        let mut set = Vec::new();
+        if self.cc != d.cc {
+            set.push("cc");
+        }
+        if self.brutal_up_mbps != d.brutal_up_mbps || self.brutal_down_mbps != d.brutal_down_mbps {
+            set.push("brutal_up_mbps/brutal_down_mbps");
+        }
+        if self.ignore_client_bandwidth != d.ignore_client_bandwidth {
+            set.push("ignore_client_bandwidth");
+        }
+        if self.fec_profile != d.fec_profile {
+            set.push("fec_profile");
+        }
+        if self.port_hop != d.port_hop {
+            set.push("port_hop");
+        }
+        if self.masque_front != d.masque_front {
+            set.push("masque_front");
+        }
+        if self.ech != d.ech {
+            set.push("ech");
+        }
+        set
+    }
+}
+
+/// Convert a TOML parse error into a sanitized `ConfigError` exposing ONLY the
+/// line/column — never the offending source content. We must not let
+/// `toml::de::Error`'s `Display` (which renders the source line via toml_edit),
+/// its retained raw-document copy, OR its `message()` reach stderr/logs: config
+/// lines carry long-lived secrets (`crypto.psk`, `server.private_key`,
+/// `pq_secret_key`, `identity_secret_key`), and `message()` is NOT value-free —
+/// a type-mismatch (e.g. a secret string pasted onto a numeric field) yields
+/// `invalid type: string "<the secret>", expected usize`. So we drop the message
+/// entirely and report only the position; the operator finds the typo by line.
+fn toml_error(raw: &str, err: toml::de::Error) -> ConfigError {
+    let off = err.span().map(|s| s.start).unwrap_or(0).min(raw.len());
+    let line = raw[..off].bytes().filter(|&b| b == b'\n').count() + 1;
+    let line_start = raw[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = off - line_start + 1;
+    ConfigError::Toml { line, column }
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let raw = Zeroizing::new(fs::read_to_string(path)?);
-        let mut cfg = toml::from_str::<Self>(raw.as_str())?;
+        // Read the secret config through a single opened fd whose permissions are
+        // verified on the fd itself (fstat), before parsing. This closes the
+        // symlink / TOCTOU window that exists when a path-based permission check
+        // and a separate path-based read can resolve to different inodes.
+        let raw = read_secret_config_file(path)?;
+        let mut cfg =
+            toml::from_str::<Self>(raw.as_str()).map_err(|e| toml_error(raw.as_str(), e))?;
         cfg.resolve_paths_relative_to(path);
         cfg.validate()?;
-        cfg.validate_file_permissions(path)?;
         Ok(cfg)
     }
 
@@ -199,8 +458,21 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        decode_psk(&self.crypto.psk)?;
+        let psk = decode_psk(&self.crypto.psk)?;
+        if psk_looks_low_entropy(&psk) {
+            // Not fatal (and the auto-generated PSK is always random), but warn:
+            // the PSK is one of the two secrets the whole auth scheme rests on
+            // (it salts the carrier-mask and auth-key HKDFs and keys replay/AEAD
+            // derivation). The v4 masks are no longer a raw-PSK offline oracle,
+            // but a low-entropy / human-chosen PSK still weakens auth against an
+            // attacker who can guess it. Only a CSPRNG-generated key is safe.
+            tracing::warn!(
+                "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
+                 (e.g. `plx init` / `openssl rand -base64 32`)"
+            );
+        }
         self.traffic.validate()?;
+        self.udp.validate()?;
 
         match self.mode {
             Mode::Client => {
@@ -249,6 +521,54 @@ impl Config {
                 for sni in &server.authorized_sni {
                     require_non_empty("server.authorized_sni", sni)?;
                 }
+                if server.replay_cache_capacity == 0 {
+                    return Err(ConfigError::InvalidReplayCacheCapacity);
+                }
+                if server.max_concurrent_per_source_v4 == 0
+                    || server.max_concurrent_per_source_v6 == 0
+                {
+                    return Err(ConfigError::InvalidSourceConcurrencyLimit);
+                }
+                if server.source_ipv6_prefix_len == 0 || server.source_ipv6_prefix_len > 128 {
+                    return Err(ConfigError::InvalidSourceIpv6Prefix);
+                }
+                // The first-record wait is a one-shot give-up; 250ms is a safe
+                // lower bound. The idle backstop resets on every byte, so a tiny
+                // value would close active-but-bursty relays on any short gap --
+                // ParallaX originating the close is exactly the tell we avoid --
+                // hence a much higher minimum.
+                if server.first_record_wait_floor_ms < 250 {
+                    return Err(ConfigError::InvalidTimeoutFloor);
+                }
+                // Cap the floor too: it is a short one-shot give-up for the first
+                // client record, not the idle backstop. 300000ms matches the jitter
+                // cap below, so floor + jitter stays within the deliberate 600s
+                // idle window and a fat-fingered value cannot pin a slot/fd for
+                // hours per silent connection.
+                if server.first_record_wait_floor_ms > 300_000 {
+                    return Err(ConfigError::InvalidTimeoutCeiling);
+                }
+                if server.fallback_idle_floor_ms < 5_000 {
+                    return Err(ConfigError::InvalidIdleBackstop);
+                }
+                // Cap jitter so a fat-fingered value cannot extend a relay's
+                // fd-hold unboundedly (or, on the idle path, paint a very wide
+                // synthetic close band).
+                if server.first_record_wait_jitter_ms > 300_000
+                    || server.fallback_idle_jitter_ms > 300_000
+                {
+                    return Err(ConfigError::InvalidTimeoutJitter);
+                }
+                if let Some(algorithm) = &server.tcp_congestion {
+                    let valid = !algorithm.is_empty()
+                        && algorithm.len() <= 15
+                        && algorithm
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                    if !valid {
+                        return Err(ConfigError::InvalidCongestionControl);
+                    }
+                }
             }
         }
 
@@ -269,17 +589,25 @@ impl Config {
             .unwrap_or_else(|| Path::new("."));
         server.replay_cache_path = config_dir.join(&server.replay_cache_path);
     }
-
-    fn validate_file_permissions(&self, path: &Path) -> Result<(), ConfigError> {
-        validate_secret_config_file_permissions(path)
-    }
 }
 
 #[cfg(unix)]
-fn validate_secret_config_file_permissions(path: &Path) -> Result<(), ConfigError> {
-    use std::os::unix::fs::MetadataExt;
+fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let metadata = fs::metadata(path)?;
+    // O_NOFOLLOW: refuse to open the config if its final path component is a
+    // symlink (a classic way to aim a privileged reader at another file). It
+    // guards only the last component, but together with the fd-based permission
+    // check below it removes the path-vs-read race.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+
+    // fstat the OPEN fd, not the path, so the inode whose permissions we approve
+    // is exactly the inode we then read — no TOCTOU between check and read.
+    let metadata = file.metadata()?;
     let mode = metadata.mode() & 0o777;
     let uid = metadata.uid();
     let euid = unsafe { libc::geteuid() };
@@ -291,12 +619,15 @@ fn validate_secret_config_file_permissions(path: &Path) -> Result<(), ConfigErro
             euid,
         });
     }
-    Ok(())
+
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    Ok(Zeroizing::new(raw))
 }
 
 #[cfg(not(unix))]
-fn validate_secret_config_file_permissions(_path: &Path) -> Result<(), ConfigError> {
-    Ok(())
+fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
+    Ok(Zeroizing::new(fs::read_to_string(path)?))
 }
 
 impl TrafficConfig {
@@ -304,7 +635,9 @@ impl TrafficConfig {
         if self.max_padding < self.min_padding {
             return Err(ConfigError::InvalidPaddingRange);
         }
-        if crate::protocol::data::max_plaintext_len(self.max_padding) == 0 {
+        if crate::protocol::data::max_plaintext_len(self.max_padding)
+            < crate::protocol::data::MIN_USABLE_PLAINTEXT_LEN
+        {
             return Err(ConfigError::ExcessivePadding);
         }
         if self.max_delay_ms < self.min_delay_ms {
@@ -312,6 +645,30 @@ impl TrafficConfig {
         }
         if self.cover_max_interval_ms < self.cover_min_interval_ms {
             return Err(ConfigError::InvalidCoverIntervalRange);
+        }
+        // Floor the cover interval when cover is enabled. `sample_interval` draws
+        // `gen_range(min..=max)` ms and the loop re-arms a timer for that long, so
+        // a near-zero `cover_min_interval_ms` (e.g. 0) makes the cover loop spin at
+        // thousands of empty records/s — a CPU hog and a trivially fingerprintable
+        // high-rate beacon. 50ms caps the worst case at ~20 records/s, far below
+        // any realistic cover cadence. Bound the floor (`min`); the range check
+        // above then forces `max >= min >= 50` too. A fixed universal floor, no new
+        // knob.
+        const MIN_COVER_INTERVAL_MS: u16 = 50;
+        if self.cover_max_interval_ms > 0 && self.cover_min_interval_ms < MIN_COVER_INTERVAL_MS {
+            return Err(ConfigError::CoverIntervalTooSmall {
+                min_ms: MIN_COVER_INTERVAL_MS,
+            });
+        }
+        // If cover traffic is enabled it seals empty payloads whose record size
+        // is driven entirely by the padding sampler. With a degenerate padding
+        // range (max_padding == min_padding, e.g. padding disabled) every cover
+        // record is an identical-length record emitted at quasi-periodic
+        // intervals — a constant-size beacon a censor can fingerprint, which is
+        // worse than sending no cover at all. Require variable padding so cover
+        // record sizes are randomized.
+        if self.cover_max_interval_ms > 0 && self.max_padding <= self.min_padding {
+            return Err(ConfigError::CoverRequiresVariablePadding);
         }
         if self.max_concurrent_streams == 0 {
             return Err(ConfigError::InvalidMaxConcurrentStreams);
@@ -331,6 +688,23 @@ pub fn decode_psk(value: &str) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
         return Err(ConfigError::WeakPsk);
     }
     Ok(Zeroizing::new(decoded))
+}
+
+/// Heuristic, conservative low-entropy check for a decoded PSK. A CSPRNG-derived
+/// 32-byte key spans ~30 distinct byte values, so requiring at least 16 distinct
+/// values flags only obviously weak keys (repeated characters, short passphrases)
+/// with no false positives for random keys. Used to warn, never to reject.
+fn psk_looks_low_entropy(decoded: &[u8]) -> bool {
+    const MIN_DISTINCT_BYTES: usize = 16;
+    let mut seen = [false; 256];
+    let mut distinct = 0_usize;
+    for &b in decoded {
+        if !seen[b as usize] {
+            seen[b as usize] = true;
+            distinct += 1;
+        }
+    }
+    distinct < MIN_DISTINCT_BYTES
 }
 
 pub fn decode_key32(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {
@@ -478,8 +852,44 @@ const fn default_max_concurrent_streams() -> u8 {
     4
 }
 
+const fn default_udp_probe_timeout_ms() -> u16 {
+    300
+}
+
 fn default_replay_cache_path() -> PathBuf {
     PathBuf::from(DEFAULT_REPLAY_CACHE_PATH)
+}
+
+const fn default_replay_cache_capacity() -> usize {
+    DEFAULT_REPLAY_CACHE_CAPACITY
+}
+
+const fn default_max_concurrent_per_source() -> u32 {
+    // Shared v4/v6 starting point on purpose: 256 is generous enough not to
+    // throttle real shared/CGNAT sources while still bounding single-source
+    // monopolization (the global limit is the real backstop). Operators behind
+    // heavy carrier-NAT or running /64-per-VM fleets can raise the v6 cap.
+    256
+}
+
+const fn default_source_ipv6_prefix_len() -> u8 {
+    64
+}
+
+const fn default_first_record_wait_floor_ms() -> u64 {
+    8_000
+}
+
+const fn default_first_record_wait_jitter_ms() -> u64 {
+    7_000
+}
+
+const fn default_fallback_idle_floor_ms() -> u64 {
+    600_000
+}
+
+const fn default_fallback_idle_jitter_ms() -> u64 {
+    60_000
 }
 
 #[cfg(test)]
@@ -571,6 +981,290 @@ authorized_sni = ["example.com"]
     }
 
     #[test]
+    fn udp_defaults_are_disabled_and_safe() {
+        let udp = UdpConfig::default();
+        assert!(!udp.enabled);
+        assert_eq!(udp.cc, UdpCongestionControl::Bbr);
+        assert_eq!(udp.fec_profile, UdpFecProfile::Adaptive);
+        assert_eq!(udp.probe_timeout_ms, 300);
+        assert_eq!(udp.brutal_up_mbps, 0);
+        assert_eq!(udp.brutal_down_mbps, 0);
+        assert!(!udp.ignore_client_bandwidth);
+        assert!(!udp.port_hop);
+        assert!(udp.masque_front.is_none());
+        assert!(!udp.ech);
+        udp.validate().unwrap();
+    }
+
+    #[test]
+    fn config_without_udp_section_defaults_to_disabled() {
+        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.udp.enabled);
+        assert_eq!(cfg.udp, UdpConfig::default());
+    }
+
+    #[test]
+    fn udp_section_parses_overrides() {
+        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+
+[udp]
+enabled = true
+cc = "brutal"
+brutal_up_mbps = 50
+brutal_down_mbps = 200
+fec_profile = "rs"
+probe_timeout_ms = 250
+port_hop = true
+masque_front = "cdn.example.com"
+ech = true
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.udp.enabled);
+        assert_eq!(cfg.udp.cc, UdpCongestionControl::Brutal);
+        assert_eq!(cfg.udp.brutal_up_mbps, 50);
+        assert_eq!(cfg.udp.brutal_down_mbps, 200);
+        assert_eq!(cfg.udp.fec_profile, UdpFecProfile::Rs);
+        assert_eq!(cfg.udp.probe_timeout_ms, 250);
+        assert!(cfg.udp.port_hop);
+        assert_eq!(cfg.udp.masque_front.as_deref(), Some("cdn.example.com"));
+        assert!(cfg.udp.ech);
+    }
+
+    #[test]
+    fn rejects_zero_udp_probe_timeout() {
+        let udp = UdpConfig {
+            enabled: true,
+            probe_timeout_ms: 0,
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            udp.validate().unwrap_err(),
+            ConfigError::InvalidUdpProbeTimeout
+        ));
+    }
+
+    #[test]
+    fn rejects_brutal_without_declared_bandwidth() {
+        let udp = UdpConfig {
+            enabled: true,
+            cc: UdpCongestionControl::Brutal,
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            udp.validate().unwrap_err(),
+            ConfigError::UdpBrutalMissingBandwidth
+        ));
+    }
+
+    #[test]
+    fn accepts_brutal_with_declared_bandwidth() {
+        let udp = UdpConfig {
+            enabled: true,
+            cc: UdpCongestionControl::Brutal,
+            brutal_up_mbps: 50,
+            brutal_down_mbps: 200,
+            ..UdpConfig::default()
+        };
+        udp.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_brutal_when_ignoring_client_bandwidth() {
+        let udp = UdpConfig {
+            enabled: true,
+            cc: UdpCongestionControl::Brutal,
+            ignore_client_bandwidth: true,
+            ..UdpConfig::default()
+        };
+        udp.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_brutal_with_partial_bandwidth() {
+        let up_only = UdpConfig {
+            enabled: true,
+            cc: UdpCongestionControl::Brutal,
+            brutal_up_mbps: 50,
+            brutal_down_mbps: 0,
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            up_only.validate().unwrap_err(),
+            ConfigError::UdpBrutalMissingBandwidth
+        ));
+        let down_only = UdpConfig {
+            enabled: true,
+            cc: UdpCongestionControl::Brutal,
+            brutal_up_mbps: 0,
+            brutal_down_mbps: 200,
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            down_only.validate().unwrap_err(),
+            ConfigError::UdpBrutalMissingBandwidth
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_masque_front() {
+        let udp = UdpConfig {
+            enabled: true,
+            masque_front: Some("  ".to_owned()),
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            udp.validate().unwrap_err(),
+            ConfigError::InvalidSocket { .. }
+        ));
+    }
+
+    #[test]
+    fn reserved_knobs_in_use_flags_only_non_default_reserved_fields() {
+        // Default + the two LIVE knobs flipped => nothing reserved is in use.
+        let live = UdpConfig {
+            enabled: true,
+            probe_timeout_ms: 250,
+            ..UdpConfig::default()
+        };
+        assert!(live.reserved_knobs_in_use().is_empty());
+
+        // A reserved knob set away from default IS flagged.
+        let reserved = UdpConfig {
+            enabled: true,
+            port_hop: true,
+            fec_profile: UdpFecProfile::Rs,
+            masque_front: Some("cdn.example.com".to_owned()),
+            ..UdpConfig::default()
+        };
+        let flagged = reserved.reserved_knobs_in_use();
+        assert!(flagged.contains(&"port_hop"));
+        assert!(flagged.contains(&"fec_profile"));
+        assert!(flagged.contains(&"masque_front"));
+        // LIVE knobs never appear.
+        assert!(!flagged
+            .iter()
+            .any(|k| k.contains("probe") || k.contains("enabled")));
+    }
+
+    #[test]
+    fn udp_partial_section_uses_field_defaults() {
+        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+
+[udp]
+enabled = true
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.udp,
+            UdpConfig {
+                enabled: true,
+                ..UdpConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn udp_enum_wire_spellings_round_trip() {
+        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+
+[udp]
+cc = "bbr"
+fec_profile = "off"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.udp.cc, UdpCongestionControl::Bbr);
+        assert_eq!(cfg.udp.fec_profile, UdpFecProfile::Off);
+    }
+
+    #[test]
+    fn server_mode_accepts_udp_section() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+
+[udp]
+enabled = true
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.udp.enabled);
+    }
+
+    #[test]
     fn rejects_non_loopback_client_listener() {
         let raw = format!(
             r#"
@@ -628,6 +1322,34 @@ server_identity_public_key = "{KEY}"
     }
 
     #[test]
+    fn rejects_padding_below_min_usable_plaintext_floor() {
+        use crate::protocol::data::{max_plaintext_len, MIN_USABLE_PLAINTEXT_LEN};
+        // The first max_padding that pushes usable plaintext under the floor: a
+        // config there would let a single relay read explode into tens of
+        // thousands of records and reserve ~1 GiB, so it must be rejected even
+        // though it leaves a few non-zero plaintext bytes.
+        let below = (0..=u16::MAX)
+            .find(|&p| max_plaintext_len(p) < MIN_USABLE_PLAINTEXT_LEN)
+            .expect("some padding drops plaintext below the floor");
+        assert!(below > 0);
+        let bad = TrafficConfig {
+            max_padding: below,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            bad.validate().unwrap_err(),
+            ConfigError::ExcessivePadding
+        ));
+        // One less padding stays at/above the floor and validates.
+        assert!(max_plaintext_len(below - 1) >= MIN_USABLE_PLAINTEXT_LEN);
+        let ok = TrafficConfig {
+            max_padding: below - 1,
+            ..TrafficConfig::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
     fn accepts_multiplexing_stream_count() {
         let traffic = TrafficConfig {
             max_concurrent_streams: 2,
@@ -659,6 +1381,34 @@ server_identity_public_key = "{KEY}"
             traffic.validate().unwrap_err(),
             ConfigError::InvalidCoverIntervalRange
         ));
+    }
+
+    #[test]
+    fn rejects_cover_traffic_with_degenerate_padding() {
+        // Cover traffic enabled but padding is degenerate (max == min == 0):
+        // every cover record would be an identical-length beacon. Validation must
+        // reject this combination.
+        let traffic = TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 200,
+            min_padding: 0,
+            max_padding: 0,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            traffic.validate().unwrap_err(),
+            ConfigError::CoverRequiresVariablePadding
+        ));
+
+        // The same cover config with a non-degenerate padding range is accepted.
+        let ok = TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 200,
+            min_padding: 0,
+            max_padding: 256,
+            ..TrafficConfig::default()
+        };
+        ok.validate().unwrap();
     }
 
     #[cfg(unix)]
@@ -977,6 +1727,402 @@ authorized_sni = ["  "]
     }
 
     #[test]
+    fn server_replay_cache_capacity_defaults_when_omitted() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.server.unwrap().replay_cache_capacity,
+            DEFAULT_REPLAY_CACHE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn server_timeout_fields_default_when_omitted() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        let server = cfg.server.unwrap();
+        assert_eq!(server.first_record_wait_floor_ms, 8_000);
+        assert_eq!(server.first_record_wait_jitter_ms, 7_000);
+        assert_eq!(server.fallback_idle_floor_ms, 600_000);
+        assert_eq!(server.fallback_idle_jitter_ms, 60_000);
+        assert!(server.tcp_congestion.is_none());
+    }
+
+    #[test]
+    fn server_validate_rejects_sub_minimum_timeout_floor() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+first_record_wait_floor_ms = 100
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidTimeoutFloor
+        ));
+    }
+
+    #[test]
+    fn server_validate_rejects_excessive_first_record_floor() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let make = |floor: u64| {
+            format!(
+                r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+first_record_wait_floor_ms = {floor}
+"#
+            )
+        };
+        // Above the 300_000ms ceiling: rejected.
+        let cfg = toml::from_str::<Config>(&make(400_000)).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidTimeoutCeiling
+        ));
+        // Exactly at the ceiling: accepted (guards > vs >=).
+        let cfg = toml::from_str::<Config>(&make(300_000)).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        // A misspelled safety key under [server] must now hard-fail at parse
+        // (deny_unknown_fields) instead of being silently dropped to the default.
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+max_pading = 1500
+"#
+        );
+        let err = toml::from_str::<Config>(&raw).unwrap_err();
+        assert!(
+            err.to_string().contains("max_pading"),
+            "error should name the unknown key, got: {err}"
+        );
+
+        // Same for the highest-stakes struct: a typo'd padding key under [traffic].
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{KEY}"
+
+[traffic]
+max_padd = 1500
+"#
+        );
+        let err = toml::from_str::<Config>(&raw).unwrap_err();
+        assert!(
+            err.to_string().contains("max_padd"),
+            "error should name the unknown traffic key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn udp_validate_skips_reserved_checks_when_disabled() {
+        // Every individual rule deliberately violated, but the plane is OFF: the
+        // disabled guard short-circuits all checks, matching the documented
+        // "byte-identical to TCP-only" contract.
+        let disabled = UdpConfig {
+            enabled: false,
+            cc: UdpCongestionControl::Brutal,
+            brutal_up_mbps: 0,
+            brutal_down_mbps: 0,
+            probe_timeout_ms: 0,
+            masque_front: Some("  ".to_owned()),
+            ..UdpConfig::default()
+        };
+        disabled.validate().unwrap();
+
+        // The same struct with the plane ON is rejected by the first check, proving
+        // the guard does not mask validation when UDP is live.
+        let enabled = UdpConfig {
+            enabled: true,
+            ..disabled
+        };
+        assert!(matches!(
+            enabled.validate().unwrap_err(),
+            ConfigError::InvalidUdpProbeTimeout
+        ));
+    }
+
+    #[test]
+    fn rejects_near_zero_cover_interval() {
+        // The exact footgun: cover enabled with a near-zero floor hot-spins the
+        // cover loop. Variable padding so it passes the CoverRequiresVariablePadding
+        // gate and reaches the interval-floor check.
+        let footgun = TrafficConfig {
+            cover_min_interval_ms: 0,
+            cover_max_interval_ms: 1,
+            min_padding: 0,
+            max_padding: 64,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            footgun.validate().unwrap_err(),
+            ConfigError::CoverIntervalTooSmall { .. }
+        ));
+        // Just below the 50ms floor is still rejected (pins the boundary).
+        let just_under = TrafficConfig {
+            cover_min_interval_ms: 49,
+            cover_max_interval_ms: 100,
+            min_padding: 0,
+            max_padding: 64,
+            ..TrafficConfig::default()
+        };
+        assert!(matches!(
+            just_under.validate().unwrap_err(),
+            ConfigError::CoverIntervalTooSmall { .. }
+        ));
+        // Smallest accepted enabled config validates.
+        let ok = TrafficConfig {
+            cover_min_interval_ms: 50,
+            cover_max_interval_ms: 200,
+            min_padding: 0,
+            max_padding: 256,
+            ..TrafficConfig::default()
+        };
+        ok.validate().unwrap();
+        // Disabled cover (both 0) is unaffected by the floor.
+        let disabled = TrafficConfig {
+            cover_min_interval_ms: 0,
+            cover_max_interval_ms: 0,
+            ..TrafficConfig::default()
+        };
+        disabled.validate().unwrap();
+    }
+
+    #[test]
+    fn server_validate_rejects_tiny_idle_backstop() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+fallback_idle_floor_ms = 1000
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidIdleBackstop
+        ));
+    }
+
+    #[test]
+    fn server_validate_rejects_excessive_timeout_jitter() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+fallback_idle_jitter_ms = 999999999
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidTimeoutJitter
+        ));
+    }
+
+    #[test]
+    fn server_validate_rejects_bogus_tcp_congestion() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        for bogus in ["\"\"", "\"bbr xtls\"", "\"a;b\""] {
+            let raw = format!(
+                r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+tcp_congestion = {bogus}
+"#
+            );
+            let cfg = toml::from_str::<Config>(&raw).unwrap();
+            assert!(
+                matches!(
+                    cfg.validate().unwrap_err(),
+                    ConfigError::InvalidCongestionControl
+                ),
+                "expected rejection for tcp_congestion = {bogus}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_validate_accepts_plausible_tcp_congestion() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+tcp_congestion = "cubic"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.unwrap().tcp_congestion.as_deref(), Some("cubic"));
+    }
+
+    #[test]
+    fn server_replay_cache_capacity_parses_override() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+replay_cache_capacity = 65536
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.unwrap().replay_cache_capacity, 65536);
+    }
+
+    #[test]
+    fn server_validate_rejects_zero_replay_cache_capacity() {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+replay_cache_capacity = 0
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::InvalidReplayCacheCapacity
+        ));
+    }
+
+    #[test]
     fn server_validate_rejects_bad_data_target() {
         let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
         let raw = format!(
@@ -1046,7 +2192,43 @@ psk = "{KEY}"
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
-        assert!(matches!(Config::load(&path), Err(ConfigError::Toml(_))));
+        assert!(matches!(Config::load(&path), Err(ConfigError::Toml { .. })));
+    }
+
+    /// M-12: a TOML syntax error on or near a secret line must NOT leak the
+    /// offending source line (which carries `crypto.psk` / `server.private_key`
+    /// etc.) through the error's Display or Debug — only line/column/kind.
+    #[test]
+    fn toml_parse_error_never_leaks_secret_value() {
+        let secret = "S3CR3T-DO-NOT-LEAK-0123456789abcdef";
+        // Two operator-typo classes that historically leaked the secret:
+        //  (1) an unterminated string on the psk line (toml_edit's Display renders
+        //      the whole source line, secret included);
+        //  (2) a secret string transposed onto a NUMERIC field, whose toml
+        //      type-mismatch message() echoes the value verbatim
+        //      (invalid type: string "<secret>", expected usize).
+        // Neither may surface in Display or Debug of the resulting error.
+        for body in [
+            format!("mode = \"server\"\n[crypto]\npsk = \"{secret}\n"),
+            format!("mode = \"server\"\n[server]\nreplay_cache_capacity = \"{secret}\"\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("leaky.toml");
+            fs::write(&path, &body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let err = Config::load(&path).unwrap_err();
+            let rendered = format!("{err}");
+            let debugged = format!("{err:?}");
+            assert!(
+                !rendered.contains(secret) && !debugged.contains(secret),
+                "TOML parse error must not contain the secret (Display={rendered:?}, Debug={debugged:?})",
+            );
+            assert!(matches!(err, ConfigError::Toml { .. }));
+        }
     }
 
     #[test]

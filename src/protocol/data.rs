@@ -450,12 +450,18 @@ impl DataRecordCodec {
         if record_count == 0 {
             return Ok(());
         }
+        self.aead.ensure_usable()?;
         debug_assert_eq!(record_lens.iter().sum::<usize>(), plaintext.len());
         let group_count = pool.width().max(1).min(record_count);
 
         let cipher = self.aead.cipher();
         let nonce_base = self.aead.nonce_base();
         let base_sequence = self.aead.sequence();
+        // Defense in depth: reject a batch that would wrap the per-direction
+        // sequence counter past u64::MAX before any record is sealed.
+        if base_sequence.checked_add(record_count as u64).is_none() {
+            return Err(SessionError::NonceExhausted.into());
+        }
         let aad = self.aad;
         let padding = self.padding;
 
@@ -511,6 +517,19 @@ impl DataRecordCodec {
         records: &mut [u8],
         out: &mut Vec<u8>,
     ) -> Result<(), DataRecordError> {
+        self.aead.ensure_usable()?;
+        let result = self.open_concat_records_inner(records, out);
+        if result.is_err() {
+            self.aead.poison();
+        }
+        result
+    }
+
+    fn open_concat_records_inner(
+        &mut self,
+        records: &mut [u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError> {
         let mut offset = 0;
         while offset < records.len() {
             let header = record::parse_header(&records[offset..])?;
@@ -556,6 +575,20 @@ impl DataRecordCodec {
     /// the counter is left untouched (mirroring the serial `open*` methods, so
     /// a rejected record cannot silently desynchronize the stream).
     pub fn open_concat_records_parallel(
+        &mut self,
+        pool: &CryptoPool,
+        records: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError> {
+        self.aead.ensure_usable()?;
+        let result = self.open_concat_records_parallel_inner(pool, records, out);
+        if result.is_err() {
+            self.aead.poison();
+        }
+        result
+    }
+
+    fn open_concat_records_parallel_inner(
         &mut self,
         pool: &CryptoPool,
         records: &[u8],
@@ -792,9 +825,53 @@ pub fn should_parallelize_aead(record_count: usize, total_bytes: usize) -> bool 
 pub const CLIENT_TO_SERVER_AAD: &[u8] = b"ParallaX v1 client appdata";
 pub const SERVER_TO_CLIENT_AAD: &[u8] = b"ParallaX v1 server appdata";
 
+/// Fixed plaintext payload of the QUIC fast-plane teardown DONE marker. After a
+/// side has fully drained both relay directions (its `try_join` is Ok), it seals
+/// exactly one record carrying this marker on its send-direction codec and
+/// writes it over the reliable TCP control stream; the peer opens one record on
+/// the matching receive-direction codec and verifies this payload. It is a
+/// normal sealed ApplicationData record on the wire (camouflage-consistent), and
+/// it consumes exactly the next per-direction sequence number — the codec
+/// continues monotonically (Connect rode TCP, the relay rode the QUIC stream,
+/// this DONE is the next record on each direction over TCP). The payload is a
+/// fixed, non-empty marker so it can never be confused with the empty
+/// cover/rendezvous records (whose plaintext is `&[]` and which the relay loops
+/// skip). Follows the PX1* command convention used elsewhere on the wire.
+pub const QUIC_RELAY_DONE_MARKER: &[u8] = b"PX1Z-quic-relay-done";
+
+/// QUIC application close code for a graceful, mutually-recognized idle teardown
+/// of the fast-plane relay. Code 0 stays the generic/abrupt close; when one side's
+/// idle watchdog fires it closes the connection with this code so the peer can
+/// distinguish a benign idle teardown (return Ok) from a real relay error — making
+/// the outcome symmetric regardless of which side's watchdog fires first.
+pub const RELAY_IDLE_CLOSE_CODE: u32 = 1;
+
+/// True iff a QUIC connection's close reason is the agreed relay idle teardown
+/// (`ApplicationClosed` carrying exactly [`RELAY_IDLE_CLOSE_CODE`]). A pure
+/// classifier so the client and server idle-close recognizers share one tested
+/// implementation; it must match ONLY the agreed code — never a generic code-0
+/// application close, a transport close, or the QUIC idle-timeout abort — so a
+/// real relay error is never mistaken for a benign idle teardown.
+pub(crate) fn is_relay_idle_close_reason(reason: Option<&quinn::ConnectionError>) -> bool {
+    matches!(
+        reason,
+        Some(quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose { error_code, .. }))
+            if *error_code == quinn::VarInt::from_u32(RELAY_IDLE_CLOSE_CODE)
+    )
+}
+
 pub fn max_plaintext_len(max_padding: u16) -> usize {
     OUTER_TLS_RECORD_LIMIT.saturating_sub(max_padding as usize + AEAD_TAG_LEN + PADDING_LEN_FIELD)
 }
+
+/// Minimum plaintext bytes that must remain per record after padding overhead.
+/// Configs whose `max_padding` drives `max_plaintext_len` below this are rejected
+/// at validation: a near-record-sized padding (e.g. leaving 1 plaintext byte)
+/// makes a single 64 KiB relay read split into tens of thousands of records, and
+/// the up-front `out.reserve(...)` for that would attempt a ~1 GiB allocation
+/// (an availability footgun). 1 KiB still permits very heavy padding (>90% of the
+/// record) while bounding worst-case buffering to a few MiB per relay read.
+pub const MIN_USABLE_PLAINTEXT_LEN: usize = 1024;
 
 pub fn relay_read_buffer_len(max_payload_chunk_len: usize) -> usize {
     if max_payload_chunk_len == 0 {
@@ -1484,6 +1561,54 @@ mod tests {
     }
 
     #[test]
+    fn batch_open_failure_poisons_codec() {
+        let key = [9_u8; KEY_LEN];
+        let nonce = [10_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut rng = StdRng::seed_from_u64(81);
+        // Record sealed at sequence 0; keep a pristine copy.
+        let good = enc.seal(b"first", &mut rng).unwrap();
+
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut tampered = good.clone();
+        let flip = tampered.len() - 1;
+        tampered[flip] ^= 0x01;
+        let mut opened = Vec::new();
+        // Batch open of the tampered (first) record fails without advancing the
+        // sequence counter, so the failure is only detectable as a poison.
+        assert!(matches!(
+            dec.open_concat_records(&mut tampered, &mut opened),
+            Err(DataRecordError::Aead(_))
+        ));
+        // The pristine record still matches sequence 0, so without poisoning the
+        // codec this open would succeed. Poisoning makes every later op fail-close.
+        assert!(matches!(dec.open(&good), Err(DataRecordError::Aead(_))));
+    }
+
+    #[test]
+    fn parallel_seal_rejects_sequence_overflow() {
+        let key = [11_u8; KEY_LEN];
+        let nonce = [12_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        // Drive the per-direction sequence counter to the edge so a 2-record
+        // batch would wrap past u64::MAX.
+        enc.aead.advance_sequence(u64::MAX - 1);
+        let payload = vec![0_u8; 8];
+        let lens = vec![4_usize, 4_usize];
+        let mut rng = StdRng::seed_from_u64(91);
+        let mut out = Vec::new();
+        assert!(matches!(
+            enc.seal_records_into_parallel(&test_pool(), &payload, &lens, &mut rng, &mut out),
+            Err(DataRecordError::Aead(SessionError::NonceExhausted))
+        ));
+    }
+
+    #[test]
     fn should_parallelize_aead_requires_both_thresholds() {
         assert!(should_parallelize_aead(
             PARALLEL_AEAD_MIN_RECORDS,
@@ -1550,5 +1675,28 @@ mod tests {
             relay_read_buffer_len(RELAY_READ_BUFFER_TARGET + 1),
             RELAY_READ_BUFFER_TARGET + 1
         );
+    }
+
+    #[test]
+    fn relay_idle_close_reason_matches_only_the_agreed_code() {
+        use quinn::{ApplicationClose, ConnectionError, VarInt};
+
+        let idle = ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u32(RELAY_IDLE_CLOSE_CODE),
+            reason: bytes::Bytes::new(),
+        });
+        assert!(is_relay_idle_close_reason(Some(&idle)));
+
+        // A generic code-0 application close, a transport close, and "no reason
+        // yet" (live connection) must NOT be mistaken for the idle teardown.
+        let generic = ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u32(0),
+            reason: bytes::Bytes::new(),
+        });
+        assert!(!is_relay_idle_close_reason(Some(&generic)));
+        assert!(!is_relay_idle_close_reason(Some(
+            &ConnectionError::TimedOut
+        )));
+        assert!(!is_relay_idle_close_reason(None));
     }
 }

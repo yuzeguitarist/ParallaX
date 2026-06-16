@@ -34,6 +34,8 @@ pub enum SocksError {
     UnsupportedAddressType(u8),
     #[error("SOCKS domain name is empty")]
     EmptyDomain,
+    #[error("SOCKS domain name is not valid UTF-8")]
+    InvalidDomain,
     #[error("SOCKS target port must not be zero")]
     ZeroPort,
 }
@@ -101,7 +103,10 @@ where
             }
             let mut domain = vec![0_u8; len];
             stream.read_exact(&mut domain).await?;
-            String::from_utf8_lossy(&domain).into_owned()
+            // Reject non-UTF-8 domains at the SOCKS boundary instead of lossily
+            // substituting U+FFFD: the server decodes the host strictly, so a
+            // lossy rewrite here would forward a different host than the app sent.
+            String::from_utf8(domain).map_err(|_| SocksError::InvalidDomain)?
         }
         4 => {
             let raw = stream.read_u128().await?;
@@ -163,6 +168,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejects_non_utf8_domain() {
+        let (mut client, mut server) = duplex(128);
+        let task = tokio::spawn(async move { accept_connect(&mut server).await });
+
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+
+        // ATYP=3, len=3, domain = 0xFF 0xFE 0xFD (not valid UTF-8), port 443.
+        client
+            .write_all(&[5, 1, 0, 3, 3, 0xFF, 0xFE, 0xFD, 1, 187])
+            .await
+            .unwrap();
+
+        let result = task.await.unwrap();
+        assert!(
+            matches!(result, Err(SocksError::InvalidDomain)),
+            "non-UTF-8 domain must be rejected at the SOCKS boundary, got {result:?}"
+        );
+    }
+
     #[test]
     fn target_brackets_ipv6_literals() {
         let request = SocksRequest {
@@ -171,5 +199,22 @@ mod tests {
         };
 
         assert_eq!(request.target(), "[::1]:443");
+    }
+}
+
+/// Fuzz-only sync driver for the private async SOCKS5 CONNECT parser. Compiled
+/// ONLY under `--cfg fuzzing` (which cargo-fuzz sets); absent from normal
+/// `cargo build` / `cargo test` and CI, so it adds no production API surface.
+#[cfg(fuzzing)]
+#[allow(clippy::result_unit_err)] // fuzz-only wrapper intentionally erases the error type
+pub mod fuzz {
+    use super::{read_connect_request, SocksRequest};
+
+    pub fn read_connect_request_sync(mut data: &[u8]) -> Result<SocksRequest, ()> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|_| ())?;
+        rt.block_on(async move { read_connect_request(&mut data).await })
+            .map_err(|_| ())
     }
 }

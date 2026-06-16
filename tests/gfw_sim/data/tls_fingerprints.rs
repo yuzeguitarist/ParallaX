@@ -18,6 +18,14 @@ pub struct BrowserFingerprintEntry {
     pub ja4: &'static str,
 }
 
+/// Canonical real Safari 26.4 / macOS JA4 — the FoxIO algorithm over the
+/// first-party `tests/fixtures/safari26_apple_com_clienthello.bin` capture, which
+/// the product emits 1:1. Single source of truth: the `safari-26-macos` entry
+/// below references it, `gfw_sim_provenance.rs` imports it, and
+/// `ja4_census_oracle.rs` cross-checks the census band against it — so a
+/// re-capture that updates one site cannot silently desync the oracles.
+pub const SAFARI26_MACOS_JA4: &str = "t13d2013h2_a09f3c656075_7f0f34a4126d";
+
 /// Hand-picked JA3 / JA4 hashes for recent browser builds. These are *public*
 /// values - they are what any HTTPS server sees from a vanilla browser.
 ///
@@ -51,16 +59,25 @@ pub const KNOWN_BROWSER_FINGERPRINTS: &[BrowserFingerprintEntry] = &[
         ja3_md5: "773906b0efdefa24a7f2b8eb6985bf37",
         ja4: "t13d1517h2_8daaf6152771_b0da82dd1658",
     },
-    // Safari 26 (macOS).
+    // Safari 26 (macOS). JA3/JA4 VERIFIED 2026-06 against the first-party
+    // tcpdump capture tests/fixtures/safari26_apple_com_clienthello.bin, which
+    // the product emitter matches 1:1 (see tests/safari_parity_baseline.rs).
+    // The earlier `t13d2014h2_..._e1a3cbb20efb` value was an unverified ja4db
+    // copy and was WRONG: real Safari 26.4 emits 13 non-GREASE extensions
+    // (t13d2013h2), not 14. Keep this value tied to a real capture, never to an
+    // un-sourced external constant.
     BrowserFingerprintEntry {
         label: "safari-26-macos",
-        ja3_md5: "1538eeb4d31b9ff9f81b00cae0a1d0c9",
-        ja4: "t13d2014h2_a09f3c656075_e1a3cbb20efb",
+        ja3_md5: "ecdf4f49dd59effc439639da29186671",
+        ja4: SAFARI26_MACOS_JA4,
     },
+    // Safari 26 (iOS). UNVERIFIED: there is no first-party iOS capture in-tree;
+    // assumed identical to macOS because iOS/macOS Safari share the Secure
+    // Transport TLS stack. Replace with a real iOS capture when one exists.
     BrowserFingerprintEntry {
         label: "safari-26-ios",
-        ja3_md5: "a8e23f8a51a8a89cd66ad6b4e7d3b7c6",
-        ja4: "t13d2014h2_a09f3c656075_b5f5c9b6f6a4",
+        ja3_md5: "ecdf4f49dd59effc439639da29186671",
+        ja4: "t13d2013h2_a09f3c656075_7f0f34a4126d",
     },
     // Firefox 124 (current ESR-ish baseline).
     BrowserFingerprintEntry {

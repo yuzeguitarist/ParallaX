@@ -1,0 +1,40 @@
+# Notifies the ParallaX docs site (Vercel) to rebuild whenever the DeepWiki
+# docs change on main, so the published docs always track this repo.
+#
+# One-time setup:
+#   1. In the Vercel project (Settings → Git → Deploy Hooks) create a hook on
+#      branch `main` and copy its URL.
+#   2. In this repo (Settings → Secrets and variables → Actions) add a secret
+#      named VERCEL_DEPLOY_HOOK_URL with that URL.
+#
+# You can also trigger a rebuild by hand from the Actions tab (workflow_dispatch).
+name: Redeploy docs site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ParallaX-DeepWiki/**"
+  workflow_dispatch: {}
+
+# This job only POSTs to an external deploy hook; it needs no repo token scopes.
+permissions: {}
+
+# Don't pile up redeploys if several doc commits land quickly.
+concurrency:
+  group: redeploy-docs-site
+  cancel-in-progress: true
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Vercel deploy hook
+        env:
+          HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::error::VERCEL_DEPLOY_HOOK_URL secret is not set." >&2
+            exit 1
+          fi
+          curl -fsS -X POST "$HOOK" -o /dev/null -w "deploy hook → HTTP %{http_code}\n"

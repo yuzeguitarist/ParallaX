@@ -1,0 +1,19 @@
+[Unit]
+Description=ParallaX fuzz cluster — publish status-<nodeid>.json to the fuzz-status branch
+Documentation=https://github.com/yuzeguitarist/ParallaX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=plxfuzz
+WorkingDirectory=/var/lib/plxfuzz/src
+Environment=HOME=/var/lib/plxfuzz
+Environment=CARGO_HOME=/var/lib/plxfuzz/.cargo
+Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
+Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Heartbeat is best-effort; a transient gh/git failure must not mark the unit
+# failed (the script already wraps every network op and exits 0).
+ExecStart=/var/lib/plxfuzz/bin/status.sh
+Nice=10
+TimeoutStartSec=120

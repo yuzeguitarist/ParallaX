@@ -30,15 +30,13 @@ use rand::{rngs::OsRng, RngCore};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256, Sha384};
 use thiserror::Error;
-use tokio::{
-    io::AsyncWriteExt,
-    net::TcpStream,
-    time::{sleep, timeout},
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 use zeroize::Zeroizing;
 
 use super::{
-    record::{parse_header, read_record, TLS_CONTENT_ALERT, TLS_CONTENT_APPLICATION_DATA},
+    record::{
+        parse_header, read_record, TlsRecordReader, TLS_CONTENT_ALERT, TLS_CONTENT_APPLICATION_DATA,
+    },
     server_hello::parse_server_hello,
 };
 use crate::crypto::{
@@ -57,7 +55,6 @@ const POST_HANDSHAKE_DRAIN_LIMIT: usize = 4;
 const POST_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(180);
 const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
 const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
-const H2_OPEN_HEADERS_DELAY: Duration = Duration::from_millis(12);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
 
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
@@ -65,6 +62,24 @@ const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
 const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
 const TLS_RECORD_VERSION_CLIENT_HELLO: [u8; 2] = [0x03, 0x01];
 const TLS_RECORD_VERSION_TLS13: [u8; 2] = [0x03, 0x03];
+
+/// Upper bound on a decompressed server certificate chain (TLS 1.3 cert
+/// compression). Real chains are a few KiB; 256 KiB is generous headroom while
+/// bounding the memory an attacker-supplied CompressedCertificate can force.
+const MAX_DECOMPRESSED_CERT_CHAIN: usize = 256 * 1024;
+
+/// Maximum ChangeCipherSpec records tolerated across a handshake. RFC 8446 allows
+/// at most one (a middlebox-compatibility no-op); accepting unbounded CCS lets an
+/// on-path attacker (CCS is unauthenticated/pre-AEAD) trickle them to stall the
+/// client handshake indefinitely.
+const MAX_CHANGE_CIPHER_SPEC_RECORDS: usize = 2;
+
+/// Upper bound on a single encrypted handshake message length declared by the
+/// (still-unauthenticated, at this stage) server. Must exceed
+/// `MAX_DECOMPRESSED_CERT_CHAIN` (256 KiB) plus Certificate framing — the largest
+/// legitimate member of the flight — while killing the ~16 MiB memory-amplification
+/// vector a malicious cover origin could otherwise force via one length field.
+const MAX_ENCRYPTED_HANDSHAKE_MESSAGE: usize = 512 * 1024;
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
@@ -214,11 +229,27 @@ impl Safari26TlsCamouflage {
             x25519_shared_secret(&parallax_x25519.private, server_public_key);
         let auth_key = derive_client_auth_key_from_shared(psk, &parallax_shared_secret)?;
 
+        // Generate the TLS handshake ephemeral up-front: its public half is
+        // carried UNMASKED in the key_share, and the v4 carrier-mask key is
+        // derived from X25519(server_static, this ephemeral) so a passive
+        // observer (who lacks the server static private key) cannot recompute the
+        // masks and therefore cannot run the v3 offline PSK-guessing oracle. This
+        // MUST precede the mask builds below.
+        let tls_x25519 = X25519KeyPair::generate();
+        let mask_ecdh =
+            Zeroizing::new(x25519_shared_secret(&tls_x25519.private, server_public_key));
+
         let tail = build_auth_tail(&mut OsRng)?;
-        let encoded_client_random =
-            build_masked_stateful_client_random(psk, &sni, &parallax_x25519.public, &tail)?;
+        let encoded_client_random = build_masked_stateful_client_random(
+            psk,
+            &mask_ecdh,
+            &sni,
+            &parallax_x25519.public,
+            &tail,
+        )?;
         let session_id = build_masked_stateful_auth_session_id(
             psk,
+            &mask_ecdh,
             &auth_key,
             &sni,
             &parallax_x25519.public,
@@ -226,7 +257,6 @@ impl Safari26TlsCamouflage {
             &tail,
         )?;
 
-        let tls_x25519 = X25519KeyPair::generate();
         let (mlkem_public, mlkem_secret) = mlkem768::keypair();
         let mut grease_seed = [0_u8; 5];
         OsRng.fill_bytes(&mut grease_seed);
@@ -240,7 +270,7 @@ impl Safari26TlsCamouflage {
             grease,
         )?;
 
-        let Some(material) = recover_stateful_auth_material(&client_hello, psk)? else {
+        let Some(material) = recover_stateful_auth_material(&client_hello, psk, &mask_ecdh)? else {
             return Err(Safari26TlsError::UnauthenticatedClientHello);
         };
         let auth = verify_masked_stateful_client_hello_auth_with_material(
@@ -327,13 +357,22 @@ impl Safari26TlsSession {
         &mut self,
         stream: &mut TcpStream,
     ) -> Result<Vec<u8>, Safari26TlsError> {
+        let mut ccs_records = 0_usize;
         loop {
             let record = read_record(stream).await?;
             self.tap_records(RecordDirection::Inbound, &record);
             let header = parse_header(&record)
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
             match header.content_type {
-                TLS_RECORD_CHANGE_CIPHER_SPEC => continue,
+                TLS_RECORD_CHANGE_CIPHER_SPEC => {
+                    ccs_records += 1;
+                    if ccs_records > MAX_CHANGE_CIPHER_SPEC_RECORDS {
+                        return Err(Safari26TlsError::Handshake(
+                            "too many ChangeCipherSpec records before ServerHello".to_owned(),
+                        ));
+                    }
+                    continue;
+                }
                 TLS_CONTENT_ALERT => return parse_alert(&record),
                 TLS_RECORD_HANDSHAKE => {
                     let _ = parse_server_hello(&record)?;
@@ -396,6 +435,7 @@ impl Safari26TlsSession {
     ) -> Result<ServerFlight, Safari26TlsError> {
         let mut flight = ServerFlight::default();
         let mut handshake_buf = Vec::new();
+        let mut ccs_records = 0_usize;
 
         while !flight.finished {
             let record = read_record(stream).await?;
@@ -403,7 +443,15 @@ impl Safari26TlsSession {
             let header = parse_header(&record)
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
             match header.content_type {
-                TLS_RECORD_CHANGE_CIPHER_SPEC => continue,
+                TLS_RECORD_CHANGE_CIPHER_SPEC => {
+                    ccs_records += 1;
+                    if ccs_records > MAX_CHANGE_CIPHER_SPEC_RECORDS {
+                        return Err(Safari26TlsError::Handshake(
+                            "too many ChangeCipherSpec records in server flight".to_owned(),
+                        ));
+                    }
+                    continue;
+                }
                 TLS_CONTENT_ALERT => return parse_alert(&record),
                 TLS_RECORD_APPLICATION_DATA => {
                     let decrypted = keys.server_handshake.decrypt_record(&record)?;
@@ -458,13 +506,33 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
     ) -> Result<usize, Safari26TlsError> {
         let mut observed = 0usize;
+        // One long-lived UNBUFFERED reader across the loop: a per-record timeout
+        // mid-read must NOT discard bytes already pulled off the socket. A
+        // throwaway reader (the old `read_record(stream)` per iteration) would
+        // drop the partially-read header/payload on timeout, desyncing the
+        // data-phase stream we hand off. On timeout we stop cleanly only when the
+        // reader is at a record boundary (the benign slow/absent NewSessionTicket
+        // case); a mid-record stall fails honestly so the connection is dropped
+        // rather than silently desynced.
+        let mut reader = TlsRecordReader::new(&mut *stream);
+        let mut record = Vec::new();
         for _ in 0..POST_HANDSHAKE_DRAIN_LIMIT {
-            let record = match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, read_record(stream)).await {
-                Ok(Ok(record)) => record,
+            match timeout(
+                POST_HANDSHAKE_DRAIN_TIMEOUT,
+                reader.read_record_into(&mut record),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
                 Ok(Err(err)) if is_clean_close(&err) => return Ok(observed),
                 Ok(Err(err)) => return Err(err.into()),
-                Err(_) => return Ok(observed),
-            };
+                Err(_) if reader.at_record_boundary() => return Ok(observed),
+                Err(_) => {
+                    return Err(Safari26TlsError::Handshake(
+                        "post-handshake drain timed out mid-record".to_owned(),
+                    ))
+                }
+            }
             observed += 1;
             self.tap_records(RecordDirection::Inbound, &record);
             let header = parse_header(&record)
@@ -489,14 +557,27 @@ impl Safari26TlsSession {
             return Ok(());
         }
 
+        // HTTP/2 clients send their opening request right after their own preface,
+        // without first waiting for the server's SETTINGS — the standard behavior
+        // that saves a round trip (a client may send requests as soon as it has
+        // sent its preface; the server buffers them). Writing the preface, blocking
+        // on the server's SETTINGS, then sending HEADERS made the first
+        // client->server flight preface-only and added a
+        // server-round-trip-before-request pattern no browser exhibits. Send the
+        // preface and the opening HEADERS back-to-back as one flight, then drain
+        // and ACK the server's SETTINGS afterward.
+        //
+        // Keep them as two separate writes (their existing record framing) rather
+        // than coalescing into one TLS record: no capture pins the real Safari
+        // opening-flight record boundary — the committed fixture is a plaintext
+        // reassembly that proves byte shape, not record count. Change only the
+        // proven tell (the wait), not the on-wire record framing.
         let fingerprint = Http2Fingerprint::safari26();
         let preface = fingerprint.connection_preface()?;
         self.write_application_data(stream, keys, &preface).await?;
-        self.await_http2_settings_ack(stream, keys).await?;
-
         let headers = fingerprint.headers_frame(&self.sni)?;
         self.write_application_data(stream, keys, &headers).await?;
-        sleep(H2_OPEN_HEADERS_DELAY).await;
+        self.await_http2_settings_ack(stream, keys).await?;
         Ok(())
     }
 
@@ -522,13 +603,29 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
     ) -> Result<(), Safari26TlsError> {
         let mut plaintext = Vec::new();
+        // Long-lived UNBUFFERED reader (see drain_post_handshake): a mid-record
+        // timeout must not discard buffered bytes and desync the stream. The
+        // settings-ack write is routed through reader.get_mut() because the reader
+        // holds the stream borrow for the loop's lifetime.
+        let mut reader = TlsRecordReader::new(&mut *stream);
+        let mut record = Vec::new();
         for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
-            let record = match timeout(H2_SETTINGS_ACK_TIMEOUT, read_record(stream)).await {
-                Ok(Ok(record)) => record,
+            match timeout(
+                H2_SETTINGS_ACK_TIMEOUT,
+                reader.read_record_into(&mut record),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
                 Ok(Err(err)) if is_clean_close(&err) => return Ok(()),
                 Ok(Err(err)) => return Err(err.into()),
-                Err(_) => return Ok(()),
-            };
+                Err(_) if reader.at_record_boundary() => return Ok(()),
+                Err(_) => {
+                    return Err(Safari26TlsError::Handshake(
+                        "http/2 settings ack timed out mid-record".to_owned(),
+                    ))
+                }
+            }
             self.tap_records(RecordDirection::Inbound, &record);
             let header = parse_header(&record)
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
@@ -544,7 +641,7 @@ impl Safari26TlsSession {
                         plaintext.clear();
                     }
                     if self
-                        .process_http2_frames(&mut plaintext, stream, keys)
+                        .process_http2_frames(&mut plaintext, reader.get_mut(), keys)
                         .await?
                     {
                         return Ok(());
@@ -1346,6 +1443,22 @@ struct ServerFlight {
     finished: bool,
 }
 
+/// Rejects a Certificate/CompressedCertificate that is a duplicate or arrives
+/// after CertificateVerify. This binds the leaf that CertificateVerify proves
+/// possession of to the leaf that is finally validated: without it, a second
+/// Certificate could overwrite `flight.certificates` while `certificate_verify_seen`
+/// stays true, letting an active MITM prove possession of an attacker key
+/// (Certificate#1 + CV) and then present the real chain (Certificate#2) before
+/// Finished — defeating the cover-origin TLS authentication.
+fn reject_out_of_order_certificate(flight: &ServerFlight) -> Result<(), Safari26TlsError> {
+    if !flight.certificates.is_empty() || flight.certificate_verify_seen {
+        return Err(Safari26TlsError::Handshake(
+            "duplicate or out-of-order Certificate message in server flight".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn process_server_handshake_messages(
     buf: &mut Vec<u8>,
     flight: &mut ServerFlight,
@@ -1357,6 +1470,16 @@ fn process_server_handshake_messages(
             return Ok(());
         }
         let len = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | buf[3] as usize;
+        // Reject on the FIRST record carrying an oversized length header, before
+        // the buffer can accumulate toward the declared target — this bounds the
+        // handshake buffer to ~MAX_ENCRYPTED_HANDSHAKE_MESSAGE plus one in-flight
+        // record, closing the memory-amplification vector from an unauthenticated
+        // cover origin.
+        if len > MAX_ENCRYPTED_HANDSHAKE_MESSAGE {
+            return Err(Safari26TlsError::Handshake(
+                "encrypted handshake message length exceeds maximum".to_owned(),
+            ));
+        }
         if buf.len() < 4 + len {
             return Ok(());
         }
@@ -1365,19 +1488,31 @@ fn process_server_handshake_messages(
         let body = &message[4..];
         match message[0] {
             HANDSHAKE_ENCRYPTED_EXTENSIONS => {
+                if flight.encrypted_extensions_seen {
+                    return Err(Safari26TlsError::Handshake(
+                        "duplicate EncryptedExtensions in server flight".to_owned(),
+                    ));
+                }
                 parse_encrypted_extensions(body, keys)?;
                 flight.encrypted_extensions_seen = true;
                 transcript.push(&message);
             }
             HANDSHAKE_CERTIFICATE => {
+                reject_out_of_order_certificate(flight)?;
                 flight.certificates = parse_certificate_body(body)?;
                 transcript.push(&message);
             }
             HANDSHAKE_COMPRESSED_CERTIFICATE => {
+                reject_out_of_order_certificate(flight)?;
                 flight.certificates = parse_compressed_certificate_body(body)?;
                 transcript.push(&message);
             }
             HANDSHAKE_CERTIFICATE_VERIFY => {
+                if flight.certificate_verify_seen {
+                    return Err(Safari26TlsError::Handshake(
+                        "duplicate CertificateVerify in server flight".to_owned(),
+                    ));
+                }
                 verify_certificate_verify(body, flight, transcript, keys)?;
                 flight.certificate_verify_seen = true;
                 transcript.push(&message);
@@ -1455,10 +1590,31 @@ fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari
         ));
     }
     let uncompressed_len = c.u24()? as usize;
+    // Reject an oversized declared length BEFORE allocating: a real server
+    // certificate chain is a few KiB, and zlib's ~1000:1 ratio means a tiny
+    // attacker-supplied blob can declare (and inflate to) gigabytes. Without this
+    // an on-path attacker — reachable here BEFORE certificate verification, since
+    // the handshake keys come from the still-unauthenticated server key_share —
+    // could OOM-kill the client/prober with one small CompressedCertificate.
+    if uncompressed_len > MAX_DECOMPRESSED_CERT_CHAIN {
+        return Err(Safari26TlsError::Handshake(
+            "compressed_certificate uncompressed_length exceeds maximum".to_owned(),
+        ));
+    }
     let compressed = c.vec_u24()?;
-    let mut decoder = ZlibDecoder::new(Cursor::new(compressed));
-    let mut decompressed = Vec::with_capacity(uncompressed_len);
-    decoder.read_to_end(&mut decompressed)?;
+    let decoder = ZlibDecoder::new(Cursor::new(compressed));
+    // Cap the actual inflation independently of the declared length so a lying
+    // header (small uncompressed_len, huge real output) cannot exhaust memory
+    // either. take() bounds the bytes pulled from the decoder; reading one extra
+    // byte past the cap lets us detect an over-cap stream.
+    let mut decompressed = Vec::with_capacity(uncompressed_len.min(MAX_DECOMPRESSED_CERT_CHAIN));
+    let mut limited = decoder.take((MAX_DECOMPRESSED_CERT_CHAIN as u64) + 1);
+    limited.read_to_end(&mut decompressed)?;
+    if decompressed.len() > MAX_DECOMPRESSED_CERT_CHAIN {
+        return Err(Safari26TlsError::Handshake(
+            "compressed_certificate inflates beyond maximum".to_owned(),
+        ));
+    }
     if decompressed.len() != uncompressed_len {
         return Err(Safari26TlsError::Handshake(
             "compressed_certificate length mismatch".to_owned(),
@@ -1565,22 +1721,26 @@ fn verify_server_certificate(
 }
 
 fn native_roots() -> Result<&'static [CertificateDer<'static>], Safari26TlsError> {
-    static ROOTS: OnceLock<Result<Vec<CertificateDer<'static>>, String>> = OnceLock::new();
-    ROOTS
-        .get_or_init(|| {
-            let loaded = rustls_native_certs::load_native_certs();
-            if loaded.certs.is_empty() {
-                let detail = loaded
-                    .errors
-                    .first()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "platform root store returned no certificates".to_owned());
-                return Err(detail);
-            }
-            Ok(loaded.certs)
-        })
-        .as_deref()
-        .map_err(|err| Safari26TlsError::Certificate(err.clone()))
+    // Cache only the SUCCESS value: a transient empty/error load (boot-time
+    // trust-store rotation, a momentary sandbox denial) must NOT be memoized, or
+    // it would poison certificate verification for the whole process lifetime.
+    // Each failed load returns an error and the next handshake retries.
+    static ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
+    if let Some(roots) = ROOTS.get() {
+        return Ok(roots.as_slice());
+    }
+    let loaded = rustls_native_certs::load_native_certs();
+    if loaded.certs.is_empty() {
+        let detail = loaded
+            .errors
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "platform root store returned no certificates".to_owned());
+        return Err(Safari26TlsError::Certificate(detail));
+    }
+    // Another thread may win the init race; both then observe the winner's value.
+    let _ = ROOTS.set(loaded.certs);
+    Ok(ROOTS.get().expect("ROOTS populated above").as_slice())
 }
 
 struct HandshakeTranscript {
@@ -1699,6 +1859,23 @@ impl<'a> TlsCursor<'a> {
     }
 }
 
+/// Fuzz-only entry points for internal handshake parsers. Compiled ONLY under
+/// `--cfg fuzzing` (which cargo-fuzz sets automatically); absent from normal
+/// `cargo build` / `cargo test` and from CI builds, so it cannot widen the
+/// production API surface. These are thin wrappers (not `pub use`, which would
+/// hit E0364 on the private fns) and erase the crate-internal error type.
+#[cfg(fuzzing)]
+#[allow(clippy::result_unit_err)] // fuzz-only wrappers intentionally erase the crate error type
+pub mod fuzz {
+    pub fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+        super::parse_compressed_certificate_body(body).map_err(|_| ())
+    }
+
+    pub fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+        super::parse_certificate_body(body).map_err(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1707,6 +1884,46 @@ mod tests {
         session::X25519KeyPair,
     };
     use crate::tls::client_hello::parse_client_hello;
+
+    fn build_compressed_cert_body(declared_uncompressed_len: usize, plaintext: &[u8]) -> Vec<u8> {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(plaintext).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&CERT_COMPRESSION_ZLIB.to_be_bytes());
+        push_u24(&mut body, declared_uncompressed_len).unwrap();
+        push_u24(&mut body, compressed.len()).unwrap();
+        body.extend_from_slice(&compressed);
+        body
+    }
+
+    #[test]
+    fn compressed_certificate_rejects_oversized_declared_length_before_allocating() {
+        // A declared uncompressed length above the cap must be refused outright
+        // (no multi-GiB Vec::with_capacity), regardless of the compressed body.
+        let body = build_compressed_cert_body(MAX_DECOMPRESSED_CERT_CHAIN + 1, b"hi");
+        let err = parse_compressed_certificate_body(&body).unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("exceeds maximum")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn compressed_certificate_rejects_inflation_beyond_cap_with_lying_header() {
+        // Declared length is small (passes the pre-check), but the stream inflates
+        // far beyond the cap. The bounded reader must stop and reject rather than
+        // inflating gigabytes.
+        let plaintext = vec![0_u8; MAX_DECOMPRESSED_CERT_CHAIN + 4096];
+        let body = build_compressed_cert_body(64, &plaintext);
+        let err = parse_compressed_certificate_body(&body).unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("beyond maximum")),
+            "unexpected error: {err:?}"
+        );
+    }
 
     #[test]
     fn safari26_camouflage_emits_authenticated_client_hello() {
@@ -1717,7 +1934,13 @@ mod tests {
             .unwrap();
 
         let parsed = parse_client_hello(&session.client_hello).unwrap();
-        let material = recover_stateful_auth_material(&session.client_hello, psk)
+        let mask_ecdh = x25519_shared_secret(
+            &server.private,
+            &parsed
+                .x25519_key_share
+                .expect("Safari26 carries a standalone X25519 key_share"),
+        );
+        let material = recover_stateful_auth_material(&session.client_hello, psk, &mask_ecdh)
             .unwrap()
             .unwrap();
         let auth_key =

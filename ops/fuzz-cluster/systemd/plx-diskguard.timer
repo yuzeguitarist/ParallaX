@@ -1,0 +1,13 @@
+[Unit]
+Description=ParallaX fuzz cluster — disk guard, hourly
+Documentation=https://github.com/yuzeguitarist/ParallaX
+
+[Timer]
+# Hourly, at :23 past the hour (off the top of the hour on purpose).
+OnCalendar=*-*-* *:23:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

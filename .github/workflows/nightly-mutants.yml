@@ -1,0 +1,90 @@
+name: nightly-mutants
+
+# Non-gating nightly mutation-testing report (cargo-mutants).
+#
+# Purpose: prove the camouflage/crypto oracles are NOT self-referential by
+# showing that the indistinguishability + auth tests actually KILL byte-flip
+# and label-swap mutants. Scoped to the two highest-signal files:
+#   - src/tls/safari26.rs  (Safari 2.6 TLS fingerprint / ClientHello shape)
+#   - src/crypto/auth.rs   (handshake auth / MAC verification)
+#
+# This workflow is informational only: `continue-on-error: true` and no
+# branch protection references it, so surviving mutants NEVER block a PR.
+# Read survivors in the uploaded `mutants.out/` artifact (outcomes.json /
+# mutants.out/*.txt): a MISSED mutant is a code change no test caught and is
+# a candidate for a new/strengthened test. Most config lives in .cargo/mutants.toml.
+
+on:
+  schedule:
+    # Off-peak; deliberately avoids minute 0/30 to dodge cron stampede.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+# Least-privilege: only needs to read the repo to build/mutate/test.
+permissions:
+  contents: read
+
+# Cancel an in-flight nightly run if a newer one starts (e.g. manual dispatch).
+concurrency:
+  group: nightly-mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  mutants:
+    name: cargo-mutants (indistinguishability/crypto surface)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # NON-GATING: this report must never fail a PR or the nightly schedule.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and target/
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-ci
+          # Nightly mutation builds are unusual; never write back to the shared cache.
+          save-if: false
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: cargo-mutants@27.1.0
+
+      - name: Run cargo-mutants (scoped, bounded)
+        # Scope, the per-mutant timeout, and --locked all live in
+        # .cargo/mutants.toml (the only path cargo-mutants reads config from); we
+        # pass --config explicitly for clarity. The per-mutant timeout is
+        # baseline-relative (timeout_multiplier x the unmutated test time, with a
+        # minimum_test_timeout floor) so it adapts to the runner instead of a
+        # brittle fixed wall-clock — do NOT add a CLI --timeout, which would
+        # override and silence the config. The two -f flags re-pin scope to
+        # exactly these files even if the config drifts (CLI overrides
+        # examine_globs).
+        run: |
+          cargo mutants \
+            --config .cargo/mutants.toml \
+            --no-shuffle \
+            -f src/tls/safari26.rs \
+            -f src/crypto/auth.rs
+
+      - name: Upload mutants.out report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutants-out
+          path: mutants.out/
+          if-no-files-found: warn
+          retention-days: 14

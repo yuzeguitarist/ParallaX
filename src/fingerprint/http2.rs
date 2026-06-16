@@ -339,7 +339,13 @@ const HPACK_HUFFMAN: [(u32, u8); 256] = [
 mod tests {
     use super::*;
 
-    const SAFARI26_HEADERS_CAPTURE_HEX: &str = concat!(
+    // COMPOSED expected value — NOT a raw first-party capture: real Safari 26.4
+    // HEADERS metadata bytes with this project's English accept-language HPACK
+    // segment spliced in (the genuine capture carries Chinese; see
+    // tests/safari_h2_parity_baseline.rs). The accept-language slice here is thus
+    // the encoder's own output, which is why the test below ALSO checks it against
+    // an independent RFC 7541 oracle rather than only against this constant.
+    const SAFARI26_HEADERS_EXPECTED_HEX: &str = concat!(
         "828784418aa0e41d139d09b8f34d33",
         "53032a2f2a",
         "7ad8d07f66a281b0dae053fad0321aa49d13fda992a49685340c8a6adca7e281",
@@ -455,16 +461,33 @@ mod tests {
         assert_eq!(header.len, 150);
         assert_eq!(
             payload,
-            hex(SAFARI26_HEADERS_CAPTURE_HEX.as_bytes()),
+            hex(SAFARI26_HEADERS_EXPECTED_HEX.as_bytes()),
             concat!(
-                "Safari26 HEADERS metadata should match the capture except for ",
-                "the configured English accept-language value",
+                "Safari26 HEADERS metadata should match the composed expected ",
+                "value (real capture metadata + English accept-language)",
             ),
         );
         assert!(SAFARI26_ACCEPT_LANGUAGE.starts_with("en-US"));
         assert!(
             !SAFARI26_ACCEPT_LANGUAGE.contains("zh"),
             "Safari26 accept-language must stay English-only"
+        );
+
+        // Independent oracle: derive the accept-language HPACK segment from the
+        // source STRING via the RFC-7541-validated Huffman helper (not from the
+        // composed constant), so a wrong-but-internally-consistent encoding of the
+        // accept-language value cannot pass unnoticed. 0x51 = literal header field
+        // with incremental indexing, static-table name index 17 (accept-language);
+        // 0x80|len is the Huffman-coded value-length prefix.
+        let al = huffman_payload(SAFARI26_ACCEPT_LANGUAGE.as_bytes());
+        let mut expected_al = vec![0x51_u8, 0x80 | al.len() as u8];
+        expected_al.extend_from_slice(&al);
+        assert!(
+            payload
+                .windows(expected_al.len())
+                .any(|window| window == expected_al),
+            "accept-language segment must match the RFC 7541 Huffman encoding of \
+             SAFARI26_ACCEPT_LANGUAGE, independent of the composed expected constant",
         );
     }
 
