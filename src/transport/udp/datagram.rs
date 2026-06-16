@@ -1,15 +1,28 @@
-//! Windowed forward-error-corrected datagram carrier protocol (logic only; the
-//! quinn `Leg` wrappers live in `leg.rs`). Crypto-agnostic: it frames, reorders,
-//! and FEC-recovers opaque *sealed* AEAD record bytes and never opens them.
+//! Windowed forward-error-corrected datagram carrier protocol + the quinn `Leg`
+//! wrappers that carry the DOWNLOAD direction of the single-Connect relay over
+//! unreliable QUIC datagrams. Crypto-agnostic: it frames, reorders, and
+//! FEC-recovers opaque *sealed* AEAD record bytes and never opens them.
 //!
-//! WHY windowed, delivered window-at-a-time: QUIC datagrams are not retransmitted
-//! (RFC 9221), so a lost datagram is a permanent seq gap. We group `FEC_K`
-//! consecutive sealed records into a window and send `FEC_R` repair symbols after
-//! it, so any `FEC_R` losses in the window recover. The receiver delivers a window
-//! ONLY once all `FEC_K` sources are present (directly or via FEC) — never the
-//! contiguous-prefix-as-it-arrives — because to FEC-decode a late gap it needs the
-//! window's earlier sources still buffered; delivering them early would discard the
-//! symbols the decoder needs. Latency cost: up to one window.
+//! WHY windowed FEC: QUIC datagrams are not retransmitted (RFC 9221), so a lost
+//! datagram is a permanent seq gap. We group `FEC_K` consecutive sealed records
+//! into a window and send `FEC_R` repair symbols after it, so any `FEC_R` losses in
+//! the window recover.
+//!
+//! DELIVERY: the receiver delivers the CONTIGUOUS PREFIX as soon as it arrives (so
+//! interactive / request-response flows are not stalled waiting for a window to
+//! fill), retaining a window's already-delivered sources only long enough to
+//! FEC-recover a LATER gap in the SAME window, then freeing them once delivery has
+//! passed the window. (An earlier window-at-a-time design stalled the trailing
+//! partial window of a response until the EOF-driven FIN — broken for interactive
+//! flows.)
+//!
+//! GIVE-UP IS LIVENESS, NOT WALL-CLOCK: a missing record's repair datagrams are
+//! themselves paced/reorderable and may still be in flight, so neither a wall-clock
+//! deadline nor a structural "high-water past the window" margin can tell "delayed"
+//! from "lost" without false-resetting a healthy backlog draining over many RTTs.
+//! The leg therefore resets only when a gap is OUTSTANDING and NO datagram arrives
+//! for a grace period (re-armed on every datagram); the pending/repair capacity
+//! caps bound memory.
 //!
 //! SAFETY (生死项): symbols are post-seal CIPHERTEXT, so a recovered symbol is the
 //! byte-identical sealed record that would have arrived; it opens at its own seq
@@ -17,17 +30,23 @@
 //! decode) is caught by the AEAD tag when the relay opens it, and the gap demotes —
 //! never silent corruption. The recovered record is trimmed to its own TLS record
 //! length (`record::parse_header().total_len`), so FEC zero-padding never reaches
-//! the AEAD. Every length/count from the wire is bounds-checked; buffers are
-//! capacity-bounded (anti-exhaustion); unrecoverable gaps return an error the leg
-//! turns into a non-clean-close (reset → demote to the reliable carrier).
+//! the AEAD. Every length/count from the wire is bounds-checked; an unrecoverable
+//! gap / lost tail returns an error the leg turns into a non-clean-close (reset →
+//! the client's reachability breaker demotes to the reliable carrier).
 //!
-//! Not yet wired into a leg (the `Leg` impls + relay wiring are a later slice);
-//! kept behind `#![allow(dead_code)]` like `envelope`/`reorder`/`fec`.
+//! LIMITATION (v1, documented): datagrams have NO end-to-end flow control
+//! (RFC 9221). A local consumer slower than the download cannot back-pressure the
+//! sender; quinn drops the oldest buffered incoming datagrams once its receive
+//! buffer overflows, which can manufacture losses beyond `FEC_R` and force a reset
+//! → demote to the flow-controlled stream carrier. So the datagram carrier suits
+//! fast-consumer bulk download; a graceful (no-connection-break) demote via a
+//! retransmit ring is a deferred slice. The carrier is opt-in (`udp.datagram`,
+//! default off) and download-only; the default-off and stream paths are unaffected.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
@@ -191,8 +210,6 @@ pub(crate) struct DatagramReceiver {
     repairs: BTreeMap<u64, BTreeMap<u8, Vec<u8>>>,
     /// Completed records awaiting `pop_ready`, in seq order.
     ready: VecDeque<Vec<u8>>,
-    /// One past the highest source seq ever seen (drives unrecoverability).
-    high_water: u64,
     /// One past the last source seq the sender will ever send (the download-FIN
     /// count), set via [`Self::set_final_seq`]. The window extending past it is the
     /// FINAL partial window (delivered contiguously, no FEC — the sender emits
@@ -201,10 +218,6 @@ pub(crate) struct DatagramReceiver {
     max_pending_records: usize,
     max_pending_bytes: usize,
 }
-
-/// How far past a window's end (in seqs) we must have seen before declaring its
-/// missing pieces lost — tolerates this many seqs of reordering. One full window.
-const REORDER_MARGIN: u64 = FEC_K as u64;
 
 impl DatagramReceiver {
     pub(crate) fn new(
@@ -225,7 +238,6 @@ impl DatagramReceiver {
             pending_bytes: 0,
             repairs: BTreeMap::new(),
             ready: VecDeque::new(),
-            high_water: start_seq,
             final_seq: None,
             max_pending_records,
             max_pending_bytes,
@@ -262,9 +274,6 @@ impl DatagramReceiver {
     fn ingest_source(&mut self, body: &[u8]) -> Result<(), DatagramError> {
         let env = envelope::decode_prefix(body)?;
         let seq = env.seq;
-        if seq >= self.high_water {
-            self.high_water = seq.wrapping_add(1);
-        }
         // Stale (window already passed + freed) or duplicate (still retained): ignore.
         if seq < self.window_base(self.deliver_seq) || self.pending.contains_key(&seq) {
             return Ok(());
@@ -297,23 +306,29 @@ impl DatagramReceiver {
         if base < self.window_base(self.deliver_seq) {
             return Ok(());
         }
-        // Bound the repair store too (one entry per (window, idx); cap windows).
-        let window_count = self.repairs.len();
-        let slot = self.repairs.entry(base).or_default();
-        if !slot.contains_key(&idx) {
-            if window_count >= self.max_pending_records {
-                self.repairs.remove(&base);
-                return Err(DatagramError::CapacityExceeded);
-            }
-            if self.pending_bytes + symbol.len() > self.max_pending_bytes {
-                if slot.is_empty() {
-                    self.repairs.remove(&base);
-                }
-                return Err(DatagramError::CapacityExceeded);
-            }
-            self.pending_bytes += symbol.len();
-            slot.insert(idx, symbol.to_vec());
+        // Duplicate (window, idx): idempotent no-op.
+        if self
+            .repairs
+            .get(&base)
+            .is_some_and(|m| m.contains_key(&idx))
+        {
+            return Ok(());
         }
+        // Bound the repair store: cap the number of windows (only a genuinely NEW
+        // window counts), and the total buffered bytes. Check BEFORE inserting so a
+        // rejection never drops an existing window's already-counted symbols.
+        let is_new_window = !self.repairs.contains_key(&base);
+        if is_new_window && self.repairs.len() >= self.max_pending_records {
+            return Err(DatagramError::CapacityExceeded);
+        }
+        if self.pending_bytes + symbol.len() > self.max_pending_bytes {
+            return Err(DatagramError::CapacityExceeded);
+        }
+        self.pending_bytes += symbol.len();
+        self.repairs
+            .entry(base)
+            .or_default()
+            .insert(idx, symbol.to_vec());
         Ok(())
     }
 
@@ -339,16 +354,30 @@ impl DatagramReceiver {
             if self.try_fec_fill(base, k)? {
                 continue; // filled — loop will deliver the now-contiguous run
             }
-            // Cannot fill. A FULL window whose stragglers are lost beyond the reorder
-            // margin is unrecoverable; the FINAL window is bounded by the leg's
-            // post-FIN deadline instead (it has no FEC).
-            let is_final_window = self.final_seq.is_some_and(|fin| base + FEC_K as u64 > fin);
-            if !is_final_window && self.high_water >= base + FEC_K as u64 + REORDER_MARGIN {
-                return Err(DatagramError::Unrecoverable(base));
+            // Gap at `deliver_seq`. Try to FEC-fill its window.
+            let base = self.window_base(self.deliver_seq);
+            let k = self.window_k(base);
+            if self.try_fec_fill(base, k)? {
+                continue; // filled — loop will deliver the now-contiguous run
             }
-            break; // wait for more datagrams
+            // Cannot fill yet. Do NOT declare unrecoverable on a structural margin:
+            // a window's repair datagrams are themselves paced/reorderable and may
+            // still be in flight, so a margin check (`high_water` past the window)
+            // false-trips on a healthy, recoverable stream. Instead the LEG bounds
+            // this by LIVENESS — if no datagram arrives for a grace period while a
+            // gap is outstanding ([`Self::has_buffered_ahead`]), it resets — and the
+            // pending/repair capacity caps bound memory. Just wait for more here.
+            break;
         }
         Ok(())
+    }
+
+    /// Whether records are buffered AHEAD of a gap (i.e. delivery is blocked waiting
+    /// to fill a hole, not merely caught up). The leg arms its stall timer only when
+    /// this (or a received FIN) is true, so a slow-but-healthy sender with no gap is
+    /// never reset — only a genuinely stalled gap is.
+    pub(crate) fn has_buffered_ahead(&self) -> bool {
+        self.pending.range(self.deliver_seq..).next().is_some()
     }
 
     /// If the window at `base` (with `k` sources) has `>= k` symbols, FEC-decode it
@@ -418,7 +447,14 @@ impl DatagramReceiver {
 
     /// Record the download-FIN count (one past the last source seq the sender will
     /// send), then deliver whatever the now-known final window makes deliverable.
+    /// The count must be at least `start_seq` and at least what we have already
+    /// delivered — a smaller value would be a truncation reported as a clean end, so
+    /// it fails closed (→ reset) instead. (The FIN rides the AEAD-protected QUIC
+    /// stream, so this only guards a buggy/compromised peer, not an on-path one.)
     pub(crate) fn set_final_seq(&mut self, one_past_last: u64) -> Result<(), DatagramError> {
+        if one_past_last < self.start_seq || one_past_last < self.deliver_seq {
+            return Err(DatagramError::BadLength);
+        }
         self.final_seq = Some(one_past_last);
         self.try_deliver()
     }
@@ -601,9 +637,15 @@ pub(crate) struct UdpDatagramLegReader {
     /// Resolves to the FIN count once the reliable side-channel delivers it.
     fin_rx: oneshot::Receiver<io::Result<u64>>,
     fin_seen: bool,
-    /// After the FIN, the deadline by which the (possibly FEC-less) tail must
-    /// complete; if it does not, the tail was lost → reset.
-    fin_deadline: Option<Instant>,
+    /// The background FIN-reader task, aborted on drop so it never outlives the leg
+    /// holding the RecvStream (a dropped JoinHandle merely detaches).
+    fin_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for UdpDatagramLegReader {
+    fn drop(&mut self) {
+        self.fin_task.abort();
+    }
 }
 
 impl UdpDatagramLegReader {
@@ -622,7 +664,7 @@ impl UdpDatagramLegReader {
         let (tx, fin_rx) = oneshot::channel();
         // Read the 8-byte FIN count off the reliable side-channel in the background
         // so the main read loop can select between datagrams and the FIN.
-        tokio::spawn(async move {
+        let fin_task = tokio::spawn(async move {
             let mut buf = [0u8; 8];
             let result = match fin.read_exact(&mut buf).await {
                 Ok(()) => Ok(u64::from_be_bytes(buf)),
@@ -638,14 +680,19 @@ impl UdpDatagramLegReader {
             receiver,
             fin_rx,
             fin_seen: false,
-            fin_deadline: None,
+            fin_task,
         })
     }
 
-    /// Grace after the FIN for an in-flight (FEC-less) tail to arrive before the
-    /// gap is declared lost. Scaled to the path RTT, floored for low-RTT links.
-    fn tail_grace(&self) -> Duration {
-        (self.conn.rtt() * 4).max(Duration::from_millis(200))
+    /// LIVENESS grace: the maximum time the reader waits with an OUTSTANDING gap (or
+    /// a post-FIN incomplete tail) and NO arriving datagram before declaring the
+    /// stream stalled/lost. It is re-armed on every received datagram, so it bounds
+    /// the INTER-datagram gap during active transfer, not the total transfer time —
+    /// a large backlog draining over many RTTs keeps re-arming and is never falsely
+    /// reset (the wall-clock version of this was the bug this replaced). Scaled to
+    /// the path RTT with a generous floor to tolerate pacing/reorder jitter.
+    fn stall_grace(&self) -> Duration {
+        (self.conn.rtt() * 8).max(Duration::from_secs(1))
     }
 }
 
@@ -661,40 +708,35 @@ impl LegReader for UdpDatagramLegReader {
                 // Clean end-of-download: every record up to the FIN count delivered.
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }
-            if let Some(deadline) = self.fin_deadline {
-                tokio::select! {
-                    biased;
-                    dg = self.conn.read_datagram() => {
-                        let bytes = dg.map_err(|e| {
-                            io::Error::new(io::ErrorKind::ConnectionReset, format!("read_datagram: {e}"))
-                        })?;
-                        self.receiver.ingest(&bytes).map_err(map_datagram_err)?;
-                    }
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        // Post-FIN grace expired with the tail still incomplete: the
-                        // missing (FEC-less) tail record is lost → reset.
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionReset,
-                            "datagram download tail lost after FIN",
-                        ));
-                    }
+            // Arm the stall timer ONLY when something is overdue: a gap with records
+            // buffered past it, or the sender has FIN'd and we are not yet done. A
+            // slow-but-healthy sender that is merely caught up (no gap) is bounded by
+            // the relay's idle watchdog, NOT reset here. The timer is recreated each
+            // iteration, so every datagram that arrives re-arms it (liveness).
+            let armed = self.fin_seen || self.receiver.has_buffered_ahead();
+            let grace = self.stall_grace();
+            tokio::select! {
+                biased;
+                fin = &mut self.fin_rx, if !self.fin_seen => {
+                    self.fin_seen = true;
+                    let count = fin
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "fin channel closed"))??;
+                    self.receiver.set_final_seq(count).map_err(map_datagram_err)?;
                 }
-            } else {
-                tokio::select! {
-                    biased;
-                    fin = &mut self.fin_rx, if !self.fin_seen => {
-                        self.fin_seen = true;
-                        let count = fin
-                            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "fin channel closed"))??;
-                        self.receiver.set_final_seq(count).map_err(map_datagram_err)?;
-                        self.fin_deadline = Some(Instant::now() + self.tail_grace());
-                    }
-                    dg = self.conn.read_datagram() => {
-                        let bytes = dg.map_err(|e| {
-                            io::Error::new(io::ErrorKind::ConnectionReset, format!("read_datagram: {e}"))
-                        })?;
-                        self.receiver.ingest(&bytes).map_err(map_datagram_err)?;
-                    }
+                dg = self.conn.read_datagram() => {
+                    let bytes = dg.map_err(|e| {
+                        io::Error::new(io::ErrorKind::ConnectionReset, format!("read_datagram: {e}"))
+                    })?;
+                    self.receiver.ingest(&bytes).map_err(map_datagram_err)?;
+                }
+                _ = tokio::time::sleep(grace), if armed => {
+                    // A gap (or post-FIN tail) went `grace` with no arriving datagram:
+                    // the missing records are lost. Reset → the relay demotes (never a
+                    // silent truncation).
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "datagram stream stalled with an unrecoverable gap",
+                    ));
                 }
             }
         }
@@ -916,24 +958,48 @@ mod tests {
         .unwrap();
     }
 
-    /// Losing MORE than FEC_R in a window is unrecoverable: the receiver surfaces
-    /// Unrecoverable once it has seen past the window (the reset trigger), never
-    /// wrong bytes, never an unbounded stall.
+    /// Losing MORE than FEC_R in a window is unrecoverable. The receiver must NOT
+    /// deliver past the gap (no corruption, no wrong record) and must NOT itself
+    /// declare a false error — it simply STALLS; the leg's liveness timer turns a
+    /// genuine stall into a reset (the receiver never delivers an unrecoverable
+    /// window as data).
     #[test]
-    fn beyond_r_losses_in_a_window_is_unrecoverable() {
-        // Drop R+1 source datagrams of the FIRST window; keep everything after so
-        // the high-water mark advances past the window and closes it.
+    fn beyond_r_losses_stall_delivery_without_corruption() {
         let n = FEC_K * 3;
-        let err = run(n, 300, |i, dg| {
-            // first window's source datagrams are interleaved as: each window is
-            // K source datagrams then R repairs (sources at positions 0..K).
-            dg.first() == Some(&TAG_SOURCE) && i < FEC_R + 1
-        })
-        .unwrap_err();
-        match err {
-            DatagramError::Unrecoverable(_) => {}
-            other => panic!("expected Unrecoverable, got {other:?}"),
+        let (start, sealed, _plain) = seal_stream(n, 300);
+        let mut sender = DatagramSender::new(start, SYMBOL_LEN).unwrap();
+        let mut rx = DatagramReceiver::new(start, SYMBOL_LEN, MAX_REC, MAX_BYTES).unwrap();
+        let mut dgs = Vec::new();
+        for (i, rec) in sealed.iter().enumerate() {
+            dgs.extend(sender.push(start + i as u64, rec).unwrap());
         }
+        // Make window 0 unrecoverable: drop R+1 of its source datagrams (seqs
+        // start..start+R+1, so the gap is right at the front) AND all of its repairs.
+        for dg in &dgs {
+            match dg[0] {
+                TAG_SOURCE => {
+                    let seq = u64::from_be_bytes(dg[1..9].try_into().unwrap());
+                    if seq < start + FEC_R as u64 + 1 {
+                        continue;
+                    }
+                }
+                _ => {
+                    let base = u64::from_be_bytes(dg[1..9].try_into().unwrap());
+                    if base == start {
+                        continue;
+                    }
+                }
+            }
+            // Never errors: the receiver buffers later windows, never falsely
+            // declaring window 0 unrecoverable on its own.
+            rx.ingest(dg).unwrap();
+        }
+        // The gap at `start` blocks all delivery; nothing is handed up.
+        assert!(
+            rx.pop_ready().is_none(),
+            "must not deliver past an unrecoverable gap"
+        );
+        assert!(!rx.is_done());
     }
 
     /// A duplicated datagram is idempotent (no double-delivery, no corruption).
@@ -959,10 +1025,9 @@ mod tests {
         assert_eq!(got, plain);
     }
 
-    /// Capacity bound: a flood of out-of-window sources without the gap filling is
-    /// rejected (CapacityExceeded) rather than growing unboundedly. A small record
-    /// cap (below the reorder margin) makes the capacity path trip before the
-    /// high-water unrecoverability would.
+    /// Capacity bound: a flood of out-of-window sources behind an unfilled gap is
+    /// rejected (CapacityExceeded) rather than growing unboundedly — the memory
+    /// backstop for a stalled stream (the leg's liveness timer is the other).
     #[test]
     fn pending_capacity_is_bounded() {
         let start = 0u64;
