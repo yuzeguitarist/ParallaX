@@ -9,6 +9,7 @@
 | ParallaX | The Rust proxy/protocol implemented in this repository. |
 | `plx` | Short CLI binary alias for the ParallaX command-line interface. |
 | Product path | The current shipped operator path: TCP/TLS camouflage, SOCKS5 client, server fallback, AEAD relay. |
+| UDP/QUIC fast plane | Experimental, off-by-default QUIC reliable-stream carrier for the single-Connect relay, enabled with `[udp].enabled = true` on both ends. |
 | Fallback origin | A real TLS website/origin that unauthenticated or malformed traffic is relayed to. |
 | Camouflage | Making ParallaX's visible wire behavior resemble ordinary browser TLS traffic. |
 | Probe resistance | Server behavior that prevents scanners from receiving a distinct proxy-shaped failure. |
@@ -58,7 +59,7 @@
 | Term | Meaning |
 |---|---|
 | GFW simulator | Source-level test model of censorship/DPI behaviors under `tests/gfw_sim/`. |
-| QUIC research | Research-only material and simulator detection logic; not an active product transport. |
+| QUIC research | Simulator detection logic and adversary-model context, separate from the experimental UDP/QUIC fast plane; neither is a default product transport, and there is no `--quic` CLI flag. |
 | JA3/JA4 | TLS fingerprinting families modeled by simulator detectors. |
 
 ## Documentation metadata terms

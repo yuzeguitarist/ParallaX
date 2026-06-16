@@ -28,6 +28,15 @@ codec lives in `src/protocol/data.rs`.
 | `PX1V` | speed ack | client to server | Warmup upload done. |
 | `PX1D` | speed ack | client/server | Download sample done. |
 | `PX1U` | speed ack | client/server | Upload sample done. |
+| `PX1M` | `MuxFrame` | client/server | Multiplexed substream frame: stream id, flags, and payload length over one authenticated session. |
+| `PX1G` | `UdpRequest` | client to server | Opt-in request to negotiate the experimental UDP/QUIC fast plane (version byte). |
+| `PX1O` | `UdpOffer` | server to client | UDP fast-plane offer: `offer_id` (also the RFC 5705 exporter-binding context), UDP port, and parameters. |
+| `PX1P` | `UdpProbeAck` | client to server | Client reports the UDP probe outcome over the TCP control plane, echoing the `offer_id`. |
+| `PX1N` | `UdpDecline` | server to client | Fail-soft decline of a `UdpRequest`; the client proceeds on TCP only. |
+
+`PX1M` carries the default multiplexing path (`max_concurrent_streams > 1`), and
+`PX1G`/`PX1O`/`PX1P`/`PX1N` drive the experimental, off-by-default UDP/QUIC fast
+plane negotiation over the TCP control plane.
 
 All decoders fail on truncation, bad magic, malformed lengths, empty required
 fields, and port `0` where a target port is present.
@@ -50,9 +59,11 @@ AEAD ciphertext over:
 AEAD tag
 ```
 
-The AEAD additional authenticated data is direction-specific and comes from
-session key derivation. The codec rejects non-ApplicationData records, truncated
-records, oversized records, AEAD failures, and malformed padding.
+The AEAD additional authenticated data is direction-specific: it is one of two
+fixed constants, `b"ParallaX v1 client appdata"` or `b"ParallaX v1 server appdata"`
+(`src/protocol/data.rs`), chosen by direction rather than derived from the session
+keys. The codec rejects non-ApplicationData records, truncated records, oversized
+records, AEAD failures, and malformed padding.
 
 ## Chunking
 

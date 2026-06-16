@@ -5,9 +5,9 @@
 ## Purpose
 
 When the fallback origin negotiates ALPN `h2`, the TLS camouflage layer should
-not stop after TLS handshake bytes. `src/fingerprint/http2.rs` provides a
-Safari-shaped HTTP/2 connection preface so the post-handshake behavior remains
-browser-like.
+not stop after TLS handshake bytes. `src/fingerprint/http2.rs` provides
+Safari-shaped HTTP/2 opening-flight frames (a connection preface plus an opening
+request) so the post-handshake behavior remains browser-like.
 
 ## Implemented pieces
 
@@ -16,8 +16,24 @@ browser-like.
 | HTTP/2 connection preface | Emits `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`. |
 | SETTINGS frame | Uses the captured Safari 26.4 settings order and values. |
 | WINDOW_UPDATE | Emits the captured connection-level update. |
-| SETTINGS ACK parser | Lets the camouflage backend drain expected fallback responses. |
-| HEADERS helper | Builds a minimal Safari-like request header block for tests/profile checks. |
+| SETTINGS ACK parser | Lets the camouflage backend drain and ACK the server's SETTINGS after sending its own opening flight. |
+| HEADERS frame | Builds the Safari-like opening `GET` request header block, sent on the wire right after the preface (and reused by parity tests). |
+
+## Opening flight
+
+When ALPN selects `h2`, the camouflage backend sends a browser-shaped opening
+flight and does **not** wait for the server's SETTINGS before sending its request
+(`open_http2_connection` in `src/tls/safari26.rs`):
+
+1. the connection preface — the `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` magic followed
+   by the SETTINGS frame and the connection-level WINDOW_UPDATE, all built by
+   `connection_preface()` — written as one record;
+2. the opening `GET` HEADERS frame, written back-to-back as a second record;
+3. only then does it drain and ACK the server's SETTINGS.
+
+Sending preface and HEADERS as two back-to-back records (not coalesced into one
+TLS record, and without a request-after-server-SETTINGS wait) matches a real
+browser's first flight.
 
 ## Ground-truth fixture
 

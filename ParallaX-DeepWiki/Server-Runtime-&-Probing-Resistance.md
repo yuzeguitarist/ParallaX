@@ -16,6 +16,7 @@ client TCP accepted
   │
   ├─ timeout / partial prefix ─────────────► fallback passthrough
   ├─ not a complete TLS ClientHello ───────► fallback passthrough
+  ├─ ClientHello does not offer TLS 1.3 ───► fallback passthrough
   ├─ SNI not in authorized_sni ────────────► fallback passthrough
   ├─ auth tag invalid ─────────────────────► fallback passthrough
   ├─ replay cache rejects ClientHello ─────► fallback passthrough
@@ -47,8 +48,9 @@ flow alive long enough to preserve a browser-like transition. During this phase:
    PQ rekey exchange.
 6. Identity proof chunks are sealed and sent as data-plane records.
 
-The fallback forward limit prevents a chatty fallback origin from outrunning
-the client's residual camouflage budget before the key exchange arrives.
+The fallback forward limit (`PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT`, 64 records)
+prevents a chatty fallback origin from outrunning the client's residual
+camouflage budget (16 records) before the key exchange arrives.
 
 ## Target selection
 
@@ -71,6 +73,37 @@ The authenticated first record is checked against a persistent
 ```
 
 See [Replay Protection](Replay-Protection.md).
+
+## Probing resistance and anti-DoS
+
+Beyond uniform fallback, the server runtime carries several measurement- and
+resource-resistance mechanisms. Defaults are configurable under `[server]`; see
+[Configuration Reference](Configuration-Reference.md).
+
+- **First-record wait floor + jitter.** The client-facing wait for the first
+  record has a floor (`first_record_wait_floor_ms`, default 8000) plus upward
+  jitter (`first_record_wait_jitter_ms`, default 7000), so the timeout a prober
+  observes is not a fixed, fingerprintable constant.
+- **Per-source concurrency caps.** A source limiter
+  (`src/handshake/source_limit.rs`) bounds concurrent connections per IPv4 /32
+  and per IPv6 prefix (`source_ipv6_prefix_len`, default /64), each capped at
+  `max_concurrent_per_source_v4` / `_v6` (default 256). A coarser /48 rollup
+  ceiling (a small multiple of the per-/64 cap) bounds /64 rotation within one
+  routed allocation. These are concurrency caps, not rate limits.
+- **Cap-shed fallback.** When the global connection cap is reached, the server
+  does not emit a bare FIN; it relays the excess connection to the fallback
+  origin under a small independent budget (64 concurrent) with a tight idle
+  timeout (10 s + 2 s jitter), so an over-cap probe still sees ordinary origin
+  behavior.
+- **Fallback idle backstop.** Camouflage relays use a per-gap idle backstop
+  (`fallback_idle_floor_ms`, default 600000 = 10 min, min enforced 5000; plus
+  `fallback_idle_jitter_ms`, default 60000). The timer resets on every byte in
+  either direction, so it only fires on a fully silent connection rather than
+  capping a live session.
+- **Bounded replay cache.** The persistent replay cache has a bounded capacity
+  (`replay_cache_capacity`, default 49152) sized against the handshake freshness
+  window; when it is full the server fails closed (`CacheFull`) rather than
+  accepting a possibly replayed handshake.
 
 ## Operational logs
 

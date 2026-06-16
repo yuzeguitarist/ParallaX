@@ -23,8 +23,10 @@
                               └────────────────────┘
 ```
 
-The product transport is TCP. TLS records are the outer wire shape; ParallaX
-data records are encrypted payloads carried as TLS `ApplicationData`.
+The default transport is TCP; an experimental, off-by-default UDP/QUIC fast
+plane also exists (see [Transport Layer](Transport-Layer.md)). TLS records are
+the outer wire shape; ParallaX data records are encrypted payloads carried as
+TLS `ApplicationData`.
 
 ## Startup flow
 
@@ -68,7 +70,7 @@ Details: [Server Runtime & Probing Resistance](Server-Runtime-&-Probing-Resistan
 | TLS camouflage | Browser-shaped TLS handshake and fallback-origin interaction. | ParallaX data-plane encryption. |
 | Handshake | Authentication, transcript binding, rekey, identity proof. | Local SOCKS parsing. |
 | Protocol | Binary control messages and AEAD record format. | Target selection policy. |
-| Transport | TCP socket tuning and relay limits. | QUIC/UDP runtime. |
+| Transport | TCP tuning, relay limits, and the leg abstraction spanning TCP and the experimental QUIC carrier. | AEAD record encryption. |
 | Operations | Deployment and service hardening. | Protocol negotiation. |
 
 ## Key invariants

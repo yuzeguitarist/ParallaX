@@ -1,8 +1,10 @@
 # ParallaX DeepWiki
 
 > Interlinked technical knowledge base for the current ParallaX `main` branch.
-> These pages describe the shipped TCP/TLS product path. Historical QUIC work is
-> covered only as research/simulator context, not as an active transport.
+> These pages describe the shipped TCP/TLS product path — the default and only
+> fingerprint-hardened transport. An experimental, off-by-default UDP/QUIC fast
+> plane (`[udp].enabled`) is also wired into the runtimes; QUIC otherwise appears
+> as research/simulator context. There is no `--quic` CLI flag.
 
 ## Fast orientation
 
@@ -68,7 +70,7 @@
 |---|---|---|
 | "How do I deploy this without copying source to the VPS?" | `binary-only`, `deploy-vps`, `systemd`, `BBR`, `Polar Signals` | [Deployment](Deployment.md) |
 | "Which docs must change if a source file changes?" | `doc-id`, `source-to-document ownership`, source path | [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md) |
-| "Where is the TCP-only product path documented?" | `product path`, `TCP/TLS`, `no --quic`, `research-only` | [ParallaX Overview](ParallaX-Overview.md), [Transport Layer](Transport-Layer.md) |
+| "Where is the transport documented (TCP default, experimental UDP/QUIC)?" | `product path`, `TCP/TLS`, `no --quic`, `[udp].enabled`, `experimental QUIC` | [ParallaX Overview](ParallaX-Overview.md), [Transport Layer](Transport-Layer.md) |
 | "Where are config validation rules documented?" | `authorized_sni`, `strict_tls13`, `replay_cache_path`, `loopback` | [Configuration Reference](Configuration-Reference.md) |
 | "What proves this still works?" | `plx check`, `plx speed`, `plx bench`, `gfw_simulator` | [Probing & Benchmarking](<Probing-&-Benchmarking.md>) |
 
