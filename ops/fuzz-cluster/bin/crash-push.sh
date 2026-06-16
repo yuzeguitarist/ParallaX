@@ -107,6 +107,16 @@ normalize_frames() {  # stdin = repro log -> up to 3 normalized frame lines
     | sed -E 's#/[^ ]*/##g'
 }
 
+# Extract the Rust panic SITE (file.rs:line) from a repro log. Stable across
+# inputs and boxes — unlike no-san backtrace frames, which vary per input and
+# made one bug open many issues. Empty for crashes with no Rust panic line
+# (e.g. an ASan OOB), where the caller falls back to frames.
+panic_location() {  # stdin = repro log -> "<file>.rs:<line>" or empty
+  grep -aoE 'panicked at [^ ]+\.rs:[0-9]+' \
+    | head -1 \
+    | sed -E 's#^panicked at ##; s#.*/##'
+}
+
 # detect the OOM (H1 zlib-bomb) class from a repro log or artifact name.
 is_oom() {  # <artifact_basename> <repro_log_file>
   case "$1" in oom-*) return 0 ;; esac
@@ -212,16 +222,22 @@ process_artifact() {  # <artifact_path>
     # genuine OOM (e.g. data_record_open, also rss=2048 on box-b).
     bugkey="oom@$TARGET@rss=$RSS_CAP"
   else
-    local frames; frames="$(normalize_frames < "$log")"
-    if [ -z "$frames" ]; then
-      # H-2: a non-reproducing / timeout / SIGKILL replay yields no stack frames.
-      # Without this, every such crash collapses to ONE constant key per (target,
-      # sanitizer) and distinct bugs dedup away. Fold the per-input artifact name
-      # (libFuzzer's crash-<sha1-of-input>) so distinct inputs stay distinct while
-      # re-finds of the SAME input still dedup.
-      bugkey="$(printf '%s\n%s\n%s\n' "$TARGET" "$SAN" "nostack:$base" | sha256_of)"
+    # Prefer the Rust panic SITE (file:line): stable across inputs, so the same
+    # bug yields ONE issue instead of one-per-input. (no-san backtrace frames vary
+    # by input — that is what opened 5 issues for the single reorder.rs:90 bug.)
+    local loc; loc="$(panic_location < "$log")"
+    if [ -n "$loc" ]; then
+      bugkey="$(printf '%s\n%s\npanic@%s\n' "$TARGET" "$SAN" "$loc" | sha256_of)"
     else
-      bugkey="$(printf '%s\n%s\n%s\n' "$TARGET" "$SAN" "$frames" | sha256_of)"
+      local frames; frames="$(normalize_frames < "$log")"
+      if [ -z "$frames" ]; then
+        # H-2: a non-reproducing / timeout / SIGKILL replay yields no stack frames
+        # and no panic line. Fold the per-input artifact name so distinct inputs
+        # stay distinct while re-finds of the SAME input still dedup.
+        bugkey="$(printf '%s\n%s\n%s\n' "$TARGET" "$SAN" "nostack:$base" | sha256_of)"
+      else
+        bugkey="$(printf '%s\n%s\n%s\n' "$TARGET" "$SAN" "$frames" | sha256_of)"
+      fi
     fi
   fi
   local key12="${bugkey:0:12}"
