@@ -358,6 +358,9 @@ pub fn safari_census() -> Census {
         ja4_full: FieldBand {
             axis: "ja4_full",
             // The full JA4 the FoxIO algorithm yields over real Safari 26.4.
+            // SYNC: must equal the canonical `gfw_sim::data::tls_fingerprints::
+            // SAFARI26_MACOS_JA4`; the `census_ja4_full_agrees_with_canonical_constant`
+            // test in ja4_census_oracle.rs fails the build if these ever desync.
             members: &["t13d2013h2_a09f3c656075_7f0f34a4126d"],
             provenance: PROV_CLIENTHELLO,
             trust: Trust::FirstPartyCapture,

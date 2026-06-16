@@ -20,6 +20,14 @@
 //! baseline with justification. It is deliberately biased toward catching a gross
 //! regression, not toward proving the current tree correct.
 //!
+//! SCOPE (not whole-tree): this scans only `src/handshake/server.rs` and
+//! `src/client/runtime.rs` — the TCP handshake/relay read-loop surface — and
+//! only the `read_record_into` / `read_exact` / `.read(` token shapes. An untimed
+//! read introduced in another module (e.g. a UDP/QUIC datagram path) or via a
+//! different read primitive is OUT of scope and would NOT trip this ratchet; a
+//! green build means "no new untimed read of the watched shapes in those two
+//! files", not "no new untimed read anywhere".
+//!
 //! How it works (deterministic static text scan)
 //! ---------------------------------------------
 //! At test time we `read_to_string` two source files via `CARGO_MANIFEST_DIR`

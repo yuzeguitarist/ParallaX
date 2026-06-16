@@ -80,9 +80,11 @@ const BLOCKLISTED_SNI: &str = "relay7.shadowsocks.io";
 /// in-tree first-party tcpdump captures). This is independent of the product:
 /// the provenance guard asserts the JA4 derived from the bytes a detector
 /// consumed equals THIS constant, so the check cannot be satisfied by the
-/// product validating against its own buffer. Mirrors the `ja4_full` census band
-/// in `tests/support/census.rs`.
-const REAL_SAFARI26_JA4: &str = "t13d2013h2_a09f3c656075_7f0f34a4126d";
+/// product validating against its own buffer. Sourced from the single canonical
+/// `gfw_sim::data::tls_fingerprints::SAFARI26_MACOS_JA4` so it can never desync
+/// from the census `ja4_full` band (cross-checked by the census oracle's
+/// `census_ja4_full_agrees_with_canonical_constant` test).
+const REAL_SAFARI26_JA4: &str = gfw_sim::data::tls_fingerprints::SAFARI26_MACOS_JA4;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);

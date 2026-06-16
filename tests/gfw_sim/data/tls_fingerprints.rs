@@ -18,6 +18,14 @@ pub struct BrowserFingerprintEntry {
     pub ja4: &'static str,
 }
 
+/// Canonical real Safari 26.4 / macOS JA4 — the FoxIO algorithm over the
+/// first-party `tests/fixtures/safari26_apple_com_clienthello.bin` capture, which
+/// the product emits 1:1. Single source of truth: the `safari-26-macos` entry
+/// below references it, `gfw_sim_provenance.rs` imports it, and
+/// `ja4_census_oracle.rs` cross-checks the census band against it — so a
+/// re-capture that updates one site cannot silently desync the oracles.
+pub const SAFARI26_MACOS_JA4: &str = "t13d2013h2_a09f3c656075_7f0f34a4126d";
+
 /// Hand-picked JA3 / JA4 hashes for recent browser builds. These are *public*
 /// values - they are what any HTTPS server sees from a vanilla browser.
 ///
@@ -61,7 +69,7 @@ pub const KNOWN_BROWSER_FINGERPRINTS: &[BrowserFingerprintEntry] = &[
     BrowserFingerprintEntry {
         label: "safari-26-macos",
         ja3_md5: "ecdf4f49dd59effc439639da29186671",
-        ja4: "t13d2013h2_a09f3c656075_7f0f34a4126d",
+        ja4: SAFARI26_MACOS_JA4,
     },
     // Safari 26 (iOS). UNVERIFIED: there is no first-party iOS capture in-tree;
     // assumed identical to macOS because iOS/macOS Safari share the Secure

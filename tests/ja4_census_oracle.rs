@@ -550,3 +550,19 @@ fn h2_settings_order_is_load_bearing_not_just_the_set() {
          must NOT be a member"
     );
 }
+
+/// Desync guard. The census `ja4_full` band and the canonical
+/// `gfw_sim::data::tls_fingerprints::SAFARI26_MACOS_JA4` (also referenced by
+/// `gfw_sim_provenance.rs`) must agree on the real Safari-26 JA4. A re-capture
+/// that updated one site but not the other would leave one oracle asserting
+/// stale ground truth while the other still passed; this fails the build the
+/// moment they diverge, so the JA4 constant has a single effective source.
+#[test]
+fn census_ja4_full_agrees_with_canonical_constant() {
+    use gfw_sim::data::tls_fingerprints::SAFARI26_MACOS_JA4;
+    assert!(
+        safari_census().ja4_full.contains(SAFARI26_MACOS_JA4),
+        "census ja4_full band must contain the canonical SAFARI26_MACOS_JA4 \
+         ({SAFARI26_MACOS_JA4}); a re-capture desynced the JA4 oracles"
+    );
+}
