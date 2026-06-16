@@ -566,3 +566,83 @@ fn census_ja4_full_agrees_with_canonical_constant() {
          ({SAFARI26_MACOS_JA4}); a re-capture desynced the JA4 oracles"
     );
 }
+
+/// Teeth for the strengthened `validate()`: a `FirstPartyCapture` band whose
+/// only "second source" is the emitter (`artifact: None`) — exactly the H2
+/// mistake the security review flagged — must be REJECTED. `len() >= 2` is not
+/// enough; the tier requires >= 2 real `tests/fixtures/` captures.
+#[test]
+fn validate_rejects_firstparty_band_corroborated_only_by_the_emitter() {
+    let mut census = safari_census();
+    census.n_ciphers = FieldBand {
+        axis: "n_ciphers",
+        members: &[20],
+        provenance: &[
+            Provenance {
+                build: "Safari 26.4 / macOS Tahoe (apple.com capture)",
+                artifact: Some("tests/fixtures/safari26_apple_com_clienthello.bin"),
+            },
+            Provenance {
+                build: "emitter (capture-calibrated, NOT an independent capture)",
+                artifact: None,
+            },
+        ],
+        trust: Trust::FirstPartyCapture,
+    };
+    let err = census
+        .validate()
+        .expect_err("FirstPartyCapture with only one real capture must be rejected");
+    assert!(
+        err.contains("n_ciphers") && err.contains("INDEPENDENT"),
+        "rejection must name the axis + the >=2-independent-capture rule, got: {err}"
+    );
+}
+
+/// Teeth: a product source file (`src/...`) can never be blessed as capture
+/// provenance — `validate()` must reject it outright.
+#[test]
+fn validate_rejects_src_artifact_as_capture_provenance() {
+    let mut census = safari_census();
+    census.n_exts = FieldBand {
+        axis: "n_exts",
+        members: &[13],
+        provenance: &[
+            Provenance {
+                build: "Safari 26.4 / macOS Tahoe (apple.com capture)",
+                artifact: Some("tests/fixtures/safari26_apple_com_clienthello.bin"),
+            },
+            Provenance {
+                build: "product emitter source",
+                artifact: Some("src/fingerprint/http2.rs"),
+            },
+        ],
+        trust: Trust::FirstPartyCapture,
+    };
+    let err = census
+        .validate()
+        .expect_err("a src/ artifact must be rejected as capture provenance");
+    assert!(
+        err.contains("n_exts") && err.contains("src/"),
+        "rejection must name the axis + the src/ reason, got: {err}"
+    );
+}
+
+/// The H2 bands have only one independent capture today, so they must be tiered
+/// honestly as `SingleFirstPartyCapture` (still hard-RED) rather than
+/// `FirstPartyCapture` (which would falsely claim >= 2 independent captures) —
+/// and the shipped census must still pass the strengthened `validate()`.
+#[test]
+fn h2_bands_are_single_first_party_capture_and_census_validates() {
+    let census = safari_census();
+    assert_eq!(
+        census.h2_settings_id_order.trust,
+        Trust::SingleFirstPartyCapture
+    );
+    assert_eq!(
+        census.h2_window_update.trust,
+        Trust::SingleFirstPartyCapture
+    );
+    census
+        .validate()
+        .expect("shipped census must satisfy the strengthened provenance discipline");
+}

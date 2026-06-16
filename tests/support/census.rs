@@ -24,11 +24,15 @@
 //! axis. We therefore do not claim distribution membership or non-outlier-ness
 //! here — only captured-value equality with independent provenance.
 //!
-//! Provenance is load-bearing: every band carries >= 2 provenance entries, and
-//! every entry names a concrete build string. [`Census::validate`] REJECTS any
-//! band that has fewer than two provenance entries or an empty build string, so
-//! the census can never silently degrade into a single-source (i.e. tautological)
-//! claim.
+//! Provenance is load-bearing and tiered (see [`Trust`]). [`Census::validate`]
+//! enforces it: a `FirstPartyCapture` band must carry >= 2 INDEPENDENT real
+//! captures (artifacts under `tests/fixtures/`, never the emitter); a
+//! `SingleFirstPartyCapture` band (the H2 axes today) must carry >= 1 real
+//! capture; every entry must name a concrete build string; and NO entry may cite
+//! a `src/` product source as capture provenance. So a `FirstPartyCapture` band
+//! can never silently degrade into a single-source (tautological) claim, and a
+//! single-capture axis must be tiered honestly rather than masquerade as
+//! dual-sourced.
 //!
 //! Anti-inversion
 //! --------------
@@ -61,9 +65,18 @@ pub struct Provenance {
 /// How much we trust a band's provenance. Drives the anti-inversion guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trust {
-    /// Anchored to >= 1 first-party capture in `tests/fixtures/`. Disagreement
-    /// is a hard RED.
+    /// Anchored to >= 2 INDEPENDENT first-party captures in `tests/fixtures/`.
+    /// Disagreement is a hard RED. `validate()` enforces the >= 2 real-capture
+    /// floor (counting only `tests/fixtures/` artifacts, never the emitter), so
+    /// this tier can never silently degrade into a single source.
     FirstPartyCapture,
+    /// Anchored to exactly ONE first-party capture in `tests/fixtures/` (plus,
+    /// optionally, a non-capture calibration entry such as the emitter). Still a
+    /// hard RED on disagreement — it IS backed by a real capture — but it does
+    /// NOT claim the >= 2 independent-capture corroboration of
+    /// [`Trust::FirstPartyCapture`]. Used for axes with only one capture today
+    /// (the H2 bands), pending a second independent capture.
+    SingleFirstPartyCapture,
     /// Derived only from external/inferred sources (no in-tree capture).
     /// Disagreement is a neutral WARN + PASS, never RED.
     Inferred,
@@ -78,8 +91,10 @@ pub struct FieldBand<T: 'static> {
     pub axis: &'static str,
     /// The captured value(s) for this axis.
     pub members: &'static [T],
-    /// Provenance entries; [`Census::validate`] requires len >= 2 with non-empty
-    /// `build` strings.
+    /// Provenance entries; [`Census::validate`] enforces the per-[`Trust`]-tier
+    /// real-capture floor (>= 2 for `FirstPartyCapture`, >= 1 for
+    /// `SingleFirstPartyCapture`) with non-empty `build` strings and no `src/`
+    /// artifacts.
     pub provenance: &'static [Provenance],
     /// Trust level controlling enforce-vs-warn (see [`Trust`]).
     pub trust: Trust,
@@ -136,7 +151,7 @@ pub fn anti_inversion_decision(outcome: &MembershipOutcome) -> Result<Option<Str
         return Ok(None);
     }
     match outcome.trust {
-        Trust::FirstPartyCapture => Err(format!(
+        Trust::FirstPartyCapture | Trust::SingleFirstPartyCapture => Err(format!(
             "axis `{}`: live product value is NOT a member of the first-party \
              capture band — the product fingerprint drifted from real Safari",
             outcome.axis
@@ -189,44 +204,113 @@ impl Census {
     /// first offending axis if any band has < 2 provenance entries or an empty
     /// build string. This is the guard that keeps the census honest.
     pub fn validate(&self) -> Result<(), String> {
-        // Collect (axis, provenance) pairs without caring about the member type.
-        let bands: [(&'static str, &'static [Provenance]); 10] = [
-            (self.ja4_version.axis, self.ja4_version.provenance),
-            (self.n_ciphers.axis, self.n_ciphers.provenance),
-            (self.n_exts.axis, self.n_exts.provenance),
-            (self.alpn_pair.axis, self.alpn_pair.provenance),
+        // Collect (axis, provenance, trust) tuples without caring about member type.
+        let bands: [(&'static str, &'static [Provenance], Trust); 10] = [
+            (
+                self.ja4_version.axis,
+                self.ja4_version.provenance,
+                self.ja4_version.trust,
+            ),
+            (
+                self.n_ciphers.axis,
+                self.n_ciphers.provenance,
+                self.n_ciphers.trust,
+            ),
+            (self.n_exts.axis, self.n_exts.provenance, self.n_exts.trust),
+            (
+                self.alpn_pair.axis,
+                self.alpn_pair.provenance,
+                self.alpn_pair.trust,
+            ),
             (
                 self.cipher_set_sorted.axis,
                 self.cipher_set_sorted.provenance,
+                self.cipher_set_sorted.trust,
             ),
             (
                 self.ext_set_sorted_no_sni_alpn.axis,
                 self.ext_set_sorted_no_sni_alpn.provenance,
+                self.ext_set_sorted_no_sni_alpn.trust,
             ),
-            (self.sig_alg_order.axis, self.sig_alg_order.provenance),
-            (self.ja4_full.axis, self.ja4_full.provenance),
+            (
+                self.sig_alg_order.axis,
+                self.sig_alg_order.provenance,
+                self.sig_alg_order.trust,
+            ),
+            (
+                self.ja4_full.axis,
+                self.ja4_full.provenance,
+                self.ja4_full.trust,
+            ),
             (
                 self.h2_settings_id_order.axis,
                 self.h2_settings_id_order.provenance,
+                self.h2_settings_id_order.trust,
             ),
-            (self.h2_window_update.axis, self.h2_window_update.provenance),
+            (
+                self.h2_window_update.axis,
+                self.h2_window_update.provenance,
+                self.h2_window_update.trust,
+            ),
         ];
 
-        for (axis, provenance) in bands {
-            if provenance.len() < 2 {
-                return Err(format!(
-                    "census band `{axis}` has {} provenance entries; >= 2 distinct \
-                     real-build sources are required so the band is not a \
-                     single-source tautology",
-                    provenance.len()
-                ));
-            }
+        for (axis, provenance, trust) in bands {
+            // Every entry must name a concrete build, and no entry may cite a
+            // product source file as capture provenance (citing the code under
+            // test would be the self-referential trap this census exists to avoid).
             for (i, p) in provenance.iter().enumerate() {
                 if p.build.trim().is_empty() {
                     return Err(format!(
                         "census band `{axis}` provenance[{i}] has an empty build \
                          string; every observed value must name a concrete build"
                     ));
+                }
+                if let Some(artifact) = p.artifact {
+                    if artifact.starts_with("src/") {
+                        return Err(format!(
+                            "census band `{axis}` provenance[{i}] cites product source \
+                             `{artifact}` as capture provenance; only real captures under \
+                             tests/fixtures/ count as a first-party source"
+                        ));
+                    }
+                }
+            }
+
+            // Count ONLY real first-party captures (artifacts under tests/fixtures/),
+            // never the emitter-calibration entry (artifact: None) — so a band's
+            // trust tier cannot be inflated by listing the product under test.
+            let real_captures = provenance
+                .iter()
+                .filter(|p| p.artifact.is_some_and(|a| a.starts_with("tests/fixtures/")))
+                .count();
+
+            match trust {
+                Trust::FirstPartyCapture => {
+                    if real_captures < 2 {
+                        return Err(format!(
+                            "census band `{axis}` is Trust::FirstPartyCapture but has only \
+                             {real_captures} first-party-capture provenance entries; >= 2 \
+                             INDEPENDENT captures are required (use \
+                             Trust::SingleFirstPartyCapture for a single-capture band)"
+                        ));
+                    }
+                }
+                Trust::SingleFirstPartyCapture => {
+                    if real_captures < 1 {
+                        return Err(format!(
+                            "census band `{axis}` is Trust::SingleFirstPartyCapture but has no \
+                             first-party-capture (tests/fixtures/) provenance entry"
+                        ));
+                    }
+                }
+                Trust::Inferred => {
+                    if provenance.len() < 2 {
+                        return Err(format!(
+                            "census band `{axis}` has {} provenance entries; >= 2 distinct \
+                             sources are required so the band is not a single-source tautology",
+                            provenance.len()
+                        ));
+                    }
                 }
             }
         }
@@ -240,7 +324,7 @@ impl Census {
 //
 // CENSUS DATE: 2026-06-15.
 //
-// Two first-party captures back every band:
+// First-party captures backing the bands:
 //   A = "Safari 26.4 / macOS Tahoe (apple.com capture)"
 //       -> tests/fixtures/safari26_apple_com_clienthello.bin
 //   B = "Safari 26.4 / macOS Tahoe (cloudflare.com capture)"
@@ -248,10 +332,12 @@ impl Census {
 //   H = "Safari 26.4 / macOS Tahoe (localhost h2 capture)"
 //       -> tests/fixtures/safari26_h2_preface_localhost.bin
 //
-// Both ClientHello captures agree on every scalar/structural axis below (they
-// differ only in SNI and per-connection GREASE/random, which are excluded from
-// JA4_a), so each band lists the agreed value once but is corroborated by two
-// independent provenance entries. That dual-source agreement is exactly what
+// The ClientHello bands are corroborated by TWO independent captures (A and B):
+// both agree on every scalar/structural axis below (they differ only in SNI and
+// per-connection GREASE/random, which are excluded from JA4_a), so each band
+// lists the agreed value once but is dual-sourced -> Trust::FirstPartyCapture.
+// The H2 bands have only ONE independent capture (H) today, so they are tiered
+// honestly as Trust::SingleFirstPartyCapture (still hard-RED). That dual-source agreement is exactly what
 // makes a match non-outlier.
 
 /// Provenance shared by ClientHello-derived bands: both first-party captures.
@@ -369,13 +455,16 @@ pub fn safari_census() -> Census {
             axis: "h2_settings_id_order",
             members: &[SAFARI_H2_SETTINGS_ID_ORDER],
             provenance: PROV_H2,
-            trust: Trust::FirstPartyCapture,
+            // Only ONE independent H2 capture exists today (see PROV_H2; the 2nd
+            // entry is the emitter, not a capture). Hard-RED, but honestly tiered
+            // as single-capture rather than falsely claiming >= 2 corroboration.
+            trust: Trust::SingleFirstPartyCapture,
         },
         h2_window_update: FieldBand {
             axis: "h2_window_update",
             members: &[10_485_760],
             provenance: PROV_H2,
-            trust: Trust::FirstPartyCapture,
+            trust: Trust::SingleFirstPartyCapture,
         },
     }
 }
