@@ -66,15 +66,29 @@ impl CryptoPool {
         self.width
     }
 
-    fn submit(&self, job: Job) {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("crypto pool mutex poisoned");
-        state.jobs.push_back(job);
-        drop(state);
-        self.shared.available.notify_one();
+    /// Enqueues a whole batch of jobs under a SINGLE lock acquisition, then
+    /// wakes one worker per job. The old path took the lock once per job (one
+    /// `lock`+`notify_one` round-trip each); for an N-record fan-out this
+    /// collapses the N-1 lock acquisitions — the cross-tunnel enqueue
+    /// serialization point — into one, while keeping the exact same wake pattern
+    /// (precise `notify_one`, so no thundering herd when the pool is wider than
+    /// the batch).
+    fn submit_all(&self, jobs: Vec<Job>) {
+        let job_count = jobs.len();
+        if job_count == 0 {
+            return;
+        }
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("crypto pool mutex poisoned");
+            state.jobs.extend(jobs);
+        }
+        for _ in 0..job_count {
+            self.shared.available.notify_one();
+        }
     }
 
     /// Runs `jobs` and returns their results in the original order, blocking
@@ -126,13 +140,16 @@ impl CryptoPool {
         let (tx, rx) = mpsc::channel::<(usize, thread::Result<T>)>();
         let mut jobs = jobs.into_iter().enumerate();
         let (first_idx, first_job) = jobs.next().expect("n >= 1 checked above");
+        let mut batch: Vec<Job> = Vec::with_capacity(n - 1);
         for (idx, job) in jobs {
             let tx = tx.clone();
-            self.submit(Box::new(move || {
+            batch.push(Box::new(move || {
                 let result = catch_unwind(AssertUnwindSafe(job));
                 let _ = tx.send((idx, result));
             }));
         }
+        // Enqueue the entire fan-out under one lock acquisition + one wakeup.
+        self.submit_all(batch);
         // Drop the caller's sender so `rx` closes once every worker sender has.
         drop(tx);
 
