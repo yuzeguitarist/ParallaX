@@ -1,0 +1,21 @@
+[Unit]
+Description=ParallaX fuzz cluster — scan artifact dirs and file any unreported crashes
+Documentation=https://github.com/yuzeguitarist/ParallaX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=plxfuzz
+WorkingDirectory=/var/lib/plxfuzz/src
+Environment=HOME=/var/lib/plxfuzz
+Environment=CARGO_HOME=/var/lib/plxfuzz/.cargo
+Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
+Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=RUST_BACKTRACE=1
+# Reliable crash reporting independent of OnFailure (see crash-scan.sh header).
+# Per target with unfiled artifacts it runs crash-push (tmin + reproduce + issue),
+# so a sweep with several crashing targets can take a while; bound it generously.
+ExecStart=/var/lib/plxfuzz/bin/crash-scan.sh
+Nice=10
+TimeoutStartSec=1800

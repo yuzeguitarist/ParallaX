@@ -87,7 +87,12 @@ impl ReorderBuffer {
     pub(crate) fn pop_next(&mut self) -> Option<Vec<u8>> {
         let record = self.pending.remove(&self.next_seq)?;
         self.pending_bytes -= record.len();
-        self.next_seq += 1;
+        // Saturating: next_seq is a monotonic u64; only an extreme start_seq could
+        // drive it to u64::MAX, where wrapping back to 0 would corrupt the
+        // seq < next_seq duplicate check. Saturate to stay panic-free under
+        // overflow-checks. Caught by the udp_reorder fuzz target before this
+        // buffer was wired into the datapath.
+        self.next_seq = self.next_seq.saturating_add(1);
         Some(record)
     }
 }
