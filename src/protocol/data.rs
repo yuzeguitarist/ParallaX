@@ -396,6 +396,44 @@ impl DataRecordCodec {
         Ok(())
     }
 
+    /// Like [`Self::seal_records_into`] but each record's plaintext is written
+    /// directly into `out` by `fill(i, out)` between begin/finish, so the caller
+    /// need not stage the plaintext in a separate buffer first. Byte-identical to
+    /// `seal_records_into` when `fill` appends the same per-record slices; this is
+    /// the zero-copy seal path for the relay/mux writers (Track A2). `record_lens`
+    /// gives the per-record plaintext lengths used to size the up-front reserve
+    /// (and, in debug, to assert `fill` appends exactly that many bytes).
+    pub fn seal_records_into_inplace<R, F>(
+        &mut self,
+        record_lens: &[usize],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+        mut fill: F,
+    ) -> Result<(), DataRecordError>
+    where
+        R: Rng + rand::RngCore + ?Sized,
+        F: FnMut(usize, &mut Vec<u8>),
+    {
+        let total: usize = record_lens.iter().sum();
+        out.reserve(chunked_records_capacity(
+            total,
+            record_lens.len().max(1),
+            self.padding.max_len(),
+        ));
+        for (i, &len) in record_lens.iter().enumerate() {
+            let builder = self.begin_record(out);
+            let before = out.len();
+            fill(i, out);
+            debug_assert_eq!(
+                out.len() - before,
+                len,
+                "fill must append exactly record_lens[i] plaintext bytes"
+            );
+            self.finish_record(builder, rng, out)?;
+        }
+        Ok(())
+    }
+
     /// Parallel counterpart of [`Self::seal_chunks_into_untracked`]: splits
     /// `payload` into `max_plaintext_len`-sized records and seals them across
     /// `pool`'s worker threads, appending the records to `out` in order. The
@@ -1461,6 +1499,46 @@ mod tests {
 
         // Zero padding consumes no rng, so the wire bytes are deterministic.
         assert_eq!(batched_out, reference_out);
+    }
+
+    #[test]
+    fn seal_records_into_inplace_matches_seal_records_into_byte_for_byte() {
+        let key = [5_u8; KEY_LEN];
+        let nonce = [6_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let lens = variable_record_lens(
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD)
+                .max_plaintext_len(),
+        );
+        let payload = patterned_payload(lens.iter().sum());
+
+        // Reference: the staging-buffer path (seal_records_into copies each slice).
+        let mut reference =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut reference_rng = StdRng::seed_from_u64(61);
+        let mut reference_out = Vec::new();
+        reference
+            .seal_records_into(&payload, &lens, &mut reference_rng, &mut reference_out)
+            .unwrap();
+
+        // In-place: each record's plaintext is written straight into `out`.
+        let mut inplace =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut inplace_rng = StdRng::seed_from_u64(62);
+        let mut inplace_out = Vec::new();
+        let mut off = 0usize;
+        inplace
+            .seal_records_into_inplace(&lens, &mut inplace_rng, &mut inplace_out, |i, out| {
+                let len = lens[i];
+                out.extend_from_slice(&payload[off..off + len]);
+                off += len;
+            })
+            .unwrap();
+
+        // Zero padding consumes no rng, so the two seal paths must be
+        // byte-for-byte identical (and inplace therefore round-trips, since the
+        // reference output is proven to round-trip elsewhere).
+        assert_eq!(inplace_out, reference_out);
     }
 
     #[test]
