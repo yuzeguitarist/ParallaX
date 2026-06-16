@@ -275,6 +275,21 @@ pub mod tests {
         assert!(parsed.x25519_key_share.is_some());
     }
 
+    #[test]
+    fn key_share_no_sni_fixture_has_key_share_and_no_sni() {
+        // Ground truth for the M-2 recover==None reject shape: key_share present,
+        // session_id is 32 bytes, but SNI absent -> recover must take the missing-
+        // SNI early-None gate.
+        let record = client_hello_fixture_with_key_share_no_sni(&[0x66; 32]);
+        let parsed = parse_client_hello(&record).unwrap();
+        assert_eq!(parsed.sni, None, "fixture must omit SNI");
+        assert_eq!(parsed.session_id_range.len(), 32);
+        assert!(
+            parsed.x25519_key_share.is_some(),
+            "fixture must carry an x25519 key_share"
+        );
+    }
+
     pub fn client_hello_fixture(sni: &str) -> Vec<u8> {
         client_hello_fixture_with_key_share(sni, &[0x22; 32])
     }
@@ -288,35 +303,51 @@ pub mod tests {
         client_random: &[u8; 32],
         key_share_bytes: &[u8; 32],
     ) -> Vec<u8> {
+        build_client_hello_fixture(client_random, Some(sni), Some(key_share_bytes))
+    }
+
+    /// Shared assembler for the ClientHello fixtures: a TLS 1.3 ClientHello with
+    /// `client_random` as the random carrier, a 32-byte zero SessionID, the single
+    /// TLS_AES_128_GCM_SHA256 suite, and extensions in wire order: SNI (when
+    /// `sni` is Some), supported_versions, key_share (when `key_share` is Some).
+    /// The two `Option`s let the same builder emit every shape the M-2 reject-path
+    /// tests need (with/without SNI, with/without key_share) without duplicating
+    /// the body/extension/record-framing logic across fixtures.
+    fn build_client_hello_fixture(
+        client_random: &[u8; 32],
+        sni: Option<&str>,
+        key_share: Option<&[u8; 32]>,
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // legacy_version
-        body.extend_from_slice(client_random); // ParallaX v2 public key carrier
+        body.extend_from_slice(client_random);
         body.push(32);
-        body.extend_from_slice(&[0_u8; 32]); // ParallaX signed SessionID placeholder
+        body.extend_from_slice(&[0_u8; 32]); // 32-byte SessionID placeholder
         body.extend_from_slice(&2_u16.to_be_bytes());
         body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
         body.push(1);
         body.push(0);
 
         let mut extensions = Vec::new();
-        let host = sni.as_bytes();
-        let mut sni_data = Vec::new();
-        sni_data.extend_from_slice(&((1 + 2 + host.len()) as u16).to_be_bytes());
-        sni_data.push(0);
-        sni_data.extend_from_slice(&(host.len() as u16).to_be_bytes());
-        sni_data.extend_from_slice(host);
-        extension(&mut extensions, EXT_SERVER_NAME, &sni_data);
-
+        if let Some(host) = sni.map(str::as_bytes) {
+            let mut sni_data = Vec::new();
+            sni_data.extend_from_slice(&((1 + 2 + host.len()) as u16).to_be_bytes());
+            sni_data.push(0);
+            sni_data.extend_from_slice(&(host.len() as u16).to_be_bytes());
+            sni_data.extend_from_slice(host);
+            extension(&mut extensions, EXT_SERVER_NAME, &sni_data);
+        }
         extension(&mut extensions, EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]);
-
-        let mut key_share_data = Vec::new();
-        let mut share = Vec::new();
-        share.extend_from_slice(&NAMED_GROUP_X25519.to_be_bytes());
-        share.extend_from_slice(&32_u16.to_be_bytes());
-        share.extend_from_slice(key_share_bytes);
-        key_share_data.extend_from_slice(&(share.len() as u16).to_be_bytes());
-        key_share_data.extend_from_slice(&share);
-        extension(&mut extensions, EXT_KEY_SHARE, &key_share_data);
+        if let Some(key_share_bytes) = key_share {
+            let mut key_share_data = Vec::new();
+            let mut share = Vec::new();
+            share.extend_from_slice(&NAMED_GROUP_X25519.to_be_bytes());
+            share.extend_from_slice(&32_u16.to_be_bytes());
+            share.extend_from_slice(key_share_bytes);
+            key_share_data.extend_from_slice(&(share.len() as u16).to_be_bytes());
+            key_share_data.extend_from_slice(&share);
+            extension(&mut extensions, EXT_KEY_SHARE, &key_share_data);
+        }
 
         body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
         body.extend_from_slice(&extensions);
@@ -344,41 +375,18 @@ pub mod tests {
     /// inbound decision takes the no-X25519-key_share branch (M-2 shape B). Used to
     /// assert the rejection path's DH count is input-independent.
     pub fn client_hello_fixture_no_key_share(sni: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
-        body.extend_from_slice(&[0x22; 32]); // client_random
-        body.push(32);
-        body.extend_from_slice(&[0_u8; 32]); // SessionID placeholder
-        body.extend_from_slice(&2_u16.to_be_bytes());
-        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
-        body.push(1);
-        body.push(0);
+        build_client_hello_fixture(&[0x22; 32], Some(sni), None)
+    }
 
-        let mut extensions = Vec::new();
-        let host = sni.as_bytes();
-        let mut sni_data = Vec::new();
-        sni_data.extend_from_slice(&((1 + 2 + host.len()) as u16).to_be_bytes());
-        sni_data.push(0);
-        sni_data.extend_from_slice(&(host.len() as u16).to_be_bytes());
-        sni_data.extend_from_slice(host);
-        extension(&mut extensions, EXT_SERVER_NAME, &sni_data);
-        extension(&mut extensions, EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]);
-        // Deliberately NO key_share extension.
-
-        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
-        body.extend_from_slice(&extensions);
-
-        let mut handshake = Vec::new();
-        handshake.push(HANDSHAKE_CLIENT_HELLO);
-        push_u24(&mut handshake, body.len() as u32);
-        handshake.extend_from_slice(&body);
-
-        let mut record = Vec::new();
-        record.push(TLS_CONTENT_HANDSHAKE);
-        record.extend_from_slice(&[0x03, 0x01]);
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake);
-        record
+    /// A TLS 1.3 ClientHello fixture WITH an x25519 key_share but NO SNI
+    /// extension. The 32-byte session_id placeholder is present, so the only
+    /// early-None gate in `recover_stateful_auth_material_from_parsed` that fires
+    /// is the missing-SNI one (`parsed.sni == None`). This drives the server's
+    /// inbound decision down the "key_share present + recover==None" reject shape
+    /// (M-2 shape: ballast DH on the v4 auth slot), which a key_share-present
+    /// fixture WITH an SNI cannot reach (that one recovers `Some`).
+    pub fn client_hello_fixture_with_key_share_no_sni(key_share_bytes: &[u8; 32]) -> Vec<u8> {
+        build_client_hello_fixture(key_share_bytes, None, Some(key_share_bytes))
     }
 
     fn push_u24(out: &mut Vec<u8>, value: u32) {

@@ -4251,6 +4251,7 @@ mod tests {
         tls::{
             client_hello::tests::{
                 client_hello_fixture_no_key_share, client_hello_fixture_with_key_share,
+                client_hello_fixture_with_key_share_no_sni,
                 client_hello_fixture_with_random_and_key_share,
             },
             server_hello::{parse_server_hello, tests::server_hello_fixture},
@@ -4708,6 +4709,16 @@ mod tests {
         );
     }
 
+    /// Run `decide_connection_inbound` once and return how many X25519 DH ops it
+    /// performed (via the #[cfg(test)] REJECT_DH_OPS counter). Shared by the
+    /// constant-work / timing tests below, all #[ignore]d + serial because the
+    /// counter is process-global.
+    fn dh_ops_for(record: &[u8], server_priv: &[u8; 32]) -> usize {
+        REJECT_DH_OPS.store(0, Ordering::Relaxed);
+        let _ = decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
+        REJECT_DH_OPS.load(Ordering::Relaxed)
+    }
+
     /// M-2: the inbound-decision rejection path must perform an input-INDEPENDENT
     /// number of X25519 DH ops, else the per-DH latency step (no key_share = 1 vs
     /// auth-fail = 3, pre-fix) is a timing distinguisher. Ignored + serial: it reads
@@ -4715,12 +4726,6 @@ mod tests {
     #[test]
     #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
     fn rejection_path_x25519_count_is_input_independent() {
-        fn dh_ops_for(record: &[u8], server_priv: &[u8; 32]) -> usize {
-            REJECT_DH_OPS.store(0, Ordering::Relaxed);
-            let _ =
-                decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
-            REJECT_DH_OPS.load(Ordering::Relaxed)
-        }
         let server = X25519KeyPair::generate();
 
         // Shape B: no x25519 key_share -> pre-fix only the legacy DH (1).
@@ -4739,6 +4744,196 @@ mod tests {
         assert_eq!(
             b, 3,
             "rejection path must perform a constant 3 X25519 DH ops"
+        );
+    }
+
+    /// M-2 (coverage extension): the THIRD attacker-reachable parseable reject
+    /// shape — a key_share IS present but `recover_stateful_auth_material` returns
+    /// None — must also perform the constant 3 DH ops, so ALL parseable-but-
+    /// rejected ClientHello shapes (no-key_share, recover==None, masked-auth-fail)
+    /// are mutually timing-indistinguishable, not just two of the three.
+    ///
+    /// To actually reach recover==None WITH a key_share present, the fixture must
+    /// trip one of recover's early-None gates while still carrying a key_share. A
+    /// fixture with an SNI and a 32-byte session_id (e.g.
+    /// `client_hello_fixture_with_key_share`) recovers `Some` — it would silently
+    /// re-test the masked-auth-fail (recover==Some) shape, not this one. So we use
+    /// a key_share-present fixture with NO SNI, which makes recover return None via
+    /// its missing-SNI gate. We assert that None as independent ground truth so the
+    /// test cannot silently mis-cover.
+    #[test]
+    #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
+    fn rejection_path_x25519_count_covers_recover_none_shape() {
+        let server = X25519KeyPair::generate();
+        // key_share present, but NO SNI -> recover hits its missing-SNI early-None
+        // gate and the code takes the `ballast: v4 auth-slot, recover==None` path.
+        const KEY_SHARE: [u8; 32] = [0x66; 32];
+        let key_share_no_recover = client_hello_fixture_with_key_share_no_sni(&KEY_SHARE);
+
+        // Independent ground truth: prove the intended branch is actually taken —
+        // recover returns None for this fixture. mask_ecdh is computed exactly as
+        // the server does for a present key_share: X25519(server_static, key_share).
+        let parsed = parse_client_hello(&key_share_no_recover).expect("fixture parses");
+        assert!(
+            parsed.x25519_key_share.is_some(),
+            "fixture must carry a key_share so the recover==None path is the \
+             key_share-present shape, not the no-key_share shape"
+        );
+        let mask_ecdh = x25519_shared_secret(&server.private, &KEY_SHARE);
+        let recovered = recover_stateful_auth_material_from_parsed(
+            &key_share_no_recover,
+            PSK,
+            &mask_ecdh,
+            &parsed,
+        )
+        .expect("recover must not error on a parseable record");
+        assert!(
+            recovered.is_none(),
+            "ground truth: recover must return None for this fixture, else the test \
+             re-covers the recover==Some shape instead of the intended recover==None"
+        );
+
+        assert_eq!(
+            dh_ops_for(&key_share_no_recover, &server.private),
+            3,
+            "key_share + recover==None reject path must perform the constant 3 X25519 DH ops"
+        );
+    }
+
+    /// META-TEST (deterministic teeth for the constant-work guard): prove the
+    /// REJECT_DH_OPS counter is NOT vacuously pinned to 3. A genuinely different
+    /// path — an unparseable record short-circuits at `parse_client_hello` before
+    /// any DH — must read a DIFFERENT count (0). Without this, the constant-work
+    /// assertions above could pass against a broken/stuck counter; with it, we
+    /// know the counter discriminates and the `assert_eq!(.., 3)` guards bite.
+    #[test]
+    #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
+    fn constant_work_counter_is_non_vacuous() {
+        let server = X25519KeyPair::generate();
+        let unparseable = dh_ops_for(b"this is not a TLS ClientHello", &server.private);
+        let valid_unauth = dh_ops_for(
+            &client_hello_fixture_no_key_share("example.com"),
+            &server.private,
+        );
+        assert_eq!(unparseable, 0, "an unparseable record performs zero DH ops");
+        assert_eq!(
+            valid_unauth, 3,
+            "a parseable-but-unauthenticated record performs 3 DH ops"
+        );
+        assert_ne!(
+            unparseable, valid_unauth,
+            "the counter must discriminate, else the constant-work guards are vacuous"
+        );
+    }
+
+    /// Median of a sample (sorts in place). Robust to scheduler/GC outliers.
+    #[cfg(test)]
+    fn timing_median_ns(mut samples: Vec<u64>) -> u64 {
+        assert!(!samples.is_empty());
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    /// META-TEST (deterministic teeth for the timing gate's STATISTICS): the
+    /// self-normalized separability used by the dynamic test below must correctly
+    /// FLAG a shifted distribution and PASS an unshifted one — otherwise a green
+    /// dynamic-timing result would be meaningless. We test the pure median logic
+    /// on synthetic data so this is fast and never flaky.
+    #[test]
+    fn timing_separability_statistic_is_non_vacuous() {
+        // Same distribution split in two -> medians ~equal -> tiny gap.
+        let a: Vec<u64> = (0..1000).map(|i| 1000 + (i % 7)).collect();
+        let a2: Vec<u64> = (0..1000).map(|i| 1000 + ((i + 3) % 7)).collect();
+        let same_gap = (timing_median_ns(a.clone()) as i64 - timing_median_ns(a2) as i64).abs();
+        // A clearly shifted distribution (+200) -> large gap the gate must catch.
+        let shifted: Vec<u64> = (0..1000).map(|i| 1200 + (i % 7)).collect();
+        let shift_gap = (timing_median_ns(a) as i64 - timing_median_ns(shifted) as i64).abs();
+        assert!(
+            same_gap <= 3,
+            "same-distribution median gap must be ~0, got {same_gap}"
+        );
+        assert!(
+            shift_gap >= 150,
+            "a 200ns shift must produce a large median gap, got {shift_gap}"
+        );
+    }
+
+    /// WORLD-FIRST-FOR-THIS-REPO dynamic side-channel MEASUREMENT. The
+    /// counter tests above prove the DH OP COUNT is input-independent; this
+    /// proves the actual WALL-CLOCK latency of the rejection decision is not
+    /// grossly input-dependent either (catching a data-dependent branch or
+    /// memory pattern a pure op-count cannot see). It is SELF-NORMALIZED — the
+    /// cross-shape median gap is compared against a same-shape control gap
+    /// measured in the same run — and gated GENEROUSLY so it documents the
+    /// signal and catches only a gross asymmetry without flaking on shared CI
+    /// runners; the precise 1-DH-asymmetry guard is the deterministic counter
+    /// test, not this one. #[ignore]: wall-clock + global counter, serial lane.
+    #[test]
+    #[ignore = "dynamic wall-clock timing; run serially in the --ignored lane"]
+    fn rejection_path_timing_is_not_grossly_input_dependent() {
+        use std::time::Instant;
+        let server = X25519KeyPair::generate();
+        let shape_b = client_hello_fixture_no_key_share("example.com");
+        let mut shape_d = client_hello_fixture_with_key_share("example.com", &[0x66; 32]);
+        let mut rng = StdRng::seed_from_u64(7);
+        sign_client_hello_session_id(&mut shape_d, b"wrong-auth-key", &mut rng).unwrap();
+
+        let reject = |record: &[u8]| {
+            let _ = decide_connection_inbound(
+                record,
+                PSK,
+                &[String::from("example.com")],
+                &server.private,
+            );
+        };
+        // Warm up code/data caches and the branch predictor for both shapes.
+        for _ in 0..2000 {
+            reject(&shape_b);
+            reject(&shape_d);
+        }
+
+        // Interleaved paired sampling cancels environmental drift: in each round
+        // we time shape_b, shape_d, then shape_b again (the second b is the
+        // same-shape control). Drift over a round hits all three equally.
+        let n = 3000usize;
+        let (mut tb, mut td, mut tb2) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for _ in 0..n {
+            let s = Instant::now();
+            reject(&shape_b);
+            tb.push(s.elapsed().as_nanos() as u64);
+            let s = Instant::now();
+            reject(&shape_d);
+            td.push(s.elapsed().as_nanos() as u64);
+            let s = Instant::now();
+            reject(&shape_b);
+            tb2.push(s.elapsed().as_nanos() as u64);
+        }
+        let med_b = timing_median_ns(tb);
+        let med_d = timing_median_ns(td);
+        let med_b2 = timing_median_ns(tb2);
+
+        let cross_gap = (med_b as i64 - med_d as i64).unsigned_abs();
+        let control_gap = (med_b as i64 - med_b2 as i64).unsigned_abs();
+        eprintln!(
+            "decide_inbound reject timing: med_b={med_b}ns med_d={med_d}ns med_b2={med_b2}ns \
+             cross_gap={cross_gap}ns control_gap={control_gap}ns"
+        );
+
+        // Generous, self-normalized bound: the cross-shape gap must not exceed a
+        // large multiple of the same-shape noise floor, with an absolute slack
+        // floor so a near-zero control_gap cannot make this spuriously strict.
+        let slack = (med_b.min(med_d) / 4)
+            .max(control_gap.saturating_mul(6))
+            .max(2_000);
+        assert!(
+            cross_gap <= slack,
+            "rejection latency is grossly input-dependent: cross_gap={cross_gap}ns exceeds \
+             slack={slack}ns (control_gap={control_gap}ns). A timing distinguisher between \
+             reject shapes may have been introduced."
         );
     }
 
