@@ -1,18 +1,18 @@
 # ParallaX distributed-fuzz cluster — operator runbook
 
-Hands-only. You open three DigitalOcean boxes, paste one line into each, and
+Hands-only. You open two DigitalOcean boxes, paste one line into each, and
 walk away. Crashes arrive as GitHub Issues on your phone; progress shows on a
 dashboard. No SSH, no professional knowledge, no per-box config.
 
 - **Repo:** `yuzeguitarist/ParallaX` (PRIVATE)
-- **Pinned commit (this campaign):** `84c78add` — every box clones and checks out
+- **Pinned commit (this campaign):** `3b551fa` — every box clones and checks out
   exactly this commit and never moves. All corpus/crash assets are tagged to it.
-- **Boxes:** 3 × DigitalOcean **c-4** (4 vCPU / 8 GB / 50 GB, **dedicated**, no spot),
-  Ubuntu 24.04, named by role: `box-a`, `box-b`, `box-c`.
+- **Boxes:** 2 × DigitalOcean **c-4** (4 vCPU / 8 GB / 50 GB, **dedicated**, no spot),
+  Ubuntu 24.04, named by role: `box-a`, `box-b`.
 - **Toolchain (pinned, installed by bootstrap):** `nightly-2026-06-10` +
   `cargo-fuzz 0.13.2`.
 - **Where state lives (zero extra infra — the repo IS the backend):**
-  - **Corpus** → a GitHub **Release** `fuzz-corpus-84c78add` (assets, not a branch).
+  - **Corpus** → a GitHub **Release** `fuzz-corpus-3b551fa` (assets, not a branch).
   - **Crashes** → GitHub **Issues** (label `fuzz-crash`) **+** committed repros on
     the `fuzz-crashes` branch.
   - **Status** → `status-<box>.json` committed to the `fuzz-status` branch every
@@ -24,7 +24,7 @@ dashboard. No SSH, no professional knowledge, no per-box config.
 
 ### 1. Pick the commit
 
-This campaign is pinned to **`84c78add`** (current HEAD; full 13-target fuzz set
+This campaign is pinned to **`3b551fa`** (current HEAD; full 14-target fuzz set
 incl. the TUDP targets). To run a different commit, substitute its SHA
 everywhere below **and** in the paste line — the Release tag, the bootstrap URL,
 and every box's checkout all key off it.
@@ -70,7 +70,7 @@ git push -u origin fuzz-crashes
 # fuzz-status: holds status-<box>.json heartbeats + the committed dashboard
 git switch --orphan fuzz-status
 mkdir -p fuzz/dashboard
-git checkout 84c78add -- fuzz/dashboard/index.html   # publish the dashboard here
+git checkout 3b551fa -- fuzz/dashboard/index.html   # publish the dashboard here
 git add fuzz/dashboard/index.html
 git commit -m "init fuzz-status (orphan; heartbeats + dashboard)"
 git push -u origin fuzz-status
@@ -78,7 +78,7 @@ git push -u origin fuzz-status
 git switch main   # back to where you were
 ```
 
-The Release `fuzz-corpus-84c78add` does **not** need pre-creating: the first box
+The Release `fuzz-corpus-3b551fa` does **not** need pre-creating: the first box
 to sync creates it race-safely (it ignores `already_exists`).
 
 ### 4. Watch results on your phone (two clicks, once)
@@ -92,7 +92,7 @@ to sync creates it race-safely (it ignores `already_exists`).
 
 ## Start the cluster (paste one line per box)
 
-Open three c-4 boxes. On each, paste **as root** the three-line block for that
+Open two c-4 boxes. On each, paste **as root** the three-line block for that
 box. The first line reads the PAT (input hidden, kept out of shell history); it
 authenticates both the `bootstrap.sh` download **and** the private-repo clone.
 The **only** difference between boxes is the trailing node-id.
@@ -107,11 +107,6 @@ curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeg
 read -rsp 'GitHub PAT: ' T; echo
 curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-b
 ```
-```bash
-# box-c
-read -rsp 'GitHub PAT: ' T; echo
-curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-c
-```
 
 > The repo is **private**, so the bootstrap download and the clone both need the
 > token — that's why the PAT rides in via `Authorization:` (for curl) and
@@ -121,7 +116,7 @@ curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeg
 
 `bootstrap.sh` picks the PAT up from `PLXFUZZ_PAT`, stores it `0600` at
 `/etc/plxfuzz/pat`, then unattended: installs the pinned toolchain + build deps,
-clones `84c78add`, `gh auth login --with-token`, warm-builds the fuzzers,
+clones `3b551fa`, `gh auth login --with-token`, warm-builds the fuzzers,
 installs+enables the systemd units, and starts fuzzing. It is idempotent —
 re-pasting on a half-built box self-heals. When it prints `node box-a live`,
 walk away.
@@ -132,20 +127,18 @@ walk away.
 ### What each box runs (for reference; you don't configure this)
 
 The shard table inside the bootstrap derives the per-box plan from the node-id
-(Σ rss caps < 7000 MB/box; caps are backstops, real RSS is far lower):
+(caps are loose backstops; real RSS is far lower):
 
-- **box-a** — sanitizer `address`, small inputs:
-  `tls_client_hello`, `tls_server_hello`, `client_hello_auth`, `server_decide_inbound`.
-- **box-b** — sanitizer `address`, large inputs:
-  `tls_compressed_cert`, `mux_frame`, `data_record_open`, `http2_frame_header`.
-- **box-c** — sanitizer `none`, `RUSTFLAGS=-C overflow-checks=on`:
-  `command_codecs`, `replay_journal`, `socks_connect_request`, `udp_envelope`, `udp_reorder`.
+- **box-a** — sanitizer `address` (parsers; catches OOB/UAF/leaks):
+  `server_decide_inbound`, `tls_client_hello`, `tls_server_hello`, `client_hello_auth`, `tls_compressed_cert`, `socks_connect_request`.
+- **box-b** — sanitizer `none`, `RUSTFLAGS=-C overflow-checks=on` (codecs/arithmetic; catches overflow, runs faster):
+  `mux_frame`, `data_record_open`, `http2_frame_header`, `command_codecs`, `replay_journal`, `udp_envelope`, `udp_reorder`, `replay_dedup`.
 
 Each target runs as **one in-process fuzzer** (no `-jobs`/`-workers`/`-fork`, which
 can hide crashes); box parallelism comes from running several such units. Corpus
 ownership is independent of who runs a target: each target's canonical
 `corpus-<target>.tar.zst` asset is written only by its owner box
-(`owner = crc32(target) % 3`); non-owners contribute `contrib-<target>-<box>.tar.zst`
+(`owner = crc32(target) % 2`); non-owners contribute `contrib-<target>-<box>.tar.zst`
 which the owner folds in. One writer per asset → no clobber race.
 
 ---
@@ -156,7 +149,7 @@ which the owner folds in. One writer per asset → no clobber race.
 
 New unique crash → a new Issue titled `[fuzz-crash] <target> <bugkey>`, label
 `fuzz-crash`, with the symbolized stack + base64 minimized input + exact repro
-command. Deduped three ways so the same bug from 3 boxes opens **one** issue:
+command. Deduped three ways so the same bug from 2 boxes opens **one** issue:
 an `gh issue list` search, the atomic `fuzz-crashes` branch push, and the
 `suppressions.txt` known-live list. Browse them:
 
@@ -214,8 +207,8 @@ entire procedure; no other coordination.
 
 ### Ending the campaign
 
-Day 15: destroy all three boxes. The corpus survives in the Release
-`fuzz-corpus-84c78add` and the crash repros in the `fuzz-crashes` branch. A new
+Day 15: destroy both boxes. The corpus survives in the Release
+`fuzz-corpus-3b551fa` and the crash repros in the `fuzz-crashes` branch. A new
 campaign = a new commit SHA (new Release tag) + a fresh 16-day PAT; the old PAT
 expires on its own with the boxes.
 

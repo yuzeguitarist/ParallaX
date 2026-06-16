@@ -41,7 +41,7 @@ read_cfg() { [ -r "$ETC/$1" ] && tr -d ' \t\r\n' < "$ETC/$1" || true; }
 
 NODE_ID="$(read_cfg node-id)"
 REPO="$(read_cfg repo)";        REPO="${REPO:-yuzeguitarist/ParallaX}"
-TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-84c78add}"
+TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-3b551fa}"
 export GH_REPO="$REPO"
 export GH_TOKEN="${GH_TOKEN:-$(read_cfg pat)}"   # env, never argv (matches sync.sh)
 
@@ -58,7 +58,7 @@ for cand in \
   if [ -r "$cand" ]; then . "$cand"; break; fi
 done
 if ! declare -p ALL_TARGETS >/dev/null 2>&1; then
-  ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame server_decide_inbound client_hello_auth command_codecs http2_frame_header data_record_open replay_journal socks_connect_request udp_envelope udp_reorder"
+  ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame server_decide_inbound client_hello_auth command_codecs http2_frame_header data_record_open replay_journal socks_connect_request udp_envelope udp_reorder replay_dedup"
 fi
 type shard_sanitizer >/dev/null 2>&1 || shard_sanitizer() { echo address; }
 type shard_rustflags >/dev/null 2>&1 || shard_rustflags() { :; }

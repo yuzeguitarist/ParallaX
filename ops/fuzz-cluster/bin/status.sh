@@ -20,7 +20,7 @@ read_cfg() { [ -r "$ETC/$1" ] && tr -d ' \t\r\n' < "$ETC/$1" || true; }
 NODE_ID="$(read_cfg node-id)"
 PINNED="$(read_cfg pinned-commit)"
 REPO="$(read_cfg repo)";        REPO="${REPO:-yuzeguitarist/ParallaX}"
-TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-84c78add}"
+TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-3b551fa}"
 export GH_REPO="$REPO"   # gh reads this; PAT is an env var (NEVER argv).
 # Token via env (matches sync.sh) so gh works under systemd even if the
 # bootstrap `gh auth login` creds aren't on this unit's HOME. Never argv.
@@ -36,7 +36,7 @@ for cand in \
   if [ -r "$cand" ]; then . "$cand"; break; fi
 done
 if ! declare -p ALL_TARGETS >/dev/null 2>&1; then
-  ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame server_decide_inbound client_hello_auth command_codecs http2_frame_header data_record_open replay_journal socks_connect_request udp_envelope udp_reorder"
+  ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame server_decide_inbound client_hello_auth command_codecs http2_frame_header data_record_open replay_journal socks_connect_request udp_envelope udp_reorder replay_dedup"
 fi
 type owner_box     >/dev/null 2>&1 || owner_box()     { :; }
 type shard_targets >/dev/null 2>&1 || shard_targets() { :; }
