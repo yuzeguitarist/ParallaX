@@ -22,8 +22,8 @@ set -uo pipefail
 # Locked campaign constants.
 # ---------------------------------------------------------------------------
 REPO="yuzeguitarist/ParallaX"
-PINNED_COMMIT="e409efa"
-CAMPAIGN_TAG="fuzz-corpus-e409efa"
+PINNED_COMMIT="f3c9c32f"
+CAMPAIGN_TAG="fuzz-corpus-f3c9c32f"
 NIGHTLY="nightly-2026-06-10"
 CARGO_FUZZ_VERSION="0.13.2"
 
