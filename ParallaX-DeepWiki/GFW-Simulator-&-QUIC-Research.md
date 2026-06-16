@@ -4,15 +4,19 @@
 
 ## Status
 
-ParallaX does not currently ship a QUIC/UDP product transport. Older QUIC
-transport documentation was removed because it no longer describes current
-`main`.
+ParallaX ships TCP/TLS as its default, fingerprint-hardened transport and has no
+`--quic` CLI flag. It does, however, carry an **experimental, off-by-default
+UDP/QUIC fast plane** wired into the client and server runtimes (enabled with
+`[udp].enabled = true` on both ends; see [Transport Layer](Transport-Layer.md)
+and [Configuration Reference](Configuration-Reference.md)). That fast plane is
+for throughput experimentation and is not yet shaped to match a browser's QUIC
+fingerprint.
 
-QUIC remains in the repository as research and adversary-model context:
+QUIC also appears in this repository as research and adversary-model context:
 
-- research notes under `docs/`
 - QUIC Initial detection logic in `tests/gfw_sim/detection/quic_initial.rs`
-- scenario-level validation in `tests/gfw_simulator.rs`
+- scenario-level validation in `tests/gfw_simulator.rs`, including UDP-leg QUIC
+  Initial tests that drive the real ParallaX QUIC client
 
 ## Simulator purpose
 
@@ -33,6 +37,8 @@ Current top-level scenarios cover:
 - DNS keyword injection
 - residual blocking and retry behavior
 - permissive policy mode
+- standard-decryptable QUIC v1 Initial from the real ParallaX UDP leg
+- partial-ClientHello first datagram from the ParallaX UDP leg
 
 Run:
 
@@ -55,6 +61,8 @@ cargo test --test gfw_simulator
 
 ## Documentation rule
 
-Do not describe QUIC as an operator mode unless the CLI and runtime grow a
-current, tested QUIC product path again. Link to this page for research-only
-QUIC material.
+Describe the UDP/QUIC fast plane as **experimental and off by default**, not as
+removed or nonexistent. There is still no `--quic` CLI flag, so do not present
+QUIC as a default operator mode; when it grows a Safari-shaped, production-ready
+path, promote it here and in [Transport Layer](Transport-Layer.md). Link to this
+page for the research and detector context.

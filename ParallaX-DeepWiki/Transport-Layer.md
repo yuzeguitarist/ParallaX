@@ -2,15 +2,22 @@
 
 > Navigation: [Index](README.md) | [TCP Transport](TCP-Camouflage-Transport.md) | [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>)
 
-## Current product transport
+## Transport plane
 
-ParallaX currently ships one product transport:
+ParallaX's default, fingerprint-hardened transport is TCP:
 
 ```text
 TCP socket → TLS records → ParallaX encrypted data records
 ```
 
-There is no active `--quic` or UDP runtime in the operator CLI.
+There is no `--quic` CLI flag. An **experimental** UDP/QUIC fast plane is also
+wired into the client and server runtimes, but it is **off by default**: setting
+`[udp].enabled = true` on both ends (with matched binaries) activates a QUIC
+reliable-stream carrier for the single-Connect data relay. While disabled, every
+path stays byte-identical on TCP, and the QUIC handshake is not yet
+Safari-fingerprint-shaped, so it is for experimentation only. See the `[udp]`
+knobs in [Configuration Reference](Configuration-Reference.md) and the detector
+context in [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 
 ## Responsibilities
 
@@ -20,12 +27,16 @@ There is no active `--quic` or UDP runtime in the operator CLI.
 | TLS record layer | `src/tls/record.rs` | Read/write exact TLS records and parse headers. |
 | Data record layer | `src/protocol/data.rs` | AEAD-sealed payloads inside TLS ApplicationData. |
 | Client/server relay | `src/client/runtime.rs`, `src/handshake/server.rs` | Bidirectional application relay. |
+| Transport leg abstraction | `src/transport/leg.rs` | Uniform reader/writer over either a TCP or a QUIC stream leg. |
+| UDP/QUIC fast plane (experimental, off by default) | `src/transport/udp/` | QUIC endpoint, Happy-Eyeballs probe, datagram envelope, reordering, and exporter-bound auth. |
 
-## Why TCP-only
+## Why TCP is the default
 
-The current product line favors one carefully shaped path over multiple
-half-maintained transports. QUIC research remains important for the adversary
-model, but the production runtime is TCP/TLS.
+The product line favors one carefully shaped path over multiple half-maintained
+transports, so TCP/TLS is the default and the only fingerprint-hardened
+transport. The experimental UDP/QUIC fast plane exists for throughput
+experimentation and is not yet shaped to match a browser's QUIC fingerprint;
+QUIC also remains important for the adversary model.
 
 ## Validation
 

@@ -14,16 +14,22 @@ hybrid post-quantum exchange.
 
 | In scope on current `main` | Out of scope / research-only |
 |---|---|
-| TCP transport carrying TLS records | Shipped QUIC/UDP product transport |
+| TCP/TLS as the default, fingerprint-hardened transport | QUIC/UDP as a default or fingerprint-shaped production transport |
 | Safari-shaped TLS 1.3 camouflage | Generic "random bytes" obfuscation |
 | Local unauthenticated SOCKS5 bound to loopback | Public SOCKS5 listener |
 | Fallback passthrough for unauthenticated/probe traffic | Dropping scanners with proxy-shaped errors |
 | ML-KEM-1024 rekey and ML-DSA-87 server identity | CA-based server authentication for the ParallaX identity |
 | Source-level GFW simulator tests | Claiming the simulator proves universal bypass |
 
-The removed QUIC runtime is intentionally not documented as an operator mode.
-QUIC remains relevant in this repository only through research notes and
-detectors inside the simulator; see [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
+There is no `--quic` CLI flag. An **experimental** UDP/QUIC fast plane *is* wired
+into the client and server runtimes, but it is **off by default**: setting
+`[udp].enabled = true` on both ends (with matched binaries) activates a QUIC
+reliable-stream carrier for the single-Connect data relay. While disabled, every
+path stays byte-identical on TCP. The QUIC handshake is not yet
+Safari-fingerprint-shaped, so enabling it is for experimentation, not
+censorship-resistant production use. QUIC also appears as research and detector
+context in the simulator; see
+[GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 
 ## Main components
 
@@ -69,8 +75,9 @@ plx serve
 2. **Make denial indistinguishable from an ordinary website path.** Probe and
    auth failures are forwarded to the fallback origin.
 3. **Keep operational defaults speed-first.** Generated traffic shaping is zero
-   padding, zero delay, zero cover traffic, and one stream until multiplexing
-   can be scheduled safely.
+   padding, zero delay, and zero cover traffic, and multiplexing is on by
+   default across up to four concurrent SOCKS streams over one authenticated
+   session.
 4. **Prefer measured evidence over claims.** `plx probe`, `plx speed`,
    `plx bench`, fixtures, and simulator tests all produce repeatable evidence.
 

@@ -39,15 +39,17 @@ complete_handshake()
   ├─ require a TLS 1.3 ServerHello
   ├─ derive TLS 1.3 handshake/application secrets
   ├─ verify Certificate, CertificateVerify, and Finished
-  └─ emit HTTP/2 camouflage preface when negotiated
+  └─ emit the HTTP/2 camouflage opening flight (preface + opening HEADERS) when h2 is negotiated
 ```
 
 ## HTTP/2 post-handshake behavior
 
-When HTTP/2 is negotiated, the backend can emit a Safari-shaped HTTP/2
-connection preface and drain SETTINGS ACK behavior with a bounded record limit
-and timeout. This avoids leaving the fallback TLS connection in a visibly
-unfinished state.
+When HTTP/2 is negotiated, the backend sends a Safari-shaped opening flight —
+the connection preface (magic + SETTINGS + WINDOW_UPDATE) followed back-to-back
+by the opening `GET` HEADERS frame — without waiting for the server's SETTINGS,
+then drains and ACKs the server's SETTINGS with a bounded record limit and
+timeout. This avoids leaving the fallback TLS connection in a visibly unfinished
+state and matches a real browser's first flight.
 
 ## Drift risks
 

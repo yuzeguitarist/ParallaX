@@ -15,7 +15,7 @@ agreement. It is the visible outer shape of the product transport.
 | ClientHello parser | `src/tls/client_hello.rs` | Extract SNI, random, SessionID, TLS 1.3 support, X25519 key share. |
 | ServerHello parser | `src/tls/server_hello.rs` | Verify fallback-origin ServerHello and TLS 1.3 selection. |
 | TLS record helpers | `src/tls/record.rs` | Parse/write TLS record headers and read exact records. |
-| Safari profile backend | `src/tls/safari26.rs` | Serialize Safari ClientHello, run the narrow TLS 1.3 state machine, verify certificates, patch auth entropy, send HTTP/2 preface. |
+| Safari profile backend | `src/tls/safari26.rs` | Serialize Safari ClientHello, run the narrow TLS 1.3 state machine, verify certificates, patch auth entropy, send the HTTP/2 opening flight (preface + HEADERS). |
 | HTTP/2 fingerprint | `src/fingerprint/http2.rs` | Build Safari 26.4-style HTTP/2 preface, SETTINGS, WINDOW_UPDATE, and HEADERS. |
 
 ## Handshake shape

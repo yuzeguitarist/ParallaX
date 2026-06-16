@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- Rust `1.80+`
+- A recent stable Rust toolchain (the pinned `Cargo.lock` needs Cargo ≥ 1.85; the `rust-version = 1.80` in `Cargo.toml` is nominal)
 - `cargo`
 - A fallback TLS origin that is reachable from the VPS
 - A VPS that can listen on the configured TCP port, usually `443`
@@ -56,7 +56,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 | `plx probe [DEST] [-c FILE]` | Probe an explicit or config-derived camouflage target. | Accepts `domain`, `domain:port`, or `https://domain`. |
 | `plx init <DEST> ...` | Generate paired config files with fresh key material. | Use `-o DIR` to choose the output directory. |
 
-There is no `--quic` option on current `main`.
+There is no `--quic` CLI flag; the experimental UDP/QUIC fast plane is enabled via `[udp].enabled` in config, not the CLI.
 
 ## Important options
 

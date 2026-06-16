@@ -13,6 +13,7 @@ Unix rejects group/world-readable secret files.
 | `mode` | `"client"` or `"server"` | yes | Selects which section must be present. |
 | `[crypto]` | table | yes | Shared cryptographic material. |
 | `[traffic]` | table | no | Padding, timing, cover traffic, and stream-count settings. Defaults are speed-first. |
+| `[udp]` | table | no | Experimental UDP/QUIC fast plane. Off by default; see the `[udp]` section below. |
 | `[client]` | table | client mode | Local SOCKS and remote server settings. |
 | `[server]` | table | server mode | Listener, fallback, target, replay, and server secrets. |
 
@@ -66,6 +67,43 @@ ParallaX session.
 | `replay_cache_path` | no | Defaults to `/var/lib/parallax/parallax-replay.cache`; relative paths resolve relative to the config file. |
 | `authorized_sni` | yes | Non-empty SNI allowlist for authenticated ClientHellos. Matching is case-insensitive. |
 | `strict_tls13` | no | Defaults to `true`; fallback ServerHello must negotiate TLS 1.3 when enabled. |
+| `replay_cache_capacity` | no | Default `49152`. Bounded capacity of the persistent replay cache; pairs with the freshness window to fail closed when full. |
+| `max_concurrent_per_source_v4` | no | Default `256`. Concurrency cap (not a rate limit) per IPv4 /32 source; high so shared/CGNAT addresses are not throttled. |
+| `max_concurrent_per_source_v6` | no | Default `256`. Concurrency cap per IPv6 source prefix; separate from v4 because a prefix aggregates many endpoints. |
+| `source_ipv6_prefix_len` | no | Default `64`. Prefix length used to group IPv6 sources for the per-source cap. |
+| `first_record_wait_floor_ms` | no | Default `8000`. Floor for the client-facing first-record wait (a measurement-resistant timeout). |
+| `first_record_wait_jitter_ms` | no | Default `7000`. Upward jitter added to the first-record wait floor. |
+| `fallback_idle_floor_ms` | no | Default `600000` (10 min; min enforced `5000`). Per-gap idle backstop for the camouflage relay; resets on every byte, so it only fires on a fully silent connection. |
+| `fallback_idle_jitter_ms` | no | Default `60000`. Upward jitter on the idle backstop. |
+| `tcp_congestion` | no | Optional Linux TCP congestion-control algorithm for relay sockets (e.g. `"bbr"`, `"cubic"`) to match the camouflage origin's CDN; unset keeps the kernel default, and an unavailable algorithm is logged and ignored. |
+
+## `[udp]`
+
+The experimental UDP/QUIC fast plane. It is **off by default**; with
+`enabled = false` the runtime is byte-identical to TCP-only, so this whole table
+can be omitted (generated configs do not include it). Enabling requires matched
+binaries on both ends. Only two knobs are LIVE today; the rest are parsed and
+validated for forward-compatibility but **not yet honored** (setting one logs a
+startup warning so an inert knob is not mistaken for an active one).
+
+| Field | Default | Status | Meaning |
+|---|---:|---|---|
+| `enabled` | `false` | LIVE | Turn the UDP/QUIC fast plane on (both ends). |
+| `probe_timeout_ms` | `300` | LIVE | Happy-Eyeballs UDP probe timeout before committing to TCP-only. Must be ≥ 1 when enabled. |
+| `cc` | `"bbr"` | RESERVED | Congestion controller: `"bbr"` (safe default) or `"brutal"` (Hysteria-style, opt-in, detectable). Phase 3. |
+| `brutal_up_mbps` | `0` | RESERVED | Declared uplink Mbps for Brutal; `0` means unset. Required with `brutal_down_mbps` when `cc = "brutal"` unless `ignore_client_bandwidth` is set. |
+| `brutal_down_mbps` | `0` | RESERVED | Declared downlink Mbps for Brutal; `0` means unset. |
+| `ignore_client_bandwidth` | `false` | RESERVED | Let the server override the client-declared Brutal bandwidth. |
+| `fec_profile` | `"adaptive"` | RESERVED | Forward error correction: `"off"`, `"adaptive"` (loss×RTT-gated), or `"rs"` (Reed-Solomon). Phase 3. |
+| `port_hop` | `false` | RESERVED | UDP port hopping (Phase 2 camouflage). |
+| `masque_front` | unset | RESERVED | SNI/host to front the masquerading HTTP/3 face on; unset keeps the TCP `sni`. Phase 2. |
+| `ech` | `false` | RESERVED | Encrypted ClientHello for the QUIC face (Phase 2). |
+
+Validation only runs when `enabled = true`: `probe_timeout_ms` must be non-zero,
+`cc = "brutal"` requires the two Brutal bandwidths (unless
+`ignore_client_bandwidth`), and `masque_front` (if set) must be non-empty. The
+QUIC handshake is not yet Safari-fingerprint-shaped, so enabling the fast plane
+is for throughput experimentation, not censorship-resistant production use.
 
 ## Generated server example
 

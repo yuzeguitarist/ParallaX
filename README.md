@@ -64,10 +64,10 @@ experimentation, not censorship-resistant production use.
 | Handshake authentication | PSK + X25519 material embedded into `ClientHello.random` and compatibility `SessionID`; replay cache gates authenticated handshakes. | `src/crypto/auth.rs`, `src/crypto/replay.rs` |
 | PQ and identity | ML-KEM-1024 rekey, transcript-bound server key exchange, ML-DSA-87 identity proof over the rekey binding. | `src/crypto/pq.rs`, `src/crypto/identity.rs`, `src/protocol/command.rs` |
 | Data plane | ChaCha20-Poly1305 records (96-bit per-record counter nonce) carried inside TLS `ApplicationData` frames, per-direction nonce ratchets, optional padding/timing/cover traffic; bulk batches seal/open across a shared multi-core crypto pool. | `src/crypto/session.rs`, `src/protocol/data.rs`, `src/crypto/parallel.rs`, `src/traffic.rs` |
-| TCP transport | TCP-only product transport with `TCP_NODELAY`, Linux keepalive tuning, fd-limit based relay concurrency, and 64 KiB relay buffers. | `src/transport/tcp.rs` |
+| TCP transport | Default TCP product transport with `TCP_NODELAY`, Linux keepalive tuning, fd-limit based relay concurrency, and 64 KiB relay buffers. | `src/transport/tcp.rs` |
 | Process hardening | Best-effort no-core-dump setup, non-dumpable process flag, `mlock`, `MADV_DONTDUMP`, and strict config file ownership/mode checks. | `src/process_hardening.rs`, `src/config.rs` |
 | Operations | Local build, binary-only VPS upload, hardened systemd unit, optional BBR/fq setup, optional Polar Signals / parca-agent profiling. | `scripts/deploy-vps.sh`, `scripts/uninstall-vps.sh` |
-| Validation | Unit/integration tests, Safari parity fixtures, ignored loopback tests, GFW simulator, fixed 57-case benchmark suite, speed evidence report. | `tests/`, `src/bench.rs`, `src/speed.rs` |
+| Validation | Unit/integration tests, Safari parity fixtures, ignored loopback tests, GFW simulator, fixed 58-case benchmark suite, speed evidence report. | `tests/`, `src/bench.rs`, `src/speed.rs` |
 
 ---
 
@@ -75,7 +75,7 @@ experimentation, not censorship-resistant production use.
 
 Requirements:
 
-- Rust `1.80+`
+- A recent stable Rust toolchain (the pinned `Cargo.lock` needs Cargo ≥ 1.85; the `rust-version = 1.80` in `Cargo.toml` is nominal)
 - `cargo`
 - No `openssl-sys` or system OpenSSL dependency
 
@@ -298,7 +298,7 @@ plx bench --json
 ```
 
 The benchmark suite is intentionally fixed-parameter. Current `main` runs
-57 cases across six groups: `handshake.crypto`, `handshake.protocol`,
+58 cases across six groups: `handshake.crypto`, `handshake.protocol`,
 `record.aead`, `record.pipeline`, `traffic`, and `state`.
 
 Network speed evidence test:
