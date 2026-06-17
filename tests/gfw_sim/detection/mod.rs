@@ -20,6 +20,8 @@
 //! - [`cross_flow`]: cross-flow connection-topology correlation (one source ->
 //!   many destinations near-simultaneously); guards multipath/fleet designs
 //!   against fan-out tells the per-flow layers above are blind to.
+//! - [`quic_timing`]: QUIC send-behavior plausibility (inter-packet pacing CV);
+//!   guards future FEC / congestion-pacing changes against constant-rate tells.
 //! - [`active_prober`]: active-probing infrastructure;
 //!   Fifield 2015, Alice 2020, and Frolov 2020.
 //! - [`tcp_dual_mb`]: dual middlebox MB-RA + MB-R state machine;
@@ -32,6 +34,7 @@ pub mod dns_inject;
 pub mod fully_encrypted;
 pub mod http_host;
 pub mod quic_initial;
+pub mod quic_timing;
 pub mod sni_filter;
 pub mod tcp_dual_mb;
 pub mod tls_fingerprint;
