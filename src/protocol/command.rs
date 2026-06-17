@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::crypto::session::CipherSuite;
+
 const CONNECT_MAGIC: &[u8; 4] = b"PX1C";
 const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
 const SERVER_KEY_EXCHANGE_MAGIC: &[u8; 4] = b"PX1K";
@@ -187,6 +189,8 @@ pub enum ServerKeyExchangeError {
     EmptyCiphertext,
     #[error("server key exchange ML-KEM ciphertext length is invalid")]
     InvalidCiphertextLength,
+    #[error("server key exchange carries an unknown cipher suite tag")]
+    InvalidCipherSuite,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -442,6 +446,16 @@ impl ServerKeyExchange {
         Ok(out)
     }
 
+    /// Like [`Self::encode`] but appends the one-byte negotiated cipher-suite
+    /// tag. The server uses this; the client reads it with
+    /// [`Self::decode_ref_with_suite`]. Legacy records (no tag) decode as
+    /// ChaCha20-Poly1305, so the two layouts are wire-compatible.
+    pub fn encode_with_suite(&self, suite: CipherSuite) -> Result<Vec<u8>, ServerKeyExchangeError> {
+        let mut out = self.encode()?;
+        out.push(suite.to_wire());
+        Ok(out)
+    }
+
     pub fn decode(input: &[u8]) -> Result<Self, ServerKeyExchangeError> {
         let exchange = Self::decode_ref(input)?;
         Ok(Self {
@@ -451,6 +465,16 @@ impl ServerKeyExchange {
     }
 
     pub fn decode_ref(input: &[u8]) -> Result<ServerKeyExchangeRef<'_>, ServerKeyExchangeError> {
+        Self::decode_ref_with_suite(input).map(|(exchange, _suite)| exchange)
+    }
+
+    /// Canonical parser. Accepts both the legacy `40 + ct_len` layout (no suite
+    /// tag -> ChaCha20-Poly1305 default) and the `41 + ct_len` layout with a
+    /// trailing cipher-suite tag. The ciphertext slice is bounded to exactly
+    /// `ct_len`, so a trailing tag never bleeds into it.
+    pub fn decode_ref_with_suite(
+        input: &[u8],
+    ) -> Result<(ServerKeyExchangeRef<'_>, CipherSuite), ServerKeyExchangeError> {
         if input.len() < 4 {
             return Err(ServerKeyExchangeError::Truncated);
         }
@@ -466,13 +490,21 @@ impl ServerKeyExchange {
         if len == 0 {
             return Err(ServerKeyExchangeError::EmptyCiphertext);
         }
-        if input.len() != 40 + len {
+        let suite = if input.len() == 40 + len {
+            CipherSuite::ChaCha20Poly1305
+        } else if input.len() == 41 + len {
+            CipherSuite::from_wire(input[40 + len])
+                .ok_or(ServerKeyExchangeError::InvalidCipherSuite)?
+        } else {
             return Err(ServerKeyExchangeError::InvalidCiphertextLength);
-        }
-        Ok(ServerKeyExchangeRef {
-            server_x25519_public,
-            mlkem_ciphertext: &input[40..],
-        })
+        };
+        Ok((
+            ServerKeyExchangeRef {
+                server_x25519_public,
+                mlkem_ciphertext: &input[40..40 + len],
+            },
+            suite,
+        ))
     }
 }
 

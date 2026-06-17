@@ -1552,8 +1552,8 @@ async fn apply_server_key_exchange_record_blocking(
 ) -> Result<(), ClientRuntimeError> {
     let exchange_payload_range = data_session.open_server_record_in_place_payload_range(record)?;
     let exchange_payload = &record[exchange_payload_range];
-    let exchange =
-        ServerKeyExchange::decode_ref(exchange_payload).map_err(ClientHandshakeError::from)?;
+    let (exchange, cipher_suite) = ServerKeyExchange::decode_ref_with_suite(exchange_payload)
+        .map_err(ClientHandshakeError::from)?;
     let pq_identity_binding = pending_rekey.identity_binding(exchange_payload);
     let x25519_shared = pending_rekey.x25519_shared_secret(&exchange.server_x25519_public);
     let mlkem_ciphertext = exchange.mlkem_ciphertext.to_vec();
@@ -1564,6 +1564,7 @@ async fn apply_server_key_exchange_record_blocking(
     })
     .await??;
     data_session.apply_pq_rekey_shared_with_identity_binding(
+        cipher_suite,
         &x25519_shared,
         &pq_shared,
         psk,

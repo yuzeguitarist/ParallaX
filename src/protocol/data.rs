@@ -8,7 +8,10 @@ use zeroize::Zeroize;
 use crate::{
     crypto::{
         parallel::{self, CryptoPool},
-        session::{self, AeadCodec, SessionError, SharedCipher, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN},
+        session::{
+            self, AeadCodec, CipherSuite, SessionError, SharedCipher, AEAD_TAG_LEN, KEY_LEN,
+            NONCE_LEN,
+        },
     },
     tls::record::{self, TLS_CONTENT_APPLICATION_DATA, TLS_LEGACY_VERSION},
     traffic::{PaddingProfile, TrafficError},
@@ -363,6 +366,17 @@ impl DataRecordCodec {
 
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
         self.aead.rekey(key, nonce_base);
+    }
+
+    /// Rekeys and switches the data-plane cipher suite (used by the PQ rekey to
+    /// adopt the server-negotiated suite). On-wire record sizes are unchanged.
+    pub fn rekey_with_suite(
+        &mut self,
+        suite: CipherSuite,
+        key: [u8; KEY_LEN],
+        nonce_base: [u8; NONCE_LEN],
+    ) {
+        self.aead.rekey_with_suite(suite, key, nonce_base);
     }
 
     pub fn max_plaintext_len(&self) -> usize {

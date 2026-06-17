@@ -48,7 +48,7 @@ use crate::{
         },
         session::{
             derive_server_keys_from_shared, expand_epoch_keys, x25519_public_from_private,
-            x25519_shared_secret, AeadCodec, SessionError, SessionKeys, X25519KeyPair,
+            x25519_shared_secret, AeadCodec, CipherSuite, SessionError, SessionKeys, X25519KeyPair,
         },
     },
     protocol::{
@@ -1436,11 +1436,12 @@ async fn run_authenticated_data_mode(
                         let pq_shared_secret =
                             zeroize::Zeroizing::new(pq_encapsulation.shared_secret);
                         pq_encapsulation.shared_secret.zeroize();
+                        let cipher_suite = server_data_cipher_suite();
                         let key_exchange_payload = ServerKeyExchange {
                             server_x25519_public: server_ephemeral.public,
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
                         }
-                        .encode()?;
+                        .encode_with_suite(cipher_suite)?;
                         let pq_identity_binding =
                             identity::pq_rekey_binding(first_payload.as_slice(), &key_exchange_payload);
                         crate::process_hardening::protect_secret_bytes(
@@ -1469,6 +1470,7 @@ async fn run_authenticated_data_mode(
                             "server key exchange record written"
                         );
                         let rekeyed_keys = apply_server_pq_rekey(
+                            cipher_suite,
                             &mut client_open,
                             &mut server_seal,
                             &handshake.session_keys,
@@ -2333,6 +2335,7 @@ async fn commit_pending_replay_entry(
 }
 
 fn apply_server_pq_rekey(
+    suite: CipherSuite,
     client_open: &mut DataRecordCodec,
     server_seal: &mut DataRecordCodec,
     keys: &SessionKeys,
@@ -2352,9 +2355,31 @@ fn apply_server_pq_rekey(
         keys.transcript_hash,
         *x25519_shared_secret,
     )?;
-    client_open.rekey(next_keys.client_key, next_keys.client_nonce);
-    server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
+    client_open.rekey_with_suite(suite, next_keys.client_key, next_keys.client_nonce);
+    server_seal.rekey_with_suite(suite, next_keys.server_key, next_keys.server_nonce);
     Ok(next_keys)
+}
+
+/// Picks the data-plane AEAD for a new session: AES-256-GCM where the CPU has
+/// AES hardware (then it is ~2x ChaCha20-Poly1305), otherwise ChaCha. Both are
+/// equally strong 256-bit AEADs, so this is a pure throughput choice, signaled
+/// to the client in the AEAD-sealed ServerKeyExchange (no downgrade surface). A
+/// busy server's per-byte AEAD cost is the scaling bottleneck, so the server's
+/// hardware decides the session suite.
+fn server_data_cipher_suite() -> CipherSuite {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        if std::arch::is_x86_feature_detected!("aes") {
+            return CipherSuite::Aes256Gcm;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("aes") {
+            return CipherSuite::Aes256Gcm;
+        }
+    }
+    CipherSuite::ChaCha20Poly1305
 }
 
 fn server_identity_chunk_delay<R>(timing: TimingProfile, rng: &mut R) -> Duration

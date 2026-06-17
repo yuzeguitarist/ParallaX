@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use sha2::Sha256;
@@ -287,6 +287,7 @@ pub struct AeadCodec {
     key: [u8; KEY_LEN],
     nonce_base: [u8; NONCE_LEN],
     sequence: u64,
+    suite: CipherSuite,
     cipher: SharedCipher,
     /// Set when a batch open/seal left the sequence counter in an indeterminate
     /// state. Once poisoned, every seal/open entry point refuses to operate so
@@ -302,9 +303,43 @@ impl Drop for AeadCodec {
     }
 }
 
-fn chacha20_poly1305_key(key: &[u8; KEY_LEN]) -> SharedCipher {
+/// The AEAD the data plane uses for a session. Both options are 256-bit AEADs
+/// with a 12-byte nonce and 16-byte tag, so the record framing, nonce schedule,
+/// and on-wire record sizes are identical — only the cipher core differs. The
+/// server picks one per session (AES-256-GCM where AES-NI makes it ~2x faster
+/// than ChaCha, else ChaCha20-Poly1305) and signals it in the AEAD-sealed
+/// ServerKeyExchange; both ciphers being equally strong, there is no downgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CipherSuite {
+    ChaCha20Poly1305,
+    Aes256Gcm,
+}
+
+impl CipherSuite {
+    /// One-byte wire tag carried (optionally) at the tail of a ServerKeyExchange.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            CipherSuite::ChaCha20Poly1305 => 0,
+            CipherSuite::Aes256Gcm => 1,
+        }
+    }
+
+    pub fn from_wire(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(CipherSuite::ChaCha20Poly1305),
+            1 => Some(CipherSuite::Aes256Gcm),
+            _ => None,
+        }
+    }
+}
+
+fn make_cipher(suite: CipherSuite, key: &[u8; KEY_LEN]) -> SharedCipher {
+    let algorithm = match suite {
+        CipherSuite::ChaCha20Poly1305 => &CHACHA20_POLY1305,
+        CipherSuite::Aes256Gcm => &AES_256_GCM,
+    };
     Arc::new(LessSafeKey::new(
-        UnboundKey::new(&CHACHA20_POLY1305, key).expect("ChaCha20-Poly1305 key length is fixed"),
+        UnboundKey::new(algorithm, key).expect("AEAD key length is fixed at KEY_LEN"),
     ))
 }
 
@@ -370,24 +405,51 @@ pub(crate) fn open_in_place_split_with(
 
 impl AeadCodec {
     pub fn new(key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) -> Self {
+        Self::new_with_suite(CipherSuite::ChaCha20Poly1305, key, nonce_base)
+    }
+
+    /// Builds a codec for an explicit cipher suite. The data plane uses this
+    /// after the PQ rekey to adopt the server-negotiated suite; the initial
+    /// handshake session always uses the default ChaCha20-Poly1305 via [`Self::new`].
+    pub fn new_with_suite(
+        suite: CipherSuite,
+        key: [u8; KEY_LEN],
+        nonce_base: [u8; NONCE_LEN],
+    ) -> Self {
         let codec = Self {
             key,
             nonce_base,
             sequence: 0,
-            cipher: chacha20_poly1305_key(&key),
+            suite,
+            cipher: make_cipher(suite, &key),
             poisoned: false,
         };
         codec.protect_secret_memory();
         codec
     }
 
+    /// Rekeys, preserving the current cipher suite.
     pub fn rekey(&mut self, key: [u8; KEY_LEN], nonce_base: [u8; NONCE_LEN]) {
+        self.rekey_with_suite(self.suite, key, nonce_base);
+    }
+
+    /// Rekeys AND switches to `suite`. The PQ rekey uses this to move the data
+    /// plane from the initial ChaCha20-Poly1305 session onto the
+    /// server-negotiated suite; the per-record nonce/tag layout is unchanged so
+    /// the on-wire record sizes do not move.
+    pub fn rekey_with_suite(
+        &mut self,
+        suite: CipherSuite,
+        key: [u8; KEY_LEN],
+        nonce_base: [u8; NONCE_LEN],
+    ) {
         self.key.zeroize();
         self.nonce_base.zeroize();
         self.key = key;
         self.nonce_base = nonce_base;
         self.sequence = 0;
-        self.cipher = chacha20_poly1305_key(&key);
+        self.suite = suite;
+        self.cipher = make_cipher(suite, &key);
         self.protect_secret_memory();
     }
 
@@ -610,6 +672,42 @@ mod tests {
             dec.open(&ciphertext, b"tls-appdata"),
             Err(SessionError::Aead)
         ));
+    }
+
+    #[test]
+    fn aes256_gcm_round_trips_and_differs_from_chacha() {
+        let key = [7_u8; KEY_LEN];
+        let nonce = [9_u8; NONCE_LEN];
+
+        // AES-256-GCM round-trips.
+        let mut enc = AeadCodec::new_with_suite(CipherSuite::Aes256Gcm, key, nonce);
+        let mut dec = AeadCodec::new_with_suite(CipherSuite::Aes256Gcm, key, nonce);
+        let ct = enc.seal(b"payload", b"tls-appdata").unwrap();
+        assert_eq!(dec.open(&ct, b"tls-appdata").unwrap(), b"payload");
+
+        // Same key/nonce/plaintext under ChaCha yields different ciphertext, and
+        // a ChaCha codec cannot open an AES record: the suite really swaps the
+        // cipher core (no silent cross-suite acceptance).
+        let mut chacha = AeadCodec::new_with_suite(CipherSuite::ChaCha20Poly1305, key, nonce);
+        let chacha_ct = chacha.seal(b"payload", b"tls-appdata").unwrap();
+        assert_ne!(
+            ct, chacha_ct,
+            "AES-GCM and ChaCha must differ for same inputs"
+        );
+        let mut chacha_dec = AeadCodec::new_with_suite(CipherSuite::ChaCha20Poly1305, key, nonce);
+        assert!(matches!(
+            chacha_dec.open(&ct, b"tls-appdata"),
+            Err(SessionError::Aead)
+        ));
+
+        // rekey_with_suite moves an existing (ChaCha) codec onto AES and the
+        // rekeyed stream round-trips against an AES peer.
+        let mut codec = AeadCodec::new(key, nonce);
+        codec.rekey_with_suite(CipherSuite::Aes256Gcm, [3_u8; KEY_LEN], [4_u8; NONCE_LEN]);
+        let mut peer =
+            AeadCodec::new_with_suite(CipherSuite::Aes256Gcm, [3_u8; KEY_LEN], [4_u8; NONCE_LEN]);
+        let rk = codec.seal(b"after-rekey", b"tls-appdata").unwrap();
+        assert_eq!(peer.open(&rk, b"tls-appdata").unwrap(), b"after-rekey");
     }
 
     #[test]
