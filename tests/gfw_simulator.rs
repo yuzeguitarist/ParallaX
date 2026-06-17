@@ -211,6 +211,73 @@ fn chrome_like_burst_lengths() -> Vec<LengthObservation> {
         .collect()
 }
 
+/// Data-plane stealth gate (offline form of the planned netmatrix_stealth_parity):
+/// the REAL per-record length series the AEAD data plane emits must not match a
+/// known-proxy centroid, and switching the negotiated cipher suite
+/// (ChaCha20-Poly1305 vs AES-256-GCM) must NOT move that series at all -- both
+/// AEADs share the 12-byte nonce / 16-byte tag / record framing. This guards every
+/// record-sizing/cipher change (A2 zero-copy, A10 AES-GCM, future shaping) against
+/// an indistinguishability regression on the length channel.
+#[test]
+fn data_plane_record_lengths_stay_non_proxy_across_cipher_suites() {
+    use crate::gfw_sim::detection::burst_statistics::{BurstDetector, BurstVerdict};
+    use parallax::crypto::session::CipherSuite;
+
+    // A representative client->server transfer: a small Connect-sized record, a
+    // bulk body that chunks into full max-size records, then small interactive
+    // writes -- the shape an HTTP request + response body produces.
+    let payloads: Vec<Vec<u8>> = vec![
+        vec![0x11; 512],
+        vec![0x22; 16 * 1024],
+        vec![0x22; 16 * 1024],
+        vec![0x22; 9 * 1024],
+        vec![0x33; 280],
+        vec![0x33; 64],
+    ];
+
+    let lengths_for = |suite: CipherSuite| -> Vec<usize> {
+        let padding = PaddingProfile::new(0, 0).expect("zero padding");
+        let mut codec = DataRecordCodec::new(
+            AeadCodec::new_with_suite(suite, [7_u8; 32], [9_u8; 12]),
+            padding,
+            SERVER_TO_CLIENT_AAD,
+        );
+        let mut rng = StdRng::seed_from_u64(0xD47A);
+        let mut out = Vec::new();
+        for payload in &payloads {
+            for record in codec.seal_chunks(payload, &mut rng).expect("seal chunks") {
+                out.push(record.len() - TLS_HEADER_LEN - AEAD_TAG_LEN);
+            }
+        }
+        out
+    };
+
+    let chacha_lengths = lengths_for(CipherSuite::ChaCha20Poly1305);
+    let aes_lengths = lengths_for(CipherSuite::Aes256Gcm);
+    assert_eq!(
+        chacha_lengths, aes_lengths,
+        "AES-256-GCM must produce byte-identical record lengths to ChaCha"
+    );
+
+    let start = Instant::now();
+    let series: Vec<LengthObservation> = chacha_lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &length)| LengthObservation {
+            length,
+            at: start + Duration::from_millis(i as u64),
+            client_to_server: true,
+        })
+        .collect();
+    assert!(!series.is_empty(), "length series must be non-empty");
+
+    let verdict = BurstDetector::default().evaluate(&series);
+    assert!(
+        !matches!(verdict, BurstVerdict::LooksLikeProxy { .. }),
+        "data-plane record lengths must not match a proxy centroid: {verdict:?}"
+    );
+}
+
 fn test_flow_key() -> FlowKey {
     FlowKey {
         client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11)),
