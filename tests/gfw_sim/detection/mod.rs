@@ -17,6 +17,9 @@
 //!   gfw.report 2024 QUIC SNI study and RFC 9001.
 //! - [`burst_statistics`]: chi-squared 3-gram + Mahalanobis bursts;
 //!   Xue et al. NDSS 2022, "Towards Fingerprinting Proxies".
+//! - [`cross_flow`]: cross-flow connection-topology correlation (one source ->
+//!   many destinations near-simultaneously); guards multipath/fleet designs
+//!   against fan-out tells the per-flow layers above are blind to.
 //! - [`active_prober`]: active-probing infrastructure;
 //!   Fifield 2015, Alice 2020, and Frolov 2020.
 //! - [`tcp_dual_mb`]: dual middlebox MB-RA + MB-R state machine;
@@ -24,6 +27,7 @@
 
 pub mod active_prober;
 pub mod burst_statistics;
+pub mod cross_flow;
 pub mod dns_inject;
 pub mod fully_encrypted;
 pub mod http_host;
