@@ -1351,6 +1351,46 @@ mod tests {
         assert_eq!(opened, payload);
     }
 
+    /// Property test (seeded, no extra deps): random payloads spanning one to
+    /// several records, with random padding profiles and both AADs, must
+    /// round-trip byte-for-byte through the real chunked seal -> concat open
+    /// path. Locks the core AEAD record contract the relay/seal optimizations
+    /// build on (padding RNG draw, chunk boundaries, in-place open).
+    #[test]
+    fn random_payloads_round_trip_through_seal_and_open() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        for seed in 0..120u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let key = [seed as u8; KEY_LEN];
+            let nonce = [seed.wrapping_mul(7) as u8; NONCE_LEN];
+            let max_pad = rng.gen_range(0..=512u16);
+            let min_pad = rng.gen_range(0..=max_pad);
+            let padding = PaddingProfile::new(min_pad, max_pad).unwrap();
+            let len = rng.gen_range(1..=80 * 1024usize);
+            let payload: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+            let aad = if seed % 2 == 0 {
+                CLIENT_TO_SERVER_AAD
+            } else {
+                SERVER_TO_CLIENT_AAD
+            };
+
+            let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, aad);
+            let mut seal_rng = StdRng::seed_from_u64(seed ^ 0x5050);
+            let mut sealed = Vec::new();
+            enc.seal_chunks_into_untracked(&payload, &mut seal_rng, &mut sealed)
+                .unwrap();
+
+            let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, aad);
+            let mut opened = Vec::new();
+            dec.open_concat_records(&mut sealed, &mut opened).unwrap();
+            assert_eq!(
+                opened, payload,
+                "seed {seed}: round-trip must reconstruct payload"
+            );
+        }
+    }
+
     #[test]
     fn parallel_open_matches_serial_open_across_many_records() {
         let key = [5_u8; KEY_LEN];
