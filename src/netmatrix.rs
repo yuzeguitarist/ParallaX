@@ -18,6 +18,16 @@
 //! need the Linux netns + `tc qdisc netem` arm, which is a separate slice; this
 //! `--emulated` shaper covers latency and bandwidth, which are reproducible on
 //! any one machine including macOS dev.
+//!
+//! A second caveat is directional. The shaper paces BOTH directions correctly
+//! (the read side admits at the cap; see `shaper_caps_upload_direction_throughput`),
+//! and the **download** figure is trustworthy because `plx speed` measures it as
+//! the client's *read* rate, which the shaper gates directly. The **upload**
+//! figure, however, is the client's *write-completion* time, which over-reads
+//! when the OS TCP send buffer absorbs the (small) upload sample before the
+//! paced shaper backpressures it — so a capped cell can report well above the
+//! cap. Treat emulated upload as a loose upper bound; an exact upload rate needs
+//! server-receive-time accounting in `speed`, tracked separately.
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -131,11 +141,21 @@ where
     let (tx, mut rx) = mpsc::channel::<(Instant, Vec<u8>)>(1024);
 
     let read_task = tokio::spawn(async move {
+        // Pace ADMISSION to the link (ingress) rather than the egress write.
+        // Egress pacing lets the reader drain the source into the channel
+        // unthrottled, so an UPLOAD's client-side write completes at buffer
+        // speed and the measured rate ignores the bandwidth cap. Pacing the
+        // ingress backpressures the source symmetrically, so both directions
+        // measure the configured cap. The delay line below still decouples
+        // latency from throughput (a paced-in chunk is held half_rtt, but
+        // reads keep admitting at the cap rate).
+        let mut bucket = TokenBucket::new(imp.bandwidth_mbit);
         let mut buf = vec![0_u8; 32 * 1024];
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    bucket.consume(n).await;
                     let deliver_at = Instant::now() + half_rtt;
                     if tx.send((deliver_at, buf[..n].to_vec())).await.is_err() {
                         break;
@@ -145,10 +165,8 @@ where
         }
     });
 
-    let mut bucket = TokenBucket::new(imp.bandwidth_mbit);
     while let Some((deliver_at, chunk)) = rx.recv().await {
         sleep_until(deliver_at).await;
-        bucket.consume(chunk.len()).await;
         if writer.write_all(&chunk).await.is_err() {
             break;
         }
@@ -428,5 +446,51 @@ mod tests {
             elapsed >= Duration::from_millis(400) && elapsed <= Duration::from_millis(900),
             "10 Mbit/s should pace 6x125KB to ~0.5s, saw {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn shaper_caps_upload_direction_throughput() {
+        // A draining sink upstream: the client -> server (upload) direction is
+        // the one whose pacing we are checking. Before the ingress-pacing fix
+        // this finished near-instantly (the reader buffered the whole payload
+        // into the channel), so the measured upload rate ignored the cap.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut total = 0usize;
+            let mut buf = vec![0_u8; 64 * 1024];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+            }
+            let _ = done_tx.send(total);
+        });
+
+        let imp = Impairment {
+            label: "t",
+            rtt_ms: 0,
+            bandwidth_mbit: Some(20),
+        };
+        let (shaper_addr, shaper) = spawn_shaper(addr.to_string(), imp).await.unwrap();
+
+        let mut c = TcpStream::connect(shaper_addr).await.unwrap();
+        let payload = vec![0x5a_u8; 2 * 1024 * 1024]; // 2 MiB
+        let start = std::time::Instant::now();
+        c.write_all(&payload).await.unwrap();
+        c.shutdown().await.unwrap();
+        let total = done_rx.await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(total, payload.len(), "sink must receive every byte");
+        // 20 Mbit/s = 2.5 MB/s; 2 MiB paced is ~0.84s. The cap must bite in the
+        // upload direction, so this cannot complete in a small fraction of that.
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "upload must be paced to ~20 Mbit/s, finished in {elapsed:?}"
+        );
+        shaper.abort();
     }
 }
