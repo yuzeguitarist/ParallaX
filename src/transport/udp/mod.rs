@@ -729,4 +729,77 @@ mod tests {
             "BDP-sized window worst-case ({prod_worst:.2} MB/s) must beat old 1.25MB clean ({old_clean:.2} MB/s)"
         );
     }
+
+    /// Same bounds + window as `relay_test_transport`, but quinn's DEFAULT
+    /// congestion controller (Cubic) rather than BBR, so the harness can measure
+    /// the loss response that motivates the BBR choice.
+    fn relay_test_transport_cubic(window: u32) -> Arc<quinn::TransportConfig> {
+        let mut t = quinn::TransportConfig::default();
+        t.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
+        t.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        t.receive_window(quinn::VarInt::from_u32(window));
+        t.stream_receive_window(quinn::VarInt::from_u32(window));
+        Arc::new(t)
+    }
+
+    /// Measure MB/s actually delivered within `cap` (timed from the first byte,
+    /// so the initial RTT is excluded). The right tool when a controller
+    /// collapses: a fixed-SIZE transfer would take minutes at ~0.05 MB/s.
+    async fn download_rate_in_window(
+        client: &Connection,
+        server: &Connection,
+        cap: Duration,
+    ) -> f64 {
+        let server = server.clone();
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut send, _recv)) = server.accept_bi().await {
+                let chunk = vec![0xAB_u8; 64 * 1024];
+                while send.write_all(&chunk).await.is_ok() {} // until flow-control/close
+            }
+        });
+        let (mut _kick, mut recv) = client.open_bi().await.expect("open_bi");
+        _kick.write_all(b"go").await.expect("kick");
+        let mut buf = vec![0_u8; 64 * 1024];
+        // Block for the first byte so the initial RTT is excluded from the rate.
+        let mut got = recv.read(&mut buf).await.expect("read").unwrap_or(0);
+        let start = Instant::now();
+        while start.elapsed() < cap {
+            match tokio::time::timeout(cap - start.elapsed(), recv.read(&mut buf)).await {
+                Ok(Ok(Some(read))) => got += read,
+                _ => break,
+            }
+        }
+        let secs = start.elapsed().as_secs_f64();
+        server_task.abort();
+        (got as f64 / 1_048_576.0) / secs.max(1e-6)
+    }
+
+    /// Evidence for the BBR choice (mod.rs:144): on a lossy cross-border path
+    /// Cubic reads every random loss as congestion and collapses its window,
+    /// while BBR's model-based rate holds up. With the BDP window in place, this
+    /// isolates the congestion-controller's loss response. Heavy; `--ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "heavy QUIC network-emulation benchmark; run with --ignored"]
+    async fn quic_bbr_beats_cubic_under_cross_border_loss() {
+        let delay = Duration::from_millis(80); // ~160 ms RTT
+        let loss = 0.03; // 3% — the worst modeled cross-border loss
+        let window = UDP_FLOW_CONTROL_WINDOW;
+        let cap = Duration::from_secs(8);
+
+        let (_se1, _ce1, cc1, sc1, r1) =
+            relay_pair(relay_test_transport(window), delay, loss, 0xB0BB).await;
+        let bbr = download_rate_in_window(&cc1, &sc1, cap).await;
+        r1.abort();
+
+        let (_se2, _ce2, cc2, sc2, r2) =
+            relay_pair(relay_test_transport_cubic(window), delay, loss, 0xB0BB).await;
+        let cubic = download_rate_in_window(&cc2, &sc2, cap).await;
+        r2.abort();
+
+        println!("rtt=160ms loss=3.0% (8s window)  BBR={bbr:.2} MB/s  Cubic={cubic:.2} MB/s");
+        assert!(
+            bbr > cubic * 2.0,
+            "BBR ({bbr:.2}) must clearly beat Cubic ({cubic:.2}) under cross-border loss"
+        );
+    }
 }
