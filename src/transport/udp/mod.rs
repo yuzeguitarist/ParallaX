@@ -598,12 +598,17 @@ mod tests {
         delay: Duration,
         loss: f64,
         seed: u64,
-    ) -> (Endpoint, Endpoint, Connection, Connection, tokio::task::JoinHandle<()>) {
+    ) -> (
+        Endpoint,
+        Endpoint,
+        Connection,
+        Connection,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (cert, key) = self_signed_cert();
         let mut server_cfg = server_config(cert, key).unwrap();
         server_cfg.transport_config(transport.clone());
-        let server_endpoint =
-            Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_endpoint = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
 
         let (relay_addr, relay) = delay_loss_relay(server_addr, delay, loss, seed).await;
