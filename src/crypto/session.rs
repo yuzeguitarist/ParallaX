@@ -711,6 +711,96 @@ mod tests {
     }
 
     #[test]
+    fn aes256_gcm_codec_matches_independent_impl() {
+        // Cross-implementation KAT: the aws-lc-rs-backed AES-256-GCM codec must
+        // produce byte-identical ciphertext||tag to the independent RustCrypto
+        // `aes-gcm` crate for the same key/nonce/AAD/plaintext. Validates the
+        // negotiated suite is genuinely standard AES-256-GCM, checked against a
+        // second implementation rather than only round-tripping against itself.
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        let key = [0x11_u8; KEY_LEN];
+        let nonce_base = [0x22_u8; NONCE_LEN];
+        let aad = b"parallax-aad";
+        let plaintext = b"verify AES-256-GCM against a second implementation";
+
+        // Fresh codec -> sequence 0 -> record nonce == nonce_base.
+        let mut codec = AeadCodec::new_with_suite(CipherSuite::Aes256Gcm, key, nonce_base);
+        let mine = codec.seal(plaintext, aad).unwrap();
+
+        let independent = Aes256Gcm::new_from_slice(&key).unwrap();
+        let theirs = independent
+            .encrypt(
+                Nonce::from_slice(&nonce_base),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            mine, theirs,
+            "AeadCodec AES-256-GCM must match an independent AES-256-GCM implementation"
+        );
+    }
+
+    #[test]
+    fn aes256_gcm_never_reuses_a_nonce() {
+        // GCM nonce reuse is catastrophic, so prove the per-record counter drives
+        // a distinct nonce per record: identical plaintext re-encrypts differently,
+        // and each record matches an independent AES-256-GCM keyed identically at
+        // exactly nonce_base ^ sequence -- confirming the counter, not a fixed
+        // nonce, is in effect.
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        let key = [0x33_u8; KEY_LEN];
+        let nonce_base = [0x44_u8; NONCE_LEN];
+        let aad = b"aad";
+        let mut codec = AeadCodec::new_with_suite(CipherSuite::Aes256Gcm, key, nonce_base);
+        let first = codec.seal(b"same plaintext", aad).unwrap();
+        let second = codec.seal(b"same plaintext", aad).unwrap();
+        assert_ne!(
+            first, second,
+            "AES-256-GCM must advance the nonce so identical plaintext differs"
+        );
+
+        let nonce0 = record_nonce_from(&nonce_base, 0);
+        let nonce1 = record_nonce_from(&nonce_base, 1);
+        assert_ne!(nonce0, nonce1, "per-record nonces must differ");
+
+        let independent = Aes256Gcm::new_from_slice(&key).unwrap();
+        let rc0 = independent
+            .encrypt(
+                Nonce::from_slice(&nonce0),
+                Payload {
+                    msg: b"same plaintext",
+                    aad,
+                },
+            )
+            .unwrap();
+        let rc1 = independent
+            .encrypt(
+                Nonce::from_slice(&nonce1),
+                Payload {
+                    msg: b"same plaintext",
+                    aad,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            first, rc0,
+            "record 0 must equal AES-256-GCM at nonce_base^0"
+        );
+        assert_eq!(
+            second, rc1,
+            "record 1 must equal AES-256-GCM at nonce_base^1"
+        );
+    }
+
+    #[test]
     fn aead_opens_in_place() {
         let key = [7_u8; KEY_LEN];
         let nonce = [9_u8; NONCE_LEN];
