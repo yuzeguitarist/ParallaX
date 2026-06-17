@@ -658,6 +658,34 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_suite_byte_is_aead_protected_against_downgrade() {
+        // The server signals the data-plane suite in the AEAD-sealed
+        // ServerKeyExchange. A MITM cannot flip the suite (AES <-> ChaCha) without
+        // breaking the AEAD tag, so the negotiation fails closed (DoS at worst),
+        // never a silent downgrade.
+        let key = [0x55_u8; 32];
+        let nonce = [0x66_u8; NONCE_LEN];
+        let ske = ServerKeyExchange {
+            server_x25519_public: [0x77_u8; 32],
+            mlkem_ciphertext: vec![0x88_u8; 64],
+        };
+        let plaintext = ske.encode_with_suite(CipherSuite::Aes256Gcm).unwrap();
+        let suite_pos = plaintext.len() - 1; // the suite tag is the last plaintext byte
+
+        let mut enc = AeadCodec::new(key, nonce);
+        let mut sealed = enc.seal(&plaintext, CLIENT_TO_SERVER_AAD).unwrap();
+        sealed[suite_pos] ^= 1; // flip the ciphertext byte carrying the suite tag
+        let mut dec = AeadCodec::new(key, nonce);
+        assert!(
+            matches!(
+                dec.open(&sealed, CLIENT_TO_SERVER_AAD),
+                Err(SessionError::Aead)
+            ),
+            "tampering the sealed suite byte must fail the AEAD, blocking a downgrade"
+        );
+    }
+
+    #[test]
     fn server_identity_rejects_proof_from_different_pq_rekey() {
         let keys = SessionKeys {
             client_key: [9_u8; 32],
