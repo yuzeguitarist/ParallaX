@@ -334,4 +334,33 @@ mod tests {
         std::panic::set_hook(prev);
         assert!(r.is_err());
     }
+
+    #[test]
+    fn run_ordered_is_correct_under_concurrent_submitters() {
+        // Hammer the shared pool from many threads at once: this is the real
+        // cross-tunnel contract the A3 batched submit must satisfy. Each call's
+        // results must stay correctly ordered and routed to its own caller, with
+        // no lost wakeup and no cross-call mixing, even while other threads are
+        // enqueueing concurrently onto the same global pool.
+        use std::sync::Arc;
+        use std::thread;
+
+        let pool = Arc::new(CryptoPool::new(4));
+        let mut handles = Vec::new();
+        for t in 0..8usize {
+            let pool = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                for round in 0..200usize {
+                    let base = t * 100_000 + round * 16;
+                    let jobs: Vec<_> = (0..16usize).map(|i| move || base + i).collect();
+                    let out = pool.run_ordered(jobs);
+                    let want: Vec<usize> = (0..16).map(|i| base + i).collect();
+                    assert_eq!(out, want, "thread {t} round {round}: wrong/mixed results");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 }
