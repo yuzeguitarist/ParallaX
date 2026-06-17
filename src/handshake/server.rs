@@ -943,6 +943,7 @@ async fn relay_fallback_with_idle_timeout(
             // native threads), which scales without per-relay threads.
             if let Some(_splice_slot) = crate::transport::tcp::try_enter_kernel_splice_relay() {
                 tracing::debug!("using Linux splice(2) kernel relay for fallback TCP tunnel");
+                crate::transport::tcp::record_kernel_splice_relay();
                 return crate::transport::tcp::relay_kernel_splice_bidirectional_with_idle_timeout(
                     client,
                     fallback,
@@ -954,8 +955,12 @@ async fn relay_fallback_with_idle_timeout(
             tracing::debug!(
                 "kernel splice relay cap reached; using userspace fallback relay instead"
             );
+            crate::transport::tcp::record_userspace_cap_hit_relay();
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    crate::transport::tcp::record_userspace_non_linux_relay();
 
     let (mut client_read, mut client_write) = client.into_split();
     let (mut fallback_read, mut fallback_write) = fallback.into_split();

@@ -3,7 +3,7 @@ use std::time::Duration;
 use std::{
     io,
     net::SocketAddr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use tokio::{
@@ -57,6 +57,40 @@ impl Drop for ExtraConnectGuard {
 const MAX_CONCURRENT_KERNEL_SPLICE_RELAYS: usize = 256;
 #[cfg(target_os = "linux")]
 static ACTIVE_KERNEL_SPLICE_RELAYS: AtomicUsize = AtomicUsize::new(0);
+
+/// Path-attribution counters for fallback relays: how often the zero-copy kernel
+/// splice path was taken vs forced to userspace, and why. Observability only --
+/// no behavior change. Read via [`splice_path_stats`]; the relay decision in
+/// `handshake::server::relay_fallback_with_idle_timeout` records into them.
+static SPLICE_KERNEL_TAKEN: AtomicU64 = AtomicU64::new(0);
+static SPLICE_USERSPACE_CAP_HIT: AtomicU64 = AtomicU64::new(0);
+static SPLICE_USERSPACE_NON_LINUX: AtomicU64 = AtomicU64::new(0);
+
+/// Records that a fallback relay took the zero-copy kernel splice(2) path.
+pub fn record_kernel_splice_relay() {
+    SPLICE_KERNEL_TAKEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records that a fallback relay was forced to userspace because the kernel
+/// splice cap was reached.
+pub fn record_userspace_cap_hit_relay() {
+    SPLICE_USERSPACE_CAP_HIT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records that a fallback relay used userspace because the platform has no
+/// kernel splice (non-Linux).
+pub fn record_userspace_non_linux_relay() {
+    SPLICE_USERSPACE_NON_LINUX.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(kernel_splice_taken, userspace_cap_hit, userspace_non_linux)` since start.
+pub fn splice_path_stats() -> (u64, u64, u64) {
+    (
+        SPLICE_KERNEL_TAKEN.load(Ordering::Relaxed),
+        SPLICE_USERSPACE_CAP_HIT.load(Ordering::Relaxed),
+        SPLICE_USERSPACE_NON_LINUX.load(Ordering::Relaxed),
+    )
+}
 
 /// RAII slot for a kernel-splice relay; releases the slot on drop.
 #[cfg(target_os = "linux")]
@@ -760,6 +794,18 @@ mod kernel_splice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splice_path_stats_counts_each_path() {
+        let before = splice_path_stats();
+        record_kernel_splice_relay();
+        record_userspace_cap_hit_relay();
+        record_userspace_non_linux_relay();
+        let after = splice_path_stats();
+        assert_eq!(after.0, before.0 + 1, "kernel-splice counter");
+        assert_eq!(after.1, before.1 + 1, "userspace cap-hit counter");
+        assert_eq!(after.2, before.2 + 1, "userspace non-linux counter");
+    }
 
     #[test]
     fn relay_connection_limit_reserves_process_fds() {
