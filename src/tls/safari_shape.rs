@@ -48,23 +48,11 @@ pub(crate) const SIG_ECDSA_SHA1: u16 = 0x0201;
 pub(crate) const MLKEM768_PUBLIC_KEY_LEN: usize = 1184;
 pub(crate) const X25519_KEY_LEN: usize = 32;
 
-// Extension codepoints used as raw-extension types in the H3 plan, consumed by
-// `safari_h3_ch_profile` (the default QUIC client backend, S6).
-const EXT_EXTENDED_MASTER_SECRET: u16 = 0x0017;
-const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
-
 /// Standard GREASE values from RFC 8701.
 pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
     0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
     0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
-
-/// CAPTURE SWITCH: emit `extended_master_secret` (0x17) and
-/// `renegotiation_info` (0xff01) on the H3 path to match the TCP fixture. A real
-/// Safari-26 H3 capture may show these are dropped on the pure-1.3 QUIC path; if
-/// so, flip this to `false`. Gated on STRUCTURE only — never assert their
-/// presence/absence in tests beyond this switch.
-pub(crate) const SAFARI_H3_EMIT_LEGACY_EXTS: bool = true;
 
 /// GREASE codepoints chosen for one ClientHello: distinct values for the cipher,
 /// the first (len-0) extension, the supported_groups/key_share/supported_versions
@@ -203,6 +191,18 @@ pub(crate) fn supported_versions_extension(grease_version: u16) -> Vec<u8> {
     out
 }
 
+/// `supported_versions` body for the H3/QUIC path: GREASE-led, then **TLS 1.3
+/// only** (no TLS 1.2). QUIC pins min=max=TLS1.3, so Safari's QUIC ClientHello
+/// drops 0x0303 — unlike the TCP path's [`supported_versions_extension`], which
+/// still offers TLS 1.2.
+pub(crate) fn supported_versions_extension_h3(grease_version: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5);
+    out.push(4);
+    out.extend_from_slice(&grease_version.to_be_bytes());
+    out.extend_from_slice(&TLS13.to_be_bytes());
+    out
+}
+
 // --- QUIC/H3 typed profile ---------------------------------------------------
 
 /// Assemble the exact Safari-26 H3 ClientHello shape as a typed
@@ -210,6 +210,12 @@ pub(crate) fn supported_versions_extension(grease_version: u16) -> Vec<u8> {
 ///
 /// COLD-START only: `psk_key_exchange_modes` is present (a `Managed` extension),
 /// but `pre_shared_key` and `early_data` are absent (`Resumption::disabled()`).
+///
+/// QUIC drops two extensions the TCP Safari hello carries: `extended_master_secret`
+/// (0x17) and `renegotiation_info` (0xff01). QUIC pins min=max=TLS1.3 and both
+/// extensions' send-gate is min<=TLS1.2, so they never appear on the pure-1.3 QUIC
+/// path — and `supported_versions` advertises GREASE + 0x0304 only (no TLS 1.2),
+/// via [`supported_versions_extension_h3`].
 ///
 /// Structurally-load-bearing extensions whose exact bytes matter — the GREASE
 /// pair, the GREASE-led `supported_groups`/`supported_versions`, and the
@@ -225,12 +231,6 @@ pub(crate) fn safari_h3_ch_profile(grease: GreaseSet) -> SafariChProfile {
     // Leading GREASE, len 0.
     plan.push(SafariExt::Raw(grease.extension, Vec::new()));
     plan.push(SafariExt::Managed(ExtensionType::ServerName));
-
-    // Capture-gated legacy extensions (match the TCP fixture; see switch above).
-    if SAFARI_H3_EMIT_LEGACY_EXTS {
-        plan.push(SafariExt::Raw(EXT_EXTENDED_MASTER_SECRET, Vec::new()));
-        plan.push(SafariExt::Raw(EXT_RENEGOTIATION_INFO, vec![0x00]));
-    }
 
     plan.push(SafariExt::Raw(
         u16::from(ExtensionType::EllipticCurves),
@@ -257,7 +257,7 @@ pub(crate) fn safari_h3_ch_profile(grease: GreaseSet) -> SafariChProfile {
     plan.push(SafariExt::Managed(ExtensionType::PSKKeyExchangeModes));
     plan.push(SafariExt::Raw(
         u16::from(ExtensionType::SupportedVersions),
-        supported_versions_extension(grease.version),
+        supported_versions_extension_h3(grease.version),
     ));
     // quic_transport_parameters (0x39): Managed, carrying the opaque ascending
     // blob the QUIC Session substitutes for quinn's `params.write()`.
@@ -387,6 +387,18 @@ mod tests {
         assert!(is_grease(read_u16(&versions, 1)));
         assert_eq!(read_u16(&versions, 3), TLS13);
         assert_eq!(read_u16(&versions, 5), TLS12);
+
+        // The H3/QUIC variant is GREASE + TLS 1.3 ONLY (no TLS 1.2).
+        let versions_h3 = supported_versions_extension_h3(g.version);
+        assert_eq!(versions_h3[0] as usize + 1, versions_h3.len());
+        assert_eq!(versions_h3.len(), 5, "GREASE + 0x0304 only");
+        assert_eq!(read_u16(&versions_h3, 1), g.version);
+        assert!(is_grease(read_u16(&versions_h3, 1)));
+        assert_eq!(read_u16(&versions_h3, 3), TLS13);
+        assert!(
+            !versions_h3.chunks_exact(2).any(|c| read_u16(c, 0) == TLS12),
+            "QUIC supported_versions must NOT offer TLS 1.2"
+        );
     }
 
     #[test]
@@ -421,11 +433,11 @@ mod tests {
             _ => panic!("trailing GREASE must be Raw"),
         }
 
-        // The static Safari H3 table between the GREASE bookends.
+        // The static Safari H3 table between the GREASE bookends. The confirmed
+        // spec drops extended_master_secret (0x17) and renegotiation_info (0xff01)
+        // on the pure-1.3 QUIC path (present only on the TCP hello).
         let expected = [
             0x0000, // server_name
-            0x0017, // extended_master_secret (capture switch)
-            0xff01, // renegotiation_info (capture switch)
             0x000a, // supported_groups
             0x000b, // ec_point_formats
             0x0010, // ALPN (h3)
@@ -439,6 +451,23 @@ mod tests {
             0x001b, // compress_certificate
         ];
         assert_eq!(&order[1..order.len() - 1], &expected);
+
+        // The QUIC path drops EMS (0x17) / renegotiation_info (0xff01) entirely.
+        assert!(
+            !order.contains(&0x0017) && !order.contains(&0xff01),
+            "QUIC H3: extended_master_secret (0x17) and renegotiation_info (0xff01) must be absent"
+        );
+
+        // supported_versions advertises GREASE + 0x0304 only on the QUIC path.
+        let sv = profile
+            .extension_plan
+            .iter()
+            .find_map(|ext| match ext {
+                SafariExt::Raw(0x002b, body) => Some(body.clone()),
+                _ => None,
+            })
+            .expect("supported_versions is a Raw extension in the plan");
+        assert_eq!(sv, supported_versions_extension_h3(g.version));
 
         // Cold-start: no pre_shared_key, no early_data anywhere in the plan.
         assert!(

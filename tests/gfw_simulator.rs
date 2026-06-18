@@ -1067,18 +1067,21 @@ async fn udp_leg_initial_first_datagram_holds_only_partial_clienthello() {
 //
 // This gate drives the REAL UDP-leg QUIC client backend
 // (`parallax::transport::udp::client_config`), reassembles its multi-datagram
-// ClientHello via the in-repo RFC-9001 decryptor, and asserts STRUCTURE ONLY:
-// the 20-cipher GREASE-led list, the static Safari extension order (GREASE matched
-// by class), and the ascending `quic_transport_parameters` (0x39) id set with
-// `max_datagram_frame_size` (0x20) present and `grease_quic_bit`/`min_ack_delay`
-// omitted. It NEVER asserts transport-param VALUES, nor `extended_master_secret`
-// (0x17) / `renegotiation_info` (0xff01) presence (both capture-gated unknowns).
+// ClientHello via the in-repo RFC-9001 decryptor, and asserts the FULLY-CONFIRMED
+// Safari-26 H3 spec: the 20-cipher GREASE-led list, the static Safari extension
+// order (GREASE matched by class) with extended_master_secret (0x17) /
+// renegotiation_info (0xff01) ABSENT, supported_versions = GREASE + 0x0304 only,
+// and the ascending `quic_transport_parameters` (0x39) id set with 0x0a/0x0b/0x0c
+// OMITTED, `max_datagram_frame_size` (0x20) KEPT (the probe uses datagrams), and
+// the vendor/GREASE codepoint 0x17f7586d2cb571 LAST. It also asserts the confirmed
+// transport-param VALUES (idle=0, payload=1200, stream_data=2 MiB, bidi=0, uni=8,
+// vendor GREASE=0) — EXCEPT initial_max_data (0x04), the single runtime-read value
+// (presence only). active_connection_id_limit asserts quinn's enforced 2, not
+// Safari's 64, which quinn-proto 0.11.14 cannot honor (CidQueue::LEN=5).
 //
-// It turns GREEN only when the vendored-rustls fork + the Safari QUIC Session are
-// wired and selected (S6: production `safari_ch_profile` set in `client_config`
-// and the Safari backend made the default). Until then the stock quinn/rustls
-// backend emits a 3-suite, shuffled-extension, ascending-only-by-accident hello,
-// so the assertions below fail — exactly characterizing the fix.
+// It is GREEN once the vendored-rustls fork + the Safari QUIC Session are wired and
+// selected (production `safari_ch_profile` set in `client_config` and the Safari
+// backend made the default).
 
 /// RFC 8701 GREASE values: `0x?a?a` with both bytes equal.
 fn is_grease_u16(value: u16) -> bool {
@@ -1148,11 +1151,11 @@ fn read_quic_varint(b: &[u8]) -> Option<(u64, usize)> {
     Some((v, len))
 }
 
-/// Parse a `quic_transport_parameters` (0x39) extension body into the ordered
-/// list of parameter ids on the wire. Each entry is varint(id) || varint(len) ||
-/// value[len]; we only need the id sequence for the structural gate.
-fn parse_transport_param_ids(body: &[u8]) -> Option<Vec<u64>> {
-    let mut ids = Vec::new();
+/// Parse a `quic_transport_parameters` (0x39) body into ordered `(id, value)`
+/// pairs, so the gate can assert the confirmed parameter ids AND values. Each
+/// entry is varint(id) || varint(len) || value[len].
+fn parse_transport_params(body: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
+    let mut out = Vec::new();
     let mut p = 0;
     while p < body.len() {
         let (id, n) = read_quic_varint(&body[p..])?;
@@ -1163,10 +1166,17 @@ fn parse_transport_param_ids(body: &[u8]) -> Option<Vec<u64>> {
         if p + len > body.len() {
             return None;
         }
+        out.push((id, body[p..p + len].to_vec()));
         p += len;
-        ids.push(id);
     }
-    Some(ids)
+    Some(out)
+}
+
+/// Read a varint-valued transport parameter's value as a u64 (the confirmed
+/// standard params are all varint-encoded).
+fn tp_varint_value(params: &[(u64, Vec<u8>)], id: u64) -> Option<u64> {
+    let (_, bytes) = params.iter().find(|(qid, _)| *qid == id)?;
+    Some(read_quic_varint(bytes)?.0)
 }
 
 #[tokio::test]
@@ -1215,16 +1225,19 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         "legacy suite 0x000a must survive (no pure-1.3 pruning tell)"
     );
 
-    // 3) Extension order: the static Safari table, GREASE matched by CLASS, with
-    //    extended_master_secret (0x17) / renegotiation_info (0xff01) IGNORED
-    //    (capture-gated — never assert their presence/absence). Project the wire
-    //    order onto class tokens, drop the legacy capture-gated pair, then compare.
+    // 3) Extension order: the static Safari H3 table, GREASE matched by CLASS. The
+    //    confirmed spec DROPS extended_master_secret (0x17) and renegotiation_info
+    //    (0xff01) on the pure-1.3 QUIC path, so they must be ABSENT (not merely
+    //    ignored). Project the wire order onto class tokens, then compare.
     const TOKEN_GREASE: u16 = 0xFFFF; // sentinel class token for any GREASE codepoint
+    assert!(
+        !parsed.extensions_order.contains(&0x0017) && !parsed.extensions_order.contains(&0xff01),
+        "QUIC H3: extended_master_secret (0x17) and renegotiation_info (0xff01) must be ABSENT"
+    );
     let order: Vec<u16> = parsed
         .extensions_order
         .iter()
         .copied()
-        .filter(|&e| e != 0x0017 && e != 0xff01) // ignore EMS / reneg (capture-gated)
         .map(|e| if is_grease_u16(e) { TOKEN_GREASE } else { e })
         .collect();
     let expected_order: Vec<u16> = vec![
@@ -1245,7 +1258,7 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     ];
     assert_eq!(
         order, expected_order,
-        "extension order must be the static Safari-26 H3 table (GREASE by class, EMS/reneg ignored)"
+        "extension order must be the static Safari-26 H3 table (GREASE by class, no EMS/reneg)"
     );
     // The two GREASE bookends must be DISTINCT values (RFC 8701), and the hello is
     // cold-start: no pre_shared_key (0x29) / early_data (0x2a).
@@ -1267,12 +1280,48 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         "cold-start: pre_shared_key (0x29) and early_data (0x2a) must be absent"
     );
 
+    // 3b) supported_versions (0x2b) advertises GREASE + 0x0304 ONLY (no TLS 1.2).
+    let sv_body = extension_body(&record, 0x002b).expect("supported_versions (0x2b) present");
+    // Body: [list_len(1)] then 2-byte versions. Expect exactly two: GREASE, 0x0304.
+    assert!(!sv_body.is_empty(), "supported_versions body non-empty");
+    let sv_list_len = sv_body[0] as usize;
+    assert_eq!(
+        sv_list_len + 1,
+        sv_body.len(),
+        "supported_versions inner length prefix must cover the body"
+    );
+    let sv_versions: Vec<u16> = sv_body[1..]
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(
+        sv_versions.len(),
+        2,
+        "QUIC supported_versions must be GREASE + 0x0304 only; got {sv_versions:#06x?}"
+    );
+    assert!(
+        is_grease_u16(sv_versions[0]),
+        "supported_versions must lead with GREASE"
+    );
+    assert_eq!(
+        sv_versions[1], 0x0304,
+        "supported_versions must offer TLS 1.3"
+    );
+    assert!(
+        !sv_versions.contains(&0x0303),
+        "QUIC supported_versions must NOT offer TLS 1.2 (0x0303)"
+    );
+
     // 4) quic_transport_parameters (0x39): present, ids strictly ascending, the
-    //    exact Safari id set, 0x20 present, grease_quic_bit/min_ack_delay omitted.
-    //    Structure only — NEVER assert the parameter VALUES.
+    //    exact confirmed Safari id set with 0x0a/0x0b/0x0c and 0x20 ABSENT and the
+    //    vendor/GREASE codepoint 0x17f7586d2cb571 LAST. The confirmed VALUES are
+    //    asserted too — EXCEPT initial_max_data (0x04), whose number is the single
+    //    runtime-read value (assert presence only).
+    const VENDOR_GREASE_TP: u64 = 0x17f7586d2cb571;
     let tp_body =
         extension_body(&record, 0x0039).expect("quic_transport_parameters (0x39) present");
-    let tp_ids = parse_transport_param_ids(&tp_body).expect("0x39 body parses as TP id list");
+    let tp = parse_transport_params(&tp_body).expect("0x39 body parses as TP list");
+    let tp_ids: Vec<u64> = tp.iter().map(|(id, _)| *id).collect();
     for w in tp_ids.windows(2) {
         assert!(
             w[0] < w[1],
@@ -1283,15 +1332,40 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         );
     }
     let expected_tp_ids: Vec<u64> = vec![
-        0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0e, 0x0f, 0x20,
+        0x01,
+        0x03,
+        0x04,
+        0x05,
+        0x06,
+        0x07,
+        0x08,
+        0x09,
+        0x0e,
+        0x0f,
+        0x20,
+        VENDOR_GREASE_TP,
     ];
     assert_eq!(
         tp_ids, expected_tp_ids,
-        "transport-param id set must be exactly Safari's ascending set"
+        "transport-param id set must be the confirmed Safari ascending set (no 0x0a/0x0b/0x0c, vendor GREASE last)"
     );
+    for dropped in [0x0a_u64, 0x0b, 0x0c] {
+        assert!(
+            !tp_ids.contains(&dropped),
+            "transport-param {dropped:#x} must be omitted per the confirmed spec"
+        );
+    }
+    // max_datagram_frame_size (0x20) is KEPT: ParallaX's reachability probe uses
+    // QUIC datagrams, so per the spec's "send 0x20 only if datagrams are used" rule
+    // it must be present (and quinn must advertise it or the probe breaks).
     assert!(
         tp_ids.contains(&0x20),
-        "max_datagram_frame_size (0x20) is the Apple/libquic signature and must be present"
+        "max_datagram_frame_size (0x20) must be present (probe uses datagrams)"
+    );
+    assert_eq!(
+        *tp_ids.last().unwrap(),
+        VENDOR_GREASE_TP,
+        "the vendor/GREASE transport parameter must sort LAST"
     );
     assert!(
         !tp_ids.contains(&0x2ab2),
@@ -1300,5 +1374,61 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     assert!(
         !tp_ids.contains(&0xff04de1b),
         "min_ack_delay (0xff04de1b) must be omitted"
+    );
+
+    // Confirmed VALUES (initial_max_data 0x04 excepted — runtime value, presence
+    // only; initial_source_connection_id 0x0f is the dynamic SCID, presence only).
+    assert_eq!(
+        tp_varint_value(&tp, 0x01),
+        Some(0),
+        "max_idle_timeout must be 0"
+    );
+    assert_eq!(
+        tp_varint_value(&tp, 0x03),
+        Some(1200),
+        "max_udp_payload_size must be 1200"
+    );
+    assert!(
+        tp.iter().any(|(id, _)| *id == 0x04),
+        "initial_max_data (0x04) must be present (value not asserted — runtime)"
+    );
+    for stream_id in [0x05_u64, 0x06, 0x07] {
+        assert_eq!(
+            tp_varint_value(&tp, stream_id),
+            Some(2 * 1024 * 1024),
+            "initial_max_stream_data ({stream_id:#x}) must be 2 MiB"
+        );
+    }
+    assert_eq!(
+        tp_varint_value(&tp, 0x08),
+        Some(0),
+        "initial_max_streams_bidi must be 0"
+    );
+    assert_eq!(
+        tp_varint_value(&tp, 0x09),
+        Some(8),
+        "initial_max_streams_uni must be 8"
+    );
+    // active_connection_id_limit: the confirmed Safari value is 64, but quinn-proto
+    // 0.11.14 cannot honor it (hardcoded CidQueue::LEN=5, no public setter), so the
+    // carrier advertises quinn's real enforced 2 to keep the relay working. Assert
+    // the actual advertised value (2), not Safari's unreachable 64.
+    assert_eq!(
+        tp_varint_value(&tp, 0x0e),
+        Some(2),
+        "active_connection_id_limit must be quinn's enforced 2 (Safari's 64 is unreachable)"
+    );
+    assert!(
+        tp.iter().any(|(id, _)| *id == 0x0f),
+        "initial_source_connection_id (0x0f) must be present (dynamic SCID)"
+    );
+    assert!(
+        tp.iter().any(|(id, _)| *id == 0x20),
+        "max_datagram_frame_size (0x20) must be present (value is quinn's datagram value)"
+    );
+    assert_eq!(
+        tp_varint_value(&tp, VENDOR_GREASE_TP),
+        Some(0),
+        "vendor/GREASE transport parameter value must be 0"
     );
 }

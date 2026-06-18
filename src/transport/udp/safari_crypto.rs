@@ -325,61 +325,104 @@ fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {
     }
 }
 
-/// The Safari-26 H3 `0x39` transport-parameter id set, in STRICT ASCENDING
-/// order (the Apple/libquic signature; see the H3 spec). The presence of `0x20`
-/// (`max_datagram_frame_size`) at the end is part of that signature.
+/// `initial_max_data` (0x04) — the SINGLE runtime-read transport-param value in
+/// the Safari-26 H3 blob. The confirmed spec ties it to the connection-level
+/// receive window; 16 MiB matches CFNetwork/libquic. quinn's real
+/// `udp_transport_config` advertises the same number so the wire bytes EQUAL the
+/// enforced behaviour (no advertised-vs-actual gap).
+pub(crate) const SAFARI_TP_INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
+
+/// Per-stream flow-control window (0x05/0x06/0x07) — 2 MiB each, the confirmed
+/// libquic value. Mirrored by quinn's `stream_receive_window`.
+pub(crate) const SAFARI_TP_INITIAL_MAX_STREAM_DATA: u64 = 2 * 1024 * 1024;
+
+/// `active_connection_id_limit` (0x0e). The confirmed Safari value is 64, but
+/// quinn-proto 0.11.14 hardcodes its remote-CID queue to `CidQueue::LEN = 5` and
+/// its own `active_connection_id_limit` to 2 with NO public setter, so advertising
+/// 64 makes a stock-quinn peer issue `min(64, LOC_CID_COUNT=8)=8` connection IDs,
+/// overflowing the 5-slot queue and killing every connection with
+/// `CONNECTION_ID_LIMIT_ERROR`. We therefore advertise quinn's REAL enforced value
+/// (2) — advertised==actual, the relay works — and accept the divergence from
+/// Safari's 64 (it cannot be reconciled without forking quinn-proto; see the gate).
+pub(crate) const SAFARI_TP_ACTIVE_CID_LIMIT: u64 = 2;
+
+/// `initial_max_streams_uni` (0x09) — libquic value 8. Mirrored by quinn.
+pub(crate) const SAFARI_TP_MAX_STREAMS_UNI: u64 = 8;
+
+/// `max_udp_payload_size` (0x03) — libquic floor 1200. Mirrored by quinn.
+pub(crate) const SAFARI_TP_MAX_UDP_PAYLOAD: u64 = 1200;
+
+/// Apple's vendor/GREASE transport-parameter codepoint (value 0). Sorts LAST in
+/// the ascending id order (it is the largest id), preserving the Apple/libquic
+/// strict-ascending signature.
+const SAFARI_TP_VENDOR_GREASE_ID: u64 = 0x17f7586d2cb571;
+
+/// The Safari-26 H3 `0x39` transport-parameter id set, in STRICT ASCENDING order
+/// (the Apple/libquic signature; see the H3 spec). `initial_source_connection_id`
+/// (0x0f) is the genuine SCID quinn chose (dynamic, server-validated) and
+/// `max_datagram_frame_size` (0x20) is quinn's real datagram value; every other id
+/// carries a CONFIRMED fixed value (see [`safari_tp_value_for_id`]). The
+/// vendor/GREASE codepoint [`SAFARI_TP_VENDOR_GREASE_ID`] is emitted separately,
+/// last, by the encoder.
 ///
-/// Deliberately OMITS the ids quinn would otherwise emit but Safari does not:
-/// `grease_quic_bit` (0x2ab2), `min_ack_delay` (0xff04de1b), and the GREASE-TP
-/// (`grease_transport_parameter`, 0x1b). Also omits server-only ids
-/// (`stateless_reset_token` 0x02, `original_destination_connection_id` 0x00,
-/// etc.) which a client never sends.
-const SAFARI_TP_IDS: [u64; 14] = [
-    0x01, // max_idle_timeout
-    0x03, // max_udp_payload_size
-    0x04, // initial_max_data
-    0x05, // initial_max_stream_data_bidi_local
-    0x06, // initial_max_stream_data_bidi_remote
-    0x07, // initial_max_stream_data_uni
-    0x08, // initial_max_streams_bidi
-    0x09, // initial_max_streams_uni
-    0x0a, // ack_delay_exponent
-    0x0b, // max_ack_delay
-    0x0c, // disable_active_migration (empty value)
-    0x0e, // active_connection_id_limit
+/// Deliberately OMITS:
+/// - `ack_delay_exponent` (0x0a), `max_ack_delay` (0x0b),
+///   `disable_active_migration` (0x0c) — the confirmed spec drops all three.
+/// - the ids quinn would otherwise emit but Safari does not: `grease_quic_bit`
+///   (0x2ab2), `min_ack_delay` (0xff04de1b), `grease_transport_parameter` (0x1b).
+/// - server-only ids (`stateless_reset_token` 0x02, etc.) a client never sends.
+///
+/// KEEPS `max_datagram_frame_size` (0x20): the confirmed spec sends it only when
+/// datagrams are used, and ParallaX's reachability probe (RFC 9221) DOES use QUIC
+/// datagrams (quinn enables `datagram_receive_buffer_size` by default), so omitting
+/// it would make the peer report `UnsupportedByPeer` and break the probe.
+const SAFARI_TP_IDS: [u64; 11] = [
+    0x01, // max_idle_timeout = 0
+    0x03, // max_udp_payload_size = 1200
+    0x04, // initial_max_data = 16 MiB (runtime)
+    0x05, // initial_max_stream_data_bidi_local = 2 MiB
+    0x06, // initial_max_stream_data_bidi_remote = 2 MiB
+    0x07, // initial_max_stream_data_uni = 2 MiB
+    0x08, // initial_max_streams_bidi = 0
+    0x09, // initial_max_streams_uni = 8
+    0x0e, // active_connection_id_limit (quinn's 2; see SAFARI_TP_ACTIVE_CID_LIMIT)
     0x0f, // initial_source_connection_id (REAL, server-validated)
-    0x20, // max_datagram_frame_size (Apple/libquic signature)
+    0x20, // max_datagram_frame_size (datagrams used by the probe; quinn's value)
 ];
+
+/// The CONFIRMED Safari-26 H3 value for each standard varint transport parameter.
+/// Returns `None` for `initial_source_connection_id` (0x0f), which is not a varint
+/// param — its value is the dynamic SCID pulled from quinn's blob.
+fn safari_tp_value_for_id(id: u64) -> Option<u64> {
+    match id {
+        0x01 => Some(0),                          // max_idle_timeout (CFNetwork forces 0)
+        0x03 => Some(SAFARI_TP_MAX_UDP_PAYLOAD),  // max_udp_payload_size
+        0x04 => Some(SAFARI_TP_INITIAL_MAX_DATA), // initial_max_data (runtime)
+        0x05 => Some(SAFARI_TP_INITIAL_MAX_STREAM_DATA), // bidi_local
+        0x06 => Some(SAFARI_TP_INITIAL_MAX_STREAM_DATA), // bidi_remote
+        0x07 => Some(SAFARI_TP_INITIAL_MAX_STREAM_DATA), // uni
+        0x08 => Some(0),                          // initial_max_streams_bidi (CFNetwork)
+        0x09 => Some(SAFARI_TP_MAX_STREAMS_UNI),  // initial_max_streams_uni (libquic)
+        0x0e => Some(SAFARI_TP_ACTIVE_CID_LIMIT), // active_connection_id_limit
+        _ => None,
+    }
+}
 
 /// Hand-encode the Safari-26 ascending `0x39` transport-parameters blob.
 ///
-/// Emits exactly [`SAFARI_TP_IDS`] in strict ascending order, each entry as
-/// `varint(id) || varint(len) || value`. The VALUES are NOT invented magic
-/// numbers: every value that quinn already advertises is read back verbatim from
-/// quinn's own `params.write()` output (the only public accessor — quinn keeps
-/// every `TransportParameters` field `pub(crate)`), so the wire carries this
-/// endpoint's REAL transport config. In particular `initial_source_connection_id`
-/// (0x0f) MUST be the genuine source CID quinn chose, or the server rejects the
-/// handshake with a `TRANSPORT_PARAMETER_ERROR`.
+/// Emits [`SAFARI_TP_IDS`] in strict ascending order, each entry as
+/// `varint(id) || varint(len) || value`, then appends the vendor/GREASE codepoint
+/// [`SAFARI_TP_VENDOR_GREASE_ID`] (value 0) last. The standard params carry the
+/// CONFIRMED Safari values from [`safari_tp_value_for_id`] (these CAP QUIC
+/// throughput at Safari's level — exceeding Safari is detectable). The ONLY value
+/// read at runtime is `initial_source_connection_id` (0x0f): it MUST be the genuine
+/// source CID quinn chose, read back from quinn's own `params.write()` output (the
+/// only public accessor — quinn keeps every `TransportParameters` field
+/// `pub(crate)`), or the server rejects the handshake with a
+/// `TRANSPORT_PARAMETER_ERROR`.
 ///
-/// Two Safari ids are present that quinn omits for a client and therefore have no
-/// value to copy:
-/// - `disable_active_migration` (0x0c): an empty-valued flag. quinn only sets it
-///   server-side (`server_config.is_some_and(..)`), so the client blob never
-///   carries it; Safari always sends it, so we emit it with a zero-length value.
-/// - `max_datagram_frame_size` (0x20): quinn only emits it when
-///   `datagram_receive_buffer_size` is configured, which the carrier's
-///   `udp_transport_config()` does not set. It is the Apple signature id, so it
-///   MUST be present; absent a quinn value we fall back to a conservative
-///   structure-only default.
-///
-/// NOTE (capture-gated): the fallback value for 0x20 (and the question of whether
-/// Safari emits 0x0c/0x20 at all) is NOT yet calibrated to a real Safari-26 H3
-/// capture; the gate asserts STRUCTURE (ascending ids, 0x20 present), never these
-/// values. This blob is the DEFAULT QUIC client transport-param image as of S6,
-/// but the QUIC plane stays off-by-default at the config level
-/// (`[udp].enabled = false`), so it only reaches the wire once an operator turns
-/// the fast-plane on; the values are calibrated against a capture before then.
+/// quinn's real `udp_transport_config` is aligned to the SAME advertised values
+/// (see `mod.rs`), so the wire bytes EQUAL quinn's enforced behaviour.
 fn encode_safari_transport_params(params: &TransportParameters) -> Vec<u8> {
     let mut quinn_blob = Vec::new();
     params.write(&mut quinn_blob);
@@ -390,57 +433,34 @@ fn encode_safari_transport_params(params: &TransportParameters) -> Vec<u8> {
 /// Core of [`encode_safari_transport_params`], split out for unit testing because
 /// quinn's [`TransportParameters`] cannot be constructed outside quinn-proto
 /// (every field is `pub(crate)` and there is no public constructor). Takes the
-/// `(id, value_bytes)` pairs already parsed from quinn's `params.write()` blob and
-/// emits [`SAFARI_TP_IDS`] in strict ascending order, copying each value quinn
-/// supplied and falling back to a structure-only default for the ids quinn omits
-/// for a client (see [`encode_safari_transport_params`] doc).
+/// `(id, value_bytes)` pairs already parsed from quinn's `params.write()` blob —
+/// used to recover the dynamic `initial_source_connection_id` (0x0f) and the real
+/// `max_datagram_frame_size` (0x20) — and emits the confirmed Safari blob:
+/// [`SAFARI_TP_IDS`] with their confirmed values in ascending order, then the
+/// vendor/GREASE codepoint last.
 fn encode_safari_tp_from_pairs(quinn_values: &[(u64, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     for &id in &SAFARI_TP_IDS {
-        match quinn_values.iter().find(|(qid, _)| *qid == id) {
-            // Value derived from quinn's real transport config — copy verbatim.
-            Some((_, value)) => put_param_bytes(&mut out, id, value),
-            // Safari id absent from quinn's blob. quinn's writer OMITS a standard
-            // varint param whose value equals its protocol default (verified:
-            // transport_parameters.rs `if self.$name.0 != $default`), so the
-            // genuine effective value is that default — emit it varint-encoded.
-            // The two ids quinn never emits for a client get structure-only
-            // fallbacks. An empty/raw value here would be rejected as malformed
-            // (the reader requires `len == value.size()` for varint params).
-            None => match quinn_default_for_id(id) {
-                Some(default) => put_param(&mut out, id, default),
-                // disable_active_migration (0x0c): empty-valued flag, never a
-                // varint. max_datagram_frame_size (0x20): conservative default
-                // (capture-gated), quinn only emits it with a datagram buffer.
-                None if id == 0x0c => put_param_bytes(&mut out, id, &[]),
-                None => put_param(&mut out, id, 65_535),
+        match safari_tp_value_for_id(id) {
+            // Confirmed Safari value — emit varint-encoded.
+            Some(value) => put_param(&mut out, id, value),
+            // Dynamic/quinn-derived values, read back from quinn's own blob:
+            // - initial_source_connection_id (0x0f): the REAL SCID quinn chose; an
+            //   empty/missing value would fail the server's TP validation, but
+            //   quinn always emits 0x0f for a client, so the lookup succeeds.
+            // - max_datagram_frame_size (0x20): quinn's effective datagram value
+            //   (datagrams are enabled by default); fall back to quinn's clamped
+            //   default 65535 so the probe never sees datagrams reported disabled.
+            None => match quinn_values.iter().find(|(qid, _)| *qid == id) {
+                Some((_, value)) => put_param_bytes(&mut out, id, value),
+                None if id == 0x20 => put_param(&mut out, id, 65_535),
+                None => put_param_bytes(&mut out, id, &[]),
             },
         }
     }
+    // Vendor/GREASE TP (value 0), last in ascending order.
+    put_param(&mut out, SAFARI_TP_VENDOR_GREASE_ID, 0);
     out
-}
-
-/// The protocol default value quinn uses for a standard varint transport
-/// parameter (from quinn-proto's `apply_params!` table). Returns `None` for ids
-/// that are not plain varint params (`disable_active_migration` 0x0c,
-/// `max_datagram_frame_size` 0x20, `initial_source_connection_id` 0x0f). Used
-/// only as a fallback when quinn omitted the id because its value matched this
-/// default — so re-emitting the default carries the genuine effective value.
-fn quinn_default_for_id(id: u64) -> Option<u64> {
-    match id {
-        0x01 => Some(0),      // max_idle_timeout
-        0x03 => Some(65_527), // max_udp_payload_size
-        0x04 => Some(0),      // initial_max_data
-        0x05 => Some(0),      // initial_max_stream_data_bidi_local
-        0x06 => Some(0),      // initial_max_stream_data_bidi_remote
-        0x07 => Some(0),      // initial_max_stream_data_uni
-        0x08 => Some(0),      // initial_max_streams_bidi
-        0x09 => Some(0),      // initial_max_streams_uni
-        0x0a => Some(3),      // ack_delay_exponent
-        0x0b => Some(25),     // max_ack_delay
-        0x0e => Some(2),      // active_connection_id_limit
-        _ => None,
-    }
 }
 
 /// QUIC varint encode (RFC 9000 §16) into `out`.
@@ -525,17 +545,32 @@ mod tests {
     #[test]
     fn safari_tp_id_table_is_strictly_ascending() {
         // The Apple/libquic signature is the strict-ascending id order itself.
+        // The vendor/GREASE id (emitted last by the encoder) is larger than every
+        // entry in the table, so the whole on-wire sequence stays ascending.
         for w in SAFARI_TP_IDS.windows(2) {
             assert!(w[0] < w[1], "ids not strictly ascending at {w:?}");
         }
+        assert!(
+            *SAFARI_TP_IDS.last().unwrap() < SAFARI_TP_VENDOR_GREASE_ID,
+            "vendor/GREASE id must sort after every standard id"
+        );
     }
 
     #[test]
-    fn safari_tp_id_table_contains_0x20_and_omits_grease_and_min_ack_delay() {
+    fn safari_tp_id_table_omits_dropped_ids_and_grease_quic_bit() {
+        // The confirmed spec drops 0x0a/0x0b/0x0c from the QUIC blob. 0x20
+        // (max_datagram_frame_size) is KEPT because the probe uses datagrams.
+        for dropped in [0x0a, 0x0b, 0x0c] {
+            assert!(
+                !SAFARI_TP_IDS.contains(&dropped),
+                "id {dropped:#x} must be omitted per the confirmed spec"
+            );
+        }
         assert!(
             SAFARI_TP_IDS.contains(&0x20),
-            "max_datagram_frame_size (0x20) must be present"
+            "max_datagram_frame_size (0x20) must be kept (probe uses datagrams)"
         );
+        // quinn-only ids must never appear.
         assert!(
             !SAFARI_TP_IDS.contains(&0x2ab2),
             "grease_quic_bit (0x2ab2) must be omitted"
@@ -551,24 +586,17 @@ mod tests {
     }
 
     #[test]
-    fn emitted_ids_are_exactly_the_safari_set_in_ascending_order() {
-        // Feed a quinn-like blob that carries every Safari id (plus the ids
-        // Safari omits, to prove they are filtered out) and confirm the output
-        // ids match SAFARI_TP_IDS exactly, in order.
+    fn emitted_ids_are_the_safari_set_plus_vendor_grease_ascending() {
+        // 0x0f and 0x20 are read from quinn; supply them (plus the ids Safari omits,
+        // to prove they are filtered out) and confirm the output ids are
+        // SAFARI_TP_IDS followed by the vendor/GREASE codepoint, ascending.
         let quinn_pairs: Vec<(u64, Vec<u8>)> = vec![
-            (0x01, vec![0x67, 0x08]), // max_idle_timeout
-            (0x03, vec![0x44, 0xb8]), // max_udp_payload_size
-            (0x04, vec![0x80, 0x10, 0x00, 0x00]),
-            (0x05, vec![0x80, 0x04, 0x00, 0x00]),
-            (0x06, vec![0x80, 0x04, 0x00, 0x00]),
-            (0x07, vec![0x80, 0x04, 0x00, 0x00]),
-            (0x08, vec![0x01]),
-            (0x09, vec![0x00]),
-            (0x0a, vec![0x03]),
-            (0x0b, vec![0x19]),
-            (0x0e, vec![0x04]),
             (0x0f, vec![0xde, 0xad, 0xbe, 0xef]), // initial_source_connection_id
-            // Ids Safari OMITS — must be filtered out of the output.
+            (0x20, vec![0x80, 0x00, 0xff, 0xff]), // max_datagram_frame_size (kept)
+            // Ids that must never reach the output.
+            (0x0a, vec![0x03]),             // ack_delay_exponent (dropped)
+            (0x0b, vec![0x19]),             // max_ack_delay (dropped)
+            (0x0c, vec![]),                 // disable_active_migration (dropped)
             (0x2ab2, vec![]),               // grease_quic_bit
             (0xff04de1b, vec![0x40, 0xfa]), // min_ack_delay
             (0x1b, vec![0xca, 0xfe]),       // grease_transport_parameter
@@ -579,65 +607,61 @@ mod tests {
         let decoded = decode_emitted(&emitted);
         let ids: Vec<u64> = decoded.iter().map(|(id, _)| *id).collect();
 
+        let mut expected = SAFARI_TP_IDS.to_vec();
+        expected.push(SAFARI_TP_VENDOR_GREASE_ID);
         assert_eq!(
-            ids,
-            SAFARI_TP_IDS.to_vec(),
-            "emitted ids must equal the Safari set in strict ascending order"
+            ids, expected,
+            "emitted ids must be the Safari set + vendor/GREASE, ascending"
         );
-        // Strictly ascending is implied by equality with the (ascending) table,
-        // but assert it directly as the make-or-break invariant.
         for w in ids.windows(2) {
             assert!(w[0] < w[1], "emitted ids not strictly ascending");
         }
     }
 
     #[test]
-    fn values_present_in_quinn_blob_are_copied_verbatim() {
+    fn emitted_values_are_the_confirmed_safari_values() {
+        // Read each emitted varint value back and compare to the confirmed spec.
         let cid = vec![0xde, 0xad, 0xbe, 0xef];
-        let quinn_pairs: Vec<(u64, Vec<u8>)> = vec![(0x01, vec![0x67, 0x08]), (0x0f, cid.clone())];
-        let emitted = encode_safari_tp_from_pairs(&quinn_pairs);
+        let dgram = vec![0x80, 0x00, 0xff, 0xff]; // varint 65535
+        let emitted = encode_safari_tp_from_pairs(&[(0x0f, cid.clone()), (0x20, dgram)]);
         let decoded = decode_emitted(&emitted);
 
-        let max_idle = decoded.iter().find(|(id, _)| *id == 0x01).unwrap();
+        let val = |id: u64| -> u64 {
+            let (_, bytes) = decoded.iter().find(|(qid, _)| *qid == id).unwrap();
+            read_varint(bytes).unwrap().0
+        };
+
+        assert_eq!(val(0x01), 0, "max_idle_timeout = 0");
+        assert_eq!(val(0x03), 1200, "max_udp_payload_size = 1200");
         assert_eq!(
-            max_idle.1,
-            vec![0x67, 0x08],
-            "max_idle_timeout copied verbatim"
+            val(0x04),
+            SAFARI_TP_INITIAL_MAX_DATA,
+            "initial_max_data = 16 MiB"
         );
-
-        let src_cid = decoded.iter().find(|(id, _)| *id == 0x0f).unwrap();
+        assert_eq!(val(0x05), 2 * 1024 * 1024, "stream_data_bidi_local = 2 MiB");
         assert_eq!(
-            src_cid.1, cid,
-            "initial_source_connection_id must be the real quinn value"
+            val(0x06),
+            2 * 1024 * 1024,
+            "stream_data_bidi_remote = 2 MiB"
         );
-    }
+        assert_eq!(val(0x07), 2 * 1024 * 1024, "stream_data_uni = 2 MiB");
+        assert_eq!(val(0x08), 0, "max_streams_bidi = 0");
+        assert_eq!(val(0x09), 8, "max_streams_uni = 8");
+        // active_connection_id_limit is quinn's enforced 2 (NOT Safari's 64, which
+        // quinn-proto 0.11.14 cannot honor; see SAFARI_TP_ACTIVE_CID_LIMIT).
+        assert_eq!(val(0x0e), 2, "active_connection_id_limit = 2 (quinn limit)");
 
-    #[test]
-    fn client_omitted_ids_get_structure_only_fallbacks() {
-        // quinn omits 0x0c (disable_active_migration, server-only) and 0x20
-        // (max_datagram_frame_size, no datagram buffer) for this carrier's
-        // client config. Both must still appear with structure-only values.
-        let emitted = encode_safari_tp_from_pairs(&[]);
-        let decoded = decode_emitted(&emitted);
-        let ids: Vec<u64> = decoded.iter().map(|(id, _)| *id).collect();
+        // The vendor/GREASE TP carries value 0.
+        assert_eq!(val(SAFARI_TP_VENDOR_GREASE_ID), 0, "vendor/GREASE TP = 0");
 
+        // initial_source_connection_id is the REAL dynamic SCID quinn chose.
+        let (_, src_cid) = decoded.iter().find(|(id, _)| *id == 0x0f).unwrap();
         assert_eq!(
-            ids,
-            SAFARI_TP_IDS.to_vec(),
-            "every Safari id must be present even when quinn supplies none"
+            src_cid, &cid,
+            "initial_source_connection_id must be the real quinn SCID"
         );
-
-        let mig = decoded.iter().find(|(id, _)| *id == 0x0c).unwrap();
-        assert!(
-            mig.1.is_empty(),
-            "disable_active_migration is an empty-valued flag"
-        );
-
-        let dgram = decoded.iter().find(|(id, _)| *id == 0x20).unwrap();
-        assert!(
-            !dgram.1.is_empty(),
-            "max_datagram_frame_size carries a value (Apple signature)"
-        );
+        // max_datagram_frame_size carries quinn's real value (datagrams enabled).
+        assert_eq!(val(0x20), 65_535, "max_datagram_frame_size = quinn value");
     }
 
     #[test]
