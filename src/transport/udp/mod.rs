@@ -104,24 +104,31 @@ const UDP_MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// timing out. quinn defaults keep-alive to None (off).
 const UDP_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Connection + single-stream flow-control window for the fast-plane relay.
+/// Flow-control windows for the fast-plane relay's single reliable stream.
 ///
-/// quinn's default `stream_receive_window` is ~1.25 MB (sized for a 12.5 MB/s x
-/// 100 ms path) and the previous config also pinned `receive_window` to 1.25 MB.
-/// On a 160-320 ms cross-border path that window caps a single stream at
-/// window/RTT — measured ~3.9 MB/s at 160 ms, i.e. BELOW the ~11 MB/s TCP
-/// baseline, which is the real reason the QUIC fast plane could not beat TCP. See
-/// the `quic_fast_plane_goodput_under_cross_border_loss` harness: 1.25 MB ->
-/// ~4 MB/s, 16 MiB -> ~15 MB/s, holding ~13 MB/s at 3% loss where TCP collapses.
+/// quinn's default `stream_receive_window` (~1.25 MB, sized for ~12.5 MB/s x
+/// 100 ms) caps a single stream at window/RTT, which on a 160-320 ms cross-border
+/// path throttles the one relay stream far below the link rate (1.25 MB / 0.16 s
+/// ≈ 7.8 MB/s, lower at 320 ms). Size the STREAM window to the cross-border BDP
+/// (320 ms x ~100 Mbit/s ≈ 4 MiB) so the relay stream is not flow-control-bound.
+/// This rationale is window/RTT arithmetic only; it is NOT a measured wire
+/// throughput (the in-repo loss harness models delay+loss with no bandwidth cap,
+/// so its MB/s figures are a loopback ceiling, not a cross-border goodput).
 ///
-/// Size it to the worst-case BDP the relay should saturate (320 ms RTT at
-/// ~400 Mbit/s ≈ 16 MiB) so the single relay stream is never flow-control-bound
-/// on a realistic cross-border link. This is also MORE browser-like — Safari /
-/// Chromium H3 use large flow-control windows; the 1.25 MB pin was the anomaly.
-/// DoS exposure stays bounded (at most this many bytes of un-drained buffer per
-/// authenticated single-stream connection, vs quinn's unbounded `VarInt::MAX`
-/// connection default).
-const UDP_FLOW_CONTROL_WINDOW: u32 = 16 * 1024 * 1024;
+/// The CONNECTION window is kept DISTINCT from (and larger than) the stream
+/// window on purpose: real Chrome/Safari H3 advertise connection > stream
+/// values, so emitting all four flow-control transport parameters EQUAL (which a
+/// single shared window does) is a shape no browser emits — observable to a
+/// censor that decrypts the QUIC v1 Initial. WARNING: these magnitudes are NOT
+/// matched to a real Safari-26 H3 capture; they are BDP-headroom values,
+/// acceptable ONLY while the UDP plane is off by default. Before enabling the
+/// plane: (1) calibrate against a capture, and (2) add a global
+/// concurrent-QUIC-relay cap — aggregate worst-case un-drained buffer is
+/// conn_window x the 16384 connection limit ≈ 128 GiB if authenticated peers
+/// stall their read side, so the per-connection bound is not enough at scale
+/// (cf. the kernel-splice relay cap).
+const UDP_STREAM_RECV_WINDOW: u32 = 4 * 1024 * 1024;
+const UDP_CONN_RECV_WINDOW: u32 = 8 * 1024 * 1024;
 
 /// Shared QUIC transport tuning applied to both the server and client endpoints
 /// so the two ends agree on idle/keep-alive behavior. The effective idle timeout
@@ -142,18 +149,17 @@ fn udp_transport_config() -> Arc<quinn::TransportConfig> {
     // separately by `datagram_receive_buffer_size`. quinn's defaults (100 bidi +
     // 100 uni concurrent streams, connection `receive_window = VarInt::MAX`) let
     // an authenticated peer pin hundreds of MB of un-drained receive buffers
-    // against this one-stream relay. Bound it to the relay reality: at most one
-    // incoming bidi stream and no uni streams. The flow-control WINDOW, however,
-    // must be sized to the cross-border BDP, not minimized — quinn's ~1.25 MB
-    // default throttles a single stream to window/RTT (~4 MB/s at 160 ms, below
-    // the TCP baseline). Set the connection and single-stream receive windows to
-    // UDP_FLOW_CONTROL_WINDOW so the relay stream can saturate the link, and the
-    // sender's send_window to match so neither end is the bottleneck.
+    // against this one-stream relay. Bound concurrency to exactly one bidi stream
+    // and no uni streams. The receive windows are BDP-sized and kept
+    // connection > stream (see UDP_{CONN,STREAM}_RECV_WINDOW), which both lifts
+    // the high-RTT flow-control cap and avoids the all-equal transport-param
+    // shape no browser emits; send_window matches the connection window so the
+    // sender is not the bottleneck.
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
-    transport.receive_window(quinn::VarInt::from_u32(UDP_FLOW_CONTROL_WINDOW));
-    transport.stream_receive_window(quinn::VarInt::from_u32(UDP_FLOW_CONTROL_WINDOW));
-    transport.send_window(u64::from(UDP_FLOW_CONTROL_WINDOW));
+    transport.receive_window(quinn::VarInt::from_u32(UDP_CONN_RECV_WINDOW));
+    transport.stream_receive_window(quinn::VarInt::from_u32(UDP_STREAM_RECV_WINDOW));
+    transport.send_window(u64::from(UDP_CONN_RECV_WINDOW));
 
     // Congestion control: BBR, not quinn's default Cubic. The fast plane only
     // earns its keep on lossy links, where Cubic's loss-as-congestion backoff
@@ -694,6 +700,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "heavy QUIC network-emulation benchmark; run with --ignored"]
     async fn quic_fast_plane_goodput_under_cross_border_loss() {
+        if std::env::var_os("PLX_RUN_NET_BENCH").is_none() {
+            eprintln!("skipping: set PLX_RUN_NET_BENCH=1 to run this heavy QUIC benchmark");
+            return;
+        }
         let n = 16 * 1024 * 1024; // 16 MiB download per cell
         let delay = Duration::from_millis(80); // ~160 ms RTT
         let loss_levels = [0.0_f64, 0.01, 0.03];
@@ -786,9 +796,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "heavy QUIC network-emulation benchmark; run with --ignored"]
     async fn quic_bbr_beats_cubic_under_cross_border_loss() {
+        if std::env::var_os("PLX_RUN_NET_BENCH").is_none() {
+            eprintln!("skipping: set PLX_RUN_NET_BENCH=1 to run this heavy QUIC benchmark");
+            return;
+        }
         let delay = Duration::from_millis(80); // ~160 ms RTT
         let loss = 0.03; // 3% — the worst modeled cross-border loss
-        let window = UDP_FLOW_CONTROL_WINDOW;
+        let window = UDP_STREAM_RECV_WINDOW;
         let cap = Duration::from_secs(8);
 
         let (_se1, _ce1, cc1, sc1, r1) =

@@ -450,10 +450,10 @@ mod tests {
 
     #[tokio::test]
     async fn shaper_caps_upload_direction_throughput() {
-        // A draining sink upstream: the client -> server (upload) direction is
-        // the one whose pacing we are checking. Before the ingress-pacing fix
-        // this finished near-instantly (the reader buffered the whole payload
-        // into the channel), so the measured upload rate ignored the cap.
+        // Guards the 96288aec ingress-pacing fix by timing the CLIENT's write of
+        // an upload through the shaper to a draining sink. See the assertion below
+        // for why write_all time (not sink-receive time) is the discriminating
+        // signal.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -473,23 +473,33 @@ mod tests {
         let imp = Impairment {
             label: "t",
             rtt_ms: 0,
-            bandwidth_mbit: Some(20),
+            bandwidth_mbit: Some(100), // 12.5 MB/s
         };
         let (shaper_addr, shaper) = spawn_shaper(addr.to_string(), imp).await.unwrap();
 
         let mut c = TcpStream::connect(shaper_addr).await.unwrap();
-        let payload = vec![0x5a_u8; 2 * 1024 * 1024]; // 2 MiB
+        // Payload must exceed the OS loopback socket buffers (macOS caps a socket
+        // buffer at kern.ipc.maxsockbuf, ~8 MiB) so the ingress-paced reader
+        // actually backpressures the client write. A 2 MiB payload fit entirely in
+        // the send buffer on some runs and returned in ~2 ms, flaking the test.
+        let payload = vec![0x5a_u8; 16 * 1024 * 1024]; // 16 MiB
         let start = std::time::Instant::now();
         c.write_all(&payload).await.unwrap();
+        let write_elapsed = start.elapsed();
         c.shutdown().await.unwrap();
         let total = done_rx.await.unwrap();
-        let elapsed = start.elapsed();
         assert_eq!(total, payload.len(), "sink must receive every byte");
-        // 20 Mbit/s = 2.5 MB/s; 2 MiB paced is ~0.84s. The cap must bite in the
-        // upload direction, so this cannot complete in a small fraction of that.
+        // Time write_all, NOT the sink receive: the sink is delivered at the cap
+        // in both the old (egress-paced) and new (ingress-paced) shaper, so
+        // sink-timing would pass either way. Only the client write differs —
+        // egress let the reader drain the socket unthrottled into the 32 MB
+        // channel (write_all returned at buffer speed, <100 ms); ingress paces the
+        // reader to 12.5 MB/s, so writing 16 MiB backpressures for ~0.8 s+. The
+        // 200 ms floor sits far above the pre-fix path and well below the post-fix
+        // time, so it fails loudly if the ingress pacing (96288aec) is reverted.
         assert!(
-            elapsed >= Duration::from_millis(500),
-            "upload must be paced to ~20 Mbit/s, finished in {elapsed:?}"
+            write_elapsed >= Duration::from_millis(200),
+            "ingress pacing must backpressure the client write; write_all took {write_elapsed:?}"
         );
         shaper.abort();
     }

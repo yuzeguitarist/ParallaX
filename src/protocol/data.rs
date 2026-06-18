@@ -1559,7 +1559,7 @@ mod tests {
     fn seal_records_into_inplace_matches_seal_records_into_byte_for_byte() {
         let key = [5_u8; KEY_LEN];
         let nonce = [6_u8; NONCE_LEN];
-        let padding = PaddingProfile::new(0, 0).unwrap();
+        let padding = PaddingProfile::new(3, 900).unwrap();
         let lens = variable_record_lens(
             DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD)
                 .max_plaintext_len(),
@@ -1575,10 +1575,11 @@ mod tests {
             .seal_records_into(&payload, &lens, &mut reference_rng, &mut reference_out)
             .unwrap();
 
-        // In-place: each record's plaintext is written straight into `out`.
+        // In-place: each record's plaintext is written straight into `out`. SAME
+        // seed as the reference so the per-record padding draws line up.
         let mut inplace =
             DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
-        let mut inplace_rng = StdRng::seed_from_u64(62);
+        let mut inplace_rng = StdRng::seed_from_u64(61);
         let mut inplace_out = Vec::new();
         let mut off = 0usize;
         inplace
@@ -1589,9 +1590,11 @@ mod tests {
             })
             .unwrap();
 
-        // Zero padding consumes no rng, so the two seal paths must be
-        // byte-for-byte identical (and inplace therefore round-trips, since the
-        // reference output is proven to round-trip elsewhere).
+        // NON-zero padding (3..=900) is drawn per record from the SAME seeded RNG
+        // on both paths, so byte-for-byte equality here also proves the padding
+        // draw ORDER and COUNT match — the exact divergence a zero-padding test
+        // (which draws no rng) could not catch. inplace therefore round-trips too,
+        // since the reference output is proven to round-trip elsewhere.
         assert_eq!(inplace_out, reference_out);
     }
 

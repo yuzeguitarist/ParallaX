@@ -490,6 +490,13 @@ impl ServerKeyExchange {
         if len == 0 {
             return Err(ServerKeyExchangeError::EmptyCiphertext);
         }
+        // Reject an impossible length before the `40 + len` / `41 + len`
+        // arithmetic so it cannot wrap usize on a hypothetical 32-bit target
+        // (ParallaX ships 64-bit only; belt-and-suspenders, redundant with the
+        // exact-length checks below on 64-bit but free).
+        if len > input.len() {
+            return Err(ServerKeyExchangeError::InvalidCiphertextLength);
+        }
         let suite = if input.len() == 40 + len {
             CipherSuite::ChaCha20Poly1305
         } else if input.len() == 41 + len {
