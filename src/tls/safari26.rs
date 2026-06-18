@@ -37,6 +37,14 @@ use super::{
     record::{
         parse_header, read_record, TlsRecordReader, TLS_CONTENT_ALERT, TLS_CONTENT_APPLICATION_DATA,
     },
+    safari_shape::{
+        key_share_extension, signature_algorithms_extension, supported_groups_extension,
+        supported_versions_extension, GreaseSet, GROUP_X25519, GROUP_X25519_MLKEM768,
+        MLKEM768_PUBLIC_KEY_LEN, SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384,
+        SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512, SIG_RSA_PSS_RSAE_SHA256,
+        SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, TLS12, TLS13, TLS_AES_128_GCM_SHA256,
+        TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, X25519_KEY_LEN,
+    },
     server_hello::parse_server_hello,
 };
 use crate::crypto::{
@@ -89,19 +97,6 @@ const HANDSHAKE_CERTIFICATE_VERIFY: u8 = 0x0f;
 const HANDSHAKE_FINISHED: u8 = 0x14;
 const HANDSHAKE_COMPRESSED_CERTIFICATE: u8 = 0x19;
 
-const TLS13: u16 = 0x0304;
-const TLS12: u16 = 0x0303;
-
-const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
-const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
-const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
-
-const GROUP_X25519_MLKEM768: u16 = 0x11ec;
-const GROUP_X25519: u16 = 0x001d;
-const GROUP_SECP256R1: u16 = 0x0017;
-const GROUP_SECP384R1: u16 = 0x0018;
-const GROUP_SECP521R1: u16 = 0x0019;
-
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_STATUS_REQUEST: u16 = 0x0005;
 const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
@@ -116,33 +111,16 @@ const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 
-const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
-const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
-const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
-const SIG_ECDSA_SECP384R1_SHA384: u16 = 0x0503;
-const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
-const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
-const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
-const SIG_RSA_PKCS1_SHA512: u16 = 0x0601;
-
 const CERT_COMPRESSION_ZLIB: u16 = 0x0001;
 
 const AEAD_TAG_LEN: usize = 16;
 const TLS13_IV_LEN: usize = 12;
-const MLKEM768_PUBLIC_KEY_LEN: usize = 1184;
 const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
-const X25519_KEY_LEN: usize = 32;
 
 #[cfg(test)]
 const LOOPBACK_CAMOUFLAGE_CERT_SHA256: [u8; 32] = [
     0x2b, 0x05, 0xc7, 0x0a, 0x17, 0x2e, 0xe9, 0x87, 0x32, 0xd1, 0xf5, 0xd0, 0x49, 0x48, 0xa2, 0x46,
     0xa8, 0xf7, 0x33, 0xa8, 0x48, 0x04, 0x64, 0xa5, 0x35, 0x42, 0xd2, 0x72, 0x03, 0x92, 0xa1, 0xc0,
-];
-
-/// Standard GREASE values from RFC 8701.
-const BROWSER_GREASE_VALUES: [u16; 16] = [
-    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
-    0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
 
 #[derive(Debug, Error)]
@@ -732,36 +710,6 @@ impl fmt::Debug for CompletedSafari26Handshake {
     }
 }
 
-#[derive(Clone, Copy)]
-struct GreaseSet {
-    cipher: u16,
-    extension: u16,
-    group: u16,
-    version: u16,
-    final_extension: u16,
-}
-
-impl GreaseSet {
-    fn from_seed(seed: [u8; 5]) -> Self {
-        let mut cipher_index = seed[0] as usize % BROWSER_GREASE_VALUES.len();
-        let extension_index = seed[1] as usize % BROWSER_GREASE_VALUES.len();
-        if cipher_index == extension_index {
-            cipher_index = (cipher_index + 1) % BROWSER_GREASE_VALUES.len();
-        }
-        let mut final_extension_index = seed[4] as usize % BROWSER_GREASE_VALUES.len();
-        if final_extension_index == extension_index {
-            final_extension_index = (final_extension_index + 1) % BROWSER_GREASE_VALUES.len();
-        }
-        Self {
-            cipher: BROWSER_GREASE_VALUES[cipher_index],
-            extension: BROWSER_GREASE_VALUES[extension_index],
-            group: BROWSER_GREASE_VALUES[seed[2] as usize % BROWSER_GREASE_VALUES.len()],
-            version: BROWSER_GREASE_VALUES[seed[3] as usize % BROWSER_GREASE_VALUES.len()],
-            final_extension: BROWSER_GREASE_VALUES[final_extension_index],
-        }
-    }
-}
-
 fn build_safari_client_hello(
     sni: &str,
     client_random: [u8; 32],
@@ -780,30 +728,10 @@ fn build_safari_client_hello(
     body.push(session_id.len() as u8);
     body.extend_from_slice(&session_id);
 
-    let ciphers = [
-        grease.cipher,
-        TLS_AES_256_GCM_SHA384,
-        TLS_CHACHA20_POLY1305_SHA256,
-        TLS_AES_128_GCM_SHA256,
-        0xc02c,
-        0xc02b,
-        0xcca9,
-        0xc030,
-        0xc02f,
-        0xcca8,
-        0xc00a,
-        0xc009,
-        0xc014,
-        0xc013,
-        0x009d,
-        0x009c,
-        0x0035,
-        0x002f,
-        0xc008,
-        0xc012,
-        0x000a,
-    ];
-    push_u16_len_prefixed_u16s(&mut body, &ciphers)?;
+    push_u16_len_prefixed_u16s(
+        &mut body,
+        &super::safari_shape::safari_cipher_suites(grease),
+    )?;
     body.push(1);
     body.push(0);
 
@@ -819,7 +747,7 @@ fn build_safari_client_hello(
     push_extension(
         &mut extensions,
         EXT_SUPPORTED_GROUPS,
-        &supported_groups_extension(grease.group)?,
+        &supported_groups_extension(grease.group),
     )?;
     push_extension(&mut extensions, EXT_EC_POINT_FORMATS, &[1, 0])?;
     push_extension(&mut extensions, EXT_ALPN, &alpn_extension()?)?;
@@ -827,13 +755,13 @@ fn build_safari_client_hello(
     push_extension(
         &mut extensions,
         EXT_SIGNATURE_ALGORITHMS,
-        &signature_algorithms_extension()?,
+        &signature_algorithms_extension(),
     )?;
     push_extension(&mut extensions, EXT_SIGNED_CERTIFICATE_TIMESTAMP, &[])?;
     push_extension(
         &mut extensions,
         EXT_KEY_SHARE,
-        &key_share_extension(grease.group, mlkem768_public, x25519_public)?,
+        &key_share_extension(grease.group, mlkem768_public, x25519_public),
     )?;
     push_extension(&mut extensions, EXT_PSK_KEY_EXCHANGE_MODES, &[1, 1])?;
     push_extension(
@@ -867,20 +795,6 @@ fn server_name_extension(sni: &str) -> Result<Vec<u8>, Safari26TlsError> {
     Ok(out)
 }
 
-fn supported_groups_extension(grease_group: u16) -> Result<Vec<u8>, Safari26TlsError> {
-    let groups = [
-        grease_group,
-        GROUP_X25519_MLKEM768,
-        GROUP_X25519,
-        GROUP_SECP256R1,
-        GROUP_SECP384R1,
-        GROUP_SECP521R1,
-    ];
-    let mut out = Vec::with_capacity(2 + groups.len() * 2);
-    push_u16_len_prefixed_u16s(&mut out, &groups)?;
-    Ok(out)
-}
-
 fn alpn_extension() -> Result<Vec<u8>, Safari26TlsError> {
     let mut out = Vec::with_capacity(14);
     push_u16_len(&mut out, 12)?;
@@ -889,57 +803,6 @@ fn alpn_extension() -> Result<Vec<u8>, Safari26TlsError> {
     out.push(8);
     out.extend_from_slice(b"http/1.1");
     Ok(out)
-}
-
-fn signature_algorithms_extension() -> Result<Vec<u8>, Safari26TlsError> {
-    let schemes = [
-        SIG_ECDSA_SECP256R1_SHA256,
-        SIG_RSA_PSS_RSAE_SHA256,
-        SIG_RSA_PKCS1_SHA256,
-        SIG_ECDSA_SECP384R1_SHA384,
-        SIG_RSA_PSS_RSAE_SHA384,
-        SIG_RSA_PSS_RSAE_SHA384,
-        SIG_RSA_PKCS1_SHA384,
-        SIG_RSA_PSS_RSAE_SHA512,
-        SIG_RSA_PKCS1_SHA512,
-        0x0201,
-    ];
-    let mut out = Vec::with_capacity(2 + schemes.len() * 2);
-    push_u16_len_prefixed_u16s(&mut out, &schemes)?;
-    Ok(out)
-}
-
-fn key_share_extension(
-    grease_group: u16,
-    mlkem768_public: &[u8],
-    x25519_public: &[u8; 32],
-) -> Result<Vec<u8>, Safari26TlsError> {
-    let hybrid_len = MLKEM768_PUBLIC_KEY_LEN + X25519_KEY_LEN;
-    let shares_len = (2 + 2 + 1) + (2 + 2 + hybrid_len) + (2 + 2 + X25519_KEY_LEN);
-    let mut shares = Vec::with_capacity(shares_len);
-    shares.extend_from_slice(&grease_group.to_be_bytes());
-    push_vec_u16(&mut shares, &[0])?;
-
-    shares.extend_from_slice(&GROUP_X25519_MLKEM768.to_be_bytes());
-    push_u16_len(&mut shares, hybrid_len)?;
-    shares.extend_from_slice(mlkem768_public);
-    shares.extend_from_slice(x25519_public);
-
-    shares.extend_from_slice(&GROUP_X25519.to_be_bytes());
-    push_vec_u16(&mut shares, x25519_public)?;
-
-    let mut out = Vec::with_capacity(2 + shares_len);
-    push_vec_u16(&mut out, &shares)?;
-    Ok(out)
-}
-
-fn supported_versions_extension(grease_version: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(7);
-    out.push(6);
-    out.extend_from_slice(&grease_version.to_be_bytes());
-    out.extend_from_slice(&TLS13.to_be_bytes());
-    out.extend_from_slice(&TLS12.to_be_bytes());
-    out
 }
 
 fn push_extension(out: &mut Vec<u8>, ext_type: u16, data: &[u8]) -> Result<(), Safari26TlsError> {

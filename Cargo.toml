@@ -14,6 +14,15 @@ default-run = "parallax"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
+[features]
+# Safari-26 H3 QUIC ClientHello carrier (the vendored-rustls fork + the
+# ParallaX-owned quinn crypto Session). As of S6 the Safari Session is the
+# DEFAULT QUIC client backend in `udp::client_config` (the structural
+# verification gate is green); the QUIC plane itself stays off-by-default at the
+# config level (`[udp].enabled = false`). This feature no longer changes which
+# backend is selected — it is retained only as an explicit selector / build knob.
+safari-quic = []
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"
@@ -37,6 +46,10 @@ pqcrypto-traits = "0.3"
 # default, so every rustls config here MUST use builder_with_provider(aws_lc_rs).
 # rustls is pinned (=0.23.40) to stay in lockstep with quinn-proto's Quic*Config.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
+# Direct dep ONLY to name `quinn_proto::transport_parameters::TransportParameters`
+# in the `safari-quic` Session seam (quinn does not re-export that type). Pinned to
+# the exact version quinn 0.11 resolves so no second quinn-proto is linked.
+quinn-proto = { version = "=0.11.14", default-features = false }
 rcgen = "0.13"
 rustls = { version = "=0.23.40", features = ["std", "aws_lc_rs"] }
 rustls-native-certs = "0.8.3"

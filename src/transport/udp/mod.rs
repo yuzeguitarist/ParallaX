@@ -17,6 +17,12 @@ pub mod endpoint;
 pub(crate) mod envelope;
 pub mod probe;
 pub(crate) mod reorder;
+/// Safari-26 H3 QUIC ClientHello carrier (S2). This is now the DEFAULT QUIC
+/// client backend (S6): `client_config` drives the Safari Session so the
+/// emitted ClientHello is byte/structurally indistinguishable from Safari-26 H3.
+/// The `safari-quic` feature remains defined for explicit selection but no longer
+/// changes which backend is used.
+pub mod safari_crypto;
 
 /// Fuzz-only re-exports of the internal TUDP wire parsers. Compiled ONLY under
 /// `--cfg fuzzing` (which cargo-fuzz sets); absent from normal `cargo build` /
@@ -81,7 +87,7 @@ pub mod fuzz {
 
 use std::sync::Arc;
 
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::crypto::rustls::QuicServerConfig;
 use rustls::{
     client::danger::ServerCertVerifier,
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -263,9 +269,28 @@ pub fn client_config(
         .with_no_client_auth();
     tls.alpn_protocols = vec![UDP_ALPN.to_vec()];
 
-    let crypto = QuicClientConfig::try_from(Arc::new(tls))
-        .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?;
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    // S6: the Safari-26 H3 Session is the DEFAULT QUIC client backend. The rustls
+    // config carries the production `safari_ch_profile`, so the vendored-rustls
+    // ClientHello assembly (S1) emits the exact Safari wire shape, and the Safari
+    // Session substitutes the hand-encoded ascending 0x39 transport-param blob
+    // (S4) for quinn's `params.write()`. Cold-start ONLY: resumption is disabled
+    // so no `pre_shared_key` / `early_data` is emitted (`psk_key_exchange_modes`
+    // is still present in the profile). True 0-RTT is a later capture-gated slice.
+    tls.resumption = rustls::client::Resumption::disabled();
+
+    let mut grease_seed = [0_u8; 5];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut grease_seed);
+    let grease = crate::tls::safari_shape::GreaseSet::from_seed(grease_seed);
+    tls.safari_ch_profile = Some(Arc::new(crate::tls::safari_shape::safari_h3_ch_profile(
+        grease,
+    )));
+
+    let crypto: Arc<dyn quinn::crypto::ClientConfig> = Arc::new(
+        safari_crypto::SafariQuicClientConfig::new(Arc::new(tls))
+            .ok_or_else(|| UdpTransportError::TlsConfig("no QUIC initial cipher suite".into()))?,
+    );
+
+    let mut config = quinn::ClientConfig::new(crypto);
     config.transport_config(udp_transport_config());
     Ok(config)
 }

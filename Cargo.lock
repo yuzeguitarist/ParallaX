@@ -772,6 +772,7 @@ dependencies = [
  "pqcrypto-mlkem",
  "pqcrypto-traits",
  "quinn",
+ "quinn-proto",
  "rand 0.8.6",
  "rcgen",
  "rustls",

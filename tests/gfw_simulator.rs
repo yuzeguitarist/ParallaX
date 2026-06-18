@@ -824,6 +824,139 @@ async fn capture_udp_leg_initial(server_name: &str) -> Vec<u8> {
     buf
 }
 
+/// Drive the UDP-leg quinn client and capture *all* Initial datagrams that carry
+/// its ClientHello, then reassemble the full ClientHello handshake bytes across
+/// CRYPTO frames spanning multiple datagrams.
+///
+/// ParallaX's H3 ClientHello carries the ~1216 B X25519MLKEM768 key_share, which
+/// pushes it well past a single 1200 B QUIC Initial — quinn fragments the CH
+/// across several Initial packets, one per datagram. The single-datagram
+/// [`capture_udp_leg_initial`] helper cannot see the whole hello; this loop recvs
+/// each Initial datagram, decrypts it via the in-repo RFC-9001 path, collects its
+/// CRYPTO frames, and stops once the offset-0 reassembled stream covers the
+/// declared ClientHello length (bounded by a per-recv timeout and an 8-datagram
+/// cap so a regression that never completes the CH fails fast instead of hanging).
+async fn capture_udp_leg_full_client_hello(server_name: &str) -> Vec<u8> {
+    use std::sync::Arc;
+
+    use crate::gfw_sim::detection::quic_initial::{
+        decrypt_payload, derive_client_initial_keys_v2, parse_initial_frames,
+        parse_protected_long_header, reassemble_crypto_stream, unprotect_header, InitialFrame,
+    };
+    use parallax::transport::udp::client_config;
+    use quinn::Endpoint;
+    use rustls::{
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        DigitallySignedStruct, SignatureScheme,
+    };
+
+    // Same never-invoked verifier as `capture_udp_leg_initial`: the Initial is
+    // emitted before any ServerHello, so the cert path never runs.
+    #[derive(Debug)]
+    struct NeverCalled;
+    impl ServerCertVerifier for NeverCalled {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(client_config(Arc::new(NeverCalled)).unwrap());
+
+    let connecting = endpoint.connect(server_addr, server_name).unwrap();
+    let drive = tokio::spawn(async move {
+        let _ = connecting.await;
+    });
+
+    // Decrypt one Initial datagram and return its CRYPTO frames. A single
+    // datagram may coalesce a padded Initial; the Length field bounds the payload
+    // so trailing bytes are ignored. Out-of-band/handshake packets that fail to
+    // parse as a v1 Initial are skipped (return no frames).
+    let crypto_frames_from = |datagram: &[u8]| -> Vec<InitialFrame> {
+        let mut pkt = datagram.to_vec();
+        let mut hdr = match parse_protected_long_header(&pkt) {
+            Ok(h) => h,
+            Err(_) => return Vec::new(),
+        };
+        let keys = match derive_client_initial_keys_v2(&hdr.dcid) {
+            Ok(k) => k,
+            Err(_) => return Vec::new(),
+        };
+        if unprotect_header(&mut pkt, &mut hdr, &keys).is_err() {
+            return Vec::new();
+        }
+        let payload = match decrypt_payload(&pkt, &hdr, &keys) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+        parse_initial_frames(&payload).unwrap_or_default()
+    };
+
+    let mut all_frames: Vec<InitialFrame> = Vec::new();
+    let mut buf = vec![0_u8; 2048];
+    // 8-datagram / 5s overall cap: the CH fits in 2-3 Initial datagrams, so this
+    // is generous but still fails fast if reassembly never completes.
+    for _ in 0..8 {
+        let recv =
+            tokio::time::timeout(Duration::from_millis(2000), listener.recv_from(&mut buf)).await;
+        let n = match recv {
+            Ok(Ok((n, _))) => n,
+            // No more datagrams arriving (client done with the initial flight) or
+            // socket error: stop and reassemble whatever we have.
+            _ => break,
+        };
+        all_frames.extend(crypto_frames_from(&buf[..n]));
+
+        // Stop once the offset-0 reassembled stream covers the full declared CH.
+        let crypto = reassemble_crypto_stream(&all_frames);
+        if crypto.len() >= 4 && crypto[0] == 0x01 {
+            let declared = 4
+                + (((crypto[1] as usize) << 16)
+                    | ((crypto[2] as usize) << 8)
+                    | (crypto[3] as usize));
+            if crypto.len() >= declared {
+                break;
+            }
+        }
+    }
+    drive.abort();
+
+    reassemble_crypto_stream(&all_frames)
+}
+
 #[tokio::test]
 async fn udp_leg_initial_is_standard_decryptable_quic_v1() {
     use crate::gfw_sim::detection::quic_initial::{
@@ -928,4 +1061,244 @@ async fn udp_leg_initial_first_datagram_holds_only_partial_clienthello() {
             }
         }
     }
+}
+
+// --------------------- S5: Safari-26 H3 ClientHello structural gate ---------------------
+//
+// This gate drives the REAL UDP-leg QUIC client backend
+// (`parallax::transport::udp::client_config`), reassembles its multi-datagram
+// ClientHello via the in-repo RFC-9001 decryptor, and asserts STRUCTURE ONLY:
+// the 20-cipher GREASE-led list, the static Safari extension order (GREASE matched
+// by class), and the ascending `quic_transport_parameters` (0x39) id set with
+// `max_datagram_frame_size` (0x20) present and `grease_quic_bit`/`min_ack_delay`
+// omitted. It NEVER asserts transport-param VALUES, nor `extended_master_secret`
+// (0x17) / `renegotiation_info` (0xff01) presence (both capture-gated unknowns).
+//
+// It turns GREEN only when the vendored-rustls fork + the Safari QUIC Session are
+// wired and selected (S6: production `safari_ch_profile` set in `client_config`
+// and the Safari backend made the default). Until then the stock quinn/rustls
+// backend emits a 3-suite, shuffled-extension, ascending-only-by-accident hello,
+// so the assertions below fail — exactly characterizing the fix.
+
+/// RFC 8701 GREASE values: `0x?a?a` with both bytes equal.
+fn is_grease_u16(value: u16) -> bool {
+    value & 0x0f0f == 0x0a0a && (value >> 8) == (value & 0xff)
+}
+
+/// Wrap reassembled ClientHello handshake bytes (starting at type 0x01) in a
+/// synthetic TLS record so the standard parser accepts them, mirroring the
+/// detector's `parse_tls_handshake_clienthello`.
+fn wrap_handshake_as_tls_record(crypto: &[u8]) -> Vec<u8> {
+    use crate::gfw_sim::detection::sni_filter::TLS_CONTENT_HANDSHAKE;
+    let mut wrapped = Vec::with_capacity(5 + crypto.len());
+    wrapped.push(TLS_CONTENT_HANDSHAKE);
+    wrapped.extend_from_slice(&[0x03, 0x03]);
+    wrapped.extend_from_slice(&(crypto.len() as u16).to_be_bytes());
+    wrapped.extend_from_slice(crypto);
+    wrapped
+}
+
+/// Walk the extensions of a wrapped ClientHello TLS record and return the raw
+/// body of the first extension whose type equals `want`. The standard parser
+/// (`parse_client_hello`) exposes `extensions_order` but not raw bodies; the
+/// `quic_transport_parameters` (0x39) body needs its own walk.
+fn extension_body(record: &[u8], want: u16) -> Option<Vec<u8>> {
+    // record: [type][0x0303][len(2)] then handshake: [0x01][hs_len(3)] body...
+    let mut p = 5 + 4; // skip record header + handshake header
+    let r = record;
+    let rd16 = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+    p += 2; // legacy_version
+    p += 32; // client_random
+    let sid_len = *r.get(p)? as usize;
+    p += 1 + sid_len;
+    let cs_len = rd16(r, p) as usize;
+    p += 2 + cs_len;
+    let comp_len = *r.get(p)? as usize;
+    p += 1 + comp_len;
+    let exts_len = rd16(r, p) as usize;
+    p += 2;
+    let exts_end = p + exts_len;
+    while p + 4 <= exts_end && p + 4 <= r.len() {
+        let ext_type = rd16(r, p);
+        let ext_len = rd16(r, p + 2) as usize;
+        let body_start = p + 4;
+        let body_end = body_start + ext_len;
+        if body_end > r.len() {
+            return None;
+        }
+        if ext_type == want {
+            return Some(r[body_start..body_end].to_vec());
+        }
+        p = body_end;
+    }
+    None
+}
+
+/// Minimal QUIC-varint reader (RFC 9000 §16): returns (value, bytes_consumed).
+fn read_quic_varint(b: &[u8]) -> Option<(u64, usize)> {
+    let first = *b.first()?;
+    let len = 1usize << (first >> 6);
+    if b.len() < len {
+        return None;
+    }
+    let mut v = u64::from(first & 0x3f);
+    for &byte in &b[1..len] {
+        v = (v << 8) | u64::from(byte);
+    }
+    Some((v, len))
+}
+
+/// Parse a `quic_transport_parameters` (0x39) extension body into the ordered
+/// list of parameter ids on the wire. Each entry is varint(id) || varint(len) ||
+/// value[len]; we only need the id sequence for the structural gate.
+fn parse_transport_param_ids(body: &[u8]) -> Option<Vec<u64>> {
+    let mut ids = Vec::new();
+    let mut p = 0;
+    while p < body.len() {
+        let (id, n) = read_quic_varint(&body[p..])?;
+        p += n;
+        let (len, n) = read_quic_varint(&body[p..])?;
+        p += n;
+        let len = len as usize;
+        if p + len > body.len() {
+            return None;
+        }
+        p += len;
+        ids.push(id);
+    }
+    Some(ids)
+}
+
+#[tokio::test]
+async fn udp_leg_clienthello_matches_safari26_h3_structure() {
+    use crate::gfw_sim::detection::sni_filter::parse_client_hello;
+
+    // 1) Drive the real UDP-leg QUIC client and reassemble the full multi-datagram
+    //    ClientHello, then parse it.
+    let crypto = capture_udp_leg_full_client_hello("cloudflare.com").await;
+    assert!(
+        crypto.len() >= 4 && crypto[0] == 0x01,
+        "reassembled bytes must start a TLS ClientHello (type 0x01)"
+    );
+    let declared =
+        4 + (((crypto[1] as usize) << 16) | ((crypto[2] as usize) << 8) | (crypto[3] as usize));
+    assert!(
+        crypto.len() >= declared,
+        "ClientHello not fully reassembled across datagrams: have {} B, declared {} B",
+        crypto.len(),
+        declared
+    );
+    let record = wrap_handshake_as_tls_record(&crypto[..declared]);
+    let parsed = parse_client_hello(&record).expect("reassembled ClientHello parses");
+
+    // 2) Cipher suites: 20 Safari suites + 1 GREASE in slot 0 = 21 entries.
+    assert_eq!(
+        parsed.cipher_suites.len(),
+        21,
+        "Safari-26 H3 advertises 20 cipher suites led by one GREASE value; got {:?}",
+        parsed.cipher_suites
+    );
+    assert!(
+        is_grease_u16(parsed.cipher_suites[0]),
+        "cipher slot 0 must be a GREASE value; got {:#06x}",
+        parsed.cipher_suites[0]
+    );
+    // The three TLS 1.3 suites follow the GREASE lead, in Safari's order (no
+    // pruning to pure-1.3 — a legacy suite must survive).
+    assert_eq!(
+        &parsed.cipher_suites[1..4],
+        &[0x1302, 0x1303, 0x1301],
+        "TLS 1.3 suites must follow the GREASE lead in Safari order"
+    );
+    assert!(
+        parsed.cipher_suites.contains(&0x000a),
+        "legacy suite 0x000a must survive (no pure-1.3 pruning tell)"
+    );
+
+    // 3) Extension order: the static Safari table, GREASE matched by CLASS, with
+    //    extended_master_secret (0x17) / renegotiation_info (0xff01) IGNORED
+    //    (capture-gated — never assert their presence/absence). Project the wire
+    //    order onto class tokens, drop the legacy capture-gated pair, then compare.
+    const TOKEN_GREASE: u16 = 0xFFFF; // sentinel class token for any GREASE codepoint
+    let order: Vec<u16> = parsed
+        .extensions_order
+        .iter()
+        .copied()
+        .filter(|&e| e != 0x0017 && e != 0xff01) // ignore EMS / reneg (capture-gated)
+        .map(|e| if is_grease_u16(e) { TOKEN_GREASE } else { e })
+        .collect();
+    let expected_order: Vec<u16> = vec![
+        TOKEN_GREASE, // leading GREASE (len 0)
+        0x0000,       // server_name
+        0x000a,       // supported_groups
+        0x000b,       // ec_point_formats
+        0x0010,       // ALPN (h3)
+        0x0005,       // status_request
+        0x000d,       // signature_algorithms (Apple's dup 0x0805 kept)
+        0x0012,       // signed_certificate_timestamp
+        0x0033,       // key_share
+        0x002d,       // psk_key_exchange_modes
+        0x002b,       // supported_versions
+        0x0039,       // quic_transport_parameters
+        0x001b,       // compress_certificate
+        TOKEN_GREASE, // trailing GREASE (len 1)
+    ];
+    assert_eq!(
+        order, expected_order,
+        "extension order must be the static Safari-26 H3 table (GREASE by class, EMS/reneg ignored)"
+    );
+    // The two GREASE bookends must be DISTINCT values (RFC 8701), and the hello is
+    // cold-start: no pre_shared_key (0x29) / early_data (0x2a).
+    let greases: Vec<u16> = parsed
+        .extensions_order
+        .iter()
+        .copied()
+        .filter(|&e| is_grease_u16(e))
+        .collect();
+    assert_eq!(greases.len(), 2, "exactly two GREASE extensions (bookends)");
+    assert_ne!(greases[0], greases[1], "GREASE bookends must differ");
+    assert_eq!(
+        *parsed.extensions_order.last().unwrap(),
+        greases[1],
+        "cold-start: the trailing GREASE is the LAST extension (no pre_shared_key after it)"
+    );
+    assert!(
+        !parsed.extensions_order.contains(&0x0029) && !parsed.extensions_order.contains(&0x002a),
+        "cold-start: pre_shared_key (0x29) and early_data (0x2a) must be absent"
+    );
+
+    // 4) quic_transport_parameters (0x39): present, ids strictly ascending, the
+    //    exact Safari id set, 0x20 present, grease_quic_bit/min_ack_delay omitted.
+    //    Structure only — NEVER assert the parameter VALUES.
+    let tp_body =
+        extension_body(&record, 0x0039).expect("quic_transport_parameters (0x39) present");
+    let tp_ids = parse_transport_param_ids(&tp_body).expect("0x39 body parses as TP id list");
+    for w in tp_ids.windows(2) {
+        assert!(
+            w[0] < w[1],
+            "transport-param ids must be STRICTLY ascending; saw {:#x} then {:#x} in {:x?}",
+            w[0],
+            w[1],
+            tp_ids
+        );
+    }
+    let expected_tp_ids: Vec<u64> = vec![
+        0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0e, 0x0f, 0x20,
+    ];
+    assert_eq!(
+        tp_ids, expected_tp_ids,
+        "transport-param id set must be exactly Safari's ascending set"
+    );
+    assert!(
+        tp_ids.contains(&0x20),
+        "max_datagram_frame_size (0x20) is the Apple/libquic signature and must be present"
+    );
+    assert!(
+        !tp_ids.contains(&0x2ab2),
+        "grease_quic_bit (0x2ab2) must be omitted"
+    );
+    assert!(
+        !tp_ids.contains(&0xff04de1b),
+        "min_ack_delay (0xff04de1b) must be omitted"
+    );
 }

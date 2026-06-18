@@ -933,6 +933,11 @@ extension_struct! {
 
         /// Extensions that must appear contiguously.
         pub(crate) contiguous_extensions: Vec<ExtensionType>,
+
+        /// ParallaX fork: when `Some`, fully drives the extension wire order and
+        /// allows interleaving raw (GREASE/legacy) extensions, replacing the
+        /// `order_seed` shuffle and force-last logic. See [`crate::client::safari`].
+        pub(crate) safari_plan: Option<Vec<crate::client::SafariExt>>,
     }
 }
 
@@ -964,6 +969,7 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            safari_plan,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -991,6 +997,7 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            safari_plan,
         }
     }
 
@@ -1050,6 +1057,28 @@ impl ClientExtensions<'_> {
 
 impl<'a> Codec<'a> for ClientExtensions<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
+        // ParallaX fork: a Safari plan, when present, fully drives the wire
+        // order and lets raw (GREASE/legacy) extensions interleave with the
+        // rustls-managed ones. The same `encode` is used for both the wire
+        // bytes and the transcript hash, so this stays byte-consistent.
+        if let Some(plan) = &self.safari_plan {
+            if plan.is_empty() {
+                return;
+            }
+            let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+            for item in plan {
+                match item {
+                    crate::client::SafariExt::Managed(typ) => self.encode_one(*typ, body.buf),
+                    crate::client::SafariExt::Raw(typ, payload) => {
+                        typ.encode(body.buf);
+                        let inner = LengthPrefixedBuffer::new(ListLength::U16, body.buf);
+                        inner.buf.extend_from_slice(payload);
+                    }
+                }
+            }
+            return;
+        }
+
         let order = self.used_extensions_in_encoding_order();
 
         if order.is_empty() {

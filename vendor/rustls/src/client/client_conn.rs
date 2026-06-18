@@ -287,6 +287,13 @@ pub struct ClientConfig {
 
     /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
     pub(super) ech_mode: Option<EchMode>,
+
+    /// ParallaX fork: an optional Safari-faithful ClientHello shape. When
+    /// `Some`, the ClientHello assembly substitutes this profile's cipher-suite
+    /// list, extension order, ALPN, and GREASE key-share prefix onto the typed
+    /// payload before it is hashed into the transcript. `None` (the default)
+    /// leaves rustls behaviour completely unchanged.
+    pub safari_ch_profile: Option<Arc<crate::client::SafariChProfile>>,
 }
 
 impl ClientConfig {

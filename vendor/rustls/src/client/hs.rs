@@ -16,6 +16,7 @@ use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
+use crate::client::safari::SafariChProfile;
 use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::conn::ConnectionRandoms;
@@ -380,6 +381,15 @@ fn emit_client_hello_for_retry(
         extensions: exts,
     };
 
+    // ParallaX fork: apply the Safari-faithful ClientHello shape, if configured.
+    // This MUST happen before the message is frozen + hashed below (the typed
+    // payload is what both the wire and the transcript serialize from), so the
+    // server Finished MAC stays consistent. COLD-START only: the plan never
+    // carries pre_shared_key/early_data.
+    if let Some(profile) = config.safari_ch_profile.clone() {
+        apply_safari_profile(&mut chp_payload, &profile);
+    }
+
     let ech_grease_ext = config
         .ech_mode
         .as_ref()
@@ -517,6 +527,41 @@ fn emit_client_hello_for_retry(
     } else {
         Box::new(next)
     })
+}
+
+/// ParallaX fork: rewrite `chp_payload` into the Safari-faithful shape described
+/// by `profile`. Mutates the typed payload in place; the caller must do this
+/// before the message is frozen into the transcript hash.
+fn apply_safari_profile(chp_payload: &mut ClientHelloPayload, profile: &SafariChProfile) {
+    // (a) Replace the cipher-suite list verbatim (incl. GREASE + the dup 0x0805).
+    chp_payload.cipher_suites = profile.cipher_suites.clone();
+
+    // (d) Swap ALPN to the profile's protocols (e.g. h3).
+    chp_payload.extensions.protocols = Some(
+        profile
+            .alpn
+            .iter()
+            .cloned()
+            .map(ProtocolName::from)
+            .collect(),
+    );
+
+    // (c) Prepend a GREASE KeyShareEntry, carrying a single throwaway byte, in
+    // front of the real (hybrid + standalone) shares. The real shares — and
+    // rustls's private ActiveKeyExchange halves — are untouched.
+    if let Some(shares) = chp_payload.extensions.key_shares.as_mut() {
+        shares.insert(
+            0,
+            KeyShareEntry::new(
+                crate::NamedGroup::Unknown(profile.key_share_grease_group),
+                vec![0u8],
+            ),
+        );
+    }
+
+    // (b) Install the exact extension order plan, replacing the order_seed
+    // shuffle and force-last logic.
+    chp_payload.extensions.safari_plan = Some(profile.extension_plan.clone());
 }
 
 /// Prepares `exts` and `cx` with TLS 1.2 or TLS 1.3 session

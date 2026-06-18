@@ -586,6 +586,8 @@ pub mod client {
     mod ech;
     pub(super) mod handy;
     mod hs;
+    /// ParallaX fork: Safari-faithful ClientHello shaping.
+    pub mod safari;
     #[cfg(test)]
     mod test;
     #[cfg(feature = "tls12")]
@@ -593,6 +595,7 @@ pub mod client {
     mod tls13;
 
     pub use builder::WantsClientCert;
+    pub use safari::{SafariChProfile, SafariExt};
     pub use client_conn::{
         ClientConfig, ClientConnectionData, ClientSessionStore, EarlyDataError, ResolvesClientCert,
         Resumption, Tls12Resumption, UnbufferedClientConnection,
