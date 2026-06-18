@@ -70,3 +70,14 @@ split-debuginfo = "off"
 strip = false
 lto = "thin"
 codegen-units = 1
+
+# Vendored rustls 0.23.40 (path patch) — substrate for a surgical fork that
+# hand-writes the Safari-26 H3 QUIC ClientHello (the client ClientHello assembly
+# in vendor/rustls/src/client/hs.rs cannot be controlled via a CryptoProvider).
+# Pinned =0.23.40 to stay lockstep with quinn-proto 0.11.14's Quic*Config; the
+# crate name `rustls` is kept so quinn-proto's blanket PacketKey impls still
+# apply. S0 vendors it UNMODIFIED (build must stay byte-identical); the surgical
+# CH change lands in a later slice. Upstream rustls CVEs/patches must be
+# re-applied to the vendored copy.
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
