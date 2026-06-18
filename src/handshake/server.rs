@@ -48,7 +48,7 @@ use crate::{
         },
         session::{
             derive_server_keys_from_shared, expand_epoch_keys, x25519_public_from_private,
-            x25519_shared_secret, AeadCodec, SessionError, SessionKeys, X25519KeyPair,
+            x25519_shared_secret, AeadCodec, CipherSuite, SessionError, SessionKeys, X25519KeyPair,
         },
     },
     protocol::{
@@ -943,6 +943,7 @@ async fn relay_fallback_with_idle_timeout(
             // native threads), which scales without per-relay threads.
             if let Some(_splice_slot) = crate::transport::tcp::try_enter_kernel_splice_relay() {
                 tracing::debug!("using Linux splice(2) kernel relay for fallback TCP tunnel");
+                crate::transport::tcp::record_kernel_splice_relay();
                 return crate::transport::tcp::relay_kernel_splice_bidirectional_with_idle_timeout(
                     client,
                     fallback,
@@ -954,8 +955,12 @@ async fn relay_fallback_with_idle_timeout(
             tracing::debug!(
                 "kernel splice relay cap reached; using userspace fallback relay instead"
             );
+            crate::transport::tcp::record_userspace_cap_hit_relay();
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    crate::transport::tcp::record_userspace_non_linux_relay();
 
     let (mut client_read, mut client_write) = client.into_split();
     let (mut fallback_read, mut fallback_write) = fallback.into_split();
@@ -1436,11 +1441,12 @@ async fn run_authenticated_data_mode(
                         let pq_shared_secret =
                             zeroize::Zeroizing::new(pq_encapsulation.shared_secret);
                         pq_encapsulation.shared_secret.zeroize();
+                        let cipher_suite = server_data_cipher_suite();
                         let key_exchange_payload = ServerKeyExchange {
                             server_x25519_public: server_ephemeral.public,
                             mlkem_ciphertext: pq_encapsulation.ciphertext,
                         }
-                        .encode()?;
+                        .encode_with_suite(cipher_suite)?;
                         let pq_identity_binding =
                             identity::pq_rekey_binding(first_payload.as_slice(), &key_exchange_payload);
                         crate::process_hardening::protect_secret_bytes(
@@ -1469,6 +1475,7 @@ async fn run_authenticated_data_mode(
                             "server key exchange record written"
                         );
                         let rekeyed_keys = apply_server_pq_rekey(
+                            cipher_suite,
                             &mut client_open,
                             &mut server_seal,
                             &handshake.session_keys,
@@ -2333,6 +2340,7 @@ async fn commit_pending_replay_entry(
 }
 
 fn apply_server_pq_rekey(
+    suite: CipherSuite,
     client_open: &mut DataRecordCodec,
     server_seal: &mut DataRecordCodec,
     keys: &SessionKeys,
@@ -2352,9 +2360,31 @@ fn apply_server_pq_rekey(
         keys.transcript_hash,
         *x25519_shared_secret,
     )?;
-    client_open.rekey(next_keys.client_key, next_keys.client_nonce);
-    server_seal.rekey(next_keys.server_key, next_keys.server_nonce);
+    client_open.rekey_with_suite(suite, next_keys.client_key, next_keys.client_nonce);
+    server_seal.rekey_with_suite(suite, next_keys.server_key, next_keys.server_nonce);
     Ok(next_keys)
+}
+
+/// Picks the data-plane AEAD for a new session: AES-256-GCM where the CPU has
+/// AES hardware (then it is ~2x ChaCha20-Poly1305), otherwise ChaCha. Both are
+/// equally strong 256-bit AEADs, so this is a pure throughput choice, signaled
+/// to the client in the AEAD-sealed ServerKeyExchange (no downgrade surface). A
+/// busy server's per-byte AEAD cost is the scaling bottleneck, so the server's
+/// hardware decides the session suite.
+fn server_data_cipher_suite() -> CipherSuite {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        if std::arch::is_x86_feature_detected!("aes") {
+            return CipherSuite::Aes256Gcm;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("aes") {
+            return CipherSuite::Aes256Gcm;
+        }
+    }
+    CipherSuite::ChaCha20Poly1305
 }
 
 fn server_identity_chunk_delay<R>(timing: TimingProfile, rng: &mut R) -> Duration
@@ -2678,14 +2708,23 @@ impl Drop for ServerMuxStreams {
     }
 }
 
+/// Monotonic milliseconds since a process-local epoch, backing the lock-free
+/// relay activity clock. Coarse (ms) granularity is ample for the idle backstop
+/// (timeouts are whole seconds) and lets the clock live in a single atomic.
+fn relay_now_millis() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Shared last-activity clock for an authenticated relay, reset on every byte
-/// moved in either direction.
-type RelayActivity = Arc<Mutex<Instant>>;
+/// moved in either direction. Lock-free: both relay directions and the watchdog
+/// touch it with a single relaxed atomic, so the hot path never contends on a
+/// mutex (the previous `Arc<Mutex<Instant>>` bounced a cache line between the two
+/// relay tasks on every relayed chunk).
+type RelayActivity = Arc<AtomicU64>;
 
 fn bump_relay_activity(activity: &RelayActivity) {
-    if let Ok(mut last) = activity.lock() {
-        *last = Instant::now();
-    }
+    activity.store(relay_now_millis(), Ordering::Relaxed);
 }
 
 /// Resolves once the relay has been idle (no bytes either direction) for
@@ -2698,15 +2737,13 @@ fn bump_relay_activity(activity: &RelayActivity) {
 /// reset the clock; server-generated cover records deliberately do NOT, so the
 /// backstop still fires on a genuinely-idle relay even when cover traffic is on.
 async fn relay_idle_watchdog(activity: RelayActivity, idle_timeout: Duration) {
+    let timeout_ms = idle_timeout.as_millis() as u64;
     loop {
-        let elapsed = activity
-            .lock()
-            .map(|last| last.elapsed())
-            .unwrap_or(idle_timeout);
-        if elapsed >= idle_timeout {
+        let elapsed_ms = relay_now_millis().saturating_sub(activity.load(Ordering::Relaxed));
+        if elapsed_ms >= timeout_ms {
             return;
         }
-        sleep(idle_timeout - elapsed).await;
+        sleep(idle_timeout.saturating_sub(Duration::from_millis(elapsed_ms))).await;
     }
 }
 
@@ -2756,7 +2793,7 @@ impl DataRelay {
             // clock. The QUIC connection's own idle-timeout is a separate, coarser
             // bound; this is the operator-tunable backstop that matches the TCP
             // path's behavior.
-            let activity: RelayActivity = Arc::new(Mutex::new(Instant::now()));
+            let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
             let idle_timeout = fallback_idle_timeout();
             match tokio::time::timeout(QUIC_RELAY_ACCEPT_TIMEOUT, conn.accept_bi()).await {
                 Ok(Ok((send, recv))) => {
@@ -2902,7 +2939,7 @@ impl DataRelay {
         // this slice. The idle backstop (main's DoS hardening) bounds the relay so
         // a silent target cannot pin resources forever; only real payload bytes
         // (either direction) reset the clock.
-        let activity: RelayActivity = Arc::new(Mutex::new(Instant::now()));
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
         let idle_timeout = fallback_idle_timeout();
         let upload = server_upload_loop(
             TcpLegReader(client_records),
@@ -4236,6 +4273,59 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+
+    // --- Track A1: lock-free relay activity clock — watchdog semantics ---
+    // Below the `mod tests` boundary, so the no-timeout static ratchet (which
+    // scans the production region) is unaffected. Lock the preserved idle
+    // semantics so a future coarsening that broke the DoS backstop turns red.
+
+    #[tokio::test]
+    async fn relay_idle_watchdog_fires_after_idle_timeout() {
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let fired = tokio::time::timeout(
+            Duration::from_secs(2),
+            relay_idle_watchdog(activity, Duration::from_millis(20)),
+        )
+        .await;
+        assert!(fired.is_ok(), "watchdog must fire once the relay is idle");
+    }
+
+    #[tokio::test]
+    async fn relay_idle_watchdog_pending_before_idle_timeout() {
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let fired = tokio::time::timeout(
+            Duration::from_millis(50),
+            relay_idle_watchdog(activity, Duration::from_secs(30)),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "watchdog must not fire before the idle timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn bump_relay_activity_defers_watchdog() {
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let bumped = activity.clone();
+        let bumper = tokio::spawn(async move {
+            for _ in 0..10 {
+                sleep(Duration::from_millis(15)).await;
+                bump_relay_activity(&bumped);
+            }
+        });
+        let fired = tokio::time::timeout(
+            Duration::from_millis(100),
+            relay_idle_watchdog(activity, Duration::from_millis(60)),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "ongoing activity must defer the idle watchdog"
+        );
+        bumper.await.unwrap();
+    }
+
     use crate::{
         crypto::{
             auth::{

@@ -8,7 +8,10 @@ use zeroize::Zeroize;
 use crate::{
     crypto::{
         parallel::{self, CryptoPool},
-        session::{self, AeadCodec, SessionError, SharedCipher, AEAD_TAG_LEN, KEY_LEN, NONCE_LEN},
+        session::{
+            self, AeadCodec, CipherSuite, SessionError, SharedCipher, AEAD_TAG_LEN, KEY_LEN,
+            NONCE_LEN,
+        },
     },
     tls::record::{self, TLS_CONTENT_APPLICATION_DATA, TLS_LEGACY_VERSION},
     traffic::{PaddingProfile, TrafficError},
@@ -365,6 +368,17 @@ impl DataRecordCodec {
         self.aead.rekey(key, nonce_base);
     }
 
+    /// Rekeys and switches the data-plane cipher suite (used by the PQ rekey to
+    /// adopt the server-negotiated suite). On-wire record sizes are unchanged.
+    pub fn rekey_with_suite(
+        &mut self,
+        suite: CipherSuite,
+        key: [u8; KEY_LEN],
+        nonce_base: [u8; NONCE_LEN],
+    ) {
+        self.aead.rekey_with_suite(suite, key, nonce_base);
+    }
+
     pub fn max_plaintext_len(&self) -> usize {
         max_plaintext_len(self.padding.max_len())
     }
@@ -392,6 +406,44 @@ impl DataRecordCodec {
         for &len in record_lens {
             self.seal_into(&plaintext[offset..offset + len], rng, out)?;
             offset += len;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::seal_records_into`] but each record's plaintext is written
+    /// directly into `out` by `fill(i, out)` between begin/finish, so the caller
+    /// need not stage the plaintext in a separate buffer first. Byte-identical to
+    /// `seal_records_into` when `fill` appends the same per-record slices; this is
+    /// the zero-copy seal path for the relay/mux writers (Track A2). `record_lens`
+    /// gives the per-record plaintext lengths used to size the up-front reserve
+    /// (and, in debug, to assert `fill` appends exactly that many bytes).
+    pub fn seal_records_into_inplace<R, F>(
+        &mut self,
+        record_lens: &[usize],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+        mut fill: F,
+    ) -> Result<(), DataRecordError>
+    where
+        R: Rng + rand::RngCore + ?Sized,
+        F: FnMut(usize, &mut Vec<u8>),
+    {
+        let total: usize = record_lens.iter().sum();
+        out.reserve(chunked_records_capacity(
+            total,
+            record_lens.len().max(1),
+            self.padding.max_len(),
+        ));
+        for (i, &len) in record_lens.iter().enumerate() {
+            let builder = self.begin_record(out);
+            let before = out.len();
+            fill(i, out);
+            debug_assert_eq!(
+                out.len() - before,
+                len,
+                "fill must append exactly record_lens[i] plaintext bytes"
+            );
+            self.finish_record(builder, rng, out)?;
         }
         Ok(())
     }
@@ -1313,6 +1365,46 @@ mod tests {
         assert_eq!(opened, payload);
     }
 
+    /// Property test (seeded, no extra deps): random payloads spanning one to
+    /// several records, with random padding profiles and both AADs, must
+    /// round-trip byte-for-byte through the real chunked seal -> concat open
+    /// path. Locks the core AEAD record contract the relay/seal optimizations
+    /// build on (padding RNG draw, chunk boundaries, in-place open).
+    #[test]
+    fn random_payloads_round_trip_through_seal_and_open() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        for seed in 0..120u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let key = [seed as u8; KEY_LEN];
+            let nonce = [seed.wrapping_mul(7) as u8; NONCE_LEN];
+            let max_pad = rng.gen_range(0..=512u16);
+            let min_pad = rng.gen_range(0..=max_pad);
+            let padding = PaddingProfile::new(min_pad, max_pad).unwrap();
+            let len = rng.gen_range(1..=80 * 1024usize);
+            let payload: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+            let aad = if seed % 2 == 0 {
+                CLIENT_TO_SERVER_AAD
+            } else {
+                SERVER_TO_CLIENT_AAD
+            };
+
+            let mut enc = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, aad);
+            let mut seal_rng = StdRng::seed_from_u64(seed ^ 0x5050);
+            let mut sealed = Vec::new();
+            enc.seal_chunks_into_untracked(&payload, &mut seal_rng, &mut sealed)
+                .unwrap();
+
+            let mut dec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, aad);
+            let mut opened = Vec::new();
+            dec.open_concat_records(&mut sealed, &mut opened).unwrap();
+            assert_eq!(
+                opened, payload,
+                "seed {seed}: round-trip must reconstruct payload"
+            );
+        }
+    }
+
     #[test]
     fn parallel_open_matches_serial_open_across_many_records() {
         let key = [5_u8; KEY_LEN];
@@ -1461,6 +1553,49 @@ mod tests {
 
         // Zero padding consumes no rng, so the wire bytes are deterministic.
         assert_eq!(batched_out, reference_out);
+    }
+
+    #[test]
+    fn seal_records_into_inplace_matches_seal_records_into_byte_for_byte() {
+        let key = [5_u8; KEY_LEN];
+        let nonce = [6_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(3, 900).unwrap();
+        let lens = variable_record_lens(
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD)
+                .max_plaintext_len(),
+        );
+        let payload = patterned_payload(lens.iter().sum());
+
+        // Reference: the staging-buffer path (seal_records_into copies each slice).
+        let mut reference =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut reference_rng = StdRng::seed_from_u64(61);
+        let mut reference_out = Vec::new();
+        reference
+            .seal_records_into(&payload, &lens, &mut reference_rng, &mut reference_out)
+            .unwrap();
+
+        // In-place: each record's plaintext is written straight into `out`. SAME
+        // seed as the reference so the per-record padding draws line up.
+        let mut inplace =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut inplace_rng = StdRng::seed_from_u64(61);
+        let mut inplace_out = Vec::new();
+        let mut off = 0usize;
+        inplace
+            .seal_records_into_inplace(&lens, &mut inplace_rng, &mut inplace_out, |i, out| {
+                let len = lens[i];
+                out.extend_from_slice(&payload[off..off + len]);
+                off += len;
+            })
+            .unwrap();
+
+        // NON-zero padding (3..=900) is drawn per record from the SAME seeded RNG
+        // on both paths, so byte-for-byte equality here also proves the padding
+        // draw ORDER and COUNT match — the exact divergence a zero-padding test
+        // (which draws no rng) could not catch. inplace therefore round-trips too,
+        // since the reference output is proven to round-trip elsewhere.
+        assert_eq!(inplace_out, reference_out);
     }
 
     #[test]

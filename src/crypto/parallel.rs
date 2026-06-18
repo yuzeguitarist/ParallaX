@@ -66,15 +66,29 @@ impl CryptoPool {
         self.width
     }
 
-    fn submit(&self, job: Job) {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("crypto pool mutex poisoned");
-        state.jobs.push_back(job);
-        drop(state);
-        self.shared.available.notify_one();
+    /// Enqueues a whole batch of jobs under a SINGLE lock acquisition, then
+    /// wakes one worker per job. The old path took the lock once per job (one
+    /// `lock`+`notify_one` round-trip each); for an N-record fan-out this
+    /// collapses the N-1 lock acquisitions — the cross-tunnel enqueue
+    /// serialization point — into one, while keeping the exact same wake pattern
+    /// (precise `notify_one`, so no thundering herd when the pool is wider than
+    /// the batch).
+    fn submit_all(&self, jobs: Vec<Job>) {
+        let job_count = jobs.len();
+        if job_count == 0 {
+            return;
+        }
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("crypto pool mutex poisoned");
+            state.jobs.extend(jobs);
+        }
+        for _ in 0..job_count {
+            self.shared.available.notify_one();
+        }
     }
 
     /// Runs `jobs` and returns their results in the original order, blocking
@@ -126,13 +140,16 @@ impl CryptoPool {
         let (tx, rx) = mpsc::channel::<(usize, thread::Result<T>)>();
         let mut jobs = jobs.into_iter().enumerate();
         let (first_idx, first_job) = jobs.next().expect("n >= 1 checked above");
+        let mut batch: Vec<Job> = Vec::with_capacity(n - 1);
         for (idx, job) in jobs {
             let tx = tx.clone();
-            self.submit(Box::new(move || {
+            batch.push(Box::new(move || {
                 let result = catch_unwind(AssertUnwindSafe(job));
                 let _ = tx.send((idx, result));
             }));
         }
+        // Enqueue the entire fan-out under one lock acquisition + one wakeup.
+        self.submit_all(batch);
         // Drop the caller's sender so `rx` closes once every worker sender has.
         drop(tx);
 
@@ -316,5 +333,34 @@ mod tests {
         let r = catch_unwind(AssertUnwindSafe(|| pool.run_ordered(jobs)));
         std::panic::set_hook(prev);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn run_ordered_is_correct_under_concurrent_submitters() {
+        // Hammer the shared pool from many threads at once: this is the real
+        // cross-tunnel contract the A3 batched submit must satisfy. Each call's
+        // results must stay correctly ordered and routed to its own caller, with
+        // no lost wakeup and no cross-call mixing, even while other threads are
+        // enqueueing concurrently onto the same global pool.
+        use std::sync::Arc;
+        use std::thread;
+
+        let pool = Arc::new(CryptoPool::new(4));
+        let mut handles = Vec::new();
+        for t in 0..8usize {
+            let pool = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                for round in 0..200usize {
+                    let base = t * 100_000 + round * 16;
+                    let jobs: Vec<_> = (0..16usize).map(|i| move || base + i).collect();
+                    let out = pool.run_ordered(jobs);
+                    let want: Vec<usize> = (0..16).map(|i| base + i).collect();
+                    assert_eq!(out, want, "thread {t} round {round}: wrong/mixed results");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

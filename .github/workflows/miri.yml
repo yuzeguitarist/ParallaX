@@ -1,0 +1,59 @@
+name: miri
+
+# Nightly Miri (undefined-behavior interpreter) over the FFI-free pure-logic
+# modules: the UDP reorder buffer, the padding math, and the protocol command
+# codecs -- the untrusted-input parsers and arithmetic where a UB bug (OOB
+# slice, integer-overflow-derived index, invalid-value transmute) would be most
+# dangerous. The crypto, TLS-record and relay paths call aws-lc-rs / ring /
+# quinn FFI, which Miri cannot execute, so they are intentionally excluded here
+# and covered by the fuzz suite + loopback tests instead. Miri is slow, so this
+# runs weekly and on demand rather than on every push.
+
+on:
+  schedule:
+    - cron: '37 4 * * 1' # Mondays 04:37 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  miri:
+    name: miri (pure-logic modules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install nightly Rust + Miri
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Cache cargo registry and target/
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-miri
+
+      # Pure-logic modules only (no aws-lc-rs/ring/quinn FFI on these paths).
+      # disable-isolation lets the deterministic StdRng/time helpers run.
+      - name: cargo miri test (reorder + padding + command codecs)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: >
+          cargo +nightly miri test --locked --lib --
+          'transport::udp::reorder::'
+          'traffic::'
+          'protocol::command::'

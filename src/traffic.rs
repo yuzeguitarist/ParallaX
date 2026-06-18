@@ -213,6 +213,31 @@ impl CoverTrafficProfile {
     }
 }
 
+/// Formal proofs (Kani) over the padding parser. Compiled ONLY under `cargo
+/// kani` (which sets `cfg(kani)`); absent from a normal build/test.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::PaddingProfile;
+
+    /// The 2-byte padding-length trailer is attacker-controlled. `unpadded_len`
+    /// must NEVER panic (no integer underflow, no OOB index) for ANY input.
+    /// Proven here over all byte contents for every length up to a bound that
+    /// spans the guard boundary (len < 2, the 2-byte trailer, and pad_len vs
+    /// len), complementing the randomized + Miri property test with an exhaustive
+    /// check of the dangerous arithmetic.
+    #[kani::proof]
+    fn unpadded_len_never_panics() {
+        const N: usize = 8;
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        let mut buf = [0_u8; N];
+        for b in buf.iter_mut() {
+            *b = kani::any();
+        }
+        let _ = PaddingProfile::unpadded_len(&buf[..len]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{rngs::StdRng, SeedableRng};
@@ -231,6 +256,71 @@ mod tests {
         let mut in_place = padded.clone();
         PaddingProfile::remove_in_place(&mut in_place).unwrap();
         assert_eq!(in_place, b"hello");
+    }
+
+    #[test]
+    fn unpadded_len_never_panics_on_arbitrary_bytes() {
+        // The 2-byte padding-length trailer is attacker-controlled untrusted
+        // input. `remove` must reject malformed framing with an error and NEVER
+        // panic (no integer underflow, no OOB slice) for ANY byte string and any
+        // claimed pad_len. With the Miri lane over `traffic::`, this fuzzes the
+        // parser for UB across diverse inputs and boundary pad_len values.
+        let mut rng = StdRng::seed_from_u64(0x0BAD_F00D);
+        // Full input coverage under normal `cargo test`; a smaller sweep under
+        // the (much slower) Miri interpreter, which only needs a handful of
+        // diverse inputs to surface any UB.
+        let iters = if cfg!(miri) { 200 } else { 5000 };
+        for _ in 0..iters {
+            let len = rng.gen_range(0_usize..2048);
+            let mut bytes: Vec<u8> = (0..len).map(|_| rng.gen::<u8>()).collect();
+            // Half the time force the trailer to a uniformly-random u16 claimed
+            // pad_len so the `pad_len + 2 > len` guard sees both far-over-length
+            // values (the common case) and, occasionally, near-boundary ones.
+            if len >= 2 && rng.gen_bool(0.5) {
+                let [hi, lo] = rng.gen::<u16>().to_be_bytes();
+                let n = bytes.len();
+                bytes[n - 2] = hi;
+                bytes[n - 1] = lo;
+            }
+            if let Ok(inner) = PaddingProfile::remove(&bytes) {
+                // When accepted, framing is self-consistent: `inner` is the
+                // leading prefix and inner + pad_len + 2 reconstructs the input.
+                let pad_len =
+                    u16::from_be_bytes([bytes[bytes.len() - 2], bytes[bytes.len() - 1]]) as usize;
+                assert_eq!(inner.len() + pad_len + 2, bytes.len());
+                assert_eq!(&inner[..], &bytes[..inner.len()]);
+            }
+        }
+    }
+
+    #[test]
+    fn padding_round_trips_for_random_payloads_and_profiles() {
+        // remove(apply(x)) == x across random (min,max) profiles and payloads,
+        // and the padded length always lands in [payload+min+2, payload+max+2]
+        // (the observed-target branch clamps pad_len into [min,max]).
+        let mut rng = StdRng::seed_from_u64(0x5EED_CAFE);
+        let iters = if cfg!(miri) { 100 } else { 2000 };
+        for _ in 0..iters {
+            let a = rng.gen_range(0..=300_u16);
+            let b = rng.gen_range(0..=300_u16);
+            let (min, max) = (a.min(b), a.max(b));
+            let profile = PaddingProfile::new(min, max).unwrap();
+            let payload_len = rng.gen_range(0_usize..512);
+            let payload: Vec<u8> = (0..payload_len).map(|_| rng.gen::<u8>()).collect();
+
+            let padded = profile.apply(&payload, &mut rng);
+            assert!(padded.len() >= payload.len() + min as usize + 2);
+            assert!(padded.len() <= payload.len() + max as usize + 2);
+
+            assert_eq!(
+                PaddingProfile::remove(&padded).unwrap(),
+                payload,
+                "remove(apply(x)) must equal x"
+            );
+            let mut in_place = padded.clone();
+            PaddingProfile::remove_in_place(&mut in_place).unwrap();
+            assert_eq!(in_place, payload);
+        }
     }
 
     #[test]

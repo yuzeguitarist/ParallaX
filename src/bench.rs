@@ -8,7 +8,7 @@
 //!
 //! Design notes:
 //!
-//! * 58 cases across six groups exercise the asymmetric primitives, KDFs,
+//! * 59 cases across six groups exercise the asymmetric primitives, KDFs,
 //!   handshake composition, application-data AEAD pipeline, traffic shaping,
 //!   and replay-cache bookkeeping that dominate ParallaX's wall-clock cost.
 //! * Each case declares an iteration [`Tier`]. Tiers are static constants so
@@ -44,8 +44,8 @@ use crate::{
         replay::{ReplayCache, ReplayEntry},
         session::{
             derive_client_keys, derive_client_keys_from_shared, x25519_public_from_private,
-            x25519_shared_secret, AeadCodec, SessionKeys, X25519KeyPair, AEAD_TAG_LEN, KEY_LEN,
-            NONCE_LEN,
+            x25519_shared_secret, AeadCodec, CipherSuite, SessionKeys, X25519KeyPair, AEAD_TAG_LEN,
+            KEY_LEN, NONCE_LEN,
         },
     },
     handshake::client::ClientDataSession,
@@ -383,6 +383,7 @@ const CASES: &[CaseRunner] = &[
     bench_aead_seal_64b,
     bench_aead_seal_1k,
     bench_aead_seal_16k,
+    bench_aead_seal_16k_aes,
     bench_aead_round_trip_1k,
     bench_record_seal_1k,
     bench_record_open_in_place_1k,
@@ -1233,15 +1234,46 @@ fn bench_client_identity_verify_cached(options: BenchmarkOptions) -> Result<Benc
 // ---------------------------------------------------------------------------
 
 fn bench_aead_seal_64b(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    bench_aead_seal(options, "aead.seal_64b", TIER_HOT, SIZE_64B)
+    bench_aead_seal(
+        options,
+        "aead.seal_64b",
+        TIER_HOT,
+        SIZE_64B,
+        CipherSuite::ChaCha20Poly1305,
+    )
 }
 
 fn bench_aead_seal_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    bench_aead_seal(options, "aead.seal_1k", TIER_FAST, SIZE_1K)
+    bench_aead_seal(
+        options,
+        "aead.seal_1k",
+        TIER_FAST,
+        SIZE_1K,
+        CipherSuite::ChaCha20Poly1305,
+    )
 }
 
 fn bench_aead_seal_16k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    bench_aead_seal(options, "aead.seal_16k", TIER_MEDIUM, SIZE_16K)
+    bench_aead_seal(
+        options,
+        "aead.seal_16k",
+        TIER_MEDIUM,
+        SIZE_16K,
+        CipherSuite::ChaCha20Poly1305,
+    )
+}
+
+/// AES-256-GCM counterpart of `aead.seal_16k`, so the negotiated data-plane
+/// suite's bulk throughput can be compared head-to-head with ChaCha on the
+/// running CPU (AES-256-GCM is ~2x on hardware with AES acceleration).
+fn bench_aead_seal_16k_aes(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    bench_aead_seal(
+        options,
+        "aead.seal_16k_aes",
+        TIER_MEDIUM,
+        SIZE_16K,
+        CipherSuite::Aes256Gcm,
+    )
 }
 
 fn bench_aead_seal(
@@ -1249,10 +1281,11 @@ fn bench_aead_seal(
     name: &'static str,
     tier: Tier,
     payload_size: usize,
+    suite: CipherSuite,
 ) -> Result<BenchmarkCase> {
     let key = [0x07_u8; KEY_LEN];
     let nonce_base = [0x09_u8; NONCE_LEN];
-    let mut codec = AeadCodec::new(key, nonce_base);
+    let mut codec = AeadCodec::new_with_suite(suite, key, nonce_base);
     let plaintext = vec![0x42_u8; payload_size];
     run_case(BenchGroup::RecordAead, name, tier, options, || {
         let ciphertext = codec.seal(&plaintext, CLIENT_TO_SERVER_AAD)?;

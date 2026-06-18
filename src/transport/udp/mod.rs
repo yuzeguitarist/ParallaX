@@ -104,6 +104,32 @@ const UDP_MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// timing out. quinn defaults keep-alive to None (off).
 const UDP_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Flow-control windows for the fast-plane relay's single reliable stream.
+///
+/// quinn's default `stream_receive_window` (~1.25 MB, sized for ~12.5 MB/s x
+/// 100 ms) caps a single stream at window/RTT, which on a 160-320 ms cross-border
+/// path throttles the one relay stream far below the link rate (1.25 MB / 0.16 s
+/// ≈ 7.8 MB/s, lower at 320 ms). Size the STREAM window to the cross-border BDP
+/// (320 ms x ~100 Mbit/s ≈ 4 MiB) so the relay stream is not flow-control-bound.
+/// This rationale is window/RTT arithmetic only; it is NOT a measured wire
+/// throughput (the in-repo loss harness models delay+loss with no bandwidth cap,
+/// so its MB/s figures are a loopback ceiling, not a cross-border goodput).
+///
+/// The CONNECTION window is kept DISTINCT from (and larger than) the stream
+/// window on purpose: real Chrome/Safari H3 advertise connection > stream
+/// values, so emitting all four flow-control transport parameters EQUAL (which a
+/// single shared window does) is a shape no browser emits — observable to a
+/// censor that decrypts the QUIC v1 Initial. WARNING: these magnitudes are NOT
+/// matched to a real Safari-26 H3 capture; they are BDP-headroom values,
+/// acceptable ONLY while the UDP plane is off by default. Before enabling the
+/// plane: (1) calibrate against a capture, and (2) add a global
+/// concurrent-QUIC-relay cap — aggregate worst-case un-drained buffer is
+/// conn_window x the 16384 connection limit ≈ 128 GiB if authenticated peers
+/// stall their read side, so the per-connection bound is not enough at scale
+/// (cf. the kernel-splice relay cap).
+const UDP_STREAM_RECV_WINDOW: u32 = 4 * 1024 * 1024;
+const UDP_CONN_RECV_WINDOW: u32 = 8 * 1024 * 1024;
+
 /// Shared QUIC transport tuning applied to both the server and client endpoints
 /// so the two ends agree on idle/keep-alive behavior. The effective idle timeout
 /// is the minimum of the two peers' values, so configuring both keeps it
@@ -123,13 +149,17 @@ fn udp_transport_config() -> Arc<quinn::TransportConfig> {
     // separately by `datagram_receive_buffer_size`. quinn's defaults (100 bidi +
     // 100 uni concurrent streams, connection `receive_window = VarInt::MAX`) let
     // an authenticated peer pin hundreds of MB of un-drained receive buffers
-    // against this one-stream relay. Bound the flow-control envelope to the relay
-    // reality: at most one incoming bidi stream, no uni streams, and a finite
-    // connection-level receive window. `stream_receive_window` is left at quinn's
-    // tuned default so single-stream throughput is unchanged.
+    // against this one-stream relay. Bound concurrency to exactly one bidi stream
+    // and no uni streams. The receive windows are BDP-sized and kept
+    // connection > stream (see UDP_{CONN,STREAM}_RECV_WINDOW), which both lifts
+    // the high-RTT flow-control cap and avoids the all-equal transport-param
+    // shape no browser emits; send_window matches the connection window so the
+    // sender is not the bottleneck.
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
-    transport.receive_window(quinn::VarInt::from_u32(1_250_000));
+    transport.receive_window(quinn::VarInt::from_u32(UDP_CONN_RECV_WINDOW));
+    transport.stream_receive_window(quinn::VarInt::from_u32(UDP_STREAM_RECV_WINDOW));
+    transport.send_window(u64::from(UDP_CONN_RECV_WINDOW));
 
     // Congestion control: BBR, not quinn's default Cubic. The fast plane only
     // earns its keep on lossy links, where Cubic's loss-as-congestion backoff
@@ -496,6 +526,304 @@ mod tests {
                 rustls::NamedGroup::secp384r1,
             ],
             "QUIC kx groups must mirror aws-lc-rs prefer-post-quantum default order",
+        );
+    }
+
+    // --- Cross-border loss/RTT harness ------------------------------------
+    // Offline evidence (no netem, no second host): a userspace UDP relay injects
+    // one-way delay + Bernoulli loss into a REAL quinn connection, so we can see
+    // whether the fast plane survives lossy high-RTT links and whether the
+    // connection/stream receive_window throttles a high-BDP path.
+
+    use quinn::Connection;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::net::SocketAddr;
+    use tokio::net::UdpSocket;
+    use tokio::time::Instant;
+
+    /// Loopback UDP relay adding `delay` one-way and Bernoulli `loss` in each
+    /// direction between a client (which dials the returned addr) and
+    /// `server_addr`. Abort the handle to stop it.
+    async fn delay_loss_relay(
+        server_addr: SocketAddr,
+        delay: Duration,
+        loss: f64,
+        seed: u64,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_addr = sock.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut client_addr: Option<SocketAddr> = None;
+            let mut buf = vec![0_u8; 2048];
+            loop {
+                let (n, from) = match sock.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let dest = if from == server_addr {
+                    match client_addr {
+                        Some(a) => a,
+                        None => continue,
+                    }
+                } else {
+                    client_addr = Some(from);
+                    server_addr
+                };
+                if rng.gen::<f64>() < loss {
+                    continue; // drop this packet
+                }
+                let pkt = buf[..n].to_vec();
+                let sock = sock.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = sock.send_to(&pkt, dest).await;
+                });
+            }
+        });
+        (relay_addr, handle)
+    }
+
+    /// Production fast-plane bounds, but with the connection + stream
+    /// receive_window set to `window`, so the harness can isolate the high-BDP
+    /// throughput cap. BBR matches production.
+    fn relay_test_transport(window: u32) -> Arc<quinn::TransportConfig> {
+        let mut t = quinn::TransportConfig::default();
+        t.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
+        t.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        t.receive_window(quinn::VarInt::from_u32(window));
+        t.stream_receive_window(quinn::VarInt::from_u32(window));
+        t.send_window(u64::from(window));
+        t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        Arc::new(t)
+    }
+
+    /// Establish a client/server QUIC pair whose packets traverse a delay+loss
+    /// relay, both ends using `transport`.
+    async fn relay_pair(
+        transport: Arc<quinn::TransportConfig>,
+        delay: Duration,
+        loss: f64,
+        seed: u64,
+    ) -> (
+        Endpoint,
+        Endpoint,
+        Connection,
+        Connection,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (cert, key) = self_signed_cert();
+        let mut server_cfg = server_config(cert, key).unwrap();
+        server_cfg.transport_config(transport.clone());
+        let server_endpoint = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let (relay_addr, relay) = delay_loss_relay(server_addr, delay, loss, seed).await;
+
+        let mut client_cfg = client_config(Arc::new(AcceptAnyServerCert)).unwrap();
+        client_cfg.transport_config(transport);
+        let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+
+        let acceptor = {
+            let server_endpoint = server_endpoint.clone();
+            tokio::spawn(async move {
+                server_endpoint
+                    .accept()
+                    .await
+                    .expect("incoming")
+                    .await
+                    .expect("server conn")
+            })
+        };
+        let client_conn = tokio::time::timeout(
+            Duration::from_secs(25),
+            client_endpoint
+                .connect(relay_addr, "localhost")
+                .expect("start connect"),
+        )
+        .await
+        .expect("client connect timed out through relay")
+        .expect("client conn");
+        let server_conn = tokio::time::timeout(Duration::from_secs(25), acceptor)
+            .await
+            .expect("server accept timed out")
+            .expect("accept task");
+        (
+            server_endpoint,
+            client_endpoint,
+            client_conn,
+            server_conn,
+            relay,
+        )
+    }
+
+    /// Measure single-bidi-stream download goodput (server -> client) in MB/s,
+    /// timed from first byte received to last (excludes the initial RTT).
+    async fn download_goodput(client: &Connection, server: &Connection, n: usize) -> f64 {
+        let server = server.clone();
+        let server_task = tokio::spawn(async move {
+            let (mut send, _recv) = server.accept_bi().await.expect("accept_bi");
+            let chunk = vec![0xAB_u8; 64 * 1024];
+            let mut written = 0;
+            while written < n {
+                let take = (n - written).min(chunk.len());
+                send.write_all(&chunk[..take]).await.expect("write");
+                written += take;
+            }
+            send.finish().expect("finish");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        // Open the relay's single bidi stream and kick a byte so the server's
+        // accept_bi resolves; keep the send half alive for the stream's lifetime.
+        let (mut _kick, mut recv) = client.open_bi().await.expect("open_bi");
+        _kick.write_all(b"go").await.expect("kick");
+        let mut got = 0_usize;
+        let mut start: Option<Instant> = None;
+        let mut buf = vec![0_u8; 64 * 1024];
+        while let Some(read) = recv.read(&mut buf).await.expect("read") {
+            if start.is_none() {
+                start = Some(Instant::now());
+            }
+            got += read;
+        }
+        let secs = start.expect("at least one byte").elapsed().as_secs_f64();
+        server_task.await.unwrap();
+        assert_eq!(got, n, "must receive the whole object");
+        (got as f64 / 1_048_576.0) / secs.max(1e-6)
+    }
+
+    /// Evidence harness: does the 1.25 MB production receive_window throttle a
+    /// 160 ms cross-border path, and does a BDP-sized window lift it? Prints a
+    /// goodput table across loss levels for both windows. Heavy; run with
+    /// `--ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "heavy QUIC network-emulation benchmark; run with --ignored"]
+    async fn quic_fast_plane_goodput_under_cross_border_loss() {
+        if std::env::var_os("PLX_RUN_NET_BENCH").is_none() {
+            eprintln!("skipping: set PLX_RUN_NET_BENCH=1 to run this heavy QUIC benchmark");
+            return;
+        }
+        let n = 16 * 1024 * 1024; // 16 MiB download per cell
+        let delay = Duration::from_millis(80); // ~160 ms RTT
+        let loss_levels = [0.0_f64, 0.01, 0.03];
+
+        // "old": the previous 1.25 MB window. "prod-fixed": the real shipping
+        // config (udp_transport_config, now BDP-sized). Same BBR, same relay.
+        let cases: [(&str, Arc<quinn::TransportConfig>); 2] = [
+            ("old-1.25MB", relay_test_transport(1_250_000)),
+            ("prod-fixed", udp_transport_config()),
+        ];
+
+        let mut old_clean = 0.0_f64;
+        let mut prod_worst = f64::INFINITY;
+        for (label, transport) in cases {
+            for (i, &loss) in loss_levels.iter().enumerate() {
+                let (_se, _ce, cc, sc, relay) =
+                    relay_pair(transport.clone(), delay, loss, 0x0C0FFEE0).await;
+                let mbps = download_goodput(&cc, &sc, n).await;
+                println!(
+                    "[{label}] rtt=160ms loss={:>4.1}% goodput={:>7.2} MB/s",
+                    loss * 100.0,
+                    mbps
+                );
+                relay.abort();
+                if label == "old-1.25MB" && i == 0 {
+                    old_clean = mbps;
+                }
+                if label == "prod-fixed" {
+                    prod_worst = prod_worst.min(mbps);
+                }
+            }
+        }
+
+        // The fix is decisive: the shipping (BDP-sized) config at its WORST
+        // modeled loss still beats the old 1.25 MB window on a CLEAN link.
+        assert!(
+            prod_worst > old_clean,
+            "BDP-sized window worst-case ({prod_worst:.2} MB/s) must beat old 1.25MB clean ({old_clean:.2} MB/s)"
+        );
+    }
+
+    /// Same bounds + window as `relay_test_transport`, but quinn's DEFAULT
+    /// congestion controller (Cubic) rather than BBR, so the harness can measure
+    /// the loss response that motivates the BBR choice.
+    fn relay_test_transport_cubic(window: u32) -> Arc<quinn::TransportConfig> {
+        let mut t = quinn::TransportConfig::default();
+        t.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
+        t.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        t.receive_window(quinn::VarInt::from_u32(window));
+        t.stream_receive_window(quinn::VarInt::from_u32(window));
+        t.send_window(u64::from(window));
+        Arc::new(t)
+    }
+
+    /// Measure MB/s actually delivered within `cap` (timed from the first byte,
+    /// so the initial RTT is excluded). The right tool when a controller
+    /// collapses: a fixed-SIZE transfer would take minutes at ~0.05 MB/s.
+    async fn download_rate_in_window(
+        client: &Connection,
+        server: &Connection,
+        cap: Duration,
+    ) -> f64 {
+        let server = server.clone();
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut send, _recv)) = server.accept_bi().await {
+                let chunk = vec![0xAB_u8; 64 * 1024];
+                while send.write_all(&chunk).await.is_ok() {} // until flow-control/close
+            }
+        });
+        let (mut _kick, mut recv) = client.open_bi().await.expect("open_bi");
+        _kick.write_all(b"go").await.expect("kick");
+        let mut buf = vec![0_u8; 64 * 1024];
+        // Block for the first byte so the initial RTT is excluded, then start the
+        // clock and the byte counter together (the first read's bytes are dropped
+        // from the numerator so numerator and denominator cover the same window).
+        let _ = recv.read(&mut buf).await.expect("read");
+        let start = Instant::now();
+        let mut got = 0_usize;
+        while start.elapsed() < cap {
+            match tokio::time::timeout(cap - start.elapsed(), recv.read(&mut buf)).await {
+                Ok(Ok(Some(read))) => got += read,
+                _ => break,
+            }
+        }
+        let secs = start.elapsed().as_secs_f64();
+        server_task.abort();
+        (got as f64 / 1_048_576.0) / secs.max(1e-6)
+    }
+
+    /// Evidence for the BBR choice (mod.rs:144): on a lossy cross-border path
+    /// Cubic reads every random loss as congestion and collapses its window,
+    /// while BBR's model-based rate holds up. With the BDP window in place, this
+    /// isolates the congestion-controller's loss response. Heavy; `--ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "heavy QUIC network-emulation benchmark; run with --ignored"]
+    async fn quic_bbr_beats_cubic_under_cross_border_loss() {
+        if std::env::var_os("PLX_RUN_NET_BENCH").is_none() {
+            eprintln!("skipping: set PLX_RUN_NET_BENCH=1 to run this heavy QUIC benchmark");
+            return;
+        }
+        let delay = Duration::from_millis(80); // ~160 ms RTT
+        let loss = 0.03; // 3% — the worst modeled cross-border loss
+        let window = UDP_STREAM_RECV_WINDOW;
+        let cap = Duration::from_secs(8);
+
+        let (_se1, _ce1, cc1, sc1, r1) =
+            relay_pair(relay_test_transport(window), delay, loss, 0xB0BB).await;
+        let bbr = download_rate_in_window(&cc1, &sc1, cap).await;
+        r1.abort();
+
+        let (_se2, _ce2, cc2, sc2, r2) =
+            relay_pair(relay_test_transport_cubic(window), delay, loss, 0xB0BB).await;
+        let cubic = download_rate_in_window(&cc2, &sc2, cap).await;
+        r2.abort();
+
+        println!("rtt=160ms loss=3.0% (8s window)  BBR={bbr:.2} MB/s  Cubic={cubic:.2} MB/s");
+        assert!(
+            bbr > cubic * 2.0,
+            "BBR ({bbr:.2}) must clearly beat Cubic ({cubic:.2}) under cross-border loss"
         );
     }
 }

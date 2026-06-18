@@ -7,11 +7,12 @@ description = "ParallaX censorship-resistant proxy protocol core"
 license = "MIT"
 default-run = "parallax"
 
-# The `fuzzing` cfg is set automatically by cargo-fuzz. Declare it here so normal
-# and CI builds (which never set it) don't emit unexpected_cfgs warnings for the
-# #[cfg(fuzzing)] fuzz-only hooks — keeping `-D warnings` green.
+# The `fuzzing` cfg is set automatically by cargo-fuzz and `kani` by cargo-kani.
+# Declare both here so normal and CI builds (which never set them) don't emit
+# unexpected_cfgs warnings for the #[cfg(fuzzing)] fuzz-only hooks and the
+# #[cfg(kani)] proof harnesses — keeping `-D warnings` green.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [dependencies]
 anyhow = "1"

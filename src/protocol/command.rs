@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::crypto::session::CipherSuite;
+
 const CONNECT_MAGIC: &[u8; 4] = b"PX1C";
 const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
 const SERVER_KEY_EXCHANGE_MAGIC: &[u8; 4] = b"PX1K";
@@ -187,6 +189,8 @@ pub enum ServerKeyExchangeError {
     EmptyCiphertext,
     #[error("server key exchange ML-KEM ciphertext length is invalid")]
     InvalidCiphertextLength,
+    #[error("server key exchange carries an unknown cipher suite tag")]
+    InvalidCipherSuite,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -442,6 +446,16 @@ impl ServerKeyExchange {
         Ok(out)
     }
 
+    /// Like [`Self::encode`] but appends the one-byte negotiated cipher-suite
+    /// tag. The server uses this; the client reads it with
+    /// [`Self::decode_ref_with_suite`]. Legacy records (no tag) decode as
+    /// ChaCha20-Poly1305, so the two layouts are wire-compatible.
+    pub fn encode_with_suite(&self, suite: CipherSuite) -> Result<Vec<u8>, ServerKeyExchangeError> {
+        let mut out = self.encode()?;
+        out.push(suite.to_wire());
+        Ok(out)
+    }
+
     pub fn decode(input: &[u8]) -> Result<Self, ServerKeyExchangeError> {
         let exchange = Self::decode_ref(input)?;
         Ok(Self {
@@ -451,6 +465,16 @@ impl ServerKeyExchange {
     }
 
     pub fn decode_ref(input: &[u8]) -> Result<ServerKeyExchangeRef<'_>, ServerKeyExchangeError> {
+        Self::decode_ref_with_suite(input).map(|(exchange, _suite)| exchange)
+    }
+
+    /// Canonical parser. Accepts both the legacy `40 + ct_len` layout (no suite
+    /// tag -> ChaCha20-Poly1305 default) and the `41 + ct_len` layout with a
+    /// trailing cipher-suite tag. The ciphertext slice is bounded to exactly
+    /// `ct_len`, so a trailing tag never bleeds into it.
+    pub fn decode_ref_with_suite(
+        input: &[u8],
+    ) -> Result<(ServerKeyExchangeRef<'_>, CipherSuite), ServerKeyExchangeError> {
         if input.len() < 4 {
             return Err(ServerKeyExchangeError::Truncated);
         }
@@ -466,13 +490,28 @@ impl ServerKeyExchange {
         if len == 0 {
             return Err(ServerKeyExchangeError::EmptyCiphertext);
         }
-        if input.len() != 40 + len {
+        // Reject an impossible length before the `40 + len` / `41 + len`
+        // arithmetic so it cannot wrap usize on a hypothetical 32-bit target
+        // (ParallaX ships 64-bit only; belt-and-suspenders, redundant with the
+        // exact-length checks below on 64-bit but free).
+        if len > input.len() {
             return Err(ServerKeyExchangeError::InvalidCiphertextLength);
         }
-        Ok(ServerKeyExchangeRef {
-            server_x25519_public,
-            mlkem_ciphertext: &input[40..],
-        })
+        let suite = if input.len() == 40 + len {
+            CipherSuite::ChaCha20Poly1305
+        } else if input.len() == 41 + len {
+            CipherSuite::from_wire(input[40 + len])
+                .ok_or(ServerKeyExchangeError::InvalidCipherSuite)?
+        } else {
+            return Err(ServerKeyExchangeError::InvalidCiphertextLength);
+        };
+        Ok((
+            ServerKeyExchangeRef {
+                server_x25519_public,
+                mlkem_ciphertext: &input[40..40 + len],
+            },
+            suite,
+        ))
     }
 }
 
@@ -1491,6 +1530,50 @@ mod tests {
 
         assert_eq!(decoded.server_x25519_public, exchange.server_x25519_public);
         assert_eq!(decoded.mlkem_ciphertext, exchange.mlkem_ciphertext);
+    }
+
+    #[test]
+    fn server_key_exchange_decode_ref_with_suite_round_trips_and_rejects_bad_tags() {
+        let exchange = ServerKeyExchange {
+            server_x25519_public: [9_u8; 32],
+            mlkem_ciphertext: vec![10, 11, 12, 13],
+        };
+
+        // Each negotiated suite round-trips: the one-byte tag maps back to the
+        // SAME suite (guards against a refactor mapping the tag to the wrong one).
+        for suite in [CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm] {
+            let encoded = exchange.encode_with_suite(suite).unwrap();
+            let (decoded, got) = ServerKeyExchange::decode_ref_with_suite(&encoded).unwrap();
+            assert_eq!(
+                got, suite,
+                "tag must decode to the suite it was encoded with"
+            );
+            assert_eq!(decoded.mlkem_ciphertext, exchange.mlkem_ciphertext);
+            assert_eq!(decoded.server_x25519_public, exchange.server_x25519_public);
+        }
+
+        // A legacy record (no tag) decodes as ChaCha20-Poly1305 (wire-compat).
+        let legacy = exchange.encode().unwrap();
+        let (_, legacy_suite) = ServerKeyExchange::decode_ref_with_suite(&legacy).unwrap();
+        assert_eq!(legacy_suite, CipherSuite::ChaCha20Poly1305);
+
+        // An out-of-range suite tag (41+len shape, unknown byte) is rejected, not
+        // silently mapped onto a valid suite.
+        let mut bad_tag = exchange.encode().unwrap();
+        bad_tag.push(0xff);
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&bad_tag),
+            Err(ServerKeyExchangeError::InvalidCipherSuite)
+        ));
+
+        // Trailing garbage beyond the tag (42+len) is neither legacy nor tagged.
+        let mut wrong_len = exchange.encode().unwrap();
+        wrong_len.push(CipherSuite::Aes256Gcm.to_wire());
+        wrong_len.push(0x00);
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&wrong_len),
+            Err(ServerKeyExchangeError::InvalidCiphertextLength)
+        ));
     }
 
     #[test]

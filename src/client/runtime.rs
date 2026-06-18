@@ -1552,8 +1552,8 @@ async fn apply_server_key_exchange_record_blocking(
 ) -> Result<(), ClientRuntimeError> {
     let exchange_payload_range = data_session.open_server_record_in_place_payload_range(record)?;
     let exchange_payload = &record[exchange_payload_range];
-    let exchange =
-        ServerKeyExchange::decode_ref(exchange_payload).map_err(ClientHandshakeError::from)?;
+    let (exchange, cipher_suite) = ServerKeyExchange::decode_ref_with_suite(exchange_payload)
+        .map_err(ClientHandshakeError::from)?;
     let pq_identity_binding = pending_rekey.identity_binding(exchange_payload);
     let x25519_shared = pending_rekey.x25519_shared_secret(&exchange.server_x25519_public);
     let mlkem_ciphertext = exchange.mlkem_ciphertext.to_vec();
@@ -1564,6 +1564,7 @@ async fn apply_server_key_exchange_record_blocking(
     })
     .await??;
     data_session.apply_pq_rekey_shared_with_identity_binding(
+        cipher_suite,
         &x25519_shared,
         &pq_shared,
         psk,
@@ -1746,7 +1747,7 @@ impl ClientRelay {
         // silently stops accepting new local SOCKS connections. Only real payload
         // bytes in either direction reset the clock; cover records do not. The
         // watchdog wraps BOTH relay paths (QUIC fast plane and TCP).
-        let activity: ClientRelayActivity = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let activity: ClientRelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
 
         // QUIC fast-plane path: the probe was Verified on BOTH ends, so the client
         // (the bidi opener) opens a reliable bidi stream and carries both relay
@@ -1938,26 +1939,32 @@ impl ClientRelay {
     }
 }
 
+/// Monotonic milliseconds since a process-local epoch, backing the lock-free
+/// client relay activity clock. Coarse (ms) granularity is ample for the idle
+/// backstop (timeouts are whole seconds) and lets the clock live in one atomic.
+fn relay_now_millis() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Shared last-activity clock for a client relay, reset on every real payload
-/// byte moved in either direction (cover records excluded).
-type ClientRelayActivity = Arc<std::sync::Mutex<Instant>>;
+/// byte moved in either direction (cover records excluded). Lock-free: both relay
+/// directions and the watchdog touch it with a single relaxed atomic, so the hot
+/// path never contends on a mutex.
+type ClientRelayActivity = Arc<AtomicU64>;
 
 fn bump_client_relay_activity(activity: &ClientRelayActivity) {
-    if let Ok(mut last) = activity.lock() {
-        *last = Instant::now();
-    }
+    activity.store(relay_now_millis(), Ordering::Relaxed);
 }
 
 async fn client_relay_idle_watchdog(activity: ClientRelayActivity, idle_timeout: Duration) {
+    let timeout_ms = idle_timeout.as_millis() as u64;
     loop {
-        let elapsed = activity
-            .lock()
-            .map(|last| last.elapsed())
-            .unwrap_or(idle_timeout);
-        if elapsed >= idle_timeout {
+        let elapsed_ms = relay_now_millis().saturating_sub(activity.load(Ordering::Relaxed));
+        if elapsed_ms >= timeout_ms {
             return;
         }
-        sleep(idle_timeout - elapsed).await;
+        sleep(idle_timeout.saturating_sub(Duration::from_millis(elapsed_ms))).await;
     }
 }
 
@@ -2913,6 +2920,58 @@ mod tests {
     };
 
     use super::*;
+
+    // --- Track A1: lock-free relay activity clock — watchdog semantics ---
+    // Below the `mod tests` boundary, so the no-timeout static ratchet is
+    // unaffected. Locks the preserved idle-backstop semantics for the client.
+
+    #[tokio::test]
+    async fn client_relay_idle_watchdog_fires_after_idle_timeout() {
+        let activity: ClientRelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let fired = timeout(
+            Duration::from_secs(2),
+            client_relay_idle_watchdog(activity, Duration::from_millis(20)),
+        )
+        .await;
+        assert!(fired.is_ok(), "watchdog must fire once the relay is idle");
+    }
+
+    #[tokio::test]
+    async fn client_relay_idle_watchdog_pending_before_idle_timeout() {
+        let activity: ClientRelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let fired = timeout(
+            Duration::from_millis(50),
+            client_relay_idle_watchdog(activity, Duration::from_secs(30)),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "watchdog must not fire before the idle timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn bump_client_relay_activity_defers_watchdog() {
+        let activity: ClientRelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let bumped = activity.clone();
+        let bumper = tokio::spawn(async move {
+            for _ in 0..10 {
+                sleep(Duration::from_millis(15)).await;
+                bump_client_relay_activity(&bumped);
+            }
+        });
+        let fired = timeout(
+            Duration::from_millis(100),
+            client_relay_idle_watchdog(activity, Duration::from_millis(60)),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "ongoing activity must defer the idle watchdog"
+        );
+        bumper.await.unwrap();
+    }
+
     use crate::{
         config::ServerConfig,
         crypto::{

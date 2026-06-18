@@ -9,7 +9,7 @@ use crate::{
         pq::{self, PqError},
         session::{
             derive_client_keys, derive_client_keys_from_shared, expand_epoch_keys,
-            x25519_shared_secret, AeadCodec, SessionError, SessionKeys, X25519KeyPair,
+            x25519_shared_secret, AeadCodec, CipherSuite, SessionError, SessionKeys, X25519KeyPair,
         },
     },
     protocol::{
@@ -170,7 +170,7 @@ impl ClientDataSession {
         sandwich_secret: &[u8],
     ) -> Result<(), ClientHandshakeError> {
         let exchange_payload = self.open_from_server.open(record)?;
-        let exchange = ServerKeyExchange::decode_ref(&exchange_payload)?;
+        let (exchange, cipher_suite) = ServerKeyExchange::decode_ref_with_suite(&exchange_payload)?;
         let pq_identity_binding = pending.identity_binding(&exchange_payload);
         let x25519_shared =
             Zeroizing::new(pending.x25519_shared_secret(&exchange.server_x25519_public));
@@ -179,6 +179,7 @@ impl ClientDataSession {
             &pending.mlkem.secret,
         )?);
         self.apply_pq_rekey_shared_with_identity_binding(
+            cipher_suite,
             &x25519_shared,
             &pq_shared,
             sandwich_secret,
@@ -370,6 +371,7 @@ impl ClientDataSession {
 
     pub fn apply_pq_rekey_shared(
         &mut self,
+        suite: CipherSuite,
         x25519_shared_secret: &[u8; 32],
         pq_shared_secret: &[u8; 32],
         sandwich_secret: &[u8],
@@ -388,9 +390,9 @@ impl ClientDataSession {
         )?;
 
         self.seal_to_server
-            .rekey(next_keys.client_key, next_keys.client_nonce);
+            .rekey_with_suite(suite, next_keys.client_key, next_keys.client_nonce);
         self.open_from_server
-            .rekey(next_keys.server_key, next_keys.server_nonce);
+            .rekey_with_suite(suite, next_keys.server_key, next_keys.server_nonce);
         self.keys = next_keys;
         self.keys.protect_secret_memory();
         Ok(())
@@ -398,12 +400,18 @@ impl ClientDataSession {
 
     pub fn apply_pq_rekey_shared_with_identity_binding(
         &mut self,
+        suite: CipherSuite,
         x25519_shared_secret: &[u8; 32],
         pq_shared_secret: &[u8; 32],
         sandwich_secret: &[u8],
         pq_identity_binding: [u8; 32],
     ) -> Result<(), ClientHandshakeError> {
-        self.apply_pq_rekey_shared(x25519_shared_secret, pq_shared_secret, sandwich_secret)?;
+        self.apply_pq_rekey_shared(
+            suite,
+            x25519_shared_secret,
+            pq_shared_secret,
+            sandwich_secret,
+        )?;
         self.pq_identity_binding = Some(pq_identity_binding);
         Ok(())
     }
@@ -555,6 +563,126 @@ mod tests {
         assert_eq!(session.keys.epoch, 1);
         assert_eq!(session.keys.client_key, next_keys.client_key);
         assert_eq!(session.keys.client_nonce, next_keys.client_nonce);
+    }
+
+    #[test]
+    fn pq_rekey_with_aes_suite_switches_data_plane_cipher() {
+        let keys = SessionKeys {
+            client_key: [9_u8; 32],
+            server_key: [8_u8; 32],
+            client_nonce: [7_u8; NONCE_LEN],
+            server_nonce: [6_u8; NONCE_LEN],
+            chain_secret: [5_u8; 32],
+            epoch: 0,
+            transcript_hash: [4_u8; 32],
+            x25519_shared_secret: [3_u8; 32],
+        };
+        let traffic = TrafficConfig::default();
+        let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(6);
+
+        let (record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
+        let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
+        let request = PqRekeyRequest::decode(&server_open.open(&record).unwrap()).unwrap();
+        let server_x25519 = X25519KeyPair::generate();
+        let x25519_shared =
+            x25519_shared_secret(&server_x25519.private, &request.client_x25519_public);
+        let encapsulation = pq::encapsulate(&request.client_mlkem_public_key).unwrap();
+        let (_, mut client_open) = data_codecs(&keys, traffic).unwrap();
+        // The server signals AES-256-GCM in the (ChaCha-sealed) ServerKeyExchange.
+        let exchange_record = client_open
+            .seal(
+                &ServerKeyExchange {
+                    server_x25519_public: server_x25519.public,
+                    mlkem_ciphertext: encapsulation.ciphertext,
+                }
+                .encode_with_suite(CipherSuite::Aes256Gcm)
+                .unwrap(),
+                &mut rng,
+            )
+            .unwrap();
+        session
+            .apply_server_key_exchange_record(&exchange_record, &pending, b"test-psk")
+            .unwrap();
+
+        // The epoch keys the server would independently derive.
+        let chain_secret = pq::hybrid_sandwich_rekey(
+            &keys.chain_secret,
+            &x25519_shared,
+            &encapsulation.shared_secret,
+            b"test-psk",
+        )
+        .unwrap();
+        let next_keys = expand_epoch_keys(
+            chain_secret,
+            keys.epoch + 1,
+            keys.transcript_hash,
+            x25519_shared,
+        )
+        .unwrap();
+
+        // The client now seals data-plane records under the negotiated suite. A
+        // server opener built with AES-256-GCM + the same epoch keys opens them;
+        // a ChaCha opener does NOT -- proving the data plane really switched to
+        // AES rather than silently staying on ChaCha.
+        let mut payload_rng = StdRng::seed_from_u64(99);
+        let sealed = session
+            .seal_payload(b"after-aes-rekey", &mut payload_rng)
+            .unwrap();
+        let padding = PaddingProfile::from_config(traffic).unwrap();
+
+        let mut aes_opener = DataRecordCodec::new(
+            AeadCodec::new_with_suite(
+                CipherSuite::Aes256Gcm,
+                next_keys.client_key,
+                next_keys.client_nonce,
+            ),
+            padding,
+            CLIENT_TO_SERVER_AAD,
+        );
+        assert_eq!(aes_opener.open(&sealed).unwrap(), b"after-aes-rekey");
+
+        let mut chacha_opener = DataRecordCodec::new(
+            AeadCodec::new_with_suite(
+                CipherSuite::ChaCha20Poly1305,
+                next_keys.client_key,
+                next_keys.client_nonce,
+            ),
+            padding,
+            CLIENT_TO_SERVER_AAD,
+        );
+        assert!(
+            chacha_opener.open(&sealed).is_err(),
+            "data plane must have switched to AES-256-GCM"
+        );
+    }
+
+    #[test]
+    fn negotiated_suite_byte_is_aead_protected_against_downgrade() {
+        // The server signals the data-plane suite in the AEAD-sealed
+        // ServerKeyExchange. A MITM cannot flip the suite (AES <-> ChaCha) without
+        // breaking the AEAD tag, so the negotiation fails closed (DoS at worst),
+        // never a silent downgrade.
+        let key = [0x55_u8; 32];
+        let nonce = [0x66_u8; NONCE_LEN];
+        let ske = ServerKeyExchange {
+            server_x25519_public: [0x77_u8; 32],
+            mlkem_ciphertext: vec![0x88_u8; 64],
+        };
+        let plaintext = ske.encode_with_suite(CipherSuite::Aes256Gcm).unwrap();
+        let suite_pos = plaintext.len() - 1; // the suite tag is the last plaintext byte
+
+        let mut enc = AeadCodec::new(key, nonce);
+        let mut sealed = enc.seal(&plaintext, CLIENT_TO_SERVER_AAD).unwrap();
+        sealed[suite_pos] ^= 1; // flip the ciphertext byte carrying the suite tag
+        let mut dec = AeadCodec::new(key, nonce);
+        assert!(
+            matches!(
+                dec.open(&sealed, CLIENT_TO_SERVER_AAD),
+                Err(SessionError::Aead)
+            ),
+            "tampering the sealed suite byte must fail the AEAD, blocking a downgrade"
+        );
     }
 
     #[test]
