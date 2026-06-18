@@ -1,0 +1,61 @@
+# cargo-deny configuration — supply-chain gate for ParallaX.
+#
+# Curated against the locked dependency tree (run `cargo deny check` locally to
+# re-verify after Cargo.lock changes). The CI gate lives in
+# .github/workflows/cargo-deny.yml.
+
+[advisories]
+# RustSec advisory DB. Vulnerabilities are always denied; yanked crates are
+# denied so the locked tree can't pin a pulled release. `ignore` holds advisory
+# IDs we've consciously accepted — each is an UNMAINTAINED notice (not a
+# vulnerability) with no safe upgrade today. Ignoring a specific ID does not
+# silence future/different advisories on the same crate, so the gate still bites
+# if any of these ever gets a real CVE.
+ignore = [
+  # The pqcrypto stack wraps PQClean (C), which upstream is archiving (~2026-07),
+  # so RustSec marks it unmaintained. It is ParallaX's core PQ crypto
+  # (ML-KEM-1024 + ML-DSA-87) and has no drop-in replacement; the migration
+  # target is the pure-Rust `ml-kem` / `ml-dsa` crates, tracked separately.
+  "RUSTSEC-2026-0161",  # pqcrypto-mlkem unmaintained
+  "RUSTSEC-2026-0162",  # pqcrypto-traits unmaintained
+  "RUSTSEC-2026-0163",  # pqcrypto-mldsa unmaintained
+  "RUSTSEC-2026-0166",  # pqcrypto-internals unmaintained
+  # `paste` (transitive proc-macro helper) is unmaintained but feature-complete
+  # and has no maintained drop-in; widely accepted as ignored.
+  "RUSTSEC-2024-0436",  # paste unmaintained
+]
+
+[licenses]
+# Allow-list curated from `cargo deny list` over the current tree: every crate
+# resolves to one of these permissive SPDX terms. r-efi's LGPL option is NOT
+# allowed on purpose — it is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`, satisfied
+# by MIT/Apache, so copyleft never actually applies. A new dependency on a
+# copyleft/unknown license will fail the gate until reviewed and added here.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "0BSD",
+  "CC0-1.0",
+  "Zlib",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are common and benign in a tree this size (getrandom 0.2/0.3,
+# rand 0.8/0.9, windows-sys 0.52/0.61, ...), so warn rather than block. Wildcard
+# version requirements (`*`) in our own manifest are flagged.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only crates.io and (none today) explicitly-listed git sources are allowed.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
