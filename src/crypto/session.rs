@@ -357,6 +357,29 @@ pub(crate) fn record_nonce_from(nonce_base: &[u8; NONCE_LEN], sequence: u64) -> 
     nonce
 }
 
+/// Formal proofs (Kani) over the counter-nonce scheme. Compiled ONLY under
+/// `cargo kani` (which sets `cfg(kani)`); absent from a normal build/test.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{record_nonce_from, NONCE_LEN};
+
+    /// The catastrophic-failure guard: within one epoch (a fixed `nonce_base`)
+    /// the per-record nonce MUST be unique per sequence number, or AEAD security
+    /// collapses. `record_nonce_from` XORs the big-endian sequence into the low 8
+    /// bytes, so it is injective in `sequence` for ANY base. Proven here over the
+    /// full u64 sequence space and all 12-byte bases (equal nonces ⇒ equal
+    /// sequences ⇒ no two distinct records in an epoch share a nonce).
+    #[kani::proof]
+    fn record_nonce_from_is_injective_in_sequence() {
+        let base: [u8; NONCE_LEN] = kani::any();
+        let s1: u64 = kani::any();
+        let s2: u64 = kani::any();
+        if record_nonce_from(&base, s1) == record_nonce_from(&base, s2) {
+            assert_eq!(s1, s2, "equal nonces must imply equal sequences (no reuse)");
+        }
+    }
+}
+
 /// Seals `plaintext` in place with an explicit sequence number using a shared
 /// cipher. Stateless: it neither reads nor advances any sequence counter, so
 /// multiple records can be sealed concurrently on different threads provided

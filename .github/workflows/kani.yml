@@ -1,0 +1,60 @@
+name: kani
+
+# Nightly Kani (bounded model checker) formal proofs over the most
+# safety-critical pure-logic invariants: the per-epoch counter-nonce is injective
+# in the sequence number (no AEAD nonce reuse -- the catastrophic-failure guard),
+# and the padding-length parser never panics on attacker-controlled input. These
+# are EXHAUSTIVE proofs over the input space, complementing the sampled property
+# tests and the Miri UB lane. Kani builds its own toolchain + CBMC, so this is
+# slow and runs weekly / on demand rather than on every push.
+
+on:
+  schedule:
+    - cron: '41 4 * * 1' # Mondays 04:41 UTC (offset from the miri lane)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kani-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  # Pin the Kani version so the weekly proof run is reproducible; bump
+  # deliberately alongside local upgrades.
+  KANI_VERSION: 0.67.0
+
+jobs:
+  kani:
+    name: kani (nonce-injectivity + padding-parser proofs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and target/
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-kani
+
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+
+      # Runs every #[kani::proof] harness in the crate (nonce injectivity in
+      # crypto::session, padding-parser panic-freedom in traffic). --locked keeps
+      # dependency resolution pinned so the scheduled run is reproducible.
+      - name: cargo kani (all proof harnesses)
+        run: cargo kani --locked

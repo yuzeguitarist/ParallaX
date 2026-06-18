@@ -213,6 +213,31 @@ impl CoverTrafficProfile {
     }
 }
 
+/// Formal proofs (Kani) over the padding parser. Compiled ONLY under `cargo
+/// kani` (which sets `cfg(kani)`); absent from a normal build/test.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::PaddingProfile;
+
+    /// The 2-byte padding-length trailer is attacker-controlled. `unpadded_len`
+    /// must NEVER panic (no integer underflow, no OOB index) for ANY input.
+    /// Proven here over all byte contents for every length up to a bound that
+    /// spans the guard boundary (len < 2, the 2-byte trailer, and pad_len vs
+    /// len), complementing the randomized + Miri property test with an exhaustive
+    /// check of the dangerous arithmetic.
+    #[kani::proof]
+    fn unpadded_len_never_panics() {
+        const N: usize = 8;
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        let mut buf = [0_u8; N];
+        for b in buf.iter_mut() {
+            *b = kani::any();
+        }
+        let _ = PaddingProfile::unpadded_len(&buf[..len]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{rngs::StdRng, SeedableRng};
