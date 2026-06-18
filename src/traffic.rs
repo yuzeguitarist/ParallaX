@@ -248,8 +248,9 @@ mod tests {
         for _ in 0..iters {
             let len = rng.gen_range(0_usize..2048);
             let mut bytes: Vec<u8> = (0..len).map(|_| rng.gen::<u8>()).collect();
-            // Half the time force the trailer to a boundary-ish claimed pad_len
-            // so the `pad_len + 2 > len` guard is hit at its edges, not at random.
+            // Half the time force the trailer to a uniformly-random u16 claimed
+            // pad_len so the `pad_len + 2 > len` guard sees both far-over-length
+            // values (the common case) and, occasionally, near-boundary ones.
             if len >= 2 && rng.gen_bool(0.5) {
                 let [hi, lo] = rng.gen::<u16>().to_be_bytes();
                 let n = bytes.len();

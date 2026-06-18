@@ -177,8 +177,10 @@ where
 }
 
 /// Binds a loopback shaper that forwards to `upstream`, applying `imp` to both
-/// directions. Returns its local address and the accept-loop handle (abort it to
-/// stop the shaper). `upstream` is the real server address (`host:port`).
+/// directions. Returns its local address and the accept-loop handle. Aborting it
+/// stops accepting NEW connections; in-flight per-connection relay tasks are
+/// detached and self-drain when their connection closes (each cell awaits
+/// `speed::run`, which drops its socket). `upstream` is the real server address.
 async fn spawn_shaper(
     upstream: String,
     imp: Impairment,

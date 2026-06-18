@@ -593,6 +593,7 @@ mod tests {
         t.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
         t.receive_window(quinn::VarInt::from_u32(window));
         t.stream_receive_window(quinn::VarInt::from_u32(window));
+        t.send_window(u64::from(window));
         t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         Arc::new(t)
     }
@@ -754,6 +755,7 @@ mod tests {
         t.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
         t.receive_window(quinn::VarInt::from_u32(window));
         t.stream_receive_window(quinn::VarInt::from_u32(window));
+        t.send_window(u64::from(window));
         Arc::new(t)
     }
 
@@ -775,9 +777,12 @@ mod tests {
         let (mut _kick, mut recv) = client.open_bi().await.expect("open_bi");
         _kick.write_all(b"go").await.expect("kick");
         let mut buf = vec![0_u8; 64 * 1024];
-        // Block for the first byte so the initial RTT is excluded from the rate.
-        let mut got = recv.read(&mut buf).await.expect("read").unwrap_or(0);
+        // Block for the first byte so the initial RTT is excluded, then start the
+        // clock and the byte counter together (the first read's bytes are dropped
+        // from the numerator so numerator and denominator cover the same window).
+        let _ = recv.read(&mut buf).await.expect("read");
         let start = Instant::now();
+        let mut got = 0_usize;
         while start.elapsed() < cap {
             match tokio::time::timeout(cap - start.elapsed(), recv.read(&mut buf)).await {
                 Ok(Ok(Some(read))) => got += read,

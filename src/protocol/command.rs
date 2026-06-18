@@ -1533,6 +1533,50 @@ mod tests {
     }
 
     #[test]
+    fn server_key_exchange_decode_ref_with_suite_round_trips_and_rejects_bad_tags() {
+        let exchange = ServerKeyExchange {
+            server_x25519_public: [9_u8; 32],
+            mlkem_ciphertext: vec![10, 11, 12, 13],
+        };
+
+        // Each negotiated suite round-trips: the one-byte tag maps back to the
+        // SAME suite (guards against a refactor mapping the tag to the wrong one).
+        for suite in [CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm] {
+            let encoded = exchange.encode_with_suite(suite).unwrap();
+            let (decoded, got) = ServerKeyExchange::decode_ref_with_suite(&encoded).unwrap();
+            assert_eq!(
+                got, suite,
+                "tag must decode to the suite it was encoded with"
+            );
+            assert_eq!(decoded.mlkem_ciphertext, exchange.mlkem_ciphertext);
+            assert_eq!(decoded.server_x25519_public, exchange.server_x25519_public);
+        }
+
+        // A legacy record (no tag) decodes as ChaCha20-Poly1305 (wire-compat).
+        let legacy = exchange.encode().unwrap();
+        let (_, legacy_suite) = ServerKeyExchange::decode_ref_with_suite(&legacy).unwrap();
+        assert_eq!(legacy_suite, CipherSuite::ChaCha20Poly1305);
+
+        // An out-of-range suite tag (41+len shape, unknown byte) is rejected, not
+        // silently mapped onto a valid suite.
+        let mut bad_tag = exchange.encode().unwrap();
+        bad_tag.push(0xff);
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&bad_tag),
+            Err(ServerKeyExchangeError::InvalidCipherSuite)
+        ));
+
+        // Trailing garbage beyond the tag (42+len) is neither legacy nor tagged.
+        let mut wrong_len = exchange.encode().unwrap();
+        wrong_len.push(CipherSuite::Aes256Gcm.to_wire());
+        wrong_len.push(0x00);
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&wrong_len),
+            Err(ServerKeyExchangeError::InvalidCiphertextLength)
+        ));
+    }
+
+    #[test]
     fn server_identity_proof_round_trip() {
         let proof = ServerIdentityProof {
             signature: vec![4, 5, 6],
