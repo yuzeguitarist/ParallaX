@@ -53,7 +53,7 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: >
-          cargo +nightly miri test --lib --
+          cargo +nightly miri test --locked --lib --
           'transport::udp::reorder::'
           'traffic::'
           'protocol::command::'
