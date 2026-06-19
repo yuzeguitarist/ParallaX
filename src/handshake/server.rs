@@ -2186,7 +2186,19 @@ async fn connect_outbound_target(
 async fn resolve_public_target_addrs(
     target_addr: &str,
 ) -> Result<Vec<SocketAddr>, HandshakeServerError> {
-    let addrs: Vec<SocketAddr> = lookup_host(target_addr).await?.collect();
+    // Map the resolver error to a host-free message too: std's getaddrinfo
+    // wrapper does not normally echo the queried host, but the raw error would
+    // otherwise be the one decrypted-target path left unscrubbed (this is logged
+    // via `error = %err` on the connection-close line).
+    let addrs: Vec<SocketAddr> = lookup_host(target_addr)
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "client-selected target lookup failed",
+            )
+        })?
+        .collect();
     if addrs.is_empty() {
         // No host detail in the message: it is the client's decrypted destination
         // and the connection-close path logs errors via Display.
