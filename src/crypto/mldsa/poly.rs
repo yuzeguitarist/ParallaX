@@ -213,8 +213,13 @@ impl Poly {
             return true;
         }
         for i in 0..N {
-            // Branchless absolute value of the centered representative.
-            let mut t = self.coeffs[i] >> 31;
+            // Branchless absolute value of the centered representative. The sign
+            // mask `a >> 31` is fed through `black_box` so the optimizer cannot
+            // prove it equals `a < 0` and lower the abs to a data-dependent
+            // branch (constant-time defense-in-depth, plan §5). `black_box` is a
+            // value-level identity, so the computed `t` — and thus every byte of
+            // the ACVP output — is unchanged.
+            let mut t = core::hint::black_box(self.coeffs[i] >> 31);
             t = self.coeffs[i].wrapping_sub(t & self.coeffs[i].wrapping_mul(2));
             if t >= b {
                 return true;

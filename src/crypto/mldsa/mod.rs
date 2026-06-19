@@ -110,14 +110,17 @@ pub fn keypair() -> (Vec<u8>, Vec<u8>) {
 /// signature ([`SIG_BYTES`] bytes).
 pub fn sign(sk: &[u8], msg: &[u8], ctx: &[u8]) -> Result<Vec<u8>, MlDsaError> {
     let sk_arr = to_sk_array(sk)?;
-    // signature_ctx only fails on ctx > 255 (the rejection loop always
-    // terminates), so map its unit error to the context-length variant.
     let mut rnd = [0u8; RNDBYTES];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
     let res = sign::signature_ctx(&sk_arr, msg, ctx, &rnd);
     rnd.zeroize();
     drop_sk_array(sk_arr);
-    let sig = res.map_err(|()| MlDsaError::ContextTooLong)?;
+    // Exhaustive match (not `map_err(|_| ...)`): if `signature_ctx` ever grows a
+    // second failure mode, this stops compiling instead of silently relabeling
+    // the new error as `ContextTooLong` (security-review fix #4).
+    let sig = res.map_err(|e| match e {
+        sign::SignatureCtxError::ContextTooLong => MlDsaError::ContextTooLong,
+    })?;
     Ok(sig.to_vec())
 }
 
@@ -159,7 +162,9 @@ pub fn sign_deterministic(
     let sk_arr = to_sk_array(sk)?;
     let res = sign::signature_ctx(&sk_arr, msg, ctx, rnd);
     drop_sk_array(sk_arr);
-    let sig = res.map_err(|()| MlDsaError::ContextTooLong)?;
+    let sig = res.map_err(|e| match e {
+        sign::SignatureCtxError::ContextTooLong => MlDsaError::ContextTooLong,
+    })?;
     Ok(sig.to_vec())
 }
 
@@ -270,5 +275,37 @@ mod tests {
         let c = sign_deterministic(&sk, msg, ctx, &rnd1).unwrap();
         assert_ne!(a, c, "different rnd must give a different signature");
         verify(&pk, &c, msg, ctx).expect("hedged-rnd signature must verify");
+    }
+
+    /// Empty-message (`msg = b""`) end-to-end: keygen -> sign -> verify must
+    /// round-trip, and a tampered signature over the empty message must reject.
+    /// FIPS 204 places no lower bound on the message length, so the zero-length
+    /// case must be a first-class input, not an accidental panic / silent accept.
+    #[test]
+    fn empty_message_round_trip_and_tamper_rejects() {
+        let (pk, sk) = keypair();
+        let msg: &[u8] = b"";
+        let ctx: &[u8] = b"ParallaX v2 ML-DSA-87 server identity";
+
+        let sig = sign(&sk, msg, ctx).expect("empty-message sign must succeed");
+        assert_eq!(sig.len(), SIG_BYTES);
+        verify(&pk, &sig, msg, ctx).expect("empty-message signature must verify");
+
+        // Tamper one signature byte: verification of the empty message must fail.
+        let mut bad = sig.clone();
+        bad[0] ^= 0x01;
+        assert_eq!(
+            verify(&pk, &bad, msg, ctx),
+            Err(MlDsaError::VerificationFailed),
+            "tampered empty-message signature must reject"
+        );
+
+        // A non-empty message must not verify against the empty-message signature
+        // (so the empty case is genuinely bound, not ignored).
+        assert_eq!(
+            verify(&pk, &sig, b"x", ctx),
+            Err(MlDsaError::VerificationFailed),
+            "non-empty message must not verify under empty-message signature"
+        );
     }
 }

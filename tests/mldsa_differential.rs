@@ -26,7 +26,9 @@
 //! this file goes with it and the ACVP KATs remain the permanent gate.
 
 use parallax::crypto::mldsa;
-use parallax::crypto::mldsa::params::{RNDBYTES, SECRETKEYBYTES};
+use parallax::crypto::mldsa::params::{
+    CTILDEBYTES, K, L, OMEGA, POLYZ_PACKEDBYTES, RNDBYTES, SECRETKEYBYTES, SIGNBYTES,
+};
 use parallax::crypto::mldsa::sign;
 
 use pqcrypto_mldsa::mldsa87 as oracle;
@@ -223,4 +225,76 @@ fn oracle_accepts_handrolled_hedged_sign() {
     }
     assert!(iters > 0);
     eprintln!("differential production-path: oracle accepted {iters} hedged signatures");
+}
+
+/// Hint-region tamper: flipping a byte inside the run-length-encoded hint region
+/// of a valid hand-rolled signature must be rejected by BOTH the hand-rolled
+/// `verify` and the pqcrypto oracle. The hint encoding is the SUF-CMA-critical
+/// part of the signature (its decode rejections are what stop hint-forgery), so a
+/// regression that accepted a malformed hint would be a forgery hole the
+/// happy-path interop tests above would miss.
+///
+/// The hint region is the trailing `OMEGA + K` bytes: `OMEGA` index bytes then
+/// `K` running-count bytes. We sweep one bit-flip across both sub-regions (an
+/// index byte and a count byte) so the malformation is exercised on each.
+#[test]
+fn hint_region_tamper_rejected_by_both() {
+    // Offset of the hint region inside the packed signature (matches packing.rs).
+    const HINT_OFF: usize = CTILDEBYTES + L * POLYZ_PACKEDBYTES;
+    assert_eq!(HINT_OFF + OMEGA + K, SIGNBYTES, "hint region layout");
+
+    let mut rng = rand::rngs::OsRng;
+    let (pk, sk) = mldsa::keypair();
+    let oracle_pk = oracle::PublicKey::from_bytes(&pk).expect("hand-rolled pk loads into oracle");
+    let sk_arr: [u8; SECRETKEYBYTES] = sk.as_slice().try_into().unwrap();
+
+    let ctx: &[u8] = b"ParallaX v2 ML-DSA-87 hint tamper";
+
+    // A few signatures so the hint weight varies (different runs / count bytes).
+    let mut checked = 0usize;
+    for round in 0u64..6 {
+        let msg = message(7000 + round, 1 + (round as usize) * 48);
+        let mut rnd = [0u8; RNDBYTES];
+        rng.fill_bytes(&mut rnd);
+        let sig = sign::signature_ctx(&sk_arr, &msg, ctx, &rnd).expect("hand-rolled sign");
+
+        // Sanity: the pristine signature is accepted by both, so any rejection
+        // below is caused by the tamper, not a pre-existing failure.
+        mldsa::verify(&pk, &sig, &msg, ctx).expect("pristine sig verifies (hand-rolled)");
+        let oracle_ok =
+            oracle::DetachedSignature::from_bytes(&sig).expect("pristine sig loads into oracle");
+        assert!(
+            oracle::verify_detached_signature_ctx(&oracle_ok, &msg, ctx, &oracle_pk).is_ok(),
+            "pristine sig verifies (oracle)"
+        );
+
+        // Tamper one byte in the index sub-region and one in the count sub-region.
+        // The last K bytes are the per-poly running counts (always meaningful for
+        // a valid signature); the first OMEGA bytes are the index list.
+        for &pos in &[HINT_OFF, HINT_OFF + OMEGA + K - 1] {
+            let mut bad = sig;
+            bad[pos] ^= 0x01;
+            if bad == sig {
+                continue; // (cannot happen for XOR 0x01, but stay defensive)
+            }
+
+            // Hand-rolled verify must reject the tampered hint.
+            assert_eq!(
+                mldsa::verify(&pk, &bad, &msg, ctx),
+                Err(mldsa::MlDsaError::VerificationFailed),
+                "hand-rolled verify accepted a hint-region tamper at byte {pos} (round {round})"
+            );
+
+            // The oracle must reject it too (length unchanged, so it still loads).
+            let oracle_bad = oracle::DetachedSignature::from_bytes(&bad)
+                .expect("tampered signature still loads (length unchanged)");
+            assert!(
+                oracle::verify_detached_signature_ctx(&oracle_bad, &msg, ctx, &oracle_pk).is_err(),
+                "oracle accepted a hint-region tamper at byte {pos} (round {round})"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0);
+    eprintln!("differential hint-tamper: {checked} hint-region flips rejected by both");
 }

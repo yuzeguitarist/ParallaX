@@ -60,9 +60,11 @@ impl Polyvecl {
     /// `seed` is `CRHBYTES` (64) long. (ExpandS for the `s1` half.)
     pub fn uniform_eta(&mut self, seed: &[u8; CRHBYTES], nonce: u16) {
         // C: `poly_uniform_eta(&v->vec[i], seed, nonce++)` — element i uses
-        // nonce + i (post-increment from the starting value).
+        // nonce + i (post-increment from the starting value). Widen-then-truncate
+        // matching the C `(uint16_t)` wrap (never panics on overflow-checked
+        // builds), consistent with `uniform_gamma1` even though this sum is small.
         for (i, p) in self.vec.iter_mut().enumerate() {
-            p.poly_uniform_eta(seed, nonce + i as u16);
+            p.poly_uniform_eta(seed, (nonce as u32 + i as u32) as u16);
         }
     }
 
@@ -70,8 +72,11 @@ impl Polyvecl {
     /// `[-(GAMMA1-1), GAMMA1]` via `poly_uniform_gamma1` with per-element nonce
     /// `L * nonce + i`. `seed` is `CRHBYTES` (64) long. (ExpandMask for `y`.)
     pub fn uniform_gamma1(&mut self, seed: &[u8; CRHBYTES], nonce: u16) {
+        // C: `(uint16_t)(L*nonce + i)` — widen to u32, add, then truncate, so an
+        // overflow-checked (debug/test) build cannot panic on a large `nonce`
+        // (the multiply alone overflows u16 well before nonce's u16 max).
         for (i, p) in self.vec.iter_mut().enumerate() {
-            p.poly_uniform_gamma1(seed, L as u16 * nonce + i as u16);
+            p.poly_uniform_gamma1(seed, ((L as u32) * (nonce as u32) + i as u32) as u16);
         }
     }
 
@@ -185,9 +190,10 @@ impl Polyveck {
     /// (ExpandS for the `s2` half; the caller passes `nonce = L` so `s1`/`s2`
     /// share one contiguous nonce range.)
     pub fn uniform_eta(&mut self, seed: &[u8; CRHBYTES], nonce: u16) {
-        // C: `poly_uniform_eta(&v->vec[i], seed, nonce++)`.
+        // C: `poly_uniform_eta(&v->vec[i], seed, nonce++)`. Widen-then-truncate
+        // matching the C `(uint16_t)` wrap (never panics), as in `uniform_gamma1`.
         for (i, p) in self.vec.iter_mut().enumerate() {
-            p.poly_uniform_eta(seed, nonce + i as u16);
+            p.poly_uniform_eta(seed, (nonce as u32 + i as u32) as u16);
         }
     }
 
@@ -523,35 +529,69 @@ mod tests {
         }
     }
 
-    /// `decompose` then `use_hint` with an all-zero hint recovers the high bits
-    /// `a1` that `decompose` produced, for a whole `Polyveck`. And `make_hint`
-    /// over identical (v0=v1=0..) inputs counts consistently. Exercises the
-    /// vector fan-out of decompose/make_hint/use_hint together.
+    /// `make_hint` then `use_hint` over a whole `Polyveck` recovers the high bits
+    /// `a1` that `decompose` produced, with a genuine (non-zero) hint vector — the
+    /// real signing/verification round-trip, not just the zero-hint identity.
+    ///
+    /// For a random `w` and a small per-coefficient correction `z` with
+    /// `|z| <= GAMMA2` (standing in for the signing loop's `ct0` term), with
+    /// `(w1, w0) = decompose(w)`: `make_hint(w0 + z, w1)` then
+    /// `use_hint(w + z, hint)` must equal `w1`. This drives the vector fan-out of
+    /// `decompose`/`make_hint`/`use_hint` together and actually sets hint bits
+    /// (asserted: the total hint weight is > 0), unlike the prior all-zero-hint
+    /// version which only exercised the `use_hint(.., 0)` identity branch.
     #[test]
-    fn polyveck_decompose_use_hint_zero_hint_is_identity() {
+    fn polyveck_make_use_hint_round_trip() {
         let mut rng = Lcg(0x0DEC_0FFE_E0DD_1357);
-        let mut v = Polyveck::zero();
-        for p in v.vec.iter_mut() {
+        let mut w = Polyveck::zero();
+        for p in w.vec.iter_mut() {
             for c in p.coeffs.iter_mut() {
                 // decompose expects standard reps in [0, Q).
                 *c = rng.coeff_modq();
             }
         }
-        let mut v1 = Polyveck::zero();
-        let mut v0 = Polyveck::zero();
-        v.decompose(&mut v1, &mut v0);
+        let mut w1 = Polyveck::zero();
+        let mut w0 = Polyveck::zero();
+        w.decompose(&mut w1, &mut w0);
 
-        // Zero hint -> use_hint returns a1 unchanged.
+        // Zero hint -> use_hint returns a1 unchanged (kept as a baseline guard).
         let zero_hint = Polyveck::zero();
         let mut hi = Polyveck::zero();
-        hi.use_hint(&v, &zero_hint);
-        assert_eq!(hi, v1, "use_hint with zero hint must return decompose's a1");
+        hi.use_hint(&w, &zero_hint);
+        assert_eq!(hi, w1, "use_hint with zero hint must return decompose's a1");
+
+        // Build a small per-coefficient correction z in [-GAMMA2, GAMMA2] and the
+        // corrected value w_plus_z = w + z (standard rep), plus the perturbed low
+        // part w0_plus_z = w0 + z that make_hint actually sees.
+        let mut w_plus_z = Polyveck::zero();
+        let mut w0_plus_z = Polyveck::zero();
+        for i in 0..K {
+            for c in 0..N {
+                let z = (rng.next_u64() as i32).rem_euclid(2 * GAMMA2 + 1) - GAMMA2;
+                w_plus_z.vec[i].coeffs[c] =
+                    ((w.vec[i].coeffs[c] as i64 + z as i64).rem_euclid(Q as i64)) as i32;
+                w0_plus_z.vec[i].coeffs[c] = w0.vec[i].coeffs[c] + z;
+            }
+        }
+
+        // make_hint(w0 + z, w1) over the vector, then use_hint(w + z, hint).
+        let mut hint = Polyveck::zero();
+        let weight = hint.make_hint(&w0_plus_z, &w1);
+        let mut recovered = Polyveck::zero();
+        recovered.use_hint(&w_plus_z, &hint);
+        assert_eq!(
+            recovered, w1,
+            "use_hint(w+z, make_hint(w0+z, w1)) must recover decompose's high bits"
+        );
+        // The hint must actually carry set bits, or this would be vacuous (the
+        // |z| up to GAMMA2 correction reliably flips a good fraction of coeffs).
+        assert!(weight > 0, "make_hint produced an all-zero hint (vacuous)");
 
         // Bound check: every a0 is centered in (-GAMMA2, GAMMA2] (the wrap case
         // a1==0 allows a0 == -GAMMA2). This pins decompose's vector fan-out.
         for i in 0..K {
             for c in 0..N {
-                let a0 = v0.vec[i].coeffs[c];
+                let a0 = w0.vec[i].coeffs[c];
                 assert!(
                     a0 > -GAMMA2 - 1 && a0 <= GAMMA2,
                     "poly {i} coeff {c}: a0={a0} out of (-GAMMA2-1, GAMMA2]"

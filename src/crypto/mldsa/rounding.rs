@@ -47,7 +47,12 @@ pub fn decompose(a: i32) -> (i32, i32) {
     // *a0  = a - a1 * 2 * GAMMA2;
     let mut a0 = a.wrapping_sub(a1.wrapping_mul(2).wrapping_mul(GAMMA2));
     // *a0 -= (((Q - 1) / 2 - *a0) >> 31) & Q;   (branchless centering)
-    a0 = a0.wrapping_sub(((((Q - 1) / 2).wrapping_sub(a0)) >> 31) & Q);
+    // The sign mask `(... >> 31)` is fed through `black_box` so the optimizer
+    // cannot recognize it as `a0 > (Q-1)/2` and lower the centering to a branch
+    // (constant-time defense-in-depth, plan §5). `black_box` is a value-level
+    // identity, so `a0` — and every byte of the ACVP output — is unchanged.
+    let mask = core::hint::black_box((((Q - 1) / 2).wrapping_sub(a0)) >> 31) & Q;
+    a0 = a0.wrapping_sub(mask);
     (a1, a0)
 }
 
@@ -156,51 +161,90 @@ mod tests {
         }
     }
 
-    /// `make_hint` must equal the predicate
-    /// `HighBits(a) != HighBits(a + a0)` that it is a fast path for: the hint is
-    /// set exactly when adding the low part `a0` changes the high bits.
-    /// We test that `use_hint(a + a0, make_hint(a0, decompose(a+a0).1))` recovers
-    /// the true high bits — i.e. the make_hint / use_hint pair is consistent with
-    /// `decompose`, which is the property the signing/verification rely on.
+    /// `make_hint` / `use_hint` recover the true high bits, checked against an
+    /// INDEPENDENT reference (not the module's own `decompose`).
+    ///
+    /// The FIPS 204 contract this pins (as the signing/verification rely on it):
+    /// for a value `w` and a small correction `z` with `|z| <= GAMMA2`, with
+    /// `(r1, r0) = decompose(w)`, the hint `make_hint(r0 + z, r1)` lets
+    /// `use_hint(w + z, hint)` recover `HighBits(w)` — where `HighBits(w)` is
+    /// computed here directly from the spec in `i128` (`highbits_ref`), so a
+    /// `make_hint` boundary regression (dropping the `a1 != 0` guard, or `>` vs
+    /// `>=`) makes the recovered value disagree with the reference and turns this
+    /// RED. The sweep also asserts BOTH hint branches actually fire (counts > 0)
+    /// and explicitly drives the asymmetric `a0 == -GAMMA2` boundary on both the
+    /// `a1 == 0` (no hint) and `a1 != 0` (hint) sides.
     #[test]
     fn make_use_hint_recover_high_bits() {
-        // Walk (w, w0) := decompose(w) and a perturbation `cw0` bounded like the
-        // signing loop's ct0 term, then verify use_hint(w - cw0, hint) == w1.
-        // Deterministic sweep keeps the test fast while covering boundaries.
+        // Independent HighBits(w): spec Decompose_q in i128, NOT this module's
+        // `decompose`. alpha = 2*GAMMA2; r0 is w centered mod alpha; the
+        // wraparound r1 = (Q-1)/alpha collapses to 0 (matching `& 15`).
+        let alpha = 2 * GAMMA2;
+        fn highbits_ref(w: i32, alpha: i32) -> i32 {
+            let rp = modp(w as i64); // w mod^+ Q, in [0, Q)
+            let mut r0 = rp % alpha; // [0, alpha)
+            if r0 > alpha / 2 {
+                r0 -= alpha; // center into (-alpha/2, alpha/2]
+            }
+            if rp - r0 == Q - 1 {
+                0 // wraparound case: high bits wrap to 0
+            } else {
+                (rp - r0) / alpha
+            }
+        }
+
+        let mut hint0_seen = 0u64;
+        let mut hint1_seen = 0u64;
+        let mut check = |w: i32, z: i32| {
+            let (r1, r0) = decompose(w);
+            // Reference high bits of w, computed independently of `decompose`.
+            assert_eq!(
+                r1,
+                highbits_ref(w, alpha),
+                "decompose r1 != reference for w={w}"
+            );
+            // make_hint sees the low part AFTER adding the correction z (which may
+            // push it out of the centered range — exactly what the hint exists
+            // for), with the ORIGINAL high part r1.
+            let hint = make_hint(r0 + z, r1);
+            // use_hint must recover the original high bits HighBits(w).
+            let recovered = use_hint(w.wrapping_add(z), hint);
+            assert_eq!(
+                recovered,
+                highbits_ref(w, alpha),
+                "use_hint(w+z, make_hint(r0+z, r1)) != HighBits(w): w={w} z={z} hint={hint}"
+            );
+            if hint == 0 {
+                hint0_seen += 1;
+            } else {
+                hint1_seen += 1;
+            }
+        };
+
+        // Deterministic sweep with a small signed perturbation in [-GAMMA2, GAMMA2].
         let mut s: u64 = 0x5151_5151_2727_2727;
         for _ in 0..300_000 {
             s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             let w = (s % Q as u64) as i32; // standard representative
-            let (w1, _w0) = decompose(w);
-
-            // A small signed perturbation, in the range the make_hint contract
-            // covers (|a0| around GAMMA2). Derive deterministically from s.
-            let delta = ((s >> 40) as i32 % (2 * GAMMA2 + 1)) - GAMMA2;
-            let r = modp(w as i64 + delta as i64); // r = w + delta mod Q
-            let (r1, r0) = decompose(r);
-
-            // hint says whether the high bits of r and (r - delta)=w differ; the
-            // canonical use is make_hint over the (low, high) split of the value
-            // whose high bits we want to correct back. Mirror the C contract:
-            // make_hint(a0=r0 of the masked value, a1=r1), then use_hint(r,hint).
-            let hint = make_hint(r0, r1);
-            let corrected = use_hint(r, hint);
-            // use_hint(r, make_hint(r0, r1)) is identity on r's own decompose, so
-            // it must return r1 (hint=0 path) — a self-consistency guard.
-            if hint == 0 {
-                assert_eq!(corrected, r1, "use_hint(r,0) must return r1");
-            } else {
-                assert_eq!(
-                    corrected,
-                    (r1 + 1) & 15,
-                    "use_hint with set hint and r0={r0}"
-                );
-            }
-            // Touch w1 so the perturbation derivation is not dead code.
-            let _ = w1;
+            let z = ((s >> 40) as i32 % (2 * GAMMA2 + 1)) - GAMMA2;
+            check(w, z);
         }
+
+        // Explicit asymmetric-boundary inputs: w = r1*alpha decomposes to
+        // (r1, 0), so z = -GAMMA2 makes a0 == -GAMMA2 exactly. r1 == 0 must NOT
+        // set the hint (the `a1 != 0` guard); r1 in [1,15] MUST set it.
+        for r1 in 0..16i32 {
+            let w = r1 * alpha;
+            check(w, -GAMMA2); // a0 == -GAMMA2, a1 == r1
+            check(w, GAMMA2); // a0 == +GAMMA2 boundary (never a hint)
+        }
+
+        // Both branches of the hint must have been exercised, or the test would
+        // be vacuous (the old version only ever hit the hint==0 identity path).
+        assert!(hint0_seen > 0, "hint==0 branch never exercised");
+        assert!(hint1_seen > 0, "hint==1 branch never exercised");
     }
 
     /// `use_hint` matches the literal `rounding.c` branch table for the explicit

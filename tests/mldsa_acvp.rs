@@ -74,11 +74,17 @@ fn hex_field_opt(t: &Value, key: &str) -> Vec<u8> {
 
 /// Is this test group exactly ParallaX's ML-DSA-87 external/pure path? keyGen has
 /// no `signatureInterface`/`preHash` keys, so this predicate (used for sigGen /
-/// sigVer) is gated by `parameterSet` plus those two fields.
+/// sigVer) is gated by `parameterSet` plus those two fields, and explicitly
+/// excludes the `externalMu` groups (which feed a pre-hashed mu, an interface
+/// this module does not implement). The current vectors only set `externalMu` on
+/// `internal` groups, so the `signatureInterface`/`preHash` gate already drops
+/// them, but checking `externalMu` directly keeps the filter correct if a future
+/// vector set pairs `externalMu: true` with `external`/`pure` (absent == false).
 fn is_ml_dsa_87_external_pure(group: &Value) -> bool {
     group.get("parameterSet").and_then(Value::as_str) == Some("ML-DSA-87")
         && group.get("signatureInterface").and_then(Value::as_str) == Some("external")
         && group.get("preHash").and_then(Value::as_str) == Some("pure")
+        && group.get("externalMu").and_then(Value::as_bool) != Some(true)
 }
 
 fn groups(doc: &Value) -> &Vec<Value> {
@@ -200,7 +206,7 @@ fn acvp_siggen_byte_exact() {
 
             let sk_arr: [u8; SECRETKEYBYTES] = sk.try_into().unwrap();
             let sig = sign::signature_ctx(&sk_arr, &msg, &ctx, &rnd)
-                .unwrap_or_else(|()| panic!("tcId {}: signature_ctx rejected ctx", tc_id(t)));
+                .unwrap_or_else(|e| panic!("tcId {}: signature_ctx rejected ctx: {e:?}", tc_id(t)));
 
             assert_eq!(
                 sig.as_slice(),

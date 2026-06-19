@@ -35,6 +35,18 @@ use super::params::{
 use super::poly::Poly;
 use super::polyvec::{matrix_expand, matrix_pointwise_montgomery, Polyveck, Polyvecl};
 
+/// The single failure mode of [`signature_ctx`]: the FIPS 204 context string
+/// exceeded the 255-byte cap. Modeled as an enum (not a unit `Err(())`) so the
+/// invariant "the only way signing fails is an over-long context" is pinned in
+/// the type: any future second failure mode must add a variant here, which makes
+/// the exhaustive match in `mod.rs` fail to compile rather than silently
+/// mislabel the new error as `ContextTooLong` (security-review fix #4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureCtxError {
+    /// `ctx` was longer than the FIPS 204 limit of 255 bytes.
+    ContextTooLong,
+}
+
 /// FIPS 204 Alg 6 `ML-DSA.KeyGen_internal` — `sign.c`
 /// `crypto_sign_keypair`, but with the 32-byte seed `xi` injected instead of
 /// drawn from `randombytes`. Returns `(pk, sk)` as fixed-size byte arrays
@@ -120,17 +132,16 @@ pub fn keygen_internal(xi: &[u8; SEEDBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; SECR
 /// Builds `mu = SHAKE256(tr || 0x00 || IntToBytes(ctxlen,1) || ctx || m)` (the
 /// "pure" / `preHash="pure"` external interface, separator `0x00`) and
 /// `rhoprime = SHAKE256(key || rnd || mu)`, then runs the rejection loop. Returns
-/// the `SIGNBYTES`-long signature, or `Err(())` if `ctx` is longer than 255 bytes
-/// (FIPS 204 caps the context string at 255).
-#[allow(clippy::result_unit_err)]
+/// the `SIGNBYTES`-long signature, or [`SignatureCtxError::ContextTooLong`] if
+/// `ctx` is longer than 255 bytes (FIPS 204 caps the context string at 255).
 pub fn signature_ctx(
     sk: &[u8; SECRETKEYBYTES],
     m: &[u8],
     ctx: &[u8],
     rnd: &[u8; RNDBYTES],
-) -> Result<[u8; SIGNBYTES], ()> {
+) -> Result<[u8; SIGNBYTES], SignatureCtxError> {
     if ctx.len() > 255 {
-        return Err(());
+        return Err(SignatureCtxError::ContextTooLong);
     }
 
     // Unpack the secret key.
@@ -356,8 +367,11 @@ pub fn keypair() -> ([u8; PUBLICKEYBYTES], [u8; SECRETKEYBYTES]) {
 
 /// Hedged signing (FIPS 204 Alg 2 `ML-DSA.Sign`, hedged variant): draw the
 /// 32-byte hedging nonce `rnd` from the OS CSPRNG and run [`signature_ctx`].
-#[allow(clippy::result_unit_err)]
-pub fn sign(sk: &[u8; SECRETKEYBYTES], m: &[u8], ctx: &[u8]) -> Result<[u8; SIGNBYTES], ()> {
+pub fn sign(
+    sk: &[u8; SECRETKEYBYTES],
+    m: &[u8],
+    ctx: &[u8],
+) -> Result<[u8; SIGNBYTES], SignatureCtxError> {
     let mut rnd = [0u8; RNDBYTES];
     OsRng.fill_bytes(&mut rnd);
     let out = signature_ctx(sk, m, ctx, &rnd);
