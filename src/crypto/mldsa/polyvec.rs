@@ -91,6 +91,16 @@ impl Polyvecl {
         }
     }
 
+    /// In-place `self = self + v`, no modular reduction. Mirrors the C
+    /// `polyvecl_add(&z, &z, &v)` aliasing dest=src: each coefficient is read and
+    /// written in place with no temporary copy of the secret `self`, so the
+    /// cleartext is not spilled into an unnamed Copy temporary (plan §5).
+    pub fn add_assign(&mut self, v: &Polyvecl) {
+        for i in 0..L {
+            self.vec[i].add_assign(&v.vec[i]);
+        }
+    }
+
     /// `polyvecl_ntt`: forward NTT of all `L` polynomials in place.
     pub fn ntt(&mut self) {
         for p in self.vec.iter_mut() {
@@ -203,11 +213,29 @@ impl Polyveck {
         }
     }
 
+    /// In-place `self = self + v`, no modular reduction. Mirrors the C
+    /// `polyveck_add(&w0, &w0, &v)` aliasing dest=src: read-modify-write per
+    /// coefficient with no temporary copy of the secret `self` (plan §5).
+    pub fn add_assign(&mut self, v: &Polyveck) {
+        for i in 0..K {
+            self.vec[i].add_assign(&v.vec[i]);
+        }
+    }
+
     /// `polyveck_sub`: `self = u - v`, no modular reduction.
     pub fn sub(&mut self, u: &Polyveck, v: &Polyveck) {
         for i in 0..K {
             let (ui, vi) = (u.vec[i], v.vec[i]);
             self.vec[i].sub(&ui, &vi);
+        }
+    }
+
+    /// In-place `self = self - v`, no modular reduction. Mirrors the C
+    /// `polyveck_sub(&w0, &w0, &v)` aliasing dest=src: read-modify-write per
+    /// coefficient with no temporary copy of the secret `self` (plan §5).
+    pub fn sub_assign(&mut self, v: &Polyveck) {
+        for i in 0..K {
+            self.vec[i].sub_assign(&v.vec[i]);
         }
     }
 

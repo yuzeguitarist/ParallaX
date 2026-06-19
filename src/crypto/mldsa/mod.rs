@@ -52,6 +52,23 @@ pub const SECRETKEY_BYTES: usize = SECRETKEYBYTES;
 /// Signature length in bytes (`4627`).
 pub const SIG_BYTES: usize = SIGNBYTES;
 
+/// FIPS 204 ML-DSA-87 serialized public-key length (bytes). The `fn` form mirrors
+/// the retired `pqcrypto_mldsa::mldsa87::public_key_bytes()` (and `crypto::pq`'s
+/// ML-KEM accessors) so config/probe/speed call sites only change the path.
+pub fn public_key_bytes() -> usize {
+    PUBLICKEYBYTES
+}
+/// FIPS 204 ML-DSA-87 serialized secret-key length (bytes). Mirrors the retired
+/// `pqcrypto_mldsa::mldsa87::secret_key_bytes()`.
+pub fn secret_key_bytes() -> usize {
+    SECRETKEYBYTES
+}
+/// FIPS 204 ML-DSA-87 detached-signature length (bytes). Mirrors the retired
+/// `pqcrypto_mldsa::mldsa87::signature_bytes()`.
+pub fn signature_bytes() -> usize {
+    SIGNBYTES
+}
+
 /// Errors from the byte-oriented public API.
 ///
 /// The variants mirror what `crypto::identity` needs to distinguish (plan §6):

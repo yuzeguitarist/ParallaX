@@ -4,9 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::crypto::mldsa;
 use crate::crypto::pq;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use pqcrypto_mldsa::mldsa87;
 use serde::Deserialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -493,7 +493,7 @@ impl Config {
                 decode_base64_bytes_exact(
                     "client.server_identity_public_key",
                     &client.server_identity_public_key,
-                    mldsa87::public_key_bytes(),
+                    mldsa::public_key_bytes(),
                 )?;
             }
             Mode::Server => {
@@ -513,7 +513,7 @@ impl Config {
                 decode_base64_secret_exact(
                     "server.identity_secret_key",
                     &server.identity_secret_key,
-                    mldsa87::secret_key_bytes(),
+                    mldsa::secret_key_bytes(),
                 )?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
@@ -901,7 +901,7 @@ mod tests {
     #[test]
     fn validates_client_config() {
         let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
-        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let raw = format!(
             r#"
 mode = "client"
@@ -924,8 +924,8 @@ server_identity_public_key = "{server_identity_public_key}"
 
     #[test]
     fn validates_configs_without_legacy_static_pq_keys() {
-        let identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let client_raw = format!(
             r#"
 mode = "client"
@@ -998,7 +998,7 @@ authorized_sni = ["example.com"]
 
     #[test]
     fn config_without_udp_section_defaults_to_disabled() {
-        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let identity = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let raw = format!(
             r#"
 mode = "client"
@@ -1022,7 +1022,7 @@ server_identity_public_key = "{identity}"
 
     #[test]
     fn udp_section_parses_overrides() {
-        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let identity = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let raw = format!(
             r#"
 mode = "client"
@@ -1180,7 +1180,7 @@ ech = true
 
     #[test]
     fn udp_partial_section_uses_field_defaults() {
-        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let identity = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let raw = format!(
             r#"
 mode = "client"
@@ -1212,7 +1212,7 @@ enabled = true
 
     #[test]
     fn udp_enum_wire_spellings_round_trip() {
-        let identity = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let identity = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let raw = format!(
             r#"
 mode = "client"
@@ -1240,7 +1240,7 @@ fec_profile = "off"
 
     #[test]
     fn server_mode_accepts_udp_section() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1418,7 +1418,7 @@ server_identity_public_key = "{KEY}"
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.toml");
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1454,7 +1454,7 @@ authorized_sni = ["example.com"]
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client.toml");
         let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
-        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let raw = format!(
             r#"
 mode = "client"
@@ -1487,7 +1487,7 @@ server_identity_public_key = "{server_identity_public_key}"
     fn server_replay_cache_default_uses_writable_state_dir() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.toml");
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1669,7 +1669,7 @@ authorized_sni = ["example.com"]
         let nested = dir.path().join("conf");
         fs::create_dir(&nested).unwrap();
         let path = nested.join("server.toml");
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1700,7 +1700,7 @@ authorized_sni = ["example.com"]
 
     #[test]
     fn server_validate_rejects_empty_authorized_sni_entry() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1725,7 +1725,7 @@ authorized_sni = ["  "]
 
     #[test]
     fn server_replay_cache_capacity_defaults_when_omitted() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1751,7 +1751,7 @@ authorized_sni = ["example.com"]
 
     #[test]
     fn server_timeout_fields_default_when_omitted() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1779,7 +1779,7 @@ authorized_sni = ["example.com"]
 
     #[test]
     fn server_validate_rejects_sub_minimum_timeout_floor() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1805,7 +1805,7 @@ first_record_wait_floor_ms = 100
 
     #[test]
     fn server_validate_rejects_excessive_first_record_floor() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let make = |floor: u64| {
             format!(
                 r#"
@@ -1837,7 +1837,7 @@ first_record_wait_floor_ms = {floor}
 
     #[test]
     fn unknown_config_key_is_rejected() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         // A misspelled safety key under [server] must now hard-fail at parse
         // (deny_unknown_fields) instead of being silently dropped to the default.
         let raw = format!(
@@ -1964,7 +1964,7 @@ max_padd = 1500
 
     #[test]
     fn server_validate_rejects_tiny_idle_backstop() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -1990,7 +1990,7 @@ fallback_idle_floor_ms = 1000
 
     #[test]
     fn server_validate_rejects_excessive_timeout_jitter() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -2016,7 +2016,7 @@ fallback_idle_jitter_ms = 999999999
 
     #[test]
     fn server_validate_rejects_bogus_tcp_congestion() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         for bogus in ["\"\"", "\"bbr xtls\"", "\"a;b\""] {
             let raw = format!(
                 r#"
@@ -2047,7 +2047,7 @@ tcp_congestion = {bogus}
 
     #[test]
     fn server_validate_accepts_plausible_tcp_congestion() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -2071,7 +2071,7 @@ tcp_congestion = "cubic"
 
     #[test]
     fn server_replay_cache_capacity_parses_override() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -2095,7 +2095,7 @@ replay_cache_capacity = 65536
 
     #[test]
     fn server_validate_rejects_zero_replay_cache_capacity() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"
@@ -2121,7 +2121,7 @@ replay_cache_capacity = 0
 
     #[test]
     fn server_validate_rejects_bad_data_target() {
-        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]);
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let raw = format!(
             r#"
 mode = "server"

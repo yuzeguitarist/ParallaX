@@ -89,11 +89,33 @@ impl Poly {
         }
     }
 
+    /// In-place `self = self + b`, no modular reduction. The C `poly_add` aliases
+    /// dest=src safely (`poly_add(&z,&z,&y)`); this mirrors that with an explicit
+    /// read-modify-write per coefficient so no Copy temporary of the secret `self`
+    /// is spilled (plan §5).
+    #[inline]
+    pub fn add_assign(&mut self, b: &Poly) {
+        for i in 0..N {
+            self.coeffs[i] = self.coeffs[i].wrapping_add(b.coeffs[i]);
+        }
+    }
+
     /// `self = a - b`, no modular reduction (`poly.c` `poly_sub`).
     #[inline]
     pub fn sub(&mut self, a: &Poly, b: &Poly) {
         for i in 0..N {
             self.coeffs[i] = a.coeffs[i].wrapping_sub(b.coeffs[i]);
+        }
+    }
+
+    /// In-place `self = self - b`, no modular reduction. Mirrors the C `poly_sub`
+    /// aliasing dest=src (`poly_sub(&w0,&w0,&h)`) with an explicit
+    /// read-modify-write per coefficient, avoiding a Copy temporary of the secret
+    /// `self` (plan §5).
+    #[inline]
+    pub fn sub_assign(&mut self, b: &Poly) {
+        for i in 0..N {
+            self.coeffs[i] = self.coeffs[i].wrapping_sub(b.coeffs[i]);
         }
     }
 
@@ -246,12 +268,14 @@ impl Poly {
     /// computed without a branch/divide, and the value is `2 - (t mod 5)`.
     pub fn poly_uniform_eta(&mut self, seed: &[u8], nonce: u16) {
         const POLY_UNIFORM_ETA_NBLOCKS: usize = 136usize.div_ceil(SHAKE256_RATE);
-        let mut buf = [0u8; POLY_UNIFORM_ETA_NBLOCKS * SHAKE256_RATE];
+        // `buf` holds secret-derived bytes (the s1/s2 sample stream); zeroize it
+        // on drop so the cleartext is not left on the stack (plan §5).
+        let mut buf = zeroize::Zeroizing::new([0u8; POLY_UNIFORM_ETA_NBLOCKS * SHAKE256_RATE]);
 
         let mut state = Shake256Stream::init(seed, nonce);
-        state.read(&mut buf);
+        state.read(&mut buf[..]);
 
-        let mut ctr = rej_eta(&mut self.coeffs, N, &buf);
+        let mut ctr = rej_eta(&mut self.coeffs, N, &buf[..]);
 
         while ctr < N {
             state.read(&mut buf[..SHAKE256_RATE]);
@@ -271,11 +295,13 @@ impl Poly {
     /// secret data).
     pub fn poly_uniform_gamma1(&mut self, seed: &[u8], nonce: u16) {
         const POLY_UNIFORM_GAMMA1_NBLOCKS: usize = POLYZ_PACKEDBYTES.div_ceil(SHAKE256_RATE);
-        let mut buf = [0u8; POLY_UNIFORM_GAMMA1_NBLOCKS * SHAKE256_RATE];
+        // `buf` IS the packed secret mask `y` (ExpandMask output); zeroize it on
+        // drop so the cleartext mask is not left on the stack (plan §5).
+        let mut buf = zeroize::Zeroizing::new([0u8; POLY_UNIFORM_GAMMA1_NBLOCKS * SHAKE256_RATE]);
 
         let mut state = Shake256Stream::init(seed, nonce);
-        state.read(&mut buf);
-        self.polyz_unpack(&buf);
+        state.read(&mut buf[..]);
+        self.polyz_unpack(&buf[..]);
     }
 
     /// Unpack a `z`-range polynomial (coefficients in `[-(GAMMA1-1), GAMMA1]`,

@@ -178,3 +178,49 @@ fn shared_key_cross_sign_and_verify() {
     mldsa::verify(&pk, oracle_sig.as_bytes(), msg, ctx)
         .expect("hand-rolled verify rejected oracle signature under shared key");
 }
+
+/// Production-path differential: drive the *high-level hedged* `mldsa::sign`
+/// (the exact entry `crypto::identity` calls — fresh OS `rnd`, byte-slice in/out),
+/// not the lower-level `signature_ctx` seam, and require the pqcrypto oracle to
+/// accept every signature. This guards the production signer end-to-end (key bytes
+/// -> hedged sign -> oracle verify), so a regression in the public surface — not
+/// just the deterministic core — is caught. Tampering one bit must make the oracle
+/// reject, so acceptance is never vacuous.
+#[test]
+fn oracle_accepts_handrolled_hedged_sign() {
+    let mut iters = 0usize;
+    for round in 0u64..6 {
+        let (pk, sk) = mldsa::keypair();
+        let oracle_pk =
+            oracle::PublicKey::from_bytes(&pk).expect("hand-rolled pk loads into oracle");
+
+        for (ci, ctx) in context_cases().iter().enumerate() {
+            let msg = message(round * 23 + ci as u64, 1 + ci * 80);
+
+            // Production hedged sign: takes byte slices, draws its own `rnd`.
+            let sig = mldsa::sign(&sk, &msg, ctx)
+                .expect("hand-rolled hedged sign succeeds for ctx <= 255");
+            assert_eq!(sig.len(), mldsa::SIG_BYTES);
+
+            let oracle_sig = oracle::DetachedSignature::from_bytes(&sig)
+                .expect("hand-rolled hedged signature loads into oracle");
+            assert!(
+                oracle::verify_detached_signature_ctx(&oracle_sig, &msg, ctx, &oracle_pk).is_ok(),
+                "oracle rejected a valid hand-rolled hedged signature (round {round}, ctx#{ci})"
+            );
+
+            // Tamper one bit: the oracle must reject.
+            let mut bad = sig;
+            bad[0] ^= 0x01;
+            let oracle_bad = oracle::DetachedSignature::from_bytes(&bad)
+                .expect("tampered signature still loads (length unchanged)");
+            assert!(
+                oracle::verify_detached_signature_ctx(&oracle_bad, &msg, ctx, &oracle_pk).is_err(),
+                "oracle accepted a bit-flipped hand-rolled hedged signature (round {round}, ctx#{ci})"
+            );
+            iters += 1;
+        }
+    }
+    assert!(iters > 0);
+    eprintln!("differential production-path: oracle accepted {iters} hedged signatures");
+}

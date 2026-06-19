@@ -27,8 +27,6 @@ hkdf = "0.12"
 hmac = "0.12"
 libc = "0.2"
 rand = "0.8"
-pqcrypto-mldsa = "0.1.2"
-pqcrypto-traits = "0.3"
 # QUIC fast-plane (TUDP) data path. quinn 0.11 exposes no aws-lc-rs backend for
 # quinn-proto's QUIC transport crypto, so `ring` is required there and is linked
 # unconditionally; the TLS handshake and all of ParallaX's other crypto stay on
@@ -59,6 +57,12 @@ zeroize = { version = "1.7", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# ML-DSA-87 differential oracle (tests/mldsa_differential.rs only): the PQClean C
+# FFI implementation the hand-rolled `crypto::mldsa` is cross-checked against. The
+# production identity signer is `crypto::mldsa`; these are test-only since the
+# cutover and must not re-enter [dependencies].
+pqcrypto-mldsa = "0.1.2"
+pqcrypto-traits = "0.3"
 # ML-DSA-87 ACVP validation harness (tests/mldsa_acvp.rs): parse NIST ACVP JSON
 # vectors and decode their uppercase-hex fields. Test-only; not runtime deps.
 serde_json = "1"

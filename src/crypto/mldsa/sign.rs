@@ -51,8 +51,11 @@ pub fn keygen_internal(xi: &[u8; SEEDBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; SECR
     seedbuf[..SEEDBYTES].copy_from_slice(xi);
     seedbuf[SEEDBYTES] = K as u8;
     seedbuf[SEEDBYTES + 1] = L as u8;
-    let absorbed: [u8; SEEDBYTES + 2] = core::array::from_fn(|i| seedbuf[i]);
-    fips202::shake256(&mut seedbuf, &[&absorbed]);
+    // `absorbed` is a copy of the secret seed `xi` (|| K || L); zeroize it on drop
+    // so the cleartext seed is not left in an unnamed Copy temporary (plan §5).
+    let absorbed: zeroize::Zeroizing<[u8; SEEDBYTES + 2]> =
+        zeroize::Zeroizing::new(core::array::from_fn(|i| seedbuf[i]));
+    fips202::shake256(&mut seedbuf, &[&absorbed[..]]);
 
     let rho: [u8; SEEDBYTES] = core::array::from_fn(|i| seedbuf[i]);
     let rhoprime: [u8; CRHBYTES] = core::array::from_fn(|i| seedbuf[SEEDBYTES + i]);
@@ -76,7 +79,7 @@ pub fn keygen_internal(xi: &[u8; SEEDBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; SECR
     t1.reduce();
     t1.invntt_tomont();
 
-    t1.add(&{ t1 }, &s2);
+    t1.add_assign(&s2);
 
     // Extract (t1, t0) = Power2Round(t), write pk.
     t1.caddq();
@@ -157,6 +160,11 @@ pub fn signature_ctx(
 
     let mut nonce: u16 = 0;
     let mut sig = [0u8; SIGNBYTES];
+    // `w0` (the secret low part of `w`) is hoisted out of the loop so it can be
+    // zeroized exactly once after the loop, rather than at each reject `continue`.
+    // It is fully overwritten by `decompose` every iteration before any read, so
+    // hoisting does not leak state across iterations (plan §5 BLOCKER 1).
+    let mut w0 = Polyveck::zero();
 
     let result = loop {
         // Sample intermediate vector y (ExpandMask).
@@ -174,8 +182,8 @@ pub fn signature_ctx(
 
         // Decompose w and call the random oracle.
         w1.caddq();
-        let mut w0 = Polyveck::zero();
-        // C: decompose(&w1, &w0, &w1) — in place.
+        // C: decompose(&w1, &w0, &w1) — in place. `w0` is the hoisted buffer,
+        // fully rewritten here each iteration.
         let mut w1_hi = Polyveck::zero();
         w1.decompose(&mut w1_hi, &mut w0);
         w1 = w1_hi;
@@ -196,7 +204,7 @@ pub fn signature_ctx(
         // z = y + c*s1; reject if it reveals the secret.
         z.pointwise_poly_montgomery(&cp, &s1);
         z.invntt_tomont();
-        z.add(&{ z }, &y);
+        z.add_assign(&y);
         z.reduce();
         if z.chknorm(GAMMA1_MINUS_BETA) {
             y.zeroize();
@@ -208,7 +216,7 @@ pub fn signature_ctx(
         let mut h = Polyveck::zero();
         h.pointwise_poly_montgomery(&cp, &s2);
         h.invntt_tomont();
-        w0.sub(&{ w0 }, &h);
+        w0.sub_assign(&h);
         w0.reduce();
         if w0.chknorm(GAMMA2_MINUS_BETA) {
             y.zeroize();
@@ -228,7 +236,7 @@ pub fn signature_ctx(
             continue;
         }
 
-        w0.add(&{ w0 }, &h);
+        w0.add_assign(&h);
         let n = h.make_hint(&w0, &w1);
         if n as usize > OMEGA {
             y.zeroize();
@@ -252,6 +260,9 @@ pub fn signature_ctx(
     s1.zeroize();
     s2.zeroize();
     t0.zeroize();
+    // `w0` holds the secret low part of `w` from the final iteration; scrub it
+    // once here (it was hoisted out of the loop for exactly this).
+    w0.zeroize();
 
     result
 }
@@ -445,5 +456,32 @@ mod tests {
 
         let (pk_b, _) = keygen_internal(&xi_b);
         assert_ne!(pk_a1, pk_b, "different seeds must give different pk");
+    }
+
+    /// The signing path must be panic-free across many fresh hedged signatures
+    /// (plan §5 BLOCKER 1 regression guard). A panic anywhere between secret
+    /// population and the trailing manual `zeroize()` of `w0` / the secret-key
+    /// vectors would unwind past the scrub and leave cleartext secrets on the
+    /// stack. This drives `keygen` + many hedged `signature_ctx` (so the rejection
+    /// loop runs to completion repeatedly, exercising every reject `continue`) and
+    /// a verify round-trip; reaching the end without a panic is the assertion.
+    #[test]
+    fn signing_path_is_panic_free() {
+        let xi: [u8; SEEDBYTES] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(5));
+        let (pk, sk) = keygen_internal(&xi);
+
+        let msg = b"ParallaX ml-dsa-87 panic-free signing-path regression guard";
+        let ctx = b"ParallaX v2 ML-DSA-87 server identity";
+
+        // Many distinct hedging nonces so the rejection loop iterates a varying
+        // number of times across runs (covering the reject `continue` paths that
+        // carry secret `w0`/`z`). Each signature must succeed and verify, with no
+        // panic from secret population through the trailing zeroize.
+        for k in 0u8..16 {
+            let rnd = [k.wrapping_mul(31).wrapping_add(1); RNDBYTES];
+            let sig = signature_ctx(&sk, msg, ctx, &rnd).expect("sign must not fail");
+            verify_ctx(&pk, &sig, msg, ctx).expect("fresh signature must verify");
+        }
     }
 }
