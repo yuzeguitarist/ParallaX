@@ -188,14 +188,6 @@ impl ClientDataSession {
         Ok(())
     }
 
-    pub fn open_server_key_exchange_record(
-        &mut self,
-        record: &[u8],
-    ) -> Result<ServerKeyExchange, ClientHandshakeError> {
-        let payload = self.open_from_server.open(record)?;
-        Ok(ServerKeyExchange::decode(&payload)?)
-    }
-
     pub fn build_connect_record<R>(
         &mut self,
         request: ConnectRequest,
@@ -537,7 +529,7 @@ mod tests {
                     server_x25519_public: server_x25519.public,
                     mlkem_ciphertext: encapsulation.ciphertext,
                 }
-                .encode()
+                .encode_with_suite(CipherSuite::ChaCha20Poly1305)
                 .unwrap(),
                 &mut rng,
             )
@@ -749,7 +741,7 @@ mod tests {
             server_x25519_public: server_x25519.public,
             mlkem_ciphertext: encapsulation.ciphertext,
         }
-        .encode()
+        .encode_with_suite(CipherSuite::ChaCha20Poly1305)
         .unwrap();
         let binding = pending.identity_binding(&exchange_payload);
         let exchange_record = server_seal.seal(&exchange_payload, rng).unwrap();

@@ -787,7 +787,7 @@ fn bench_server_key_exchange_decode_owned(options: BenchmarkOptions) -> Result<B
         server_x25519_public: server.public,
         mlkem_ciphertext: encapsulation.ciphertext,
     }
-    .encode()?;
+    .encode_with_suite(CipherSuite::ChaCha20Poly1305)?;
 
     run_case(
         BenchGroup::HandshakeProtocol,
@@ -811,7 +811,7 @@ fn bench_server_key_exchange_decode_borrowed(options: BenchmarkOptions) -> Resul
         server_x25519_public: server.public,
         mlkem_ciphertext: encapsulation.ciphertext,
     }
-    .encode()?;
+    .encode_with_suite(CipherSuite::ChaCha20Poly1305)?;
 
     run_case(
         BenchGroup::HandshakeProtocol,

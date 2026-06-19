@@ -3288,7 +3288,7 @@ mod tests {
                     server_x25519_public: server_ephemeral.public,
                     mlkem_ciphertext: pq_encapsulation.ciphertext,
                 }
-                .encode()
+                .encode_with_suite(crate::crypto::session::CipherSuite::ChaCha20Poly1305)
                 .unwrap(),
                 &mut rng,
             )
