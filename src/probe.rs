@@ -487,9 +487,9 @@ mod tests {
     }
 
     use crate::config::{ClientConfig, CryptoConfig, Mode, ServerConfig, TrafficConfig, UdpConfig};
+    use crate::crypto::mldsa;
+    use crate::crypto::pq;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use pqcrypto_mldsa::mldsa87;
-    use pqcrypto_mlkem::mlkem1024;
     use std::path::PathBuf;
 
     #[test]
@@ -668,8 +668,8 @@ mod tests {
     }
 
     fn client_config() -> Config {
-        let server_pq_public_key = STANDARD.encode(vec![0_u8; mlkem1024::public_key_bytes()]);
-        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
+        let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         Config {
             mode: Mode::Client,
             crypto: CryptoConfig {
@@ -704,7 +704,7 @@ mod tests {
                 data_target: None,
                 private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
                 pq_secret_key: String::new(),
-                identity_secret_key: STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]),
+                identity_secret_key: STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]),
                 replay_cache_path: PathBuf::from("/tmp/parallax-test-replay.cache"),
                 replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni,
