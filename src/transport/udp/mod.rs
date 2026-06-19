@@ -1,9 +1,8 @@
 //! UDP fast-plane transport (the "U" in TUDP).
 //!
 //! Provides the QUIC endpoint building blocks for the masquerading HTTP/3 face on
-//! UDP: a QUIC connection, bidirectional unreliable datagrams (RFC 9221) used by
-//! the reachability probe, and RFC 5705 keying-material export backing the
-//! exporter-bound UDP auth token.
+//! UDP: a QUIC connection, a uni-stream round-trip used by the reachability probe,
+//! and RFC 5705 keying-material export backing the exporter-bound UDP auth token.
 //!
 //! Wired into the client/server runtimes for the single-Connect data relay: when
 //! `[udp].enabled` is set on both ends and the client's probe is Verified, the
@@ -249,12 +248,12 @@ fn udp_transport_config(peer_bidi: u32) -> Arc<quinn::TransportConfig> {
     // Stream limits and flow-control windows EQUAL the advertised Safari values:
     // bidi grant per the `peer_bidi` asymmetry above; uni = 8
     // (`initial_max_streams_uni`); per-stream window 2 MiB; connection window
-    // 16 MiB. The uni = 8 grant is Safari-faithful but UNUSED by the relay, which
-    // carries its payload over a single client-initiated BIDI stream and uses
-    // unreliable datagrams (not uni streams) for the probe — it is advertised only
-    // so the wire matches Safari. Granting the advertised 8 uni is bounded by the
-    // 2 MiB per-uni-stream window under the 16 MiB connection window; send_window
-    // matches the connection window so the sender is not the bottleneck.
+    // 16 MiB. The relay carries its payload over a single client-initiated BIDI
+    // stream; the reachability probe rides a uni-stream round-trip (one client uni
+    // + one server uni), well within the advertised 8 uni budget. Granting the
+    // advertised 8 uni is bounded by the 2 MiB per-uni-stream window under the
+    // 16 MiB connection window; send_window matches the connection window so the
+    // sender is not the bottleneck.
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(peer_bidi));
     transport.max_concurrent_uni_streams(
         quinn::VarInt::from_u64(safari_crypto::SAFARI_TP_MAX_STREAMS_UNI)
@@ -263,6 +262,17 @@ fn udp_transport_config(peer_bidi: u32) -> Arc<quinn::TransportConfig> {
     transport.receive_window(quinn::VarInt::from_u32(UDP_CONN_RECV_WINDOW));
     transport.stream_receive_window(quinn::VarInt::from_u32(UDP_STREAM_RECV_WINDOW));
     transport.send_window(u64::from(UDP_CONN_RECV_WINDOW));
+
+    // Disable QUIC datagrams (RFC 9221). Safari-26 H3 advertises no
+    // `max_datagram_frame_size` for plain H3 (it sends no datagrams), so the
+    // camouflaged transport params omit 0x20; disabling datagrams here makes
+    // quinn's enforced behaviour match the wire (it neither advertises 0x20 in its
+    // own `params.write()` nor accepts datagram frames). The reachability probe no
+    // longer needs them — it rides a QUIC uni-stream round-trip (see `probe.rs`),
+    // which uses the advertised `initial_max_streams_uni = 8` budget. quinn's
+    // default enables datagrams (`datagram_receive_buffer_size = Some(..)`), so this
+    // explicit `None` is required.
+    transport.datagram_receive_buffer_size(None);
 
     // Congestion control: BBR, not quinn's default Cubic. The fast plane only
     // earns its keep on lossy links, where Cubic's loss-as-congestion backoff
@@ -415,7 +425,7 @@ pub(crate) mod test_support {
         DigitallySignedStruct, SignatureScheme,
     };
 
-    use super::{client_config, server_config};
+    use super::server_config;
 
     /// Test-only verifier that accepts any certificate. Mirrors REALITY's posture
     /// (the cert is camouflage, not the trust anchor); real authenticity is the
@@ -483,9 +493,13 @@ pub(crate) mod test_support {
         .unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
 
-        let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client_endpoint
-            .set_default_client_config(client_config(Arc::new(AcceptAnyServerCert)).unwrap());
+        // PRODUCTION client builder: zero-length source connection id (Safari
+        // fidelity), so the loopback pair exercises the real wire shape.
+        let client_endpoint = super::endpoint::bind_client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(AcceptAnyServerCert),
+        )
+        .unwrap();
 
         let acceptor = {
             let server_endpoint = server_endpoint.clone();
@@ -512,7 +526,6 @@ pub(crate) mod test_support {
 mod tests {
     use std::time::Duration;
 
-    use bytes::Bytes;
     use quinn::Endpoint;
 
     use super::test_support::{loopback_pair, self_signed_cert, AcceptAnyServerCert};
@@ -522,11 +535,12 @@ mod tests {
     const TEST_PSK: &[u8] = b"parallax-tudp-loopback-psk-012345";
 
     /// Proves the QUIC fast-plane plumbing on loopback: connection establishment,
-    /// bidirectional unreliable datagrams, and that the RFC 5705 keying-material
-    /// exporter (open question #1 for the exporter-bound auth token) is available
-    /// and agrees on both ends under the aws-lc-rs backend.
+    /// a uni-stream round-trip (the transport the reachability probe now uses), and
+    /// that the RFC 5705 keying-material exporter (open question #1 for the
+    /// exporter-bound auth token) is available and agrees on both ends under the
+    /// aws-lc-rs backend.
     #[tokio::test]
-    async fn quic_loopback_datagram_and_exporter_round_trip() {
+    async fn quic_loopback_stream_and_exporter_round_trip() {
         let (cert, key) = self_signed_cert();
         let server_endpoint = Endpoint::server(
             server_config(cert, key).unwrap(),
@@ -535,18 +549,25 @@ mod tests {
         .unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
 
-        let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client_endpoint
-            .set_default_client_config(client_config(Arc::new(AcceptAnyServerCert)).unwrap());
+        // PRODUCTION client builder (zero-length source connection id).
+        let client_endpoint = super::endpoint::bind_client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(AcceptAnyServerCert),
+        )
+        .unwrap();
 
         let server_task = tokio::spawn(async move {
             let incoming = server_endpoint.accept().await.expect("incoming connection");
             let conn = incoming.await.expect("server-side connection");
-            let datagram = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+            // Echo the client's uni-stream request back on a server uni stream.
+            let mut recv = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
                 .await
-                .expect("server datagram timeout")
-                .expect("read client datagram");
-            conn.send_datagram(datagram).expect("echo datagram");
+                .expect("server accept_uni timeout")
+                .expect("accept client uni stream");
+            let got = recv.read_to_end(64).await.expect("read client uni payload");
+            let mut send = conn.open_uni().await.expect("server open_uni");
+            send.write_all(&got).await.expect("echo uni payload");
+            send.finish().expect("finish echo uni stream");
             let mut ekm = [0_u8; 32];
             conn.export_keying_material(&mut ekm, b"tudp-loopback", b"context")
                 .expect("server export_keying_material");
@@ -563,12 +584,14 @@ mod tests {
             .await
             .expect("client-side connection");
 
-        conn.send_datagram(Bytes::from_static(b"ping"))
-            .expect("client send datagram");
-        let echo = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        let mut send = conn.open_uni().await.expect("client open_uni");
+        send.write_all(b"ping").await.expect("client write uni");
+        send.finish().expect("finish client uni stream");
+        let mut recv = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
             .await
-            .expect("client datagram timeout")
-            .expect("read echoed datagram");
+            .expect("client accept_uni timeout")
+            .expect("accept echoed uni stream");
+        let echo = recv.read_to_end(64).await.expect("read echoed uni payload");
         assert_eq!(&echo[..], b"ping");
 
         let mut client_ekm = [0_u8; 32];
@@ -794,10 +817,13 @@ mod tests {
         let server_addr = server_endpoint.local_addr().unwrap();
 
         // Production client config (carries the Safari profile advertising zlib +
-        // the flate2 decompressor under test).
-        let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client_endpoint
-            .set_default_client_config(client_config(Arc::new(AcceptAnyServerCert)).unwrap());
+        // the flate2 decompressor under test) via the production endpoint builder
+        // (zero-length source connection id).
+        let client_endpoint = super::endpoint::bind_client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(AcceptAnyServerCert),
+        )
+        .unwrap();
 
         let acceptor = {
             let server_endpoint = server_endpoint.clone();

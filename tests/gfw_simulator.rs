@@ -750,61 +750,17 @@ fn scenario_9_permissive_policy_disables_all_enforcement() {
 /// Drive ParallaX's UDP-leg quinn client far enough to emit its QUIC Initial and
 /// capture that first datagram off a plain UDP socket standing in for the server.
 async fn capture_udp_leg_initial(server_name: &str) -> Vec<u8> {
-    use std::sync::Arc;
-
-    use parallax::transport::udp::client_config;
-    use quinn::Endpoint;
-    use rustls::{
-        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        pki_types::{CertificateDer, ServerName, UnixTime},
-        DigitallySignedStruct, SignatureScheme,
-    };
-
-    // The Initial is sent before any ServerHello arrives, so the cert verifier is
-    // never invoked; a never-called accept-any verifier is enough to build the
-    // client config for capture.
-    #[derive(Debug)]
-    struct NeverCalled;
-    impl ServerCertVerifier for NeverCalled {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ED25519,
-            ]
-        }
-    }
+    use parallax::transport::udp::endpoint::bind_client_endpoint_accept_any;
 
     let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
 
-    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    endpoint.set_default_client_config(client_config(Arc::new(NeverCalled)).unwrap());
+    // Build the client endpoint through the PRODUCTION builder so the captured
+    // Initial carries the real wire shape — including the zero-length source
+    // connection id (Safari fidelity; see `client_endpoint_config`). The
+    // accept-any verifier is never invoked: the Initial is emitted before any
+    // ServerHello arrives.
+    let endpoint = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap()).unwrap();
 
     // Registering the connection makes quinn's driver transmit the Initial; it
     // never completes (no real QUIC server replies), so hold it on a task while
@@ -837,64 +793,19 @@ async fn capture_udp_leg_initial(server_name: &str) -> Vec<u8> {
 /// declared ClientHello length (bounded by a per-recv timeout and an 8-datagram
 /// cap so a regression that never completes the CH fails fast instead of hanging).
 async fn capture_udp_leg_full_client_hello(server_name: &str) -> Vec<u8> {
-    use std::sync::Arc;
-
     use crate::gfw_sim::detection::quic_initial::{
         decrypt_payload, derive_client_initial_keys_v2, parse_initial_frames,
         parse_protected_long_header, reassemble_crypto_stream, unprotect_header, InitialFrame,
     };
-    use parallax::transport::udp::client_config;
-    use quinn::Endpoint;
-    use rustls::{
-        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        pki_types::{CertificateDer, ServerName, UnixTime},
-        DigitallySignedStruct, SignatureScheme,
-    };
-
-    // Same never-invoked verifier as `capture_udp_leg_initial`: the Initial is
-    // emitted before any ServerHello, so the cert path never runs.
-    #[derive(Debug)]
-    struct NeverCalled;
-    impl ServerCertVerifier for NeverCalled {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ED25519,
-            ]
-        }
-    }
+    use parallax::transport::udp::endpoint::bind_client_endpoint_accept_any;
 
     let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
 
-    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    endpoint.set_default_client_config(client_config(Arc::new(NeverCalled)).unwrap());
+    // PRODUCTION builder (zero-length source connection id; see
+    // `client_endpoint_config`). The accept-any verifier never runs: the Initial
+    // is emitted before any ServerHello arrives.
+    let endpoint = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap()).unwrap();
 
     let connecting = endpoint.connect(server_addr, server_name).unwrap();
     let drive = tokio::spawn(async move {
@@ -1071,13 +982,14 @@ async fn udp_leg_initial_first_datagram_holds_only_partial_clienthello() {
 // Safari-26 H3 spec: the 20-cipher GREASE-led list, the static Safari extension
 // order (GREASE matched by class) with extended_master_secret (0x17) /
 // renegotiation_info (0xff01) ABSENT, supported_versions = GREASE + 0x0304 only,
-// and the ascending `quic_transport_parameters` (0x39) id set with 0x0a/0x0b/0x0c
-// OMITTED, `max_datagram_frame_size` (0x20) KEPT (the probe uses datagrams), and
-// the vendor/GREASE codepoint 0x17f7586d2cb571 LAST. It also asserts the confirmed
-// transport-param VALUES (idle=0, payload=1200, stream_data=2 MiB, bidi=0, uni=8,
-// vendor GREASE=0) — EXCEPT initial_max_data (0x04), the single runtime-read value
-// (presence only). active_connection_id_limit asserts quinn's enforced 2, not
-// Safari's 64, which quinn-proto 0.11.14 cannot honor (CidQueue::LEN=5).
+// and the ascending `quic_transport_parameters` (0x39) id set with
+// 0x03/0x0a/0x0b/0x0c/0x20 OMITTED (full disassembly: no max_udp_payload_size, no
+// datagrams), `initial_source_connection_id` (0x0f) ZERO-LENGTH, and the
+// vendor/GREASE codepoint 0x17f7586d2cb571 LAST. It also asserts the confirmed
+// transport-param VALUES (idle=0, stream_data=2 MiB, bidi=0, uni=8, vendor
+// GREASE=0) — EXCEPT initial_max_data (0x04), the single runtime-read value
+// (presence only). active_connection_id_limit asserts quinn's enforced 5
+// (CidQueue::LEN), not Safari's 64, which quinn-proto 0.11.14 cannot honor.
 //
 // It is GREEN once the vendored-rustls fork + the Safari QUIC Session are wired and
 // selected (production `safari_ch_profile` set in `client_config` and the Safari
@@ -1313,11 +1225,11 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     );
 
     // 4) quic_transport_parameters (0x39): present, ids strictly ascending, the
-    //    exact confirmed Safari id set with 0x0a/0x0b/0x0c ABSENT and 0x20 PRESENT
-    //    (the probe uses RFC-9221 datagrams), and the vendor/GREASE codepoint
-    //    0x17f7586d2cb571 LAST. The confirmed VALUES are asserted too — EXCEPT
-    //    initial_max_data (0x04), whose number is the single runtime-read value
-    //    (assert presence only).
+    //    exact confirmed Safari id set with 0x03/0x0a/0x0b/0x0c/0x20 ABSENT (full
+    //    disassembly: no max_udp_payload_size, no datagrams), 0x0f zero-length, and
+    //    the vendor/GREASE codepoint 0x17f7586d2cb571 LAST. The confirmed VALUES are
+    //    asserted too — EXCEPT initial_max_data (0x04), whose number is the single
+    //    runtime-read value (assert presence only).
     const VENDOR_GREASE_TP: u64 = 0x17f7586d2cb571;
     let tp_body =
         extension_body(&record, 0x0039).expect("quic_transport_parameters (0x39) present");
@@ -1334,7 +1246,6 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     }
     let expected_tp_ids: Vec<u64> = vec![
         0x01,
-        0x03,
         0x04,
         0x05,
         0x06,
@@ -1343,25 +1254,24 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         0x09,
         0x0e,
         0x0f,
-        0x20,
         VENDOR_GREASE_TP,
     ];
     assert_eq!(
         tp_ids, expected_tp_ids,
-        "transport-param id set must be the confirmed Safari ascending set (no 0x0a/0x0b/0x0c, vendor GREASE last)"
+        "transport-param id set must be the confirmed Safari ascending set (no 0x03/0x0a/0x0b/0x0c/0x20, vendor GREASE last)"
     );
-    for dropped in [0x0a_u64, 0x0b, 0x0c] {
+    for dropped in [0x03_u64, 0x0a, 0x0b, 0x0c, 0x20] {
         assert!(
             !tp_ids.contains(&dropped),
             "transport-param {dropped:#x} must be omitted per the confirmed spec"
         );
     }
-    // max_datagram_frame_size (0x20) is KEPT: ParallaX's reachability probe uses
-    // QUIC datagrams, so per the spec's "send 0x20 only if datagrams are used" rule
-    // it must be present (and quinn must advertise it or the probe breaks).
+    // max_datagram_frame_size (0x20) is ABSENT: full disassembly confirms Safari-26
+    // sends no 0x20 for plain H3 (no datagrams), and ParallaX's reachability probe
+    // now rides QUIC uni streams, so quinn's datagram support is disabled too.
     assert!(
-        tp_ids.contains(&0x20),
-        "max_datagram_frame_size (0x20) must be present (probe uses datagrams)"
+        !tp_ids.contains(&0x20),
+        "max_datagram_frame_size (0x20) must be ABSENT (Safari sends no datagrams)"
     );
     assert_eq!(
         *tp_ids.last().unwrap(),
@@ -1378,16 +1288,15 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     );
 
     // Confirmed VALUES (initial_max_data 0x04 excepted — runtime value, presence
-    // only; initial_source_connection_id 0x0f is the dynamic SCID, presence only).
+    // only; initial_source_connection_id 0x0f is the SCID, asserted zero-length).
     assert_eq!(
         tp_varint_value(&tp, 0x01),
         Some(0),
         "max_idle_timeout must be 0"
     );
-    assert_eq!(
-        tp_varint_value(&tp, 0x03),
-        Some(1200),
-        "max_udp_payload_size must be 1200"
+    assert!(
+        !tp.iter().any(|(id, _)| *id == 0x03),
+        "max_udp_payload_size (0x03) must be ABSENT (Safari does not send it)"
     );
     assert!(
         tp.iter().any(|(id, _)| *id == 0x04),
@@ -1411,22 +1320,30 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         "initial_max_streams_uni must be 8"
     );
     // active_connection_id_limit: the confirmed Safari value is 64, but quinn-proto
-    // 0.11.14 cannot honor it (CidQueue::LEN = 5 for the default cid_len=8 endpoint,
-    // no public setter), so the carrier advertises quinn's real CidQueue::LEN = 5
-    // (the value stock quinn actually emits, and the max quinn-safe value). Assert
-    // the actual advertised value (5), not Safari's unreachable 64.
+    // 0.11.14 cannot honor it (the remote-CID queue is a fixed CidQueue::LEN = 5,
+    // no public setter), so the carrier advertises 5 (the max quinn-safe value).
+    // This is independent of the client's now-zero-length source CID. Assert the
+    // actual advertised value (5), not Safari's unreachable 64.
     assert_eq!(
         tp_varint_value(&tp, 0x0e),
         Some(5),
         "active_connection_id_limit must be quinn's CidQueue::LEN = 5 (Safari's 64 is unreachable)"
     );
+    // initial_source_connection_id (0x0f) must be present AND zero-length: Safari-26
+    // emits it with length 0 (full disassembly), and ParallaX's client uses a
+    // zero-length source CID so the advertised value equals the Initial header SCID
+    // (RFC 9000 §7.3).
+    let (_, src_cid) = tp
+        .iter()
+        .find(|(id, _)| *id == 0x0f)
+        .expect("initial_source_connection_id (0x0f) must be present");
     assert!(
-        tp.iter().any(|(id, _)| *id == 0x0f),
-        "initial_source_connection_id (0x0f) must be present (dynamic SCID)"
+        src_cid.is_empty(),
+        "initial_source_connection_id (0x0f) must be zero-length (matches header SCID)"
     );
     assert!(
-        tp.iter().any(|(id, _)| *id == 0x20),
-        "max_datagram_frame_size (0x20) must be present (value is quinn's datagram value)"
+        !tp.iter().any(|(id, _)| *id == 0x20),
+        "max_datagram_frame_size (0x20) must be ABSENT (Safari sends no datagrams)"
     );
     assert_eq!(
         tp_varint_value(&tp, VENDOR_GREASE_TP),
