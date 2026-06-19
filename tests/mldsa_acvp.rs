@@ -34,12 +34,13 @@ use parallax::crypto::mldsa::params::{
 use parallax::crypto::mldsa::sign;
 use serde_json::Value;
 
-/// ACVP JSON files live under `code_refs/` relative to the crate root; resolve
-/// them via `CARGO_MANIFEST_DIR` so the tests are independent of the working
-/// directory the test binary is launched from.
+/// Curated NIST ACVP FIPS-204 vectors (ML-DSA-87, external/pure groups only),
+/// vendored under `tests/fixtures/mldsa_acvp/` so this gate is self-contained and
+/// reproducible — no dependency on any gitignored local download. Resolved via
+/// `CARGO_MANIFEST_DIR` so the test is independent of the launch directory.
 fn acvp_path(op: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("code_refs/mldsa87/ACVP-Server/gen-val/json-files")
+        .join("tests/fixtures/mldsa_acvp")
         .join(op)
         .join("internalProjection.json")
 }
