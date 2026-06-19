@@ -38,7 +38,7 @@ use crate::{
     crypto::{
         auth::{
             derive_server_auth_key, recover_stateful_auth_material,
-            verify_client_hello_auth_with_material, StatefulAuthMaterial,
+            verify_masked_stateful_client_hello_auth_with_material, StatefulAuthMaterial,
         },
         identity, pq,
         replay::{ReplayCache, ReplayEntry},
@@ -669,10 +669,10 @@ fn bench_clienthello_verify_auth(options: BenchmarkOptions) -> Result<BenchmarkC
         TIER_FAST,
         options,
         || {
-            let auth = verify_client_hello_auth_with_material(
+            let auth = verify_masked_stateful_client_hello_auth_with_material(
                 &record,
                 &server_auth,
-                Some(material.clone()),
+                &material,
             )?;
             if !auth.authenticated {
                 bail!("benchmark ClientHello did not authenticate");

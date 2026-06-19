@@ -36,7 +36,6 @@ use crate::{
     crypto::{
         auth::{
             derive_server_auth_key_from_shared, recover_stateful_auth_material_from_parsed,
-            verify_client_hello_auth_with_parsed,
             verify_masked_stateful_client_hello_auth_with_parsed_material, AuthError, ClientAuth,
         },
         identity::{self, IdentityError},
@@ -695,10 +694,11 @@ fn decide_connection_inbound(
     }
     // Constant-time-by-op-count DH (M-2): the auth-failing path must perform a
     // FIXED number of X25519 ops regardless of ClientHello shape, else an off-path
-    // observer reads the per-DH latency step (no key_share=1, recover-None=2,
-    // auth-fail=3) as a distinguisher. Route every DH through this closure and pad
-    // with discarded ballast so EVERY path runs exactly 3 ops; ballast results are
-    // Zeroizing to match the real-DH zeroize discipline. Auth semantics unchanged.
+    // observer reads the per-DH latency step (no key_share / recover-None /
+    // auth-fail) as a distinguisher. Route every DH through this closure and pad
+    // with discarded ballast so EVERY path runs exactly 2 ops (mask slot + auth
+    // slot); ballast results are Zeroizing to match the real-DH zeroize discipline.
+    // Auth semantics unchanged.
     let dh = |peer: &[u8; 32]| -> zeroize::Zeroizing<[u8; 32]> {
         #[cfg(test)]
         REJECT_DH_OPS.fetch_add(1, Ordering::Relaxed);
@@ -749,40 +749,17 @@ fn decide_connection_inbound(
                     x25519_shared_secret,
                 );
             }
-            // v4 decoded but auth failed -> fall through to the legacy check below.
+            // Masked auth failed. The two real DH ops (mask slot + auth slot) are
+            // already done, matching the recover==None and no-key_share reject
+            // shapes below at a fixed 2 ops, so fall straight to the splice.
         } else {
-            let _ = dh(&parsed.client_random); // ballast: v4 auth-slot, recover==None
+            let _ = dh(&parsed.client_random); // ballast: auth-slot, recover==None
         }
     } else {
-        let _ = dh(&parsed.client_random); // ballast: v4 auth-slot, no key_share
+        let _ = dh(&parsed.client_random); // ballast: auth-slot, no key_share
     }
 
-    let x25519_key_share = parsed.client_random;
-    let x25519_shared_secret = dh(&x25519_key_share);
-    let auth_key = zeroize::Zeroizing::new(derive_server_auth_key_from_shared(
-        psk,
-        &x25519_shared_secret,
-    )?);
-    let auth = match verify_client_hello_auth_with_parsed(
-        first_client_record,
-        auth_key.as_slice(),
-        None,
-        parsed,
-    ) {
-        Ok(auth) => auth,
-        Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
-        Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
-    };
-    if !auth.authenticated {
-        return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
-    }
-    authenticated_decision(
-        first_client_record,
-        auth,
-        authorized_sni,
-        x25519_key_share,
-        x25519_shared_secret,
-    )
+    Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed))
 }
 
 fn authenticated_decision(
@@ -4353,7 +4330,6 @@ mod tests {
             auth::{
                 build_auth_tail_at, build_masked_stateful_auth_session_id,
                 build_masked_stateful_client_random, derive_client_auth_key,
-                sign_client_hello_session_id,
             },
             session::X25519KeyPair,
         },
@@ -4570,14 +4546,58 @@ mod tests {
         }
     }
 
+    /// Builds a v4 masked-stateful authenticated ClientHello: `parallax_public`
+    /// (the ParallaX ephemeral the server recovers) rides behind the carrier
+    /// mask, `tls_key_share` is the standalone TLS key_share the server uses to
+    /// derive mask_ecdh, and the masked auth tag is keyed by `auth_key`. Pass a
+    /// wrong `auth_key` for a record that recovers (recover==Some) but fails
+    /// masked auth -- the M-2 "shape D" reject case.
+    fn masked_authed_client_hello(
+        server_private: &[u8; 32],
+        parallax_public: &[u8; 32],
+        tls_key_share: &[u8; 32],
+        sni: &str,
+        auth_key: &[u8],
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let mut record =
+            client_hello_fixture_with_random_and_key_share(sni, parallax_public, tls_key_share);
+        let parsed = parse_client_hello(&record).unwrap();
+        let mut rng = StdRng::seed_from_u64(3);
+        let tail = build_auth_tail_at(timestamp, &mut rng);
+        let mask_ecdh = x25519_shared_secret(server_private, tls_key_share);
+        let encoded_random =
+            build_masked_stateful_client_random(PSK, &mask_ecdh, sni, parallax_public, &tail)
+                .unwrap();
+        let session_id = build_masked_stateful_auth_session_id(
+            PSK,
+            &mask_ecdh,
+            auth_key,
+            sni,
+            parallax_public,
+            &encoded_random,
+            &tail,
+        )
+        .unwrap();
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        record[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
+        record[parsed.session_id_range].copy_from_slice(&session_id);
+        record
+    }
+
     #[test]
     fn decides_authenticated_inbound() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
         let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
-        let mut record = client_hello_fixture_with_key_share("example.com", &client.public);
-        let mut rng = StdRng::seed_from_u64(1);
-        sign_client_hello_session_id(&mut record, &auth_key, &mut rng).unwrap();
+        let record = masked_authed_client_hello(
+            &server.private,
+            &client.public,
+            &[0x44_u8; 32],
+            "example.com",
+            &auth_key,
+            1_700_000_001,
+        );
 
         let decision = decide_inbound(
             &record,
@@ -4802,9 +4822,9 @@ mod tests {
     fn falls_back_on_bad_auth() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
-        let mut record = client_hello_fixture_with_key_share("example.com", &client.public);
-        let mut rng = StdRng::seed_from_u64(1);
-        sign_client_hello_session_id(&mut record, b"wrong-auth-key", &mut rng).unwrap();
+        // Unsigned fixture: 32-byte session_id placeholder + SNI -> recover==Some,
+        // but the placeholder is not a valid masked auth tag, so auth fails.
+        let record = client_hello_fixture_with_key_share("example.com", &client.public);
 
         let decision = decide_inbound(
             &record,
@@ -4831,20 +4851,20 @@ mod tests {
     }
 
     /// M-2: the inbound-decision rejection path must perform an input-INDEPENDENT
-    /// number of X25519 DH ops, else the per-DH latency step (no key_share = 1 vs
-    /// auth-fail = 3, pre-fix) is a timing distinguisher. Ignored + serial: it reads
+    /// number of X25519 DH ops, else the per-DH latency step (no key_share vs
+    /// auth-fail) is a timing distinguisher. Ignored + serial: it reads
     /// the process-global REJECT_DH_OPS counter that parallel decide_* tests perturb.
     #[test]
     #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
     fn rejection_path_x25519_count_is_input_independent() {
         let server = X25519KeyPair::generate();
 
-        // Shape B: no x25519 key_share -> pre-fix only the legacy DH (1).
+        // Shape B: no x25519 key_share -> mask-slot ballast + auth-slot ballast (2).
         let no_ks = client_hello_fixture_no_key_share("example.com");
-        // Shape D: key_share present, recover==Some, masked auth fails -> pre-fix 3.
-        let mut auth_fail = client_hello_fixture_with_key_share("example.com", &[0x66; 32]);
-        let mut rng = StdRng::seed_from_u64(7);
-        sign_client_hello_session_id(&mut auth_fail, b"wrong-auth-key", &mut rng).unwrap();
+        // Shape D: key_share present, recover==Some, masked auth fails. The unsigned
+        // fixture's 32-byte session_id placeholder recovers Some but is not a valid
+        // masked auth tag, so the mask-slot and auth-slot DH both run (2).
+        let auth_fail = client_hello_fixture_with_key_share("example.com", &[0x66; 32]);
 
         let b = dh_ops_for(&no_ks, &server.private);
         let d = dh_ops_for(&auth_fail, &server.private);
@@ -4853,14 +4873,14 @@ mod tests {
             "no-key_share vs auth-fail DH count differs (timing distinguisher)"
         );
         assert_eq!(
-            b, 3,
-            "rejection path must perform a constant 3 X25519 DH ops"
+            b, 2,
+            "rejection path must perform a constant 2 X25519 DH ops"
         );
     }
 
     /// M-2 (coverage extension): the THIRD attacker-reachable parseable reject
     /// shape — a key_share IS present but `recover_stateful_auth_material` returns
-    /// None — must also perform the constant 3 DH ops, so ALL parseable-but-
+    /// None — must also perform the constant 2 DH ops, so ALL parseable-but-
     /// rejected ClientHello shapes (no-key_share, recover==None, masked-auth-fail)
     /// are mutually timing-indistinguishable, not just two of the three.
     ///
@@ -4906,8 +4926,8 @@ mod tests {
 
         assert_eq!(
             dh_ops_for(&key_share_no_recover, &server.private),
-            3,
-            "key_share + recover==None reject path must perform the constant 3 X25519 DH ops"
+            2,
+            "key_share + recover==None reject path must perform the constant 2 X25519 DH ops"
         );
     }
 
@@ -4916,7 +4936,7 @@ mod tests {
     /// path — an unparseable record short-circuits at `parse_client_hello` before
     /// any DH — must read a DIFFERENT count (0). Without this, the constant-work
     /// assertions above could pass against a broken/stuck counter; with it, we
-    /// know the counter discriminates and the `assert_eq!(.., 3)` guards bite.
+    /// know the counter discriminates and the `assert_eq!(.., 2)` guards bite.
     #[test]
     #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
     fn constant_work_counter_is_non_vacuous() {
@@ -4928,8 +4948,8 @@ mod tests {
         );
         assert_eq!(unparseable, 0, "an unparseable record performs zero DH ops");
         assert_eq!(
-            valid_unauth, 3,
-            "a parseable-but-unauthenticated record performs 3 DH ops"
+            valid_unauth, 2,
+            "a parseable-but-unauthenticated record performs 2 DH ops"
         );
         assert_ne!(
             unparseable, valid_unauth,
@@ -4985,9 +5005,7 @@ mod tests {
         use std::time::Instant;
         let server = X25519KeyPair::generate();
         let shape_b = client_hello_fixture_no_key_share("example.com");
-        let mut shape_d = client_hello_fixture_with_key_share("example.com", &[0x66; 32]);
-        let mut rng = StdRng::seed_from_u64(7);
-        sign_client_hello_session_id(&mut shape_d, b"wrong-auth-key", &mut rng).unwrap();
+        let shape_d = client_hello_fixture_with_key_share("example.com", &[0x66; 32]);
 
         let reject = |record: &[u8]| {
             let _ = decide_connection_inbound(
@@ -5138,9 +5156,14 @@ mod tests {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
         let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
-        let mut record = client_hello_fixture_with_key_share("example.com", &client.public);
-        let mut rng = StdRng::seed_from_u64(1);
-        sign_client_hello_session_id(&mut record, &auth_key, &mut rng).unwrap();
+        let record = masked_authed_client_hello(
+            &server.private,
+            &client.public,
+            &[0x44_u8; 32],
+            "example.com",
+            &auth_key,
+            1_700_000_001,
+        );
 
         let decision = decide_inbound(
             &record,
@@ -5161,9 +5184,14 @@ mod tests {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
         let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
-        let mut record = client_hello_fixture_with_key_share("Example.COM", &client.public);
-        let mut rng = StdRng::seed_from_u64(2);
-        sign_client_hello_session_id(&mut record, &auth_key, &mut rng).unwrap();
+        let record = masked_authed_client_hello(
+            &server.private,
+            &client.public,
+            &[0x44_u8; 32],
+            "Example.COM",
+            &auth_key,
+            1_700_000_001,
+        );
 
         let decision = decide_inbound(
             &record,
@@ -5983,12 +6011,17 @@ mod tests {
         traffic: TrafficConfig,
     ) -> (TcpStream, ClientDataSession, StdRng) {
         let mut client = TcpStream::connect(parallax_addr).await.unwrap();
-        let mut client_hello =
-            client_hello_fixture_with_key_share("example.com", &client_keys.public);
-        let mut rng = StdRng::seed_from_u64(20);
         let auth_key =
             derive_client_auth_key(PSK, &client_keys.private, &server_keys.public).unwrap();
-        sign_client_hello_session_id(&mut client_hello, &auth_key, &mut rng).unwrap();
+        let client_hello = masked_authed_client_hello(
+            &server_keys.private,
+            &client_keys.public,
+            &[0x44_u8; 32],
+            "example.com",
+            &auth_key,
+            1_700_000_001,
+        );
+        let mut rng = StdRng::seed_from_u64(20);
         client.write_all(&client_hello).await.unwrap();
 
         let server_hello_record = read_record(&mut client).await.unwrap();

@@ -50,62 +50,6 @@ pub enum AuthError {
     Clock,
 }
 
-pub fn sign_client_hello_session_id<R>(
-    record: &mut [u8],
-    auth_key: &[u8],
-    rng: &mut R,
-) -> Result<[u8; AUTH_TAG_LEN], AuthError>
-where
-    R: RngCore + CryptoRng,
-{
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| AuthError::Clock)?
-        .as_secs();
-    sign_client_hello_session_id_at(record, auth_key, timestamp, rng)
-}
-
-pub fn sign_client_hello_session_id_at<R>(
-    record: &mut [u8],
-    auth_key: &[u8],
-    timestamp: u64,
-    rng: &mut R,
-) -> Result<[u8; AUTH_TAG_LEN], AuthError>
-where
-    R: RngCore + CryptoRng,
-{
-    if auth_key.is_empty() {
-        return Err(AuthError::EmptyPsk);
-    }
-
-    let parsed = parse_client_hello(record)?;
-    let range = parsed.session_id_range.clone();
-    if range.len() != SESSION_ID_LEN {
-        return Err(AuthError::InvalidSessionIdLen);
-    }
-
-    record[range.start..range.start + AUTH_TAG_LEN].fill(0);
-    let tail = build_auth_tail_at(timestamp, rng);
-    record[range.start + AUTH_TAG_LEN..range.end].copy_from_slice(&tail);
-
-    let tag = compute_tag(record, parsed.record_len, &range, auth_key)?;
-    record[range.start..range.start + AUTH_TAG_LEN].copy_from_slice(&tag);
-    Ok(tag)
-}
-
-pub fn build_stateful_auth_session_id(
-    auth_key: &[u8],
-    sni: &str,
-    parallax_x25519_public: &[u8; 32],
-    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
-) -> Result<[u8; SESSION_ID_LEN], AuthError> {
-    let tag = compute_stateful_tag(auth_key, sni, parallax_x25519_public, tail)?;
-    let mut session_id = [0_u8; SESSION_ID_LEN];
-    session_id[..AUTH_TAG_LEN].copy_from_slice(&tag);
-    session_id[AUTH_TAG_LEN..].copy_from_slice(tail);
-    Ok(session_id)
-}
-
 pub fn build_masked_stateful_client_random(
     psk: &[u8],
     mask_ecdh: &[u8; 32],
@@ -202,11 +146,6 @@ where
     tail
 }
 
-pub fn verify_client_hello_auth(record: &[u8], auth_key: &[u8]) -> Result<ClientAuth, AuthError> {
-    let parsed = parse_client_hello(record)?;
-    verify_client_hello_auth_with_parsed(record, auth_key, None, parsed)
-}
-
 pub(crate) fn verify_masked_stateful_client_hello_auth_with_material(
     record: &[u8],
     auth_key: &[u8],
@@ -270,89 +209,6 @@ pub(crate) fn verify_masked_stateful_client_hello_auth_with_parsed_material(
         authenticated,
         sni: parsed.sni.clone(),
         x25519_key_share: Some(material.x25519_public),
-        timestamp: Some(timestamp),
-        nonce: Some(nonce),
-    })
-}
-
-pub fn verify_client_hello_auth_with_material(
-    record: &[u8],
-    auth_key: &[u8],
-    material: Option<StatefulAuthMaterial>,
-) -> Result<ClientAuth, AuthError> {
-    let parsed = parse_client_hello(record)?;
-    verify_client_hello_auth_with_parsed(record, auth_key, material, parsed)
-}
-
-pub(crate) fn verify_client_hello_auth_with_parsed(
-    record: &[u8],
-    auth_key: &[u8],
-    material: Option<StatefulAuthMaterial>,
-    parsed: ClientHello,
-) -> Result<ClientAuth, AuthError> {
-    if auth_key.is_empty() {
-        return Err(AuthError::EmptyPsk);
-    }
-
-    if parsed.session_id_range.len() != SESSION_ID_LEN {
-        return Ok(ClientAuth {
-            authenticated: false,
-            sni: parsed.sni,
-            x25519_key_share: material
-                .as_ref()
-                .map(|material| material.x25519_public)
-                .or(Some(parsed.client_random)),
-            timestamp: None,
-            nonce: None,
-        });
-    }
-
-    let actual =
-        &record[parsed.session_id_range.start..parsed.session_id_range.start + AUTH_TAG_LEN];
-    let expected = compute_tag(
-        record,
-        parsed.record_len,
-        &parsed.session_id_range,
-        auth_key,
-    )?;
-    let transcript_authenticated: bool = actual.ct_eq(&expected).into();
-    let stateful_authenticated = match parsed.sni.as_deref() {
-        Some(sni) => {
-            let mut encoded_tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
-            encoded_tail.copy_from_slice(
-                &record[parsed.session_id_range.start + AUTH_TAG_LEN..parsed.session_id_range.end],
-            );
-            let expected = match material.as_ref() {
-                Some(material) => compute_masked_stateful_tag(
-                    auth_key,
-                    sni,
-                    &material.x25519_public,
-                    &material.tail,
-                    &parsed.client_random,
-                    &encoded_tail,
-                )?,
-                None => compute_stateful_tag(auth_key, sni, &parsed.client_random, &encoded_tail)?,
-            };
-            bool::from(actual.ct_eq(&expected))
-        }
-        None => false,
-    };
-    let timestamp_start = parsed.session_id_range.start + AUTH_TAG_LEN;
-    let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
-    if let Some(material) = material.as_ref() {
-        tail.copy_from_slice(&material.tail);
-    } else {
-        tail.copy_from_slice(&record[timestamp_start..parsed.session_id_range.end]);
-    }
-    let (timestamp, nonce) = auth_tail_timestamp_nonce(&tail);
-
-    Ok(ClientAuth {
-        authenticated: transcript_authenticated || stateful_authenticated,
-        sni: parsed.sni,
-        x25519_key_share: material
-            .as_ref()
-            .map(|material| material.x25519_public)
-            .or(Some(parsed.client_random)),
         timestamp: Some(timestamp),
         nonce: Some(nonce),
     })
@@ -454,48 +310,6 @@ fn derive_mask_key(psk: &[u8], mask_ecdh: &[u8; 32]) -> Result<Zeroizing<[u8; 32
     hk.expand(b"ParallaX v4 ClientHello carrier mask key", out.as_mut())
         .map_err(|_| AuthError::Hkdf)?;
     Ok(out)
-}
-
-fn compute_tag(
-    record: &[u8],
-    record_len: usize,
-    session_id_range: &std::ops::Range<usize>,
-    psk: &[u8],
-) -> Result<[u8; AUTH_TAG_LEN], AuthError> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(psk).map_err(|_| AuthError::EmptyPsk)?;
-    mac.update(b"ParallaX v2 transcript ClientHello auth");
-    mac.update(&record[crate::tls::record::TLS_HEADER_LEN..session_id_range.start]);
-    mac.update(&[0_u8; AUTH_TAG_LEN]);
-    mac.update(&record[session_id_range.start + AUTH_TAG_LEN..record_len]);
-    let digest = mac.finalize().into_bytes();
-
-    let mut tag = [0_u8; AUTH_TAG_LEN];
-    tag.copy_from_slice(&digest[..AUTH_TAG_LEN]);
-    Ok(tag)
-}
-
-fn compute_stateful_tag(
-    auth_key: &[u8],
-    sni: &str,
-    parallax_x25519_public: &[u8; 32],
-    tail: &[u8; STATEFUL_AUTH_TAIL_LEN],
-) -> Result<[u8; AUTH_TAG_LEN], AuthError> {
-    if auth_key.is_empty() {
-        return Err(AuthError::EmptyPsk);
-    }
-
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(auth_key).map_err(|_| AuthError::EmptyPsk)?;
-    mac.update(b"ParallaX v2 stateful rustls ClientHello auth");
-    mac.update(&(sni.len() as u16).to_be_bytes());
-    mac.update(sni.as_bytes());
-    // v2 binds the ParallaX ephemeral X25519 public key carried in ClientHello.random.
-    mac.update(parallax_x25519_public);
-    mac.update(tail);
-    let digest = mac.finalize().into_bytes();
-
-    let mut tag = [0_u8; AUTH_TAG_LEN];
-    tag.copy_from_slice(&digest[..AUTH_TAG_LEN]);
-    Ok(tag)
 }
 
 fn compute_masked_stateful_tag(
@@ -632,27 +446,9 @@ fn stateful_mask(
 
 #[cfg(test)]
 mod tests {
-    use rand::{rngs::StdRng, SeedableRng};
-
     use super::*;
     use crate::crypto::session::X25519KeyPair;
     use crate::tls::client_hello::tests::client_hello_fixture;
-
-    #[test]
-    fn signs_and_verifies_client_hello_session_id() {
-        let mut hello = client_hello_fixture("example.com");
-        let mut rng = StdRng::seed_from_u64(7);
-        let psk = b"0123456789abcdef0123456789abcdef";
-
-        sign_client_hello_session_id(&mut hello, psk, &mut rng).unwrap();
-        let auth = verify_client_hello_auth(&hello, psk).unwrap();
-
-        assert!(auth.authenticated);
-        assert_eq!(auth.sni.as_deref(), Some("example.com"));
-        assert!(auth.x25519_key_share.is_some());
-        assert!(auth.timestamp.is_some());
-        assert!(auth.nonce.is_some());
-    }
 
     #[test]
     fn derives_same_ecdh_bound_auth_key() {
@@ -677,56 +473,6 @@ mod tests {
         let from_shared = derive_client_auth_key_from_shared(psk, &shared).unwrap();
 
         assert_eq!(from_private, from_shared);
-    }
-
-    #[test]
-    fn rejects_modified_client_hello() {
-        let mut hello = client_hello_fixture("example.com");
-        let mut rng = StdRng::seed_from_u64(7);
-        let psk = b"0123456789abcdef0123456789abcdef";
-
-        sign_client_hello_session_id(&mut hello, psk, &mut rng).unwrap();
-        let last = hello.len() - 1;
-        hello[last] ^= 0x55;
-
-        let auth = verify_client_hello_auth(&hello, psk).unwrap();
-        assert!(!auth.authenticated);
-    }
-
-    #[test]
-    fn rejects_modified_stateful_client_random() {
-        let mut hello = client_hello_fixture("example.com");
-        let parsed = parse_client_hello(&hello).unwrap();
-        let parallax_public = parsed.client_random;
-        let tail = [9_u8; STATEFUL_AUTH_TAIL_LEN];
-        let psk = b"0123456789abcdef0123456789abcdef";
-        let session_id =
-            build_stateful_auth_session_id(psk, "example.com", &parallax_public, &tail).unwrap();
-        hello[parsed.session_id_range].copy_from_slice(&session_id);
-
-        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
-        hello[random_offset] ^= 0x55;
-
-        let auth = verify_client_hello_auth(&hello, psk).unwrap();
-        assert!(!auth.authenticated);
-    }
-
-    #[test]
-    fn verifies_stateful_session_id_auth() {
-        let mut hello = client_hello_fixture("example.com");
-        let parsed = parse_client_hello(&hello).unwrap();
-        let key_share = parsed.client_random;
-        let tail = [9_u8; STATEFUL_AUTH_TAIL_LEN];
-        let psk = b"0123456789abcdef0123456789abcdef";
-        let session_id =
-            build_stateful_auth_session_id(psk, "example.com", &key_share, &tail).unwrap();
-        hello[parsed.session_id_range].copy_from_slice(&session_id);
-
-        let auth = verify_client_hello_auth(&hello, psk).unwrap();
-
-        assert!(auth.authenticated);
-        assert_eq!(auth.sni.as_deref(), Some("example.com"));
-        assert_eq!(auth.x25519_key_share, Some(key_share));
     }
 
     #[test]
@@ -824,7 +570,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let auth =
-            verify_client_hello_auth_with_material(&hello, auth_key, Some(material)).unwrap();
+            verify_masked_stateful_client_hello_auth_with_material(&hello, auth_key, &material)
+                .unwrap();
 
         assert!(auth.authenticated);
         assert_eq!(auth.x25519_key_share, Some(public));
