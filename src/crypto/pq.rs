@@ -103,8 +103,9 @@ pub fn hybrid_sandwich_rekey(
             pq_shared_secret,
             symmetric_secret,
         );
-        let (prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm[..used]);
+        let (mut prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm[..used]);
         chain_secret.copy_from_slice(&prk);
+        prk.zeroize();
         ikm[..used].zeroize();
     } else {
         let mut ikm = Vec::with_capacity(ikm_len);
@@ -114,8 +115,9 @@ pub fn hybrid_sandwich_rekey(
             pq_shared_secret,
             symmetric_secret,
         );
-        let (prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm);
+        let (mut prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm);
         chain_secret.copy_from_slice(&prk);
+        prk.zeroize();
         ikm.zeroize();
     }
     Ok(chain_secret)

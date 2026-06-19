@@ -271,8 +271,12 @@ pub enum HandshakeServerError {
     ReplayCache(#[from] ReplayCacheError),
     #[error("missing encrypted connect request and no fixed server.data_target configured")]
     MissingConnectTarget,
-    #[error("client-selected outbound target is denied by server egress policy: {0}")]
-    OutboundTargetDenied(String),
+    // Unit variant on purpose: the denied target is the client's decrypted
+    // destination (host + resolved IP) and must never reach logs via either
+    // Display or the derived Debug (the connection-close path renders errors with
+    // `error = %err`). Carrying no payload keeps the secret off every error sink.
+    #[error("client-selected outbound target is denied by server egress policy")]
+    OutboundTargetDenied,
     #[error("blocking crypto task failed: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
 }
@@ -319,7 +323,7 @@ pub struct AuthenticatedHandshake {
 
 struct AuthenticatedInbound {
     hello: AuthenticatedHello,
-    x25519_shared_secret: [u8; 32],
+    x25519_shared_secret: zeroize::Zeroizing<[u8; 32]>,
 }
 
 struct PendingReplayEntry {
@@ -721,11 +725,14 @@ fn decide_connection_inbound(
             &parsed,
         )? {
             let x25519_key_share = material.x25519_public;
-            let x25519_shared_secret = *dh(&x25519_key_share);
-            let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
+            let x25519_shared_secret = dh(&x25519_key_share);
+            let auth_key = zeroize::Zeroizing::new(derive_server_auth_key_from_shared(
+                psk,
+                &x25519_shared_secret,
+            )?);
             let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
                 first_client_record,
-                &auth_key,
+                auth_key.as_slice(),
                 &material,
                 &parsed,
             ) {
@@ -751,14 +758,21 @@ fn decide_connection_inbound(
     }
 
     let x25519_key_share = parsed.client_random;
-    let x25519_shared_secret = *dh(&x25519_key_share);
-    let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
-    let auth =
-        match verify_client_hello_auth_with_parsed(first_client_record, &auth_key, None, parsed) {
-            Ok(auth) => auth,
-            Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
-            Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
-        };
+    let x25519_shared_secret = dh(&x25519_key_share);
+    let auth_key = zeroize::Zeroizing::new(derive_server_auth_key_from_shared(
+        psk,
+        &x25519_shared_secret,
+    )?);
+    let auth = match verify_client_hello_auth_with_parsed(
+        first_client_record,
+        auth_key.as_slice(),
+        None,
+        parsed,
+    ) {
+        Ok(auth) => auth,
+        Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
+        Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
+    };
     if !auth.authenticated {
         return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
     }
@@ -776,7 +790,7 @@ fn authenticated_decision(
     auth: ClientAuth,
     authorized_sni: &[String],
     x25519_key_share: [u8; 32],
-    x25519_shared_secret: [u8; 32],
+    x25519_shared_secret: zeroize::Zeroizing<[u8; 32]>,
 ) -> Result<ConnectionDecision, HandshakeServerError> {
     let timestamp = match auth.timestamp {
         Some(timestamp) => timestamp,
@@ -814,7 +828,7 @@ pub async fn accept_authenticated(
     mut client: TcpStream,
     config: &ServerConfig,
     server_public_key: [u8; 32],
-    x25519_shared_secret: [u8; 32],
+    x25519_shared_secret: zeroize::Zeroizing<[u8; 32]>,
     first_client_record: Vec<u8>,
     client_hello: AuthenticatedHello,
 ) -> Result<AuthenticatedHandshake, HandshakeServerError> {
@@ -2174,26 +2188,22 @@ async fn resolve_public_target_addrs(
 ) -> Result<Vec<SocketAddr>, HandshakeServerError> {
     let addrs: Vec<SocketAddr> = lookup_host(target_addr).await?.collect();
     if addrs.is_empty() {
+        // No host detail in the message: it is the client's decrypted destination
+        // and the connection-close path logs errors via Display.
         return Err(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            format!("client-selected target did not resolve: {target_addr}"),
+            "client-selected target did not resolve",
         )
         .into());
     }
-    validate_public_target_addrs(target_addr, &addrs)?;
+    validate_public_target_addrs(&addrs)?;
     Ok(addrs)
 }
 
-fn validate_public_target_addrs(
-    target_addr: &str,
-    addrs: &[SocketAddr],
-) -> Result<(), HandshakeServerError> {
+fn validate_public_target_addrs(addrs: &[SocketAddr]) -> Result<(), HandshakeServerError> {
     for addr in addrs {
         if is_denied_outbound_ip(addr.ip()) {
-            return Err(HandshakeServerError::OutboundTargetDenied(format!(
-                "{target_addr} resolved to {}",
-                addr.ip()
-            )));
+            return Err(HandshakeServerError::OutboundTargetDenied);
         }
     }
     Ok(())
@@ -2348,14 +2358,14 @@ fn apply_server_pq_rekey(
     pq_shared_secret: &[u8; 32],
     sandwich_secret: &[u8],
 ) -> Result<SessionKeys, HandshakeServerError> {
-    let chain_secret = pq::hybrid_sandwich_rekey(
+    let chain_secret = zeroize::Zeroizing::new(pq::hybrid_sandwich_rekey(
         &keys.chain_secret,
         x25519_shared_secret,
         pq_shared_secret,
         sandwich_secret,
-    )?;
+    )?);
     let next_keys = expand_epoch_keys(
-        chain_secret,
+        *chain_secret,
         keys.epoch.saturating_add(1),
         keys.transcript_hash,
         *x25519_shared_secret,
@@ -4584,7 +4594,7 @@ mod tests {
         match decision {
             ConnectionDecision::Authenticated(authenticated) => {
                 assert_eq!(
-                    authenticated.x25519_shared_secret,
+                    *authenticated.x25519_shared_secret,
                     x25519_shared_secret(&server.private, &client.public)
                 );
             }
@@ -5268,7 +5278,7 @@ mod tests {
         for target in denied {
             let addr: SocketAddr = target.parse().unwrap();
             assert!(
-                validate_public_target_addrs(target, &[addr]).is_err(),
+                validate_public_target_addrs(&[addr]).is_err(),
                 "{target} should be denied"
             );
         }
@@ -5283,7 +5293,7 @@ mod tests {
 
         for target in allowed {
             let addr: SocketAddr = target.parse().unwrap();
-            validate_public_target_addrs(target, &[addr]).unwrap();
+            validate_public_target_addrs(&[addr]).unwrap();
         }
     }
 
@@ -5295,8 +5305,8 @@ mod tests {
         ];
 
         assert!(matches!(
-            validate_public_target_addrs("example.test:443", &addrs).unwrap_err(),
-            HandshakeServerError::OutboundTargetDenied(_)
+            validate_public_target_addrs(&addrs).unwrap_err(),
+            HandshakeServerError::OutboundTargetDenied
         ));
     }
 
@@ -5828,7 +5838,7 @@ mod tests {
                 server_side,
                 &config,
                 server_keys.public,
-                [0_u8; 32],
+                zeroize::Zeroizing::new([0_u8; 32]),
                 first_client_record,
                 AuthenticatedHello {
                     sni: String::from("example.com"),

@@ -225,9 +225,14 @@ impl Safari26TlsCamouflage {
             .map_err(|_| Safari26TlsError::InvalidServerName(sni.clone()))?;
 
         let parallax_x25519 = X25519KeyPair::generate();
-        let parallax_shared_secret =
-            x25519_shared_secret(&parallax_x25519.private, server_public_key);
-        let auth_key = derive_client_auth_key_from_shared(psk, &parallax_shared_secret)?;
+        let parallax_shared_secret = Zeroizing::new(x25519_shared_secret(
+            &parallax_x25519.private,
+            server_public_key,
+        ));
+        let auth_key = Zeroizing::new(derive_client_auth_key_from_shared(
+            psk,
+            &parallax_shared_secret,
+        )?);
 
         // Generate the TLS handshake ephemeral up-front: its public half is
         // carried UNMASKED in the key_share, and the v4 carrier-mask key is
@@ -250,7 +255,7 @@ impl Safari26TlsCamouflage {
         let session_id = build_masked_stateful_auth_session_id(
             psk,
             &mask_ecdh,
-            &auth_key,
+            auth_key.as_slice(),
             &sni,
             &parallax_x25519.public,
             &encoded_client_random,
@@ -275,7 +280,7 @@ impl Safari26TlsCamouflage {
         };
         let auth = verify_masked_stateful_client_hello_auth_with_material(
             &client_hello,
-            &auth_key,
+            auth_key.as_slice(),
             &material,
         )?;
         if !auth.authenticated || auth.x25519_key_share != Some(parallax_x25519.public) {
@@ -287,7 +292,7 @@ impl Safari26TlsCamouflage {
         Ok(Safari26TlsSession {
             client_hello,
             parallax_x25519,
-            parallax_x25519_shared_secret: Zeroizing::new(parallax_shared_secret),
+            parallax_x25519_shared_secret: parallax_shared_secret,
             tls_x25519,
             tls_mlkem768_secret: mlkem_secret,
             sni,
