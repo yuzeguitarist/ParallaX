@@ -1313,10 +1313,11 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     );
 
     // 4) quic_transport_parameters (0x39): present, ids strictly ascending, the
-    //    exact confirmed Safari id set with 0x0a/0x0b/0x0c and 0x20 ABSENT and the
-    //    vendor/GREASE codepoint 0x17f7586d2cb571 LAST. The confirmed VALUES are
-    //    asserted too — EXCEPT initial_max_data (0x04), whose number is the single
-    //    runtime-read value (assert presence only).
+    //    exact confirmed Safari id set with 0x0a/0x0b/0x0c ABSENT and 0x20 PRESENT
+    //    (the probe uses RFC-9221 datagrams), and the vendor/GREASE codepoint
+    //    0x17f7586d2cb571 LAST. The confirmed VALUES are asserted too — EXCEPT
+    //    initial_max_data (0x04), whose number is the single runtime-read value
+    //    (assert presence only).
     const VENDOR_GREASE_TP: u64 = 0x17f7586d2cb571;
     let tp_body =
         extension_body(&record, 0x0039).expect("quic_transport_parameters (0x39) present");
@@ -1410,13 +1411,14 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         "initial_max_streams_uni must be 8"
     );
     // active_connection_id_limit: the confirmed Safari value is 64, but quinn-proto
-    // 0.11.14 cannot honor it (hardcoded CidQueue::LEN=5, no public setter), so the
-    // carrier advertises quinn's real enforced 2 to keep the relay working. Assert
-    // the actual advertised value (2), not Safari's unreachable 64.
+    // 0.11.14 cannot honor it (CidQueue::LEN = 5 for the default cid_len=8 endpoint,
+    // no public setter), so the carrier advertises quinn's real CidQueue::LEN = 5
+    // (the value stock quinn actually emits, and the max quinn-safe value). Assert
+    // the actual advertised value (5), not Safari's unreachable 64.
     assert_eq!(
         tp_varint_value(&tp, 0x0e),
-        Some(2),
-        "active_connection_id_limit must be quinn's enforced 2 (Safari's 64 is unreachable)"
+        Some(5),
+        "active_connection_id_limit must be quinn's CidQueue::LEN = 5 (Safari's 64 is unreachable)"
     );
     assert!(
         tp.iter().any(|(id, _)| *id == 0x0f),

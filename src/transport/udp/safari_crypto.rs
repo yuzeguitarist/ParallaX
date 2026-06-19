@@ -336,20 +336,30 @@ pub(crate) const SAFARI_TP_INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
 /// libquic value. Mirrored by quinn's `stream_receive_window`.
 pub(crate) const SAFARI_TP_INITIAL_MAX_STREAM_DATA: u64 = 2 * 1024 * 1024;
 
-/// `active_connection_id_limit` (0x0e). The confirmed Safari value is 64, but
-/// quinn-proto 0.11.14 hardcodes its remote-CID queue to `CidQueue::LEN = 5` and
-/// its own `active_connection_id_limit` to 2 with NO public setter, so advertising
-/// 64 makes a stock-quinn peer issue `min(64, LOC_CID_COUNT=8)=8` connection IDs,
+/// `active_connection_id_limit` (0x0e). The confirmed Safari value is 64, but it
+/// is unreachable in-tree: quinn-proto 0.11.14 sizes its remote-CID queue to
+/// `CidQueue::LEN = 5` for the default `cid_len = 8` endpoint ParallaX uses
+/// (transport_parameters.rs:163-169 → cid_queue.rs:125), with NO public setter, so
+/// advertising 64 makes a peer issue `min(64, LOC_CID_COUNT=8)=8` connection IDs,
 /// overflowing the 5-slot queue and killing every connection with
-/// `CONNECTION_ID_LIMIT_ERROR`. We therefore advertise quinn's REAL enforced value
-/// (2) — advertised==actual, the relay works — and accept the divergence from
-/// Safari's 64 (it cannot be reconciled without forking quinn-proto; see the gate).
-pub(crate) const SAFARI_TP_ACTIVE_CID_LIMIT: u64 = 2;
+/// `CONNECTION_ID_LIMIT_ERROR`. We therefore advertise `5` = `CidQueue::LEN`: the
+/// value STOCK quinn actually puts on the wire for this endpoint, and the maximum
+/// quinn-safe value (a peer then issues `min(5, 8) = 5` CIDs, filling the queue
+/// exactly). Note `2` is NOT a byte stock quinn ever emits — it is only the
+/// `cid_len == 0` unsent branch, and quinn's `write()` suppresses the param when
+/// the value equals the default `2` — so the old `0x0e=2` was a quinn-impossible
+/// byte. Reaching Safari's 64 needs forking quinn-proto to raise `CidQueue::LEN`
+/// (and `LOC_CID_COUNT`); see the gate. `5` narrows the gap to 5-vs-64.
+pub(crate) const SAFARI_TP_ACTIVE_CID_LIMIT: u64 = 5;
 
 /// `initial_max_streams_uni` (0x09) — libquic value 8. Mirrored by quinn.
 pub(crate) const SAFARI_TP_MAX_STREAMS_UNI: u64 = 8;
 
-/// `max_udp_payload_size` (0x03) — libquic floor 1200. Mirrored by quinn.
+/// `max_udp_payload_size` (0x03) — libquic floor 1200. Hand-encoded onto the wire
+/// here; NOT mirrored by quinn (quinn's stock 0x03 comes from
+/// `EndpointConfig::max_udp_payload_size`, default 1472, which ParallaX leaves at
+/// the default — wire-invisible, it only bounds the local receive buffer, and the
+/// hand-encoded 0x39 blob substitutes 1200 for the wire value regardless).
 pub(crate) const SAFARI_TP_MAX_UDP_PAYLOAD: u64 = 1200;
 
 /// Apple's vendor/GREASE transport-parameter codepoint (value 0). Sorts LAST in
@@ -647,9 +657,14 @@ mod tests {
         assert_eq!(val(0x07), 2 * 1024 * 1024, "stream_data_uni = 2 MiB");
         assert_eq!(val(0x08), 0, "max_streams_bidi = 0");
         assert_eq!(val(0x09), 8, "max_streams_uni = 8");
-        // active_connection_id_limit is quinn's enforced 2 (NOT Safari's 64, which
-        // quinn-proto 0.11.14 cannot honor; see SAFARI_TP_ACTIVE_CID_LIMIT).
-        assert_eq!(val(0x0e), 2, "active_connection_id_limit = 2 (quinn limit)");
+        // active_connection_id_limit is quinn's real advertised CidQueue::LEN = 5
+        // (NOT Safari's 64, which quinn-proto 0.11.14 cannot honor; see
+        // SAFARI_TP_ACTIVE_CID_LIMIT).
+        assert_eq!(
+            val(0x0e),
+            5,
+            "active_connection_id_limit = 5 (quinn CidQueue::LEN)"
+        );
 
         // The vendor/GREASE TP carries value 0.
         assert_eq!(val(SAFARI_TP_VENDOR_GREASE_ID), 0, "vendor/GREASE TP = 0");
@@ -672,6 +687,124 @@ mod tests {
             let (decoded, n) = read_varint(&buf).unwrap();
             assert_eq!(decoded, v, "varint value round-trip");
             assert_eq!(n, buf.len(), "varint consumed exactly its bytes");
+        }
+    }
+
+    /// Walk a handshake-layer ClientHello, returning `(extension_type, body)`
+    /// pairs in wire order. Minimal but strict: panics on any truncation so a
+    /// malformed flight fails loudly instead of silently passing.
+    fn parse_client_hello_extensions(hs: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        assert_eq!(
+            hs[0], 0x01,
+            "handshake flight must start with ClientHello (0x01)"
+        );
+        let body_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
+        let body = &hs[4..4 + body_len];
+        let mut p = 0usize;
+        p += 2; // legacy_version
+        p += 32; // random
+        let sid_len = body[p] as usize;
+        p += 1 + sid_len; // session_id
+        let cs_len = ((body[p] as usize) << 8) | (body[p + 1] as usize);
+        p += 2 + cs_len; // cipher_suites
+        let comp_len = body[p] as usize;
+        p += 1 + comp_len; // compression_methods
+        let ext_total = ((body[p] as usize) << 8) | (body[p + 1] as usize);
+        p += 2;
+        let exts = &body[p..p + ext_total];
+        let mut out = Vec::new();
+        let mut q = 0usize;
+        while q + 4 <= exts.len() {
+            let typ = ((exts[q] as u16) << 8) | (exts[q + 1] as u16);
+            let len = ((exts[q + 2] as usize) << 8) | (exts[q + 3] as usize);
+            q += 4;
+            out.push((typ, exts[q..q + len].to_vec()));
+            q += len;
+        }
+        out
+    }
+
+    /// Hermetic (no-network) guard: drive the PRODUCTION `safari_h3_ch_profile`
+    /// through the real vendored-rustls ClientHello assembly (the `apply_safari_profile`
+    /// and `ClientExtensions::encode` path, exercised end-to-end by
+    /// `rustls::quic::ClientConnection::new` then `write_hs`) and assert every
+    /// `Managed` extension entry resolves to a PRESENT, NON-EMPTY extension at its
+    /// expected ordinal. A `Managed(typ)` whose typed `ClientExtensions` field is
+    /// left `None` by a future profile/provider refactor would `encode_one` to
+    /// nothing and silently vanish from the wire; today only the networked
+    /// `gfw_simulator` gate would catch that, whereas this test catches it in
+    /// milliseconds.
+    #[test]
+    fn managed_extensions_all_present_in_emitted_h3_clienthello() {
+        let mut grease_seed = [0u8; 5];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut grease_seed);
+        let grease = crate::tls::safari_shape::GreaseSet::from_seed(grease_seed);
+        let profile = crate::tls::safari_shape::safari_h3_ch_profile(grease);
+
+        // The Managed entries in `safari_h3_ch_profile`, with their wire ordinals.
+        // These are the ones backed by a typed `ClientExtensions` field and so the
+        // only ones at risk of silently vanishing if that field is `None`.
+        let managed_ordinals: [u16; 7] = [
+            0x0000, // server_name
+            0x000b, // ec_point_formats
+            0x0010, // ALPN (h3)
+            0x0005, // status_request
+            0x0033, // key_share
+            0x002d, // psk_key_exchange_modes
+            0x0039, // quic_transport_parameters
+        ];
+
+        // Build the H3 rustls config exactly like `client_config`, minus the quinn
+        // wrapper: TLS 1.3, resumption disabled (cold-start), the production
+        // profile. The aws-lc-rs default provider is sufficient — extension
+        // PRESENCE is independent of the camouflage kx-group pinning.
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(
+            crate::transport::udp::test_support::AcceptAnyServerCert,
+        ))
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        tls.resumption = rustls::client::Resumption::disabled();
+        tls.safari_ch_profile = Some(Arc::new(profile));
+
+        // Non-empty transport-parameters blob so the Managed(TransportParameters)
+        // entry has a typed field to encode (production substitutes the ascending
+        // 0x39 blob; any non-empty bytes prove the field is populated and emitted).
+        let params = vec![0x0f, 0x00];
+        let mut conn = rustls::quic::ClientConnection::new(
+            Arc::new(tls),
+            Version::V1,
+            ServerName::try_from("example.com").unwrap().to_owned(),
+            params,
+        )
+        .expect("build in-memory QUIC ClientConnection");
+
+        let mut flight = Vec::new();
+        conn.write_hs(&mut flight);
+        assert!(
+            !flight.is_empty(),
+            "write_hs must emit the ClientHello flight"
+        );
+
+        let exts = parse_client_hello_extensions(&flight);
+        for ord in managed_ordinals {
+            let found = exts.iter().find(|(typ, _)| *typ == ord);
+            let (_, body) = found.unwrap_or_else(|| {
+                panic!(
+                    "Managed extension {ord:#06x} vanished from the emitted ClientHello \
+                     (its typed ClientExtensions field was None); wire ords: {:#06x?}",
+                    exts.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+                )
+            });
+            assert!(
+                !body.is_empty(),
+                "Managed extension {ord:#06x} is present but EMPTY in the emitted ClientHello",
+            );
         }
     }
 }

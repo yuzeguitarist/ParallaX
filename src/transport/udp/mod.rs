@@ -20,8 +20,7 @@ pub(crate) mod reorder;
 /// Safari-26 H3 QUIC ClientHello carrier (S2). This is now the DEFAULT QUIC
 /// client backend (S6): `client_config` drives the Safari Session so the
 /// emitted ClientHello is byte/structurally indistinguishable from Safari-26 H3.
-/// The `safari-quic` feature remains defined for explicit selection but no longer
-/// changes which backend is used.
+/// The QUIC plane itself is gated at the config level (`[udp].enabled = false`).
 pub mod safari_crypto;
 
 /// Fuzz-only re-exports of the internal TUDP wire parsers. Compiled ONLY under

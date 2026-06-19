@@ -532,6 +532,14 @@ fn emit_client_hello_for_retry(
 /// ParallaX fork: rewrite `chp_payload` into the Safari-faithful shape described
 /// by `profile`. Mutates the typed payload in place; the caller must do this
 /// before the message is frozen into the transcript hash.
+//
+// KNOWN-UNREACHABLE FOLLOW-UP (HRR cookie on CH2): the static `safari_plan` has no
+// `Managed(Cookie)` entry and the encode loop short-circuits `ClientExtensions`,
+// so a server-set HRR cookie would be dropped from the retried ClientHello. This
+// is double-gated unreachable today — the QUIC client only talks to the controlled
+// ParallaX server, which never emits an HRR cookie — so it is not a live bug. If a
+// stock-server / HRR-cookie path is ever added, special-case `Cookie` in the plan
+// encode (or splice it into the plan on retry) and add an HRR loopback test.
 fn apply_safari_profile(chp_payload: &mut ClientHelloPayload, profile: &SafariChProfile) {
     // (a) Replace the cipher-suite list verbatim (incl. GREASE + the dup 0x0805).
     chp_payload.cipher_suites = profile.cipher_suites.clone();

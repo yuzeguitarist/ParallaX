@@ -54,9 +54,12 @@ pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
     0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
 
-/// GREASE codepoints chosen for one ClientHello: distinct values for the cipher,
-/// the first (len-0) extension, the supported_groups/key_share/supported_versions
-/// lead, and the last (len-1) extension.
+/// GREASE codepoints chosen for one ClientHello: independent values for the
+/// cipher, the first (len-0) extension, the supported_groups/key_share/
+/// supported_versions lead, and the last (len-1) extension. Only the first and
+/// last extension GREASE are forced to differ from each other (mirroring
+/// BoringSSL); every other surface is drawn freely, matching the value space real
+/// Safari occupies.
 #[derive(Clone, Copy)]
 pub(crate) struct GreaseSet {
     pub(crate) cipher: u16,
@@ -68,11 +71,8 @@ pub(crate) struct GreaseSet {
 
 impl GreaseSet {
     pub(crate) fn from_seed(seed: [u8; 5]) -> Self {
-        let mut cipher_index = seed[0] as usize % BROWSER_GREASE_VALUES.len();
+        let cipher_index = seed[0] as usize % BROWSER_GREASE_VALUES.len();
         let extension_index = seed[1] as usize % BROWSER_GREASE_VALUES.len();
-        if cipher_index == extension_index {
-            cipher_index = (cipher_index + 1) % BROWSER_GREASE_VALUES.len();
-        }
         let mut final_extension_index = seed[4] as usize % BROWSER_GREASE_VALUES.len();
         if final_extension_index == extension_index {
             final_extension_index = (final_extension_index + 1) % BROWSER_GREASE_VALUES.len();
