@@ -45,7 +45,11 @@ sha2 = "0.10"
 # 0.10 (NOT 0.11/0.12): sha3 0.12 moved to digest 0.11, which would fork the
 # digest stack into two majors. Stays on the shared digest 0.10.x already pulled
 # via sha2/hmac/hkdf — keeps `cargo tree -d` free of a duplicate digest.
-sha3 = "0.10"
+# The `zeroize` feature scrubs the Keccak [u64;25] sponge state on drop: signing
+# absorbs secret seeds (sk `key`, `rnd`, `mu`, `rhoprime`) into SHAKE, so the sponge
+# holds a second copy beyond the named stack scrubs. zeroize is already in-tree
+# (1.8.2) — no new crate, no digest-stack fork. Value-neutral (no byte impact).
+sha3 = { version = "0.10", features = ["zeroize"] }
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
