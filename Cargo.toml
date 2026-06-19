@@ -92,3 +92,13 @@ codegen-units = 1
 # a path-patched dependency).
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }
+# Vendored quinn-proto 0.11.14 (path patch) — surgical fork with EXACTLY ONE
+# delta: cid_queue.rs CidQueue::LEN 5 -> 64, so the client tracks (and advertises)
+# active_connection_id_limit = 64, matching Safari-26's disassembly-confirmed
+# value. The crate name/version are unchanged, so this redirects BOTH our direct
+# `quinn-proto = "=0.11.14"` dependency and quinn 0.11.9's internal `proto` to the
+# fork; quinn does not touch CidQueue, so the patch is transparent to it. Pinned
+# =0.11.14 lockstep with rustls 0.23.40. The fork delta, re-apply procedure, and
+# RUSTSEC tracking are documented in vendor/quinn-proto/PARALLAX_FORK.md (cargo
+# audit does NOT flag a path-patched dependency).
+quinn-proto = { path = "vendor/quinn-proto" }

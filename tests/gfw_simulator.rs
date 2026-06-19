@@ -792,7 +792,12 @@ async fn capture_udp_leg_initial(server_name: &str) -> Vec<u8> {
 /// CRYPTO frames, and stops once the offset-0 reassembled stream covers the
 /// declared ClientHello length (bounded by a per-recv timeout and an 8-datagram
 /// cap so a regression that never completes the CH fails fast instead of hanging).
-async fn capture_udp_leg_full_client_hello(server_name: &str) -> Vec<u8> {
+/// Drive the production UDP-leg QUIC client and reassemble its full
+/// ClientHello, returning `(crypto_stream, header_scid)`. `header_scid` is the
+/// Source Connection ID from the **Initial packet long header** (RFC 9000 §7.3),
+/// captured independently of the transport-parameters blob so a caller can prove
+/// the header SCID and the `initial_source_connection_id` TP agree.
+async fn capture_udp_leg_full_client_hello(server_name: &str) -> (Vec<u8>, Vec<u8>) {
     use crate::gfw_sim::detection::quic_initial::{
         decrypt_payload, derive_client_initial_keys_v2, parse_initial_frames,
         parse_protected_long_header, reassemble_crypto_stream, unprotect_header, InitialFrame,
@@ -812,31 +817,24 @@ async fn capture_udp_leg_full_client_hello(server_name: &str) -> Vec<u8> {
         let _ = connecting.await;
     });
 
-    // Decrypt one Initial datagram and return its CRYPTO frames. A single
-    // datagram may coalesce a padded Initial; the Length field bounds the payload
-    // so trailing bytes are ignored. Out-of-band/handshake packets that fail to
-    // parse as a v1 Initial are skipped (return no frames).
-    let crypto_frames_from = |datagram: &[u8]| -> Vec<InitialFrame> {
+    // Decrypt one Initial datagram and return `(header_scid, CRYPTO frames)`. A
+    // single datagram may coalesce a padded Initial; the Length field bounds the
+    // payload so trailing bytes are ignored. Out-of-band/handshake packets that
+    // fail to parse as a v1 Initial are skipped (return None).
+    let initial_from = |datagram: &[u8]| -> Option<(Vec<u8>, Vec<InitialFrame>)> {
         let mut pkt = datagram.to_vec();
-        let mut hdr = match parse_protected_long_header(&pkt) {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
-        let keys = match derive_client_initial_keys_v2(&hdr.dcid) {
-            Ok(k) => k,
-            Err(_) => return Vec::new(),
-        };
+        let mut hdr = parse_protected_long_header(&pkt).ok()?;
+        let keys = derive_client_initial_keys_v2(&hdr.dcid).ok()?;
+        let scid = hdr.scid.clone();
         if unprotect_header(&mut pkt, &mut hdr, &keys).is_err() {
-            return Vec::new();
+            return None;
         }
-        let payload = match decrypt_payload(&pkt, &hdr, &keys) {
-            Ok(p) => p,
-            Err(_) => return Vec::new(),
-        };
-        parse_initial_frames(&payload).unwrap_or_default()
+        let payload = decrypt_payload(&pkt, &hdr, &keys).ok()?;
+        Some((scid, parse_initial_frames(&payload).unwrap_or_default()))
     };
 
     let mut all_frames: Vec<InitialFrame> = Vec::new();
+    let mut header_scid: Option<Vec<u8>> = None;
     let mut buf = vec![0_u8; 2048];
     // 8-datagram / 5s overall cap: the CH fits in 2-3 Initial datagrams, so this
     // is generous but still fails fast if reassembly never completes.
@@ -849,7 +847,10 @@ async fn capture_udp_leg_full_client_hello(server_name: &str) -> Vec<u8> {
             // socket error: stop and reassemble whatever we have.
             _ => break,
         };
-        all_frames.extend(crypto_frames_from(&buf[..n]));
+        if let Some((scid, frames)) = initial_from(&buf[..n]) {
+            header_scid.get_or_insert(scid);
+            all_frames.extend(frames);
+        }
 
         // Stop once the offset-0 reassembled stream covers the full declared CH.
         let crypto = reassemble_crypto_stream(&all_frames);
@@ -865,7 +866,10 @@ async fn capture_udp_leg_full_client_hello(server_name: &str) -> Vec<u8> {
     }
     drive.abort();
 
-    reassemble_crypto_stream(&all_frames)
+    (
+        reassemble_crypto_stream(&all_frames),
+        header_scid.unwrap_or_default(),
+    )
 }
 
 #[tokio::test]
@@ -988,8 +992,8 @@ async fn udp_leg_initial_first_datagram_holds_only_partial_clienthello() {
 // vendor/GREASE codepoint 0x17f7586d2cb571 LAST. It also asserts the confirmed
 // transport-param VALUES (idle=0, stream_data=2 MiB, bidi=0, uni=8, vendor
 // GREASE=0) — EXCEPT initial_max_data (0x04), the single runtime-read value
-// (presence only). active_connection_id_limit asserts quinn's enforced 5
-// (CidQueue::LEN), not Safari's 64, which quinn-proto 0.11.14 cannot honor.
+// (presence only). active_connection_id_limit asserts Safari's confirmed 64,
+// reachable because vendor/quinn-proto raises CidQueue::LEN to 64.
 //
 // It is GREEN once the vendored-rustls fork + the Safari QUIC Session are wired and
 // selected (production `safari_ch_profile` set in `client_config` and the Safari
@@ -1096,8 +1100,20 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     use crate::gfw_sim::detection::sni_filter::parse_client_hello;
 
     // 1) Drive the real UDP-leg QUIC client and reassemble the full multi-datagram
-    //    ClientHello, then parse it.
-    let crypto = capture_udp_leg_full_client_hello("cloudflare.com").await;
+    //    ClientHello, then parse it. Also capture the Initial packet long-header
+    //    SCID so the zero-length CID can be checked at the QUIC packet-header layer
+    //    (RFC 9000 §7.3), independently of the 0x39 transport-params blob.
+    let (crypto, header_scid) = capture_udp_leg_full_client_hello("cloudflare.com").await;
+    // RFC 9000 §7.3: the Initial header Source Connection ID and the
+    // initial_source_connection_id transport parameter (asserted zero-length
+    // below) MUST match. ParallaX uses a zero-length client SCID (Safari-26
+    // fidelity), so the header SCID itself must be empty — verified here directly
+    // from the parsed long header, not just from the TP blob's self-report.
+    assert!(
+        header_scid.is_empty(),
+        "Initial long-header SCID must be zero-length (RFC 9000 §7.3; matches 0x0f TP); got {} B",
+        header_scid.len()
+    );
     assert!(
         crypto.len() >= 4 && crypto[0] == 0x01,
         "reassembled bytes must start a TLS ClientHello (type 0x01)"
@@ -1319,15 +1335,14 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         Some(8),
         "initial_max_streams_uni must be 8"
     );
-    // active_connection_id_limit: the confirmed Safari value is 64, but quinn-proto
-    // 0.11.14 cannot honor it (the remote-CID queue is a fixed CidQueue::LEN = 5,
-    // no public setter), so the carrier advertises 5 (the max quinn-safe value).
-    // This is independent of the client's now-zero-length source CID. Assert the
-    // actual advertised value (5), not Safari's unreachable 64.
+    // active_connection_id_limit: Safari's confirmed value is 64, and ParallaX
+    // now advertises it because vendor/quinn-proto raises CidQueue::LEN to 64 (the
+    // remote-CID receive queue holds 64 slots, so advertised == capacity). This is
+    // independent of the client's zero-length source CID. Assert the advertised 64.
     assert_eq!(
         tp_varint_value(&tp, 0x0e),
-        Some(5),
-        "active_connection_id_limit must be quinn's CidQueue::LEN = 5 (Safari's 64 is unreachable)"
+        Some(64),
+        "active_connection_id_limit must be Safari's 64 (vendored CidQueue::LEN)"
     );
     // initial_source_connection_id (0x0f) must be present AND zero-length: Safari-26
     // emits it with length 0 (full disassembly), and ParallaX's client uses a

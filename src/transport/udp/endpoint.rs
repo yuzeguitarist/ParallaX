@@ -102,6 +102,15 @@ pub fn bind_server_endpoint(addr: SocketAddr, sni: &str) -> Result<Endpoint, Udp
 /// the zero-length local CID explicitly (`new_cid`/`issue_first_cids`/
 /// `cids_exhausted` all special-case `cid_len == 0`), so the client simply never
 /// issues alternate CIDs — which is exactly the zero-length-CID endpoint posture.
+///
+/// TRADEOFF — no NAT-rebinding survival. With a zero-length local SCID the server
+/// can only index this connection by the UDP 4-tuple (there is no client CID to
+/// route on), so if the client's NAT remaps its source port mid-connection the
+/// server cannot re-associate the datagrams and the connection drops. This is a
+/// deliberate Safari-faithful choice: Safari-26 itself emits a zero-length SCID,
+/// and ParallaX's UDP leg is a short-lived single-Connect relay, so the exposure
+/// window is small and a rebind simply surfaces as the existing clean
+/// connection-reset failure mode (the caller re-probes / falls back).
 fn client_endpoint_config() -> EndpointConfig {
     let mut config = EndpointConfig::default();
     config.cid_generator(|| -> Box<dyn ConnectionIdGenerator> {
@@ -132,6 +141,15 @@ pub fn bind_client_endpoint(
 
 /// Bind a UDP QUIC client endpoint that accepts any server certificate
 /// (authenticity is the exporter-bound auth token, not the cert).
+///
+/// FOOTGUN — this disables TLS certificate validation entirely. It is sound ONLY
+/// on the UDP leg, whose trust derives from the exporter-bound auth token
+/// ([`AcceptAnyServerCert`]), NOT from the cert. It is crate-public solely so the
+/// production probe path (`client::runtime`) and the `gfw_simulator` integration
+/// test crate can build the same endpoint; it is `#[doc(hidden)]` to keep it out
+/// of the public API surface. NEVER wire this into a path whose security depends
+/// on certificate validation.
+#[doc(hidden)]
 pub fn bind_client_endpoint_accept_any(addr: SocketAddr) -> Result<Endpoint, UdpTransportError> {
     bind_client_endpoint(addr, Arc::new(AcceptAnyServerCert))
 }

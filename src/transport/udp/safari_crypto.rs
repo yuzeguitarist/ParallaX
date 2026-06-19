@@ -339,24 +339,20 @@ pub(crate) const SAFARI_TP_INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
 /// libquic value. Mirrored by quinn's `stream_receive_window`.
 pub(crate) const SAFARI_TP_INITIAL_MAX_STREAM_DATA: u64 = 2 * 1024 * 1024;
 
-/// `active_connection_id_limit` (0x0e). The confirmed Safari value is 64, but it
-/// is unreachable in-tree: this parameter bounds how many of the PEER's connection
-/// ids the client will track, and quinn-proto 0.11.14 sizes that remote-CID queue
-/// to a fixed `CidQueue::LEN = 5` with NO public setter (cid_queue.rs:14), so
-/// advertising 64 makes a peer issue `min(64, LOC_CID_COUNT=8)=8` connection IDs,
-/// overflowing the 5-slot queue and killing every connection with
-/// `CONNECTION_ID_LIMIT_ERROR`. We therefore advertise `5` = `CidQueue::LEN`: the
-/// maximum quinn-safe value (a peer then issues `min(5, 8) = 5` CIDs, filling the
-/// queue exactly). This is independent of the client's own (now zero-length)
-/// source CID — that governs the ids the client ISSUES, not the ids it tracks, and
-/// a zero-length-CID client issues none. quinn's own `params.write()` would emit
-/// the default `2` (suppressed) for a zero-length-CID endpoint
-/// (transport_parameters.rs:164), but ParallaX's hand-encoded blob substitutes `5`
-/// independently of quinn's blob, and 5 matches the client's actual `rem_cids`
-/// capacity, so there is no advertised-vs-actual gap. Reaching Safari's 64 needs
-/// forking quinn-proto to raise `CidQueue::LEN`; see the gate. `5` narrows the gap
-/// to 5-vs-64.
-pub(crate) const SAFARI_TP_ACTIVE_CID_LIMIT: u64 = 5;
+/// `active_connection_id_limit` (0x0e). The confirmed Safari value is **64**, and
+/// ParallaX now advertises exactly that: `vendor/quinn-proto` raises
+/// `CidQueue::LEN` from the upstream 5 to 64 (the sole fork delta; see
+/// vendor/quinn-proto/PARALLAX_FORK.md), so the client's remote-CID receive queue
+/// holds 64 slots and the advertised limit equals the actual capacity — no
+/// advertised-vs-actual gap. A peer may then issue up to `min(64, its own
+/// LOC_CID_COUNT)` connection IDs and the 64-slot queue absorbs them all instead
+/// of overflowing with `CONNECTION_ID_LIMIT_ERROR`. This is independent of the
+/// client's own (zero-length) source CID — that governs the ids the client
+/// ISSUES (none, for a zero-length-CID endpoint), not the ids it tracks. quinn's
+/// own `params.write()` would emit a different value, but ParallaX's hand-encoded
+/// blob substitutes 64 independently, matching both Safari's wire value and the
+/// vendored `CidQueue::LEN`.
+pub(crate) const SAFARI_TP_ACTIVE_CID_LIMIT: u64 = 64;
 
 /// `initial_max_streams_uni` (0x09) — libquic value 8. Mirrored by quinn.
 pub(crate) const SAFARI_TP_MAX_STREAMS_UNI: u64 = 8;
@@ -394,7 +390,7 @@ const SAFARI_TP_IDS: [u64; 9] = [
     0x07, // initial_max_stream_data_uni = 2 MiB
     0x08, // initial_max_streams_bidi = 0
     0x09, // initial_max_streams_uni = 8
-    0x0e, // active_connection_id_limit = 5 (SAFARI_TP_ACTIVE_CID_LIMIT; quinn CidQueue::LEN)
+    0x0e, // active_connection_id_limit = 64 (SAFARI_TP_ACTIVE_CID_LIMIT; vendored CidQueue::LEN)
     0x0f, // initial_source_connection_id (REAL, server-validated, zero-length)
 ];
 
@@ -654,13 +650,13 @@ mod tests {
         assert_eq!(val(0x07), 2 * 1024 * 1024, "stream_data_uni = 2 MiB");
         assert_eq!(val(0x08), 0, "max_streams_bidi = 0");
         assert_eq!(val(0x09), 8, "max_streams_uni = 8");
-        // active_connection_id_limit is quinn's real advertised CidQueue::LEN = 5
-        // (NOT Safari's 64, which quinn-proto 0.11.14 cannot honor; see
+        // active_connection_id_limit is Safari's confirmed 64, now reachable
+        // because vendor/quinn-proto raises CidQueue::LEN to 64 (see
         // SAFARI_TP_ACTIVE_CID_LIMIT).
         assert_eq!(
             val(0x0e),
-            5,
-            "active_connection_id_limit = 5 (quinn CidQueue::LEN)"
+            64,
+            "active_connection_id_limit = 64 (vendored CidQueue::LEN)"
         );
 
         // The vendor/GREASE TP carries value 0.
