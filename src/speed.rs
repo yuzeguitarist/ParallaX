@@ -870,8 +870,8 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{ClientConfig, CryptoConfig, ServerConfig, TrafficConfig, UdpConfig};
+    use crate::crypto::mldsa;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use pqcrypto_mldsa::mldsa87;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -1008,7 +1008,7 @@ mod tests {
                 data_target: None,
                 private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
                 pq_secret_key: String::new(),
-                identity_secret_key: STANDARD.encode(vec![0_u8; mldsa87::secret_key_bytes()]),
+                identity_secret_key: STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]),
                 replay_cache_path: PathBuf::from("/tmp/parallax-speed-test-replay.cache"),
                 replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni: vec!["example.com".to_owned()],
@@ -1062,7 +1062,7 @@ mod tests {
             sni: "example.com".to_owned(),
             server_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             server_pq_public_key: String::new(),
-            server_identity_public_key: STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]),
+            server_identity_public_key: STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]),
         });
         let err = run(cfg).await.unwrap_err();
         assert!(matches!(err, SpeedError::Config(ConfigError::WeakPsk)));

@@ -27,9 +27,6 @@ hkdf = "0.12"
 hmac = "0.12"
 libc = "0.2"
 rand = "0.8"
-pqcrypto-mlkem = "0.1"
-pqcrypto-mldsa = "0.1.2"
-pqcrypto-traits = "0.3"
 # QUIC fast-plane (TUDP) data path. quinn 0.11 exposes no aws-lc-rs backend for
 # quinn-proto's QUIC transport crypto, so `ring` is required there and is linked
 # unconditionally; the TLS handshake and all of ParallaX's other crypto stay on
@@ -44,6 +41,15 @@ rustls-pki-types = "1"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "aws-lc-rs"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+# Hand-rolled ML-DSA-87 (crypto::mldsa) uses SHAKE128/256 from `sha3`. Pinned to
+# 0.10 (NOT 0.11/0.12): sha3 0.12 moved to digest 0.11, which would fork the
+# digest stack into two majors. Stays on the shared digest 0.10.x already pulled
+# via sha2/hmac/hkdf — keeps `cargo tree -d` free of a duplicate digest.
+# The `zeroize` feature scrubs the Keccak [u64;25] sponge state on drop: signing
+# absorbs secret seeds (sk `key`, `rnd`, `mu`, `rhoprime`) into SHAKE, so the sponge
+# holds a second copy beyond the named stack scrubs. zeroize is already in-tree
+# (1.8.2) — no new crate, no digest-stack fork. Value-neutral (no byte impact).
+sha3 = { version = "0.10", features = ["zeroize"] }
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -55,6 +61,16 @@ zeroize = { version = "1.7", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# ML-DSA-87 differential oracle (tests/mldsa_differential.rs only): the PQClean C
+# FFI implementation the hand-rolled `crypto::mldsa` is cross-checked against. The
+# production identity signer is `crypto::mldsa`; these are test-only since the
+# cutover and must not re-enter [dependencies].
+pqcrypto-mldsa = "0.1.2"
+pqcrypto-traits = "0.3"
+# ML-DSA-87 ACVP validation harness (tests/mldsa_acvp.rs): parse NIST ACVP JSON
+# vectors and decode their uppercase-hex fields. Test-only; not runtime deps.
+serde_json = "1"
+hex = "0.4"
 # Crypto used exclusively by the GFW simulator (tests/gfw_sim/):
 # - aes: RFC 9001 QUIC Initial header protection
 # - cipher: shared trait crate

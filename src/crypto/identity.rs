@@ -1,11 +1,8 @@
-use pqcrypto_mldsa::mldsa87;
-use pqcrypto_traits::sign::{
-    DetachedSignature as DetachedSignatureTrait, PublicKey as SignPublicKey,
-    SecretKey as SignSecretKey,
-};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::crypto::mldsa::{self, MlDsaError};
 
 const IDENTITY_CONTEXT: &[u8] = b"ParallaX v2 ML-DSA-87 server identity";
 const IDENTITY_MESSAGE_LABEL: &[u8] = b"ParallaX v2 server identity proof";
@@ -23,6 +20,24 @@ pub enum IdentityError {
     VerificationFailed,
 }
 
+impl From<MlDsaError> for IdentityError {
+    /// Exhaustively map the hand-rolled `crypto::mldsa` error surface onto the
+    /// identity error surface. `ContextTooLong` cannot occur here — the only
+    /// context this module signs/verifies under is the fixed 37-byte
+    /// `IDENTITY_CONTEXT`, well within the FIPS 204 255-byte cap — but it is mapped
+    /// explicitly (to `InvalidSignature`, the malformed-input bucket) so no variant
+    /// is silently dropped if the upstream enum grows.
+    fn from(e: MlDsaError) -> Self {
+        match e {
+            MlDsaError::InvalidPublicKeyLength => IdentityError::InvalidPublicKey,
+            MlDsaError::InvalidSecretKeyLength => IdentityError::InvalidSecretKey,
+            MlDsaError::InvalidSignatureLength => IdentityError::InvalidSignature,
+            MlDsaError::ContextTooLong => IdentityError::InvalidSignature,
+            MlDsaError::VerificationFailed => IdentityError::VerificationFailed,
+        }
+    }
+}
+
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MlDsaKeyPair {
     pub public: Vec<u8>,
@@ -30,11 +45,8 @@ pub struct MlDsaKeyPair {
 }
 
 pub fn keypair() -> MlDsaKeyPair {
-    let (public, secret) = mldsa87::keypair();
-    MlDsaKeyPair {
-        public: public.as_bytes().to_vec(),
-        secret: secret.as_bytes().to_vec(),
-    }
+    let (public, secret) = mldsa::keypair();
+    MlDsaKeyPair { public, secret }
 }
 
 pub fn identity_message(
@@ -75,16 +87,13 @@ pub fn sign_server_identity(
     pq_rekey_binding: &[u8; 32],
     epoch: u64,
 ) -> Result<Vec<u8>, IdentityError> {
-    let secret =
-        mldsa87::SecretKey::from_bytes(secret_key).map_err(|_| IdentityError::InvalidSecretKey)?;
     let message = identity_message(
         transcript_hash,
         server_x25519_public_key,
         pq_rekey_binding,
         epoch,
     );
-    let signature = mldsa87::detached_sign_ctx(&message, IDENTITY_CONTEXT, &secret);
-    Ok(signature.as_bytes().to_vec())
+    Ok(mldsa::sign(secret_key, &message, IDENTITY_CONTEXT)?)
 }
 
 pub fn verify_server_identity(
@@ -95,18 +104,18 @@ pub fn verify_server_identity(
     pq_rekey_binding: &[u8; 32],
     epoch: u64,
 ) -> Result<(), IdentityError> {
-    let public =
-        mldsa87::PublicKey::from_bytes(public_key).map_err(|_| IdentityError::InvalidPublicKey)?;
-    let signature = mldsa87::DetachedSignature::from_bytes(signature)
-        .map_err(|_| IdentityError::InvalidSignature)?;
     let message = identity_message(
         transcript_hash,
         server_x25519_public_key,
         pq_rekey_binding,
         epoch,
     );
-    mldsa87::verify_detached_signature_ctx(&signature, &message, IDENTITY_CONTEXT, &public)
-        .map_err(|_| IdentityError::VerificationFailed)
+    Ok(mldsa::verify(
+        public_key,
+        signature,
+        &message,
+        IDENTITY_CONTEXT,
+    )?)
 }
 
 #[cfg(test)]
