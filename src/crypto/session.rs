@@ -7,7 +7,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
@@ -81,6 +81,12 @@ impl fmt::Debug for SessionKeys {
 }
 
 impl SessionKeys {
+    /// Best-effort: these are inline `[u8; N]` fields, so if the owning
+    /// `SessionKeys` is later moved the lock pins the pre-move page (unlike
+    /// [`AeadCodec`], whose key/nonce live behind a stable heap box). The live
+    /// AEAD keys the data plane actually uses are copied into `AeadCodec` and
+    /// pinned there; this call additionally excludes the derivation material from
+    /// core dumps. `ZeroizeOnDrop` wipes every field regardless of pinning.
     pub fn protect_secret_memory(&self) {
         crate::process_hardening::protect_secret_bytes("session.client_key", &self.client_key);
         crate::process_hardening::protect_secret_bytes("session.server_key", &self.server_key);
@@ -141,14 +147,17 @@ fn derive_keys(
     peer_public: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    let x25519_shared_secret = x25519_shared_secret(private, peer_public);
-    derive_keys_from_shared(x25519_shared_secret, transcript_hash)
+    let x25519_shared_secret = Zeroizing::new(x25519_shared_secret(private, peer_public));
+    derive_keys_from_shared(*x25519_shared_secret, transcript_hash)
 }
 
 fn derive_keys_from_shared(
     x25519_shared_secret: [u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
+    // Wrap so the shared-secret stack copy is wiped on every return path below
+    // (degenerate-reject and HKDF-error included).
+    let x25519_shared_secret = Zeroizing::new(x25519_shared_secret);
     // Defense-in-depth: reject a degenerate (all-zero) X25519 shared secret.
     // x25519-dalek does not reject low-order/contributory base points (RFC 7748
     // leaves the all-zero-output check to the caller), so a peer that supplies a
@@ -160,8 +169,11 @@ fn derive_keys_from_shared(
     if bool::from(x25519_shared_secret.ct_eq(&[0u8; KEY_LEN])) {
         return Err(SessionError::DegenerateSharedSecret);
     }
-    let chain_secret = initial_chain_secret(&x25519_shared_secret, transcript_hash)?;
-    expand_epoch_keys(chain_secret, 0, *transcript_hash, x25519_shared_secret)
+    let chain_secret = Zeroizing::new(initial_chain_secret(
+        &x25519_shared_secret,
+        transcript_hash,
+    )?);
+    expand_epoch_keys(*chain_secret, 0, *transcript_hash, *x25519_shared_secret)
 }
 
 pub fn expand_epoch_keys(
@@ -170,17 +182,21 @@ pub fn expand_epoch_keys(
     transcript_hash: [u8; KEY_LEN],
     x25519_shared_secret: [u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    let hk = Hkdf::<Sha256>::from_prk(&chain_secret).map_err(|_| SessionError::Hkdf)?;
+    // Wipe the secret stack copies of the inputs on return; `out` keeps its own
+    // copies (zeroized on drop via SessionKeys: ZeroizeOnDrop).
+    let chain_secret = Zeroizing::new(chain_secret);
+    let x25519_shared_secret = Zeroizing::new(x25519_shared_secret);
+    let hk = Hkdf::<Sha256>::from_prk(chain_secret.as_slice()).map_err(|_| SessionError::Hkdf)?;
 
     let mut out = SessionKeys {
         client_key: [0; KEY_LEN],
         server_key: [0; KEY_LEN],
         client_nonce: [0; NONCE_LEN],
         server_nonce: [0; NONCE_LEN],
-        chain_secret,
+        chain_secret: *chain_secret,
         epoch,
         transcript_hash,
-        x25519_shared_secret,
+        x25519_shared_secret: *x25519_shared_secret,
     };
 
     expand(
@@ -284,8 +300,17 @@ fn write_epoch_hkdf_info(
 pub type SharedCipher = Arc<LessSafeKey>;
 
 pub struct AeadCodec {
-    key: [u8; KEY_LEN],
-    nonce_base: [u8; NONCE_LEN],
+    // Boxed so the secret bytes live at a stable heap address: an `AeadCodec` is
+    // built then moved into its owner (and returned by value from constructors),
+    // which would relocate inline `[u8; N]` arrays and leave `protect_secret_memory`
+    // pinning a dead pre-move page. The heap allocation does not move with the
+    // struct, so the page locked at construction stays the live key's page for the
+    // codec's lifetime. We deliberately do NOT munlock on drop: the allocator can
+    // pack this 32/12-byte box onto a page shared with other live secrets, so a
+    // per-codec munlock would un-pin a neighbor. The kernel releases the lock at
+    // process exit; the leaked budget is bounded by the live working set.
+    key: Box<[u8; KEY_LEN]>,
+    nonce_base: Box<[u8; NONCE_LEN]>,
     sequence: u64,
     suite: CipherSuite,
     cipher: SharedCipher,
@@ -440,8 +465,8 @@ impl AeadCodec {
         nonce_base: [u8; NONCE_LEN],
     ) -> Self {
         let codec = Self {
-            key,
-            nonce_base,
+            key: Box::new(key),
+            nonce_base: Box::new(nonce_base),
             sequence: 0,
             suite,
             cipher: make_cipher(suite, &key),
@@ -468,8 +493,10 @@ impl AeadCodec {
     ) {
         self.key.zeroize();
         self.nonce_base.zeroize();
-        self.key = key;
-        self.nonce_base = nonce_base;
+        // Overwrite the existing heap allocations in place so the locked pages
+        // stay valid across the rekey (re-`protect` below is then idempotent).
+        *self.key = key;
+        *self.nonce_base = nonce_base;
         self.sequence = 0;
         self.suite = suite;
         self.cipher = make_cipher(suite, &key);
@@ -489,7 +516,7 @@ impl AeadCodec {
     /// Session nonce base; combine with a sequence number via
     /// [`record_nonce_from`] to reproduce a record's nonce off-thread.
     pub(crate) fn nonce_base(&self) -> [u8; NONCE_LEN] {
-        self.nonce_base
+        *self.nonce_base
     }
 
     /// Advances the sequence counter by `count` after a batch of records was
@@ -516,8 +543,11 @@ impl AeadCodec {
     }
 
     pub fn protect_secret_memory(&self) {
-        crate::process_hardening::protect_secret_bytes("aead.key", &self.key);
-        crate::process_hardening::protect_secret_bytes("aead.nonce_base", &self.nonce_base);
+        crate::process_hardening::protect_secret_bytes("aead.key", self.key.as_slice());
+        crate::process_hardening::protect_secret_bytes(
+            "aead.nonce_base",
+            self.nonce_base.as_slice(),
+        );
     }
 
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SessionError> {

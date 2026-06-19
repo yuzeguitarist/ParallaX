@@ -376,14 +376,14 @@ impl ClientDataSession {
         pq_shared_secret: &[u8; 32],
         sandwich_secret: &[u8],
     ) -> Result<(), ClientHandshakeError> {
-        let chain_secret = pq::hybrid_sandwich_rekey(
+        let chain_secret = Zeroizing::new(pq::hybrid_sandwich_rekey(
             &self.keys.chain_secret,
             x25519_shared_secret,
             pq_shared_secret,
             sandwich_secret,
-        )?;
+        )?);
         let next_keys = expand_epoch_keys(
-            chain_secret,
+            *chain_secret,
             self.keys.epoch.saturating_add(1),
             self.keys.transcript_hash,
             *x25519_shared_secret,
