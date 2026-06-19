@@ -1,9 +1,5 @@
+use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_1024};
 use hkdf::Hkdf;
-use pqcrypto_mlkem::mlkem1024;
-use pqcrypto_traits::kem::{
-    Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
-    SharedSecret as KemSharedSecret,
-};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -38,31 +34,57 @@ pub struct MlKemEncapsulation {
     pub shared_secret: [u8; 32],
 }
 
+/// FIPS 203 ML-KEM-1024 serialized sizes (bytes). Exposed so config/probe can
+/// validate stored key lengths without depending on the KEM backend crate; the
+/// fn form mirrors the previous pqcrypto API so call sites only change the path.
+pub fn public_key_bytes() -> usize {
+    1568
+}
+pub fn secret_key_bytes() -> usize {
+    3168
+}
+pub fn ciphertext_bytes() -> usize {
+    1568
+}
+
 pub fn keypair() -> MlKemKeyPair {
-    let (public, secret) = mlkem1024::keypair();
+    let dk = DecapsulationKey::generate(&ML_KEM_1024).expect("ML-KEM-1024 key generation");
+    let ek = dk
+        .encapsulation_key()
+        .expect("ML-KEM-1024 encapsulation-key derivation");
     MlKemKeyPair {
-        public: public.as_bytes().to_vec(),
-        secret: secret.as_bytes().to_vec(),
+        public: ek
+            .key_bytes()
+            .expect("serialize ML-KEM-1024 encapsulation key")
+            .as_ref()
+            .to_vec(),
+        secret: dk
+            .key_bytes()
+            .expect("serialize ML-KEM-1024 decapsulation key")
+            .as_ref()
+            .to_vec(),
     }
 }
 
 pub fn encapsulate(public_key: &[u8]) -> Result<MlKemEncapsulation, PqError> {
     let public =
-        mlkem1024::PublicKey::from_bytes(public_key).map_err(|_| PqError::InvalidPublicKey)?;
-    let (shared_secret, ciphertext) = mlkem1024::encapsulate(&public);
+        EncapsulationKey::new(&ML_KEM_1024, public_key).map_err(|_| PqError::InvalidPublicKey)?;
+    let (ciphertext, shared_secret) = public
+        .encapsulate()
+        .map_err(|_| PqError::InvalidPublicKey)?;
     Ok(MlKemEncapsulation {
-        ciphertext: ciphertext.as_bytes().to_vec(),
-        shared_secret: shared_secret_32(shared_secret.as_bytes())?,
+        ciphertext: ciphertext.as_ref().to_vec(),
+        shared_secret: shared_secret_32(shared_secret.as_ref())?,
     })
 }
 
 pub fn decapsulate(ciphertext: &[u8], secret_key: &[u8]) -> Result<[u8; 32], PqError> {
-    let ciphertext =
-        mlkem1024::Ciphertext::from_bytes(ciphertext).map_err(|_| PqError::InvalidCiphertext)?;
     let secret =
-        mlkem1024::SecretKey::from_bytes(secret_key).map_err(|_| PqError::InvalidSecretKey)?;
-    let shared_secret = mlkem1024::decapsulate(&ciphertext, &secret);
-    shared_secret_32(shared_secret.as_bytes())
+        DecapsulationKey::new(&ML_KEM_1024, secret_key).map_err(|_| PqError::InvalidSecretKey)?;
+    let shared_secret = secret
+        .decapsulate(Ciphertext::from(ciphertext))
+        .map_err(|_| PqError::InvalidCiphertext)?;
+    shared_secret_32(shared_secret.as_ref())
 }
 
 pub fn hybrid_rekey(
@@ -103,8 +125,9 @@ pub fn hybrid_sandwich_rekey(
             pq_shared_secret,
             symmetric_secret,
         );
-        let (prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm[..used]);
+        let (mut prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm[..used]);
         chain_secret.copy_from_slice(&prk);
+        prk.zeroize();
         ikm[..used].zeroize();
     } else {
         let mut ikm = Vec::with_capacity(ikm_len);
@@ -114,8 +137,9 @@ pub fn hybrid_sandwich_rekey(
             pq_shared_secret,
             symmetric_secret,
         );
-        let (prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm);
+        let (mut prk, _) = Hkdf::<Sha256>::extract(Some(old_chain_secret), &ikm);
         chain_secret.copy_from_slice(&prk);
+        prk.zeroize();
         ikm.zeroize();
     }
     Ok(chain_secret)
@@ -180,9 +204,9 @@ mod tests {
         let enc = encapsulate(&keys.public).unwrap();
         let dec = decapsulate(&enc.ciphertext, &keys.secret).unwrap();
         assert_eq!(enc.shared_secret, dec);
-        assert_eq!(keys.public.len(), mlkem1024::public_key_bytes());
-        assert_eq!(keys.secret.len(), mlkem1024::secret_key_bytes());
-        assert_eq!(enc.ciphertext.len(), mlkem1024::ciphertext_bytes());
+        assert_eq!(keys.public.len(), public_key_bytes());
+        assert_eq!(keys.secret.len(), secret_key_bytes());
+        assert_eq!(enc.ciphertext.len(), ciphertext_bytes());
     }
 
     #[test]

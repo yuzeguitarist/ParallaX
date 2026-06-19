@@ -92,13 +92,15 @@ jobs:
 
       # Unit tests + Safari parity baselines + any other integration test except gfw_simulator.
       # gfw_simulator has its own required status check below.
-      - name: cargo test (lib, bins, parity baselines)
+      - name: cargo test (lib, bins, parity + ML-DSA ACVP/differential)
         run: |
           cargo test --locked --no-fail-fast \
             --lib \
             --bins \
             --test safari_parity_baseline \
-            --test safari_h2_parity_baseline
+            --test safari_h2_parity_baseline \
+            --test mldsa_acvp \
+            --test mldsa_differential
 
       # Loopback integration tests are marked #[ignore] because they open
       # local TCP sockets. Run them serially so the OS doesn't get into a

@@ -1,0 +1,109 @@
+name: release
+
+# Build native release binaries for ParallaX's real platforms and publish them to
+# a GitHub Release when a `v*` tag is pushed.
+#
+# NATIVE build per target (no cross-compilation): each target builds on a matching
+# runner so the heavy crypto deps (aws-lc-rs, pqcrypto, ring) compile with their
+# native toolchain — this deliberately avoids the cross-compile fragility that the
+# zigbuild path in scripts/deploy-vps.sh exists to work around.
+#
+# Adds NO third-party action: the Release is created and assets uploaded with the
+# bundled `gh` CLI (github.token, contents: write). The default token is fine here
+# — a Release does not need to trigger downstream CI.
+#
+# aarch64-unknown-linux-gnu is omitted because a native build needs an arm Linux
+# runner. To ship it, add this matrix entry (requires arm runners on your plan):
+#   - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build and upload, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write   # create the Release and upload assets
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${ref}" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin parallax --bin plx
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="parallax-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$dist"
+          bindir="target/${{ matrix.target }}/release"
+          for b in parallax plx; do
+            cp "$bindir/$b" "$dist/"
+            strip "$dist/$b" 2>/dev/null || true
+          done
+          cp README.md "$dist/" 2>/dev/null || true
+          tar -czf "$dist.tar.gz" "$dist"
+          shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+          echo "tarball=$dist.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Create the Release once; concurrent matrix jobs that lose the race fall
+          # through to the upload (|| true swallows the "already exists" error).
+          gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag 2>/dev/null || true
+          gh release upload "$TAG" \
+            "${{ steps.pkg.outputs.tarball }}" \
+            "${{ steps.pkg.outputs.tarball }}.sha256" \
+            --clobber

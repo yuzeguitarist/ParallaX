@@ -14,6 +14,7 @@ use std::{
 };
 
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
+use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, ML_KEM_768};
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305,
@@ -21,11 +22,6 @@ use chacha20poly1305::{
 use flate2::read::ZlibDecoder;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::{
-    Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
-    SharedSecret as KemSharedSecret,
-};
 use rand::{rngs::OsRng, RngCore};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256, Sha384};
@@ -203,9 +199,14 @@ impl Safari26TlsCamouflage {
             .map_err(|_| Safari26TlsError::InvalidServerName(sni.clone()))?;
 
         let parallax_x25519 = X25519KeyPair::generate();
-        let parallax_shared_secret =
-            x25519_shared_secret(&parallax_x25519.private, server_public_key);
-        let auth_key = derive_client_auth_key_from_shared(psk, &parallax_shared_secret)?;
+        let parallax_shared_secret = Zeroizing::new(x25519_shared_secret(
+            &parallax_x25519.private,
+            server_public_key,
+        ));
+        let auth_key = Zeroizing::new(derive_client_auth_key_from_shared(
+            psk,
+            &parallax_shared_secret,
+        )?);
 
         // Generate the TLS handshake ephemeral up-front: its public half is
         // carried UNMASKED in the key_share, and the v4 carrier-mask key is
@@ -228,14 +229,28 @@ impl Safari26TlsCamouflage {
         let session_id = build_masked_stateful_auth_session_id(
             psk,
             &mask_ecdh,
-            &auth_key,
+            auth_key.as_slice(),
             &sni,
             &parallax_x25519.public,
             &encoded_client_random,
             &tail,
         )?;
 
-        let (mlkem_public, mlkem_secret) = mlkem768::keypair();
+        let mlkem_dk =
+            DecapsulationKey::generate(&ML_KEM_768).map_err(|_| Safari26TlsError::MlKem)?;
+        let mlkem_public = mlkem_dk
+            .encapsulation_key()
+            .and_then(|ek| ek.key_bytes())
+            .map_err(|_| Safari26TlsError::MlKem)?
+            .as_ref()
+            .to_vec();
+        let mlkem_secret = Zeroizing::new(
+            mlkem_dk
+                .key_bytes()
+                .map_err(|_| Safari26TlsError::MlKem)?
+                .as_ref()
+                .to_vec(),
+        );
         let mut grease_seed = [0_u8; 5];
         OsRng.fill_bytes(&mut grease_seed);
         let grease = GreaseSet::from_seed(grease_seed);
@@ -244,7 +259,7 @@ impl Safari26TlsCamouflage {
             encoded_client_random,
             session_id,
             &tls_x25519.public,
-            mlkem_public.as_bytes(),
+            &mlkem_public,
             grease,
         )?;
 
@@ -253,19 +268,17 @@ impl Safari26TlsCamouflage {
         };
         let auth = verify_masked_stateful_client_hello_auth_with_material(
             &client_hello,
-            &auth_key,
+            auth_key.as_slice(),
             &material,
         )?;
         if !auth.authenticated || auth.x25519_key_share != Some(parallax_x25519.public) {
             return Err(Safari26TlsError::UnauthenticatedClientHello);
         }
 
-        let mlkem_secret = Zeroizing::new(mlkem_secret.as_bytes().to_vec());
-
         Ok(Safari26TlsSession {
             client_hello,
             parallax_x25519,
-            parallax_x25519_shared_secret: Zeroizing::new(parallax_shared_secret),
+            parallax_x25519_shared_secret: parallax_shared_secret,
             tls_x25519,
             tls_mlkem768_secret: mlkem_secret,
             sni,
@@ -386,16 +399,16 @@ impl Safari26TlsSession {
                 }
                 let (mlkem_ciphertext, server_x25519) =
                     server_hello.key_share.split_at(MLKEM768_CIPHERTEXT_LEN);
-                let ciphertext = mlkem768::Ciphertext::from_bytes(mlkem_ciphertext)
+                let secret = DecapsulationKey::new(&ML_KEM_768, &self.tls_mlkem768_secret)
                     .map_err(|_| Safari26TlsError::MlKem)?;
-                let secret = mlkem768::SecretKey::from_bytes(&self.tls_mlkem768_secret)
+                let mlkem_shared = secret
+                    .decapsulate(Ciphertext::from(mlkem_ciphertext))
                     .map_err(|_| Safari26TlsError::MlKem)?;
-                let mlkem_shared = mlkem768::decapsulate(&ciphertext, &secret);
                 let mut server_public = [0_u8; X25519_KEY_LEN];
                 server_public.copy_from_slice(server_x25519);
                 let x25519_shared = x25519_shared_secret(&self.tls_x25519.private, &server_public);
                 let mut combined = Vec::with_capacity(64);
-                combined.extend_from_slice(mlkem_shared.as_bytes());
+                combined.extend_from_slice(mlkem_shared.as_ref());
                 combined.extend_from_slice(&x25519_shared);
                 Ok(Zeroizing::new(combined))
             }

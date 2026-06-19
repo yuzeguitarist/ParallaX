@@ -385,4 +385,8 @@ ParallaX-DeepWiki/        Interlinked English technical knowledge base
 
 ## License
 
-MIT. See `Cargo.toml`.
+[PolyForm Noncommercial License 1.0.0](LICENSE). Noncommercial use only —
+read, study, run, fork, modify, and contribute freely; **commercial use of any
+kind is not permitted**. Forks and modified versions must stay under this same
+license and must state that they are based on ParallaX. See `LICENSE` for the
+full terms and `NOTICE` for the attribution and noncommercial conditions.
