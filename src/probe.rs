@@ -488,7 +488,6 @@ mod tests {
 
     use crate::config::{ClientConfig, CryptoConfig, Mode, ServerConfig, TrafficConfig, UdpConfig};
     use crate::crypto::mldsa;
-    use crate::crypto::pq;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::path::PathBuf;
 
@@ -668,7 +667,6 @@ mod tests {
     }
 
     fn client_config() -> Config {
-        let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
         let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         Config {
             mode: Mode::Client,
@@ -682,7 +680,6 @@ mod tests {
                 server_addr: "example.com:443".to_owned(),
                 sni: "camouflage.example:443".to_owned(),
                 server_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-                server_pq_public_key,
                 server_identity_public_key,
             }),
             server: None,
@@ -703,7 +700,6 @@ mod tests {
                 fallback_addr: "fallback.example:443".to_owned(),
                 data_target: None,
                 private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-                pq_secret_key: String::new(),
                 identity_secret_key: STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]),
                 replay_cache_path: PathBuf::from("/tmp/parallax-test-replay.cache"),
                 replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,

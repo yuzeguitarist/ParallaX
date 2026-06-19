@@ -496,11 +496,6 @@ pub(crate) fn client_config_fingerprint(client: &ClientConfig) -> String {
     hash_field(&mut hasher, "server_public_key", &client.server_public_key);
     hash_field(
         &mut hasher,
-        "server_pq_public_key",
-        &client.server_pq_public_key,
-    );
-    hash_field(
-        &mut hasher,
         "server_identity_public_key",
         &client.server_identity_public_key,
     );
@@ -544,7 +539,6 @@ mod tests {
                 server_addr: server_addr.to_owned(),
                 sni: "example.com".to_owned(),
                 server_public_key: "server-public".to_owned(),
-                server_pq_public_key: "server-pq-public".to_owned(),
                 server_identity_public_key: "server-identity-public".to_owned(),
             }),
             server: None,
@@ -712,13 +706,6 @@ mod tests {
 
         let mut alt = base.clone();
         alt.client.as_mut().unwrap().server_public_key = "rotated".to_owned();
-        assert_ne!(
-            client_config_fingerprint(alt.client.as_ref().unwrap()),
-            base_id
-        );
-
-        let mut alt = base.clone();
-        alt.client.as_mut().unwrap().server_pq_public_key = "rotated-pq".to_owned();
         assert_ne!(
             client_config_fingerprint(alt.client.as_ref().unwrap()),
             base_id

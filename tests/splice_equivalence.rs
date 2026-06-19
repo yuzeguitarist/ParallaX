@@ -58,8 +58,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use parallax::config::{ServerConfig, TrafficConfig, UdpConfig};
+use parallax::crypto::identity;
 use parallax::crypto::session::X25519KeyPair;
-use parallax::crypto::{identity, pq};
 use parallax::handshake::server;
 
 // ---------------------------------------------------------------------------
@@ -261,7 +261,6 @@ fn untrusting_verifier() -> Arc<dyn ServerCertVerifier> {
 /// validates them. `data_target` is unset: the fallback path ignores it.
 fn fallback_server_config(fallback_addr: SocketAddr) -> ServerConfig {
     let server_keys = X25519KeyPair::generate();
-    let server_pq_keys = pq::keypair();
     let server_identity_keys = identity::keypair();
     // Use a private tempdir (like prober_loop.rs / chaos_liveness.rs) rather than
     // a predictable name in the shared temp dir. The fallback path never opens
@@ -275,7 +274,6 @@ fn fallback_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         fallback_addr: fallback_addr.to_string(),
         data_target: None,
         private_key: STANDARD.encode(server_keys.private),
-        pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
         identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
         replay_cache_path,
         // The fallback path never touches the replay cache; any positive

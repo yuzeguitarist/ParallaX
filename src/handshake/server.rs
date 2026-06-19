@@ -4355,7 +4355,6 @@ mod tests {
                 build_masked_stateful_client_random, derive_client_auth_key,
                 sign_client_hello_session_id,
             },
-            pq,
             session::X25519KeyPair,
         },
         handshake::client::ClientDataSession,
@@ -5831,13 +5830,11 @@ mod tests {
         });
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = identity::keypair();
         let replay_cache_dir = tempfile::tempdir().unwrap();
         let config = authenticated_server_config(
             fallback_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_dir.path().join("parallax-replay.cache"),
         );
@@ -5879,7 +5876,6 @@ mod tests {
         let (target_addr, target_task) = spawn_ping_pong_target().await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = identity::keypair();
         let client_keys = X25519KeyPair::generate();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
@@ -5888,7 +5884,6 @@ mod tests {
         let mut config = authenticated_server_config(
             fallback_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -5941,7 +5936,6 @@ mod tests {
     fn authenticated_server_config(
         fallback_addr: SocketAddr,
         server_keys: &X25519KeyPair,
-        server_pq_keys: &pq::MlKemKeyPair,
         server_identity_keys: &identity::MlDsaKeyPair,
         replay_cache_path: std::path::PathBuf,
     ) -> ServerConfig {
@@ -5950,7 +5944,6 @@ mod tests {
             fallback_addr: fallback_addr.to_string(),
             data_target: None,
             private_key: STANDARD.encode(server_keys.private),
-            pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
             identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
             replay_cache_path,
             replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,

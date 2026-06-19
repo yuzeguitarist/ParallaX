@@ -3099,7 +3099,6 @@ mod tests {
         });
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_config = Arc::new(ClientConfig {
@@ -3107,7 +3106,6 @@ mod tests {
             server_addr: stall_addr.to_string(),
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
-            server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
         });
         let server_addr = ServerAddrResolver::new(&client_config.server_addr)
@@ -3338,7 +3336,6 @@ mod tests {
         let (target_addr, target_task) = spawn_echo_target().await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3346,18 +3343,12 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
         let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
-        let (local_addr, client_task) = spawn_local_client(
-            parallax_addr,
-            &server_keys,
-            &server_pq_keys,
-            &server_identity_keys,
-        )
-        .await;
+        let (local_addr, client_task) =
+            spawn_local_client(parallax_addr, &server_keys, &server_identity_keys).await;
 
         let app = connect_socks_target(local_addr, target_addr).await;
         assert_large_payload_round_trips(app).await;
@@ -3375,7 +3366,6 @@ mod tests {
         let (target_addr, target_task) = spawn_eof_response_target().await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3383,18 +3373,12 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
         let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
-        let (local_addr, client_task) = spawn_local_client(
-            parallax_addr,
-            &server_keys,
-            &server_pq_keys,
-            &server_identity_keys,
-        )
-        .await;
+        let (local_addr, client_task) =
+            spawn_local_client(parallax_addr, &server_keys, &server_identity_keys).await;
 
         let mut app = connect_socks_target(local_addr, target_addr).await;
         app.write_all(b"request-before-half-close").await.unwrap();
@@ -3430,7 +3414,6 @@ mod tests {
         let (target_addr, target_task) = spawn_eof_response_target().await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3438,7 +3421,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -3446,7 +3428,6 @@ mod tests {
         let (local_addr, client_task) = spawn_local_client_with_udp(
             parallax_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             client_udp,
         )
@@ -3488,7 +3469,6 @@ mod tests {
         let (target_addr, target_task) = spawn_eof_response_target().await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3496,7 +3476,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -3509,7 +3488,6 @@ mod tests {
         let (local_addr, client_task) = spawn_local_client_with_udp(
             parallax_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             enabled_udp,
         )
@@ -3555,7 +3533,6 @@ mod tests {
         let (target_addr, target_task) = spawn_echo_target().await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3563,7 +3540,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -3576,7 +3552,6 @@ mod tests {
         let (local_addr, client_task) = spawn_local_client_with_udp(
             parallax_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             enabled_udp,
         )
@@ -3622,7 +3597,6 @@ mod tests {
         let (target_addr, target_task) = spawn_slow_large_response_target(RESPONSE_LEN).await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3630,7 +3604,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -3648,7 +3621,6 @@ mod tests {
         let (local_addr, client_task) = spawn_local_client_with_udp_allow_err(
             parallax_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             enabled_udp,
         )
@@ -3751,7 +3723,6 @@ mod tests {
         let (target_addr, target_task, received_rx) = spawn_slow_reader_target(UPLOAD_LEN).await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3759,7 +3730,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -3772,7 +3742,6 @@ mod tests {
         let (local_addr, client_task) = spawn_local_client_with_udp(
             parallax_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             enabled_udp,
         )
@@ -3892,7 +3861,6 @@ mod tests {
         let (target_addr, target_task) = spawn_fast_large_response_target(DOWNLOAD_LEN).await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3900,7 +3868,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -3913,7 +3880,6 @@ mod tests {
         let (local_addr, client_task) = spawn_local_client_with_udp(
             parallax_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             enabled_udp,
         )
@@ -3982,7 +3948,6 @@ mod tests {
         let (target_addr, target_task) = spawn_multi_echo_target(2).await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -3990,7 +3955,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -4000,14 +3964,8 @@ mod tests {
         };
         let (parallax_addr, server_task) =
             spawn_parallax_server_with_traffic(server_config, mux_traffic).await;
-        let (local_addr, client_task) = spawn_mux_local_client(
-            parallax_addr,
-            &server_keys,
-            &server_pq_keys,
-            &server_identity_keys,
-            2,
-        )
-        .await;
+        let (local_addr, client_task) =
+            spawn_mux_local_client(parallax_addr, &server_keys, &server_identity_keys, 2).await;
 
         let app_one = connect_socks_target(local_addr, target_addr).await;
         let app_two = connect_socks_target(local_addr, target_addr).await;
@@ -4035,7 +3993,6 @@ mod tests {
         let (target_addr, target_task) = spawn_echo_target().await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -4043,7 +4000,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -4055,14 +4011,8 @@ mod tests {
         };
         let (parallax_addr, server_task) =
             spawn_parallax_server_with_traffic(server_config, mux_traffic).await;
-        let (local_addr, client_task) = spawn_mux_local_client(
-            parallax_addr,
-            &server_keys,
-            &server_pq_keys,
-            &server_identity_keys,
-            1,
-        )
-        .await;
+        let (local_addr, client_task) =
+            spawn_mux_local_client(parallax_addr, &server_keys, &server_identity_keys, 1).await;
 
         let app = connect_socks_target(local_addr, target_addr).await;
         let (mut app_read, mut app_write) = app.into_split();
@@ -4129,7 +4079,6 @@ mod tests {
         let (target_addr, target_task) = spawn_multi_echo_target(STREAMS).await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let _replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
@@ -4137,7 +4086,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -4147,14 +4095,9 @@ mod tests {
         };
         let (parallax_addr, server_task) =
             spawn_parallax_server_with_traffic(server_config, mux_traffic).await;
-        let (local_addr, client_task) = spawn_mux_local_client(
-            parallax_addr,
-            &server_keys,
-            &server_pq_keys,
-            &server_identity_keys,
-            STREAMS,
-        )
-        .await;
+        let (local_addr, client_task) =
+            spawn_mux_local_client(parallax_addr, &server_keys, &server_identity_keys, STREAMS)
+                .await;
 
         let mut apps = Vec::with_capacity(STREAMS);
         for _ in 0..STREAMS {
@@ -4292,7 +4235,6 @@ mod tests {
         let (target_addr, target_task) = spawn_multi_echo_target(params.streams).await;
 
         let server_keys = X25519KeyPair::generate();
-        let server_pq_keys = pq::keypair();
         let server_identity_keys = crate::crypto::identity::keypair();
         let replay_cache_dir = tempfile::tempdir().unwrap();
         let replay_cache_path = replay_cache_dir.path().join("parallax-replay.cache");
@@ -4300,7 +4242,6 @@ mod tests {
             fallback_addr,
             target_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             replay_cache_path,
         );
@@ -4313,7 +4254,6 @@ mod tests {
         let (local_addr, client_task) = spawn_mux_local_client(
             parallax_addr,
             &server_keys,
-            &server_pq_keys,
             &server_identity_keys,
             params.streams,
         )
@@ -4568,7 +4508,6 @@ mod tests {
         fallback_addr: SocketAddr,
         target_addr: SocketAddr,
         server_keys: &X25519KeyPair,
-        server_pq_keys: &pq::MlKemKeyPair,
         server_identity_keys: &identity::MlDsaKeyPair,
         replay_cache_path: std::path::PathBuf,
     ) -> ServerConfig {
@@ -4577,7 +4516,6 @@ mod tests {
             fallback_addr: fallback_addr.to_string(),
             data_target: Some(target_addr.to_string()),
             private_key: STANDARD.encode(server_keys.private),
-            pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
             identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
             replay_cache_path,
             replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
@@ -4644,7 +4582,6 @@ mod tests {
     async fn spawn_mux_local_client(
         parallax_addr: SocketAddr,
         server_keys: &X25519KeyPair,
-        server_pq_keys: &pq::MlKemKeyPair,
         server_identity_keys: &identity::MlDsaKeyPair,
         stream_count: usize,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -4655,7 +4592,6 @@ mod tests {
             server_addr: parallax_addr.to_string(),
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
-            server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
         });
         let traffic = TrafficConfig {
@@ -4697,13 +4633,11 @@ mod tests {
     async fn spawn_local_client(
         parallax_addr: SocketAddr,
         server_keys: &X25519KeyPair,
-        server_pq_keys: &pq::MlKemKeyPair,
         server_identity_keys: &identity::MlDsaKeyPair,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         spawn_local_client_with_udp(
             parallax_addr,
             server_keys,
-            server_pq_keys,
             server_identity_keys,
             UdpConfig::default(),
         )
@@ -4713,7 +4647,6 @@ mod tests {
     async fn spawn_local_client_with_udp(
         parallax_addr: SocketAddr,
         server_keys: &X25519KeyPair,
-        server_pq_keys: &pq::MlKemKeyPair,
         server_identity_keys: &identity::MlDsaKeyPair,
         udp: UdpConfig,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -4724,7 +4657,6 @@ mod tests {
             server_addr: parallax_addr.to_string(),
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
-            server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
         };
         let server_public_key = server_keys.public;
@@ -4751,7 +4683,6 @@ mod tests {
     async fn spawn_local_client_with_udp_allow_err(
         parallax_addr: SocketAddr,
         server_keys: &X25519KeyPair,
-        server_pq_keys: &pq::MlKemKeyPair,
         server_identity_keys: &identity::MlDsaKeyPair,
         udp: UdpConfig,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -4762,7 +4693,6 @@ mod tests {
             server_addr: parallax_addr.to_string(),
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
-            server_pq_public_key: STANDARD.encode(&server_pq_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
         };
         let server_public_key = server_keys.public;

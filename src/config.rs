@@ -5,7 +5,6 @@ use std::{
 };
 
 use crate::crypto::mldsa;
-use crate::crypto::pq;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
 use thiserror::Error;
@@ -155,8 +154,6 @@ pub struct ClientConfig {
     pub server_addr: String,
     pub sni: String,
     pub server_public_key: String,
-    #[serde(default)]
-    pub server_pq_public_key: String,
     pub server_identity_public_key: String,
 }
 
@@ -168,8 +165,6 @@ pub struct ServerConfig {
     #[serde(default)]
     pub data_target: Option<String>,
     pub private_key: String,
-    #[serde(default)]
-    pub pq_secret_key: String,
     pub identity_secret_key: String,
     #[serde(default = "default_replay_cache_path")]
     pub replay_cache_path: PathBuf,
@@ -407,7 +402,7 @@ impl UdpConfig {
 /// `toml::de::Error`'s `Display` (which renders the source line via toml_edit),
 /// its retained raw-document copy, OR its `message()` reach stderr/logs: config
 /// lines carry long-lived secrets (`crypto.psk`, `server.private_key`,
-/// `pq_secret_key`, `identity_secret_key`), and `message()` is NOT value-free —
+/// `identity_secret_key`), and `message()` is NOT value-free —
 /// a type-mismatch (e.g. a secret string pasted onto a numeric field) yields
 /// `invalid type: string "<the secret>", expected usize`. So we drop the message
 /// entirely and report only the position; the operator finds the typo by line.
@@ -444,12 +439,6 @@ impl Config {
                 "config.server.private_key",
                 server.private_key.as_bytes(),
             );
-            if !server.pq_secret_key.is_empty() {
-                crate::process_hardening::protect_secret_bytes(
-                    "config.server.pq_secret_key",
-                    server.pq_secret_key.as_bytes(),
-                );
-            }
             crate::process_hardening::protect_secret_bytes(
                 "config.server.identity_secret_key",
                 server.identity_secret_key.as_bytes(),
@@ -483,13 +472,6 @@ impl Config {
                 require_host_port("client.server_addr", &client.server_addr)?;
                 require_non_empty("client.sni", &client.sni)?;
                 decode_key32("client.server_public_key", &client.server_public_key)?;
-                if !client.server_pq_public_key.is_empty() {
-                    decode_base64_bytes_exact(
-                        "client.server_pq_public_key",
-                        &client.server_pq_public_key,
-                        pq::public_key_bytes(),
-                    )?;
-                }
                 decode_base64_bytes_exact(
                     "client.server_identity_public_key",
                     &client.server_identity_public_key,
@@ -503,13 +485,6 @@ impl Config {
                     require_host_port("server.data_target", data_target)?;
                 }
                 decode_key32_secret("server.private_key", &server.private_key)?;
-                if !server.pq_secret_key.is_empty() {
-                    decode_base64_secret_exact(
-                        "server.pq_secret_key",
-                        &server.pq_secret_key,
-                        pq::secret_key_bytes(),
-                    )?;
-                }
                 decode_base64_secret_exact(
                     "server.identity_secret_key",
                     &server.identity_secret_key,
@@ -900,7 +875,6 @@ mod tests {
 
     #[test]
     fn validates_client_config() {
-        let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
         let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let raw = format!(
             r#"
@@ -914,7 +888,6 @@ listen = "127.0.0.1:1080"
 server_addr = "example.com:443"
 sni = "example.com"
 server_public_key = "{KEY}"
-server_pq_public_key = "{server_pq_public_key}"
 server_identity_public_key = "{server_identity_public_key}"
 "#
         );
@@ -923,7 +896,7 @@ server_identity_public_key = "{server_identity_public_key}"
     }
 
     #[test]
-    fn validates_configs_without_legacy_static_pq_keys() {
+    fn validates_client_and_server_configs() {
         let identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
         let client_raw = format!(
@@ -1278,7 +1251,6 @@ listen = "0.0.0.0:1080"
 server_addr = "example.com:443"
 sni = "example.com"
 server_public_key = "{KEY}"
-server_pq_public_key = "{KEY}"
 server_identity_public_key = "{KEY}"
 "#
         );
@@ -1453,7 +1425,6 @@ authorized_sni = ["example.com"]
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client.toml");
-        let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
         let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
         let raw = format!(
             r#"
@@ -1467,7 +1438,6 @@ listen = "127.0.0.1:1080"
 server_addr = "example.com:443"
 sni = "example.com"
 server_public_key = "{KEY}"
-server_pq_public_key = "{server_pq_public_key}"
 server_identity_public_key = "{server_identity_public_key}"
 "#
         );
@@ -1538,18 +1508,21 @@ authorized_sni = ["example.com"]
     }
 
     #[test]
-    fn rejects_wrong_pq_key_length_during_validation() {
-        let err =
-            decode_base64_bytes_exact("client.server_pq_public_key", KEY, pq::public_key_bytes())
-                .unwrap_err();
+    fn rejects_wrong_identity_key_length_during_validation() {
+        let err = decode_base64_bytes_exact(
+            "client.server_identity_public_key",
+            KEY,
+            mldsa::public_key_bytes(),
+        )
+        .unwrap_err();
         match err {
             ConfigError::InvalidBytesLen {
                 field,
                 expected,
                 actual,
             } => {
-                assert_eq!(field, "client.server_pq_public_key");
-                assert_eq!(expected, pq::public_key_bytes());
+                assert_eq!(field, "client.server_identity_public_key");
+                assert_eq!(expected, mldsa::public_key_bytes());
                 assert_eq!(actual, 32);
             }
             other => panic!("unexpected error: {other:?}"),

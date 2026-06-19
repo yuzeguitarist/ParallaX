@@ -33,7 +33,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use parallax::config::{ServerConfig, TrafficConfig, UdpConfig};
-use parallax::crypto::{identity, pq, session::X25519KeyPair};
+use parallax::crypto::{identity, session::X25519KeyPair};
 use parallax::handshake::server;
 
 const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
@@ -56,7 +56,6 @@ const REAL_CLIENT_HELLO: &[u8] = include_bytes!("fixtures/safari26_apple_com_cli
 /// `tests/prober_loop.rs` / `src/client/runtime.rs` tests.
 fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
     let server_keys = X25519KeyPair::generate();
-    let server_pq_keys = pq::keypair();
     let server_identity_keys = identity::keypair();
     let replay_dir = tempfile::tempdir().unwrap();
     let replay_cache_path = replay_dir.path().join("parallax-replay.cache");
@@ -69,7 +68,6 @@ fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         fallback_addr: fallback_addr.to_string(),
         data_target: None,
         private_key: STANDARD.encode(server_keys.private),
-        pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
         identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
         replay_cache_path,
         replay_cache_capacity: 49_152,

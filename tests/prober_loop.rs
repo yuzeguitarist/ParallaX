@@ -68,8 +68,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use parallax::config::{ServerConfig, TrafficConfig, UdpConfig};
+use parallax::crypto::identity;
 use parallax::crypto::session::X25519KeyPair;
-use parallax::crypto::{identity, pq};
 use parallax::handshake::server;
 use parallax::tls::server_hello::parse_server_hello;
 
@@ -214,7 +214,6 @@ async fn spawn_fallback_origin() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 
 fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
     let server_keys = X25519KeyPair::generate();
-    let server_pq_keys = pq::keypair();
     let server_identity_keys = identity::keypair();
     let replay_dir = tempfile::tempdir().unwrap();
     let replay_cache_path = replay_dir.path().join("parallax-replay.cache");
@@ -230,7 +229,6 @@ fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         // takes the fallback splice before data mode is ever reached.
         data_target: None,
         private_key: STANDARD.encode(server_keys.private),
-        pq_secret_key: STANDARD.encode(&server_pq_keys.secret),
         identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
         replay_cache_path,
         // DEFAULT_REPLAY_CACHE_CAPACITY is pub(crate); a literal is fine since
