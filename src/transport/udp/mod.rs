@@ -157,13 +157,30 @@ impl CertDecompressor for Flate2ZlibCertDecompressor {
 /// outbound target connect before the relay's first stream byte; keep-alive PING
 /// frames keep it (and any NAT binding) alive across that gap without traffic.
 ///
-/// The connection advertises `max_idle_timeout = 0` (the confirmed Safari value;
-/// see `safari_crypto.rs`) and quinn is set to `max_idle_timeout(None)` to MATCH —
-/// so there is no advertised-vs-actual idle-timeout gap. With the idle timeout
-/// disabled, connection liveness rests on this keep-alive: a vanished peer's
-/// unacknowledged PINGs drive quinn's loss detection to close the connection.
-/// quinn defaults keep-alive to None (off).
+/// This must stay comfortably below [`UDP_LOCAL_IDLE_TIMEOUT`] so a healthy idle
+/// connection keeps refreshing the local idle timer and is never reaped. quinn
+/// defaults keep-alive to None (off).
 const UDP_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// LOCAL idle-timeout backstop for reaping a black-holed connection.
+///
+/// This is the only transport-level connection reaper: quinn-proto 0.11 loss
+/// detection on a vanished peer only PTO-retransmits the unacknowledged
+/// keep-alive PINGs — it does NOT terminate the connection — so without an idle
+/// timeout a peer that silently disappears would pin its connection and up to
+/// `conn_window` (16 MiB) of receive buffers forever. A generous 60 s timeout
+/// reclaims those resources well after [`UDP_KEEP_ALIVE_INTERVAL`] (15 s) has had
+/// several chances to refresh a live connection.
+///
+/// CRITICAL — this is purely LOCAL and does NOT change the on-wire advertised
+/// value. The Safari-26 H3 wire shape advertises `max_idle_timeout = 0` (the
+/// confirmed CFNetwork value), and that 0 is emitted by the hand-encoded `0x39`
+/// blob in `safari_crypto.rs` (`start_session` substitutes our blob for quinn's
+/// `params.write()`), so quinn's config value here never reaches the wire — it
+/// only drives quinn's local idle timer. The advertised `0` (no peer-negotiated
+/// idle timeout) and this locally-enforced backstop are independent: the peer
+/// sees Safari fidelity while this endpoint still reaps a dead connection.
+const UDP_LOCAL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Flow-control windows for the fast-plane relay's single reliable stream.
 ///
@@ -178,10 +195,17 @@ const UDP_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// The connection window (16 MiB) is larger than the per-stream window (2 MiB),
 /// matching real Safari/Chrome H3 (connection > stream); a single shared window
 /// would emit all four flow-control params equal, a shape no browser sends.
-/// WARNING: before enabling the UDP plane, add a global concurrent-QUIC-relay cap —
-/// aggregate worst-case un-drained buffer is conn_window x the 16384 connection
-/// limit if authenticated peers stall their read side (cf. the kernel-splice relay
-/// cap).
+///
+/// HARD PRE-ENABLE GATE — DoS surface. BEFORE setting `[udp].enabled = true` in
+/// production, a global concurrent-QUIC-relay cap (analogous to the TCP carrier's
+/// kernel-splice relay cap, `MAX_CONCURRENT_KERNEL_SPLICE_RELAYS`) is REQUIRED.
+/// This is the DoS surface: the relay endpoint grants each authenticated peer a
+/// `conn_window` (16 MiB) connection-level receive window, and a peer that stalls
+/// its read side can pin that full window; with no global cap the aggregate
+/// worst-case un-drained buffer is 16 MiB x the 16384 per-endpoint connection
+/// limit (~256 GiB). The local idle-timeout backstop ([`UDP_LOCAL_IDLE_TIMEOUT`])
+/// reaps a black-holed peer but does NOT bound concurrent live stallers; only a
+/// concurrency cap does.
 const UDP_STREAM_RECV_WINDOW: u32 = safari_crypto::SAFARI_TP_INITIAL_MAX_STREAM_DATA as u32;
 const UDP_CONN_RECV_WINDOW: u32 = safari_crypto::SAFARI_TP_INITIAL_MAX_DATA as u32;
 
@@ -202,22 +226,35 @@ const UDP_CONN_RECV_WINDOW: u32 = safari_crypto::SAFARI_TP_INITIAL_MAX_DATA as u
 ///   server `accept_bi`). The server emits its own quinn transport params (not the
 ///   Safari blob), so it is not bound to the client's advertised bidi value.
 ///
-/// `max_idle_timeout(None)` matches the advertised `max_idle_timeout = 0`; liveness
-/// rests on the keep-alive (see [`UDP_KEEP_ALIVE_INTERVAL`]).
+/// The advertised `max_idle_timeout = 0` (Safari fidelity) is emitted by the
+/// hand-encoded `0x39` blob in `safari_crypto.rs`, NOT from quinn's config, so
+/// this function sets a LOCAL idle-timeout backstop ([`UDP_LOCAL_IDLE_TIMEOUT`])
+/// to reap a black-holed connection without changing the wire value; liveness of
+/// a healthy connection rests on the keep-alive (see [`UDP_KEEP_ALIVE_INTERVAL`]).
 fn udp_transport_config(peer_bidi: u32) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    // Advertise/enforce no idle timeout (Safari's value 0); keep-alive keeps the
-    // retained connection alive across the probe -> accept_bi/open_bi gap.
-    transport.max_idle_timeout(None);
+    // LOCAL idle-timeout backstop ONLY: the wire advertises max_idle_timeout = 0
+    // (Safari's value), hand-encoded in safari_crypto.rs independently of this
+    // config, so this value never reaches the peer — it just lets quinn reap a
+    // vanished peer's connection (loss detection alone never would; see
+    // UDP_LOCAL_IDLE_TIMEOUT). Keep-alive refreshes the timer for a live
+    // connection across the probe -> accept_bi/open_bi gap.
+    transport.max_idle_timeout(Some(
+        UDP_LOCAL_IDLE_TIMEOUT
+            .try_into()
+            .expect("60s fits a QUIC idle-timeout VarInt"),
+    ));
     transport.keep_alive_interval(Some(UDP_KEEP_ALIVE_INTERVAL));
 
     // Stream limits and flow-control windows EQUAL the advertised Safari values:
     // bidi grant per the `peer_bidi` asymmetry above; uni = 8
     // (`initial_max_streams_uni`); per-stream window 2 MiB; connection window
-    // 16 MiB. The relay never opens uni streams (the probe uses unreliable
-    // datagrams), so granting the advertised 8 uni is bounded by the 2 MiB
-    // per-uni-stream window under the 16 MiB connection window; send_window matches
-    // the connection window so the sender is not the bottleneck.
+    // 16 MiB. The uni = 8 grant is Safari-faithful but UNUSED by the relay, which
+    // carries its payload over a single client-initiated BIDI stream and uses
+    // unreliable datagrams (not uni streams) for the probe — it is advertised only
+    // so the wire matches Safari. Granting the advertised 8 uni is bounded by the
+    // 2 MiB per-uni-stream window under the 16 MiB connection window; send_window
+    // matches the connection window so the sender is not the bottleneck.
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(peer_bidi));
     transport.max_concurrent_uni_streams(
         quinn::VarInt::from_u64(safari_crypto::SAFARI_TP_MAX_STREAMS_UNI)

@@ -86,8 +86,9 @@ codegen-units = 1
 # in vendor/rustls/src/client/hs.rs cannot be controlled via a CryptoProvider).
 # Pinned =0.23.40 to stay lockstep with quinn-proto 0.11.14's Quic*Config; the
 # crate name `rustls` is kept so quinn-proto's blanket PacketKey impls still
-# apply. S0 vendors it UNMODIFIED (build must stay byte-identical); the surgical
-# CH change lands in a later slice. Upstream rustls CVEs/patches must be
-# re-applied to the vendored copy.
+# apply. The fork delta (6 files), pin lockstep, re-apply procedure, and RUSTSEC
+# tracking are documented in vendor/rustls/PARALLAX_FORK.md. Upstream rustls
+# CVEs/patches must be re-applied to the vendored copy (cargo audit does NOT flag
+# a path-patched dependency).
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }

@@ -325,11 +325,15 @@ fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {
     }
 }
 
-/// `initial_max_data` (0x04) — the SINGLE runtime-read transport-param value in
-/// the Safari-26 H3 blob. The confirmed spec ties it to the connection-level
-/// receive window; 16 MiB matches CFNetwork/libquic. quinn's real
-/// `udp_transport_config` advertises the same number so the wire bytes EQUAL the
-/// enforced behaviour (no advertised-vs-actual gap).
+/// `initial_max_data` (0x04) — the connection-level receive window. This is a
+/// FIXED const (NOT read back from quinn's blob at runtime): the spec ties it to
+/// the connection-level window and 16 MiB matches CFNetwork/libquic. The only ids
+/// actually read back from quinn's `params.write()` output are
+/// `initial_source_connection_id` (0x0f, the dynamic SCID) and
+/// `max_datagram_frame_size` (0x20); every other id (this one included) carries a
+/// confirmed fixed value. quinn's real `udp_transport_config` advertises the same
+/// number so the wire bytes EQUAL the enforced behaviour (no advertised-vs-actual
+/// gap).
 pub(crate) const SAFARI_TP_INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
 
 /// Per-stream flow-control window (0x05/0x06/0x07) — 2 MiB each, the confirmed
@@ -395,7 +399,7 @@ const SAFARI_TP_IDS: [u64; 11] = [
     0x07, // initial_max_stream_data_uni = 2 MiB
     0x08, // initial_max_streams_bidi = 0
     0x09, // initial_max_streams_uni = 8
-    0x0e, // active_connection_id_limit (quinn's 2; see SAFARI_TP_ACTIVE_CID_LIMIT)
+    0x0e, // active_connection_id_limit = 5 (SAFARI_TP_ACTIVE_CID_LIMIT; quinn CidQueue::LEN)
     0x0f, // initial_source_connection_id (REAL, server-validated)
     0x20, // max_datagram_frame_size (datagrams used by the probe; quinn's value)
 ];
@@ -424,11 +428,12 @@ fn safari_tp_value_for_id(id: u64) -> Option<u64> {
 /// `varint(id) || varint(len) || value`, then appends the vendor/GREASE codepoint
 /// [`SAFARI_TP_VENDOR_GREASE_ID`] (value 0) last. The standard params carry the
 /// CONFIRMED Safari values from [`safari_tp_value_for_id`] (these CAP QUIC
-/// throughput at Safari's level — exceeding Safari is detectable). The ONLY value
-/// read at runtime is `initial_source_connection_id` (0x0f): it MUST be the genuine
-/// source CID quinn chose, read back from quinn's own `params.write()` output (the
-/// only public accessor — quinn keeps every `TransportParameters` field
-/// `pub(crate)`), or the server rejects the handshake with a
+/// throughput at Safari's level — exceeding Safari is detectable). The values read
+/// back at runtime from quinn's own `params.write()` output are
+/// `initial_source_connection_id` (0x0f) and `max_datagram_frame_size` (0x20) —
+/// that output is the only public accessor, since quinn keeps every
+/// `TransportParameters` field `pub(crate)`. The 0x0f value MUST be the genuine
+/// source CID quinn chose, or the server rejects the handshake with a
 /// `TRANSPORT_PARAMETER_ERROR`.
 ///
 /// quinn's real `udp_transport_config` is aligned to the SAME advertised values
