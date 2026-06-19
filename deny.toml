@@ -12,14 +12,15 @@
 # silence future/different advisories on the same crate, so the gate still bites
 # if any of these ever gets a real CVE.
 ignore = [
-  # The pqcrypto stack wraps PQClean (C), which upstream is archiving (~2026-07),
-  # so RustSec marks it unmaintained. It is ParallaX's core PQ crypto
-  # (ML-KEM-1024 + ML-DSA-87) and has no drop-in replacement; the migration
-  # target is the pure-Rust `ml-kem` / `ml-dsa` crates, tracked separately.
-  "RUSTSEC-2026-0161",  # pqcrypto-mlkem unmaintained
-  "RUSTSEC-2026-0162",  # pqcrypto-traits unmaintained
-  "RUSTSEC-2026-0163",  # pqcrypto-mldsa unmaintained
-  "RUSTSEC-2026-0166",  # pqcrypto-internals unmaintained
+  # pqcrypto-mldsa/-traits/-internals remain ONLY as the dev-dependency
+  # differential-test oracle for the hand-rolled crypto::mldsa (production
+  # ML-DSA-87 is in-crate; ML-KEM is now aws-lc-rs). Upstream PQClean is archiving
+  # (~2026-07) so RustSec marks them unmaintained — accepted because they are
+  # test-only now. (pqcrypto-mlkem was removed, so its RUSTSEC-2026-0161 ignore
+  # went with it.)
+  "RUSTSEC-2026-0162",  # pqcrypto-traits unmaintained (dev-only oracle)
+  "RUSTSEC-2026-0163",  # pqcrypto-mldsa unmaintained (dev-only oracle)
+  "RUSTSEC-2026-0166",  # pqcrypto-internals unmaintained (dev-only oracle)
   # `paste` (transitive proc-macro helper) is unmaintained but feature-complete
   # and has no maintained drop-in; widely accepted as ignored.
   "RUSTSEC-2024-0436",  # paste unmaintained
