@@ -98,8 +98,11 @@ pub enum MlDsaError {
 /// (FIPS 204 Alg 1 `ML-DSA.KeyGen`). Returns `(public_key, secret_key)` as byte
 /// vectors of length [`PUBLICKEY_BYTES`] / [`SECRETKEY_BYTES`].
 pub fn keypair() -> (Vec<u8>, Vec<u8>) {
-    let (pk, sk) = sign::keypair();
-    (pk.to_vec(), sk.to_vec())
+    let (pk, mut sk) = sign::keypair();
+    let sk_vec = sk.to_vec();
+    // Scrub the on-stack secret-key array; only the returned Vec should carry it.
+    sk.zeroize();
+    (pk.to_vec(), sk_vec)
 }
 
 /// Sign `msg` under context `ctx` with the bit-packed secret key `sk`, hedged

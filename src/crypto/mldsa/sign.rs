@@ -219,6 +219,7 @@ pub fn signature_ctx(
         z.reduce();
         if z.chknorm(GAMMA1_MINUS_BETA) {
             y.zeroize();
+            z.zeroize();
             continue;
         }
 

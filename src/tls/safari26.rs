@@ -261,11 +261,13 @@ impl Safari26TlsCamouflage {
             .map_err(|_| Safari26TlsError::MlKem)?
             .as_ref()
             .to_vec();
-        let mlkem_secret = mlkem_dk
-            .key_bytes()
-            .map_err(|_| Safari26TlsError::MlKem)?
-            .as_ref()
-            .to_vec();
+        let mlkem_secret = Zeroizing::new(
+            mlkem_dk
+                .key_bytes()
+                .map_err(|_| Safari26TlsError::MlKem)?
+                .as_ref()
+                .to_vec(),
+        );
         let mut grease_seed = [0_u8; 5];
         OsRng.fill_bytes(&mut grease_seed);
         let grease = GreaseSet::from_seed(grease_seed);
@@ -289,8 +291,6 @@ impl Safari26TlsCamouflage {
         if !auth.authenticated || auth.x25519_key_share != Some(parallax_x25519.public) {
             return Err(Safari26TlsError::UnauthenticatedClientHello);
         }
-
-        let mlkem_secret = Zeroizing::new(mlkem_secret);
 
         Ok(Safari26TlsSession {
             client_hello,

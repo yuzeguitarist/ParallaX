@@ -44,6 +44,12 @@ pub fn shake256(out: &mut [u8], inputs: &[&[u8]]) {
     }
     let mut reader = h.finalize_xof();
     reader.read(out);
+    // `sha3`'s `zeroize` feature makes `Sha3State` (the [u64;25] Keccak sponge)
+    // ZeroizeOnDrop; both `h` and `reader` (which owns the post-finalize
+    // Sha3State) scrub it on drop, so secret-derived absorbed material — e.g.
+    // `key`/`rnd` in the rhoprime derivation — leaves no sponge residue here.
+    // (Source secrets are also zeroized at their bindings; squeezed output is
+    // captured into Zeroizing buffers by callers.)
 }
 
 /// One-shot SHAKE128: absorb each slice in `inputs` (in order), then squeeze
