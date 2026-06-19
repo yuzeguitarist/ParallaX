@@ -346,12 +346,13 @@ pub fn configure_congestion_control(algorithm: Option<&str>) {
 
 #[cfg(target_os = "linux")]
 fn set_low_latency_congestion(stream: &TcpStream) {
-    use rustix::net::sockopt::{set_tcp_congestion, tcp_congestion};
+    use socket2::SockRef;
 
     let configured = CONGESTION_OVERRIDE.get().and_then(|opt| opt.clone());
     let algorithm = configured.unwrap_or_else(|| "bbr".to_owned());
 
-    if set_tcp_congestion(stream, &algorithm).is_err() {
+    let sock = SockRef::from(stream);
+    if sock.set_tcp_congestion(algorithm.as_bytes()).is_err() {
         tracing::trace!(
             algorithm = %algorithm,
             "TCP congestion control request failed; keeping kernel default"
@@ -360,13 +361,17 @@ fn set_low_latency_congestion(stream: &TcpStream) {
     }
     // Read back: the kernel silently ignores an unknown/unloaded algorithm, so a
     // successful set does not mean it was applied. Warn on mismatch so a
-    // configured algorithm the kernel dropped does not silently lie.
-    if let Ok(applied) = tcp_congestion(stream) {
-        let applied = applied.trim_end_matches('\0');
-        if applied != algorithm {
+    // configured algorithm the kernel dropped does not silently lie. Use socket2's
+    // getter, which returns raw bytes and never panics; rustix's tcp_congestion()
+    // asserts + unwraps on a malformed reply, which this best-effort diagnostic
+    // must not do.
+    if let Ok(applied) = sock.tcp_congestion() {
+        // Kernel returns the name NUL-padded; compare up to the first NUL.
+        let applied = applied.split(|&b| b == 0).next().unwrap_or(&[]);
+        if applied != algorithm.as_bytes() {
             tracing::warn!(
                 requested = %algorithm,
-                applied = %applied,
+                applied = %String::from_utf8_lossy(applied),
                 "kernel did not apply the requested TCP congestion control (algorithm not loaded?)"
             );
         }
@@ -455,6 +460,8 @@ fn set_incoming_cpu<S>(socket: &S)
 where
     S: std::os::fd::AsFd,
 {
+    // rustix sched_getcpu() returns usize (no error sentinel) and does not fail on
+    // Linux; a bogus value would just make the setsockopt below a no-op.
     let cpu = rustix::thread::sched_getcpu();
     if rustix::net::sockopt::set_socket_incoming_cpu(socket, cpu as u32).is_err() {
         tracing::trace!("SO_INCOMING_CPU is unavailable; keeping kernel default");
