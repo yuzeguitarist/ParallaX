@@ -487,9 +487,9 @@ mod tests {
     }
 
     use crate::config::{ClientConfig, CryptoConfig, Mode, ServerConfig, TrafficConfig, UdpConfig};
+    use crate::crypto::pq;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use pqcrypto_mldsa::mldsa87;
-    use pqcrypto_mlkem::mlkem1024;
     use std::path::PathBuf;
 
     #[test]
@@ -668,7 +668,7 @@ mod tests {
     }
 
     fn client_config() -> Config {
-        let server_pq_public_key = STANDARD.encode(vec![0_u8; mlkem1024::public_key_bytes()]);
+        let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
         let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
         Config {
             mode: Mode::Client,

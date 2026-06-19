@@ -27,7 +27,6 @@ hkdf = "0.12"
 hmac = "0.12"
 libc = "0.2"
 rand = "0.8"
-pqcrypto-mlkem = "0.1"
 pqcrypto-mldsa = "0.1.2"
 pqcrypto-traits = "0.3"
 # QUIC fast-plane (TUDP) data path. quinn 0.11 exposes no aws-lc-rs backend for

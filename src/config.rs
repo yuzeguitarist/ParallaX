@@ -4,9 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::crypto::pq;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use pqcrypto_mldsa::mldsa87;
-use pqcrypto_mlkem::mlkem1024;
 use serde::Deserialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -487,7 +487,7 @@ impl Config {
                     decode_base64_bytes_exact(
                         "client.server_pq_public_key",
                         &client.server_pq_public_key,
-                        mlkem1024::public_key_bytes(),
+                        pq::public_key_bytes(),
                     )?;
                 }
                 decode_base64_bytes_exact(
@@ -507,7 +507,7 @@ impl Config {
                     decode_base64_secret_exact(
                         "server.pq_secret_key",
                         &server.pq_secret_key,
-                        mlkem1024::secret_key_bytes(),
+                        pq::secret_key_bytes(),
                     )?;
                 }
                 decode_base64_secret_exact(
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn validates_client_config() {
-        let server_pq_public_key = STANDARD.encode(vec![0_u8; mlkem1024::public_key_bytes()]);
+        let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
         let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
         let raw = format!(
             r#"
@@ -1453,7 +1453,7 @@ authorized_sni = ["example.com"]
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client.toml");
-        let server_pq_public_key = STANDARD.encode(vec![0_u8; mlkem1024::public_key_bytes()]);
+        let server_pq_public_key = STANDARD.encode(vec![0_u8; pq::public_key_bytes()]);
         let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa87::public_key_bytes()]);
         let raw = format!(
             r#"
@@ -1539,12 +1539,9 @@ authorized_sni = ["example.com"]
 
     #[test]
     fn rejects_wrong_pq_key_length_during_validation() {
-        let err = decode_base64_bytes_exact(
-            "client.server_pq_public_key",
-            KEY,
-            mlkem1024::public_key_bytes(),
-        )
-        .unwrap_err();
+        let err =
+            decode_base64_bytes_exact("client.server_pq_public_key", KEY, pq::public_key_bytes())
+                .unwrap_err();
         match err {
             ConfigError::InvalidBytesLen {
                 field,
@@ -1552,7 +1549,7 @@ authorized_sni = ["example.com"]
                 actual,
             } => {
                 assert_eq!(field, "client.server_pq_public_key");
-                assert_eq!(expected, mlkem1024::public_key_bytes());
+                assert_eq!(expected, pq::public_key_bytes());
                 assert_eq!(actual, 32);
             }
             other => panic!("unexpected error: {other:?}"),
