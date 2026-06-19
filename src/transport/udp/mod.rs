@@ -1,9 +1,8 @@
 //! UDP fast-plane transport (the "U" in TUDP).
 //!
 //! Provides the QUIC endpoint building blocks for the masquerading HTTP/3 face on
-//! UDP: a QUIC connection, bidirectional unreliable datagrams (RFC 9221) used by
-//! the reachability probe, and RFC 5705 keying-material export backing the
-//! exporter-bound UDP auth token.
+//! UDP: a QUIC connection, a uni-stream round-trip used by the reachability probe,
+//! and RFC 5705 keying-material export backing the exporter-bound UDP auth token.
 //!
 //! Wired into the client/server runtimes for the single-Connect data relay: when
 //! `[udp].enabled` is set on both ends and the client's probe is Verified, the
@@ -17,6 +16,11 @@ pub mod endpoint;
 pub(crate) mod envelope;
 pub mod probe;
 pub(crate) mod reorder;
+/// Safari-26 H3 QUIC ClientHello carrier (S2). This is now the DEFAULT QUIC
+/// client backend (S6): `client_config` drives the Safari Session so the
+/// emitted ClientHello is byte/structurally indistinguishable from Safari-26 H3.
+/// The QUIC plane itself is gated at the config level (`[udp].enabled = false`).
+pub mod safari_crypto;
 
 /// Fuzz-only re-exports of the internal TUDP wire parsers. Compiled ONLY under
 /// `--cfg fuzzing` (which cargo-fuzz sets); absent from normal `cargo build` /
@@ -81,85 +85,194 @@ pub mod fuzz {
 
 use std::sync::Arc;
 
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::crypto::rustls::QuicServerConfig;
 use rustls::{
     client::danger::ServerCertVerifier,
+    compress::{CertDecompressor, DecompressionFailed},
     pki_types::{CertificateDer, PrivateKeyDer},
+    CertificateCompressionAlgorithm,
 };
 use thiserror::Error;
 
 /// ALPN for the masquerading HTTP/3 face: the UDP leg presents itself as h3.
 pub const UDP_ALPN: &[u8] = b"h3";
 
-/// Maximum idle time before quinn tears the connection down. quinn's default is
-/// 30s, but the fast-plane connection is retained across the probe and then sits
-/// idle through the TCP control exchange (PX1P) and the outbound target connect
-/// before the relay's first stream byte. A slow outbound connect can exceed 30s,
-/// which would silently kill the retained connection and force a desync-prone
-/// fallback. Raise the ceiling and pair it with an active keep-alive so the
-/// connection survives the probe -> accept_bi/open_bi gap without traffic.
-const UDP_MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// Active keep-alive interval, comfortably below [`UDP_MAX_IDLE_TIMEOUT`] so a
-/// fully idle retained connection is kept alive by PING frames rather than
-/// timing out. quinn defaults keep-alive to None (off).
+/// Zlib certificate decompressor for the QUIC client, implemented with the
+/// existing `flate2` dependency.
+///
+/// The Safari-26 H3 ClientHello advertises `compress_certificate` = zlib (the
+/// `[len=2, zlib=0x0001]` body in `safari_shape.rs` / `safari26.rs`), so a
+/// TLS-1.3 server MAY answer with a `CompressedCertificate` message. The
+/// vendored rustls ships zlib support only behind its `zlib` cargo feature
+/// (which would pull in `zlib-rs`); that feature is OFF here, so
+/// `default_cert_decompressors()` is EMPTY and rustls would reject any
+/// `CompressedCertificate` with `SelectedUnofferedCertCompression`, failing the
+/// handshake. Installing this decompressor closes that gap WITHOUT a new
+/// dependency, reusing the same `flate2` zlib backend the TCP camouflage path
+/// already uses for the identical message (`safari26.rs`
+/// `parse_compressed_certificate_body`).
+///
+/// In production the QUIC client only ever reaches ParallaX's own QUIC server,
+/// whose `server_config` installs no compressor, so today this is latent
+/// robustness/fidelity hardening; it becomes load-bearing the moment the
+/// masquerade fronts a real (compressing) H3 origin.
+#[derive(Debug)]
+struct Flate2ZlibCertDecompressor;
+
+/// Installed on the QUIC client config's `cert_decompressors`.
+static FLATE2_ZLIB_CERT_DECOMPRESSOR: &dyn CertDecompressor = &Flate2ZlibCertDecompressor;
+
+impl CertDecompressor for Flate2ZlibCertDecompressor {
+    fn decompress(&self, input: &[u8], output: &mut [u8]) -> Result<(), DecompressionFailed> {
+        // rustls pre-sizes `output` to the server's declared `uncompressed_len`
+        // (already bounded by rustls against `CERTIFICATE_MAX_SIZE_LIMIT` before
+        // this call, so a lying length cannot force a large allocation here). The
+        // contract — mirroring rustls's own `zlib-rs` decompressor — is to fill
+        // `output` EXACTLY: a stream that inflates to more or fewer bytes than
+        // `output.len()`, or is otherwise malformed, must fail.
+        let mut decompress = flate2::Decompress::new(/* zlib_header = */ true);
+        match decompress.decompress(input, output, flate2::FlushDecompress::Finish) {
+            // StreamEnd having consumed all input and filled the buffer exactly is
+            // the only success: total_out == output.len() rejects a short inflate,
+            // and BufError on a full output buffer rejects an over-long one (the
+            // decoder cannot drain the remaining stream).
+            Ok(flate2::Status::StreamEnd)
+                if decompress.total_in() == input.len() as u64
+                    && decompress.total_out() == output.len() as u64 =>
+            {
+                Ok(())
+            }
+            _ => Err(DecompressionFailed),
+        }
+    }
+
+    fn algorithm(&self) -> CertificateCompressionAlgorithm {
+        CertificateCompressionAlgorithm::Zlib
+    }
+}
+
+/// Active keep-alive interval. The fast-plane connection is retained across the
+/// probe and then sits idle through the TCP control exchange (PX1P) and the
+/// outbound target connect before the relay's first stream byte; keep-alive PING
+/// frames keep it (and any NAT binding) alive across that gap without traffic.
+///
+/// This must stay comfortably below [`UDP_LOCAL_IDLE_TIMEOUT`] so a healthy idle
+/// connection keeps refreshing the local idle timer and is never reaped. quinn
+/// defaults keep-alive to None (off).
 const UDP_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// LOCAL idle-timeout backstop for reaping a black-holed connection.
+///
+/// This is the only transport-level connection reaper: quinn-proto 0.11 loss
+/// detection on a vanished peer only PTO-retransmits the unacknowledged
+/// keep-alive PINGs — it does NOT terminate the connection — so without an idle
+/// timeout a peer that silently disappears would pin its connection and up to
+/// `conn_window` (16 MiB) of receive buffers forever. A generous 60 s timeout
+/// reclaims those resources well after [`UDP_KEEP_ALIVE_INTERVAL`] (15 s) has had
+/// several chances to refresh a live connection.
+///
+/// CRITICAL — this is purely LOCAL and does NOT change the on-wire advertised
+/// value. The Safari-26 H3 wire shape advertises `max_idle_timeout = 0` (the
+/// confirmed CFNetwork value), and that 0 is emitted by the hand-encoded `0x39`
+/// blob in `safari_crypto.rs` (`start_session` substitutes our blob for quinn's
+/// `params.write()`), so quinn's config value here never reaches the wire — it
+/// only drives quinn's local idle timer. The advertised `0` (no peer-negotiated
+/// idle timeout) and this locally-enforced backstop are independent: the peer
+/// sees Safari fidelity while this endpoint still reaps a dead connection.
+const UDP_LOCAL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Flow-control windows for the fast-plane relay's single reliable stream.
 ///
-/// quinn's default `stream_receive_window` (~1.25 MB, sized for ~12.5 MB/s x
-/// 100 ms) caps a single stream at window/RTT, which on a 160-320 ms cross-border
-/// path throttles the one relay stream far below the link rate (1.25 MB / 0.16 s
-/// ≈ 7.8 MB/s, lower at 320 ms). Size the STREAM window to the cross-border BDP
-/// (320 ms x ~100 Mbit/s ≈ 4 MiB) so the relay stream is not flow-control-bound.
-/// This rationale is window/RTT arithmetic only; it is NOT a measured wire
-/// throughput (the in-repo loss harness models delay+loss with no bandwidth cap,
-/// so its MB/s figures are a loopback ceiling, not a cross-border goodput).
+/// These EQUAL the values advertised in the Safari-26 H3 `quic_transport_parameters`
+/// blob (see `safari_crypto.rs`): the per-stream window is `initial_max_stream_data_*`
+/// (2 MiB) and the connection window is `initial_max_data` (16 MiB). Keeping quinn's
+/// ENFORCED flow control equal to the advertised wire bytes closes the
+/// advertised-vs-actual gap — a censor that decrypts the QUIC v1 Initial sees
+/// transport params that match the connection's real behaviour, and the throughput
+/// is capped at Safari's level (exceeding Safari is itself detectable).
 ///
-/// The CONNECTION window is kept DISTINCT from (and larger than) the stream
-/// window on purpose: real Chrome/Safari H3 advertise connection > stream
-/// values, so emitting all four flow-control transport parameters EQUAL (which a
-/// single shared window does) is a shape no browser emits — observable to a
-/// censor that decrypts the QUIC v1 Initial. WARNING: these magnitudes are NOT
-/// matched to a real Safari-26 H3 capture; they are BDP-headroom values,
-/// acceptable ONLY while the UDP plane is off by default. Before enabling the
-/// plane: (1) calibrate against a capture, and (2) add a global
-/// concurrent-QUIC-relay cap — aggregate worst-case un-drained buffer is
-/// conn_window x the 16384 connection limit ≈ 128 GiB if authenticated peers
-/// stall their read side, so the per-connection bound is not enough at scale
-/// (cf. the kernel-splice relay cap).
-const UDP_STREAM_RECV_WINDOW: u32 = 4 * 1024 * 1024;
-const UDP_CONN_RECV_WINDOW: u32 = 8 * 1024 * 1024;
+/// The connection window (16 MiB) is larger than the per-stream window (2 MiB),
+/// matching real Safari/Chrome H3 (connection > stream); a single shared window
+/// would emit all four flow-control params equal, a shape no browser sends.
+///
+/// HARD PRE-ENABLE GATE — DoS surface. BEFORE setting `[udp].enabled = true` in
+/// production, a global concurrent-QUIC-relay cap (analogous to the TCP carrier's
+/// kernel-splice relay cap, `MAX_CONCURRENT_KERNEL_SPLICE_RELAYS`) is REQUIRED.
+/// This is the DoS surface: the relay endpoint grants each authenticated peer a
+/// `conn_window` (16 MiB) connection-level receive window, and a peer that stalls
+/// its read side can pin that full window; with no global cap the aggregate
+/// worst-case un-drained buffer is 16 MiB x the 16384 per-endpoint connection
+/// limit (~256 GiB). The local idle-timeout backstop ([`UDP_LOCAL_IDLE_TIMEOUT`])
+/// reaps a black-holed peer but does NOT bound concurrent live stallers; only a
+/// concurrency cap does.
+const UDP_STREAM_RECV_WINDOW: u32 = safari_crypto::SAFARI_TP_INITIAL_MAX_STREAM_DATA as u32;
+const UDP_CONN_RECV_WINDOW: u32 = safari_crypto::SAFARI_TP_INITIAL_MAX_DATA as u32;
 
-/// Shared QUIC transport tuning applied to both the server and client endpoints
-/// so the two ends agree on idle/keep-alive behavior. The effective idle timeout
-/// is the minimum of the two peers' values, so configuring both keeps it
-/// deterministic.
-fn udp_transport_config() -> Arc<quinn::TransportConfig> {
+/// Shared QUIC transport tuning for the fast-plane endpoints.
+///
+/// The flow-control and stream limits EQUAL the values advertised in the Safari-26
+/// H3 transport-parameters blob (`safari_crypto.rs`), so quinn's enforced behaviour
+/// matches the camouflaged wire bytes (no advertised-vs-actual gap). The one
+/// asymmetry is `peer_bidi`: it sets `initial_max_streams_bidi`, i.e. how many bidi
+/// streams THIS endpoint grants the PEER to open.
+///
+/// * Client: `peer_bidi = 0` — the client grants the server NO server-initiated
+///   bidi streams, matching Safari's advertised `initial_max_streams_bidi = 0`. The
+///   relay's client-initiated bidi stream is governed by the SERVER's grant, not
+///   this value, so the relay still works.
+/// * Server: `peer_bidi = 1` — the server grants the client exactly one bidi stream,
+///   which is the relay's single multiplexed stream (client `open_bi` /
+///   server `accept_bi`). The server emits its own quinn transport params (not the
+///   Safari blob), so it is not bound to the client's advertised bidi value.
+///
+/// The advertised `max_idle_timeout = 0` (Safari fidelity) is emitted by the
+/// hand-encoded `0x39` blob in `safari_crypto.rs`, NOT from quinn's config, so
+/// this function sets a LOCAL idle-timeout backstop ([`UDP_LOCAL_IDLE_TIMEOUT`])
+/// to reap a black-holed connection without changing the wire value; liveness of
+/// a healthy connection rests on the keep-alive (see [`UDP_KEEP_ALIVE_INTERVAL`]).
+fn udp_transport_config(peer_bidi: u32) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
+    // LOCAL idle-timeout backstop ONLY: the wire advertises max_idle_timeout = 0
+    // (Safari's value), hand-encoded in safari_crypto.rs independently of this
+    // config, so this value never reaches the peer — it just lets quinn reap a
+    // vanished peer's connection (loss detection alone never would; see
+    // UDP_LOCAL_IDLE_TIMEOUT). Keep-alive refreshes the timer for a live
+    // connection across the probe -> accept_bi/open_bi gap.
     transport.max_idle_timeout(Some(
-        UDP_MAX_IDLE_TIMEOUT
+        UDP_LOCAL_IDLE_TIMEOUT
             .try_into()
-            .expect("60s is a valid quinn idle timeout"),
+            .expect("60s fits a QUIC idle-timeout VarInt"),
     ));
     transport.keep_alive_interval(Some(UDP_KEEP_ALIVE_INTERVAL));
 
-    // The fast-plane relay multiplexes BOTH directions onto a SINGLE reliable
-    // bidi QUIC stream (client `open_bi` / server `accept_bi`) and never opens a
-    // uni stream; the reachability probe uses unreliable datagrams, governed
-    // separately by `datagram_receive_buffer_size`. quinn's defaults (100 bidi +
-    // 100 uni concurrent streams, connection `receive_window = VarInt::MAX`) let
-    // an authenticated peer pin hundreds of MB of un-drained receive buffers
-    // against this one-stream relay. Bound concurrency to exactly one bidi stream
-    // and no uni streams. The receive windows are BDP-sized and kept
-    // connection > stream (see UDP_{CONN,STREAM}_RECV_WINDOW), which both lifts
-    // the high-RTT flow-control cap and avoids the all-equal transport-param
-    // shape no browser emits; send_window matches the connection window so the
+    // Stream limits and flow-control windows EQUAL the advertised Safari values:
+    // bidi grant per the `peer_bidi` asymmetry above; uni = 8
+    // (`initial_max_streams_uni`); per-stream window 2 MiB; connection window
+    // 16 MiB. The relay carries its payload over a single client-initiated BIDI
+    // stream; the reachability probe rides a uni-stream round-trip (one client uni
+    // + one server uni), well within the advertised 8 uni budget. Granting the
+    // advertised 8 uni is bounded by the 2 MiB per-uni-stream window under the
+    // 16 MiB connection window; send_window matches the connection window so the
     // sender is not the bottleneck.
-    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
-    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(peer_bidi));
+    transport.max_concurrent_uni_streams(
+        quinn::VarInt::from_u64(safari_crypto::SAFARI_TP_MAX_STREAMS_UNI)
+            .expect("8 fits a QUIC VarInt"),
+    );
     transport.receive_window(quinn::VarInt::from_u32(UDP_CONN_RECV_WINDOW));
     transport.stream_receive_window(quinn::VarInt::from_u32(UDP_STREAM_RECV_WINDOW));
     transport.send_window(u64::from(UDP_CONN_RECV_WINDOW));
+
+    // Disable QUIC datagrams (RFC 9221). Safari-26 H3 advertises no
+    // `max_datagram_frame_size` for plain H3 (it sends no datagrams), so the
+    // camouflaged transport params omit 0x20; disabling datagrams here makes
+    // quinn's enforced behaviour match the wire (it neither advertises 0x20 in its
+    // own `params.write()` nor accepts datagram frames). The reachability probe no
+    // longer needs them — it rides a QUIC uni-stream round-trip (see `probe.rs`),
+    // which uses the advertised `initial_max_streams_uni = 8` budget. quinn's
+    // default enables datagrams (`datagram_receive_buffer_size = Some(..)`), so this
+    // explicit `None` is required.
+    transport.datagram_receive_buffer_size(None);
 
     // Congestion control: BBR, not quinn's default Cubic. The fast plane only
     // earns its keep on lossy links, where Cubic's loss-as-congestion backoff
@@ -241,7 +354,8 @@ pub fn server_config(
     let crypto = QuicServerConfig::try_from(Arc::new(tls))
         .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(udp_transport_config());
+    // Server grants the client exactly one bidi stream (the relay's stream).
+    config.transport_config(udp_transport_config(1));
     Ok(config)
 }
 
@@ -263,10 +377,40 @@ pub fn client_config(
         .with_no_client_auth();
     tls.alpn_protocols = vec![UDP_ALPN.to_vec()];
 
-    let crypto = QuicClientConfig::try_from(Arc::new(tls))
-        .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?;
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(udp_transport_config());
+    // The Safari profile advertises `compress_certificate` = zlib, so install a
+    // zlib decompressor to handle a server that answers with a
+    // `CompressedCertificate`. The vendored rustls leaves `cert_decompressors`
+    // empty (its `zlib` feature is off to avoid the `zlib-rs` dep), which would
+    // otherwise make any compressed cert fail the handshake; this reuses the
+    // existing `flate2` backend (no new dependency). See
+    // [`Flate2ZlibCertDecompressor`].
+    tls.cert_decompressors = vec![FLATE2_ZLIB_CERT_DECOMPRESSOR];
+
+    // S6: the Safari-26 H3 Session is the DEFAULT QUIC client backend. The rustls
+    // config carries the production `safari_ch_profile`, so the vendored-rustls
+    // ClientHello assembly (S1) emits the exact Safari wire shape, and the Safari
+    // Session substitutes the hand-encoded ascending 0x39 transport-param blob
+    // (S4) for quinn's `params.write()`. Cold-start ONLY: resumption is disabled
+    // so no `pre_shared_key` / `early_data` is emitted (`psk_key_exchange_modes`
+    // is still present in the profile). True 0-RTT is a later capture-gated slice.
+    tls.resumption = rustls::client::Resumption::disabled();
+
+    let mut grease_seed = [0_u8; 5];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut grease_seed);
+    let grease = crate::tls::safari_shape::GreaseSet::from_seed(grease_seed);
+    tls.safari_ch_profile = Some(Arc::new(crate::tls::safari_shape::safari_h3_ch_profile(
+        grease,
+    )));
+
+    let crypto: Arc<dyn quinn::crypto::ClientConfig> = Arc::new(
+        safari_crypto::SafariQuicClientConfig::new(Arc::new(tls))
+            .ok_or_else(|| UdpTransportError::TlsConfig("no QUIC initial cipher suite".into()))?,
+    );
+
+    let mut config = quinn::ClientConfig::new(crypto);
+    // Client grants the server NO bidi streams (Safari advertises bidi=0); the
+    // relay's client-initiated bidi is governed by the server's grant above.
+    config.transport_config(udp_transport_config(0));
     Ok(config)
 }
 
@@ -281,7 +425,7 @@ pub(crate) mod test_support {
         DigitallySignedStruct, SignatureScheme,
     };
 
-    use super::{client_config, server_config};
+    use super::server_config;
 
     /// Test-only verifier that accepts any certificate. Mirrors REALITY's posture
     /// (the cert is camouflage, not the trust anchor); real authenticity is the
@@ -349,9 +493,13 @@ pub(crate) mod test_support {
         .unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
 
-        let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client_endpoint
-            .set_default_client_config(client_config(Arc::new(AcceptAnyServerCert)).unwrap());
+        // PRODUCTION client builder: zero-length source connection id (Safari
+        // fidelity), so the loopback pair exercises the real wire shape.
+        let client_endpoint = super::endpoint::bind_client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(AcceptAnyServerCert),
+        )
+        .unwrap();
 
         let acceptor = {
             let server_endpoint = server_endpoint.clone();
@@ -378,7 +526,6 @@ pub(crate) mod test_support {
 mod tests {
     use std::time::Duration;
 
-    use bytes::Bytes;
     use quinn::Endpoint;
 
     use super::test_support::{loopback_pair, self_signed_cert, AcceptAnyServerCert};
@@ -388,11 +535,12 @@ mod tests {
     const TEST_PSK: &[u8] = b"parallax-tudp-loopback-psk-012345";
 
     /// Proves the QUIC fast-plane plumbing on loopback: connection establishment,
-    /// bidirectional unreliable datagrams, and that the RFC 5705 keying-material
-    /// exporter (open question #1 for the exporter-bound auth token) is available
-    /// and agrees on both ends under the aws-lc-rs backend.
+    /// a uni-stream round-trip (the transport the reachability probe now uses), and
+    /// that the RFC 5705 keying-material exporter (open question #1 for the
+    /// exporter-bound auth token) is available and agrees on both ends under the
+    /// aws-lc-rs backend.
     #[tokio::test]
-    async fn quic_loopback_datagram_and_exporter_round_trip() {
+    async fn quic_loopback_stream_and_exporter_round_trip() {
         let (cert, key) = self_signed_cert();
         let server_endpoint = Endpoint::server(
             server_config(cert, key).unwrap(),
@@ -401,18 +549,25 @@ mod tests {
         .unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
 
-        let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client_endpoint
-            .set_default_client_config(client_config(Arc::new(AcceptAnyServerCert)).unwrap());
+        // PRODUCTION client builder (zero-length source connection id).
+        let client_endpoint = super::endpoint::bind_client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(AcceptAnyServerCert),
+        )
+        .unwrap();
 
         let server_task = tokio::spawn(async move {
             let incoming = server_endpoint.accept().await.expect("incoming connection");
             let conn = incoming.await.expect("server-side connection");
-            let datagram = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+            // Echo the client's uni-stream request back on a server uni stream.
+            let mut recv = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
                 .await
-                .expect("server datagram timeout")
-                .expect("read client datagram");
-            conn.send_datagram(datagram).expect("echo datagram");
+                .expect("server accept_uni timeout")
+                .expect("accept client uni stream");
+            let got = recv.read_to_end(64).await.expect("read client uni payload");
+            let mut send = conn.open_uni().await.expect("server open_uni");
+            send.write_all(&got).await.expect("echo uni payload");
+            send.finish().expect("finish echo uni stream");
             let mut ekm = [0_u8; 32];
             conn.export_keying_material(&mut ekm, b"tudp-loopback", b"context")
                 .expect("server export_keying_material");
@@ -429,12 +584,14 @@ mod tests {
             .await
             .expect("client-side connection");
 
-        conn.send_datagram(Bytes::from_static(b"ping"))
-            .expect("client send datagram");
-        let echo = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        let mut send = conn.open_uni().await.expect("client open_uni");
+        send.write_all(b"ping").await.expect("client write uni");
+        send.finish().expect("finish client uni stream");
+        let mut recv = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
             .await
-            .expect("client datagram timeout")
-            .expect("read echoed datagram");
+            .expect("client accept_uni timeout")
+            .expect("accept echoed uni stream");
+        let echo = recv.read_to_end(64).await.expect("read echoed uni payload");
         assert_eq!(&echo[..], b"ping");
 
         let mut client_ekm = [0_u8; 32];
@@ -461,34 +618,51 @@ mod tests {
         );
     }
 
-    /// M-6: the relay endpoint's QUIC transport config bounds flow control to the
-    /// single-bidi-stream relay shape — uni streams are forbidden and at most one
-    /// concurrent bidi stream is granted — so an authenticated peer cannot pin
-    /// hundreds of MB of un-drained receive buffers by over-opening streams.
-    /// TransportConfig fields have no getters, so this drives a loopback pair and
-    /// observes the peer being denied stream credit.
+    /// The relay endpoint's QUIC transport config matches the advertised Safari
+    /// values: the server grants the client exactly ONE bidi stream (the relay's
+    /// stream; a second is denied) and the advertised EIGHT uni streams
+    /// (`initial_max_streams_uni = 8`). It also proves the CRITICAL property that
+    /// after the bidi=0-on-client / bidi=1-on-server split, the client-initiated
+    /// relay stream still opens AND transfers data both directions. TransportConfig
+    /// fields have no getters, so this drives a loopback pair and observes the
+    /// granted/denied stream credit.
     #[tokio::test]
     async fn quic_transport_config_bounds_streams_to_single_bidi_relay() {
         let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
 
-        // (1) The single-stream relay shape still works: one bidi stream opens
-        // and the server accepts it. Keep both ends' handles alive (dropping the
-        // send half would free the bidi credit and defeat assertion (3)).
-        let (mut s1, _r1) = client_conn.open_bi().await.expect("open_bi #1");
-        s1.write_all(b"x").await.expect("write stream #1");
-        let _srv1 = tokio::time::timeout(Duration::from_secs(2), server_conn.accept_bi())
-            .await
-            .expect("server must accept the first bidi stream")
-            .expect("accept_bi #1");
-
-        // (2) Uni streams are forbidden (max_concurrent_uni_streams = 0): the peer
-        // grants no uni credit, so open_uni never resolves.
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), client_conn.open_uni())
+        // (1) The client-initiated relay bidi stream opens (governed by the
+        // server's bidi=1 grant, NOT the client's advertised bidi=0) and the server
+        // accepts it. Keep both ends' handles alive (dropping the send half would
+        // free the bidi credit and defeat assertion (3)).
+        let (mut s1, mut r1) = client_conn.open_bi().await.expect("open_bi #1");
+        s1.write_all(b"ping").await.expect("write stream #1");
+        let (mut srv_s, mut srv_r) =
+            tokio::time::timeout(Duration::from_secs(2), server_conn.accept_bi())
                 .await
-                .is_err(),
-            "uni streams must be forbidden on the single-stream relay endpoint",
-        );
+                .expect("server must accept the first bidi stream")
+                .expect("accept_bi #1");
+
+        // (1b) CRITICAL: data transfers both directions over the relay stream.
+        let mut got = [0_u8; 4];
+        srv_r
+            .read_exact(&mut got)
+            .await
+            .expect("server reads client->server bytes");
+        assert_eq!(&got, b"ping", "client->server relay data must arrive");
+        srv_s.write_all(b"pong").await.expect("server echoes");
+        let mut echoed = [0_u8; 4];
+        r1.read_exact(&mut echoed)
+            .await
+            .expect("client reads server->client bytes");
+        assert_eq!(&echoed, b"pong", "server->client relay data must arrive");
+
+        // (2) Uni streams: the server advertises the Safari value of 8, so the
+        // client can open a uni stream (and several more), unlike the old
+        // forbidden-uni posture. Opening one must succeed promptly.
+        tokio::time::timeout(Duration::from_secs(2), client_conn.open_uni())
+            .await
+            .expect("uni open must not time out (server grants 8)")
+            .expect("first uni stream opens");
 
         // (3) Bidi is capped at 1: stream #1 is still open, so a second open_bi
         // gets no further credit and never resolves.
@@ -526,6 +700,166 @@ mod tests {
                 rustls::NamedGroup::secp384r1,
             ],
             "QUIC kx groups must mirror aws-lc-rs prefer-post-quantum default order",
+        );
+    }
+
+    /// The `flate2` zlib cert decompressor installed on the QUIC client config
+    /// round-trips a real zlib stream into an exactly-sized buffer and rejects
+    /// every malformed/length-mismatched input — the contract rustls's
+    /// `ExpectCompressedCertificate` relies on (it pre-sizes `output` to the
+    /// server's declared `uncompressed_len` and treats any failure as a fatal
+    /// `InvalidCertCompression`).
+    #[test]
+    fn flate2_zlib_cert_decompressor_round_trips_and_rejects_malformed() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+
+        let plaintext = b"the quick brown fox jumps over the lazy dog, repeatedly. \
+                          the quick brown fox jumps over the lazy dog, repeatedly.";
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(plaintext).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressor = Flate2ZlibCertDecompressor;
+        assert_eq!(
+            decompressor.algorithm(),
+            CertificateCompressionAlgorithm::Zlib
+        );
+
+        // Exact-length buffer: succeeds and reproduces the plaintext.
+        let mut out = vec![0u8; plaintext.len()];
+        decompressor
+            .decompress(&compressed, &mut out)
+            .expect("exact-length zlib decompress must succeed");
+        assert_eq!(out, plaintext, "decompressed bytes must match the original");
+
+        // Declared length too SHORT: the stream inflates past the buffer; reject.
+        let mut short = vec![0u8; plaintext.len() - 1];
+        assert!(
+            decompressor.decompress(&compressed, &mut short).is_err(),
+            "a too-short output buffer must fail (over-long inflation)"
+        );
+
+        // Declared length too LONG: the stream fills fewer bytes than the buffer;
+        // reject (total_out != output.len()).
+        let mut long = vec![0u8; plaintext.len() + 1];
+        assert!(
+            decompressor.decompress(&compressed, &mut long).is_err(),
+            "a too-long output buffer must fail (short inflation)"
+        );
+
+        // Garbage input: not a valid zlib stream; reject without panicking.
+        let mut out = vec![0u8; plaintext.len()];
+        assert!(
+            decompressor
+                .decompress(b"not a zlib stream at all", &mut out)
+                .is_err(),
+            "malformed input must fail"
+        );
+    }
+
+    /// End-to-end proof of the fix: a QUIC server that answers with a
+    /// `CompressedCertificate` (zlib) completes the handshake with the PRODUCTION
+    /// `client_config`. Before installing the `flate2` decompressor, the vendored
+    /// rustls had no zlib decompressor (its `zlib` feature is off), so rustls
+    /// rejected the compressed cert with `SelectedUnofferedCertCompression` and
+    /// the handshake failed despite the ClientHello advertising
+    /// `compress_certificate` = zlib. The production server installs no compressor,
+    /// so this test builds a compressing server config to exercise the receive
+    /// path the advertised extension promises a real (e.g. CDN-fronted) origin
+    /// could use.
+    #[tokio::test]
+    async fn quic_client_completes_handshake_with_compressed_certificate() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use rustls::compress::{CertCompressor, CompressionFailed, CompressionLevel};
+        use std::io::Write;
+
+        /// Test-only zlib certificate compressor (flate2) so the loopback server
+        /// emits a `CompressedCertificate`; production servers ship none.
+        #[derive(Debug)]
+        struct Flate2ZlibCertCompressor;
+
+        impl CertCompressor for Flate2ZlibCertCompressor {
+            fn compress(
+                &self,
+                input: Vec<u8>,
+                _level: CompressionLevel,
+            ) -> Result<Vec<u8>, CompressionFailed> {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(&input).map_err(|_| CompressionFailed)?;
+                encoder.finish().map_err(|_| CompressionFailed)
+            }
+
+            fn algorithm(&self) -> CertificateCompressionAlgorithm {
+                CertificateCompressionAlgorithm::Zlib
+            }
+        }
+
+        static COMPRESSOR: &dyn CertCompressor = &Flate2ZlibCertCompressor;
+
+        // Server config mirroring production `server_config`, but with a zlib
+        // compressor installed so it answers a zlib-advertising client with a
+        // CompressedCertificate.
+        let (cert, key) = self_signed_cert();
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(camouflage_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        tls.alpn_protocols = vec![UDP_ALPN.to_vec()];
+        tls.cert_compressors = vec![COMPRESSOR];
+        let crypto = QuicServerConfig::try_from(Arc::new(tls)).unwrap();
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        server_cfg.transport_config(udp_transport_config(1));
+
+        let server_endpoint = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        // Production client config (carries the Safari profile advertising zlib +
+        // the flate2 decompressor under test) via the production endpoint builder
+        // (zero-length source connection id).
+        let client_endpoint = super::endpoint::bind_client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(AcceptAnyServerCert),
+        )
+        .unwrap();
+
+        let acceptor = {
+            let server_endpoint = server_endpoint.clone();
+            tokio::spawn(async move {
+                server_endpoint
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("server-side connection")
+            })
+        };
+
+        // The handshake completing is the assertion: a missing/incompatible
+        // decompressor would fail `.connect(..).await` with the rustls alert.
+        let client_conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_endpoint
+                .connect(server_addr, "localhost")
+                .expect("start connect"),
+        )
+        .await
+        .expect("handshake with a CompressedCertificate server must not time out")
+        .expect("client must complete the handshake despite the compressed certificate");
+
+        let _server_conn = acceptor.await.expect("accept task");
+
+        // The client received and decompressed the server's certificate chain.
+        let peer = client_conn
+            .peer_identity()
+            .expect("peer identity present after a verified handshake")
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .expect("peer identity is the server certificate chain");
+        assert!(
+            !peer.is_empty(),
+            "the decompressed certificate chain must be non-empty"
         );
     }
 
@@ -710,10 +1044,11 @@ mod tests {
         let loss_levels = [0.0_f64, 0.01, 0.03];
 
         // "old": the previous 1.25 MB window. "prod-fixed": the real shipping
-        // config (udp_transport_config, now BDP-sized). Same BBR, same relay.
+        // config (udp_transport_config; the server grant is bidi=1 so the client's
+        // download stream opens). Same BBR, same relay.
         let cases: [(&str, Arc<quinn::TransportConfig>); 2] = [
             ("old-1.25MB", relay_test_transport(1_250_000)),
-            ("prod-fixed", udp_transport_config()),
+            ("prod-fixed", udp_transport_config(1)),
         ];
 
         let mut old_clean = 0.0_f64;

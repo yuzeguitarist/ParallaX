@@ -787,6 +787,7 @@ dependencies = [
  "pqcrypto-mldsa",
  "pqcrypto-traits",
  "quinn",
+ "quinn-proto",
  "rand 0.8.6",
  "rcgen",
  "rustls",
@@ -942,8 +943,6 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -1129,8 +1128,6 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.40"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
  "log",

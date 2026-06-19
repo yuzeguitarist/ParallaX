@@ -180,10 +180,10 @@ fn assert_real_safari_shape(fields: &ClientHelloFields, host: &str) {
     );
     assert!(is_grease(fields.extensions[0]));
     assert!(is_grease(*fields.extensions.last().unwrap()));
-    assert_ne!(
-        fields.cipher_suites[0], fields.extensions[0],
-        "{host}: Safari uses a separate GREASE surface for cipher_suites and extensions"
-    );
+    // NOTE: cipher-suite GREASE and the opening extension GREASE are drawn
+    // independently by BoringSSL and MAY coincide; Safari does not force them apart,
+    // so this captured fixture's values are not asserted distinct (a recapture that
+    // happened to collide them is still valid Safari shaping).
     assert_eq!(
         extension_payload(fields, fields.extensions[0]),
         Some(&[][..]),
@@ -309,10 +309,11 @@ fn assert_parallax_matches_safari(safari: &ClientHelloFields, parallax: &ClientH
         SAFARI_CIPHERS,
         "Safari fixture cipher list drifted from the calibrated constant"
     );
-    assert_ne!(
-        parallax.cipher_suites[0], parallax.extensions[0],
-        "ParallaX must not reuse the cipher-suite GREASE value as the opening GREASE extension"
-    );
+    // NOTE: cipher-suite GREASE and the opening extension GREASE are drawn
+    // independently and MAY coincide (~1/16) — real Safari does not force them
+    // apart, so neither does ParallaX (forcing carved a detectable slice out of
+    // Safari's value space). Only the leading vs trailing extension GREASE are
+    // forced distinct (see GreaseSet::from_seed).
 
     // --- Supported groups ------------------------------------------------
     assert!(
