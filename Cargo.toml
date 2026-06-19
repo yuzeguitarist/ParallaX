@@ -45,6 +45,13 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 # the exact version quinn 0.11 resolves so no second quinn-proto is linked.
 quinn-proto = { version = "=0.11.14", default-features = false }
 rcgen = "0.13"
+# Safe wrappers for the libc syscalls ParallaX makes directly (geteuid, flock,
+# getrlimit/setrlimit, page_size, recv(MSG_PEEK), poll, splice, pipe2,
+# sched_getcpu, prctl(PR_SET_DUMPABLE), and the TCP/socket options). Already in
+# the tree transitively; pulled in directly so those call sites drop their
+# `unsafe { libc::* }` blocks. The handful rustix does not cover stay on libc
+# (mlock/madvise, macOS PT_DENY_ATTACH, FreeBSD procctl, SO_PREFER_BUSY_POLL).
+rustix = { version = "1", features = ["event", "fs", "net", "param", "pipe", "process", "thread"] }
 rustls = { version = "=0.23.40", features = ["std", "aws_lc_rs"] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1"
@@ -60,6 +67,10 @@ sha2 = "0.10"
 # holds a second copy beyond the named stack scrubs. zeroize is already in-tree
 # (1.8.2) — no new crate, no digest-stack fork. Value-neutral (no byte impact).
 sha3 = { version = "0.10", features = ["zeroize"] }
+# Linux-only TCP/socket options rustix does not expose: TCP_NOTSENT_LOWAT and
+# SO_BUSY_POLL. The `all` feature un-gates these (platform-specific) setters.
+# Already transitive via tokio/quinn; the `all` feature is compile-time only.
+socket2 = { version = "0.6", features = ["all"] }
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

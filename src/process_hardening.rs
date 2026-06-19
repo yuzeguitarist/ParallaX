@@ -135,17 +135,16 @@ fn transient_plaintext_setting_enabled(value: &str) -> bool {
 }
 #[cfg(unix)]
 fn disable_core_dumps() -> io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `setrlimit` only receives a pointer to a stack-allocated
-    // immutable `rlimit` and affects the current process.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    use rustix::process::{setrlimit, Resource, Rlimit};
+
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(not(unix))]
@@ -155,13 +154,11 @@ fn disable_core_dumps() -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn disable_ptrace_dumpability() -> io::Result<()> {
-    // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` changes only the current process'
-    // dumpable flag and does not dereference any user-provided pointer.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    use rustix::process::{set_dumpable_behavior, DumpableBehavior};
+
+    // `prctl(PR_SET_DUMPABLE, 0)`: clears the dumpable flag so a non-root process
+    // can no longer be ptrace-attached / core-dumped.
+    set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(Into::into)
 }
 
 #[cfg(target_os = "macos")]
@@ -267,14 +264,7 @@ fn page_size() -> usize {
 
 #[cfg(unix)]
 fn query_page_size() -> usize {
-    // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and no memory
-    // safety requirements.
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if size > 0 {
-        size as usize
-    } else {
-        4096
-    }
+    rustix::param::page_size()
 }
 
 #[cfg(any(unix, test))]
