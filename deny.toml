@@ -48,6 +48,14 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# ParallaX itself ships under PolyForm Noncommercial 1.0.0 (see LICENSE). That is
+# a noncommercial license and is intentionally NOT in the allow-list above — a
+# *dependency* under such terms must still fail the gate. This exception scopes
+# the license to our own crate only.
+[[licenses.exceptions]]
+crate = "parallax"
+allow = ["PolyForm-Noncommercial-1.0.0"]
+
 [bans]
 # Duplicate versions are common and benign in a tree this size (getrandom 0.2/0.3,
 # rand 0.8/0.9, windows-sys 0.52/0.61, ...), so warn rather than block. Wildcard

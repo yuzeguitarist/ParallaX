@@ -1,0 +1,43 @@
+ParallaX — NOTICE
+=================
+
+Copyright (c) 2026 Yuze Pan
+Project: ParallaX (https://github.com/yuzeguitarist/ParallaX)
+
+ParallaX is licensed under the PolyForm Noncommercial License 1.0.0.
+See the LICENSE file for the full terms. The short version:
+
+What you MAY do (noncommercial only)
+------------------------------------
+  - read, study, and learn from the source
+  - run it locally
+  - use it for noncommercial research and experimentation
+  - fork it, modify it, and publish your fork / modified version
+  - open pull requests
+
+What you MAY NOT do
+-------------------
+  - any commercial use whatsoever, including (non-exhaustive):
+      * selling it or selling access to it
+      * running it as a paid VPN, paid proxy, relay, tunnel,
+        bridge, or transit/forwarding service
+      * offering it as a SaaS or any hosted/managed service
+      * integrating it into a commercial product or service
+      * building a competing product on top of it, at any scale
+      * re-skinning / renaming a fork and selling it as your own
+
+Conditions on every copy, fork, and modified version
+----------------------------------------------------
+  1. ATTRIBUTION. You must keep the "Required Notice:" line from the
+     LICENSE file intact, and you must clearly state that your work
+     is based on ParallaX (https://github.com/yuzeguitarist/ParallaX).
+  2. SAME LICENSE. You must keep distributing under the PolyForm
+     Noncommercial License 1.0.0. You may NOT relicense ParallaX
+     (or any part of it) under MIT, Apache-2.0, GPL, any other
+     license, or a proprietary/closed-source license.
+  3. PASS IT ON. Anyone who receives the software from you must also
+     receive these terms and the LICENSE.
+
+These conditions express the intent of the project. Where the
+PolyForm Noncommercial License 1.0.0 governs, the LICENSE file
+controls.

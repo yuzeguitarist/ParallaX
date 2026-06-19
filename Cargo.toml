@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "ParallaX censorship-resistant proxy protocol core"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 default-run = "parallax"
 
 # The `fuzzing` cfg is set automatically by cargo-fuzz and `kani` by cargo-kani.
