@@ -9,18 +9,23 @@
 //! error), so detection is ACTIVE: no verified echo within the Happy-Eyeballs
 //! window means treat the UDP leg as unreachable and stay on TCP.
 //!
-//! The round-trip rides QUIC **unidirectional streams** (not RFC-9221 datagrams):
-//! the client opens a uni stream for the request, the server answers on its own
-//! uni stream. Safari-26 H3 advertises no `max_datagram_frame_size` for plain H3
-//! (it sends no datagrams), so the camouflaged transport params omit it and quinn
-//! disables datagram support; uni streams use the already-advertised
-//! `initial_max_streams_uni = 8` budget and are orthogonal to the relay's single
-//! bidi stream. Reliable delivery also means a single lost packet is retransmitted
-//! rather than silently dropping the probe.
+//! The PRODUCTION round-trip rides an HTTP/3 **request bidi** stream (RFC 9114):
+//! the client writes a HEADERS frame (Safari-26 request fields, method GET)
+//! followed by a DATA frame whose body is the `PXp1 + nonce` request; the server
+//! replies with a `:status 200` HEADERS frame and a DATA frame whose body is the
+//! `PXp2 + HMAC` response. The SAME bidi stream then carries the data relay (the
+//! probe round-trip IS the fast-plane Verified determination). See
+//! [`probe_client_over_bidi`] / [`serve_probe_over_bidi`].
+//!
+//! The bare-uni-stream round-trip ([`probe_client`] / [`serve_probe`]) is the
+//! earlier carrier, now PRODUCTION-UNUSED: it is retained as a tested reference
+//! for the exporter-token round-trip and the Unreachable-timeout coverage (see
+//! the `#[cfg(test)]` cases below). Reliable delivery (bidi or uni) means a single
+//! lost packet is retransmitted rather than silently dropping the probe.
 //!
 //! Wired into the client/server runtimes: a Verified probe causes both ends to
-//! retain the QUIC connection and carry the single-Connect data relay over a
-//! reliable bidi stream. The demote/promote scheduler (switching transports
+//! retain the QUIC connection and carry the single-Connect data relay over the
+//! request bidi stream. The demote/promote scheduler (switching transports
 //! mid-session) is a later slice; for now a Verified probe commits the relay to
 //! QUIC, and a mid-relay failure is a clean connection reset.
 
@@ -77,6 +82,12 @@ fn probe_response(token: &[u8; UDP_AUTH_TOKEN_LEN], nonce: &[u8]) -> [u8; PROBE_
 
 /// Client side: send an authenticated probe over the UDP leg and classify the
 /// result against the Happy-Eyeballs `timeout`.
+///
+/// PRODUCTION-UNUSED: the production probe rides the request bidi
+/// ([`probe_client_over_bidi`]); this bare-uni carrier is kept as a tested
+/// reference for the exporter-token round-trip and the Unreachable-timeout
+/// coverage (its `#[cfg(test)]` cases below). It shares the SAME token derivation
+/// and `probe_response` HMAC as the bidi path.
 pub async fn probe_client(
     connection: &quinn::Connection,
     psk: &[u8],
@@ -120,6 +131,8 @@ pub async fn probe_client(
 /// Send the request on a client-initiated uni stream and read the server's reply
 /// off a server-initiated uni stream. Returns the raw reply bytes (validated by
 /// the caller). A lost/closed connection maps to `ConnectionLost` (-> Unreachable).
+///
+/// PRODUCTION-UNUSED helper of [`probe_client`]; see that fn's note.
 async fn probe_client_round_trip(
     connection: &quinn::Connection,
     request: &[u8],
@@ -145,6 +158,10 @@ async fn probe_client_round_trip(
 
 /// Server side: answer one probe request with an authenticated response derived
 /// from the same exporter-bound token.
+///
+/// PRODUCTION-UNUSED: the production server serves the probe over the request bidi
+/// ([`serve_probe_over_bidi`]); this bare-uni responder is the peer of
+/// [`probe_client`] and is kept as a tested reference (see that fn's note).
 pub async fn serve_probe(
     connection: &quinn::Connection,
     psk: &[u8],
@@ -177,6 +194,187 @@ pub async fn serve_probe(
     send.finish()
         .map_err(|err| ProbeError::Send(err.to_string()))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 request-bidi probe carrier.
+//
+// Same exporter-bound auth as the uni probe above (token derivation +
+// `probe_response` HMAC are UNCHANGED): only the carrier moves from a bare uni
+// round-trip to an HTTP/3 request bidi stream. The client writes a HEADERS frame
+// (Safari-26 request fields for `authority`, method GET) followed by a DATA frame
+// whose body is the SAME `PXp1 + nonce` request bytes; the server replies with a
+// `:status 200` HEADERS frame and a DATA frame whose body is the SAME
+// `PXp2 + HMAC` response bytes. After a Verified exchange the SAME bidi stream
+// carries the relay (DATA-framed sealed records), so the probe round-trip IS the
+// fast-plane Verified determination.
+// ---------------------------------------------------------------------------
+
+/// Defensive cap on a probe-carrying H3 frame payload read off the bidi. The
+/// probe request/response bodies are tiny (<=36 bytes) and the HEADERS field
+/// section is small; this bounds a hostile peer's frame allocation.
+const MAX_PROBE_H3_FRAME_LEN: usize = 4096;
+
+/// Client side of the request-bidi probe. Writes HEADERS + DATA(request) on
+/// `send`, reads the server's HEADERS + DATA(response) on `recv`, and classifies
+/// the result against `timeout`. The bidi streams are caller-owned (opened by the
+/// relay so the SAME stream continues into the data relay); a lost/closed
+/// connection maps to Unreachable, a malformed-but-present reply to Failed.
+pub async fn probe_client_over_bidi(
+    connection: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    authority: &str,
+    psk: &[u8],
+    context: &[u8],
+    timeout: Duration,
+) -> Result<ProbeOutcome, ProbeError> {
+    let token = export_udp_auth_token(connection, psk, context)?;
+    let nonce: [u8; PROBE_NONCE_LEN] = rand::random();
+
+    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
+    request.extend_from_slice(PROBE_REQUEST_MAGIC);
+    request.extend_from_slice(&nonce);
+
+    let expected = probe_response(&token, &nonce);
+    let started = Instant::now();
+
+    match tokio::time::timeout(
+        timeout,
+        probe_client_bidi_round_trip(send, recv, authority, &request),
+    )
+    .await
+    {
+        Err(_) => Ok(ProbeOutcome::Unreachable),
+        Ok(Err(ProbeError::ConnectionLost(_))) => Ok(ProbeOutcome::Unreachable),
+        Ok(Err(other)) => Err(other),
+        Ok(Ok(reply)) => {
+            let authentic = reply.len() == PROBE_RESPONSE_WIRE_LEN
+                && &reply[..4] == PROBE_RESPONSE_MAGIC
+                && bool::from(reply[4..].ct_eq(&expected[..]));
+            if authentic {
+                Ok(ProbeOutcome::Verified {
+                    rtt: started.elapsed(),
+                })
+            } else {
+                Ok(ProbeOutcome::Failed)
+            }
+        }
+    }
+}
+
+/// Write the H3 request (HEADERS + DATA(request)) on the bidi send half and read
+/// the server's H3 response (HEADERS + DATA), returning the response DATA body.
+async fn probe_client_bidi_round_trip(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    authority: &str,
+    request: &[u8],
+) -> Result<Vec<u8>, ProbeError> {
+    use crate::fingerprint::http3::{encode_frame, safari26_headers_frame, FRAME_TYPE_DATA};
+
+    // TODO(h3-request-semantics): the HEADERS use method GET (Safari's opening
+    // request shape), but we then send a client->server DATA frame (the probe
+    // request, and subsequently the relay payload). A real browser GET carries NO
+    // request body, so a GET followed by request-body DATA is non-typical H3
+    // request semantics. This is sub-wire: it lives inside the 1-RTT-encrypted
+    // request stream, so it is observable only to an adversary with MITM + the PSK
+    // (who can decrypt the stream). It is the residual of the method choice in the
+    // request-bidi threat model; a fully browser-faithful shape would use a method
+    // that legitimately carries an upload body (or a request/response pattern with
+    // no client body). Gated behind the same QUIC enable decision.
+    let headers =
+        safari26_headers_frame(authority).map_err(|err| ProbeError::Send(err.to_string()))?;
+    let data =
+        encode_frame(FRAME_TYPE_DATA, request).map_err(|err| ProbeError::Send(err.to_string()))?;
+    let mut out = headers;
+    out.extend_from_slice(&data);
+    send.write_all(&out)
+        .await
+        .map_err(|err| ProbeError::Send(err.to_string()))?;
+
+    read_probe_data_after_headers(recv).await
+}
+
+/// Server side of the request-bidi probe. Reads the client's HEADERS + DATA on
+/// `recv`, verifies the exporter-bound token over the request nonce, and writes a
+/// `:status 200` HEADERS + DATA(response) on `send`. Auth is identical to the uni
+/// `serve_probe`; only the carrier differs. The caller keeps the bidi open for the
+/// relay that follows on the SAME stream.
+pub async fn serve_probe_over_bidi(
+    connection: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    psk: &[u8],
+    context: &[u8],
+) -> Result<(), ProbeError> {
+    use crate::fingerprint::http3::{
+        encode_frame, response_status_200_headers_frame, FRAME_TYPE_DATA,
+    };
+
+    let token = export_udp_auth_token(connection, psk, context)?;
+    let request = read_probe_data_after_headers(recv).await?;
+    if request.len() != PROBE_REQUEST_WIRE_LEN || &request[..4] != PROBE_REQUEST_MAGIC {
+        return Err(ProbeError::Malformed);
+    }
+    let response = probe_response(&token, &request[4..]);
+    let mut reply = Vec::with_capacity(PROBE_RESPONSE_WIRE_LEN);
+    reply.extend_from_slice(PROBE_RESPONSE_MAGIC);
+    reply.extend_from_slice(&response);
+
+    let headers =
+        response_status_200_headers_frame().map_err(|err| ProbeError::Send(err.to_string()))?;
+    let data =
+        encode_frame(FRAME_TYPE_DATA, &reply).map_err(|err| ProbeError::Send(err.to_string()))?;
+    let mut out = headers;
+    out.extend_from_slice(&data);
+    send.write_all(&out)
+        .await
+        .map_err(|err| ProbeError::Send(err.to_string()))?;
+    Ok(())
+}
+
+/// Read the peer's HEADERS frame (skipped — its field section is not interpreted
+/// by the probe) and then the first DATA frame, returning the DATA body. Any
+/// non-HEADERS-then-DATA shape, or a lost connection, is surfaced as an error.
+///
+/// A frame that the de-framer rejects as malformed (e.g. an advertised length
+/// over the cap — a protocol divergence the peer chose) is classified as
+/// `Malformed`, not `ConnectionLost`: that keeps protocol tampering out of the
+/// transport-loss (`Unreachable`) bucket. Genuine transport faults (truncation, a
+/// closed/lost connection) stay `ConnectionLost`. Both `Malformed` and
+/// `Unreachable` keep the session on TCP, so this is a classification-accuracy
+/// fix, not a behaviour change.
+async fn read_probe_data_after_headers(
+    recv: &mut quinn::RecvStream,
+) -> Result<Vec<u8>, ProbeError> {
+    use crate::fingerprint::http3::{FRAME_TYPE_DATA, FRAME_TYPE_HEADERS};
+
+    let (first_type, _first_payload) = super::h3::read_one_h3_frame(recv, MAX_PROBE_H3_FRAME_LEN)
+        .await
+        .map_err(classify_h3_read_error)?;
+    if first_type != FRAME_TYPE_HEADERS {
+        return Err(ProbeError::Malformed);
+    }
+    let (second_type, data) = super::h3::read_one_h3_frame(recv, MAX_PROBE_H3_FRAME_LEN)
+        .await
+        .map_err(classify_h3_read_error)?;
+    if second_type != FRAME_TYPE_DATA {
+        return Err(ProbeError::Malformed);
+    }
+    Ok(data)
+}
+
+/// Classify an error from the H3 frame de-framer. `InvalidData` is a protocol
+/// divergence the peer chose (e.g. an over-cap advertised frame length) ->
+/// `Malformed`; everything else (truncation, a closed/lost connection) is a
+/// transport fault -> `ConnectionLost`.
+fn classify_h3_read_error(err: std::io::Error) -> ProbeError {
+    if err.kind() == std::io::ErrorKind::InvalidData {
+        ProbeError::Malformed
+    } else {
+        ProbeError::ConnectionLost(err.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +460,224 @@ mod tests {
             outcome,
             ProbeOutcome::Failed,
             "a response that fails the exporter-bound HMAC must be Failed, not Verified"
+        );
+    }
+
+    const AUTHORITY: &str = "example.com";
+
+    #[tokio::test]
+    async fn bidi_probe_verifies_over_loopback() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        let server = async {
+            let (mut send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
+            serve_probe_over_bidi(&server_conn, &mut send, &mut recv, PSK, CTX)
+                .await
+                .expect("server serve_probe_over_bidi");
+            // Keep the streams alive until the client has read the reply.
+            (send, recv)
+        };
+        let client = async {
+            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            probe_client_over_bidi(
+                &client_conn,
+                &mut send,
+                &mut recv,
+                AUTHORITY,
+                PSK,
+                CTX,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("client probe_client_over_bidi")
+        };
+        let (_server_streams, outcome) = tokio::join!(server, client);
+        assert!(
+            matches!(outcome, ProbeOutcome::Verified { .. }),
+            "expected Verified over the request bidi, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bidi_probe_with_wrong_token_is_failed_not_verified() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+        const WRONG_PSK: &[u8] = b"a-completely-different-psk-value!";
+
+        let server = async {
+            let (mut send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
+            serve_probe_over_bidi(&server_conn, &mut send, &mut recv, WRONG_PSK, CTX)
+                .await
+                .expect("server serve_probe_over_bidi");
+            (send, recv)
+        };
+        let client = async {
+            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            probe_client_over_bidi(
+                &client_conn,
+                &mut send,
+                &mut recv,
+                AUTHORITY,
+                PSK,
+                CTX,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("client probe_client_over_bidi")
+        };
+        let (_server_streams, outcome) = tokio::join!(server, client);
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Failed,
+            "a bidi response that fails the exporter-bound HMAC must be Failed, not Verified"
+        );
+    }
+
+    /// Wire-structure oracle (application layer): the client's probe request on the
+    /// H3 request bidi must be a HEADERS frame whose QPACK field section decodes to
+    /// EXACTLY Safari-26's request fields (method GET, `:authority` = the camouflage
+    /// SNI), followed by a DATA frame carrying the `PXp1` probe request. The
+    /// server's reply must be a `:status 200` HEADERS frame + a DATA frame. This
+    /// asserts the H3 framing the censor would observe matches Safari ground truth.
+    ///
+    /// TODO(wire-1rtt): this validates the H3 frames at the application layer (the
+    /// bytes handed to/from quinn streams). A byte-level 1-RTT wire assertion (the
+    /// encrypted QUIC packets a censor sees) requires in-process 1-RTT decryption
+    /// and is deferred to a dedicated parity slice.
+    #[tokio::test]
+    async fn bidi_probe_headers_match_safari26_ground_truth() {
+        use crate::fingerprint::http3::{
+            decode_field_section, safari26_request_fields, FRAME_TYPE_DATA, FRAME_TYPE_HEADERS,
+        };
+
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        // Server: read the raw H3 frames the client wrote (HEADERS + DATA), assert
+        // their structure, then reply with a serve_probe_over_bidi-shaped response
+        // so the client's round-trip completes.
+        let server = async {
+            let (mut send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
+            // First frame: HEADERS decoding to Safari-26 request fields.
+            let (htype, hpayload) = super::super::h3::read_one_h3_frame(&mut recv, 4096)
+                .await
+                .expect("read client HEADERS");
+            assert_eq!(
+                htype, FRAME_TYPE_HEADERS,
+                "client first frame must be HEADERS"
+            );
+            let fields = decode_field_section(&hpayload).expect("decode client HEADERS");
+            assert_eq!(
+                fields,
+                safari26_request_fields(AUTHORITY),
+                "client probe HEADERS must equal Safari-26 request fields",
+            );
+            // Second frame: DATA carrying the PXp1 probe request.
+            let (dtype, dpayload) = super::super::h3::read_one_h3_frame(&mut recv, 4096)
+                .await
+                .expect("read client DATA");
+            assert_eq!(dtype, FRAME_TYPE_DATA, "client second frame must be DATA");
+            assert_eq!(
+                &dpayload[..4],
+                PROBE_REQUEST_MAGIC,
+                "DATA carries PXp1 request"
+            );
+
+            // Reply with the real server response so the client classifies Verified.
+            serve_probe_response_for_test(&server_conn, &mut send, &dpayload).await;
+            (send, recv)
+        };
+        let client = async {
+            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            let outcome = probe_client_over_bidi(
+                &client_conn,
+                &mut send,
+                &mut recv,
+                AUTHORITY,
+                PSK,
+                CTX,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("client probe_client_over_bidi");
+            (outcome, send, recv)
+        };
+        let (_server_streams, (outcome, _c_send, _c_recv)) = tokio::join!(server, client);
+        assert!(
+            matches!(outcome, ProbeOutcome::Verified { .. }),
+            "round-trip with structurally-asserted HEADERS must Verify, got {outcome:?}"
+        );
+    }
+
+    /// Test helper: build the server's `:status 200` HEADERS + DATA(PXp2 response)
+    /// for a given client request body, mirroring `serve_probe_over_bidi`'s reply
+    /// (used by the wire-structure oracle which reads the request frames manually).
+    async fn serve_probe_response_for_test(
+        conn: &quinn::Connection,
+        send: &mut quinn::SendStream,
+        request: &[u8],
+    ) {
+        use crate::fingerprint::http3::{
+            encode_frame, response_status_200_headers_frame, FRAME_TYPE_DATA,
+        };
+        let token = export_udp_auth_token(conn, PSK, CTX).expect("export token");
+        let response = probe_response(&token, &request[4..]);
+        let mut reply = Vec::new();
+        reply.extend_from_slice(PROBE_RESPONSE_MAGIC);
+        reply.extend_from_slice(&response);
+        let headers = response_status_200_headers_frame().expect("status headers");
+        let data = encode_frame(FRAME_TYPE_DATA, &reply).expect("data frame");
+        let mut out = headers;
+        out.extend_from_slice(&data);
+        send.write_all(&out).await.expect("write response");
+    }
+
+    /// Fix C: a server reply whose second frame advertises an OVER-CAP length is a
+    /// protocol divergence (malformed), not a transport fault. The client's bidi
+    /// probe must surface it as `ProbeError::Malformed` (which the runtime maps to
+    /// `Failed`), NOT as `Ok(Unreachable)` — keeping protocol tampering out of the
+    /// transport-loss bucket. (Before the fix every de-framer error became
+    /// `ConnectionLost` -> `Ok(Unreachable)`.) Both stay on TCP, so this asserts
+    /// classification accuracy, not a behaviour change.
+    #[tokio::test]
+    async fn bidi_probe_malformed_reply_is_malformed_not_unreachable() {
+        use crate::fingerprint::http3::{
+            encode_stream_type, response_status_200_headers_frame, FRAME_TYPE_DATA,
+        };
+
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        let server = async {
+            let (mut send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
+            // Drain the client's HEADERS + DATA(request) so its send completes.
+            let _ = read_probe_data_after_headers(&mut recv).await;
+            // Reply: a well-formed HEADERS frame, then a DATA frame header that
+            // advertises a length far past MAX_PROBE_H3_FRAME_LEN. The client's
+            // de-framer rejects the oversize length with InvalidData -> Malformed.
+            // `encode_stream_type` emits a single QUIC varint as bytes; reuse it for
+            // both the DATA frame-type varint and the deliberately over-cap length
+            // varint, then send no body.
+            let mut out = response_status_200_headers_frame().expect("status headers");
+            out.extend_from_slice(&encode_stream_type(FRAME_TYPE_DATA));
+            out.extend_from_slice(&encode_stream_type((MAX_PROBE_H3_FRAME_LEN as u64) + 1));
+            send.write_all(&out).await.expect("write malformed reply");
+            (send, recv)
+        };
+        let client = async {
+            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            probe_client_over_bidi(
+                &client_conn,
+                &mut send,
+                &mut recv,
+                AUTHORITY,
+                PSK,
+                CTX,
+                Duration::from_secs(5),
+            )
+            .await
+        };
+        let (_server_streams, result) = tokio::join!(server, client);
+        assert!(
+            matches!(result, Err(ProbeError::Malformed)),
+            "an over-cap reply frame must be Malformed (not Unreachable), got {result:?}"
         );
     }
 }

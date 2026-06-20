@@ -51,7 +51,7 @@ use crate::{
     traffic::CoverTrafficProfile,
     transport::{
         leg::{
-            LegReader, LegWriter, QuicStreamLegReader, QuicStreamLegWriter, TcpLegReader,
+            H3DataFrameLegReader, H3DataFrameLegWriter, LegReader, LegWriter, TcpLegReader,
             TcpLegWriter,
         },
         tcp::{
@@ -1138,13 +1138,23 @@ pub(crate) async fn establish_authenticated_data_session(
 }
 
 /// A QUIC fast-plane connection the client has retained for the data relay after
-/// a Verified probe, together with the client `Endpoint` that owns it. BOTH must
-/// stay alive for the relay's whole duration: dropping the last `Connection`
-/// handle application-closes the connection, and dropping the `Endpoint` stops
-/// driving its I/O. Carried through the session seam to `ClientRelay`.
+/// a Verified probe, together with the client `Endpoint` that owns it and the
+/// HTTP/3 stream set established during the probe. ALL of these must stay alive
+/// for the relay's whole duration: dropping the last `Connection` handle
+/// application-closes the connection, dropping the `Endpoint` stops driving its
+/// I/O, and the control/encoder streams must stay open per RFC 9114 §6.2.1. The
+/// request bidi (`relay_send`/`relay_recv`) carried the probe round-trip and now
+/// continues to carry the relay (DATA-framed). Carried through the session seam to
+/// `ClientRelay`.
 struct RetainedClientQuic {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
+    /// HTTP/3 control + encoder uni streams, held open for the connection's life.
+    h3_control: crate::transport::udp::h3::H3ControlStreams,
+    /// The request bidi's send/recv halves. The probe round-trip already ran on
+    /// this stream (HEADERS + DATA); the relay continues on the SAME stream.
+    relay_send: quinn::SendStream,
+    relay_recv: quinn::RecvStream,
 }
 
 impl RetainedClientQuic {
@@ -1159,25 +1169,33 @@ impl RetainedClientQuic {
 }
 
 /// Outcome of the client UDP probe: the classification plus, on `Verified`, the
-/// retained connection + endpoint to carry the relay over a bidi stream.
+/// retained connection + endpoint + H3 streams to carry the relay.
 struct ClientProbeResult {
     outcome: crate::transport::udp::probe::ProbeOutcome,
-    /// `Some` only when `outcome` is `Verified`: the live QUIC connection kept
-    /// alive for the data relay. `None` otherwise (the probe connection/endpoint
-    /// are dropped, staying on TCP).
+    /// `Some` only when `outcome` is `Verified`: the live QUIC connection + H3
+    /// stream set kept alive for the data relay. `None` otherwise (everything is
+    /// dropped, staying on TCP).
     retained: Option<RetainedClientQuic>,
 }
 
 /// Probe the offered UDP fast plane over a fresh QUIC connection to the server's
 /// IP and the offered port. Never errors — failures map to Unreachable/Failed so
 /// the caller can always report a PX1P and keep the control stream aligned. On a
-/// Verified probe the connection AND its endpoint are RETAINED (returned to the
-/// caller) so the data relay can open a reliable bidi stream on the same
-/// connection; on any other outcome they are dropped here.
+/// Verified probe the connection, its endpoint, and the established HTTP/3 stream
+/// set are RETAINED (returned to the caller) so the data relay continues on the
+/// SAME request bidi; on any other outcome they are dropped here.
 ///
-/// `sni` is the camouflage front domain (the client's REALITY SNI), used as the
-/// QUIC ClientHello server name; it is never the literal "localhost", which would
-/// be a zero-false-positive censorship signature on the wire.
+/// The probe rides an HTTP/3 request bidi (RFC 9114): after opening the control
+/// stream (SETTINGS), the client opens the request bidi and writes HEADERS + a
+/// DATA frame carrying the probe request, reads the server's HEADERS + DATA(probe
+/// response), then opens the QPACK encoder stream — matching Safari's control ->
+/// request -> encoder stream order. The exporter-bound auth is unchanged; only the
+/// carrier is H3 framing.
+///
+/// `sni` is the camouflage front domain (the client's REALITY SNI), used as both
+/// the QUIC ClientHello server name AND the request's `:authority`; it is never
+/// the literal "localhost", which would be a zero-false-positive censorship
+/// signature on the wire.
 async fn run_client_udp_probe(
     server: &TcpStream,
     offer: &crate::protocol::command::UdpOffer,
@@ -1215,18 +1233,99 @@ async fn run_client_udp_probe(
         Ok(Ok(conn)) => conn,
         _ => return unreachable(),
     };
-    let outcome =
-        crate::transport::udp::probe::probe_client(&conn, psk, &offer.offer_id, probe_timeout)
-            .await
-            .unwrap_or(ProbeOutcome::Failed);
+
+    // H3 stream order: control (SETTINGS) -> request bidi (probe) -> encoder.
+    // Timeout-bounded like the other post-connect H3 steps (open_bi/encoder
+    // open/SETTINGS read below): the client accepts any server cert during the
+    // probe handshake (AcceptAnyServerCert), so an on-path peer that completes the
+    // unauthenticated QUIC handshake but advertises `initial_max_streams_uni=0`
+    // and never sends MAX_STREAMS would otherwise stall this `open_uni` forever —
+    // the probe would never return, never write PX1P, never fall back to TCP. On
+    // timeout/error treat as Unreachable (stay on TCP).
+    let control_send = match tokio::time::timeout(
+        probe_timeout,
+        crate::transport::udp::h3::open_h3_control_stream(&conn),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return unreachable(),
+    };
+    let (mut relay_send, mut relay_recv) =
+        match tokio::time::timeout(probe_timeout, conn.open_bi()).await {
+            Ok(Ok(streams)) => streams,
+            _ => return unreachable(),
+        };
+    let outcome = crate::transport::udp::probe::probe_client_over_bidi(
+        &conn,
+        &mut relay_send,
+        &mut relay_recv,
+        sni,
+        psk,
+        &offer.offer_id,
+        probe_timeout,
+    )
+    .await
+    .unwrap_or(ProbeOutcome::Failed);
+
     match outcome {
-        ProbeOutcome::Verified { .. } => ClientProbeResult {
-            outcome,
-            // Retain BOTH the endpoint and the connection for the relay. They are
-            // dropped by the caller if the relay path is not single-Connect.
-            retained: Some(RetainedClientQuic { endpoint, conn }),
-        },
-        // Drop conn + endpoint (function-local) -> connection closes, stay on TCP.
+        ProbeOutcome::Verified { .. } => {
+            // Probe Verified: open the QPACK encoder stream (last in Safari's
+            // stream order), then retain everything for the relay on the SAME bidi.
+            // Timeout-bounded like the other post-connect H3 steps: a non-
+            // cooperative peer that grants bidi/control credit but withholds uni
+            // credit (`initial_max_streams_uni`) could otherwise stall `open_uni`
+            // here indefinitely. On timeout/error treat as Unreachable (stay on TCP).
+            let encoder_send = match tokio::time::timeout(
+                probe_timeout,
+                crate::transport::udp::h3::open_h3_encoder_stream(&conn),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                // The connection died right after a Verified probe (or the peer
+                // withheld uni credit past the deadline); treat as Unreachable so
+                // the client stays on TCP rather than reporting a Verified path it
+                // can no longer use.
+                _ => return unreachable(),
+            };
+            // Read + verify the server's H3 SETTINGS off its control stream (the
+            // server opened its control stream before serving the bidi probe, so it
+            // is already in flight; no deadlock). A peer that does not advertise
+            // Safari-26's SETTINGS is a protocol divergence -> stay on TCP.
+            //
+            // LOCKSTEP: this requires the server's SETTINGS to be EXACTLY
+            // `safari26_settings()`. The server currently sends those same
+            // client-shaped SETTINGS (see `TODO(quic-active-probing)` in
+            // handshake/server.rs). When that gate is lifted and the server switches
+            // to origin-shaped SETTINGS, THIS equality check must change in lockstep
+            // (to the server's new SETTINGS), or the client will reject every server
+            // and silently never verify the QUIC path.
+            match tokio::time::timeout(
+                probe_timeout,
+                crate::transport::udp::h3::read_peer_h3_settings(&conn),
+            )
+            .await
+            {
+                Ok(Ok(settings)) if settings == crate::fingerprint::http3::safari26_settings() => {}
+                _ => return unreachable(),
+            }
+            ClientProbeResult {
+                outcome,
+                retained: Some(RetainedClientQuic {
+                    endpoint,
+                    conn,
+                    h3_control: crate::transport::udp::h3::H3ControlStreams::new(
+                        control_send,
+                        encoder_send,
+                    ),
+                    relay_send,
+                    relay_recv,
+                }),
+            }
+        }
+        // Drop conn + endpoint + streams (function-local) -> connection closes,
+        // stay on TCP.
         _ => ClientProbeResult {
             outcome,
             retained: None,
@@ -1688,12 +1787,6 @@ struct ClientRelay {
     cid: u64,
 }
 
-/// Short bound on the client's `open_bi` rendezvous. `open_bi` itself returns
-/// immediately in quinn, but if the retained connection has died this surfaces
-/// promptly; the trigger write that follows is what the server's `accept_bi`
-/// waits on. Sized to match the server's accept timeout family.
-const QUIC_RELAY_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Generous backstop on the teardown DONE read. The read is PRIMARILY bounded on
 /// connection liveness (`conn.closed()`), but the 15s keep-alive masks the ~60s
 /// idle timeout for a peer that is alive-but-stuck (e.g. a target that responds
@@ -1728,7 +1821,7 @@ impl ClientRelay {
             cid,
         } = self;
         let local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
-        let (mut seal_to_server, open_from_server) = data_session.into_data_codecs();
+        let (seal_to_server, open_from_server) = data_session.into_data_codecs();
 
         // Shared idle backstop for the relay (main's DoS hardening). Without it a
         // server that goes silent (e.g. an on-path adversary holding the single
@@ -1745,9 +1838,18 @@ impl ClientRelay {
         // server, recv = server->client), so client_upload (local->server) writes
         // the SendStream and client_download (server->client) reads the RecvStream.
         if let Some(retained) = retained_quic {
-            let RetainedClientQuic { endpoint, conn } = retained;
-            // Hold the endpoint + connection alive for the relay's whole duration.
+            let RetainedClientQuic {
+                endpoint,
+                conn,
+                h3_control,
+                relay_send,
+                relay_recv,
+            } = retained;
+            // Hold the endpoint + connection + H3 control streams alive for the
+            // relay's whole duration. The control/encoder uni streams must stay
+            // open per RFC 9114 §6.2.1; `_endpoint` must not drop early.
             let _endpoint = endpoint;
+            let _h3_control = h3_control;
             // Keep the TCP control halves alive too so the outer TCP connection
             // stays open for the relay's duration (the server likewise holds its
             // TCP halves). They carry no relay DATA, but they DO carry the
@@ -1758,57 +1860,14 @@ impl ClientRelay {
             // needs `mut` to write our DONE marker.
             let mut server_write = server_write;
 
-            let (send, recv) =
-                match tokio::time::timeout(QUIC_RELAY_OPEN_TIMEOUT, conn.open_bi()).await {
-                    Ok(Ok(streams)) => streams,
-                    Ok(Err(err)) => {
-                        // The retained connection died before we could open the relay
-                        // stream. The server retained on the same Verified signal and
-                        // is awaiting this stream; there is no safe TCP fallback (the
-                        // server would never see our relay bytes). Fail cleanly.
-                        tracing::warn!(cid, error = %err, "QUIC fast-plane open_bi failed");
-                        conn.close(0u32.into(), b"open-failed");
-                        return Err(ClientRuntimeError::Io(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            format!("QUIC fast-plane open_bi failed: {err}"),
-                        )));
-                    }
-                    Err(_) => {
-                        tracing::warn!(cid, "QUIC fast-plane open_bi timed out");
-                        conn.close(0u32.into(), b"open-timeout");
-                        return Err(ClientRuntimeError::Io(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "QUIC fast-plane open_bi timed out",
-                        )));
-                    }
-                };
-
-            // quinn opens a bidi stream lazily: the server's `accept_bi` will not
-            // return until the opener writes to the SendStream. Send a single
-            // empty sealed record as the rendezvous trigger. This is NOT a wire
-            // envelope -- an empty record is a legitimate protocol record (the
-            // cover-traffic path seals `&[]`, and the server's upload loop skips
-            // empty plaintext). It consumes record #N+1 on the client->server
-            // codec; the server reads it on the same codec at #N+1 and skips it.
-            // Real relay data continues at #N+2 on the SAME SendStream.
-            let mut server_write_leg = QuicStreamLegWriter(send);
-            // The server's `accept_bi` is already waiting on this trigger. If we
-            // fail to seal or write it, close the connection EXPLICITLY (parity
-            // with the open_bi error arms above, which do not rely on Drop) so the
-            // server's `accept_bi` unblocks promptly with a CONNECTION_CLOSE rather
-            // than parking until its accept timeout.
-            let trigger = match seal_to_server.seal(&[], &mut OsRng) {
-                Ok(trigger) => trigger,
-                Err(err) => {
-                    conn.close(0u32.into(), b"trigger-failed");
-                    return Err(ClientRuntimeError::Handshake(err.into()));
-                }
-            };
-            if let Err(err) = server_write_leg.write_records(&trigger).await {
-                conn.close(0u32.into(), b"trigger-failed");
-                return Err(ClientRuntimeError::Io(err));
-            }
-
+            // The HTTP/3 control set and the request bidi were established during
+            // the probe (control -> request[HEADERS+DATA probe] -> encoder), and
+            // the probe round-trip already woke the server's `accept_bi`. The relay
+            // continues on the SAME request bidi, now carrying DATA-framed sealed
+            // records — no rendezvous trigger record is needed (the probe HEADERS
+            // already triggered the stream). The relay leg wraps each record batch
+            // in an H3 DATA frame and the reader strips DATA headers.
+            let server_write_leg = H3DataFrameLegWriter(relay_send);
             let upload = client_upload_loop(
                 local_read,
                 server_write_leg,
@@ -1822,7 +1881,7 @@ impl ClientRelay {
             // clean EOF (the app sees its response EOF immediately, decoupled from
             // the upload direction -- read-until-close apps depend on this).
             let download = client_download_loop(
-                QuicStreamLegReader::buffered(recv),
+                H3DataFrameLegReader::buffered(relay_recv),
                 local_write,
                 open_from_server,
                 activity.clone(),

@@ -1,8 +1,9 @@
 //! UDP fast-plane transport (the "U" in TUDP).
 //!
 //! Provides the QUIC endpoint building blocks for the masquerading HTTP/3 face on
-//! UDP: a QUIC connection, a uni-stream round-trip used by the reachability probe,
-//! and RFC 5705 keying-material export backing the exporter-bound UDP auth token.
+//! UDP: a QUIC connection, the HTTP/3 control/encoder uni streams plus the request
+//! bidi that carries the reachability probe and relay, and RFC 5705 keying-material
+//! export backing the exporter-bound UDP auth token.
 //!
 //! Wired into the client/server runtimes for the single-Connect data relay: when
 //! `[udp].enabled` is set on both ends and the client's probe is Verified, the
@@ -14,6 +15,7 @@
 pub mod auth;
 pub mod endpoint;
 pub(crate) mod envelope;
+pub(crate) mod h3;
 pub mod probe;
 pub(crate) mod reorder;
 /// Safari-26 H3 QUIC ClientHello carrier (S2). This is now the DEFAULT QUIC
@@ -252,8 +254,9 @@ fn udp_transport_config(peer_bidi: u32) -> Arc<quinn::TransportConfig> {
     // bidi grant per the `peer_bidi` asymmetry above; uni = 8
     // (`initial_max_streams_uni`); per-stream window 2 MiB; connection window
     // 16 MiB. The relay carries its payload over a single client-initiated BIDI
-    // stream; the reachability probe rides a uni-stream round-trip (one client uni
-    // + one server uni), well within the advertised 8 uni budget. Granting the
+    // stream, into which the reachability probe is folded (HEADERS + DATA on that
+    // same bidi). The uni budget carries the H3 control streams (control 0x00 +
+    // QPACK encoder 0x02 per end), well within the advertised 8. Granting the
     // advertised 8 uni is bounded by the 2 MiB per-uni-stream window under the
     // 16 MiB connection window; send_window matches the connection window so the
     // sender is not the bottleneck.
@@ -270,11 +273,11 @@ fn udp_transport_config(peer_bidi: u32) -> Arc<quinn::TransportConfig> {
     // `max_datagram_frame_size` for plain H3 (it sends no datagrams), so the
     // camouflaged transport params omit 0x20; disabling datagrams here makes
     // quinn's enforced behaviour match the wire (it neither advertises 0x20 in its
-    // own `params.write()` nor accepts datagram frames). The reachability probe no
-    // longer needs them — it rides a QUIC uni-stream round-trip (see `probe.rs`),
-    // which uses the advertised `initial_max_streams_uni = 8` budget. quinn's
-    // default enables datagrams (`datagram_receive_buffer_size = Some(..)`), so this
-    // explicit `None` is required.
+    // own `params.write()` nor accepts datagram frames). The reachability probe
+    // does not need them — it rides the H3 request bidi (HEADERS + DATA; see
+    // `probe.rs`). quinn's default enables datagrams
+    // (`datagram_receive_buffer_size = Some(..)`), so this explicit `None` is
+    // required.
     transport.datagram_receive_buffer_size(None);
 
     // Congestion control: BBR, not quinn's default Cubic. The fast plane only
@@ -538,10 +541,10 @@ mod tests {
     const TEST_PSK: &[u8] = b"parallax-tudp-loopback-psk-012345";
 
     /// Proves the QUIC fast-plane plumbing on loopback: connection establishment,
-    /// a uni-stream round-trip (the transport the reachability probe now uses), and
-    /// that the RFC 5705 keying-material exporter (open question #1 for the
-    /// exporter-bound auth token) is available and agrees on both ends under the
-    /// aws-lc-rs backend.
+    /// a uni-stream round-trip (the earlier probe carrier, still exercised here as
+    /// raw uni-stream plumbing), and that the RFC 5705 keying-material exporter
+    /// (open question #1 for the exporter-bound auth token) is available and agrees
+    /// on both ends under the aws-lc-rs backend.
     #[tokio::test]
     async fn quic_loopback_stream_and_exporter_round_trip() {
         let (cert, key) = self_signed_cert();
