@@ -57,17 +57,17 @@ experimentation, not censorship-resistant production use.
 
 | Area | Current behavior | Main code |
 |---|---|---|
-| CLI and config | `check`, `keygen`, `crypto-self-test`, `serve`, `client`, `speed`, `bench`, `config-template`, `probe`, `init`; TOML config with secret-permission checks. | `src/cli.rs`, `src/config.rs` |
+| CLI and config | `check`, `keygen`, `crypto-self-test`, `serve`, `client`, `speed`, `netmatrix`, `bench`, `config-template`, `probe`, `init`; TOML config with secret-permission checks. | `src/cli.rs`, `src/config.rs` |
 | Client runtime | Loopback-only SOCKS5 listener, authenticated server connection, PQ rekey, ML-DSA identity verification, bidirectional relay. | `src/client/runtime.rs`, `src/client/socks.rs` |
 | Server runtime | First-record classification, authorized-SNI check, fallback passthrough, authenticated data relay, fixed `server.data_target` support. | `src/handshake/server.rs` |
 | TLS camouflage | Handwritten Safari 26 TLS 1.3 client state machine with Safari cipher/group/extension ordering, GREASE, ALPN, ClientHello authentication fields, certificate verification, and HTTP/2 preface support. | `src/tls/safari26.rs`, `src/tls/client_hello.rs`, `src/fingerprint/http2.rs` |
 | Handshake authentication | PSK + X25519 material embedded into `ClientHello.random` and compatibility `SessionID`; replay cache gates authenticated handshakes. | `src/crypto/auth.rs`, `src/crypto/replay.rs` |
 | PQ and identity | ML-KEM-1024 rekey, transcript-bound server key exchange, ML-DSA-87 identity proof over the rekey binding. | `src/crypto/pq.rs`, `src/crypto/identity.rs`, `src/protocol/command.rs` |
-| Data plane | ChaCha20-Poly1305 records (96-bit per-record counter nonce) carried inside TLS `ApplicationData` frames, per-direction nonce ratchets, optional padding/timing/cover traffic; bulk batches seal/open across a shared multi-core crypto pool. | `src/crypto/session.rs`, `src/protocol/data.rs`, `src/crypto/parallel.rs`, `src/traffic.rs` |
-| TCP transport | Default TCP product transport with `TCP_NODELAY`, Linux keepalive tuning, fd-limit based relay concurrency, and 64 KiB relay buffers. | `src/transport/tcp.rs` |
+| Data plane | AEAD records (server-negotiated AES-256-GCM or ChaCha20-Poly1305; 96-bit per-record counter nonce) carried inside TLS `ApplicationData` frames, per-direction nonce ratchets, optional padding/timing/cover traffic; bulk batches seal/open across a shared multi-core crypto pool. | `src/crypto/session.rs`, `src/protocol/data.rs`, `src/crypto/parallel.rs`, `src/traffic.rs` |
+| TCP transport | Default TCP product transport with `TCP_NODELAY`, cross-platform TCP keepalive (SO_KEEPALIVE), fd-limit based relay concurrency, and 64 KiB relay buffers. | `src/transport/tcp.rs` |
 | Process hardening | Best-effort no-core-dump setup, non-dumpable process flag, `mlock`, `MADV_DONTDUMP`, and strict config file ownership/mode checks. | `src/process_hardening.rs`, `src/config.rs` |
 | Operations | Local build, binary-only VPS upload, hardened systemd unit, optional BBR/fq setup, optional Polar Signals / parca-agent profiling. | `scripts/deploy-vps.sh`, `scripts/uninstall-vps.sh` |
-| Validation | Unit/integration tests, Safari parity fixtures, ignored loopback tests, GFW simulator, fixed 58-case benchmark suite, speed evidence report. | `tests/`, `src/bench.rs`, `src/speed.rs` |
+| Validation | Unit/integration tests, Safari parity fixtures, ignored loopback tests, GFW simulator, fixed 59-case benchmark suite, speed evidence report. | `tests/`, `src/bench.rs`, `src/speed.rs` |
 
 ---
 
@@ -296,7 +296,7 @@ plx bench --json
 ```
 
 The benchmark suite is intentionally fixed-parameter. Current `main` runs
-58 cases across six groups: `handshake.crypto`, `handshake.protocol`,
+59 cases across six groups: `handshake.crypto`, `handshake.protocol`,
 `record.aead`, `record.pipeline`, `traffic`, and `state`.
 
 Network speed evidence test:

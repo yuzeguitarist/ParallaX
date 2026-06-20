@@ -13,7 +13,7 @@ supports TCP sockets that carry TLS-shaped ParallaX traffic.
 The runtime applies:
 
 - `TCP_NODELAY`
-- platform-specific Linux TCP keepalive where available
+- cross-platform TCP keepalive (SO_KEEPALIVE) on the socket
 - best-effort `RLIMIT_NOFILE` soft-limit bump for long-lived processes
 
 The deploy script can also configure the VPS for:

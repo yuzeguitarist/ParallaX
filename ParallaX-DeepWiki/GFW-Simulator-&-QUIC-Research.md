@@ -8,9 +8,11 @@ ParallaX ships TCP/TLS as its default, fingerprint-hardened transport and has no
 `--quic` CLI flag. It does, however, carry an **experimental, off-by-default
 UDP/QUIC fast plane** wired into the client and server runtimes (enabled with
 `[udp].enabled = true` on both ends; see [Transport Layer](Transport-Layer.md)
-and [Configuration Reference](Configuration-Reference.md)). That fast plane is
-for throughput experimentation and is not yet shaped to match a browser's QUIC
-fingerprint.
+and [Configuration Reference](Configuration-Reference.md)). Its QUIC client
+already emits a Safari-26 H3-shaped ClientHello by default (matching Safari's
+cipher suites, GREASE, and transport-parameter encoding); the plane is for
+throughput experimentation and remains off by default and not yet a
+production-ready operator mode.
 
 QUIC also appears in this repository as research and adversary-model context:
 

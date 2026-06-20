@@ -22,7 +22,7 @@ which cases exist.
 
 ## Current suite
 
-Current `main` runs 58 cases across six groups:
+Current `main` runs 59 cases across six groups:
 
 | Group | Examples |
 |---|---|

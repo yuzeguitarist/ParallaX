@@ -51,6 +51,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 | `plx serve [-c FILE]` | Start the server listener. | Long-lived process hardening runs before config use. |
 | `plx client [-c FILE]` | Start the loopback SOCKS5 client. | Uses a runtime guard to avoid conflicts with `plx speed`. |
 | `plx speed [-c FILE] [--json]` | Run one network speed evidence test against the configured server. | Fixed warmup + three samples per direction. |
+| `plx netmatrix [-c FILE] [--json]` | Run a reproducible controlled-network RTT/bandwidth speed matrix against the configured server. | Uses an emulated loopback shaper, not a live-network test. |
 | `plx bench [--quick] [--json]` | Run the fixed CPU benchmark suite. | `--quick` is a smoke profile, not a custom benchmark knob. |
 | `plx config-template ...` | Print paired server/client TOML templates to stdout. | Advanced mode; no file writes. |
 | `plx probe [DEST] [-c FILE]` | Probe an explicit or config-derived camouflage target. | Accepts `domain`, `domain:port`, or `https://domain`. |
