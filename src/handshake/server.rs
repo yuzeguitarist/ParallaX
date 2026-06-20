@@ -585,6 +585,7 @@ async fn handle_connection_inner(
             let handshake = accept_authenticated(
                 client,
                 config,
+                psk,
                 server_public_key,
                 x25519_shared_secret,
                 first_record,
@@ -820,6 +821,7 @@ fn authenticated_decision(
 pub async fn accept_authenticated(
     mut client: TcpStream,
     config: &ServerConfig,
+    psk: &[u8],
     server_public_key: [u8; 32],
     x25519_shared_secret: zeroize::Zeroizing<[u8; 32]>,
     first_client_record: Vec<u8>,
@@ -842,7 +844,7 @@ pub async fn accept_authenticated(
     write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await?;
 
     let context = transcript_hash(&first_client_record, &forwarded.raw_record);
-    let session_keys = derive_server_keys_from_shared(&x25519_shared_secret, &context)?;
+    let session_keys = derive_server_keys_from_shared(psk, &x25519_shared_secret, &context)?;
     session_keys.protect_secret_memory();
 
     Ok(AuthenticatedHandshake {
@@ -6075,6 +6077,7 @@ mod tests {
             accept_authenticated(
                 server_side,
                 &config,
+                &[0x5a_u8; 32],
                 server_keys.public,
                 zeroize::Zeroizing::new([0_u8; 32]),
                 first_client_record,
@@ -6228,6 +6231,7 @@ mod tests {
         let server_hello_record = read_record(&mut client).await.unwrap();
         let _server_hello = parse_server_hello(&server_hello_record).unwrap();
         let session_keys = crate::handshake::client::derive_session_keys(
+            PSK,
             &client_keys.private,
             &server_keys.public,
             &client_hello,

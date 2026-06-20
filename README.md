@@ -213,6 +213,8 @@ Minimal generated server shape:
 mode = "server"
 
 [crypto]
+# Must be a CSPRNG-generated key (>= 32 bytes), e.g. `openssl rand -base64 32`.
+# A release-build server refuses to start with a low-entropy / guessable PSK.
 psk = "base64..."
 
 [traffic]

@@ -113,45 +113,51 @@ pub enum SessionError {
 }
 
 pub fn derive_client_keys(
+    psk: &[u8],
     client_private: &[u8; KEY_LEN],
     server_public: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    derive_keys(client_private, server_public, transcript_hash)
+    derive_keys(psk, client_private, server_public, transcript_hash)
 }
 
 pub fn derive_server_keys(
+    psk: &[u8],
     server_private: &[u8; KEY_LEN],
     client_public: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    derive_keys(server_private, client_public, transcript_hash)
+    derive_keys(psk, server_private, client_public, transcript_hash)
 }
 
 pub fn derive_client_keys_from_shared(
+    psk: &[u8],
     x25519_shared_secret: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    derive_keys_from_shared(*x25519_shared_secret, transcript_hash)
+    derive_keys_from_shared(psk, *x25519_shared_secret, transcript_hash)
 }
 
 pub fn derive_server_keys_from_shared(
+    psk: &[u8],
     x25519_shared_secret: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
-    derive_keys_from_shared(*x25519_shared_secret, transcript_hash)
+    derive_keys_from_shared(psk, *x25519_shared_secret, transcript_hash)
 }
 
 fn derive_keys(
+    psk: &[u8],
     private: &[u8; KEY_LEN],
     peer_public: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
     let x25519_shared_secret = Zeroizing::new(x25519_shared_secret(private, peer_public));
-    derive_keys_from_shared(*x25519_shared_secret, transcript_hash)
+    derive_keys_from_shared(psk, *x25519_shared_secret, transcript_hash)
 }
 
 fn derive_keys_from_shared(
+    psk: &[u8],
     x25519_shared_secret: [u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<SessionKeys, SessionError> {
@@ -170,6 +176,7 @@ fn derive_keys_from_shared(
         return Err(SessionError::DegenerateSharedSecret);
     }
     let chain_secret = Zeroizing::new(initial_chain_secret(
+        psk,
         &x25519_shared_secret,
         transcript_hash,
     )?);
@@ -232,17 +239,23 @@ pub fn expand_epoch_keys(
 }
 
 fn initial_chain_secret(
+    psk: &[u8],
     x25519_shared_secret: &[u8; KEY_LEN],
     transcript_hash: &[u8; KEY_LEN],
 ) -> Result<[u8; KEY_LEN], SessionError> {
-    let hk = Hkdf::<Sha256>::new(
-        Some(b"ParallaX v1 initial x25519 chain"),
-        x25519_shared_secret,
-    );
+    // Two-secret binding for the initial data-plane key, mirroring the discipline
+    // in crypto/auth.rs (`derive_auth_key_from_shared` / `derive_mask_key`) and
+    // the PQ sandwich rekey (crypto/pq.rs): the PSK is the HKDF salt and the
+    // X25519 shared secret is the IKM, so the initial chain secret requires BOTH.
+    // An X25519 compromise alone cannot reproduce the initial session keys without
+    // the PSK. Transcript binding stays explicit in the expand `info` below, which
+    // also carries the (bumped) domain-separation label. psk non-emptiness is
+    // enforced upstream by config validation (crypto.psk >= 32 bytes).
+    let hk = Hkdf::<Sha256>::new(Some(psk), x25519_shared_secret);
     let mut chain_secret = [0_u8; KEY_LEN];
     expand(
         &hk,
-        b"initial chain secret",
+        b"ParallaX v2 initial psk+x25519 chain secret",
         0,
         transcript_hash,
         &mut chain_secret,
@@ -624,6 +637,9 @@ fn write_bytes(out: &mut [u8; HKDF_INFO_STACK_LEN], offset: &mut usize, bytes: &
 mod tests {
     use super::*;
 
+    /// CSPRNG-grade PSK fixture for key-derivation tests (>= 32 distinct bytes).
+    const TEST_PSK: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz!@#$";
+
     #[test]
     fn x25519_derives_same_session_keys() {
         let client = X25519KeyPair::generate();
@@ -631,13 +647,38 @@ mod tests {
         let transcript_hash = [7_u8; 32];
 
         let client_keys =
-            derive_client_keys(&client.private, &server.public, &transcript_hash).unwrap();
+            derive_client_keys(TEST_PSK, &client.private, &server.public, &transcript_hash)
+                .unwrap();
         let server_keys =
-            derive_server_keys(&server.private, &client.public, &transcript_hash).unwrap();
+            derive_server_keys(TEST_PSK, &server.private, &client.public, &transcript_hash)
+                .unwrap();
 
         assert_eq!(client_keys, server_keys);
         assert_eq!(client_keys.epoch, 0);
         assert_eq!(client_keys.transcript_hash, transcript_hash);
+    }
+
+    #[test]
+    fn initial_session_key_depends_on_psk() {
+        // Issue #50 (#1): X25519 compromise alone must not reproduce the initial
+        // session keys. Same X25519 secret + transcript, different PSK => different
+        // keys.
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        let transcript_hash = [7_u8; 32];
+        let shared = x25519_shared_secret(&client.private, &server.public);
+
+        let psk_a = derive_client_keys_from_shared(TEST_PSK, &shared, &transcript_hash).unwrap();
+        let psk_b = derive_client_keys_from_shared(
+            b"a different csprng psk value xyz!",
+            &shared,
+            &transcript_hash,
+        )
+        .unwrap();
+
+        assert_ne!(psk_a.client_key, psk_b.client_key);
+        assert_ne!(psk_a.server_key, psk_b.server_key);
+        assert_ne!(psk_a.chain_secret, psk_b.chain_secret);
     }
 
     #[test]
@@ -648,8 +689,10 @@ mod tests {
         let shared = x25519_shared_secret(&client.private, &server.public);
 
         let from_private =
-            derive_client_keys(&client.private, &server.public, &transcript_hash).unwrap();
-        let from_shared = derive_client_keys_from_shared(&shared, &transcript_hash).unwrap();
+            derive_client_keys(TEST_PSK, &client.private, &server.public, &transcript_hash)
+                .unwrap();
+        let from_shared =
+            derive_client_keys_from_shared(TEST_PSK, &shared, &transcript_hash).unwrap();
 
         assert_eq!(from_private, from_shared);
     }
@@ -662,8 +705,10 @@ mod tests {
         let shared = x25519_shared_secret(&server.private, &client.public);
 
         let from_private =
-            derive_server_keys(&server.private, &client.public, &transcript_hash).unwrap();
-        let from_shared = derive_server_keys_from_shared(&shared, &transcript_hash).unwrap();
+            derive_server_keys(TEST_PSK, &server.private, &client.public, &transcript_hash)
+                .unwrap();
+        let from_shared =
+            derive_server_keys_from_shared(TEST_PSK, &shared, &transcript_hash).unwrap();
 
         assert_eq!(from_private, from_shared);
     }
@@ -900,11 +945,11 @@ mod tests {
     fn derive_keys_rejects_all_zero_shared_secret() {
         let transcript_hash = [7_u8; 32];
         assert!(matches!(
-            derive_client_keys_from_shared(&[0_u8; KEY_LEN], &transcript_hash),
+            derive_client_keys_from_shared(TEST_PSK, &[0_u8; KEY_LEN], &transcript_hash),
             Err(SessionError::DegenerateSharedSecret)
         ));
         assert!(matches!(
-            derive_server_keys_from_shared(&[0_u8; KEY_LEN], &transcript_hash),
+            derive_server_keys_from_shared(TEST_PSK, &[0_u8; KEY_LEN], &transcript_hash),
             Err(SessionError::DegenerateSharedSecret)
         ));
     }
@@ -922,7 +967,7 @@ mod tests {
         );
         let transcript_hash = [9_u8; 32];
         assert!(matches!(
-            derive_client_keys_from_shared(&shared, &transcript_hash),
+            derive_client_keys_from_shared(TEST_PSK, &shared, &transcript_hash),
             Err(SessionError::DegenerateSharedSecret)
         ));
     }

@@ -51,6 +51,12 @@ pub enum ConfigError {
     },
     #[error("crypto.psk must decode to at least 32 bytes")]
     WeakPsk,
+    #[error(
+        "crypto.psk appears to have low entropy; a production (release-build) server \
+         refuses to start with a guessable PSK. Generate a CSPRNG key with `plx init` \
+         or `openssl rand -base64 32`"
+    )]
+    LowEntropyPsk,
     #[error("traffic.max_padding must be >= traffic.min_padding")]
     InvalidPaddingRange,
     #[error("traffic.max_padding leaves too little room for encrypted payload")]
@@ -144,6 +150,12 @@ impl fmt::Display for Mode {
 #[serde(deny_unknown_fields)]
 pub struct CryptoConfig {
     /// Base64-encoded pre-shared secret. Require at least 32 bytes after decode.
+    ///
+    /// The PSK is one of the two secrets the auth scheme and the initial session
+    /// key derivation rest on, so it MUST be CSPRNG-generated (`plx init` or
+    /// `openssl rand -base64 32`). A low-entropy / guessable PSK is rejected at
+    /// startup on a release-build server (`ConfigError::LowEntropyPsk`); debug
+    /// builds and client mode only warn.
     pub psk: String,
 }
 
@@ -450,18 +462,13 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let psk = decode_psk(&self.crypto.psk)?;
-        if psk_looks_low_entropy(&psk) {
-            // Not fatal (and the auto-generated PSK is always random), but warn:
-            // the PSK is one of the two secrets the whole auth scheme rests on
-            // (it salts the carrier-mask and auth-key HKDFs and keys replay/AEAD
-            // derivation). The v4 masks are no longer a raw-PSK offline oracle,
-            // but a low-entropy / human-chosen PSK still weakens auth against an
-            // attacker who can guess it. Only a CSPRNG-generated key is safe.
-            tracing::warn!(
-                "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
-                 (e.g. `plx init` / `openssl rand -base64 32`)"
-            );
-        }
+        // The PSK is one of the two secrets the whole auth scheme rests on (it
+        // salts the carrier-mask and auth-key HKDFs, the initial session key, and
+        // keys replay/AEAD derivation). A low-entropy / human-chosen PSK is
+        // guessable, so a production server must refuse to start; dev/test builds
+        // and client mode only warn. "Production" == release build (debug_assertions
+        // off), which is how `cargo install` / CI release artifacts are built.
+        check_psk_strength(&psk, is_production_server(self.mode))?;
         self.traffic.validate()?;
         self.udp.validate()?;
 
@@ -670,7 +677,7 @@ pub fn decode_psk(value: &str) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
 /// Heuristic, conservative low-entropy check for a decoded PSK. A CSPRNG-derived
 /// 32-byte key spans ~30 distinct byte values, so requiring at least 16 distinct
 /// values flags only obviously weak keys (repeated characters, short passphrases)
-/// with no false positives for random keys. Used to warn, never to reject.
+/// with no false positives for random keys.
 fn psk_looks_low_entropy(decoded: &[u8]) -> bool {
     const MIN_DISTINCT_BYTES: usize = 16;
     let mut seen = [false; 256];
@@ -682,6 +689,32 @@ fn psk_looks_low_entropy(decoded: &[u8]) -> bool {
         }
     }
     distinct < MIN_DISTINCT_BYTES
+}
+
+/// Whether weak-PSK enforcement is strict for this config: a release-build server.
+/// Debug builds (the test/dev profile) and client mode only warn. Kept separate
+/// from [`check_psk_strength`] so the policy is unit-testable without depending on
+/// the build profile.
+fn is_production_server(mode: Mode) -> bool {
+    !cfg!(debug_assertions) && matches!(mode, Mode::Server)
+}
+
+/// Enforces PSK strength. In `strict` mode (a production server) a low-entropy PSK
+/// is a hard error; otherwise it is a warning. The minimum length (>= 32 bytes) is
+/// already enforced by [`decode_psk`] before this runs — this only gates entropy.
+fn check_psk_strength(psk: &[u8], strict: bool) -> Result<(), ConfigError> {
+    if !psk_looks_low_entropy(psk) {
+        return Ok(());
+    }
+    if strict {
+        return Err(ConfigError::LowEntropyPsk);
+    }
+    tracing::warn!(
+        "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
+         (e.g. `plx init` / `openssl rand -base64 32`). This is a hard error on a \
+         release-build server."
+    );
+    Ok(())
 }
 
 pub fn decode_key32(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {
@@ -1268,6 +1301,39 @@ server_identity_public_key = "{KEY}"
     fn rejects_weak_psk() {
         let err = decode_psk("AA==").unwrap_err();
         assert!(matches!(err, ConfigError::WeakPsk));
+    }
+
+    #[test]
+    fn low_entropy_psk_hard_fails_in_strict_mode() {
+        // A 32-byte all-same-byte PSK passes the length floor but is low entropy.
+        let weak = [0x41_u8; 32];
+        assert!(psk_looks_low_entropy(&weak));
+        assert!(matches!(
+            check_psk_strength(&weak, true),
+            Err(ConfigError::LowEntropyPsk)
+        ));
+    }
+
+    #[test]
+    fn low_entropy_psk_only_warns_in_non_strict_mode() {
+        let weak = [0x41_u8; 32];
+        assert!(check_psk_strength(&weak, false).is_ok());
+    }
+
+    #[test]
+    fn strong_psk_passes_strict_mode() {
+        // >= 16 distinct bytes => not flagged, so strict mode accepts it.
+        let strong = b"0123456789abcdef0123456789abcdef";
+        assert!(!psk_looks_low_entropy(strong));
+        assert!(check_psk_strength(strong, true).is_ok());
+    }
+
+    #[test]
+    fn production_server_predicate_is_server_and_release_only() {
+        // Client mode is never strict regardless of build profile.
+        assert!(!is_production_server(Mode::Client));
+        // Server mode is strict iff this is a release build (debug_assertions off).
+        assert_eq!(is_production_server(Mode::Server), !cfg!(debug_assertions));
     }
 
     #[test]
