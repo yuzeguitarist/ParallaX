@@ -1,0 +1,150 @@
+# Free-tier nightly fuzz on the public-repo GitHub Actions quota.
+#
+# Complements the VPS cluster (ops/fuzz-cluster/, pinned to commit d240e663):
+#   - the VPS deep-soaks the PINNED release 24/7;
+#   - this job fuzzes HEAD — the new code the pinned cluster structurally cannot
+#     reach — on an ADAPTIVE 4-6 target subset so it finishes in one ~5.5h window.
+#
+# Timing: cron is UTC and 18:30 + ~5h fuzz + ~0.5h overhead ends ~00:00 UTC =
+# 08:00 Asia/Shanghai (wake time). cron can drift a few/-teen minutes under load;
+# timeout-minutes:350 is the <6h hard backstop. Crashes are filed as public
+# `fuzz-crash` issues (via the FUZZ_PAT secret) which drive fuzz-crash-triage.yml.
+name: fuzz-nightly
+
+on:
+  schedule:
+    - cron: '30 18 * * *'
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: 'libFuzzer -max_total_time seconds per target (dry-run: e.g. 120)'
+        default: '18000'
+      cap:
+        description: 'max targets this run'
+        default: '6'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      targets: ${{ steps.sel.outputs.targets }}
+      empty: ${{ steps.sel.outputs.empty }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0 # need history back to the VPS pin for the diff
+      - name: Select targets (changed since VPS pin, then date-rotation fill)
+        id: sel
+        env:
+          CAP: ${{ github.event.inputs.cap || '6' }}
+        run: |
+          set -euo pipefail
+          PIN="$(grep -oE 'PINNED_COMMIT="[0-9a-f]+"' ops/fuzz-cluster/bootstrap.sh | head -1 | grep -oE '[0-9a-f]{6,}')"
+          [ -n "$PIN" ] || PIN=d240e663
+          if git cat-file -e "${PIN}^{commit}" 2>/dev/null; then
+            python3 fuzz/ci/select_targets.py --mode nightly --pin "$PIN" --cap "$CAP" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::pin $PIN not in history; running rotation-only"
+            : | python3 fuzz/ci/select_targets.py --mode nightly --pin "$PIN" --cap "$CAP" --files-from - >> "$GITHUB_OUTPUT"
+          fi
+
+  fuzz:
+    needs: select
+    if: needs.select.outputs.empty != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        target: ${{ fromJSON(needs.select.outputs.targets) }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2026-06-10
+          components: rust-src
+
+      - name: Resolve target run params
+        run: python3 fuzz/ci/select_targets.py --params "$TARGET" >> "$GITHUB_ENV"
+
+      - name: Sanitizer build flags
+        run: |
+          if [ "$FUZZ_SANITIZER" = "none" ]; then
+            echo "RUSTFLAGS=-C overflow-checks=on" >> "$GITHUB_ENV"
+          fi
+
+      - name: Cache cargo-fuzz binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: fuzz
+          key: ${{ matrix.target }}-${{ env.FUZZ_SANITIZER }}
+
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo +nightly-2026-06-10 install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Restore GHA-grown corpus
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: gha-fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            gha-fuzz-corpus-${{ matrix.target }}-
+
+      - name: Seed corpus from VPS Release (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          TAG="$(grep -oE 'CAMPAIGN_TAG="[^"]+"' ops/fuzz-cluster/bootstrap.sh | head -1 | sed -E 's/.*="//; s/"//')"
+          [ -n "$TAG" ] || TAG=fuzz-corpus-d240e663
+          mkdir -p "fuzz/corpus/$TARGET"
+          if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "corpus-$TARGET.tar.zst" -D /tmp/seed 2>/dev/null; then
+            tar -C "fuzz/corpus/$TARGET" --zstd -xf "/tmp/seed/corpus-$TARGET.tar.zst" 2>/dev/null || true
+            echo "seeded $TARGET corpus from release $TAG"
+          else
+            echo "no release corpus asset for $TARGET (using cache + repo seeds only)"
+          fi
+
+      - name: Fuzz HEAD
+        env:
+          MAXTIME: ${{ github.event.inputs.max_total_time || '18000' }}
+        run: |
+          set -uo pipefail
+          DICT=""; [ -f "fuzz/$TARGET.dict" ] && DICT="-dict=fuzz/$TARGET.dict"
+          SEEDS=""; [ -d "fuzz/seeds/$TARGET" ] && SEEDS="fuzz/seeds/$TARGET"
+          set +e
+          # shellcheck disable=SC2086
+          cargo +nightly-2026-06-10 fuzz run --sanitizer "$FUZZ_SANITIZER" "$TARGET" \
+            "fuzz/corpus/$TARGET" $SEEDS -- \
+            $DICT -rss_limit_mb="$FUZZ_RSS" -malloc_limit_mb="$FUZZ_RSS" \
+            -timeout="$FUZZ_TIMEOUT" -max_len="$FUZZ_MAXLEN" \
+            -max_total_time="$MAXTIME" -print_final_stats=1
+          rc=$?
+          set -e
+          echo "FUZZ_RC=$rc" >> "$GITHUB_ENV"
+          echo "[$TARGET] cargo fuzz exit=$rc" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report crash (file issue via PAT -> auto-triage)
+        if: env.FUZZ_RC != '0'
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_NIGHTLY: nightly-2026-06-10
+          GH_TOKEN: ${{ secrets.FUZZ_PAT }}
+        run: bash .github/scripts/fuzz-report.sh

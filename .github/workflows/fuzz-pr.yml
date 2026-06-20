@@ -1,0 +1,147 @@
+# PR-adaptive smoke fuzz: ~5 minutes on ONLY the targets the PR diff touches.
+#
+# Meaningful in 5 min because it warm-starts from the VPS corpus Release + the
+# in-repo seeds, and concentrates the budget on the changed code (selector =
+# fuzz/ci/select_targets.py, same map as the nightly).
+#
+# NON-BLOCKING by design: a crash is reported as a job-summary entry + a ::warning::
+# annotation and the job still exits 0. Do NOT add this workflow as a required
+# status check. Uses `pull_request` (not pull_request_target): fork PRs run with a
+# read-only token and no secrets, so untrusted PR code never runs with write access.
+name: fuzz-pr
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'fuzz/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'fuzz/ci/target-map.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      targets: ${{ steps.sel.outputs.targets }}
+      empty: ${{ steps.sel.outputs.empty }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0 # need merge-base with the PR base for the diff
+      - name: Validate target map (fails if a fuzz target is unmapped)
+        run: python3 fuzz/ci/select_targets.py --check
+      - name: Select targets from the PR diff
+        id: sel
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: python3 fuzz/ci/select_targets.py --mode pr --base "$BASE" --cap 4 >> "$GITHUB_OUTPUT"
+
+  smoke:
+    needs: select
+    if: needs.select.outputs.empty != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        target: ${{ fromJSON(needs.select.outputs.targets) }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2026-06-10
+          components: rust-src
+
+      - name: Resolve target run params
+        run: python3 fuzz/ci/select_targets.py --params "$TARGET" >> "$GITHUB_ENV"
+
+      - name: Sanitizer build flags
+        run: |
+          if [ "$FUZZ_SANITIZER" = "none" ]; then
+            echo "RUSTFLAGS=-C overflow-checks=on" >> "$GITHUB_ENV"
+          fi
+
+      - name: Cache cargo-fuzz binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: fuzz
+          key: ${{ matrix.target }}-${{ env.FUZZ_SANITIZER }}
+
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo +nightly-2026-06-10 install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Seed corpus from VPS Release (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          TAG="$(grep -oE 'CAMPAIGN_TAG="[^"]+"' ops/fuzz-cluster/bootstrap.sh | head -1 | sed -E 's/.*="//; s/"//')"
+          [ -n "$TAG" ] || TAG=fuzz-corpus-d240e663
+          mkdir -p "fuzz/corpus/$TARGET"
+          if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "corpus-$TARGET.tar.zst" -D /tmp/seed 2>/dev/null; then
+            tar -C "fuzz/corpus/$TARGET" --zstd -xf "/tmp/seed/corpus-$TARGET.tar.zst" 2>/dev/null || true
+            echo "seeded $TARGET corpus from release $TAG"
+          else
+            echo "no release corpus asset for $TARGET (cold-ish smoke)"
+          fi
+
+      - name: Smoke fuzz (non-blocking)
+        run: |
+          set -uo pipefail
+          DICT=""; [ -f "fuzz/$TARGET.dict" ] && DICT="-dict=fuzz/$TARGET.dict"
+          SEEDS=""; [ -d "fuzz/seeds/$TARGET" ] && SEEDS="fuzz/seeds/$TARGET"
+          set +e
+          # shellcheck disable=SC2086
+          cargo +nightly-2026-06-10 fuzz run --sanitizer "$FUZZ_SANITIZER" "$TARGET" \
+            "fuzz/corpus/$TARGET" $SEEDS -- \
+            $DICT -rss_limit_mb="$FUZZ_RSS" -malloc_limit_mb="$FUZZ_RSS" \
+            -timeout="$FUZZ_TIMEOUT" -max_len="$FUZZ_MAXLEN" \
+            -max_total_time=120 -print_final_stats=1
+          rc=$?
+          set -e
+          echo "FUZZ_RC=$rc" >> "$GITHUB_ENV"
+
+      - name: Annotate crash (warn only, never blocks)
+        if: env.FUZZ_RC != '0'
+        run: |
+          set -uo pipefail
+          art="$(find "fuzz/artifacts/$TARGET" -maxdepth 1 -type f \( -name 'crash-*' -o -name 'oom-*' -o -name 'timeout-*' \) ! -name '*.handled' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+          {
+            echo "### fuzz smoke: \`$TARGET\` CRASHED (non-blocking)"
+            echo "The PR-targeted smoke fuzz found a crash in \`$TARGET\` on this PR's code."
+            if [ -n "$art" ]; then
+              cargo +nightly-2026-06-10 fuzz tmin --sanitizer "$FUZZ_SANITIZER" "$TARGET" "fuzz/artifacts/$TARGET/$art" >/dev/null 2>&1 || true
+              minf="$(find "fuzz/artifacts/$TARGET" -maxdepth 1 -type f -name 'minimized-from-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+              [ -n "$minf" ] || minf="fuzz/artifacts/$TARGET/$art"
+              echo '<details><summary>minimized reproducer (base64)</summary>'
+              echo
+              echo '```'
+              base64 < "$minf"
+              echo '```'
+              echo '</details>'
+              echo
+              echo "Repro locally: decode the base64 to a file, then"
+              echo "\`cargo +nightly-2026-06-10 fuzz run $TARGET <file>\` (or \`fuzz/run.sh repro $TARGET <file>\`)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=fuzz smoke crash::$TARGET crashed in PR smoke fuzz (non-blocking; see job summary)"
+          exit 0

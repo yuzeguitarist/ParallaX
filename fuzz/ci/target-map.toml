@@ -1,0 +1,178 @@
+# fuzz/ci/target-map.toml
+#
+# Single source of truth for the FREE-TIER GitHub Actions fuzzing (nightly + PR).
+# Consumed only by fuzz/ci/select_targets.py. NOT used by the VPS cluster.
+#
+# Two jobs it feeds:
+#   - nightly (.github/workflows/fuzz-nightly.yml): fuzzes HEAD; selects the
+#     targets touched since the VPS pin (commit d240e663), fills to the cap with a
+#     date-rotated round-robin.
+#   - PR (.github/workflows/fuzz-pr.yml): fuzzes the PR diff's targets only.
+#
+# Per-target run params (sanitizer/rss/max_len/timeout) are an authoritative COPY
+# of ops/fuzz-cluster/lib/shard-table.sh (box-a = address parsers; box-b = none +
+# `-C overflow-checks=on` codecs). Keep them in sync if the cluster table changes.
+# `paths` are the changed-file globs that select each target (verified against the
+# harness imports in fuzz/fuzz_targets/*.rs). A glob ending in `/**` is a recursive
+# directory prefix; everything else is an exact path / fnmatch pattern.
+#
+# select_targets.py --check (run in normal PR CI) asserts the [targets] keys equal
+# `ls fuzz/fuzz_targets/*.rs`, so a newly added target without a row here fails CI.
+
+[selection]
+# The "core" subset: highest-value pre-auth / remote-reachable targets. Used as the
+# fail-open fallback when a shared/unknown file changes. Ordered by priority (the PR
+# cap truncates from the end).
+core = [
+  "tls_client_hello",
+  "server_decide_inbound",
+  "command_codecs",
+  "data_record_open",
+  "client_hello_auth",
+  "replay_dedup",
+]
+# Changed files matching these → trigger the core subset (build/dep/toolchain churn
+# can affect any target, but running all 18 in a PR is noise — core is the floor).
+core_triggers = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "vendor/**",
+  "fuzz/Cargo.toml",
+  "fuzz/Cargo.lock",
+  "fuzz/ci/target-map.toml",
+  "rust-toolchain",
+  "rust-toolchain.toml",
+]
+# Any other changed file under these prefixes that matches no target glob → also
+# trigger core (fail-open: an unmapped src change still fuzzes the core surface).
+src_prefixes = ["src/"]
+
+# --- box-a group: sanitizer = address (parsers; OOB/UAF/leaks) ----------------
+
+[targets.tls_client_hello]
+sanitizer = "address"
+rss = 1024
+max_len = 4096
+timeout = 20
+paths = ["src/tls/client_hello.rs", "src/tls/record.rs", "src/tls/safari26.rs"]
+
+[targets.tls_server_hello]
+sanitizer = "address"
+rss = 1024
+max_len = 4096
+timeout = 20
+paths = ["src/tls/server_hello.rs", "src/tls/record.rs"]
+
+[targets.tls_compressed_cert]
+sanitizer = "address"
+rss = 2048
+max_len = 4194304
+timeout = 25
+paths = ["src/tls/safari26.rs", "src/tls/record.rs"]
+
+[targets.server_decide_inbound]
+sanitizer = "address"
+rss = 4096
+max_len = 8192
+timeout = 25
+paths = ["src/handshake/server.rs"]
+
+[targets.client_hello_auth]
+sanitizer = "address"
+rss = 1536
+max_len = 8192
+timeout = 25
+paths = ["src/crypto/auth.rs"]
+
+[targets.socks_connect_request]
+sanitizer = "address"
+rss = 1024
+max_len = 8192
+timeout = 20
+paths = ["src/client/socks.rs"]
+
+[targets.h3_frame_decode]
+sanitizer = "address"
+rss = 1024
+max_len = 8192
+timeout = 20
+paths = ["src/fingerprint/http3.rs"]
+
+[targets.h3_settings_parse]
+sanitizer = "address"
+rss = 1024
+max_len = 4096
+timeout = 20
+paths = ["src/fingerprint/http3.rs"]
+
+[targets.h3_qpack_field_section]
+sanitizer = "address"
+rss = 1024
+max_len = 8192
+timeout = 20
+paths = ["src/fingerprint/http3.rs"]
+
+# --- box-b group: sanitizer = none + `-C overflow-checks=on` (codecs/arith) ----
+
+[targets.mux_frame]
+sanitizer = "none"
+rss = 1536
+max_len = 65536
+timeout = 20
+paths = ["src/protocol/command.rs"]
+
+[targets.data_record_open]
+sanitizer = "none"
+rss = 2048
+max_len = 65536
+timeout = 25
+paths = ["src/crypto/session.rs", "src/protocol/data.rs", "src/traffic.rs"]
+
+[targets.http2_frame_header]
+sanitizer = "none"
+rss = 1536
+max_len = 65536
+timeout = 20
+paths = ["src/fingerprint/http2.rs"]
+
+[targets.command_codecs]
+sanitizer = "none"
+rss = 1024
+max_len = 65536
+timeout = 20
+paths = ["src/protocol/command.rs", "src/crypto/pq.rs"]
+
+[targets.replay_journal]
+sanitizer = "none"
+rss = 1024
+max_len = 65536
+timeout = 25
+paths = ["src/crypto/replay.rs"]
+
+[targets.udp_envelope]
+sanitizer = "none"
+rss = 1024
+max_len = 65536
+timeout = 20
+paths = ["src/transport/udp/envelope.rs", "src/transport/udp/mod.rs"]
+
+[targets.udp_reorder]
+sanitizer = "none"
+rss = 1024
+max_len = 65536
+timeout = 20
+paths = ["src/transport/udp/reorder.rs", "src/transport/udp/mod.rs"]
+
+[targets.replay_dedup]
+sanitizer = "none"
+rss = 1024
+max_len = 65536
+timeout = 25
+paths = ["src/crypto/replay.rs"]
+
+[targets.mldsa_verify]
+sanitizer = "none"
+rss = 2048
+max_len = 8192
+timeout = 25
+paths = ["src/crypto/mldsa/**"]
