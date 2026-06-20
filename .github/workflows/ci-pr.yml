@@ -93,7 +93,7 @@ jobs:
       # Unit tests (lib + bins) + EVERY integration test target except
       # gfw_simulator (which has its own required check below). cargo runs ONLY the
       # targets named here, so the previous short list silently skipped
-      # ja4_census_oracle, no_timeout_ratchet, gfw_sim_provenance, safari_clienthello,
+      # ja4_census_oracle, no_timeout_ratchet, gfw_sim_provenance,
       # etc.: the `--ignored` step below runs only #[ignore] tests, so their
       # non-ignored tests never executed in CI. Keep this list = `ls tests/*.rs`
       # minus gfw_simulator; any new tests/*.rs MUST be added here or it will never
@@ -110,7 +110,6 @@ jobs:
             --test mldsa_differential \
             --test no_timeout_ratchet \
             --test prober_loop \
-            --test safari_clienthello \
             --test safari_h2_parity_baseline \
             --test safari_parity_baseline \
             --test splice_equivalence

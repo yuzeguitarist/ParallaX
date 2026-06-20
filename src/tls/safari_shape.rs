@@ -7,16 +7,14 @@
 //!
 //! * the handwritten TCP camouflage path in [`super::safari26`], which assembles
 //!   a full ClientHello record from these extension bodies, and
-//! * the QUIC/H3 path, which assembles a typed [`SafariChProfile`] (consumed by
-//!   the vendored-rustls fork) from the same GREASE rules and the same exact
-//!   `signature_algorithms` bytes.
+//! * the hand-written QUIC TLS engine in [`super::quic`], which assembles the
+//!   Safari-26 H3 ClientHello handshake message from the same GREASE rules and the
+//!   same exact `signature_algorithms` bytes.
 //!
 //! Keeping both paths on one builder guarantees the GREASE classes and the kept
 //! `0x0805` duplicate stay identical no matter which carrier emits the hello.
-
-use rustls::client::{SafariChProfile, SafariExt};
-use rustls::internal::msgs::enums::ExtensionType;
-use rustls::CipherSuite;
+//! These builders are rustls-free; the QUIC path is no longer routed through the
+//! vendored-rustls fork.
 
 // --- Wire codepoints (RFC-fixed values, shared with the TCP path) ------------
 
@@ -203,88 +201,6 @@ pub(crate) fn supported_versions_extension_h3(grease_version: u16) -> Vec<u8> {
     out
 }
 
-// --- QUIC/H3 typed profile ---------------------------------------------------
-
-/// Assemble the exact Safari-26 H3 ClientHello shape as a typed
-/// [`SafariChProfile`] for the vendored-rustls fork.
-///
-/// COLD-START only: `psk_key_exchange_modes` is present (a `Managed` extension),
-/// but `pre_shared_key` and `early_data` are absent (`Resumption::disabled()`).
-///
-/// QUIC drops two extensions the TCP Safari hello carries: `extended_master_secret`
-/// (0x17) and `renegotiation_info` (0xff01). QUIC pins min=max=TLS1.3 and both
-/// extensions' send-gate is min<=TLS1.2, so they never appear on the pure-1.3 QUIC
-/// path — and `supported_versions` advertises GREASE + 0x0304 only (no TLS 1.2),
-/// via [`supported_versions_extension_h3`].
-///
-/// Structurally-load-bearing extensions whose exact bytes matter — the GREASE
-/// pair, the GREASE-led `supported_groups`/`supported_versions`, and the
-/// `signature_algorithms` with the kept `0x0805` duplicate — are emitted as
-/// [`SafariExt::Raw`] from the shared byte-builders. Extensions rustls encodes
-/// byte-faithfully (and which carry live key material / SNI) stay
-/// [`SafariExt::Managed`], including `key_share` (GREASE prepend + real shares
-/// applied by the fork) and `quic_transport_parameters` (0x39, carrying the
-/// hand-encoded ascending blob the QUIC Session substitutes).
-pub(crate) fn safari_h3_ch_profile(grease: GreaseSet) -> SafariChProfile {
-    let mut plan = Vec::with_capacity(16);
-
-    // Leading GREASE, len 0.
-    plan.push(SafariExt::Raw(grease.extension, Vec::new()));
-    plan.push(SafariExt::Managed(ExtensionType::ServerName));
-
-    plan.push(SafariExt::Raw(
-        u16::from(ExtensionType::EllipticCurves),
-        supported_groups_extension(grease.group),
-    ));
-    plan.push(SafariExt::Managed(ExtensionType::ECPointFormats));
-    // ALPN = h3 (the profile's `alpn` field drives the body).
-    plan.push(SafariExt::Managed(ExtensionType::ALProtocolNegotiation));
-    plan.push(SafariExt::Managed(ExtensionType::StatusRequest));
-    // signature_algorithms with the kept duplicate 0x0805 — Raw to preserve the
-    // dup that a typed `Vec<SignatureScheme>` cannot represent.
-    plan.push(SafariExt::Raw(
-        u16::from(ExtensionType::SignatureAlgorithms),
-        signature_algorithms_extension(),
-    ));
-    // signed_certificate_timestamp (SCT, 0x12): an empty client-side flag. rustls
-    // has NO `ClientExtensions` field for it, so a `Managed` entry would encode to
-    // nothing and silently drop from the wire; emit it Raw with the empty body the
-    // TCP fixture uses (safari26.rs:760).
-    plan.push(SafariExt::Raw(u16::from(ExtensionType::SCT), Vec::new()));
-    // key_share: Managed so rustls keeps the real hybrid+x25519 shares (and the
-    // fork prepends the GREASE entry); never reconstruct the live key material.
-    plan.push(SafariExt::Managed(ExtensionType::KeyShare));
-    plan.push(SafariExt::Managed(ExtensionType::PSKKeyExchangeModes));
-    plan.push(SafariExt::Raw(
-        u16::from(ExtensionType::SupportedVersions),
-        supported_versions_extension_h3(grease.version),
-    ));
-    // quic_transport_parameters (0x39): Managed, carrying the opaque ascending
-    // blob the QUIC Session substitutes for quinn's `params.write()`.
-    plan.push(SafariExt::Managed(ExtensionType::TransportParameters));
-    // compress_certificate (0x1b): the QUIC rustls config leaves
-    // `certificate_compression_algorithms` unset, so a `Managed` entry would drop
-    // from the wire; emit it Raw with the `[len=2, zlib=0x0001]` body the TCP
-    // fixture uses (safari26.rs:772).
-    plan.push(SafariExt::Raw(
-        u16::from(ExtensionType::CompressCertificate),
-        vec![0x02, 0x00, 0x01],
-    ));
-
-    // Trailing GREASE, len 1.
-    plan.push(SafariExt::Raw(grease.final_extension, vec![0x00]));
-
-    SafariChProfile {
-        cipher_suites: safari_cipher_suites(grease)
-            .into_iter()
-            .map(CipherSuite::Unknown)
-            .collect(),
-        extension_plan: plan,
-        alpn: vec![b"h3".to_vec()],
-        key_share_grease_group: grease.group,
-    }
-}
-
 // --- Infallible byte helpers --------------------------------------------------
 //
 // Every list these write is a small, compile-time-bounded protocol vector, so a
@@ -399,94 +315,5 @@ mod tests {
             !versions_h3.chunks_exact(2).any(|c| read_u16(c, 0) == TLS12),
             "QUIC supported_versions must NOT offer TLS 1.2"
         );
-    }
-
-    #[test]
-    fn h3_profile_extension_plan_is_the_static_safari_order() {
-        let g = grease();
-        let profile = safari_h3_ch_profile(g);
-
-        assert_eq!(profile.alpn, vec![b"h3".to_vec()]);
-        assert_eq!(profile.key_share_grease_group, g.group);
-        assert_eq!(profile.cipher_suites.len(), 21);
-
-        // Project the plan onto its wire extension-type codepoints.
-        let order: Vec<u16> = profile
-            .extension_plan
-            .iter()
-            .map(|ext| match ext {
-                SafariExt::Raw(typ, _) => *typ,
-                SafariExt::Managed(typ) => u16::from(*typ),
-            })
-            .collect();
-
-        // First is GREASE (len 0), last is GREASE (len 1), and they differ.
-        assert!(is_grease(order[0]));
-        assert!(is_grease(*order.last().unwrap()));
-        assert_ne!(order[0], *order.last().unwrap());
-        match &profile.extension_plan[0] {
-            SafariExt::Raw(_, body) => assert!(body.is_empty(), "leading GREASE is len 0"),
-            _ => panic!("leading GREASE must be Raw"),
-        }
-        match profile.extension_plan.last().unwrap() {
-            SafariExt::Raw(_, body) => assert_eq!(body, &[0x00], "trailing GREASE is len 1"),
-            _ => panic!("trailing GREASE must be Raw"),
-        }
-
-        // The static Safari H3 table between the GREASE bookends. The confirmed
-        // spec drops extended_master_secret (0x17) and renegotiation_info (0xff01)
-        // on the pure-1.3 QUIC path (present only on the TCP hello).
-        let expected = [
-            0x0000, // server_name
-            0x000a, // supported_groups
-            0x000b, // ec_point_formats
-            0x0010, // ALPN (h3)
-            0x0005, // status_request
-            0x000d, // signature_algorithms (with dup 0x0805)
-            0x0012, // SCT
-            0x0033, // key_share
-            0x002d, // psk_key_exchange_modes
-            0x002b, // supported_versions
-            0x0039, // quic_transport_parameters
-            0x001b, // compress_certificate
-        ];
-        assert_eq!(&order[1..order.len() - 1], &expected);
-
-        // The QUIC path drops EMS (0x17) / renegotiation_info (0xff01) entirely.
-        assert!(
-            !order.contains(&0x0017) && !order.contains(&0xff01),
-            "QUIC H3: extended_master_secret (0x17) and renegotiation_info (0xff01) must be absent"
-        );
-
-        // supported_versions advertises GREASE + 0x0304 only on the QUIC path.
-        let sv = profile
-            .extension_plan
-            .iter()
-            .find_map(|ext| match ext {
-                SafariExt::Raw(0x002b, body) => Some(body.clone()),
-                _ => None,
-            })
-            .expect("supported_versions is a Raw extension in the plan");
-        assert_eq!(sv, supported_versions_extension_h3(g.version));
-
-        // Cold-start: no pre_shared_key, no early_data anywhere in the plan.
-        assert!(
-            !order.contains(&0x0029) && !order.contains(&0x002a),
-            "cold-start: pre_shared_key (0x29) and early_data (0x2a) must be absent"
-        );
-    }
-
-    #[test]
-    fn h3_profile_signature_algorithms_carries_the_kept_duplicate() {
-        let profile = safari_h3_ch_profile(grease());
-        let sig = profile
-            .extension_plan
-            .iter()
-            .find_map(|ext| match ext {
-                SafariExt::Raw(0x000d, body) => Some(body.clone()),
-                _ => None,
-            })
-            .expect("signature_algorithms is a Raw extension in the plan");
-        assert_eq!(sig, signature_algorithms_extension());
     }
 }

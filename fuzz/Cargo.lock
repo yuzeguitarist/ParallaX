@@ -706,12 +706,15 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "parallax"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "anyhow",
  "aws-lc-rs",
  "base64",
  "bytes",
+ "chacha20",
  "chacha20poly1305",
+ "cipher",
  "clap",
  "flate2",
  "hkdf",
@@ -1014,6 +1017,8 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
  "log",

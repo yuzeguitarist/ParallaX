@@ -55,14 +55,13 @@ additional_cargo_args = ["--locked"]
 # the indistinguishability + auth oracle surface:
 #   --lib  ............... auth.rs mod tests (MAC / auth-tail / timestamp) +
 #                          safari26.rs unit tests (fingerprint shape)
-#   safari_clienthello, safari_parity_baseline, safari_h2_parity_baseline,
+#   safari_parity_baseline, safari_h2_parity_baseline,
 #   ja4_census_oracle  ... byte-exact ClientHello + JA4 fingerprint oracles
 #   gfw_simulator, gfw_sim_provenance  in-memory censor sim over the real CH
 # (Verified: the auth.rs survivors are identical with and without the excluded
 # tests, i.e. they were never the ones killing these mutants.)
 additional_cargo_test_args = [
     "--lib",
-    "--test=safari_clienthello",
     "--test=safari_parity_baseline",
     "--test=safari_h2_parity_baseline",
     "--test=ja4_census_oracle",

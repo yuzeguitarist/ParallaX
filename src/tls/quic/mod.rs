@@ -1,0 +1,140 @@
+//! Hand-written, transport-agnostic TLS 1.3 client engine for QUIC (RFC 9001).
+//!
+//! This is ParallaX's own TLS 1.3 client state machine. It owns the visible QUIC
+//! handshake wire image (a byte-faithful Safari-26 H3 ClientHello) and the full
+//! QUIC key schedule, with **no dependency on rustls and no dependency on quinn**.
+//! The crate's QUIC fast plane drives it through a thin adapter
+//! ([`crate::transport::udp::safari_crypto`]) that implements quinn-proto's
+//! `crypto::{ClientConfig, Session, PacketKey, HeaderKey}` traits over the types
+//! exported here.
+//!
+//! ## Why transport-agnostic
+//!
+//! The de-vendoring north star is two-phase: Phase 1 (this engine) removes the
+//! vendored rustls fork from the production QUIC client path; Phase 2 removes
+//! quinn itself in favour of a hand-written QUIC transport. To keep Phase 2
+//! cheap, the engine exposes a transport-neutral API ([`ClientHandshake`],
+//! [`Keys`], [`PacketKey`], [`HeaderProtectionKey`], the RFC 5705 exporter, retry
+//! validation) and never names a quinn or rustls type. The quinn glue is a
+//! separable adapter; Phase 2 replaces only that adapter.
+//!
+//! ## What it does / does not verify
+//!
+//! The production QUIC leg is REALITY-style: trust derives from the
+//! exporter-bound auth token, not the certificate (see
+//! [`crate::transport::udp::auth`]). The engine therefore takes a pluggable
+//! [`ServerCertVerifier`]; production injects [`AcceptAnyServerCert`]. Regardless
+//! of the verifier, the engine ALWAYS parses Certificate/CertificateVerify into
+//! the transcript and ALWAYS verifies the server Finished MAC — those are
+//! intrinsic to TLS 1.3 correctness, not policy.
+
+mod client_hello;
+mod keys;
+mod schedule;
+mod suite;
+mod verify;
+
+pub use keys::{DirectionalKeys, HeaderProtectionKey, KeyPair, Keys, PacketKey};
+pub use suite::CipherSuite;
+pub use verify::{AcceptAnyServerCert, CertVerifyError, ServerCertVerifier};
+
+use std::sync::Arc;
+
+use thiserror::Error;
+
+/// QUIC v1 (RFC 9000). The only version this engine speaks; drafts and v2 are
+/// rejected at [`ClientHandshake::new`].
+pub const QUIC_VERSION_V1: u32 = 0x0000_0001;
+
+/// Endpoint role, used to pick the Initial-secret label and the local/remote
+/// direction. The client engine always runs as [`Side::Client`]; [`Side::Server`]
+/// exists so [`ClientHandshake::initial_keys`] can derive both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Client,
+    Server,
+}
+
+// --- TLS alert codes (RFC 8446 §6) used to tag fatal handshake failures --------
+//
+// The adapter maps `QuicTlsError::Alert(code, _)` onto a QUIC CRYPTO_ERROR
+// (0x0100 | code); anything else becomes PROTOCOL_VIOLATION.
+pub(crate) const ALERT_UNEXPECTED_MESSAGE: u8 = 10;
+pub(crate) const ALERT_BAD_RECORD_MAC: u8 = 20;
+pub(crate) const ALERT_HANDSHAKE_FAILURE: u8 = 40;
+pub(crate) const ALERT_BAD_CERTIFICATE: u8 = 42;
+pub(crate) const ALERT_ILLEGAL_PARAMETER: u8 = 47;
+pub(crate) const ALERT_DECODE_ERROR: u8 = 50;
+pub(crate) const ALERT_DECRYPT_ERROR: u8 = 51;
+pub(crate) const ALERT_MISSING_EXTENSION: u8 = 109;
+pub(crate) const ALERT_UNSUPPORTED_EXTENSION: u8 = 110;
+pub(crate) const ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
+
+/// Errors surfaced by the hand-written TLS engine.
+///
+/// [`QuicTlsError::Alert`] carries the TLS alert description the peer should see;
+/// the quinn adapter turns it into a QUIC `CRYPTO_ERROR`. The remaining variants
+/// map to `PROTOCOL_VIOLATION` (or the `ConnectError` cases at `start_session`).
+#[derive(Debug, Error)]
+pub enum QuicTlsError {
+    /// A fatal TLS alert (`description`) with a human-readable reason.
+    #[error("TLS alert {description}: {reason}")]
+    Alert { description: u8, reason: String },
+    /// Local crypto operation (HKDF/AEAD/KEM) failed.
+    #[error("TLS crypto failure: {0}")]
+    Crypto(String),
+    /// Certificate or CertificateVerify rejected by the verifier.
+    #[error("certificate verification failed: {0}")]
+    Certificate(String),
+    /// Unsupported QUIC version (engine speaks v1 only).
+    #[error("unsupported QUIC version")]
+    UnsupportedVersion,
+    /// Malformed SNI handed to [`ClientHandshake::new`].
+    #[error("invalid server name: {0}")]
+    InvalidServerName(String),
+}
+
+impl QuicTlsError {
+    pub(crate) fn alert(description: u8, reason: impl Into<String>) -> Self {
+        Self::Alert {
+            description,
+            reason: reason.into(),
+        }
+    }
+
+    /// The TLS alert description to surface to the peer, if this failure has one.
+    pub fn alert_description(&self) -> Option<u8> {
+        match self {
+            Self::Alert { description, .. } => Some(*description),
+            _ => None,
+        }
+    }
+}
+
+/// Immutable configuration shared across handshakes from one client endpoint.
+///
+/// Rustls-free analogue of the old `rustls::ClientConfig` the QUIC carrier used.
+/// The Safari-26 ClientHello shape, the pinned post-quantum-hybrid key exchange,
+/// and TLS-1.3-only are all hard-coded by the engine (they are camouflage
+/// invariants, not knobs); only the cert verifier and ALPN are configurable.
+#[derive(Clone)]
+pub struct ClientConfig {
+    /// Offered ALPN protocols, in preference order. The QUIC carrier uses `[b"h3"]`.
+    pub alpn_protocols: Vec<Vec<u8>>,
+    /// Server-certificate trust policy. Production uses [`AcceptAnyServerCert`].
+    pub verifier: Arc<dyn ServerCertVerifier>,
+}
+
+impl ClientConfig {
+    /// Build a config with the given verifier and ALPN list.
+    pub fn new(verifier: Arc<dyn ServerCertVerifier>, alpn_protocols: Vec<Vec<u8>>) -> Self {
+        Self {
+            alpn_protocols,
+            verifier,
+        }
+    }
+}
+
+pub use handshake::{ClientHandshake, KeyChange};
+
+mod handshake;
