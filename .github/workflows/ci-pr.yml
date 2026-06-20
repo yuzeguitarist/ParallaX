@@ -90,17 +90,30 @@ jobs:
           shared-key: parallax-ci
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
-      # Unit tests + Safari parity baselines + any other integration test except gfw_simulator.
-      # gfw_simulator has its own required status check below.
-      - name: cargo test (lib, bins, parity + ML-DSA ACVP/differential)
+      # Unit tests (lib + bins) + EVERY integration test target except
+      # gfw_simulator (which has its own required check below). cargo runs ONLY the
+      # targets named here, so the previous short list silently skipped
+      # ja4_census_oracle, no_timeout_ratchet, gfw_sim_provenance, safari_clienthello,
+      # etc.: the `--ignored` step below runs only #[ignore] tests, so their
+      # non-ignored tests never executed in CI. Keep this list = `ls tests/*.rs`
+      # minus gfw_simulator; any new tests/*.rs MUST be added here or it will never
+      # run in CI.
+      - name: cargo test (lib, bins, all integration tests except gfw_simulator)
         run: |
           cargo test --locked --no-fail-fast \
             --lib \
             --bins \
-            --test safari_parity_baseline \
-            --test safari_h2_parity_baseline \
+            --test chaos_liveness \
+            --test gfw_sim_provenance \
+            --test ja4_census_oracle \
             --test mldsa_acvp \
-            --test mldsa_differential
+            --test mldsa_differential \
+            --test no_timeout_ratchet \
+            --test prober_loop \
+            --test safari_clienthello \
+            --test safari_h2_parity_baseline \
+            --test safari_parity_baseline \
+            --test splice_equivalence
 
       # Loopback integration tests are marked #[ignore] because they open
       # local TCP sockets. Run them serially so the OS doesn't get into a

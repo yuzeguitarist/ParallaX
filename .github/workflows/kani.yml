@@ -5,10 +5,28 @@ name: kani
 # in the sequence number (no AEAD nonce reuse -- the catastrophic-failure guard),
 # and the padding-length parser never panics on attacker-controlled input. These
 # are EXHAUSTIVE proofs over the input space, complementing the sampled property
-# tests and the Miri UB lane. Kani builds its own toolchain + CBMC, so this is
-# slow and runs weekly / on demand rather than on every push.
+# tests and the Miri UB lane. Kani builds its own toolchain + CBMC, so beyond the
+# weekly baseline it runs on PRs/pushes only when one of the two proof-carrying
+# files changes (path-filtered below), not on every push.
 
 on:
+  # Narrow path-filtered gate: only the two files that carry #[kani::proof]
+  # harnesses (nonce injectivity in crypto/session.rs, the padding-length parser
+  # in traffic.rs). Kani installs CBMC + its own toolchain (tens of minutes), so
+  # keep this tight to avoid long runs on unrelated changes; the weekly schedule
+  # covers dependency drift.
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'src/crypto/session.rs'
+      - 'src/traffic.rs'
+      - '.github/workflows/kani.yml'
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/crypto/session.rs'
+      - 'src/traffic.rs'
+      - '.github/workflows/kani.yml'
   schedule:
     - cron: '41 4 * * 1' # Mondays 04:41 UTC (offset from the miri lane)
   workflow_dispatch:

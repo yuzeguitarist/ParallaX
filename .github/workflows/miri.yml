@@ -6,10 +6,27 @@ name: miri
 # slice, integer-overflow-derived index, invalid-value transmute) would be most
 # dangerous. The crypto, TLS-record and relay paths call aws-lc-rs / ring /
 # quinn FFI, which Miri cannot execute, so they are intentionally excluded here
-# and covered by the fuzz suite + loopback tests instead. Miri is slow, so this
-# runs weekly and on demand rather than on every push.
+# and covered by the fuzz suite + loopback tests instead. Miri is slow, so beyond
+# the weekly baseline it runs on PRs/pushes only when one of the pure-logic
+# modules it covers changes (path-filtered below), not on every push.
 
 on:
+  # Path-filtered gate: run only when one of the FFI-free pure-logic modules Miri
+  # actually exercises changes (see the run filter at the bottom of this file).
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'src/transport/udp/reorder.rs'
+      - 'src/traffic.rs'
+      - 'src/protocol/command.rs'
+      - '.github/workflows/miri.yml'
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/transport/udp/reorder.rs'
+      - 'src/traffic.rs'
+      - 'src/protocol/command.rs'
+      - '.github/workflows/miri.yml'
   schedule:
     - cron: '37 4 * * 1' # Mondays 04:37 UTC
   workflow_dispatch:

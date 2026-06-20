@@ -1,0 +1,83 @@
+name: ci-fuzz-build
+
+# Compile-check the fuzz workspace on every change that can break a fuzz target.
+#
+# fuzz/ is a SEPARATE cargo workspace (it replicates the parent's
+# [patch.crates-io] and is excluded from the main build), so the primary CI never
+# compiles it: a change to a public src/ API can break a fuzz harness while every
+# other check stays green. This gate closes that gap.
+#
+# IMPORTANT: the fuzz targets reach `parallax::…::fuzz` re-export modules that are
+# gated behind `#[cfg(fuzzing)]`, so a plain `cargo check` does NOT compile (it
+# fails with "could not find `fuzz` in …"). The build MUST set `--cfg fuzzing` —
+# exactly what cargo-fuzz does — but NOT nightly / cargo-fuzz / a sanitizer, which
+# are only needed to RUN a fuzzer, not to type-check the harnesses.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      # Anything that feeds the fuzz workspace's compile: first-party sources, the
+      # vendored forks it patches in, the fuzz crate itself, the lockfile, and this
+      # workflow.
+      - 'src/**'
+      - 'vendor/**'
+      - 'fuzz/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-fuzz-build.yml'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'src/**'
+      - 'vendor/**'
+      - 'fuzz/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-fuzz-build.yml'
+  workflow_dispatch:
+
+# Least-privilege: this job only reads the repo to compile-check.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-fuzz-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  fuzz-build:
+    name: fuzz-build (cargo check --cfg fuzzing)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      # Separate cache key: the `--cfg fuzzing` build artifacts differ from the
+      # main build's, so they must not share/pollute the parallax-ci cache.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-fuzz-check
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      # `--cfg fuzzing` makes the `#[cfg(fuzzing)]` re-export modules visible; a
+      # plain `cargo check` fails to compile without it. No nightly / cargo-fuzz
+      # needed — this only type-checks the harnesses, it does not run them.
+      - name: cargo check (fuzz workspace, --cfg fuzzing)
+        env:
+          RUSTFLAGS: --cfg fuzzing
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
