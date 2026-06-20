@@ -29,10 +29,22 @@ pub struct MlKemKeyPair {
     pub secret: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MlKemEncapsulation {
     pub ciphertext: Vec<u8>,
     pub shared_secret: [u8; 32],
+}
+
+// Hand-written redacting Debug so the ML-KEM shared secret can never reach a log
+// or panic message, mirroring the redacting impls on X25519KeyPair / SessionKeys
+// in crypto/session.rs. The ciphertext is public wire material.
+impl std::fmt::Debug for MlKemEncapsulation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlKemEncapsulation")
+            .field("ciphertext", &self.ciphertext)
+            .field("shared_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// FIPS 203 ML-KEM-1024 serialized sizes (bytes). Exposed so config/probe can

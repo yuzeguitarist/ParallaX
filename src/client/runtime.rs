@@ -1000,7 +1000,11 @@ async fn handle_local_connection_with_cid(
         let speculative_server_addr = server_addr.clone();
         let speculative_udp = udp.clone();
         let speculative_reachability = Arc::clone(&reachability);
-        let speculative_psk = Arc::<[u8]>::from(psk.to_vec().into_boxed_slice());
+        // Wrap the speculative-path PSK copy in Zeroizing so it is wiped when the
+        // spawned task's Arc drops, matching the canonical PSK and the warm/mux
+        // pools (which keep Arc<Zeroizing<Vec<u8>>>); a bare Arc<[u8]> would leave
+        // a plaintext PSK copy un-wiped on this single-connect path.
+        let speculative_psk = Arc::new(Zeroizing::new(psk.to_vec()));
         let speculative_server_public = *server_public;
         let speculative_server_identity_public = server_identity_public.clone();
         tokio::spawn(async move {
@@ -1010,7 +1014,7 @@ async fn handle_local_connection_with_cid(
                 traffic,
                 &speculative_udp,
                 &speculative_reachability,
-                speculative_psk.as_ref(),
+                speculative_psk.as_slice(),
                 &speculative_server_public,
                 speculative_server_identity_public,
             )

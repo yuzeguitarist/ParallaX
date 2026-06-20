@@ -203,10 +203,7 @@ impl Safari26TlsCamouflage {
             &parallax_x25519.private,
             server_public_key,
         ));
-        let auth_key = Zeroizing::new(derive_client_auth_key_from_shared(
-            psk,
-            &parallax_shared_secret,
-        )?);
+        let auth_key = derive_client_auth_key_from_shared(psk, &parallax_shared_secret)?;
 
         // Generate the TLS handshake ephemeral up-front: its public half is
         // carried UNMASKED in the key_share, and the v4 carrier-mask key is
@@ -1847,7 +1844,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let auth_key =
-            derive_server_auth_key(psk, &server.private, &material.x25519_public).unwrap();
+            *derive_server_auth_key(psk, &server.private, &material.x25519_public).unwrap();
         let auth = verify_masked_stateful_client_hello_auth_with_material(
             &session.client_hello,
             &auth_key,

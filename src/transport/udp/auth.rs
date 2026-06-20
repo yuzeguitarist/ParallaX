@@ -23,6 +23,7 @@
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// RFC 5705 exporter label for the UDP auth binding.
 pub const UDP_AUTH_EXPORTER_LABEL: &[u8] = b"ParallaX v1 TUDP auth exporter binding";
@@ -64,7 +65,7 @@ fn exporter_context(context: &[u8]) -> [u8; 32] {
 pub fn derive_udp_auth_token(
     exporter_secret: &[u8; UDP_AUTH_EXPORTER_LEN],
     psk: &[u8],
-) -> Result<[u8; UDP_AUTH_TOKEN_LEN], UdpAuthError> {
+) -> Result<Zeroizing<[u8; UDP_AUTH_TOKEN_LEN]>, UdpAuthError> {
     if psk.is_empty() {
         return Err(UdpAuthError::EmptyPsk);
     }
@@ -72,8 +73,10 @@ pub fn derive_udp_auth_token(
     // the shared secret and the live TLS session (mirrors the prior QUIC runtime
     // and crypto/auth's "need both" posture).
     let hk = Hkdf::<Sha256>::new(Some(psk), exporter_secret);
-    let mut token = [0_u8; UDP_AUTH_TOKEN_LEN];
-    hk.expand(UDP_AUTH_KEY_LABEL, &mut token)
+    // Wipe the derived token's stack slot on return (it is the HMAC key gating the
+    // probe), matching the Zeroizing discipline in crypto/session.rs.
+    let mut token = Zeroizing::new([0_u8; UDP_AUTH_TOKEN_LEN]);
+    hk.expand(UDP_AUTH_KEY_LABEL, token.as_mut())
         .map_err(|_| UdpAuthError::Derive)?;
     Ok(token)
 }
@@ -85,14 +88,17 @@ pub fn export_udp_auth_token(
     connection: &quinn::Connection,
     psk: &[u8],
     context: &[u8],
-) -> Result<[u8; UDP_AUTH_TOKEN_LEN], UdpAuthError> {
+) -> Result<Zeroizing<[u8; UDP_AUTH_TOKEN_LEN]>, UdpAuthError> {
     if psk.is_empty() {
         return Err(UdpAuthError::EmptyPsk);
     }
     let ctx = exporter_context(context);
-    let mut exporter_secret = [0_u8; UDP_AUTH_EXPORTER_LEN];
+    // The live RFC 5705 exporter secret is wiped on return (including the
+    // export-error path) rather than left in the stack frame, matching
+    // crypto/session.rs.
+    let mut exporter_secret = Zeroizing::new([0_u8; UDP_AUTH_EXPORTER_LEN]);
     connection
-        .export_keying_material(&mut exporter_secret, UDP_AUTH_EXPORTER_LABEL, &ctx)
+        .export_keying_material(exporter_secret.as_mut(), UDP_AUTH_EXPORTER_LABEL, &ctx)
         .map_err(|_| UdpAuthError::Exporter)?;
     derive_udp_auth_token(&exporter_secret, psk)
 }

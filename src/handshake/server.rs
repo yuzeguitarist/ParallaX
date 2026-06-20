@@ -745,10 +745,7 @@ fn decide_connection_inbound(
         if let Some(material) = recovered {
             let x25519_key_share = material.x25519_public;
             let x25519_shared_secret = dh(&x25519_key_share);
-            let auth_key = zeroize::Zeroizing::new(derive_server_auth_key_from_shared(
-                psk,
-                &x25519_shared_secret,
-            )?);
+            let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
             let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
                 first_client_record,
                 auth_key.as_slice(),
@@ -4793,7 +4790,7 @@ mod tests {
     fn decides_authenticated_inbound() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
-        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let auth_key = *derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
         let record = masked_authed_client_hello(
             &server.private,
             &client.public,
@@ -4841,7 +4838,7 @@ mod tests {
     fn decides_masked_stateful_inbound() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
-        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let auth_key = *derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
         let mut record = client_hello_fixture_with_random_and_key_share(
             "example.com",
             &client.public,
@@ -4898,7 +4895,7 @@ mod tests {
     fn masked_stateful_without_tls13_support_falls_back() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
-        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let auth_key = *derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
         let mut record = client_hello_fixture_with_random_and_key_share(
             "example.com",
             &client.public,
@@ -4976,7 +4973,7 @@ mod tests {
         // → tag mismatch → Fallback, never Authenticated (fail-closed).
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
-        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let auth_key = *derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
         let mut record = client_hello_fixture_with_random_and_key_share(
             "example.com",
             &client.public,
@@ -5359,7 +5356,7 @@ mod tests {
     fn falls_back_on_unauthorized_sni() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
-        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let auth_key = *derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
         let record = masked_authed_client_hello(
             &server.private,
             &client.public,
@@ -5387,7 +5384,7 @@ mod tests {
     fn authorized_sni_matching_is_case_insensitive() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
-        let auth_key = derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
+        let auth_key = *derive_client_auth_key(PSK, &client.private, &server.public).unwrap();
         let record = masked_authed_client_hello(
             &server.private,
             &client.public,
@@ -6216,7 +6213,7 @@ mod tests {
     ) -> (TcpStream, ClientDataSession, StdRng) {
         let mut client = TcpStream::connect(parallax_addr).await.unwrap();
         let auth_key =
-            derive_client_auth_key(PSK, &client_keys.private, &server_keys.public).unwrap();
+            *derive_client_auth_key(PSK, &client_keys.private, &server_keys.public).unwrap();
         let client_hello = masked_authed_client_hello(
             &server_keys.private,
             &client_keys.public,
