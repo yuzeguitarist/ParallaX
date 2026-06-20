@@ -1,0 +1,84 @@
+name: CodeQL
+
+# Static security analysis (GitHub code scanning) for ParallaX.
+#
+# Tailored from GitHub's "CodeQL Advanced" template for this repo:
+#   - Languages: `rust` (the entire proxy) + `actions` (15 tracked workflow
+#     files, several of which — claude-*.yml — process untrusted PR content, the
+#     classic script-injection target CodeQL's actions queries catch). The
+#     template's `python` leg was dropped: the only git-tracked Python is
+#     fuzz/seeds/gen_h1_seeds.py (a one-off seed generator); the rest lives in
+#     gitignored code_refs/ and is never checked out in CI.
+#   - Vendored third-party forks (vendor/rustls, vendor/quinn-proto — pulled in
+#     via [patch.crates-io] path deps) are excluded from analysis below; they are
+#     not first-party code and their supply-chain risk is tracked separately by
+#     cargo-deny.yml / claude-dependency-audit.yml.
+#   - Actions are SHA-pinned with a version comment, matching this repo's
+#     convention (see actions/checkout pins) and kept fresh by Dependabot.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly baseline scan (Mon 12:43 UTC) so new CodeQL queries catch latent
+    # issues even when no code changes land.
+    - cron: '43 12 * * 1'
+  workflow_dispatch:
+
+# Least-privilege default; the analyze job escalates only what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      security-events: write # upload CodeQL results to the Security tab
+      packages: read         # fetch CodeQL query packs
+      actions: read          # read workflow run metadata (needed on private repos)
+      contents: read         # checkout
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: actions
+            build-mode: none
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Extra security queries — worthwhile for a censorship-resistance proxy
+          # with hand-rolled crypto and network parsers, and for the PR-handling
+          # Actions workflows. Drop to the default suite (remove this line) if the
+          # Security tab gets too noisy.
+          queries: security-extended
+          # CodeQL `paths-ignore` is honored for Rust under build-mode none.
+          # vendor/** = the vendored rustls / quinn-proto forks; scan only
+          # ParallaX's own sources.
+          config: |
+            paths-ignore:
+              - vendor/**
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          category: "/language:${{ matrix.language }}"
