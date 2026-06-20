@@ -14,6 +14,12 @@ default-run = "parallax"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
+[features]
+# (No Safari-QUIC feature gate: the Safari-26 H3 ClientHello carrier — the
+# vendored-rustls fork + the ParallaX-owned quinn crypto Session — is the DEFAULT
+# QUIC client backend in `udp::client_config`. The QUIC plane itself is gated at
+# the config level by `[udp].enabled = false`, which is the real off-switch.)
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"
@@ -34,7 +40,18 @@ rand = "0.8"
 # default, so every rustls config here MUST use builder_with_provider(aws_lc_rs).
 # rustls is pinned (=0.23.40) to stay in lockstep with quinn-proto's Quic*Config.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
+# Direct dep ONLY to name `quinn_proto::transport_parameters::TransportParameters`
+# in the Safari QUIC Session seam (quinn does not re-export that type). Pinned to
+# the exact version quinn 0.11 resolves so no second quinn-proto is linked.
+quinn-proto = { version = "=0.11.14", default-features = false }
 rcgen = "0.13"
+# Safe wrappers for the libc syscalls ParallaX makes directly (geteuid, flock,
+# getrlimit/setrlimit, page_size, recv(MSG_PEEK), poll, splice, pipe2,
+# sched_getcpu, prctl(PR_SET_DUMPABLE), and the TCP/socket options). Already in
+# the tree transitively; pulled in directly so those call sites drop their
+# `unsafe { libc::* }` blocks. The handful rustix does not cover stay on libc
+# (mlock/madvise, macOS PT_DENY_ATTACH, FreeBSD procctl, SO_PREFER_BUSY_POLL).
+rustix = { version = "1", features = ["event", "fs", "net", "param", "pipe", "process", "thread"] }
 rustls = { version = "=0.23.40", features = ["std", "aws_lc_rs"] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1"
@@ -50,6 +67,10 @@ sha2 = "0.10"
 # holds a second copy beyond the named stack scrubs. zeroize is already in-tree
 # (1.8.2) — no new crate, no digest-stack fork. Value-neutral (no byte impact).
 sha3 = { version = "0.10", features = ["zeroize"] }
+# Linux-only TCP/socket options rustix does not expose: TCP_NOTSENT_LOWAT and
+# SO_BUSY_POLL. The `all` feature un-gates these (platform-specific) setters.
+# Already transitive via tokio/quinn; the `all` feature is compile-time only.
+socket2 = { version = "0.6", features = ["all"] }
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -86,3 +107,25 @@ split-debuginfo = "off"
 strip = false
 lto = "thin"
 codegen-units = 1
+
+# Vendored rustls 0.23.40 (path patch) — substrate for a surgical fork that
+# hand-writes the Safari-26 H3 QUIC ClientHello (the client ClientHello assembly
+# in vendor/rustls/src/client/hs.rs cannot be controlled via a CryptoProvider).
+# Pinned =0.23.40 to stay lockstep with quinn-proto 0.11.14's Quic*Config; the
+# crate name `rustls` is kept so quinn-proto's blanket PacketKey impls still
+# apply. The fork delta (6 files), pin lockstep, re-apply procedure, and RUSTSEC
+# tracking are documented in vendor/rustls/PARALLAX_FORK.md. Upstream rustls
+# CVEs/patches must be re-applied to the vendored copy (cargo audit does NOT flag
+# a path-patched dependency).
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
+# Vendored quinn-proto 0.11.14 (path patch) — surgical fork with EXACTLY ONE
+# delta: cid_queue.rs CidQueue::LEN 5 -> 64, so the client tracks (and advertises)
+# active_connection_id_limit = 64, matching Safari-26's disassembly-confirmed
+# value. The crate name/version are unchanged, so this redirects BOTH our direct
+# `quinn-proto = "=0.11.14"` dependency and quinn 0.11.9's internal `proto` to the
+# fork; quinn does not touch CidQueue, so the patch is transparent to it. Pinned
+# =0.11.14 lockstep with rustls 0.23.40. The fork delta, re-apply procedure, and
+# RUSTSEC tracking are documented in vendor/quinn-proto/PARALLAX_FORK.md (cargo
+# audit does NOT flag a path-patched dependency).
+quinn-proto = { path = "vendor/quinn-proto" }

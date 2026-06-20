@@ -9,6 +9,15 @@
 //! error), so detection is ACTIVE: no verified echo within the Happy-Eyeballs
 //! window means treat the UDP leg as unreachable and stay on TCP.
 //!
+//! The round-trip rides QUIC **unidirectional streams** (not RFC-9221 datagrams):
+//! the client opens a uni stream for the request, the server answers on its own
+//! uni stream. Safari-26 H3 advertises no `max_datagram_frame_size` for plain H3
+//! (it sends no datagrams), so the camouflaged transport params omit it and quinn
+//! disables datagram support; uni streams use the already-advertised
+//! `initial_max_streams_uni = 8` budget and are orthogonal to the relay's single
+//! bidi stream. Reliable delivery also means a single lost packet is retransmitted
+//! rather than silently dropping the probe.
+//!
 //! Wired into the client/server runtimes: a Verified probe causes both ends to
 //! retain the QUIC connection and carry the single-Connect data relay over a
 //! reliable bidi stream. The demote/promote scheduler (switching transports
@@ -17,7 +26,6 @@
 
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -30,6 +38,10 @@ const PROBE_REQUEST_MAGIC: &[u8; 4] = b"PXp1";
 const PROBE_RESPONSE_MAGIC: &[u8; 4] = b"PXp2";
 const PROBE_NONCE_LEN: usize = 16;
 const PROBE_RESPONSE_LEN: usize = 32;
+/// On-wire request length: magic + nonce.
+const PROBE_REQUEST_WIRE_LEN: usize = 4 + PROBE_NONCE_LEN;
+/// On-wire response length: magic + HMAC.
+const PROBE_RESPONSE_WIRE_LEN: usize = 4 + PROBE_RESPONSE_LEN;
 
 /// Result of a single UDP probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +60,9 @@ pub enum ProbeOutcome {
 pub enum ProbeError {
     #[error("UDP auth: {0}")]
     Auth(#[from] UdpAuthError),
-    #[error("QUIC datagram send failed: {0}")]
+    #[error("QUIC probe stream send failed: {0}")]
     Send(String),
-    #[error("malformed probe datagram")]
+    #[error("malformed probe message")]
     Malformed,
     #[error("connection lost during probe: {0}")]
     ConnectionLost(String),
@@ -74,24 +86,26 @@ pub async fn probe_client(
     let token = export_udp_auth_token(connection, psk, context)?;
     let nonce: [u8; PROBE_NONCE_LEN] = rand::random();
 
-    let mut request = Vec::with_capacity(4 + PROBE_NONCE_LEN);
+    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
     request.extend_from_slice(PROBE_REQUEST_MAGIC);
     request.extend_from_slice(&nonce);
 
-    let started = Instant::now();
-    connection
-        .send_datagram(Bytes::from(request))
-        .map_err(|err| ProbeError::Send(err.to_string()))?;
-
     let expected = probe_response(&token, &nonce);
-    match tokio::time::timeout(timeout, connection.read_datagram()).await {
+    let started = Instant::now();
+
+    // The whole request-send + response-read round-trip rides the Happy-Eyeballs
+    // window. A silent black-hole or a dead connection surfaces as a timeout or a
+    // stream error -> Unreachable; a well-formed but unauthenticated reply ->
+    // Failed.
+    match tokio::time::timeout(timeout, probe_client_round_trip(connection, &request)).await {
         // Silent black-hole, or the connection died: the path is unusable.
         Err(_) => Ok(ProbeOutcome::Unreachable),
-        Ok(Err(_)) => Ok(ProbeOutcome::Unreachable),
-        Ok(Ok(datagram)) => {
-            let authentic = datagram.len() == 4 + PROBE_RESPONSE_LEN
-                && &datagram[..4] == PROBE_RESPONSE_MAGIC
-                && bool::from(datagram[4..].ct_eq(&expected[..]));
+        Ok(Err(ProbeError::ConnectionLost(_))) => Ok(ProbeOutcome::Unreachable),
+        Ok(Err(other)) => Err(other),
+        Ok(Ok(reply)) => {
+            let authentic = reply.len() == PROBE_RESPONSE_WIRE_LEN
+                && &reply[..4] == PROBE_RESPONSE_MAGIC
+                && bool::from(reply[4..].ct_eq(&expected[..]));
             if authentic {
                 Ok(ProbeOutcome::Verified {
                     rtt: started.elapsed(),
@@ -103,6 +117,32 @@ pub async fn probe_client(
     }
 }
 
+/// Send the request on a client-initiated uni stream and read the server's reply
+/// off a server-initiated uni stream. Returns the raw reply bytes (validated by
+/// the caller). A lost/closed connection maps to `ConnectionLost` (-> Unreachable).
+async fn probe_client_round_trip(
+    connection: &quinn::Connection,
+    request: &[u8],
+) -> Result<Vec<u8>, ProbeError> {
+    let mut send = connection
+        .open_uni()
+        .await
+        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
+    send.write_all(request)
+        .await
+        .map_err(|err| ProbeError::Send(err.to_string()))?;
+    send.finish()
+        .map_err(|err| ProbeError::Send(err.to_string()))?;
+
+    let mut recv = connection
+        .accept_uni()
+        .await
+        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
+    recv.read_to_end(PROBE_RESPONSE_WIRE_LEN)
+        .await
+        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))
+}
+
 /// Server side: answer one probe request with an authenticated response derived
 /// from the same exporter-bound token.
 pub async fn serve_probe(
@@ -111,19 +151,30 @@ pub async fn serve_probe(
     context: &[u8],
 ) -> Result<(), ProbeError> {
     let token = export_udp_auth_token(connection, psk, context)?;
-    let datagram = connection
-        .read_datagram()
+    let mut recv = connection
+        .accept_uni()
         .await
         .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
-    if datagram.len() != 4 + PROBE_NONCE_LEN || &datagram[..4] != PROBE_REQUEST_MAGIC {
+    let request = recv
+        .read_to_end(PROBE_REQUEST_WIRE_LEN)
+        .await
+        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
+    if request.len() != PROBE_REQUEST_WIRE_LEN || &request[..4] != PROBE_REQUEST_MAGIC {
         return Err(ProbeError::Malformed);
     }
-    let response = probe_response(&token, &datagram[4..]);
-    let mut reply = Vec::with_capacity(4 + PROBE_RESPONSE_LEN);
+    let response = probe_response(&token, &request[4..]);
+    let mut reply = Vec::with_capacity(PROBE_RESPONSE_WIRE_LEN);
     reply.extend_from_slice(PROBE_RESPONSE_MAGIC);
     reply.extend_from_slice(&response);
-    connection
-        .send_datagram(Bytes::from(reply))
+
+    let mut send = connection
+        .open_uni()
+        .await
+        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
+    send.write_all(&reply)
+        .await
+        .map_err(|err| ProbeError::Send(err.to_string()))?;
+    send.finish()
         .map_err(|err| ProbeError::Send(err.to_string()))?;
     Ok(())
 }

@@ -585,7 +585,7 @@ fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError
     let metadata = file.metadata()?;
     let mode = metadata.mode() & 0o777;
     let uid = metadata.uid();
-    let euid = unsafe { libc::geteuid() };
+    let euid = rustix::process::geteuid().as_raw();
     if mode & 0o077 != 0 || uid != euid {
         return Err(ConfigError::InsecureConfigPermissions {
             path: path.to_path_buf(),
