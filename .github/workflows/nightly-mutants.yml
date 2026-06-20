@@ -10,7 +10,8 @@ name: nightly-mutants
 #
 # This workflow is informational only: `continue-on-error: true` and no
 # branch protection references it, so surviving mutants NEVER block a PR.
-# Read survivors in the uploaded `mutants.out/` artifact (outcomes.json /
+# Each night tests ONE of 8 rolling shards (full surface every 8 days); read its
+# survivors in the uploaded `mutants-out-shard-N` artifact (outcomes.json /
 # mutants.out/*.txt): a MISSED mutant is a code change no test caught and is
 # a candidate for a new/strengthened test. Most config lives in .cargo/mutants.toml.
 
@@ -33,15 +34,21 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
+  # The per-mutant cost on the 4-vCPU runner is the lib REBUILD, not the test.
+  # Drop debuginfo (tests don't need it) to shave that rebuild; nothing here
+  # relies on symbols/backtraces.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   mutants:
     name: cargo-mutants (indistinguishability/crypto surface)
     runs-on: ubuntu-latest
-    # Budget for the whole scoped run: ~480 mutants at ~8s test each, two at a
-    # time (--jobs 2), plus a cold baseline build per worker. Completes well
-    # inside this on the 4-vCPU runner; the job exits as soon as cargo-mutants
-    # finishes, so the cap is just a hang backstop, not a target.
+    # One rolling shard per night (see the run step): ~60 mutants at ~50s each on
+    # the 4-vCPU runner -- the per-mutant cost is the lib REBUILD (~40s), not the
+    # scoped test (~8s). At two-in-parallel (--jobs 2) a shard finishes in
+    # ~25-40 min, so this cap is just a backstop. We shard because the full
+    # 479-mutant suite needs ~5h here -- over GitHub's 6h job limit, and what made
+    # this job SIGKILL at timeout-minutes every night.
     timeout-minutes: 75
     # NON-GATING: this report must never fail a PR or the nightly schedule.
     continue-on-error: true
@@ -67,28 +74,29 @@ jobs:
         with:
           tool: cargo-mutants@27.1.0
 
-      - name: Run cargo-mutants (scoped, bounded)
-        # Scope, the per-mutant test set, the per-mutant timeout, and --locked all
-        # live in .cargo/mutants.toml (the only path cargo-mutants reads config
-        # from); we pass --config explicitly for clarity. The per-mutant timeout
-        # is baseline-relative (timeout_multiplier x the unmutated test time, with
-        # a minimum_test_timeout floor) so it adapts to the runner instead of a
-        # brittle fixed wall-clock — do NOT add a CLI --timeout, which would
-        # override and silence the config. The two -f flags re-pin scope to
-        # exactly these files even if the config drifts (CLI overrides
-        # examine_globs).
+      - name: Run cargo-mutants (scoped, one rolling shard)
+        # WHY sharded: on the 4-vCPU runner each mutant costs ~50s (a ~40s lib
+        # rebuild + ~8s scoped test), so all 479 mutants would need ~5h -- over
+        # GitHub's 6h job limit. Instead we test one of 8 shards per night,
+        # rotating by day-of-year, so the whole surface is covered every 8 days.
+        # Each shard is ~60 mutants (~25-40 min). 10# forces base-10 so a
+        # zero-padded day (e.g. 008) is not parsed as octal.
         #
-        # --jobs 2: run two mutants in parallel. The config restricts each mutant's
-        # tests to the byte-level fingerprint/auth oracles (see mutants.toml), none
-        # of which bind a fixed port, so parallel workers never collide; two
-        # concurrent cold baseline builds also stay well within the runner's RAM.
-        # This + the scoped test set is what brings the run back under budget (it
-        # used to be SIGKILLed at timeout-minutes every night).
+        # Scope, the per-mutant test set (--lib + the fingerprint/auth oracles),
+        # the per-mutant timeout, and --locked all live in .cargo/mutants.toml; we
+        # pass --config explicitly for clarity. Do NOT add a CLI --timeout -- it
+        # would override the baseline-relative config timeout. --no-shuffle makes
+        # each shard a fixed, reproducible partition. --jobs 2 runs two mutants in
+        # parallel; the scoped tests bind no fixed ports, so workers never collide.
         run: |
+          shard=$(( 10#$(date -u +%j) % 8 ))
+          echo "MUT_SHARD=$shard" >> "$GITHUB_ENV"
+          echo "Testing mutation shard $shard/8 (rotates daily; full surface every 8 days)"
           cargo mutants \
             --config .cargo/mutants.toml \
             --no-shuffle \
             --jobs 2 \
+            --shard "$shard/8" \
             -f src/tls/safari26.rs \
             -f src/crypto/auth.rs
 
@@ -96,7 +104,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutants-out
+          # One artifact per shard so a manual re-run of a different day's shard
+          # does not clobber the previous one.
+          name: mutants-out-shard-${{ env.MUT_SHARD }}
           path: mutants.out/
           if-no-files-found: warn
           retention-days: 14
