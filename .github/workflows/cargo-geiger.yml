@@ -1,0 +1,53 @@
+name: cargo-geiger
+
+# Visibility into `unsafe` usage across ParallaX AND its dependency tree. This is
+# INFORMATIONAL, not a gate: cargo-geiger must compile the whole tree and is
+# historically brittle against heavy build-script crates (aws-lc-rs, ring, quinn),
+# so the whole job is `continue-on-error` and runs only on a weekly schedule /
+# manual dispatch — never on the PR path. The report is written to the run summary.
+
+on:
+  schedule:
+    - cron: '43 5 * * 1'   # weekly (Mon 05:43 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-geiger-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  geiger:
+    name: cargo geiger
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      # Read the shared CI cache to speed the dep compile, but do not write back
+      # (save-if: false) so geiger's build artifacts never pollute parallax-ci.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-ci
+          save-if: false
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger --locked
+      - name: Run cargo geiger -> run summary
+        run: |
+          {
+            echo '# cargo-geiger (unsafe usage)'
+            echo ''
+            echo '```'
+            cargo geiger --locked 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

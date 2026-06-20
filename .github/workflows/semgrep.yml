@@ -1,0 +1,59 @@
+name: semgrep
+
+# Pattern-based static analysis (Semgrep OSS) over the Rust sources. This overlaps
+# with CodeQL by design and is kept narrow to the `p/rust` ruleset to avoid
+# duplicating the secret-scanning (gitleaks) and Actions-audit (zizmor) coverage.
+# Findings upload to the Security tab as SARIF and are NON-blocking — Semgrep's
+# Rust ruleset is small, so this is a supplementary lens, not a gate.
+#
+# Semgrep is installed into a throwaway venv at a pinned version. NOTE: this pin is
+# maintained BY HAND — Dependabot's github-actions ecosystem does not track a pip
+# package (it is not a `uses:` action), so bump the version below when desired.
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths-ignore: ['**.md', 'ParallaX-DeepWiki/**']
+  push:
+    branches: [main, master]
+    paths-ignore: ['**.md', 'ParallaX-DeepWiki/**']
+  schedule:
+    - cron: '29 5 * * 1'   # weekly (Mon 05:29 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semgrep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF to code scanning
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      # vendor/** = the vendored rustls / quinn-proto forks (not first-party), matching
+      # the CodeQL config; --error is omitted so findings do not fail the job.
+      - name: Run Semgrep (p/rust) -> SARIF
+        run: |
+          python3 -m venv /tmp/sg
+          /tmp/sg/bin/pip install --quiet semgrep==1.167.0
+          /tmp/sg/bin/semgrep scan --config p/rust --exclude vendor \
+            --sarif --output semgrep.sarif .
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep

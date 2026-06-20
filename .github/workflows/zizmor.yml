@@ -1,0 +1,48 @@
+name: zizmor
+
+# Static security audit of THIS repo's GitHub Actions workflows + composite
+# actions. ParallaX runs several workflows (claude-*.yml) that process untrusted
+# PR content — the classic template-injection / artifact-poisoning target — so a
+# dedicated Actions auditor earns its place on top of CodeQL's `actions` queries
+# (zizmor is more specialized and updates faster).
+#
+# Results upload to the Security tab as SARIF (advanced-security mode, the action
+# default). The first run is NON-blocking (continue-on-error) so the existing
+# baseline lands in the Security tab without wedging every PR; remove
+# `continue-on-error` to promote it to a hard gate once the baseline is triaged.
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths: ['.github/**']
+  push:
+    branches: [main, master]
+    paths: ['.github/**']
+  schedule:
+    - cron: '23 5 * * 1'   # weekly full audit (Mon 05:23 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zizmor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF to code scanning
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        continue-on-error: true   # baseline first; remove to enforce as a gate

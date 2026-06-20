@@ -1,0 +1,54 @@
+name: gitleaks
+
+# Secret scanning — the one finding class this repo had ZERO coverage for.
+# ParallaX generates X25519 / ML-DSA keypairs and writes private keys into 0600
+# config files, and the test tree carries crypto fixtures, so an accidentally
+# committed secret is a real risk.
+#
+# Scan scope is event-driven (gitleaks-action derives it from the event):
+#   - pull_request: scans ONLY the commits the PR adds, so this gate blocks
+#     newly-introduced secrets WITHOUT being tripped by older fixtures already in
+#     history. That is why it can stay BLOCKING (a hit fails the job).
+#   - push: scans the pushed commits.
+#   - schedule / workflow_dispatch: full-history sweep — informational; a hit here
+#     surfaces a pre-existing secret to triage, it does not block a PR.
+#
+# Personal-account public repo => no GITLEAKS_LICENSE needed (only org-owned repos
+# need the free key). PR commenting is turned OFF so the default GITHUB_TOKEN can
+# stay read-only (no pull-requests: write). False positives are silenced with a
+# committed .gitleaksignore (fingerprint) or a gitleaks.toml allowlist.
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '17 5 * * 1'   # Mondays 05:17 UTC (off the :00/:30 stampede)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0          # full history so the PR/commit-range scan resolves
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: false        # no PR comments => token stays read-only
+          # GITLEAKS_LICENSE intentionally unset: not required for personal accounts.

@@ -1,0 +1,40 @@
+name: osv-scanner
+
+# Dependency vulnerability scan via Google's OSV-Scanner (OSV.dev database).
+# This OVERLAPS with cargo-deny's RustSec advisories check; cargo-deny stays the
+# deterministic BLOCKING supply-chain gate, while OSV is a NON-blocking second
+# source (fail-on-vuln: false) whose results land in the Security tab for a
+# broader, cross-database view.
+#
+# Uses OSV's official reusable workflow, which runs the scan AND uploads SARIF to
+# code scanning itself (upload-sarif defaults to true). A reusable-workflow job is
+# `uses:`-only, so — unlike the other scanners here — it cannot host a
+# harden-runner step; that is expected, not an omission.
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths: ['**/Cargo.toml', '**/Cargo.lock']
+  push:
+    branches: [main, master]
+    paths: ['**/Cargo.toml', '**/Cargo.lock']
+  schedule:
+    - cron: '37 5 * * 1'   # weekly: catch new advisories against unchanged deps
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: osv-scanner-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    permissions:
+      actions: read
+      contents: read
+      security-events: write   # reusable workflow uploads SARIF to code scanning
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+    with:
+      fail-on-vuln: false      # non-blocking; cargo-deny is the blocking RustSec gate

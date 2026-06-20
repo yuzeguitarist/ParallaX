@@ -1,0 +1,54 @@
+name: scorecard
+
+# OpenSSF Scorecard — assesses the repo's OWN security posture (branch protection,
+# token permissions, pinned dependencies, dangerous workflow patterns, presence of
+# a security policy, etc.) and uploads the result to the Security tab as SARIF.
+# publish_results is on (public repo) so the score is published to the OpenSSF API
+# (enables the scorecard.dev badge). Non-blocking: this is a posture report, not a
+# code gate.
+#
+# Branch-Protection checks report fully only with an admin-scoped PAT in
+# `repo_token`; left on the default GITHUB_TOKEN here, so that one check stays
+# partial while every other check runs.
+
+on:
+  push:
+    branches: [main]
+  branch_protection_rule:
+  schedule:
+    - cron: '47 5 * * 1'   # weekly (Mon 05:47 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write   # upload SARIF to code scanning
+      id-token: write          # publish_results -> OpenSSF API (OIDC)
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          sarif_file: results.sarif
+          category: scorecard
