@@ -38,12 +38,10 @@ env:
   # Drop debuginfo (tests don't need it) to shave that rebuild; nothing here
   # relies on symbols/backtraces.
   CARGO_PROFILE_DEV_DEBUG: "0"
-  # Disable incremental compilation. cargo-mutants rebuilds the crate ~60 times
-  # per shard in ONE target dir (in-place); with incremental on, the
-  # target/debug/incremental cache accrues a stale session per mutant and grows
-  # into the tens of GB (measured 14 GB locally), which is what filled the
-  # runner's disk and got it SIGKILLed. Off, the target stays ~flat; each mutant
-  # already recompiles most of the crate anyway, so the build-time cost is small.
+  # ~480 in-place rebuilds in one target dir; turning incremental off keeps the
+  # target from accreting a stale incremental session per mutant (bounded size,
+  # smaller rustc footprint). Each mutant recompiles most of the crate anyway, so
+  # the build-time cost is small.
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -52,10 +50,10 @@ jobs:
     runs-on: ubuntu-latest
     # One rolling shard per night (see the run step): ~60 mutants at ~50s each on
     # the 4-vCPU runner -- the per-mutant cost is the lib REBUILD (~40s), not the
-    # scoped test (~8s). Run in-place at one-at-a-time, a shard finishes in
-    # ~45-55 min, so this cap is a backstop. We shard because the full 479-mutant
-    # suite needs ~6h here -- over GitHub's 6h job limit, and what made this job
-    # SIGKILL at timeout-minutes every night.
+    # scoped test (~8s). One-at-a-time (in-place) a shard finishes in ~25-50 min,
+    # so this cap is a backstop. We shard because the full 479-mutant suite needs
+    # ~6h here -- over GitHub's 6h job limit, and what made this job SIGKILL at
+    # timeout-minutes every night before sharding.
     timeout-minutes: 75
     # NON-GATING: this report must never fail a PR or the nightly schedule.
     continue-on-error: true
@@ -63,18 +61,6 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-
-      - name: Free disk space
-        # cargo-mutants rebuilds the crate once per mutant; the incremental build
-        # cache grows into the tens of GB over a shard and overran the runner's
-        # ~14 GB free disk mid-run, which SIGKILLed the runner ("received a
-        # shutdown signal", with no "no space" line because the agent died first).
-        # Drop preinstalled toolchains this job never uses to free ~20-30 GB.
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/share/swift /usr/local/share/powershell /opt/hostedtoolcache/CodeQL
-          df -h /
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -95,26 +81,29 @@ jobs:
 
       - name: Run cargo-mutants (scoped, one rolling shard)
         # WHY sharded: on the 4-vCPU runner each mutant costs ~50s (a ~40s lib
-        # rebuild + ~8s scoped test), so all 479 mutants would need ~5h -- over
+        # rebuild + ~8s scoped test), so all 479 mutants would need ~6h -- over
         # GitHub's 6h job limit. Instead we test one of 8 shards per night,
         # rotating by day-of-year, so the whole surface is covered every 8 days.
-        # Each shard is ~60 mutants (~45-55 min). 10# forces base-10 so a
-        # zero-padded day (e.g. 008) is not parsed as octal.
+        # Each shard is ~60 mutants. 10# forces base-10 so a zero-padded day
+        # (e.g. 008) is not parsed as octal.
+        #
+        # WHY ulimit: some mutants turn a size/length calc into a blow-up -- e.g.
+        # `tap_records` `total += len` -> `total *= len` -- so the mutated code
+        # asks for ~16 GB and OOM-killed the whole runner ("received a shutdown
+        # signal"), which is what killed this job ~14 min in regardless of disk.
+        # Capping address space makes that allocation fail inside the test process
+        # (-> the mutant is caught) instead of taking down the runner. --in-place
+        # runs one mutant at a time (no per-job tree copy), so a single 12 GB-capped
+        # process stays well under the 16 GB runner; the ephemeral CI checkout
+        # makes mutating then restoring the tree safe.
         #
         # Scope, the per-mutant test set (--lib + the fingerprint/auth oracles),
-        # the per-mutant timeout, and --locked all live in .cargo/mutants.toml; we
-        # pass --config explicitly for clarity. Do NOT add a CLI --timeout -- it
-        # would override the baseline-relative config timeout. --no-shuffle makes
-        # each shard a fixed, reproducible partition.
-        #
-        # --in-place: mutate the checked-out tree directly instead of copying it to
-        # a per-job scratch dir. cargo-mutants' default copy mode duplicates the
-        # whole tree (incl. the ~9 GB fuzz/ workspace) plus a build cache per job,
-        # which filled the runner's ~14 GB disk mid-run and got it SIGKILLed
-        # ("runner received a shutdown signal"). In-place reuses one target dir
-        # (it implies --jobs 1); the ephemeral CI checkout makes mutating then
-        # restoring the tree safe.
+        # the per-mutant timeout, and --locked live in .cargo/mutants.toml; we pass
+        # --config explicitly for clarity. Do NOT add a CLI --timeout (it would
+        # override the baseline-relative config timeout). --no-shuffle makes each
+        # shard a fixed, reproducible partition.
         run: |
+          ulimit -v 12582912   # 12 GiB address-space cap per process
           shard=$(( 10#$(date -u +%j) % 8 ))
           echo "MUT_SHARD=$shard" >> "$GITHUB_ENV"
           echo "Testing mutation shard $shard/8 (rotates daily; full surface every 8 days)"
