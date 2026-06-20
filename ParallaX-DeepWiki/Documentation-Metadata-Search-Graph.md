@@ -16,8 +16,9 @@ The current documentation contract is:
   [`../tests/gfw_simulator.rs`](../tests/gfw_simulator.rs).
 - **Experimental path:** an off-by-default UDP/QUIC fast plane (`[udp].enabled`
   on both ends) is wired into the client/server runtimes for the single-Connect
-  relay; there is still no `--quic` CLI flag, and the QUIC handshake is not yet
-  fingerprint-shaped.
+  relay; there is still no `--quic` CLI flag. When enabled, its QUIC client
+  already emits a Safari-26 H3-shaped ClientHello by default, but the plane stays
+  off by default and is not yet a production-ready operator mode.
 
 ## Metadata schema
 

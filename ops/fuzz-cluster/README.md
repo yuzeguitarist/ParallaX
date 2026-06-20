@@ -24,8 +24,9 @@ dashboard. No SSH, no professional knowledge, no per-box config.
 
 ### 1. Pick the commit
 
-This campaign is pinned to **`f3c9c32f`** (current HEAD; full 14-target fuzz set
-incl. the TUDP targets). To run a different commit, substitute its SHA
+This campaign is pinned to **`f3c9c32f`** (current HEAD). It schedules 14 of the
+15 fuzz targets in `fuzz/Cargo.toml`, incl. the TUDP targets; `mldsa_verify` is
+intentionally not run by either box. To run a different commit, substitute its SHA
 everywhere below **and** in the paste line — the Release tag, the bootstrap URL,
 and every box's checkout all key off it.
 
@@ -118,7 +119,7 @@ curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeg
 `/etc/plxfuzz/pat`, then unattended: installs the pinned toolchain + build deps,
 clones `f3c9c32f`, `gh auth login --with-token`, warm-builds the fuzzers,
 installs+enables the systemd units, and starts fuzzing. It is idempotent —
-re-pasting on a half-built box self-heals. When it prints `node box-a live`,
+re-pasting on a half-built box self-heals. When it prints `cluster node box-a live`,
 walk away.
 
 > Paste the block over a fast connection if you can — step one is a one-time
@@ -180,9 +181,10 @@ GitHub session. Two ways to open it:
 ### Optional liveness watchdog (the only Action, and it's optional)
 
 A box can't report its own death. `ops/fuzz-cluster/liveness.yml` is a tiny
-daily Action that reads the three heartbeats and opens/updates one
-`[fuzz-cluster] node down` issue if any is stale (>90 min) or fewer than 3 nodes
-report. To enable: copy it into `.github/workflows/`. Cost ~1 billed min/day on
+daily Action that auto-discovers whichever nodes are publishing heartbeats and
+opens/updates one `[fuzz-cluster] node down` issue if any discovered node is
+stale (>90 min); it stays quiet if nothing is publishing. To enable: copy it
+into `.github/workflows/`. Cost ~1 billed min/day on
 this private repo; delete it for literally zero Actions (the dashboard's stale
 "last seen" already reveals a dead box on a glance).
 
@@ -220,7 +222,7 @@ expires on its own with the boxes.
 ops/fuzz-cluster/
   bootstrap.sh                 # the one-line target; prompts for PAT
   lib/shard-table.sh           # authoritative per-box plan (sourced by bootstrap + run-one)
-  bin/                         # run-one.sh, sync.sh, status.sh, crash-push.sh, disk-guard.sh, drain.sh
+  bin/                         # run-one.sh, sync.sh, status.sh, crash-push.sh, crash-scan.sh, cmin.sh, disk-guard.sh, drain.sh
   systemd/                     # plx-fuzz@.service + timers/units
   config/
     journald-plxfuzz.conf      # SystemMaxUse=2G journal cap

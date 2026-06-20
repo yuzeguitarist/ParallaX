@@ -232,10 +232,10 @@ bash scripts/deploy-vps.sh \
   --server-addr YOUR_VPS_IP:443
 ```
 
-If the local deploy directory was removed later, `--reuse-config` will
-fetch the existing server config back from `/etc/parallax/parallax.toml`
-over SSH and perform a server-only redeploy. Your already-working local
-client config is not regenerated or changed.
+`--reuse-config` reuses the already-generated configs under
+`target/parallax-deploy/<host>/` instead of regenerating them. It requires both
+`parallax.server.toml` and `parallax.client.toml` to still exist there and aborts
+if the deploy directory was removed; it does not fetch anything back from the VPS.
 
 For unattended / CI use:
 

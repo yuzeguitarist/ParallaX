@@ -25,9 +25,10 @@ There is no `--quic` CLI flag. An **experimental** UDP/QUIC fast plane *is* wire
 into the client and server runtimes, but it is **off by default**: setting
 `[udp].enabled = true` on both ends (with matched binaries) activates a QUIC
 reliable-stream carrier for the single-Connect data relay. While disabled, every
-path stays byte-identical on TCP. The QUIC handshake is not yet
-Safari-fingerprint-shaped, so enabling it is for experimentation, not
-censorship-resistant production use. QUIC also appears as research and detector
+path stays byte-identical on TCP. When enabled, its QUIC client already emits a
+Safari-26 H3-shaped ClientHello by default, but it stays off by default and is
+not yet a production-ready operator mode, so enabling it is for experimentation,
+not censorship-resistant production use. QUIC also appears as research and detector
 context in the simulator; see
 [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 

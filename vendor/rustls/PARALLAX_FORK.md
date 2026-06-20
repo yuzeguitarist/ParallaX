@@ -60,7 +60,8 @@ injects `pre_shared_key` / `early_data`; the consuming config disables resumptio
 4. **Re-run the wire oracle and the transcript-consistency loopback:**
    - `cargo test --locked --test gfw_simulator` — the wire-oracle gate
      (`udp_leg_clienthello_matches_safari26_h3_structure` and the transport-param
-     value assertions, incl. `max_idle_timeout = 0`).
+     value assertions, incl. the `max_idle_timeout` (0x01) omission assertion
+     (omit != value=0)).
    - `cargo test --locked` — including the loopback QUIC handshake tests in
      `src/transport/udp/mod.rs` (`quic_loopback_*`,
      `quic_transport_config_bounds_streams_to_single_bidi_relay`,

@@ -32,21 +32,25 @@ build must stay byte-for-byte equivalent in behaviour. The one change is:
 ### Why, and why it is safe
 
 - **Why.** `CidQueue` is the client's receive queue for the PEER's connection IDs;
-  its `LEN` both sizes the ring buffer and, via `transport_parameters.rs`
-  (`CidQueue::LEN as u32`), sets the advertised `active_connection_id_limit`.
-  Safari-26's disassembly-confirmed value is **64**. With the upstream `LEN = 5`,
-  ParallaX could only advertise 5 (advertising 64 with a 5-slot queue would let a
-  peer issue enough `NEW_CONNECTION_ID` frames to overflow the queue and kill the
-  connection with `CONNECTION_ID_LIMIT_ERROR`). Raising `LEN` to 64 makes the
-  advertised limit equal the receive capacity, so ParallaX advertises Safari's
-  true 64 with no advertised-vs-actual gap. The matching ParallaX-side constant is
-  `SAFARI_TP_ACTIVE_CID_LIMIT` in `src/transport/udp/safari_crypto.rs`.
+  its `LEN` sizes the ring buffer (`buffer: [Option<CidData>; LEN]`).
+  Safari-26's disassembly-confirmed `active_connection_id_limit` is **64**, and
+  ParallaX advertises 64 via its hand-encoded transport-parameter blob
+  (`SAFARI_TP_ACTIVE_CID_LIMIT = 64` in `src/transport/udp/safari_crypto.rs`,
+  emitted for TP `0x0e`) — not via quinn-proto's `transport_parameters.rs`.
+  (ParallaX's client uses a zero-length source CID, so quinn-proto's encoder
+  `if cid_gen.cid_len() == 0 { 2 } else { CidQueue::LEN as u32 }` would emit 2,
+  never `CidQueue::LEN`.) The fork raises the receive-queue **capacity** to 64 so
+  it matches the advertised 64: with the upstream `LEN = 5`, advertising 64 with a
+  5-slot queue would let a peer issue enough `NEW_CONNECTION_ID` frames to overflow
+  the queue and kill the connection with `CONNECTION_ID_LIMIT_ERROR`. Raising `LEN`
+  to 64 closes that advertised-vs-actual gap. The on-wire 64 is asserted by
+  `tests/gfw_simulator.rs` (`active_connection_id_limit == 64`).
 - **Why safe.** `CidQueue` is pure **modular ring-buffer arithmetic**
   (`buffer: [Option<CidData>; LEN]`, `cursor`, `offset`); there is **no**
   power-of-two or bitmask assumption, so any positive `LEN` is correct.
   `MAX_PENDING_RETIRED_CIDS = CidQueue::LEN * 10` (in `src/connection/mod.rs`)
   scales to 640, which is harmless. There is no second CID-count-sized fixed array
-  anywhere in the crate. The crate's own `cid_queue.rs` / `tests/mod.rs` unit
+  anywhere in the crate. The crate's own `cid_queue.rs` / `src/tests/mod.rs` unit
   tests reference `CidQueue::LEN` symbolically, so they continue to pass at 64.
 
 ## (c) Re-apply procedure (when bumping quinn-proto or rustls)

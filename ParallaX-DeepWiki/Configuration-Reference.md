@@ -100,8 +100,10 @@ startup warning so an inert knob is not mistaken for an active one).
 Validation only runs when `enabled = true`: `probe_timeout_ms` must be non-zero,
 `cc = "brutal"` requires the two Brutal bandwidths (unless
 `ignore_client_bandwidth`), and `masque_front` (if set) must be non-empty. The
-QUIC handshake is not yet Safari-fingerprint-shaped, so enabling the fast plane
-is for throughput experimentation, not censorship-resistant production use.
+QUIC client already emits a Safari-26 H3-shaped ClientHello by default, but the
+fast plane stays off by default and is not yet a production-ready operator mode,
+so enabling it is for throughput experimentation, not censorship-resistant
+production use.
 
 ## Generated server example
 

@@ -14,8 +14,10 @@ There is no `--quic` CLI flag. An **experimental** UDP/QUIC fast plane is also
 wired into the client and server runtimes, but it is **off by default**: setting
 `[udp].enabled = true` on both ends (with matched binaries) activates a QUIC
 reliable-stream carrier for the single-Connect data relay. While disabled, every
-path stays byte-identical on TCP, and the QUIC handshake is not yet
-Safari-fingerprint-shaped, so it is for experimentation only. See the `[udp]`
+path stays byte-identical on TCP. When enabled, its QUIC client already emits a
+Safari-26 H3-shaped ClientHello by default, but it stays off by default and is
+not yet a production-ready operator mode, so it is for experimentation only. See
+the `[udp]`
 knobs in [Configuration Reference](Configuration-Reference.md) and the detector
 context in [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 
@@ -43,7 +45,7 @@ operator mode. QUIC also remains important for the adversary model.
 
 - TCP relay behavior: regular and ignored Rust tests
 - TLS record behavior: unit tests in `src/tls/record.rs`
-- data record behavior: unit tests and benchmarks in `src/protocol/data.rs`
+- data record behavior: unit tests in `src/protocol/data.rs`
 - adversary behavior: [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>)
 
 Related page: [TCP Camouflage Transport](TCP-Camouflage-Transport.md).

@@ -28,15 +28,17 @@ codec lives in `src/protocol/data.rs`.
 | `PX1V` | speed ack | client to server | Warmup upload done. |
 | `PX1D` | speed ack | client/server | Download sample done. |
 | `PX1U` | speed ack | client/server | Upload sample done. |
-| `PX1M` | `MuxFrame` | client/server | Multiplexed substream frame: stream id, flags, and payload length over one authenticated session. |
+| `PX1M` | `MuxFrame` | client/server | Multiplexed substream frame: stream id, a 1-byte frame kind (Open/Data/Fin/Reset/Cover), and payload length over one authenticated session. |
 | `PX1G` | `UdpRequest` | client to server | Opt-in request to negotiate the experimental UDP/QUIC fast plane (version byte). |
 | `PX1O` | `UdpOffer` | server to client | UDP fast-plane offer: `offer_id` (also the RFC 5705 exporter-binding context), UDP port, and parameters. |
 | `PX1P` | `UdpProbeAck` | client to server | Client reports the UDP probe outcome over the TCP control plane, echoing the `offer_id`. |
 | `PX1N` | `UdpDecline` | server to client | Fail-soft decline of a `UdpRequest`; the client proceeds on TCP only. |
+| `PX1Z` | `QUIC_RELAY_DONE_MARKER` | client/server | AEAD-sealed end-of-relay marker exchanged on the QUIC fast plane to confirm a clean relay teardown. |
 
 `PX1M` carries the default multiplexing path (`max_concurrent_streams > 1`), and
 `PX1G`/`PX1O`/`PX1P`/`PX1N` drive the experimental, off-by-default UDP/QUIC fast
-plane negotiation over the TCP control plane.
+plane negotiation over the TCP control plane, and `PX1Z` is the AEAD-sealed
+marker both ends exchange to confirm a clean QUIC-leg relay teardown.
 
 All decoders fail on truncation, bad magic, malformed lengths, empty required
 fields, and port `0` where a target port is present.

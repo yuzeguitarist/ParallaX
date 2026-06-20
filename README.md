@@ -26,8 +26,9 @@ There is no `--quic` CLI flag, but an **experimental** UDP/QUIC fast plane (the
 for the single-Connect data relay, authenticated by an exporter-bound probe token
 (the QUIC leg treats its server certificate as camouflage, not the trust anchor).
 It is **off by default**; while disabled, every path stays byte-identical on TCP.
-The QUIC handshake is not yet Safari-fingerprint-shaped, so enabling it is for
-experimentation, not censorship-resistant production use.
+When enabled, its QUIC client already emits a Safari-26 H3-shaped ClientHello by
+default, but the fast plane is not yet a production-ready operator mode, so
+enabling it is for experimentation, not censorship-resistant production use.
 
 ---
 
@@ -125,7 +126,6 @@ existing config files. The generated material includes:
 
 - 32-byte PSK
 - X25519 server key pair
-- ML-KEM-1024 server key pair
 - ML-DSA-87 server identity key pair
 
 ### 3. Deploy the server
@@ -181,6 +181,10 @@ plx client [-c parallax.toml]
 
 plx speed [-c parallax.toml] [--json]
     Run a one-shot network speed evidence test against the configured server.
+
+plx netmatrix [-c parallax.toml] [--json]
+    Run a reproducible controlled-network RTT/bandwidth speed matrix against the
+    configured server via an emulated loopback shaper.
 
 plx bench [--quick] [--json]
     Run the fixed-parameter CPU benchmark suite.
@@ -265,7 +269,7 @@ See the full configuration reference in
 Use these checks after code or documentation changes:
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked --no-fail-fast
 ```
