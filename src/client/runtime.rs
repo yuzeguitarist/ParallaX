@@ -149,7 +149,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         .client
         .clone()
         .ok_or(ClientRuntimeError::MissingClient)?;
-    let psk = decode_psk(&config.crypto.psk)?;
+    let psk = decode_psk(config.crypto.psk.as_b64())?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
     let psk = Arc::new(psk);
     let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
@@ -4557,8 +4557,8 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: Some(target_addr.to_string()),
-            private_key: STANDARD.encode(server_keys.private),
-            identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
+            private_key: STANDARD.encode(server_keys.private).into(),
+            identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
             replay_cache_path,
             replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
             authorized_sni: vec![String::from("example.com")],

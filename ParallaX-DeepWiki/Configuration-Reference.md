@@ -21,10 +21,30 @@ Unix rejects group/world-readable secret files.
 
 | Field | Required | Validation |
 |---|---:|---|
-| `psk` | yes | Base64 string that decodes to at least 32 bytes. |
+| `psk` | yes | Base64 string that decodes to at least 32 bytes, **or** a secret reference (see below). |
 
 The same PSK must appear in both generated configs. It is part of ClientHello
 authentication and the hybrid rekey sandwich input.
+
+## Secret sources (`psk`, `private_key`, `identity_secret_key`)
+
+The three long-lived secret fields are **public-vs-secret aware**: each accepts
+either an inline base64 string (back-compat) or an indirection table so the
+config file itself is not a bearer credential. `Config::load` resolves every
+source to its base64 bytes once, up front, before validation; the rest of the
+runtime is unchanged regardless of where the bytes came from.
+
+| Form | Example | Notes |
+|---|---|---|
+| Inline | `psk = "base64=="` | Legacy. The config file IS a credential — `plx check` warns. |
+| File | `psk = { file = "parallax.secrets.toml#psk" }` | Reads a `#key` entry from a 0600 TOML sidecar (the `plx init` default), or the whole file when no `#fragment` is given. Relative paths resolve next to the config. Owner-only `0600` is enforced. |
+| Env | `psk = { env = "PARALLAX_PSK" }` | Reads the base64 from an environment variable — composes with systemd `LoadCredential=` / container secrets. |
+| Sealed | `psk = { sealed = "parallax.secrets.enc#psk" }` | Machine-bound: decrypted at load with the host keyfile (`$PARALLAX_HOST_KEY_FILE` or `/var/lib/parallax/host.key`). Written by `plx seal`. |
+
+Exactly one of `file` / `env` / `sealed` may be set per reference. Only these
+three fields are secret; every other config field is a public parameter. See the
+[SECURITY.md threat model](../SECURITY.md#secret-handling--config-threat-model)
+for what sealing protects against.
 
 ## `[traffic]`
 
@@ -60,8 +80,8 @@ ParallaX session.
 | `listen` | yes | Server bind address, usually `0.0.0.0:443`. |
 | `fallback_addr` | yes | Real TLS origin used for unauthenticated/probe traffic. |
 | `data_target` | no | Fixed upstream target for authenticated data. If omitted, the client CONNECT command chooses the target. |
-| `private_key` | yes | Base64 X25519 server secret key, exactly 32 bytes. |
-| `identity_secret_key` | yes | Base64 ML-DSA-87 server identity secret key. |
+| `private_key` | yes | Base64 X25519 server secret key, exactly 32 bytes — or a secret reference (see *Secret sources*). |
+| `identity_secret_key` | yes | Base64 ML-DSA-87 server identity secret key — or a secret reference (see *Secret sources*). |
 | `replay_cache_path` | no | Defaults to `/var/lib/parallax/parallax-replay.cache`; relative paths resolve relative to the config file. |
 | `authorized_sni` | yes | Non-empty SNI allowlist for authenticated ClientHellos. Matching is case-insensitive. |
 | `strict_tls13` | no | Defaults to `true`; fallback ServerHello must negotiate TLS 1.3 when enabled. |

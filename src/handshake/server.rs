@@ -385,7 +385,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     }
     crate::transport::tcp::configure_congestion_control(server.tcp_congestion.as_deref());
     let traffic = config.traffic;
-    let psk = decode_psk(&config.crypto.psk)?;
+    let psk = decode_psk(config.crypto.psk.as_b64())?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
     let psk = Arc::new(psk);
     let replay_cache = Arc::new(Mutex::new(
@@ -623,10 +623,12 @@ struct ServerRuntimeSecrets {
 
 impl ServerRuntimeSecrets {
     fn decode(config: &ServerConfig) -> Result<Self, ConfigError> {
-        let private_key = decode_key32_secret("server.private_key", &config.private_key)?;
+        let private_key = decode_key32_secret("server.private_key", config.private_key.as_b64())?;
         let server_public_key = x25519_public_from_private(&private_key);
-        let identity_secret_key =
-            decode_base64_secret("server.identity_secret_key", &config.identity_secret_key)?;
+        let identity_secret_key = decode_base64_secret(
+            "server.identity_secret_key",
+            config.identity_secret_key.as_b64(),
+        )?;
 
         // Pin the secrets at their FINAL, stable addresses. private_key is an
         // inline [u8;32]: protecting it before the Arc::new below would mlock the
@@ -6172,8 +6174,8 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: None,
-            private_key: STANDARD.encode(server_keys.private),
-            identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
+            private_key: STANDARD.encode(server_keys.private).into(),
+            identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
             replay_cache_path,
             replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
             authorized_sni: vec![String::from("example.com")],

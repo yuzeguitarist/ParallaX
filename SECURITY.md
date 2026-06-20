@@ -85,6 +85,70 @@ Out of scope:
 
 - Purely documentation and research notes with no executable attack surface.
 
+## Secret handling & config threat model
+
+A ParallaX deployment rests on a few long-lived secrets. Treating the config
+file as a single artifact that is safe to share is the most common way to lose a
+deployment, so the file format separates **public parameters** from **secrets**
+and lets the secrets live outside the config.
+
+### Which config fields are public vs secret
+
+| Field | Sensitivity | If leaked |
+| --- | --- | --- |
+| `crypto.psk` | **SECRET** (shared by client and server) | client/server impersonation; the *client* config alone is a bearer credential |
+| `server.private_key` | **SECRET** (X25519 static private) | server impersonation, session decryption |
+| `server.identity_secret_key` | **SECRET** (ML-DSA-87 signing key) | forge the server identity signature |
+| `client.server_public_key`, `client.server_identity_public_key` | Public | none — verification material |
+| `listen` / `server_addr` / `fallback_addr` / `sni` / `authorized_sni` / `traffic.*` / `udp.*` / `replay_cache_*` / timeouts | Public parameters | none |
+
+### Keeping secrets out of the config file
+
+Each of the three secret fields accepts **either** an inline base64 string
+(back-compat, discouraged) **or** an indirection so the config file itself is not
+a credential:
+
+```toml
+psk = "base64=="                              # inline — file IS a credential
+psk = { file = "parallax.secrets.toml#psk" } # 0600 sidecar file (default for `plx init`)
+psk = { env = "PARALLAX_PSK" }               # environment / systemd LoadCredential
+psk = { sealed = "parallax.secrets.enc#psk" }# machine-bound, encrypted at rest
+```
+
+- `plx init` writes **referenced** secrets (0600 sidecar files) by default;
+  `--inline-secrets` restores the legacy all-in-one file.
+- `plx check` warns when any secret is still inline.
+- `plx seal` encrypts the secrets into a machine-bound bundle (see below) and
+  rewrites the config to reference it.
+
+### What sealing protects against
+
+`plx seal` derives a per-secret key (HKDF-SHA256) from a host-local keyfile
+(`/var/lib/parallax/host.key`, mode `0600`) and encrypts each secret with
+XChaCha20-Poly1305 (the logical field name is bound as AAD). The sealed bundle
+and the config that references it are then **safe to back up, commit, or paste**:
+without the host keyfile they decrypt to nothing on any other machine.
+
+**Protects against** the realistic leakage mistakes this issue targets: pasting a
+config into an issue/chat/log, committing it to git, a stray backup or upload, or
+a wrong-permissions copy.
+
+**Does NOT protect against** (consistent with the in-memory hardening above and
+the stated non-goal): a root/kernel compromise, an attacker who can read the host
+keyfile *and* the sealed bundle on the same host, live process-memory scraping,
+or leakage of the plaintext secret/sidecar files themselves. It is not a
+TEE/HSM/TPM and does not claim root-compromise resistance.
+
+### Operational guidance
+
+- Keep secret and sidecar files (`*.secrets.toml`, `*.secrets.enc`, `host.key`)
+  out of version control — they are git-ignored by default.
+- Prefer `env`/systemd credentials or `plx seal` over inline secrets in
+  production.
+- Rotate on suspected leak: regenerate the keypair/identity and PSK and
+  redistribute. The PSK is shared, so PSK rotation is a coordinated two-sided op.
+- Redact secrets when filing issues (see *What to include* above).
+
 ## Disclosure process
 
 - We aim to acknowledge a report within a few days. This is a small project, so

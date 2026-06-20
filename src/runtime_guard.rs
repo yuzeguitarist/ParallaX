@@ -515,7 +515,7 @@ mod tests {
         Config {
             mode: Mode::Client,
             crypto: CryptoConfig {
-                psk: "test-psk-not-read-by-runtime-guard".to_owned(),
+                psk: "test-psk-not-read-by-runtime-guard".into(),
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),

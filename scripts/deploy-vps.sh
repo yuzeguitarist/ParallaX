@@ -727,11 +727,16 @@ build_host_tools_and_configs() {
   else
     rm -f "$server_cfg" "$client_cfg"
     deploy_info_log "generating local-only server/client configs"
+    # Inline secrets here on purpose: the deploy flow uploads a single
+    # self-contained server config to the VPS (kept 0600, never committed). To
+    # machine-bind it afterwards, run `plx seal -c parallax.server.toml` on the
+    # server. Interactive `plx init` defaults to split/referenced secret files.
     run cargo run --locked --quiet --bin plx -- init "$DEST" \
       --server-addr "$SERVER_ADDR" \
       --server-listen "$SERVER_LISTEN" \
       --client-listen "$CLIENT_LISTEN" \
-      --output "$deploy_dir"
+      --output "$deploy_dir" \
+      --inline-secrets
   fi
 
   require_deploy_replay_cache_path "$server_cfg"

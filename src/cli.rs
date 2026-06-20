@@ -22,7 +22,7 @@ use crate::{
     handshake::server,
     netmatrix, probe, process_hardening,
     runtime_guard::RuntimeGuard,
-    speed,
+    secret_store, speed,
     transport::tcp::bump_nofile_soft_limit,
 };
 
@@ -124,6 +124,25 @@ enum Command {
         /// Directory for parallax.server.toml and parallax.client.toml.
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
+        /// Write secrets inline into the config files (legacy, leak-unsafe).
+        /// By default secrets go into separate 0600 sidecar files the config
+        /// only references, so a leaked config alone is not a bearer credential.
+        #[arg(long)]
+        inline_secrets: bool,
+    },
+    /// Machine-bind a config's secrets: encrypt them into a sealed bundle under a
+    /// host-local key and rewrite the config to reference it. After sealing, the
+    /// config and bundle are useless on any other machine.
+    Seal {
+        #[arg(short, long, default_value = "parallax.toml")]
+        config: PathBuf,
+        /// Sealed bundle output path (default: <config-dir>/parallax.secrets.enc).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Host keyfile path (default: $PARALLAX_HOST_KEY_FILE or
+        /// /var/lib/parallax/host.key). Created if it does not exist.
+        #[arg(long)]
+        host_key: Option<PathBuf>,
     },
 }
 
@@ -172,7 +191,20 @@ async fn handle_command(command: Command) -> anyhow::Result<()> {
             server_listen,
             client_listen,
             output,
-        } => write_init_config(&dest, &server_addr, &server_listen, &client_listen, &output)?,
+            inline_secrets,
+        } => write_init_config(
+            &dest,
+            &server_addr,
+            &server_listen,
+            &client_listen,
+            &output,
+            inline_secrets,
+        )?,
+        Command::Seal {
+            config,
+            output,
+            host_key,
+        } => seal_config(&config, output.as_deref(), host_key.as_deref())?,
     }
     Ok(())
 }
@@ -185,6 +217,19 @@ fn check_config(config: PathBuf) -> anyhow::Result<()> {
         cfg.mode,
         config.display()
     );
+    let inline = cfg.inline_secret_fields();
+    if inline.is_empty() {
+        println!("ok: secrets are referenced/sealed; this config file alone is not a credential");
+    } else {
+        println!(
+            "warning: secrets are stored inline ({}); this config file is a bearer credential.",
+            inline.join(", ")
+        );
+        println!(
+            "         Anyone who obtains it can use or impersonate this deployment. Run \
+             `plx seal` to machine-bind the secrets, or move them into a 0600 sidecar file."
+        );
+    }
     Ok(())
 }
 
@@ -286,16 +331,148 @@ fn write_init_config(
     server_listen: &str,
     client_listen: &str,
     output: &Path,
+    inline_secrets: bool,
 ) -> anyhow::Result<()> {
     let target = probe::ProbeTarget::parse(dest)?;
-    let generated = generate_config_template(
-        server_listen,
-        client_listen,
-        server_addr,
-        &target.authority(),
-        &target.host,
+    if inline_secrets {
+        let generated = generate_config_template(
+            server_listen,
+            client_listen,
+            server_addr,
+            &target.authority(),
+            &target.host,
+        );
+        write_init_files(output, &generated)
+    } else {
+        let generated = generate_referenced_config(
+            server_listen,
+            client_listen,
+            server_addr,
+            &target.authority(),
+            &target.host,
+        );
+        write_referenced_init_files(output, &generated)
+    }
+}
+
+/// Encrypt a config's secrets into a machine-bound sealed bundle and rewrite the
+/// config to reference it. See [`crate::secret_store`] for the crypto + threat
+/// model.
+fn seal_config(
+    config: &Path,
+    output: Option<&Path>,
+    host_key: Option<&Path>,
+) -> anyhow::Result<()> {
+    // Load (and thus resolve any existing references) so we seal the real secret
+    // values regardless of how the source config stored them.
+    let cfg = load_config(config)?;
+    cfg.validate()?;
+
+    let mut secrets: Vec<(&'static str, String)> =
+        vec![("psk", cfg.crypto.psk.as_b64().to_owned())];
+    if let Some(server) = cfg.server.as_ref() {
+        secrets.push(("private_key", server.private_key.as_b64().to_owned()));
+        secrets.push((
+            "identity_secret_key",
+            server.identity_secret_key.as_b64().to_owned(),
+        ));
+    }
+
+    let host_key_bytes = match secret_store::load_host_key(host_key) {
+        Ok(key) => key,
+        Err(secret_store::SealError::HostKeyMissing { path }) => {
+            let key = secret_store::create_host_key(host_key)?;
+            println!("Created host keyfile: {}", path.display());
+            key
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let bundle = secret_store::seal_all(
+        &host_key_bytes,
+        secrets
+            .iter()
+            .map(|(field, value)| (*field, value.as_str())),
     );
-    write_init_files(output, &generated)
+
+    let config_dir = config
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let bundle_path = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| config_dir.join("parallax.secrets.enc"));
+    let bundle_name = bundle_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("sealed bundle output path has no file name")?
+        .to_owned();
+
+    fs::write(&bundle_path, secret_store::bundle_to_toml(&bundle))
+        .with_context(|| format!("failed to write {}", bundle_path.display()))?;
+
+    let original = fs::read_to_string(config)
+        .with_context(|| format!("failed to re-read {}", config.display()))?;
+    let rewritten = rewrite_secrets_to_sealed(
+        &original,
+        &bundle_name,
+        secrets.iter().map(|(field, _)| *field),
+    );
+    write_secret_file_overwrite(config, &rewritten)?;
+
+    println!(
+        "Sealed {} secret(s) into {}",
+        secrets.len(),
+        bundle_path.display()
+    );
+    println!(
+        "Rewrote {} to reference the sealed bundle.",
+        config.display()
+    );
+    println!(
+        "The host keyfile stays on THIS machine only. The config and bundle are \
+         now safe to back up; they cannot be used elsewhere without it."
+    );
+    Ok(())
+}
+
+/// Rewrite each named secret assignment line to a `{ sealed = "<bundle>#<field>" }`
+/// reference, preserving the rest of the file (comments, formatting, ordering).
+/// Secrets are always single-line assignments, so a line-targeted rewrite is
+/// safe and avoids a lossy TOML round-trip.
+fn rewrite_secrets_to_sealed<'a>(
+    original: &str,
+    bundle_name: &str,
+    fields: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let targets: Vec<&str> = fields.into_iter().collect();
+    let mut out = String::with_capacity(original.len());
+    for line in original.lines() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        let mut replaced = false;
+        for field in &targets {
+            // Match `psk = ...` / `private_key= ...` etc. at the start of the
+            // logical assignment (after indentation), not as a substring.
+            if let Some(rest) = trimmed.strip_prefix(field) {
+                let rest = rest.trim_start();
+                if rest.starts_with('=') {
+                    out.push_str(indent);
+                    out.push_str(field);
+                    out.push_str(&format!(" = {{ sealed = \"{bundle_name}#{field}\" }}"));
+                    out.push('\n');
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if !replaced {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn prepare_long_lived_process() {
@@ -501,6 +678,185 @@ fn write_secret_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Overwrite an existing 0600 secret file in place (used by `plx seal` to rewrite
+/// a config). Unlike [`write_secret_file`] this truncates rather than refusing
+/// when the file exists, and (re)asserts owner-only permissions.
+fn write_secret_file_overwrite(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).truncate(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    }
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Config files plus the separate secret sidecars they reference (leak-safe
+/// default for `plx init`).
+struct ReferencedConfig {
+    server: String,
+    client: String,
+    server_secrets: String,
+    client_secrets: String,
+}
+
+const SERVER_SECRETS_FILE: &str = "parallax.server.secrets.toml";
+const CLIENT_SECRETS_FILE: &str = "parallax.client.secrets.toml";
+
+/// Build paired configs whose secrets live in separate 0600 sidecar files that
+/// the configs only reference. A leaked config alone is then not a credential.
+fn generate_referenced_config(
+    server_listen: &str,
+    client_listen: &str,
+    server_addr: &str,
+    fallback_addr: &str,
+    sni: &str,
+) -> ReferencedConfig {
+    let mut psk = [0_u8; 32];
+    OsRng.fill_bytes(&mut psk);
+    let server_keys = X25519KeyPair::generate();
+    let server_identity_keys = identity::keypair();
+
+    let psk = STANDARD.encode(psk);
+    let server_private = STANDARD.encode(server_keys.private);
+    let server_public = STANDARD.encode(server_keys.public);
+    let identity_secret = STANDARD.encode(&server_identity_keys.secret);
+    let identity_public = STANDARD.encode(&server_identity_keys.public);
+    let server_listen = toml_basic_string(server_listen);
+    let client_listen = toml_basic_string(client_listen);
+    let server_addr = toml_basic_string(server_addr);
+    let fallback_addr = toml_basic_string(fallback_addr);
+    let sni = toml_basic_string(sni);
+
+    let server = format!(
+        r#"mode = "server"
+
+[crypto]
+psk = {{ file = "{SERVER_SECRETS_FILE}#psk" }}
+
+[traffic]
+min_padding = 0
+max_padding = 0
+min_delay_ms = 0
+max_delay_ms = 0
+cover_min_interval_ms = 0
+cover_max_interval_ms = 0
+max_concurrent_streams = 4
+
+[server]
+listen = {server_listen}
+fallback_addr = {fallback_addr}
+private_key = {{ file = "{SERVER_SECRETS_FILE}#private_key" }}
+identity_secret_key = {{ file = "{SERVER_SECRETS_FILE}#identity_secret_key" }}
+replay_cache_path = "{DEFAULT_REPLAY_CACHE_PATH}"
+authorized_sni = [{sni}]
+strict_tls13 = true
+"#
+    );
+
+    let client = format!(
+        r#"mode = "client"
+
+[crypto]
+psk = {{ file = "{CLIENT_SECRETS_FILE}#psk" }}
+
+[traffic]
+min_padding = 0
+max_padding = 0
+min_delay_ms = 0
+max_delay_ms = 0
+cover_min_interval_ms = 0
+cover_max_interval_ms = 0
+max_concurrent_streams = 4
+
+[client]
+listen = {client_listen}
+server_addr = {server_addr}
+sni = {sni}
+server_public_key = "{server_public}"
+server_identity_public_key = "{identity_public}"
+"#
+    );
+
+    let server_secrets = format!(
+        "# ParallaX SERVER secrets — SENSITIVE. Keep mode 0600. Never commit, never paste.\n\
+         psk = \"{psk}\"\n\
+         private_key = \"{server_private}\"\n\
+         identity_secret_key = \"{identity_secret}\"\n"
+    );
+    let client_secrets = format!(
+        "# ParallaX CLIENT secrets — SENSITIVE. Keep mode 0600. Never commit, never paste.\n\
+         psk = \"{psk}\"\n"
+    );
+
+    ReferencedConfig {
+        server,
+        client,
+        server_secrets,
+        client_secrets,
+    }
+}
+
+fn write_referenced_init_files(output: &Path, generated: &ReferencedConfig) -> anyhow::Result<()> {
+    let files = [
+        (output.join("parallax.server.toml"), &generated.server),
+        (output.join("parallax.client.toml"), &generated.client),
+        (output.join(SERVER_SECRETS_FILE), &generated.server_secrets),
+        (output.join(CLIENT_SECRETS_FILE), &generated.client_secrets),
+    ];
+    anyhow::ensure!(
+        output.is_dir(),
+        "output directory does not exist: {}",
+        output.display()
+    );
+    for (path, _) in &files {
+        anyhow::ensure!(
+            !path.exists(),
+            "refusing to overwrite existing file in {}: {}",
+            output.display(),
+            path.display()
+        );
+    }
+
+    let mut written: Vec<&Path> = Vec::new();
+    for (path, contents) in &files {
+        if let Err(err) = write_secret_file(path, contents) {
+            // Roll back any partial set so a retry isn't blocked by orphans.
+            for done in &written {
+                let _ = fs::remove_file(done);
+            }
+            return Err(err);
+        }
+        written.push(path);
+    }
+
+    println!("Configs written (secrets kept in separate 0600 sidecar files):");
+    println!("  server: {}", files[0].0.display());
+    println!("  client: {}", files[1].0.display());
+    println!("  server secrets: {}", files[2].0.display());
+    println!("  client secrets: {}", files[3].0.display());
+    println!(
+        "Next: upload BOTH parallax.server.toml and {SERVER_SECRETS_FILE} to the VPS (same \
+         directory), and keep the client files on this machine. Add *.secrets.toml to .gitignore."
+    );
+    println!(
+        "Tip: on the VPS, run `plx seal -c parallax.server.toml` to machine-bind the secrets."
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,13 +878,15 @@ mod tests {
         client.validate().unwrap();
         assert_eq!(server.mode, crate::config::Mode::Server);
         assert_eq!(client.mode, crate::config::Mode::Client);
-        assert_eq!(server.crypto.psk, client.crypto.psk);
+        assert_eq!(server.crypto.psk.as_b64(), client.crypto.psk.as_b64());
 
         let server_cfg = server.server.as_ref().unwrap();
         let client_cfg = client.client.as_ref().unwrap();
-        let server_private =
-            crate::config::decode_key32_secret("server.private_key", &server_cfg.private_key)
-                .unwrap();
+        let server_private = crate::config::decode_key32_secret(
+            "server.private_key",
+            server_cfg.private_key.as_b64(),
+        )
+        .unwrap();
         let server_public =
             crate::config::decode_key32("client.server_public_key", &client_cfg.server_public_key)
                 .unwrap();
@@ -689,6 +1047,7 @@ mod tests {
             "0.0.0.0:443",
             "127.0.0.1:1080",
             dir.path(),
+            true,
         )
         .unwrap();
         let server_path = dir.path().join("parallax.server.toml");
@@ -716,6 +1075,7 @@ mod tests {
             "0.0.0.0:443",
             "127.0.0.1:1080",
             dir.path(),
+            true,
         )
         .unwrap_err();
         assert!(format!("{err:?}").contains("target cannot be empty"));
@@ -763,5 +1123,101 @@ mod tests {
 
         let server_path = dir.path().join("parallax.server.toml");
         Config::load(server_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn referenced_init_splits_secrets_into_sidecars_and_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_init_config(
+            "example.com",
+            "203.0.113.10:443",
+            "0.0.0.0:443",
+            "127.0.0.1:1080",
+            dir.path(),
+            false,
+        )
+        .unwrap();
+
+        for name in [
+            "parallax.server.toml",
+            "parallax.client.toml",
+            SERVER_SECRETS_FILE,
+            CLIENT_SECRETS_FILE,
+        ] {
+            let path = dir.path().join(name);
+            assert!(path.exists(), "missing {name}");
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} should be 0600");
+        }
+
+        // The config file alone must NOT contain the raw secret bytes.
+        let server_text = fs::read_to_string(dir.path().join("parallax.server.toml")).unwrap();
+        assert!(server_text.contains("file = \"parallax.server.secrets.toml#psk\""));
+
+        // It loads (resolving the sidecars) and reports no inline secrets.
+        let server = Config::load(dir.path().join("parallax.server.toml")).unwrap();
+        assert!(server.inline_secret_fields().is_empty());
+        let client = Config::load(dir.path().join("parallax.client.toml")).unwrap();
+        client.validate().unwrap();
+
+        // Client and server resolve to the SAME shared PSK.
+        assert_eq!(server.crypto.psk.as_b64(), client.crypto.psk.as_b64());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_round_trips_and_strips_inline_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "example.com:443",
+            "example.com:443",
+            "example.com",
+        );
+        let server_path = dir.path().join("parallax.server.toml");
+        fs::write(&server_path, &generated.server).unwrap();
+        fs::set_permissions(&server_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Capture an inline secret value so we can prove it is gone post-seal.
+        let before = Config::load(&server_path).unwrap();
+        let private_b64 = before
+            .server
+            .as_ref()
+            .unwrap()
+            .private_key
+            .as_b64()
+            .to_owned();
+        assert!(generated.server.contains(&private_b64));
+        assert!(!before.inline_secret_fields().is_empty());
+
+        // Use a temp host keyfile (both seal and runtime read it via the env var).
+        let host_key = dir.path().join("host.key");
+        std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+
+        seal_config(&server_path, None, None).unwrap();
+
+        let bundle_path = dir.path().join("parallax.secrets.enc");
+        assert!(bundle_path.exists());
+        let rewritten = fs::read_to_string(&server_path).unwrap();
+        assert!(
+            !rewritten.contains(&private_b64),
+            "sealed config must not retain the raw private key"
+        );
+        assert!(rewritten.contains("sealed = \"parallax.secrets.enc#private_key\""));
+
+        // Reload resolves the sealed bundle back to the original secret bytes.
+        let after = Config::load(&server_path).unwrap();
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        assert_eq!(
+            after.server.as_ref().unwrap().private_key.as_b64(),
+            private_b64
+        );
+        assert!(after.inline_secret_fields().is_empty());
     }
 }

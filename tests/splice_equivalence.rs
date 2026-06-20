@@ -273,8 +273,8 @@ fn fallback_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         fallback_addr: fallback_addr.to_string(),
         data_target: None,
-        private_key: STANDARD.encode(server_keys.private),
-        identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
+        private_key: STANDARD.encode(server_keys.private).into(),
+        identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
         replay_cache_path,
         // The fallback path never touches the replay cache; any positive
         // capacity is fine. (`DEFAULT_REPLAY_CACHE_CAPACITY` is `pub(crate)` and
