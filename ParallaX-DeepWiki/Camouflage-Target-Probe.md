@@ -68,5 +68,3 @@ Prefer a fallback origin that:
 
 Related pages: [TLS Camouflage Layer](TLS-Camouflage-Layer.md) and
 [Deployment](Deployment.md).
-
-<!-- wiki-sync e2e test: remove after verification -->
