@@ -18,9 +18,12 @@
 //! send handles so they are not finished until the relay tears the connection
 //! down.
 //!
-//! This is the H3 *control* layer only. Folding the reachability probe and the
-//! relay payload into an H3 request bidi stream (HEADERS + DATA frames) is a
-//! separate slice; the probe and relay byte carriers are unchanged here.
+//! This module owns the H3 *control* layer (the uni streams above). The
+//! reachability probe and the relay payload ride an H3 *request bidi* stream
+//! (HEADERS + DATA frames); that carrier lives in [`crate::transport::udp::probe`]
+//! and the client/server runtimes, which interleave the request bidi between the
+//! control and encoder opens to match Safari's control -> request -> encoder
+//! stream order.
 //!
 //! TODO(qpack-dynamic-encoder): confirm whether real Safari 26 issues QPACK
 //! dynamic-table inserts on its encoder stream for the first request. ParallaX is

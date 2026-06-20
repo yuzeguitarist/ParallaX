@@ -9,18 +9,23 @@
 //! error), so detection is ACTIVE: no verified echo within the Happy-Eyeballs
 //! window means treat the UDP leg as unreachable and stay on TCP.
 //!
-//! The round-trip rides QUIC **unidirectional streams** (not RFC-9221 datagrams):
-//! the client opens a uni stream for the request, the server answers on its own
-//! uni stream. Safari-26 H3 advertises no `max_datagram_frame_size` for plain H3
-//! (it sends no datagrams), so the camouflaged transport params omit it and quinn
-//! disables datagram support; uni streams use the already-advertised
-//! `initial_max_streams_uni = 8` budget and are orthogonal to the relay's single
-//! bidi stream. Reliable delivery also means a single lost packet is retransmitted
-//! rather than silently dropping the probe.
+//! The PRODUCTION round-trip rides an HTTP/3 **request bidi** stream (RFC 9114):
+//! the client writes a HEADERS frame (Safari-26 request fields, method GET)
+//! followed by a DATA frame whose body is the `PXp1 + nonce` request; the server
+//! replies with a `:status 200` HEADERS frame and a DATA frame whose body is the
+//! `PXp2 + HMAC` response. The SAME bidi stream then carries the data relay (the
+//! probe round-trip IS the fast-plane Verified determination). See
+//! [`probe_client_over_bidi`] / [`serve_probe_over_bidi`].
+//!
+//! The bare-uni-stream round-trip ([`probe_client`] / [`serve_probe`]) is the
+//! earlier carrier, now PRODUCTION-UNUSED: it is retained as a tested reference
+//! for the exporter-token round-trip and the Unreachable-timeout coverage (see
+//! the `#[cfg(test)]` cases below). Reliable delivery (bidi or uni) means a single
+//! lost packet is retransmitted rather than silently dropping the probe.
 //!
 //! Wired into the client/server runtimes: a Verified probe causes both ends to
-//! retain the QUIC connection and carry the single-Connect data relay over a
-//! reliable bidi stream. The demote/promote scheduler (switching transports
+//! retain the QUIC connection and carry the single-Connect data relay over the
+//! request bidi stream. The demote/promote scheduler (switching transports
 //! mid-session) is a later slice; for now a Verified probe commits the relay to
 //! QUIC, and a mid-relay failure is a clean connection reset.
 
@@ -77,6 +82,12 @@ fn probe_response(token: &[u8; UDP_AUTH_TOKEN_LEN], nonce: &[u8]) -> [u8; PROBE_
 
 /// Client side: send an authenticated probe over the UDP leg and classify the
 /// result against the Happy-Eyeballs `timeout`.
+///
+/// PRODUCTION-UNUSED: the production probe rides the request bidi
+/// ([`probe_client_over_bidi`]); this bare-uni carrier is kept as a tested
+/// reference for the exporter-token round-trip and the Unreachable-timeout
+/// coverage (its `#[cfg(test)]` cases below). It shares the SAME token derivation
+/// and `probe_response` HMAC as the bidi path.
 pub async fn probe_client(
     connection: &quinn::Connection,
     psk: &[u8],
@@ -120,6 +131,8 @@ pub async fn probe_client(
 /// Send the request on a client-initiated uni stream and read the server's reply
 /// off a server-initiated uni stream. Returns the raw reply bytes (validated by
 /// the caller). A lost/closed connection maps to `ConnectionLost` (-> Unreachable).
+///
+/// PRODUCTION-UNUSED helper of [`probe_client`]; see that fn's note.
 async fn probe_client_round_trip(
     connection: &quinn::Connection,
     request: &[u8],
@@ -145,6 +158,10 @@ async fn probe_client_round_trip(
 
 /// Server side: answer one probe request with an authenticated response derived
 /// from the same exporter-bound token.
+///
+/// PRODUCTION-UNUSED: the production server serves the probe over the request bidi
+/// ([`serve_probe_over_bidi`]); this bare-uni responder is the peer of
+/// [`probe_client`] and is kept as a tested reference (see that fn's note).
 pub async fn serve_probe(
     connection: &quinn::Connection,
     psk: &[u8],
@@ -256,6 +273,16 @@ async fn probe_client_bidi_round_trip(
 ) -> Result<Vec<u8>, ProbeError> {
     use crate::fingerprint::http3::{encode_frame, safari26_headers_frame, FRAME_TYPE_DATA};
 
+    // TODO(h3-request-semantics): the HEADERS use method GET (Safari's opening
+    // request shape), but we then send a client->server DATA frame (the probe
+    // request, and subsequently the relay payload). A real browser GET carries NO
+    // request body, so a GET followed by request-body DATA is non-typical H3
+    // request semantics. This is sub-wire: it lives inside the 1-RTT-encrypted
+    // request stream, so it is observable only to an adversary with MITM + the PSK
+    // (who can decrypt the stream). It is the residual of the method choice in the
+    // request-bidi threat model; a fully browser-faithful shape would use a method
+    // that legitimately carries an upload body (or a request/response pattern with
+    // no client body). Gated behind the same QUIC enable decision.
     let headers =
         safari26_headers_frame(authority).map_err(|err| ProbeError::Send(err.to_string()))?;
     let data =

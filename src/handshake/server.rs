@@ -2575,6 +2575,18 @@ async fn accept_probed_quic_from_peer(
         // exporter-bound auth inside `serve_probe_over_bidi` is unchanged; only the
         // carrier is H3 framing. A failure to open a control stream means the QUIC
         // connection is unusable for H3 — decline (stay on TCP).
+        //
+        // TODO(quic-active-probing): HARD PRE-ENABLE GATE. This sends the SAME
+        // Safari-26 *client* SETTINGS (`safari26_settings_frame`, browser-shaped) as
+        // the server's control-stream first frame. A real H3 *origin* advertises a
+        // DIFFERENT, server-shaped SETTINGS set. An active prober that completes the
+        // TLS handshake can read this server 1-RTT SETTINGS frame BEFORE it fails
+        // authentication and we drop it — so reusing the client SETTINGS here is an
+        // active-probing tell (and the unconditional drop-on-auth-failure differs
+        // from how a real origin would respond). BEFORE enabling QUIC in production,
+        // the server must emit origin-shaped SETTINGS and, on auth failure, behave
+        // like the fronted origin rather than dropping. Gated on the camouflage-
+        // origin decision + a captured reference of the origin's H3 SETTINGS.
         let control_send = crate::transport::udp::h3::open_h3_control_stream(&conn)
             .await
             .ok()?;

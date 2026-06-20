@@ -1260,13 +1260,22 @@ async fn run_client_udp_probe(
         ProbeOutcome::Verified { .. } => {
             // Probe Verified: open the QPACK encoder stream (last in Safari's
             // stream order), then retain everything for the relay on the SAME bidi.
-            let encoder_send = match crate::transport::udp::h3::open_h3_encoder_stream(&conn).await
+            // Timeout-bounded like the other post-connect H3 steps: a non-
+            // cooperative peer that grants bidi/control credit but withholds uni
+            // credit (`initial_max_streams_uni`) could otherwise stall `open_uni`
+            // here indefinitely. On timeout/error treat as Unreachable (stay on TCP).
+            let encoder_send = match tokio::time::timeout(
+                probe_timeout,
+                crate::transport::udp::h3::open_h3_encoder_stream(&conn),
+            )
+            .await
             {
-                Ok(s) => s,
-                // The connection died right after a Verified probe; treat as
-                // Unreachable so the client stays on TCP rather than reporting a
-                // Verified path it can no longer use.
-                Err(_) => return unreachable(),
+                Ok(Ok(s)) => s,
+                // The connection died right after a Verified probe (or the peer
+                // withheld uni credit past the deadline); treat as Unreachable so
+                // the client stays on TCP rather than reporting a Verified path it
+                // can no longer use.
+                _ => return unreachable(),
             };
             // Read + verify the server's H3 SETTINGS off its control stream (the
             // server opened its control stream before serving the bidi probe, so it
