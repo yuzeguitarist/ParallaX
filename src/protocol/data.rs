@@ -414,9 +414,13 @@ impl DataRecordCodec {
     /// directly into `out` by `fill(i, out)` between begin/finish, so the caller
     /// need not stage the plaintext in a separate buffer first. Byte-identical to
     /// `seal_records_into` when `fill` appends the same per-record slices; this is
-    /// the zero-copy seal path for the relay/mux writers (Track A2). `record_lens`
-    /// gives the per-record plaintext lengths used to size the up-front reserve
-    /// (and, in debug, to assert `fill` appends exactly that many bytes).
+    /// an alternative in-place seal path intended for a future relay/mux writer
+    /// wiring (Track A2). It is not currently on the hot path — the live writers
+    /// use `seal_records_into_parallel`/`seal_records_into` — but it is retained
+    /// and kept byte-for-byte equivalence-tested against `seal_records_into`.
+    /// `record_lens` gives the per-record plaintext lengths used to size the
+    /// up-front reserve (and, in debug, to assert `fill` appends exactly that
+    /// many bytes).
     pub fn seal_records_into_inplace<R, F>(
         &mut self,
         record_lens: &[usize],
@@ -672,6 +676,11 @@ impl DataRecordCodec {
         let cipher = self.aead.cipher();
         let nonce_base = self.aead.nonce_base();
         let base_sequence = self.aead.sequence();
+        // Defense in depth: reject a batch that would wrap the per-direction
+        // sequence counter past u64::MAX before any record is opened.
+        if base_sequence.checked_add(record_count as u64).is_none() {
+            return Err(SessionError::NonceExhausted.into());
+        }
         let aad = self.aad;
 
         let mut jobs = Vec::with_capacity(group_count);

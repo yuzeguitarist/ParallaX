@@ -442,13 +442,7 @@ where
     }
     let elapsed = start.map(|s| s.elapsed()).unwrap_or_default();
 
-    let ack = read_ack_from_records(records, data_session, expected_ack, expected_bytes).await?;
-    if ack.bytes != received {
-        return Err(SpeedError::ByteCountMismatch {
-            expected: received,
-            actual: ack.bytes,
-        });
-    }
+    read_ack_from_records(records, data_session, expected_ack, expected_bytes).await?;
 
     Ok(PhaseMeasurement {
         bytes: received,
@@ -490,14 +484,7 @@ async fn write_upload_phase(
     let elapsed = start.elapsed();
 
     let mut ack_reader = TlsRecordReader::new(server);
-    let ack =
-        read_ack_from_records(&mut ack_reader, data_session, expected_ack, expected_bytes).await?;
-    if ack.bytes != expected_bytes {
-        return Err(SpeedError::ByteCountMismatch {
-            expected: expected_bytes,
-            actual: ack.bytes,
-        });
-    }
+    read_ack_from_records(&mut ack_reader, data_session, expected_ack, expected_bytes).await?;
 
     Ok(PhaseMeasurement {
         bytes: expected_bytes,

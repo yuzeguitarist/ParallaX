@@ -528,8 +528,12 @@ mod kernel_splice {
             )
         });
 
-        join_splice_thread(left_to_right)?;
-        join_splice_thread(right_to_left)
+        // Always join BOTH threads before returning so neither relay thread (and
+        // its socket/pipe fds) is detached when the sibling direction errors;
+        // surface the first error via `and`.
+        let left_result = join_splice_thread(left_to_right);
+        let right_result = join_splice_thread(right_to_left);
+        left_result.and(right_result)
     }
 
     fn join_splice_thread(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {

@@ -471,7 +471,12 @@ fn write_init_files(output: &Path, generated: &GeneratedConfig) -> anyhow::Resul
     );
 
     write_secret_file(&server_path, &generated.server)?;
-    write_secret_file(&client_path, &generated.client)?;
+    if let Err(err) = write_secret_file(&client_path, &generated.client) {
+        // Client write failed after the secret-bearing server file was created;
+        // best-effort remove the orphan so a later `init` retry isn't blocked.
+        let _ = fs::remove_file(&server_path);
+        return Err(err);
+    }
     println!("Configs written:");
     println!("  server: {}", server_path.display());
     println!("  client: {}", client_path.display());

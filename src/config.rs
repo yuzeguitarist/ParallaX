@@ -202,9 +202,11 @@ pub struct ServerConfig {
     /// Default 600000 (10 min).
     #[serde(default = "default_fallback_idle_floor_ms")]
     pub fallback_idle_floor_ms: u64,
-    /// Upward jitter (ms) on the idle backstop. Default 0 and discouraged: a
-    /// uniform idle-close band is itself a synthetic signature no real origin
-    /// produces (the floor, not the ceiling, is what a prober converges to).
+    /// Upward jitter (ms) on the idle backstop: the all-silent connection close
+    /// is spread uniformly into [floor, floor+jitter] per connection. Default
+    /// 60000 (60s) to break the fixed ~600s close tell -- a round, fixed close
+    /// is a synthetic signature no real origin produces (see
+    /// FALLBACK_IDLE_TIMEOUT_JITTER in handshake/server.rs).
     #[serde(default = "default_fallback_idle_jitter_ms")]
     pub fallback_idle_jitter_ms: u64,
     /// Optional TCP congestion-control algorithm to request on relay sockets, to
