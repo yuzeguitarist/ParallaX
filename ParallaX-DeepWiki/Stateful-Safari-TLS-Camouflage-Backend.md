@@ -33,7 +33,7 @@ start()
   ├─ verify embedded ClientHello auth material
   └─ return Safari26TlsSession
 
-complete_handshake()
+complete()
   ├─ write ClientHello to fallback-origin stream
   ├─ read fallback TLS records
   ├─ require a TLS 1.3 ServerHello

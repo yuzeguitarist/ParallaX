@@ -23,7 +23,7 @@ context in [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 
 | Layer | Code | Responsibility |
 |---|---|---|
-| TCP socket helpers | `src/transport/tcp.rs` | `TCP_NODELAY`, Linux keepalive tuning, fd-limit derived relay caps. |
+| TCP socket helpers | `src/transport/tcp.rs` | `TCP_NODELAY`, cross-platform TCP keepalive (SO_KEEPALIVE), fd-limit derived relay caps. |
 | TLS record layer | `src/tls/record.rs` | Read/write exact TLS records and parse headers. |
 | Data record layer | `src/protocol/data.rs` | AEAD-sealed payloads inside TLS ApplicationData. |
 | Client/server relay | `src/client/runtime.rs`, `src/handshake/server.rs` | Bidirectional application relay. |
@@ -35,8 +35,9 @@ context in [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 The product line favors one carefully shaped path over multiple half-maintained
 transports, so TCP/TLS is the default and the only fingerprint-hardened
 transport. The experimental UDP/QUIC fast plane exists for throughput
-experimentation and is not yet shaped to match a browser's QUIC fingerprint;
-QUIC also remains important for the adversary model.
+experimentation; its QUIC client already emits a Safari-26 H3-shaped ClientHello
+by default, but it stays off by default and is not yet a production-ready
+operator mode. QUIC also remains important for the adversary model.
 
 ## Validation
 

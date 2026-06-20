@@ -19,7 +19,6 @@ client TCP accepted
   ├─ ClientHello does not offer TLS 1.3 ───► fallback passthrough
   ├─ SNI not in authorized_sni ────────────► fallback passthrough
   ├─ auth tag invalid ─────────────────────► fallback passthrough
-  ├─ replay cache rejects ClientHello ─────► fallback passthrough
   └─ authenticated ────────────────────────► ParallaX handshake
 ```
 
@@ -65,8 +64,11 @@ rejected.
 
 ## Replay protection
 
-The authenticated first record is checked against a persistent
-`ReplayCache`. The default path is:
+Replay is not a first-record check. The authenticated handshake is committed to a
+persistent `ReplayCache` only after the client proves the data stream (the
+post-PQ-rekey commit point). A replayed (or stale / cache-full) handshake is
+gracefully drained and FIN-closed at that point — it is not relayed to the
+fallback origin. The default path is:
 
 ```text
 /var/lib/parallax/parallax-replay.cache

@@ -45,7 +45,7 @@ That command will:
 3. probe the camouflage target (`plx probe`);
 4. build a Linux `plx` binary locally;
 5. enable and verify TCP BBR + `fq` on the VPS;
-6. upload only the binary and `parallax.server.toml` to the VPS;
+6. upload the binary, `parallax.server.toml`, and the generated `parallax.service` unit to the VPS;
 7. install and restart `parallax.service` through systemd.
 
 The generated client config stays local at:

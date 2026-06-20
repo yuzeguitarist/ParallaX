@@ -43,9 +43,9 @@ The score is out of 100:
 
 Verdicts:
 
-- `Good`: score >= 80
+- `Recommended` (internally `Good`): score >= 80
 - `Usable`: score >= 50
-- `Bad`: score < 50
+- `Not recommended` (internally `Bad`): score < 50
 
 ## Example
 

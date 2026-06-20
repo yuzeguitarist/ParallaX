@@ -35,9 +35,13 @@ writeable `/var/lib/parallax` directory for the replay cache.
 
 ## Failure behavior
 
-Replay rejection is treated like authentication failure at the first-record
-decision layer: the connection is sent to fallback passthrough instead of
-receiving a distinct proxy error.
+Unlike an authentication failure — a bad or absent PSK, which is routed to
+fallback passthrough at the first-record decision layer — a replay is only
+detected after the authenticated handshake completes and the client proves the
+data stream (the post-PQ-rekey commit point). A rejected replay (or a stale
+timestamp / full cache) does not receive a distinct proxy error and is not
+relayed to the fallback origin: the server gracefully drains and FIN-closes the
+connection.
 
 ## Related invariants
 
