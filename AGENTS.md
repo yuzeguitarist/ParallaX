@@ -4,6 +4,11 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+## Git commit/push policy (apply the bullet that matches you)
+
+- **Local / interactive sessions** (a developer running Claude Code, Codex, etc. on their own machine): when the user says commit/push, commit and `git push origin main` **directly**. Do NOT create a `claude/*` branch or open a PR unless the user explicitly asks.
+- **Cloud automation** (`claude-code-action`, which loads `.github/claude-hooks/settings.json`): never write to `main`/`master`; use a `claude/*` branch and open a PR via `gh pr create`. This is hard-enforced by `.github/claude-hooks/guard-no-main-push.sh`, which applies **only** to the cloud bot, never to local sessions.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
