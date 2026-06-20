@@ -447,6 +447,14 @@ impl Safari26TlsSession {
                 TLS_RECORD_APPLICATION_DATA => {
                     let decrypted = keys.server_handshake.decrypt_record(&record)?;
                     if decrypted.content_type != TLS_RECORD_HANDSHAKE {
+                        if decrypted.content_type == TLS_CONTENT_ALERT
+                            && decrypted.plaintext.len() >= 2
+                        {
+                            return Err(Safari26TlsError::Alert {
+                                level: decrypted.plaintext[0],
+                                description: decrypted.plaintext[1],
+                            });
+                        }
                         return Err(Safari26TlsError::Handshake(
                             "expected encrypted handshake record".to_owned(),
                         ));
@@ -531,7 +539,14 @@ impl Safari26TlsSession {
             match header.content_type {
                 TLS_CONTENT_ALERT => return parse_alert(&record),
                 TLS_RECORD_APPLICATION_DATA => {
-                    let _ = keys.server_application.decrypt_record(&record)?;
+                    let decrypted = keys.server_application.decrypt_record(&record)?;
+                    if decrypted.content_type == TLS_CONTENT_ALERT && decrypted.plaintext.len() >= 2
+                    {
+                        return Err(Safari26TlsError::Alert {
+                            level: decrypted.plaintext[0],
+                            description: decrypted.plaintext[1],
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -625,16 +640,28 @@ impl Safari26TlsSession {
                 TLS_RECORD_APPLICATION_DATA => {
                     let chunk = keys.server_application.decrypt_record(&record)?;
                     if chunk.content_type != TLS_RECORD_APPLICATION_DATA {
+                        if chunk.content_type == TLS_CONTENT_ALERT && chunk.plaintext.len() >= 2 {
+                            return Err(Safari26TlsError::Alert {
+                                level: chunk.plaintext[0],
+                                description: chunk.plaintext[1],
+                            });
+                        }
                         continue;
                     }
                     plaintext.extend_from_slice(&chunk.plaintext);
-                    if plaintext.len() > H2_FRAME_BUFFER_LIMIT {
-                        plaintext.clear();
-                    }
                     if self
                         .process_http2_frames(&mut plaintext, reader.get_mut(), keys)
                         .await?
                     {
+                        return Ok(());
+                    }
+                    // Bound only the UNCONSUMED remainder, AFTER draining complete
+                    // frames above. A residual past the limit means a single frame
+                    // larger than we will buffer (abnormal for a server preface); stop
+                    // waiting cleanly rather than clear() mid-frame, which would drop a
+                    // partial frame header and desync the parser for the rest of the
+                    // loop.
+                    if plaintext.len() > H2_FRAME_BUFFER_LIMIT {
                         return Ok(());
                     }
                 }

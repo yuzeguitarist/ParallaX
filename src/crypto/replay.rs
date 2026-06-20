@@ -196,7 +196,8 @@ impl ReplayCache {
         // and synced. Treat that the same as "no file": a fresh, empty, loadable
         // journal (auth_journal is already count=0). The header-only crash variant
         // is healed by the count=0 parse below; this covers the pre-header window.
-        // The next insert_new -> persist_authenticated rewrites the empty header.
+        // The next insert_new -> persist_authenticated sees count==0 and rewrites the
+        // file cleanly via compact (tmp-file + rename), discarding any stale bytes.
         if raw.trim().is_empty() {
             return Ok(cache);
         }
@@ -348,6 +349,15 @@ impl ReplayCache {
         let Some(journal) = self.auth_journal else {
             return self.compact_authenticated_journal(path, mac_key);
         };
+        // count==0 means no committed header exists yet (fresh file, or a 0-byte/
+        // whitespace-only file left by a crash before the empty header was synced).
+        // Route the first insert through the atomic tmp-file+rename clean write so
+        // any stale prefix bytes are discarded instead of being half-overwritten by
+        // the in-place header rewrite below (the in-memory order already holds the
+        // just-inserted entry, so this persists it as a clean count=1 journal).
+        if journal.count == 0 {
+            return self.compact_authenticated_journal(path, mac_key);
+        }
         if self.should_compact_authenticated_journal(journal) {
             return self.compact_authenticated_journal(path, mac_key);
         }
@@ -362,12 +372,12 @@ impl ReplayCache {
 
         let mut file = open_cache_file_for_append(path)?;
         if file.metadata()?.len() == 0 {
-            if journal.count != 0 {
-                drop(file);
-                return self.compact_authenticated_journal(path, mac_key);
-            }
-            let empty_header = authenticated_journal_header(mac_key, 0, &[0_u8; 32]);
-            file.write_all(empty_header.as_bytes())?;
+            // count >= 1 is guaranteed here (the count == 0 case returned via compact
+            // above), so a 0-length file is an externally-truncated journal: rewrite
+            // it cleanly via tmp-file + rename rather than appending onto a missing
+            // header.
+            drop(file);
+            return self.compact_authenticated_journal(path, mac_key);
         }
         let committed_len = file.seek(SeekFrom::End(0))?;
         // Append the entry, then rewrite the header. On a failed APPEND (the common
@@ -379,8 +389,8 @@ impl ReplayCache {
         // overwritten header, so a subsequent restart can still hit a MacMismatch.
         // The append-failure rollback below is the guarantee; a torn header rewrite
         // is a narrower residual (a robust fix would write via tmp-file + rename,
-        // like compact_authenticated_journal). committed_len is the empty-header
-        // length for a fresh file or the prior committed length otherwise.
+        // like compact_authenticated_journal). committed_len is the prior committed
+        // length (a 0-length file already returned via compact above).
         let append_and_commit = |file: &mut fs::File| -> io::Result<()> {
             file.write_all(line.as_bytes())?;
             // Make the appended entry durable BEFORE the header that will advertise

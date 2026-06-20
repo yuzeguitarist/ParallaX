@@ -29,7 +29,7 @@ use tokio::{
 
 use crate::{
     client::initial_payload,
-    client::socks::{self, SocksError, SocksRequest},
+    client::socks::{self, SocksError},
     config::{
         decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
         TrafficConfig, UdpConfig,
@@ -965,12 +965,7 @@ async fn handle_local_mux_connection_with_cid(
 }
 
 fn next_mux_stream_id(next: &AtomicU32) -> u32 {
-    loop {
-        let id = next.fetch_add(2, Ordering::Relaxed) | 1;
-        if id != 0 {
-            return id;
-        }
-    }
+    next.fetch_add(2, Ordering::Relaxed) | 1
 }
 
 async fn handle_local_connection_with_cid(
@@ -2432,7 +2427,8 @@ where
         // records that did arrive have been relayed.
         let mut record_count = 1_usize;
         batch_records.clear();
-        while batch_records.len() + server_record.len() < MUX_OPEN_BATCH_BYTES {
+        let mut batch_bytes = server_record.len();
+        while batch_bytes < MUX_OPEN_BATCH_BYTES {
             match server_records.try_read_record_into(&mut extra_record).await {
                 None => break,
                 Some(Ok(())) => {
@@ -2446,6 +2442,7 @@ where
                         batch_records.extend_from_slice(&server_record);
                     }
                     batch_records.extend_from_slice(&extra_record);
+                    batch_bytes += extra_record.len();
                     record_count += 1;
                 }
                 Some(Err(err)) => {
@@ -2950,11 +2947,6 @@ fn log_outer_write(
 /// error, so a tightened server idle floor does not surface as client failures.
 fn is_peer_idle_close(conn: &quinn::Connection) -> bool {
     crate::protocol::data::is_relay_idle_close_reason(conn.close_reason().as_ref())
-}
-
-#[allow(dead_code)]
-fn _request_target(request: &SocksRequest) -> String {
-    request.target()
 }
 
 #[cfg(test)]

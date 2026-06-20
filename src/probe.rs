@@ -214,7 +214,8 @@ async fn probe_with_timeout(
     let tcp_latency = started.elapsed();
     let _ = stream.set_nodelay(true);
 
-    let tls = match complete_tls_probe(&mut stream, &sni, deadline).await {
+    let remaining = deadline.saturating_sub(started.elapsed());
+    let tls = match complete_tls_probe(&mut stream, &sni, remaining).await {
         Ok(tls) => tls,
         Err(reason) => {
             notes.push(reason);
@@ -230,16 +231,10 @@ async fn probe_with_timeout(
         }
     };
 
-    if tls.tls13 {
-        notes.push(
-            "Target completed a TLS 1.3 handshake — reasonable camouflage fallback candidate."
-                .to_owned(),
-        );
-    } else {
-        notes.push(
-            "ParallaX currently requires TLS 1.3; this target is not recommended.".to_owned(),
-        );
-    }
+    notes.push(
+        "Target completed a TLS 1.3 handshake — reasonable camouflage fallback candidate."
+            .to_owned(),
+    );
     if matches!(tls.alpn.as_deref(), Some("h2")) {
         notes
             .push("Target negotiated HTTP/2 (ALPN h2): better browser-like camouflage.".to_owned());

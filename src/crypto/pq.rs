@@ -16,6 +16,7 @@ pub enum PqError {
     InvalidSecretKey,
     #[error("invalid ML-KEM ciphertext")]
     InvalidCiphertext,
+    /// Retained for symmetry with the sibling crypto error enums; pq.rs currently uses only the infallible Hkdf::extract, so this is not constructed here.
     #[error("HKDF expansion failed")]
     Hkdf,
     #[error("degenerate (all-zero) X25519 shared secret")]

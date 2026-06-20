@@ -198,6 +198,11 @@ const SERVER_MUX_MAX_STREAMS: usize = 256;
 /// Cap on the ciphertext bytes batched per mux read before opening, bounding
 /// scratch memory while leaving enough records for the crypto pool to fan out.
 const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
+/// Max consecutive zero-length (padding-only) upload records tolerated before
+/// the speed-test upload phase tears the connection down, so a client streaming
+/// only empty records cannot loop forever (the per-read idle timeout resets on
+/// every record and so never fires under that input).
+const MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS: u32 = 1024;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3281,7 +3286,11 @@ where
         // records that did arrive have been relayed.
         let mut record_count = 1_usize;
         batch_records.clear();
-        while batch_records.len() + client_record.len() < MUX_OPEN_BATCH_BYTES {
+        // Explicit byte accumulator seeded with the first record's length so the
+        // batch budget counts each record exactly once (the first record is
+        // appended into `batch_records` lazily on the first extra read).
+        let mut batch_bytes = client_record.len();
+        while batch_bytes < MUX_OPEN_BATCH_BYTES {
             match client_records.try_read_record_into(&mut extra_record).await {
                 None => break,
                 Some(Ok(())) => {
@@ -3295,6 +3304,7 @@ where
                         batch_records.extend_from_slice(&client_record);
                     }
                     batch_records.extend_from_slice(&extra_record);
+                    batch_bytes += extra_record.len();
                     record_count += 1;
                 }
                 Some(Err(err)) => {
@@ -3372,14 +3382,65 @@ async fn process_server_mux_frame(
                 return Ok(());
             }
             let mut payload = frame.payload.to_vec();
-            let (target_addr, initial_payload) = {
-                let (target_addr, initial_payload) =
-                    resolve_connect_target(payload.as_mut_slice(), context.fixed_data_target)?;
-                (target_addr, initial_payload.to_vec())
-            };
+            // Per-stream target setup (resolve / connect / tune) fails on routine
+            // client-chosen destinations: a bad ConnectRequest, DNS failure, a denied
+            // IP, or a refused/timed-out connect. Shed ONLY this substream on any of
+            // these — never `?`-propagate, which would poison the serial reader loop
+            // and tear down the whole mux session (one bad target killing every
+            // healthy concurrent stream). Nothing is registered yet, so a Reset for
+            // this stream id plus returning (dropping any half-built `target`, closing
+            // its fds) is the complete teardown — exactly like the cap-reached,
+            // duplicate-stream, and initial-payload-write arms.
+            let (target_addr, initial_payload) =
+                match resolve_connect_target(payload.as_mut_slice(), context.fixed_data_target) {
+                    Ok((target_addr, initial_payload)) => (target_addr, initial_payload.to_vec()),
+                    Err(_) => {
+                        tracing::debug!(
+                            cid = context.cid,
+                            stream_id = frame.stream_id,
+                            "mux connect target resolve failed; resetting stream"
+                        );
+                        send_server_mux_frame(
+                            frame_tx,
+                            frame.stream_id,
+                            MuxFrameKind::Reset,
+                            Vec::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
             let mut target =
-                connect_outbound_target(&target_addr, context.fixed_data_target.is_some()).await?;
-            tune_tcp_stream(&target)?;
+                match connect_outbound_target(&target_addr, context.fixed_data_target.is_some())
+                    .await
+                {
+                    Ok(target) => target,
+                    Err(_) => {
+                        tracing::debug!(
+                            cid = context.cid,
+                            stream_id = frame.stream_id,
+                            "mux outbound connect failed; resetting stream"
+                        );
+                        send_server_mux_frame(
+                            frame_tx,
+                            frame.stream_id,
+                            MuxFrameKind::Reset,
+                            Vec::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            if tune_tcp_stream(&target).is_err() {
+                tracing::debug!(
+                    cid = context.cid,
+                    stream_id = frame.stream_id,
+                    "mux target tune failed; resetting stream"
+                );
+                send_server_mux_frame(frame_tx, frame.stream_id, MuxFrameKind::Reset, Vec::new())
+                    .await?;
+                return Ok(());
+            }
             if !initial_payload.is_empty() {
                 // Bound the initial-payload write (H-3): a wedged target must not
                 // park the serial mux reader loop. Nothing is registered yet, so on
@@ -3390,7 +3451,25 @@ async fn process_server_mux_frame(
                 )
                 .await
                 {
-                    Ok(result) => result?,
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        // Initial-payload write failed before anything was
+                        // registered: Reset this stream and drop `target` (both
+                        // fds close). Never poison the serial mux reader loop.
+                        tracing::debug!(
+                            cid = context.cid,
+                            stream_id = frame.stream_id,
+                            "mux target initial-payload write failed; resetting stream"
+                        );
+                        send_server_mux_frame(
+                            frame_tx,
+                            frame.stream_id,
+                            MuxFrameKind::Reset,
+                            Vec::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     Err(_) => {
                         tracing::debug!(
                             cid = context.cid,
@@ -3453,26 +3532,27 @@ async fn process_server_mux_frame(
                     None => None,
                 };
                 match outcome {
-                    Some(Ok(result)) => result?,
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(_))) => {
+                        // Routine per-destination write failure (e.g. the target
+                        // closed its end). Shed ONLY this substream and keep the
+                        // serial reader loop + every healthy substream alive,
+                        // exactly as the stall path below does.
+                        tracing::debug!(
+                            cid = context.cid,
+                            stream_id = frame.stream_id,
+                            "mux target write failed; resetting stream"
+                        );
+                        shed_server_mux_substream(streams, frame_tx, frame.stream_id).await?;
+                        return Ok(());
+                    }
                     Some(Err(_)) => {
                         tracing::debug!(
                             cid = context.cid,
                             stream_id = frame.stream_id,
                             "mux target write stalled; resetting stream"
                         );
-                        if let Some(mut w) = streams.writes.remove(&frame.stream_id) {
-                            let _ = w.shutdown().await;
-                        }
-                        if let Some(h) = streams.readers.remove(&frame.stream_id) {
-                            h.abort();
-                        }
-                        send_server_mux_frame(
-                            frame_tx,
-                            frame.stream_id,
-                            MuxFrameKind::Reset,
-                            Vec::new(),
-                        )
-                        .await?;
+                        shed_server_mux_substream(streams, frame_tx, frame.stream_id).await?;
                     }
                     None => {}
                 }
@@ -3501,6 +3581,24 @@ async fn process_server_mux_frame(
     Ok(())
 }
 
+/// Shed a single mux substream without disturbing the rest of the connection:
+/// close + drop its write half, abort + drop its reader task, and tell the
+/// client to tear down that stream id with a Reset. Used on per-destination
+/// write stalls/errors so one bad target never poisons the whole mux session.
+async fn shed_server_mux_substream(
+    streams: &mut ServerMuxStreams,
+    frame_tx: &mpsc::Sender<MuxFrame>,
+    stream_id: u32,
+) -> Result<(), HandshakeServerError> {
+    if let Some(mut w) = streams.writes.remove(&stream_id) {
+        let _ = w.shutdown().await;
+    }
+    if let Some(h) = streams.readers.remove(&stream_id) {
+        h.abort();
+    }
+    send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new()).await
+}
+
 async fn server_mux_target_reader_loop(
     mut target_read: OwnedReadHalf,
     frame_tx: mpsc::Sender<MuxFrame>,
@@ -3527,7 +3625,16 @@ async fn server_mux_target_reader_loop(
 
     loop {
         let n = match timeout(read_idle_timeout, target_read.read(&mut target_buf)).await {
-            Ok(result) => result?,
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => {
+                // Target read failed: tell the client to tear down this substream
+                // promptly (best-effort) instead of letting it dangle until the
+                // whole-session idle backstop, mirroring the Fin-on-EOF handling.
+                let _ =
+                    send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Reset, Vec::new())
+                        .await;
+                return Err(HandshakeServerError::Io(err));
+            }
             Err(_) => {
                 tracing::debug!(cid, stream_id, "mux target reader idle backstop reached");
                 send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
@@ -3538,7 +3645,17 @@ async fn server_mux_target_reader_loop(
             send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
             return Ok(());
         }
-        let n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
+        let n = match drain_ready_tcp_read(&target_read, &mut target_buf, n) {
+            Ok(n) => n,
+            Err(err) => {
+                // Drain of additional ready bytes failed: same prompt teardown as
+                // the primary read-error path above.
+                let _ =
+                    send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Reset, Vec::new())
+                        .await;
+                return Err(HandshakeServerError::Io(err));
+            }
+        };
         let delay = timing.sample_delay(&mut rng);
         if !delay.is_zero() {
             sleep(delay).await;
@@ -3988,6 +4105,7 @@ where
     R: Rng + rand::RngCore + ?Sized,
 {
     let mut uploaded = 0_u64;
+    let mut consecutive_empty: u32 = 0;
     let mut client_record = Vec::new();
     let idle = fallback_idle_timeout();
     while uploaded < bytes {
@@ -4010,8 +4128,19 @@ where
             .open_in_place_payload_range(&mut client_record)?;
         let len = plaintext.len() as u64;
         if len == 0 {
+            // Padding-only record carries no progress. Bound how many may arrive
+            // back-to-back so a client streaming only empty records cannot pin the
+            // phase forever (the idle timeout resets on every record received).
+            consecutive_empty += 1;
+            if consecutive_empty > MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed upload sent too many consecutive empty records",
+                )));
+            }
             continue;
         }
+        consecutive_empty = 0;
         if uploaded + len > bytes {
             return Err(HandshakeServerError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
