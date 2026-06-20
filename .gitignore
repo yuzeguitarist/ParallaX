@@ -12,3 +12,8 @@ parallax.toml
 parallax.server.toml
 parallax.client.toml
 audits/
+
+# cargo-mutants output (nightly-mutants CI uploads it as an artifact; local
+# `cargo mutants` runs leave these dirs behind).
+mutants.out/
+mutants.out.old/

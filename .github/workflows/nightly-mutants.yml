@@ -38,7 +38,11 @@ jobs:
   mutants:
     name: cargo-mutants (indistinguishability/crypto surface)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Budget for the whole scoped run: ~480 mutants at ~8s test each, two at a
+    # time (--jobs 2), plus a cold baseline build per worker. Completes well
+    # inside this on the 4-vCPU runner; the job exits as soon as cargo-mutants
+    # finishes, so the cap is just a hang backstop, not a target.
+    timeout-minutes: 75
     # NON-GATING: this report must never fail a PR or the nightly schedule.
     continue-on-error: true
     steps:
@@ -64,19 +68,27 @@ jobs:
           tool: cargo-mutants@27.1.0
 
       - name: Run cargo-mutants (scoped, bounded)
-        # Scope, the per-mutant timeout, and --locked all live in
-        # .cargo/mutants.toml (the only path cargo-mutants reads config from); we
-        # pass --config explicitly for clarity. The per-mutant timeout is
-        # baseline-relative (timeout_multiplier x the unmutated test time, with a
-        # minimum_test_timeout floor) so it adapts to the runner instead of a
+        # Scope, the per-mutant test set, the per-mutant timeout, and --locked all
+        # live in .cargo/mutants.toml (the only path cargo-mutants reads config
+        # from); we pass --config explicitly for clarity. The per-mutant timeout
+        # is baseline-relative (timeout_multiplier x the unmutated test time, with
+        # a minimum_test_timeout floor) so it adapts to the runner instead of a
         # brittle fixed wall-clock — do NOT add a CLI --timeout, which would
         # override and silence the config. The two -f flags re-pin scope to
         # exactly these files even if the config drifts (CLI overrides
         # examine_globs).
+        #
+        # --jobs 2: run two mutants in parallel. The config restricts each mutant's
+        # tests to the byte-level fingerprint/auth oracles (see mutants.toml), none
+        # of which bind a fixed port, so parallel workers never collide; two
+        # concurrent cold baseline builds also stay well within the runner's RAM.
+        # This + the scoped test set is what brings the run back under budget (it
+        # used to be SIGKILLed at timeout-minutes every night).
         run: |
           cargo mutants \
             --config .cargo/mutants.toml \
             --no-shuffle \
+            --jobs 2 \
             -f src/tls/safari26.rs \
             -f src/crypto/auth.rs
 

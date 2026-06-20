@@ -39,8 +39,39 @@ exclude_globs = [
 # pass it to every Cargo invocation the mutation run makes (build + test).
 additional_cargo_args = ["--locked"]
 
+# Per-mutant TEST SCOPE: run only the fast, hang-free, byte-level oracles that
+# actually assert the ClientHello fingerprint shape and the handshake auth/MAC.
+#
+# WHY this exists: a mutation in these two files makes the live-network /
+# liveness tests (chaos_liveness, prober_loop, no_timeout_ratchet,
+# splice_equivalence) block to their internal deadlines, so under the *full*
+# suite each mutant's test phase balloons from ~15s (baseline) to ~30-60s (the
+# auto-set timeout below). Across ~480 mutants that overruns any nightly budget
+# (the job used to be SIGKILLed at timeout-minutes every night). Restricting to
+# the targets below keeps each mutant's test phase ~8s with no hangs.
+#
+# This does NOT weaken the report: the excluded tests are liveness/timing/relay
+# robustness checks, not byte-flip / label-swap oracles. The kept set is exactly
+# the indistinguishability + auth oracle surface:
+#   --lib  ............... auth.rs mod tests (MAC / auth-tail / timestamp) +
+#                          safari26.rs unit tests (fingerprint shape)
+#   safari_clienthello, safari_parity_baseline, safari_h2_parity_baseline,
+#   ja4_census_oracle  ... byte-exact ClientHello + JA4 fingerprint oracles
+#   gfw_simulator, gfw_sim_provenance  in-memory censor sim over the real CH
+# (Verified: the auth.rs survivors are identical with and without the excluded
+# tests, i.e. they were never the ones killing these mutants.)
+additional_cargo_test_args = [
+    "--lib",
+    "--test=safari_clienthello",
+    "--test=safari_parity_baseline",
+    "--test=safari_h2_parity_baseline",
+    "--test=ja4_census_oracle",
+    "--test=gfw_simulator",
+    "--test=gfw_sim_provenance",
+]
+
 # Bound each mutant's test run relative to the baseline so the nightly job stays
-# within its timeout-minutes budget even if a mutant induces a near-hang.
+# within its timeout-minutes budget even if a mutant still induces a near-hang.
 timeout_multiplier = 3.0
 
 # Floor for the per-mutant test timeout (seconds); guards against a too-fast
