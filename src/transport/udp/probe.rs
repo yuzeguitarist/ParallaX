@@ -34,7 +34,6 @@ use std::time::{Duration, Instant};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
 
 use super::auth::{export_udp_auth_token, UdpAuthError, UDP_AUTH_TOKEN_LEN};
 
@@ -95,7 +94,7 @@ pub async fn probe_client(
     context: &[u8],
     timeout: Duration,
 ) -> Result<ProbeOutcome, ProbeError> {
-    let token = Zeroizing::new(export_udp_auth_token(connection, psk, context)?);
+    let token = export_udp_auth_token(connection, psk, context)?;
     let nonce: [u8; PROBE_NONCE_LEN] = rand::random();
 
     let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
@@ -168,7 +167,7 @@ pub async fn serve_probe(
     psk: &[u8],
     context: &[u8],
 ) -> Result<(), ProbeError> {
-    let token = Zeroizing::new(export_udp_auth_token(connection, psk, context)?);
+    let token = export_udp_auth_token(connection, psk, context)?;
     let mut recv = connection
         .accept_uni()
         .await

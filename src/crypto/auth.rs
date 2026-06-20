@@ -236,21 +236,21 @@ pub fn derive_client_auth_key(
     psk: &[u8],
     client_private: &[u8; 32],
     server_public: &[u8; 32],
-) -> Result<[u8; 32], AuthError> {
+) -> Result<Zeroizing<[u8; 32]>, AuthError> {
     derive_auth_key(psk, client_private, server_public)
 }
 
 pub fn derive_client_auth_key_from_shared(
     psk: &[u8],
     x25519_shared_secret: &[u8; 32],
-) -> Result<[u8; 32], AuthError> {
+) -> Result<Zeroizing<[u8; 32]>, AuthError> {
     derive_auth_key_from_shared(psk, x25519_shared_secret)
 }
 
 pub fn derive_server_auth_key_from_shared(
     psk: &[u8],
     x25519_shared_secret: &[u8; 32],
-) -> Result<[u8; 32], AuthError> {
+) -> Result<Zeroizing<[u8; 32]>, AuthError> {
     derive_auth_key_from_shared(psk, x25519_shared_secret)
 }
 
@@ -258,7 +258,7 @@ pub fn derive_server_auth_key(
     psk: &[u8],
     server_private: &[u8; 32],
     client_public: &[u8; 32],
-) -> Result<[u8; 32], AuthError> {
+) -> Result<Zeroizing<[u8; 32]>, AuthError> {
     derive_auth_key(psk, server_private, client_public)
 }
 
@@ -266,7 +266,7 @@ fn derive_auth_key(
     psk: &[u8],
     private: &[u8; 32],
     peer_public: &[u8; 32],
-) -> Result<[u8; 32], AuthError> {
+) -> Result<Zeroizing<[u8; 32]>, AuthError> {
     if psk.is_empty() {
         return Err(AuthError::EmptyPsk);
     }
@@ -280,7 +280,7 @@ fn derive_auth_key(
 fn derive_auth_key_from_shared(
     psk: &[u8],
     x25519_shared_secret: &[u8; 32],
-) -> Result<[u8; 32], AuthError> {
+) -> Result<Zeroizing<[u8; 32]>, AuthError> {
     if psk.is_empty() {
         return Err(AuthError::EmptyPsk);
     }
@@ -292,7 +292,7 @@ fn derive_auth_key_from_shared(
     let mut out = Zeroizing::new([0_u8; 32]);
     hk.expand(b"ParallaX v1 ClientHello authentication", out.as_mut())
         .map_err(|_| AuthError::Hkdf)?;
-    Ok(*out)
+    Ok(out)
 }
 
 /// Derives the v4 carrier-mask key for the stateful ClientHello masks.

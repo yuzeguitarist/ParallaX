@@ -713,7 +713,7 @@ fn signed_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN], StatefulAuth
     let material = recover_stateful_auth_material(&record, BENCH_PSK, &mask_ecdh)?
         .ok_or_else(|| anyhow::anyhow!("Safari26 ClientHello must carry stateful auth material"))?;
     let server_auth = derive_server_auth_key(BENCH_PSK, &server.private, &material.x25519_public)?;
-    Ok((record, server_auth, material))
+    Ok((record, *server_auth, material))
 }
 
 fn authenticated_client_hello_fixture() -> Result<(Vec<u8>, [u8; KEY_LEN])> {

@@ -65,7 +65,7 @@ fn exporter_context(context: &[u8]) -> [u8; 32] {
 pub fn derive_udp_auth_token(
     exporter_secret: &[u8; UDP_AUTH_EXPORTER_LEN],
     psk: &[u8],
-) -> Result<[u8; UDP_AUTH_TOKEN_LEN], UdpAuthError> {
+) -> Result<Zeroizing<[u8; UDP_AUTH_TOKEN_LEN]>, UdpAuthError> {
     if psk.is_empty() {
         return Err(UdpAuthError::EmptyPsk);
     }
@@ -78,7 +78,7 @@ pub fn derive_udp_auth_token(
     let mut token = Zeroizing::new([0_u8; UDP_AUTH_TOKEN_LEN]);
     hk.expand(UDP_AUTH_KEY_LABEL, token.as_mut())
         .map_err(|_| UdpAuthError::Derive)?;
-    Ok(*token)
+    Ok(token)
 }
 
 /// Export the RFC 5705 secret bound to `context` from a live QUIC connection and
@@ -88,7 +88,7 @@ pub fn export_udp_auth_token(
     connection: &quinn::Connection,
     psk: &[u8],
     context: &[u8],
-) -> Result<[u8; UDP_AUTH_TOKEN_LEN], UdpAuthError> {
+) -> Result<Zeroizing<[u8; UDP_AUTH_TOKEN_LEN]>, UdpAuthError> {
     if psk.is_empty() {
         return Err(UdpAuthError::EmptyPsk);
     }
