@@ -286,10 +286,13 @@ fn derive_auth_key_from_shared(
     }
 
     let hk = Hkdf::<Sha256>::new(Some(psk), x25519_shared_secret);
-    let mut out = [0_u8; 32];
-    hk.expand(b"ParallaX v1 ClientHello authentication", &mut out)
+    // Wipe the derived auth key's stack slot on return, matching `derive_mask_key`
+    // below and the Zeroizing discipline in crypto/session.rs (callers wrap the
+    // returned copy in Zeroizing). The auth key is a live HMAC authentication key.
+    let mut out = Zeroizing::new([0_u8; 32]);
+    hk.expand(b"ParallaX v1 ClientHello authentication", out.as_mut())
         .map_err(|_| AuthError::Hkdf)?;
-    Ok(out)
+    Ok(*out)
 }
 
 /// Derives the v4 carrier-mask key for the stateful ClientHello masks.
