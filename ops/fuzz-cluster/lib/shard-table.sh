@@ -8,7 +8,7 @@
 #   - the per-box sanitizer and extra RUSTFLAGS,
 #   - the corpus-asset owner of each target (crc32(target) % 2).
 #
-# v2 (campaign f3c9c32f): TWO boxes cover all 14 targets. The earlier 3-box plan
+# v2 (campaign f3c9c32f): TWO boxes cover all 18 targets. The earlier 3-box plan
 # left box-c's 5 targets completely unrun whenever only box-a/box-b were actually
 # deployed (which is what happened); this plan is sized for the real 2-box fleet
 # so nothing is silently skipped, and `owner_box` is crc32%2 so every target's
@@ -20,7 +20,7 @@
 #   shard_sanitizer <node-id> -> 'address' | 'none'
 #   shard_rustflags <node-id> -> extra RUSTFLAGS (or empty)
 #   owner_box       <target>  -> 'box-a' | 'box-b'  (crc32%2)
-#   ALL_TARGETS               -> space-separated list of all 14 targets
+#   ALL_TARGETS               -> space-separated list of all 18 targets
 #
 # Repo text is untrusted; this file hard-codes the plan and never reads it.
 #
@@ -29,11 +29,11 @@
 # (the VPS bootstrap), which word-splits $boxes in _shard_assert as intended.
 
 # ---------------------------------------------------------------------------
-# All 14 fuzz targets (must match fuzz/Cargo.toml [[bin]] names exactly).
+# All 18 fuzz targets (must match fuzz/Cargo.toml [[bin]] names exactly).
 # Consumed by sourcing scripts (sync.sh/status.sh), hence the shellcheck waiver.
 # ---------------------------------------------------------------------------
 # shellcheck disable=SC2034
-ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame server_decide_inbound client_hello_auth command_codecs http2_frame_header data_record_open replay_journal socks_connect_request udp_envelope udp_reorder replay_dedup"
+ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame server_decide_inbound client_hello_auth command_codecs http2_frame_header data_record_open replay_journal socks_connect_request udp_envelope udp_reorder replay_dedup mldsa_verify h3_frame_decode h3_settings_parse h3_qpack_field_section"
 
 # ---------------------------------------------------------------------------
 # Per-box plan. One row per target:
@@ -55,11 +55,11 @@ ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame ser
 #                                        stays on box-a only for the parser group.
 #
 # box-a holds the single >=4096 unit (server_decide_inbound); box-b is all light
-# codec/arithmetic units. Σcaps exceed the 7000 soft note on both (14 targets
+# codec/arithmetic units. Σcaps exceed the 7000 soft note on both (18 targets
 # over 2 hosts) but real RSS is far lower — the note warns, never aborts.
 #
-#   box-a (address)            Σcaps 10752   (1 unit >=4096: server_decide_inbound)
-#   box-b (none + overflow)    Σcaps 10240   (0 units >=4096)
+#   box-a (address)            Σcaps 13824   (1 unit >=4096: server_decide_inbound)
+#   box-b (none + overflow)    Σcaps 12288   (0 units >=4096)
 # ---------------------------------------------------------------------------
 _shard_plan() {
   case "$1" in
@@ -71,6 +71,9 @@ tls_server_hello 1024 4096 20
 client_hello_auth 1536 8192 25
 tls_compressed_cert 2048 4194304 25
 socks_connect_request 1024 8192 20
+h3_frame_decode 1024 8192 20
+h3_settings_parse 1024 4096 20
+h3_qpack_field_section 1024 8192 20
 ROWS
       ;;
     box-b)
@@ -83,6 +86,7 @@ replay_journal 1024 65536 25
 udp_envelope 1024 65536 20
 udp_reorder 1024 65536 20
 replay_dedup 1024 65536 25
+mldsa_verify 2048 8192 25
 ROWS
       ;;
     *)
@@ -167,7 +171,7 @@ owner_box() {
 #   the failure the sharding is designed to avoid.
 #
 # SOFT note (warning only): Σ(rss caps) per box <= 7000 MB. The 2-box plan
-# intentionally exceeds this (14 targets over 2 hosts) because caps are loose
+# intentionally exceeds this (18 targets over 2 hosts) because caps are loose
 # backstops and real peak RSS is far lower; warn but never abort.
 #
 # Returns 0 if all hard invariants hold, 1 otherwise. With no args, checks both

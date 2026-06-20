@@ -18,6 +18,16 @@ rand = "0.8"
 [dependencies.parallax]
 path = ".."
 
+# fuzz/ is its own workspace (the empty [workspace] above), so it does NOT inherit
+# the parent crate's [patch.crates-io]. Replicate it here so `parallax` compiles
+# against the SAME vendored rustls / quinn-proto forks the main build uses: the
+# Safari-26 ClientHello shaping (src/tls/safari_shape.rs) + the QUIC H3 façade need
+# rustls::client::SafariChProfile / ClientConfig::safari_ch_profile and the
+# quinn-proto CidQueue::LEN=64 delta, none of which exist in upstream crates.io.
+[patch.crates-io]
+rustls = { path = "../vendor/rustls" }
+quinn-proto = { path = "../vendor/quinn-proto" }
+
 # --- Targets -----------------------------------------------------------------
 # All targets take raw &[u8] (attacker-influenced bytes). cargo-fuzz compiles
 # the parallax crate with `--cfg fuzzing`, which is what makes the
@@ -124,6 +134,27 @@ bench = false
 [[bin]]
 name = "mldsa_verify"
 path = "fuzz_targets/mldsa_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_frame_decode"
+path = "fuzz_targets/h3_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_settings_parse"
+path = "fuzz_targets/h3_settings_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_qpack_field_section"
+path = "fuzz_targets/h3_qpack_field_section.rs"
 test = false
 doc = false
 bench = false
