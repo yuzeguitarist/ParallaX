@@ -72,7 +72,8 @@ jobs:
           cargo kani setup
 
       # Runs every #[kani::proof] harness in the crate (nonce injectivity in
-      # crypto::session, padding-parser panic-freedom in traffic). --locked keeps
-      # dependency resolution pinned so the scheduled run is reproducible.
+      # crypto::session, padding-parser panic-freedom in traffic). `cargo kani`
+      # does NOT accept --locked (it errors "unexpected argument"); the committed
+      # Cargo.lock is used by default, so the run stays reproducible.
       - name: cargo kani (all proof harnesses)
-        run: cargo kani --locked
+        run: cargo kani

@@ -206,12 +206,25 @@ fn madvise_range(bytes: &[u8], advice: libc::c_int) -> io::Result<()> {
     let Some((addr, len)) = page_aligned_range(bytes.as_ptr() as usize, bytes.len()) else {
         return Ok(());
     };
-    // SAFETY: the address/length pair is page-aligned and covers live memory
-    // belonging to this process. `madvise` changes VMA dump metadata only.
-    if unsafe { libc::madvise(addr as *mut libc::c_void, len, advice) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    // Miri cannot execute the `madvise` foreign function. It only adjusts VMA
+    // core-dump metadata (no effect observable from program logic), so under Miri
+    // treat it as a successful no-op; this keeps the pure-logic codec tests in the
+    // Miri lane runnable. `cfg(miri)` is set only by the Miri interpreter, never
+    // in a real build, so production behavior is unchanged.
+    #[cfg(miri)]
+    {
+        let _ = (addr, len, advice);
+        return Ok(());
+    }
+    #[cfg(not(miri))]
+    {
+        // SAFETY: the address/length pair is page-aligned and covers live memory
+        // belonging to this process. `madvise` changes VMA dump metadata only.
+        if unsafe { libc::madvise(addr as *mut libc::c_void, len, advice) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }
 
