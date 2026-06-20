@@ -1756,7 +1756,7 @@ pub mod fuzz {
 mod tests {
     use super::*;
     use crate::crypto::{
-        auth::{derive_server_auth_key, verify_client_hello_auth_with_material},
+        auth::{derive_server_auth_key, verify_masked_stateful_client_hello_auth_with_material},
         session::X25519KeyPair,
     };
     use crate::tls::client_hello::parse_client_hello;
@@ -1821,10 +1821,10 @@ mod tests {
             .unwrap();
         let auth_key =
             derive_server_auth_key(psk, &server.private, &material.x25519_public).unwrap();
-        let auth = verify_client_hello_auth_with_material(
+        let auth = verify_masked_stateful_client_hello_auth_with_material(
             &session.client_hello,
             &auth_key,
-            Some(material),
+            &material,
         )
         .unwrap();
 

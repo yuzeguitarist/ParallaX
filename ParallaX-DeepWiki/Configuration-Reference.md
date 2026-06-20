@@ -51,7 +51,6 @@ ParallaX session.
 | `server_addr` | yes | Remote ParallaX server as `host:port`; IPv6 literals must be bracketed. |
 | `sni` | yes | SNI sent in the camouflage TLS handshake. |
 | `server_public_key` | yes | Base64 X25519 server public key, exactly 32 bytes. |
-| `server_pq_public_key` | no | Base64 ML-KEM-1024 server public key. Generated configs include it. |
 | `server_identity_public_key` | yes | Base64 ML-DSA-87 server identity public key. |
 
 ## `[server]`
@@ -62,7 +61,6 @@ ParallaX session.
 | `fallback_addr` | yes | Real TLS origin used for unauthenticated/probe traffic. |
 | `data_target` | no | Fixed upstream target for authenticated data. If omitted, the client CONNECT command chooses the target. |
 | `private_key` | yes | Base64 X25519 server secret key, exactly 32 bytes. |
-| `pq_secret_key` | no | Base64 ML-KEM-1024 server secret key. Generated configs include it. |
 | `identity_secret_key` | yes | Base64 ML-DSA-87 server identity secret key. |
 | `replay_cache_path` | no | Defaults to `/var/lib/parallax/parallax-replay.cache`; relative paths resolve relative to the config file. |
 | `authorized_sni` | yes | Non-empty SNI allowlist for authenticated ClientHellos. Matching is case-insensitive. |
@@ -126,7 +124,6 @@ max_concurrent_streams = 4
 listen = "0.0.0.0:443"
 fallback_addr = "cloudflare.com:443"
 private_key = "base64-x25519-secret"
-pq_secret_key = "base64-mlkem-secret"
 identity_secret_key = "base64-mldsa-secret"
 replay_cache_path = "/var/lib/parallax/parallax-replay.cache"
 authorized_sni = ["cloudflare.com"]
@@ -155,7 +152,6 @@ listen = "127.0.0.1:1080"
 server_addr = "203.0.113.10:443"
 sni = "cloudflare.com"
 server_public_key = "base64-x25519-public"
-server_pq_public_key = "base64-mlkem-public"
 server_identity_public_key = "base64-mldsa-public"
 ```
 

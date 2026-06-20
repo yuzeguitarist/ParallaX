@@ -38,7 +38,7 @@ use crate::{
     crypto::{
         auth::{
             derive_server_auth_key, recover_stateful_auth_material,
-            verify_client_hello_auth_with_material, StatefulAuthMaterial,
+            verify_masked_stateful_client_hello_auth_with_material, StatefulAuthMaterial,
         },
         identity, pq,
         replay::{ReplayCache, ReplayEntry},
@@ -669,10 +669,10 @@ fn bench_clienthello_verify_auth(options: BenchmarkOptions) -> Result<BenchmarkC
         TIER_FAST,
         options,
         || {
-            let auth = verify_client_hello_auth_with_material(
+            let auth = verify_masked_stateful_client_hello_auth_with_material(
                 &record,
                 &server_auth,
-                Some(material.clone()),
+                &material,
             )?;
             if !auth.authenticated {
                 bail!("benchmark ClientHello did not authenticate");
@@ -787,7 +787,7 @@ fn bench_server_key_exchange_decode_owned(options: BenchmarkOptions) -> Result<B
         server_x25519_public: server.public,
         mlkem_ciphertext: encapsulation.ciphertext,
     }
-    .encode()?;
+    .encode_with_suite(CipherSuite::ChaCha20Poly1305)?;
 
     run_case(
         BenchGroup::HandshakeProtocol,
@@ -811,7 +811,7 @@ fn bench_server_key_exchange_decode_borrowed(options: BenchmarkOptions) -> Resul
         server_x25519_public: server.public,
         mlkem_ciphertext: encapsulation.ciphertext,
     }
-    .encode()?;
+    .encode_with_suite(CipherSuite::ChaCha20Poly1305)?;
 
     run_case(
         BenchGroup::HandshakeProtocol,

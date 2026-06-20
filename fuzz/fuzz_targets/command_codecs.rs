@@ -47,6 +47,29 @@ macro_rules! rt_eq_vec {
     }};
 }
 
+// ServerKeyExchange's canonical wire form carries a trailing cipher-suite tag
+// (the bare encode() is crate-internal and tag-less), so it round-trips through
+// the tagged encoder/decoder rather than the generic rt_eq! that assumes
+// encode()/decode() are inverses. Value AND suite must be stable, and the tagged
+// encoding must be idempotent.
+fn rt_ske(b: &[u8]) {
+    if let Ok((_, suite1)) = ServerKeyExchange::decode_ref_with_suite(b) {
+        let v1 = ServerKeyExchange::decode(b).expect("decode_ref_with_suite Ok implies decode Ok");
+        let e1 = v1
+            .encode_with_suite(suite1)
+            .expect("decoded value must re-encode");
+        let v2 = ServerKeyExchange::decode(&e1).expect("our own encoding must decode");
+        let (_, suite2) =
+            ServerKeyExchange::decode_ref_with_suite(&e1).expect("our own encoding must decode");
+        assert_eq!(suite1, suite2, "ServerKeyExchange suite not stable");
+        assert_eq!(v1, v2, "ServerKeyExchange roundtrip not value-stable");
+        let e2 = v2
+            .encode_with_suite(suite2)
+            .expect("re-encode must succeed");
+        assert_eq!(e1, e2, "ServerKeyExchange encode not idempotent");
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
@@ -55,7 +78,7 @@ fuzz_target!(|data: &[u8]| {
     match sel % 11 {
         0 => rt_eq!(ConnectRequest, body),
         1 => rt_eq!(PqRekeyRequest, body),
-        2 => rt_eq!(ServerKeyExchange, body),
+        2 => rt_ske(body),
         3 => rt_eq!(ServerIdentityProof, body),
         4 => rt_eq!(ServerIdentityChunk, body),
         5 => rt_eq!(SpeedTestRequest, body),

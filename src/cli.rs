@@ -16,7 +16,7 @@ use crate::{
     client::runtime,
     config::{Config, DEFAULT_REPLAY_CACHE_PATH},
     crypto::{
-        identity, pq,
+        identity,
         session::{derive_client_keys, AeadCodec, X25519KeyPair},
     },
     handshake::server,
@@ -381,14 +381,11 @@ fn generate_config_template(
     let mut psk = [0_u8; 32];
     OsRng.fill_bytes(&mut psk);
     let server_keys = X25519KeyPair::generate();
-    let server_pq_keys = pq::keypair();
     let server_identity_keys = identity::keypair();
 
     let psk = STANDARD.encode(psk);
     let server_private = STANDARD.encode(server_keys.private);
     let server_public = STANDARD.encode(server_keys.public);
-    let pq_secret = STANDARD.encode(&server_pq_keys.secret);
-    let pq_public = STANDARD.encode(&server_pq_keys.public);
     let identity_secret = STANDARD.encode(&server_identity_keys.secret);
     let identity_public = STANDARD.encode(&server_identity_keys.public);
     let server_listen = toml_basic_string(server_listen);
@@ -416,7 +413,6 @@ max_concurrent_streams = 4
 listen = {}
 fallback_addr = {}
 private_key = "{}"
-pq_secret_key = "{}"
 identity_secret_key = "{}"
 replay_cache_path = "{}"
 authorized_sni = [{}]
@@ -427,7 +423,6 @@ strict_tls13 = true
         server_listen,
         fallback_addr,
         server_private,
-        pq_secret,
         identity_secret,
         DEFAULT_REPLAY_CACHE_PATH,
         sni,
@@ -453,10 +448,9 @@ listen = {}
 server_addr = {}
 sni = {}
 server_public_key = "{}"
-server_pq_public_key = "{}"
 server_identity_public_key = "{}"
 "#,
-        psk, client_listen, server_addr, sni, server_public, pq_public, identity_public,
+        psk, client_listen, server_addr, sni, server_public, identity_public,
     );
 
     GeneratedConfig { server, client }

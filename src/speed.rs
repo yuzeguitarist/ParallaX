@@ -1007,7 +1007,6 @@ mod tests {
                 fallback_addr: "fallback.example:443".to_owned(),
                 data_target: None,
                 private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-                pq_secret_key: String::new(),
                 identity_secret_key: STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]),
                 replay_cache_path: PathBuf::from("/tmp/parallax-speed-test-replay.cache"),
                 replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
@@ -1061,7 +1060,6 @@ mod tests {
             server_addr: "example.com:443".to_owned(),
             sni: "example.com".to_owned(),
             server_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-            server_pq_public_key: String::new(),
             server_identity_public_key: STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]),
         });
         let err = run(cfg).await.unwrap_err();
