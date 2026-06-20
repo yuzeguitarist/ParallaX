@@ -718,12 +718,26 @@ fn decide_connection_inbound(
         }
     };
     if let Some(mask_ecdh) = mask_ecdh.as_deref() {
-        if let Some(material) = recover_stateful_auth_material_from_parsed(
+        // `recover` runs after the mask-slot DH but before the auth-slot DH. Its
+        // only error sources are EmptyPsk (config-enforced non-empty) and HKDF
+        // (infallible over fixed-length input), so on attacker-controlled parsed
+        // input it always resolves to Ok(None)/Ok(Some) -- never Err. Handle Err
+        // explicitly anyway, spending the auth-slot ballast first, so the M-2
+        // fixed 2-DH-op reject budget cannot regress to 1 op if recover's error
+        // surface is ever widened (mirrors the verify EmptyPsk/Hkdf arm below).
+        let recovered = match recover_stateful_auth_material_from_parsed(
             first_client_record,
             psk,
             mask_ecdh,
             &parsed,
-        )? {
+        ) {
+            Ok(recovered) => recovered,
+            Err(err) => {
+                let _ = dh(&parsed.client_random); // ballast: auth-slot, recover error
+                return Err(err.into());
+            }
+        };
+        if let Some(material) = recovered {
             let x25519_key_share = material.x25519_public;
             let x25519_shared_secret = dh(&x25519_key_share);
             let auth_key = zeroize::Zeroizing::new(derive_server_auth_key_from_shared(
