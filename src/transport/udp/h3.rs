@@ -129,11 +129,27 @@ pub(crate) async fn open_h3_control(
 /// inserts). On the control stream it reads exactly the first frame and parses it
 /// as SETTINGS, returning the peer's advertised settings. Fail-closed on an
 /// unexpected non-control/non-encoder stream type, a non-SETTINGS first frame, an
-/// oversize length, or truncation. Streams are left open (dropping a `RecvStream`
-/// stops reading without resetting the peer's send side).
+/// oversize length, or truncation.
+///
+/// Fail-fast on a non-cooperative peer: each of the encoder (0x02) and decoder
+/// (0x03) streams is legal exactly once before the control stream (RFC 9114
+/// §6.2.1 / RFC 9204 §4.2), so a DUPLICATE encoder/decoder — or more than that
+/// many non-control uni streams in total — is a protocol violation and is
+/// rejected rather than skipped forever. (Without this, a peer that opens endless
+/// encoder/decoder streams and never opens its control stream would keep this
+/// loop spinning until the caller's outer timeout fired; rejecting here turns that
+/// into a prompt, clean Unreachable.) Streams are left open (dropping a
+/// `RecvStream` stops reading without resetting the peer's send side).
 pub(crate) async fn read_peer_h3_settings(
     conn: &quinn::Connection,
 ) -> Result<Vec<Http3Setting>, io::Error> {
+    // At most one encoder + one decoder stream may legitimately precede the
+    // control stream; cap the non-control uni streams we will skip at that count
+    // so a peer cannot stall us with a flood of (even distinct-looking) streams.
+    const MAX_NON_CONTROL_UNI_STREAMS: usize = 2;
+    let mut seen_encoder = false;
+    let mut seen_decoder = false;
+    let mut non_control_seen = 0usize;
     let mut recv = loop {
         let mut recv = conn
             .accept_uni()
@@ -145,7 +161,23 @@ pub(crate) async fn read_peer_h3_settings(
         }
         if stream_type == STREAM_TYPE_QPACK_ENCODER || stream_type == STREAM_TYPE_QPACK_DECODER {
             // A QPACK encoder/decoder stream the peer opened; ParallaX is
-            // static-only, so skip it and keep looking for the control stream.
+            // static-only, so skip it and keep looking for the control stream — but
+            // each type is legal only once, and only so many total, so reject a
+            // duplicate or an over-cap flood instead of skipping it forever.
+            let duplicate = if stream_type == STREAM_TYPE_QPACK_ENCODER {
+                std::mem::replace(&mut seen_encoder, true)
+            } else {
+                std::mem::replace(&mut seen_decoder, true)
+            };
+            non_control_seen += 1;
+            if duplicate || non_control_seen > MAX_NON_CONTROL_UNI_STREAMS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "peer opened a duplicate/excess H3 uni stream (type {stream_type:#x}) before its control stream"
+                    ),
+                ));
+            }
             continue;
         }
         return Err(io::Error::new(
@@ -237,7 +269,88 @@ pub(crate) fn decode_buffered_frame(
 mod tests {
     use super::*;
     use crate::fingerprint::http3::safari26_settings;
-    use crate::transport::udp::test_support::loopback_pair;
+    use crate::transport::udp::test_support::{
+        loopback_pair, self_signed_cert, AcceptAnyServerCert,
+    };
+
+    /// Open a loopback QUIC pair whose SERVER grants the client ZERO uni-stream
+    /// credit (`initial_max_streams_uni = 0`) and never raises it. The client's
+    /// `open_uni` (used by `open_h3_control_stream` / `open_h3_encoder_stream`)
+    /// therefore never completes — modelling the on-path peer of fix A's threat
+    /// model. Returns both endpoints AND the server connection (all of which the
+    /// caller MUST keep alive — dropping the server connection would close the link
+    /// and make the client's `open_uni` resolve with an error instead of hanging),
+    /// plus the client connection under test.
+    async fn loopback_pair_server_no_uni_credit() -> (
+        quinn::Endpoint,
+        quinn::Endpoint,
+        quinn::Connection,
+        quinn::Connection,
+    ) {
+        use std::sync::Arc;
+
+        let (cert, key) = self_signed_cert();
+        // Build the server config like `server_config` but with a transport config
+        // that grants the peer 0 uni streams (and 1 bidi, like production).
+        let mut server_config = crate::transport::udp::server_config(cert, key).unwrap();
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
+        transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        server_config.transport_config(Arc::new(transport));
+
+        let server_endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let client_endpoint = crate::transport::udp::endpoint::bind_client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(AcceptAnyServerCert),
+        )
+        .unwrap();
+
+        let acceptor = {
+            let server_endpoint = server_endpoint.clone();
+            tokio::spawn(async move {
+                server_endpoint
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("server-side connection")
+            })
+        };
+        let client_conn = client_endpoint
+            .connect(server_addr, "localhost")
+            .expect("start connect")
+            .await
+            .expect("client-side connection");
+        let server_conn = acceptor.await.expect("accept task");
+        (server_endpoint, client_endpoint, client_conn, server_conn)
+    }
+
+    /// Fix A: a peer that completes the (unauthenticated) handshake but withholds
+    /// uni-stream credit makes `open_h3_control_stream`'s `open_uni` hang forever.
+    /// The probe must NOT hang: wrapping the control open in a timeout (as the
+    /// client runtime does) elapses, which the runtime maps to Unreachable (stay on
+    /// TCP). This asserts the timeout fires rather than the open resolving.
+    #[tokio::test]
+    async fn control_open_times_out_when_peer_withholds_uni_credit() {
+        // Keep `_server_conn` bound for the test's life: dropping it closes the
+        // connection, which would make `open_uni` resolve with an error rather than
+        // hang — defeating what this test asserts.
+        let (_server_endpoint, _client_endpoint, client_conn, _server_conn) =
+            loopback_pair_server_no_uni_credit().await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            open_h3_control_stream(&client_conn),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "control open must time out (not resolve) when the peer grants no uni credit"
+        );
+    }
 
     /// Both ends open their H3 control set and each reads the OTHER's SETTINGS;
     /// the parsed settings must equal Safari-26's ground truth, and the connection
@@ -286,6 +399,33 @@ mod tests {
         let reader = async { read_peer_h3_settings(&server_conn).await };
         let (_keepalive, result) = tokio::join!(bad, reader);
         let err = result.expect_err("an unexpected-type uni stream must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A peer that opens a DUPLICATE QPACK encoder stream (each is legal only once)
+    /// without ever opening its control stream must be rejected fail-fast rather
+    /// than skipped forever — so a non-cooperative peer cannot stall the SETTINGS
+    /// read by flooding encoder/decoder streams.
+    #[tokio::test]
+    async fn read_peer_h3_settings_rejects_duplicate_encoder_stream() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        let bad = async move {
+            // Two encoder streams (type 0x02), no control stream: the first is
+            // legitimately skipped, the duplicate must be rejected.
+            for _ in 0..2 {
+                let mut s = client_conn.open_uni().await.unwrap();
+                s.write_all(&http3::encode_stream_type(STREAM_TYPE_QPACK_ENCODER))
+                    .await
+                    .unwrap();
+                s.finish().unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            client_conn
+        };
+        let reader = async { read_peer_h3_settings(&server_conn).await };
+        let (_keepalive, result) = tokio::join!(bad, reader);
+        let err = result.expect_err("a duplicate encoder uni stream must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 

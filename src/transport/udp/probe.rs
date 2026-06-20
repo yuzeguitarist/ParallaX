@@ -337,6 +337,14 @@ pub async fn serve_probe_over_bidi(
 /// Read the peer's HEADERS frame (skipped — its field section is not interpreted
 /// by the probe) and then the first DATA frame, returning the DATA body. Any
 /// non-HEADERS-then-DATA shape, or a lost connection, is surfaced as an error.
+///
+/// A frame that the de-framer rejects as malformed (e.g. an advertised length
+/// over the cap — a protocol divergence the peer chose) is classified as
+/// `Malformed`, not `ConnectionLost`: that keeps protocol tampering out of the
+/// transport-loss (`Unreachable`) bucket. Genuine transport faults (truncation, a
+/// closed/lost connection) stay `ConnectionLost`. Both `Malformed` and
+/// `Unreachable` keep the session on TCP, so this is a classification-accuracy
+/// fix, not a behaviour change.
 async fn read_probe_data_after_headers(
     recv: &mut quinn::RecvStream,
 ) -> Result<Vec<u8>, ProbeError> {
@@ -344,17 +352,29 @@ async fn read_probe_data_after_headers(
 
     let (first_type, _first_payload) = super::h3::read_one_h3_frame(recv, MAX_PROBE_H3_FRAME_LEN)
         .await
-        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
+        .map_err(classify_h3_read_error)?;
     if first_type != FRAME_TYPE_HEADERS {
         return Err(ProbeError::Malformed);
     }
     let (second_type, data) = super::h3::read_one_h3_frame(recv, MAX_PROBE_H3_FRAME_LEN)
         .await
-        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
+        .map_err(classify_h3_read_error)?;
     if second_type != FRAME_TYPE_DATA {
         return Err(ProbeError::Malformed);
     }
     Ok(data)
+}
+
+/// Classify an error from the H3 frame de-framer. `InvalidData` is a protocol
+/// divergence the peer chose (e.g. an over-cap advertised frame length) ->
+/// `Malformed`; everything else (truncation, a closed/lost connection) is a
+/// transport fault -> `ConnectionLost`.
+fn classify_h3_read_error(err: std::io::Error) -> ProbeError {
+    if err.kind() == std::io::ErrorKind::InvalidData {
+        ProbeError::Malformed
+    } else {
+        ProbeError::ConnectionLost(err.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -608,5 +628,56 @@ mod tests {
         let mut out = headers;
         out.extend_from_slice(&data);
         send.write_all(&out).await.expect("write response");
+    }
+
+    /// Fix C: a server reply whose second frame advertises an OVER-CAP length is a
+    /// protocol divergence (malformed), not a transport fault. The client's bidi
+    /// probe must surface it as `ProbeError::Malformed` (which the runtime maps to
+    /// `Failed`), NOT as `Ok(Unreachable)` — keeping protocol tampering out of the
+    /// transport-loss bucket. (Before the fix every de-framer error became
+    /// `ConnectionLost` -> `Ok(Unreachable)`.) Both stay on TCP, so this asserts
+    /// classification accuracy, not a behaviour change.
+    #[tokio::test]
+    async fn bidi_probe_malformed_reply_is_malformed_not_unreachable() {
+        use crate::fingerprint::http3::{
+            encode_stream_type, response_status_200_headers_frame, FRAME_TYPE_DATA,
+        };
+
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        let server = async {
+            let (mut send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
+            // Drain the client's HEADERS + DATA(request) so its send completes.
+            let _ = read_probe_data_after_headers(&mut recv).await;
+            // Reply: a well-formed HEADERS frame, then a DATA frame header that
+            // advertises a length far past MAX_PROBE_H3_FRAME_LEN. The client's
+            // de-framer rejects the oversize length with InvalidData -> Malformed.
+            // `encode_stream_type` emits a single QUIC varint as bytes; reuse it for
+            // both the DATA frame-type varint and the deliberately over-cap length
+            // varint, then send no body.
+            let mut out = response_status_200_headers_frame().expect("status headers");
+            out.extend_from_slice(&encode_stream_type(FRAME_TYPE_DATA));
+            out.extend_from_slice(&encode_stream_type((MAX_PROBE_H3_FRAME_LEN as u64) + 1));
+            send.write_all(&out).await.expect("write malformed reply");
+            (send, recv)
+        };
+        let client = async {
+            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            probe_client_over_bidi(
+                &client_conn,
+                &mut send,
+                &mut recv,
+                AUTHORITY,
+                PSK,
+                CTX,
+                Duration::from_secs(5),
+            )
+            .await
+        };
+        let (_server_streams, result) = tokio::join!(server, client);
+        assert!(
+            matches!(result, Err(ProbeError::Malformed)),
+            "an over-cap reply frame must be Malformed (not Unreachable), got {result:?}"
+        );
     }
 }

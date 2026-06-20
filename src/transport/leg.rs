@@ -198,6 +198,16 @@ where
                     // A zero-length DATA frame carries no payload; loop to read the
                     // next header rather than returning Ok with 0 bytes (which a
                     // reader would misread as EOF).
+                    //
+                    // A hostile peer streaming endless 2-byte zero-length DATA
+                    // frames spins this loop without yielding payload, but it is
+                    // bounded: each iteration consumes 2 inner bytes, so progress is
+                    // capped by QUIC stream flow control (the peer cannot send
+                    // unbounded bytes without our reads granting credit), and a
+                    // payload-starved relay is torn down by the relay idle watchdog.
+                    // So this is a no-payload-progress, not an unbounded-memory or
+                    // unbounded-CPU, condition; left as-is to keep the de-framer
+                    // behaviour byte-faithful.
                     if this.remaining == 0 {
                         continue;
                     }

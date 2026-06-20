@@ -149,10 +149,14 @@ pub fn decode_frame(input: &[u8]) -> Result<(Http3FrameHeader, &[u8], usize), Ht
     let (frame_type, type_len) = read_varint(input).ok_or(Http3Error::Truncated)?;
     let rest = &input[type_len..];
     let (len_u64, len_len) = read_varint(rest).ok_or(Http3Error::Truncated)?;
-    let len = len_u64 as usize;
-    if len > MAX_PAYLOAD_LEN {
+    // Compare the u64 length against the cap BEFORE narrowing to usize: on a
+    // 32-bit target `len_u64 as usize` would truncate a large advertised length
+    // and could slip past the bound (matches `read_one_h3_frame`'s u64-first
+    // check). Downstream is fail-closed, but checking pre-cast is correct.
+    if len_u64 > MAX_PAYLOAD_LEN as u64 {
         return Err(Http3Error::FrameTooLarge);
     }
+    let len = len_u64 as usize;
     let header_len = type_len + len_len;
     let total = header_len.checked_add(len).ok_or(Http3Error::Truncated)?;
     if input.len() < total {
@@ -894,6 +898,17 @@ mod tests {
         // type=DATA, length = 2 MiB (8-byte varint), no payload.
         let mut buf = vec![FRAME_TYPE_DATA as u8];
         put_varint(&mut buf, (MAX_PAYLOAD_LEN + 1) as u64);
+        assert_eq!(decode_frame(&buf), Err(Http3Error::FrameTooLarge));
+    }
+
+    #[test]
+    fn decode_frame_rejects_length_above_u32_without_truncation() {
+        // A length that exceeds u32::MAX must be rejected as FrameTooLarge. The
+        // bound is compared on the u64 BEFORE narrowing to usize; on a 32-bit
+        // target `len as usize` would truncate this to a small value and could slip
+        // past the cap, so this guards the pre-cast ordering.
+        let mut buf = vec![FRAME_TYPE_DATA as u8];
+        put_varint(&mut buf, (u32::MAX as u64) + 1);
         assert_eq!(decode_frame(&buf), Err(Http3Error::FrameTooLarge));
     }
 

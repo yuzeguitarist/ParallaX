@@ -1235,9 +1235,21 @@ async fn run_client_udp_probe(
     };
 
     // H3 stream order: control (SETTINGS) -> request bidi (probe) -> encoder.
-    let control_send = match crate::transport::udp::h3::open_h3_control_stream(&conn).await {
-        Ok(s) => s,
-        Err(_) => return unreachable(),
+    // Timeout-bounded like the other post-connect H3 steps (open_bi/encoder
+    // open/SETTINGS read below): the client accepts any server cert during the
+    // probe handshake (AcceptAnyServerCert), so an on-path peer that completes the
+    // unauthenticated QUIC handshake but advertises `initial_max_streams_uni=0`
+    // and never sends MAX_STREAMS would otherwise stall this `open_uni` forever —
+    // the probe would never return, never write PX1P, never fall back to TCP. On
+    // timeout/error treat as Unreachable (stay on TCP).
+    let control_send = match tokio::time::timeout(
+        probe_timeout,
+        crate::transport::udp::h3::open_h3_control_stream(&conn),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return unreachable(),
     };
     let (mut relay_send, mut relay_recv) =
         match tokio::time::timeout(probe_timeout, conn.open_bi()).await {
@@ -1281,6 +1293,14 @@ async fn run_client_udp_probe(
             // server opened its control stream before serving the bidi probe, so it
             // is already in flight; no deadlock). A peer that does not advertise
             // Safari-26's SETTINGS is a protocol divergence -> stay on TCP.
+            //
+            // LOCKSTEP: this requires the server's SETTINGS to be EXACTLY
+            // `safari26_settings()`. The server currently sends those same
+            // client-shaped SETTINGS (see `TODO(quic-active-probing)` in
+            // handshake/server.rs). When that gate is lifted and the server switches
+            // to origin-shaped SETTINGS, THIS equality check must change in lockstep
+            // (to the server's new SETTINGS), or the client will reject every server
+            // and silently never verify the QUIC path.
             match tokio::time::timeout(
                 probe_timeout,
                 crate::transport::udp::h3::read_peer_h3_settings(&conn),
