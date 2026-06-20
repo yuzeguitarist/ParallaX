@@ -434,7 +434,7 @@ impl PqRekeyRequest {
 }
 
 impl ServerKeyExchange {
-    pub fn encode(&self) -> Result<Vec<u8>, ServerKeyExchangeError> {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, ServerKeyExchangeError> {
         if self.mlkem_ciphertext.is_empty() {
             return Err(ServerKeyExchangeError::EmptyCiphertext);
         }
@@ -1551,6 +1551,15 @@ mod tests {
             assert_eq!(decoded.mlkem_ciphertext, exchange.mlkem_ciphertext);
             assert_eq!(decoded.server_x25519_public, exchange.server_x25519_public);
         }
+
+        // A bare untagged 40+len record (the removed legacy layout) no longer
+        // decodes: encode() omits the suite tag, so the canonical parser rejects
+        // it. Locks in that legacy untagged records are gone.
+        let untagged = exchange.encode().unwrap();
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&untagged),
+            Err(ServerKeyExchangeError::InvalidCiphertextLength)
+        ));
 
         // An out-of-range suite tag (41+len shape, unknown byte) is rejected, not
         // silently mapped onto a valid suite.

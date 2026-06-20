@@ -56,23 +56,16 @@ different rekey exchange.
 
 Generated server config includes:
 
-- `server.pq_secret_key`
 - `server.identity_secret_key`
 
 Generated client config includes:
 
-- `client.server_pq_public_key`
 - `client.server_identity_public_key`
-
-`server_pq_public_key` and `pq_secret_key` are optional in the schema for legacy
-config compatibility, but generated current configs include both.
 
 ## Operational implications
 
 - Rotating server identity requires distributing the new
   `server_identity_public_key` to clients.
-- Rotating ML-KEM server keys requires regenerating both sides if static config
-  keys are used.
 - Identity proof verification failure is a hard client-side failure.
 
 Related pages: [Client Runtime & SOCKS5 Proxy](Client-Runtime-&-SOCKS5-Proxy.md),

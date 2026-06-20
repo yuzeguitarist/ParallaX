@@ -224,7 +224,6 @@ max_concurrent_streams = 4
 listen = "0.0.0.0:443"
 fallback_addr = "cloudflare.com:443"
 private_key = "base64-x25519-secret"
-pq_secret_key = "base64-mlkem1024-secret"
 identity_secret_key = "base64-mldsa87-secret"
 replay_cache_path = "/var/lib/parallax/parallax-replay.cache"
 authorized_sni = ["cloudflare.com"]
@@ -253,7 +252,6 @@ listen = "127.0.0.1:1080"
 server_addr = "YOUR_VPS_IP:443"
 sni = "cloudflare.com"
 server_public_key = "base64-x25519-public"
-server_pq_public_key = "base64-mlkem1024-public"
 server_identity_public_key = "base64-mldsa87-public"
 ```
 

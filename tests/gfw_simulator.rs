@@ -98,7 +98,7 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
         server_x25519_public: server_ephemeral.public,
         mlkem_ciphertext: encapsulation.ciphertext,
     }
-    .encode()
+    .encode_with_suite(parallax::crypto::session::CipherSuite::ChaCha20Poly1305)
     .expect("encode ServerKeyExchange");
 
     // Real ML-DSA-87 signature -> real ServerIdentityProof -> real chunking. The
