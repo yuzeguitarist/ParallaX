@@ -562,30 +562,17 @@ impl Drop for AbortOnDrop {
 /// case); any other errno (e.g. `ECONNRESET`) => dead.
 #[cfg(unix)]
 fn warm_session_is_live(stream: &TcpStream) -> bool {
-    use std::os::fd::AsRawFd;
+    use rustix::io::Errno;
+    use rustix::net::{recv, RecvFlags};
 
-    let fd = stream.as_raw_fd();
     let mut byte = [0_u8; 1];
-    // SAFETY: recv with MSG_PEEK|MSG_DONTWAIT on a valid borrowed fd into a local
-    // buffer; non-destructive (peek) and non-blocking.
-    let rc = unsafe {
-        libc::recv(
-            fd,
-            byte.as_mut_ptr().cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    if rc > 0 {
-        return true;
+    // Non-destructive (peek) + non-blocking probe on the borrowed fd. The second
+    // tuple field is recv()'s return: > 0 => live, 0 => clean EOF (dead);
+    // EWOULDBLOCK/EAGAIN => live (idle warm socket, the normal case).
+    match recv(stream, &mut byte, RecvFlags::PEEK | RecvFlags::DONTWAIT) {
+        Ok((_, peeked)) => peeked > 0,
+        Err(err) => err == Errno::WOULDBLOCK || err == Errno::AGAIN,
     }
-    if rc == 0 {
-        return false;
-    }
-    matches!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
-    )
 }
 
 #[cfg(not(unix))]

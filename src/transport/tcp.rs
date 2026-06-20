@@ -237,32 +237,30 @@ pub async fn relay_kernel_splice_bidirectional_with_idle_timeout(
 
 #[cfg(unix)]
 pub fn bump_nofile_soft_limit() {
-    use libc::{getrlimit, rlimit, setrlimit, RLIMIT_NOFILE};
+    use rustix::process::{getrlimit, setrlimit, Resource};
 
-    let mut limit = rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    let rc = unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) };
-    if rc != 0 || limit.rlim_cur >= limit.rlim_max {
+    let mut limit = getrlimit(Resource::Nofile);
+    // rustix uses `None` for RLIM_INFINITY; fold it to u64::MAX so the
+    // "already at the hard limit?" check matches the old raw-value comparison.
+    let old_soft = limit.current.unwrap_or(u64::MAX);
+    let hard = limit.maximum.unwrap_or(u64::MAX);
+    if old_soft >= hard {
         return;
     }
 
-    let old_soft = limit.rlim_cur;
-    limit.rlim_cur = limit.rlim_max;
-    if unsafe { setrlimit(RLIMIT_NOFILE, &limit) } == 0 {
-        tracing::debug!(
+    limit.current = limit.maximum; // raise the soft limit up to the hard limit
+    match setrlimit(Resource::Nofile, limit) {
+        Ok(()) => tracing::debug!(
             old_soft_limit = old_soft,
-            new_soft_limit = limit.rlim_cur,
+            new_soft_limit = hard,
             "raised RLIMIT_NOFILE soft limit"
-        );
-    } else {
-        tracing::debug!(
-            error = %io::Error::last_os_error(),
+        ),
+        Err(err) => tracing::debug!(
+            error = %io::Error::from(err),
             old_soft_limit = old_soft,
-            hard_limit = limit.rlim_max,
+            hard_limit = hard,
             "failed to raise RLIMIT_NOFILE soft limit"
-        );
+        ),
     }
 }
 
@@ -315,16 +313,13 @@ pub fn relay_connection_limit_from_nofile(
 
 #[cfg(unix)]
 fn nofile_soft_limit() -> io::Result<usize> {
-    use libc::{getrlimit, rlimit, RLIMIT_NOFILE};
+    use rustix::process::{getrlimit, Resource};
 
-    let mut limit = rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(limit.rlim_cur as usize)
+    // None == RLIM_INFINITY; clamp to usize::MAX for the relay-budget math,
+    // matching the old `rlim_cur as usize` behaviour on 64-bit.
+    Ok(getrlimit(Resource::Nofile)
+        .current
+        .map_or(usize::MAX, |cur| cur as usize))
 }
 
 #[cfg(not(unix))]
@@ -333,14 +328,17 @@ fn nofile_soft_limit() -> io::Result<usize> {
 }
 
 /// Process-wide TCP congestion-control override, set once at startup.
-static CONGESTION_OVERRIDE: std::sync::OnceLock<Option<std::ffi::CString>> =
-    std::sync::OnceLock::new();
+static CONGESTION_OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Sets the congestion-control algorithm requested on relay sockets, process
 /// wide. Call once at startup before any socket is tuned. `None` (or a name
 /// containing a NUL) keeps the built-in default ("bbr" on Linux).
 pub fn configure_congestion_control(algorithm: Option<&str>) {
-    let value = algorithm.and_then(|name| std::ffi::CString::new(name).ok());
+    // A name with an interior NUL can't be a valid sockopt value; treat it as
+    // unset (matches the previous `CString::new(name).ok()` rejection).
+    let value = algorithm
+        .filter(|name| !name.contains('\0'))
+        .map(str::to_owned);
     if CONGESTION_OVERRIDE.set(value).is_err() {
         tracing::debug!("congestion control override already set; keeping the first value");
     }
@@ -348,62 +346,35 @@ pub fn configure_congestion_control(algorithm: Option<&str>) {
 
 #[cfg(target_os = "linux")]
 fn set_low_latency_congestion(stream: &TcpStream) {
-    use std::{ffi::CString, os::fd::AsRawFd};
+    use socket2::SockRef;
 
-    let default = CString::new("bbr").ok();
     let configured = CONGESTION_OVERRIDE.get().and_then(|opt| opt.clone());
-    let Some(algorithm) = configured.or(default) else {
-        return;
-    };
-    let fd = stream.as_raw_fd();
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_CONGESTION,
-            algorithm.as_ptr().cast(),
-            algorithm.as_bytes().len() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
+    let algorithm = configured.unwrap_or_else(|| "bbr".to_owned());
+
+    let sock = SockRef::from(stream);
+    if sock.set_tcp_congestion(algorithm.as_bytes()).is_err() {
         tracing::trace!(
-            algorithm = ?algorithm,
+            algorithm = %algorithm,
             "TCP congestion control request failed; keeping kernel default"
         );
         return;
     }
     // Read back: the kernel silently ignores an unknown/unloaded algorithm, so a
-    // zero setsockopt return does not mean it was applied. Warn on mismatch so a
-    // configured algorithm the kernel dropped does not silently lie.
-    let mut current = [0_u8; 32];
-    let mut len = current.len() as libc::socklen_t;
-    let rrc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_CONGESTION,
-            current.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if rrc != 0 {
-        return;
-    }
-    // getsockopt(TCP_CONGESTION) returns min(buf, TCP_CA_NAME_MAX) bytes with the
-    // name NUL-padded, so trim at the first NUL before comparing to the requested
-    // name (which carries no NUL). Clamp len defensively against the buffer.
-    let len = (len as usize).min(current.len());
-    let applied = &current[..len];
-    let applied = &applied[..applied
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(applied.len())];
-    if applied != algorithm.as_bytes() {
-        tracing::warn!(
-            requested = ?algorithm,
-            applied = %String::from_utf8_lossy(applied),
-            "kernel did not apply the requested TCP congestion control (algorithm not loaded?)"
-        );
+    // successful set does not mean it was applied. Warn on mismatch so a
+    // configured algorithm the kernel dropped does not silently lie. Use socket2's
+    // getter, which returns raw bytes and never panics; rustix's tcp_congestion()
+    // asserts + unwraps on a malformed reply, which this best-effort diagnostic
+    // must not do.
+    if let Ok(applied) = sock.tcp_congestion() {
+        // Kernel returns the name NUL-padded; compare up to the first NUL.
+        let applied = applied.split(|&b| b == 0).next().unwrap_or(&[]);
+        if applied != algorithm.as_bytes() {
+            tracing::warn!(
+                requested = %algorithm,
+                applied = %String::from_utf8_lossy(applied),
+                "kernel did not apply the requested TCP congestion control (algorithm not loaded?)"
+            );
+        }
     }
 }
 
@@ -427,24 +398,14 @@ fn tune_tcp_socket_before_connect(_socket: &TcpSocket) {}
 #[cfg(target_os = "linux")]
 fn set_notsent_lowat<S>(socket: &S)
 where
-    S: std::os::fd::AsRawFd,
+    S: std::os::fd::AsFd,
 {
-    set_notsent_lowat_fd(socket.as_raw_fd());
-}
+    use socket2::SockRef;
 
-#[cfg(target_os = "linux")]
-fn set_notsent_lowat_fd(fd: std::os::fd::RawFd) {
-    let lowat = TCP_NOTSENT_LOWAT_BYTES;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NOTSENT_LOWAT,
-            (&lowat as *const libc::c_uint).cast(),
-            std::mem::size_of_val(&lowat) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
+    if SockRef::from(socket)
+        .set_tcp_notsent_lowat(TCP_NOTSENT_LOWAT_BYTES)
+        .is_err()
+    {
         tracing::trace!("TCP_NOTSENT_LOWAT is unavailable; keeping kernel send queue defaults");
     }
 }
@@ -455,38 +416,55 @@ fn set_notsent_lowat<S>(_socket: &S) {}
 #[cfg(target_os = "linux")]
 fn set_busy_poll<S>(socket: &S)
 where
-    S: std::os::fd::AsRawFd,
+    S: std::os::fd::AsFd,
 {
-    set_busy_poll_fd(socket.as_raw_fd());
-}
+    use socket2::SockRef;
 
-#[cfg(target_os = "linux")]
-fn set_busy_poll_fd(fd: std::os::fd::RawFd) {
-    set_socket_int_option_fd(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_BUSY_POLL,
-        SOCKET_BUSY_POLL_MICROS,
-    );
-    set_socket_int_option_fd(fd, libc::SOL_SOCKET, libc::SO_PREFER_BUSY_POLL, 1);
+    if SockRef::from(socket)
+        .set_busy_poll(SOCKET_BUSY_POLL_MICROS as u32)
+        .is_err()
+    {
+        tracing::trace!("SO_BUSY_POLL is unavailable; keeping kernel default");
+    }
+    // SO_PREFER_BUSY_POLL has no safe wrapper in rustix or socket2, so it stays on
+    // libc — the only remaining FFI in the socket-tuning path.
+    set_prefer_busy_poll(socket.as_fd());
 }
 
 #[cfg(not(target_os = "linux"))]
 fn set_busy_poll<S>(_socket: &S) {}
 
 #[cfg(target_os = "linux")]
-fn set_incoming_cpu<S>(socket: &S)
-where
-    S: std::os::fd::AsRawFd,
-{
-    set_incoming_cpu_fd(socket.as_raw_fd());
+fn set_prefer_busy_poll(fd: std::os::fd::BorrowedFd<'_>) {
+    use std::os::fd::AsRawFd;
+
+    let enabled: libc::c_int = 1;
+    // SAFETY: setsockopt with a pointer to a stack-local c_int of matching length
+    // on a valid borrowed fd; it only mutates this socket's option state.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PREFER_BUSY_POLL,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::trace!("SO_PREFER_BUSY_POLL is unavailable; keeping kernel default");
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn set_incoming_cpu_fd(fd: std::os::fd::RawFd) {
-    let cpu = unsafe { libc::sched_getcpu() };
-    if cpu >= 0 {
-        set_socket_int_option_fd(fd, libc::SOL_SOCKET, libc::SO_INCOMING_CPU, cpu);
+fn set_incoming_cpu<S>(socket: &S)
+where
+    S: std::os::fd::AsFd,
+{
+    // rustix sched_getcpu() returns usize (no error sentinel) and does not fail on
+    // Linux; a bogus value would just make the setsockopt below a no-op.
+    let cpu = rustix::thread::sched_getcpu();
+    if rustix::net::sockopt::set_socket_incoming_cpu(socket, cpu as u32).is_err() {
+        tracing::trace!("SO_INCOMING_CPU is unavailable; keeping kernel default");
     }
 }
 
@@ -494,45 +472,8 @@ fn set_incoming_cpu_fd(fd: std::os::fd::RawFd) {
 fn set_incoming_cpu<S>(_socket: &S) {}
 
 #[cfg(target_os = "linux")]
-fn set_socket_int_option_fd(
-    fd: std::os::fd::RawFd,
-    level: libc::c_int,
-    optname: libc::c_int,
-    value: libc::c_int,
-) {
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            optname,
-            (&value as *const libc::c_int).cast(),
-            std::mem::size_of_val(&value) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        tracing::trace!(
-            error = %io::Error::last_os_error(),
-            optname,
-            "socket option unavailable; keeping kernel default"
-        );
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn set_quick_ack(stream: &TcpStream) {
-    use std::os::fd::AsRawFd;
-
-    let enabled: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            stream.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_QUICKACK,
-            (&enabled as *const libc::c_int).cast(),
-            std::mem::size_of_val(&enabled) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
+    if rustix::net::sockopt::set_tcp_quickack(stream, true).is_err() {
         tracing::trace!("TCP_QUICKACK is unavailable; keeping kernel delayed-ACK defaults");
     }
 }
@@ -545,11 +486,13 @@ mod kernel_splice {
     use std::{
         io,
         net::{Shutdown, TcpStream as StdTcpStream},
-        os::fd::{AsRawFd, RawFd},
+        os::fd::{AsFd, BorrowedFd, OwnedFd},
         sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant},
     };
+
+    use rustix::event::PollFlags;
 
     const SPLICE_CHUNK: usize = 256 * 1024;
 
@@ -623,14 +566,14 @@ mod kernel_splice {
         let pipe = Pipe::new()?;
         loop {
             if !poll_fd_until_progress(
-                read_stream.as_raw_fd(),
-                libc::POLLIN,
+                read_stream.as_fd(),
+                PollFlags::IN,
                 idle_timeout,
                 last_progress,
             )? {
                 return Ok(()); // read-side idle timeout
             }
-            let Some(moved) = splice_fd(read_stream.as_raw_fd(), pipe.write_fd, SPLICE_CHUNK)?
+            let Some(moved) = splice_fd(read_stream.as_fd(), pipe.write_fd.as_fd(), SPLICE_CHUNK)?
             else {
                 continue;
             };
@@ -645,14 +588,15 @@ mod kernel_splice {
             let mut remaining = moved;
             while remaining > 0 {
                 if !poll_fd_until_progress(
-                    write_stream.as_raw_fd(),
-                    libc::POLLOUT,
+                    write_stream.as_fd(),
+                    PollFlags::OUT,
                     idle_timeout,
                     last_progress,
                 )? {
                     return Ok(()); // write-side idle timeout
                 }
-                let Some(written) = splice_fd(pipe.read_fd, write_stream.as_raw_fd(), remaining)?
+                let Some(written) =
+                    splice_fd(pipe.read_fd.as_fd(), write_stream.as_fd(), remaining)?
                 else {
                     continue;
                 };
@@ -686,107 +630,89 @@ mod kernel_splice {
     }
 
     fn poll_fd_until_progress(
-        fd: RawFd,
-        events: libc::c_short,
+        fd: BorrowedFd<'_>,
+        events: PollFlags,
         idle_timeout: Duration,
         last_progress: &Mutex<Instant>,
     ) -> io::Result<bool> {
+        use rustix::event::{poll, PollFd, Timespec};
+        use rustix::io::Errno;
+
         loop {
-            let timeout = poll_timeout_ms(idle_timeout, last_progress)?;
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events,
-                revents: 0,
+            let remaining = poll_timeout(idle_timeout, last_progress)?;
+            let timeout = Timespec {
+                tv_sec: remaining.as_secs() as i64,
+                tv_nsec: remaining.subsec_nanos() as _,
             };
-            let rc = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
-            if rc > 0 {
-                return Ok(true);
-            }
-            if rc == 0 {
-                // Poll timed out. The sibling direction shares last_progress and
-                // may have bumped it while we waited, so only give up if the
-                // shared idle deadline has truly elapsed; otherwise re-poll with
-                // the refreshed remaining. This keeps the idle timer a single
-                // shared deadline rather than letting a quiet direction tear down
-                // a connection the other direction is actively pumping.
-                if poll_timeout_ms(idle_timeout, last_progress)? == 0 {
-                    return Ok(false);
+            let mut poll_fds = [PollFd::from_borrowed_fd(fd, events)];
+            match poll(&mut poll_fds, Some(&timeout)) {
+                Ok(ready) if ready > 0 => return Ok(true),
+                Ok(_) => {
+                    // Poll timed out. The sibling direction shares last_progress and
+                    // may have bumped it while we waited, so only give up if the
+                    // shared idle deadline has truly elapsed; otherwise re-poll with
+                    // the refreshed remaining. This keeps the idle timer a single
+                    // shared deadline rather than letting a quiet direction tear down
+                    // a connection the other direction is actively pumping.
+                    if poll_timeout(idle_timeout, last_progress)?.is_zero() {
+                        return Ok(false);
+                    }
+                    continue;
                 }
-                continue;
+                Err(Errno::INTR) => continue,
+                Err(err) => return Err(err.into()),
             }
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(err);
         }
     }
 
-    fn poll_timeout_ms(
+    fn poll_timeout(
         idle_timeout: Duration,
         last_progress: &Mutex<Instant>,
-    ) -> io::Result<libc::c_int> {
+    ) -> io::Result<Duration> {
         let elapsed = last_progress
             .lock()
             .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))?
             .elapsed();
-        let remaining = idle_timeout.saturating_sub(elapsed);
-        if remaining.is_zero() {
-            Ok(0)
-        } else {
-            Ok(remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int)
-        }
+        Ok(idle_timeout.saturating_sub(elapsed))
     }
 
-    fn splice_fd(read_fd: RawFd, write_fd: RawFd, len: usize) -> io::Result<Option<usize>> {
+    fn splice_fd(
+        read_fd: BorrowedFd<'_>,
+        write_fd: BorrowedFd<'_>,
+        len: usize,
+    ) -> io::Result<Option<usize>> {
+        use rustix::io::Errno;
+        use rustix::pipe::{splice, SpliceFlags};
+
         loop {
-            let moved = unsafe {
-                libc::splice(
-                    read_fd,
-                    std::ptr::null_mut(),
-                    write_fd,
-                    std::ptr::null_mut(),
-                    len,
-                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
-                )
-            };
-            if moved >= 0 {
-                return Ok(Some(moved as usize));
-            }
-            let err = io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return Ok(None),
-                _ => return Err(err),
+            match splice(
+                read_fd,
+                None,
+                write_fd,
+                None,
+                len,
+                SpliceFlags::MOVE | SpliceFlags::NONBLOCK,
+            ) {
+                Ok(moved) => return Ok(Some(moved)),
+                Err(Errno::INTR) => continue,
+                Err(Errno::AGAIN) => return Ok(None),
+                Err(err) => return Err(err.into()),
             }
         }
     }
 
     struct Pipe {
-        read_fd: RawFd,
-        write_fd: RawFd,
+        read_fd: OwnedFd,
+        write_fd: OwnedFd,
     }
 
     impl Pipe {
         fn new() -> io::Result<Self> {
-            let mut fds = [0; 2];
-            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-            if rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Self {
-                read_fd: fds[0],
-                write_fd: fds[1],
-            })
-        }
-    }
+            use rustix::pipe::{pipe_with, PipeFlags};
 
-    impl Drop for Pipe {
-        fn drop(&mut self) {
-            unsafe {
-                libc::close(self.read_fd);
-                libc::close(self.write_fd);
-            }
+            // OwnedFd closes each end on drop, so `Pipe` needs no manual `Drop`.
+            let (read_fd, write_fd) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+            Ok(Self { read_fd, write_fd })
         }
     }
 }

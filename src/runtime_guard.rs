@@ -363,7 +363,7 @@ fn ensure_state_dir(dir: &Path) -> io::Result<()> {
             .open(dir)?;
         let metadata = dir_file.metadata()?;
         let uid = metadata.uid();
-        let euid = unsafe { libc::geteuid() };
+        let euid = rustix::process::geteuid().as_raw();
         if !metadata.is_dir() || uid != euid {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -409,8 +409,7 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
 fn default_state_dir() -> PathBuf {
     #[cfg(unix)]
     {
-        // SAFETY: geteuid has no preconditions and does not dereference pointers.
-        let uid = unsafe { libc::geteuid() };
+        let uid = rustix::process::geteuid().as_raw();
         PathBuf::from(format!("/tmp/parallax-{uid}/runtime"))
     }
     #[cfg(not(unix))]
@@ -421,17 +420,13 @@ fn default_state_dir() -> PathBuf {
 
 #[cfg(unix)]
 fn try_lock_file(file: &File) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
+    use rustix::fs::{flock, FlockOperation};
+    use rustix::io::Errno;
 
-    // SAFETY: flock only operates on the valid file descriptor borrowed from File.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(false),
-        _ => Err(err),
+    match flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(err) if err == Errno::WOULDBLOCK || err == Errno::AGAIN => Ok(false),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -447,19 +442,15 @@ fn try_lock_file(_file: &File) -> io::Result<bool> {
 /// critical section instead of fail-fasting on contention.
 #[cfg(unix)]
 fn lock_file_blocking(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
+    use rustix::fs::{flock, FlockOperation};
+    use rustix::io::Errno;
 
     loop {
-        // SAFETY: flock only operates on the valid file descriptor borrowed from File.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc == 0 {
-            return Ok(());
+        match flock(file, FlockOperation::LockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(Errno::INTR) => continue,
+            Err(err) => return Err(err.into()),
         }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        return Err(err);
     }
 }
 
@@ -473,15 +464,9 @@ fn lock_file_blocking(_file: &File) -> io::Result<()> {
 
 #[cfg(unix)]
 fn unlock_file(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
+    use rustix::fs::{flock, FlockOperation};
 
-    // SAFETY: flock only operates on the valid file descriptor borrowed from File.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    flock(file, FlockOperation::Unlock).map_err(Into::into)
 }
 
 #[cfg(not(unix))]
