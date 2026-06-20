@@ -1,0 +1,34 @@
+name: Sync Wiki
+
+# Mirror ParallaX-DeepWiki/ to this repo's GitHub Wiki on every change to the
+# docs (or to the sync tooling). One-way: the repo is the source of truth.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ParallaX-DeepWiki/**"
+      - "scripts/wiki_sync/**"
+      - ".github/workflows/sync-wiki.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # the default GITHUB_TOKEN needs this to push this repo's wiki
+
+concurrency:
+  group: sync-wiki
+  cancel-in-progress: false # never cancel a push mid-flight; queued runs re-sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      # ubuntu-latest ships python3; convert.py is standard-library only.
+      # GITHUB_TOKEN is auto-masked by Actions; sync.sh also redacts it from
+      # any clone error. GITHUB_REPOSITORY / GITHUB_SHA are default runner env.
+      - name: Sync DeepWiki -> GitHub Wiki
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/wiki_sync/sync.sh
