@@ -171,14 +171,15 @@ const UDP_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// reclaims those resources well after [`UDP_KEEP_ALIVE_INTERVAL`] (15 s) has had
 /// several chances to refresh a live connection.
 ///
-/// CRITICAL — this is purely LOCAL and does NOT change the on-wire advertised
-/// value. The Safari-26 H3 wire shape advertises `max_idle_timeout = 0` (the
-/// confirmed CFNetwork value), and that 0 is emitted by the hand-encoded `0x39`
-/// blob in `safari_crypto.rs` (`start_session` substitutes our blob for quinn's
-/// `params.write()`), so quinn's config value here never reaches the wire — it
-/// only drives quinn's local idle timer. The advertised `0` (no peer-negotiated
-/// idle timeout) and this locally-enforced backstop are independent: the peer
-/// sees Safari fidelity while this endpoint still reaps a dead connection.
+/// CRITICAL — this is purely LOCAL and does NOT change the on-wire shape. The
+/// Safari-26 H3 wire shape OMITS `max_idle_timeout` entirely (the confirmed
+/// CFNetwork 2026-06 behaviour — omit ≠ value=0), so the hand-encoded `0x39` blob
+/// in `safari_crypto.rs` (`start_session` substitutes our blob for quinn's
+/// `params.write()`) writes no idle-timeout param, and quinn's config value here
+/// never reaches the wire — it only drives quinn's local idle timer. The omitted
+/// idle param (no peer-negotiated idle timeout) and this locally-enforced backstop
+/// are independent: the peer sees Safari fidelity while this endpoint still reaps a
+/// dead connection.
 const UDP_LOCAL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Flow-control windows for the fast-plane relay's single reliable stream.
@@ -217,27 +218,29 @@ const UDP_CONN_RECV_WINDOW: u32 = safari_crypto::SAFARI_TP_INITIAL_MAX_DATA as u
 /// streams THIS endpoint grants the PEER to open.
 ///
 /// * Client: `peer_bidi = 0` — the client grants the server NO server-initiated
-///   bidi streams, matching Safari's advertised `initial_max_streams_bidi = 0`. The
-///   relay's client-initiated bidi stream is governed by the SERVER's grant, not
-///   this value, so the relay still works.
+///   bidi streams, matching Safari's wire shape (it OMITS `initial_max_streams_bidi`,
+///   which defaults to 0 per RFC 9000; omit ≠ value=0 on the wire but the enforced
+///   limit is the same 0). The relay's client-initiated bidi stream is governed by
+///   the SERVER's grant, not this value, so the relay still works.
 /// * Server: `peer_bidi = 1` — the server grants the client exactly one bidi stream,
 ///   which is the relay's single multiplexed stream (client `open_bi` /
 ///   server `accept_bi`). The server emits its own quinn transport params (not the
-///   Safari blob), so it is not bound to the client's advertised bidi value.
+///   Safari blob), so it is not bound to the client's wire bidi shape.
 ///
-/// The advertised `max_idle_timeout = 0` (Safari fidelity) is emitted by the
-/// hand-encoded `0x39` blob in `safari_crypto.rs`, NOT from quinn's config, so
-/// this function sets a LOCAL idle-timeout backstop ([`UDP_LOCAL_IDLE_TIMEOUT`])
-/// to reap a black-holed connection without changing the wire value; liveness of
-/// a healthy connection rests on the keep-alive (see [`UDP_KEEP_ALIVE_INTERVAL`]).
+/// The omitted `max_idle_timeout` (Safari fidelity — the wire carries no idle param)
+/// is handled by the hand-encoded `0x39` blob in `safari_crypto.rs`, NOT from quinn's
+/// config, so this function sets a LOCAL idle-timeout backstop
+/// ([`UDP_LOCAL_IDLE_TIMEOUT`]) to reap a black-holed connection without changing the
+/// wire shape; liveness of a healthy connection rests on the keep-alive (see
+/// [`UDP_KEEP_ALIVE_INTERVAL`]).
 fn udp_transport_config(peer_bidi: u32) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    // LOCAL idle-timeout backstop ONLY: the wire advertises max_idle_timeout = 0
-    // (Safari's value), hand-encoded in safari_crypto.rs independently of this
-    // config, so this value never reaches the peer — it just lets quinn reap a
-    // vanished peer's connection (loss detection alone never would; see
-    // UDP_LOCAL_IDLE_TIMEOUT). Keep-alive refreshes the timer for a live
-    // connection across the probe -> accept_bi/open_bi gap.
+    // LOCAL idle-timeout backstop ONLY: the wire OMITS max_idle_timeout (Safari's
+    // shape), hand-encoded in safari_crypto.rs independently of this config, so this
+    // value never reaches the peer — it just lets quinn reap a vanished peer's
+    // connection (loss detection alone never would; see UDP_LOCAL_IDLE_TIMEOUT).
+    // Keep-alive refreshes the timer for a live connection across the
+    // probe -> accept_bi/open_bi gap.
     transport.max_idle_timeout(Some(
         UDP_LOCAL_IDLE_TIMEOUT
             .try_into()
