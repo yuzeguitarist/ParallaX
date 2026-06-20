@@ -11,61 +11,11 @@ use std::{net::SocketAddr, sync::Arc};
 
 use quinn::{ConnectionIdGenerator, Endpoint, EndpointConfig};
 use quinn_proto::RandomConnectionIdGenerator;
-use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
-    DigitallySignedStruct, SignatureScheme,
-};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+use crate::tls::quic::{AcceptAnyServerCert, ServerCertVerifier};
 
 use super::{client_config, server_config, UdpTransportError};
-
-/// Certificate verifier that accepts any server certificate. The UDP leg does
-/// not derive security from cert validation (REALITY-style: the cert is
-/// camouflage); authenticity is the exporter-bound auth token. A wrong/forged
-/// cert therefore changes nothing — only a peer holding the live TLS exporter +
-/// PSK can pass the probe.
-#[derive(Debug)]
-pub(crate) struct AcceptAnyServerCert;
-
-impl ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-        ]
-    }
-}
 
 /// Generate an ephemeral self-signed certificate for the UDP QUIC server.
 pub fn ephemeral_self_signed(

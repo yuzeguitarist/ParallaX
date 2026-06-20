@@ -19,13 +19,11 @@ rand = "0.8"
 path = ".."
 
 # fuzz/ is its own workspace (the empty [workspace] above), so it does NOT inherit
-# the parent crate's [patch.crates-io]. Replicate it here so `parallax` compiles
-# against the SAME vendored rustls / quinn-proto forks the main build uses: the
-# Safari-26 ClientHello shaping (src/tls/safari_shape.rs) + the QUIC H3 façade need
-# rustls::client::SafariChProfile / ClientConfig::safari_ch_profile and the
-# quinn-proto CidQueue::LEN=64 delta, none of which exist in upstream crates.io.
+# the parent crate's [patch.crates-io]. Replicate the one remaining vendored fork
+# so `parallax` builds against the SAME quinn-proto the main build uses (the
+# CidQueue::LEN=64 delta). rustls is now unforked (crates.io): the QUIC client TLS
+# engine is ParallaX's hand-written `src/tls/quic`, which needs no rustls fork API.
 [patch.crates-io]
-rustls = { path = "../vendor/rustls" }
 quinn-proto = { path = "../vendor/quinn-proto" }
 
 # --- Targets -----------------------------------------------------------------

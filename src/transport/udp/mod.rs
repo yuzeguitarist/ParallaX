@@ -88,70 +88,13 @@ pub mod fuzz {
 use std::sync::Arc;
 
 use quinn::crypto::rustls::QuicServerConfig;
-use rustls::{
-    client::danger::ServerCertVerifier,
-    compress::{CertDecompressor, DecompressionFailed},
-    pki_types::{CertificateDer, PrivateKeyDer},
-    CertificateCompressionAlgorithm,
-};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
+
+use crate::tls::quic::ServerCertVerifier;
 
 /// ALPN for the masquerading HTTP/3 face: the UDP leg presents itself as h3.
 pub const UDP_ALPN: &[u8] = b"h3";
-
-/// Zlib certificate decompressor for the QUIC client, implemented with the
-/// existing `flate2` dependency.
-///
-/// The Safari-26 H3 ClientHello advertises `compress_certificate` = zlib (the
-/// `[len=2, zlib=0x0001]` body in `safari_shape.rs` / `safari26.rs`), so a
-/// TLS-1.3 server MAY answer with a `CompressedCertificate` message. The
-/// vendored rustls ships zlib support only behind its `zlib` cargo feature
-/// (which would pull in `zlib-rs`); that feature is OFF here, so
-/// `default_cert_decompressors()` is EMPTY and rustls would reject any
-/// `CompressedCertificate` with `SelectedUnofferedCertCompression`, failing the
-/// handshake. Installing this decompressor closes that gap WITHOUT a new
-/// dependency, reusing the same `flate2` zlib backend the TCP camouflage path
-/// already uses for the identical message (`safari26.rs`
-/// `parse_compressed_certificate_body`).
-///
-/// In production the QUIC client only ever reaches ParallaX's own QUIC server,
-/// whose `server_config` installs no compressor, so today this is latent
-/// robustness/fidelity hardening; it becomes load-bearing the moment the
-/// masquerade fronts a real (compressing) H3 origin.
-#[derive(Debug)]
-struct Flate2ZlibCertDecompressor;
-
-/// Installed on the QUIC client config's `cert_decompressors`.
-static FLATE2_ZLIB_CERT_DECOMPRESSOR: &dyn CertDecompressor = &Flate2ZlibCertDecompressor;
-
-impl CertDecompressor for Flate2ZlibCertDecompressor {
-    fn decompress(&self, input: &[u8], output: &mut [u8]) -> Result<(), DecompressionFailed> {
-        // rustls pre-sizes `output` to the server's declared `uncompressed_len`
-        // (already bounded by rustls against `CERTIFICATE_MAX_SIZE_LIMIT` before
-        // this call, so a lying length cannot force a large allocation here). The
-        // contract — mirroring rustls's own `zlib-rs` decompressor — is to fill
-        // `output` EXACTLY: a stream that inflates to more or fewer bytes than
-        // `output.len()`, or is otherwise malformed, must fail.
-        let mut decompress = flate2::Decompress::new(/* zlib_header = */ true);
-        match decompress.decompress(input, output, flate2::FlushDecompress::Finish) {
-            // StreamEnd having consumed all input and filled the buffer exactly is
-            // the only success: total_out == output.len() rejects a short inflate,
-            // and BufError on a full output buffer rejects an over-long one (the
-            // decoder cannot drain the remaining stream).
-            Ok(flate2::Status::StreamEnd)
-                if decompress.total_in() == input.len() as u64
-                    && decompress.total_out() == output.len() as u64 =>
-            {
-                Ok(())
-            }
-            _ => Err(DecompressionFailed),
-        }
-    }
-
-    fn algorithm(&self) -> CertificateCompressionAlgorithm {
-        CertificateCompressionAlgorithm::Zlib
-    }
-}
 
 /// Active keep-alive interval. The fast-plane connection is retained across the
 /// probe and then sits idle through the TCP control exchange (PX1P) and the
@@ -372,46 +315,22 @@ pub fn server_config(
 /// cert, and authenticity is instead established by the exporter-bound auth
 /// token (a later slice). The verifier is therefore injected by the caller so
 /// this module ships no built-in "accept anything" default in production code.
+///
+/// The TLS engine is ParallaX's hand-written, rustls-free [`crate::tls::quic`]
+/// client (driven through [`safari_crypto::SafariQuicClientConfig`]). It emits the
+/// byte-faithful Safari-26 H3 ClientHello (pinned post-quantum-hybrid key share,
+/// TLS 1.3 only, cold-start, internal zlib certificate decompression) and
+/// substitutes the hand-encoded ascending `0x39` transport-parameters blob, so no
+/// rustls config / provider / profile is built on the client path anymore.
 pub fn client_config(
     verifier: Arc<dyn ServerCertVerifier>,
 ) -> Result<quinn::ClientConfig, UdpTransportError> {
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(camouflage_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|err| UdpTransportError::TlsConfig(err.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![UDP_ALPN.to_vec()];
-
-    // The Safari profile advertises `compress_certificate` = zlib, so install a
-    // zlib decompressor to handle a server that answers with a
-    // `CompressedCertificate`. The vendored rustls leaves `cert_decompressors`
-    // empty (its `zlib` feature is off to avoid the `zlib-rs` dep), which would
-    // otherwise make any compressed cert fail the handshake; this reuses the
-    // existing `flate2` backend (no new dependency). See
-    // [`Flate2ZlibCertDecompressor`].
-    tls.cert_decompressors = vec![FLATE2_ZLIB_CERT_DECOMPRESSOR];
-
-    // S6: the Safari-26 H3 Session is the DEFAULT QUIC client backend. The rustls
-    // config carries the production `safari_ch_profile`, so the vendored-rustls
-    // ClientHello assembly (S1) emits the exact Safari wire shape, and the Safari
-    // Session substitutes the hand-encoded ascending 0x39 transport-param blob
-    // (S4) for quinn's `params.write()`. Cold-start ONLY: resumption is disabled
-    // so no `pre_shared_key` / `early_data` is emitted (`psk_key_exchange_modes`
-    // is still present in the profile). True 0-RTT is a later capture-gated slice.
-    tls.resumption = rustls::client::Resumption::disabled();
-
-    let mut grease_seed = [0_u8; 5];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut grease_seed);
-    let grease = crate::tls::safari_shape::GreaseSet::from_seed(grease_seed);
-    tls.safari_ch_profile = Some(Arc::new(crate::tls::safari_shape::safari_h3_ch_profile(
-        grease,
-    )));
-
-    let crypto: Arc<dyn quinn::crypto::ClientConfig> = Arc::new(
-        safari_crypto::SafariQuicClientConfig::new(Arc::new(tls))
-            .ok_or_else(|| UdpTransportError::TlsConfig("no QUIC initial cipher suite".into()))?,
-    );
+    let engine = Arc::new(crate::tls::quic::ClientConfig::new(
+        verifier,
+        vec![UDP_ALPN.to_vec()],
+    ));
+    let crypto: Arc<dyn quinn::crypto::ClientConfig> =
+        Arc::new(safari_crypto::SafariQuicClientConfig::new(engine));
 
     let mut config = quinn::ClientConfig::new(crypto);
     // Client grants the server NO bidi streams (Safari advertises bidi=0); the
@@ -425,59 +344,14 @@ pub(crate) mod test_support {
     use std::sync::Arc;
 
     use quinn::{Connection, Endpoint};
-    use rustls::{
-        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
-        DigitallySignedStruct, SignatureScheme,
-    };
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     use super::server_config;
 
-    /// Test-only verifier that accepts any certificate. Mirrors REALITY's posture
-    /// (the cert is camouflage, not the trust anchor); real authenticity is the
-    /// exporter-bound auth token.
-    #[derive(Debug)]
-    pub(crate) struct AcceptAnyServerCert;
-
-    impl ServerCertVerifier for AcceptAnyServerCert {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::ED25519,
-                SignatureScheme::RSA_PSS_SHA256,
-            ]
-        }
-    }
+    /// Test verifier that accepts any certificate (REALITY posture; trust is the
+    /// exporter-bound auth token). Re-exports the engine's own no-op verifier so
+    /// the loopback tests drive the production TLS engine's trust path.
+    pub(crate) use crate::tls::quic::AcceptAnyServerCert;
 
     pub(crate) fn self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
@@ -709,75 +583,19 @@ mod tests {
         );
     }
 
-    /// The `flate2` zlib cert decompressor installed on the QUIC client config
-    /// round-trips a real zlib stream into an exactly-sized buffer and rejects
-    /// every malformed/length-mismatched input — the contract rustls's
-    /// `ExpectCompressedCertificate` relies on (it pre-sizes `output` to the
-    /// server's declared `uncompressed_len` and treats any failure as a fatal
-    /// `InvalidCertCompression`).
-    #[test]
-    fn flate2_zlib_cert_decompressor_round_trips_and_rejects_malformed() {
-        use flate2::{write::ZlibEncoder, Compression};
-        use std::io::Write;
-
-        let plaintext = b"the quick brown fox jumps over the lazy dog, repeatedly. \
-                          the quick brown fox jumps over the lazy dog, repeatedly.";
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-        encoder.write_all(plaintext).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        let decompressor = Flate2ZlibCertDecompressor;
-        assert_eq!(
-            decompressor.algorithm(),
-            CertificateCompressionAlgorithm::Zlib
-        );
-
-        // Exact-length buffer: succeeds and reproduces the plaintext.
-        let mut out = vec![0u8; plaintext.len()];
-        decompressor
-            .decompress(&compressed, &mut out)
-            .expect("exact-length zlib decompress must succeed");
-        assert_eq!(out, plaintext, "decompressed bytes must match the original");
-
-        // Declared length too SHORT: the stream inflates past the buffer; reject.
-        let mut short = vec![0u8; plaintext.len() - 1];
-        assert!(
-            decompressor.decompress(&compressed, &mut short).is_err(),
-            "a too-short output buffer must fail (over-long inflation)"
-        );
-
-        // Declared length too LONG: the stream fills fewer bytes than the buffer;
-        // reject (total_out != output.len()).
-        let mut long = vec![0u8; plaintext.len() + 1];
-        assert!(
-            decompressor.decompress(&compressed, &mut long).is_err(),
-            "a too-long output buffer must fail (short inflation)"
-        );
-
-        // Garbage input: not a valid zlib stream; reject without panicking.
-        let mut out = vec![0u8; plaintext.len()];
-        assert!(
-            decompressor
-                .decompress(b"not a zlib stream at all", &mut out)
-                .is_err(),
-            "malformed input must fail"
-        );
-    }
-
     /// End-to-end proof of the fix: a QUIC server that answers with a
     /// `CompressedCertificate` (zlib) completes the handshake with the PRODUCTION
-    /// `client_config`. Before installing the `flate2` decompressor, the vendored
-    /// rustls had no zlib decompressor (its `zlib` feature is off), so rustls
-    /// rejected the compressed cert with `SelectedUnofferedCertCompression` and
-    /// the handshake failed despite the ClientHello advertising
-    /// `compress_certificate` = zlib. The production server installs no compressor,
-    /// so this test builds a compressing server config to exercise the receive
-    /// path the advertised extension promises a real (e.g. CDN-fronted) origin
-    /// could use.
+    /// `client_config`. The hand-written TLS engine decompresses the chain with
+    /// `flate2` internally (`tls::quic` `parse_compressed_certificate_body`); the
+    /// production server installs no compressor, so this test builds a compressing
+    /// server config to exercise the receive path the advertised
+    /// `compress_certificate` = zlib extension promises a real (e.g. CDN-fronted)
+    /// origin could use.
     #[tokio::test]
     async fn quic_client_completes_handshake_with_compressed_certificate() {
         use flate2::{write::ZlibEncoder, Compression};
         use rustls::compress::{CertCompressor, CompressionFailed, CompressionLevel};
+        use rustls::CertificateCompressionAlgorithm;
         use std::io::Write;
 
         /// Test-only zlib certificate compressor (flate2) so the loopback server

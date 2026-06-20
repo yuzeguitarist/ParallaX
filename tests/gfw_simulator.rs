@@ -995,9 +995,8 @@ async fn udp_leg_initial_first_datagram_holds_only_partial_clienthello() {
 // (presence only). active_connection_id_limit asserts Safari's confirmed 64,
 // reachable because vendor/quinn-proto raises CidQueue::LEN to 64.
 //
-// It is GREEN once the vendored-rustls fork + the Safari QUIC Session are wired and
-// selected (production `safari_ch_profile` set in `client_config` and the Safari
-// backend made the default).
+// It is GREEN once the hand-written QUIC TLS engine (`src/tls/quic`, driven via the
+// `safari_crypto` quinn adapter) is wired as the default QUIC client backend.
 
 /// RFC 8701 GREASE values: `0x?a?a` with both bytes equal.
 fn is_grease_u16(value: u16) -> bool {
