@@ -20,7 +20,7 @@ read_cfg() { [ -r "$ETC/$1" ] && tr -d ' \t\r\n' < "$ETC/$1" || true; }
 NODE_ID="$(read_cfg node-id)"
 PINNED="$(read_cfg pinned-commit)"
 REPO="$(read_cfg repo)";        REPO="${REPO:-yuzeguitarist/ParallaX}"
-TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-f3c9c32f}"
+TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-d240e663}"
 export GH_REPO="$REPO"   # gh reads this; PAT is an env var (NEVER argv).
 # Token via env (matches sync.sh) so gh works under systemd even if the
 # bootstrap `gh auth login` creds aren't on this unit's HOME. Never argv.

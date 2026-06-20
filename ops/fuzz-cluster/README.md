@@ -5,14 +5,14 @@ walk away. Crashes arrive as GitHub Issues on your phone; progress shows on a
 dashboard. No SSH, no professional knowledge, no per-box config.
 
 - **Repo:** `yuzeguitarist/ParallaX` (PRIVATE)
-- **Pinned commit (this campaign):** `f3c9c32f` — every box clones and checks out
+- **Pinned commit (this campaign):** `d240e663` — every box clones and checks out
   exactly this commit and never moves. All corpus/crash assets are tagged to it.
 - **Boxes:** 2 × DigitalOcean **c-4** (4 vCPU / 8 GB / 50 GB, **dedicated**, no spot),
   Ubuntu 24.04, named by role: `box-a`, `box-b`.
 - **Toolchain (pinned, installed by bootstrap):** `nightly-2026-06-10` +
   `cargo-fuzz 0.13.2`.
 - **Where state lives (zero extra infra — the repo IS the backend):**
-  - **Corpus** → a GitHub **Release** `fuzz-corpus-f3c9c32f` (assets, not a branch).
+  - **Corpus** → a GitHub **Release** `fuzz-corpus-d240e663` (assets, not a branch).
   - **Crashes** → GitHub **Issues** (label `fuzz-crash`) **+** committed repros on
     the `fuzz-crashes` branch.
   - **Status** → `status-<box>.json` committed to the `fuzz-status` branch every
@@ -24,9 +24,9 @@ dashboard. No SSH, no professional knowledge, no per-box config.
 
 ### 1. Pick the commit
 
-This campaign is pinned to **`f3c9c32f`** (current HEAD). It schedules 14 of the
-15 fuzz targets in `fuzz/Cargo.toml`, incl. the TUDP targets; `mldsa_verify` is
-intentionally not run by either box. To run a different commit, substitute its SHA
+This campaign is pinned to **`d240e663`**. It schedules all 18 fuzz targets in
+`fuzz/Cargo.toml`, incl. the TUDP targets, `mldsa_verify`, and the H3/QPACK
+targets. To run a different commit, substitute its SHA
 everywhere below **and** in the paste line — the Release tag, the bootstrap URL,
 and every box's checkout all key off it.
 
@@ -71,7 +71,7 @@ git push -u origin fuzz-crashes
 # fuzz-status: holds status-<box>.json heartbeats + the committed dashboard
 git switch --orphan fuzz-status
 mkdir -p fuzz/dashboard
-git checkout f3c9c32f -- fuzz/dashboard/index.html   # publish the dashboard here
+git checkout d240e663 -- fuzz/dashboard/index.html   # publish the dashboard here
 git add fuzz/dashboard/index.html
 git commit -m "init fuzz-status (orphan; heartbeats + dashboard)"
 git push -u origin fuzz-status
@@ -79,7 +79,7 @@ git push -u origin fuzz-status
 git switch main   # back to where you were
 ```
 
-The Release `fuzz-corpus-f3c9c32f` does **not** need pre-creating: the first box
+The Release `fuzz-corpus-d240e663` does **not** need pre-creating: the first box
 to sync creates it race-safely (it ignores `already_exists`).
 
 ### 4. Watch results on your phone (two clicks, once)
@@ -117,7 +117,7 @@ curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeg
 
 `bootstrap.sh` picks the PAT up from `PLXFUZZ_PAT`, stores it `0600` at
 `/etc/plxfuzz/pat`, then unattended: installs the pinned toolchain + build deps,
-clones `f3c9c32f`, `gh auth login --with-token`, warm-builds the fuzzers,
+clones `d240e663`, `gh auth login --with-token`, warm-builds the fuzzers,
 installs+enables the systemd units, and starts fuzzing. It is idempotent —
 re-pasting on a half-built box self-heals. When it prints `cluster node box-a live`,
 walk away.
@@ -131,9 +131,9 @@ The shard table inside the bootstrap derives the per-box plan from the node-id
 (caps are loose backstops; real RSS is far lower):
 
 - **box-a** — sanitizer `address` (parsers; catches OOB/UAF/leaks):
-  `server_decide_inbound`, `tls_client_hello`, `tls_server_hello`, `client_hello_auth`, `tls_compressed_cert`, `socks_connect_request`.
+  `server_decide_inbound`, `tls_client_hello`, `tls_server_hello`, `client_hello_auth`, `tls_compressed_cert`, `socks_connect_request`, `h3_frame_decode`, `h3_settings_parse`, `h3_qpack_field_section`.
 - **box-b** — sanitizer `none`, `RUSTFLAGS=-C overflow-checks=on` (codecs/arithmetic; catches overflow, runs faster):
-  `mux_frame`, `data_record_open`, `http2_frame_header`, `command_codecs`, `replay_journal`, `udp_envelope`, `udp_reorder`, `replay_dedup`.
+  `mux_frame`, `data_record_open`, `http2_frame_header`, `command_codecs`, `replay_journal`, `udp_envelope`, `udp_reorder`, `replay_dedup`, `mldsa_verify`.
 
 Each target runs as **one in-process fuzzer** (no `-jobs`/`-workers`/`-fork`, which
 can hide crashes); box parallelism comes from running several such units. Corpus
@@ -210,7 +210,7 @@ entire procedure; no other coordination.
 ### Ending the campaign
 
 Day 15: destroy both boxes. The corpus survives in the Release
-`fuzz-corpus-f3c9c32f` and the crash repros in the `fuzz-crashes` branch. A new
+`fuzz-corpus-d240e663` and the crash repros in the `fuzz-crashes` branch. A new
 campaign = a new commit SHA (new Release tag) + a fresh 16-day PAT; the old PAT
 expires on its own with the boxes.
 
