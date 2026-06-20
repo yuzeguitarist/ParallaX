@@ -2808,12 +2808,73 @@ impl DataRelay {
             // path's behavior.
             let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
             let idle_timeout = fallback_idle_timeout();
+
+            // HTTP/3 control layer (RFC 9114): open this endpoint's H3 control set
+            // (control stream + SETTINGS, QPACK encoder stream) before any relay
+            // data, so the post-handshake QUIC behaviour is compliant H3. Opening
+            // (write-only) is fast and cannot deadlock against the accept_bi
+            // rendezvous; the client's SETTINGS are read AFTER the rendezvous. The
+            // returned handles are HELD for the relay's duration so the control
+            // streams stay open per RFC 9114 §6.2.1.
+            let h3_control = match crate::transport::udp::h3::open_h3_control(&conn).await {
+                Ok(control) => control,
+                Err(err) => {
+                    tracing::warn!(cid, error = %err, "QUIC fast-plane H3 control open failed");
+                    conn.close(0u32.into(), b"h3-control-failed");
+                    return Err(HandshakeServerError::Io(err));
+                }
+            };
+            let _h3_control = h3_control;
+
             match tokio::time::timeout(QUIC_RELAY_ACCEPT_TIMEOUT, conn.accept_bi()).await {
                 Ok(Ok((send, recv))) => {
                     tracing::info!(
                         cid,
                         "QUIC fast-plane bidi stream accepted; relaying over UDP"
                     );
+                    // Read the client's H3 SETTINGS off its control stream now that
+                    // the relay rendezvous has completed (so the client's control
+                    // set is in flight). Verify it matches Safari-26's SETTINGS; a
+                    // peer that diverges fails the connection. Bounded by the accept
+                    // timeout so a silent peer cannot stall here.
+                    match tokio::time::timeout(
+                        QUIC_RELAY_ACCEPT_TIMEOUT,
+                        crate::transport::udp::h3::read_peer_h3_settings(&conn),
+                    )
+                    .await
+                    {
+                        Ok(Ok(settings)) => {
+                            if settings != crate::fingerprint::http3::safari26_settings() {
+                                tracing::warn!(
+                                    cid,
+                                    "QUIC fast-plane peer H3 SETTINGS did not match Safari-26 \
+                                     ground truth"
+                                );
+                                conn.close(0u32.into(), b"h3-settings-mismatch");
+                                return Err(HandshakeServerError::Io(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "peer H3 SETTINGS mismatch",
+                                )));
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            tracing::warn!(
+                                cid,
+                                error = %err,
+                                "QUIC fast-plane H3 SETTINGS read failed"
+                            );
+                            conn.close(0u32.into(), b"h3-settings-failed");
+                            return Err(HandshakeServerError::Io(err));
+                        }
+                        Err(_) => {
+                            tracing::warn!(cid, "QUIC fast-plane H3 SETTINGS read timed out");
+                            conn.close(0u32.into(), b"h3-settings-timeout");
+                            return Err(HandshakeServerError::Io(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "peer H3 SETTINGS read timed out",
+                            )));
+                        }
+                    }
                     let upload = server_upload_loop(
                         QuicStreamLegReader::buffered(recv),
                         target_write,

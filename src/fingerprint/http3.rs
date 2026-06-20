@@ -39,6 +39,28 @@ pub const FRAME_TYPE_DATA: u64 = 0x00;
 pub const FRAME_TYPE_HEADERS: u64 = 0x01;
 pub const FRAME_TYPE_SETTINGS: u64 = 0x04;
 
+/// HTTP/3 unidirectional stream type codes (RFC 9114 §6.2 / RFC 9204 §4.2). The
+/// first byte(s) of a uni stream are a varint naming the stream's role; ParallaX's
+/// QUIC façade opens a control stream (carrying SETTINGS) and a (static-only,
+/// therefore empty) QPACK encoder stream to match a real H3 client's stream set.
+pub const STREAM_TYPE_CONTROL: u64 = 0x00;
+pub const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
+pub const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
+
+/// Encode an HTTP/3 unidirectional stream-type prefix (a single QUIC varint), the
+/// first bytes written on a freshly opened uni stream (RFC 9114 §6.2).
+pub fn encode_stream_type(stream_type: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    put_varint(&mut out, stream_type);
+    out
+}
+
+/// Read the leading unidirectional stream-type varint from `buf`, returning
+/// `(stream_type, consumed)` or `None` if `buf` is too short to hold it.
+pub fn read_stream_type(buf: &[u8]) -> Option<(u64, usize)> {
+    read_varint(buf)
+}
+
 /// HTTP/3 SETTINGS identifiers (RFC 9114 §7.2.4.1, RFC 9204 §5).
 pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
 pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
@@ -794,6 +816,29 @@ mod tests {
     }
 
     // --- H3 frame round-trips (RFC 9114 §7.1) -----------------------------
+
+    #[test]
+    fn stream_type_prefix_roundtrip() {
+        for ty in [
+            STREAM_TYPE_CONTROL,
+            STREAM_TYPE_QPACK_ENCODER,
+            STREAM_TYPE_QPACK_DECODER,
+        ] {
+            let encoded = encode_stream_type(ty);
+            let (decoded, consumed) = read_stream_type(&encoded).unwrap();
+            assert_eq!(decoded, ty);
+            assert_eq!(consumed, encoded.len());
+        }
+        // Control/encoder/decoder are all single-byte varints.
+        assert_eq!(encode_stream_type(STREAM_TYPE_CONTROL), vec![0x00]);
+        assert_eq!(encode_stream_type(STREAM_TYPE_QPACK_ENCODER), vec![0x02]);
+        assert_eq!(encode_stream_type(STREAM_TYPE_QPACK_DECODER), vec![0x03]);
+    }
+
+    #[test]
+    fn read_stream_type_too_short_is_none() {
+        assert!(read_stream_type(&[]).is_none());
+    }
 
     #[test]
     fn frame_roundtrip_data() {

@@ -14,6 +14,7 @@
 pub mod auth;
 pub mod endpoint;
 pub(crate) mod envelope;
+pub(crate) mod h3;
 pub mod probe;
 pub(crate) mod reorder;
 /// Safari-26 H3 QUIC ClientHello carrier (S2). This is now the DEFAULT QUIC

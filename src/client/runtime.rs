@@ -1758,6 +1758,24 @@ impl ClientRelay {
             // needs `mut` to write our DONE marker.
             let mut server_write = server_write;
 
+            // HTTP/3 control layer (RFC 9114): before any relay data, open this
+            // endpoint's H3 control set (control stream + SETTINGS, QPACK encoder
+            // stream) so the post-handshake QUIC behaviour is compliant H3 rather
+            // than a bare byte stream. Opening (write-only) is fast and cannot
+            // deadlock against the bidi rendezvous below; the peer's SETTINGS are
+            // read AFTER the rendezvous (by which point both control streams are in
+            // flight). The returned handles are HELD for the relay's duration so the
+            // control streams stay open per RFC 9114 §6.2.1.
+            let h3_control = match crate::transport::udp::h3::open_h3_control(&conn).await {
+                Ok(control) => control,
+                Err(err) => {
+                    tracing::warn!(cid, error = %err, "QUIC fast-plane H3 control open failed");
+                    conn.close(0u32.into(), b"h3-control-failed");
+                    return Err(ClientRuntimeError::Io(err));
+                }
+            };
+            let _h3_control = h3_control;
+
             let (send, recv) =
                 match tokio::time::timeout(QUIC_RELAY_OPEN_TIMEOUT, conn.open_bi()).await {
                     Ok(Ok(streams)) => streams,
@@ -1782,6 +1800,45 @@ impl ClientRelay {
                         )));
                     }
                 };
+
+            // Read the server's H3 SETTINGS off its control stream now that the
+            // relay rendezvous has completed (so the server's control set is in
+            // flight). Verify it advertises Safari-26's SETTINGS; a peer that does
+            // not is a protocol divergence and the connection is failed. Bounded by
+            // the relay open timeout so a silent peer cannot stall here.
+            match tokio::time::timeout(
+                QUIC_RELAY_OPEN_TIMEOUT,
+                crate::transport::udp::h3::read_peer_h3_settings(&conn),
+            )
+            .await
+            {
+                Ok(Ok(settings)) => {
+                    if settings != crate::fingerprint::http3::safari26_settings() {
+                        tracing::warn!(
+                            cid,
+                            "QUIC fast-plane peer H3 SETTINGS did not match Safari-26 ground truth"
+                        );
+                        conn.close(0u32.into(), b"h3-settings-mismatch");
+                        return Err(ClientRuntimeError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "peer H3 SETTINGS mismatch",
+                        )));
+                    }
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(cid, error = %err, "QUIC fast-plane H3 SETTINGS read failed");
+                    conn.close(0u32.into(), b"h3-settings-failed");
+                    return Err(ClientRuntimeError::Io(err));
+                }
+                Err(_) => {
+                    tracing::warn!(cid, "QUIC fast-plane H3 SETTINGS read timed out");
+                    conn.close(0u32.into(), b"h3-settings-timeout");
+                    return Err(ClientRuntimeError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "peer H3 SETTINGS read timed out",
+                    )));
+                }
+            }
 
             // quinn opens a bidi stream lazily: the server's `accept_bi` will not
             // return until the opener writes to the SendStream. Send a single
