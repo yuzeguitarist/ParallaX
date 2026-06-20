@@ -38,6 +38,13 @@ env:
   # Drop debuginfo (tests don't need it) to shave that rebuild; nothing here
   # relies on symbols/backtraces.
   CARGO_PROFILE_DEV_DEBUG: "0"
+  # Disable incremental compilation. cargo-mutants rebuilds the crate ~60 times
+  # per shard in ONE target dir (in-place); with incremental on, the
+  # target/debug/incremental cache accrues a stale session per mutant and grows
+  # into the tens of GB (measured 14 GB locally), which is what filled the
+  # runner's disk and got it SIGKILLed. Off, the target stays ~flat; each mutant
+  # already recompiles most of the crate anyway, so the build-time cost is small.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   mutants:
@@ -56,6 +63,18 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Free disk space
+        # cargo-mutants rebuilds the crate once per mutant; the incremental build
+        # cache grows into the tens of GB over a shard and overran the runner's
+        # ~14 GB free disk mid-run, which SIGKILLed the runner ("received a
+        # shutdown signal", with no "no space" line because the agent died first).
+        # Drop preinstalled toolchains this job never uses to free ~20-30 GB.
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/share/swift /usr/local/share/powershell /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
