@@ -67,6 +67,7 @@ pub(crate) const ALERT_ILLEGAL_PARAMETER: u8 = 47;
 pub(crate) const ALERT_DECODE_ERROR: u8 = 50;
 pub(crate) const ALERT_DECRYPT_ERROR: u8 = 51;
 pub(crate) const ALERT_MISSING_EXTENSION: u8 = 109;
+pub(crate) const ALERT_UNSUPPORTED_EXTENSION: u8 = 110;
 pub(crate) const ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 
 /// Errors surfaced by the hand-written TLS engine.

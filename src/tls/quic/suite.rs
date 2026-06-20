@@ -114,6 +114,16 @@ impl CipherSuite {
         context: &[u8],
         len: usize,
     ) -> Result<Vec<u8>, QuicTlsError> {
+        // The wire encoding packs `full_label_len`, `context.len()`, and `len`
+        // into u8/u16 fields. Every internal caller uses short constant labels and
+        // bounded contexts (hashes ≤48 B), so these never overflow; assert it in
+        // debug builds to catch any future misuse before the silent truncation.
+        debug_assert!(label.len() <= 249, "TLS 1.3 label + \"tls13 \" must fit u8");
+        debug_assert!(context.len() <= 255, "TLS 1.3 HKDF context must fit u8");
+        debug_assert!(
+            len <= u16::MAX as usize,
+            "HKDF-Expand-Label output must fit u16"
+        );
         let full_label_len = 6 + label.len();
         let mut info = Vec::with_capacity(2 + 1 + full_label_len + 1 + context.len());
         info.extend_from_slice(&(len as u16).to_be_bytes());

@@ -75,26 +75,26 @@ pub(crate) fn build_client_hello(params: &ClientHelloParams) -> Result<Vec<u8>, 
 
     // extensions, in the fixed Safari-26 H3 order with GREASE bookends.
     let mut ext = Vec::with_capacity(1410);
-    push_ext(&mut ext, params.grease.extension, &[]);
+    push_ext(&mut ext, params.grease.extension, &[])?;
     push_ext(
         &mut ext,
         EXT_SERVER_NAME,
         &server_name_extension(params.server_name)?,
-    );
+    )?;
     push_ext(
         &mut ext,
         EXT_SUPPORTED_GROUPS,
         &supported_groups_extension(params.grease.group),
-    );
-    push_ext(&mut ext, EXT_EC_POINT_FORMATS, &[1, 0]);
-    push_ext(&mut ext, EXT_ALPN, &alpn_extension(params.alpn_protocols)?);
-    push_ext(&mut ext, EXT_STATUS_REQUEST, &[1, 0, 0, 0, 0]);
+    )?;
+    push_ext(&mut ext, EXT_EC_POINT_FORMATS, &[1, 0])?;
+    push_ext(&mut ext, EXT_ALPN, &alpn_extension(params.alpn_protocols)?)?;
+    push_ext(&mut ext, EXT_STATUS_REQUEST, &[1, 0, 0, 0, 0])?;
     push_ext(
         &mut ext,
         EXT_SIGNATURE_ALGORITHMS,
         &signature_algorithms_extension(),
-    );
-    push_ext(&mut ext, EXT_SIGNED_CERTIFICATE_TIMESTAMP, &[]);
+    )?;
+    push_ext(&mut ext, EXT_SIGNED_CERTIFICATE_TIMESTAMP, &[])?;
     push_ext(
         &mut ext,
         EXT_KEY_SHARE,
@@ -103,20 +103,20 @@ pub(crate) fn build_client_hello(params: &ClientHelloParams) -> Result<Vec<u8>, 
             params.mlkem768_public,
             params.x25519_public,
         ),
-    );
-    push_ext(&mut ext, EXT_PSK_KEY_EXCHANGE_MODES, &[1, 1]);
+    )?;
+    push_ext(&mut ext, EXT_PSK_KEY_EXCHANGE_MODES, &[1, 1])?;
     push_ext(
         &mut ext,
         EXT_SUPPORTED_VERSIONS,
         &supported_versions_extension_h3(params.grease.version),
-    );
+    )?;
     push_ext(
         &mut ext,
         EXT_QUIC_TRANSPORT_PARAMETERS,
         params.transport_params,
-    );
-    push_ext(&mut ext, EXT_COMPRESS_CERTIFICATE, &[2, 0, 1]);
-    push_ext(&mut ext, params.grease.final_extension, &[0]);
+    )?;
+    push_ext(&mut ext, EXT_COMPRESS_CERTIFICATE, &[2, 0, 1])?;
+    push_ext(&mut ext, params.grease.final_extension, &[0])?;
 
     push_u16_vec(&mut body, &ext)?;
 
@@ -158,12 +158,12 @@ fn alpn_extension(protocols: &[Vec<u8>]) -> Result<Vec<u8>, QuicTlsError> {
     Ok(out)
 }
 
-fn push_ext(out: &mut Vec<u8>, ext_type: u16, body: &[u8]) {
+fn push_ext(out: &mut Vec<u8>, ext_type: u16, body: &[u8]) -> Result<(), QuicTlsError> {
     out.extend_from_slice(&ext_type.to_be_bytes());
-    // Extension bodies are small protocol vectors bounded well under u16::MAX, so
-    // this length cast is sound by construction.
-    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-    out.extend_from_slice(body);
+    // Extension bodies are small in practice, but a pathological SNI could push
+    // the server_name body past u16::MAX; error rather than emit a truncated
+    // (malformed) length via an unchecked `as u16` cast.
+    push_u16_vec(out, body)
 }
 
 fn push_u16_prefixed_u16s(out: &mut Vec<u8>, values: &[u16]) {
