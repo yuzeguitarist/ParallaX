@@ -25,5 +25,6 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod packet;
 pub(crate) mod transport_params;
 pub(crate) mod varint;
