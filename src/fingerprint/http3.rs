@@ -274,6 +274,16 @@ pub fn safari26_request_fields(authority: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// Build a minimal HTTP/3 response HEADERS frame carrying only `:status 200`
+/// (QPACK static index 25, a full Indexed Field Line). ParallaX's QUIC façade
+/// answers its single synthetic request with this; a real origin would add more
+/// headers, but the response side faces only the (cooperating) ParallaX client,
+/// so a minimal compliant `:status 200` is sufficient and unambiguous.
+pub fn response_status_200_headers_frame() -> Result<Vec<u8>, Http3Error> {
+    let section = encode_field_section(&[(":status".to_string(), "200".to_string())]);
+    encode_frame(FRAME_TYPE_HEADERS, &section)
+}
+
 // ---------------------------------------------------------------------------
 // QPACK field-section codec (RFC 9204 §4).
 // ---------------------------------------------------------------------------
@@ -1121,6 +1131,16 @@ mod tests {
         assert_eq!(total, frame.len());
         let decoded = decode_field_section(payload).unwrap();
         assert_eq!(decoded, safari26_request_fields(authority));
+    }
+
+    #[test]
+    fn response_status_200_headers_frame_decodes_to_status_200() {
+        let frame = response_status_200_headers_frame().unwrap();
+        let (hdr, payload, total) = decode_frame(&frame).unwrap();
+        assert_eq!(hdr.frame_type, FRAME_TYPE_HEADERS);
+        assert_eq!(total, frame.len());
+        let decoded = decode_field_section(payload).unwrap();
+        assert_eq!(decoded, vec![(":status".to_string(), "200".to_string())]);
     }
 
     #[test]

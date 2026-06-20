@@ -105,28 +105,167 @@ impl LegWriter for TcpLegWriter {
     }
 }
 
-/// QUIC-stream record-reader leg over a reliable bidi `quinn::RecvStream`.
-///
-/// A quinn reliable bidi stream carries the record byte-stream exactly like TCP,
-/// so reads delegate 1:1 to the inner [`TcpLegReader`] (which is already generic
-/// over any `R: AsyncRead + Unpin + Send`, and `quinn::RecvStream` is one in
-/// quinn 0.11). It is a NEWTYPE rather than a bare type alias because the QUIC
-/// leg must OVERRIDE [`LegReader::is_clean_close`]: quinn maps a peer
-/// `RESET_STREAM` to `io::ErrorKind::ConnectionReset`, which on a reliable relay
-/// stream is a mid-transfer truncation that must surface as an error — unlike a
-/// TCP RST, which is conventionally a clean half-close. `read_record_into` /
-/// `try_read_record_into` keep their exact `BufferedTlsRecordReader` semantics.
-pub(crate) struct QuicStreamLegReader(TcpLegReader<quinn::RecvStream>);
+/// Test-only counter of record bytes written through the QUIC relay leg
+/// ([`H3DataFrameLegWriter`]). Lets the relay e2e tests prove application data
+/// actually traversed the QUIC stream (rather than silently falling back to TCP).
+/// Not compiled in release.
+#[cfg(test)]
+pub(crate) static QUIC_LEG_BYTES_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
-impl QuicStreamLegReader {
-    /// Wraps a `quinn::RecvStream` in a buffered record reader, mirroring
-    /// [`TcpLegReader::buffered`].
-    pub(crate) fn buffered(reader: quinn::RecvStream) -> Self {
-        Self(TcpLegReader::buffered(reader))
+// ---------------------------------------------------------------------------
+// HTTP/3 DATA-frame relay legs.
+//
+// On the H3 request bidi the relay record byte-stream is carried inside HTTP/3
+// DATA frames (RFC 9114 §7.2.1): the writer wraps each `write_records` batch in
+// one `DATA = varint(0x00) varint(len) bytes` frame, and the reader strips DATA
+// frame headers to recover the original record byte-stream before the TLS-record
+// splitter runs on it. Records may span DATA frames and a DATA frame may contain
+// partial records — exactly the H3 body model — because the de-framer presents a
+// continuous byte stream regardless of frame boundaries. The REPLACE read
+// semantics and the RESET-as-truncation close semantics are preserved: the
+// de-framer propagates the inner stream's `io::Error` kind unchanged (a peer
+// `RESET_STREAM` stays `ConnectionReset`, a clean finish stays `UnexpectedEof`),
+// so the leg's clean-close override still distinguishes them.
+// ---------------------------------------------------------------------------
+
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use tokio::io::{AsyncRead, ReadBuf};
+
+use crate::fingerprint::http3::{read_stream_type, FRAME_TYPE_DATA};
+
+/// Max H3 DATA frame payload the de-framer will accept, mirroring the codec's
+/// [`crate::fingerprint::http3::MAX_PAYLOAD_LEN`] bound so a hostile peer cannot
+/// announce an unbounded DATA frame.
+const MAX_H3_DATA_FRAME_LEN: u64 = 1 << 20;
+
+/// An `AsyncRead` that de-frames HTTP/3 DATA frames from an inner reader, yielding
+/// only the concatenated DATA-frame payload bytes. Frame headers (`DATA` type +
+/// length varints) are consumed and discarded; a non-DATA frame on this stream is
+/// a protocol error (the relay bidi carries only DATA after the probe HEADERS).
+pub(crate) struct H3DataFrameReader<R> {
+    inner: R,
+    /// Bytes left in the current DATA frame's payload; 0 means "read a header next".
+    remaining: u64,
+    /// Partial frame-header bytes accumulated while parsing `type` + `length`.
+    header: Vec<u8>,
+}
+
+impl<R> H3DataFrameReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            remaining: 0,
+            header: Vec::with_capacity(9),
+        }
     }
 }
 
-impl LegReader for QuicStreamLegReader {
+impl<R> AsyncRead for H3DataFrameReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // Parse frame headers (one DATA frame at a time) until we are positioned
+        // inside a payload, then copy payload bytes into `buf`.
+        while this.remaining == 0 {
+            // Try to parse `type` + `length` from the bytes accumulated so far.
+            if let Some((frame_type, type_len)) = read_stream_type(&this.header) {
+                if let Some((len, _len_len)) = read_stream_type(&this.header[type_len..]) {
+                    if frame_type != FRAME_TYPE_DATA {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("non-DATA H3 frame on relay bidi (type {frame_type:#x})"),
+                        )));
+                    }
+                    if len > MAX_H3_DATA_FRAME_LEN {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("H3 DATA frame length {len} exceeds bound"),
+                        )));
+                    }
+                    this.header.clear();
+                    this.remaining = len;
+                    // A zero-length DATA frame carries no payload; loop to read the
+                    // next header rather than returning Ok with 0 bytes (which a
+                    // reader would misread as EOF).
+                    if this.remaining == 0 {
+                        continue;
+                    }
+                    break;
+                }
+            }
+            // Need more header bytes: read exactly one more into a 1-byte scratch.
+            let mut byte = [0u8; 1];
+            let mut one = ReadBuf::new(&mut byte);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut one) {
+                Poll::Ready(Ok(())) => {
+                    if one.filled().is_empty() {
+                        // Clean EOF. At a frame boundary (no partial header) this is
+                        // a clean finish; mid-header it is a truncated header. Either
+                        // way surface EOF as the inner reader would (UnexpectedEof
+                        // via read_exact upstack) — return Ok with 0 filled so the
+                        // record reader sees EOF.
+                        return Poll::Ready(Ok(()));
+                    }
+                    this.header.push(byte[0]);
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Inside a DATA payload: copy up to min(buf capacity, remaining).
+        let want = std::cmp::min(buf.remaining() as u64, this.remaining);
+        if want == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        // Limit the inner read to `want` so we never read past this frame's payload,
+        // following tokio's `io::Take` pattern to propagate the fill to `buf`.
+        let mut limited = buf.take(want as usize);
+        match Pin::new(&mut this.inner).poll_read(cx, &mut limited) {
+            Poll::Ready(Ok(())) => {
+                let n = limited.filled().len();
+                // SAFETY: the inner reader initialized and filled `n` bytes in
+                // `limited`, which aliases `buf`'s spare capacity (tokio Take pattern).
+                unsafe {
+                    buf.assume_init(n);
+                }
+                buf.advance(n);
+                this.remaining -= n as u64;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// QUIC-stream record-reader leg that de-frames HTTP/3 DATA frames before the
+/// TLS-record split. A NEWTYPE over `TcpLegReader<H3DataFrameReader<..>>`: it
+/// keeps the exact `BufferedTlsRecordReader` record semantics but the underlying
+/// byte source is an [`H3DataFrameReader`] over the bidi `quinn::RecvStream`, and
+/// it OVERRIDES [`LegReader::is_clean_close`] for QUIC (RESET = truncation).
+pub(crate) struct H3DataFrameLegReader(TcpLegReader<H3DataFrameReader<quinn::RecvStream>>);
+
+impl H3DataFrameLegReader {
+    /// Wrap a relay-bidi `quinn::RecvStream` in a DATA-frame de-framer + buffered
+    /// record reader.
+    pub(crate) fn buffered(reader: quinn::RecvStream) -> Self {
+        Self(TcpLegReader::buffered(H3DataFrameReader::new(reader)))
+    }
+}
+
+impl LegReader for H3DataFrameLegReader {
     async fn read_record_into(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         self.0.read_record_into(buf).await
     }
@@ -135,8 +274,10 @@ impl LegReader for QuicStreamLegReader {
         self.0.try_read_record_into(buf).await
     }
 
-    /// A QUIC clean finish surfaces as `UnexpectedEof`; `ConnectionReset`
-    /// (`RESET_STREAM`) is a truncated relay and is therefore NOT a clean close.
+    /// QUIC clean-close override: a clean finish is `UnexpectedEof`;
+    /// `ConnectionReset` (`RESET_STREAM`) is a truncated relay and is NOT a clean
+    /// close. The de-framer propagates the inner error kind, so this classification
+    /// is unchanged by the DATA framing.
     fn is_clean_close(&self, err: &io::Error) -> bool {
         matches!(
             err.kind(),
@@ -145,36 +286,24 @@ impl LegReader for QuicStreamLegReader {
     }
 }
 
-/// Test-only counter of record bytes written through [`QuicStreamLegWriter`].
-/// Lets the relay e2e tests prove application data actually traversed the QUIC
-/// stream (rather than silently falling back to TCP). Not compiled in release.
-#[cfg(test)]
-pub(crate) static QUIC_LEG_BYTES_WRITTEN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// QUIC-stream record-writer leg that frames each record batch as one HTTP/3 DATA
+/// frame: it prepends a `DATA` frame header to every `write_records` batch (RFC
+/// 9114 §7.2.1) before writing to the reliable bidi `quinn::SendStream`.
+/// `shutdown` finishes the stream (no trailing frame).
+pub(crate) struct H3DataFrameLegWriter(pub quinn::SendStream);
 
-/// QUIC-stream record-writer leg: writes sealed record bytes straight to a
-/// reliable bidi `quinn::SendStream`. A thin 1:1 wrapper mirroring
-/// [`TcpLegWriter`]: `quinn::SendStream` implements `tokio::io::AsyncWrite`, so
-/// `AsyncWriteExt::write_all`/`shutdown` already yield `io::Result` (the
-/// `AsyncWrite` impl converts quinn's `WriteError` to `io::Error` internally),
-/// and `shutdown` issues the stream's QUIC finish via `poll_shutdown`.
-pub(crate) struct QuicStreamLegWriter(pub quinn::SendStream);
-
-impl LegWriter for QuicStreamLegWriter {
+impl LegWriter for H3DataFrameLegWriter {
     async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
-        // `quinn::SendStream` has an inherent `write_all(&mut self, &[u8]) ->
-        // Result<(), quinn::WriteError>` that shadows `AsyncWriteExt::write_all`,
-        // so call the trait method explicitly to get the `io::Result` (the
-        // `AsyncWrite` impl converts `WriteError` -> `io::Error` internally),
-        // mirroring `TcpLegWriter` exactly.
-        AsyncWriteExt::write_all(&mut self.0, bytes).await?;
+        // Wrap this batch in a single DATA frame: varint(0x00) varint(len) bytes.
+        let framed = crate::fingerprint::http3::encode_frame(FRAME_TYPE_DATA, bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        AsyncWriteExt::write_all(&mut self.0, &framed).await?;
         #[cfg(test)]
         QUIC_LEG_BYTES_WRITTEN.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
-        // `poll_shutdown` issues the QUIC stream finish.
         AsyncWriteExt::shutdown(&mut self.0).await
     }
 }
@@ -204,14 +333,14 @@ mod tests {
         DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD)
     }
 
-    /// Proves the QUIC reliable bidi stream is a drop-in record carrier for the
+    /// Proves the H3 DATA-frame relay leg is a drop-in record carrier for the
     /// Leg seam: real sealed `DataRecordCodec` records round-trip byte-exact
-    /// through `QuicStreamLegWriter` -> `QuicStreamLegReader`, and the mux
-    /// batch-drain contract (`try_read_record_into`) holds over a
+    /// through `H3DataFrameLegWriter` -> `H3DataFrameLegReader`, and the mux
+    /// batch-drain contract (`try_read_record_into`) holds over a DATA-framed
     /// `quinn::RecvStream` — it yields complete records in order when buffered
     /// and `None` (not a partial/garbage record) when nothing is yet available.
     #[tokio::test]
-    async fn quic_stream_leg_round_trips_sealed_records_and_batch_drains() {
+    async fn h3_leg_round_trips_sealed_records_and_batch_drains() {
         let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
 
         // The reader signals the opener once it has fully drained the stream, so
@@ -224,13 +353,14 @@ mod tests {
         // the opener writes, so open + first write + accept must run together.
         let opener = tokio::spawn(async move {
             let (send, _recv) = client_conn.open_bi().await.expect("open_bi");
-            let mut writer = QuicStreamLegWriter(send);
+            let mut writer = H3DataFrameLegWriter(send);
 
             let mut seal = data_codec();
             let mut rng = StdRng::seed_from_u64(0x5EA1);
 
             // Phase 1: several multi-KB records, sealed and concatenated, then
-            // written in one call (mirrors how the mux flushes a batch).
+            // written in one call (mirrors how the mux flushes a batch -> one DATA
+            // frame holding multiple records).
             let payloads_phase1: Vec<Vec<u8>> = vec![
                 vec![0xA1_u8; 1500],
                 vec![0xB2_u8; 4096],
@@ -272,7 +402,7 @@ mod tests {
         let (server_send, server_recv) = server_conn.accept_bi().await.expect("accept_bi");
         // Keep the acceptor's send half alive for the stream's lifetime.
         let _server_send = server_send;
-        let mut reader = QuicStreamLegReader::buffered(server_recv);
+        let mut reader = H3DataFrameLegReader::buffered(server_recv);
         let mut open = data_codec();
         let mut buf = Vec::new();
 
@@ -295,7 +425,7 @@ mod tests {
         // not a partial/garbage record.
         assert!(
             reader.try_read_record_into(&mut buf).await.is_none(),
-            "try_read_record_into over a quinn RecvStream must return None when no record is ready",
+            "try_read_record_into over a DATA-framed RecvStream must return None when no record is ready",
         );
 
         // Wait for the phase-2 burst to arrive, then opportunistically drain it
@@ -351,70 +481,130 @@ mod tests {
         assert_eq!(writer_phase2, phase2_expected);
     }
 
-    /// M-9/M-10: a QUIC `RESET_STREAM` (which quinn surfaces as
-    /// `io::ErrorKind::ConnectionReset`) is a mid-transfer TRUNCATION and MUST
-    /// surface as an error that `LegReader::is_clean_close` rejects — never be
-    /// swallowed as a clean EOF. The TCP leg keeps its conventional
-    /// RST-as-clean-half-close behavior (probe-resistance), proving the override
-    /// is QUIC-scoped; a clean QUIC finish (`UnexpectedEof`) stays clean too.
+    /// H3 DATA-frame relay leg: real sealed `DataRecordCodec` records must
+    /// round-trip BYTE-EXACT through `H3DataFrameLegWriter` -> `H3DataFrameLegReader`
+    /// when each writer batch is wrapped in its own DATA frame. Exercises the
+    /// record/frame misalignment the design requires the de-framer to absorb:
+    /// several records concatenated into ONE DATA frame, and records split across
+    /// SEPARATE DATA frames, all recovered in order.
     #[tokio::test]
-    async fn quic_leg_reset_stream_is_truncation_not_clean_close() {
+    async fn h3_data_frame_leg_round_trips_records_across_frame_boundaries() {
         let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Gate the reset on the reader having consumed the one good record, so the
-        // record is delivered before the abort (deterministic, no data race).
-        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
         let opener = tokio::spawn(async move {
             let (send, _recv) = client_conn.open_bi().await.expect("open_bi");
-            let mut writer = QuicStreamLegWriter(send);
+            let mut writer = H3DataFrameLegWriter(send);
+            let mut seal = data_codec();
+            let mut rng = StdRng::seed_from_u64(0xD474);
+
+            let payloads: Vec<Vec<u8>> = vec![
+                vec![0xA1; 1500],
+                vec![0xB2; 4096],
+                b"short-control-frame".to_vec(),
+                vec![0xC3; 9000],
+                b"tail".to_vec(),
+            ];
+
+            // Batch 1: three records concatenated into ONE DATA frame.
+            let mut batch = Vec::new();
+            for p in &payloads[..3] {
+                batch.extend_from_slice(&seal.seal(p, &mut rng).unwrap());
+            }
+            writer.write_records(&batch).await.unwrap();
+
+            // Batch 2 + 3: one record each, in their own DATA frames.
+            for p in &payloads[3..] {
+                let one = seal.seal(p, &mut rng).unwrap();
+                writer.write_records(&one).await.unwrap();
+            }
+            writer.shutdown().await.unwrap();
+            let _ = done_rx.await;
+            payloads
+        });
+
+        let (server_send, server_recv) = server_conn.accept_bi().await.expect("accept_bi");
+        let _server_send = server_send;
+        let mut reader = H3DataFrameLegReader::buffered(server_recv);
+        let mut open = data_codec();
+        let mut buf = Vec::new();
+
+        let expected: Vec<Vec<u8>> = vec![
+            vec![0xA1; 1500],
+            vec![0xB2; 4096],
+            b"short-control-frame".to_vec(),
+            vec![0xC3; 9000],
+            b"tail".to_vec(),
+        ];
+        for want in &expected {
+            reader.read_record_into(&mut buf).await.unwrap();
+            assert_eq!(&open.open(&buf).unwrap(), want, "record must round-trip");
+        }
+        // After all records, the clean stream finish must surface as UnexpectedEof
+        // (a clean close), NOT a partial record.
+        let err = reader
+            .read_record_into(&mut buf)
+            .await
+            .expect_err("clean finish surfaces as an error, not a record");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(reader.is_clean_close(&err));
+
+        let _ = done_tx.send(());
+        let payloads = opener.await.expect("opener task");
+        assert_eq!(payloads, expected);
+    }
+
+    /// A `RESET_STREAM` mid-transfer must surface through the DATA-frame de-framer
+    /// as `ConnectionReset` (a truncation), and `H3DataFrameLegReader::is_clean_close`
+    /// must reject it — the DATA framing does not mask the truncation semantics.
+    #[tokio::test]
+    async fn h3_data_frame_leg_reset_is_truncation_not_clean_close() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let opener = tokio::spawn(async move {
+            let (send, _recv) = client_conn.open_bi().await.expect("open_bi");
+            let mut writer = H3DataFrameLegWriter(send);
             let mut seal = data_codec();
             let mut rng = StdRng::seed_from_u64(0x4E5E7);
             let good = seal.seal(b"first-and-only-record", &mut rng).unwrap();
             writer.write_records(&good).await.unwrap();
             let _ = proceed_rx.await;
-            // Abort mid-transfer with RESET_STREAM instead of a clean finish.
             writer
                 .0
                 .reset(quinn::VarInt::from_u32(0))
                 .expect("reset stream");
-            // Keep the connection (not just the stream) alive so the reader
-            // observes a stream RESET, not a connection close.
             tokio::time::sleep(Duration::from_millis(200)).await;
             client_conn
         });
 
         let (server_send, server_recv) = server_conn.accept_bi().await.expect("accept_bi");
         let _server_send = server_send;
-        let mut reader = QuicStreamLegReader::buffered(server_recv);
+        let mut reader = H3DataFrameLegReader::buffered(server_recv);
         let mut open = data_codec();
         let mut buf = Vec::new();
 
-        // The one good record arrives intact.
         reader
             .read_record_into(&mut buf)
             .await
             .expect("first record");
         assert_eq!(open.open(&buf).unwrap(), b"first-and-only-record");
 
-        // Now let the opener RESET_STREAM, and observe the truncation.
         let _ = proceed_tx.send(());
         let err = reader
             .read_record_into(&mut buf)
             .await
-            .expect_err("RESET_STREAM must surface as an error, not a clean EOF");
-        assert_eq!(
-            err.kind(),
-            io::ErrorKind::ConnectionReset,
-            "quinn maps RESET_STREAM to ConnectionReset",
-        );
+            .expect_err("RESET_STREAM must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
         assert!(
             !reader.is_clean_close(&err),
-            "the QUIC leg must NOT treat a RESET_STREAM as a clean close (would silently truncate)",
+            "the H3 DATA-frame leg must NOT treat a RESET_STREAM as a clean close",
         );
-        // No over-correction: a genuine clean finish stays clean on the QUIC leg.
+        // No over-correction: a genuine clean finish stays clean on the H3 leg.
         assert!(reader.is_clean_close(&io::Error::from(io::ErrorKind::UnexpectedEof)));
 
-        // The TCP leg is unchanged: a RST is still a conventional clean half-close.
+        // The TCP leg is unchanged: a RST is still a conventional clean half-close,
+        // proving the QUIC truncation override is transport-scoped (probe-resistance).
         let tcp = TcpLegReader::buffered(tokio::io::duplex(64).0);
         assert!(
             tcp.is_clean_close(&io::Error::from(io::ErrorKind::ConnectionReset)),

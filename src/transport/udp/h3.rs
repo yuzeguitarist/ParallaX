@@ -31,7 +31,7 @@ use std::io;
 
 use crate::fingerprint::http3::{
     self, parse_settings_payload, safari26_settings_frame, Http3Setting, FRAME_TYPE_SETTINGS,
-    STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_ENCODER,
+    STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER, STREAM_TYPE_QPACK_ENCODER,
 };
 
 /// Defensive cap on the SETTINGS frame this façade will read off the peer's
@@ -52,17 +52,25 @@ pub(crate) struct H3ControlStreams {
     _encoder_send: quinn::SendStream,
 }
 
-/// Open this endpoint's HTTP/3 control-stream set and send the Safari-26 SETTINGS.
-///
-/// Opens the control uni stream (writes `stream_type(0x00) ++ SETTINGS`) and the
-/// QPACK encoder uni stream (writes `stream_type(0x02)`; static-only, so nothing
-/// more). Symmetric on client and server — both peers open their own control set
-/// and emit their own SETTINGS, exactly as RFC 9114 requires of each H3 endpoint.
-/// Returns the held send handles so the caller keeps the streams open for the
-/// connection's life.
-pub(crate) async fn open_h3_control(
+impl H3ControlStreams {
+    /// Assemble the held control-stream set from its individually-opened halves.
+    /// Used by callers that interleave the request bidi between the control and
+    /// encoder opens to match Safari's control -> request -> encoder ordering.
+    pub(crate) fn new(control_send: quinn::SendStream, encoder_send: quinn::SendStream) -> Self {
+        Self {
+            _control_send: control_send,
+            _encoder_send: encoder_send,
+        }
+    }
+}
+
+/// Open this endpoint's HTTP/3 **control** uni stream and send the Safari-26
+/// SETTINGS (writes `stream_type(0x00) ++ SETTINGS`). Returned send handle MUST
+/// be held for the connection's life (RFC 9114 §6.2.1). Opened FIRST in the
+/// Safari control -> request -> encoder stream order.
+pub(crate) async fn open_h3_control_stream(
     conn: &quinn::Connection,
-) -> Result<H3ControlStreams, io::Error> {
+) -> Result<quinn::SendStream, io::Error> {
     let mut control_send = conn
         .open_uni()
         .await
@@ -75,51 +83,73 @@ pub(crate) async fn open_h3_control(
         .write_all(&control_bytes)
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+    Ok(control_send)
+}
 
+/// Open this endpoint's HTTP/3 **QPACK encoder** uni stream (writes
+/// `stream_type(0x02)`; static-only, so nothing more). Opened LAST in the Safari
+/// control -> request -> encoder stream order. The returned send handle is held
+/// for the connection's life.
+pub(crate) async fn open_h3_encoder_stream(
+    conn: &quinn::Connection,
+) -> Result<quinn::SendStream, io::Error> {
     let mut encoder_send = conn
         .open_uni()
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string()))?;
-    // Static-only QPACK encoder stream: just the type prefix, then idle.
     let encoder_bytes = http3::encode_stream_type(STREAM_TYPE_QPACK_ENCODER);
     encoder_send
         .write_all(&encoder_bytes)
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+    Ok(encoder_send)
+}
 
-    Ok(H3ControlStreams {
-        _control_send: control_send,
-        _encoder_send: encoder_send,
-    })
+/// Open this endpoint's full HTTP/3 control-stream set (control + SETTINGS, then
+/// QPACK encoder) back to back. Used where there is no request bidi to interleave
+/// (the loopback tests); production interleaves the request bidi between the two
+/// opens to match Safari's control -> request -> encoder ordering.
+#[cfg(test)]
+pub(crate) async fn open_h3_control(
+    conn: &quinn::Connection,
+) -> Result<H3ControlStreams, io::Error> {
+    let control_send = open_h3_control_stream(conn).await?;
+    let encoder_send = open_h3_encoder_stream(conn).await?;
+    Ok(H3ControlStreams::new(control_send, encoder_send))
 }
 
 /// Accept the peer's HTTP/3 control stream and read its SETTINGS frame.
 ///
-/// Accepts a single incoming uni stream, verifies its leading stream-type varint
-/// is the control stream (0x00), then reads exactly the first frame and parses it
-/// as SETTINGS. Returns the peer's advertised settings. Fail-closed on a wrong
-/// stream type, a non-SETTINGS first frame, an oversize length, or truncation.
-///
-/// This reads ONLY the control stream's first frame; the stream is left open (the
-/// returned `RecvStream` is dropped, which on a receive stream just stops reading
-/// — it does not reset the peer's send side). The QPACK encoder/decoder streams
-/// the peer may also open are not awaited here: ParallaX is static-only, so it
-/// never needs to consume encoder-stream inserts.
+/// Accepts incoming uni streams until it finds the control stream (type 0x00) —
+/// the peer also opens a QPACK encoder stream (type 0x02), which may arrive first
+/// and is skipped here (ParallaX is static-only, so it never needs encoder-stream
+/// inserts). On the control stream it reads exactly the first frame and parses it
+/// as SETTINGS, returning the peer's advertised settings. Fail-closed on an
+/// unexpected non-control/non-encoder stream type, a non-SETTINGS first frame, an
+/// oversize length, or truncation. Streams are left open (dropping a `RecvStream`
+/// stops reading without resetting the peer's send side).
 pub(crate) async fn read_peer_h3_settings(
     conn: &quinn::Connection,
 ) -> Result<Vec<Http3Setting>, io::Error> {
-    let mut recv = conn
-        .accept_uni()
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string()))?;
-
-    let stream_type = read_varint_from_stream(&mut recv).await?;
-    if stream_type != STREAM_TYPE_CONTROL {
+    let mut recv = loop {
+        let mut recv = conn
+            .accept_uni()
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string()))?;
+        let stream_type = read_varint_from_stream(&mut recv).await?;
+        if stream_type == STREAM_TYPE_CONTROL {
+            break recv;
+        }
+        if stream_type == STREAM_TYPE_QPACK_ENCODER || stream_type == STREAM_TYPE_QPACK_DECODER {
+            // A QPACK encoder/decoder stream the peer opened; ParallaX is
+            // static-only, so skip it and keep looking for the control stream.
+            continue;
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("peer first uni stream is not the H3 control stream (type {stream_type:#x})"),
+            format!("peer uni stream has unexpected H3 stream type {stream_type:#x}"),
         ));
-    }
+    };
 
     let frame_type = read_varint_from_stream(&mut recv).await?;
     if frame_type != FRAME_TYPE_SETTINGS {
@@ -166,6 +196,30 @@ async fn read_varint_from_stream(recv: &mut quinn::RecvStream) -> Result<u64, io
     Ok(value)
 }
 
+/// Read exactly one complete HTTP/3 frame off a quinn `RecvStream`, returning its
+/// `(frame_type, payload)`. The frame's length is read incrementally (type + length
+/// varints, then the payload), so this works on a streaming bidi without
+/// pre-buffering. `max_payload` bounds the payload allocation so a hostile peer
+/// cannot make us buffer an unbounded frame.
+pub(crate) async fn read_one_h3_frame(
+    recv: &mut quinn::RecvStream,
+    max_payload: usize,
+) -> Result<(u64, Vec<u8>), io::Error> {
+    let frame_type = read_varint_from_stream(recv).await?;
+    let len = read_varint_from_stream(recv).await?;
+    if len > max_payload as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("H3 frame payload length {len} exceeds bound {max_payload}"),
+        ));
+    }
+    let mut payload = vec![0u8; len as usize];
+    recv.read_exact(&mut payload)
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::UnexpectedEof, err.to_string()))?;
+    Ok((frame_type, payload))
+}
+
 /// Decode a self-describing H3 frame already fully buffered (used by tests and by
 /// the relay-bidi slice). Thin pass-through to the codec's [`decode_frame`] so
 /// callers in this module need not import the codec directly.
@@ -209,18 +263,18 @@ mod tests {
         assert!(server_conn.close_reason().is_none());
     }
 
-    /// A peer whose first uni stream is NOT the control stream (wrong type prefix)
-    /// must be rejected fail-closed rather than silently parsed.
+    /// A peer whose uni stream has an UNEXPECTED type (not control, encoder, or
+    /// decoder) must be rejected fail-closed. (Encoder/decoder streams are
+    /// legitimately skipped while searching for the control stream.)
     #[tokio::test]
-    async fn read_peer_h3_settings_rejects_wrong_stream_type() {
+    async fn read_peer_h3_settings_rejects_unexpected_stream_type() {
         let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
 
         let bad = async move {
             let mut s = client_conn.open_uni().await.unwrap();
-            // Open a uni stream whose type is the encoder stream (0x02), not control.
-            s.write_all(&http3::encode_stream_type(STREAM_TYPE_QPACK_ENCODER))
-                .await
-                .unwrap();
+            // Open a uni stream with a reserved/unexpected type (0x21), neither the
+            // control (0x00) nor the QPACK encoder/decoder (0x02/0x03) streams.
+            s.write_all(&http3::encode_stream_type(0x21)).await.unwrap();
             s.finish().unwrap();
             // Keep the connection alive until the reader has classified the stream.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -228,7 +282,7 @@ mod tests {
         };
         let reader = async { read_peer_h3_settings(&server_conn).await };
         let (_keepalive, result) = tokio::join!(bad, reader);
-        let err = result.expect_err("a non-control first uni stream must be rejected");
+        let err = result.expect_err("an unexpected-type uni stream must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
