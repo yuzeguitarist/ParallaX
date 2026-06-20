@@ -370,7 +370,16 @@ const SAFARI_TP_VENDOR_GREASE_ID: u64 = 0x17f7586d2cb571;
 /// vendor/GREASE codepoint [`SAFARI_TP_VENDOR_GREASE_ID`] is emitted separately,
 /// last, by the encoder.
 ///
-/// Deliberately OMITS (all confirmed by full disassembly of Safari-26.4):
+/// Deliberately OMITS (all confirmed by measurement of Safari/CFNetwork 2026-06,
+/// macOS 15 / CFNetwork 3860.500.112, and full disassembly of Safari-26.4):
+/// - `max_idle_timeout` (0x01) — Safari does NOT send it (omit ≠ value=0; the wire
+///   simply has no idle-timeout param, so the peer negotiates none). The local
+///   idle-timeout backstop in `udp_transport_config` (`UDP_LOCAL_IDLE_TIMEOUT`) is
+///   independent of this and still reaps black-holed connections.
+/// - `initial_max_streams_bidi` (0x08) — Safari does NOT send it (omit defaults to
+///   0 per RFC 9000, i.e. the client grants the peer no server-initiated bidi
+///   streams). The relay's stream is CLIENT-initiated and governed by the SERVER's
+///   limit, so this is unaffected.
 /// - `max_udp_payload_size` (0x03) — Safari does NOT send it.
 /// - `max_datagram_frame_size` (0x20) — Safari does NOT send it for plain H3
 ///   (non-WebTransport); ParallaX's reachability probe no longer uses RFC-9221
@@ -382,13 +391,11 @@ const SAFARI_TP_VENDOR_GREASE_ID: u64 = 0x17f7586d2cb571;
 /// - the ids quinn would otherwise emit but Safari does not: `grease_quic_bit`
 ///   (0x2ab2), `min_ack_delay` (0xff04de1b), `grease_transport_parameter` (0x1b).
 /// - server-only ids (`stateless_reset_token` 0x02, etc.) a client never sends.
-const SAFARI_TP_IDS: [u64; 9] = [
-    0x01, // max_idle_timeout = 0
+const SAFARI_TP_IDS: [u64; 7] = [
     0x04, // initial_max_data = 16 MiB (runtime)
     0x05, // initial_max_stream_data_bidi_local = 2 MiB
     0x06, // initial_max_stream_data_bidi_remote = 2 MiB
     0x07, // initial_max_stream_data_uni = 2 MiB
-    0x08, // initial_max_streams_bidi = 0
     0x09, // initial_max_streams_uni = 8
     0x0e, // active_connection_id_limit = 64 (SAFARI_TP_ACTIVE_CID_LIMIT; vendored CidQueue::LEN)
     0x0f, // initial_source_connection_id (REAL, server-validated, zero-length)
@@ -399,12 +406,10 @@ const SAFARI_TP_IDS: [u64; 9] = [
 /// param — its value is the SCID pulled from quinn's blob (now zero-length).
 fn safari_tp_value_for_id(id: u64) -> Option<u64> {
     match id {
-        0x01 => Some(0),                          // max_idle_timeout (CFNetwork forces 0)
         0x04 => Some(SAFARI_TP_INITIAL_MAX_DATA), // initial_max_data (runtime)
         0x05 => Some(SAFARI_TP_INITIAL_MAX_STREAM_DATA), // bidi_local
         0x06 => Some(SAFARI_TP_INITIAL_MAX_STREAM_DATA), // bidi_remote
         0x07 => Some(SAFARI_TP_INITIAL_MAX_STREAM_DATA), // uni
-        0x08 => Some(0),                          // initial_max_streams_bidi (CFNetwork)
         0x09 => Some(SAFARI_TP_MAX_STREAMS_UNI),  // initial_max_streams_uni (libquic)
         0x0e => Some(SAFARI_TP_ACTIVE_CID_LIMIT), // active_connection_id_limit
         _ => None,
@@ -561,9 +566,12 @@ mod tests {
     #[test]
     fn safari_tp_id_table_omits_dropped_ids_and_grease_quic_bit() {
         // The confirmed spec drops 0x0a/0x0b/0x0c from the QUIC blob, and (per full
-        // disassembly) also omits 0x03 (max_udp_payload_size) and 0x20
-        // (max_datagram_frame_size, plain H3 sends no datagrams).
-        for dropped in [0x03, 0x0a, 0x0b, 0x0c, 0x20] {
+        // disassembly + CFNetwork measurement 2026-06) also omits 0x01
+        // (max_idle_timeout), 0x08 (initial_max_streams_bidi), 0x03
+        // (max_udp_payload_size) and 0x20 (max_datagram_frame_size, plain H3 sends
+        // no datagrams). Omitting 0x01/0x08 is NOT the same as sending value=0 —
+        // the wire bytes differ, so they must be absent from the id set.
+        for dropped in [0x01, 0x03, 0x08, 0x0a, 0x0b, 0x0c, 0x20] {
             assert!(
                 !SAFARI_TP_IDS.contains(&dropped),
                 "id {dropped:#x} must be omitted per the confirmed spec"
@@ -587,21 +595,23 @@ mod tests {
     #[test]
     fn emitted_ids_are_the_safari_set_plus_vendor_grease_ascending() {
         // 0x0f is read from quinn (zero-length under the zero-length CID generator);
-        // supply it plus the ids Safari omits (0x03 and 0x20 included now) to prove
-        // they are filtered out, and confirm the output ids are SAFARI_TP_IDS
-        // followed by the vendor/GREASE codepoint, ascending.
+        // supply it plus the ids Safari omits (0x01, 0x08, 0x03 and 0x20 included
+        // now) to prove they are filtered out, and confirm the output ids are
+        // SAFARI_TP_IDS followed by the vendor/GREASE codepoint, ascending.
         let quinn_pairs: Vec<(u64, Vec<u8>)> = vec![
             (0x0f, vec![]), // initial_source_connection_id (zero-length)
             // Ids that must never reach the output.
+            (0x01, vec![0x00]), // max_idle_timeout (now dropped; omit ≠ value=0)
             (0x03, vec![0x44, 0xb0]), // max_udp_payload_size (now dropped)
+            (0x08, vec![0x00]), // initial_max_streams_bidi (now dropped; omit ≠ value=0)
             (0x20, vec![0x80, 0x00, 0xff, 0xff]), // max_datagram_frame_size (now dropped)
-            (0x0a, vec![0x03]),       // ack_delay_exponent (dropped)
-            (0x0b, vec![0x19]),       // max_ack_delay (dropped)
-            (0x0c, vec![]),           // disable_active_migration (dropped)
-            (0x2ab2, vec![]),         // grease_quic_bit
+            (0x0a, vec![0x03]), // ack_delay_exponent (dropped)
+            (0x0b, vec![0x19]), // max_ack_delay (dropped)
+            (0x0c, vec![]),     // disable_active_migration (dropped)
+            (0x2ab2, vec![]),   // grease_quic_bit
             (0xff04de1b, vec![0x40, 0xfa]), // min_ack_delay
             (0x1b, vec![0xca, 0xfe]), // grease_transport_parameter
-            (0x02, vec![0u8; 16]),    // stateless_reset_token (server-only)
+            (0x02, vec![0u8; 16]), // stateless_reset_token (server-only)
         ];
 
         let emitted = encode_safari_tp_from_pairs(&quinn_pairs);
@@ -631,7 +641,10 @@ mod tests {
             read_varint(bytes).unwrap().0
         };
 
-        assert_eq!(val(0x01), 0, "max_idle_timeout = 0");
+        assert!(
+            !decoded.iter().any(|(id, _)| *id == 0x01),
+            "max_idle_timeout (0x01) must be ABSENT (Safari omits it; omit ≠ value=0)"
+        );
         assert!(
             !decoded.iter().any(|(id, _)| *id == 0x03),
             "max_udp_payload_size (0x03) must be ABSENT (Safari does not send it)"
@@ -648,7 +661,10 @@ mod tests {
             "stream_data_bidi_remote = 2 MiB"
         );
         assert_eq!(val(0x07), 2 * 1024 * 1024, "stream_data_uni = 2 MiB");
-        assert_eq!(val(0x08), 0, "max_streams_bidi = 0");
+        assert!(
+            !decoded.iter().any(|(id, _)| *id == 0x08),
+            "initial_max_streams_bidi (0x08) must be ABSENT (Safari omits it; omit ≠ value=0)"
+        );
         assert_eq!(val(0x09), 8, "max_streams_uni = 8");
         // active_connection_id_limit is Safari's confirmed 64, now reachable
         // because vendor/quinn-proto raises CidQueue::LEN to 64 (see
