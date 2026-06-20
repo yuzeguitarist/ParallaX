@@ -17,6 +17,14 @@ pub mod endpoint;
 pub(crate) mod envelope;
 pub(crate) mod h3;
 pub mod probe;
+/// Hand-written, quinn-free QUIC transport stack (Phase 2 of de-vendoring).
+///
+/// Built clean-room from RFC 9000/9001/9002 to replace `quinn` + the vendored
+/// `quinn-proto` fork. Lands incrementally: each module is verified by its own
+/// RFC KAT / round-trip tests and is INERT (not yet wired into the live data
+/// path) until the cutover PR repoints the carrier off `quinn`. `#![allow(dead_code)]`
+/// in the module marks that staged, not-yet-referenced status.
+pub(crate) mod quic;
 pub(crate) mod reorder;
 /// Safari-26 H3 QUIC ClientHello carrier (S2). This is now the DEFAULT QUIC
 /// client backend (S6): `client_config` drives the Safari Session so the
