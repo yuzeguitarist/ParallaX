@@ -13,7 +13,7 @@
 //! milestone). Loss recovery / ACK timing (RFC 9002) and the 1-RTT data streams
 //! land in later slices; a lossless loopback completes without them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -139,9 +139,6 @@ const MAX_DATAGRAM: usize = 1252;
 /// is a memory-exhaustion DoS (anyone can mint Initials carrying CRYPTO frames at
 /// ever-rising offsets that never become contiguous).
 const MAX_CRYPTO_REASSEMBLY: usize = 64 * 1024;
-/// Cap on out-of-order STREAM bytes buffered for the relay — the advertised
-/// per-stream receive window (full MAX_STREAM_DATA flow control lands in B2).
-const MAX_STREAM_REASSEMBLY: usize = 2 * 1024 * 1024;
 
 /// RFC 9000 §18.2 default `ack_delay_exponent`. The peer scales its ACK `delay`
 /// field by `2^exponent` microseconds; we decode with the default (neither we nor
@@ -181,8 +178,8 @@ fn space_index(space: PacketSpace) -> usize {
 struct SentContent {
     /// CRYPTO byte ranges `(offset, len)` in this space's outgoing CRYPTO stream.
     crypto: Vec<(u64, u64)>,
-    /// Relay-stream byte ranges `(offset, len, fin)`.
-    stream: Vec<(u64, u64, bool)>,
+    /// Relay-stream byte ranges `(stream_id, offset, len, fin)`.
+    stream: Vec<(u64, u64, u64, bool)>,
     /// This packet carried HANDSHAKE_DONE (RFC 9001 §4.1.2); resend it if lost.
     handshake_done: bool,
 }
@@ -215,24 +212,45 @@ struct Space {
     crypto_pending: Vec<(u64, Vec<u8>)>,
 }
 
-/// The relay's single bidirectional stream (client-initiated, id 0): the outgoing
-/// byte buffer + how much has been packetized, and the in-order reassembled
-/// inbound bytes. Flow control, FIN, and the general N-stream mux land with the
-/// stream API in a later slice; the relay rides exactly this one bidi.
+/// One QUIC stream's send + receive halves (RFC 9000 §2–3). A unidirectional
+/// stream drives only the half its initiator owns; a bidirectional stream uses
+/// both. The relay opens one client bidi (id 0) for data plus a few uni streams
+/// for HTTP/3 control + QPACK. Full flow control lands in a later slice; for now a
+/// fixed per-stream receive window bounds out-of-order buffering.
 #[derive(Default)]
-struct BidiStream {
+struct Stream {
+    // Send half (bytes this endpoint transmits on the stream).
     send: Vec<u8>,
+    /// Next absolute offset to packetize from `send`.
     send_off: u64,
-    /// Stream byte ranges `(offset, len, fin)` to RESEND before any fresh data.
+    /// Lost `(offset, len, fin)` ranges to resend before fresh bytes.
     retransmit: Vec<(u64, u64, bool)>,
+    /// The app has requested FIN after all buffered bytes.
+    fin: bool,
+    /// The FIN bit has been packetized at the final offset.
+    fin_sent: bool,
+    // Receive half (bytes this endpoint receives on the stream).
     recv: Vec<u8>,
     recv_off: u64,
     recv_pending: Vec<(u64, Vec<u8>)>,
+    /// Final size once a FIN has been received (RFC 9000 §4.5).
+    recv_fin: Option<u64>,
+    /// A peer RESET_STREAM error code, if the receive half was reset.
+    recv_reset: Option<u64>,
 }
 
-/// The relay bidi stream id (client-initiated bidirectional stream 0, RFC 9000
-/// §2.1). Both ends read and write it.
+/// The relay's data stream: client-initiated bidirectional stream 0 (RFC 9000
+/// §2.1). The carrier opens it for the HTTP/3 request/response relay.
 const RELAY_STREAM_ID: u64 = 0;
+
+/// Per-stream receive window bounding out-of-order buffering until full
+/// MAX_STREAM_DATA flow control lands (replaces the old single-stream cap).
+const STREAM_RECV_WINDOW: u64 = 2 * 1024 * 1024;
+
+/// Stream-id bit 1 (RFC 9000 §2.1): set for unidirectional streams.
+fn is_uni(id: u64) -> bool {
+    id & 0x2 != 0
+}
 
 /// A hand-rolled QUIC v1 connection (client or server), carried to handshake
 /// completion. Role-generic over a [`TlsSession`].
@@ -272,8 +290,14 @@ pub struct Connection {
     ping_pending: bool,
     /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
     write_level: usize,
-    /// The relay's single bidirectional data stream (1-RTT).
-    stream: BidiStream,
+    /// All open streams, keyed by stream id (RFC 9000 §2.1).
+    streams: BTreeMap<u64, Stream>,
+    /// Next stream id this endpoint will allocate for an outgoing bidi / uni stream.
+    next_bidi: u64,
+    next_uni: u64,
+    /// Peer-initiated streams newly observed, awaiting `accept_bi` / `accept_uni`.
+    accept_bidi: VecDeque<u64>,
+    accept_uni: VecDeque<u64>,
 }
 
 impl Connection {
@@ -313,7 +337,12 @@ impl Connection {
             last_send_time: None,
             ping_pending: false,
             write_level: SPACE_INITIAL,
-            stream: BidiStream::default(),
+            streams: BTreeMap::new(),
+            // Client-initiated stream ids: bidi 0,4,8,…; uni 2,6,10,… (RFC 9000 §2.1).
+            next_bidi: 0,
+            next_uni: 2,
+            accept_bidi: VecDeque::new(),
+            accept_uni: VecDeque::new(),
         };
         conn.pump_write(); // pull the ClientHello into the Initial CRYPTO stream
         Ok(conn)
@@ -353,7 +382,12 @@ impl Connection {
             last_send_time: None,
             ping_pending: false,
             write_level: SPACE_INITIAL,
-            stream: BidiStream::default(),
+            streams: BTreeMap::new(),
+            // Server-initiated stream ids: bidi 1,5,9,…; uni 3,7,11,… (RFC 9000 §2.1).
+            next_bidi: 1,
+            next_uni: 3,
+            accept_bidi: VecDeque::new(),
+            accept_uni: VecDeque::new(),
         })
     }
 
@@ -383,15 +417,77 @@ impl Connection {
         self.tls.next_1rtt_keys()
     }
 
-    /// Queue application bytes for the relay's bidi stream; they are packetized
-    /// into 1-RTT STREAM frames once the handshake installs Data keys.
-    pub fn send_stream(&mut self, data: &[u8]) {
-        self.stream.send.extend_from_slice(data);
+    /// Open a new outgoing bidirectional stream, returning its id (RFC 9000 §2.1).
+    /// The relay's first call returns the data stream ([`RELAY_STREAM_ID`]).
+    pub fn open_bi(&mut self) -> u64 {
+        let id = self.next_bidi;
+        self.next_bidi += 4;
+        self.streams.entry(id).or_default();
+        id
     }
 
-    /// Take the bytes reassembled in order from the peer's STREAM frames.
-    pub fn read_stream(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.stream.recv)
+    /// Open a new outgoing unidirectional stream (HTTP/3 control / QPACK).
+    pub fn open_uni(&mut self) -> u64 {
+        let id = self.next_uni;
+        self.next_uni += 4;
+        self.streams.entry(id).or_default();
+        id
+    }
+
+    /// Take the id of the next peer-initiated bidirectional stream, if any.
+    pub fn accept_bi(&mut self) -> Option<u64> {
+        self.accept_bidi.pop_front()
+    }
+
+    /// Take the id of the next peer-initiated unidirectional stream, if any.
+    pub fn accept_uni(&mut self) -> Option<u64> {
+        self.accept_uni.pop_front()
+    }
+
+    /// Queue application bytes on stream `id`; they are packetized into 1-RTT STREAM
+    /// frames once the handshake installs Data keys. Creates the stream if absent.
+    pub fn send_stream(&mut self, id: u64, data: &[u8]) {
+        self.streams
+            .entry(id)
+            .or_default()
+            .send
+            .extend_from_slice(data);
+    }
+
+    /// Mark stream `id` finished (a FIN is sent after all buffered bytes).
+    pub fn finish_stream(&mut self, id: u64) {
+        if let Some(s) = self.streams.get_mut(&id) {
+            s.fin = true;
+        }
+    }
+
+    /// Take the bytes reassembled in order from stream `id`'s STREAM frames.
+    pub fn read_stream(&mut self, id: u64) -> Vec<u8> {
+        self.streams
+            .get_mut(&id)
+            .map(|s| std::mem::take(&mut s.recv))
+            .unwrap_or_default()
+    }
+
+    /// Whether stream `id`'s receive half has delivered all bytes through a FIN
+    /// (a clean end-of-stream, RFC 9000 §4.5).
+    pub fn stream_recv_finished(&self, id: u64) -> bool {
+        self.streams
+            .get(&id)
+            .is_some_and(|s| s.recv_fin.is_some_and(|fin| s.recv_off >= fin))
+    }
+
+    /// The RESET_STREAM error code if stream `id`'s receive half was reset by the
+    /// peer (a mid-transfer truncation, surfaced to the relay as ConnectionReset).
+    pub fn stream_reset(&self, id: u64) -> Option<u64> {
+        self.streams.get(&id).and_then(|s| s.recv_reset)
+    }
+
+    /// Stream-id bit 0 (RFC 9000 §2.1): a stream is peer-initiated when its
+    /// initiator bit differs from ours (client = 0, server = 1).
+    fn is_peer_initiated(&self, id: u64) -> bool {
+        let our_bit = if self.side == Side::Client { 0 } else { 1 };
+        (id & 0x1) != our_bit
     }
 
     /// Drain the TLS engine's outgoing CRYPTO into the right space and install the
@@ -462,14 +558,14 @@ impl Connection {
                 self.probe_pending = self.probe_pending.saturating_sub(1);
                 return Some(dg);
             }
-            // 1-RTT relay data: once Data keys are installed, resend losses then drain.
-            if self.spaces[SPACE_DATA].keys.is_some()
-                && (!self.stream.retransmit.is_empty()
-                    || (self.stream.send_off as usize) < self.stream.send.len())
-            {
-                let dg = self.build_stream_packet(now);
-                self.probe_pending = self.probe_pending.saturating_sub(1);
-                return Some(dg);
+            // 1-RTT relay data: once Data keys are installed, resend losses then
+            // drain whichever stream has bytes (or a pending FIN) to send.
+            if self.spaces[SPACE_DATA].keys.is_some() {
+                if let Some(id) = self.next_stream_to_send() {
+                    let dg = self.build_stream_packet(id, now);
+                    self.probe_pending = self.probe_pending.saturating_sub(1);
+                    return Some(dg);
+                }
             }
             // A keep-alive or PTO-fallback PING, last so real data goes first.
             if self.spaces[SPACE_DATA].keys.is_some() && self.ping_pending {
@@ -599,8 +695,10 @@ impl Connection {
         for range in content.crypto {
             self.spaces[space].retransmit_crypto.push(range);
         }
-        for range in content.stream {
-            self.stream.retransmit.push(range);
+        for (id, offset, len, fin) in content.stream {
+            if let Some(s) = self.streams.get_mut(&id) {
+                s.retransmit.push((offset, len, fin));
+            }
         }
         if content.handshake_done {
             self.handshake_done_pending = true;
@@ -806,9 +904,23 @@ impl Connection {
         datagram
     }
 
-    /// Build one 1-RTT (short-header) packet carrying a STREAM frame — either a
-    /// resend of a lost range or the next fresh slice of the relay stream.
-    fn build_stream_packet(&mut self, now: Instant) -> Vec<u8> {
+    /// The id of the next stream with something to send (a resend, fresh bytes, or
+    /// a pending FIN), in ascending id order, or `None`.
+    fn next_stream_to_send(&self) -> Option<u64> {
+        self.streams
+            .iter()
+            .find(|(_, s)| {
+                !s.retransmit.is_empty()
+                    || (s.send_off as usize) < s.send.len()
+                    || (s.fin && !s.fin_sent)
+            })
+            .map(|(&id, _)| id)
+    }
+
+    /// Build one 1-RTT (short-header) packet carrying a STREAM frame for stream
+    /// `id` — either a resend of a lost range or the next fresh slice (with the FIN
+    /// bit when the final byte is reached).
+    fn build_stream_packet(&mut self, id: u64, now: Instant) -> Vec<u8> {
         let pn = self.spaces[SPACE_DATA].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let tag_len = self.spaces[SPACE_DATA]
@@ -822,25 +934,28 @@ impl Connection {
         let mut probe = Vec::new();
         let pn_offset = header.encode(&mut probe);
 
-        let (offset, end, fin, is_retransmit) =
-            if let Some(&(off, len, fin)) = self.stream.retransmit.first() {
-                (off, off + len, fin, true)
-            } else {
-                let offset = self.stream.send_off;
-                let frame_hdr =
-                    1 + super::varint::size(RELAY_STREAM_ID) + super::varint::size(offset) + 2;
-                let budget = MAX_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
-                let remaining = self.stream.send.len() - offset as usize;
-                let chunk = remaining.min(budget.max(1));
-                (offset, offset + chunk as u64, false, false)
-            };
+        let s = &self.streams[&id];
+        let (offset, end, fin, is_retransmit) = if let Some(&(off, len, fin)) = s.retransmit.first()
+        {
+            (off, off + len, fin, true)
+        } else {
+            let offset = s.send_off;
+            let frame_hdr = 1 + super::varint::size(id) + super::varint::size(offset) + 2;
+            let budget = MAX_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
+            let remaining = s.send.len() - offset as usize;
+            let chunk = remaining.min(budget.max(1));
+            let end = offset + chunk as u64;
+            // Carry the FIN only once the final buffered byte is in this frame.
+            let fin = s.fin && !s.fin_sent && end as usize == s.send.len();
+            (offset, end, fin, false)
+        };
 
         let datagram = {
             let frame = Frame::Stream {
-                id: RELAY_STREAM_ID,
+                id,
                 offset,
                 fin,
-                data: &self.stream.send[offset as usize..end as usize],
+                data: &self.streams[&id].send[offset as usize..end as usize],
             };
             let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
             seal_packet(&keys.local, header, &[frame])
@@ -848,14 +963,18 @@ impl Connection {
 
         let content = SentContent {
             crypto: Vec::new(),
-            stream: vec![(offset, end - offset, fin)],
+            stream: vec![(id, offset, end - offset, fin)],
             handshake_done: false,
         };
         self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
+        let s = self.streams.get_mut(&id).unwrap();
         if is_retransmit {
-            self.stream.retransmit.remove(0);
+            s.retransmit.remove(0);
         } else {
-            self.stream.send_off = end;
+            s.send_off = end;
+            if fin {
+                s.fin_sent = true;
+            }
         }
         datagram
     }
@@ -978,10 +1097,30 @@ impl Connection {
                     self.recv_crypto(space, offset, data)?;
                 }
                 Frame::Stream {
-                    id, offset, data, ..
-                } if id == RELAY_STREAM_ID => {
+                    id,
+                    offset,
+                    fin,
+                    data,
+                } => {
                     ack_eliciting = true;
-                    self.recv_stream(offset, data)?;
+                    self.recv_stream(id, offset, fin, data)?;
+                }
+                Frame::ResetStream {
+                    id,
+                    error_code,
+                    final_size,
+                } => {
+                    ack_eliciting = true;
+                    self.recv_reset_stream(id, error_code, final_size);
+                }
+                Frame::StopSending { id, .. } => {
+                    ack_eliciting = true;
+                    // The peer will not read more of this stream: stop sending it.
+                    // (A full RESET_STREAM emission lands with flow control.)
+                    if let Some(s) = self.streams.get_mut(&id) {
+                        s.send_off = s.send.len() as u64;
+                        s.retransmit.clear();
+                    }
                 }
                 Frame::Ack(ack) => self.recv_ack(space, &ack, now),
                 Frame::HandshakeDone => {
@@ -1123,20 +1262,31 @@ impl Connection {
         Ok(())
     }
 
-    /// Reassemble an incoming STREAM fragment in order into the relay stream's
-    /// receive buffer (out-of-order fragments are buffered until contiguous, up to
-    /// the advertised window — see [`MAX_STREAM_REASSEMBLY`]).
-    fn recv_stream(&mut self, offset: u64, data: &[u8]) -> Result<(), QuicTlsError> {
-        let s = &mut self.stream;
+    /// Reassemble an incoming STREAM fragment for stream `id` in order (out-of-order
+    /// fragments buffered until contiguous, up to the per-stream receive window). A
+    /// previously-unseen peer-initiated stream is created and queued for `accept_*`.
+    /// `fin` records the final size (RFC 9000 §4.5).
+    fn recv_stream(
+        &mut self,
+        id: u64,
+        offset: u64,
+        fin: bool,
+        data: &[u8],
+    ) -> Result<(), QuicTlsError> {
+        self.ensure_stream(id);
+        let s = self.streams.get_mut(&id).expect("just ensured");
+        if fin {
+            s.recv_fin = Some(offset + data.len() as u64);
+        }
         if offset > s.recv_off {
-            // Bound out-of-order STREAM buffering to the advertised window rather
-            // than buffer unboundedly (full MAX_STREAM_DATA flow control is B2).
+            // Bound out-of-order buffering to the receive window (proper
+            // MAX_STREAM_DATA flow control lands in the next slice).
             let buffered: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
-            if offset.saturating_sub(s.recv_off) > MAX_STREAM_REASSEMBLY as u64
-                || buffered + data.len() > MAX_STREAM_REASSEMBLY
+            if offset.saturating_sub(s.recv_off) > STREAM_RECV_WINDOW
+                || buffered + data.len() > STREAM_RECV_WINDOW as usize
             {
                 return Err(QuicTlsError::Crypto(
-                    "STREAM reassembly window exceeded".into(),
+                    "STREAM receive window exceeded".into(),
                 ));
             }
             s.recv_pending.push((offset, data.to_vec()));
@@ -1158,6 +1308,29 @@ impl Connection {
             s.recv_off += (d.len() - sk) as u64;
         }
         Ok(())
+    }
+
+    /// Record a peer RESET_STREAM (RFC 9000 §19.4): the receive half is truncated.
+    /// The relay surfaces this as a ConnectionReset (a mid-transfer truncation),
+    /// distinct from a clean FIN.
+    fn recv_reset_stream(&mut self, id: u64, error_code: u64, _final_size: u64) {
+        self.ensure_stream(id);
+        self.streams.get_mut(&id).expect("just ensured").recv_reset = Some(error_code);
+    }
+
+    /// Create a stream on first sight, queuing a peer-initiated one for `accept_*`.
+    fn ensure_stream(&mut self, id: u64) {
+        if self.streams.contains_key(&id) {
+            return;
+        }
+        self.streams.insert(id, Stream::default());
+        if self.is_peer_initiated(id) {
+            if is_uni(id) {
+                self.accept_uni.push_back(id);
+            } else {
+                self.accept_bidi.push_back(id);
+            }
+        }
     }
 }
 
@@ -1478,9 +1651,9 @@ mod tests {
         assert_eq!(ce, se, "exporter agrees across coalesced delivery");
 
         // And 1-RTT relay data still round-trips through coalesced datagrams.
-        client.send_stream(b"coalesced request");
+        client.send_stream(RELAY_STREAM_ID, b"coalesced request");
         drive_coalesced(&mut client, &mut server);
-        assert_eq!(server.read_stream(), b"coalesced request");
+        assert_eq!(server.read_stream(RELAY_STREAM_ID), b"coalesced request");
     }
 
     #[test]
@@ -1505,19 +1678,74 @@ mod tests {
 
         // Client -> server over the 1-RTT bidi stream.
         let request = b"GET / over the hand-rolled QUIC 1-RTT relay stream";
-        client.send_stream(request);
+        client.send_stream(RELAY_STREAM_ID, request);
         drive(&mut client, &mut server);
-        assert_eq!(server.read_stream(), request, "server received the request");
+        assert_eq!(
+            server.read_stream(RELAY_STREAM_ID),
+            request,
+            "server received the request"
+        );
 
         // Server -> client over the same bidi stream.
         let response = b"200 OK back over the hand-rolled bidi stream";
-        server.send_stream(response);
+        server.send_stream(RELAY_STREAM_ID, response);
         drive(&mut client, &mut server);
         assert_eq!(
-            client.read_stream(),
+            client.read_stream(RELAY_STREAM_ID),
             response,
             "client received the response"
         );
+    }
+
+    #[test]
+    fn uni_and_bidi_streams_multiplex_with_fin() {
+        let dcid = ConnectionId::new(&[0x70; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0x07, 0x07, 0x07, 0x07]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // Client opens a uni stream (HTTP/3 control-style) with a FIN, plus the
+        // bidi relay stream — exactly the shape the H3 layer drives.
+        let ctrl = client.open_uni();
+        assert_eq!(ctrl, 2, "first client uni stream id is 2");
+        client.send_stream(ctrl, b"H3-SETTINGS");
+        client.finish_stream(ctrl);
+        let bidi = client.open_bi();
+        assert_eq!(bidi, RELAY_STREAM_ID, "first client bidi stream id is 0");
+        client.send_stream(bidi, b"request");
+        drive(&mut client, &mut server);
+
+        // The server surfaces both peer-initiated streams via accept_*.
+        assert_eq!(server.accept_uni(), Some(ctrl), "uni stream accepted");
+        assert_eq!(server.accept_bi(), Some(bidi), "bidi stream accepted");
+        assert_eq!(server.read_stream(ctrl), b"H3-SETTINGS");
+        assert!(
+            server.stream_recv_finished(ctrl),
+            "the uni stream's FIN was delivered"
+        );
+        assert_eq!(server.read_stream(bidi), b"request");
+        assert!(
+            !server.stream_recv_finished(bidi),
+            "the bidi stream has no FIN yet"
+        );
+
+        // The server replies on the reverse direction of the bidi stream.
+        server.send_stream(bidi, b"response");
+        drive(&mut client, &mut server);
+        assert_eq!(client.read_stream(bidi), b"response");
+        // No spurious extra accepts.
+        assert_eq!(server.accept_uni(), None);
+        assert_eq!(client.accept_bi(), None);
     }
 
     #[test]
@@ -1540,7 +1768,7 @@ mod tests {
 
         // A payload spanning several 1-RTT packets.
         let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
-        client.send_stream(&payload);
+        client.send_stream(RELAY_STREAM_ID, &payload);
 
         // Collect the client's data packets, then deliver all but the SECOND —
         // simulating one mid-stream packet lost on the wire.
@@ -1579,7 +1807,7 @@ mod tests {
         }
 
         assert_eq!(
-            server.read_stream(),
+            server.read_stream(RELAY_STREAM_ID),
             payload,
             "the dropped packet was retransmitted and the stream reassembled in order"
         );
@@ -1604,7 +1832,7 @@ mod tests {
         assert!(!client.is_handshaking() && !server.is_handshaking());
 
         let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-        client.send_stream(&payload);
+        client.send_stream(RELAY_STREAM_ID, &payload);
 
         // Deliver every data packet EXCEPT the last — a tail loss, which has no
         // higher-numbered packet to trigger packet-threshold detection.
@@ -1645,7 +1873,7 @@ mod tests {
         }
 
         assert_eq!(
-            server.read_stream(),
+            server.read_stream(RELAY_STREAM_ID),
             payload,
             "the tail packet was recovered by a PTO probe and the stream reassembled"
         );
@@ -1671,7 +1899,7 @@ mod tests {
 
         // Offer far more than one initial congestion window (12000 bytes) of data
         // without delivering any ACK: the client must stop sending at ~the window.
-        client.send_stream(&vec![0x5a; 256 * 1024]);
+        client.send_stream(RELAY_STREAM_ID, &vec![0x5a; 256 * 1024]);
         let mut burst = 0usize;
         while let Some(dg) = client.poll_transmit(now) {
             burst += dg.len();
