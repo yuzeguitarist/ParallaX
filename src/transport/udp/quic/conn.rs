@@ -161,6 +161,23 @@ struct Space {
     crypto_pending: Vec<(u64, Vec<u8>)>,
 }
 
+/// The relay's single bidirectional stream (client-initiated, id 0): the outgoing
+/// byte buffer + how much has been packetized, and the in-order reassembled
+/// inbound bytes. Flow control, FIN, and the general N-stream mux land with the
+/// stream API in a later slice; the relay rides exactly this one bidi.
+#[derive(Default)]
+struct BidiStream {
+    send: Vec<u8>,
+    send_off: u64,
+    recv: Vec<u8>,
+    recv_off: u64,
+    recv_pending: Vec<(u64, Vec<u8>)>,
+}
+
+/// The relay bidi stream id (client-initiated bidirectional stream 0, RFC 9000
+/// §2.1). Both ends read and write it.
+const RELAY_STREAM_ID: u64 = 0;
+
 /// A hand-rolled QUIC v1 connection (client or server), carried to handshake
 /// completion. Role-generic over a [`TlsSession`].
 pub struct Connection {
@@ -179,6 +196,8 @@ pub struct Connection {
     spaces: [Space; 3],
     /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
     write_level: usize,
+    /// The relay's single bidirectional data stream (1-RTT).
+    stream: BidiStream,
 }
 
 impl Connection {
@@ -209,6 +228,7 @@ impl Connection {
             tls: Box::new(tls),
             spaces,
             write_level: SPACE_INITIAL,
+            stream: BidiStream::default(),
         };
         conn.pump_write(); // pull the ClientHello into the Initial CRYPTO stream
         Ok(conn)
@@ -233,6 +253,7 @@ impl Connection {
             tls: Box::new(tls),
             spaces: [Space::default(), Space::default(), Space::default()],
             write_level: SPACE_INITIAL,
+            stream: BidiStream::default(),
         }
     }
 
@@ -260,6 +281,17 @@ impl Connection {
     /// be `Some` once the connection has 1-RTT keys (the Data-space-entry contract).
     pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
         self.tls.next_1rtt_keys()
+    }
+
+    /// Queue application bytes for the relay's bidi stream; they are packetized
+    /// into 1-RTT STREAM frames once the handshake installs Data keys.
+    pub fn send_stream(&mut self, data: &[u8]) {
+        self.stream.send.extend_from_slice(data);
+    }
+
+    /// Take the bytes reassembled in order from the peer's STREAM frames.
+    pub fn read_stream(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.stream.recv)
     }
 
     /// Drain the TLS engine's outgoing CRYPTO into the right space and install the
@@ -299,6 +331,12 @@ impl Connection {
             if sp.keys.is_some() && sp.crypto_send_off < sp.crypto_send.len() {
                 return Some(self.build_crypto_packet(space));
             }
+        }
+        // 1-RTT relay data: once Data keys are installed, drain the bidi stream.
+        if self.spaces[SPACE_DATA].keys.is_some()
+            && (self.stream.send_off as usize) < self.stream.send.len()
+        {
+            return Some(self.build_stream_packet());
         }
         None
     }
@@ -380,6 +418,50 @@ impl Connection {
         datagram
     }
 
+    /// Build one 1-RTT (short-header) packet carrying a STREAM frame with the next
+    /// slice of the relay stream's outgoing bytes.
+    fn build_stream_packet(&mut self) -> Vec<u8> {
+        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let offset = self.stream.send_off;
+        let tag_len = self.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .unwrap()
+            .local
+            .packet
+            .tag_len();
+
+        let header = Header::Short {
+            spin: false,
+            key_phase: false,
+            dcid: self.dcid,
+            packet_number: pn,
+            pn_len,
+        };
+        let mut probe = Vec::new();
+        let pn_offset = header.encode(&mut probe);
+
+        let frame_hdr = 1 + super::varint::size(RELAY_STREAM_ID) + super::varint::size(offset) + 2;
+        let budget = MAX_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
+        let remaining = self.stream.send.len() - self.stream.send_off as usize;
+        let chunk_len = remaining.min(budget.max(1));
+        let end = self.stream.send_off as usize + chunk_len;
+
+        let datagram = {
+            let frame = Frame::Stream {
+                id: RELAY_STREAM_ID,
+                offset,
+                fin: false,
+                data: &self.stream.send[self.stream.send_off as usize..end],
+            };
+            let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
+            seal_packet(&keys.local, header, &[frame])
+        };
+        self.stream.send_off = end as u64;
+        datagram
+    }
+
     /// Process one received datagram: identify the space, (for the server's first
     /// Initial) derive Initial keys + learn CIDs, AEAD-open, dispatch the frames,
     /// then pump the TLS engine for the response and key transitions.
@@ -426,10 +508,14 @@ impl Connection {
         for frame in Iter::new(&payload) {
             let frame =
                 frame.map_err(|e| QuicTlsError::Crypto(format!("frame decode failed: {e:?}")))?;
-            // Only CRYPTO advances the handshake here; ACK timing / loss recovery
-            // and the data-stream frames land in later (B2 / B4) slices.
-            if let Frame::Crypto { offset, data } = frame {
-                self.recv_crypto(space, offset, data)?;
+            // CRYPTO advances the handshake; STREAM carries 1-RTT relay data. ACK
+            // timing / loss recovery land in B2; other frames are ignored here.
+            match frame {
+                Frame::Crypto { offset, data } => self.recv_crypto(space, offset, data)?,
+                Frame::Stream {
+                    id, offset, data, ..
+                } if id == RELAY_STREAM_ID => self.recv_stream(offset, data),
+                _ => {}
             }
         }
         self.pump_write();
@@ -465,6 +551,31 @@ impl Connection {
             self.tls.read_handshake(&to_feed)?;
         }
         Ok(())
+    }
+
+    /// Reassemble an incoming STREAM fragment in order into the relay stream's
+    /// receive buffer (out-of-order fragments are buffered until contiguous).
+    fn recv_stream(&mut self, offset: u64, data: &[u8]) {
+        let s = &mut self.stream;
+        if offset > s.recv_off {
+            s.recv_pending.push((offset, data.to_vec()));
+            return;
+        }
+        let skip = (s.recv_off - offset) as usize;
+        if skip < data.len() {
+            s.recv.extend_from_slice(&data[skip..]);
+            s.recv_off += (data.len() - skip) as u64;
+        }
+        while let Some(i) = s
+            .recv_pending
+            .iter()
+            .position(|(o, d)| *o <= s.recv_off && *o + d.len() as u64 > s.recv_off)
+        {
+            let (o, d) = s.recv_pending.remove(i);
+            let sk = (s.recv_off - o) as usize;
+            s.recv.extend_from_slice(&d[sk..]);
+            s.recv_off += (d.len() - sk) as u64;
+        }
     }
 }
 
@@ -617,18 +728,8 @@ mod tests {
             ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
         );
 
-        // Ping-pong real QUIC datagrams until both complete (lossless: no ACKs).
-        for _ in 0..8 {
-            while let Some(dg) = client.poll_transmit() {
-                server.handle_datagram(&dg).unwrap();
-            }
-            while let Some(dg) = server.poll_transmit() {
-                client.handle_datagram(&dg).unwrap();
-            }
-            if !client.is_handshaking() && !server.is_handshaking() {
-                break;
-            }
-        }
+        // Ping-pong real QUIC datagrams until both sides go idle (lossless: no ACKs).
+        drive(&mut client, &mut server);
 
         assert!(!client.is_handshaking(), "client handshake completed");
         assert!(!server.is_handshaking(), "server handshake completed");
@@ -665,6 +766,60 @@ mod tests {
         assert!(
             server.next_1rtt_keys().is_some(),
             "server 1-RTT key update ready"
+        );
+    }
+
+    /// Ping-pong datagrams between two connections until neither has anything more
+    /// to send (handshake CRYPTO, then 1-RTT data).
+    fn drive(a: &mut Connection, b: &mut Connection) {
+        for _ in 0..16 {
+            let mut moved = false;
+            while let Some(dg) = a.poll_transmit() {
+                b.handle_datagram(&dg).unwrap();
+                moved = true;
+            }
+            while let Some(dg) = b.poll_transmit() {
+                a.handle_datagram(&dg).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn relay_data_round_trips_over_one_rtt() {
+        let dcid = ConnectionId::new(&[0x0a; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0x55, 0x66, 0x77, 0x88]),
+        );
+        drive(&mut client, &mut server);
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "handshake done"
+        );
+
+        // Client -> server over the 1-RTT bidi stream.
+        let request = b"GET / over the hand-rolled QUIC 1-RTT relay stream";
+        client.send_stream(request);
+        drive(&mut client, &mut server);
+        assert_eq!(server.read_stream(), request, "server received the request");
+
+        // Server -> client over the same bidi stream.
+        let response = b"200 OK back over the hand-rolled bidi stream";
+        server.send_stream(response);
+        drive(&mut client, &mut server);
+        assert_eq!(
+            client.read_stream(),
+            response,
+            "client received the response"
         );
     }
 }
