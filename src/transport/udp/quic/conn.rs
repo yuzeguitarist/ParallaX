@@ -1867,6 +1867,21 @@ impl Connection {
         self.ensure_stream(id)?;
         let end = offset + data.len() as u64;
         let s = self.streams.get_mut(&id).expect("just ensured");
+        // FINAL_SIZE validation (RFC 9000 §4.5): once a final size is known it is
+        // immutable, no data may arrive beyond it, and a FIN must not retroactively
+        // place the final size below data already received.
+        if let Some(final_size) = s.recv_fin {
+            if end > final_size || (fin && end != final_size) {
+                return Err(QuicTlsError::Protocol(
+                    "STREAM frame violates the stream's final size".into(),
+                ));
+            }
+        }
+        if fin && end < s.recv_high {
+            return Err(QuicTlsError::Protocol(
+                "FIN final size below data already received".into(),
+            ));
+        }
         if end > s.recv_max {
             return Err(QuicTlsError::Crypto(
                 "peer exceeded the stream receive window".into(),
@@ -1928,10 +1943,38 @@ impl Connection {
         &mut self,
         id: u64,
         error_code: u64,
-        _final_size: u64,
+        final_size: u64,
     ) -> Result<(), QuicTlsError> {
         self.ensure_stream(id)?;
-        self.streams.get_mut(&id).expect("just ensured").recv_reset = Some(error_code);
+        let s = self.streams.get_mut(&id).expect("just ensured");
+        // RFC 9000 §4.5: the reset's final size must agree with any known final
+        // size and must not be below data already received; the bytes up to it count
+        // toward connection-level flow control (they are considered delivered).
+        if s.recv_fin.is_some_and(|known| known != final_size) {
+            return Err(QuicTlsError::Protocol(
+                "RESET_STREAM final size conflicts with a known final size".into(),
+            ));
+        }
+        if final_size < s.recv_high {
+            return Err(QuicTlsError::Protocol(
+                "RESET_STREAM final size below data already received".into(),
+            ));
+        }
+        if final_size > s.recv_max {
+            return Err(QuicTlsError::Crypto(
+                "RESET_STREAM exceeded the stream receive window".into(),
+            ));
+        }
+        let delta = final_size - s.recv_high;
+        if self.recv_data_total + delta > self.recv_max_data {
+            return Err(QuicTlsError::Crypto(
+                "RESET_STREAM exceeded the connection receive window".into(),
+            ));
+        }
+        s.recv_high = final_size;
+        s.recv_fin = Some(final_size);
+        s.recv_reset = Some(error_code);
+        self.recv_data_total += delta;
         Ok(())
     }
 
@@ -1943,29 +1986,34 @@ impl Connection {
         if self.streams.contains_key(&id) {
             return Ok(());
         }
-        let peer = self.is_peer_initiated(id);
-        if peer {
-            let kind_uni = is_uni(id);
-            let count = self
-                .streams
-                .keys()
-                .filter(|&&k| self.is_peer_initiated(k) && is_uni(k) == kind_uni)
-                .count();
-            if count >= MAX_PEER_STREAMS {
-                return Err(QuicTlsError::Crypto(
-                    "peer exceeded the stream limit".into(),
-                ));
-            }
+        // ensure_stream runs only on the receive path (the peer referenced `id`).
+        // A peer may open streams only in ITS OWN initiator space (RFC 9000 §3.2 /
+        // §19.8); referencing an unopened stream in our space is a STREAM_STATE_ERROR
+        // and would otherwise bypass the peer-stream cap below (the count filters on
+        // is_peer_initiated, so an our-space id was never counted — unbounded creation).
+        if !self.is_peer_initiated(id) {
+            return Err(QuicTlsError::Protocol(
+                "peer referenced an unopened locally-initiated stream".into(),
+            ));
+        }
+        let kind_uni = is_uni(id);
+        let count = self
+            .streams
+            .keys()
+            .filter(|&&k| self.is_peer_initiated(k) && is_uni(k) == kind_uni)
+            .count();
+        if count >= MAX_PEER_STREAMS {
+            return Err(QuicTlsError::Crypto(
+                "peer exceeded the stream limit".into(),
+            ));
         }
         let mut s = Stream::fresh();
         s.send_max = self.peer_send_limit(id);
         self.streams.insert(id, s);
-        if peer {
-            if is_uni(id) {
-                self.accept_uni.push_back(id);
-            } else {
-                self.accept_bidi.push_back(id);
-            }
+        if is_uni(id) {
+            self.accept_uni.push_back(id);
+        } else {
+            self.accept_bidi.push_back(id);
         }
         Ok(())
     }
@@ -2836,5 +2884,60 @@ mod tests {
             accepted <= MAX_STREAM_REASSEMBLY / chunk.len() + 1,
             "recv_pending is bounded by the byte cap (accepted {accepted})"
         );
+    }
+
+    #[test]
+    fn peer_cannot_open_a_locally_initiated_stream() {
+        // A client never opened stream 0 (client-initiated bidi); a peer STREAM frame
+        // for it is a STREAM_STATE_ERROR and must not bypass the peer-stream cap.
+        let dcid = ConnectionId::new(&[0x4a; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let err = client
+            .recv_stream(0, 0, false, b"x")
+            .expect_err("a peer may not open a locally-initiated stream");
+        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn final_size_violations_are_rejected() {
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x4b, 0x4b, 0x4b, 0x4b]),
+        )
+        .unwrap();
+        // Stream 0 is client-initiated bidi (peer-initiated for the server).
+        server.recv_stream(0, 0, true, b"hello").unwrap(); // final size = 5
+        let err = server
+            .recv_stream(0, 5, false, b"more")
+            .expect_err("data past the final size is rejected");
+        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        let err2 = server
+            .recv_stream(0, 0, true, b"hi")
+            .expect_err("a conflicting final size is rejected");
+        assert!(matches!(err2, QuicTlsError::Protocol(_)), "got {err2:?}");
+    }
+
+    #[test]
+    fn reset_stream_final_size_is_validated_and_flow_accounted() {
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x4c, 0x4c, 0x4c, 0x4c]),
+        )
+        .unwrap();
+        server.recv_stream(0, 0, false, &[0u8; 200]).unwrap(); // recv_high = 200
+        let err = server
+            .recv_reset_stream(0, 7, 100)
+            .expect_err("a reset below data already received is rejected");
+        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        // A consistent reset (final size >= received) is accepted.
+        server.recv_reset_stream(0, 7, 200).unwrap();
     }
 }
