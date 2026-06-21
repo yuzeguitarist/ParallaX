@@ -19,9 +19,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 
@@ -73,6 +76,11 @@ struct ConnShared {
     /// Fired whenever the connection state advances (handshake progress, new
     /// readable data, a newly-accepted stream, or teardown).
     event: Notify,
+    /// Nudge the driver after a handle queues outbound work (a write / open / FIN).
+    wake: Arc<Notify>,
+    /// Wakers of `RecvStream::poll_read` calls blocked for data, woken by the
+    /// driver after each event. (Async handles use `event` instead.)
+    read_wakers: Mutex<Vec<Waker>>,
     /// Set once the connection has been pushed to the accept queue (server only).
     accept_taken: std::sync::atomic::AtomicBool,
 }
@@ -80,6 +88,28 @@ struct ConnShared {
 impl ConnShared {
     fn is_handshaking(&self) -> bool {
         self.core.lock().unwrap().is_handshaking()
+    }
+
+    /// Nudge the driver to flush this connection's outbound datagrams.
+    fn nudge(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Register a `poll_read` waker (deduplicated). Called while holding the core
+    /// lock so the driver cannot deliver + wake between the read-check and here.
+    fn register_read_waker(&self, w: &Waker) {
+        let mut wakers = self.read_wakers.lock().unwrap();
+        if !wakers.iter().any(|e| e.will_wake(w)) {
+            wakers.push(w.clone());
+        }
+    }
+
+    /// Wake every blocked reader + async waiter (called by the driver after events).
+    fn wake_handles(&self) {
+        self.event.notify_waiters();
+        for w in std::mem::take(&mut *self.read_wakers.lock().unwrap()) {
+            w.wake();
+        }
     }
 }
 
@@ -254,7 +284,7 @@ impl Driver {
         let now = Instant::now();
         if let Some(c) = self.conns.get(&peer) {
             let _ = c.core.lock().unwrap().handle_datagram(data, now);
-            c.event.notify_waiters();
+            c.wake_handles();
             return;
         }
         // A datagram from an unknown peer: open a server connection if configured.
@@ -277,6 +307,8 @@ impl Driver {
             core: Mutex::new(core),
             peer,
             event: Notify::new(),
+            wake: self.wake.clone(),
+            read_wakers: Mutex::new(Vec::new()),
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
         let _ = shared.core.lock().unwrap().handle_datagram(data, now);
@@ -294,6 +326,8 @@ impl Driver {
             core: Mutex::new(core),
             peer: req.addr,
             event: Notify::new(),
+            wake: self.wake.clone(),
+            read_wakers: Mutex::new(Vec::new()),
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
         self.conns.insert(req.addr, shared.clone());
@@ -311,7 +345,7 @@ impl Driver {
                     out.push((dg, c.peer));
                 }
             }
-            c.event.notify_waiters();
+            c.wake_handles();
         }
         for (dg, peer) in out {
             let _ = self.socket.send_to(&dg, peer).await;
@@ -388,6 +422,187 @@ impl Connection {
             .peer_transport_parameters()
             .map(|tp| tp.to_vec())
     }
+
+    /// Open an outgoing bidirectional stream (RFC 9000 §2.1).
+    pub fn open_bi(&self) -> (SendStream, RecvStream) {
+        let id = self.shared.core.lock().unwrap().open_bi();
+        self.shared.nudge();
+        (
+            SendStream::new(self.shared.clone(), id),
+            RecvStream::new(self.shared.clone(), id),
+        )
+    }
+
+    /// Open an outgoing unidirectional stream (HTTP/3 control / QPACK).
+    pub fn open_uni(&self) -> SendStream {
+        let id = self.shared.core.lock().unwrap().open_uni();
+        self.shared.nudge();
+        SendStream::new(self.shared.clone(), id)
+    }
+
+    /// Accept the next peer-initiated bidirectional stream.
+    pub async fn accept_bi(&self) -> Option<(SendStream, RecvStream)> {
+        let id = self.await_accept(false).await?;
+        Some((
+            SendStream::new(self.shared.clone(), id),
+            RecvStream::new(self.shared.clone(), id),
+        ))
+    }
+
+    /// Accept the next peer-initiated unidirectional stream.
+    pub async fn accept_uni(&self) -> Option<RecvStream> {
+        let id = self.await_accept(true).await?;
+        Some(RecvStream::new(self.shared.clone(), id))
+    }
+
+    /// Await the next peer-initiated stream id of the given directionality.
+    async fn await_accept(&self, uni: bool) -> Option<u64> {
+        loop {
+            let notified = self.shared.event.notified();
+            tokio::pin!(notified);
+            // Arm the waiter BEFORE checking so a stream that races the check still
+            // wakes us (RFC-agnostic tokio Notify lost-wakeup avoidance).
+            notified.as_mut().enable();
+            {
+                let mut core = self.shared.core.lock().unwrap();
+                let id = if uni {
+                    core.accept_uni()
+                } else {
+                    core.accept_bi()
+                };
+                if let Some(id) = id {
+                    return Some(id);
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The send half of a QUIC stream — an [`AsyncWrite`] into the connection's stream
+/// buffer (the driver packetizes it under flow + congestion control).
+pub struct SendStream {
+    shared: Arc<ConnShared>,
+    id: u64,
+}
+
+impl SendStream {
+    fn new(shared: Arc<ConnShared>, id: u64) -> Self {
+        Self { shared, id }
+    }
+
+    /// The stream id (RFC 9000 §2.1).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Mark the stream finished: a FIN follows the buffered bytes (RFC 9000 §3.3).
+    pub fn finish(&mut self) {
+        self.shared.core.lock().unwrap().finish_stream(self.id);
+        self.shared.nudge();
+    }
+
+    /// Abruptly reset the send half with `error_code` (RFC 9000 §19.4).
+    pub fn reset(&mut self, error_code: u64) {
+        self.shared
+            .core
+            .lock()
+            .unwrap()
+            .reset_stream(self.id, error_code);
+        self.shared.nudge();
+    }
+}
+
+impl AsyncWrite for SendStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.shared.core.lock().unwrap().send_stream(self.id, data);
+        self.shared.nudge();
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Bytes are buffered in the core and sent by the driver; nothing to force.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.shared.core.lock().unwrap().finish_stream(self.id);
+        self.shared.nudge();
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// The receive half of a QUIC stream — an [`AsyncRead`] over the in-order bytes the
+/// driver reassembles. A clean FIN reads as EOF (`Ok(0)`); a peer RESET_STREAM is a
+/// truncation surfaced as [`io::ErrorKind::ConnectionReset`] (the leg.rs contract).
+pub struct RecvStream {
+    shared: Arc<ConnShared>,
+    id: u64,
+    /// Leftover bytes from a read that did not fit the caller's buffer.
+    pending: Vec<u8>,
+    pos: usize,
+}
+
+impl RecvStream {
+    fn new(shared: Arc<ConnShared>, id: u64) -> Self {
+        Self {
+            shared,
+            id,
+            pending: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    /// The stream id (RFC 9000 §2.1).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl AsyncRead for RecvStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        // Serve any leftover from a prior oversized read first.
+        if me.pos < me.pending.len() {
+            let n = (me.pending.len() - me.pos).min(buf.remaining());
+            buf.put_slice(&me.pending[me.pos..me.pos + n]);
+            me.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        // Pull fresh in-order bytes from the core. Register the waker while holding
+        // the core lock so the driver cannot deliver + wake between check and
+        // registration (lost-wakeup avoidance).
+        let mut core = me.shared.core.lock().unwrap();
+        let data = core.read_stream(me.id);
+        if !data.is_empty() {
+            drop(core);
+            me.pending = data;
+            me.pos = 0;
+            let n = me.pending.len().min(buf.remaining());
+            buf.put_slice(&me.pending[..n]);
+            me.pos = n;
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(code) = core.stream_reset(me.id) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("stream reset by peer (code {code})"),
+            )));
+        }
+        if core.stream_recv_finished(me.id) {
+            return Poll::Ready(Ok(())); // clean FIN → EOF (buf left unfilled)
+        }
+        me.shared.register_read_waker(cx.waker());
+        Poll::Pending
+    }
 }
 
 #[cfg(test)]
@@ -451,5 +666,68 @@ mod tests {
             conn.peer_transport_parameters().is_some(),
             "client learned the server's transport parameters"
         );
+    }
+
+    #[tokio::test]
+    async fn async_bidi_stream_round_trips_with_fin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut req = Vec::new();
+            recv.read_to_end(&mut req).await.unwrap();
+            // Echo the request back with a suffix, then FIN.
+            send.write_all(&req).await.unwrap();
+            send.write_all(b"-pong").await.unwrap();
+            send.finish();
+            // Keep the endpoint alive until the client has read the response.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let conn = client
+            .connect(server_addr, "example.com", client_config())
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi();
+        send.write_all(b"ping").await.unwrap();
+        send.finish();
+        let mut resp = Vec::new();
+        recv.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(resp, b"ping-pong", "bidi stream echoes with FIN → EOF");
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_uni_stream_delivers_to_accept_uni() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap();
+            let mut recv = conn.accept_uni().await.unwrap();
+            let mut got = Vec::new();
+            recv.read_to_end(&mut got).await.unwrap();
+            got
+        });
+
+        let conn = client
+            .connect(server_addr, "example.com", client_config())
+            .await
+            .unwrap();
+        let mut ctrl = conn.open_uni();
+        ctrl.write_all(b"H3-SETTINGS").await.unwrap();
+        ctrl.finish();
+        let got = srv.await.unwrap();
+        assert_eq!(got, b"H3-SETTINGS", "uni stream delivered to accept_uni");
     }
 }

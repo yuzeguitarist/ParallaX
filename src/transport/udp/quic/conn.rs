@@ -186,6 +186,8 @@ struct SentContent {
     max_data: bool,
     /// Stream ids whose MAX_STREAM_DATA this packet carried; re-arm them if lost.
     max_stream_data: Vec<u64>,
+    /// Stream ids whose RESET_STREAM this packet carried; re-arm them if lost.
+    reset: Vec<u64>,
 }
 
 /// Per-packet-number-space state: protection keys (installed as the handshake
@@ -235,6 +237,10 @@ struct Stream {
     fin: bool,
     /// The FIN bit has been packetized at the final offset.
     fin_sent: bool,
+    /// The app requested RESET_STREAM with this error code; stop sending data.
+    reset: Option<u64>,
+    /// The RESET_STREAM frame has been packetized.
+    reset_sent: bool,
     // Receive half (bytes this endpoint receives on the stream).
     recv: Vec<u8>,
     recv_off: u64,
@@ -546,6 +552,17 @@ impl Connection {
         }
     }
 
+    /// Abruptly reset stream `id`'s send half with `error_code` (RFC 9000 §19.4):
+    /// stop sending its data and emit RESET_STREAM.
+    pub fn reset_stream(&mut self, id: u64, error_code: u64) {
+        self.create_local_stream(id);
+        if let Some(s) = self.streams.get_mut(&id) {
+            if s.reset.is_none() {
+                s.reset = Some(error_code);
+            }
+        }
+    }
+
     /// Take the bytes reassembled in order from stream `id`'s STREAM frames, and
     /// extend the receive windows (RFC 9000 §4.1): consuming data grows this
     /// stream's MAX_STREAM_DATA and the connection's MAX_DATA so the peer may send
@@ -708,6 +725,14 @@ impl Connection {
                 self.probe_pending = self.probe_pending.saturating_sub(1);
                 return Some(dg);
             }
+            // RESET_STREAM for any stream the app aborted.
+            if self.spaces[SPACE_DATA].keys.is_some() {
+                if let Some(id) = self.next_stream_to_reset() {
+                    let dg = self.build_reset_packet(id, now);
+                    self.probe_pending = self.probe_pending.saturating_sub(1);
+                    return Some(dg);
+                }
+            }
             // 1-RTT relay data: once Data keys are installed, resend losses then
             // drain whichever stream has bytes (or a pending FIN) to send.
             if self.spaces[SPACE_DATA].keys.is_some() {
@@ -860,6 +885,11 @@ impl Connection {
         for id in content.max_stream_data {
             if let Some(s) = self.streams.get_mut(&id) {
                 s.need_max_stream_data = true;
+            }
+        }
+        for id in content.reset {
+            if let Some(s) = self.streams.get_mut(&id) {
+                s.reset_sent = false;
             }
         }
     }
@@ -1135,6 +1165,9 @@ impl Connection {
         self.streams
             .iter()
             .find(|(_, s)| {
+                if s.reset.is_some() {
+                    return false; // a reset stream sends RESET_STREAM, not data
+                }
                 if !s.retransmit.is_empty() {
                     return true;
                 }
@@ -1147,6 +1180,43 @@ impl Connection {
                 fresh && stream_window > 0 && conn_window > 0
             })
             .map(|(&id, _)| id)
+    }
+
+    /// The id of the next stream that owes a RESET_STREAM, if any.
+    fn next_stream_to_reset(&self) -> Option<u64> {
+        self.streams
+            .iter()
+            .find(|(_, s)| s.reset.is_some() && !s.reset_sent)
+            .map(|(&id, _)| id)
+    }
+
+    /// Build a 1-RTT packet carrying RESET_STREAM for `id` (RFC 9000 §19.4),
+    /// recording it for loss re-arm.
+    fn build_reset_packet(&mut self, id: u64, now: Instant) -> Vec<u8> {
+        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(SPACE_DATA, pn, pn_len);
+        let s = &self.streams[&id];
+        let error_code = s.reset.unwrap_or(0);
+        let final_size = s.send_off;
+        let datagram = {
+            let frame = Frame::ResetStream {
+                id,
+                error_code,
+                final_size,
+            };
+            let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
+            seal_packet(&keys.local, header, &[frame, Frame::Padding(3)])
+        };
+        if let Some(s) = self.streams.get_mut(&id) {
+            s.reset_sent = true;
+        }
+        let content = SentContent {
+            reset: vec![id],
+            ..Default::default()
+        };
+        self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
+        datagram
     }
 
     /// Build one 1-RTT (short-header) packet carrying a STREAM frame for stream
