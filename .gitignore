@@ -11,6 +11,10 @@ code_refs/
 parallax.toml
 parallax.server.toml
 parallax.client.toml
+# Referenced/sealed secret material (plx init --default, plx seal). Never commit.
+*.secrets.toml
+*.secrets.enc
+host.key
 audits/
 
 # cargo-mutants output (nightly-mutants CI uploads it as an artifact; local

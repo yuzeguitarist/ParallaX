@@ -228,8 +228,8 @@ fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         // No fixed data_target: irrelevant here, every probe fails auth and
         // takes the fallback splice before data mode is ever reached.
         data_target: None,
-        private_key: STANDARD.encode(server_keys.private),
-        identity_secret_key: STANDARD.encode(&server_identity_keys.secret),
+        private_key: STANDARD.encode(server_keys.private).into(),
+        identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
         replay_cache_path,
         // DEFAULT_REPLAY_CACHE_CAPACITY is pub(crate); a literal is fine since
         // the replay cache is not constructed on this code path.

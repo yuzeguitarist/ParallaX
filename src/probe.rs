@@ -666,7 +666,7 @@ mod tests {
         Config {
             mode: Mode::Client,
             crypto: CryptoConfig {
-                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
@@ -685,7 +685,7 @@ mod tests {
         Config {
             mode: Mode::Server,
             crypto: CryptoConfig {
-                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
@@ -694,8 +694,10 @@ mod tests {
                 listen: "127.0.0.1:8443".parse().unwrap(),
                 fallback_addr: "fallback.example:443".to_owned(),
                 data_target: None,
-                private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-                identity_secret_key: STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]),
+                private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                identity_secret_key: STANDARD
+                    .encode(vec![0_u8; mldsa::secret_key_bytes()])
+                    .into(),
                 replay_cache_path: PathBuf::from("/tmp/parallax-test-replay.cache"),
                 replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni,

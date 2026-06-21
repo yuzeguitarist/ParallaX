@@ -6,7 +6,7 @@ use std::{
 
 use crate::crypto::mldsa;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde::Deserialize;
+use serde::{de, Deserialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -51,6 +51,14 @@ pub enum ConfigError {
     },
     #[error("crypto.psk must decode to at least 32 bytes")]
     WeakPsk,
+    #[error("{field}: a secret reference must set exactly one of `file`, `env`, or `sealed`")]
+    SecretReference { field: &'static str },
+    #[error("{field}: failed to read the referenced secret (missing file/env, bad permissions, or unknown entry)")]
+    SecretRead { field: &'static str },
+    #[error("{field}: failed to open the sealed secret (wrong host key, tampered bundle, or missing entry)")]
+    SecretSeal { field: &'static str },
+    #[error("{field}: cannot open the sealed secret because the host keyfile is missing or has insecure permissions; set $PARALLAX_HOST_KEY_FILE (or place the keyfile at /var/lib/parallax/host.key) to the host key used by `plx seal`")]
+    SecretHostKey { field: &'static str },
     #[error(
         "crypto.psk appears to have low entropy; a server refuses to start with a \
          guessable PSK. Generate a CSPRNG key with `plx init` or \
@@ -117,6 +125,21 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    /// True when secret resolution failed *because the source is unavailable* on
+    /// this host (missing/insecure host key, or a missing sidecar file / env var /
+    /// bundle entry) — as opposed to a malformed reference. `plx check` treats
+    /// these as "cannot decrypt here" and degrades to a structure-only check.
+    fn is_secret_unavailable(&self) -> bool {
+        matches!(
+            self,
+            ConfigError::SecretHostKey { .. }
+                | ConfigError::SecretRead { .. }
+                | ConfigError::SecretSeal { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -149,14 +172,261 @@ impl fmt::Display for Mode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CryptoConfig {
-    /// Base64-encoded pre-shared secret. Require at least 32 bytes after decode.
+    /// Pre-shared secret (≥32 bytes after base64 decode). May be inline base64 or
+    /// an indirect [`SecretSource`] reference (`file`/`env`/`sealed`).
     ///
     /// The PSK is one of the two secrets the auth scheme and the initial session
     /// key derivation rest on, so it MUST be CSPRNG-generated (`plx init` or
     /// `openssl rand -base64 32`). A low-entropy / guessable PSK is rejected at
     /// startup on a server in any build profile (`ConfigError::LowEntropyPsk`);
     /// client mode only warns.
-    pub psk: String,
+    pub psk: SecretSource,
+}
+
+/// Where a long-lived secret's bytes come from. Deserializes from **either** an
+/// inline base64 string (back-compat, discouraged — makes the config a bearer
+/// credential) **or** an indirection table:
+///
+/// ```toml
+/// psk = "base64=="                                   # inline
+/// psk = { file = "parallax.secrets.toml#psk" }       # 0600 sidecar file
+/// psk = { env = "PARALLAX_PSK" }                      # environment / systemd cred
+/// psk = { sealed = "parallax.secrets.enc#psk" }      # machine-bound encrypted
+/// ```
+///
+/// `Config::load` resolves every source to its base64 text once, up front, so the
+/// rest of the runtime keeps consuming the same bytes regardless of where they
+/// came from. After resolution the variant is [`SecretSource::Resolved`].
+#[derive(Clone)]
+pub enum SecretSource {
+    /// Literal base64 written straight into the config.
+    Inline(String),
+    /// An unresolved indirection (`file`/`env`/`sealed`); resolved at load time.
+    Reference(SecretRef),
+    /// The resolved base64 text plus whether it originated inline (for warnings).
+    Resolved(ResolvedSecret),
+}
+
+/// Resolved secret text and provenance. The base64 lives in `Zeroizing` so it is
+/// scrubbed on drop.
+#[derive(Clone)]
+pub struct ResolvedSecret {
+    b64: Zeroizing<String>,
+    was_inline: bool,
+}
+
+/// Indirection table for a secret: exactly one of the fields must be set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    sealed: Option<String>,
+}
+
+impl fmt::Debug for SecretSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never render secret bytes through Debug — only the shape.
+        match self {
+            Self::Inline(_) => f.write_str("Inline(<redacted>)"),
+            Self::Resolved(r) => f
+                .debug_struct("Resolved")
+                .field("was_inline", &r.was_inline)
+                .finish_non_exhaustive(),
+            Self::Reference(r) => f.debug_tuple("Reference").field(r).finish(),
+        }
+    }
+}
+
+impl From<String> for SecretSource {
+    fn from(value: String) -> Self {
+        Self::Inline(value)
+    }
+}
+
+impl From<&str> for SecretSource {
+    fn from(value: &str) -> Self {
+        Self::Inline(value.to_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct SecretVisitor;
+
+        impl<'de> de::Visitor<'de> for SecretVisitor {
+            type Value = SecretSource;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a base64 string or a { file | env | sealed } table")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(SecretSource::Inline(v.to_owned()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(SecretSource::Inline(v))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let reference = SecretRef::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(SecretSource::Reference(reference))
+            }
+        }
+
+        deserializer.deserialize_any(SecretVisitor)
+    }
+}
+
+impl SecretSource {
+    /// The resolved base64 secret text. Inline/Resolved variants return their
+    /// bytes; an unresolved `Reference` returns `""` (it is always resolved
+    /// before any consumer reads it — see `Config::load`).
+    pub fn as_b64(&self) -> &str {
+        match self {
+            Self::Inline(s) => s,
+            Self::Resolved(r) => &r.b64,
+            Self::Reference(_) => "",
+        }
+    }
+
+    /// Whether this secret is (or was) stored inline in the config file, i.e. the
+    /// config file itself carries the secret. Drives the `plx check` warning.
+    pub fn is_inline_secret(&self) -> bool {
+        match self {
+            Self::Inline(_) => true,
+            Self::Resolved(r) => r.was_inline,
+            Self::Reference(_) => false,
+        }
+    }
+
+    /// If this secret is an unresolved `{ file = "<path>#<frag>" }` reference, the
+    /// sidecar path part (without the `#fragment`). `plx seal` uses this to delete
+    /// the plaintext sidecar after sealing its secret. Only meaningful before
+    /// resolution (a [`SecretSource::Resolved`] no longer remembers its origin).
+    pub(crate) fn file_reference_path(&self) -> Option<&str> {
+        match self {
+            Self::Reference(r) => r
+                .file
+                .as_deref()
+                .map(|spec| crate::secret_store::split_fragment(spec).0),
+            _ => None,
+        }
+    }
+
+    /// Resolve any indirection in place, reading `file`/`env`/`sealed` sources.
+    /// `base` is the config directory used to resolve relative reference paths.
+    fn resolve_in_place(&mut self, field: &'static str, base: &Path) -> Result<(), ConfigError> {
+        let resolved = match self {
+            Self::Resolved(_) => return Ok(()),
+            Self::Inline(s) => ResolvedSecret {
+                // Move the inline string out rather than cloning it, so we don't
+                // leave a second, non-zeroized heap copy of the secret behind.
+                b64: Zeroizing::new(std::mem::take(s)),
+                was_inline: true,
+            },
+            Self::Reference(reference) => ResolvedSecret {
+                b64: reference.resolve(field, base)?,
+                was_inline: false,
+            },
+        };
+        *self = Self::Resolved(resolved);
+        Ok(())
+    }
+}
+
+/// One long-lived secret field of a [`Config`], with every name a secret-handling
+/// site needs. This is the single authoritative description of a secret: the
+/// resolution, inline-detection, memory-protection, and `plx seal` paths all
+/// enumerate secrets through [`Config::secret_sources`] so a newly added secret
+/// cannot silently skip sealing or scrubbing.
+pub(crate) struct SecretFieldRef<'a> {
+    /// Dotted config path (`crypto.psk`): resolution-error field, inline warning.
+    pub dotted: &'static str,
+    /// Bare TOML key (`psk`): the sealed-bundle entry key / reference `#fragment`
+    /// and the assignment the config rewriter targets.
+    pub seal_key: &'static str,
+    /// Static label for `protect_secret_bytes` (`config.crypto.psk`).
+    pub mem_label: &'static str,
+    pub source: &'a SecretSource,
+}
+
+impl SecretRef {
+    fn resolve(&self, field: &'static str, base: &Path) -> Result<Zeroizing<String>, ConfigError> {
+        match (
+            self.file.as_deref(),
+            self.env.as_deref(),
+            self.sealed.as_deref(),
+        ) {
+            (Some(spec), None, None) => resolve_file_secret(base, spec, field),
+            (None, Some(name), None) => resolve_env_secret(name, field),
+            (None, None, Some(spec)) => {
+                crate::secret_store::open_sealed_reference(base, spec, None).map_err(|err| {
+                    tracing::debug!(%field, error = %err, "failed to open sealed secret");
+                    match err {
+                        // A missing/locked host keyfile is the common misconfig
+                        // (e.g. `plx seal --host-key <custom>` not mirrored in the
+                        // runtime env); surface that distinctly from a real
+                        // decrypt failure so the operator looks in the right place.
+                        crate::secret_store::SealError::HostKeyMissing { .. }
+                        | crate::secret_store::SealError::HostKeyPermissions { .. } => {
+                            ConfigError::SecretHostKey { field }
+                        }
+                        _ => ConfigError::SecretSeal { field },
+                    }
+                })
+            }
+            _ => Err(ConfigError::SecretReference { field }),
+        }
+    }
+}
+
+/// Read a base64 secret from a 0600 sidecar file. The spec may carry a
+/// `#<key>` fragment selecting one entry from a TOML key/value file; without a
+/// fragment the whole (trimmed) file content is the secret.
+fn resolve_file_secret(
+    base: &Path,
+    spec: &str,
+    field: &'static str,
+) -> Result<Zeroizing<String>, ConfigError> {
+    let (path_part, fragment) = crate::secret_store::split_fragment(spec);
+    let path = crate::secret_store::resolve_path(base, path_part);
+    let text = read_secret_config_file(&path).map_err(|_| ConfigError::SecretRead { field })?;
+    match fragment {
+        None => Ok(Zeroizing::new(text.trim().to_owned())),
+        Some(key) => {
+            let table: toml::Table =
+                toml::from_str(text.as_str()).map_err(|_| ConfigError::SecretRead { field })?;
+            let value = table
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .ok_or(ConfigError::SecretRead { field })?;
+            Ok(Zeroizing::new(value.to_owned()))
+        }
+    }
+}
+
+fn resolve_env_secret(name: &str, field: &'static str) -> Result<Zeroizing<String>, ConfigError> {
+    // Hold the raw env value in Zeroizing so the (untrimmed) copy is scrubbed on
+    // drop rather than left in the heap after we copy the trimmed text out.
+    let value = Zeroizing::new(std::env::var(name).map_err(|_| ConfigError::SecretRead { field })?);
+    Ok(Zeroizing::new(value.trim().to_owned()))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,8 +446,8 @@ pub struct ServerConfig {
     pub fallback_addr: String,
     #[serde(default)]
     pub data_target: Option<String>,
-    pub private_key: String,
-    pub identity_secret_key: String,
+    pub private_key: SecretSource,
+    pub identity_secret_key: SecretSource,
     #[serde(default = "default_replay_cache_path")]
     pub replay_cache_path: PathBuf,
     #[serde(default = "default_replay_cache_capacity")]
@@ -439,37 +709,150 @@ impl Config {
         let mut cfg =
             toml::from_str::<Self>(raw.as_str()).map_err(|e| toml_error(raw.as_str(), e))?;
         cfg.resolve_paths_relative_to(path);
+        cfg.resolve_secrets(path)?;
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Load + validate as thoroughly as the host allows, for `plx check`. Always
+    /// enforces file permissions (the hardened reader), TOML structure, and every
+    /// non-secret field. If the secrets resolve (host key / sidecar / env present),
+    /// it also validates the secret bytes — identical to [`Config::load`]. If they
+    /// cannot resolve *because the source is unavailable* (missing host key,
+    /// sidecar, or env var), it degrades to structure-only and reports that via the
+    /// returned flag instead of failing, so a sealed config is still checkable on a
+    /// machine without the key. A malformed config or a present-but-wrong secret
+    /// still fails. Returns `(config, secrets_validated)`.
+    pub fn load_for_check(path: impl AsRef<Path>) -> Result<(Self, bool), ConfigError> {
+        let path = path.as_ref();
+        let raw = read_secret_config_file(path)?;
+        let mut cfg =
+            toml::from_str::<Self>(raw.as_str()).map_err(|e| toml_error(raw.as_str(), e))?;
+        cfg.resolve_paths_relative_to(path);
+        match cfg.resolve_secrets(path) {
+            Ok(()) => {
+                cfg.validate()?;
+                Ok((cfg, true))
+            }
+            Err(err) if err.is_secret_unavailable() => {
+                cfg.validate_structure()?;
+                Ok((cfg, false))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn protect_secret_memory(&self) {
-        crate::process_hardening::protect_secret_bytes(
-            "config.crypto.psk",
-            self.crypto.psk.as_bytes(),
-        );
-        if let Some(server) = &self.server {
+        for field in self.secret_sources() {
             crate::process_hardening::protect_secret_bytes(
-                "config.server.private_key",
-                server.private_key.as_bytes(),
-            );
-            crate::process_hardening::protect_secret_bytes(
-                "config.server.identity_secret_key",
-                server.identity_secret_key.as_bytes(),
+                field.mem_label,
+                field.source.as_b64().as_bytes(),
             );
         }
     }
 
+    /// The authoritative set of long-lived secret fields (see [`SecretFieldRef`]).
+    /// Every secret-handling site enumerates secrets through this one method.
+    ///
+    /// NOTE: Rust's borrow model can't express a single iterator yielding both
+    /// shared and `&mut` views, so [`Config::secret_sources_mut`] mirrors this
+    /// list for in-place resolution. The two MUST stay in sync — add new secrets
+    /// to both (a test asserts they have equal length).
+    pub(crate) fn secret_sources(&self) -> Vec<SecretFieldRef<'_>> {
+        let mut fields = vec![SecretFieldRef {
+            dotted: "crypto.psk",
+            seal_key: "psk",
+            mem_label: "config.crypto.psk",
+            source: &self.crypto.psk,
+        }];
+        if let Some(server) = &self.server {
+            fields.push(SecretFieldRef {
+                dotted: "server.private_key",
+                seal_key: "private_key",
+                mem_label: "config.server.private_key",
+                source: &server.private_key,
+            });
+            fields.push(SecretFieldRef {
+                dotted: "server.identity_secret_key",
+                seal_key: "identity_secret_key",
+                mem_label: "config.server.identity_secret_key",
+                source: &server.identity_secret_key,
+            });
+        }
+        fields
+    }
+
+    /// Mutable view of the same authoritative secret set, for in-place
+    /// resolution. MUST stay in sync with [`Config::secret_sources`] (see the
+    /// note there); a test asserts the two yield the same number of fields.
+    fn secret_sources_mut(&mut self) -> Vec<(&'static str, &mut SecretSource)> {
+        let mut fields: Vec<(&'static str, &mut SecretSource)> =
+            vec![("crypto.psk", &mut self.crypto.psk)];
+        if let Some(server) = self.server.as_mut() {
+            fields.push(("server.private_key", &mut server.private_key));
+            fields.push((
+                "server.identity_secret_key",
+                &mut server.identity_secret_key,
+            ));
+        }
+        fields
+    }
+
+    /// Names of the secret fields whose bytes are stored inline in the config
+    /// file (so the file itself is a bearer credential). Empty once every secret
+    /// is referenced or sealed. Used by `plx check` to warn operators.
+    pub fn inline_secret_fields(&self) -> Vec<&'static str> {
+        self.secret_sources()
+            .into_iter()
+            .filter(|field| field.source.is_inline_secret())
+            .map(|field| field.dotted)
+            .collect()
+    }
+
+    /// Path parts of plaintext sidecars referenced via `{ file = "..." }` (the
+    /// `#fragment` stripped), deduplicated. `plx seal` removes these after sealing
+    /// so the directory stops being a bearer credential. Only meaningful on a
+    /// freshly parsed (unresolved) config.
+    pub(crate) fn referenced_secret_files(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |path: Option<&str>| {
+            if let Some(path) = path {
+                if !out.iter().any(|existing| existing == path) {
+                    out.push(path.to_owned());
+                }
+            }
+        };
+        add(self.crypto.psk.file_reference_path());
+        if let Some(server) = &self.server {
+            add(server.private_key.file_reference_path());
+            add(server.identity_secret_key.file_reference_path());
+        }
+        out
+    }
+    /// Resolve every secret field's `file`/`env`/`sealed` indirection to its
+    /// value, in place, relative to the config file's directory.
+    fn resolve_secrets(&mut self, config_path: &Path) -> Result<(), ConfigError> {
+        let base = config_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for (field, source) in self.secret_sources_mut() {
+            source.resolve_in_place(field, base)?;
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let psk = decode_psk(&self.crypto.psk)?;
-        // The PSK is one of the two secrets the whole auth scheme rests on (it
-        // salts the carrier-mask and auth-key HKDFs, the initial session key, and
-        // keys replay/AEAD derivation). A low-entropy / human-chosen PSK is
-        // guessable, so a server must refuse to start; client mode only warns. The
-        // policy is keyed on the mode alone, NOT the build profile, so `plx check`
-        // gives the same verdict regardless of how the binary was compiled and the
-        // strict reject path is exercised by the default `cargo test`.
-        check_psk_strength(&psk, matches!(self.mode, Mode::Server))?;
+        self.validate_structure()?;
+        self.validate_secret_bytes()
+    }
+
+    /// Validate everything that does NOT require the resolved secret bytes:
+    /// traffic/udp parameters, addresses, public keys, and mode invariants.
+    /// `plx check` runs only this layer when the host key/sidecar is unavailable,
+    /// so a sealed config can still be structurally validated on a machine that
+    /// lacks the key.
+    pub fn validate_structure(&self) -> Result<(), ConfigError> {
         self.traffic.validate()?;
         self.udp.validate()?;
 
@@ -494,12 +877,6 @@ impl Config {
                 if let Some(data_target) = &server.data_target {
                     require_host_port("server.data_target", data_target)?;
                 }
-                decode_key32_secret("server.private_key", &server.private_key)?;
-                decode_base64_secret_exact(
-                    "server.identity_secret_key",
-                    &server.identity_secret_key,
-                    mldsa::secret_key_bytes(),
-                )?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
                 }
@@ -560,6 +937,32 @@ impl Config {
         Ok(())
     }
 
+    /// Validate the resolved secret bytes (PSK + server key lengths). Requires the
+    /// secrets to have been resolved (see [`Config::resolve_secrets`]); on an
+    /// unresolved `Reference` the bytes are empty and this fails.
+    fn validate_secret_bytes(&self) -> Result<(), ConfigError> {
+        let psk = decode_psk(self.crypto.psk.as_b64())?;
+        // The PSK is one of the two secrets the whole auth scheme rests on (it
+        // salts the carrier-mask and auth-key HKDFs, the initial session key, and
+        // keys replay/AEAD derivation). A low-entropy / human-chosen PSK is
+        // guessable, so a server must refuse to start; client mode only warns. The
+        // policy is keyed on the mode alone, NOT the build profile, so `plx check`
+        // gives the same verdict regardless of how the binary was compiled and the
+        // strict reject path is exercised by the default `cargo test`.
+        check_psk_strength(&psk, matches!(self.mode, Mode::Server))?;
+        if let Mode::Server = self.mode {
+            if let Some(server) = self.server.as_ref() {
+                decode_key32_secret("server.private_key", server.private_key.as_b64())?;
+                decode_base64_secret_exact(
+                    "server.identity_secret_key",
+                    server.identity_secret_key.as_b64(),
+                    mldsa::secret_key_bytes(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_paths_relative_to(&mut self, config_path: &Path) {
         let Some(server) = self.server.as_mut() else {
             return;
@@ -577,7 +980,7 @@ impl Config {
 }
 
 #[cfg(unix)]
-fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
+pub(crate) fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -611,7 +1014,7 @@ fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError
 }
 
 #[cfg(not(unix))]
-fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
+pub(crate) fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
     Ok(Zeroizing::new(fs::read_to_string(path)?))
 }
 
@@ -972,6 +1375,34 @@ authorized_sni = ["example.com"]
             .unwrap()
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn secret_sources_views_stay_in_sync() {
+        // `secret_sources` and `secret_sources_mut` are two hand-maintained lists
+        // (Rust can't yield shared + `&mut` views from one fn). Guard against one
+        // drifting from the other when a future secret field is added.
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
+        let server_raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let mut cfg = toml::from_str::<Config>(&server_raw).unwrap();
+        let shared = cfg.secret_sources().len();
+        let mutable = cfg.secret_sources_mut().len();
+        assert_eq!(shared, mutable);
+        assert_eq!(shared, 3, "server config exposes psk + 2 server keys");
     }
 
     #[test]
@@ -2318,5 +2749,138 @@ psk = "{STRONG_PSK}"
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.toml");
         assert!(matches!(Config::load(&missing), Err(ConfigError::Read(_))));
+    }
+
+    #[cfg(unix)]
+    fn write_0600(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_secret_is_parsed_and_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.toml");
+        let identity = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        write_0600(
+            &path,
+            &format!(
+                r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+"#
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.crypto.psk.as_b64(), KEY);
+        assert!(cfg.crypto.psk.is_inline_secret());
+        assert_eq!(cfg.inline_secret_fields(), vec!["crypto.psk"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn psk_resolves_from_file_reference_and_is_not_flagged_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("parallax.client.secrets.toml");
+        write_0600(&secrets, &format!("psk = \"{KEY}\"\n"));
+        let path = dir.path().join("client.toml");
+        let identity = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        write_0600(
+            &path,
+            &format!(
+                r#"
+mode = "client"
+
+[crypto]
+psk = {{ file = "parallax.client.secrets.toml#psk" }}
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+"#
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.crypto.psk.as_b64(), KEY);
+        assert!(!cfg.crypto.psk.is_inline_secret());
+        assert!(cfg.inline_secret_fields().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn psk_resolves_from_env_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.toml");
+        let identity = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let var = "PARALLAX_TEST_PSK_ENV_REF";
+        std::env::set_var(var, KEY);
+        write_0600(
+            &path,
+            &format!(
+                r#"
+mode = "client"
+
+[crypto]
+psk = {{ env = "{var}" }}
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+"#
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+        std::env::remove_var(var);
+        assert_eq!(cfg.crypto.psk.as_b64(), KEY);
+        assert!(!cfg.crypto.psk.is_inline_secret());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_reference_with_two_sources_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.toml");
+        let identity = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        write_0600(
+            &path,
+            &format!(
+                r#"
+mode = "client"
+
+[crypto]
+psk = {{ file = "a", env = "B" }}
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{identity}"
+"#
+            ),
+        );
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::SecretReference {
+                field: "crypto.psk"
+            })
+        ));
     }
 }

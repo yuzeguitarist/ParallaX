@@ -116,17 +116,32 @@ fallback.
 plx init cloudflare.com --server-addr YOUR_VPS_IP:443
 ```
 
-This writes:
+This writes (by default, with secrets kept **out** of the config files):
 
-- `parallax.server.toml`
-- `parallax.client.toml`
+- `parallax.server.toml`, `parallax.client.toml` — configs that *reference* their
+  secrets, so a leaked config alone is not a credential.
+- `parallax.server.secrets.toml`, `parallax.client.secrets.toml` — the 0600
+  sidecar files holding the actual base64 secrets. Keep these off version control
+  (they are git-ignored) and upload the server pair together.
 
-Both files are created with mode `0600` on Unix. `init` refuses to overwrite
-existing config files. The generated material includes:
+All files are created with mode `0600` on Unix, and `init` refuses to overwrite
+existing files. Pass `--inline-secrets` to write the legacy all-in-one config
+where secrets live directly in the config file. The generated material includes:
 
 - 32-byte PSK
 - X25519 server key pair
 - ML-DSA-87 server identity key pair
+
+To machine-bind the secrets on the server (encrypt them at rest under a
+host-local key so the config + bundle are useless if copied elsewhere):
+
+```bash
+plx seal -c parallax.server.toml
+```
+
+See [Secret handling & config threat model](./SECURITY.md#secret-handling--config-threat-model)
+for which fields are public vs secret and exactly what sealing does and does not
+protect against.
 
 ### 3. Deploy the server
 
@@ -165,7 +180,7 @@ If you generated configs manually, use the path to your local
 plx check [-c parallax.toml]
     Validate config syntax, required sections, key lengths, traffic bounds,
     loopback-only client listen addresses, server SNI allowlist, and Unix
-    secret-file permissions.
+    secret-file permissions. Warns if any secret is still stored inline.
 
 plx keygen
     Print a fresh X25519 key pair.
@@ -197,8 +212,18 @@ plx probe [DEST] [-c parallax.toml]
     Probe an explicit fallback destination, or infer one from config.
 
 plx init <DEST> [--server-addr ...] [--server-listen ...]
-                [--client-listen ...] [-o DIR]
-    Generate paired config files with fresh key material.
+                [--client-listen ...] [-o DIR] [--inline-secrets]
+    Generate paired config files with fresh key material. By default secrets go
+    into separate 0600 sidecar files the configs reference; --inline-secrets
+    writes the legacy all-in-one config instead.
+
+plx seal [-c parallax.toml] [--output BUNDLE] [--host-key PATH]
+    Encrypt the config's secrets into a machine-bound sealed bundle (default
+    <config-dir>/parallax.secrets.enc) under a host-local key, then rewrite the
+    config to reference it and delete the plaintext sidecar it read them from.
+    After sealing, the config and bundle are useless on any other machine.
+    With a non-default --host-key, set PARALLAX_HOST_KEY_FILE to that path in the
+    runtime environment or loading the sealed config will fail.
 ```
 
 Every command supports `--help`.
@@ -260,6 +285,21 @@ sni = "cloudflare.com"
 server_public_key = "base64-x25519-public"
 server_identity_public_key = "base64-mldsa87-public"
 ```
+
+The three secret fields (`crypto.psk`, `server.private_key`,
+`server.identity_secret_key`) accept either an inline base64 string (shown above,
+back-compat) or an indirection that keeps the bytes out of the config file:
+
+```toml
+psk = "base64=="                              # inline — file IS a credential
+psk = { file = "parallax.secrets.toml#psk" } # 0600 sidecar file (init default)
+psk = { env = "PARALLAX_PSK" }               # environment / systemd credential
+psk = { sealed = "parallax.secrets.enc#psk" }# machine-bound, written by `plx seal`
+```
+
+All other fields are public parameters. See
+[Secret handling & config threat model](./SECURITY.md#secret-handling--config-threat-model)
+for the full public-vs-secret breakdown.
 
 See the full configuration reference in
 [`ParallaX-DeepWiki/Configuration-Reference.md`](./ParallaX-DeepWiki/Configuration-Reference.md).

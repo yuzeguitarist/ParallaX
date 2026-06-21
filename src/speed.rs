@@ -278,7 +278,7 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     // retained QUIC fast-plane connection (the speed path stays on TCP in this
     // slice), so the UDP probe runs but the measured data transfer is over TCP.
     let client = config.client.clone().ok_or(SpeedError::MissingClient)?;
-    let psk = decode_psk(&config.crypto.psk)?;
+    let psk = decode_psk(config.crypto.psk.as_b64())?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
     let server_public = decode_key32("client.server_public_key", &client.server_public_key)?;
     let server_identity_public = decode_base64_bytes(
@@ -984,7 +984,7 @@ mod tests {
         Config {
             mode: Mode::Server,
             crypto: CryptoConfig {
-                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
@@ -993,8 +993,10 @@ mod tests {
                 listen: "127.0.0.1:8443".parse::<SocketAddr>().unwrap(),
                 fallback_addr: "fallback.example:443".to_owned(),
                 data_target: None,
-                private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-                identity_secret_key: STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]),
+                private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                identity_secret_key: STANDARD
+                    .encode(vec![0_u8; mldsa::secret_key_bytes()])
+                    .into(),
                 replay_cache_path: PathBuf::from("/tmp/parallax-speed-test-replay.cache"),
                 replay_cache_capacity: crate::config::DEFAULT_REPLAY_CACHE_CAPACITY,
                 authorized_sni: vec!["example.com".to_owned()],
@@ -1015,7 +1017,7 @@ mod tests {
         Config {
             mode: Mode::Client,
             crypto: CryptoConfig {
-                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
@@ -1041,7 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn run_propagates_invalid_psk() {
         let mut cfg = client_only_config();
-        cfg.crypto.psk = "AA==".to_owned();
+        cfg.crypto.psk = "AA==".into();
         cfg.client = Some(ClientConfig {
             listen: "127.0.0.1:1080".parse().unwrap(),
             server_addr: "example.com:443".to_owned(),

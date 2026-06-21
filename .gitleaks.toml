@@ -1,0 +1,18 @@
+# gitleaks configuration for ParallaX.
+#
+# Keeps every built-in gitleaks rule (`extend.useDefault`) and only adds a narrow
+# allowlist for known test fixtures that are NOT real secrets. A config allowlist
+# is required (rather than an inline `# gitleaks:allow`) because the PR/CI scan
+# walks the whole commit range: a fixture introduced in an earlier commit is
+# flagged at that commit, where no inline comment exists, so only a config-level
+# allowlist suppresses it across the history.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "ParallaX unit-test fixtures (not real secrets)"
+regexes = [
+  # base64 of the literal "secret-psk-base64-value-32bytes" — the PSK fixture in
+  # src/secret_store.rs `seal_open_round_trips`. High entropy trips generic-api-key.
+  '''c2VjcmV0LXBzay1iYXNlNjQtdmFsdWUtMzJieXRlcw==''',
+]
