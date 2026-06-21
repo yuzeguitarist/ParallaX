@@ -27,6 +27,7 @@
 
 pub(crate) mod congestion;
 pub(crate) mod conn;
+pub(crate) mod endpoint;
 pub(crate) mod frame;
 pub(crate) mod packet;
 pub(crate) mod recovery;
