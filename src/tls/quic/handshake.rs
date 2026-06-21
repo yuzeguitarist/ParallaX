@@ -441,6 +441,12 @@ impl ClientHandshake {
                     let mut ks = Cursor::new(data);
                     key_share_group = Some(ks.u16()?);
                     key_share = Some(ks.vec_u16()?.to_vec());
+                    if ks.remaining() != 0 {
+                        return Err(QuicTlsError::alert(
+                            ALERT_DECODE_ERROR,
+                            "trailing bytes after ServerHello key_share",
+                        ));
+                    }
                 }
                 // RFC 8446 §4.2: a TLS 1.3 ServerHello carries only
                 // supported_versions + key_share (and pre_shared_key, which a
@@ -458,6 +464,15 @@ impl ClientHandshake {
             return Err(QuicTlsError::alert(
                 ALERT_MISSING_EXTENSION,
                 "ServerHello did not select TLS 1.3 (no supported_versions)",
+            ));
+        }
+        // A real TLS stack rejects trailing bytes after the extensions block; silent
+        // tolerance is an active-probe distinguisher (same posture as the unknown-
+        // extension rejection above).
+        if c.remaining() != 0 {
+            return Err(QuicTlsError::alert(
+                ALERT_DECODE_ERROR,
+                "trailing bytes after ServerHello extensions",
             ));
         }
         let group = key_share_group.ok_or_else(|| {
@@ -559,6 +574,12 @@ impl ClientHandshake {
             let data = e.vec_u16()?;
             match ext_type {
                 EXT_ALPN => {
+                    if self.alpn.is_some() {
+                        return Err(QuicTlsError::alert(
+                            ALERT_ILLEGAL_PARAMETER,
+                            "duplicate ALPN extension in EncryptedExtensions",
+                        ));
+                    }
                     let selected = parse_selected_alpn(data)?;
                     // RFC 7301 §3.2: the server MUST select a protocol the client
                     // offered. Reject an unoffered (or empty) selection rather than
@@ -577,10 +598,23 @@ impl ClientHandshake {
                     self.alpn = Some(selected.to_vec());
                 }
                 EXT_QUIC_TRANSPORT_PARAMETERS => {
+                    if self.peer_transport_params.is_some() {
+                        return Err(QuicTlsError::alert(
+                            ALERT_ILLEGAL_PARAMETER,
+                            "duplicate quic_transport_parameters in EncryptedExtensions",
+                        ));
+                    }
                     self.peer_transport_params = Some(data.to_vec());
                 }
                 _ => {}
             }
+        }
+        // Reject trailing bytes after the extensions block (active-probe distinguisher).
+        if c.remaining() != 0 {
+            return Err(QuicTlsError::alert(
+                ALERT_DECODE_ERROR,
+                "trailing bytes after EncryptedExtensions",
+            ));
         }
         // ALPN is mandatory for QUIC: if we offered ALPN the server must select one.
         if !self.config.alpn_protocols.is_empty() && self.alpn.is_none() {
@@ -708,8 +742,22 @@ fn reject_degenerate_x25519(secret: &[u8; X25519_KEY_LEN]) -> Result<(), QuicTls
 fn parse_selected_alpn(data: &[u8]) -> Result<&[u8], QuicTlsError> {
     let mut c = Cursor::new(data);
     let list = c.vec_u16()?;
+    if c.remaining() != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "trailing bytes after ALPN protocol list",
+        ));
+    }
     let mut l = Cursor::new(list);
-    l.vec_u8()
+    let proto = l.vec_u8()?;
+    // RFC 7301 §3.2: the server selects exactly one protocol.
+    if l.remaining() != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "ALPN list carried more than one protocol",
+        ));
+    }
+    Ok(proto)
 }
 
 /// Parse a TLS 1.3 Certificate message body into the DER chain.
@@ -717,6 +765,12 @@ fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
     let mut c = Cursor::new(body);
     let _request_context = c.vec_u8()?;
     let list = c.vec_u24()?;
+    if c.remaining() != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "trailing bytes after the certificate list",
+        ));
+    }
     let mut l = Cursor::new(list);
     let mut certs = Vec::new();
     while l.remaining() > 0 {
@@ -984,5 +1038,33 @@ mod tests {
         hs.read_handshake(&msg(HANDSHAKE_ENCRYPTED_EXTENSIONS, &ee))
             .unwrap();
         assert_eq!(hs.alpn_protocol(), Some(&b"h3"[..]));
+    }
+
+    #[test]
+    fn duplicate_alpn_extension_is_rejected() {
+        // A second ALPN extension is a malformed message a real stack rejects;
+        // tolerating it is an active-probe distinguisher.
+        let mut hs = handshake();
+        hs.read_state = ReadState::EncryptedExtensions;
+        let alpn = alpn_ext_body(b"h3");
+        let ee = encrypted_extensions(&[(EXT_ALPN, alpn.as_slice()), (EXT_ALPN, alpn.as_slice())]);
+        let err = hs
+            .read_handshake(&msg(HANDSHAKE_ENCRYPTED_EXTENSIONS, &ee))
+            .unwrap_err();
+        assert_eq!(err.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+    }
+
+    #[test]
+    fn alpn_list_with_more_than_one_protocol_is_rejected() {
+        // RFC 7301 §3.2: the server selects exactly one protocol.
+        let mut list = Vec::new();
+        for p in [b"h3".as_slice(), b"h2".as_slice()] {
+            list.push(p.len() as u8);
+            list.extend_from_slice(p);
+        }
+        let mut data = (list.len() as u16).to_be_bytes().to_vec();
+        data.extend_from_slice(&list);
+        let err = parse_selected_alpn(&data).unwrap_err();
+        assert_eq!(err.alert_description(), Some(ALERT_DECODE_ERROR));
     }
 }
