@@ -15,12 +15,16 @@
 #![allow(dead_code)]
 
 use aws_lc_rs::kem::{EncapsulationKey, ML_KEM_768};
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use super::schedule::KeySchedule;
+use super::suite::CipherSuite;
 use super::{
-    QuicTlsError, ALERT_DECODE_ERROR, ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER,
-    ALERT_MISSING_EXTENSION,
+    KeyChange, Keys, QuicTlsError, ALERT_DECODE_ERROR, ALERT_DECRYPT_ERROR,
+    ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
+    ALERT_UNEXPECTED_MESSAGE,
 };
 use crate::crypto::session::{x25519_shared_secret, X25519KeyPair};
 
@@ -224,6 +228,354 @@ impl<'a> Reader<'a> {
     }
 }
 
+// --- Server handshake flight (RFC 8446 §4) -------------------------------------
+
+const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
+const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
+const HANDSHAKE_CERTIFICATE: u8 = 0x0b;
+const HANDSHAKE_CERTIFICATE_VERIFY: u8 = 0x0f;
+const HANDSHAKE_FINISHED: u8 = 0x14;
+const EXT_ALPN: u16 = 0x0010;
+const TLS13_LEGACY_VERSION: u16 = 0x0303;
+/// `ecdsa_secp256r1_sha256` (RFC 8446 §4.2.3) — the CertificateVerify scheme.
+const SIG_SCHEME_ECDSA_P256: u16 = 0x0403;
+/// Largest handshake message the server will buffer (the client Finished is tiny).
+const MAX_HANDSHAKE_MESSAGE: usize = 1 << 16;
+
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+fn put_u24(out: &mut Vec<u8>, v: usize) {
+    out.push((v >> 16) as u8);
+    out.push((v >> 8) as u8);
+    out.push(v as u8);
+}
+
+fn put_vec_u8(out: &mut Vec<u8>, body: &[u8]) {
+    out.push(body.len() as u8);
+    out.extend_from_slice(body);
+}
+
+fn put_vec_u16(out: &mut Vec<u8>, body: &[u8]) {
+    put_u16(out, body.len() as u16);
+    out.extend_from_slice(body);
+}
+
+fn put_vec_u24(out: &mut Vec<u8>, body: &[u8]) {
+    put_u24(out, body.len());
+    out.extend_from_slice(body);
+}
+
+/// Wrap a handshake-message body in its `type(1) ‖ length(3)` header.
+fn handshake_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(4 + body.len());
+    m.push(msg_type);
+    put_u24(&mut m, body.len());
+    m.extend_from_slice(body);
+    m
+}
+
+/// ServerHello: pins TLS 1.3 + `TLS_AES_128_GCM_SHA256`, echoes the (empty)
+/// session id, and carries supported_versions + the X25519MLKEM768 key_share.
+fn build_server_hello(
+    session_id_echo: &[u8],
+    server_key_share: &[u8],
+    random: &[u8; 32],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_u16(&mut body, TLS13_LEGACY_VERSION);
+    body.extend_from_slice(random);
+    put_vec_u8(&mut body, session_id_echo);
+    put_u16(&mut body, TLS_AES_128_GCM_SHA256);
+    body.push(0); // null compression
+
+    let mut exts = Vec::new();
+    put_u16(&mut exts, EXT_SUPPORTED_VERSIONS);
+    put_vec_u16(&mut exts, &0x0304u16.to_be_bytes());
+    let mut ks = Vec::new();
+    put_u16(&mut ks, GROUP_X25519MLKEM768);
+    put_vec_u16(&mut ks, server_key_share);
+    put_u16(&mut exts, EXT_KEY_SHARE);
+    put_vec_u16(&mut exts, &ks);
+    put_vec_u16(&mut body, &exts);
+
+    handshake_message(HANDSHAKE_SERVER_HELLO, &body)
+}
+
+/// EncryptedExtensions: the selected ALPN + the server's transport parameters.
+fn build_encrypted_extensions(alpn: &[u8], transport_params: &[u8]) -> Vec<u8> {
+    let mut exts = Vec::new();
+    let mut alpn_list = Vec::new();
+    put_vec_u8(&mut alpn_list, alpn);
+    let mut alpn_ext = Vec::new();
+    put_vec_u16(&mut alpn_ext, &alpn_list);
+    put_u16(&mut exts, EXT_ALPN);
+    put_vec_u16(&mut exts, &alpn_ext);
+    put_u16(&mut exts, EXT_QUIC_TRANSPORT_PARAMETERS);
+    put_vec_u16(&mut exts, transport_params);
+    let mut body = Vec::new();
+    put_vec_u16(&mut body, &exts);
+    handshake_message(HANDSHAKE_ENCRYPTED_EXTENSIONS, &body)
+}
+
+/// Certificate: empty request context + the DER chain (each entry with empty
+/// per-certificate extensions).
+fn build_certificate(cert_chain: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_vec_u8(&mut body, &[]); // certificate_request_context
+    let mut list = Vec::new();
+    for cert in cert_chain {
+        put_vec_u24(&mut list, cert);
+        put_vec_u16(&mut list, &[]); // per-cert extensions
+    }
+    put_vec_u24(&mut body, &list);
+    handshake_message(HANDSHAKE_CERTIFICATE, &body)
+}
+
+fn build_certificate_verify(scheme: u16, signature: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_u16(&mut body, scheme);
+    put_vec_u16(&mut body, signature);
+    handshake_message(HANDSHAKE_CERTIFICATE_VERIFY, &body)
+}
+
+fn build_finished(verify_data: &[u8]) -> Vec<u8> {
+    handshake_message(HANDSHAKE_FINISHED, verify_data)
+}
+
+/// Re-key a client-perspective [`Keys`] aggregate to the server's perspective:
+/// the schedule always returns `local = client`, `remote = server`, so the server
+/// swaps them (it seals with the server secret, opens with the client secret).
+fn swap(keys: Keys) -> Keys {
+    Keys {
+        local: keys.remote,
+        remote: keys.local,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerState {
+    ExpectClientHello,
+    ExpectClientFinished,
+    Complete,
+}
+
+/// Clean-room server half of the QUIC TLS 1.3 handshake (the mirror of
+/// [`super::handshake::ClientHandshake`]). It ingests the ClientHello, builds the
+/// full server flight, derives the Handshake + 1-RTT keys via the shared
+/// [`KeySchedule`], and verifies the client Finished.
+pub struct ServerHandshake {
+    alpn_protocols: Vec<Vec<u8>>,
+    cert_chain: Vec<Vec<u8>>,
+    transport_params: Vec<u8>,
+    suite: CipherSuite,
+    schedule: Option<KeySchedule>,
+    transcript: Vec<u8>,
+    state: ServerState,
+    peer_transport_params: Option<Vec<u8>>,
+    pending_server_hello: Option<Vec<u8>>,
+    pending_handshake_keys: Option<Keys>,
+    pending_handshake_flight: Option<Vec<u8>>,
+    pending_1rtt_keys: Option<Keys>,
+    expected_client_finished: Option<Vec<u8>>,
+    handshake_complete: bool,
+    inbound: Vec<u8>,
+}
+
+impl ServerHandshake {
+    /// Build a server handshake with the cover certificate chain (DER), the ALPN
+    /// list to select from, and the server's transport-parameters blob. The QUIC
+    /// v1 Initial suite (`TLS_AES_128_GCM_SHA256`) is pinned.
+    pub fn new(
+        cert_chain: Vec<Vec<u8>>,
+        alpn_protocols: Vec<Vec<u8>>,
+        transport_params: Vec<u8>,
+    ) -> Self {
+        Self {
+            alpn_protocols,
+            cert_chain,
+            transport_params,
+            suite: CipherSuite::Aes128GcmSha256,
+            schedule: None,
+            transcript: Vec::new(),
+            state: ServerState::ExpectClientHello,
+            peer_transport_params: None,
+            pending_server_hello: None,
+            pending_handshake_keys: None,
+            pending_handshake_flight: None,
+            pending_1rtt_keys: None,
+            expected_client_finished: None,
+            handshake_complete: false,
+            inbound: Vec::new(),
+        }
+    }
+
+    pub fn is_handshaking(&self) -> bool {
+        !self.handshake_complete
+    }
+
+    /// The client's raw `quic_transport_parameters` blob, once the ClientHello has
+    /// been ingested.
+    pub fn peer_transport_parameters(&self) -> Option<&[u8]> {
+        self.peer_transport_params.as_deref()
+    }
+
+    /// RFC 5705 exporter; available once the schedule reaches 1-RTT.
+    pub fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), QuicTlsError> {
+        self.schedule
+            .as_ref()
+            .ok_or_else(|| QuicTlsError::Crypto("exporter before handshake".into()))?
+            .export_keying_material(out, label, context)
+    }
+
+    /// Emit outgoing CRYPTO bytes; return a [`KeyChange`] when crossing into the
+    /// next packet-number space. Steps: ServerHello (Initial) → Handshake keys →
+    /// EncryptedExtensions/Certificate/CertificateVerify/Finished (Handshake) +
+    /// 1-RTT keys.
+    pub fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
+        if let Some(sh) = self.pending_server_hello.take() {
+            out.extend_from_slice(&sh);
+            return None;
+        }
+        if let Some(keys) = self.pending_handshake_keys.take() {
+            return Some(KeyChange::Handshake { keys });
+        }
+        if let Some(flight) = self.pending_handshake_flight.take() {
+            out.extend_from_slice(&flight);
+            let keys = self
+                .pending_1rtt_keys
+                .take()
+                .expect("1-RTT keys derived with the server flight");
+            return Some(KeyChange::OneRtt { keys });
+        }
+        None
+    }
+
+    /// Feed reassembled CRYPTO bytes (the ClientHello, then the client Finished).
+    /// Returns `Ok(true)` once handshake data (peer TPs / completion) is available.
+    pub fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
+        self.inbound.extend_from_slice(data);
+        loop {
+            if self.inbound.len() < 4 {
+                break;
+            }
+            let len = ((self.inbound[1] as usize) << 16)
+                | ((self.inbound[2] as usize) << 8)
+                | (self.inbound[3] as usize);
+            if len > MAX_HANDSHAKE_MESSAGE {
+                return Err(QuicTlsError::alert(
+                    ALERT_DECODE_ERROR,
+                    "handshake message exceeds maximum",
+                ));
+            }
+            if self.inbound.len() < 4 + len {
+                break;
+            }
+            let message = self.inbound[..4 + len].to_vec();
+            self.inbound.drain(..4 + len);
+            self.process_message(&message)?;
+        }
+        Ok(self.peer_transport_params.is_some() || self.handshake_complete)
+    }
+
+    fn process_message(&mut self, message: &[u8]) -> Result<(), QuicTlsError> {
+        let msg_type = message[0];
+        match (self.state, msg_type) {
+            (ServerState::ExpectClientHello, HANDSHAKE_CLIENT_HELLO) => {
+                self.process_client_hello(message)?;
+                self.state = ServerState::ExpectClientFinished;
+                Ok(())
+            }
+            (ServerState::ExpectClientFinished, HANDSHAKE_FINISHED) => {
+                self.verify_client_finished(&message[4..])?;
+                self.transcript.extend_from_slice(message);
+                self.state = ServerState::Complete;
+                self.handshake_complete = true;
+                Ok(())
+            }
+            (state, ty) => Err(QuicTlsError::alert(
+                ALERT_UNEXPECTED_MESSAGE,
+                format!("unexpected handshake message {ty:#04x} in state {state:?}"),
+            )),
+        }
+    }
+
+    fn process_client_hello(&mut self, message: &[u8]) -> Result<(), QuicTlsError> {
+        let summary = parse_client_hello(&message[4..])?;
+        let (server_share, shared) = server_hybrid_kex(&summary.hybrid_key_share)?;
+        self.peer_transport_params = Some(summary.transport_params);
+
+        let mut random = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| QuicTlsError::Crypto("server random".into()))?;
+
+        // transcript: ClientHello, then ServerHello.
+        self.transcript.extend_from_slice(message);
+        let server_hello = build_server_hello(&summary.legacy_session_id, &server_share, &random);
+        self.transcript.extend_from_slice(&server_hello);
+        let hash_sh = self.suite.digest(&self.transcript);
+        let (mut schedule, hs_keys) =
+            KeySchedule::after_server_hello(self.suite, &shared, &hash_sh)?;
+
+        let alpn = self.alpn_protocols.first().cloned().unwrap_or_default();
+        let ee = build_encrypted_extensions(&alpn, &self.transport_params);
+        self.transcript.extend_from_slice(&ee);
+        let cert = build_certificate(&self.cert_chain);
+        self.transcript.extend_from_slice(&cert);
+
+        // CertificateVerify over Transcript-Hash(ClientHello..Certificate). The
+        // REALITY client (AcceptAnyServerCert) does not verify this signature, so a
+        // placeholder is sound for the controlled peer.
+        // TODO(de-quinn signing slice): sign certificate_verify_content(hash) with
+        // the cover cert's key (aws-lc-rs ECDSA P-256) instead of the placeholder.
+        let _hash_cert = self.suite.digest(&self.transcript);
+        let cv = build_certificate_verify(SIG_SCHEME_ECDSA_P256, &[0u8; 64]);
+        self.transcript.extend_from_slice(&cv);
+
+        let hash_cv = self.suite.digest(&self.transcript);
+        let server_verify = schedule.server_finished_verify_data(&hash_cv)?;
+        let fin = build_finished(&server_verify);
+        self.transcript.extend_from_slice(&fin);
+
+        let hash_sf = self.suite.digest(&self.transcript);
+        let onertt = schedule.derive_application(&hash_sf)?;
+        self.expected_client_finished = Some(schedule.client_finished_verify_data(&hash_sf)?);
+
+        let mut handshake_flight = ee;
+        handshake_flight.extend_from_slice(&cert);
+        handshake_flight.extend_from_slice(&cv);
+        handshake_flight.extend_from_slice(&fin);
+
+        self.schedule = Some(schedule);
+        self.pending_server_hello = Some(server_hello);
+        self.pending_handshake_keys = Some(swap(hs_keys));
+        self.pending_handshake_flight = Some(handshake_flight);
+        self.pending_1rtt_keys = Some(swap(onertt));
+        Ok(())
+    }
+
+    fn verify_client_finished(&mut self, verify_data: &[u8]) -> Result<(), QuicTlsError> {
+        let expected = self.expected_client_finished.as_ref().ok_or_else(|| {
+            QuicTlsError::alert(ALERT_UNEXPECTED_MESSAGE, "Finished before flight")
+        })?;
+        if !bool::from(verify_data.ct_eq(expected)) {
+            return Err(QuicTlsError::alert(
+                ALERT_DECRYPT_ERROR,
+                "client Finished verify_data mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +662,98 @@ mod tests {
         let (server_share, secret) = server_hybrid_kex(&summary.hybrid_key_share).unwrap();
         assert_eq!(server_share.len(), MLKEM768_CIPHERTEXT_LEN + X25519_LEN);
         assert_eq!(secret.len(), HYBRID_SHARED_LEN);
+    }
+
+    #[test]
+    fn client_and_server_complete_a_tls_handshake_with_matching_exporter() {
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, QUIC_VERSION_V1,
+        };
+        use std::sync::Arc;
+
+        // A dummy cover certificate (the REALITY client accepts any) and the
+        // server/client transport-parameter blobs (opaque to the TLS handshake).
+        let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        let server_tp = vec![0x01, 0x02, 0x03, 0x04];
+        let mut server = ServerHandshake::new(cert_chain, vec![b"h3".to_vec()], server_tp.clone());
+
+        let client_config = Arc::new(ClientConfig::new(
+            Arc::new(AcceptAnyServerCert),
+            vec![b"h3".to_vec()],
+        ));
+        let mut client = ClientHandshake::new(
+            client_config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0xaa, 0xbb],
+        )
+        .unwrap();
+
+        // Drain a handshake's write side into a byte buffer (the QUIC space routing
+        // is irrelevant at the TLS-message level — the peer reads them in order).
+        fn drain_client(h: &mut ClientHandshake) -> Vec<u8> {
+            let mut all = Vec::new();
+            loop {
+                let mut b = Vec::new();
+                let kc = h.write_handshake(&mut b);
+                if b.is_empty() && kc.is_none() {
+                    break;
+                }
+                all.extend_from_slice(&b);
+            }
+            all
+        }
+        fn drain_server(h: &mut ServerHandshake) -> Vec<u8> {
+            let mut all = Vec::new();
+            loop {
+                let mut b = Vec::new();
+                let kc = h.write_handshake(&mut b);
+                if b.is_empty() && kc.is_none() {
+                    break;
+                }
+                all.extend_from_slice(&b);
+            }
+            all
+        }
+
+        // 1. ClientHello -> server.
+        let ch = drain_client(&mut client);
+        server.read_handshake(&ch).unwrap();
+        // 2. ServerHello..Finished -> client.
+        let flight = drain_server(&mut server);
+        client.read_handshake(&flight).unwrap();
+        // 3. client Finished -> server.
+        let client_fin = drain_client(&mut client);
+        server.read_handshake(&client_fin).unwrap();
+
+        assert!(!client.is_handshaking(), "client completed");
+        assert!(!server.is_handshaking(), "server completed");
+
+        // The RFC 5705 exporter must be byte-identical on both ends — it backs the
+        // UDP auth token.
+        let mut ce = [0u8; 32];
+        let mut se = [0u8; 32];
+        client
+            .export_keying_material(&mut ce, b"parallax tudp", b"ctx")
+            .unwrap();
+        server
+            .export_keying_material(&mut se, b"parallax tudp", b"ctx")
+            .unwrap();
+        assert_eq!(
+            ce, se,
+            "client and server derive identical exporter material"
+        );
+
+        // The client negotiated our ALPN and saw our transport parameters.
+        assert_eq!(client.alpn_protocol(), Some(b"h3".as_ref()));
+        assert_eq!(
+            client.peer_transport_parameters(),
+            Some(server_tp.as_slice())
+        );
+        // ...and the server saw the client's.
+        assert_eq!(
+            server.peer_transport_parameters(),
+            Some([0xaa, 0xbb].as_ref())
+        );
     }
 }
