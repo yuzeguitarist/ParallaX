@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::congestion::{Controller, NewReno};
+use super::congestion::{AckInfo, Bbr, Controller};
 use super::frame::{Ack, Frame, Iter};
 use super::packet::{self, ConnectionId, Header, LongType, PacketSpace};
 use super::recovery::{RttEstimator, SentPacket, SentPackets};
@@ -330,8 +330,12 @@ pub struct Connection {
     spaces: [Space; 3],
     /// Connection-wide RTT estimator (RFC 9002 §5 keeps one across all spaces).
     rtt: RttEstimator,
-    /// Congestion controller behind the CC seam (NewReno scaffold; BBR later).
+    /// Congestion controller behind the CC seam (clean-room BBRv1; NewReno also
+    /// implements the trait for tests / fallback).
     cc: Box<dyn Controller>,
+    /// Connection-wide cumulative delivered (acknowledged) bytes — the BBR /
+    /// delivery-rate "delivered" counter (draft-cheng-iccrg-delivery-rate-est).
+    delivered: u64,
     /// PTO exponential-backoff exponent, reset to 0 whenever an ACK is received.
     pto_count: u32,
     /// Number of probe packets allowed to bypass the congestion window (RFC 9002
@@ -415,7 +419,8 @@ impl Connection {
             tls: Box::new(tls),
             spaces,
             rtt: RttEstimator::new(),
-            cc: Box::new(NewReno::new()),
+            cc: Box::new(Bbr::new()),
+            delivered: 0,
             pto_count: 0,
             probe_pending: 0,
             last_ack_eliciting_sent: None,
@@ -475,7 +480,8 @@ impl Connection {
             tls: Box::new(tls),
             spaces: [Space::default(), Space::default(), Space::default()],
             rtt: RttEstimator::new(),
-            cc: Box::new(NewReno::new()),
+            cc: Box::new(Bbr::new()),
+            delivered: 0,
             pto_count: 0,
             probe_pending: 0,
             last_ack_eliciting_sent: None,
@@ -892,7 +898,7 @@ impl Connection {
             }
         }
         if any_loss {
-            self.cc.on_congestion_event();
+            self.cc.on_congestion_event(now);
         }
 
         // Otherwise, if the PTO has elapsed with packets in flight, probe.
@@ -1020,6 +1026,7 @@ impl Connection {
                 time_sent: now,
                 size: size as u64,
                 ack_eliciting,
+                delivered: self.delivered,
             },
         );
         if ack_eliciting {
@@ -1614,8 +1621,10 @@ impl Connection {
         // An ACK confirms forward progress, so reset the PTO backoff (RFC 9002 §6.2).
         self.pto_count = 0;
         // RTT sample: only when the largest acked is newly acked AND at least one
-        // newly-acked packet was ack-eliciting (RFC 9002 §5.1).
+        // newly-acked packet was ack-eliciting (RFC 9002 §5.1). Track the largest
+        // newly-acked packet's send time + its delivered mark for the BBR rate.
         let mut largest_time = None;
+        let mut largest_delivered = None;
         let mut any_ack_eliciting = false;
         let mut acked_bytes = 0u64;
         for (pn, sp) in &newly {
@@ -1626,6 +1635,7 @@ impl Connection {
             }
             if *pn == ack.largest {
                 largest_time = Some(sp.time_sent);
+                largest_delivered = Some(sp.delivered);
             }
         }
         if let (Some(sent_at), true) = (largest_time, any_ack_eliciting) {
@@ -1639,11 +1649,32 @@ impl Connection {
             self.rtt
                 .update(ack_delay, now.saturating_duration_since(sent_at));
         }
-        // Grow the congestion window on newly-acked ack-eliciting bytes. (Proper
-        // app-limited suppression — RFC 9002 §7.8 — lands with BBR; NewReno
-        // over-growing while app-limited is benign for the scaffold.)
+        // Feed the congestion controller: grow on newly-acked bytes + (for BBR) a
+        // delivery-rate sample = (delivered since the largest packet was sent) /
+        // (its in-flight time). See draft-cheng-iccrg-delivery-rate-estimation.
         if acked_bytes > 0 {
-            self.cc.on_ack(acked_bytes, false);
+            self.delivered += acked_bytes;
+            let delivery_rate = match (largest_time, largest_delivered) {
+                (Some(sent_at), Some(sent_delivered)) => {
+                    let elapsed = now.saturating_duration_since(sent_at).as_secs_f64();
+                    if elapsed > 0.0 {
+                        ((self.delivered - sent_delivered) as f64 / elapsed) as u64
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            };
+            let info = AckInfo {
+                now,
+                bytes_acked: acked_bytes,
+                rtt: self.rtt.latest(),
+                delivery_rate,
+                in_flight: self.bytes_in_flight(),
+                delivered: self.delivered,
+                app_limited: false,
+            };
+            self.cc.on_ack(&info);
         }
 
         // Loss detection: re-queue the content of every packet declared lost and
@@ -1659,7 +1690,7 @@ impl Connection {
             }
         }
         if any_lost {
-            self.cc.on_congestion_event();
+            self.cc.on_congestion_event(now);
         }
     }
 

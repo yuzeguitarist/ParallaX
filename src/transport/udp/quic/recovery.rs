@@ -112,6 +112,9 @@ pub struct SentPacket {
     pub time_sent: Instant,
     pub size: u64,
     pub ack_eliciting: bool,
+    /// Connection-wide delivered-byte count when this packet was sent (the BBR /
+    /// delivery-rate "delivered" sample, draft-cheng-iccrg-delivery-rate-estimation).
+    pub delivered: u64,
 }
 
 /// One packet-number space's sent-packet bookkeeping + RFC 9002 §6.1 loss
@@ -289,6 +292,7 @@ mod tests {
             time_sent: now,
             size: 1200,
             ack_eliciting: true,
+            delivered: 0,
         }
     }
 
@@ -320,6 +324,7 @@ mod tests {
                 time_sent: now,
                 size: 1200,
                 ack_eliciting: false,
+                delivered: 0,
             },
         );
         assert_eq!(
@@ -333,6 +338,7 @@ mod tests {
                 time_sent: now,
                 size: 1200,
                 ack_eliciting: true,
+                delivered: 0,
             },
         );
         assert_eq!(sp.in_flight(), 1200, "only the ack-eliciting packet counts");
