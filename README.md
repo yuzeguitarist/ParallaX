@@ -264,19 +264,6 @@ server_identity_public_key = "base64-mldsa87-public"
 See the full configuration reference in
 [`ParallaX-DeepWiki/Configuration-Reference.md`](./ParallaX-DeepWiki/Configuration-Reference.md).
 
-### Upgrade note: PSK-bound key schedule (lockstep required)
-
-The initial data-plane key schedule binds the PSK into the HKDF (salt = PSK,
-IKM = X25519 shared secret) under a `v2` domain-separation label. This is a
-**breaking wire change with no version negotiation**: a peer on the new schedule
-and a peer on the old one authenticate the handshake but derive different
-session keys, so the first AEAD record fails to open (an opaque decrypt error).
-When upgrading, **upgrade both ends together** — there is no mixed-version /
-rolling-upgrade path. The failure direction is safe (fail-closed: no downgrade,
-no silent weak-key fallback). Separately, a server whose `crypto.psk` previously
-only triggered a warning will now refuse to start; rotate it to a
-CSPRNG-generated key (`plx init` or `openssl rand -base64 32`) before upgrading.
-
 ---
 
 ## Verification
