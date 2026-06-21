@@ -392,3 +392,8 @@ read, study, run, fork, modify, and contribute freely; **commercial use of any
 kind is not permitted**. Forks and modified versions must stay under this same
 license and must state that they are based on ParallaX. See `LICENSE` for the
 full terms and `NOTICE` for the attribution and noncommercial conditions.
+
+**No AI/ML training.** This repository may not be used as training, fine-tuning,
+or evaluation data, nor distilled, into any machine learning or generative AI
+system. Public availability is not consent to such use. See `AI_USAGE.md` for
+the full, binding AI/ML usage restrictions.
