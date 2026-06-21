@@ -16,6 +16,7 @@
 //! in lockstep with it (this native encoder is not yet on the wire).
 
 use super::varint;
+use std::collections::BTreeSet;
 
 // --- Transport-parameter ids (RFC 9000 §18.2 codepoints) -----------------------
 // Only the ids Safari-26 H3 actually emits; everything else is omitted on the
@@ -45,6 +46,9 @@ const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
 
 /// RFC 9000 §18.2: the minimum legal `active_connection_id_limit`.
 const MIN_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
+
+/// RFC 9000 §17.2/§18.2: a connection id is at most 20 bytes.
+const MAX_CONNECTION_ID_LEN: usize = 20;
 /// RFC 9000 §4.6: a `max_streams` parameter MUST NOT exceed 2^60.
 const MAX_STREAMS_LIMIT: u64 = 1 << 60;
 
@@ -76,8 +80,10 @@ pub struct TransportParameters {
     pub initial_max_streams_bidi: u64,
     pub initial_max_streams_uni: u64,
     pub active_connection_id_limit: u64,
-    /// `initial_source_connection_id` (0x0f). Zero-length for the Safari client,
-    /// and MUST equal the Initial packet-header SCID (RFC 9000 §7.3).
+    /// `initial_source_connection_id` (0x0f). Zero-length for the Safari client.
+    /// RFC 9000 §7.3 defines it to equal the Initial packet-header SCID; the relay
+    /// does not verify that match (its trust anchor is the exporter-bound token, not
+    /// the connection id), only that the value is a valid (<= 20 byte) CID.
     pub initial_src_cid: Vec<u8>,
 }
 
@@ -217,16 +223,19 @@ impl TransportParameters {
             active_connection_id_limit: DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
             initial_src_cid: Vec::new(),
         };
-        let mut seen: Vec<u64> = Vec::new();
+        // Duplicate detection over a set (O(n log n)): a Vec::contains scan is
+        // O(n^2), and this parses attacker-controlled, pre-authentication input on
+        // the server (a blob can pack thousands of distinct GREASE ids), so the
+        // quadratic scan is a handshake CPU-DoS amplifier.
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
         let mut i = 0usize;
         while i < blob.len() {
             let (id, n) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
             i += n;
             // RFC 9000 §7.4.1: a transport parameter MUST NOT appear more than once.
-            if seen.contains(&id) {
+            if !seen.insert(id) {
                 return Err(Error::Duplicate);
             }
-            seen.push(id);
             let (len, m) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
             i += m;
             let len = len as usize;
@@ -257,7 +266,15 @@ impl TransportParameters {
                     }
                     tp.active_connection_id_limit = v;
                 }
-                TP_INITIAL_SOURCE_CONNECTION_ID => tp.initial_src_cid = body.to_vec(),
+                TP_INITIAL_SOURCE_CONNECTION_ID => {
+                    // RFC 9000 §17.2: a connection id is at most 20 bytes. (The relay
+                    // trusts the exporter-bound token, not the SCID match, so the
+                    // §7.3 advertised-vs-header check is intentionally not enforced.)
+                    if body.len() > MAX_CONNECTION_ID_LEN {
+                        return Err(Error::Invalid);
+                    }
+                    tp.initial_src_cid = body.to_vec();
+                }
                 _ => {} // unknown / GREASE / not-enforced-by-the-relay: ignore
             }
         }
@@ -482,6 +499,23 @@ mod tests {
         let mut blob = Vec::new();
         put_param(&mut blob, TP_ACTIVE_CONNECTION_ID_LIMIT, 1);
         assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn read_rejects_over_length_initial_source_connection_id() {
+        // A connection id is at most 20 bytes (RFC 9000 §17.2); a longer one is
+        // invalid.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_SOURCE_CONNECTION_ID, &mut blob);
+        varint::encode(21, &mut blob);
+        blob.extend_from_slice(&[0xab; 21]);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
+        // A 20-byte CID is accepted.
+        let mut ok = Vec::new();
+        varint::encode(TP_INITIAL_SOURCE_CONNECTION_ID, &mut ok);
+        varint::encode(20, &mut ok);
+        ok.extend_from_slice(&[0xab; 20]);
+        assert!(TransportParameters::read(&ok).is_ok());
     }
 
     #[test]
