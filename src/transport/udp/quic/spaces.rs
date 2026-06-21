@@ -20,6 +20,13 @@ use super::frame::Ack;
 /// is a 62-bit value).
 const MAX_PACKET_NUMBER: u64 = (1 << 62) - 1;
 
+/// Upper bound on the number of stored received-packet ranges. A peer sending
+/// deliberately gapped packet numbers (0, 2, 4, …) would otherwise grow the set
+/// without limit (memory) and make every `insert` scan O(N) (CPU). When the cap
+/// is exceeded we drop the lowest (oldest) range; those packet numbers stop being
+/// acknowledged, which at worst prompts a retransmit.
+const MAX_ACK_RANGES: usize = 32;
+
 /// Monotonic send-side packet-number allocator for one packet-number space.
 #[derive(Debug, Default)]
 pub struct PacketNumberSpace {
@@ -93,6 +100,7 @@ impl ReceivedPackets {
             // pn is beyond every range: append (it cannot be adjacent below since
             // the loop ran past the last range whose high+1 < pn).
             self.ranges.push((pn, pn));
+            self.enforce_cap();
             return true;
         }
         let (lo, hi) = self.ranges[i];
@@ -113,8 +121,18 @@ impl ReceivedPackets {
         } else {
             // Strictly below this range with a gap: insert a new singleton.
             self.ranges.insert(i, (pn, pn));
+            self.enforce_cap();
         }
         true
+    }
+
+    /// Bound the stored ranges (see [`MAX_ACK_RANGES`]); drops the lowest (oldest)
+    /// range when the cap is exceeded. Each `insert` adds at most one range, so at
+    /// most one range is dropped per call.
+    fn enforce_cap(&mut self) {
+        if self.ranges.len() > MAX_ACK_RANGES {
+            self.ranges.remove(0);
+        }
     }
 
     /// Build an ACK frame acknowledging everything recorded so far, with the given
@@ -212,5 +230,28 @@ mod tests {
     #[test]
     fn to_ack_is_none_when_empty() {
         assert!(ReceivedPackets::new().to_ack(0).is_none());
+    }
+
+    #[test]
+    fn received_ranges_are_capped_under_gappy_input() {
+        let mut recv = ReceivedPackets::new();
+        // 100 gapped packets (0, 2, 4, …) would otherwise create 100 singleton
+        // ranges; the cap must bound the stored set.
+        for k in 0..100u64 {
+            recv.insert(k * 2);
+        }
+        assert!(
+            recv.ranges.len() <= MAX_ACK_RANGES,
+            "ranges must be capped at {MAX_ACK_RANGES}"
+        );
+        assert_eq!(recv.largest(), Some(198), "the newest packet is retained");
+        // The capped set still produces a well-formed, codec-round-trippable ACK.
+        let ack = recv.to_ack(0).unwrap();
+        let mut buf = Vec::new();
+        frame::Frame::Ack(ack.clone()).encode(&mut buf);
+        assert_eq!(
+            frame::Iter::new(&buf).next().unwrap().unwrap(),
+            frame::Frame::Ack(ack)
+        );
     }
 }

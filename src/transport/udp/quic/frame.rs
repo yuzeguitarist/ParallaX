@@ -44,6 +44,9 @@ const FT_APPLICATION_CLOSE: u64 = 0x1d;
 const FT_HANDSHAKE_DONE: u64 = 0x1e;
 
 const RESET_TOKEN_LEN: usize = 16;
+/// RFC 9000 §19.15: a NEW_CONNECTION_ID connection-id length is valid only in
+/// `1..=20`; any other value is a FRAME_ENCODING_ERROR.
+const MAX_CONNECTION_ID_LEN: usize = 20;
 
 /// Error decoding a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +447,10 @@ impl<'a> Iter<'a> {
                 let seq = self.varint()?;
                 let retire_prior_to = self.varint()?;
                 let cid_len = *self.buf.get(self.pos).ok_or(FrameError::Truncated)? as usize;
+                // RFC 9000 §19.15: a length outside 1..=20 is a FRAME_ENCODING_ERROR.
+                if !(1..=MAX_CONNECTION_ID_LEN).contains(&cid_len) {
+                    return Err(FrameError::Malformed);
+                }
                 self.pos += 1;
                 let cid = self.take(cid_len)?;
                 let reset_token = self.take(RESET_TOKEN_LEN)?;
@@ -479,7 +486,15 @@ impl<'a> Iter<'a> {
         let delay = self.varint()?;
         let range_count = self.varint()?;
         let first_range = self.varint()?;
-        let mut ranges = Vec::with_capacity(range_count as usize + 1);
+        // `range_count` is attacker-controlled (RFC 9000 §16 permits up to 2^62-1)
+        // and unrelated to the bytes actually present, so it MUST NOT size the
+        // allocation directly: a tiny ACK frame could otherwise force a huge
+        // `Vec::with_capacity` (capacity-overflow panic / OOM abort) before the
+        // loop runs. Each additional range costs >=2 wire bytes (gap+len varints),
+        // so the real range count cannot exceed the remaining bytes; clamp the
+        // hint to that. The loop below still validates every range.
+        let cap = (range_count as usize).min(self.buf.len().saturating_sub(self.pos) / 2);
+        let mut ranges = Vec::with_capacity(cap + 1);
         let first_low = largest
             .checked_sub(first_range)
             .ok_or(FrameError::Malformed)?;
@@ -726,5 +741,38 @@ mod tests {
         }
         out.extend_from_slice(&[0xaa, 0xbb]);
         assert_eq!(Iter::new(&out).next(), Some(Err(FrameError::Truncated)));
+    }
+
+    #[test]
+    fn ack_with_huge_range_count_does_not_over_allocate() {
+        // A tiny ACK frame announcing an enormous range_count but carrying no
+        // range bytes must fail with Truncated, NOT attempt a giant allocation.
+        let mut out = Vec::new();
+        for v in [FT_ACK, 0, 0, 1u64 << 40, 0] {
+            varint::encode(v, &mut out);
+        }
+        assert_eq!(Iter::new(&out).next(), Some(Err(FrameError::Truncated)));
+    }
+
+    #[test]
+    fn new_connection_id_rejects_out_of_range_length() {
+        // cid_len = 0 (RFC 9000 §19.15 requires 1..=20).
+        let mut zero = Vec::new();
+        varint::encode(FT_NEW_CONNECTION_ID, &mut zero);
+        varint::encode(1, &mut zero); // seq
+        varint::encode(0, &mut zero); // retire_prior_to
+        zero.push(0); // cid_len = 0 -> invalid
+        zero.extend_from_slice(&[0u8; RESET_TOKEN_LEN]);
+        assert_eq!(Iter::new(&zero).next(), Some(Err(FrameError::Malformed)));
+
+        // cid_len = 21 (> 20) -> invalid.
+        let mut big = Vec::new();
+        varint::encode(FT_NEW_CONNECTION_ID, &mut big);
+        varint::encode(1, &mut big);
+        varint::encode(0, &mut big);
+        big.push(21);
+        big.extend_from_slice(&[0u8; 21]);
+        big.extend_from_slice(&[0u8; RESET_TOKEN_LEN]);
+        assert_eq!(Iter::new(&big).next(), Some(Err(FrameError::Malformed)));
     }
 }

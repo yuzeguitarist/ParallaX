@@ -11,7 +11,9 @@
 //! The client encoder reproduces Safari-26 H3's exact `0x39` blob: the confirmed
 //! id set in STRICT ASCENDING order, then Apple's vendor/GREASE codepoint last,
 //! omitting every id Safari does not send (omit is NOT the same as value 0). This
-//! is a byte-exact camouflage invariant guarded by `tests/gfw_simulator.rs`.
+//! is a byte-exact camouflage invariant: `tests/gfw_simulator.rs` guards the live
+//! carrier's wire image, and the in-file drift guard keeps these native constants
+//! in lockstep with it (this native encoder is not yet on the wire).
 
 use super::varint;
 
@@ -41,6 +43,11 @@ const SAFARI_ACTIVE_CID_LIMIT: u64 = 64;
 /// absent from a received blob.
 const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
 
+/// RFC 9000 §18.2: the minimum legal `active_connection_id_limit`.
+const MIN_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
+/// RFC 9000 §4.6: a `max_streams` parameter MUST NOT exceed 2^60.
+const MAX_STREAMS_LIMIT: u64 = 1 << 60;
+
 /// Error parsing a peer transport-parameters blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -48,6 +55,12 @@ pub enum Error {
     Truncated,
     /// A varint-typed parameter's body was not exactly one varint.
     Malformed,
+    /// A transport parameter appeared more than once (RFC 9000 §7.4.1: an endpoint
+    /// MUST treat this as a TRANSPORT_PARAMETER_ERROR).
+    Duplicate,
+    /// A parameter carried a value outside its RFC 9000 §18.2 valid range (e.g.
+    /// `max_streams` > 2^60 per §4.6, or `active_connection_id_limit` < 2).
+    Invalid,
 }
 
 /// QUIC transport parameters as ParallaX advertises and enforces them.
@@ -143,10 +156,16 @@ impl TransportParameters {
             active_connection_id_limit: DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
             initial_src_cid: Vec::new(),
         };
+        let mut seen: Vec<u64> = Vec::new();
         let mut i = 0usize;
         while i < blob.len() {
             let (id, n) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
             i += n;
+            // RFC 9000 §7.4.1: a transport parameter MUST NOT appear more than once.
+            if seen.contains(&id) {
+                return Err(Error::Duplicate);
+            }
+            seen.push(id);
             let (len, m) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
             i += m;
             let len = len as usize;
@@ -164,11 +183,18 @@ impl TransportParameters {
                     tp.initial_max_stream_data_uni = read_varint_body(body)?;
                 }
                 TP_INITIAL_MAX_STREAMS_BIDI => {
-                    tp.initial_max_streams_bidi = read_varint_body(body)?
+                    tp.initial_max_streams_bidi = read_max_streams(body)?;
                 }
-                TP_INITIAL_MAX_STREAMS_UNI => tp.initial_max_streams_uni = read_varint_body(body)?,
+                TP_INITIAL_MAX_STREAMS_UNI => {
+                    tp.initial_max_streams_uni = read_max_streams(body)?;
+                }
                 TP_ACTIVE_CONNECTION_ID_LIMIT => {
-                    tp.active_connection_id_limit = read_varint_body(body)?;
+                    // RFC 9000 §18.2: a value below 2 is a TRANSPORT_PARAMETER_ERROR.
+                    let v = read_varint_body(body)?;
+                    if v < MIN_ACTIVE_CONNECTION_ID_LIMIT {
+                        return Err(Error::Invalid);
+                    }
+                    tp.active_connection_id_limit = v;
                 }
                 TP_INITIAL_SOURCE_CONNECTION_ID => tp.initial_src_cid = body.to_vec(),
                 _ => {} // unknown / GREASE / not-enforced-by-the-relay: ignore
@@ -198,6 +224,16 @@ fn read_varint_body(body: &[u8]) -> Result<u64, Error> {
     let (value, n) = varint::decode(body).ok_or(Error::Truncated)?;
     if n != body.len() {
         return Err(Error::Malformed);
+    }
+    Ok(value)
+}
+
+/// Decode a `max_streams` parameter body, enforcing the RFC 9000 §4.6 cap (2^60):
+/// a larger value cannot encode a valid stream id and is a TRANSPORT_PARAMETER_ERROR.
+fn read_max_streams(body: &[u8]) -> Result<u64, Error> {
+    let value = read_varint_body(body)?;
+    if value > MAX_STREAMS_LIMIT {
+        return Err(Error::Invalid);
     }
     Ok(value)
 }
@@ -346,5 +382,32 @@ mod tests {
             SAFARI_ACTIVE_CID_LIMIT,
             safari_crypto::SAFARI_TP_ACTIVE_CID_LIMIT
         );
+    }
+
+    #[test]
+    fn read_rejects_duplicate_parameter() {
+        // RFC 9000 §7.4.1: the same id twice MUST be a TRANSPORT_PARAMETER_ERROR.
+        let mut blob = Vec::new();
+        put_param(&mut blob, TP_INITIAL_MAX_DATA, 1);
+        put_param(&mut blob, TP_INITIAL_MAX_DATA, 2);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Duplicate));
+    }
+
+    #[test]
+    fn read_rejects_max_streams_above_2_pow_60() {
+        let mut bad = Vec::new();
+        put_param(&mut bad, TP_INITIAL_MAX_STREAMS_UNI, (1u64 << 60) + 1);
+        assert_eq!(TransportParameters::read(&bad), Err(Error::Invalid));
+        // Exactly 2^60 is the maximum legal value (RFC 9000 §4.6).
+        let mut ok = Vec::new();
+        put_param(&mut ok, TP_INITIAL_MAX_STREAMS_UNI, 1u64 << 60);
+        assert!(TransportParameters::read(&ok).is_ok());
+    }
+
+    #[test]
+    fn read_rejects_active_cid_limit_below_2() {
+        let mut blob = Vec::new();
+        put_param(&mut blob, TP_ACTIVE_CONNECTION_ID_LIMIT, 1);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
     }
 }
