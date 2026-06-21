@@ -110,6 +110,8 @@ pub enum SessionError {
     NonceExhausted,
     #[error("degenerate (all-zero) X25519 shared secret")]
     DegenerateSharedSecret,
+    #[error("PSK (HKDF salt) must not be empty")]
+    EmptyPsk,
 }
 
 pub fn derive_client_keys(
@@ -250,13 +252,14 @@ fn initial_chain_secret(
     // An X25519 compromise alone cannot reproduce the initial session keys without
     // the PSK. Transcript binding stays explicit in the expand `info` below, which
     // also carries the (bumped) domain-separation label. psk non-emptiness is
-    // enforced upstream by config validation (crypto.psk >= 32 bytes); this
-    // debug-only assert makes that contract self-checking against future internal
-    // callers (an empty salt silently degrades to the zero salt).
-    debug_assert!(
-        !psk.is_empty(),
-        "initial_chain_secret requires a non-empty PSK (HKDF salt); enforced upstream by config validation"
-    );
+    // enforced upstream by config validation (crypto.psk >= 32 bytes), but the
+    // public `derive_*_keys[_from_shared]` entry points take an unchecked `&[u8]`,
+    // so reject an empty PSK at runtime — in release too — because an empty HKDF
+    // salt is identical to the all-zero salt and would silently drop the PSK
+    // binding. Mirrors the `AuthError::EmptyPsk` guard in crypto/auth.rs.
+    if psk.is_empty() {
+        return Err(SessionError::EmptyPsk);
+    }
     let hk = Hkdf::<Sha256>::new(Some(psk), x25519_shared_secret);
     let mut chain_secret = [0_u8; KEY_LEN];
     expand(
@@ -957,6 +960,24 @@ mod tests {
         assert!(matches!(
             derive_server_keys_from_shared(TEST_PSK, &[0_u8; KEY_LEN], &transcript_hash),
             Err(SessionError::DegenerateSharedSecret)
+        ));
+    }
+
+    #[test]
+    fn derive_rejects_empty_psk() {
+        // An empty PSK would make the HKDF salt identical to the all-zero salt and
+        // silently drop the PSK binding, so the public entry points reject it at
+        // runtime (release included). A non-degenerate shared secret ensures we hit
+        // the PSK guard rather than the all-zero shared-secret reject.
+        let transcript_hash = [7_u8; 32];
+        let shared = [3_u8; KEY_LEN];
+        assert!(matches!(
+            derive_client_keys_from_shared(b"", &shared, &transcript_hash),
+            Err(SessionError::EmptyPsk)
+        ));
+        assert!(matches!(
+            derive_server_keys_from_shared(b"", &shared, &transcript_hash),
+            Err(SessionError::EmptyPsk)
         ));
     }
 

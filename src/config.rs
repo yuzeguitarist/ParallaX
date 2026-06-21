@@ -52,9 +52,9 @@ pub enum ConfigError {
     #[error("crypto.psk must decode to at least 32 bytes")]
     WeakPsk,
     #[error(
-        "crypto.psk appears to have low entropy; a production (release-build) server \
-         refuses to start with a guessable PSK. Generate a CSPRNG key with `plx init` \
-         or `openssl rand -base64 32`"
+        "crypto.psk appears to have low entropy; a server refuses to start with a \
+         guessable PSK. Generate a CSPRNG key with `plx init` or \
+         `openssl rand -base64 32`"
     )]
     LowEntropyPsk,
     #[error("traffic.max_padding must be >= traffic.min_padding")]
@@ -154,8 +154,8 @@ pub struct CryptoConfig {
     /// The PSK is one of the two secrets the auth scheme and the initial session
     /// key derivation rest on, so it MUST be CSPRNG-generated (`plx init` or
     /// `openssl rand -base64 32`). A low-entropy / guessable PSK is rejected at
-    /// startup on a release-build server (`ConfigError::LowEntropyPsk`); debug
-    /// builds and client mode only warn.
+    /// startup on a server in any build profile (`ConfigError::LowEntropyPsk`);
+    /// client mode only warns.
     pub psk: String,
 }
 
@@ -465,10 +465,11 @@ impl Config {
         // The PSK is one of the two secrets the whole auth scheme rests on (it
         // salts the carrier-mask and auth-key HKDFs, the initial session key, and
         // keys replay/AEAD derivation). A low-entropy / human-chosen PSK is
-        // guessable, so a production server must refuse to start; dev/test builds
-        // and client mode only warn. "Production" == release build (debug_assertions
-        // off), which is how `cargo install` / CI release artifacts are built.
-        check_psk_strength(&psk, is_production_server(self.mode))?;
+        // guessable, so a server must refuse to start; client mode only warns. The
+        // policy is keyed on the mode alone, NOT the build profile, so `plx check`
+        // gives the same verdict regardless of how the binary was compiled and the
+        // strict reject path is exercised by the default `cargo test`.
+        check_psk_strength(&psk, matches!(self.mode, Mode::Server))?;
         self.traffic.validate()?;
         self.udp.validate()?;
 
@@ -691,17 +692,11 @@ fn psk_looks_low_entropy(decoded: &[u8]) -> bool {
     distinct < MIN_DISTINCT_BYTES
 }
 
-/// Whether weak-PSK enforcement is strict for this config: a release-build server.
-/// Debug builds (the test/dev profile) and client mode only warn. Kept separate
-/// from [`check_psk_strength`] so the policy is unit-testable without depending on
-/// the build profile.
-fn is_production_server(mode: Mode) -> bool {
-    !cfg!(debug_assertions) && matches!(mode, Mode::Server)
-}
-
-/// Enforces PSK strength. In `strict` mode (a production server) a low-entropy PSK
-/// is a hard error; otherwise it is a warning. The minimum length (>= 32 bytes) is
-/// already enforced by [`decode_psk`] before this runs — this only gates entropy.
+/// Enforces PSK strength. In `strict` mode (a server) a low-entropy PSK is a hard
+/// error; otherwise (client mode) it is a warning. Strictness is keyed on the mode
+/// alone, never on the build profile, so the verdict is reproducible. The minimum
+/// length (>= 32 bytes) is already enforced by [`decode_psk`] before this runs —
+/// this only gates entropy.
 fn check_psk_strength(psk: &[u8], strict: bool) -> Result<(), ConfigError> {
     if !psk_looks_low_entropy(psk) {
         return Ok(());
@@ -712,7 +707,7 @@ fn check_psk_strength(psk: &[u8], strict: bool) -> Result<(), ConfigError> {
     tracing::warn!(
         "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
          (e.g. `plx init` / `openssl rand -base64 32`). This is a hard error on a \
-         release-build server."
+         server."
     );
     Ok(())
 }
@@ -907,6 +902,10 @@ mod tests {
     use super::*;
 
     const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    /// A 32-byte, high-entropy (32 distinct bytes) PSK for configs that must
+    /// validate: server mode now hard-rejects a low-entropy PSK in every build
+    /// profile, so the all-zero `KEY` cannot be reused for the `psk` field there.
+    const STRONG_PSK: &str = "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY=";
 
     #[test]
     fn validates_client_config() {
@@ -916,7 +915,7 @@ mod tests {
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "127.0.0.1:1080"
@@ -939,7 +938,7 @@ server_identity_public_key = "{server_identity_public_key}"
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "127.0.0.1:1080"
@@ -959,7 +958,7 @@ server_identity_public_key = "{identity_public_key}"
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1012,7 +1011,7 @@ authorized_sni = ["example.com"]
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "127.0.0.1:1080"
@@ -1036,7 +1035,7 @@ server_identity_public_key = "{identity}"
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "127.0.0.1:1080"
@@ -1194,7 +1193,7 @@ ech = true
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "127.0.0.1:1080"
@@ -1226,7 +1225,7 @@ enabled = true
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "127.0.0.1:1080"
@@ -1254,7 +1253,7 @@ fec_profile = "off"
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1279,7 +1278,7 @@ enabled = true
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "0.0.0.0:1080"
@@ -1329,11 +1328,56 @@ server_identity_public_key = "{KEY}"
     }
 
     #[test]
-    fn production_server_predicate_is_server_and_release_only() {
-        // Client mode is never strict regardless of build profile.
-        assert!(!is_production_server(Mode::Client));
-        // Server mode is strict iff this is a release build (debug_assertions off).
-        assert_eq!(is_production_server(Mode::Server), !cfg!(debug_assertions));
+    fn server_validate_hard_fails_low_entropy_psk() {
+        // The strict weak-PSK reject path is reached through the public validate()
+        // entry point (not just the helper) and is uniform across build profiles,
+        // so it runs and passes under the default `cargo test`. `KEY` is a 32-byte
+        // but all-zero (low-entropy) PSK that clears the length floor.
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::LowEntropyPsk
+        ));
+    }
+
+    #[test]
+    fn client_validate_accepts_low_entropy_psk_with_warning() {
+        // Client mode only warns on a low-entropy PSK, so validate() still
+        // succeeds with the same all-zero `KEY`.
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{KEY}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{server_identity_public_key}"
+"#
+        );
+        let cfg = toml::from_str::<Config>(&raw).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -1464,7 +1508,7 @@ server_identity_public_key = "{KEY}"
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1499,7 +1543,7 @@ authorized_sni = ["example.com"]
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "127.0.0.1:1080"
@@ -1531,7 +1575,7 @@ server_identity_public_key = "{server_identity_public_key}"
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1716,7 +1760,7 @@ authorized_sni = ["example.com"]
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1747,7 +1791,7 @@ authorized_sni = ["example.com"]
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1772,7 +1816,7 @@ authorized_sni = ["  "]
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1798,7 +1842,7 @@ authorized_sni = ["example.com"]
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1826,7 +1870,7 @@ authorized_sni = ["example.com"]
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1853,7 +1897,7 @@ first_record_wait_floor_ms = 100
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1886,7 +1930,7 @@ first_record_wait_floor_ms = {floor}
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -1909,7 +1953,7 @@ max_pading = 1500
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [client]
 listen = "127.0.0.1:1080"
@@ -2011,7 +2055,7 @@ max_padd = 1500
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -2037,7 +2081,7 @@ fallback_idle_floor_ms = 1000
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -2064,7 +2108,7 @@ fallback_idle_jitter_ms = 999999999
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -2094,7 +2138,7 @@ tcp_congestion = {bogus}
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -2118,7 +2162,7 @@ tcp_congestion = "cubic"
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -2142,7 +2186,7 @@ replay_cache_capacity = 65536
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -2168,7 +2212,7 @@ replay_cache_capacity = 0
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 
 [server]
 listen = "127.0.0.1:8443"
@@ -2193,7 +2237,7 @@ authorized_sni = ["example.com"]
 mode = "server"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 "#
         );
         let cfg = toml::from_str::<Config>(&raw).unwrap();
@@ -2210,7 +2254,7 @@ psk = "{KEY}"
 mode = "client"
 
 [crypto]
-psk = "{KEY}"
+psk = "{STRONG_PSK}"
 "#
         );
         let cfg = toml::from_str::<Config>(&raw).unwrap();

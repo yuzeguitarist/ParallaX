@@ -542,44 +542,18 @@ mod tests {
 
     #[test]
     fn verifies_masked_stateful_client_random_and_tail() {
-        let mut hello = client_hello_fixture("example.com");
-        let parsed = parse_client_hello(&hello).unwrap();
-        let public = parsed.client_random;
-        let psk = b"0123456789abcdef0123456789abcdef";
-        let auth_key = psk;
-        let mask_ecdh = [0x55_u8; 32];
-        let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
-        tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&1234_u64.to_be_bytes());
-        tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&[7_u8; AUTH_NONCE_LEN]);
-        let encoded_random =
-            build_masked_stateful_client_random(psk, &mask_ecdh, "example.com", &public, &tail)
-                .unwrap();
-        assert_ne!(encoded_random, public);
-        let session_id = build_masked_stateful_auth_session_id(
-            psk,
-            &mask_ecdh,
-            auth_key,
-            "example.com",
-            &public,
-            &encoded_random,
-            &tail,
-        )
-        .unwrap();
-        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
-        hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
-        hello[parsed.session_id_range].copy_from_slice(&session_id);
-
-        let material = recover_stateful_auth_material(&hello, psk, &mask_ecdh)
+        // Shares the construction with `valid_authed_hello`; this case additionally
+        // asserts the recovered key_share / timestamp / nonce round-trip. The
+        // fixture's client_random ([0x22; 32]) is the ParallaX public key share.
+        let public = parse_client_hello(&client_hello_fixture(TEST_SNI))
             .unwrap()
-            .unwrap();
-        let auth =
-            verify_masked_stateful_client_hello_auth_with_material(&hello, auth_key, &material)
-                .unwrap();
+            .client_random;
+        let auth = recover_and_verify(&valid_authed_hello(TEST_SNI));
 
         assert!(auth.authenticated);
         assert_eq!(auth.x25519_key_share, Some(public));
-        assert_eq!(auth.timestamp, Some(1234));
-        assert_eq!(auth.nonce, Some([7_u8; AUTH_NONCE_LEN]));
+        assert_eq!(auth.timestamp, Some(TEST_TIMESTAMP));
+        assert_eq!(auth.nonce, Some(TEST_NONCE));
     }
 
     // ---- Issue #50 (#3): field-mutation / negative property tests ----
@@ -625,10 +599,16 @@ mod tests {
     }
 
     fn recover_and_verify(hello: &[u8]) -> ClientAuth {
-        let material = recover_stateful_auth_material(hello, TEST_PSK, &TEST_MASK_ECDH)
-            .unwrap()
-            .unwrap();
+        let material = recover_material(hello);
         verify_masked_stateful_client_hello_auth_with_material(hello, TEST_PSK, &material).unwrap()
+    }
+
+    /// Recovers the stateful auth material for `hello` under the test PSK/mask.
+    /// Shared by the field-mutation tests, which then perturb one recovered field.
+    fn recover_material(hello: &[u8]) -> StatefulAuthMaterial {
+        recover_stateful_auth_material(hello, TEST_PSK, &TEST_MASK_ECDH)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -681,9 +661,7 @@ mod tests {
         // Mutate the recovered ParallaX public key only; the record (and thus the
         // stored tag) is unchanged, so the recomputed tag must no longer match.
         let hello = valid_authed_hello(TEST_SNI);
-        let mut material = recover_stateful_auth_material(&hello, TEST_PSK, &TEST_MASK_ECDH)
-            .unwrap()
-            .unwrap();
+        let mut material = recover_material(&hello);
         material.x25519_public[0] ^= 0x01;
         let auth =
             verify_masked_stateful_client_hello_auth_with_material(&hello, TEST_PSK, &material)
@@ -694,9 +672,7 @@ mod tests {
     #[test]
     fn changing_timestamp_fails() {
         let hello = valid_authed_hello(TEST_SNI);
-        let mut material = recover_stateful_auth_material(&hello, TEST_PSK, &TEST_MASK_ECDH)
-            .unwrap()
-            .unwrap();
+        let mut material = recover_material(&hello);
         material.tail[0] ^= 0x01; // first timestamp byte
         let auth =
             verify_masked_stateful_client_hello_auth_with_material(&hello, TEST_PSK, &material)
@@ -707,9 +683,7 @@ mod tests {
     #[test]
     fn changing_nonce_fails() {
         let hello = valid_authed_hello(TEST_SNI);
-        let mut material = recover_stateful_auth_material(&hello, TEST_PSK, &TEST_MASK_ECDH)
-            .unwrap()
-            .unwrap();
+        let mut material = recover_material(&hello);
         material.tail[AUTH_TIMESTAMP_LEN] ^= 0x01; // first nonce byte
         let auth =
             verify_masked_stateful_client_hello_auth_with_material(&hello, TEST_PSK, &material)
@@ -720,9 +694,7 @@ mod tests {
     #[test]
     fn wrong_psk_fails() {
         let hello = valid_authed_hello(TEST_SNI);
-        let material = recover_stateful_auth_material(&hello, TEST_PSK, &TEST_MASK_ECDH)
-            .unwrap()
-            .unwrap();
+        let material = recover_material(&hello);
         let auth = verify_masked_stateful_client_hello_auth_with_material(
             &hello,
             b"a totally different 32-byte psk!",
@@ -759,10 +731,14 @@ mod tests {
 
     #[test]
     fn empty_auth_key_is_rejected() {
+        // An empty auth key short-circuits to EmptyPsk before any recovered
+        // material or stored tag is read, so a parseable hello plus a placeholder
+        // material is enough to exercise the guard — no recover scaffolding needed.
         let hello = valid_authed_hello(TEST_SNI);
-        let material = recover_stateful_auth_material(&hello, TEST_PSK, &TEST_MASK_ECDH)
-            .unwrap()
-            .unwrap();
+        let material = StatefulAuthMaterial {
+            x25519_public: [0_u8; 32],
+            tail: [0_u8; STATEFUL_AUTH_TAIL_LEN],
+        };
         assert!(matches!(
             verify_masked_stateful_client_hello_auth_with_material(&hello, b"", &material),
             Err(AuthError::EmptyPsk)
