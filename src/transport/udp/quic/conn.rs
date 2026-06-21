@@ -154,6 +154,23 @@ const MAX_DATAGRAM: usize = 1252;
 /// ever-rising offsets that never become contiguous).
 const MAX_CRYPTO_REASSEMBLY: usize = 64 * 1024;
 
+/// Entry-count cap on out-of-order CRYPTO fragments (complements the byte cap
+/// above): bounds the number of buffered `(offset, Vec)` tuples so a flood of tiny
+/// fragments cannot exhaust per-entry overhead even within the byte budget.
+const MAX_CRYPTO_PENDING_FRAGMENTS: usize = 256;
+
+/// Cap on out-of-order STREAM bytes buffered per stream. Connection/stream flow
+/// control bounds the high watermark (the furthest offset seen), but NOT the
+/// reassembly buffer: duplicate or overlapping out-of-order fragments do not
+/// advance the watermark yet still buffer bytes. This byte cap (mirroring the
+/// per-stream receive window) plus the zero-length guard and entry-count cap below
+/// bound that buffer (memory-exhaustion DoS otherwise).
+const MAX_STREAM_REASSEMBLY: usize = 2 * 1024 * 1024;
+
+/// Entry-count cap on out-of-order STREAM fragments per stream (complements the
+/// byte cap): bounds buffered tuples against a tiny-fragment flood.
+const MAX_STREAM_PENDING_FRAGMENTS: usize = 4096;
+
 /// RFC 9000 §18.2 default `ack_delay_exponent`. The peer scales its ACK `delay`
 /// field by `2^exponent` microseconds; we decode with the default (neither we nor
 /// the Safari client negotiate a different value).
@@ -1788,16 +1805,24 @@ impl Connection {
     /// Reassemble an incoming CRYPTO fragment in order and feed the contiguous
     /// run to the TLS engine (which buffers partial handshake messages itself).
     fn recv_crypto(&mut self, space: usize, offset: u64, data: &[u8]) -> Result<(), QuicTlsError> {
+        // A zero-length CRYPTO fragment carries nothing to reassemble and never
+        // advances crypto_recv_off; dropping it here stops empty future-offset
+        // fragments from growing crypto_pending without counting against the byte
+        // cap (memory-exhaustion DoS — Initial keys are public, RFC 9001 §5.2).
+        if data.is_empty() {
+            return Ok(());
+        }
         let mut to_feed: Vec<u8> = Vec::new();
         {
             let sp = &mut self.spaces[space];
             if offset > sp.crypto_recv_off {
                 // Bound out-of-order CRYPTO buffering (see MAX_CRYPTO_REASSEMBLY):
-                // reject offsets/volume beyond the window rather than buffer an
-                // attacker's ever-rising, never-contiguous fragments.
+                // reject offsets/volume/entry-count beyond the window rather than
+                // buffer an attacker's ever-rising, never-contiguous fragments.
                 let buffered: usize = sp.crypto_pending.iter().map(|(_, d)| d.len()).sum();
                 if offset.saturating_sub(sp.crypto_recv_off) > MAX_CRYPTO_REASSEMBLY as u64
                     || buffered + data.len() > MAX_CRYPTO_REASSEMBLY
+                    || sp.crypto_pending.len() >= MAX_CRYPTO_PENDING_FRAGMENTS
                 {
                     return Err(QuicTlsError::Crypto(
                         "CRYPTO reassembly window exceeded".into(),
@@ -1859,9 +1884,23 @@ impl Connection {
         if fin {
             s.recv_fin = Some(end);
         }
-        // In-order reassembly (the window above bounds out-of-order buffering).
+        // In-order reassembly. Flow control above bounds the high watermark, but
+        // NOT this buffer: a zero-length fragment (e.g. a bare FIN, already recorded
+        // above) carries nothing to reassemble, and duplicate/overlapping fragments
+        // do not advance the watermark yet still buffer bytes. Drop empties and cap
+        // both buffered bytes and entry count (memory-exhaustion DoS otherwise).
         if offset > s.recv_off {
-            s.recv_pending.push((offset, data.to_vec()));
+            if !data.is_empty() {
+                let buffered: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
+                if buffered + data.len() > MAX_STREAM_REASSEMBLY
+                    || s.recv_pending.len() >= MAX_STREAM_PENDING_FRAGMENTS
+                {
+                    return Err(QuicTlsError::Crypto(
+                        "stream reassembly buffer exceeded".into(),
+                    ));
+                }
+                s.recv_pending.push((offset, data.to_vec()));
+            }
             return Ok(());
         }
         let skip = (s.recv_off - offset) as usize;
@@ -2744,6 +2783,58 @@ mod tests {
         assert!(
             saw_transport_close,
             "the close packet carries CONNECTION_CLOSE"
+        );
+    }
+
+    #[test]
+    fn empty_crypto_fragments_do_not_grow_the_reassembly_buffer() {
+        // Zero-length CRYPTO at a future offset can never become contiguous and
+        // contributes 0 to the byte cap; it must be dropped, not buffered.
+        let dcid = ConnectionId::new(&[0x6a; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        for _ in 0..10_000 {
+            client.recv_crypto(SPACE_INITIAL, 1, &[]).unwrap();
+        }
+        assert!(
+            client.spaces[SPACE_INITIAL].crypto_pending.is_empty(),
+            "empty CRYPTO fragments are not buffered (no unbounded growth)"
+        );
+    }
+
+    #[test]
+    fn duplicate_out_of_order_stream_fragments_are_bounded() {
+        // Each duplicate of a future-offset fragment leaves the flow-control high
+        // watermark unchanged (delta 0), so only the reassembly cap bounds the
+        // buffer. Without it, recv_pending would grow without bound.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x6b, 0x6b, 0x6b, 0x6b]),
+        )
+        .unwrap();
+        let chunk = vec![0xAB; 1000];
+        let mut accepted = 0usize;
+        let mut rejected = false;
+        for _ in 0..5000 {
+            match server.recv_stream(0, 10_000, false, &chunk) {
+                Ok(()) => accepted += 1,
+                Err(_) => {
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            rejected,
+            "duplicate out-of-order fragments are eventually rejected"
+        );
+        assert!(
+            accepted <= MAX_STREAM_REASSEMBLY / chunk.len() + 1,
+            "recv_pending is bounded by the byte cap (accepted {accepted})"
         );
     }
 }
