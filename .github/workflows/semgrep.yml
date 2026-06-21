@@ -43,13 +43,12 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      # vendor/** = the vendored rustls / quinn-proto forks (not first-party), matching
-      # the CodeQL config; --error is omitted so findings do not fail the job.
+      # --error is omitted so findings do not fail the job.
       - name: Run Semgrep (p/rust) -> SARIF
         run: |
           python3 -m venv /tmp/sg
           /tmp/sg/bin/pip install --quiet semgrep==1.167.0
-          /tmp/sg/bin/semgrep scan --config p/rust --exclude vendor \
+          /tmp/sg/bin/semgrep scan --config p/rust \
             --sarif --output semgrep.sarif .
       - name: Upload SARIF
         if: always()

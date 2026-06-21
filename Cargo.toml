@@ -16,9 +16,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [features]
 # (No Safari-QUIC feature gate: the Safari-26 H3 ClientHello carrier — the
-# vendored-rustls fork + the ParallaX-owned quinn crypto Session — is the DEFAULT
-# QUIC client backend in `udp::client_config`. The QUIC plane itself is gated at
-# the config level by `[udp].enabled = false`, which is the real off-switch.)
+# clean-room QUIC + TLS stack (`src/transport/udp/quic` + `src/tls/quic`) — is the
+# DEFAULT QUIC client backend in `udp::client_config`. The QUIC plane itself is
+# gated at the config level by `[udp].enabled = false`, which is the real off-switch.)
 
 [dependencies]
 anyhow = "1"

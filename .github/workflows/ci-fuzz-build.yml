@@ -20,10 +20,8 @@ on:
       - master
     paths:
       # Anything that feeds the fuzz workspace's compile: first-party sources, the
-      # vendored forks it patches in, the fuzz crate itself, the lockfile, and this
-      # workflow.
+      # fuzz crate itself, the lockfile, and this workflow.
       - 'src/**'
-      - 'vendor/**'
       - 'fuzz/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -34,7 +32,6 @@ on:
       - master
     paths:
       - 'src/**'
-      - 'vendor/**'
       - 'fuzz/**'
       - 'Cargo.toml'
       - 'Cargo.lock'

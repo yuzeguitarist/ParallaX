@@ -50,11 +50,6 @@ jobs:
           cargo audit > cargo-audit.txt 2>&1 || rc=$?
           echo '----- cargo audit report -----'
           cat cargo-audit.txt || true
-          # REMINDER: rustls is a [patch.crates-io] path fork (vendor/rustls,
-          # pinned =0.23.40); cargo audit does NOT flag path-patched deps, so a
-          # rustls RUSTSEC advisory will NOT appear above. On any rustls/quinn-proto
-          # bump, manually check RUSTSEC for rustls and re-apply per
-          # vendor/rustls/PARALLAX_FORK.md.
           # cargo audit returns non-zero for BOTH real vulnerabilities AND
           # operational errors (e.g. "couldn't fetch advisory database"). Only the
           # former should spend an Opus run; a transient DB-fetch failure must not.
