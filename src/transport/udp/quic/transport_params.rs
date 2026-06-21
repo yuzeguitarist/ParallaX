@@ -141,6 +141,67 @@ impl TransportParameters {
         out
     }
 
+    /// The relay server's transport parameters. Unlike the client, the server is
+    /// not fingerprinted, so this is a plain encode (ascending id order). It grants
+    /// the client exactly one bidirectional stream (the relay's stream) and the
+    /// Safari uni budget, with the same flow-control windows the client advertises.
+    /// `scid` is the server's chosen source connection id.
+    pub fn server(scid: &[u8]) -> Self {
+        Self {
+            initial_max_data: SAFARI_INITIAL_MAX_DATA,
+            initial_max_stream_data_bidi_local: SAFARI_INITIAL_MAX_STREAM_DATA,
+            initial_max_stream_data_bidi_remote: SAFARI_INITIAL_MAX_STREAM_DATA,
+            initial_max_stream_data_uni: SAFARI_INITIAL_MAX_STREAM_DATA,
+            initial_max_streams_bidi: 1,
+            initial_max_streams_uni: SAFARI_MAX_STREAMS_UNI,
+            active_connection_id_limit: MIN_ACTIVE_CONNECTION_ID_LIMIT,
+            initial_src_cid: scid.to_vec(),
+        }
+    }
+
+    /// Serialize the server's transport parameters (RFC 9000 §18) in ascending id
+    /// order. Includes `initial_max_streams_bidi` (the client's encoder omits it).
+    pub fn encode_server(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(56);
+        put_param(&mut out, TP_INITIAL_MAX_DATA, self.initial_max_data);
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+            self.initial_max_stream_data_bidi_local,
+        );
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+            self.initial_max_stream_data_bidi_remote,
+        );
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAM_DATA_UNI,
+            self.initial_max_stream_data_uni,
+        );
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAMS_BIDI,
+            self.initial_max_streams_bidi,
+        );
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAMS_UNI,
+            self.initial_max_streams_uni,
+        );
+        put_param(
+            &mut out,
+            TP_ACTIVE_CONNECTION_ID_LIMIT,
+            self.active_connection_id_limit,
+        );
+        put_param_bytes(
+            &mut out,
+            TP_INITIAL_SOURCE_CONNECTION_ID,
+            &self.initial_src_cid,
+        );
+        out
+    }
+
     /// Parse a peer's transport-parameters blob (RFC 9000 §18). Recognized ids
     /// populate the matching field; unknown ids (including GREASE) are ignored.
     /// Omitted parameters keep their RFC 9000 §18.2 defaults. Returns [`Error`] on
@@ -323,6 +384,18 @@ mod tests {
         assert_eq!(tp.initial_max_streams_uni, 8);
         assert_eq!(tp.active_connection_id_limit, 64);
         assert!(tp.initial_src_cid.is_empty());
+    }
+
+    #[test]
+    fn server_encode_then_read_recovers_the_grants() {
+        let scid = [0xab, 0xcd, 0xef, 0x01];
+        let tp =
+            TransportParameters::read(&TransportParameters::server(&scid).encode_server()).unwrap();
+        assert_eq!(tp.initial_max_data, 16 * 1024 * 1024);
+        assert_eq!(tp.initial_max_stream_data_bidi_remote, 2 * 1024 * 1024);
+        assert_eq!(tp.initial_max_streams_bidi, 1, "server grants one bidi");
+        assert_eq!(tp.initial_max_streams_uni, 8);
+        assert_eq!(tp.initial_src_cid, scid, "server SCID echoed in 0x0f");
     }
 
     #[test]
