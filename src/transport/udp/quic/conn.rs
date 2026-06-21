@@ -368,6 +368,11 @@ pub struct Connection {
     app_close_pending: Option<(u64, Vec<u8>)>,
     /// The CONNECTION_CLOSE has been put on the wire.
     app_close_sent: bool,
+    /// When the connection entered the closing/draining state (RFC 9000 §10.2),
+    /// for the 3×PTO drain countdown after which it can be reaped.
+    close_time: Option<Instant>,
+    /// The drain period has elapsed; the endpoint may remove this connection.
+    drained: bool,
     /// When a packet was last received (drives the idle timeout, RFC 9000 §10.1).
     last_recv_time: Option<Instant>,
     /// Connection-level flow control (RFC 9000 §4.1). Send side: the peer's MAX_DATA
@@ -438,6 +443,8 @@ impl Connection {
             closed: None,
             app_close_pending: None,
             app_close_sent: false,
+            close_time: None,
+            drained: false,
             last_recv_time: None,
             send_max_data: 0,
             send_data_total: 0,
@@ -499,6 +506,8 @@ impl Connection {
             closed: None,
             app_close_pending: None,
             app_close_sent: false,
+            close_time: None,
+            drained: false,
             last_recv_time: None,
             send_max_data: 0,
             send_data_total: 0,
@@ -536,6 +545,12 @@ impl Connection {
     /// Whether the connection has closed (locally, by the peer, or on idle).
     pub fn is_closed(&self) -> bool {
         self.closed.is_some()
+    }
+
+    /// Whether the closing/draining period (RFC 9000 §10.2) has elapsed, so the
+    /// endpoint can drop this connection from its routing table.
+    pub fn is_drained(&self) -> bool {
+        self.drained
     }
 
     /// RFC 5705 exporter (byte-identical on both ends; backs the auth token).
@@ -747,13 +762,19 @@ impl Connection {
     /// congestion window unless a PTO probe is pending (RFC 9002 §6.2.4). One
     /// datagram per call; the driver loops until `None`.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
-        // A queued CONNECTION_CLOSE is sent once; then the connection goes quiet.
-        if self.app_close_pending.is_some() && !self.app_close_sent {
-            if let Some(dg) = self.build_close_packet(now) {
-                return Some(dg);
+        // Once closed (locally, by the peer, or on idle) the connection enters the
+        // closing/draining state (RFC 9000 §10.2): it sends at most a single
+        // CONNECTION_CLOSE (for a local close) and is otherwise silent — no ACKs,
+        // data, probes, or keep-alives. This also starts the drain countdown.
+        if self.closed.is_some() {
+            if self.close_time.is_none() {
+                self.close_time = Some(now);
             }
-        }
-        if self.app_close_sent {
+            if self.app_close_pending.is_some() && !self.app_close_sent {
+                if let Some(dg) = self.build_close_packet(now) {
+                    return Some(dg);
+                }
+            }
             return None;
         }
         // Pure ACKs first so acknowledgements are not held behind data, and are
@@ -837,9 +858,23 @@ impl Connection {
         (self.rtt.pto_base() + MAX_ACK_DELAY) * 2u32.pow(self.pto_count.min(MAX_PTO_BACKOFF))
     }
 
+    /// How long to remain in the closing/draining state before the connection is
+    /// considered drained and reapable (RFC 9000 §10.2: at least 3×PTO).
+    fn drain_duration(&self) -> Duration {
+        3 * (self.rtt.pto_base() + MAX_ACK_DELAY)
+    }
+
     /// The earliest loss-detection / PTO deadline, for the async layer to arm a
     /// timer against (RFC 9002 §6.2). `None` when nothing is outstanding.
     pub fn next_timeout(&self) -> Option<Instant> {
+        // Closing/draining (RFC 9000 §10.2): the only timer is the drain deadline,
+        // after which the connection is reapable. No loss/PTO/keep-alive/idle timers.
+        if self.closed.is_some() {
+            if self.drained {
+                return None;
+            }
+            return self.close_time.map(|t| t + self.drain_duration());
+        }
         let mut deadline: Option<Instant> = None;
         let mut earliest = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
         for sp in &self.spaces {
@@ -871,6 +906,19 @@ impl Connection {
     /// calls this when [`Self::next_timeout`] elapses; `poll_transmit` then sends
     /// any retransmits / probes that were queued.
     pub fn handle_timeout(&mut self, now: Instant) {
+        // Closing/draining (RFC 9000 §10.2): count down to drained, nothing else.
+        if self.closed.is_some() {
+            if self.close_time.is_none() {
+                self.close_time = Some(now);
+            }
+            if self
+                .close_time
+                .is_some_and(|t| now >= t + self.drain_duration())
+            {
+                self.drained = true;
+            }
+            return;
+        }
         // Idle timeout (RFC 9000 §10.1): close the connection if silent too long.
         if self.closed.is_none()
             && self
@@ -878,6 +926,7 @@ impl Connection {
                 .is_some_and(|last| now >= last + IDLE_TIMEOUT)
         {
             self.closed = Some(CloseReason::IdleTimeout);
+            self.close_time = Some(now);
             return;
         }
         // Time-threshold losses first (RFC 9002 §6.1.2).
@@ -1572,7 +1621,8 @@ impl Connection {
                 }
                 Frame::Padding(_) => {}
                 Frame::Close(c) => {
-                    // The peer is tearing the connection down (RFC 9000 §19.19).
+                    // The peer is tearing the connection down (RFC 9000 §19.19):
+                    // enter the draining state and start the drain countdown.
                     if self.closed.is_none() {
                         let reason = c.reason.to_vec();
                         self.closed = Some(if c.application {
@@ -1580,6 +1630,7 @@ impl Connection {
                         } else {
                             CloseReason::PeerTransport(c.error_code, reason)
                         });
+                        self.close_time = Some(now);
                     }
                 }
                 // PING and every other relay-relevant frame are ack-eliciting but
@@ -2510,6 +2561,67 @@ mod tests {
         assert!(
             server.poll_transmit(now).is_some(),
             "the server ACKs the keep-alive PING — the connection stays live"
+        );
+    }
+
+    #[test]
+    fn closed_connection_goes_quiet_drains_and_stops_peer() {
+        let dcid = ConnectionId::new(&[0x5c; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x5e, 0x5e, 0x5e, 0x5e]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(client.handshake_confirmed && server.handshake_confirmed);
+
+        let mut now = Instant::now();
+        // Local application close: exactly one CONNECTION_CLOSE goes out, then silence
+        // (no ACKs, data, or keep-alive PINGs — RFC 9000 §10.2.1 closing state).
+        client.close(0x1234, b"bye");
+        let close_dg = client
+            .poll_transmit(now)
+            .expect("a local close emits one CONNECTION_CLOSE");
+        assert!(
+            client.poll_transmit(now).is_none(),
+            "a closed connection is silent after its CONNECTION_CLOSE"
+        );
+        // The only armed timer is the drain deadline — not a past/immediate one that
+        // would spin the driver at 100% CPU.
+        let drain_deadline = client.next_timeout().expect("drain deadline armed");
+        assert!(
+            drain_deadline > now,
+            "drain deadline is in the future, not a spin"
+        );
+
+        // The peer enters draining on receipt and itself goes quiet (RFC 9000 §10.2.2).
+        server.handle_datagram(&close_dg, now).unwrap();
+        assert!(
+            server.is_closed(),
+            "server enters draining on peer CONNECTION_CLOSE"
+        );
+        assert!(
+            matches!(server.close_reason(), Some(CloseReason::PeerApp(0x1234, _))),
+            "server records the peer application close"
+        );
+        assert!(
+            server.poll_transmit(now).is_none(),
+            "a draining peer does not transmit"
+        );
+
+        // After the drain period the connection is reapable and arms no timer.
+        now += Duration::from_secs(60);
+        client.handle_timeout(now);
+        assert!(client.is_drained(), "closed connection drains after 3xPTO");
+        assert!(
+            client.next_timeout().is_none(),
+            "a drained connection arms no timer (endpoint can reap it)"
         );
     }
 }

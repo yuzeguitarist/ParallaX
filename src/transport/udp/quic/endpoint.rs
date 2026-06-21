@@ -55,6 +55,9 @@ pub enum ConnectError {
     Tls(QuicTlsError),
     /// The endpoint driver shut down before the handshake completed.
     EndpointClosed,
+    /// The connection closed (peer rejection or idle timeout) before the
+    /// handshake completed.
+    ConnectionClosed,
 }
 
 impl std::fmt::Display for ConnectError {
@@ -62,6 +65,7 @@ impl std::fmt::Display for ConnectError {
         match self {
             ConnectError::Tls(e) => write!(f, "handshake failed: {e:?}"),
             ConnectError::EndpointClosed => write!(f, "endpoint closed"),
+            ConnectError::ConnectionClosed => write!(f, "connection closed during handshake"),
         }
     }
 }
@@ -158,6 +162,10 @@ struct ConnShared {
 impl ConnShared {
     fn is_handshaking(&self) -> bool {
         self.core.lock().unwrap().is_handshaking()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.core.lock().unwrap().is_closed()
     }
 
     /// Nudge the driver to flush this connection's outbound datagrams.
@@ -294,11 +302,14 @@ impl Endpoint {
         // re-check so a wake-up between check and await is not lost, and never hold
         // the borrow across the move into `Connection`.
         loop {
+            if shared.is_closed() {
+                return Err(ConnectError::ConnectionClosed);
+            }
             if !shared.is_handshaking() {
                 break;
             }
             let notified = shared.event.notified();
-            if shared.is_handshaking() {
+            if shared.is_handshaking() && !shared.is_closed() {
                 notified.await;
             }
         }
@@ -370,6 +381,10 @@ impl Driver {
 
             self.flush().await;
             self.promote_accepts();
+            // Reap fully-drained connections (RFC 9000 §10.2) so the routing table
+            // and timers do not grow without bound. App handles keep their own Arc.
+            self.conns
+                .retain(|_, c| !c.core.lock().unwrap().is_drained());
         }
     }
 
@@ -614,6 +629,10 @@ impl Connection {
                 };
                 if let Some(id) = id {
                     return Some(id);
+                }
+                // A closed connection yields no further streams (Option contract).
+                if core.is_closed() {
+                    return None;
                 }
             }
             notified.await;
