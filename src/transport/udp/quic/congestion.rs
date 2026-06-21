@@ -220,7 +220,7 @@ impl Bbr {
     }
 
     /// Advance the round filter at a round boundary and run Startup detection.
-    fn on_round_start(&mut self) {
+    fn on_round_start(&mut self, now: Instant) {
         self.rate_filter[self.filter_idx] = self.round_rate_max;
         self.filter_idx = (self.filter_idx + 1) % BBR_BTLBW_FILTER_LEN;
         self.round_rate_max = 0;
@@ -235,6 +235,11 @@ impl Bbr {
                 if self.full_bw_count >= BBR_FULL_BW_COUNT {
                     self.filled_pipe = true;
                     self.mode = BbrMode::ProbeBw;
+                    // Seed the ProbeRTT clock when the pipe first fills, so the first
+                    // dip is deferred ~BBR_PROBE_RTT_INTERVAL rather than firing on
+                    // this very ack (which would stall cwnd to 4 packets the instant
+                    // we reach full bandwidth).
+                    self.last_probe_rtt = Some(now);
                 }
             }
         }
@@ -254,9 +259,15 @@ impl Bbr {
     }
 
     /// Enter/exit ProbeRTT to re-measure RTprop with a near-empty pipe.
-    fn check_probe_rtt(&mut self, now: Instant) {
+    fn check_probe_rtt(&mut self, now: Instant, in_flight: u64) {
         match self.mode {
             BbrMode::ProbeRtt => {
+                // Arm the 200ms timer only once the pipe has actually drained to the
+                // floor, so RTprop is re-measured at a near-empty pipe (not while
+                // queueing still inflates the RTT). Until then cwnd stays at the floor.
+                if self.probe_rtt_done.is_none() && in_flight <= BBR_MIN_PIPE_CWND {
+                    self.probe_rtt_done = Some(now + BBR_PROBE_RTT_DURATION);
+                }
                 if self.probe_rtt_done.is_some_and(|d| now >= d) {
                     self.last_probe_rtt = Some(now);
                     self.probe_rtt_done = None;
@@ -276,7 +287,8 @@ impl Bbr {
                 if due && self.filled_pipe {
                     self.prior_cwnd = self.cwnd;
                     self.mode = BbrMode::ProbeRtt;
-                    self.probe_rtt_done = Some(now + BBR_PROBE_RTT_DURATION);
+                    // Arm the timer later, after the pipe drains (see above).
+                    self.probe_rtt_done = None;
                 }
             }
         }
@@ -311,9 +323,9 @@ impl Controller for Bbr {
         if info.delivered >= self.next_round_delivered {
             // ~one window of data per round (a cheap proxy for one RTT).
             self.next_round_delivered = info.delivered + self.cwnd.max(MAX_DATAGRAM_SIZE);
-            self.on_round_start();
+            self.on_round_start(info.now);
         }
-        self.check_probe_rtt(info.now);
+        self.check_probe_rtt(info.now, info.in_flight);
         self.set_cwnd(info.bytes_acked);
     }
 
@@ -455,5 +467,33 @@ mod tests {
             cwnd >= bdp && cwnd <= 3 * bdp,
             "cwnd ({cwnd}) should be ~2×BDP ({bdp}) once the model is built",
         );
+    }
+
+    #[test]
+    fn bbr_does_not_enter_probe_rtt_the_instant_the_pipe_fills() {
+        // Regression for the immediate-ProbeRTT bug: with last_probe_rtt unseeded,
+        // BBR entered ProbeRTT on the very ack that filled the pipe, pinning cwnd to
+        // the 4-packet floor for 200 ms exactly when full bandwidth was reached.
+        let now = Instant::now();
+        let mut cc = Bbr::new();
+        let mut delivered = 0;
+        let mut checked = false;
+        for i in 0..40 {
+            delivered += 500_000;
+            cc.on_ack(&bbr_ack(
+                10_000_000,
+                50,
+                delivered,
+                now + Duration::from_millis(i * 50),
+            ));
+            if cc.filled_pipe && !checked {
+                checked = true;
+                assert!(
+                    cc.window() > BBR_MIN_PIPE_CWND,
+                    "cwnd collapsed to the ProbeRTT floor the instant the pipe filled",
+                );
+            }
+        }
+        assert!(checked, "the pipe should fill within the run");
     }
 }
