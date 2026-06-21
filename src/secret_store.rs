@@ -122,7 +122,10 @@ pub(crate) fn split_fragment(spec: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn resolve_path(base: &Path, spec: &str) -> PathBuf {
+/// Resolve a reference path against the config directory: absolute paths are
+/// used as-is, relative ones are joined onto `base`. Shared by the `file` and
+/// `sealed` reference resolvers.
+pub(crate) fn resolve_path(base: &Path, spec: &str) -> PathBuf {
     let candidate = Path::new(spec);
     if candidate.is_absolute() {
         candidate.to_path_buf()

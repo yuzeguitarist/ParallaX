@@ -708,16 +708,64 @@ fn generate_config_template(
     fallback_addr: &str,
     sni: &str,
 ) -> GeneratedConfig {
+    let km = generate_init_key_material();
+    render_config_pair(
+        server_listen,
+        client_listen,
+        server_addr,
+        fallback_addr,
+        sni,
+        &km.server_public,
+        &km.identity_public,
+        // Inline variant: each secret is its base64 value, quoted in-place.
+        &toml_basic_string(&km.psk),
+        &toml_basic_string(&km.server_private),
+        &toml_basic_string(&km.identity_secret),
+        &toml_basic_string(&km.psk),
+    )
+}
+
+/// Freshly generated key material for `plx init`, shared by both the inline and
+/// referenced variants.
+struct InitKeyMaterial {
+    psk: String,
+    server_private: String,
+    server_public: String,
+    identity_secret: String,
+    identity_public: String,
+}
+
+fn generate_init_key_material() -> InitKeyMaterial {
     let mut psk = [0_u8; 32];
     OsRng.fill_bytes(&mut psk);
     let server_keys = X25519KeyPair::generate();
     let server_identity_keys = identity::keypair();
+    InitKeyMaterial {
+        psk: STANDARD.encode(psk),
+        server_private: STANDARD.encode(server_keys.private),
+        server_public: STANDARD.encode(server_keys.public),
+        identity_secret: STANDARD.encode(&server_identity_keys.secret),
+        identity_public: STANDARD.encode(&server_identity_keys.public),
+    }
+}
 
-    let psk = STANDARD.encode(psk);
-    let server_private = STANDARD.encode(server_keys.private);
-    let server_public = STANDARD.encode(server_keys.public);
-    let identity_secret = STANDARD.encode(&server_identity_keys.secret);
-    let identity_public = STANDARD.encode(&server_identity_keys.public);
+/// Render the paired server/client TOML. The secret-bearing lines are the only
+/// difference between the inline and referenced `plx init` variants, so each is
+/// passed as a full TOML right-hand side (e.g. `"<b64>"` or `{ file = "...#psk" }`).
+#[allow(clippy::too_many_arguments)]
+fn render_config_pair(
+    server_listen: &str,
+    client_listen: &str,
+    server_addr: &str,
+    fallback_addr: &str,
+    sni: &str,
+    server_public: &str,
+    identity_public: &str,
+    server_psk_rhs: &str,
+    private_key_rhs: &str,
+    identity_secret_key_rhs: &str,
+    client_psk_rhs: &str,
+) -> GeneratedConfig {
     let server_listen = toml_basic_string(server_listen);
     let client_listen = toml_basic_string(client_listen);
     let server_addr = toml_basic_string(server_addr);
@@ -728,7 +776,7 @@ fn generate_config_template(
         r#"mode = "server"
 
 [crypto]
-psk = "{}"
+psk = {server_psk_rhs}
 
 [traffic]
 min_padding = 0
@@ -740,29 +788,21 @@ cover_max_interval_ms = 0
 max_concurrent_streams = 4
 
 [server]
-listen = {}
-fallback_addr = {}
-private_key = "{}"
-identity_secret_key = "{}"
-replay_cache_path = "{}"
-authorized_sni = [{}]
+listen = {server_listen}
+fallback_addr = {fallback_addr}
+private_key = {private_key_rhs}
+identity_secret_key = {identity_secret_key_rhs}
+replay_cache_path = "{DEFAULT_REPLAY_CACHE_PATH}"
+authorized_sni = [{sni}]
 strict_tls13 = true
-
-"#,
-        psk,
-        server_listen,
-        fallback_addr,
-        server_private,
-        identity_secret,
-        DEFAULT_REPLAY_CACHE_PATH,
-        sni,
+"#
     );
 
     let client = format!(
         r#"mode = "client"
 
 [crypto]
-psk = "{}"
+psk = {client_psk_rhs}
 
 [traffic]
 min_padding = 0
@@ -774,13 +814,12 @@ cover_max_interval_ms = 0
 max_concurrent_streams = 4
 
 [client]
-listen = {}
-server_addr = {}
-sni = {}
-server_public_key = "{}"
-server_identity_public_key = "{}"
-"#,
-        psk, client_listen, server_addr, sni, server_public, identity_public,
+listen = {client_listen}
+server_addr = {server_addr}
+sni = {sni}
+server_public_key = "{server_public}"
+server_identity_public_key = "{identity_public}"
+"#
     );
 
     GeneratedConfig { server, client }
@@ -902,81 +941,35 @@ fn generate_referenced_config(
     fallback_addr: &str,
     sni: &str,
 ) -> ReferencedConfig {
-    let mut psk = [0_u8; 32];
-    OsRng.fill_bytes(&mut psk);
-    let server_keys = X25519KeyPair::generate();
-    let server_identity_keys = identity::keypair();
+    let km = generate_init_key_material();
 
-    let psk = STANDARD.encode(psk);
-    let server_private = STANDARD.encode(server_keys.private);
-    let server_public = STANDARD.encode(server_keys.public);
-    let identity_secret = STANDARD.encode(&server_identity_keys.secret);
-    let identity_public = STANDARD.encode(&server_identity_keys.public);
-    let server_listen = toml_basic_string(server_listen);
-    let client_listen = toml_basic_string(client_listen);
-    let server_addr = toml_basic_string(server_addr);
-    let fallback_addr = toml_basic_string(fallback_addr);
-    let sni = toml_basic_string(sni);
-
-    let server = format!(
-        r#"mode = "server"
-
-[crypto]
-psk = {{ file = "{SERVER_SECRETS_FILE}#psk" }}
-
-[traffic]
-min_padding = 0
-max_padding = 0
-min_delay_ms = 0
-max_delay_ms = 0
-cover_min_interval_ms = 0
-cover_max_interval_ms = 0
-max_concurrent_streams = 4
-
-[server]
-listen = {server_listen}
-fallback_addr = {fallback_addr}
-private_key = {{ file = "{SERVER_SECRETS_FILE}#private_key" }}
-identity_secret_key = {{ file = "{SERVER_SECRETS_FILE}#identity_secret_key" }}
-replay_cache_path = "{DEFAULT_REPLAY_CACHE_PATH}"
-authorized_sni = [{sni}]
-strict_tls13 = true
-"#
-    );
-
-    let client = format!(
-        r#"mode = "client"
-
-[crypto]
-psk = {{ file = "{CLIENT_SECRETS_FILE}#psk" }}
-
-[traffic]
-min_padding = 0
-max_padding = 0
-min_delay_ms = 0
-max_delay_ms = 0
-cover_min_interval_ms = 0
-cover_max_interval_ms = 0
-max_concurrent_streams = 4
-
-[client]
-listen = {client_listen}
-server_addr = {server_addr}
-sni = {sni}
-server_public_key = "{server_public}"
-server_identity_public_key = "{identity_public}"
-"#
+    let GeneratedConfig { server, client } = render_config_pair(
+        server_listen,
+        client_listen,
+        server_addr,
+        fallback_addr,
+        sni,
+        &km.server_public,
+        &km.identity_public,
+        // Referenced variant: each secret is a `{ file = "...#field" }` pointer
+        // into the sidecar, so the config alone is not a bearer credential.
+        &format!(r#"{{ file = "{SERVER_SECRETS_FILE}#psk" }}"#),
+        &format!(r#"{{ file = "{SERVER_SECRETS_FILE}#private_key" }}"#),
+        &format!(r#"{{ file = "{SERVER_SECRETS_FILE}#identity_secret_key" }}"#),
+        &format!(r#"{{ file = "{CLIENT_SECRETS_FILE}#psk" }}"#),
     );
 
     let server_secrets = format!(
         "# ParallaX SERVER secrets — SENSITIVE. Keep mode 0600. Never commit, never paste.\n\
-         psk = \"{psk}\"\n\
-         private_key = \"{server_private}\"\n\
-         identity_secret_key = \"{identity_secret}\"\n"
+         psk = \"{}\"\n\
+         private_key = \"{}\"\n\
+         identity_secret_key = \"{}\"\n",
+        km.psk, km.server_private, km.identity_secret,
     );
     let client_secrets = format!(
         "# ParallaX CLIENT secrets — SENSITIVE. Keep mode 0600. Never commit, never paste.\n\
-         psk = \"{psk}\"\n"
+         psk = \"{}\"\n",
+        km.psk,
     );
 
     ReferencedConfig {

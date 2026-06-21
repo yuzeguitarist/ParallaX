@@ -394,11 +394,7 @@ fn resolve_file_secret(
     field: &'static str,
 ) -> Result<Zeroizing<String>, ConfigError> {
     let (path_part, fragment) = crate::secret_store::split_fragment(spec);
-    let path = if Path::new(path_part).is_absolute() {
-        PathBuf::from(path_part)
-    } else {
-        base.join(path_part)
-    };
+    let path = crate::secret_store::resolve_path(base, path_part);
     let text = read_secret_config_file(&path).map_err(|_| ConfigError::SecretRead { field })?;
     match fragment {
         None => Ok(Zeroizing::new(text.trim().to_owned())),
@@ -745,6 +741,11 @@ impl Config {
 
     /// The authoritative set of long-lived secret fields (see [`SecretFieldRef`]).
     /// Every secret-handling site enumerates secrets through this one method.
+    ///
+    /// NOTE: Rust's borrow model can't express a single iterator yielding both
+    /// shared and `&mut` views, so [`Config::secret_sources_mut`] mirrors this
+    /// list for in-place resolution. The two MUST stay in sync — add new secrets
+    /// to both (a test asserts they have equal length).
     pub(crate) fn secret_sources(&self) -> Vec<SecretFieldRef<'_>> {
         let mut fields = vec![SecretFieldRef {
             dotted: "crypto.psk",
@@ -769,7 +770,9 @@ impl Config {
         fields
     }
 
-    /// Mutable view of the same authoritative secret set, for in-place resolution.
+    /// Mutable view of the same authoritative secret set, for in-place
+    /// resolution. MUST stay in sync with [`Config::secret_sources`] (see the
+    /// note there); a test asserts the two yield the same number of fields.
     fn secret_sources_mut(&mut self) -> Vec<(&'static str, &mut SecretSource)> {
         let mut fields: Vec<(&'static str, &mut SecretSource)> =
             vec![("crypto.psk", &mut self.crypto.psk)];
@@ -814,7 +817,8 @@ impl Config {
         }
         out
     }
-    /// text, in place, relative to the config file's directory.
+    /// Resolve every secret field's `file`/`env`/`sealed` indirection to its
+    /// value, in place, relative to the config file's directory.
     fn resolve_secrets(&mut self, config_path: &Path) -> Result<(), ConfigError> {
         let base = config_path
             .parent()
@@ -1339,6 +1343,34 @@ authorized_sni = ["example.com"]
             .unwrap()
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn secret_sources_views_stay_in_sync() {
+        // `secret_sources` and `secret_sources_mut` are two hand-maintained lists
+        // (Rust can't yield shared + `&mut` views from one fn). Guard against one
+        // drifting from the other when a future secret field is added.
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
+        let server_raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{KEY}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let mut cfg = toml::from_str::<Config>(&server_raw).unwrap();
+        let shared = cfg.secret_sources().len();
+        let mutable = cfg.secret_sources_mut().len();
+        assert_eq!(shared, mutable);
+        assert_eq!(shared, 3, "server config exposes psk + 2 server keys");
     }
 
     #[test]
