@@ -382,6 +382,50 @@ fn read_pn(buf: &[u8], pn_offset: usize, pn_len: usize) -> Result<u64, DecodeErr
     Ok(pn)
 }
 
+/// The three packet-number spaces a received packet can map to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketSpace {
+    Initial,
+    Handshake,
+    OneRtt,
+}
+
+/// Classify a received datagram's first packet by space, from its (still
+/// HP-masked) first byte — the long-header form + type bits are not header-
+/// protected (RFC 9001 §5.4.2). Returns `None` for a clear fixed bit or an
+/// unsupported long type (0-RTT / Retry / Version Negotiation).
+pub fn first_packet_space(datagram: &[u8]) -> Option<PacketSpace> {
+    let first = *datagram.first()?;
+    if first & FIXED_BIT == 0 {
+        return None;
+    }
+    if first & LONG_HEADER_FORM == 0 {
+        return Some(PacketSpace::OneRtt);
+    }
+    match LongType::from_first_byte(first) {
+        LongType::Initial => Some(PacketSpace::Initial),
+        LongType::Handshake => Some(PacketSpace::Handshake),
+        LongType::ZeroRtt | LongType::Retry => None,
+    }
+}
+
+/// Peek the destination + source connection ids of a long-header packet WITHOUT
+/// removing header protection (the CIDs are plaintext). The server uses this on
+/// the client's first Initial to derive Initial keys from the chosen DCID and to
+/// learn the client's SCID before it can decrypt anything.
+pub fn peek_long_cids(datagram: &[u8]) -> Result<(ConnectionId, ConnectionId), DecodeError> {
+    let first = *datagram.first().ok_or(DecodeError::Truncated)?;
+    if first & LONG_HEADER_FORM == 0 {
+        return Err(DecodeError::UnsupportedPacketType);
+    }
+    let mut c = Cursor::new(datagram);
+    c.skip(1)?;
+    c.skip(4)?; // version
+    let dcid = c.cid()?;
+    let scid = c.cid()?;
+    Ok((dcid, scid))
+}
+
 /// A minimal forward cursor over a header buffer.
 struct Cursor<'a> {
     buf: &'a [u8],

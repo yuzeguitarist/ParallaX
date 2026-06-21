@@ -139,3 +139,80 @@ impl ClientConfig {
 pub use handshake::{ClientHandshake, KeyChange};
 
 mod handshake;
+
+pub(crate) use schedule::initial_keys;
+pub(crate) use server::ServerHandshake;
+
+/// The TLS-session surface the hand-rolled QUIC connection drives. Both
+/// [`ClientHandshake`] and [`ServerHandshake`] implement it, so the connection
+/// state machine is role-generic over a `Box<dyn TlsSession>`.
+pub(crate) trait TlsSession {
+    /// Feed reassembled CRYPTO-stream bytes (a handshake-message stream).
+    fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError>;
+    /// Emit outgoing CRYPTO bytes; return a [`KeyChange`] on a space transition.
+    fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange>;
+    /// The next 1-RTT packet-key generation (RFC 9001 §6 key update).
+    fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>>;
+    fn is_handshaking(&self) -> bool;
+    /// The peer's raw `quic_transport_parameters` blob, once available.
+    fn peer_transport_parameters(&self) -> Option<&[u8]>;
+    /// RFC 5705 exporter (byte-identical on both ends; backs the auth token).
+    fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), QuicTlsError>;
+}
+
+impl TlsSession for ClientHandshake {
+    fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
+        ClientHandshake::read_handshake(self, data)
+    }
+    fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
+        ClientHandshake::write_handshake(self, out)
+    }
+    fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
+        ClientHandshake::next_1rtt_keys(self)
+    }
+    fn is_handshaking(&self) -> bool {
+        ClientHandshake::is_handshaking(self)
+    }
+    fn peer_transport_parameters(&self) -> Option<&[u8]> {
+        ClientHandshake::peer_transport_parameters(self)
+    }
+    fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), QuicTlsError> {
+        ClientHandshake::export_keying_material(self, out, label, context)
+    }
+}
+
+impl TlsSession for ServerHandshake {
+    fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
+        ServerHandshake::read_handshake(self, data)
+    }
+    fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
+        ServerHandshake::write_handshake(self, out)
+    }
+    fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
+        ServerHandshake::next_1rtt_keys(self)
+    }
+    fn is_handshaking(&self) -> bool {
+        ServerHandshake::is_handshaking(self)
+    }
+    fn peer_transport_parameters(&self) -> Option<&[u8]> {
+        ServerHandshake::peer_transport_parameters(self)
+    }
+    fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), QuicTlsError> {
+        ServerHandshake::export_keying_material(self, out, label, context)
+    }
+}

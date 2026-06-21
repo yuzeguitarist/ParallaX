@@ -1,26 +1,27 @@
-//! Connection packet I/O: seal an outgoing packet and open an incoming one
-//! (RFC 9001 §5.3/§5.4 packet + header protection), clean-room.
+//! Connection packet I/O and the role-generic QUIC connection state machine
+//! (RFC 9000 §10, RFC 9001 §5), clean-room.
 //!
-//! These tie the wire codec ([`super::packet`], [`super::frame`]) to the SHIPPING
-//! AEAD / header-protection keys from the Phase-1 TLS engine
-//! ([`crate::tls::quic::DirectionalKeys`]) — no crypto is re-implemented. The
-//! connection state machine (built on top, in this module later) drives them per
-//! packet-number space.
+//! [`seal_packet`] / [`open_packet`] tie the wire codec ([`super::packet`],
+//! [`super::frame`]) to the SHIPPING AEAD / header-protection keys from the
+//! Phase-1 TLS engine ([`crate::tls::quic::DirectionalKeys`]) — no crypto is
+//! re-implemented. [`Connection`] drives the handshake on top: it owns the three
+//! packet-number spaces, pumps the [`TlsSession`] (client or server) for CRYPTO
+//! bytes + key transitions, fragments them into packets, and processes incoming
+//! datagrams (locate PN → remove HP → AEAD-open → dispatch frames → feed CRYPTO).
 //!
-//! Send: encode the header (plaintext PN), append the frame payload, AEAD-seal
-//! with the header as AAD, then apply header protection. Receive: locate the PN
-//! offset, remove header protection, decode the header, reconstruct the full
-//! packet number from the space's largest seen PN (RFC 9000 Appendix A.3), and
-//! AEAD-open the payload.
+//! This slice carries the handshake to completion (the in-memory loopback
+//! milestone). Loss recovery / ACK timing (RFC 9002) and the 1-RTT data streams
+//! land in later slices; a lossless loopback completes without them.
 
 use std::sync::Arc;
 
-use super::frame::Frame;
-use super::packet::{self, ConnectionId, Header, LongType};
-use super::spaces::PacketNumberSpace;
+use super::frame::{Frame, Iter};
+use super::packet::{self, ConnectionId, Header, LongType, PacketSpace};
+use super::spaces::{PacketNumberSpace, ReceivedPackets};
 use super::transport_params::TransportParameters;
 use crate::tls::quic::{
-    ClientConfig, ClientHandshake, DirectionalKeys, Keys, QuicTlsError, Side, QUIC_VERSION_V1,
+    initial_keys, ClientConfig, ClientHandshake, DirectionalKeys, KeyChange, KeyPair, Keys,
+    PacketKey, QuicTlsError, ServerHandshake, Side, TlsSession, QUIC_VERSION_V1,
 };
 
 /// Error opening (decrypting/parsing) an incoming packet.
@@ -128,34 +129,61 @@ pub fn open_packet(
 /// RFC 9000 §14.1: a client MUST pad every datagram carrying an Initial packet to
 /// at least 1200 bytes so the path can carry it before address validation.
 const MIN_INITIAL_DATAGRAM: usize = 1200;
+/// A conservative max UDP payload for non-Initial packets (one datagram holds the
+/// whole Handshake flight in practice).
+const MAX_DATAGRAM: usize = 1252;
 
-/// A hand-rolled QUIC v1 client connection.
-///
-/// This slice covers the Initial flight only: it constructs the Phase-1 TLS engine,
-/// pulls the Safari ClientHello into the Initial CRYPTO stream, and fragments it
-/// across 1200-byte Initial datagrams via [`Connection::poll_transmit`]. The
-/// receive path, Handshake/1-RTT spaces, timers, and streams land in later slices
-/// (the `tls` handle and dcid/scid are retained for them).
+const SPACE_INITIAL: usize = 0;
+const SPACE_HANDSHAKE: usize = 1;
+const SPACE_DATA: usize = 2;
+
+fn space_index(space: PacketSpace) -> usize {
+    match space {
+        PacketSpace::Initial => SPACE_INITIAL,
+        PacketSpace::Handshake => SPACE_HANDSHAKE,
+        PacketSpace::OneRtt => SPACE_DATA,
+    }
+}
+
+/// Per-packet-number-space state: protection keys (installed as the handshake
+/// crosses spaces), the send allocator + received-PN set, and the in-/out-bound
+/// CRYPTO byte streams.
+#[derive(Default)]
+struct Space {
+    keys: Option<Keys>,
+    send: PacketNumberSpace,
+    recv: ReceivedPackets,
+    /// Outgoing CRYPTO bytes and how much has been packetized.
+    crypto_send: Vec<u8>,
+    crypto_send_off: usize,
+    /// Next in-order CRYPTO offset expected on receive, plus buffered future gaps.
+    crypto_recv_off: u64,
+    crypto_pending: Vec<(u64, Vec<u8>)>,
+}
+
+/// A hand-rolled QUIC v1 connection (client or server), carried to handshake
+/// completion. Role-generic over a [`TlsSession`].
 pub struct Connection {
+    side: Side,
     version: u32,
-    /// Destination CID (the server's; client-chosen random for the first Initial).
+    /// The DCID the Initial secrets are derived from (RFC 9001 §5.2) — fixed once
+    /// known (the client's first-Initial choice).
+    initial_dcid: ConnectionId,
+    /// The peer connection id placed in outgoing headers; updated to the peer's
+    /// advertised SCID once seen.
     dcid: ConnectionId,
-    /// Our source CID (zero-length for the Safari client).
+    /// Our source connection id (zero-length for the Safari client).
     scid: ConnectionId,
-    tls: ClientHandshake,
-    initial_keys: Keys,
-    initial_send: PacketNumberSpace,
-    /// The outgoing Initial-space CRYPTO byte stream (the ClientHello) and how much
-    /// of it has been packetized so far.
-    initial_crypto: Vec<u8>,
-    initial_crypto_sent: usize,
+    peer_cid_adopted: bool,
+    tls: Box<dyn TlsSession>,
+    spaces: [Space; 3],
+    /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
+    write_level: usize,
 }
 
 impl Connection {
-    /// Start a client connection to `server_name`. `dcid` is the client-chosen
-    /// destination connection id for the first Initial (RFC 9001 §5.2 derives the
-    /// Initial secrets from it); `scid` is our source CID (zero-length for Safari,
-    /// echoed into the `initial_source_connection_id` transport parameter).
+    /// Start a client connection. `dcid` is the client-chosen destination
+    /// connection id for the first Initial; `scid` is our (zero-length) source CID.
     pub fn new_client(
         config: Arc<ClientConfig>,
         server_name: &str,
@@ -163,81 +191,280 @@ impl Connection {
         scid: ConnectionId,
     ) -> Result<Self, QuicTlsError> {
         let tp = TransportParameters::safari_client(scid.as_slice());
-        let mut tls = ClientHandshake::new(
+        let tls = ClientHandshake::new(
             config,
             QUIC_VERSION_V1,
             server_name,
             tp.encode_safari_client(),
         )?;
-        let initial_keys = tls.initial_keys(dcid.as_slice(), Side::Client);
-        // Pull the ClientHello into the Initial CRYPTO stream (no key change yet).
-        let mut initial_crypto = Vec::new();
-        let _ = tls.write_handshake(&mut initial_crypto);
-        Ok(Self {
+        let mut spaces = [Space::default(), Space::default(), Space::default()];
+        spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
+        let mut conn = Self {
+            side: Side::Client,
             version: QUIC_VERSION_V1,
+            initial_dcid: dcid,
             dcid,
             scid,
-            tls,
-            initial_keys,
-            initial_send: PacketNumberSpace::new(),
-            initial_crypto,
-            initial_crypto_sent: 0,
-        })
+            peer_cid_adopted: false,
+            tls: Box::new(tls),
+            spaces,
+            write_level: SPACE_INITIAL,
+        };
+        conn.pump_write(); // pull the ClientHello into the Initial CRYPTO stream
+        Ok(conn)
     }
 
-    /// Produce the next datagram to send, or `None` when the Initial flight is
-    /// fully packetized. Each datagram carries one Initial packet whose CRYPTO
-    /// frame holds the next slice of the ClientHello, padded to
-    /// [`MIN_INITIAL_DATAGRAM`].
-    pub fn poll_transmit(&mut self) -> Option<Vec<u8>> {
-        if self.initial_crypto_sent >= self.initial_crypto.len() {
-            return None;
+    /// Start a server connection. `scid` is the server's source CID; the Initial
+    /// keys and the client's CID are learned from the first Initial datagram.
+    pub fn new_server(
+        cert_chain: Vec<Vec<u8>>,
+        alpn_protocols: Vec<Vec<u8>>,
+        transport_params: Vec<u8>,
+        scid: ConnectionId,
+    ) -> Self {
+        let tls = ServerHandshake::new(cert_chain, alpn_protocols, transport_params);
+        Self {
+            side: Side::Server,
+            version: QUIC_VERSION_V1,
+            initial_dcid: ConnectionId::new(&[]),
+            dcid: ConnectionId::new(&[]),
+            scid,
+            peer_cid_adopted: false,
+            tls: Box::new(tls),
+            spaces: [Space::default(), Space::default(), Space::default()],
+            write_level: SPACE_INITIAL,
         }
-        let tag_len = self.initial_keys.local.packet.tag_len();
-        let offset = self.initial_crypto_sent as u64;
-        let pn = self.initial_send.allocate();
-        let (_, pn_len) = packet::encode_packet_number(pn, None);
+    }
 
-        // Encode the header with a 2-byte length placeholder (valid for ~1200) to
-        // measure the packet-number offset, then size the CRYPTO chunk to the
-        // remaining datagram budget.
-        let header = Header::Long {
-            ty: LongType::Initial,
-            version: self.version,
-            dcid: self.dcid,
-            scid: self.scid,
-            token: Vec::new(),
-            length: MIN_INITIAL_DATAGRAM as u64,
-            packet_number: pn,
-            pn_len,
+    pub fn is_handshaking(&self) -> bool {
+        self.tls.is_handshaking()
+    }
+
+    /// RFC 5705 exporter (byte-identical on both ends; backs the auth token).
+    pub fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), QuicTlsError> {
+        self.tls.export_keying_material(out, label, context)
+    }
+
+    /// The peer's raw `quic_transport_parameters` blob, once the handshake has
+    /// exchanged them (the relay parses it with [`TransportParameters::read`]).
+    pub fn peer_transport_parameters(&self) -> Option<&[u8]> {
+        self.tls.peer_transport_parameters()
+    }
+
+    /// The next 1-RTT packet-key generation for a key update (RFC 9001 §6). MUST
+    /// be `Some` once the connection has 1-RTT keys (the Data-space-entry contract).
+    pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
+        self.tls.next_1rtt_keys()
+    }
+
+    /// Drain the TLS engine's outgoing CRYPTO into the right space and install the
+    /// Handshake / 1-RTT keys as the engine hands them over.
+    fn pump_write(&mut self) {
+        loop {
+            let mut buf = Vec::new();
+            let kc = self.tls.write_handshake(&mut buf);
+            if !buf.is_empty() {
+                self.spaces[self.write_level]
+                    .crypto_send
+                    .extend_from_slice(&buf);
+            }
+            match kc {
+                Some(KeyChange::Handshake { keys }) => {
+                    self.spaces[SPACE_HANDSHAKE].keys = Some(keys);
+                    self.write_level = SPACE_HANDSHAKE;
+                }
+                Some(KeyChange::OneRtt { keys }) => {
+                    self.spaces[SPACE_DATA].keys = Some(keys);
+                    self.write_level = SPACE_DATA;
+                }
+                None => {
+                    if buf.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Produce the next datagram to send (one CRYPTO packet from the lowest space
+    /// with pending handshake bytes and installed keys), or `None` when idle.
+    pub fn poll_transmit(&mut self) -> Option<Vec<u8>> {
+        for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+            let sp = &self.spaces[space];
+            if sp.keys.is_some() && sp.crypto_send_off < sp.crypto_send.len() {
+                return Some(self.build_crypto_packet(space));
+            }
+        }
+        None
+    }
+
+    fn build_crypto_packet(&mut self, space: usize) -> Vec<u8> {
+        let pn = self.spaces[space].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let offset = self.spaces[space].crypto_send_off as u64;
+        let tag_len = self.spaces[space]
+            .keys
+            .as_ref()
+            .unwrap()
+            .local
+            .packet
+            .tag_len();
+
+        let header = match space {
+            SPACE_INITIAL | SPACE_HANDSHAKE => {
+                let ty = if space == SPACE_INITIAL {
+                    LongType::Initial
+                } else {
+                    LongType::Handshake
+                };
+                Header::Long {
+                    ty,
+                    version: self.version,
+                    dcid: self.dcid,
+                    scid: self.scid,
+                    token: Vec::new(),
+                    length: MIN_INITIAL_DATAGRAM as u64, // 2-byte-varint placeholder
+                    packet_number: pn,
+                    pn_len,
+                }
+            }
+            _ => Header::Short {
+                spin: false,
+                key_phase: false,
+                dcid: self.dcid,
+                packet_number: pn,
+                pn_len,
+            },
         };
         let mut probe = Vec::new();
         let pn_offset = header.encode(&mut probe);
 
         let crypto_hdr = 1 + super::varint::size(offset) + 2;
-        let budget = MIN_INITIAL_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + crypto_hdr);
-        let remaining = self.initial_crypto.len() - self.initial_crypto_sent;
+        let cap = if space == SPACE_INITIAL {
+            MIN_INITIAL_DATAGRAM
+        } else {
+            MAX_DATAGRAM
+        };
+        let budget = cap.saturating_sub(pn_offset + pn_len + tag_len + crypto_hdr);
+        let remaining = self.spaces[space].crypto_send.len() - self.spaces[space].crypto_send_off;
         let chunk_len = remaining.min(budget.max(1));
-        let end = self.initial_crypto_sent + chunk_len;
+        let end = self.spaces[space].crypto_send_off + chunk_len;
 
         let datagram = {
             let crypto = Frame::Crypto {
                 offset,
-                data: &self.initial_crypto[self.initial_crypto_sent..end],
+                data: &self.spaces[space].crypto_send[self.spaces[space].crypto_send_off..end],
             };
             let mut payload = Vec::new();
             crypto.encode(&mut payload);
-            let pad =
-                MIN_INITIAL_DATAGRAM.saturating_sub(pn_offset + pn_len + payload.len() + tag_len);
-            let frames = if pad > 0 {
-                vec![crypto, Frame::Padding(pad)]
+            let frames = if space == SPACE_INITIAL {
+                let pad = MIN_INITIAL_DATAGRAM
+                    .saturating_sub(pn_offset + pn_len + payload.len() + tag_len);
+                if pad > 0 {
+                    vec![crypto, Frame::Padding(pad)]
+                } else {
+                    vec![crypto]
+                }
             } else {
                 vec![crypto]
             };
-            seal_packet(&self.initial_keys.local, header, &frames)
+            let keys = self.spaces[space].keys.as_ref().unwrap();
+            seal_packet(&keys.local, header, &frames)
         };
-        self.initial_crypto_sent = end;
-        Some(datagram)
+        self.spaces[space].crypto_send_off = end;
+        datagram
+    }
+
+    /// Process one received datagram: identify the space, (for the server's first
+    /// Initial) derive Initial keys + learn CIDs, AEAD-open, dispatch the frames,
+    /// then pump the TLS engine for the response and key transitions.
+    pub fn handle_datagram(&mut self, datagram: &[u8]) -> Result<(), QuicTlsError> {
+        let pspace = packet::first_packet_space(datagram)
+            .ok_or_else(|| QuicTlsError::Crypto("unsupported packet type".into()))?;
+        let space = space_index(pspace);
+
+        // Server learns the client's chosen DCID (for Initial keys) + SCID, and
+        // either endpoint adopts the peer's SCID as its outgoing DCID.
+        if matches!(pspace, PacketSpace::Initial | PacketSpace::Handshake) {
+            let (dcid, scid) = packet::peek_long_cids(datagram)
+                .map_err(|_| QuicTlsError::Crypto("malformed long header".into()))?;
+            if self.side == Side::Server && self.spaces[SPACE_INITIAL].keys.is_none() {
+                self.initial_dcid = dcid;
+                self.spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Server));
+            }
+            if !self.peer_cid_adopted {
+                self.dcid = scid;
+                self.peer_cid_adopted = true;
+            }
+        }
+
+        let local_cid_len = self.scid.len();
+        let largest = self.spaces[space].recv.largest();
+        let mut buf = datagram.to_vec();
+        let (header, range) = {
+            let keys = self.spaces[space]
+                .keys
+                .as_ref()
+                .ok_or_else(|| QuicTlsError::Crypto("no keys for packet space".into()))?;
+            open_packet(&keys.remote, &mut buf, local_cid_len, largest)
+                .map_err(|e| QuicTlsError::Crypto(format!("packet open failed: {e:?}")))?
+        };
+
+        // Drop a duplicate (replayed) packet without reprocessing it.
+        if !self.spaces[space].recv.insert(header.packet_number()) {
+            return Ok(());
+        }
+
+        // Copy the decrypted frames out so the TLS engine can be mutated while we
+        // iterate.
+        let payload = buf[range].to_vec();
+        for frame in Iter::new(&payload) {
+            let frame =
+                frame.map_err(|e| QuicTlsError::Crypto(format!("frame decode failed: {e:?}")))?;
+            // Only CRYPTO advances the handshake here; ACK timing / loss recovery
+            // and the data-stream frames land in later (B2 / B4) slices.
+            if let Frame::Crypto { offset, data } = frame {
+                self.recv_crypto(space, offset, data)?;
+            }
+        }
+        self.pump_write();
+        Ok(())
+    }
+
+    /// Reassemble an incoming CRYPTO fragment in order and feed the contiguous
+    /// run to the TLS engine (which buffers partial handshake messages itself).
+    fn recv_crypto(&mut self, space: usize, offset: u64, data: &[u8]) -> Result<(), QuicTlsError> {
+        let mut to_feed: Vec<u8> = Vec::new();
+        {
+            let sp = &mut self.spaces[space];
+            if offset > sp.crypto_recv_off {
+                sp.crypto_pending.push((offset, data.to_vec()));
+            } else {
+                let skip = (sp.crypto_recv_off - offset) as usize;
+                if skip < data.len() {
+                    to_feed.extend_from_slice(&data[skip..]);
+                    sp.crypto_recv_off += (data.len() - skip) as u64;
+                }
+                // Drain any buffered fragments that are now contiguous.
+                while let Some(i) = sp.crypto_pending.iter().position(|(o, d)| {
+                    *o <= sp.crypto_recv_off && *o + d.len() as u64 > sp.crypto_recv_off
+                }) {
+                    let (o, d) = sp.crypto_pending.remove(i);
+                    let s = (sp.crypto_recv_off - o) as usize;
+                    to_feed.extend_from_slice(&d[s..]);
+                    sp.crypto_recv_off += (d.len() - s) as u64;
+                }
+            }
+        }
+        if !to_feed.is_empty() {
+            self.tls.read_handshake(&to_feed)?;
+        }
+        Ok(())
     }
 }
 
@@ -266,7 +493,7 @@ mod tests {
             dcid: packet::ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]),
             scid: packet::ConnectionId::new(&[]),
             token: vec![],
-            length: 0, // computed by seal_packet
+            length: 0,
             packet_number: 0,
             pn_len: 1,
         };
@@ -274,7 +501,7 @@ mod tests {
         let mut datagram = seal_packet(&keys, header, &frames);
         let (decoded, range) = open_packet(&keys, &mut datagram, 0, None).unwrap();
         assert_eq!(decoded.packet_number(), 0);
-        let frames_back: Vec<_> = super::super::frame::Iter::new(&datagram[range])
+        let frames_back: Vec<_> = Iter::new(&datagram[range])
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(frames_back, frames);
@@ -283,7 +510,6 @@ mod tests {
     #[test]
     fn short_packet_reconstructs_full_packet_number() {
         let keys = test_keys();
-        // A 1-RTT packet at full PN 0x1_0005 sent with the peer's largest at 0x1_0000.
         let full_pn = 0x1_0005;
         let (_, pn_len) = packet::encode_packet_number(full_pn, Some(0x1_0000));
         let frames = [Frame::Stream {
@@ -300,10 +526,9 @@ mod tests {
             pn_len,
         };
         let mut datagram = seal_packet(&keys, header, &frames);
-        // Receiver knows the largest processed PN is 0x1_0000.
         let (decoded, range) = open_packet(&keys, &mut datagram, 0, Some(0x1_0000)).unwrap();
         assert_eq!(decoded.packet_number(), full_pn, "full PN reconstructed");
-        let frames_back: Vec<_> = super::super::frame::Iter::new(&datagram[range])
+        let frames_back: Vec<_> = Iter::new(&datagram[range])
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(frames_back, frames);
@@ -331,60 +556,115 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_initial_flight_is_decryptable_and_carries_clienthello() {
+    fn client_config() -> Arc<ClientConfig> {
         use crate::tls::quic::AcceptAnyServerCert;
-
-        let config = Arc::new(ClientConfig::new(
+        Arc::new(ClientConfig::new(
             Arc::new(AcceptAnyServerCert),
             vec![b"h3".to_vec()],
-        ));
-        let dcid = packet::ConnectionId::new(&[0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]);
+        ))
+    }
+
+    #[test]
+    fn client_initial_flight_is_decryptable_and_carries_clienthello() {
+        let dcid = ConnectionId::new(&[0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]);
         let mut conn =
-            Connection::new_client(config, "example.com", dcid, packet::ConnectionId::new(&[]))
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
 
         let mut datagrams = Vec::new();
         while let Some(d) = conn.poll_transmit() {
             datagrams.push(d);
         }
-        assert!(!datagrams.is_empty(), "client emits at least one Initial");
+        assert!(
+            datagrams.len() >= 2,
+            "the Safari ClientHello spans >1 Initial"
+        );
         for d in &datagrams {
             assert!(
                 d.len() >= 1200,
                 "every Initial datagram is padded to >=1200"
             );
         }
-        // The Safari ClientHello is large (PQ key share) and MUST NOT fit one
-        // datagram — that is the SNI-not-single-packet-extractable property.
-        assert!(
-            datagrams.len() >= 2,
-            "the Safari ClientHello spans more than one Initial datagram"
-        );
 
-        // Reassemble the CRYPTO stream by opening each Initial (with our own Initial
-        // keys — symmetric AEAD) and concatenating CRYPTO payloads in offset order.
+        let initial_keys = conn.spaces[SPACE_INITIAL].keys.as_ref().unwrap();
         let mut crypto = Vec::new();
         let mut largest: Option<u64> = None;
         for d in &datagrams {
             let mut buf = d.clone();
-            let (hdr, range) = open_packet(&conn.initial_keys.local, &mut buf, 0, largest).unwrap();
+            let (hdr, range) = open_packet(&initial_keys.local, &mut buf, 0, largest).unwrap();
             largest = Some(hdr.packet_number());
-            for f in super::super::frame::Iter::new(&buf[range]) {
+            for f in Iter::new(&buf[range]) {
                 if let Frame::Crypto { offset, data } = f.unwrap() {
                     assert_eq!(offset as usize, crypto.len(), "contiguous CRYPTO offsets");
                     crypto.extend_from_slice(data);
                 }
             }
         }
-        // The reassembled stream is a TLS 1.3 ClientHello: type 0x01 then a 3-byte
-        // length that frames the rest.
         assert_eq!(crypto[0], 0x01, "CRYPTO stream starts with ClientHello");
-        let body_len = u32::from_be_bytes([0, crypto[1], crypto[2], crypto[3]]) as usize;
+    }
+
+    #[test]
+    fn client_and_server_complete_a_quic_handshake_over_loopback() {
+        let dcid = ConnectionId::new(&[0xc0, 0xff, 0xee, 0x00, 0x11, 0x22, 0x33, 0x44]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        // A dummy cover cert (the REALITY client accepts any) + a server TP blob.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
+        );
+
+        // Ping-pong real QUIC datagrams until both complete (lossless: no ACKs).
+        for _ in 0..8 {
+            while let Some(dg) = client.poll_transmit() {
+                server.handle_datagram(&dg).unwrap();
+            }
+            while let Some(dg) = server.poll_transmit() {
+                client.handle_datagram(&dg).unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+
+        assert!(!client.is_handshaking(), "client handshake completed");
+        assert!(!server.is_handshaking(), "server handshake completed");
+
+        // The exporter (RFC 5705) is byte-identical on both ends.
+        let mut ce = [0u8; 32];
+        let mut se = [0u8; 32];
+        client
+            .export_keying_material(&mut ce, b"parallax tudp", b"binding")
+            .unwrap();
+        server
+            .export_keying_material(&mut se, b"parallax tudp", b"binding")
+            .unwrap();
+        assert_eq!(ce, se, "client and server agree on exporter material");
+        assert_ne!(ce, [0u8; 32], "exporter produced real key material");
+
+        // Transport parameters were exchanged both ways.
         assert_eq!(
-            crypto.len(),
-            4 + body_len,
-            "ClientHello length frames the CRYPTO stream"
+            client.peer_transport_parameters(),
+            Some([0x01, 0x02, 0x03, 0x04].as_ref()),
+            "client received the server's transport parameters"
+        );
+        assert!(
+            server
+                .peer_transport_parameters()
+                .is_some_and(|tp| !tp.is_empty()),
+            "server received the client's (Safari) transport parameters"
+        );
+        // The next 1-RTT keys MUST be ready once the handshake completes.
+        assert!(
+            client.next_1rtt_keys().is_some(),
+            "client 1-RTT key update ready"
+        );
+        assert!(
+            server.next_1rtt_keys().is_some(),
+            "server 1-RTT key update ready"
         );
     }
 }
