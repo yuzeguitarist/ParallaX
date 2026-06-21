@@ -1937,6 +1937,16 @@ impl Connection {
                     to_feed.extend_from_slice(&d[s..]);
                     sp.crypto_recv_off += (d.len() - s) as u64;
                 }
+                // Evict fragments now fully below the receive offset. The drain
+                // loop above only matches fragments that STRADDLE recv_off; a
+                // fragment that an overlapping in-order fill jumped entirely past
+                // (`o + len <= recv_off`) matches neither it nor any other removal
+                // path, so it would linger forever while still counting toward the
+                // MAX_CRYPTO_REASSEMBLY budget. A peer could exploit that to wedge
+                // the budget and stall the (off-path-injectable, Initial-space)
+                // handshake; drop the already-consumed bytes instead.
+                sp.crypto_pending
+                    .retain(|(o, d)| *o + d.len() as u64 > sp.crypto_recv_off);
             }
         }
         if !to_feed.is_empty() {
@@ -2026,6 +2036,12 @@ impl Connection {
             s.recv.extend_from_slice(&d[sk..]);
             s.recv_off += (d.len() - sk) as u64;
         }
+        // Evict fragments now fully below the receive offset (see recv_crypto):
+        // the drain loop only removes fragments straddling recv_off, so one that an
+        // overlapping in-order fill jumped entirely past would otherwise linger and
+        // permanently consume the MAX_STREAM_REASSEMBLY budget.
+        s.recv_pending
+            .retain(|(o, d)| *o + d.len() as u64 > s.recv_off);
         Ok(())
     }
 
@@ -2209,6 +2225,39 @@ mod tests {
             Arc::new(AcceptAnyServerCert),
             vec![b"h3".to_vec()],
         ))
+    }
+
+    #[test]
+    fn reassembly_evicts_fragments_consumed_by_a_later_overlapping_fill() {
+        // Regression: an in-order fill that jumps the receive offset entirely past
+        // earlier out-of-order fragments must evict them. The drain loop only
+        // removes fragments straddling recv_off, so without the post-drain
+        // `retain` these fully-consumed fragments would wedge the bounded
+        // reassembly budget and stall further reassembly.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x4d, 0x4d, 0x4d, 0x4d]),
+        )
+        .unwrap();
+
+        // Stream 0 is client-initiated bidi (peer-initiated for the server). Two
+        // out-of-order fragments buffered ahead of the receive offset (0).
+        server.recv_stream(0, 100, false, &[0xAA; 10]).unwrap(); // 100..110
+        server.recv_stream(0, 200, false, &[0xBB; 10]).unwrap(); // 200..210
+        assert_eq!(server.streams[&0].recv_pending.len(), 2);
+
+        // A single in-order fragment fills 0..250, jumping recv_off past both
+        // buffered fragments without straddling either.
+        server.recv_stream(0, 0, false, &vec![0xCC; 250]).unwrap();
+
+        assert_eq!(server.streams[&0].recv_off, 250);
+        assert!(
+            server.streams[&0].recv_pending.is_empty(),
+            "fully-consumed out-of-order fragments must be evicted, not wedged in the budget"
+        );
     }
 
     /// A throwaway ECDSA P-256 PKCS#8 key for the server's CertificateVerify.
