@@ -2,14 +2,15 @@
 # ops/fuzz-cluster/bin/status.sh
 # GROUP 3 — observability. Runs as user 'plxfuzz' from the plx-status timer
 # (~every 1 min). Builds status-<nodeid>.json and publishes it to the dedicated
-# 'fuzz-status' branch, kept at a SINGLE commit: each tick force-pushes a
-# parentless root commit (the fetched tip's tree with our file updated) under a
-# compare-and-swap lease, so history never grows while cross-box last-writer-wins
-# is preserved (a racing peer push fails -> re-fetch + retry). Every gh/git
-# network op is wrapped so a transient failure can
+# 'fuzz-status' TAG (a force-updated tag, NOT a branch, so GitHub's home page
+# never shows a "Compare & pull request" banner for it), kept at a SINGLE commit:
+# each tick force-pushes a parentless root commit (the fetched tip's tree with
+# our file updated) under a compare-and-swap lease, so history never grows while
+# cross-box last-writer-wins is preserved (a racing peer push fails -> re-fetch +
+# retry). Every gh/git network op is wrapped so a transient failure can
 # never kill the box; the next tick just retries. Idempotent.
 #
-# IMPORTANT: the branch commit happens in a DEDICATED clone under
+# IMPORTANT: the tag commit happens in a DEDICATED clone under
 # /var/lib/plxfuzz/state/branch-fuzz-status — never in /var/lib/plxfuzz/src,
 # which is the pinned source tree the fuzzers are actively running from.
 set -uo pipefail
@@ -161,7 +162,13 @@ fi
 
 # Stage the JSON into the dedicated status worktree (created below), not src.
 WT="$STATE/branch-fuzz-status"
-BRANCH=fuzz-status
+# Published as a force-updated TAG (not a branch): GitHub only shows the
+# "recent pushes / Compare & pull request" home-page banner for branches, so a
+# tag keeps the minute-by-minute heartbeat invisible there. Consumers read it
+# the same way (Contents API ?ref=fuzz-status resolves a tag once the legacy
+# branch of the same name is gone).
+REFNAME=fuzz-status
+REF="refs/tags/$REFNAME"
 REL="fuzz/dashboard/status-${NODE_ID}.json"
 
 build_json() {  # $1 = absolute output path
@@ -210,12 +217,15 @@ ensure_status_clone() {
   fi
   mkdir -p "$STATE" 2>/dev/null || true
   rm -rf "$WT" 2>/dev/null || true
-  if git clone --depth 1 --branch "$BRANCH" --single-branch "$(auth_remote)" "$WT" -q 2>/dev/null; then
+  # `git clone --branch` accepts a tag name too (detached HEAD at the tag), so
+  # this works whether fuzz-status currently resolves to the tag or (legacy) a
+  # branch. push_status does the real work via an explicit tag fetch below.
+  if git clone --depth 1 --branch "$REFNAME" --single-branch "$(auth_remote)" "$WT" -q 2>/dev/null; then
     return 0
   fi
-  # Branch does not exist yet — create it as an orphan in a fresh clone.
+  # Neither tag nor branch exists yet — start from an empty checkout.
   if git clone --depth 1 "$(auth_remote)" "$WT" -q 2>/dev/null; then
-    git -C "$WT" checkout --orphan "$BRANCH" -q 2>/dev/null || true
+    git -C "$WT" checkout --orphan "$REFNAME" -q 2>/dev/null || true
     git -C "$WT" rm -rf --cached . -q 2>/dev/null || true
     git -C "$WT" clean -fdq 2>/dev/null || true
     return 0
@@ -223,7 +233,7 @@ ensure_status_clone() {
   return 1
 }
 
-# Keep this throwaway clone bounded. The remote branch is force-collapsed to a
+# Keep this throwaway clone bounded. The remote tag is force-collapsed to a
 # single commit every tick (see push_status), so each fetch leaves the previous
 # tip unreachable; aggressive *synchronous* auto-gc with immediate prune keeps
 # the local clone from slowly re-bloating the way the old append-history did.
@@ -240,12 +250,14 @@ push_status() {
 
   local i base tree commit
   for i in 1 2 3; do
-    git -C "$WT" fetch origin "$BRANCH" -q 2>/dev/null || true
-    if git -C "$WT" show-ref --verify --quiet "refs/remotes/origin/$BRANCH" 2>/dev/null; then
-      base="$(git -C "$WT" rev-parse "refs/remotes/origin/$BRANCH" 2>/dev/null || true)"
-      git -C "$WT" reset --hard "origin/$BRANCH" -q 2>/dev/null || true
+    # Force-sync the local tag ref to the remote tag (it is force-updated every
+    # tick, so a plain fetch would refuse the non-fast-forward tag move).
+    git -C "$WT" fetch -f origin "$REF:$REF" -q 2>/dev/null || true
+    if git -C "$WT" show-ref --verify --quiet "$REF" 2>/dev/null; then
+      base="$(git -C "$WT" rev-parse "$REF" 2>/dev/null || true)"
+      git -C "$WT" reset --hard "$REF" -q 2>/dev/null || true
     else
-      # Branch absent (first publish ever): build from an empty index.
+      # Tag absent (first publish ever): build from an empty index.
       base=""
       git -C "$WT" read-tree --empty 2>/dev/null || true
       git -C "$WT" clean -fdq 2>/dev/null || true
@@ -266,17 +278,17 @@ push_status() {
     [ -n "$commit" ] || continue
 
     if [ -n "$base" ]; then
-      # CAS: overwrite only if the remote is still at the tip we based our tree
-      # on; a peer that pushed in between makes this fail -> re-fetch + retry,
-      # so the peer's just-written status is never clobbered.
-      if git -C "$WT" push --force-with-lease="refs/heads/$BRANCH:$base" \
-           origin "$commit:refs/heads/$BRANCH" -q 2>/dev/null; then
+      # CAS: overwrite only if the remote tag is still at the tip we based our
+      # tree on; a peer that pushed in between makes this fail -> re-fetch +
+      # retry, so the peer's just-written status is never clobbered.
+      if git -C "$WT" push --force-with-lease="$REF:$base" \
+           origin "$commit:$REF" -q 2>/dev/null; then
         printf '%s\n' "$TS" > "$STATE/last-status-ts" 2>/dev/null || true
         return 0
       fi
     else
-      # Create the branch; a peer that wins the create makes this fail -> retry.
-      if git -C "$WT" push origin "$commit:refs/heads/$BRANCH" -q 2>/dev/null; then
+      # Create the tag; a peer that wins the create makes this fail -> retry.
+      if git -C "$WT" push origin "$commit:$REF" -q 2>/dev/null; then
         printf '%s\n' "$TS" > "$STATE/last-status-ts" 2>/dev/null || true
         return 0
       fi
