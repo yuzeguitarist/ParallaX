@@ -799,6 +799,12 @@ impl AsyncRead for RecvStream {
         let data = core.read_stream(me.id);
         if !data.is_empty() {
             drop(core);
+            // Consuming bytes grows the receive windows, so `read_stream` may have
+            // re-armed a MAX_DATA / MAX_STREAM_DATA grant. Nudge the driver to flush
+            // it promptly: under sustained backpressure the blocked sender transmits
+            // nothing, so without this nudge the receiver's driver would never wake
+            // to emit the grant and the transfer would stall until the idle timeout.
+            me.shared.nudge();
             me.pending = data;
             me.pos = 0;
             let n = me.pending.len().min(buf.remaining());
