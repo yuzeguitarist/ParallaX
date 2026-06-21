@@ -85,7 +85,7 @@ pub fn derive_udp_auth_token(
 /// derive the exporter-bound UDP auth token. Both peers calling this over the
 /// same connection with the same PSK and context obtain the same token.
 pub fn export_udp_auth_token(
-    connection: &quinn::Connection,
+    connection: &crate::transport::udp::quic::endpoint::Connection,
     psk: &[u8],
     context: &[u8],
 ) -> Result<Zeroizing<[u8; UDP_AUTH_TOKEN_LEN]>, UdpAuthError> {

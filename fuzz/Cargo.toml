@@ -18,14 +18,6 @@ rand = "0.8"
 [dependencies.parallax]
 path = ".."
 
-# fuzz/ is its own workspace (the empty [workspace] above), so it does NOT inherit
-# the parent crate's [patch.crates-io]. Replicate the one remaining vendored fork
-# so `parallax` builds against the SAME quinn-proto the main build uses (the
-# CidQueue::LEN=64 delta). rustls is now unforked (crates.io): the QUIC client TLS
-# engine is ParallaX's hand-written `src/tls/quic`, which needs no rustls fork API.
-[patch.crates-io]
-quinn-proto = { path = "../vendor/quinn-proto" }
-
 # --- Targets -----------------------------------------------------------------
 # All targets take raw &[u8] (attacker-influenced bytes). cargo-fuzz compiles
 # the parallax crate with `--cfg fuzzing`, which is what makes the

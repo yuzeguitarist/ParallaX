@@ -1146,14 +1146,14 @@ pub(crate) async fn establish_authenticated_data_session(
 /// continues to carry the relay (DATA-framed). Carried through the session seam to
 /// `ClientRelay`.
 struct RetainedClientQuic {
-    endpoint: quinn::Endpoint,
-    conn: quinn::Connection,
+    endpoint: crate::transport::udp::quic::endpoint::Endpoint,
+    conn: crate::transport::udp::quic::endpoint::Connection,
     /// HTTP/3 control + encoder uni streams, held open for the connection's life.
     h3_control: crate::transport::udp::h3::H3ControlStreams,
     /// The request bidi's send/recv halves. The probe round-trip already ran on
     /// this stream (HEADERS + DATA); the relay continues on the SAME stream.
-    relay_send: quinn::SendStream,
-    relay_recv: quinn::RecvStream,
+    relay_send: crate::transport::udp::quic::endpoint::SendStream,
+    relay_recv: crate::transport::udp::quic::endpoint::RecvStream,
 }
 
 impl RetainedClientQuic {
@@ -1221,14 +1221,13 @@ async fn run_client_udp_probe(
     };
     let Ok(endpoint) = crate::transport::udp::endpoint::bind_client_endpoint_accept_any(
         bind.parse().expect("valid wildcard bind address"),
-    ) else {
+    )
+    .await
+    else {
         return failed();
     };
     let udp_addr = std::net::SocketAddr::new(peer.ip(), offer.udp_port);
-    let Ok(connecting) = endpoint.connect(udp_addr, sni) else {
-        return failed();
-    };
-    let conn = match tokio::time::timeout(probe_timeout, connecting).await {
+    let conn = match tokio::time::timeout(probe_timeout, endpoint.connect(udp_addr, sni)).await {
         Ok(Ok(conn)) => conn,
         _ => return unreachable(),
     };
@@ -1250,11 +1249,10 @@ async fn run_client_udp_probe(
         Ok(Ok(s)) => s,
         _ => return unreachable(),
     };
-    let (mut relay_send, mut relay_recv) =
-        match tokio::time::timeout(probe_timeout, conn.open_bi()).await {
-            Ok(Ok(streams)) => streams,
-            _ => return unreachable(),
-        };
+    // The hand-rolled `open_bi` is synchronous and infallible (it allocates the
+    // stream id locally; flow-control is enforced when bytes are transmitted), so
+    // it neither awaits nor returns a Result.
+    let (mut relay_send, mut relay_recv) = conn.open_bi();
     let outcome = crate::transport::udp::probe::probe_client_over_bidi(
         &conn,
         &mut relay_send,
@@ -2025,7 +2023,7 @@ async fn client_relay_idle_watchdog(activity: ClientRelayActivity, idle_timeout:
 /// truncated. Returns Ok only when both DONEs are exchanged; the caller closes
 /// the QUIC connection afterward (on Ok) or eagerly (on Err).
 async fn client_exchange_quic_done(
-    conn: &quinn::Connection,
+    conn: &crate::transport::udp::quic::endpoint::Connection,
     server_write: &mut OwnedWriteHalf,
     server_read: OwnedReadHalf,
     seal_to_server: &mut DataRecordCodec,
@@ -2095,7 +2093,7 @@ async fn client_exchange_quic_done(
             // reported as a failure.
             biased;
             res = reader.read_record_into(&mut record) => res.map(|()| true).map_err(ClientRuntimeError::Io),
-            _ = conn.closed() => Ok(false),
+            _ = crate::transport::udp::endpoint::conn_closed(conn) => Ok(false),
         }
     };
     let done_read = match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, read_done).await {
@@ -2949,7 +2947,7 @@ fn log_outer_write(
 /// [`RELAY_IDLE_CLOSE_CODE`] (the server's idle watchdog fired first). Lets the
 /// client treat that as a benign mutual idle teardown (Ok) instead of a relay
 /// error, so a tightened server idle floor does not surface as client failures.
-fn is_peer_idle_close(conn: &quinn::Connection) -> bool {
+fn is_peer_idle_close(conn: &crate::transport::udp::quic::endpoint::Connection) -> bool {
     crate::protocol::data::is_relay_idle_close_reason(conn.close_reason().as_ref())
 }
 
@@ -3679,16 +3677,17 @@ mod tests {
             .expect("prefix read timed out")
             .expect("prefix read failed");
 
-        // Grab and close the server's retained QUIC connection in flight.
-        let conn = {
+        // Grab and close the server's retained QUIC fast-plane endpoint in flight
+        // (closing the endpoint closes its single relay connection).
+        let endpoint = {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
-                if let Some(conn) = server::retained_quic_conn_for_test()
+                if let Some(endpoint) = server::retained_quic_conn_for_test()
                     .lock()
                     .expect("retained quic test hook poisoned")
                     .clone()
                 {
-                    break conn;
+                    break endpoint;
                 }
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -3697,7 +3696,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        conn.close(0u32.into(), b"test-mid-relay-reset");
+        endpoint.close(0u32.into(), b"test-mid-relay-reset");
 
         // The proxied connection must terminate (error or short read), NOT hang
         // and NOT deliver the full payload.

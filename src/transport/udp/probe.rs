@@ -34,8 +34,10 @@ use std::time::{Duration, Instant};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::auth::{export_udp_auth_token, UdpAuthError, UDP_AUTH_TOKEN_LEN};
+use super::quic::endpoint::{Connection, RecvStream, SendStream};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -89,7 +91,7 @@ fn probe_response(token: &[u8; UDP_AUTH_TOKEN_LEN], nonce: &[u8]) -> [u8; PROBE_
 /// coverage (its `#[cfg(test)]` cases below). It shares the SAME token derivation
 /// and `probe_response` HMAC as the bidi path.
 pub async fn probe_client(
-    connection: &quinn::Connection,
+    connection: &Connection,
     psk: &[u8],
     context: &[u8],
     timeout: Duration,
@@ -134,26 +136,26 @@ pub async fn probe_client(
 ///
 /// PRODUCTION-UNUSED helper of [`probe_client`]; see that fn's note.
 async fn probe_client_round_trip(
-    connection: &quinn::Connection,
+    connection: &Connection,
     request: &[u8],
 ) -> Result<Vec<u8>, ProbeError> {
-    let mut send = connection
-        .open_uni()
-        .await
-        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
+    let mut send = connection.open_uni();
     send.write_all(request)
         .await
         .map_err(|err| ProbeError::Send(err.to_string()))?;
-    send.finish()
-        .map_err(|err| ProbeError::Send(err.to_string()))?;
+    send.finish();
 
-    let mut recv = connection
-        .accept_uni()
+    let recv = connection.accept_uni().await.ok_or_else(|| {
+        ProbeError::ConnectionLost("connection closed before server reply".into())
+    })?;
+    // Bound the read at the on-wire response length (the peer FINs after exactly
+    // that many bytes, so read-to-EOF over the cap recovers the whole reply).
+    let mut reply = Vec::with_capacity(PROBE_RESPONSE_WIRE_LEN);
+    recv.take(PROBE_RESPONSE_WIRE_LEN as u64)
+        .read_to_end(&mut reply)
         .await
         .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
-    recv.read_to_end(PROBE_RESPONSE_WIRE_LEN)
-        .await
-        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))
+    Ok(reply)
 }
 
 /// Server side: answer one probe request with an authenticated response derived
@@ -163,17 +165,17 @@ async fn probe_client_round_trip(
 /// ([`serve_probe_over_bidi`]); this bare-uni responder is the peer of
 /// [`probe_client`] and is kept as a tested reference (see that fn's note).
 pub async fn serve_probe(
-    connection: &quinn::Connection,
+    connection: &Connection,
     psk: &[u8],
     context: &[u8],
 ) -> Result<(), ProbeError> {
     let token = export_udp_auth_token(connection, psk, context)?;
-    let mut recv = connection
-        .accept_uni()
-        .await
-        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
-    let request = recv
-        .read_to_end(PROBE_REQUEST_WIRE_LEN)
+    let recv = connection.accept_uni().await.ok_or_else(|| {
+        ProbeError::ConnectionLost("connection closed before probe request".into())
+    })?;
+    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
+    recv.take(PROBE_REQUEST_WIRE_LEN as u64)
+        .read_to_end(&mut request)
         .await
         .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
     if request.len() != PROBE_REQUEST_WIRE_LEN || &request[..4] != PROBE_REQUEST_MAGIC {
@@ -184,15 +186,11 @@ pub async fn serve_probe(
     reply.extend_from_slice(PROBE_RESPONSE_MAGIC);
     reply.extend_from_slice(&response);
 
-    let mut send = connection
-        .open_uni()
-        .await
-        .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
+    let mut send = connection.open_uni();
     send.write_all(&reply)
         .await
         .map_err(|err| ProbeError::Send(err.to_string()))?;
-    send.finish()
-        .map_err(|err| ProbeError::Send(err.to_string()))?;
+    send.finish();
     Ok(())
 }
 
@@ -221,9 +219,9 @@ const MAX_PROBE_H3_FRAME_LEN: usize = 4096;
 /// relay so the SAME stream continues into the data relay); a lost/closed
 /// connection maps to Unreachable, a malformed-but-present reply to Failed.
 pub async fn probe_client_over_bidi(
-    connection: &quinn::Connection,
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+    connection: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
     authority: &str,
     psk: &[u8],
     context: &[u8],
@@ -266,8 +264,8 @@ pub async fn probe_client_over_bidi(
 /// Write the H3 request (HEADERS + DATA(request)) on the bidi send half and read
 /// the server's H3 response (HEADERS + DATA), returning the response DATA body.
 async fn probe_client_bidi_round_trip(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
     authority: &str,
     request: &[u8],
 ) -> Result<Vec<u8>, ProbeError> {
@@ -302,9 +300,9 @@ async fn probe_client_bidi_round_trip(
 /// `serve_probe`; only the carrier differs. The caller keeps the bidi open for the
 /// relay that follows on the SAME stream.
 pub async fn serve_probe_over_bidi(
-    connection: &quinn::Connection,
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+    connection: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
     psk: &[u8],
     context: &[u8],
 ) -> Result<(), ProbeError> {
@@ -345,9 +343,7 @@ pub async fn serve_probe_over_bidi(
 /// closed/lost connection) stay `ConnectionLost`. Both `Malformed` and
 /// `Unreachable` keep the session on TCP, so this is a classification-accuracy
 /// fix, not a behaviour change.
-async fn read_probe_data_after_headers(
-    recv: &mut quinn::RecvStream,
-) -> Result<Vec<u8>, ProbeError> {
+async fn read_probe_data_after_headers(recv: &mut RecvStream) -> Result<Vec<u8>, ProbeError> {
     use crate::fingerprint::http3::{FRAME_TYPE_DATA, FRAME_TYPE_HEADERS};
 
     let (first_type, _first_payload) = super::h3::read_one_h3_frame(recv, MAX_PROBE_H3_FRAME_LEN)
@@ -478,7 +474,7 @@ mod tests {
             (send, recv)
         };
         let client = async {
-            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            let (mut send, mut recv) = client_conn.open_bi();
             probe_client_over_bidi(
                 &client_conn,
                 &mut send,
@@ -511,7 +507,7 @@ mod tests {
             (send, recv)
         };
         let client = async {
-            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            let (mut send, mut recv) = client_conn.open_bi();
             probe_client_over_bidi(
                 &client_conn,
                 &mut send,
@@ -586,7 +582,7 @@ mod tests {
             (send, recv)
         };
         let client = async {
-            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            let (mut send, mut recv) = client_conn.open_bi();
             let outcome = probe_client_over_bidi(
                 &client_conn,
                 &mut send,
@@ -611,8 +607,8 @@ mod tests {
     /// for a given client request body, mirroring `serve_probe_over_bidi`'s reply
     /// (used by the wire-structure oracle which reads the request frames manually).
     async fn serve_probe_response_for_test(
-        conn: &quinn::Connection,
-        send: &mut quinn::SendStream,
+        conn: &Connection,
+        send: &mut SendStream,
         request: &[u8],
     ) {
         use crate::fingerprint::http3::{
@@ -662,7 +658,7 @@ mod tests {
             (send, recv)
         };
         let client = async {
-            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            let (mut send, mut recv) = client_conn.open_bi();
             probe_client_over_bidi(
                 &client_conn,
                 &mut send,

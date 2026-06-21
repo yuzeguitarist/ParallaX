@@ -552,6 +552,12 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// The peer's UDP socket address (its source 4-tuple endpoint). Used by the
+    /// server to filter an accepted connection against the authenticated peer's IP.
+    pub fn remote_address(&self) -> SocketAddr {
+        self.shared.peer
+    }
+
     /// RFC 5705 exporter (backs the auth token).
     pub fn export_keying_material(
         &self,

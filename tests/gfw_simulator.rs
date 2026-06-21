@@ -757,18 +757,25 @@ async fn capture_udp_leg_initial(server_name: &str) -> Vec<u8> {
 
     // Build the client endpoint through the PRODUCTION builder so the captured
     // Initial carries the real wire shape — including the zero-length source
-    // connection id (Safari fidelity; see `client_endpoint_config`). The
-    // accept-any verifier is never invoked: the Initial is emitted before any
-    // ServerHello arrives.
-    let endpoint = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap()).unwrap();
+    // connection id (Safari fidelity; see `bind_client_endpoint`). The accept-any
+    // verifier is never invoked: the Initial is emitted before any ServerHello
+    // arrives.
+    let endpoint = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
 
-    // Registering the connection makes quinn's driver transmit the Initial; it
-    // never completes (no real QUIC server replies), so hold it on a task while
-    // we capture the first datagram.
-    let connecting = endpoint.connect(server_addr, server_name).unwrap();
-    let drive = tokio::spawn(async move {
-        let _ = connecting.await;
-    });
+    // Starting the connection makes the hand-rolled endpoint driver transmit the
+    // Initial; it never completes (no real QUIC server replies), so hold it on a
+    // task (driving a clone of the endpoint handle) while we capture the first
+    // datagram. The outer `endpoint` is kept alive for the capture's duration so
+    // its driver task keeps owning the socket.
+    let drive = {
+        let endpoint = endpoint.clone();
+        let server_name = server_name.to_owned();
+        tokio::spawn(async move {
+            let _ = endpoint.connect(server_addr, &server_name).await;
+        })
+    };
 
     let mut buf = vec![0_u8; 2048];
     let (n, _) = tokio::time::timeout(Duration::from_secs(5), listener.recv_from(&mut buf))
@@ -808,14 +815,19 @@ async fn capture_udp_leg_full_client_hello(server_name: &str) -> (Vec<u8>, Vec<u
     let server_addr = listener.local_addr().unwrap();
 
     // PRODUCTION builder (zero-length source connection id; see
-    // `client_endpoint_config`). The accept-any verifier never runs: the Initial
+    // `bind_client_endpoint`). The accept-any verifier never runs: the Initial
     // is emitted before any ServerHello arrives.
-    let endpoint = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap()).unwrap();
+    let endpoint = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
 
-    let connecting = endpoint.connect(server_addr, server_name).unwrap();
-    let drive = tokio::spawn(async move {
-        let _ = connecting.await;
-    });
+    let drive = {
+        let endpoint = endpoint.clone();
+        let server_name = server_name.to_owned();
+        tokio::spawn(async move {
+            let _ = endpoint.connect(server_addr, &server_name).await;
+        })
+    };
 
     // Decrypt one Initial datagram and return `(header_scid, CRYPTO frames)`. A
     // single datagram may coalesce a padded Initial; the Length field bounds the

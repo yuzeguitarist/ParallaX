@@ -449,31 +449,6 @@ mod tests {
         assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
     }
 
-    /// Drift guard for the migration: the native constants must equal the values
-    /// the live `quinn` carrier still advertises/enforces, so the inert native
-    /// blob stays byte-identical to today's wire image. When `safari_crypto` is
-    /// deleted at cutover these become the sole source of truth.
-    #[test]
-    fn native_safari_values_match_the_live_carrier() {
-        use crate::transport::udp::safari_crypto;
-        assert_eq!(
-            SAFARI_INITIAL_MAX_DATA,
-            safari_crypto::SAFARI_TP_INITIAL_MAX_DATA
-        );
-        assert_eq!(
-            SAFARI_INITIAL_MAX_STREAM_DATA,
-            safari_crypto::SAFARI_TP_INITIAL_MAX_STREAM_DATA
-        );
-        assert_eq!(
-            SAFARI_MAX_STREAMS_UNI,
-            safari_crypto::SAFARI_TP_MAX_STREAMS_UNI
-        );
-        assert_eq!(
-            SAFARI_ACTIVE_CID_LIMIT,
-            safari_crypto::SAFARI_TP_ACTIVE_CID_LIMIT
-        );
-    }
-
     #[test]
     fn read_rejects_duplicate_parameter() {
         // RFC 9000 §7.4.1: the same id twice MUST be a TRANSPORT_PARAMETER_ERROR.

@@ -206,12 +206,15 @@ const MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS: u32 = 1024;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Test-only publication of the server's retained QUIC connection so a mid-relay
-/// reset test can kill the fast plane in flight and assert a clean teardown. Set
-/// to the accepted `quinn::Connection` on the Verified+enabled retain path. Not
-/// compiled in release.
+/// Test-only publication of the server's retained QUIC fast-plane endpoint so a
+/// mid-relay reset test can kill the fast plane in flight and assert a clean
+/// teardown. Set to the accepted connection's `Endpoint` on the Verified+enabled
+/// retain path (the hand-rolled `Connection` is not cloneable; closing the
+/// endpoint closes its single relay connection, which is what the test needs).
+/// Not compiled in release.
 #[cfg(test)]
-static RETAINED_QUIC_CONN_FOR_TEST: Mutex<Option<quinn::Connection>> = Mutex::new(None);
+static RETAINED_QUIC_CONN_FOR_TEST: Mutex<Option<crate::transport::udp::quic::endpoint::Endpoint>> =
+    Mutex::new(None);
 
 /// Test-only counter of X25519 DH ops performed on the inbound-decision path, used
 /// to assert the rejection path's DH count is input-independent (M-2). Not
@@ -221,9 +224,10 @@ static REJECT_DH_OPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Test accessor for [`RETAINED_QUIC_CONN_FOR_TEST`] so the mid-relay reset e2e
 /// (in the client runtime test module) can grab and kill the server's retained
-/// QUIC connection in flight.
+/// QUIC fast plane in flight.
 #[cfg(test)]
-pub(crate) fn retained_quic_conn_for_test() -> &'static Mutex<Option<quinn::Connection>> {
+pub(crate) fn retained_quic_conn_for_test(
+) -> &'static Mutex<Option<crate::transport::udp::quic::endpoint::Endpoint>> {
     &RETAINED_QUIC_CONN_FOR_TEST
 }
 
@@ -1577,7 +1581,10 @@ async fn run_authenticated_data_mode(
                         // over a reliable bidi stream. `None` on every other path
                         // (declined, probe not Verified, or udp.enabled=false), in
                         // which case the relay stays byte-identical on TCP.
-                        let mut retained_quic: Option<(quinn::Endpoint, ServerProbedQuic)> = None;
+                        let mut retained_quic: Option<(
+                            crate::transport::udp::quic::endpoint::Endpoint,
+                            ServerProbedQuic,
+                        )> = None;
 
                         // Client-initiated, fail-soft UDP negotiation (PX1G). The
                         // server NEVER offers UDP unsolicited. When udp.enabled it
@@ -1612,19 +1619,22 @@ async fn run_authenticated_data_mode(
                                 // ClientHello SNI), never the literal "localhost" — a
                                 // QUIC Initial carrying SNI=localhost to a public IP is
                                 // a zero-false-positive censorship signature.
-                                bind_server_endpoint(
+                                match bind_server_endpoint(
                                     std::net::SocketAddr::new(bind_ip, 0),
                                     &handshake.client_hello.sni,
                                 )
-                                    .ok()
-                                    .and_then(|ep| {
-                                        let port = ep.local_addr().ok()?.port();
+                                .await
+                                {
+                                    Ok(ep) => ep.local_addr().ok().and_then(|addr| {
+                                        let port = addr.port();
                                         if port == 0 {
                                             return None;
                                         }
                                         let offer_id: [u8; 16] = rand::random();
                                         Some((ep, offer_id, port))
-                                    })
+                                    }),
+                                    Err(_) => None,
+                                }
                             } else {
                                 None
                             };
@@ -1796,7 +1806,7 @@ async fn run_authenticated_data_mode(
                                             *RETAINED_QUIC_CONN_FOR_TEST
                                                 .lock()
                                                 .expect("retained quic test hook poisoned") =
-                                                Some(probed.conn.clone());
+                                                Some(udp_ep.clone());
                                         }
                                         retained_quic = Some((udp_ep, probed));
                                     }
@@ -2484,7 +2494,10 @@ struct DataRelay {
     /// stream set) when the client's probe was Verified. `Some` => carry the relay
     /// over the SAME request bidi (DATA-framed); `None` => the relay stays on the
     /// TCP record legs exactly as before this slice.
-    retained_quic: Option<(quinn::Endpoint, ServerProbedQuic)>,
+    retained_quic: Option<(
+        crate::transport::udp::quic::endpoint::Endpoint,
+        ServerProbedQuic,
+    )>,
     cid: u64,
 }
 
@@ -2534,14 +2547,14 @@ fn udp_retention_decision(
 /// continues on the SAME request bidi (`relay_send`/`relay_recv`). The control +
 /// encoder uni streams (`h3_control`) must stay open per RFC 9114 §6.2.1.
 struct ServerProbedQuic {
-    conn: quinn::Connection,
+    conn: crate::transport::udp::quic::endpoint::Connection,
     h3_control: crate::transport::udp::h3::H3ControlStreams,
-    relay_send: quinn::SendStream,
-    relay_recv: quinn::RecvStream,
+    relay_send: crate::transport::udp::quic::endpoint::SendStream,
+    relay_recv: crate::transport::udp::quic::endpoint::RecvStream,
 }
 
 async fn accept_probed_quic_from_peer(
-    udp_ep: &quinn::Endpoint,
+    udp_ep: &crate::transport::udp::quic::endpoint::Endpoint,
     expect_ip: Option<std::net::IpAddr>,
     sandwich_secret: &[u8],
     offer_id: &[u8; 16],
@@ -2558,94 +2571,100 @@ async fn accept_probed_quic_from_peer(
         );
         return None;
     };
-    loop {
-        let incoming = udp_ep.accept().await?;
-        if incoming.remote_address().ip() != expect_ip {
+    // L-6 source-IP filter: the ephemeral endpoint is reachable by anyone who
+    // learns the port, so accept ONLY a connection whose source IP matches the
+    // authenticated TCP peer. A connection from any other IP is an off-path racer
+    // trying to steal the single accept slot and force a TCP downgrade — close and
+    // drop it, then keep waiting (mirrors quinn's `Incoming::ignore()` pre-accept
+    // filter). The whole call is bounded by `probe_budget` at the call site, so a
+    // flood of mismatched connectors just times out to a safe TCP fallback.
+    let conn = loop {
+        let c = udp_ep.accept().await?;
+        if c.remote_address().ip() == expect_ip {
+            break c;
+        }
+        tracing::debug!(
+            cid,
+            peer = %c.remote_address(),
+            "declining fast-plane QUIC from an unexpected source IP (L-6)"
+        );
+        c.close(
+            crate::transport::udp::quic::endpoint::VarInt::from_u32(0),
+            b"",
+        );
+    };
+
+    // H3 stream order mirrors the client: open this endpoint's control stream
+    // (SETTINGS) first, accept the client's request bidi and serve the bidi
+    // probe (HEADERS + DATA), then open the QPACK encoder stream. The
+    // exporter-bound auth inside `serve_probe_over_bidi` is unchanged; only the
+    // carrier is H3 framing. A failure to open a control stream means the QUIC
+    // connection is unusable for H3 — decline (stay on TCP).
+    //
+    // TODO(quic-active-probing): HARD PRE-ENABLE GATE. This sends the SAME
+    // Safari-26 *client* SETTINGS (`safari26_settings_frame`, browser-shaped) as
+    // the server's control-stream first frame. A real H3 *origin* advertises a
+    // DIFFERENT, server-shaped SETTINGS set. An active prober that completes the
+    // TLS handshake can read this server 1-RTT SETTINGS frame BEFORE it fails
+    // authentication and we drop it — so reusing the client SETTINGS here is an
+    // active-probing tell (and the unconditional drop-on-auth-failure differs
+    // from how a real origin would respond). BEFORE enabling QUIC in production,
+    // the server must emit origin-shaped SETTINGS and, on auth failure, behave
+    // like the fronted origin rather than dropping. Gated on the camouflage-
+    // origin decision + a captured reference of the origin's H3 SETTINGS.
+    let control_send = crate::transport::udp::h3::open_h3_control_stream(&conn)
+        .await
+        .ok()?;
+    let (mut relay_send, mut relay_recv) = conn.accept_bi().await?;
+    if let Err(err) = crate::transport::udp::probe::serve_probe_over_bidi(
+        &conn,
+        &mut relay_send,
+        &mut relay_recv,
+        sandwich_secret,
+        offer_id,
+    )
+    .await
+    {
+        // A malformed probe means the client's probe will be Failed and it will
+        // report PX1P=Failed -> the retention gate keeps the session on TCP, so
+        // returning the (now-suspect) streams is harmless. Log and continue:
+        // parity with the uni `serve_probe`.
+        tracing::debug!(cid, error = %err, "udp serve_probe_over_bidi failed");
+    }
+    let encoder_send = crate::transport::udp::h3::open_h3_encoder_stream(&conn)
+        .await
+        .ok()?;
+    // Read + verify the client's H3 SETTINGS off its control stream (opened
+    // before the bidi probe, so already in flight; no deadlock). A client that
+    // does not advertise Safari-26's SETTINGS is a protocol divergence; decline
+    // (return None) so the session stays on TCP — the client, having seen a
+    // Verified probe response, reports PX1P=Verified and the retention gate's
+    // HardFail arm resets both ends cleanly.
+    //
+    // LOCKSTEP: this requires the client's SETTINGS to be EXACTLY
+    // `safari26_settings()`. The client sends those (client runtime SETTINGS
+    // check). The mirror of this dependency lives on the client side, which
+    // requires the SERVER's SETTINGS to equal `safari26_settings()` too: when
+    // the `TODO(quic-active-probing)` gate above is lifted and this endpoint
+    // emits origin-shaped SETTINGS, the client's expectation must change in
+    // lockstep (see client/runtime.rs SETTINGS check), or the client will
+    // silently never verify the QUIC path.
+    match crate::transport::udp::h3::read_peer_h3_settings(&conn).await {
+        Ok(settings) if settings == crate::fingerprint::http3::safari26_settings() => {}
+        _ => {
             tracing::debug!(
                 cid,
-                src = %incoming.remote_address(),
-                "ignoring fast-plane QUIC from non-authenticated source IP"
+                "client H3 SETTINGS missing/mismatched; declining fast plane"
             );
-            incoming.ignore();
-            continue;
+            return None;
         }
-        let conn = incoming.await.ok()?;
-
-        // H3 stream order mirrors the client: open this endpoint's control stream
-        // (SETTINGS) first, accept the client's request bidi and serve the bidi
-        // probe (HEADERS + DATA), then open the QPACK encoder stream. The
-        // exporter-bound auth inside `serve_probe_over_bidi` is unchanged; only the
-        // carrier is H3 framing. A failure to open a control stream means the QUIC
-        // connection is unusable for H3 — decline (stay on TCP).
-        //
-        // TODO(quic-active-probing): HARD PRE-ENABLE GATE. This sends the SAME
-        // Safari-26 *client* SETTINGS (`safari26_settings_frame`, browser-shaped) as
-        // the server's control-stream first frame. A real H3 *origin* advertises a
-        // DIFFERENT, server-shaped SETTINGS set. An active prober that completes the
-        // TLS handshake can read this server 1-RTT SETTINGS frame BEFORE it fails
-        // authentication and we drop it — so reusing the client SETTINGS here is an
-        // active-probing tell (and the unconditional drop-on-auth-failure differs
-        // from how a real origin would respond). BEFORE enabling QUIC in production,
-        // the server must emit origin-shaped SETTINGS and, on auth failure, behave
-        // like the fronted origin rather than dropping. Gated on the camouflage-
-        // origin decision + a captured reference of the origin's H3 SETTINGS.
-        let control_send = crate::transport::udp::h3::open_h3_control_stream(&conn)
-            .await
-            .ok()?;
-        let (mut relay_send, mut relay_recv) = conn.accept_bi().await.ok()?;
-        if let Err(err) = crate::transport::udp::probe::serve_probe_over_bidi(
-            &conn,
-            &mut relay_send,
-            &mut relay_recv,
-            sandwich_secret,
-            offer_id,
-        )
-        .await
-        {
-            // A malformed probe means the client's probe will be Failed and it will
-            // report PX1P=Failed -> the retention gate keeps the session on TCP, so
-            // returning the (now-suspect) streams is harmless. Log and continue:
-            // parity with the uni `serve_probe`.
-            tracing::debug!(cid, error = %err, "udp serve_probe_over_bidi failed");
-        }
-        let encoder_send = crate::transport::udp::h3::open_h3_encoder_stream(&conn)
-            .await
-            .ok()?;
-        // Read + verify the client's H3 SETTINGS off its control stream (opened
-        // before the bidi probe, so already in flight; no deadlock). A client that
-        // does not advertise Safari-26's SETTINGS is a protocol divergence; decline
-        // (return None) so the session stays on TCP — the client, having seen a
-        // Verified probe response, reports PX1P=Verified and the retention gate's
-        // HardFail arm resets both ends cleanly.
-        //
-        // LOCKSTEP: this requires the client's SETTINGS to be EXACTLY
-        // `safari26_settings()`. The client sends those (client runtime SETTINGS
-        // check). The mirror of this dependency lives on the client side, which
-        // requires the SERVER's SETTINGS to equal `safari26_settings()` too: when
-        // the `TODO(quic-active-probing)` gate above is lifted and this endpoint
-        // emits origin-shaped SETTINGS, the client's expectation must change in
-        // lockstep (see client/runtime.rs SETTINGS check), or the client will
-        // silently never verify the QUIC path.
-        match crate::transport::udp::h3::read_peer_h3_settings(&conn).await {
-            Ok(settings) if settings == crate::fingerprint::http3::safari26_settings() => {}
-            _ => {
-                tracing::debug!(
-                    cid,
-                    "client H3 SETTINGS missing/mismatched; declining fast plane"
-                );
-                return None;
-            }
-        }
-        return Some(ServerProbedQuic {
-            conn,
-            h3_control: crate::transport::udp::h3::H3ControlStreams::new(
-                control_send,
-                encoder_send,
-            ),
-            relay_send,
-            relay_recv,
-        });
     }
+    Some(ServerProbedQuic {
+        conn,
+        h3_control: crate::transport::udp::h3::H3ControlStreams::new(control_send, encoder_send),
+        relay_send,
+        relay_recv,
+    })
 }
 
 /// Drops a retained QUIC endpoint + connection (and its held H3 streams),
@@ -2653,7 +2672,12 @@ async fn accept_probed_quic_from_peer(
 /// lingers when a dispatch path (Mux/SpeedTest) stays on TCP. A bare drop would
 /// also close it, but the explicit close gives the peer an immediate
 /// CONNECTION_CLOSE rather than waiting for an idle timeout.
-fn drop_retained_quic(retained: Option<(quinn::Endpoint, ServerProbedQuic)>) {
+fn drop_retained_quic(
+    retained: Option<(
+        crate::transport::udp::quic::endpoint::Endpoint,
+        ServerProbedQuic,
+    )>,
+) {
     if let Some((endpoint, probed)) = retained {
         probed.conn.close(0u32.into(), b"tcp-path");
         endpoint.close(0u32.into(), b"tcp-path");
@@ -3065,7 +3089,7 @@ impl DataRelay {
 /// truncated. Returns Ok only when both DONEs are exchanged; the caller closes
 /// the QUIC connection afterward (on Ok) or eagerly (on Err).
 async fn server_exchange_quic_done(
-    conn: &quinn::Connection,
+    conn: &crate::transport::udp::quic::endpoint::Connection,
     client_write: &mut OwnedWriteHalf,
     client_records: &mut BufferedTlsRecordReader<OwnedReadHalf>,
     server_seal: &mut DataRecordCodec,
@@ -3126,7 +3150,7 @@ async fn server_exchange_quic_done(
             // over TCP then closes the QUIC connection).
             biased;
             res = client_records.read_record_into(&mut record) => res.map(|()| true).map_err(HandshakeServerError::Io),
-            _ = conn.closed() => Ok(false),
+            _ = crate::transport::udp::endpoint::conn_closed(conn) => Ok(false),
         }
     };
     let done_read = match tokio::time::timeout(QUIC_RELAY_DONE_BACKSTOP, read_done).await {
@@ -4449,7 +4473,7 @@ fn is_write_peer_close(err: &io::Error) -> bool {
 /// True iff the QUIC connection was closed by the peer with the agreed
 /// [`RELAY_IDLE_CLOSE_CODE`], i.e. the peer's idle watchdog fired first. Lets this
 /// side treat that as a benign mutual idle teardown (Ok) instead of a relay error.
-fn is_peer_idle_close(conn: &quinn::Connection) -> bool {
+fn is_peer_idle_close(conn: &crate::transport::udp::quic::endpoint::Connection) -> bool {
     crate::protocol::data::is_relay_idle_close_reason(conn.close_reason().as_ref())
 }
 
@@ -5303,17 +5327,13 @@ mod tests {
         );
     }
 
-    /// L-6: the fast-plane probe endpoint must accept ONLY from the authenticated
-    /// peer's source IP — a connector from a different IP is ignore()d, so a racing
-    /// off-path connector cannot steal the single accept slot and force a TCP
-    /// downgrade. Ignored: loopback QUIC sockets.
     #[tokio::test]
-    #[ignore = "requires loopback QUIC sockets"]
     async fn accept_probed_quic_pins_to_authenticated_peer_ip() {
         let server_ep = crate::transport::udp::endpoint::bind_server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             "localhost",
         )
+        .await
         .expect("bind server endpoint");
         let server_addr = server_ep.local_addr().unwrap();
 
@@ -5321,17 +5341,17 @@ mod tests {
         let client_ep = crate::transport::udp::endpoint::bind_client_endpoint_accept_any(
             "127.0.0.1:0".parse().unwrap(),
         )
+        .await
         .expect("bind client endpoint");
         let connecting = tokio::spawn(async move {
-            if let Ok(c) = client_ep.connect(server_addr, "localhost") {
-                let _ = c.await;
-            }
+            let _ = client_ep.connect(server_addr, "localhost").await;
             tokio::time::sleep(Duration::from_secs(2)).await;
             client_ep // keep the endpoint alive for the test duration
         });
 
         // Expect a DIFFERENT source IP (TEST-NET-3) than the loopback connector, so
-        // the connector is ignored and NO connection is accepted within the budget.
+        // the connector is declined (L-6 source-IP filter) and NO connection is
+        // accepted within the budget.
         let offer_id = [7_u8; 16];
         let accepted = tokio::time::timeout(
             Duration::from_millis(300),
