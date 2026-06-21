@@ -1514,7 +1514,9 @@ impl Connection {
     /// so that, e.g., the Handshake keys learned from a coalesced Initial are
     /// installed before the Handshake packet that follows it in the same datagram.
     pub fn handle_datagram(&mut self, datagram: &[u8], now: Instant) -> Result<(), QuicTlsError> {
-        self.last_recv_time = Some(now);
+        // NB: the idle timer (last_recv_time) is refreshed inside process_packet
+        // only AFTER a packet AEAD-opens (RFC 9000 §10.1: "received and processed"),
+        // so an off-path attacker cannot pin the connection open with garbage UDP.
         let mut buf = datagram.to_vec();
         let mut pos = 0;
         while pos < buf.len() {
@@ -1593,6 +1595,9 @@ impl Connection {
 
         // The packet authenticated — only NOW is it safe to commit state derived
         // from this (now-trusted) datagram.
+        // Refresh the idle timer only here, after authentication (RFC 9000 §10.1):
+        // a forged/garbage datagram that never AEAD-opens must not reset it.
+        self.last_recv_time = Some(now);
         if let Some((dcid, keys)) = pending_initial {
             self.initial_dcid = dcid;
             self.spaces[SPACE_INITIAL].keys = Some(keys);
@@ -1686,7 +1691,7 @@ impl Connection {
                         s.send_max = s.send_max.max(max);
                     }
                 }
-                Frame::Ack(ack) => self.recv_ack(space, &ack, now),
+                Frame::Ack(ack) => self.recv_ack(space, &ack, now)?,
                 Frame::HandshakeDone => {
                     ack_eliciting = true;
                     // RFC 9001 §4.1.2: the client treats HANDSHAKE_DONE as handshake
@@ -1745,10 +1750,20 @@ impl Connection {
     /// packets, fold one RTT sample (largest newly acked + an ack-eliciting packet),
     /// feed the congestion controller, then run loss detection and queue any lost
     /// CRYPTO/STREAM bytes for resend.
-    fn recv_ack(&mut self, space: usize, ack: &Ack, now: Instant) {
+    fn recv_ack(&mut self, space: usize, ack: &Ack, now: Instant) -> Result<(), QuicTlsError> {
+        // RFC 9000 §13.1: a peer must never acknowledge a packet number we never
+        // sent. Reject such an ACK (PROTOCOL_VIOLATION) before on_ack runs — it would
+        // otherwise advance largest_acked past anything sent, and the next loss
+        // detection would declare every in-flight packet lost (a spurious-retransmit
+        // storm). Critically reachable in the Initial space, whose keys are public.
+        if ack.largest >= self.spaces[space].send.peek() {
+            return Err(QuicTlsError::Protocol(
+                "ACK acknowledges a packet number that was never sent".into(),
+            ));
+        }
         let newly = self.spaces[space].sent.on_ack(ack.largest, &ack.ranges);
         if newly.is_empty() {
-            return;
+            return Ok(());
         }
         // An ACK confirms forward progress, so reset the PTO backoff (RFC 9002 §6.2).
         self.pto_count = 0;
@@ -1824,6 +1839,7 @@ impl Connection {
         if any_lost {
             self.cc.on_congestion_event(now);
         }
+        Ok(())
     }
 
     /// Reassemble an incoming CRYPTO fragment in order and feed the contiguous
@@ -3003,5 +3019,50 @@ mod tests {
         client.send_stream(RELAY_STREAM_ID, msg);
         drive(&mut client, &mut server);
         assert_eq!(server.read_stream(RELAY_STREAM_ID), msg);
+    }
+
+    #[test]
+    fn ack_of_unsent_packet_is_rejected() {
+        // The DATA space has sent nothing (peek() == 0); an ACK claiming packet 1000
+        // is a protocol violation (RFC 9000 §13.1) and must be rejected before it can
+        // poison largest_acked and trigger a spurious-loss retransmit storm.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x13, 0x13, 0x13, 0x13]),
+        )
+        .unwrap();
+        let ack = Ack {
+            largest: 1000,
+            delay: 0,
+            ranges: vec![(1000, 1000)],
+            ecn: None,
+        };
+        let err = server
+            .recv_ack(SPACE_DATA, &ack, Instant::now())
+            .expect_err("an ACK of a never-sent packet is rejected");
+        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn unauthenticated_datagram_does_not_reset_the_idle_timer() {
+        // Garbage that never AEAD-opens must not refresh the idle timer (RFC 9000
+        // §10.1), else an off-path attacker could pin a connection open forever.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x14, 0x14, 0x14, 0x14]),
+        )
+        .unwrap();
+        assert!(server.last_recv_time.is_none());
+        let _ = server.handle_datagram(&[0xff; 1200], Instant::now());
+        assert!(
+            server.last_recv_time.is_none(),
+            "a garbage datagram must not start/refresh the idle timer"
+        );
     }
 }
