@@ -84,6 +84,9 @@ pub enum QuicTlsError {
     /// Local crypto operation (HKDF/AEAD/KEM) failed.
     #[error("TLS crypto failure: {0}")]
     Crypto(String),
+    /// A QUIC-layer protocol violation (RFC 9000 §11): maps to PROTOCOL_VIOLATION.
+    #[error("QUIC protocol violation: {0}")]
+    Protocol(String),
     /// Certificate or CertificateVerify rejected by the verifier.
     #[error("certificate verification failed: {0}")]
     Certificate(String),
@@ -145,8 +148,9 @@ pub(crate) use server::ServerHandshake;
 
 /// The TLS-session surface the hand-rolled QUIC connection drives. Both
 /// [`ClientHandshake`] and [`ServerHandshake`] implement it, so the connection
-/// state machine is role-generic over a `Box<dyn TlsSession>`.
-pub(crate) trait TlsSession {
+/// state machine is role-generic over a `Box<dyn TlsSession>`. `Send` is required
+/// so a connection can live in the async endpoint's driver task.
+pub(crate) trait TlsSession: Send {
     /// Feed reassembled CRYPTO-stream bytes (a handshake-message stream).
     fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError>;
     /// Emit outgoing CRYPTO bytes; return a [`KeyChange`] on a space transition.

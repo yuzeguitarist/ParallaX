@@ -16,6 +16,7 @@
 //! in lockstep with it (this native encoder is not yet on the wire).
 
 use super::varint;
+use std::collections::BTreeSet;
 
 // --- Transport-parameter ids (RFC 9000 §18.2 codepoints) -----------------------
 // Only the ids Safari-26 H3 actually emits; everything else is omitted on the
@@ -45,6 +46,9 @@ const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
 
 /// RFC 9000 §18.2: the minimum legal `active_connection_id_limit`.
 const MIN_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
+
+/// RFC 9000 §17.2/§18.2: a connection id is at most 20 bytes.
+const MAX_CONNECTION_ID_LEN: usize = 20;
 /// RFC 9000 §4.6: a `max_streams` parameter MUST NOT exceed 2^60.
 const MAX_STREAMS_LIMIT: u64 = 1 << 60;
 
@@ -76,8 +80,10 @@ pub struct TransportParameters {
     pub initial_max_streams_bidi: u64,
     pub initial_max_streams_uni: u64,
     pub active_connection_id_limit: u64,
-    /// `initial_source_connection_id` (0x0f). Zero-length for the Safari client,
-    /// and MUST equal the Initial packet-header SCID (RFC 9000 §7.3).
+    /// `initial_source_connection_id` (0x0f). Zero-length for the Safari client.
+    /// RFC 9000 §7.3 defines it to equal the Initial packet-header SCID; the relay
+    /// does not verify that match (its trust anchor is the exporter-bound token, not
+    /// the connection id), only that the value is a valid (<= 20 byte) CID.
     pub initial_src_cid: Vec<u8>,
 }
 
@@ -141,6 +147,67 @@ impl TransportParameters {
         out
     }
 
+    /// The relay server's transport parameters. Unlike the client, the server is
+    /// not fingerprinted, so this is a plain encode (ascending id order). It grants
+    /// the client exactly one bidirectional stream (the relay's stream) and the
+    /// Safari uni budget, with the same flow-control windows the client advertises.
+    /// `scid` is the server's chosen source connection id.
+    pub fn server(scid: &[u8]) -> Self {
+        Self {
+            initial_max_data: SAFARI_INITIAL_MAX_DATA,
+            initial_max_stream_data_bidi_local: SAFARI_INITIAL_MAX_STREAM_DATA,
+            initial_max_stream_data_bidi_remote: SAFARI_INITIAL_MAX_STREAM_DATA,
+            initial_max_stream_data_uni: SAFARI_INITIAL_MAX_STREAM_DATA,
+            initial_max_streams_bidi: 1,
+            initial_max_streams_uni: SAFARI_MAX_STREAMS_UNI,
+            active_connection_id_limit: MIN_ACTIVE_CONNECTION_ID_LIMIT,
+            initial_src_cid: scid.to_vec(),
+        }
+    }
+
+    /// Serialize the server's transport parameters (RFC 9000 §18) in ascending id
+    /// order. Includes `initial_max_streams_bidi` (the client's encoder omits it).
+    pub fn encode_server(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(56);
+        put_param(&mut out, TP_INITIAL_MAX_DATA, self.initial_max_data);
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+            self.initial_max_stream_data_bidi_local,
+        );
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+            self.initial_max_stream_data_bidi_remote,
+        );
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAM_DATA_UNI,
+            self.initial_max_stream_data_uni,
+        );
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAMS_BIDI,
+            self.initial_max_streams_bidi,
+        );
+        put_param(
+            &mut out,
+            TP_INITIAL_MAX_STREAMS_UNI,
+            self.initial_max_streams_uni,
+        );
+        put_param(
+            &mut out,
+            TP_ACTIVE_CONNECTION_ID_LIMIT,
+            self.active_connection_id_limit,
+        );
+        put_param_bytes(
+            &mut out,
+            TP_INITIAL_SOURCE_CONNECTION_ID,
+            &self.initial_src_cid,
+        );
+        out
+    }
+
     /// Parse a peer's transport-parameters blob (RFC 9000 §18). Recognized ids
     /// populate the matching field; unknown ids (including GREASE) are ignored.
     /// Omitted parameters keep their RFC 9000 §18.2 defaults. Returns [`Error`] on
@@ -156,16 +223,19 @@ impl TransportParameters {
             active_connection_id_limit: DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
             initial_src_cid: Vec::new(),
         };
-        let mut seen: Vec<u64> = Vec::new();
+        // Duplicate detection over a set (O(n log n)): a Vec::contains scan is
+        // O(n^2), and this parses attacker-controlled, pre-authentication input on
+        // the server (a blob can pack thousands of distinct GREASE ids), so the
+        // quadratic scan is a handshake CPU-DoS amplifier.
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
         let mut i = 0usize;
         while i < blob.len() {
             let (id, n) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
             i += n;
             // RFC 9000 §7.4.1: a transport parameter MUST NOT appear more than once.
-            if seen.contains(&id) {
+            if !seen.insert(id) {
                 return Err(Error::Duplicate);
             }
-            seen.push(id);
             let (len, m) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
             i += m;
             let len = len as usize;
@@ -196,7 +266,15 @@ impl TransportParameters {
                     }
                     tp.active_connection_id_limit = v;
                 }
-                TP_INITIAL_SOURCE_CONNECTION_ID => tp.initial_src_cid = body.to_vec(),
+                TP_INITIAL_SOURCE_CONNECTION_ID => {
+                    // RFC 9000 §17.2: a connection id is at most 20 bytes. (The relay
+                    // trusts the exporter-bound token, not the SCID match, so the
+                    // §7.3 advertised-vs-header check is intentionally not enforced.)
+                    if body.len() > MAX_CONNECTION_ID_LEN {
+                        return Err(Error::Invalid);
+                    }
+                    tp.initial_src_cid = body.to_vec();
+                }
                 _ => {} // unknown / GREASE / not-enforced-by-the-relay: ignore
             }
         }
@@ -326,6 +404,18 @@ mod tests {
     }
 
     #[test]
+    fn server_encode_then_read_recovers_the_grants() {
+        let scid = [0xab, 0xcd, 0xef, 0x01];
+        let tp =
+            TransportParameters::read(&TransportParameters::server(&scid).encode_server()).unwrap();
+        assert_eq!(tp.initial_max_data, 16 * 1024 * 1024);
+        assert_eq!(tp.initial_max_stream_data_bidi_remote, 2 * 1024 * 1024);
+        assert_eq!(tp.initial_max_streams_bidi, 1, "server grants one bidi");
+        assert_eq!(tp.initial_max_streams_uni, 8);
+        assert_eq!(tp.initial_src_cid, scid, "server SCID echoed in 0x0f");
+    }
+
+    #[test]
     fn read_populates_known_ids_and_ignores_unknown() {
         // A server-style blob: initial_max_data, a bidi grant of 1, the CID limit,
         // and an unknown id that must be ignored without error.
@@ -359,31 +449,6 @@ mod tests {
         assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
     }
 
-    /// Drift guard for the migration: the native constants must equal the values
-    /// the live `quinn` carrier still advertises/enforces, so the inert native
-    /// blob stays byte-identical to today's wire image. When `safari_crypto` is
-    /// deleted at cutover these become the sole source of truth.
-    #[test]
-    fn native_safari_values_match_the_live_carrier() {
-        use crate::transport::udp::safari_crypto;
-        assert_eq!(
-            SAFARI_INITIAL_MAX_DATA,
-            safari_crypto::SAFARI_TP_INITIAL_MAX_DATA
-        );
-        assert_eq!(
-            SAFARI_INITIAL_MAX_STREAM_DATA,
-            safari_crypto::SAFARI_TP_INITIAL_MAX_STREAM_DATA
-        );
-        assert_eq!(
-            SAFARI_MAX_STREAMS_UNI,
-            safari_crypto::SAFARI_TP_MAX_STREAMS_UNI
-        );
-        assert_eq!(
-            SAFARI_ACTIVE_CID_LIMIT,
-            safari_crypto::SAFARI_TP_ACTIVE_CID_LIMIT
-        );
-    }
-
     #[test]
     fn read_rejects_duplicate_parameter() {
         // RFC 9000 §7.4.1: the same id twice MUST be a TRANSPORT_PARAMETER_ERROR.
@@ -409,6 +474,23 @@ mod tests {
         let mut blob = Vec::new();
         put_param(&mut blob, TP_ACTIVE_CONNECTION_ID_LIMIT, 1);
         assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn read_rejects_over_length_initial_source_connection_id() {
+        // A connection id is at most 20 bytes (RFC 9000 §17.2); a longer one is
+        // invalid.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_SOURCE_CONNECTION_ID, &mut blob);
+        varint::encode(21, &mut blob);
+        blob.extend_from_slice(&[0xab; 21]);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
+        // A 20-byte CID is accepted.
+        let mut ok = Vec::new();
+        varint::encode(TP_INITIAL_SOURCE_CONNECTION_ID, &mut ok);
+        varint::encode(20, &mut ok);
+        ok.extend_from_slice(&[0xab; 20]);
+        assert!(TransportParameters::read(&ok).is_ok());
     }
 
     #[test]

@@ -112,6 +112,9 @@ pub struct SentPacket {
     pub time_sent: Instant,
     pub size: u64,
     pub ack_eliciting: bool,
+    /// Connection-wide delivered-byte count when this packet was sent (the BBR /
+    /// delivery-rate "delivered" sample, draft-cheng-iccrg-delivery-rate-estimation).
+    pub delivered: u64,
 }
 
 /// One packet-number space's sent-packet bookkeeping + RFC 9002 §6.1 loss
@@ -143,6 +146,18 @@ impl SentPackets {
     /// Total bytes of unacknowledged in-flight packets (for the CC window gate).
     pub fn in_flight(&self) -> u64 {
         self.in_flight
+    }
+
+    /// Drop one tracked packet WITHOUT marking it acknowledged (it stays out of
+    /// `largest_acked`), decrementing bytes-in-flight. Used by a PTO probe, which
+    /// retransmits the oldest unacked packet's data in a fresh packet but does not
+    /// itself declare a loss or cut the congestion window (RFC 9002 §6.2.4).
+    pub fn discard(&mut self, pn: u64) -> Option<SentPacket> {
+        let p = self.packets.remove(&pn)?;
+        if p.ack_eliciting {
+            self.in_flight = self.in_flight.saturating_sub(p.size);
+        }
+        Some(p)
     }
 
     pub fn largest_acked(&self) -> Option<u64> {
@@ -277,6 +292,7 @@ mod tests {
             time_sent: now,
             size: 1200,
             ack_eliciting: true,
+            delivered: 0,
         }
     }
 
@@ -308,6 +324,7 @@ mod tests {
                 time_sent: now,
                 size: 1200,
                 ack_eliciting: false,
+                delivered: 0,
             },
         );
         assert_eq!(
@@ -321,6 +338,7 @@ mod tests {
                 time_sent: now,
                 size: 1200,
                 ack_eliciting: true,
+                delivered: 0,
             },
         );
         assert_eq!(sp.in_flight(), 1200, "only the ack-eliciting packet counts");
@@ -367,5 +385,21 @@ mod tests {
         let (lost, loss_time) = sp.detect_lost(Duration::from_secs(1), now);
         assert!(lost.is_empty());
         assert_eq!(loss_time, Some(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn discard_drops_in_flight_without_acking() {
+        let now = Instant::now();
+        let mut sp = SentPackets::new();
+        sp.on_sent(0, sent(now));
+        sp.on_sent(1, sent(now));
+        assert_eq!(sp.in_flight(), 2 * 1200);
+        // A PTO probe discards the oldest unacked packet: in_flight drops, but
+        // largest_acked is untouched (it was not acknowledged).
+        let p = sp.discard(0).unwrap();
+        assert_eq!(p.size, 1200);
+        assert_eq!(sp.in_flight(), 1200);
+        assert_eq!(sp.largest_acked(), None);
+        assert!(sp.discard(0).is_none(), "discarding twice is a no-op");
     }
 }

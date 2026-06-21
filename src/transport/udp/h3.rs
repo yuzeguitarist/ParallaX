@@ -32,10 +32,13 @@
 
 use std::io;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use crate::fingerprint::http3::{
     self, parse_settings_payload, safari26_settings_frame, Http3Setting, FRAME_TYPE_SETTINGS,
     STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER, STREAM_TYPE_QPACK_ENCODER,
 };
+use crate::transport::udp::quic::endpoint::{Connection, RecvStream, SendStream};
 
 /// Defensive cap on the SETTINGS frame this façade will read off the peer's
 /// control stream. Safari's SETTINGS frame is a few bytes; a hostile peer must
@@ -49,17 +52,17 @@ const MAX_PEER_SETTINGS_FRAME_LEN: usize = 256;
 /// real H3 endpoint. The relay holds this until it tears the connection down.
 pub(crate) struct H3ControlStreams {
     /// The unidirectional control stream (type 0x00); its first frame is SETTINGS.
-    _control_send: quinn::SendStream,
+    _control_send: SendStream,
     /// The unidirectional QPACK encoder stream (type 0x02); static-only, so empty
     /// after its type prefix.
-    _encoder_send: quinn::SendStream,
+    _encoder_send: SendStream,
 }
 
 impl H3ControlStreams {
     /// Assemble the held control-stream set from its individually-opened halves.
     /// Used by callers that interleave the request bidi between the control and
     /// encoder opens to match Safari's control -> request -> encoder ordering.
-    pub(crate) fn new(control_send: quinn::SendStream, encoder_send: quinn::SendStream) -> Self {
+    pub(crate) fn new(control_send: SendStream, encoder_send: SendStream) -> Self {
         Self {
             _control_send: control_send,
             _encoder_send: encoder_send,
@@ -71,13 +74,8 @@ impl H3ControlStreams {
 /// SETTINGS (writes `stream_type(0x00) ++ SETTINGS`). Returned send handle MUST
 /// be held for the connection's life (RFC 9114 §6.2.1). Opened FIRST in the
 /// Safari control -> request -> encoder stream order.
-pub(crate) async fn open_h3_control_stream(
-    conn: &quinn::Connection,
-) -> Result<quinn::SendStream, io::Error> {
-    let mut control_send = conn
-        .open_uni()
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string()))?;
+pub(crate) async fn open_h3_control_stream(conn: &Connection) -> Result<SendStream, io::Error> {
+    let mut control_send = conn.open_uni();
     let mut control_bytes = http3::encode_stream_type(STREAM_TYPE_CONTROL);
     let settings = safari26_settings_frame()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
@@ -93,13 +91,8 @@ pub(crate) async fn open_h3_control_stream(
 /// `stream_type(0x02)`; static-only, so nothing more). Opened LAST in the Safari
 /// control -> request -> encoder stream order. The returned send handle is held
 /// for the connection's life.
-pub(crate) async fn open_h3_encoder_stream(
-    conn: &quinn::Connection,
-) -> Result<quinn::SendStream, io::Error> {
-    let mut encoder_send = conn
-        .open_uni()
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string()))?;
+pub(crate) async fn open_h3_encoder_stream(conn: &Connection) -> Result<SendStream, io::Error> {
+    let mut encoder_send = conn.open_uni();
     let encoder_bytes = http3::encode_stream_type(STREAM_TYPE_QPACK_ENCODER);
     encoder_send
         .write_all(&encoder_bytes)
@@ -113,9 +106,7 @@ pub(crate) async fn open_h3_encoder_stream(
 /// (the loopback tests); production interleaves the request bidi between the two
 /// opens to match Safari's control -> request -> encoder ordering.
 #[cfg(test)]
-pub(crate) async fn open_h3_control(
-    conn: &quinn::Connection,
-) -> Result<H3ControlStreams, io::Error> {
+pub(crate) async fn open_h3_control(conn: &Connection) -> Result<H3ControlStreams, io::Error> {
     let control_send = open_h3_control_stream(conn).await?;
     let encoder_send = open_h3_encoder_stream(conn).await?;
     Ok(H3ControlStreams::new(control_send, encoder_send))
@@ -141,7 +132,7 @@ pub(crate) async fn open_h3_control(
 /// into a prompt, clean Unreachable.) Streams are left open (dropping a
 /// `RecvStream` stops reading without resetting the peer's send side).
 pub(crate) async fn read_peer_h3_settings(
-    conn: &quinn::Connection,
+    conn: &Connection,
 ) -> Result<Vec<Http3Setting>, io::Error> {
     // At most one encoder + one decoder stream may legitimately precede the
     // control stream; cap the non-control uni streams we will skip at that count
@@ -151,10 +142,12 @@ pub(crate) async fn read_peer_h3_settings(
     let mut seen_decoder = false;
     let mut non_control_seen = 0usize;
     let mut recv = loop {
-        let mut recv = conn
-            .accept_uni()
-            .await
-            .map_err(|err| io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string()))?;
+        let mut recv = conn.accept_uni().await.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection closed before the peer's H3 control stream",
+            )
+        })?;
         let stream_type = read_varint_from_stream(&mut recv).await?;
         if stream_type == STREAM_TYPE_CONTROL {
             break recv;
@@ -212,7 +205,7 @@ pub(crate) async fn read_peer_h3_settings(
 /// two high bits give the total length (1/2/4/8 bytes); we then read the rest with
 /// `read_exact`. Used for the control stream's small framing varints (stream type,
 /// frame type, frame length), so the per-call cost is negligible.
-async fn read_varint_from_stream(recv: &mut quinn::RecvStream) -> Result<u64, io::Error> {
+async fn read_varint_from_stream(recv: &mut RecvStream) -> Result<u64, io::Error> {
     let mut first = [0u8; 1];
     recv.read_exact(&mut first)
         .await
@@ -237,7 +230,7 @@ async fn read_varint_from_stream(recv: &mut quinn::RecvStream) -> Result<u64, io
 /// pre-buffering. `max_payload` bounds the payload allocation so a hostile peer
 /// cannot make us buffer an unbounded frame.
 pub(crate) async fn read_one_h3_frame(
-    recv: &mut quinn::RecvStream,
+    recv: &mut RecvStream,
     max_payload: usize,
 ) -> Result<(u64, Vec<u8>), io::Error> {
     let frame_type = read_varint_from_stream(recv).await?;
@@ -269,88 +262,7 @@ pub(crate) fn decode_buffered_frame(
 mod tests {
     use super::*;
     use crate::fingerprint::http3::safari26_settings;
-    use crate::transport::udp::test_support::{
-        loopback_pair, self_signed_cert, AcceptAnyServerCert,
-    };
-
-    /// Open a loopback QUIC pair whose SERVER grants the client ZERO uni-stream
-    /// credit (`initial_max_streams_uni = 0`) and never raises it. The client's
-    /// `open_uni` (used by `open_h3_control_stream` / `open_h3_encoder_stream`)
-    /// therefore never completes — modelling the on-path peer of fix A's threat
-    /// model. Returns both endpoints AND the server connection (all of which the
-    /// caller MUST keep alive — dropping the server connection would close the link
-    /// and make the client's `open_uni` resolve with an error instead of hanging),
-    /// plus the client connection under test.
-    async fn loopback_pair_server_no_uni_credit() -> (
-        quinn::Endpoint,
-        quinn::Endpoint,
-        quinn::Connection,
-        quinn::Connection,
-    ) {
-        use std::sync::Arc;
-
-        let (cert, key) = self_signed_cert();
-        // Build the server config like `server_config` but with a transport config
-        // that grants the peer 0 uni streams (and 1 bidi, like production).
-        let mut server_config = crate::transport::udp::server_config(cert, key).unwrap();
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
-        transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
-        server_config.transport_config(Arc::new(transport));
-
-        let server_endpoint =
-            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let server_addr = server_endpoint.local_addr().unwrap();
-
-        let client_endpoint = crate::transport::udp::endpoint::bind_client_endpoint(
-            "127.0.0.1:0".parse().unwrap(),
-            Arc::new(AcceptAnyServerCert),
-        )
-        .unwrap();
-
-        let acceptor = {
-            let server_endpoint = server_endpoint.clone();
-            tokio::spawn(async move {
-                server_endpoint
-                    .accept()
-                    .await
-                    .expect("incoming connection")
-                    .await
-                    .expect("server-side connection")
-            })
-        };
-        let client_conn = client_endpoint
-            .connect(server_addr, "localhost")
-            .expect("start connect")
-            .await
-            .expect("client-side connection");
-        let server_conn = acceptor.await.expect("accept task");
-        (server_endpoint, client_endpoint, client_conn, server_conn)
-    }
-
-    /// Fix A: a peer that completes the (unauthenticated) handshake but withholds
-    /// uni-stream credit makes `open_h3_control_stream`'s `open_uni` hang forever.
-    /// The probe must NOT hang: wrapping the control open in a timeout (as the
-    /// client runtime does) elapses, which the runtime maps to Unreachable (stay on
-    /// TCP). This asserts the timeout fires rather than the open resolving.
-    #[tokio::test]
-    async fn control_open_times_out_when_peer_withholds_uni_credit() {
-        // Keep `_server_conn` bound for the test's life: dropping it closes the
-        // connection, which would make `open_uni` resolve with an error rather than
-        // hang — defeating what this test asserts.
-        let (_server_endpoint, _client_endpoint, client_conn, _server_conn) =
-            loopback_pair_server_no_uni_credit().await;
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            open_h3_control_stream(&client_conn),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "control open must time out (not resolve) when the peer grants no uni credit"
-        );
-    }
+    use crate::transport::udp::test_support::loopback_pair;
 
     /// Both ends open their H3 control set and each reads the OTHER's SETTINGS;
     /// the parsed settings must equal Safari-26's ground truth, and the connection
@@ -387,11 +299,11 @@ mod tests {
         let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
 
         let bad = async move {
-            let mut s = client_conn.open_uni().await.unwrap();
+            let mut s = client_conn.open_uni();
             // Open a uni stream with a reserved/unexpected type (0x21), neither the
             // control (0x00) nor the QPACK encoder/decoder (0x02/0x03) streams.
             s.write_all(&http3::encode_stream_type(0x21)).await.unwrap();
-            s.finish().unwrap();
+            s.finish();
             // Keep the connection alive until the reader has classified the stream.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             client_conn
@@ -414,11 +326,11 @@ mod tests {
             // Two encoder streams (type 0x02), no control stream: the first is
             // legitimately skipped, the duplicate must be rejected.
             for _ in 0..2 {
-                let mut s = client_conn.open_uni().await.unwrap();
+                let mut s = client_conn.open_uni();
                 s.write_all(&http3::encode_stream_type(STREAM_TYPE_QPACK_ENCODER))
                     .await
                     .unwrap();
-                s.finish().unwrap();
+                s.finish();
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             client_conn

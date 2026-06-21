@@ -913,11 +913,14 @@ pub const RELAY_IDLE_CLOSE_CODE: u32 = 1;
 /// implementation; it must match ONLY the agreed code — never a generic code-0
 /// application close, a transport close, or the QUIC idle-timeout abort — so a
 /// real relay error is never mistaken for a benign idle teardown.
-pub(crate) fn is_relay_idle_close_reason(reason: Option<&quinn::ConnectionError>) -> bool {
+pub(crate) fn is_relay_idle_close_reason(
+    reason: Option<&crate::transport::udp::quic::endpoint::ConnectionError>,
+) -> bool {
+    use crate::transport::udp::quic::endpoint::{ApplicationClose, ConnectionError, VarInt};
     matches!(
         reason,
-        Some(quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose { error_code, .. }))
-            if *error_code == quinn::VarInt::from_u32(RELAY_IDLE_CLOSE_CODE)
+        Some(ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. }))
+            if *error_code == VarInt::from_u32(RELAY_IDLE_CLOSE_CODE)
     )
 }
 
@@ -1823,11 +1826,11 @@ mod tests {
 
     #[test]
     fn relay_idle_close_reason_matches_only_the_agreed_code() {
-        use quinn::{ApplicationClose, ConnectionError, VarInt};
+        use crate::transport::udp::quic::endpoint::{ApplicationClose, ConnectionError, VarInt};
 
         let idle = ConnectionError::ApplicationClosed(ApplicationClose {
             error_code: VarInt::from_u32(RELAY_IDLE_CLOSE_CODE),
-            reason: bytes::Bytes::new(),
+            reason: Vec::new(),
         });
         assert!(is_relay_idle_close_reason(Some(&idle)));
 
@@ -1835,7 +1838,7 @@ mod tests {
         // yet" (live connection) must NOT be mistaken for the idle teardown.
         let generic = ConnectionError::ApplicationClosed(ApplicationClose {
             error_code: VarInt::from_u32(0),
-            reason: bytes::Bytes::new(),
+            reason: Vec::new(),
         });
         assert!(!is_relay_idle_close_reason(Some(&generic)));
         assert!(!is_relay_idle_close_reason(Some(

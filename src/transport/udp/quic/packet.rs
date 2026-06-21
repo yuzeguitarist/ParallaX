@@ -451,6 +451,40 @@ pub fn peek_long_cids(datagram: &[u8]) -> Result<(ConnectionId, ConnectionId), D
     Ok((dcid, scid))
 }
 
+/// The total on-wire size of the long-header packet at the start of `buf`, used
+/// to find the next packet when several are coalesced into one datagram (RFC 9000
+/// §12.2). It is the header length through the §17.2 Length field plus the Length
+/// value (which covers the packet number + protected payload + AEAD tag). Reads
+/// only plaintext header fields, so it is valid BEFORE header protection is
+/// removed. Returns `None` for a short header (no Length field — a 1-RTT packet
+/// runs to the end of the datagram and so is always the last coalesced packet),
+/// for an unsupported long type, or for a truncated/clear-fixed-bit header.
+pub fn long_packet_len(buf: &[u8]) -> Option<usize> {
+    let first = *buf.first()?;
+    if first & FIXED_BIT == 0 || first & LONG_HEADER_FORM == 0 {
+        return None;
+    }
+    let ty = LongType::from_first_byte(first);
+    if ty != LongType::Initial && ty != LongType::Handshake {
+        return None;
+    }
+    let mut c = Cursor::new(buf);
+    c.skip(1).ok()?; // first byte
+    c.skip(4).ok()?; // version
+    c.cid().ok()?; // dcid
+    c.cid().ok()?; // scid
+    if ty == LongType::Initial {
+        let tlen = usize::try_from(c.varint().ok()?).ok()?;
+        c.skip(tlen).ok()?;
+    }
+    let length = usize::try_from(c.varint().ok()?).ok()?;
+    // Reject a Length that points past the datagram (a malformed long header must
+    // not yield a coalescing boundary outside `buf`); `usize::try_from` also avoids
+    // a silent `as usize` truncation on a 32-bit target.
+    let total = c.pos().checked_add(length)?;
+    (total <= buf.len()).then_some(total)
+}
+
 /// A minimal forward cursor over a header buffer.
 struct Cursor<'a> {
     buf: &'a [u8],
@@ -686,6 +720,61 @@ mod tests {
             Header::Long { packet_number, .. } => assert_eq!(packet_number, 0xa82f9b32),
             _ => panic!("expected long header"),
         }
+    }
+
+    #[test]
+    fn long_packet_len_finds_the_coalesced_boundary() {
+        // Two long-header packets concatenated into one datagram (RFC 9000 §12.2):
+        // `long_packet_len` of the buffer MUST return exactly the first packet's
+        // size, so the receiver lands on the start of the second.
+        let mk = |ty, pn: u64, payload: usize| {
+            let (_, pn_len) = encode_packet_number(pn, None);
+            let length = (pn_len + payload + 16) as u64; // + AEAD tag
+            let hdr = Header::Long {
+                ty,
+                version: 1,
+                dcid: ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]),
+                scid: ConnectionId::new(&[9, 9]),
+                token: vec![],
+                length,
+                packet_number: pn,
+                pn_len,
+            };
+            let mut out = Vec::new();
+            let pn_offset = hdr.encode(&mut out);
+            out.resize(pn_offset + length as usize, 0); // payload + tag bytes
+            out
+        };
+        let first = mk(LongType::Initial, 0, 40);
+        let second = mk(LongType::Handshake, 0, 25);
+        let first_len = first.len();
+        let mut datagram = first;
+        datagram.extend_from_slice(&second);
+
+        assert_eq!(
+            long_packet_len(&datagram),
+            Some(first_len),
+            "boundary is exactly the first packet's on-wire size"
+        );
+        // The second packet is a long header too, but it is the last → its own
+        // length still resolves (no trailing packet to find, but the value is the
+        // packet size).
+        assert_eq!(long_packet_len(&datagram[first_len..]), Some(second.len()));
+        // A short header has no Length field → None (it is always last).
+        let short = {
+            let hdr = Header::Short {
+                spin: false,
+                key_phase: false,
+                dcid: ConnectionId::new(&[]),
+                packet_number: 1,
+                pn_len: 1,
+            };
+            let mut out = Vec::new();
+            hdr.encode(&mut out);
+            out.extend_from_slice(&[0u8; 20]);
+            out
+        };
+        assert_eq!(long_packet_len(&short), None);
     }
 
     #[test]
