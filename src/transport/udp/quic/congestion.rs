@@ -123,7 +123,11 @@ mod tests {
         for _ in 0..5 {
             cc.on_ack(MAX_DATAGRAM_SIZE, false); // 5 * 1200 == one 6000-byte window
         }
-        assert_eq!(cc.window(), 6_000 + MAX_DATAGRAM_SIZE, "one MSS per window in CA");
+        assert_eq!(
+            cc.window(),
+            6_000 + MAX_DATAGRAM_SIZE,
+            "one MSS per window in CA"
+        );
     }
 
     #[test]

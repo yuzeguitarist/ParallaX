@@ -310,7 +310,11 @@ mod tests {
                 ack_eliciting: false,
             },
         );
-        assert_eq!(sp.in_flight(), 0, "a pure-ACK packet does not count in flight");
+        assert_eq!(
+            sp.in_flight(),
+            0,
+            "a pure-ACK packet does not count in flight"
+        );
         sp.on_sent(
             1,
             SentPacket {

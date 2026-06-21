@@ -575,7 +575,10 @@ impl ServerHandshake {
             .find(|p| summary.offered_alpn.iter().any(|o| o == *p))
             .cloned()
             .ok_or_else(|| {
-                QuicTlsError::alert(ALERT_NO_APPLICATION_PROTOCOL, "no overlapping ALPN protocol")
+                QuicTlsError::alert(
+                    ALERT_NO_APPLICATION_PROTOCOL,
+                    "no overlapping ALPN protocol",
+                )
             })?;
         let ee = build_encrypted_extensions(&alpn, &self.transport_params);
         self.transcript.extend_from_slice(&ee);

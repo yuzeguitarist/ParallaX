@@ -584,7 +584,9 @@ impl Connection {
                 if offset.saturating_sub(sp.crypto_recv_off) > MAX_CRYPTO_REASSEMBLY as u64
                     || buffered + data.len() > MAX_CRYPTO_REASSEMBLY
                 {
-                    return Err(QuicTlsError::Crypto("CRYPTO reassembly window exceeded".into()));
+                    return Err(QuicTlsError::Crypto(
+                        "CRYPTO reassembly window exceeded".into(),
+                    ));
                 }
                 sp.crypto_pending.push((offset, data.to_vec()));
             } else {
@@ -622,7 +624,9 @@ impl Connection {
             if offset.saturating_sub(s.recv_off) > MAX_STREAM_REASSEMBLY as u64
                 || buffered + data.len() > MAX_STREAM_REASSEMBLY
             {
-                return Err(QuicTlsError::Crypto("STREAM reassembly window exceeded".into()));
+                return Err(QuicTlsError::Crypto(
+                    "STREAM reassembly window exceeded".into(),
+                ));
             }
             s.recv_pending.push((offset, data.to_vec()));
             return Ok(());
