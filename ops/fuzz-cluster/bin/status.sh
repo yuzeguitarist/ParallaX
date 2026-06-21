@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # ops/fuzz-cluster/bin/status.sh
 # GROUP 3 — observability. Runs as user 'plxfuzz' from the plx-status timer
-# (~every 1 min). Builds status-<nodeid>.json and commits it to the dedicated
-# 'fuzz-status' branch (last-writer-wins: pull --rebase; on a push race reset to
-# remote + retry). Every gh/git network op is wrapped so a transient failure can
+# (~every 1 min). Builds status-<nodeid>.json and publishes it to the dedicated
+# 'fuzz-status' branch, kept at a SINGLE commit: each tick force-pushes a
+# parentless root commit (the fetched tip's tree with our file updated) under a
+# compare-and-swap lease, so history never grows while cross-box last-writer-wins
+# is preserved (a racing peer push fails -> re-fetch + retry). Every gh/git
+# network op is wrapped so a transient failure can
 # never kill the box; the next tick just retries. Idempotent.
 #
 # IMPORTANT: the branch commit happens in a DEDICATED clone under
@@ -220,32 +223,65 @@ ensure_status_clone() {
   return 1
 }
 
-git_commit_status() {
-  git -C "$WT" -c user.name=plxfuzz -c user.email=plxfuzz@localhost \
-    commit -q -m "status ${NODE_ID} ${TS}" 2>/dev/null || true
+# Keep this throwaway clone bounded. The remote branch is force-collapsed to a
+# single commit every tick (see push_status), so each fetch leaves the previous
+# tip unreachable; aggressive *synchronous* auto-gc with immediate prune keeps
+# the local clone from slowly re-bloating the way the old append-history did.
+tune_status_clone() {
+  git -C "$WT" config gc.auto 400 2>/dev/null || true
+  git -C "$WT" config gc.pruneExpire now 2>/dev/null || true
+  git -C "$WT" config gc.autoDetach false 2>/dev/null || true
 }
 
 push_status() {
   ensure_status_clone || return 0
+  tune_status_clone
   git -C "$WT" remote set-url origin "$(auth_remote)" 2>/dev/null || true
 
-  local i
+  local i base tree commit
   for i in 1 2 3; do
     git -C "$WT" fetch origin "$BRANCH" -q 2>/dev/null || true
     if git -C "$WT" show-ref --verify --quiet "refs/remotes/origin/$BRANCH" 2>/dev/null; then
-      git -C "$WT" checkout -B "$BRANCH" "origin/$BRANCH" -q 2>/dev/null || true
+      base="$(git -C "$WT" rev-parse "refs/remotes/origin/$BRANCH" 2>/dev/null || true)"
+      git -C "$WT" reset --hard "origin/$BRANCH" -q 2>/dev/null || true
+    else
+      # Branch absent (first publish ever): build from an empty index.
+      base=""
+      git -C "$WT" read-tree --empty 2>/dev/null || true
+      git -C "$WT" clean -fdq 2>/dev/null || true
     fi
+
     build_json "$WT/$REL"
     git -C "$WT" add "$REL" 2>/dev/null || true
-    git -C "$WT" diff --cached --quiet 2>/dev/null && return 0   # nothing to do
-    git_commit_status
-    if git -C "$WT" push origin "HEAD:$BRANCH" -q 2>/dev/null; then
-      printf '%s\n' "$TS" > "$STATE/last-status-ts" 2>/dev/null || true
+    # Our file is byte-identical to the fetched tip (no new heartbeat) -> done.
+    if [ -n "$base" ] && git -C "$WT" diff --cached --quiet "$base" -- 2>/dev/null; then
       return 0
     fi
-    # lost the race -> reset to remote tip and retry (last-writer-wins).
-    git -C "$WT" fetch origin "$BRANCH" -q 2>/dev/null || true
-    git -C "$WT" reset --hard "origin/$BRANCH" -q 2>/dev/null || true
+
+    tree="$(git -C "$WT" write-tree 2>/dev/null || true)"
+    [ -n "$tree" ] || continue
+    # No parent: a root commit, so pushing it collapses ALL prior history.
+    commit="$(git -C "$WT" -c user.name=plxfuzz -c user.email=plxfuzz@localhost \
+                commit-tree "$tree" -m "status ${NODE_ID} ${TS}" 2>/dev/null || true)"
+    [ -n "$commit" ] || continue
+
+    if [ -n "$base" ]; then
+      # CAS: overwrite only if the remote is still at the tip we based our tree
+      # on; a peer that pushed in between makes this fail -> re-fetch + retry,
+      # so the peer's just-written status is never clobbered.
+      if git -C "$WT" push --force-with-lease="refs/heads/$BRANCH:$base" \
+           origin "$commit:refs/heads/$BRANCH" -q 2>/dev/null; then
+        printf '%s\n' "$TS" > "$STATE/last-status-ts" 2>/dev/null || true
+        return 0
+      fi
+    else
+      # Create the branch; a peer that wins the create makes this fail -> retry.
+      if git -C "$WT" push origin "$commit:refs/heads/$BRANCH" -q 2>/dev/null; then
+        printf '%s\n' "$TS" > "$STATE/last-status-ts" 2>/dev/null || true
+        return 0
+      fi
+    fi
+    # Lost the lease/create race -> loop re-fetches the new tip and retries.
   done
   return 0
 }
