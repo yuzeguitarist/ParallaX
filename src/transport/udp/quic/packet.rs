@@ -196,6 +196,32 @@ pub enum Header {
 }
 
 impl Header {
+    /// The (full, reconstructed) packet number this header carries.
+    pub fn packet_number(&self) -> u64 {
+        match self {
+            Header::Long { packet_number, .. } | Header::Short { packet_number, .. } => {
+                *packet_number
+            }
+        }
+    }
+
+    /// The on-wire packet-number length (1..=4).
+    pub fn pn_len(&self) -> usize {
+        match self {
+            Header::Long { pn_len, .. } | Header::Short { pn_len, .. } => *pn_len,
+        }
+    }
+
+    /// Overwrite the packet number — used after reconstructing the full value from
+    /// the truncated wire bytes (RFC 9000 Appendix A.3) during decode.
+    pub fn set_packet_number(&mut self, pn: u64) {
+        match self {
+            Header::Long { packet_number, .. } | Header::Short { packet_number, .. } => {
+                *packet_number = pn;
+            }
+        }
+    }
+
     /// Serialize the header (through the plaintext packet number) into `out`, and
     /// return the byte offset of the packet-number field (the HP `pn_offset`). The
     /// written bytes are the AEAD AAD.

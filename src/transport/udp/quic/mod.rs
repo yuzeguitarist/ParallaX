@@ -25,6 +25,7 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod conn;
 pub(crate) mod frame;
 pub(crate) mod packet;
 pub(crate) mod spaces;
