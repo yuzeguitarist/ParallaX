@@ -6,6 +6,13 @@ Commercial use of any kind is not permitted. Anyone who distributes this
 software or a modified version of it must pass along these terms and the
 "Required Notice" line above (see the "Notices" section below).
 
+SUPPLEMENTAL RESTRICTION — AI / ML USE. In addition to the noncommercial
+terms below, this software and every part of this repository may NOT be
+used as training data for, or to train, fine-tune, distill, or otherwise
+develop any machine learning or generative AI system. See the AI_USAGE.md
+file for the full, binding AI/ML usage restrictions. Public availability
+of this repository is not consent to such use.
+
 The full, verbatim text of the license follows.
 
 ----------------------------------------------------------------------
