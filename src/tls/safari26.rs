@@ -1784,9 +1784,9 @@ mod tests {
         session::X25519KeyPair,
     };
     use crate::tls::client_hello::parse_client_hello;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::{TcpListener, TcpStream};
-    use zeroize::Zeroizing;
+    // AsyncWriteExt, TcpStream, and Zeroizing are already in scope via `use
+    // super::*` (parent imports at the top of this file); only TcpListener is new.
+    use tokio::net::TcpListener;
 
     fn build_compressed_cert_body(declared_uncompressed_len: usize, plaintext: &[u8]) -> Vec<u8> {
         use flate2::{write::ZlibEncoder, Compression};
@@ -1996,7 +1996,13 @@ mod tests {
     fn sample_handshake(shared_secret: [u8; 32]) -> CompletedSafari26Handshake {
         CompletedSafari26Handshake {
             client_hello: vec![1, 2, 3],
-            client_x25519: X25519KeyPair::generate(),
+            // Deterministic so the Debug-redaction test never scans random public
+            // bytes: X25519KeyPair's Debug prints `public` verbatim, so a random
+            // keypair could coincidentally render the secret's byte sentinel.
+            client_x25519: X25519KeyPair {
+                private: [1_u8; 32],
+                public: [1_u8; 32],
+            },
             server_hello_record: vec![4, 5, 6],
             record_events: Vec::new(),
             negotiated_alpn: Some(b"h2".to_vec()),
@@ -2045,6 +2051,24 @@ mod tests {
         assert!(matches!(events[0].direction, RecordDirection::Outbound));
     }
 
+    #[test]
+    fn tap_records_counts_zero_payload_record_ending_on_boundary() {
+        let mut session = test_session();
+        let mut buf = tls_record(0x17, &[0xaa, 0xbb]); // payload len 2
+        buf.extend_from_slice(&tls_record(0x17, &[])); // zero-payload header only
+
+        let before = session.tap.events().len();
+        session.tap_records(RecordDirection::Inbound, &buf);
+        let events = &session.tap.events()[before..];
+
+        // The trailing record starts at offset 7 and is header-only, so it ends
+        // exactly at `offset + TLS_HEADER_LEN == buf.len()`. The loop-entry guard
+        // must use `<=`; a mutation to `<` would skip this final record.
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].content_type, 0x17);
+        assert_eq!(events[1].len, 0);
+    }
+
     // ---- process_http2_frames ----
 
     #[tokio::test]
@@ -2083,6 +2107,41 @@ mod tests {
 
         assert!(!saw_ack);
         assert!(plaintext.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_http2_frames_acks_a_plain_settings_frame() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // A plain (non-ACK) SETTINGS frame drives the `else if header.is_settings()`
+        // arm and the `should_ack_peer_settings` write block: the session must
+        // encrypt and send a SETTINGS-ACK back to the peer.
+        let mut plaintext = h2_frame(0x4, 0x0, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x64]);
+        let saw_ack = session
+            .process_http2_frames(&mut plaintext, &mut stream, &mut session_keys)
+            .await
+            .unwrap();
+
+        assert!(!saw_ack); // a peer SETTINGS frame is not itself our ack signal
+        assert!(plaintext.is_empty()); // the complete frame was drained
+
+        // The reply is written via client_application.encrypt_record, so decrypt it
+        // with the matching (identical, deterministic) peer key set and confirm the
+        // inner bytes are exactly an HTTP/2 SETTINGS-ACK frame.
+        let mut record = Vec::new();
+        let mut reader = TlsRecordReader::new(&mut peer);
+        reader.read_record_into(&mut record).await.unwrap();
+        let chunk = peer_keys
+            .client_application
+            .decrypt_record(&record)
+            .unwrap();
+        assert_eq!(
+            chunk.plaintext,
+            Http2Fingerprint::settings_ack_frame().unwrap()
+        );
     }
 
     // ---- await_http2_settings_ack ----
@@ -2152,6 +2211,57 @@ mod tests {
             .encrypt_record(TLS_RECORD_HANDSHAKE, &[0xaa, 0xbb])
             .unwrap();
         peer.write_all(&record).await.unwrap();
+        drop(peer);
+
+        session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_skips_short_inner_alert() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // A 1-byte inner ALERT: too short to carry level+description. The
+        // `chunk.plaintext.len() >= 2` guard must skip it via `continue`; without
+        // that guard, indexing `plaintext[1]` would panic.
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_CONTENT_ALERT, &[0x02])
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        drop(peer);
+
+        session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_returns_via_inner_appdata_ack() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // An inner application-data record carrying an HTTP/2 SETTINGS-ACK frame
+        // drives the APPDATA -> process_http2_frames -> `return Ok(())` path.
+        let ack = h2_frame(0x4, 0x1, &[]);
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_RECORD_APPLICATION_DATA, &ack)
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        // A trailing outer alert that must NOT be reached: if the ACK path failed
+        // to return early, the loop would consume this and surface an Alert error.
+        peer.write_all(&tls_record(TLS_CONTENT_ALERT, &[0x02, 0x28]))
+            .await
+            .unwrap();
         drop(peer);
 
         session
