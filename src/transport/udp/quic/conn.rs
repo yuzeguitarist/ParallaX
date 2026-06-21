@@ -13,10 +13,13 @@
 //! milestone). Loss recovery / ACK timing (RFC 9002) and the 1-RTT data streams
 //! land in later slices; a lossless loopback completes without them.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use super::frame::{Frame, Iter};
+use super::frame::{Ack, Frame, Iter};
 use super::packet::{self, ConnectionId, Header, LongType, PacketSpace};
+use super::recovery::{RttEstimator, SentPacket, SentPackets};
 use super::spaces::{PacketNumberSpace, ReceivedPackets};
 use super::transport_params::TransportParameters;
 use crate::tls::quic::{
@@ -139,6 +142,11 @@ const MAX_CRYPTO_REASSEMBLY: usize = 64 * 1024;
 /// per-stream receive window (full MAX_STREAM_DATA flow control lands in B2).
 const MAX_STREAM_REASSEMBLY: usize = 2 * 1024 * 1024;
 
+/// RFC 9000 §18.2 default `ack_delay_exponent`. The peer scales its ACK `delay`
+/// field by `2^exponent` microseconds; we decode with the default (neither we nor
+/// the Safari client negotiate a different value).
+const ACK_DELAY_EXPONENT: u32 = 3;
+
 const SPACE_INITIAL: usize = 0;
 const SPACE_HANDSHAKE: usize = 1;
 const SPACE_DATA: usize = 2;
@@ -151,6 +159,18 @@ fn space_index(space: PacketSpace) -> usize {
     }
 }
 
+/// What an ack-eliciting sent packet carried that must be RESENT (in a new packet,
+/// RFC 9002 §6.2.4) if the packet is declared lost. ACK/PADDING/PING carry nothing
+/// retransmittable, so a pure-ACK packet stores an empty record (and is not even
+/// tracked here — only ack-eliciting packets are).
+#[derive(Default, Clone)]
+struct SentContent {
+    /// CRYPTO byte ranges `(offset, len)` in this space's outgoing CRYPTO stream.
+    crypto: Vec<(u64, u64)>,
+    /// Relay-stream byte ranges `(offset, len, fin)`.
+    stream: Vec<(u64, u64, bool)>,
+}
+
 /// Per-packet-number-space state: protection keys (installed as the handshake
 /// crosses spaces), the send allocator + received-PN set, and the in-/out-bound
 /// CRYPTO byte streams.
@@ -159,6 +179,18 @@ struct Space {
     keys: Option<Keys>,
     send: PacketNumberSpace,
     recv: ReceivedPackets,
+    /// Sent-packet bookkeeping for loss detection + RTT (RFC 9002 §6.1).
+    sent: SentPackets,
+    /// Per-packet-number retransmittable content, kept in lockstep with `sent`:
+    /// removed when the packet is acked, drained into the retransmit queues when
+    /// it is declared lost.
+    sent_content: BTreeMap<u64, SentContent>,
+    /// An ack-eliciting packet has been received and not yet acknowledged.
+    ack_pending: bool,
+    /// CRYPTO byte ranges to RESEND (lost packets) before any fresh CRYPTO.
+    retransmit_crypto: Vec<(u64, u64)>,
+    /// Earliest armed time-threshold loss deadline (RFC 9002 §6.1.2), if any.
+    loss_time: Option<Instant>,
     /// Outgoing CRYPTO bytes and how much has been packetized.
     crypto_send: Vec<u8>,
     crypto_send_off: usize,
@@ -175,6 +207,8 @@ struct Space {
 struct BidiStream {
     send: Vec<u8>,
     send_off: u64,
+    /// Stream byte ranges `(offset, len, fin)` to RESEND before any fresh data.
+    retransmit: Vec<(u64, u64, bool)>,
     recv: Vec<u8>,
     recv_off: u64,
     recv_pending: Vec<(u64, Vec<u8>)>,
@@ -200,6 +234,8 @@ pub struct Connection {
     peer_cid_adopted: bool,
     tls: Box<dyn TlsSession>,
     spaces: [Space; 3],
+    /// Connection-wide RTT estimator (RFC 9002 §5 keeps one across all spaces).
+    rtt: RttEstimator,
     /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
     write_level: usize,
     /// The relay's single bidirectional data stream (1-RTT).
@@ -233,6 +269,7 @@ impl Connection {
             peer_cid_adopted: false,
             tls: Box::new(tls),
             spaces,
+            rtt: RttEstimator::new(),
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
         };
@@ -264,6 +301,7 @@ impl Connection {
             peer_cid_adopted: false,
             tls: Box::new(tls),
             spaces: [Space::default(), Space::default(), Space::default()],
+            rtt: RttEstimator::new(),
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
         })
@@ -335,37 +373,40 @@ impl Connection {
         }
     }
 
-    /// Produce the next datagram to send (one CRYPTO packet from the lowest space
-    /// with pending handshake bytes and installed keys), or `None` when idle.
-    pub fn poll_transmit(&mut self) -> Option<Vec<u8>> {
+    /// Produce the next datagram to send, or `None` when idle. Priority: a pending
+    /// ACK (lowest space first), then CRYPTO (retransmits before fresh bytes, lowest
+    /// space first), then 1-RTT relay STREAM data (retransmits before fresh). One
+    /// datagram per call; the driver loops until `None`. `now` stamps sent packets
+    /// for RTT/loss bookkeeping.
+    pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
+        // Pure ACKs first so acknowledgements are not held behind data.
         for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
-            let sp = &self.spaces[space];
-            if sp.keys.is_some() && sp.crypto_send_off < sp.crypto_send.len() {
-                return Some(self.build_crypto_packet(space));
+            if self.spaces[space].keys.is_some() && self.spaces[space].ack_pending {
+                return Some(self.build_ack_packet(space, now));
             }
         }
-        // 1-RTT relay data: once Data keys are installed, drain the bidi stream.
+        // CRYPTO (handshake) from the lowest space with retransmits or fresh bytes.
+        for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+            let sp = &self.spaces[space];
+            if sp.keys.is_some()
+                && (!sp.retransmit_crypto.is_empty() || sp.crypto_send_off < sp.crypto_send.len())
+            {
+                return Some(self.build_crypto_packet(space, now));
+            }
+        }
+        // 1-RTT relay data: once Data keys are installed, resend losses then drain.
         if self.spaces[SPACE_DATA].keys.is_some()
-            && (self.stream.send_off as usize) < self.stream.send.len()
+            && (!self.stream.retransmit.is_empty()
+                || (self.stream.send_off as usize) < self.stream.send.len())
         {
-            return Some(self.build_stream_packet());
+            return Some(self.build_stream_packet(now));
         }
         None
     }
 
-    fn build_crypto_packet(&mut self, space: usize) -> Vec<u8> {
-        let pn = self.spaces[space].send.allocate();
-        let (_, pn_len) = packet::encode_packet_number(pn, None);
-        let offset = self.spaces[space].crypto_send_off as u64;
-        let tag_len = self.spaces[space]
-            .keys
-            .as_ref()
-            .unwrap()
-            .local
-            .packet
-            .tag_len();
-
-        let header = match space {
+    /// The long/short header for an outgoing packet in `space`.
+    fn make_header(&self, space: usize, pn: u64, pn_len: usize) -> Header {
+        match space {
             SPACE_INITIAL | SPACE_HANDSHAKE => {
                 let ty = if space == SPACE_INITIAL {
                     LongType::Initial
@@ -390,25 +431,95 @@ impl Connection {
                 packet_number: pn,
                 pn_len,
             },
+        }
+    }
+
+    /// Record an outgoing packet for loss detection. Only ack-eliciting packets
+    /// keep retransmittable content (a pure-ACK packet has none).
+    fn record_sent(
+        &mut self,
+        space: usize,
+        pn: u64,
+        size: usize,
+        ack_eliciting: bool,
+        content: SentContent,
+        now: Instant,
+    ) {
+        self.spaces[space].sent.on_sent(
+            pn,
+            SentPacket {
+                time_sent: now,
+                size: size as u64,
+                ack_eliciting,
+            },
+        );
+        if ack_eliciting {
+            self.spaces[space].sent_content.insert(pn, content);
+        }
+    }
+
+    /// Build a packet carrying only an ACK frame for `space` (non-ack-eliciting),
+    /// clearing the space's pending-ACK flag.
+    fn build_ack_packet(&mut self, space: usize, now: Instant) -> Vec<u8> {
+        let pn = self.spaces[space].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let ack = self.spaces[space]
+            .recv
+            .to_ack(0)
+            .expect("ack_pending is only set after receiving an ack-eliciting packet");
+        let header = self.make_header(space, pn, pn_len);
+        let datagram = {
+            let keys = self.spaces[space].keys.as_ref().unwrap();
+            seal_packet(&keys.local, header, &[Frame::Ack(ack)])
         };
+        self.spaces[space].ack_pending = false;
+        self.record_sent(
+            space,
+            pn,
+            datagram.len(),
+            false,
+            SentContent::default(),
+            now,
+        );
+        datagram
+    }
+
+    fn build_crypto_packet(&mut self, space: usize, now: Instant) -> Vec<u8> {
+        let pn = self.spaces[space].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let tag_len = self.spaces[space]
+            .keys
+            .as_ref()
+            .unwrap()
+            .local
+            .packet
+            .tag_len();
+        let header = self.make_header(space, pn, pn_len);
         let mut probe = Vec::new();
         let pn_offset = header.encode(&mut probe);
 
-        let crypto_hdr = 1 + super::varint::size(offset) + 2;
-        let cap = if space == SPACE_INITIAL {
-            MIN_INITIAL_DATAGRAM
-        } else {
-            MAX_DATAGRAM
-        };
-        let budget = cap.saturating_sub(pn_offset + pn_len + tag_len + crypto_hdr);
-        let remaining = self.spaces[space].crypto_send.len() - self.spaces[space].crypto_send_off;
-        let chunk_len = remaining.min(budget.max(1));
-        let end = self.spaces[space].crypto_send_off + chunk_len;
+        // A lost CRYPTO range is resent verbatim (it was already sized to fit a
+        // packet); otherwise carve the next fresh chunk under the datagram budget.
+        let (offset, end, is_retransmit) =
+            if let Some(&(off, len)) = self.spaces[space].retransmit_crypto.first() {
+                (off as usize, (off + len) as usize, true)
+            } else {
+                let off = self.spaces[space].crypto_send_off;
+                let crypto_hdr = 1 + super::varint::size(off as u64) + 2;
+                let cap = if space == SPACE_INITIAL {
+                    MIN_INITIAL_DATAGRAM
+                } else {
+                    MAX_DATAGRAM
+                };
+                let budget = cap.saturating_sub(pn_offset + pn_len + tag_len + crypto_hdr);
+                let remaining = self.spaces[space].crypto_send.len() - off;
+                (off, off + remaining.min(budget.max(1)), false)
+            };
 
         let datagram = {
             let crypto = Frame::Crypto {
-                offset,
-                data: &self.spaces[space].crypto_send[self.spaces[space].crypto_send_off..end],
+                offset: offset as u64,
+                data: &self.spaces[space].crypto_send[offset..end],
             };
             let mut payload = Vec::new();
             crypto.encode(&mut payload);
@@ -426,16 +537,25 @@ impl Connection {
             let keys = self.spaces[space].keys.as_ref().unwrap();
             seal_packet(&keys.local, header, &frames)
         };
-        self.spaces[space].crypto_send_off = end;
+
+        let content = SentContent {
+            crypto: vec![(offset as u64, (end - offset) as u64)],
+            stream: Vec::new(),
+        };
+        self.record_sent(space, pn, datagram.len(), true, content, now);
+        if is_retransmit {
+            self.spaces[space].retransmit_crypto.remove(0);
+        } else {
+            self.spaces[space].crypto_send_off = end;
+        }
         datagram
     }
 
-    /// Build one 1-RTT (short-header) packet carrying a STREAM frame with the next
-    /// slice of the relay stream's outgoing bytes.
-    fn build_stream_packet(&mut self) -> Vec<u8> {
+    /// Build one 1-RTT (short-header) packet carrying a STREAM frame — either a
+    /// resend of a lost range or the next fresh slice of the relay stream.
+    fn build_stream_packet(&mut self, now: Instant) -> Vec<u8> {
         let pn = self.spaces[SPACE_DATA].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
-        let offset = self.stream.send_off;
         let tag_len = self.spaces[SPACE_DATA]
             .keys
             .as_ref()
@@ -443,34 +563,44 @@ impl Connection {
             .local
             .packet
             .tag_len();
-
-        let header = Header::Short {
-            spin: false,
-            key_phase: false,
-            dcid: self.dcid,
-            packet_number: pn,
-            pn_len,
-        };
+        let header = self.make_header(SPACE_DATA, pn, pn_len);
         let mut probe = Vec::new();
         let pn_offset = header.encode(&mut probe);
 
-        let frame_hdr = 1 + super::varint::size(RELAY_STREAM_ID) + super::varint::size(offset) + 2;
-        let budget = MAX_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
-        let remaining = self.stream.send.len() - self.stream.send_off as usize;
-        let chunk_len = remaining.min(budget.max(1));
-        let end = self.stream.send_off as usize + chunk_len;
+        let (offset, end, fin, is_retransmit) =
+            if let Some(&(off, len, fin)) = self.stream.retransmit.first() {
+                (off, off + len, fin, true)
+            } else {
+                let offset = self.stream.send_off;
+                let frame_hdr =
+                    1 + super::varint::size(RELAY_STREAM_ID) + super::varint::size(offset) + 2;
+                let budget = MAX_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
+                let remaining = self.stream.send.len() - offset as usize;
+                let chunk = remaining.min(budget.max(1));
+                (offset, offset + chunk as u64, false, false)
+            };
 
         let datagram = {
             let frame = Frame::Stream {
                 id: RELAY_STREAM_ID,
                 offset,
-                fin: false,
-                data: &self.stream.send[self.stream.send_off as usize..end],
+                fin,
+                data: &self.stream.send[offset as usize..end as usize],
             };
             let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
             seal_packet(&keys.local, header, &[frame])
         };
-        self.stream.send_off = end as u64;
+
+        let content = SentContent {
+            crypto: Vec::new(),
+            stream: vec![(offset, end - offset, fin)],
+        };
+        self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
+        if is_retransmit {
+            self.stream.retransmit.remove(0);
+        } else {
+            self.stream.send_off = end;
+        }
         datagram
     }
 
@@ -482,7 +612,7 @@ impl Connection {
     /// datagram. The TLS engine is pumped after each packet ([`Self::process_packet`])
     /// so that, e.g., the Handshake keys learned from a coalesced Initial are
     /// installed before the Handshake packet that follows it in the same datagram.
-    pub fn handle_datagram(&mut self, datagram: &[u8]) -> Result<(), QuicTlsError> {
+    pub fn handle_datagram(&mut self, datagram: &[u8], now: Instant) -> Result<(), QuicTlsError> {
         let mut buf = datagram.to_vec();
         let mut pos = 0;
         while pos < buf.len() {
@@ -490,7 +620,7 @@ impl Connection {
             // BEFORE `process_packet` decrypts in place. `None` ⇒ a short header
             // (or unparseable) which runs to the datagram end: process it, stop.
             let advance = packet::long_packet_len(&buf[pos..]);
-            self.process_packet(&mut buf[pos..])?;
+            self.process_packet(&mut buf[pos..], now)?;
             match advance {
                 Some(n) if n != 0 && pos.checked_add(n).is_some_and(|e| e <= buf.len()) => {
                     pos += n;
@@ -507,7 +637,7 @@ impl Connection {
     /// is dropped (RFC 9001 §5.4.2 — `Ok(())`): a coalesced trailer, a replay, or a
     /// packet for keys not yet held must NOT fail the connection. Only a protocol
     /// error decoding a frame on an AUTHENTICATED packet propagates.
-    fn process_packet(&mut self, pkt: &mut [u8]) -> Result<(), QuicTlsError> {
+    fn process_packet(&mut self, pkt: &mut [u8], now: Instant) -> Result<(), QuicTlsError> {
         let pspace = match packet::first_packet_space(pkt) {
             Some(s) => s,
             None => return Ok(()), // unsupported type / clear fixed bit: drop
@@ -580,21 +710,82 @@ impl Connection {
         // Copy the decrypted frames out so the TLS engine can be mutated while we
         // iterate.
         let payload = pkt[range].to_vec();
+        // A packet is ack-eliciting (RFC 9002 §2) if it carries any frame other
+        // than ACK / PADDING / CONNECTION_CLOSE — such a packet schedules an ACK.
+        let mut ack_eliciting = false;
         for frame in Iter::new(&payload) {
             let frame =
                 frame.map_err(|e| QuicTlsError::Crypto(format!("frame decode failed: {e:?}")))?;
-            // CRYPTO advances the handshake; STREAM carries 1-RTT relay data. ACK
-            // timing / loss recovery land in B2; other frames are ignored here.
             match frame {
-                Frame::Crypto { offset, data } => self.recv_crypto(space, offset, data)?,
+                Frame::Crypto { offset, data } => {
+                    ack_eliciting = true;
+                    self.recv_crypto(space, offset, data)?;
+                }
                 Frame::Stream {
                     id, offset, data, ..
-                } if id == RELAY_STREAM_ID => self.recv_stream(offset, data)?,
-                _ => {}
+                } if id == RELAY_STREAM_ID => {
+                    ack_eliciting = true;
+                    self.recv_stream(offset, data)?;
+                }
+                Frame::Ack(ack) => self.recv_ack(space, &ack, now),
+                Frame::Padding(_) | Frame::Close(_) => {}
+                // PING, HANDSHAKE_DONE, and every other relay-relevant frame are
+                // ack-eliciting but carry no payload we act on here.
+                _ => ack_eliciting = true,
             }
+        }
+        if ack_eliciting {
+            self.spaces[space].ack_pending = true;
         }
         self.pump_write();
         Ok(())
+    }
+
+    /// Apply a received ACK frame (RFC 9002 §5–6.1): drop the acknowledged sent
+    /// packets, fold one RTT sample (largest newly acked + an ack-eliciting packet),
+    /// then run loss detection and queue any lost CRYPTO/STREAM bytes for resend.
+    fn recv_ack(&mut self, space: usize, ack: &Ack, now: Instant) {
+        let newly = self.spaces[space].sent.on_ack(ack.largest, &ack.ranges);
+        if newly.is_empty() {
+            return;
+        }
+        // RTT sample: only when the largest acked is newly acked AND at least one
+        // newly-acked packet was ack-eliciting (RFC 9002 §5.1).
+        let mut largest_time = None;
+        let mut any_ack_eliciting = false;
+        for (pn, sp) in &newly {
+            self.spaces[space].sent_content.remove(pn);
+            any_ack_eliciting |= sp.ack_eliciting;
+            if *pn == ack.largest {
+                largest_time = Some(sp.time_sent);
+            }
+        }
+        if let (Some(sent_at), true) = (largest_time, any_ack_eliciting) {
+            // ACK delay applies only to the Application space (RFC 9002 §5.3); the
+            // peer MUST send 0 for Initial/Handshake.
+            let ack_delay = if space == SPACE_DATA {
+                Duration::from_micros(ack.delay.saturating_mul(1 << ACK_DELAY_EXPONENT))
+            } else {
+                Duration::ZERO
+            };
+            self.rtt
+                .update(ack_delay, now.saturating_duration_since(sent_at));
+        }
+
+        // Loss detection: re-queue the content of every packet declared lost.
+        let loss_delay = self.rtt.loss_delay();
+        let (lost, loss_time) = self.spaces[space].sent.detect_lost(loss_delay, now);
+        self.spaces[space].loss_time = loss_time;
+        for (pn, _) in lost {
+            if let Some(content) = self.spaces[space].sent_content.remove(&pn) {
+                for range in content.crypto {
+                    self.spaces[space].retransmit_crypto.push(range);
+                }
+                for range in content.stream {
+                    self.stream.retransmit.push(range);
+                }
+            }
+        }
     }
 
     /// Reassemble an incoming CRYPTO fragment in order and feed the contiguous
@@ -794,7 +985,8 @@ mod tests {
                 .unwrap();
 
         let mut datagrams = Vec::new();
-        while let Some(d) = conn.poll_transmit() {
+        let now = Instant::now();
+        while let Some(d) = conn.poll_transmit(now) {
             datagrams.push(d);
         }
         assert!(
@@ -883,16 +1075,18 @@ mod tests {
     }
 
     /// Ping-pong datagrams between two connections until neither has anything more
-    /// to send (handshake CRYPTO, then 1-RTT data).
+    /// to send (handshake CRYPTO + ACKs, then 1-RTT data). Lossless, so a single
+    /// `now` suffices (no timers fire).
     fn drive(a: &mut Connection, b: &mut Connection) {
+        let now = Instant::now();
         for _ in 0..16 {
             let mut moved = false;
-            while let Some(dg) = a.poll_transmit() {
-                b.handle_datagram(&dg).unwrap();
+            while let Some(dg) = a.poll_transmit(now) {
+                b.handle_datagram(&dg, now).unwrap();
                 moved = true;
             }
-            while let Some(dg) = b.poll_transmit() {
-                a.handle_datagram(&dg).unwrap();
+            while let Some(dg) = b.poll_transmit(now) {
+                a.handle_datagram(&dg, now).unwrap();
                 moved = true;
             }
             if !moved {
@@ -908,23 +1102,24 @@ mod tests {
     /// the Handshake keys learned from the coalesced Initial must be installed
     /// before the Handshake packet that immediately follows it.
     fn drive_coalesced(a: &mut Connection, b: &mut Connection) {
+        let now = Instant::now();
         for _ in 0..16 {
             let mut moved = false;
             let mut from_a = Vec::new();
-            while let Some(dg) = a.poll_transmit() {
+            while let Some(dg) = a.poll_transmit(now) {
                 from_a.extend_from_slice(&dg);
                 moved = true;
             }
             if !from_a.is_empty() {
-                b.handle_datagram(&from_a).unwrap();
+                b.handle_datagram(&from_a, now).unwrap();
             }
             let mut from_b = Vec::new();
-            while let Some(dg) = b.poll_transmit() {
+            while let Some(dg) = b.poll_transmit(now) {
                 from_b.extend_from_slice(&dg);
                 moved = true;
             }
             if !from_b.is_empty() {
-                a.handle_datagram(&from_b).unwrap();
+                a.handle_datagram(&from_b, now).unwrap();
             }
             if !moved {
                 break;
@@ -1003,6 +1198,71 @@ mod tests {
             client.read_stream(),
             response,
             "client received the response"
+        );
+    }
+
+    #[test]
+    fn lost_stream_packet_is_retransmitted_and_reassembled() {
+        let mut now = Instant::now();
+        let dcid = ConnectionId::new(&[0x10; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0x12, 0x34, 0x56, 0x78]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // A payload spanning several 1-RTT packets.
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        client.send_stream(&payload);
+
+        // Collect the client's data packets, then deliver all but the SECOND —
+        // simulating one mid-stream packet lost on the wire.
+        let mut pkts = Vec::new();
+        while let Some(dg) = client.poll_transmit(now) {
+            pkts.push(dg);
+        }
+        assert!(
+            pkts.len() >= 5,
+            "payload should span several packets, got {}",
+            pkts.len()
+        );
+        for (i, dg) in pkts.iter().enumerate() {
+            if i == 1 {
+                continue; // this packet is "lost"
+            }
+            server.handle_datagram(dg, now).unwrap();
+        }
+
+        // The server's gap-ACK drives the client's packet-threshold loss detection,
+        // which resends the dropped range; pump until the hole is healed.
+        for _ in 0..16 {
+            now += Duration::from_millis(10);
+            let mut moved = false;
+            while let Some(dg) = server.poll_transmit(now) {
+                client.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            while let Some(dg) = client.poll_transmit(now) {
+                server.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+
+        assert_eq!(
+            server.read_stream(),
+            payload,
+            "the dropped packet was retransmitted and the stream reassembled in order"
         );
     }
 }
