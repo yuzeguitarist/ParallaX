@@ -1,0 +1,77 @@
+name: mutants-report
+
+# Surface nightly-mutants survivors as a single rolling GitHub issue (label:
+# `mutation-testing`) so they're visible without digging into Actions artifacts.
+# Kept separate from nightly-mutants.yml on purpose (one automation per file).
+#
+# Fires after each nightly-mutants run, downloads that run's mutants-out-shard-N
+# artifact, and rewrites that shard's section of the rolling issue via
+# .github/scripts/mutants_issue.py. Closes the issue when no reported shard has
+# survivors; (re)opens it when any do. Non-gating: failures here never affect a PR.
+
+on:
+  workflow_run:
+    workflows: ["nightly-mutants"]
+    types: [completed]
+
+# Least-privilege: read code + the triggering run's artifacts, write issues.
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  # Serialize issue edits so overlapping shard runs can't clobber each other's
+  # section (read-modify-write of one issue body).
+  group: mutants-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download the shard artifact from the triggering run
+        id: dl
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          mkdir -p art
+          # nightly-mutants uploads exactly one artifact: mutants-out-shard-N.
+          # A cancelled/failed run may have none -> report nothing, exit clean.
+          if gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir art 2>/dev/null; then
+            d=$(find art -maxdepth 1 -type d -name 'mutants-out-shard-*' | head -1)
+          else
+            d=""
+          fi
+          if [ -n "$d" ]; then
+            echo "dir=$d" >> "$GITHUB_OUTPUT"
+            echo "found=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "no mutants-out-shard-* artifact on run $RUN_ID; nothing to report"
+            echo "found=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure label exists
+        if: steps.dl.outputs.found == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create mutation-testing \
+            --repo "$GITHUB_REPOSITORY" \
+            --color BFD4F2 \
+            --description "cargo-mutants surviving mutants (nightly-mutants report)" \
+            --force || true
+
+      - name: Update rolling issue
+        if: steps.dl.outputs.found == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ART_DIR: ${{ steps.dl.outputs.dir }}
+          RUN_HTML: ${{ github.event.workflow_run.html_url }}
+        run: python3 .github/scripts/mutants_issue.py
