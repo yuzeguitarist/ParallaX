@@ -156,6 +156,11 @@ const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 /// the timer arithmetic; 2^8 = 256× the base PTO is far beyond any live path.
 const MAX_PTO_BACKOFF: u32 = 8;
 
+/// Keep-alive period: send a PING if the connection has been idle this long, to
+/// stop the peer's idle timer from tearing down a held-open relay (matches the
+/// `keep_alive_interval` the quinn carrier configured).
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
 const SPACE_INITIAL: usize = 0;
 const SPACE_HANDSHAKE: usize = 1;
 const SPACE_DATA: usize = 2;
@@ -261,6 +266,10 @@ pub struct Connection {
     /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
     /// HANDSHAKE_DONE, the client when it receives it.
     handshake_confirmed: bool,
+    /// When any packet was last sent (drives the keep-alive timer).
+    last_send_time: Option<Instant>,
+    /// A keep-alive (or PTO-fallback) PING is queued for the 1-RTT space.
+    ping_pending: bool,
     /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
     write_level: usize,
     /// The relay's single bidirectional data stream (1-RTT).
@@ -301,6 +310,8 @@ impl Connection {
             last_ack_eliciting_sent: None,
             handshake_done_pending: false,
             handshake_confirmed: false,
+            last_send_time: None,
+            ping_pending: false,
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
         };
@@ -339,6 +350,8 @@ impl Connection {
             last_ack_eliciting_sent: None,
             handshake_done_pending: false,
             handshake_confirmed: false,
+            last_send_time: None,
+            ping_pending: false,
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
         })
@@ -458,6 +471,12 @@ impl Connection {
                 self.probe_pending = self.probe_pending.saturating_sub(1);
                 return Some(dg);
             }
+            // A keep-alive or PTO-fallback PING, last so real data goes first.
+            if self.spaces[SPACE_DATA].keys.is_some() && self.ping_pending {
+                let dg = self.build_ping_packet(now);
+                self.probe_pending = self.probe_pending.saturating_sub(1);
+                return Some(dg);
+            }
         }
         None
     }
@@ -490,6 +509,12 @@ impl Connection {
         if self.any_in_flight() {
             if let Some(last) = self.last_ack_eliciting_sent {
                 earliest(last + self.pto_duration());
+            }
+        }
+        // Keep-alive: once confirmed, schedule a PING after an idle interval.
+        if self.handshake_confirmed {
+            if let Some(last) = self.last_send_time {
+                earliest(last + KEEP_ALIVE_INTERVAL);
             }
         }
         deadline
@@ -530,6 +555,16 @@ impl Connection {
                 self.queue_probe();
             }
         }
+
+        // Keep-alive: if the connection has been idle past the interval, queue a
+        // PING so the peer's idle timer does not tear down a held-open relay.
+        if self.handshake_confirmed
+            && self
+                .last_send_time
+                .is_some_and(|last| now >= last + KEEP_ALIVE_INTERVAL)
+        {
+            self.ping_pending = true;
+        }
     }
 
     /// Queue a PTO probe: retransmit the oldest unacked ack-eliciting packet's data
@@ -545,6 +580,12 @@ impl Connection {
                 // The probed packet leaves bytes-in-flight but is NOT a loss signal
                 // (cwnd is unchanged); its data is resent in a fresh packet.
                 self.spaces[space].sent.discard(pn);
+                // A PING-only packet (e.g. a lost keep-alive) has nothing to resend;
+                // probe with a fresh PING so the peer still ACKs.
+                if content.crypto.is_empty() && content.stream.is_empty() && !content.handshake_done
+                {
+                    self.ping_pending = true;
+                }
                 self.requeue(space, content);
                 self.probe_pending = self.probe_pending.saturating_add(1);
                 return;
@@ -619,6 +660,7 @@ impl Connection {
             self.spaces[space].sent_content.insert(pn, content);
             self.last_ack_eliciting_sent = Some(now);
         }
+        self.last_send_time = Some(now);
     }
 
     /// Build a packet carrying only an ACK frame for `space` (non-ack-eliciting),
@@ -670,6 +712,29 @@ impl Connection {
             handshake_done: true,
         };
         self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
+        datagram
+    }
+
+    /// Build a 1-RTT PING packet (keep-alive or PTO fallback). Ack-eliciting so it
+    /// elicits an ACK; PADDING brings it up to the header-protection sample size. It
+    /// carries no retransmittable content (a fresh PING is sent if a probe is lost).
+    fn build_ping_packet(&mut self, now: Instant) -> Vec<u8> {
+        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(SPACE_DATA, pn, pn_len);
+        let datagram = {
+            let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
+            seal_packet(&keys.local, header, &[Frame::Ping, Frame::Padding(3)])
+        };
+        self.ping_pending = false;
+        self.record_sent(
+            SPACE_DATA,
+            pn,
+            datagram.len(),
+            true,
+            SentContent::default(),
+            now,
+        );
         datagram
     }
 
@@ -1614,6 +1679,47 @@ mod tests {
         assert!(
             (12_000..=14_000).contains(&burst),
             "first burst is bounded by the initial congestion window, got {burst} bytes"
+        );
+    }
+
+    #[test]
+    fn keep_alive_ping_is_sent_after_idle_interval() {
+        let dcid = ConnectionId::new(&[0x40; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0xab, 0xba, 0xab, 0xba]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(
+            client.handshake_confirmed,
+            "handshake confirmed before idle"
+        );
+
+        // Capture a clock at/after the last send, then idle past the keep-alive
+        // interval and fire the timer.
+        let mut now = Instant::now();
+        assert!(
+            client.poll_transmit(now).is_none(),
+            "connection is idle after the handshake"
+        );
+        now += KEEP_ALIVE_INTERVAL + Duration::from_secs(1);
+        client.handle_timeout(now);
+        let ping = client
+            .poll_transmit(now)
+            .expect("an idle, confirmed connection queues a keep-alive PING");
+
+        // The PING is ack-eliciting: the server schedules an ACK on receipt.
+        server.handle_datagram(&ping, now).unwrap();
+        assert!(
+            server.poll_transmit(now).is_some(),
+            "the server ACKs the keep-alive PING — the connection stays live"
         );
     }
 }
