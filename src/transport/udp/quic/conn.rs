@@ -178,6 +178,8 @@ struct SentContent {
     crypto: Vec<(u64, u64)>,
     /// Relay-stream byte ranges `(offset, len, fin)`.
     stream: Vec<(u64, u64, bool)>,
+    /// This packet carried HANDSHAKE_DONE (RFC 9001 §4.1.2); resend it if lost.
+    handshake_done: bool,
 }
 
 /// Per-packet-number-space state: protection keys (installed as the handshake
@@ -254,6 +256,11 @@ pub struct Connection {
     probe_pending: u8,
     /// When the most recent ack-eliciting packet was sent (arms the PTO timer).
     last_ack_eliciting_sent: Option<Instant>,
+    /// The server queues HANDSHAKE_DONE once its handshake completes; resent if lost.
+    handshake_done_pending: bool,
+    /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
+    /// HANDSHAKE_DONE, the client when it receives it.
+    handshake_confirmed: bool,
     /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
     write_level: usize,
     /// The relay's single bidirectional data stream (1-RTT).
@@ -292,6 +299,8 @@ impl Connection {
             pto_count: 0,
             probe_pending: 0,
             last_ack_eliciting_sent: None,
+            handshake_done_pending: false,
+            handshake_confirmed: false,
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
         };
@@ -328,6 +337,8 @@ impl Connection {
             pto_count: 0,
             probe_pending: 0,
             last_ack_eliciting_sent: None,
+            handshake_done_pending: false,
+            handshake_confirmed: false,
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
         })
@@ -430,6 +441,13 @@ impl Connection {
                     self.probe_pending = self.probe_pending.saturating_sub(1);
                     return Some(dg);
                 }
+            }
+            // The server signals handshake confirmation (RFC 9001 §4.1.2) before
+            // relay data; it is resent if the carrying packet is lost.
+            if self.spaces[SPACE_DATA].keys.is_some() && self.handshake_done_pending {
+                let dg = self.build_handshake_done_packet(now);
+                self.probe_pending = self.probe_pending.saturating_sub(1);
+                return Some(dg);
             }
             // 1-RTT relay data: once Data keys are installed, resend losses then drain.
             if self.spaces[SPACE_DATA].keys.is_some()
@@ -534,13 +552,17 @@ impl Connection {
         }
     }
 
-    /// Push a lost/probed packet's CRYPTO + STREAM ranges onto the resend queues.
+    /// Push a lost/probed packet's CRYPTO + STREAM ranges onto the resend queues,
+    /// and re-arm HANDSHAKE_DONE if the packet carried it.
     fn requeue(&mut self, space: usize, content: SentContent) {
         for range in content.crypto {
             self.spaces[space].retransmit_crypto.push(range);
         }
         for range in content.stream {
             self.stream.retransmit.push(range);
+        }
+        if content.handshake_done {
+            self.handshake_done_pending = true;
         }
     }
 
@@ -625,6 +647,32 @@ impl Connection {
         datagram
     }
 
+    /// Build a 1-RTT packet carrying HANDSHAKE_DONE (RFC 9001 §4.1.2). Ack-eliciting
+    /// and tracked so it is resent if lost; clears the pending flag. PADDING brings
+    /// the payload up to the 4 bytes header protection needs for its sample (RFC
+    /// 9001 §5.4.2): a lone 1-byte HANDSHAKE_DONE would be too short to sample.
+    fn build_handshake_done_packet(&mut self, now: Instant) -> Vec<u8> {
+        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(SPACE_DATA, pn, pn_len);
+        let datagram = {
+            let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
+            seal_packet(
+                &keys.local,
+                header,
+                &[Frame::HandshakeDone, Frame::Padding(3)],
+            )
+        };
+        self.handshake_done_pending = false;
+        let content = SentContent {
+            crypto: Vec::new(),
+            stream: Vec::new(),
+            handshake_done: true,
+        };
+        self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
+        datagram
+    }
+
     fn build_crypto_packet(&mut self, space: usize, now: Instant) -> Vec<u8> {
         let pn = self.spaces[space].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
@@ -682,6 +730,7 @@ impl Connection {
         let content = SentContent {
             crypto: vec![(offset as u64, (end - offset) as u64)],
             stream: Vec::new(),
+            handshake_done: false,
         };
         self.record_sent(space, pn, datagram.len(), true, content, now);
         if is_retransmit {
@@ -735,6 +784,7 @@ impl Connection {
         let content = SentContent {
             crypto: Vec::new(),
             stream: vec![(offset, end - offset, fin)],
+            handshake_done: false,
         };
         self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
         if is_retransmit {
@@ -869,9 +919,17 @@ impl Connection {
                     self.recv_stream(offset, data)?;
                 }
                 Frame::Ack(ack) => self.recv_ack(space, &ack, now),
+                Frame::HandshakeDone => {
+                    ack_eliciting = true;
+                    // RFC 9001 §4.1.2: the client treats HANDSHAKE_DONE as handshake
+                    // confirmation. (Only a client should receive it.)
+                    if self.side == Side::Client {
+                        self.handshake_confirmed = true;
+                    }
+                }
                 Frame::Padding(_) | Frame::Close(_) => {}
-                // PING, HANDSHAKE_DONE, and every other relay-relevant frame are
-                // ack-eliciting but carry no payload we act on here.
+                // PING and every other relay-relevant frame are ack-eliciting but
+                // carry no payload we act on here.
                 _ => ack_eliciting = true,
             }
         }
@@ -879,7 +937,22 @@ impl Connection {
             self.spaces[space].ack_pending = true;
         }
         self.pump_write();
+        self.maybe_queue_handshake_done();
         Ok(())
+    }
+
+    /// Once the server's handshake completes (it has verified the client's
+    /// Finished), queue HANDSHAKE_DONE exactly once and mark the handshake confirmed
+    /// (RFC 9001 §4.1.2).
+    fn maybe_queue_handshake_done(&mut self) {
+        if self.side == Side::Server
+            && !self.handshake_confirmed
+            && !self.tls.is_handshaking()
+            && self.spaces[SPACE_DATA].keys.is_some()
+        {
+            self.handshake_done_pending = true;
+            self.handshake_confirmed = true;
+        }
     }
 
     /// Apply a received ACK frame (RFC 9002 §5–6.1): drop the acknowledged sent
@@ -1226,6 +1299,32 @@ mod tests {
         assert!(
             server.next_1rtt_keys().is_some(),
             "server 1-RTT key update ready"
+        );
+    }
+
+    #[test]
+    fn server_sends_handshake_done_and_both_sides_confirm() {
+        let dcid = ConnectionId::new(&[0x44; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0xde, 0xad, 0xbe, 0xef]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert!(
+            server.handshake_confirmed,
+            "server confirms when it sends HANDSHAKE_DONE"
+        );
+        assert!(
+            client.handshake_confirmed,
+            "client confirms on receiving HANDSHAKE_DONE"
         );
     }
 
