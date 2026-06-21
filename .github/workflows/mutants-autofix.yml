@@ -23,11 +23,9 @@ on:
 
 # Mirror claude.yml: the action needs to push a branch + open a PR, and uses OIDC
 # to mint the Claude GitHub App token (github_token is intentionally omitted).
+# Least-privilege at top level; the job below elevates to write (Scorecard hardening).
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: mutants-autofix-${{ github.event.workflow_run.id }}
@@ -35,12 +33,18 @@ concurrency:
 
 jobs:
   autofix:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Collect this shard's survivors
         id: surv
@@ -109,7 +113,7 @@ jobs:
 
       - name: Claude opens a test-strengthening PR
         if: steps.surv.outputs.found == '1'
-        uses: anthropics/claude-code-action@806af32823ef69c8ef357086c573a902af641307 # v1
+        uses: anthropics/claude-code-action@806af32823ef69c8ef357086c573a902af641307 # v1.0.151
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:

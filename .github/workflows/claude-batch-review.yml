@@ -19,11 +19,9 @@ on:
         type: boolean
         default: false
 
+# Least-privilege at top level; the job below elevates to write (Scorecard hardening).
 permissions:
-  contents: write          # create/move the marker tag + a claude/* fix branch (hook blocks main)
-  pull-requests: write
-  issues: write
-  id-token: write          # required: the v1 action mints the App token via GitHub OIDC
+  contents: read
 
 concurrency:
   group: claude-batch-review
@@ -31,6 +29,11 @@ concurrency:
 
 jobs:
   batch-review:
+    permissions:
+      contents: write          # create/move the marker tag + a claude/* fix branch (hook blocks main)
+      pull-requests: write
+      issues: write
+      id-token: write          # required: the v1 action mints the App token via GitHub OIDC
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -93,7 +96,7 @@ jobs:
       # block any write to main and any PR merge.
       - id: review
         if: steps.gate.outputs.run == 'true'
-        uses: anthropics/claude-code-action@806af32823ef69c8ef357086c573a902af641307 # v1
+        uses: anthropics/claude-code-action@806af32823ef69c8ef357086c573a902af641307 # v1.0.151
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:

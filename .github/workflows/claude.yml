@@ -30,12 +30,9 @@ on:
   issues:
     types: [opened]
 
+# Least-privilege at top level; the job below elevates to write (Scorecard hardening).
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-  checks: read             # so the cistatus step can read the PR's check rollup
-  id-token: write
+  contents: read
 
 # One run per issue/PR thread PER ACTOR. Including github.actor keeps Claude's own
 # progress comment (an issue_comment by claude[bot]) in a different group so it
@@ -56,6 +53,12 @@ jobs:
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
       (github.event_name == 'issues' && contains(github.event.issue.body, '@claude') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read             # so the cistatus step can read the PR's check rollup
+      id-token: write
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -109,7 +112,7 @@ jobs:
           shared-key: parallax-ci
           save-if: false
 
-      - uses: anthropics/claude-code-action@806af32823ef69c8ef357086c573a902af641307 # v1
+      - uses: anthropics/claude-code-action@806af32823ef69c8ef357086c573a902af641307 # v1.0.151
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:

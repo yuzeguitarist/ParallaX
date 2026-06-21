@@ -21,3 +21,7 @@ audits/
 # `cargo mutants` runs leave these dirs behind).
 mutants.out/
 mutants.out.old/
+
+# Python bytecode cache (scripts/wiki_sync/ is stdlib-only Python); never commit.
+__pycache__/
+*.pyc

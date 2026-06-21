@@ -11,8 +11,9 @@ on:
       - ".github/workflows/sync-wiki.yml"
   workflow_dispatch: {}
 
+# Least-privilege at top level; the job below elevates to write (Scorecard hardening).
 permissions:
-  contents: write # the default GITHUB_TOKEN needs this to push this repo's wiki
+  contents: read
 
 concurrency:
   group: sync-wiki
@@ -20,6 +21,8 @@ concurrency:
 
 jobs:
   sync:
+    permissions:
+      contents: write # the default GITHUB_TOKEN needs this to push this repo's wiki
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6

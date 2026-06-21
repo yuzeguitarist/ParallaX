@@ -26,8 +26,9 @@ on:
         description: 'Existing tag to (re)build and upload, e.g. v0.1.0'
         required: true
 
+# Least-privilege at top level; the job below elevates to write (Scorecard hardening).
 permissions:
-  contents: write   # create the Release and upload assets
+  contents: read
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
@@ -41,6 +42,8 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
+    permissions:
+      contents: write   # create the Release and upload assets
     strategy:
       fail-fast: false
       matrix:

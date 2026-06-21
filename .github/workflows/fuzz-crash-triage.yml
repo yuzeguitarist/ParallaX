@@ -23,12 +23,9 @@ on:
   issues:
     types: [opened, labeled]
 
+# Least-privilege at top level; the job below elevates to write (Scorecard hardening).
 permissions:
-  contents: write        # create the claude/* branch + commits
-  issues: write          # post the analysis comment
-  pull-requests: write   # open the fix PR
-  id-token: write        # OIDC exchange -> Claude GitHub App token (CI-triggering)
-  actions: read          # let Claude read CI results if it wants them
+  contents: read
 
 # One triage run per issue; a later label event supersedes an in-flight run.
 concurrency:
@@ -48,6 +45,12 @@ jobs:
         (github.event.action == 'opened' &&
          contains(join(github.event.issue.labels.*.name, ','), 'fuzz-crash'))
       )
+    permissions:
+      contents: write        # create the claude/* branch + commits
+      issues: write          # post the analysis comment
+      pull-requests: write   # open the fix PR
+      id-token: write        # OIDC exchange -> Claude GitHub App token (CI-triggering)
+      actions: read          # let Claude read CI results if it wants them
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -66,7 +69,7 @@ jobs:
           shared-key: parallax-ci
           save-if: false
 
-      - uses: anthropics/claude-code-action@d5726de019ec4498aa667642bc3a80fca83aa102 # v1
+      - uses: anthropics/claude-code-action@d5726de019ec4498aa667642bc3a80fca83aa102 # v1.0.148
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
