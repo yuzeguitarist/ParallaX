@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 
-use super::conn::Connection as Core;
+use super::conn::{CloseReason, Connection as Core};
 use super::packet::ConnectionId;
 use crate::tls::quic::{ClientConfig, QuicTlsError};
 
@@ -67,6 +67,76 @@ impl std::fmt::Display for ConnectError {
 }
 
 impl std::error::Error for ConnectError {}
+
+/// A QUIC variable-length integer (RFC 9000 §16), the type error codes + limits
+/// travel as. Mirrors `quinn::VarInt` closely enough for the carrier's call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VarInt(u64);
+
+impl VarInt {
+    /// The largest value a QUIC varint can hold (2^62 - 1).
+    pub const MAX: VarInt = VarInt((1 << 62) - 1);
+
+    /// Construct from a `u32` (always in range).
+    pub fn from_u32(v: u32) -> Self {
+        VarInt(v as u64)
+    }
+
+    /// The inner value.
+    pub fn into_inner(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u32> for VarInt {
+    fn from(v: u32) -> Self {
+        VarInt(v as u64)
+    }
+}
+
+impl From<VarInt> for u64 {
+    fn from(v: VarInt) -> u64 {
+        v.0
+    }
+}
+
+/// An application CONNECTION_CLOSE (RFC 9000 §19.19) the peer sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationClose {
+    pub error_code: VarInt,
+    pub reason: Vec<u8>,
+}
+
+/// Why a connection ended (a subset of quinn's `ConnectionError`, matching the
+/// carrier's pattern matches).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionError {
+    /// The peer sent an application CONNECTION_CLOSE.
+    ApplicationClosed(ApplicationClose),
+    /// The peer sent a transport CONNECTION_CLOSE.
+    ConnectionClosed(VarInt),
+    /// This endpoint closed the connection locally.
+    LocallyClosed,
+    /// The idle timeout fired.
+    TimedOut,
+}
+
+impl std::fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionError::ApplicationClosed(c) => {
+                write!(f, "application closed (code {})", c.error_code.into_inner())
+            }
+            ConnectionError::ConnectionClosed(code) => {
+                write!(f, "connection closed (code {})", code.into_inner())
+            }
+            ConnectionError::LocallyClosed => write!(f, "locally closed"),
+            ConnectionError::TimedOut => write!(f, "idle timed out"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionError {}
 
 /// Shared per-connection state: the synchronous core behind a mutex, plus the
 /// notifications the driver uses to wake blocked handles.
@@ -128,6 +198,8 @@ pub struct Endpoint {
     wake: Arc<Notify>,
     /// Submit a client connect request to the driver.
     connect_tx: mpsc::UnboundedSender<ConnectRequest>,
+    /// Ask the driver to close every connection `(error_code, reason)`.
+    close_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
     /// Receive server-accepted, fully-established connections.
     accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Arc<ConnShared>>>,
 }
@@ -147,6 +219,7 @@ impl Endpoint {
         let socket = Arc::new(UdpSocket::bind(bind).await?);
         let wake = Arc::new(Notify::new());
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
+        let (close_tx, close_rx) = mpsc::unbounded_channel();
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
         let driver = Driver {
             socket: socket.clone(),
@@ -155,6 +228,7 @@ impl Endpoint {
             server,
             accept_tx,
             connect_rx,
+            close_rx,
             next_scid: 1,
         };
         tokio::spawn(driver.run());
@@ -162,6 +236,7 @@ impl Endpoint {
             socket,
             wake,
             connect_tx,
+            close_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
         })
     }
@@ -169,6 +244,15 @@ impl Endpoint {
     /// The bound local address.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Close every connection on this endpoint with an application error code +
+    /// reason (RFC 9000 §10.2). Best-effort: the driver sends each CONNECTION_CLOSE.
+    pub fn close(&self, error_code: VarInt, reason: &[u8]) {
+        let _ = self
+            .close_tx
+            .send((error_code.into_inner(), reason.to_vec()));
+        self.wake.notify_one();
     }
 
     /// Open a client connection to `addr`, awaiting handshake completion.
@@ -228,6 +312,7 @@ struct Driver {
     server: Option<Arc<ServerConfig>>,
     accept_tx: mpsc::UnboundedSender<Arc<ConnShared>>,
     connect_rx: mpsc::UnboundedReceiver<ConnectRequest>,
+    close_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
     /// Source-connection-id counter for accepted server connections.
     next_scid: u64,
 }
@@ -251,6 +336,14 @@ impl Driver {
                     match req {
                         Some(req) => self.on_connect(req),
                         None => return, // endpoint dropped
+                    }
+                }
+                close = self.close_rx.recv() => {
+                    if let Some((code, reason)) = close {
+                        for c in self.conns.values() {
+                            c.core.lock().unwrap().close(code, &reason);
+                            c.wake_handles();
+                        }
                     }
                 }
                 _ = wake.notified() => {}
@@ -423,6 +516,37 @@ impl Connection {
             .map(|tp| tp.to_vec())
     }
 
+    /// Close the connection with an application error code + reason (RFC 9000 §10.2).
+    pub fn close(&self, error_code: VarInt, reason: &[u8]) {
+        self.shared
+            .core
+            .lock()
+            .unwrap()
+            .close(error_code.into_inner(), reason);
+        self.shared.nudge();
+    }
+
+    /// Why the connection ended, if it has (peer close, local close, or idle).
+    pub fn close_reason(&self) -> Option<ConnectionError> {
+        let core = self.shared.core.lock().unwrap();
+        core.close_reason().map(|r| match r {
+            CloseReason::PeerApp(code, reason) => {
+                ConnectionError::ApplicationClosed(ApplicationClose {
+                    error_code: VarInt(*code),
+                    reason: reason.clone(),
+                })
+            }
+            CloseReason::PeerTransport(code, _) => ConnectionError::ConnectionClosed(VarInt(*code)),
+            CloseReason::LocalApp(_, _) => ConnectionError::LocallyClosed,
+            CloseReason::IdleTimeout => ConnectionError::TimedOut,
+        })
+    }
+
+    /// Whether the connection has closed.
+    pub fn is_closed(&self) -> bool {
+        self.shared.core.lock().unwrap().is_closed()
+    }
+
     /// Open an outgoing bidirectional stream (RFC 9000 §2.1).
     pub fn open_bi(&self) -> (SendStream, RecvStream) {
         let id = self.shared.core.lock().unwrap().open_bi();
@@ -503,12 +627,12 @@ impl SendStream {
     }
 
     /// Abruptly reset the send half with `error_code` (RFC 9000 §19.4).
-    pub fn reset(&mut self, error_code: u64) {
+    pub fn reset(&mut self, error_code: VarInt) {
         self.shared
             .core
             .lock()
             .unwrap()
-            .reset_stream(self.id, error_code);
+            .reset_stream(self.id, error_code.into_inner());
         self.shared.nudge();
     }
 }
@@ -729,5 +853,41 @@ mod tests {
         ctrl.finish();
         let got = srv.await.unwrap();
         assert_eq!(got, b"H3-SETTINGS", "uni stream delivered to accept_uni");
+    }
+
+    #[tokio::test]
+    async fn application_close_reason_reaches_the_peer() {
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap();
+            // Wait until the client's CONNECTION_CLOSE arrives.
+            for _ in 0..50 {
+                if let Some(reason) = conn.close_reason() {
+                    return Some(reason);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            None
+        });
+
+        let conn = client
+            .connect(server_addr, "example.com", client_config())
+            .await
+            .unwrap();
+        conn.close(VarInt::from_u32(7), b"bye");
+
+        let reason = srv.await.unwrap();
+        assert_eq!(
+            reason,
+            Some(ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: VarInt::from_u32(7),
+                reason: b"bye".to_vec(),
+            })),
+            "the server observes the client's application close code + reason"
+        );
     }
 }

@@ -28,6 +28,20 @@ use crate::tls::quic::{
     PacketKey, QuicTlsError, ServerHandshake, Side, TlsSession, QUIC_VERSION_V1,
 };
 
+/// Why a connection is no longer usable (RFC 9000 §10), reported by
+/// [`Connection::close_reason`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseReason {
+    /// This endpoint closed with an application error code + reason.
+    LocalApp(u64, Vec<u8>),
+    /// The peer sent an application CONNECTION_CLOSE (0x1d).
+    PeerApp(u64, Vec<u8>),
+    /// The peer sent a transport CONNECTION_CLOSE (0x1c).
+    PeerTransport(u64, Vec<u8>),
+    /// The idle timeout fired (RFC 9000 §10.1).
+    IdleTimeout,
+}
+
 /// Error opening (decrypting/parsing) an incoming packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenError {
@@ -157,6 +171,11 @@ const MAX_PTO_BACKOFF: u32 = 8;
 /// stop the peer's idle timer from tearing down a held-open relay (matches the
 /// `keep_alive_interval` the quinn carrier configured).
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Idle timeout (RFC 9000 §10.1): tear the connection down after this long with no
+/// received packet. Larger than [`KEEP_ALIVE_INTERVAL`] so a live peer's keep-alive
+/// PING refreshes it.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SPACE_INITIAL: usize = 0;
 const SPACE_HANDSHAKE: usize = 1;
@@ -339,6 +358,14 @@ pub struct Connection {
     /// Peer-initiated streams newly observed, awaiting `accept_bi` / `accept_uni`.
     accept_bidi: VecDeque<u64>,
     accept_uni: VecDeque<u64>,
+    /// Why the connection closed, if it has (local close, peer close, or idle).
+    closed: Option<CloseReason>,
+    /// A pending application CONNECTION_CLOSE to transmit `(error_code, reason)`.
+    app_close_pending: Option<(u64, Vec<u8>)>,
+    /// The CONNECTION_CLOSE has been put on the wire.
+    app_close_sent: bool,
+    /// When a packet was last received (drives the idle timeout, RFC 9000 §10.1).
+    last_recv_time: Option<Instant>,
     /// Connection-level flow control (RFC 9000 §4.1). Send side: the peer's MAX_DATA
     /// limit and how much we have sent against it. Receive side: the limit we
     /// advertise, the last value sent, total received (enforcement), total consumed
@@ -403,6 +430,10 @@ impl Connection {
             next_uni: 2,
             accept_bidi: VecDeque::new(),
             accept_uni: VecDeque::new(),
+            closed: None,
+            app_close_pending: None,
+            app_close_sent: false,
+            last_recv_time: None,
             send_max_data: 0,
             send_data_total: 0,
             recv_max_data: CONN_RECV_WINDOW,
@@ -459,6 +490,10 @@ impl Connection {
             next_uni: 3,
             accept_bidi: VecDeque::new(),
             accept_uni: VecDeque::new(),
+            closed: None,
+            app_close_pending: None,
+            app_close_sent: false,
+            last_recv_time: None,
             send_max_data: 0,
             send_data_total: 0,
             recv_max_data: CONN_RECV_WINDOW,
@@ -475,6 +510,26 @@ impl Connection {
 
     pub fn is_handshaking(&self) -> bool {
         self.tls.is_handshaking()
+    }
+
+    /// Close the connection with an application error code + reason (RFC 9000
+    /// §19.19): an APPLICATION_CLOSE is queued for transmission. Idempotent.
+    pub fn close(&mut self, error_code: u64, reason: &[u8]) {
+        if self.closed.is_some() {
+            return;
+        }
+        self.closed = Some(CloseReason::LocalApp(error_code, reason.to_vec()));
+        self.app_close_pending = Some((error_code, reason.to_vec()));
+    }
+
+    /// Why the connection closed, if it has (local close, peer close, or idle).
+    pub fn close_reason(&self) -> Option<&CloseReason> {
+        self.closed.as_ref()
+    }
+
+    /// Whether the connection has closed (locally, by the peer, or on idle).
+    pub fn is_closed(&self) -> bool {
+        self.closed.is_some()
     }
 
     /// RFC 5705 exporter (byte-identical on both ends; backs the auth token).
@@ -686,6 +741,15 @@ impl Connection {
     /// congestion window unless a PTO probe is pending (RFC 9002 §6.2.4). One
     /// datagram per call; the driver loops until `None`.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
+        // A queued CONNECTION_CLOSE is sent once; then the connection goes quiet.
+        if self.app_close_pending.is_some() && !self.app_close_sent {
+            if let Some(dg) = self.build_close_packet(now) {
+                return Some(dg);
+            }
+        }
+        if self.app_close_sent {
+            return None;
+        }
         // Pure ACKs first so acknowledgements are not held behind data, and are
         // never blocked by the congestion window (they are not ack-eliciting).
         for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
@@ -788,6 +852,12 @@ impl Connection {
                 earliest(last + KEEP_ALIVE_INTERVAL);
             }
         }
+        // Idle timeout (RFC 9000 §10.1): tear down after no receipt for too long.
+        if self.closed.is_none() {
+            if let Some(last) = self.last_recv_time {
+                earliest(last + IDLE_TIMEOUT);
+            }
+        }
         deadline
     }
 
@@ -795,6 +865,15 @@ impl Connection {
     /// calls this when [`Self::next_timeout`] elapses; `poll_transmit` then sends
     /// any retransmits / probes that were queued.
     pub fn handle_timeout(&mut self, now: Instant) {
+        // Idle timeout (RFC 9000 §10.1): close the connection if silent too long.
+        if self.closed.is_none()
+            && self
+                .last_recv_time
+                .is_some_and(|last| now >= last + IDLE_TIMEOUT)
+        {
+            self.closed = Some(CloseReason::IdleTimeout);
+            return;
+        }
         // Time-threshold losses first (RFC 9002 §6.1.2).
         let mut any_loss = false;
         let loss_delay = self.rtt.loss_delay();
@@ -974,6 +1053,39 @@ impl Connection {
             now,
         );
         datagram
+    }
+
+    /// Build a packet carrying the queued application CONNECTION_CLOSE (RFC 9000
+    /// §19.19) in the highest space with keys. `None` if no keys exist yet.
+    fn build_close_packet(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let (code, reason) = self.app_close_pending.clone()?;
+        let space = [SPACE_DATA, SPACE_HANDSHAKE, SPACE_INITIAL]
+            .into_iter()
+            .find(|&s| self.spaces[s].keys.is_some())?;
+        let pn = self.spaces[space].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(space, pn, pn_len);
+        let datagram = {
+            let frame = Frame::Close(super::frame::Close {
+                application: true,
+                error_code: code,
+                frame_type: 0,
+                reason: &reason,
+            });
+            let keys = self.spaces[space].keys.as_ref().unwrap();
+            seal_packet(&keys.local, header, &[frame, Frame::Padding(3)])
+        };
+        self.app_close_sent = true;
+        // CONNECTION_CLOSE is not ack-eliciting (RFC 9002 §2).
+        self.record_sent(
+            space,
+            pn,
+            datagram.len(),
+            false,
+            SentContent::default(),
+            now,
+        );
+        Some(datagram)
     }
 
     /// Build a 1-RTT packet carrying HANDSHAKE_DONE (RFC 9001 §4.1.2). Ack-eliciting
@@ -1296,6 +1408,7 @@ impl Connection {
     /// so that, e.g., the Handshake keys learned from a coalesced Initial are
     /// installed before the Handshake packet that follows it in the same datagram.
     pub fn handle_datagram(&mut self, datagram: &[u8], now: Instant) -> Result<(), QuicTlsError> {
+        self.last_recv_time = Some(now);
         let mut buf = datagram.to_vec();
         let mut pos = 0;
         while pos < buf.len() {
@@ -1450,7 +1563,18 @@ impl Connection {
                         self.handshake_confirmed = true;
                     }
                 }
-                Frame::Padding(_) | Frame::Close(_) => {}
+                Frame::Padding(_) => {}
+                Frame::Close(c) => {
+                    // The peer is tearing the connection down (RFC 9000 §19.19).
+                    if self.closed.is_none() {
+                        let reason = c.reason.to_vec();
+                        self.closed = Some(if c.application {
+                            CloseReason::PeerApp(c.error_code, reason)
+                        } else {
+                            CloseReason::PeerTransport(c.error_code, reason)
+                        });
+                    }
+                }
                 // PING and every other relay-relevant frame are ack-eliciting but
                 // carry no payload we act on here.
                 _ => ack_eliciting = true,
