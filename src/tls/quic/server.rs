@@ -454,7 +454,14 @@ impl ServerHandshake {
 
     /// The next 1-RTT packet-key generation for a key update (RFC 9001 §6).
     pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
-        self.schedule.as_mut()?.next_1rtt_packet_keys().ok()
+        // The schedule is side-agnostic (local = client, remote = server). The server
+        // seals with the server key and opens with the client key, so swap — exactly
+        // as `swap()` does for the handshake Keys (RFC 9001 §6 key update).
+        let pair = self.schedule.as_mut()?.next_1rtt_packet_keys().ok()?;
+        Some(KeyPair {
+            local: pair.remote,
+            remote: pair.local,
+        })
     }
 
     /// The client's raw `quic_transport_parameters` blob, once the ClientHello has

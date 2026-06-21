@@ -3065,4 +3065,51 @@ mod tests {
             "a garbage datagram must not start/refresh the idle timer"
         );
     }
+
+    #[test]
+    fn server_key_update_keys_are_direction_consistent() {
+        let dcid = ConnectionId::new(&[0x6c; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x6c, 0x6c, 0x6c, 0x6c]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // The next key-update generation must be direction-consistent: the server's
+        // seal key must pair with the client's open key and vice versa. If the server
+        // omitted the local/remote swap, one direction fails to decrypt.
+        let ckp = client.next_1rtt_keys().expect("client 1-RTT update keys");
+        let skp = server.next_1rtt_keys().expect("server 1-RTT update keys");
+        let tag = ckp.local.tag_len();
+
+        // client -> server: client seals (local), server opens (remote).
+        let c2s = b"key-update probe client to server";
+        let mut buf = c2s.to_vec();
+        buf.resize(c2s.len() + tag, 0);
+        ckp.local.encrypt_in_place(42, &[], &mut buf).unwrap();
+        assert_eq!(
+            skp.remote.decrypt_in_place(42, &[], &mut buf).unwrap(),
+            c2s,
+            "server opens a packet the client sealed with the updated keys"
+        );
+
+        // server -> client: server seals (local), client opens (remote).
+        let s2c = b"key-update probe server to client";
+        let mut buf2 = s2c.to_vec();
+        buf2.resize(s2c.len() + tag, 0);
+        skp.local.encrypt_in_place(7, &[], &mut buf2).unwrap();
+        assert_eq!(
+            ckp.remote.decrypt_in_place(7, &[], &mut buf2).unwrap(),
+            s2c,
+            "client opens a packet the server sealed with the updated keys"
+        );
+    }
 }
