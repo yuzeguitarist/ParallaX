@@ -566,6 +566,7 @@ fn bench_mldsa_verify(options: BenchmarkOptions) -> Result<BenchmarkCase> {
 fn bench_hkdf_session_keys(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let client = X25519KeyPair::generate();
     let server = X25519KeyPair::generate();
+    let psk = [0x5a_u8; KEY_LEN];
     let transcript = [0x42_u8; KEY_LEN];
     run_case(
         BenchGroup::HandshakeCrypto,
@@ -573,7 +574,7 @@ fn bench_hkdf_session_keys(options: BenchmarkOptions) -> Result<BenchmarkCase> {
         TIER_FAST,
         options,
         || {
-            let keys = derive_client_keys(&client.private, &server.public, &transcript)?;
+            let keys = derive_client_keys(&psk, &client.private, &server.public, &transcript)?;
             Ok(black_box(keys.client_key.len() as u64))
         },
     )
@@ -583,6 +584,7 @@ fn bench_hkdf_session_keys_from_shared(options: BenchmarkOptions) -> Result<Benc
     let client = X25519KeyPair::generate();
     let server = X25519KeyPair::generate();
     let shared = x25519_shared_secret(&client.private, &server.public);
+    let psk = [0x5a_u8; KEY_LEN];
     let transcript = [0x42_u8; KEY_LEN];
     run_case(
         BenchGroup::HandshakeCrypto,
@@ -590,7 +592,7 @@ fn bench_hkdf_session_keys_from_shared(options: BenchmarkOptions) -> Result<Benc
         TIER_FAST,
         options,
         || {
-            let keys = derive_client_keys_from_shared(&shared, &transcript)?;
+            let keys = derive_client_keys_from_shared(&psk, &shared, &transcript)?;
             Ok(black_box(keys.client_key.len() as u64))
         },
     )
@@ -1069,8 +1071,10 @@ fn bench_server_identity_chunks_encode_all(options: BenchmarkOptions) -> Result<
 fn session_keys_fixture() -> Result<SessionKeys> {
     let client = X25519KeyPair::generate();
     let server = X25519KeyPair::generate();
+    let psk = [0x5a_u8; KEY_LEN];
     let transcript = [0x42_u8; KEY_LEN];
     Ok(derive_client_keys(
+        &psk,
         &client.private,
         &server.public,
         &transcript,

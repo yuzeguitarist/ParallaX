@@ -197,8 +197,9 @@ fn print_keypair() {
 fn crypto_self_test() -> anyhow::Result<()> {
     let server = X25519KeyPair::generate();
     let client = X25519KeyPair::generate();
+    let psk = [0x5a_u8; 32];
     let transcript_hash = [0x53_u8; 32];
-    let keys = derive_client_keys(&client.private, &server.public, &transcript_hash)?;
+    let keys = derive_client_keys(&psk, &client.private, &server.public, &transcript_hash)?;
     let mut enc = AeadCodec::new(keys.client_key, keys.client_nonce);
     let mut dec = AeadCodec::new(keys.client_key, keys.client_nonce);
     let ciphertext = enc.seal(b"parallax", b"self-test")?;

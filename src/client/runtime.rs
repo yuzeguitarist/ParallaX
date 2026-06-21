@@ -1747,6 +1747,7 @@ async fn establish_data_session(
         .complete(server)
         .await?;
     let session_keys = client::derive_session_keys_from_shared(
+        psk,
         completed.x25519_shared_secret(),
         &completed.client_hello,
         &completed.server_hello_record,
@@ -3227,6 +3228,7 @@ mod tests {
         drop(register_tx);
 
         let session_keys = derive_client_keys(
+            &[0x5a_u8; 32],
             &X25519KeyPair::generate().private,
             &X25519KeyPair::generate().public,
             &[7_u8; 32],
@@ -3304,9 +3306,13 @@ mod tests {
         let client_keys = X25519KeyPair::generate();
         let server_keys = X25519KeyPair::generate();
         let transcript_hash = [4_u8; 32];
-        let session_keys =
-            derive_client_keys(&client_keys.private, &server_keys.public, &transcript_hash)
-                .unwrap();
+        let session_keys = derive_client_keys(
+            &[0x5a_u8; 32],
+            &client_keys.private,
+            &server_keys.public,
+            &transcript_hash,
+        )
+        .unwrap();
         let traffic = TrafficConfig::default();
         let mut data_session = ClientDataSession::new(session_keys.clone(), traffic).unwrap();
         let mut rng = StdRng::seed_from_u64(90);
