@@ -238,12 +238,18 @@ impl Connection {
     /// keys and the client's CID are learned from the first Initial datagram.
     pub fn new_server(
         cert_chain: Vec<Vec<u8>>,
+        signing_key_pkcs8: &[u8],
         alpn_protocols: Vec<Vec<u8>>,
         transport_params: Vec<u8>,
         scid: ConnectionId,
-    ) -> Self {
-        let tls = ServerHandshake::new(cert_chain, alpn_protocols, transport_params);
-        Self {
+    ) -> Result<Self, QuicTlsError> {
+        let tls = ServerHandshake::new(
+            cert_chain,
+            signing_key_pkcs8,
+            alpn_protocols,
+            transport_params,
+        )?;
+        Ok(Self {
             side: Side::Server,
             version: QUIC_VERSION_V1,
             initial_dcid: ConnectionId::new(&[]),
@@ -254,7 +260,7 @@ impl Connection {
             spaces: [Space::default(), Space::default(), Space::default()],
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
-        }
+        })
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -675,6 +681,16 @@ mod tests {
         ))
     }
 
+    /// A throwaway ECDSA P-256 PKCS#8 key for the server's CertificateVerify.
+    fn server_key() -> Vec<u8> {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
     #[test]
     fn client_initial_flight_is_decryptable_and_carries_clienthello() {
         let dcid = ConnectionId::new(&[0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]);
@@ -723,10 +739,12 @@ mod tests {
         // A dummy cover cert (the REALITY client accepts any) + a server TP blob.
         let mut server = Connection::new_server(
             vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
             vec![b"h3".to_vec()],
             vec![0x01, 0x02, 0x03, 0x04],
             ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
-        );
+        )
+        .unwrap();
 
         // Ping-pong real QUIC datagrams until both sides go idle (lossless: no ACKs).
         drive(&mut client, &mut server);
@@ -796,10 +814,12 @@ mod tests {
                 .unwrap();
         let mut server = Connection::new_server(
             vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
             vec![b"h3".to_vec()],
             vec![0x01, 0x02, 0x03, 0x04],
             ConnectionId::new(&[0x55, 0x66, 0x77, 0x88]),
-        );
+        )
+        .unwrap();
         drive(&mut client, &mut server);
         assert!(
             !client.is_handshaking() && !server.is_handshaking(),

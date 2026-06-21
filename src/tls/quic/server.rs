@@ -16,6 +16,7 @@
 
 use aws_lc_rs::kem::{EncapsulationKey, ML_KEM_768};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -341,6 +342,17 @@ fn build_certificate_verify(scheme: u16, signature: &[u8]) -> Vec<u8> {
     handshake_message(HANDSHAKE_CERTIFICATE_VERIFY, &body)
 }
 
+/// The CertificateVerify signed content (RFC 8446 §4.4.3): 64 spaces, the context
+/// string, a separator 0x00, then `Transcript-Hash(ClientHello..Certificate)`.
+fn certificate_verify_content(transcript_hash: &[u8]) -> Vec<u8> {
+    let mut content = Vec::with_capacity(64 + 34 + transcript_hash.len());
+    content.extend_from_slice(&[0x20; 64]);
+    content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    content.push(0);
+    content.extend_from_slice(transcript_hash);
+    content
+}
+
 fn build_finished(verify_data: &[u8]) -> Vec<u8> {
     handshake_message(HANDSHAKE_FINISHED, verify_data)
 }
@@ -369,6 +381,7 @@ enum ServerState {
 pub struct ServerHandshake {
     alpn_protocols: Vec<Vec<u8>>,
     cert_chain: Vec<Vec<u8>>,
+    signing_key: EcdsaKeyPair,
     transport_params: Vec<u8>,
     suite: CipherSuite,
     schedule: Option<KeySchedule>,
@@ -385,17 +398,23 @@ pub struct ServerHandshake {
 }
 
 impl ServerHandshake {
-    /// Build a server handshake with the cover certificate chain (DER), the ALPN
+    /// Build a server handshake with the cover certificate chain (DER), the
+    /// ECDSA P-256 signing key (PKCS#8) that signs CertificateVerify, the ALPN
     /// list to select from, and the server's transport-parameters blob. The QUIC
     /// v1 Initial suite (`TLS_AES_128_GCM_SHA256`) is pinned.
     pub fn new(
         cert_chain: Vec<Vec<u8>>,
+        signing_key_pkcs8: &[u8],
         alpn_protocols: Vec<Vec<u8>>,
         transport_params: Vec<u8>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, QuicTlsError> {
+        let signing_key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, signing_key_pkcs8)
+                .map_err(|_| QuicTlsError::Crypto("server ECDSA P-256 signing key".into()))?;
+        Ok(Self {
             alpn_protocols,
             cert_chain,
+            signing_key,
             transport_params,
             suite: CipherSuite::Aes128GcmSha256,
             schedule: None,
@@ -409,7 +428,7 @@ impl ServerHandshake {
             expected_client_finished: None,
             handshake_complete: false,
             inbound: Vec::new(),
-        }
+        })
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -536,13 +555,17 @@ impl ServerHandshake {
         let cert = build_certificate(&self.cert_chain);
         self.transcript.extend_from_slice(&cert);
 
-        // CertificateVerify over Transcript-Hash(ClientHello..Certificate). The
-        // REALITY client (AcceptAnyServerCert) does not verify this signature, so a
-        // placeholder is sound for the controlled peer.
-        // TODO(de-quinn signing slice): sign certificate_verify_content(hash) with
-        // the cover cert's key (aws-lc-rs ECDSA P-256) instead of the placeholder.
-        let _hash_cert = self.suite.digest(&self.transcript);
-        let cv = build_certificate_verify(SIG_SCHEME_ECDSA_P256, &[0u8; 64]);
+        // CertificateVerify over Transcript-Hash(ClientHello..Certificate), signed
+        // with the cover cert's ECDSA P-256 key (RFC 8446 §4.4.3). The REALITY
+        // client (AcceptAnyServerCert) does not verify it, but a real verifier — or
+        // the differential oracle — accepts the valid signature.
+        let hash_cert = self.suite.digest(&self.transcript);
+        let content = certificate_verify_content(&hash_cert);
+        let signature = self
+            .signing_key
+            .sign(&SystemRandom::new(), &content)
+            .map_err(|_| QuicTlsError::Crypto("CertificateVerify signing".into()))?;
+        let cv = build_certificate_verify(SIG_SCHEME_ECDSA_P256, signature.as_ref());
         self.transcript.extend_from_slice(&cv);
 
         let hash_cv = self.suite.digest(&self.transcript);
@@ -680,7 +703,16 @@ mod tests {
         // server/client transport-parameter blobs (opaque to the TLS handshake).
         let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
         let server_tp = vec![0x01, 0x02, 0x03, 0x04];
-        let mut server = ServerHandshake::new(cert_chain, vec![b"h3".to_vec()], server_tp.clone());
+        let key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let mut server = ServerHandshake::new(
+            cert_chain,
+            key.as_ref(),
+            vec![b"h3".to_vec()],
+            server_tp.clone(),
+        )
+        .unwrap();
 
         let client_config = Arc::new(ClientConfig::new(
             Arc::new(AcceptAnyServerCert),
