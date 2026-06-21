@@ -27,5 +27,6 @@
 
 pub(crate) mod frame;
 pub(crate) mod packet;
+pub(crate) mod spaces;
 pub(crate) mod transport_params;
 pub(crate) mod varint;
