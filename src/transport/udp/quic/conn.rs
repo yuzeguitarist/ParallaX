@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::congestion::{Controller, NewReno};
 use super::frame::{Ack, Frame, Iter};
 use super::packet::{self, ConnectionId, Header, LongType, PacketSpace};
 use super::recovery::{RttEstimator, SentPacket, SentPackets};
@@ -147,6 +148,14 @@ const MAX_STREAM_REASSEMBLY: usize = 2 * 1024 * 1024;
 /// the Safari client negotiate a different value).
 const ACK_DELAY_EXPONENT: u32 = 3;
 
+/// RFC 9002 §6.2.1 `max_ack_delay` added to the PTO. The relay does not negotiate
+/// a different value; the QUIC default is 25 ms.
+const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
+
+/// Cap on PTO exponential backoff (`2^pto_count`) so a long outage cannot overflow
+/// the timer arithmetic; 2^8 = 256× the base PTO is far beyond any live path.
+const MAX_PTO_BACKOFF: u32 = 8;
+
 const SPACE_INITIAL: usize = 0;
 const SPACE_HANDSHAKE: usize = 1;
 const SPACE_DATA: usize = 2;
@@ -236,6 +245,15 @@ pub struct Connection {
     spaces: [Space; 3],
     /// Connection-wide RTT estimator (RFC 9002 §5 keeps one across all spaces).
     rtt: RttEstimator,
+    /// Congestion controller behind the CC seam (NewReno scaffold; BBR later).
+    cc: Box<dyn Controller>,
+    /// PTO exponential-backoff exponent, reset to 0 whenever an ACK is received.
+    pto_count: u32,
+    /// Number of probe packets allowed to bypass the congestion window (RFC 9002
+    /// §6.2.4): a PTO sets this so a retransmit goes out even when cwnd is full.
+    probe_pending: u8,
+    /// When the most recent ack-eliciting packet was sent (arms the PTO timer).
+    last_ack_eliciting_sent: Option<Instant>,
     /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
     write_level: usize,
     /// The relay's single bidirectional data stream (1-RTT).
@@ -270,6 +288,10 @@ impl Connection {
             tls: Box::new(tls),
             spaces,
             rtt: RttEstimator::new(),
+            cc: Box::new(NewReno::new()),
+            pto_count: 0,
+            probe_pending: 0,
+            last_ack_eliciting_sent: None,
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
         };
@@ -302,6 +324,10 @@ impl Connection {
             tls: Box::new(tls),
             spaces: [Space::default(), Space::default(), Space::default()],
             rtt: RttEstimator::new(),
+            cc: Box::new(NewReno::new()),
+            pto_count: 0,
+            probe_pending: 0,
+            last_ack_eliciting_sent: None,
             write_level: SPACE_INITIAL,
             stream: BidiStream::default(),
         })
@@ -373,35 +399,149 @@ impl Connection {
         }
     }
 
-    /// Produce the next datagram to send, or `None` when idle. Priority: a pending
-    /// ACK (lowest space first), then CRYPTO (retransmits before fresh bytes, lowest
-    /// space first), then 1-RTT relay STREAM data (retransmits before fresh). One
-    /// datagram per call; the driver loops until `None`. `now` stamps sent packets
-    /// for RTT/loss bookkeeping.
+    /// Produce the next datagram to send, or `None` when idle (or congestion-window
+    /// limited). Priority: a pending ACK (lowest space first; never gated), then
+    /// CRYPTO (retransmits before fresh bytes, lowest space first), then 1-RTT relay
+    /// STREAM data. Fresh/retransmitted ack-eliciting data is gated on the
+    /// congestion window unless a PTO probe is pending (RFC 9002 §6.2.4). One
+    /// datagram per call; the driver loops until `None`.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
-        // Pure ACKs first so acknowledgements are not held behind data.
+        // Pure ACKs first so acknowledgements are not held behind data, and are
+        // never blocked by the congestion window (they are not ack-eliciting).
         for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
             if self.spaces[space].keys.is_some() && self.spaces[space].ack_pending {
                 return Some(self.build_ack_packet(space, now));
             }
         }
-        // CRYPTO (handshake) from the lowest space with retransmits or fresh bytes.
-        for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
-            let sp = &self.spaces[space];
-            if sp.keys.is_some()
-                && (!sp.retransmit_crypto.is_empty() || sp.crypto_send_off < sp.crypto_send.len())
+        // Ack-eliciting data is gated on the congestion window, except a PTO probe
+        // which is allowed to exceed it to guarantee forward progress.
+        let probing = self.probe_pending > 0;
+        let congestion_ok =
+            probing || self.bytes_in_flight() + MAX_DATAGRAM as u64 <= self.cc.window();
+        if congestion_ok {
+            // CRYPTO (handshake) from the lowest space with retransmits or fresh bytes.
+            for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+                let sp = &self.spaces[space];
+                if sp.keys.is_some()
+                    && (!sp.retransmit_crypto.is_empty()
+                        || sp.crypto_send_off < sp.crypto_send.len())
+                {
+                    let dg = self.build_crypto_packet(space, now);
+                    self.probe_pending = self.probe_pending.saturating_sub(1);
+                    return Some(dg);
+                }
+            }
+            // 1-RTT relay data: once Data keys are installed, resend losses then drain.
+            if self.spaces[SPACE_DATA].keys.is_some()
+                && (!self.stream.retransmit.is_empty()
+                    || (self.stream.send_off as usize) < self.stream.send.len())
             {
-                return Some(self.build_crypto_packet(space, now));
+                let dg = self.build_stream_packet(now);
+                self.probe_pending = self.probe_pending.saturating_sub(1);
+                return Some(dg);
             }
         }
-        // 1-RTT relay data: once Data keys are installed, resend losses then drain.
-        if self.spaces[SPACE_DATA].keys.is_some()
-            && (!self.stream.retransmit.is_empty()
-                || (self.stream.send_off as usize) < self.stream.send.len())
-        {
-            return Some(self.build_stream_packet(now));
-        }
         None
+    }
+
+    /// Total ack-eliciting bytes in flight across all packet-number spaces.
+    fn bytes_in_flight(&self) -> u64 {
+        self.spaces.iter().map(|s| s.sent.in_flight()).sum()
+    }
+
+    /// Whether any space has ack-eliciting packets in flight (arms the PTO timer).
+    fn any_in_flight(&self) -> bool {
+        self.spaces.iter().any(|s| s.sent.in_flight() > 0)
+    }
+
+    /// Current PTO duration with exponential backoff (RFC 9002 §6.2.1).
+    fn pto_duration(&self) -> Duration {
+        (self.rtt.pto_base() + MAX_ACK_DELAY) * 2u32.pow(self.pto_count.min(MAX_PTO_BACKOFF))
+    }
+
+    /// The earliest loss-detection / PTO deadline, for the async layer to arm a
+    /// timer against (RFC 9002 §6.2). `None` when nothing is outstanding.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        let mut deadline: Option<Instant> = None;
+        let mut earliest = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        for sp in &self.spaces {
+            if let Some(lt) = sp.loss_time {
+                earliest(lt);
+            }
+        }
+        if self.any_in_flight() {
+            if let Some(last) = self.last_ack_eliciting_sent {
+                earliest(last + self.pto_duration());
+            }
+        }
+        deadline
+    }
+
+    /// Drive time-based loss detection and PTO (RFC 9002 §6.2). The async layer
+    /// calls this when [`Self::next_timeout`] elapses; `poll_transmit` then sends
+    /// any retransmits / probes that were queued.
+    pub fn handle_timeout(&mut self, now: Instant) {
+        // Time-threshold losses first (RFC 9002 §6.1.2).
+        let mut any_loss = false;
+        let loss_delay = self.rtt.loss_delay();
+        for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+            let due = self.spaces[space].loss_time.is_some_and(|lt| lt <= now);
+            if !due {
+                continue;
+            }
+            let (lost, loss_time) = self.spaces[space].sent.detect_lost(loss_delay, now);
+            self.spaces[space].loss_time = loss_time;
+            for (pn, _) in lost {
+                if let Some(content) = self.spaces[space].sent_content.remove(&pn) {
+                    self.requeue(space, content);
+                    any_loss = true;
+                }
+            }
+        }
+        if any_loss {
+            self.cc.on_congestion_event();
+        }
+
+        // Otherwise, if the PTO has elapsed with packets in flight, probe.
+        if !any_loss && self.any_in_flight() {
+            let elapsed = self
+                .last_ack_eliciting_sent
+                .is_some_and(|last| now >= last + self.pto_duration());
+            if elapsed {
+                self.pto_count = (self.pto_count + 1).min(MAX_PTO_BACKOFF);
+                self.queue_probe();
+            }
+        }
+    }
+
+    /// Queue a PTO probe: retransmit the oldest unacked ack-eliciting packet's data
+    /// (lowest space first, so handshake progress is not blocked behind 1-RTT).
+    fn queue_probe(&mut self) {
+        for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+            if self.spaces[space].sent.in_flight() == 0 {
+                continue;
+            }
+            let oldest = self.spaces[space].sent_content.keys().next().copied();
+            if let Some(pn) = oldest {
+                let content = self.spaces[space].sent_content.remove(&pn).unwrap();
+                // The probed packet leaves bytes-in-flight but is NOT a loss signal
+                // (cwnd is unchanged); its data is resent in a fresh packet.
+                self.spaces[space].sent.discard(pn);
+                self.requeue(space, content);
+                self.probe_pending = self.probe_pending.saturating_add(1);
+                return;
+            }
+        }
+    }
+
+    /// Push a lost/probed packet's CRYPTO + STREAM ranges onto the resend queues.
+    fn requeue(&mut self, space: usize, content: SentContent) {
+        for range in content.crypto {
+            self.spaces[space].retransmit_crypto.push(range);
+        }
+        for range in content.stream {
+            self.stream.retransmit.push(range);
+        }
     }
 
     /// The long/short header for an outgoing packet in `space`.
@@ -455,6 +595,7 @@ impl Connection {
         );
         if ack_eliciting {
             self.spaces[space].sent_content.insert(pn, content);
+            self.last_ack_eliciting_sent = Some(now);
         }
     }
 
@@ -743,19 +884,26 @@ impl Connection {
 
     /// Apply a received ACK frame (RFC 9002 §5–6.1): drop the acknowledged sent
     /// packets, fold one RTT sample (largest newly acked + an ack-eliciting packet),
-    /// then run loss detection and queue any lost CRYPTO/STREAM bytes for resend.
+    /// feed the congestion controller, then run loss detection and queue any lost
+    /// CRYPTO/STREAM bytes for resend.
     fn recv_ack(&mut self, space: usize, ack: &Ack, now: Instant) {
         let newly = self.spaces[space].sent.on_ack(ack.largest, &ack.ranges);
         if newly.is_empty() {
             return;
         }
+        // An ACK confirms forward progress, so reset the PTO backoff (RFC 9002 §6.2).
+        self.pto_count = 0;
         // RTT sample: only when the largest acked is newly acked AND at least one
         // newly-acked packet was ack-eliciting (RFC 9002 §5.1).
         let mut largest_time = None;
         let mut any_ack_eliciting = false;
+        let mut acked_bytes = 0u64;
         for (pn, sp) in &newly {
             self.spaces[space].sent_content.remove(pn);
-            any_ack_eliciting |= sp.ack_eliciting;
+            if sp.ack_eliciting {
+                any_ack_eliciting = true;
+                acked_bytes += sp.size;
+            }
             if *pn == ack.largest {
                 largest_time = Some(sp.time_sent);
             }
@@ -771,20 +919,27 @@ impl Connection {
             self.rtt
                 .update(ack_delay, now.saturating_duration_since(sent_at));
         }
+        // Grow the congestion window on newly-acked ack-eliciting bytes. (Proper
+        // app-limited suppression — RFC 9002 §7.8 — lands with BBR; NewReno
+        // over-growing while app-limited is benign for the scaffold.)
+        if acked_bytes > 0 {
+            self.cc.on_ack(acked_bytes, false);
+        }
 
-        // Loss detection: re-queue the content of every packet declared lost.
+        // Loss detection: re-queue the content of every packet declared lost and
+        // signal the congestion controller once for the batch (RFC 9002 §7.3.2).
         let loss_delay = self.rtt.loss_delay();
         let (lost, loss_time) = self.spaces[space].sent.detect_lost(loss_delay, now);
         self.spaces[space].loss_time = loss_time;
+        let mut any_lost = false;
         for (pn, _) in lost {
             if let Some(content) = self.spaces[space].sent_content.remove(&pn) {
-                for range in content.crypto {
-                    self.spaces[space].retransmit_crypto.push(range);
-                }
-                for range in content.stream {
-                    self.stream.retransmit.push(range);
-                }
+                self.requeue(space, content);
+                any_lost = true;
             }
+        }
+        if any_lost {
+            self.cc.on_congestion_event();
         }
     }
 
@@ -1263,6 +1418,103 @@ mod tests {
             server.read_stream(),
             payload,
             "the dropped packet was retransmitted and the stream reassembled in order"
+        );
+    }
+
+    #[test]
+    fn tail_loss_is_recovered_by_pto_probe() {
+        let mut now = Instant::now();
+        let dcid = ConnectionId::new(&[0x20; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0x21, 0x43, 0x65, 0x87]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        client.send_stream(&payload);
+
+        // Deliver every data packet EXCEPT the last — a tail loss, which has no
+        // higher-numbered packet to trigger packet-threshold detection.
+        let mut pkts = Vec::new();
+        while let Some(dg) = client.poll_transmit(now) {
+            pkts.push(dg);
+        }
+        assert!(pkts.len() >= 3, "payload spans several packets");
+        for dg in &pkts[..pkts.len() - 1] {
+            server.handle_datagram(dg, now).unwrap();
+        }
+        // The server ACKs what it has; the client cannot yet detect the tail loss.
+        while let Some(dg) = server.poll_transmit(now) {
+            client.handle_datagram(&dg, now).unwrap();
+        }
+        assert!(
+            client.poll_transmit(now).is_none(),
+            "tail loss is not ACK-detectable — only a PTO recovers it"
+        );
+
+        // After the PTO elapses, the probe resends the tail; pump to completion.
+        now += Duration::from_millis(500);
+        client.handle_timeout(now);
+        for _ in 0..16 {
+            now += Duration::from_millis(50);
+            let mut moved = false;
+            while let Some(dg) = client.poll_transmit(now) {
+                server.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            while let Some(dg) = server.poll_transmit(now) {
+                client.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+
+        assert_eq!(
+            server.read_stream(),
+            payload,
+            "the tail packet was recovered by a PTO probe and the stream reassembled"
+        );
+    }
+
+    #[test]
+    fn congestion_window_limits_the_in_flight_burst() {
+        let now = Instant::now();
+        let dcid = ConnectionId::new(&[0x30; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0x31, 0x41, 0x59, 0x26]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking());
+
+        // Offer far more than one initial congestion window (12000 bytes) of data
+        // without delivering any ACK: the client must stop sending at ~the window.
+        client.send_stream(&vec![0x5a; 256 * 1024]);
+        let mut burst = 0usize;
+        while let Some(dg) = client.poll_transmit(now) {
+            burst += dg.len();
+        }
+        assert!(
+            (12_000..=14_000).contains(&burst),
+            "first burst is bounded by the initial congestion window, got {burst} bytes"
         );
     }
 }
