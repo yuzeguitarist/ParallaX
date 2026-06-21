@@ -724,7 +724,17 @@ impl AsyncWrite for SendStream {
         _cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.shared.core.lock().unwrap().send_stream(self.id, data);
+        let mut core = self.shared.core.lock().unwrap();
+        if core.is_closed() {
+            // Writing to a torn-down connection can never reach the peer; fail so the
+            // relay's write side terminates instead of buffering into a dead conn.
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            )));
+        }
+        core.send_stream(self.id, data);
+        drop(core);
         self.shared.nudge();
         Poll::Ready(Ok(data.len()))
     }
@@ -804,6 +814,15 @@ impl AsyncRead for RecvStream {
         }
         if core.stream_recv_finished(me.id) {
             return Poll::Ready(Ok(())); // clean FIN → EOF (buf left unfilled)
+        }
+        if core.is_closed() {
+            // The connection was torn down (peer CONNECTION_CLOSE / idle / local)
+            // before this stream finished: surface a reset so a blocked reader (the
+            // relay) terminates instead of hanging for bytes that will never arrive.
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection closed before stream completed",
+            )));
         }
         me.shared.register_read_waker(cx.waker());
         Poll::Pending
