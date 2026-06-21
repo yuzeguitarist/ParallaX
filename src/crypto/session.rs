@@ -250,7 +250,13 @@ fn initial_chain_secret(
     // An X25519 compromise alone cannot reproduce the initial session keys without
     // the PSK. Transcript binding stays explicit in the expand `info` below, which
     // also carries the (bumped) domain-separation label. psk non-emptiness is
-    // enforced upstream by config validation (crypto.psk >= 32 bytes).
+    // enforced upstream by config validation (crypto.psk >= 32 bytes); this
+    // debug-only assert makes that contract self-checking against future internal
+    // callers (an empty salt silently degrades to the zero salt).
+    debug_assert!(
+        !psk.is_empty(),
+        "initial_chain_secret requires a non-empty PSK (HKDF salt); enforced upstream by config validation"
+    );
     let hk = Hkdf::<Sha256>::new(Some(psk), x25519_shared_secret);
     let mut chain_secret = [0_u8; KEY_LEN];
     expand(
