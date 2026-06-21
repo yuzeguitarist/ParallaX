@@ -6,7 +6,8 @@
 //! accounting, loss detection, and the congestion controllers build on top in
 //! later slices.
 
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 /// RFC 9002 §6.2: the timer granularity (1 ms) flooring the PTO RTT-variance term.
 const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
@@ -91,6 +92,108 @@ impl RttEstimator {
     pub fn pto_base(&self) -> Duration {
         self.smoothed() + (self.rttvar * 4).max(TIMER_GRANULARITY)
     }
+
+    /// Time-threshold loss delay = `max(9/8 * max(smoothed, latest), granularity)`
+    /// (RFC 9002 §6.1.2): a packet sent earlier than `now - loss_delay` is lost.
+    pub fn loss_delay(&self) -> Duration {
+        let base = self.smoothed().max(self.latest);
+        (base * 9 / 8).max(TIMER_GRANULARITY)
+    }
+}
+
+/// RFC 9002 §6.1.1 packet-reordering threshold: a packet is lost once a packet at
+/// least this many numbers higher has been acknowledged.
+const PACKET_THRESHOLD: u64 = 3;
+
+/// One sent ack-eliciting-or-not packet awaiting acknowledgement (keyed by its
+/// packet number in [`SentPackets`]).
+#[derive(Debug, Clone)]
+pub struct SentPacket {
+    pub time_sent: Instant,
+    pub size: u64,
+    pub ack_eliciting: bool,
+}
+
+/// One packet-number space's sent-packet bookkeeping + RFC 9002 §6.1 loss
+/// detection. The connection records each send, feeds received ACKs, and asks for
+/// the packets to declare lost (and retransmit). Bytes-in-flight feed the
+/// congestion controller.
+#[derive(Debug, Default)]
+pub struct SentPackets {
+    packets: BTreeMap<u64, SentPacket>,
+    largest_acked: Option<u64>,
+    in_flight: u64,
+}
+
+impl SentPackets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an outgoing packet.
+    pub fn on_sent(&mut self, pn: u64, sent: SentPacket) {
+        self.in_flight += sent.size;
+        self.packets.insert(pn, sent);
+    }
+
+    /// Total bytes of unacknowledged in-flight packets (for the CC window gate).
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight
+    }
+
+    pub fn largest_acked(&self) -> Option<u64> {
+        self.largest_acked
+    }
+
+    /// Apply an ACK: drop the acknowledged packets and return them (newly-acked,
+    /// for RTT + congestion-control feedback). `ranges` are inclusive `[low, high]`.
+    pub fn on_ack(&mut self, largest: u64, ranges: &[(u64, u64)]) -> Vec<(u64, SentPacket)> {
+        self.largest_acked = Some(self.largest_acked.map_or(largest, |l| l.max(largest)));
+        let mut acked = Vec::new();
+        for &(low, high) in ranges {
+            let keys: Vec<u64> = self.packets.range(low..=high).map(|(&k, _)| k).collect();
+            for k in keys {
+                if let Some(p) = self.packets.remove(&k) {
+                    self.in_flight = self.in_flight.saturating_sub(p.size);
+                    acked.push((k, p));
+                }
+            }
+        }
+        acked
+    }
+
+    /// Declare lost packets (RFC 9002 §6.1): a packet below `largest_acked` is lost
+    /// when a packet ≥ `pn + PACKET_THRESHOLD` is acked (packet threshold) OR it was
+    /// sent at or before `now - loss_delay` (time threshold). Returns the lost
+    /// `(pn, packet)` and the earliest future time-threshold deadline (to arm the
+    /// loss timer), if any packets remain only-time-threshold-eligible.
+    pub fn detect_lost(
+        &mut self,
+        loss_delay: Duration,
+        now: Instant,
+    ) -> (Vec<(u64, SentPacket)>, Option<Instant>) {
+        let Some(largest) = self.largest_acked else {
+            return (Vec::new(), None);
+        };
+        let lost_send_time = now.checked_sub(loss_delay);
+        let mut lost = Vec::new();
+        let mut loss_time: Option<Instant> = None;
+        let candidates: Vec<u64> = self.packets.range(..largest).map(|(&k, _)| k).collect();
+        for k in candidates {
+            let p = &self.packets[&k];
+            let by_packet = largest >= k + PACKET_THRESHOLD;
+            let by_time = lost_send_time.is_some_and(|t| p.time_sent <= t);
+            if by_packet || by_time {
+                let p = self.packets.remove(&k).expect("candidate still present");
+                self.in_flight = self.in_flight.saturating_sub(p.size);
+                lost.push((k, p));
+            } else {
+                let deadline = p.time_sent + loss_delay;
+                loss_time = Some(loss_time.map_or(deadline, |lt| lt.min(deadline)));
+            }
+        }
+        (lost, loss_time)
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +255,77 @@ mod tests {
         rtt.update(Duration::ZERO, Duration::from_millis(60));
         rtt.update(Duration::ZERO, Duration::from_millis(80));
         assert_eq!(rtt.min(), Duration::from_millis(60));
+    }
+
+    #[test]
+    fn loss_delay_is_nine_eighths_of_rtt() {
+        let mut rtt = RttEstimator::new();
+        rtt.update(Duration::ZERO, Duration::from_millis(80)); // smoothed = latest = 80
+        assert_eq!(rtt.loss_delay(), Duration::from_millis(90)); // 9/8 * 80
+    }
+
+    fn sent(now: Instant) -> SentPacket {
+        SentPacket {
+            time_sent: now,
+            size: 1200,
+            ack_eliciting: true,
+        }
+    }
+
+    fn lost_pns(lost: &[(u64, SentPacket)]) -> Vec<u64> {
+        lost.iter().map(|(k, _)| *k).collect()
+    }
+
+    #[test]
+    fn on_ack_removes_acked_and_tracks_in_flight() {
+        let now = Instant::now();
+        let mut sp = SentPackets::new();
+        for pn in 0..5 {
+            sp.on_sent(pn, sent(now));
+        }
+        assert_eq!(sp.in_flight(), 5 * 1200);
+        let acked = sp.on_ack(4, &[(3, 4)]);
+        assert_eq!(acked.len(), 2, "pn 3 and 4 acknowledged");
+        assert_eq!(sp.in_flight(), 3 * 1200);
+        assert_eq!(sp.largest_acked(), Some(4));
+    }
+
+    #[test]
+    fn detect_lost_by_packet_threshold() {
+        let now = Instant::now();
+        let mut sp = SentPackets::new();
+        for pn in 0..5 {
+            sp.on_sent(pn, sent(now));
+        }
+        sp.on_ack(4, &[(4, 4)]); // only pn 4 acked
+                                 // A huge loss_delay disables the time threshold; only the packet threshold
+                                 // fires: largest(4) >= pn + 3 ⇒ pn <= 1.
+        let (lost, _) = sp.detect_lost(Duration::from_secs(3600), now);
+        assert_eq!(lost_pns(&lost), vec![0, 1]);
+    }
+
+    #[test]
+    fn detect_lost_by_time_threshold_only() {
+        let now = Instant::now();
+        let later = now + Duration::from_millis(100);
+        let mut sp = SentPackets::new();
+        sp.on_sent(0, sent(now)); // old packet
+        sp.on_sent(2, sent(later)); // acked; largest 2 < 0+3 so pn0 is NOT packet-lost
+        sp.on_ack(2, &[(2, 2)]);
+        let (lost, _) = sp.detect_lost(Duration::from_millis(10), later);
+        assert_eq!(lost_pns(&lost), vec![0], "pn 0 lost by time threshold only");
+    }
+
+    #[test]
+    fn detect_lost_arms_loss_time_for_not_yet_lost() {
+        let now = Instant::now();
+        let mut sp = SentPackets::new();
+        sp.on_sent(0, sent(now));
+        sp.on_sent(2, sent(now));
+        sp.on_ack(2, &[(2, 2)]);
+        // pn 0: 2 < 0+3 (no packet threshold) and just sent (no time threshold yet).
+        let (lost, loss_time) = sp.detect_lost(Duration::from_secs(1), now);
+        assert!(lost.is_empty());
+        assert_eq!(loss_time, Some(now + Duration::from_secs(1)));
     }
 }
