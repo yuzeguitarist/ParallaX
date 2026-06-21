@@ -777,6 +777,17 @@ impl Connection {
         }
     }
 
+    /// Discard a packet-number space's keys and all associated state (RFC 9001 §4.9,
+    /// RFC 9002 §6.4): the packets it held leave bytes_in_flight and its loss/PTO
+    /// timers and ACK/CRYPTO buffers are cleared. Used at the Initial→Handshake and
+    /// Handshake→1-RTT transitions so stale handshake packets cannot throttle the
+    /// 1-RTT congestion window or trigger probes in a keyspace the peer can no longer
+    /// decrypt — and so the public Initial keys stop AEAD-opening forged packets once
+    /// the handshake has moved on.
+    fn discard_space(&mut self, space: usize) {
+        self.spaces[space] = Space::default();
+    }
+
     /// Produce the next datagram to send, or `None` when idle (or congestion-window
     /// limited). Priority: a pending ACK (lowest space first; never gated), then
     /// CRYPTO (retransmits before fresh bytes, lowest space first), then 1-RTT relay
@@ -1598,6 +1609,14 @@ impl Connection {
             return Ok(());
         }
 
+        // Successfully processing a Handshake packet proves the peer holds Handshake
+        // keys, hence received our Initial CRYPTO: discard Initial keys + state (RFC
+        // 9001 §4.9.1). Safe for both roles — the server's §4.9.1 trigger exactly,
+        // and for the client it implies the server acked our ClientHello.
+        if space == SPACE_HANDSHAKE && self.spaces[SPACE_INITIAL].keys.is_some() {
+            self.discard_space(SPACE_INITIAL);
+        }
+
         // Copy the decrypted frames out so the TLS engine can be mutated while we
         // iterate.
         let payload = pkt[range].to_vec();
@@ -1671,9 +1690,11 @@ impl Connection {
                 Frame::HandshakeDone => {
                     ack_eliciting = true;
                     // RFC 9001 §4.1.2: the client treats HANDSHAKE_DONE as handshake
-                    // confirmation. (Only a client should receive it.)
+                    // confirmation. (Only a client should receive it.) On confirmation
+                    // discard Handshake keys + state (RFC 9001 §4.9.2 / RFC 9002 §6.4).
                     if self.side == Side::Client {
                         self.handshake_confirmed = true;
+                        self.discard_space(SPACE_HANDSHAKE);
                     }
                 }
                 Frame::Padding(_) => {}
@@ -1714,6 +1735,9 @@ impl Connection {
         {
             self.handshake_done_pending = true;
             self.handshake_confirmed = true;
+            // The server confirms when it completes (it has the client's Finished):
+            // discard Handshake keys + state (RFC 9001 §4.9.2 / RFC 9002 §6.4).
+            self.discard_space(SPACE_HANDSHAKE);
         }
     }
 
@@ -2939,5 +2963,45 @@ mod tests {
         assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
         // A consistent reset (final size >= received) is accepted.
         server.recv_reset_stream(0, 7, 200).unwrap();
+    }
+
+    #[test]
+    fn initial_and_handshake_keys_are_discarded_after_the_handshake() {
+        let dcid = ConnectionId::new(&[0x39; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x39, 0x39, 0x39, 0x39]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(client.handshake_confirmed && server.handshake_confirmed);
+
+        // Both Initial and Handshake keys (and their sent-packet state) are gone
+        // (RFC 9001 §4.9 / RFC 9002 §6.4): no stale handshake packets in flight, and
+        // the public Initial keys no longer AEAD-open forged packets.
+        for c in [&client, &server] {
+            assert!(
+                c.spaces[SPACE_INITIAL].keys.is_none(),
+                "Initial keys discarded"
+            );
+            assert!(
+                c.spaces[SPACE_HANDSHAKE].keys.is_none(),
+                "Handshake keys discarded"
+            );
+            assert_eq!(c.spaces[SPACE_INITIAL].sent.in_flight(), 0);
+            assert_eq!(c.spaces[SPACE_HANDSHAKE].sent.in_flight(), 0);
+        }
+
+        // Relay data still flows after the keys are discarded.
+        let msg = b"after the handshake, over 1-RTT";
+        client.send_stream(RELAY_STREAM_ID, msg);
+        drive(&mut client, &mut server);
+        assert_eq!(server.read_stream(RELAY_STREAM_ID), msg);
     }
 }
