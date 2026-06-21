@@ -220,8 +220,10 @@ plx init <DEST> [--server-addr ...] [--server-listen ...]
 plx seal [-c parallax.toml] [--output BUNDLE] [--host-key PATH]
     Encrypt the config's secrets into a machine-bound sealed bundle (default
     <config-dir>/parallax.secrets.enc) under a host-local key, then rewrite the
-    config to reference it. After sealing, the config and bundle are useless on
-    any other machine.
+    config to reference it and delete the plaintext sidecar it read them from.
+    After sealing, the config and bundle are useless on any other machine.
+    With a non-default --host-key, set PARALLAX_HOST_KEY_FILE to that path in the
+    runtime environment or loading the sealed config will fail.
 ```
 
 Every command supports `--help`.

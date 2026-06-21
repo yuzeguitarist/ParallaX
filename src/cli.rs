@@ -369,6 +369,12 @@ fn seal_config(
     let cfg = load_config(config)?;
     cfg.validate()?;
 
+    // Re-read the raw config text through the hardened reader (Zeroizing: it may
+    // hold inline secrets). Used both to discover plaintext sidecars to remove and
+    // to rewrite the file below.
+    let original = crate::config::read_secret_config_file(config)
+        .with_context(|| format!("failed to re-read {}", config.display()))?;
+
     // Hold the resolved secrets in Zeroizing so the plaintext base64 is scrubbed
     // when sealing finishes, matching the Zeroizing discipline used elsewhere.
     let mut secrets: Vec<(&'static str, Zeroizing<String>)> =
@@ -394,13 +400,6 @@ fn seal_config(
         Err(err) => return Err(err.into()),
     };
 
-    let bundle = secret_store::seal_all(
-        &host_key_bytes,
-        secrets
-            .iter()
-            .map(|(field, value)| (*field, value.as_str())),
-    );
-
     let config_dir = config
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -410,21 +409,69 @@ fn seal_config(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| config_dir.join("parallax.secrets.enc"));
 
-    fs::write(&bundle_path, secret_store::bundle_to_toml(&bundle))
-        .with_context(|| format!("failed to write {}", bundle_path.display()))?;
+    // Merge into an existing bundle rather than clobbering it, so sealing one
+    // config never silently drops entries another config sealed into the same
+    // bundle. A present-but-unreadable bundle aborts the seal (don't overwrite a
+    // bundle we can't parse — it may hold other live secrets).
+    let mut bundle = if bundle_path.exists() {
+        secret_store::read_bundle(&bundle_path).with_context(|| {
+            format!(
+                "refusing to overwrite unreadable sealed bundle {}",
+                bundle_path.display()
+            )
+        })?
+    } else {
+        secret_store::SealedBundle::default()
+    };
+    secret_store::seal_into(
+        &mut bundle,
+        &host_key_bytes,
+        secrets
+            .iter()
+            .map(|(field, value)| (*field, value.as_str())),
+    );
+    // The bundle is ciphertext, but write it 0600 + O_NOFOLLOW + atomically: the
+    // default 0644 would expose salts/nonces/field names and a pre-planted symlink
+    // could redirect the write.
+    write_secret_file_overwrite(&bundle_path, &secret_store::bundle_to_toml(&bundle))?;
 
     // The bundle is on disk now, so canonicalization succeeds: build a reference
     // the config can actually resolve, even when `--output` points elsewhere.
     let bundle_ref = sealed_bundle_reference(&config_dir, &bundle_path)?;
 
-    let original = fs::read_to_string(config)
-        .with_context(|| format!("failed to re-read {}", config.display()))?;
-    let rewritten = rewrite_secrets_to_sealed(
-        &original,
+    // The rewrite output can still carry inline secrets if a line wasn't matched,
+    // so keep it in Zeroizing too.
+    let rewritten = Zeroizing::new(rewrite_secrets_to_sealed(
+        original.as_str(),
         &bundle_ref,
         secrets.iter().map(|(field, _)| *field),
+    ));
+
+    // Fail closed: re-parse the rewrite and refuse to touch the config if ANY
+    // secret is still inline (e.g. a dotted/multi-line key the line rewriter could
+    // not match). Better to abort than to report success while leaving plaintext.
+    let check: Config = toml::from_str(rewritten.as_str()).map_err(|_| {
+        anyhow::anyhow!(
+            "internal error: rewritten config for {} is not valid TOML; \
+             aborting without modifying it",
+            config.display()
+        )
+    })?;
+    let still_inline = check.inline_secret_fields();
+    anyhow::ensure!(
+        still_inline.is_empty(),
+        "could not rewrite every secret to a sealed reference in {} (still inline: {}); \
+         aborting without modifying the file. Convert any dotted/multi-line key (e.g. \
+         `crypto.psk = ...`) to a simple `key = ...` under its [table] and retry.",
+        config.display(),
+        still_inline.join(", ")
     );
-    write_secret_file_overwrite(config, &rewritten)?;
+
+    write_secret_file_overwrite(config, rewritten.as_str())?;
+
+    // Remove the plaintext sidecars the secrets were read from: leaving them on
+    // disk keeps the directory a bearer credential, which defeats sealing.
+    let removed = remove_referenced_sidecars(config, &config_dir, original.as_str());
 
     println!(
         "Sealed {} secret(s) into {}",
@@ -435,11 +482,68 @@ fn seal_config(
         "Rewrote {} to reference the sealed bundle.",
         config.display()
     );
+    for path in &removed {
+        println!("Removed plaintext secret sidecar: {}", path.display());
+    }
+
+    // Warn if the host key lives somewhere the runtime won't look: `plx seal
+    // --host-key <custom>` records the path nowhere, so the server would fail to
+    // start with a sealed config unless PARALLAX_HOST_KEY_FILE points operators
+    // back at it.
+    let used_host_key = secret_store::host_key_path(host_key);
+    let runtime_host_key = secret_store::host_key_path(None);
+    let host_key_discoverable = match (
+        used_host_key.canonicalize(),
+        runtime_host_key.canonicalize(),
+    ) {
+        (Ok(used), Ok(runtime)) => used == runtime,
+        _ => used_host_key == runtime_host_key,
+    };
+    if !host_key_discoverable {
+        println!(
+            "WARNING: the host keyfile is at {used}, but at runtime ParallaX looks for it at \
+             $PARALLAX_HOST_KEY_FILE or {default}. Set PARALLAX_HOST_KEY_FILE={used} in the \
+             service environment, or loading this sealed config will fail.",
+            used = used_host_key.display(),
+            default = secret_store::DEFAULT_HOST_KEY_PATH,
+        );
+    }
+
     println!(
-        "The host keyfile stays on THIS machine only. The config and bundle are \
-         now safe to back up; they cannot be used elsewhere without it."
+        "The host keyfile stays on THIS machine only; the config and bundle cannot be \
+         used elsewhere without it."
     );
     Ok(())
+}
+
+/// Delete the plaintext `{ file = "..." }` sidecars the sealed secrets were read
+/// from. Parses the PRE-rewrite config text to recover the references (resolution
+/// has already erased them on the loaded `Config`). Best-effort and idempotent:
+/// a missing or undeletable sidecar is skipped. Returns the paths actually removed.
+fn remove_referenced_sidecars(config: &Path, config_dir: &Path, original: &str) -> Vec<PathBuf> {
+    let Ok(unresolved) = toml::from_str::<Config>(original) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for rel in unresolved.referenced_secret_files() {
+        let path = if Path::new(&rel).is_absolute() {
+            PathBuf::from(&rel)
+        } else {
+            config_dir.join(&rel)
+        };
+        // Never delete the config file itself (a self-referential sidecar).
+        let is_config = match (path.canonicalize(), config.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => path == config,
+        };
+        if is_config {
+            continue;
+        }
+        if path.exists() && fs::remove_file(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
 }
 
 /// Build the reference a sealed config should use to find its bundle. A relative
@@ -493,9 +597,15 @@ fn rewrite_secrets_to_sealed<'a>(
             if let Some(rest) = trimmed.strip_prefix(field) {
                 let rest = rest.trim_start();
                 if rest.starts_with('=') {
+                    // Escape the reference as a TOML basic string: an absolute
+                    // --output path may legally contain `"`, `\`, or control
+                    // bytes, which raw interpolation would turn into broken TOML.
+                    let value = toml_basic_string(&format!("{bundle_name}#{field}"));
                     out.push_str(indent);
                     out.push_str(field);
-                    out.push_str(&format!(" = {{ sealed = \"{bundle_name}#{field}\" }}"));
+                    out.push_str(" = { sealed = ");
+                    out.push_str(&value);
+                    out.push_str(" }");
                     out.push('\n');
                     replaced = true;
                     break;
@@ -713,31 +823,53 @@ fn write_secret_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Overwrite an existing 0600 secret file in place (used by `plx seal` to rewrite
-/// a config). Unlike [`write_secret_file`] this truncates rather than refusing
-/// when the file exists, and (re)asserts owner-only permissions.
+/// Overwrite an existing 0600 file in place via a temp-file + atomic rename (used
+/// by `plx seal` to rewrite a config and write the bundle). The temp file is
+/// created `create_new` + `O_NOFOLLOW` at mode 0600, written and fsynced, then
+/// renamed over the target — so a crash or full disk leaves either the old file
+/// or the complete new one, never a truncated config, and a pre-planted symlink
+/// at the target is replaced rather than followed.
 fn write_secret_file_overwrite(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("path has no file name: {}", path.display()))?;
+    // Temp lives in the SAME directory so the rename is atomic (same filesystem).
+    let tmp = parent.join(format!(".{file_name}.{:016x}.tmp", OsRng.next_u64()));
+
     let mut options = fs::OpenOptions::new();
-    options.write(true).truncate(true).create(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW: refuse to follow a symlink at the final path component, so a
-        // pre-planted link can't redirect this 0600 write onto another file. This
-        // matches the hardened read path in `read_secret_config_file`.
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+
+    let write = (|| -> anyhow::Result<()> {
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to fsync {}", tmp.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = write {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
     }
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(err)
+            .context(format!("failed to atomically replace {}", path.display())));
+    }
     Ok(())
 }
 
@@ -898,6 +1030,11 @@ fn write_referenced_init_files(output: &Path, generated: &ReferencedConfig) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `seal`/`Config::load` resolution of a sealed reference reads the global
+    // PARALLAX_HOST_KEY_FILE env var. Serialize the tests that set it so the
+    // default parallel runner can't race them against each other.
+    static HOST_KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn generated_templates_validate_and_share_key_material() {
@@ -1235,6 +1372,7 @@ mod tests {
         assert!(!before.inline_secret_fields().is_empty());
 
         // Use a temp host keyfile (both seal and runtime read it via the env var).
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
         let host_key = dir.path().join("host.key");
         std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
 
@@ -1264,6 +1402,7 @@ mod tests {
     fn seal_output_in_other_dir_resolves() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let generated = generate_config_template(
             "127.0.0.1:0",
@@ -1299,5 +1438,66 @@ mod tests {
         let after = Config::load(&server_path).unwrap();
         std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
         assert_eq!(after.crypto.psk.as_b64(), psk_b64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_default_referenced_flow_removes_plaintext_sidecar() {
+        // Regression for the P0 leak: `plx seal` on the DEFAULT referenced-sidecar
+        // layout must delete the plaintext `*.secrets.toml`, not just rewrite the
+        // config — otherwise the directory stays a bearer credential.
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_init_config(
+            "example.com",
+            "203.0.113.10:443",
+            "0.0.0.0:443",
+            "127.0.0.1:1080",
+            dir.path(),
+            false,
+        )
+        .unwrap();
+
+        let server_path = dir.path().join("parallax.server.toml");
+        let sidecar = dir.path().join(SERVER_SECRETS_FILE);
+        assert!(sidecar.exists(), "init should write the plaintext sidecar");
+
+        // Capture the resolved secrets so we can prove they survive the round-trip.
+        let before = Config::load(&server_path).unwrap();
+        let psk_b64 = before.crypto.psk.as_b64().to_owned();
+        let private_b64 = before
+            .server
+            .as_ref()
+            .unwrap()
+            .private_key
+            .as_b64()
+            .to_owned();
+
+        let host_key = dir.path().join("host.key");
+        seal_config(&server_path, None, Some(&host_key)).unwrap();
+
+        // The plaintext sidecar is gone, and the bundle exists in its place.
+        assert!(
+            !sidecar.exists(),
+            "plx seal must remove the plaintext sidecar in the default flow"
+        );
+        assert!(dir.path().join("parallax.secrets.enc").exists());
+
+        // The rewritten config references the bundle, with no inline secret bytes.
+        let rewritten = fs::read_to_string(&server_path).unwrap();
+        assert!(!rewritten.contains(&psk_b64));
+        assert!(!rewritten.contains(&private_b64));
+        assert!(rewritten.contains("sealed = \"parallax.secrets.enc#psk\""));
+
+        // It loads and resolves back to the original secret bytes.
+        std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+        let after = Config::load(&server_path).unwrap();
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        assert_eq!(after.crypto.psk.as_b64(), psk_b64);
+        assert_eq!(
+            after.server.as_ref().unwrap().private_key.as_b64(),
+            private_b64
+        );
+        assert!(after.inline_secret_fields().is_empty());
     }
 }

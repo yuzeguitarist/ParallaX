@@ -57,6 +57,8 @@ pub enum ConfigError {
     SecretRead { field: &'static str },
     #[error("{field}: failed to open the sealed secret (wrong host key, tampered bundle, or missing entry)")]
     SecretSeal { field: &'static str },
+    #[error("{field}: cannot open the sealed secret because the host keyfile is missing or has insecure permissions; set $PARALLAX_HOST_KEY_FILE (or place the keyfile at /var/lib/parallax/host.key) to the host key used by `plx seal`")]
+    SecretHostKey { field: &'static str },
     #[error("traffic.max_padding must be >= traffic.min_padding")]
     InvalidPaddingRange,
     #[error("traffic.max_padding leaves too little room for encrypted payload")]
@@ -287,6 +289,20 @@ impl SecretSource {
         }
     }
 
+    /// If this secret is an unresolved `{ file = "<path>#<frag>" }` reference, the
+    /// sidecar path part (without the `#fragment`). `plx seal` uses this to delete
+    /// the plaintext sidecar after sealing its secret. Only meaningful before
+    /// resolution (a [`SecretSource::Resolved`] no longer remembers its origin).
+    pub(crate) fn file_reference_path(&self) -> Option<&str> {
+        match self {
+            Self::Reference(r) => r
+                .file
+                .as_deref()
+                .map(|spec| crate::secret_store::split_fragment(spec).0),
+            _ => None,
+        }
+    }
+
     /// Resolve any indirection in place, reading `file`/`env`/`sealed` sources.
     /// `base` is the config directory used to resolve relative reference paths.
     fn resolve_in_place(&mut self, field: &'static str, base: &Path) -> Result<(), ConfigError> {
@@ -320,7 +336,17 @@ impl SecretRef {
             (None, None, Some(spec)) => {
                 crate::secret_store::open_sealed_reference(base, spec, None).map_err(|err| {
                     tracing::debug!(%field, error = %err, "failed to open sealed secret");
-                    ConfigError::SecretSeal { field }
+                    match err {
+                        // A missing/locked host keyfile is the common misconfig
+                        // (e.g. `plx seal --host-key <custom>` not mirrored in the
+                        // runtime env); surface that distinctly from a real
+                        // decrypt failure so the operator looks in the right place.
+                        crate::secret_store::SealError::HostKeyMissing { .. }
+                        | crate::secret_store::SealError::HostKeyPermissions { .. } => {
+                            ConfigError::SecretHostKey { field }
+                        }
+                        _ => ConfigError::SecretSeal { field },
+                    }
                 })
             }
             _ => Err(ConfigError::SecretReference { field }),
@@ -358,7 +384,9 @@ fn resolve_file_secret(
 }
 
 fn resolve_env_secret(name: &str, field: &'static str) -> Result<Zeroizing<String>, ConfigError> {
-    let value = std::env::var(name).map_err(|_| ConfigError::SecretRead { field })?;
+    // Hold the raw env value in Zeroizing so the (untrimmed) copy is scrubbed on
+    // drop rather than left in the heap after we copy the trimmed text out.
+    let value = Zeroizing::new(std::env::var(name).map_err(|_| ConfigError::SecretRead { field })?);
     Ok(Zeroizing::new(value.trim().to_owned()))
 }
 
@@ -683,7 +711,26 @@ impl Config {
         fields
     }
 
-    /// Resolve every secret indirection (`file`/`env`/`sealed`) to its base64
+    /// Path parts of plaintext sidecars referenced via `{ file = "..." }` (the
+    /// `#fragment` stripped), deduplicated. `plx seal` removes these after sealing
+    /// so the directory stops being a bearer credential. Only meaningful on a
+    /// freshly parsed (unresolved) config.
+    pub(crate) fn referenced_secret_files(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |path: Option<&str>| {
+            if let Some(path) = path {
+                if !out.iter().any(|existing| existing == path) {
+                    out.push(path.to_owned());
+                }
+            }
+        };
+        add(self.crypto.psk.file_reference_path());
+        if let Some(server) = &self.server {
+            add(server.private_key.file_reference_path());
+            add(server.identity_secret_key.file_reference_path());
+        }
+        out
+    }
     /// text, in place, relative to the config file's directory.
     fn resolve_secrets(&mut self, config_path: &Path) -> Result<(), ConfigError> {
         let base = config_path

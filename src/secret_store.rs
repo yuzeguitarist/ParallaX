@@ -13,8 +13,9 @@
 //!
 //! Crypto: per-secret KEK = HKDF-SHA256(ikm = host_key, salt = random 32B,
 //! info = "parallax-seal-v1|<field>"). The base64 secret text is then sealed with
-//! XChaCha20-Poly1305 (random 24B nonce) using the logical field name as AAD, so
-//! an entry cannot be silently swapped between fields.
+//! XChaCha20-Poly1305 (random 24B nonce) using `version | bundle-id | field` as
+//! AAD, so an entry cannot be silently swapped between fields, transplanted into
+//! another bundle, or rolled back across a re-seal (each bundle has a fresh id).
 
 use std::{
     collections::BTreeMap,
@@ -32,7 +33,7 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Default host keyfile location. Co-located with the replay cache under the
 /// package state dir so an operator only has to protect one directory.
@@ -78,25 +79,26 @@ pub struct SealedEntry {
 /// On-disk sealed bundle: a versioned, named map of encrypted secrets. Safe to
 /// store next to the config and even commit, because it is useless without the
 /// host keyfile.
+///
+/// `id` is a random per-bundle identifier mixed into each entry's AAD so a sealed
+/// entry cannot be transplanted between bundles or rolled back across a re-seal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SealedBundle {
     version: u32,
+    id: String,
     #[serde(default)]
     entries: BTreeMap<String, SealedEntry>,
 }
 
 impl Default for SealedBundle {
     fn default() -> Self {
+        let mut id = [0_u8; 16];
+        OsRng.fill_bytes(&mut id);
         Self {
             version: BUNDLE_VERSION,
+            id: STANDARD.encode(id),
             entries: BTreeMap::new(),
         }
-    }
-}
-
-impl SealedBundle {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -153,7 +155,11 @@ pub fn load_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealErr
     }
     let mut key = [0_u8; 32];
     key.copy_from_slice(&decoded);
-    Ok(Zeroizing::new(key))
+    let out = Zeroizing::new(key);
+    // `[u8; 32]` is Copy, so the move into `Zeroizing` above left a plaintext copy
+    // of the host key on the stack; wipe it explicitly.
+    key.zeroize();
+    Ok(out)
 }
 
 /// Create a fresh random host keyfile (0600). Refuses to overwrite an existing
@@ -203,8 +209,23 @@ fn derive_kek(host_key: &[u8; 32], salt: &[u8], field: &str) -> Zeroizing<[u8; 3
     okm
 }
 
-/// Seal one base64 secret string into an encrypted entry bound to `field`.
-pub fn seal_secret(host_key: &[u8; 32], field: &str, plaintext_b64: &str) -> SealedEntry {
+/// AEAD associated data binding an entry to its bundle (`version | id | field`).
+/// Including the per-bundle `id` and version means a sealed entry only opens in
+/// the exact bundle it was sealed into, not after a transplant or rollback.
+fn entry_aad(version: u32, bundle_id: &str, field: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(4 + 1 + bundle_id.len() + 1 + field.len());
+    aad.extend_from_slice(&version.to_be_bytes());
+    aad.push(b'|');
+    aad.extend_from_slice(bundle_id.as_bytes());
+    aad.push(b'|');
+    aad.extend_from_slice(field.as_bytes());
+    aad
+}
+
+/// Seal one base64 secret string into an encrypted entry. `field` keys both the
+/// KEK derivation (HKDF info) and `aad`; `aad` additionally binds the bundle
+/// (see [`entry_aad`]).
+fn seal_secret(host_key: &[u8; 32], field: &str, aad: &[u8], plaintext_b64: &str) -> SealedEntry {
     let mut salt = [0_u8; 32];
     OsRng.fill_bytes(&mut salt);
     let mut nonce = [0_u8; NONCE_LEN];
@@ -217,7 +238,7 @@ pub fn seal_secret(host_key: &[u8; 32], field: &str, plaintext_b64: &str) -> Sea
             XNonce::from_slice(&nonce),
             Payload {
                 msg: plaintext_b64.as_bytes(),
-                aad: field.as_bytes(),
+                aad,
             },
         )
         .expect("XChaCha20-Poly1305 encryption never fails for valid keys");
@@ -229,10 +250,12 @@ pub fn seal_secret(host_key: &[u8; 32], field: &str, plaintext_b64: &str) -> Sea
     }
 }
 
-/// Decrypt one sealed entry back to its base64 secret string.
-pub fn open_entry(
+/// Decrypt one sealed entry back to its base64 secret string. `field` and `aad`
+/// must match the values used at seal time (see [`seal_secret`]).
+fn open_entry(
     host_key: &[u8; 32],
     field: &str,
+    aad: &[u8],
     entry: &SealedEntry,
 ) -> Result<Zeroizing<String>, SealError> {
     let salt = STANDARD
@@ -250,17 +273,21 @@ pub fn open_entry(
 
     let kek = derive_kek(host_key, &salt, field);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.as_slice()));
-    let plaintext = cipher
-        .decrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: &ciphertext,
-                aad: field.as_bytes(),
-            },
-        )
-        .map_err(|_| SealError::Decrypt)?;
-    let text = String::from_utf8(plaintext).map_err(|_| SealError::Decrypt)?;
-    Ok(Zeroizing::new(text))
+    // Hold the decrypted plaintext in Zeroizing so the buffer is wiped on every
+    // path, including the non-UTF-8 error branch below.
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| SealError::Decrypt)?,
+    );
+    let text = std::str::from_utf8(&plaintext).map_err(|_| SealError::Decrypt)?;
+    Ok(Zeroizing::new(text.to_owned()))
 }
 
 /// Read a sealed bundle from disk (the bundle itself is ciphertext, so it does
@@ -279,18 +306,30 @@ pub fn bundle_to_toml(bundle: &SealedBundle) -> String {
     toml::to_string(bundle).expect("sealed bundle always serializes")
 }
 
-/// Build a sealed bundle from `(field, base64-secret)` pairs.
+/// Seal `(field, base64-secret)` pairs into an existing bundle, in place. New
+/// fields are added; an existing field is re-sealed (overwritten). Entries are
+/// bound to `bundle.id`, so merging keeps every entry openable.
+pub fn seal_into<'a>(
+    bundle: &mut SealedBundle,
+    host_key: &[u8; 32],
+    secrets: impl IntoIterator<Item = (&'a str, &'a str)>,
+) {
+    for (field, plaintext_b64) in secrets {
+        let aad = entry_aad(bundle.version, &bundle.id, field);
+        bundle.entries.insert(
+            field.to_owned(),
+            seal_secret(host_key, field, &aad, plaintext_b64),
+        );
+    }
+}
+
+/// Build a fresh sealed bundle from `(field, base64-secret)` pairs.
 pub fn seal_all<'a>(
     host_key: &[u8; 32],
     secrets: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> SealedBundle {
     let mut bundle = SealedBundle::default();
-    for (field, plaintext_b64) in secrets {
-        bundle.entries.insert(
-            field.to_owned(),
-            seal_secret(host_key, field, plaintext_b64),
-        );
-    }
+    seal_into(&mut bundle, host_key, secrets);
     bundle
 }
 
@@ -311,7 +350,8 @@ pub fn open_sealed_reference(
             field: field.to_owned(),
         })?;
     let host_key = load_host_key(over)?;
-    open_entry(&host_key, field, entry)
+    let aad = entry_aad(bundle.version, &bundle.id, field);
+    open_entry(&host_key, field, &aad, entry)
 }
 
 #[cfg(test)]
@@ -329,18 +369,22 @@ mod tests {
     fn seal_open_round_trips() {
         let (_dir, key) = temp_host_key();
         let secret = "c2VjcmV0LXBzay1iYXNlNjQtdmFsdWUtMzJieXRlcw==";
-        let entry = seal_secret(&key, "crypto.psk", secret);
-        let opened = open_entry(&key, "crypto.psk", &entry).unwrap();
+        let aad = entry_aad(BUNDLE_VERSION, "test-id", "crypto.psk");
+        let entry = seal_secret(&key, "crypto.psk", &aad, secret);
+        let opened = open_entry(&key, "crypto.psk", &aad, &entry).unwrap();
         assert_eq!(opened.as_str(), secret);
     }
 
     #[test]
     fn open_with_wrong_field_fails() {
         let (_dir, key) = temp_host_key();
-        let entry = seal_secret(&key, "crypto.psk", "AAAA");
-        // The field is bound as AAD, so decrypting under another name must fail.
+        let aad = entry_aad(BUNDLE_VERSION, "test-id", "crypto.psk");
+        let entry = seal_secret(&key, "crypto.psk", &aad, "AAAA");
+        // The field is bound (KEK info + AAD), so decrypting under another name
+        // must fail.
+        let wrong_aad = entry_aad(BUNDLE_VERSION, "test-id", "server.private_key");
         assert!(matches!(
-            open_entry(&key, "server.private_key", &entry),
+            open_entry(&key, "server.private_key", &wrong_aad, &entry),
             Err(SealError::Decrypt)
         ));
     }
@@ -349,9 +393,24 @@ mod tests {
     fn open_with_wrong_host_key_fails() {
         let (_dir_a, key_a) = temp_host_key();
         let (_dir_b, key_b) = temp_host_key();
-        let entry = seal_secret(&key_a, "crypto.psk", "AAAA");
+        let aad = entry_aad(BUNDLE_VERSION, "test-id", "crypto.psk");
+        let entry = seal_secret(&key_a, "crypto.psk", &aad, "AAAA");
         assert!(matches!(
-            open_entry(&key_b, "crypto.psk", &entry),
+            open_entry(&key_b, "crypto.psk", &aad, &entry),
+            Err(SealError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn entry_does_not_open_after_bundle_transplant() {
+        // An entry sealed into one bundle must not decrypt under another bundle's
+        // id, even with the same host key and field — defeats transplant/rollback.
+        let (_dir, key) = temp_host_key();
+        let aad_a = entry_aad(BUNDLE_VERSION, "bundle-a", "crypto.psk");
+        let entry = seal_secret(&key, "crypto.psk", &aad_a, "AAAA");
+        let aad_b = entry_aad(BUNDLE_VERSION, "bundle-b", "crypto.psk");
+        assert!(matches!(
+            open_entry(&key, "crypto.psk", &aad_b, &entry),
             Err(SealError::Decrypt)
         ));
     }
@@ -381,13 +440,29 @@ mod tests {
         let text = bundle_to_toml(&bundle);
         let parsed: SealedBundle = toml::from_str(&text).unwrap();
         assert_eq!(parsed.version, BUNDLE_VERSION);
+        assert_eq!(parsed.id, bundle.id);
+        let aad = entry_aad(parsed.version, &parsed.id, "server.private_key");
         let opened = open_entry(
             &key,
             "server.private_key",
+            &aad,
             &parsed.entries["server.private_key"],
         )
         .unwrap();
         assert_eq!(opened.as_str(), "BBBB");
+    }
+
+    #[test]
+    fn seal_into_merges_without_dropping_existing_entries() {
+        let (_dir, key) = temp_host_key();
+        let mut bundle = seal_all(&key, [("crypto.psk", "AAAA")]);
+        seal_into(&mut bundle, &key, [("server.private_key", "BBBB")]);
+        // Both the pre-existing and the merged-in entry remain openable.
+        for (field, expected) in [("crypto.psk", "AAAA"), ("server.private_key", "BBBB")] {
+            let aad = entry_aad(bundle.version, &bundle.id, field);
+            let opened = open_entry(&key, field, &aad, &bundle.entries[field]).unwrap();
+            assert_eq!(opened.as_str(), expected);
+        }
     }
 
     #[test]
