@@ -36,7 +36,6 @@ core = [
 core_triggers = [
   "Cargo.toml",
   "Cargo.lock",
-  "vendor/**",
   "fuzz/Cargo.toml",
   "fuzz/Cargo.lock",
   "fuzz/ci/target-map.toml",

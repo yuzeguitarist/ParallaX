@@ -9,10 +9,6 @@ name: CodeQL
 #     template's `python` leg was dropped: the only git-tracked Python is
 #     fuzz/seeds/gen_h1_seeds.py (a one-off seed generator); the rest lives in
 #     gitignored code_refs/ and is never checked out in CI.
-#   - Vendored third-party forks (vendor/rustls, vendor/quinn-proto — pulled in
-#     via [patch.crates-io] path deps) are excluded from analysis below; they are
-#     not first-party code and their supply-chain risk is tracked separately by
-#     cargo-deny.yml / claude-dependency-audit.yml.
 #   - Actions are SHA-pinned with a version comment, matching this repo's
 #     convention (see actions/checkout pins) and kept fresh by Dependabot.
 
@@ -71,12 +67,6 @@ jobs:
           # Actions workflows. Drop to the default suite (remove this line) if the
           # Security tab gets too noisy.
           queries: security-extended
-          # CodeQL `paths-ignore` is honored for Rust under build-mode none.
-          # vendor/** = the vendored rustls / quinn-proto forks; scan only
-          # ParallaX's own sources.
-          config: |
-            paths-ignore:
-              - vendor/**
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2

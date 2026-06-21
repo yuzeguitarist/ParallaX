@@ -15,7 +15,6 @@ on:
     paths:
       - 'src/**'
       - 'fuzz/**'
-      - 'vendor/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'fuzz/ci/target-map.toml'
