@@ -25,6 +25,14 @@ What you MAY NOT do
       * integrating it into a commercial product or service
       * building a competing product on top of it, at any scale
       * re-skinning / renaming a fork and selling it as your own
+  - any AI / ML use, including (non-exhaustive):
+      * using the repository (code, history, docs, or any part) as
+        training, fine-tuning, or evaluation data for any model
+      * distilling or extracting it into a model, dataset, or
+        generative artifact
+      * scraping / bulk-downloading it to build an AI training corpus
+    See AI_USAGE.md for the full, binding AI/ML restrictions. Public
+    availability is not consent to AI/ML training.
 
 Conditions on every copy, fork, and modified version
 ----------------------------------------------------

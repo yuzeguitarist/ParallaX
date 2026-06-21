@@ -43,17 +43,6 @@ hkdf = "0.12"
 hmac = "0.12"
 libc = "0.2"
 rand = "0.8"
-# QUIC fast-plane (TUDP) data path. quinn 0.11 exposes no aws-lc-rs backend for
-# quinn-proto's QUIC transport crypto, so `ring` is required there and is linked
-# unconditionally; the TLS handshake and all of ParallaX's other crypto stay on
-# aws-lc-rs. rustls therefore compiles with BOTH providers and installs no process
-# default, so every rustls config here MUST use builder_with_provider(aws_lc_rs).
-# rustls is pinned (=0.23.40) to stay in lockstep with quinn-proto's Quic*Config.
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
-# Direct dep ONLY to name `quinn_proto::transport_parameters::TransportParameters`
-# in the Safari QUIC Session seam (quinn does not re-export that type). Pinned to
-# the exact version quinn 0.11 resolves so no second quinn-proto is linked.
-quinn-proto = { version = "=0.11.14", default-features = false }
 rcgen = "0.13"
 # Safe wrappers for the libc syscalls ParallaX makes directly (geteuid, flock,
 # getrlimit/setrlimit, page_size, recv(MSG_PEEK), poll, splice, pipe2,
@@ -116,21 +105,3 @@ strip = false
 lto = "thin"
 codegen-units = 1
 
-# rustls is consumed UNFORKED from crates.io. Phase 1 of de-vendoring replaced the
-# production QUIC client TLS engine with ParallaX's own hand-written `src/tls/quic`
-# (no rustls), so the former vendored-rustls fork — which existed solely to shape
-# the Safari-26 H3 QUIC ClientHello — has been removed. rustls now serves only the
-# TCP camouflage splice, the server `QuicServerConfig`, native-certs, and the
-# dev/test oracle, all on the upstream-identical path.
-[patch.crates-io]
-# Vendored quinn-proto 0.11.14 (path patch) — surgical fork with EXACTLY ONE
-# delta: cid_queue.rs CidQueue::LEN 5 -> 64, so the client tracks (and advertises)
-# active_connection_id_limit = 64, matching Safari-26's disassembly-confirmed
-# value. The crate name/version are unchanged, so this redirects BOTH our direct
-# `quinn-proto = "=0.11.14"` dependency and quinn 0.11.9's internal `proto` to the
-# fork; quinn does not touch CidQueue, so the patch is transparent to it. Pinned
-# =0.11.14 lockstep with rustls 0.23.40. The fork delta, re-apply procedure, and
-# RUSTSEC tracking are documented in vendor/quinn-proto/PARALLAX_FORK.md (cargo
-# audit does NOT flag a path-patched dependency). Phase 2 (hand-written QUIC
-# transport) will remove this last vendored fork too.
-quinn-proto = { path = "vendor/quinn-proto" }

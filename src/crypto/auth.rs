@@ -542,24 +542,51 @@ mod tests {
 
     #[test]
     fn verifies_masked_stateful_client_random_and_tail() {
-        let mut hello = client_hello_fixture("example.com");
+        // Shares the construction with `valid_authed_hello`; this case additionally
+        // asserts the recovered key_share / timestamp / nonce round-trip. The
+        // fixture's client_random ([0x22; 32]) is the ParallaX public key share.
+        let public = parse_client_hello(&client_hello_fixture(TEST_SNI))
+            .unwrap()
+            .client_random;
+        let auth = recover_and_verify(&valid_authed_hello(TEST_SNI));
+
+        assert!(auth.authenticated);
+        assert_eq!(auth.x25519_key_share, Some(public));
+        assert_eq!(auth.timestamp, Some(TEST_TIMESTAMP));
+        assert_eq!(auth.nonce, Some(TEST_NONCE));
+    }
+
+    // ---- Issue #50 (#3): field-mutation / negative property tests ----
+    //
+    // Every authenticated field must fail verification when mutated. Replay is NOT
+    // tested here: this layer is stateless, so replay rejection is enforced and
+    // tested in crypto/replay.rs. The reject path's crypto-work / X25519-op-count
+    // uniformity (missing key_share / recover-None / auth-fail) is a property of
+    // handshake::server::decide_connection_inbound and is tested there
+    // (rejection_path_x25519_count_*); this layer performs no DH.
+
+    const TEST_SNI: &str = "example.com";
+    const TEST_PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
+    const TEST_MASK_ECDH: [u8; 32] = [0x55_u8; 32];
+    const TEST_TIMESTAMP: u64 = 1_700_000_000;
+    const TEST_NONCE: [u8; AUTH_NONCE_LEN] = [7_u8; AUTH_NONCE_LEN];
+
+    /// Builds a fully valid masked-stateful authenticated ClientHello for `sni`.
+    fn valid_authed_hello(sni: &str) -> Vec<u8> {
+        let mut hello = client_hello_fixture(sni);
         let parsed = parse_client_hello(&hello).unwrap();
         let public = parsed.client_random;
-        let psk = b"0123456789abcdef0123456789abcdef";
-        let auth_key = psk;
-        let mask_ecdh = [0x55_u8; 32];
         let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
-        tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&1234_u64.to_be_bytes());
-        tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&[7_u8; AUTH_NONCE_LEN]);
+        tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&TEST_TIMESTAMP.to_be_bytes());
+        tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&TEST_NONCE);
         let encoded_random =
-            build_masked_stateful_client_random(psk, &mask_ecdh, "example.com", &public, &tail)
+            build_masked_stateful_client_random(TEST_PSK, &TEST_MASK_ECDH, sni, &public, &tail)
                 .unwrap();
-        assert_ne!(encoded_random, public);
         let session_id = build_masked_stateful_auth_session_id(
-            psk,
-            &mask_ecdh,
-            auth_key,
-            "example.com",
+            TEST_PSK,
+            &TEST_MASK_ECDH,
+            TEST_PSK,
+            sni,
             &public,
             &encoded_random,
             &tail,
@@ -568,17 +595,153 @@ mod tests {
         let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
         hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
         hello[parsed.session_id_range].copy_from_slice(&session_id);
+        hello
+    }
 
-        let material = recover_stateful_auth_material(&hello, psk, &mask_ecdh)
+    fn recover_and_verify(hello: &[u8]) -> ClientAuth {
+        let material = recover_material(hello);
+        verify_masked_stateful_client_hello_auth_with_material(hello, TEST_PSK, &material).unwrap()
+    }
+
+    /// Recovers the stateful auth material for `hello` under the test PSK/mask.
+    /// Shared by the field-mutation tests, which then perturb one recovered field.
+    fn recover_material(hello: &[u8]) -> StatefulAuthMaterial {
+        recover_stateful_auth_material(hello, TEST_PSK, &TEST_MASK_ECDH)
             .unwrap()
-            .unwrap();
-        let auth =
-            verify_masked_stateful_client_hello_auth_with_material(&hello, auth_key, &material)
-                .unwrap();
+            .unwrap()
+    }
 
-        assert!(auth.authenticated);
-        assert_eq!(auth.x25519_key_share, Some(public));
-        assert_eq!(auth.timestamp, Some(1234));
-        assert_eq!(auth.nonce, Some([7_u8; AUTH_NONCE_LEN]));
+    #[test]
+    fn unmutated_hello_authenticates() {
+        assert!(recover_and_verify(&valid_authed_hello(TEST_SNI)).authenticated);
+    }
+
+    #[test]
+    fn changing_sni_fails() {
+        // Same-length host swap so record offsets are unchanged; the SNI is bound
+        // into both the carrier masks and the auth tag, so verification must fail.
+        let mut hello = valid_authed_hello(TEST_SNI);
+        let pos = hello
+            .windows(TEST_SNI.len())
+            .position(|w| w == TEST_SNI.as_bytes())
+            .expect("sni present in record");
+        hello[pos..pos + TEST_SNI.len()].copy_from_slice(b"example.net");
+        assert!(!recover_and_verify(&hello).authenticated);
+    }
+
+    #[test]
+    fn changing_encoded_client_random_fails() {
+        let mut hello = valid_authed_hello(TEST_SNI);
+        let random_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2;
+        hello[random_offset] ^= 0x01;
+        assert!(!recover_and_verify(&hello).authenticated);
+    }
+
+    #[test]
+    fn changing_encoded_tail_fails() {
+        let mut hello = valid_authed_hello(TEST_SNI);
+        let parsed = parse_client_hello(&hello).unwrap();
+        // The encoded tail occupies session_id[AUTH_TAG_LEN..].
+        let tail_start = parsed.session_id_range.start + AUTH_TAG_LEN;
+        hello[tail_start] ^= 0x01;
+        assert!(!recover_and_verify(&hello).authenticated);
+    }
+
+    #[test]
+    fn changing_auth_tag_fails() {
+        let mut hello = valid_authed_hello(TEST_SNI);
+        let parsed = parse_client_hello(&hello).unwrap();
+        // The tag occupies session_id[..AUTH_TAG_LEN].
+        hello[parsed.session_id_range.start] ^= 0x01;
+        assert!(!recover_and_verify(&hello).authenticated);
+    }
+
+    #[test]
+    fn changing_parallax_public_key_fails() {
+        // Mutate the recovered ParallaX public key only; the record (and thus the
+        // stored tag) is unchanged, so the recomputed tag must no longer match.
+        let hello = valid_authed_hello(TEST_SNI);
+        let mut material = recover_material(&hello);
+        material.x25519_public[0] ^= 0x01;
+        let auth =
+            verify_masked_stateful_client_hello_auth_with_material(&hello, TEST_PSK, &material)
+                .unwrap();
+        assert!(!auth.authenticated);
+    }
+
+    #[test]
+    fn changing_timestamp_fails() {
+        let hello = valid_authed_hello(TEST_SNI);
+        let mut material = recover_material(&hello);
+        material.tail[0] ^= 0x01; // first timestamp byte
+        let auth =
+            verify_masked_stateful_client_hello_auth_with_material(&hello, TEST_PSK, &material)
+                .unwrap();
+        assert!(!auth.authenticated);
+    }
+
+    #[test]
+    fn changing_nonce_fails() {
+        let hello = valid_authed_hello(TEST_SNI);
+        let mut material = recover_material(&hello);
+        material.tail[AUTH_TIMESTAMP_LEN] ^= 0x01; // first nonce byte
+        let auth =
+            verify_masked_stateful_client_hello_auth_with_material(&hello, TEST_PSK, &material)
+                .unwrap();
+        assert!(!auth.authenticated);
+    }
+
+    #[test]
+    fn wrong_psk_fails() {
+        let hello = valid_authed_hello(TEST_SNI);
+        let material = recover_material(&hello);
+        let auth = verify_masked_stateful_client_hello_auth_with_material(
+            &hello,
+            b"a totally different 32-byte psk!",
+            &material,
+        )
+        .unwrap();
+        assert!(!auth.authenticated);
+    }
+
+    #[test]
+    fn missing_sni_is_unauthenticated_without_extra_oracle() {
+        // A ClientHello with a valid 32-byte session_id but NO SNI: verification
+        // must report unauthenticated. The returned ClientAuth still exposes the
+        // material-derived timestamp/nonce/key_share (intended, uniform shape) so
+        // the missing-SNI path is not a distinguishable oracle beyond "not authed".
+        use crate::tls::client_hello::tests::client_hello_fixture_with_key_share_no_sni;
+        let hello = client_hello_fixture_with_key_share_no_sni(&[0x22_u8; 32]);
+        let mut tail = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+        tail[..AUTH_TIMESTAMP_LEN].copy_from_slice(&TEST_TIMESTAMP.to_be_bytes());
+        tail[AUTH_TIMESTAMP_LEN..].copy_from_slice(&TEST_NONCE);
+        let material = StatefulAuthMaterial {
+            x25519_public: [0x22_u8; 32],
+            tail,
+        };
+        let auth =
+            verify_masked_stateful_client_hello_auth_with_material(&hello, TEST_PSK, &material)
+                .unwrap();
+        assert!(!auth.authenticated);
+        assert_eq!(auth.sni, None);
+        assert_eq!(auth.x25519_key_share, Some([0x22_u8; 32]));
+        assert_eq!(auth.timestamp, Some(TEST_TIMESTAMP));
+        assert_eq!(auth.nonce, Some(TEST_NONCE));
+    }
+
+    #[test]
+    fn empty_auth_key_is_rejected() {
+        // An empty auth key short-circuits to EmptyPsk before any recovered
+        // material or stored tag is read, so a parseable hello plus a placeholder
+        // material is enough to exercise the guard — no recover scaffolding needed.
+        let hello = valid_authed_hello(TEST_SNI);
+        let material = StatefulAuthMaterial {
+            x25519_public: [0_u8; 32],
+            tail: [0_u8; STATEFUL_AUTH_TAIL_LEN],
+        };
+        assert!(matches!(
+            verify_masked_stateful_client_hello_auth_with_material(&hello, b"", &material),
+            Err(AuthError::EmptyPsk)
+        ));
     }
 }

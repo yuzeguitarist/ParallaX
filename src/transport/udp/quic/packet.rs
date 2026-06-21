@@ -28,6 +28,10 @@ const SPIN_BIT: u8 = 0x20;
 const KEY_PHASE_BIT: u8 = 0x04;
 const PN_LEN_MASK: u8 = 0x03;
 const LONG_TYPE_MASK: u8 = 0x30;
+/// Reserved bits that MUST be zero once header protection is removed (RFC 9000
+/// §17.2 long header / §17.3 short header).
+const LONG_RESERVED_BITS: u8 = 0x0c;
+const SHORT_RESERVED_BITS: u8 = 0x18;
 
 /// Long-header packet type — the 2 bits below the form + fixed bits (RFC 9000
 /// §17.2).
@@ -72,6 +76,10 @@ pub enum DecodeError {
     /// A long-header type the relay does not process at the transport layer
     /// (0-RTT, Retry, Version Negotiation). See module scope.
     UnsupportedPacketType,
+    /// A reserved bit in the (already-unmasked) first byte was set. RFC 9000
+    /// §17.2 (long, bits 0x0c) / §17.3 (short, bits 0x18) require them clear once
+    /// header protection is removed; a set bit is a PROTOCOL_VIOLATION.
+    ReservedBitsSet,
 }
 
 /// A QUIC connection id (RFC 9000 §5.1): an inline buffer of up to
@@ -196,6 +204,32 @@ pub enum Header {
 }
 
 impl Header {
+    /// The (full, reconstructed) packet number this header carries.
+    pub fn packet_number(&self) -> u64 {
+        match self {
+            Header::Long { packet_number, .. } | Header::Short { packet_number, .. } => {
+                *packet_number
+            }
+        }
+    }
+
+    /// The on-wire packet-number length (1..=4).
+    pub fn pn_len(&self) -> usize {
+        match self {
+            Header::Long { pn_len, .. } | Header::Short { pn_len, .. } => *pn_len,
+        }
+    }
+
+    /// Overwrite the packet number — used after reconstructing the full value from
+    /// the truncated wire bytes (RFC 9000 Appendix A.3) during decode.
+    pub fn set_packet_number(&mut self, pn: u64) {
+        match self {
+            Header::Long { packet_number, .. } | Header::Short { packet_number, .. } => {
+                *packet_number = pn;
+            }
+        }
+    }
+
     /// Serialize the header (through the plaintext packet number) into `out`, and
     /// return the byte offset of the packet-number field (the HP `pn_offset`). The
     /// written bytes are the AEAD AAD.
@@ -255,9 +289,18 @@ impl Header {
     /// Decode a header whose first byte and packet number have ALREADY been
     /// unmasked (header protection removed). `local_cid_len` is the length of the
     /// destination CID this endpoint issues — needed for short headers, whose DCID
-    /// has no on-wire length prefix (zero for the Safari client). Returns the
-    /// header and the AAD length (offset of the first protected payload byte).
-    pub fn decode(buf: &[u8], local_cid_len: usize) -> Result<(Header, usize), DecodeError> {
+    /// has no on-wire length prefix (zero for the Safari client). `largest_pn` is
+    /// the largest packet number already processed in this packet-number space; it
+    /// reconstructs the full packet number from its truncated wire form (RFC 9000
+    /// §17.1 / Appendix A.3), so the returned `packet_number` is ALWAYS the full
+    /// value (the same domain [`Header::encode`] is given), never the truncated
+    /// bytes. Returns the header and the AAD length (offset of the first protected
+    /// payload byte).
+    pub fn decode(
+        buf: &[u8],
+        local_cid_len: usize,
+        largest_pn: u64,
+    ) -> Result<(Header, usize), DecodeError> {
         let first = *buf.first().ok_or(DecodeError::Truncated)?;
         if first & FIXED_BIT == 0 {
             return Err(DecodeError::MissingFixedBit);
@@ -266,6 +309,9 @@ impl Header {
             let ty = LongType::from_first_byte(first);
             if ty != LongType::Initial && ty != LongType::Handshake {
                 return Err(DecodeError::UnsupportedPacketType);
+            }
+            if first & LONG_RESERVED_BITS != 0 {
+                return Err(DecodeError::ReservedBitsSet);
             }
             let mut c = Cursor::new(buf);
             c.skip(1)?; // first byte
@@ -281,7 +327,8 @@ impl Header {
             let length = c.varint()?;
             let pn_offset = c.pos();
             let pn_len = ((first & PN_LEN_MASK) + 1) as usize;
-            let packet_number = read_pn(buf, pn_offset, pn_len)?;
+            let packet_number =
+                decode_packet_number(largest_pn, read_pn(buf, pn_offset, pn_len)?, pn_len);
             Ok((
                 Header::Long {
                     ty,
@@ -296,10 +343,14 @@ impl Header {
                 pn_offset + pn_len,
             ))
         } else {
+            if first & SHORT_RESERVED_BITS != 0 {
+                return Err(DecodeError::ReservedBitsSet);
+            }
             let pn_offset = 1 + local_cid_len;
             let dcid = ConnectionId::new(buf.get(1..pn_offset).ok_or(DecodeError::Truncated)?);
             let pn_len = ((first & PN_LEN_MASK) + 1) as usize;
-            let packet_number = read_pn(buf, pn_offset, pn_len)?;
+            let packet_number =
+                decode_packet_number(largest_pn, read_pn(buf, pn_offset, pn_len)?, pn_len);
             Ok((
                 Header::Short {
                     spin: first & SPIN_BIT != 0,
@@ -354,6 +405,84 @@ fn read_pn(buf: &[u8], pn_offset: usize, pn_len: usize) -> Result<u64, DecodeErr
         pn = (pn << 8) | u64::from(b);
     }
     Ok(pn)
+}
+
+/// The three packet-number spaces a received packet can map to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketSpace {
+    Initial,
+    Handshake,
+    OneRtt,
+}
+
+/// Classify a received datagram's first packet by space, from its (still
+/// HP-masked) first byte — the long-header form + type bits are not header-
+/// protected (RFC 9001 §5.4.2). Returns `None` for a clear fixed bit or an
+/// unsupported long type (0-RTT / Retry / Version Negotiation).
+pub fn first_packet_space(datagram: &[u8]) -> Option<PacketSpace> {
+    let first = *datagram.first()?;
+    if first & FIXED_BIT == 0 {
+        return None;
+    }
+    if first & LONG_HEADER_FORM == 0 {
+        return Some(PacketSpace::OneRtt);
+    }
+    match LongType::from_first_byte(first) {
+        LongType::Initial => Some(PacketSpace::Initial),
+        LongType::Handshake => Some(PacketSpace::Handshake),
+        LongType::ZeroRtt | LongType::Retry => None,
+    }
+}
+
+/// Peek the destination + source connection ids of a long-header packet WITHOUT
+/// removing header protection (the CIDs are plaintext). The server uses this on
+/// the client's first Initial to derive Initial keys from the chosen DCID and to
+/// learn the client's SCID before it can decrypt anything.
+pub fn peek_long_cids(datagram: &[u8]) -> Result<(ConnectionId, ConnectionId), DecodeError> {
+    let first = *datagram.first().ok_or(DecodeError::Truncated)?;
+    if first & LONG_HEADER_FORM == 0 {
+        return Err(DecodeError::UnsupportedPacketType);
+    }
+    let mut c = Cursor::new(datagram);
+    c.skip(1)?;
+    c.skip(4)?; // version
+    let dcid = c.cid()?;
+    let scid = c.cid()?;
+    Ok((dcid, scid))
+}
+
+/// The total on-wire size of the long-header packet at the start of `buf`, used
+/// to find the next packet when several are coalesced into one datagram (RFC 9000
+/// §12.2). It is the header length through the §17.2 Length field plus the Length
+/// value (which covers the packet number + protected payload + AEAD tag). Reads
+/// only plaintext header fields, so it is valid BEFORE header protection is
+/// removed. Returns `None` for a short header (no Length field — a 1-RTT packet
+/// runs to the end of the datagram and so is always the last coalesced packet),
+/// for an unsupported long type, or for a truncated/clear-fixed-bit header.
+pub fn long_packet_len(buf: &[u8]) -> Option<usize> {
+    let first = *buf.first()?;
+    if first & FIXED_BIT == 0 || first & LONG_HEADER_FORM == 0 {
+        return None;
+    }
+    let ty = LongType::from_first_byte(first);
+    if ty != LongType::Initial && ty != LongType::Handshake {
+        return None;
+    }
+    let mut c = Cursor::new(buf);
+    c.skip(1).ok()?; // first byte
+    c.skip(4).ok()?; // version
+    c.cid().ok()?; // dcid
+    c.cid().ok()?; // scid
+    if ty == LongType::Initial {
+        let tlen = usize::try_from(c.varint().ok()?).ok()?;
+        c.skip(tlen).ok()?;
+    }
+    let length = usize::try_from(c.varint().ok()?).ok()?;
+    // Reject a Length that points past the datagram (a malformed long header must
+    // not yield a coalescing boundary outside `buf`); `usize::try_from` also avoids
+    // a silent `as usize` truncation on a 32-bit target.
+    let total = c.pos().checked_add(length)?;
+    (total <= buf.len()).then_some(total)
 }
 
 /// A minimal forward cursor over a header buffer.
@@ -476,7 +605,7 @@ mod tests {
         let mut out = Vec::new();
         let pn_offset = hdr.encode(&mut out);
         assert_eq!(locate_pn_offset(&out, 0).unwrap(), pn_offset);
-        let (decoded, aad_len) = Header::decode(&out, 0).unwrap();
+        let (decoded, aad_len) = Header::decode(&out, 0, 0).unwrap();
         assert_eq!(decoded, hdr);
         assert_eq!(aad_len, out.len());
     }
@@ -493,7 +622,7 @@ mod tests {
         let mut out = Vec::new();
         let pn_offset = hdr.encode(&mut out);
         assert_eq!(locate_pn_offset(&out, 8).unwrap(), pn_offset);
-        let (decoded, _) = Header::decode(&out, 8).unwrap();
+        let (decoded, _) = Header::decode(&out, 8, 0).unwrap();
         assert_eq!(decoded, hdr);
     }
 
@@ -502,13 +631,13 @@ mod tests {
         // Retry (type bits 0x30) is not transport-processed.
         let retry = vec![LONG_HEADER_FORM | FIXED_BIT | 0x30, 0, 0, 0, 1, 0, 0];
         assert_eq!(
-            Header::decode(&retry, 0),
+            Header::decode(&retry, 0, 0),
             Err(DecodeError::UnsupportedPacketType)
         );
         // Clear fixed bit on an otherwise-short header.
         let no_fixed = vec![0x00, 0x00];
         assert_eq!(
-            Header::decode(&no_fixed, 0),
+            Header::decode(&no_fixed, 0, 0),
             Err(DecodeError::MissingFixedBit)
         );
     }
@@ -554,7 +683,7 @@ mod tests {
         let located = locate_pn_offset(&packet, 0).unwrap();
         assert_eq!(located, pn_offset);
         keys.header.decrypt_header(located, &mut packet).unwrap();
-        let (decoded, aad_len) = Header::decode(&packet, 0).unwrap();
+        let (decoded, aad_len) = Header::decode(&packet, 0, 0).unwrap();
         assert_eq!(decoded, hdr);
         let aad2 = packet[..aad_len].to_vec();
         let pt = keys
@@ -562,5 +691,204 @@ mod tests {
             .decrypt_in_place(pn, &aad2, &mut packet[aad_len..])
             .unwrap();
         assert_eq!(pt, payload);
+    }
+
+    #[test]
+    fn header_decode_reconstructs_full_packet_number() {
+        // Full PN 0xa82f9b32 truncates to 2 wire bytes (0x9b32) against largest
+        // 0xa82f30ea; decode MUST return the FULL value (RFC 9000 A.3), not the
+        // truncated bytes — otherwise the AEAD nonce (iv XOR full pn) is wrong.
+        let largest = 0xa82f30ea;
+        let full_pn = 0xa82f9b32;
+        let (_, pn_len) = encode_packet_number(full_pn, Some(largest));
+        assert_eq!(pn_len, 2);
+        let hdr = Header::Long {
+            ty: LongType::Handshake,
+            version: 1,
+            dcid: ConnectionId::new(&[9, 9, 9, 9]),
+            scid: ConnectionId::new(&[]),
+            token: vec![],
+            length: 0,
+            packet_number: full_pn,
+            pn_len,
+        };
+        let mut out = Vec::new();
+        hdr.encode(&mut out);
+        let (decoded, _) = Header::decode(&out, 0, largest).unwrap();
+        assert_eq!(decoded, hdr);
+        match decoded {
+            Header::Long { packet_number, .. } => assert_eq!(packet_number, 0xa82f9b32),
+            _ => panic!("expected long header"),
+        }
+    }
+
+    #[test]
+    fn long_packet_len_finds_the_coalesced_boundary() {
+        // Two long-header packets concatenated into one datagram (RFC 9000 §12.2):
+        // `long_packet_len` of the buffer MUST return exactly the first packet's
+        // size, so the receiver lands on the start of the second.
+        let mk = |ty, pn: u64, payload: usize| {
+            let (_, pn_len) = encode_packet_number(pn, None);
+            let length = (pn_len + payload + 16) as u64; // + AEAD tag
+            let hdr = Header::Long {
+                ty,
+                version: 1,
+                dcid: ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]),
+                scid: ConnectionId::new(&[9, 9]),
+                token: vec![],
+                length,
+                packet_number: pn,
+                pn_len,
+            };
+            let mut out = Vec::new();
+            let pn_offset = hdr.encode(&mut out);
+            out.resize(pn_offset + length as usize, 0); // payload + tag bytes
+            out
+        };
+        let first = mk(LongType::Initial, 0, 40);
+        let second = mk(LongType::Handshake, 0, 25);
+        let first_len = first.len();
+        let mut datagram = first;
+        datagram.extend_from_slice(&second);
+
+        assert_eq!(
+            long_packet_len(&datagram),
+            Some(first_len),
+            "boundary is exactly the first packet's on-wire size"
+        );
+        // The second packet is a long header too, but it is the last → its own
+        // length still resolves (no trailing packet to find, but the value is the
+        // packet size).
+        assert_eq!(long_packet_len(&datagram[first_len..]), Some(second.len()));
+        // A short header has no Length field → None (it is always last).
+        let short = {
+            let hdr = Header::Short {
+                spin: false,
+                key_phase: false,
+                dcid: ConnectionId::new(&[]),
+                packet_number: 1,
+                pn_len: 1,
+            };
+            let mut out = Vec::new();
+            hdr.encode(&mut out);
+            out.extend_from_slice(&[0u8; 20]);
+            out
+        };
+        assert_eq!(long_packet_len(&short), None);
+    }
+
+    #[test]
+    fn decode_rejects_reserved_bits() {
+        let hdr = Header::Long {
+            ty: LongType::Initial,
+            version: 1,
+            dcid: ConnectionId::new(&[1, 2, 3, 4]),
+            scid: ConnectionId::new(&[]),
+            token: vec![],
+            length: 17,
+            packet_number: 0,
+            pn_len: 1,
+        };
+        let mut out = Vec::new();
+        hdr.encode(&mut out);
+        out[0] |= 0x08; // set a long-header reserved bit (mask 0x0c)
+        assert_eq!(
+            Header::decode(&out, 0, 0),
+            Err(DecodeError::ReservedBitsSet)
+        );
+    }
+
+    #[test]
+    fn decode_packet_number_exercises_window_wraparound_branches() {
+        // The plain branch (no window adjustment).
+        assert_eq!(decode_packet_number(300, 0x05, 1), 261);
+        // ADD branch: truncated value belongs to the NEXT window up.
+        // largest 0x1ef -> expected 0x1f0; truncated 0x05 -> candidate 0x105 is
+        // >half a window below expected, so a window is added -> 0x205.
+        assert_eq!(decode_packet_number(0x1ef, 0x05, 1), 0x205);
+        // SUB branch: truncated value belongs to the PREVIOUS window down.
+        // largest 0x105 -> expected 0x106; truncated 0xfe -> candidate 0x1fe is
+        // >half a window above expected, so a window is subtracted -> 0xfe.
+        assert_eq!(decode_packet_number(0x105, 0xfe, 1), 0xfe);
+    }
+
+    // The compose test proves the layer ROUND-TRIPS against itself; the three
+    // tests below prove the AEAD/HP are not *self-consistently wrong* — i.e. a
+    // mistake shared by encrypt and decrypt (constant nonce, unauthenticated
+    // header, no-op header protection) that a plain round-trip would miss.
+
+    #[test]
+    fn aead_nonce_depends_on_packet_number() {
+        use crate::tls::quic::{CipherSuite, DirectionalKeys};
+        let keys =
+            DirectionalKeys::from_secret(CipherSuite::Aes128GcmSha256, &[0x11u8; 32]).unwrap();
+        let aad = b"quic-header";
+        let mut at5 = b"the same plaintext payload".to_vec();
+        at5.extend_from_slice(&[0u8; 16]);
+        let mut at6 = at5.clone();
+        keys.packet.encrypt_in_place(5, aad, &mut at5).unwrap();
+        keys.packet.encrypt_in_place(6, aad, &mut at6).unwrap();
+        assert_ne!(
+            at5, at6,
+            "AEAD output must depend on the packet number (nonce = iv XOR pn)"
+        );
+        // Opening pn=5's packet under pn=6 must fail the tag (the nonce is wrong).
+        assert!(
+            keys.packet.decrypt_in_place(6, aad, &mut at5).is_err(),
+            "decrypting with the wrong packet number must fail"
+        );
+    }
+
+    #[test]
+    fn aead_authenticates_the_header_aad() {
+        use crate::tls::quic::{CipherSuite, DirectionalKeys};
+        let keys =
+            DirectionalKeys::from_secret(CipherSuite::Aes128GcmSha256, &[0x33u8; 32]).unwrap();
+        let mut sealed = b"payload".to_vec();
+        sealed.extend_from_slice(&[0u8; 16]);
+        keys.packet
+            .encrypt_in_place(1, b"good-aad", &mut sealed)
+            .unwrap();
+        // A different AAD of the same length must fail to authenticate.
+        let mut tampered = sealed.clone();
+        assert!(
+            keys.packet
+                .decrypt_in_place(1, b"evil-aad", &mut tampered)
+                .is_err(),
+            "the header must be covered as AEAD AAD"
+        );
+    }
+
+    #[test]
+    fn header_protection_actually_masks_and_restores() {
+        use crate::tls::quic::{CipherSuite, DirectionalKeys};
+        let keys =
+            DirectionalKeys::from_secret(CipherSuite::Aes128GcmSha256, &[0x55u8; 32]).unwrap();
+        let hdr = Header::Long {
+            ty: LongType::Initial,
+            version: 1,
+            dcid: ConnectionId::new(&[1, 2, 3, 4]),
+            scid: ConnectionId::new(&[]),
+            token: vec![],
+            length: 1 + 16,
+            packet_number: 0x41,
+            pn_len: 1,
+        };
+        let mut pkt = Vec::new();
+        let pn_offset = hdr.encode(&mut pkt);
+        // The HP sample is 16 bytes at pn_offset+4; pad so it exists.
+        pkt.extend_from_slice(&[0xab; 32]);
+        let plain = pkt.clone();
+        keys.header.encrypt_header(pn_offset, &mut pkt).unwrap();
+        assert_ne!(
+            pkt[..pn_offset + 1],
+            plain[..pn_offset + 1],
+            "header protection must mask the first byte and packet number"
+        );
+        keys.header.decrypt_header(pn_offset, &mut pkt).unwrap();
+        assert_eq!(
+            pkt, plain,
+            "removing header protection must restore the bytes"
+        );
     }
 }

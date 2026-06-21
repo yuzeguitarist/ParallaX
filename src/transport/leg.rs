@@ -265,12 +265,14 @@ where
 /// keeps the exact `BufferedTlsRecordReader` record semantics but the underlying
 /// byte source is an [`H3DataFrameReader`] over the bidi `quinn::RecvStream`, and
 /// it OVERRIDES [`LegReader::is_clean_close`] for QUIC (RESET = truncation).
-pub(crate) struct H3DataFrameLegReader(TcpLegReader<H3DataFrameReader<quinn::RecvStream>>);
+pub(crate) struct H3DataFrameLegReader(
+    TcpLegReader<H3DataFrameReader<crate::transport::udp::quic::endpoint::RecvStream>>,
+);
 
 impl H3DataFrameLegReader {
-    /// Wrap a relay-bidi `quinn::RecvStream` in a DATA-frame de-framer + buffered
+    /// Wrap a relay-bidi QUIC `RecvStream` in a DATA-frame de-framer + buffered
     /// record reader.
-    pub(crate) fn buffered(reader: quinn::RecvStream) -> Self {
+    pub(crate) fn buffered(reader: crate::transport::udp::quic::endpoint::RecvStream) -> Self {
         Self(TcpLegReader::buffered(H3DataFrameReader::new(reader)))
     }
 }
@@ -298,9 +300,9 @@ impl LegReader for H3DataFrameLegReader {
 
 /// QUIC-stream record-writer leg that frames each record batch as one HTTP/3 DATA
 /// frame: it prepends a `DATA` frame header to every `write_records` batch (RFC
-/// 9114 §7.2.1) before writing to the reliable bidi `quinn::SendStream`.
+/// 9114 §7.2.1) before writing to the reliable bidi QUIC `SendStream`.
 /// `shutdown` finishes the stream (no trailing frame).
-pub(crate) struct H3DataFrameLegWriter(pub quinn::SendStream);
+pub(crate) struct H3DataFrameLegWriter(pub crate::transport::udp::quic::endpoint::SendStream);
 
 impl LegWriter for H3DataFrameLegWriter {
     async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -362,7 +364,7 @@ mod tests {
         // quinn opens a bidi stream lazily: the acceptor only observes it once
         // the opener writes, so open + first write + accept must run together.
         let opener = tokio::spawn(async move {
-            let (send, _recv) = client_conn.open_bi().await.expect("open_bi");
+            let (send, _recv) = client_conn.open_bi();
             let mut writer = H3DataFrameLegWriter(send);
 
             let mut seal = data_codec();
@@ -503,7 +505,7 @@ mod tests {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let opener = tokio::spawn(async move {
-            let (send, _recv) = client_conn.open_bi().await.expect("open_bi");
+            let (send, _recv) = client_conn.open_bi();
             let mut writer = H3DataFrameLegWriter(send);
             let mut seal = data_codec();
             let mut rng = StdRng::seed_from_u64(0xD474);
@@ -573,7 +575,7 @@ mod tests {
         let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
 
         let opener = tokio::spawn(async move {
-            let (send, _recv) = client_conn.open_bi().await.expect("open_bi");
+            let (send, _recv) = client_conn.open_bi();
             let mut writer = H3DataFrameLegWriter(send);
             let mut seal = data_codec();
             let mut rng = StdRng::seed_from_u64(0x4E5E7);
@@ -582,8 +584,7 @@ mod tests {
             let _ = proceed_rx.await;
             writer
                 .0
-                .reset(quinn::VarInt::from_u32(0))
-                .expect("reset stream");
+                .reset(crate::transport::udp::quic::endpoint::VarInt::from_u32(0));
             tokio::time::sleep(Duration::from_millis(200)).await;
             client_conn
         });
