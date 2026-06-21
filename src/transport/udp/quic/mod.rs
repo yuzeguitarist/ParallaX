@@ -25,8 +25,11 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod congestion;
+pub(crate) mod conn;
 pub(crate) mod frame;
 pub(crate) mod packet;
+pub(crate) mod recovery;
 pub(crate) mod spaces;
 pub(crate) mod transport_params;
 pub(crate) mod varint;
