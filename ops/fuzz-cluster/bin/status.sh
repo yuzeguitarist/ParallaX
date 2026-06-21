@@ -233,19 +233,23 @@ ensure_status_clone() {
   return 1
 }
 
-# Keep this throwaway clone bounded. The remote tag is force-collapsed to a
-# single commit every tick (see push_status), so each fetch leaves the previous
-# tip unreachable; aggressive *synchronous* auto-gc with immediate prune keeps
-# the local clone from slowly re-bloating the way the old append-history did.
-tune_status_clone() {
-  git -C "$WT" config gc.auto 400 2>/dev/null || true
-  git -C "$WT" config gc.pruneExpire now 2>/dev/null || true
-  git -C "$WT" config gc.autoDetach false 2>/dev/null || true
+# Reliably bound this throwaway clone. Do NOT trust `gc --auto` here: it estimates
+# the loose-object count from the objects/17 fanout dir (x256), and because every
+# tick force-fetches a fresh parentless root whose objects scatter, that estimate
+# stuck near 256 while the real count climbed past 700 — so auto-gc never fired.
+# Instead check the REAL loose count and hard-gc (repack + immediate prune of the
+# now-unreachable previous tips) once it crosses a small bound.
+gc_status_clone() {
+  local loose
+  loose="$(git -C "$WT" count-objects 2>/dev/null | awk '{print $1}')"
+  case "$loose" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$loose" -gt 300 ] || return 0
+  git -C "$WT" gc --prune=now --quiet 2>/dev/null || true
 }
 
 push_status() {
   ensure_status_clone || return 0
-  tune_status_clone
+  gc_status_clone
   git -C "$WT" remote set-url origin "$(auth_remote)" 2>/dev/null || true
 
   local i base tree commit
