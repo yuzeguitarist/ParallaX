@@ -474,11 +474,15 @@ pub fn long_packet_len(buf: &[u8]) -> Option<usize> {
     c.cid().ok()?; // dcid
     c.cid().ok()?; // scid
     if ty == LongType::Initial {
-        let tlen = c.varint().ok()? as usize;
+        let tlen = usize::try_from(c.varint().ok()?).ok()?;
         c.skip(tlen).ok()?;
     }
-    let length = c.varint().ok()? as usize;
-    c.pos().checked_add(length)
+    let length = usize::try_from(c.varint().ok()?).ok()?;
+    // Reject a Length that points past the datagram (a malformed long header must
+    // not yield a coalescing boundary outside `buf`); `usize::try_from` also avoids
+    // a silent `as usize` truncation on a 32-bit target.
+    let total = c.pos().checked_add(length)?;
+    (total <= buf.len()).then_some(total)
 }
 
 /// A minimal forward cursor over a header buffer.

@@ -2574,10 +2574,11 @@ async fn accept_probed_quic_from_peer(
     // L-6 source-IP filter: the ephemeral endpoint is reachable by anyone who
     // learns the port, so accept ONLY a connection whose source IP matches the
     // authenticated TCP peer. A connection from any other IP is an off-path racer
-    // trying to steal the single accept slot and force a TCP downgrade — close and
-    // drop it, then keep waiting (mirrors quinn's `Incoming::ignore()` pre-accept
-    // filter). The whole call is bounded by `probe_budget` at the call site, so a
-    // flood of mismatched connectors just times out to a safe TCP fallback.
+    // trying to steal the single accept slot and force a TCP downgrade — drop it
+    // SILENTLY (no CONNECTION_CLOSE, so the port stays unobservable; the dropped
+    // connection idle-times-out in the endpoint) and keep waiting. The whole call
+    // is bounded by `probe_budget` at the call site, so a flood of mismatched
+    // connectors just times out to a safe TCP fallback.
     let conn = loop {
         let c = udp_ep.accept().await?;
         if c.remote_address().ip() == expect_ip {
@@ -2588,10 +2589,7 @@ async fn accept_probed_quic_from_peer(
             peer = %c.remote_address(),
             "declining fast-plane QUIC from an unexpected source IP (L-6)"
         );
-        c.close(
-            crate::transport::udp::quic::endpoint::VarInt::from_u32(0),
-            b"",
-        );
+        drop(c); // silent: no CONNECTION_CLOSE on the wire (no response oracle)
     };
 
     // H3 stream order mirrors the client: open this endpoint's control stream
@@ -5337,21 +5335,22 @@ mod tests {
         .expect("bind server endpoint");
         let server_addr = server_ep.local_addr().unwrap();
 
-        // A loopback client connects (source IP 127.0.0.1).
+        // A loopback client connects (source IP 127.0.0.1). Establish it FIRST and
+        // assert the QUIC handshake actually completes, so the rejection below is
+        // proven to be the L-6 source-IP filter and not a failed/incomplete connect.
         let client_ep = crate::transport::udp::endpoint::bind_client_endpoint_accept_any(
             "127.0.0.1:0".parse().unwrap(),
         )
         .await
         .expect("bind client endpoint");
-        let connecting = tokio::spawn(async move {
-            let _ = client_ep.connect(server_addr, "localhost").await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            client_ep // keep the endpoint alive for the test duration
-        });
+        let _client_conn = client_ep
+            .connect(server_addr, "localhost")
+            .await
+            .expect("loopback client completes the QUIC handshake (reaches the server)");
 
         // Expect a DIFFERENT source IP (TEST-NET-3) than the loopback connector, so
-        // the connector is declined (L-6 source-IP filter) and NO connection is
-        // accepted within the budget.
+        // the now-established connection is declined (L-6 source-IP filter) and NO
+        // connection is accepted within the budget.
         let offer_id = [7_u8; 16];
         let accepted = tokio::time::timeout(
             Duration::from_millis(300),
@@ -5368,8 +5367,6 @@ mod tests {
             matches!(accepted, Err(_) | Ok(None)),
             "a connector from a non-authenticated source IP must not be accepted",
         );
-
-        connecting.abort();
     }
 
     #[test]

@@ -300,6 +300,16 @@ impl Frame<'_> {
 }
 
 fn encode_ack(ack: &Ack, out: &mut Vec<u8>) {
+    // An ACK frame always has at least the first (largest) range. The public field
+    // makes an empty-ranges Ack constructible; guard the indexing below so a misuse
+    // is a clear assertion in debug rather than a raw panic.
+    debug_assert!(
+        !ack.ranges.is_empty(),
+        "encode_ack requires at least one range"
+    );
+    if ack.ranges.is_empty() {
+        return;
+    }
     varint::encode(
         if ack.ecn.is_some() {
             FT_ACK_ECN

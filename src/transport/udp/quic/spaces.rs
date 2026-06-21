@@ -64,16 +64,26 @@ impl PacketNumberSpace {
 pub struct ReceivedPackets {
     /// Ascending, disjoint, non-adjacent inclusive ranges.
     ranges: Vec<(u64, u64)>,
+    /// Replay low-water mark: every packet number `<= low_water` is considered
+    /// already received, even after its range was evicted by [`Self::enforce_cap`].
+    /// Without this, evicting the lowest range would let a captured low-PN packet be
+    /// replayed (re-refreshing the idle timer / re-feeding RTT+CC). RFC 9000 §13.2.3
+    /// permits bounding the range set; below the watermark we fail safe to "duplicate".
+    low_water: Option<u64>,
 }
 
 impl ReceivedPackets {
     pub fn new() -> Self {
-        Self { ranges: Vec::new() }
+        Self {
+            ranges: Vec::new(),
+            low_water: None,
+        }
     }
 
     /// Whether `pn` has already been recorded (a duplicate / replay).
     pub fn contains(&self, pn: u64) -> bool {
-        self.ranges.iter().any(|&(lo, hi)| lo <= pn && pn <= hi)
+        self.low_water.is_some_and(|w| pn <= w)
+            || self.ranges.iter().any(|&(lo, hi)| lo <= pn && pn <= hi)
     }
 
     /// True until the first packet is recorded.
@@ -90,6 +100,11 @@ impl ReceivedPackets {
     /// duplicate (in which case the set is unchanged — the caller must drop the
     /// replayed packet without reprocessing it).
     pub fn insert(&mut self, pn: u64) -> bool {
+        // Below the replay low-water mark: already received (range was evicted), so
+        // treat as a duplicate and drop without reprocessing.
+        if self.low_water.is_some_and(|w| pn <= w) {
+            return false;
+        }
         // Find the first range whose high is >= pn-1 (the earliest range pn could
         // touch or extend). A linear scan is fine — the set is tiny.
         let mut i = 0;
@@ -131,7 +146,10 @@ impl ReceivedPackets {
     /// most one range is dropped per call.
     fn enforce_cap(&mut self) {
         if self.ranges.len() > MAX_ACK_RANGES {
-            self.ranges.remove(0);
+            let (_, hi) = self.ranges.remove(0);
+            // Everything up to the evicted range's high is now considered received
+            // (replay protection survives the eviction).
+            self.low_water = Some(self.low_water.map_or(hi, |w| w.max(hi)));
         }
     }
 
@@ -252,6 +270,27 @@ mod tests {
         assert_eq!(
             frame::Iter::new(&buf).next().unwrap().unwrap(),
             frame::Frame::Ack(ack)
+        );
+    }
+
+    #[test]
+    fn evicted_low_packets_stay_rejected_as_replays() {
+        let mut recv = ReceivedPackets::new();
+        // Force range eviction with a gappy stream so the lowest ranges are dropped.
+        for k in 0..100u64 {
+            recv.insert(k * 2);
+        }
+        assert!(recv.ranges.len() <= MAX_ACK_RANGES);
+        // Packet 0 was evicted from the explicit ranges, but it WAS received — a
+        // replay of it must still be rejected (not re-processed) via the low-water
+        // mark, or the idle timer / RTT+CC could be re-fed by a captured old packet.
+        assert!(
+            recv.contains(0),
+            "an evicted-but-received PN is still 'contained'"
+        );
+        assert!(
+            !recv.insert(0),
+            "replay of an evicted low packet is rejected, not treated as new"
         );
     }
 }

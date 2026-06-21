@@ -366,6 +366,10 @@ pub struct Connection {
     /// Number of probe packets allowed to bypass the congestion window (RFC 9002
     /// §6.2.4): a PTO sets this so a retransmit goes out even when cwnd is full.
     probe_pending: u8,
+    /// Count of 1-RTT (Data-space) packets sealed with the current key, to enforce
+    /// the AEAD confidentiality limit (RFC 9001 §6.6). Without 1-RTT key update we
+    /// force-close before exceeding it rather than overrun the AEAD safety margin.
+    data_packets_sealed: u64,
     /// The server queues HANDSHAKE_DONE once its handshake completes; resent if lost.
     handshake_done_pending: bool,
     /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
@@ -451,6 +455,7 @@ impl Connection {
             delivered: 0,
             pto_count: 0,
             probe_pending: 0,
+            data_packets_sealed: 0,
             handshake_done_pending: false,
             handshake_confirmed: false,
             last_send_time: None,
@@ -513,6 +518,7 @@ impl Connection {
             delivered: 0,
             pto_count: 0,
             probe_pending: 0,
+            data_packets_sealed: 0,
             handshake_done_pending: false,
             handshake_confirmed: false,
             last_send_time: None,
@@ -787,6 +793,26 @@ impl Connection {
         self.spaces[space] = Space::default();
     }
 
+    /// Force a local close once the 1-RTT AEAD confidentiality limit is reached
+    /// (RFC 9001 §6.6). The relay does not perform 1-RTT key update, so closing is
+    /// the spec-permitted alternative to rotating the key before the limit. (A
+    /// ChaCha20-Poly1305 key has an effectively unbounded limit, so this never
+    /// fires for it; AES-GCM caps at 2^23 packets.)
+    fn enforce_aead_confidentiality_limit(&mut self) {
+        if self.closed.is_some() {
+            return;
+        }
+        let limit = self.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .map(|k| k.local.packet.confidentiality_limit());
+        if let Some(limit) = limit {
+            if self.data_packets_sealed >= limit {
+                self.close(0, b"AEAD confidentiality limit reached");
+            }
+        }
+    }
+
     /// Produce the next datagram to send, or `None` when idle (or congestion-window
     /// limited). Priority: a pending ACK (lowest space first; never gated), then
     /// CRYPTO (retransmits before fresh bytes, lowest space first), then 1-RTT relay
@@ -794,6 +820,10 @@ impl Connection {
     /// congestion window unless a PTO probe is pending (RFC 9002 §6.2.4). One
     /// datagram per call; the driver loops until `None`.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
+        // Enforce the AEAD confidentiality limit (RFC 9001 §6.6): with no 1-RTT key
+        // update, once we have sealed the cipher's safe number of 1-RTT packets we
+        // MUST stop using the key — force-close rather than overrun the AEAD margin.
+        self.enforce_aead_confidentiality_limit();
         // Once closed (locally, by the peer, or on idle) the connection enters the
         // closing/draining state (RFC 9000 §10.2): it sends at most a single
         // CONNECTION_CLOSE (for a local close) and is otherwise silent — no ACKs,
@@ -1126,6 +1156,11 @@ impl Connection {
         if ack_eliciting {
             self.spaces[space].sent_content.insert(pn, content);
             self.spaces[space].last_ack_eliciting = Some(now);
+        }
+        if space == SPACE_DATA {
+            // Every 1-RTT packet is sealed with the Data key; count it toward the
+            // AEAD confidentiality limit (RFC 9001 §6.6).
+            self.data_packets_sealed = self.data_packets_sealed.saturating_add(1);
         }
         self.last_send_time = Some(now);
     }

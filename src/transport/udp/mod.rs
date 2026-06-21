@@ -125,8 +125,6 @@ pub fn server_config(
         // — exactly what the hand-rolled ServerHandshake's signer expects.
         signing_key_pkcs8: key.secret_der().to_vec(),
         alpn_protocols: vec![UDP_ALPN.to_vec()],
-        transport_parameters: quic::transport_params::TransportParameters::server(&[])
-            .encode_server(),
     }))
 }
 

@@ -319,11 +319,16 @@ impl Bbr {
 impl Controller for Bbr {
     fn on_ack(&mut self, info: &AckInfo) {
         self.update_rtprop(info.rtt, info.now);
-        self.update_btlbw(info.delivery_rate);
-        if info.delivered >= self.next_round_delivered {
-            // ~one window of data per round (a cheap proxy for one RTT).
-            self.next_round_delivered = info.delivered + self.cwnd.max(MAX_DATAGRAM_SIZE);
-            self.on_round_start(info.now);
+        // An app-limited sample (the sender ran out of data, not bandwidth) must not
+        // raise the bottleneck-bandwidth estimate or advance the round model, or BBR
+        // would lock in an under-estimate of the path (RFC draft / AckInfo contract).
+        if !info.app_limited {
+            self.update_btlbw(info.delivery_rate);
+            if info.delivered >= self.next_round_delivered {
+                // ~one window of data per round (a cheap proxy for one RTT).
+                self.next_round_delivered = info.delivered + self.cwnd.max(MAX_DATAGRAM_SIZE);
+                self.on_round_start(info.now);
+            }
         }
         self.check_probe_rtt(info.now, info.in_flight);
         self.set_cwnd(info.bytes_acked);
@@ -495,5 +500,20 @@ mod tests {
             }
         }
         assert!(checked, "the pipe should fill within the run");
+    }
+
+    #[test]
+    fn bbr_ignores_app_limited_samples_for_bandwidth() {
+        // An app-limited ACK (sender out of data, not bandwidth) must not raise the
+        // bottleneck-bandwidth model, even with a high reported delivery rate.
+        let now = Instant::now();
+        let mut cc = Bbr::new();
+        let mut limited = bbr_ack(10_000_000, 50, 500_000, now);
+        limited.app_limited = true;
+        cc.on_ack(&limited);
+        assert_eq!(
+            cc.btlbw, 0,
+            "app-limited samples must not raise the bottleneck-bandwidth estimate"
+        );
     }
 }

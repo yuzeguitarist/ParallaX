@@ -148,10 +148,12 @@ async fn probe_client_round_trip(
     let recv = connection.accept_uni().await.ok_or_else(|| {
         ProbeError::ConnectionLost("connection closed before server reply".into())
     })?;
-    // Bound the read at the on-wire response length (the peer FINs after exactly
-    // that many bytes, so read-to-EOF over the cap recovers the whole reply).
-    let mut reply = Vec::with_capacity(PROBE_RESPONSE_WIRE_LEN);
-    recv.take(PROBE_RESPONSE_WIRE_LEN as u64)
+    // Bound the read at one byte past the on-wire response length: a well-formed
+    // peer FINs after exactly that many bytes, while an oversized stream yields
+    // WIRE_LEN+1 bytes so the `len() == WIRE_LEN` check below rejects it instead of
+    // silently accepting a valid prefix (take() returns EOF at its cap).
+    let mut reply = Vec::with_capacity(PROBE_RESPONSE_WIRE_LEN + 1);
+    recv.take(PROBE_RESPONSE_WIRE_LEN as u64 + 1)
         .read_to_end(&mut reply)
         .await
         .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
@@ -173,8 +175,8 @@ pub async fn serve_probe(
     let recv = connection.accept_uni().await.ok_or_else(|| {
         ProbeError::ConnectionLost("connection closed before probe request".into())
     })?;
-    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
-    recv.take(PROBE_REQUEST_WIRE_LEN as u64)
+    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN + 1);
+    recv.take(PROBE_REQUEST_WIRE_LEN as u64 + 1)
         .read_to_end(&mut request)
         .await
         .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;

@@ -56,7 +56,10 @@ fn looks_like_initial(data: &[u8]) -> bool {
         && u32::from_be_bytes([data[1], data[2], data[3], data[4]]) == QUIC_VERSION_V1
 }
 
-/// Server identity + parameters for accepting connections.
+/// Server identity for accepting connections. Transport parameters are NOT stored
+/// here: they are encoded per-connection from the chosen source connection id (so
+/// `initial_source_connection_id` matches the Initial header SCID, RFC 9000 §7.3),
+/// see [`Driver::on_datagram`].
 pub struct ServerConfig {
     /// DER-encoded certificate chain presented in the TLS Certificate message.
     pub cert_chain: Vec<Vec<u8>>,
@@ -64,8 +67,6 @@ pub struct ServerConfig {
     pub signing_key_pkcs8: Vec<u8>,
     /// Offered ALPN protocols (the relay offers exactly `h3`).
     pub alpn_protocols: Vec<Vec<u8>>,
-    /// Encoded QUIC transport parameters blob.
-    pub transport_parameters: Vec<u8>,
 }
 
 /// Failure to establish a connection.
@@ -216,7 +217,7 @@ struct ConnectRequest {
     addr: SocketAddr,
     server_name: String,
     config: Arc<ClientConfig>,
-    reply: tokio::sync::oneshot::Sender<Arc<ConnShared>>,
+    reply: tokio::sync::oneshot::Sender<Result<Arc<ConnShared>, ConnectError>>,
 }
 
 /// An async QUIC endpoint: a cheap, cloneable handle onto the driver task that
@@ -317,7 +318,9 @@ impl Endpoint {
                 reply,
             })
             .map_err(|_| ConnectError::EndpointClosed)?;
-        let shared = reply_rx.await.map_err(|_| ConnectError::EndpointClosed)?;
+        // Outer `?`: the driver dropped the sender (endpoint gone). Inner `?`: the
+        // driver reported a real client-init/TLS error (ConnectError::Tls).
+        let shared = reply_rx.await.map_err(|_| ConnectError::EndpointClosed)??;
         // Drive until the handshake completes. Create the notification BEFORE the
         // re-check so a wake-up between check and await is not lost, and never hold
         // the borrow across the move into `Connection`.
@@ -450,7 +453,10 @@ impl Driver {
             cfg.cert_chain.clone(),
             &cfg.signing_key_pkcs8,
             cfg.alpn_protocols.clone(),
-            cfg.transport_parameters.clone(),
+            // Encode the server transport parameters with THIS connection's source
+            // CID, so initial_source_connection_id matches the Initial header SCID
+            // (RFC 9000 §7.3) instead of a stale config-time placeholder.
+            super::transport_params::TransportParameters::server(&scid).encode_server(),
             ConnectionId::new(&scid),
         ) {
             Ok(core) => core,
@@ -473,7 +479,12 @@ impl Driver {
         let core =
             match Core::new_client(req.config, &req.server_name, dcid, ConnectionId::new(&[])) {
                 Ok(core) => core,
-                Err(_) => return, // reply dropped → connect() sees EndpointClosed
+                Err(err) => {
+                    // Surface the real TLS/init failure to connect() instead of
+                    // letting the dropped sender masquerade as EndpointClosed.
+                    let _ = req.reply.send(Err(ConnectError::Tls(err)));
+                    return;
+                }
             };
         let shared = Arc::new(ConnShared {
             core: Mutex::new(core),
@@ -484,7 +495,7 @@ impl Driver {
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
         self.conns.insert(req.addr, shared.clone());
-        let _ = req.reply.send(shared);
+        let _ = req.reply.send(Ok(shared));
     }
 
     /// Drain every connection's outbound datagrams and wake blocked handles.
@@ -819,13 +830,10 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .to_vec();
-        let tp = super::super::transport_params::TransportParameters::safari_client(&[])
-            .encode_safari_client();
         Arc::new(ServerConfig {
             cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
             signing_key_pkcs8: key,
             alpn_protocols: vec![b"h3".to_vec()],
-            transport_parameters: tp,
         })
     }
 
