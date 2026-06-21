@@ -177,6 +177,11 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// PING refreshes it.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Transport error code APPLICATION_ERROR (RFC 9000 §20.1), used for a transport
+/// CONNECTION_CLOSE (0x1c) emitted before 1-RTT keys exist in place of an
+/// application close (0x1d), which is prohibited in Initial/Handshake (§10.2.3).
+const APPLICATION_ERROR: u64 = 0x0c;
+
 const SPACE_INITIAL: usize = 0;
 const SPACE_HANDSHAKE: usize = 1;
 const SPACE_DATA: usize = 2;
@@ -1121,15 +1126,32 @@ impl Connection {
         let pn = self.spaces[space].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let header = self.make_header(space, pn, pn_len);
-        let datagram = {
-            let frame = Frame::Close(super::frame::Close {
+        // An application CONNECTION_CLOSE (0x1d) is prohibited in Initial/Handshake
+        // packets (RFC 9000 §12.5). If 1-RTT keys are not yet installed, close with
+        // a transport CONNECTION_CLOSE (0x1c) carrying APPLICATION_ERROR and no
+        // application-specific code/reason (RFC 9000 §10.2.3).
+        let close = if space == SPACE_DATA {
+            super::frame::Close {
                 application: true,
                 error_code: code,
                 frame_type: 0,
                 reason: &reason,
-            });
+            }
+        } else {
+            super::frame::Close {
+                application: false,
+                error_code: APPLICATION_ERROR,
+                frame_type: 0,
+                reason: &[],
+            }
+        };
+        let datagram = {
             let keys = self.spaces[space].keys.as_ref().unwrap();
-            seal_packet(&keys.local, header, &[frame, Frame::Padding(3)])
+            seal_packet(
+                &keys.local,
+                header,
+                &[Frame::Close(close), Frame::Padding(3)],
+            )
         };
         self.app_close_sent = true;
         // CONNECTION_CLOSE is not ack-eliciting (RFC 9002 §2).
@@ -1568,6 +1590,24 @@ impl Connection {
         for frame in Iter::new(&payload) {
             let frame =
                 frame.map_err(|e| QuicTlsError::Crypto(format!("frame decode failed: {e:?}")))?;
+            // RFC 9000 §12.4/§12.5: Initial and Handshake packets may carry only
+            // PADDING, PING, ACK, CRYPTO, and a transport CONNECTION_CLOSE (0x1c).
+            // Any other frame is a PROTOCOL_VIOLATION. This matters because Initial
+            // keys are publicly derivable (RFC 9001 §5.2), so an on-path attacker
+            // can forge an Initial that AEAD-opens; without this gate it could inject
+            // STREAM / MAX_DATA / RESET_STREAM etc. straight into the connection's
+            // data plane. The packet is dropped (Err) rather than acted on.
+            if matches!(space, SPACE_INITIAL | SPACE_HANDSHAKE)
+                && !matches!(
+                    frame,
+                    Frame::Padding(_) | Frame::Ping | Frame::Ack(_) | Frame::Crypto { .. }
+                )
+                && !matches!(frame, Frame::Close(ref c) if !c.application)
+            {
+                return Err(QuicTlsError::Protocol(
+                    "frame type not permitted in Initial/Handshake space".into(),
+                ));
+            }
             match frame {
                 Frame::Crypto { offset, data } => {
                     ack_eliciting = true;
@@ -2622,6 +2662,88 @@ mod tests {
         assert!(
             client.next_timeout().is_none(),
             "a drained connection arms no timer (endpoint can reap it)"
+        );
+    }
+
+    #[test]
+    fn prohibited_frame_in_initial_space_is_a_protocol_violation() {
+        // Initial keys are publicly derivable (RFC 9001 §5.2), so an on-path attacker
+        // can forge an Initial that AEAD-opens. A STREAM frame is prohibited in the
+        // Initial space (RFC 9000 §12.5) and must be rejected, never reaching the
+        // data plane.
+        let dcid = ConnectionId::new(&[0x88; 8]);
+        let client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let pn = 0u64;
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = client.make_header(SPACE_INITIAL, pn, pn_len);
+        let forged = {
+            let keys = client.spaces[SPACE_INITIAL].keys.as_ref().unwrap();
+            seal_packet(
+                &keys.local,
+                header,
+                &[
+                    Frame::Stream {
+                        id: 0,
+                        offset: 0,
+                        fin: false,
+                        data: &b"injected"[..],
+                    },
+                    Frame::Padding(1200),
+                ],
+            )
+        };
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x12, 0x34, 0x56, 0x78]),
+        )
+        .unwrap();
+        let now = Instant::now();
+        let err = server
+            .handle_datagram(&forged, now)
+            .expect_err("a forged STREAM in the Initial space is a protocol violation");
+        assert!(
+            matches!(err, QuicTlsError::Protocol(_)),
+            "expected PROTOCOL_VIOLATION, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn close_before_handshake_uses_transport_connection_close() {
+        // Closing before 1-RTT keys exist must emit a transport CONNECTION_CLOSE
+        // (0x1c) with APPLICATION_ERROR, never an application close (0x1d), which is
+        // prohibited in Initial/Handshake packets (RFC 9000 §10.2.3/§12.5).
+        let dcid = ConnectionId::new(&[0x77; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let now = Instant::now();
+        while client.poll_transmit(now).is_some() {} // drain the Initial flight
+        client.close(0x99, b"nope");
+        let dg = client
+            .poll_transmit(now)
+            .expect("a close packet is emitted");
+        let keys = client.spaces[SPACE_INITIAL].keys.as_ref().unwrap();
+        let mut buf = dg.clone();
+        let (_hdr, range) = open_packet(&keys.local, &mut buf, 0, None).unwrap();
+        let mut saw_transport_close = false;
+        for f in Iter::new(&buf[range]) {
+            if let Frame::Close(c) = f.unwrap() {
+                assert!(
+                    !c.application,
+                    "must be a transport CONNECTION_CLOSE (0x1c) in the Initial space"
+                );
+                assert_eq!(c.error_code, APPLICATION_ERROR);
+                saw_transport_close = true;
+            }
+        }
+        assert!(
+            saw_transport_close,
+            "the close packet carries CONNECTION_CLOSE"
         );
     }
 }

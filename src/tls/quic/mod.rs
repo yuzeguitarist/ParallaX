@@ -84,6 +84,9 @@ pub enum QuicTlsError {
     /// Local crypto operation (HKDF/AEAD/KEM) failed.
     #[error("TLS crypto failure: {0}")]
     Crypto(String),
+    /// A QUIC-layer protocol violation (RFC 9000 §11): maps to PROTOCOL_VIOLATION.
+    #[error("QUIC protocol violation: {0}")]
+    Protocol(String),
     /// Certificate or CertificateVerify rejected by the verifier.
     #[error("certificate verification failed: {0}")]
     Certificate(String),
