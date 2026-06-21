@@ -119,6 +119,21 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    /// True when secret resolution failed *because the source is unavailable* on
+    /// this host (missing/insecure host key, or a missing sidecar file / env var /
+    /// bundle entry) — as opposed to a malformed reference. `plx check` treats
+    /// these as "cannot decrypt here" and degrades to a structure-only check.
+    fn is_secret_unavailable(&self) -> bool {
+        matches!(
+            self,
+            ConfigError::SecretHostKey { .. }
+                | ConfigError::SecretRead { .. }
+                | ConfigError::SecretSeal { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -322,6 +337,22 @@ impl SecretSource {
         *self = Self::Resolved(resolved);
         Ok(())
     }
+}
+
+/// One long-lived secret field of a [`Config`], with every name a secret-handling
+/// site needs. This is the single authoritative description of a secret: the
+/// resolution, inline-detection, memory-protection, and `plx seal` paths all
+/// enumerate secrets through [`Config::secret_sources`] so a newly added secret
+/// cannot silently skip sealing or scrubbing.
+pub(crate) struct SecretFieldRef<'a> {
+    /// Dotted config path (`crypto.psk`): resolution-error field, inline warning.
+    pub dotted: &'static str,
+    /// Bare TOML key (`psk`): the sealed-bundle entry key / reference `#fragment`
+    /// and the assignment the config rewriter targets.
+    pub seal_key: &'static str,
+    /// Static label for `protect_secret_bytes` (`config.crypto.psk`).
+    pub mem_label: &'static str,
+    pub source: &'a SecretSource,
 }
 
 impl SecretRef {
@@ -675,40 +706,92 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Load + validate as thoroughly as the host allows, for `plx check`. Always
+    /// enforces file permissions (the hardened reader), TOML structure, and every
+    /// non-secret field. If the secrets resolve (host key / sidecar / env present),
+    /// it also validates the secret bytes — identical to [`Config::load`]. If they
+    /// cannot resolve *because the source is unavailable* (missing host key,
+    /// sidecar, or env var), it degrades to structure-only and reports that via the
+    /// returned flag instead of failing, so a sealed config is still checkable on a
+    /// machine without the key. A malformed config or a present-but-wrong secret
+    /// still fails. Returns `(config, secrets_validated)`.
+    pub fn load_for_check(path: impl AsRef<Path>) -> Result<(Self, bool), ConfigError> {
+        let path = path.as_ref();
+        let raw = read_secret_config_file(path)?;
+        let mut cfg =
+            toml::from_str::<Self>(raw.as_str()).map_err(|e| toml_error(raw.as_str(), e))?;
+        cfg.resolve_paths_relative_to(path);
+        match cfg.resolve_secrets(path) {
+            Ok(()) => {
+                cfg.validate()?;
+                Ok((cfg, true))
+            }
+            Err(err) if err.is_secret_unavailable() => {
+                cfg.validate_structure()?;
+                Ok((cfg, false))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn protect_secret_memory(&self) {
-        crate::process_hardening::protect_secret_bytes(
-            "config.crypto.psk",
-            self.crypto.psk.as_b64().as_bytes(),
-        );
-        if let Some(server) = &self.server {
+        for field in self.secret_sources() {
             crate::process_hardening::protect_secret_bytes(
-                "config.server.private_key",
-                server.private_key.as_b64().as_bytes(),
-            );
-            crate::process_hardening::protect_secret_bytes(
-                "config.server.identity_secret_key",
-                server.identity_secret_key.as_b64().as_bytes(),
+                field.mem_label,
+                field.source.as_b64().as_bytes(),
             );
         }
+    }
+
+    /// The authoritative set of long-lived secret fields (see [`SecretFieldRef`]).
+    /// Every secret-handling site enumerates secrets through this one method.
+    pub(crate) fn secret_sources(&self) -> Vec<SecretFieldRef<'_>> {
+        let mut fields = vec![SecretFieldRef {
+            dotted: "crypto.psk",
+            seal_key: "psk",
+            mem_label: "config.crypto.psk",
+            source: &self.crypto.psk,
+        }];
+        if let Some(server) = &self.server {
+            fields.push(SecretFieldRef {
+                dotted: "server.private_key",
+                seal_key: "private_key",
+                mem_label: "config.server.private_key",
+                source: &server.private_key,
+            });
+            fields.push(SecretFieldRef {
+                dotted: "server.identity_secret_key",
+                seal_key: "identity_secret_key",
+                mem_label: "config.server.identity_secret_key",
+                source: &server.identity_secret_key,
+            });
+        }
+        fields
+    }
+
+    /// Mutable view of the same authoritative secret set, for in-place resolution.
+    fn secret_sources_mut(&mut self) -> Vec<(&'static str, &mut SecretSource)> {
+        let mut fields: Vec<(&'static str, &mut SecretSource)> =
+            vec![("crypto.psk", &mut self.crypto.psk)];
+        if let Some(server) = self.server.as_mut() {
+            fields.push(("server.private_key", &mut server.private_key));
+            fields.push((
+                "server.identity_secret_key",
+                &mut server.identity_secret_key,
+            ));
+        }
+        fields
     }
 
     /// Names of the secret fields whose bytes are stored inline in the config
     /// file (so the file itself is a bearer credential). Empty once every secret
     /// is referenced or sealed. Used by `plx check` to warn operators.
     pub fn inline_secret_fields(&self) -> Vec<&'static str> {
-        let mut fields = Vec::new();
-        if self.crypto.psk.is_inline_secret() {
-            fields.push("crypto.psk");
-        }
-        if let Some(server) = &self.server {
-            if server.private_key.is_inline_secret() {
-                fields.push("server.private_key");
-            }
-            if server.identity_secret_key.is_inline_secret() {
-                fields.push("server.identity_secret_key");
-            }
-        }
-        fields
+        self.secret_sources()
+            .into_iter()
+            .filter(|field| field.source.is_inline_secret())
+            .map(|field| field.dotted)
+            .collect()
     }
 
     /// Path parts of plaintext sidecars referenced via `{ file = "..." }` (the
@@ -737,32 +820,23 @@ impl Config {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        self.crypto.psk.resolve_in_place("crypto.psk", base)?;
-        if let Some(server) = self.server.as_mut() {
-            server
-                .private_key
-                .resolve_in_place("server.private_key", base)?;
-            server
-                .identity_secret_key
-                .resolve_in_place("server.identity_secret_key", base)?;
+        for (field, source) in self.secret_sources_mut() {
+            source.resolve_in_place(field, base)?;
         }
         Ok(())
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let psk = decode_psk(self.crypto.psk.as_b64())?;
-        if psk_looks_low_entropy(&psk) {
-            // Not fatal (and the auto-generated PSK is always random), but warn:
-            // the PSK is one of the two secrets the whole auth scheme rests on
-            // (it salts the carrier-mask and auth-key HKDFs and keys replay/AEAD
-            // derivation). The v4 masks are no longer a raw-PSK offline oracle,
-            // but a low-entropy / human-chosen PSK still weakens auth against an
-            // attacker who can guess it. Only a CSPRNG-generated key is safe.
-            tracing::warn!(
-                "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
-                 (e.g. `plx init` / `openssl rand -base64 32`)"
-            );
-        }
+        self.validate_structure()?;
+        self.validate_secret_bytes()
+    }
+
+    /// Validate everything that does NOT require the resolved secret bytes:
+    /// traffic/udp parameters, addresses, public keys, and mode invariants.
+    /// `plx check` runs only this layer when the host key/sidecar is unavailable,
+    /// so a sealed config can still be structurally validated on a machine that
+    /// lacks the key.
+    pub fn validate_structure(&self) -> Result<(), ConfigError> {
         self.traffic.validate()?;
         self.udp.validate()?;
 
@@ -787,12 +861,6 @@ impl Config {
                 if let Some(data_target) = &server.data_target {
                     require_host_port("server.data_target", data_target)?;
                 }
-                decode_key32_secret("server.private_key", server.private_key.as_b64())?;
-                decode_base64_secret_exact(
-                    "server.identity_secret_key",
-                    server.identity_secret_key.as_b64(),
-                    mldsa::secret_key_bytes(),
-                )?;
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
                 }
@@ -850,6 +918,36 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validate the resolved secret bytes (PSK + server key lengths). Requires the
+    /// secrets to have been resolved (see [`Config::resolve_secrets`]); on an
+    /// unresolved `Reference` the bytes are empty and this fails.
+    fn validate_secret_bytes(&self) -> Result<(), ConfigError> {
+        let psk = decode_psk(self.crypto.psk.as_b64())?;
+        if psk_looks_low_entropy(&psk) {
+            // Not fatal (and the auto-generated PSK is always random), but warn:
+            // the PSK is one of the two secrets the whole auth scheme rests on
+            // (it salts the carrier-mask and auth-key HKDFs and keys replay/AEAD
+            // derivation). The v4 masks are no longer a raw-PSK offline oracle,
+            // but a low-entropy / human-chosen PSK still weakens auth against an
+            // attacker who can guess it. Only a CSPRNG-generated key is safe.
+            tracing::warn!(
+                "crypto.psk appears to have low entropy; use a CSPRNG-generated 32-byte key \
+                 (e.g. `plx init` / `openssl rand -base64 32`)"
+            );
+        }
+        if let Mode::Server = self.mode {
+            if let Some(server) = self.server.as_ref() {
+                decode_key32_secret("server.private_key", server.private_key.as_b64())?;
+                decode_base64_secret_exact(
+                    "server.identity_secret_key",
+                    server.identity_secret_key.as_b64(),
+                    mldsa::secret_key_bytes(),
+                )?;
+            }
+        }
         Ok(())
     }
 

@@ -368,7 +368,8 @@ mod tests {
     #[test]
     fn seal_open_round_trips() {
         let (_dir, key) = temp_host_key();
-        let secret = "c2VjcmV0LXBzay1iYXNlNjQtdmFsdWUtMzJieXRlcw==";
+        // Test fixture, not a real key: base64 of "secret-psk-base64-value-32bytes".
+        let secret = "c2VjcmV0LXBzay1iYXNlNjQtdmFsdWUtMzJieXRlcw=="; // gitleaks:allow
         let aad = entry_aad(BUNDLE_VERSION, "test-id", "crypto.psk");
         let entry = seal_secret(&key, "crypto.psk", &aad, secret);
         let opened = open_entry(&key, "crypto.psk", &aad, &entry).unwrap();

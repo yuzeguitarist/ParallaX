@@ -211,13 +211,21 @@ async fn handle_command(command: Command) -> anyhow::Result<()> {
 }
 
 fn check_config(config: PathBuf) -> anyhow::Result<()> {
-    let cfg = load_config(&config)?;
-    cfg.validate()?;
+    // load_for_check enforces permissions + TOML structure + all non-secret
+    // fields, and additionally validates the secret bytes when they resolve.
+    let (cfg, secrets_validated) = Config::load_for_check(&config)
+        .with_context(|| format!("failed to load {}", config.display()))?;
     println!(
         "ok: {} mode config is valid ({})",
         cfg.mode,
         config.display()
     );
+    if !secrets_validated {
+        println!(
+            "warning: host key unavailable; validated structure and permissions only — \
+             secret values not decrypted"
+        );
+    }
     let inline = cfg.inline_secret_fields();
     if inline.is_empty() {
         println!("ok: secrets are referenced/sealed; this config file alone is not a credential");
@@ -377,18 +385,18 @@ fn seal_config(
 
     // Hold the resolved secrets in Zeroizing so the plaintext base64 is scrubbed
     // when sealing finishes, matching the Zeroizing discipline used elsewhere.
-    let mut secrets: Vec<(&'static str, Zeroizing<String>)> =
-        vec![("psk", Zeroizing::new(cfg.crypto.psk.as_b64().to_owned()))];
-    if let Some(server) = cfg.server.as_ref() {
-        secrets.push((
-            "private_key",
-            Zeroizing::new(server.private_key.as_b64().to_owned()),
-        ));
-        secrets.push((
-            "identity_secret_key",
-            Zeroizing::new(server.identity_secret_key.as_b64().to_owned()),
-        ));
-    }
+    // Enumerate via the authoritative secret list so a newly added secret is
+    // sealed automatically rather than silently skipped here.
+    let secrets: Vec<(&'static str, Zeroizing<String>)> = cfg
+        .secret_sources()
+        .into_iter()
+        .map(|field| {
+            (
+                field.seal_key,
+                Zeroizing::new(field.source.as_b64().to_owned()),
+            )
+        })
+        .collect();
 
     let host_key_bytes = match secret_store::load_host_key(host_key) {
         Ok(key) => key,
@@ -1499,5 +1507,52 @@ mod tests {
             private_b64
         );
         assert!(after.inline_secret_fields().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_degrades_to_structure_only_when_host_key_unavailable() {
+        // Regression for P2-9: a sealed config must still be checkable on a machine
+        // that lacks the host key. `load_for_check` validates structure + perms and
+        // reports secrets_validated=false instead of hard-failing; with the key it
+        // validates the secret bytes too.
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "example.com:443",
+            "example.com:443",
+            "example.com",
+        );
+        let server_path = dir.path().join("parallax.server.toml");
+        fs::write(&server_path, &generated.server).unwrap();
+        fs::set_permissions(&server_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let host_key = dir.path().join("host.key");
+        // Seal so the config now references a host-bound bundle.
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        seal_config(&server_path, None, Some(&host_key)).unwrap();
+
+        // Host key NOT discoverable (env unset, default path absent in tests):
+        // check degrades to structure-only and succeeds.
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        let (cfg, secrets_validated) = Config::load_for_check(&server_path).unwrap();
+        assert!(
+            !secrets_validated,
+            "without the host key, secrets must not be validated"
+        );
+        assert!(cfg.inline_secret_fields().is_empty());
+
+        // Host key available: the full check resolves and validates the secrets.
+        std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+        let (_cfg, secrets_validated) = Config::load_for_check(&server_path).unwrap();
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        assert!(
+            secrets_validated,
+            "with the host key, secrets must be validated"
+        );
     }
 }
