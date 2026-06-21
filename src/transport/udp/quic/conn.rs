@@ -251,6 +251,9 @@ struct Space {
     retransmit_crypto: Vec<(u64, u64)>,
     /// Earliest armed time-threshold loss deadline (RFC 9002 §6.1.2), if any.
     loss_time: Option<Instant>,
+    /// When this space last sent an ack-eliciting packet (RFC 9002 §6.2.1
+    /// GetPtoTimeAndSpace): the per-space PTO is armed from here.
+    last_ack_eliciting: Option<Instant>,
     /// Outgoing CRYPTO bytes and how much has been packetized.
     crypto_send: Vec<u8>,
     crypto_send_off: usize,
@@ -363,8 +366,6 @@ pub struct Connection {
     /// Number of probe packets allowed to bypass the congestion window (RFC 9002
     /// §6.2.4): a PTO sets this so a retransmit goes out even when cwnd is full.
     probe_pending: u8,
-    /// When the most recent ack-eliciting packet was sent (arms the PTO timer).
-    last_ack_eliciting_sent: Option<Instant>,
     /// The server queues HANDSHAKE_DONE once its handshake completes; resent if lost.
     handshake_done_pending: bool,
     /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
@@ -450,7 +451,6 @@ impl Connection {
             delivered: 0,
             pto_count: 0,
             probe_pending: 0,
-            last_ack_eliciting_sent: None,
             handshake_done_pending: false,
             handshake_confirmed: false,
             last_send_time: None,
@@ -513,7 +513,6 @@ impl Connection {
             delivered: 0,
             pto_count: 0,
             probe_pending: 0,
-            last_ack_eliciting_sent: None,
             handshake_done_pending: false,
             handshake_confirmed: false,
             last_send_time: None,
@@ -881,14 +880,16 @@ impl Connection {
         self.spaces.iter().map(|s| s.sent.in_flight()).sum()
     }
 
-    /// Whether any space has ack-eliciting packets in flight (arms the PTO timer).
-    fn any_in_flight(&self) -> bool {
-        self.spaces.iter().any(|s| s.sent.in_flight() > 0)
-    }
-
-    /// Current PTO duration with exponential backoff (RFC 9002 §6.2.1).
-    fn pto_duration(&self) -> Duration {
-        (self.rtt.pto_base() + MAX_ACK_DELAY) * 2u32.pow(self.pto_count.min(MAX_PTO_BACKOFF))
+    /// Current PTO duration with exponential backoff (RFC 9002 §6.2.1). `max_ack_delay`
+    /// is added only for the Application (1-RTT) space; Initial/Handshake peers must
+    /// ACK immediately, so adding it there arms handshake probes too late.
+    fn pto_duration(&self, space: usize) -> Duration {
+        let extra = if space == SPACE_DATA {
+            MAX_ACK_DELAY
+        } else {
+            Duration::ZERO
+        };
+        (self.rtt.pto_base() + extra) * 2u32.pow(self.pto_count.min(MAX_PTO_BACKOFF))
     }
 
     /// How long to remain in the closing/draining state before the connection is
@@ -915,9 +916,14 @@ impl Connection {
                 earliest(lt);
             }
         }
-        if self.any_in_flight() {
-            if let Some(last) = self.last_ack_eliciting_sent {
-                earliest(last + self.pto_duration());
+        // PTO per packet-number space (RFC 9002 §6.2.1 GetPtoTimeAndSpace): each
+        // space's timer is armed from its own last ack-eliciting send; the earliest
+        // across spaces is when handle_timeout must probe.
+        for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+            if self.spaces[space].sent.in_flight() > 0 {
+                if let Some(last) = self.spaces[space].last_ack_eliciting {
+                    earliest(last + self.pto_duration(space));
+                }
             }
         }
         // Keep-alive: once confirmed, schedule a PING after an idle interval.
@@ -983,11 +989,17 @@ impl Connection {
             self.cc.on_congestion_event(now);
         }
 
-        // Otherwise, if the PTO has elapsed with packets in flight, probe.
-        if !any_loss && self.any_in_flight() {
-            let elapsed = self
-                .last_ack_eliciting_sent
-                .is_some_and(|last| now >= last + self.pto_duration());
+        // Otherwise, if any space's PTO has elapsed (per-space timer, RFC 9002
+        // §6.2.1), probe. queue_probe picks the lowest space with packets in flight.
+        if !any_loss {
+            let elapsed = [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA]
+                .iter()
+                .any(|&space| {
+                    self.spaces[space].sent.in_flight() > 0
+                        && self.spaces[space]
+                            .last_ack_eliciting
+                            .is_some_and(|last| now >= last + self.pto_duration(space))
+                });
             if elapsed {
                 self.pto_count = (self.pto_count + 1).min(MAX_PTO_BACKOFF);
                 self.queue_probe();
@@ -1113,7 +1125,7 @@ impl Connection {
         );
         if ack_eliciting {
             self.spaces[space].sent_content.insert(pn, content);
-            self.last_ack_eliciting_sent = Some(now);
+            self.spaces[space].last_ack_eliciting = Some(now);
         }
         self.last_send_time = Some(now);
     }
@@ -1682,6 +1694,9 @@ impl Connection {
                 }
                 Frame::MaxData(max) => {
                     // Raise the connection-level send limit (RFC 9000 §19.9).
+                    // MAX_DATA is ack-eliciting (RFC 9002 §2), so a lone MAX_DATA
+                    // must still schedule an ACK or the peer would PTO-retransmit it.
+                    ack_eliciting = true;
                     self.send_max_data = self.send_max_data.max(max);
                 }
                 Frame::MaxStreamData { id, max } => {
@@ -1787,9 +1802,12 @@ impl Connection {
         }
         if let (Some(sent_at), true) = (largest_time, any_ack_eliciting) {
             // ACK delay applies only to the Application space (RFC 9002 §5.3); the
-            // peer MUST send 0 for Initial/Handshake.
+            // peer MUST send 0 for Initial/Handshake. Clamp to max_ack_delay so a
+            // peer cannot report a huge ack_delay to deflate our smoothed RTT (and
+            // thus trigger premature PTO/loss). RFC 9002 §5.3.
             let ack_delay = if space == SPACE_DATA {
                 Duration::from_micros(ack.delay.saturating_mul(1 << ACK_DELAY_EXPONENT))
+                    .min(MAX_ACK_DELAY)
             } else {
                 Duration::ZERO
             };
