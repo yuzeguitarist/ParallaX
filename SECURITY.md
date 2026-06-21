@@ -141,8 +141,13 @@ TEE/HSM/TPM and does not claim root-compromise resistance.
 
 ### Operational guidance
 
-- Keep secret and sidecar files (`*.secrets.toml`, `*.secrets.enc`, `host.key`)
-  out of version control — they are git-ignored by default.
+- Never commit `host.key` (the decryption key — it defeats the whole scheme) or
+  plaintext secret/sidecar files (`*.secrets.toml`). These are git-ignored by
+  default.
+- A **sealed** bundle (`*.secrets.enc`) is safe to commit or back up: without the
+  host keyfile it decrypts to nothing. Keeping it out of version control anyway is
+  reasonable defense-in-depth, so it is git-ignored by default too — remove that
+  ignore rule deliberately if you want to track it.
 - Prefer `env`/systemd credentials or `plx seal` over inline secrets in
   production.
 - Rotate on suspected leak: regenerate the keypair/identity and PSK and

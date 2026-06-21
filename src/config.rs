@@ -293,7 +293,9 @@ impl SecretSource {
         let resolved = match self {
             Self::Resolved(_) => return Ok(()),
             Self::Inline(s) => ResolvedSecret {
-                b64: Zeroizing::new(s.clone()),
+                // Move the inline string out rather than cloning it, so we don't
+                // leave a second, non-zeroized heap copy of the secret behind.
+                b64: Zeroizing::new(std::mem::take(s)),
                 was_inline: true,
             },
             Self::Reference(reference) => ResolvedSecret {

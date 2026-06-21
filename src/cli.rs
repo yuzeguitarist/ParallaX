@@ -10,6 +10,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use rand::{rngs::OsRng, RngCore};
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 use crate::{
     bench::{self, BenchmarkOptions},
@@ -368,13 +369,18 @@ fn seal_config(
     let cfg = load_config(config)?;
     cfg.validate()?;
 
-    let mut secrets: Vec<(&'static str, String)> =
-        vec![("psk", cfg.crypto.psk.as_b64().to_owned())];
+    // Hold the resolved secrets in Zeroizing so the plaintext base64 is scrubbed
+    // when sealing finishes, matching the Zeroizing discipline used elsewhere.
+    let mut secrets: Vec<(&'static str, Zeroizing<String>)> =
+        vec![("psk", Zeroizing::new(cfg.crypto.psk.as_b64().to_owned()))];
     if let Some(server) = cfg.server.as_ref() {
-        secrets.push(("private_key", server.private_key.as_b64().to_owned()));
+        secrets.push((
+            "private_key",
+            Zeroizing::new(server.private_key.as_b64().to_owned()),
+        ));
         secrets.push((
             "identity_secret_key",
-            server.identity_secret_key.as_b64().to_owned(),
+            Zeroizing::new(server.identity_secret_key.as_b64().to_owned()),
         ));
     }
 
@@ -403,20 +409,19 @@ fn seal_config(
     let bundle_path = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| config_dir.join("parallax.secrets.enc"));
-    let bundle_name = bundle_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("sealed bundle output path has no file name")?
-        .to_owned();
 
     fs::write(&bundle_path, secret_store::bundle_to_toml(&bundle))
         .with_context(|| format!("failed to write {}", bundle_path.display()))?;
+
+    // The bundle is on disk now, so canonicalization succeeds: build a reference
+    // the config can actually resolve, even when `--output` points elsewhere.
+    let bundle_ref = sealed_bundle_reference(&config_dir, &bundle_path)?;
 
     let original = fs::read_to_string(config)
         .with_context(|| format!("failed to re-read {}", config.display()))?;
     let rewritten = rewrite_secrets_to_sealed(
         &original,
-        &bundle_name,
+        &bundle_ref,
         secrets.iter().map(|(field, _)| *field),
     );
     write_secret_file_overwrite(config, &rewritten)?;
@@ -435,6 +440,36 @@ fn seal_config(
          now safe to back up; they cannot be used elsewhere without it."
     );
     Ok(())
+}
+
+/// Build the reference a sealed config should use to find its bundle. A relative
+/// reference resolves against the config's own directory, so when the bundle sits
+/// next to the config we store just its file name (portable). When `--output`
+/// puts the bundle in another directory we store its absolute path, otherwise the
+/// directory component would be lost and the config would fail to load.
+fn sealed_bundle_reference(config_dir: &Path, bundle_path: &Path) -> anyhow::Result<String> {
+    let file_name = bundle_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("sealed bundle output path has no file name")?;
+    let bundle_dir = bundle_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let same_dir = match (bundle_dir.canonicalize(), config_dir.canonicalize()) {
+        (Ok(bundle), Ok(config)) => bundle == config,
+        _ => false,
+    };
+    if same_dir {
+        return Ok(file_name.to_owned());
+    }
+    let absolute = bundle_path
+        .canonicalize()
+        .unwrap_or_else(|_| bundle_path.to_path_buf());
+    absolute
+        .to_str()
+        .map(str::to_owned)
+        .context("sealed bundle output path must be valid UTF-8")
 }
 
 /// Rewrite each named secret assignment line to a `{ sealed = "<bundle>#<field>" }`
@@ -687,7 +722,10 @@ fn write_secret_file_overwrite(path: &Path, contents: &str) -> anyhow::Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // O_NOFOLLOW: refuse to follow a symlink at the final path component, so a
+        // pre-planted link can't redirect this 0600 write onto another file. This
+        // matches the hardened read path in `read_secret_config_file`.
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options
         .open(path)
@@ -1219,5 +1257,47 @@ mod tests {
             private_b64
         );
         assert!(after.inline_secret_fields().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_output_in_other_dir_resolves() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "example.com:443",
+            "example.com:443",
+            "example.com",
+        );
+        let server_path = dir.path().join("parallax.server.toml");
+        fs::write(&server_path, &generated.server).unwrap();
+        fs::set_permissions(&server_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let before = Config::load(&server_path).unwrap();
+        let psk_b64 = before.crypto.psk.as_b64().to_owned();
+
+        // Seal the bundle into a *different* directory than the config.
+        let bundle_dir = dir.path().join("vault");
+        fs::create_dir(&bundle_dir).unwrap();
+        let bundle_path = bundle_dir.join("parallax.secrets.enc");
+        let host_key = dir.path().join("host.key");
+        seal_config(&server_path, Some(&bundle_path), Some(&host_key)).unwrap();
+
+        // The rewritten reference must keep the directory (absolute), not drop it.
+        let rewritten = fs::read_to_string(&server_path).unwrap();
+        let expected = bundle_path.canonicalize().unwrap();
+        assert!(
+            rewritten.contains(&format!("{}#psk", expected.display())),
+            "sealed reference must retain the bundle directory: {rewritten}"
+        );
+
+        // And it still resolves back to the original PSK.
+        std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+        let after = Config::load(&server_path).unwrap();
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        assert_eq!(after.crypto.psk.as_b64(), psk_b64);
     }
 }
