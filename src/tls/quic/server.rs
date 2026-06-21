@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 use super::schedule::KeySchedule;
 use super::suite::CipherSuite;
 use super::{
-    KeyChange, Keys, QuicTlsError, ALERT_DECODE_ERROR, ALERT_DECRYPT_ERROR,
+    KeyChange, KeyPair, Keys, PacketKey, QuicTlsError, ALERT_DECODE_ERROR, ALERT_DECRYPT_ERROR,
     ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
     ALERT_UNEXPECTED_MESSAGE,
 };
@@ -414,6 +414,11 @@ impl ServerHandshake {
 
     pub fn is_handshaking(&self) -> bool {
         !self.handshake_complete
+    }
+
+    /// The next 1-RTT packet-key generation for a key update (RFC 9001 §6).
+    pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
+        self.schedule.as_mut()?.next_1rtt_packet_keys().ok()
     }
 
     /// The client's raw `quic_transport_parameters` blob, once the ClientHello has
