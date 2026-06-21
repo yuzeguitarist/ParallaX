@@ -2234,23 +2234,28 @@ mod tests {
         // removes fragments straddling recv_off, so without the post-drain
         // `retain` these fully-consumed fragments would wedge the bounded
         // reassembly budget and stall further reassembly.
-        let dcid = ConnectionId::new(&[0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]);
-        let mut conn =
-            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
-                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x4d, 0x4d, 0x4d, 0x4d]),
+        )
+        .unwrap();
 
-        // Two out-of-order fragments buffered ahead of the receive offset (0).
-        conn.recv_stream(100, &[0xAA; 10]).unwrap(); // 100..110
-        conn.recv_stream(200, &[0xBB; 10]).unwrap(); // 200..210
-        assert_eq!(conn.stream.recv_pending.len(), 2);
+        // Stream 0 is client-initiated bidi (peer-initiated for the server). Two
+        // out-of-order fragments buffered ahead of the receive offset (0).
+        server.recv_stream(0, 100, false, &[0xAA; 10]).unwrap(); // 100..110
+        server.recv_stream(0, 200, false, &[0xBB; 10]).unwrap(); // 200..210
+        assert_eq!(server.streams[&0].recv_pending.len(), 2);
 
         // A single in-order fragment fills 0..250, jumping recv_off past both
         // buffered fragments without straddling either.
-        conn.recv_stream(0, &vec![0xCC; 250]).unwrap();
+        server.recv_stream(0, 0, false, &vec![0xCC; 250]).unwrap();
 
-        assert_eq!(conn.stream.recv_off, 250);
+        assert_eq!(server.streams[&0].recv_off, 250);
         assert!(
-            conn.stream.recv_pending.is_empty(),
+            server.streams[&0].recv_pending.is_empty(),
             "fully-consumed out-of-order fragments must be evicted, not wedged in the budget"
         );
     }
