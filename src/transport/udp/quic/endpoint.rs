@@ -191,7 +191,9 @@ struct ConnectRequest {
     reply: tokio::sync::oneshot::Sender<Arc<ConnShared>>,
 }
 
-/// An async QUIC endpoint: a handle onto the driver task that owns the socket.
+/// An async QUIC endpoint: a cheap, cloneable handle onto the driver task that
+/// owns the socket (like `quinn::Endpoint`).
+#[derive(Clone)]
 pub struct Endpoint {
     socket: Arc<UdpSocket>,
     /// Nudge the driver after a handle queues outbound work.
@@ -201,7 +203,10 @@ pub struct Endpoint {
     /// Ask the driver to close every connection `(error_code, reason)`.
     close_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
     /// Receive server-accepted, fully-established connections.
-    accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Arc<ConnShared>>>,
+    accept_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Arc<ConnShared>>>>,
+    /// The client config used by [`Endpoint::connect`] (set at bind or via
+    /// [`Endpoint::set_default_client_config`]).
+    default_config: Arc<Mutex<Option<Arc<ClientConfig>>>>,
 }
 
 impl Endpoint {
@@ -237,8 +242,15 @@ impl Endpoint {
             wake,
             connect_tx,
             close_tx,
-            accept_rx: tokio::sync::Mutex::new(accept_rx),
+            accept_rx: Arc::new(tokio::sync::Mutex::new(accept_rx)),
+            default_config: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Set the client config [`Endpoint::connect`] uses (like quinn's
+    /// `set_default_client_config`).
+    pub fn set_default_client_config(&self, config: Arc<ClientConfig>) {
+        *self.default_config.lock().unwrap() = Some(config);
     }
 
     /// The bound local address.
@@ -255,13 +267,19 @@ impl Endpoint {
         self.wake.notify_one();
     }
 
-    /// Open a client connection to `addr`, awaiting handshake completion.
+    /// Open a client connection to `addr`, awaiting handshake completion, using the
+    /// configured default client config (see [`Endpoint::set_default_client_config`]).
     pub async fn connect(
         &self,
         addr: SocketAddr,
         server_name: &str,
-        config: Arc<ClientConfig>,
     ) -> Result<Connection, ConnectError> {
+        let config = self
+            .default_config
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(ConnectError::EndpointClosed)?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.connect_tx
             .send(ConnectRequest {
@@ -765,10 +783,11 @@ mod tests {
         let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
 
         let accept = tokio::spawn(async move { server.accept().await });
         let conn = client
-            .connect(server_addr, "example.com", client_config())
+            .connect(server_addr, "example.com")
             .await
             .expect("client handshake completes over real UDP");
         let server_conn = accept
@@ -800,6 +819,7 @@ mod tests {
         let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
 
         let srv = tokio::spawn(async move {
             let conn = server.accept().await.unwrap();
@@ -814,10 +834,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         });
 
-        let conn = client
-            .connect(server_addr, "example.com", client_config())
-            .await
-            .unwrap();
+        let conn = client.connect(server_addr, "example.com").await.unwrap();
         let (mut send, mut recv) = conn.open_bi();
         send.write_all(b"ping").await.unwrap();
         send.finish();
@@ -835,6 +852,7 @@ mod tests {
         let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
 
         let srv = tokio::spawn(async move {
             let conn = server.accept().await.unwrap();
@@ -844,10 +862,7 @@ mod tests {
             got
         });
 
-        let conn = client
-            .connect(server_addr, "example.com", client_config())
-            .await
-            .unwrap();
+        let conn = client.connect(server_addr, "example.com").await.unwrap();
         let mut ctrl = conn.open_uni();
         ctrl.write_all(b"H3-SETTINGS").await.unwrap();
         ctrl.finish();
@@ -861,6 +876,7 @@ mod tests {
         let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
 
         let srv = tokio::spawn(async move {
             let conn = server.accept().await.unwrap();
@@ -874,10 +890,7 @@ mod tests {
             None
         });
 
-        let conn = client
-            .connect(server_addr, "example.com", client_config())
-            .await
-            .unwrap();
+        let conn = client.connect(server_addr, "example.com").await.unwrap();
         conn.close(VarInt::from_u32(7), b"bye");
 
         let reason = srv.await.unwrap();
