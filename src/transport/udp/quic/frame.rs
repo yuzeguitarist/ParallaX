@@ -775,4 +775,38 @@ mod tests {
         big.extend_from_slice(&[0u8; RESET_TOKEN_LEN]);
         assert_eq!(Iter::new(&big).next(), Some(Err(FrameError::Malformed)));
     }
+
+    #[test]
+    fn stream_without_len_bit_reads_to_end_of_packet() {
+        // encode() always sets STREAM_LEN, so hand-build the no-LEN form: type
+        // 0x08 (no OFF/LEN/FIN), id 0, then data runs to the end (RFC 9000 §19.8).
+        let buf = [FT_STREAM_BASE as u8, 0x00, 0xde, 0xad, 0xbe, 0xef];
+        let frame = Iter::new(&buf).next().unwrap().unwrap();
+        assert_eq!(
+            frame,
+            Frame::Stream {
+                id: 0,
+                offset: 0,
+                fin: false,
+                data: &[0xde, 0xad, 0xbe, 0xef],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_ack_rejects_underflowing_ranges() {
+        // first_range > largest underflows the first range's low edge.
+        let mut a = Vec::new();
+        for v in [FT_ACK, 5, 0, 0, 10] {
+            varint::encode(v, &mut a);
+        }
+        assert_eq!(Iter::new(&a).next(), Some(Err(FrameError::Malformed)));
+
+        // A gap larger than the current smallest underflows the next range.
+        let mut b = Vec::new();
+        for v in [FT_ACK, 10, 0, 1, 0, 20, 0] {
+            varint::encode(v, &mut b);
+        }
+        assert_eq!(Iter::new(&b).next(), Some(Err(FrameError::Malformed)));
+    }
 }

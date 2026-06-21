@@ -410,4 +410,13 @@ mod tests {
         put_param(&mut blob, TP_ACTIVE_CONNECTION_ID_LIMIT, 1);
         assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
     }
+
+    #[test]
+    fn read_rejects_varint_param_with_non_varint_body() {
+        // A varint-typed parameter whose body is two varints (not exactly one)
+        // must be Malformed (read_varint_body requires the body to be one varint).
+        let mut blob = Vec::new();
+        put_param_bytes(&mut blob, TP_INITIAL_MAX_DATA, &[0x01, 0x01]);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Malformed));
+    }
 }

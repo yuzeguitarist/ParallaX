@@ -638,4 +638,98 @@ mod tests {
             Err(DecodeError::ReservedBitsSet)
         );
     }
+
+    #[test]
+    fn decode_packet_number_exercises_window_wraparound_branches() {
+        // The plain branch (no window adjustment).
+        assert_eq!(decode_packet_number(300, 0x05, 1), 261);
+        // ADD branch: truncated value belongs to the NEXT window up.
+        // largest 0x1ef -> expected 0x1f0; truncated 0x05 -> candidate 0x105 is
+        // >half a window below expected, so a window is added -> 0x205.
+        assert_eq!(decode_packet_number(0x1ef, 0x05, 1), 0x205);
+        // SUB branch: truncated value belongs to the PREVIOUS window down.
+        // largest 0x105 -> expected 0x106; truncated 0xfe -> candidate 0x1fe is
+        // >half a window above expected, so a window is subtracted -> 0xfe.
+        assert_eq!(decode_packet_number(0x105, 0xfe, 1), 0xfe);
+    }
+
+    // The compose test proves the layer ROUND-TRIPS against itself; the three
+    // tests below prove the AEAD/HP are not *self-consistently wrong* — i.e. a
+    // mistake shared by encrypt and decrypt (constant nonce, unauthenticated
+    // header, no-op header protection) that a plain round-trip would miss.
+
+    #[test]
+    fn aead_nonce_depends_on_packet_number() {
+        use crate::tls::quic::{CipherSuite, DirectionalKeys};
+        let keys =
+            DirectionalKeys::from_secret(CipherSuite::Aes128GcmSha256, &[0x11u8; 32]).unwrap();
+        let aad = b"quic-header";
+        let mut at5 = b"the same plaintext payload".to_vec();
+        at5.extend_from_slice(&[0u8; 16]);
+        let mut at6 = at5.clone();
+        keys.packet.encrypt_in_place(5, aad, &mut at5).unwrap();
+        keys.packet.encrypt_in_place(6, aad, &mut at6).unwrap();
+        assert_ne!(
+            at5, at6,
+            "AEAD output must depend on the packet number (nonce = iv XOR pn)"
+        );
+        // Opening pn=5's packet under pn=6 must fail the tag (the nonce is wrong).
+        assert!(
+            keys.packet.decrypt_in_place(6, aad, &mut at5).is_err(),
+            "decrypting with the wrong packet number must fail"
+        );
+    }
+
+    #[test]
+    fn aead_authenticates_the_header_aad() {
+        use crate::tls::quic::{CipherSuite, DirectionalKeys};
+        let keys =
+            DirectionalKeys::from_secret(CipherSuite::Aes128GcmSha256, &[0x33u8; 32]).unwrap();
+        let mut sealed = b"payload".to_vec();
+        sealed.extend_from_slice(&[0u8; 16]);
+        keys.packet
+            .encrypt_in_place(1, b"good-aad", &mut sealed)
+            .unwrap();
+        // A different AAD of the same length must fail to authenticate.
+        let mut tampered = sealed.clone();
+        assert!(
+            keys.packet
+                .decrypt_in_place(1, b"evil-aad", &mut tampered)
+                .is_err(),
+            "the header must be covered as AEAD AAD"
+        );
+    }
+
+    #[test]
+    fn header_protection_actually_masks_and_restores() {
+        use crate::tls::quic::{CipherSuite, DirectionalKeys};
+        let keys =
+            DirectionalKeys::from_secret(CipherSuite::Aes128GcmSha256, &[0x55u8; 32]).unwrap();
+        let hdr = Header::Long {
+            ty: LongType::Initial,
+            version: 1,
+            dcid: ConnectionId::new(&[1, 2, 3, 4]),
+            scid: ConnectionId::new(&[]),
+            token: vec![],
+            length: 1 + 16,
+            packet_number: 0x41,
+            pn_len: 1,
+        };
+        let mut pkt = Vec::new();
+        let pn_offset = hdr.encode(&mut pkt);
+        // The HP sample is 16 bytes at pn_offset+4; pad so it exists.
+        pkt.extend_from_slice(&[0xab; 32]);
+        let plain = pkt.clone();
+        keys.header.encrypt_header(pn_offset, &mut pkt).unwrap();
+        assert_ne!(
+            pkt[..pn_offset + 1],
+            plain[..pn_offset + 1],
+            "header protection must mask the first byte and packet number"
+        );
+        keys.header.decrypt_header(pn_offset, &mut pkt).unwrap();
+        assert_eq!(
+            pkt, plain,
+            "removing header protection must restore the bytes"
+        );
+    }
 }
