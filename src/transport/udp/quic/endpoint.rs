@@ -29,12 +29,32 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 
 use super::conn::{CloseReason, Connection as Core};
-use super::packet::ConnectionId;
-use crate::tls::quic::{ClientConfig, QuicTlsError};
+use super::packet::{first_packet_space, ConnectionId, PacketSpace};
+use crate::tls::quic::{ClientConfig, QuicTlsError, QUIC_VERSION_V1};
 
 /// Maximum UDP payload we will read in one datagram (a generous ceiling above the
 /// path MTU; oversized datagrams are truncated, which fails AEAD and is dropped).
 const MAX_UDP_PAYLOAD: usize = 2048;
+
+/// Minimum size of a datagram carrying a client's first Initial (RFC 9000 §14.1):
+/// a server MUST discard smaller Initials. Used to gate server connection creation.
+const MIN_INITIAL_DATAGRAM: usize = 1200;
+
+/// Hard cap on concurrently-tracked connections. A DoS backstop: UDP source
+/// addresses are spoofable and there is no Retry address validation yet, so without
+/// a cap an off-path attacker spraying spoofed Initials could allocate connection
+/// state without bound. (Finer-grained per-address Retry validation is future work.)
+const MAX_SERVER_CONNS: usize = 1 << 16;
+
+/// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
+/// packet in a datagram padded to the §14.1 minimum. A cheap pre-check so garbage,
+/// truncated, or non-Initial datagrams from unknown peers never allocate the
+/// (multi-KB) per-connection state.
+fn looks_like_initial(data: &[u8]) -> bool {
+    data.len() >= MIN_INITIAL_DATAGRAM
+        && first_packet_space(data) == Some(PacketSpace::Initial)
+        && u32::from_be_bytes([data[1], data[2], data[3], data[4]]) == QUIC_VERSION_V1
+}
 
 /// Server identity + parameters for accepting connections.
 pub struct ServerConfig {
@@ -417,6 +437,13 @@ impl Driver {
         let Some(cfg) = self.server.clone() else {
             return;
         };
+        // Bound state creation (review finding #1): only a well-formed Initial may
+        // create a connection, and never beyond the hard cap. Garbage / truncated /
+        // non-Initial datagrams, and floods past the cap, are dropped before they can
+        // allocate a Box<ServerHandshake> + Bbr + spaces (unauthenticated DoS).
+        if self.conns.len() >= MAX_SERVER_CONNS || !looks_like_initial(data) {
+            return;
+        }
         let scid = self.next_scid.to_be_bytes();
         self.next_scid += 1;
         let core = match Core::new_server(
@@ -794,6 +821,32 @@ mod tests {
             alpn_protocols: vec![b"h3".to_vec()],
             transport_parameters: tp,
         })
+    }
+
+    #[test]
+    fn looks_like_initial_gates_connection_creation() {
+        // Garbage / truncated / non-Initial datagrams from unknown peers must not
+        // create connection state (review finding #1).
+        assert!(!looks_like_initial(&[]), "empty");
+        assert!(
+            !looks_like_initial(&[0xff; MIN_INITIAL_DATAGRAM]),
+            "a Retry-type long header is not an Initial"
+        );
+        assert!(
+            !looks_like_initial(&[0xc0, 0, 0, 0, 1]),
+            "below the 1200-byte minimum"
+        );
+        // A long-header Initial whose version is not v1 (here QUIC v2) is rejected.
+        let mut v2 = vec![0xc0u8, 0x6b, 0x33, 0x43, 0xcf];
+        v2.resize(MIN_INITIAL_DATAGRAM, 0);
+        assert!(!looks_like_initial(&v2), "non-v1 version rejected");
+        // A well-formed v1 long-header Initial, padded to the minimum, is accepted.
+        let mut good = vec![0xc0u8, 0x00, 0x00, 0x00, 0x01];
+        good.resize(MIN_INITIAL_DATAGRAM, 0);
+        assert!(
+            looks_like_initial(&good),
+            "a well-formed v1 Initial is accepted"
+        );
     }
 
     #[tokio::test]
