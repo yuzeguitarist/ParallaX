@@ -474,12 +474,44 @@ impl Connection {
         datagram
     }
 
-    /// Process one received datagram: identify the space, (for the server's first
-    /// Initial) derive Initial keys + learn CIDs, AEAD-open, dispatch the frames,
-    /// then pump the TLS engine for the response and key transitions.
+    /// Process one received datagram. A single UDP datagram MAY carry several
+    /// coalesced QUIC packets (RFC 9000 §12.2; e.g. quinn sends Initial+Handshake
+    /// together), so iterate over them: a long-header packet carries an explicit
+    /// Length, so the next coalesced packet starts immediately after it; a
+    /// short-header (1-RTT) packet has no Length and so is always the last in the
+    /// datagram. The TLS engine is pumped after each packet ([`Self::process_packet`])
+    /// so that, e.g., the Handshake keys learned from a coalesced Initial are
+    /// installed before the Handshake packet that follows it in the same datagram.
     pub fn handle_datagram(&mut self, datagram: &[u8]) -> Result<(), QuicTlsError> {
-        let pspace = packet::first_packet_space(datagram)
-            .ok_or_else(|| QuicTlsError::Crypto("unsupported packet type".into()))?;
+        let mut buf = datagram.to_vec();
+        let mut pos = 0;
+        while pos < buf.len() {
+            // Boundary of the current packet, read from its plaintext long header
+            // BEFORE `process_packet` decrypts in place. `None` ⇒ a short header
+            // (or unparseable) which runs to the datagram end: process it, stop.
+            let advance = packet::long_packet_len(&buf[pos..]);
+            self.process_packet(&mut buf[pos..])?;
+            match advance {
+                Some(n) if n != 0 && pos.checked_add(n).is_some_and(|e| e <= buf.len()) => {
+                    pos += n;
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Process ONE packet (already isolated from any coalesced trailer): for the
+    /// server's first Initial, derive Initial keys + learn CIDs; AEAD-open; on
+    /// success dispatch the frames and pump the TLS engine. An undecryptable packet
+    /// is dropped (RFC 9001 §5.4.2 — `Ok(())`): a coalesced trailer, a replay, or a
+    /// packet for keys not yet held must NOT fail the connection. Only a protocol
+    /// error decoding a frame on an AUTHENTICATED packet propagates.
+    fn process_packet(&mut self, pkt: &mut [u8]) -> Result<(), QuicTlsError> {
+        let pspace = match packet::first_packet_space(pkt) {
+            Some(s) => s,
+            None => return Ok(()), // unsupported type / clear fixed bit: drop
+        };
         let space = space_index(pspace);
 
         // Peek the long-header CIDs but DO NOT latch any state from them yet: a
@@ -488,15 +520,11 @@ impl Connection {
         // off-path attacker could otherwise inject one spoofed Initial before the
         // genuine first packet and permanently break the connection.) Everything
         // derived from this datagram is committed only AFTER the packet AEAD-opens.
-        // TODO(de-quinn): a UDP datagram may carry several coalesced QUIC packets
-        // (RFC 9000 §12.2, e.g. Initial+Handshake from quinn); this currently
-        // processes only the first. Loop over the long-header `length` before the
-        // stack is wired so the handshake does not stall against the oracle.
         let long_cids = if matches!(pspace, PacketSpace::Initial | PacketSpace::Handshake) {
-            Some(
-                packet::peek_long_cids(datagram)
-                    .map_err(|_| QuicTlsError::Crypto("malformed long header".into()))?,
-            )
+            match packet::peek_long_cids(pkt) {
+                Ok(c) => Some(c),
+                Err(_) => return Ok(()), // malformed long header: drop
+            }
         } else {
             None
         };
@@ -516,20 +544,19 @@ impl Connection {
 
         let local_cid_len = self.scid.len();
         let largest = self.spaces[space].recv.largest();
-        let mut buf = datagram.to_vec();
-        let (header, range) = {
+        let opened = {
             let keys = match &pending_initial {
                 Some((_, k)) => &k.remote,
-                None => {
-                    &self.spaces[space]
-                        .keys
-                        .as_ref()
-                        .ok_or_else(|| QuicTlsError::Crypto("no keys for packet space".into()))?
-                        .remote
-                }
+                None => match self.spaces[space].keys.as_ref() {
+                    Some(k) => &k.remote,
+                    None => return Ok(()), // no keys installed for this space yet: drop
+                },
             };
-            open_packet(keys, &mut buf, local_cid_len, largest)
-                .map_err(|e| QuicTlsError::Crypto(format!("packet open failed: {e:?}")))?
+            open_packet(keys, pkt, local_cid_len, largest)
+        };
+        let (header, range) = match opened {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // undecryptable: drop, do NOT fail the connection
         };
 
         // The packet authenticated — only NOW is it safe to commit state derived
@@ -552,7 +579,7 @@ impl Connection {
 
         // Copy the decrypted frames out so the TLS engine can be mutated while we
         // iterate.
-        let payload = buf[range].to_vec();
+        let payload = pkt[range].to_vec();
         for frame in Iter::new(&payload) {
             let frame =
                 frame.map_err(|e| QuicTlsError::Crypto(format!("frame decode failed: {e:?}")))?;
@@ -872,6 +899,74 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// Like [`drive`] but COALESCES every datagram a side has pending into a single
+    /// UDP datagram before delivering it (RFC 9000 §12.2). Exercises the receiver's
+    /// coalesced-packet loop: the client's multi-Initial ClientHello arrives as one
+    /// datagram, and the server's Initial+Handshake response arrives as one — so
+    /// the Handshake keys learned from the coalesced Initial must be installed
+    /// before the Handshake packet that immediately follows it.
+    fn drive_coalesced(a: &mut Connection, b: &mut Connection) {
+        for _ in 0..16 {
+            let mut moved = false;
+            let mut from_a = Vec::new();
+            while let Some(dg) = a.poll_transmit() {
+                from_a.extend_from_slice(&dg);
+                moved = true;
+            }
+            if !from_a.is_empty() {
+                b.handle_datagram(&from_a).unwrap();
+            }
+            let mut from_b = Vec::new();
+            while let Some(dg) = b.poll_transmit() {
+                from_b.extend_from_slice(&dg);
+                moved = true;
+            }
+            if !from_b.is_empty() {
+                a.handle_datagram(&from_b).unwrap();
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn handshake_completes_across_coalesced_datagrams() {
+        let dcid = ConnectionId::new(&[0x0c, 0x0a, 0x1e, 0x5c, 0xed, 0x00, 0x11, 0x22]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            ConnectionId::new(&[0x99, 0x88, 0x77, 0x66]),
+        )
+        .unwrap();
+
+        drive_coalesced(&mut client, &mut server);
+
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "handshake completes when packets arrive coalesced into single datagrams"
+        );
+        let mut ce = [0u8; 32];
+        let mut se = [0u8; 32];
+        client
+            .export_keying_material(&mut ce, b"parallax tudp", b"binding")
+            .unwrap();
+        server
+            .export_keying_material(&mut se, b"parallax tudp", b"binding")
+            .unwrap();
+        assert_eq!(ce, se, "exporter agrees across coalesced delivery");
+
+        // And 1-RTT relay data still round-trips through coalesced datagrams.
+        client.send_stream(b"coalesced request");
+        drive_coalesced(&mut client, &mut server);
+        assert_eq!(server.read_stream(), b"coalesced request");
     }
 
     #[test]
