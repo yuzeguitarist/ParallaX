@@ -2338,4 +2338,475 @@ mod tests {
         assert!(rendered.contains("negotiated_alpn"));
         assert!(!rendered.contains("9, 9, 9")); // raw secret bytes never printed
     }
+
+    // ---- push_u24 ----
+
+    #[test]
+    fn push_u24_accepts_max_three_byte_length() {
+        // 0x00ff_ffff is the largest value encodable in 24 bits and must be
+        // accepted: a `>`->`==` or `>`->`>=` mutation of the bound would reject
+        // this boundary value.
+        let mut out = Vec::new();
+        push_u24(&mut out, 0x00ff_ffff).unwrap();
+        assert_eq!(out, vec![0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn push_u24_rejects_oversized_length() {
+        let mut out = Vec::new();
+        let err = push_u24(&mut out, 0x0100_0000).unwrap_err();
+        assert!(matches!(err, Safari26TlsError::Handshake(_)));
+    }
+
+    // ---- hrr_random ----
+
+    #[test]
+    fn hrr_random_returns_known_sentinel() {
+        // Pins the exact HelloRetryRequest sentinel; the empty / [0] / [1] return
+        // mutants all fail the length and first/last-byte assertions.
+        let r = hrr_random();
+        assert_eq!(r.len(), 32);
+        assert_eq!(r[0], 0xcf);
+        assert_eq!(r[31], 0x9c);
+    }
+
+    // ---- TlsCipherSuite ----
+
+    #[test]
+    fn cipher_suite_from_u16_maps_each_registered_suite() {
+        assert!(matches!(
+            TlsCipherSuite::from_u16(TLS_AES_128_GCM_SHA256).unwrap(),
+            TlsCipherSuite::Aes128GcmSha256
+        ));
+        assert!(matches!(
+            TlsCipherSuite::from_u16(TLS_AES_256_GCM_SHA384).unwrap(),
+            TlsCipherSuite::Aes256GcmSha384
+        ));
+        assert!(matches!(
+            TlsCipherSuite::from_u16(TLS_CHACHA20_POLY1305_SHA256).unwrap(),
+            TlsCipherSuite::Chacha20Poly1305Sha256
+        ));
+        assert!(TlsCipherSuite::from_u16(0x0000).is_err());
+    }
+
+    #[test]
+    fn cipher_suite_hash_and_key_lengths_are_exact() {
+        assert_eq!(TlsCipherSuite::Aes128GcmSha256.hash_len(), 32);
+        assert_eq!(TlsCipherSuite::Aes256GcmSha384.hash_len(), 48);
+        assert_eq!(TlsCipherSuite::Chacha20Poly1305Sha256.hash_len(), 32);
+        assert_eq!(TlsCipherSuite::Aes128GcmSha256.key_len(), 16);
+        assert_eq!(TlsCipherSuite::Aes256GcmSha384.key_len(), 32);
+        assert_eq!(TlsCipherSuite::Chacha20Poly1305Sha256.key_len(), 32);
+    }
+
+    #[test]
+    fn cipher_suite_digest_uses_the_suite_hash() {
+        // Known SHA-256("") / SHA-384("") prefixes: the vec![] / vec![0] / vec![1]
+        // mutants fail on both length and leading byte.
+        let sha256 = TlsCipherSuite::Aes128GcmSha256.digest(b"");
+        assert_eq!(sha256.len(), 32);
+        assert_eq!(sha256[0], 0xe3);
+        let sha384 = TlsCipherSuite::Aes256GcmSha384.digest(b"");
+        assert_eq!(sha384.len(), 48);
+        assert_eq!(sha384[0], 0x38);
+    }
+
+    #[test]
+    fn cipher_suite_hmac_is_keyed_hash_of_expected_length() {
+        let mac = TlsCipherSuite::Aes128GcmSha256
+            .hmac(b"key", b"data")
+            .unwrap();
+        assert_eq!(mac.len(), 32); // kills Ok(vec![]) / Ok(vec![0]) / Ok(vec![1])
+                                   // The MAC actually depends on the key, not a constant.
+        let other = TlsCipherSuite::Aes128GcmSha256
+            .hmac(b"other-key", b"data")
+            .unwrap();
+        assert_ne!(mac, other);
+        let mac384 = TlsCipherSuite::Aes256GcmSha384
+            .hmac(b"key", b"data")
+            .unwrap();
+        assert_eq!(mac384.len(), 48);
+    }
+
+    // ---- parse_safari_server_hello ----
+
+    // Extensions a valid Safari ServerHello must carry: supported_versions=TLS1.3
+    // plus a key_share group/key. Returned separately so negative tests can drop
+    // or corrupt one arm without rebuilding the rest.
+    fn valid_sh_extensions() -> Vec<u8> {
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+        ext.extend_from_slice(&2_u16.to_be_bytes());
+        ext.extend_from_slice(&TLS13.to_be_bytes());
+
+        let mut key_share = Vec::new();
+        key_share.extend_from_slice(&0x001d_u16.to_be_bytes()); // x25519 group id
+        key_share.extend_from_slice(&32_u16.to_be_bytes());
+        key_share.extend_from_slice(&[0x42; 32]);
+        ext.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+        ext.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&key_share);
+        ext
+    }
+
+    fn build_safari_server_hello(
+        handshake_type: u8,
+        legacy_version: u16,
+        random: &[u8; 32],
+        session_id_len: usize,
+        cipher: u16,
+        compression: u8,
+        extensions: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&legacy_version.to_be_bytes());
+        body.extend_from_slice(random);
+        body.push(session_id_len as u8);
+        body.extend(std::iter::repeat(0x55).take(session_id_len));
+        body.extend_from_slice(&cipher.to_be_bytes());
+        body.push(compression);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+
+        let mut handshake = vec![handshake_type];
+        push_u24(&mut handshake, body.len()).unwrap();
+        handshake.extend_from_slice(&body);
+
+        let mut record = vec![TLS_RECORD_HANDSHAKE, 0x03, 0x03];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    fn valid_safari_server_hello() -> Vec<u8> {
+        build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS12,
+            &[0x11; 32],
+            32,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &valid_sh_extensions(),
+        )
+    }
+
+    #[test]
+    fn parse_safari_server_hello_accepts_a_valid_record() {
+        // A fully valid record must parse. This single happy-path assertion kills a
+        // large family of mutants that flip an acceptance check into a rejection:
+        // the `!=`->`==` guards on handshake_type / legacy_version / session_id /
+        // compression, the `==`->`!=` HRR-random check, the deletion of either the
+        // supported_versions or key_share match arm, and the `>` mutations of the
+        // `e.remaining() > 0` extension-loop guard (all of which would make this
+        // valid record error out).
+        let parsed = parse_safari_server_hello(&valid_safari_server_hello()).unwrap();
+        assert!(matches!(
+            parsed.cipher_suite,
+            TlsCipherSuite::Aes128GcmSha256
+        ));
+        assert_eq!(parsed.key_share_group, 0x001d);
+        assert_eq!(parsed.key_share, vec![0x42; 32]);
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_wrong_handshake_type() {
+        let record = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO + 1,
+            TLS12,
+            &[0x11; 32],
+            32,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &valid_sh_extensions(),
+        );
+        assert!(parse_safari_server_hello(&record).is_err());
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_non_tls12_legacy_version() {
+        let record = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS13,
+            &[0x11; 32],
+            32,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &valid_sh_extensions(),
+        );
+        assert!(parse_safari_server_hello(&record).is_err());
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_hello_retry_request() {
+        // random == hrr_random() must be rejected as HRR; kills the `==`->`!=`
+        // mutation of that comparison.
+        let mut hrr = [0_u8; 32];
+        hrr.copy_from_slice(hrr_random());
+        let record = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS12,
+            &hrr,
+            32,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &valid_sh_extensions(),
+        );
+        assert!(matches!(
+            parse_safari_server_hello(&record),
+            Err(Safari26TlsError::Unsupported("HelloRetryRequest"))
+        ));
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_short_session_id() {
+        let record = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS12,
+            &[0x11; 32],
+            31,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &valid_sh_extensions(),
+        );
+        assert!(parse_safari_server_hello(&record).is_err());
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_nonzero_compression() {
+        let record = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS12,
+            &[0x11; 32],
+            32,
+            TLS_AES_128_GCM_SHA256,
+            1,
+            &valid_sh_extensions(),
+        );
+        assert!(parse_safari_server_hello(&record).is_err());
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_supported_versions_not_tls13() {
+        // supported_versions present and 2 bytes long, but announcing TLS 1.2.
+        // The `data.len() == 2 && version == TLS13` guard must NOT mark TLS 1.3 as
+        // selected, so the record is rejected (MissingServerHello). Kills the
+        // `==`->`!=` and `&&`->`||` mutants on that line.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+        ext.extend_from_slice(&2_u16.to_be_bytes());
+        ext.extend_from_slice(&TLS12.to_be_bytes());
+        // include a key_share so only the version selection is at fault
+        let mut key_share = Vec::new();
+        key_share.extend_from_slice(&0x001d_u16.to_be_bytes());
+        key_share.extend_from_slice(&32_u16.to_be_bytes());
+        key_share.extend_from_slice(&[0x42; 32]);
+        ext.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+        ext.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&key_share);
+
+        let record = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS12,
+            &[0x11; 32],
+            32,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &ext,
+        );
+        assert!(matches!(
+            parse_safari_server_hello(&record),
+            Err(Safari26TlsError::MissingServerHello)
+        ));
+    }
+
+    // ---- Tls13Keys::negotiated_h2 ----
+
+    #[test]
+    fn tls13_keys_negotiated_h2_reflects_alpn() {
+        let mut keys = app_keys();
+        assert!(!keys.negotiated_h2()); // no ALPN negotiated yet
+        keys.negotiated_alpn = Some(b"h2".to_vec());
+        assert!(keys.negotiated_h2()); // kills the `-> false` mutant
+        keys.negotiated_alpn = Some(b"http/1.1".to_vec());
+        assert!(!keys.negotiated_h2());
+    }
+
+    // ---- finished_verify_data ----
+
+    #[test]
+    fn finished_verify_data_is_a_nonempty_keyed_hash() {
+        let out = finished_verify_data(TlsCipherSuite::Aes128GcmSha256, &[3_u8; 32], b"transcript")
+            .unwrap();
+        assert_eq!(out.len(), 32); // kills Ok(vec![]) / Ok(vec![0]) / Ok(vec![1])
+        assert_ne!(out, vec![0_u8; out.len()]);
+        // Depends on the traffic secret.
+        let other =
+            finished_verify_data(TlsCipherSuite::Aes128GcmSha256, &[4_u8; 32], b"transcript")
+                .unwrap();
+        assert_ne!(out, other);
+    }
+
+    // ---- RecordCipher ----
+
+    #[test]
+    fn record_cipher_nonce_xors_sequence_into_iv() {
+        let mut cipher = RecordCipher::zero(TlsCipherSuite::Aes128GcmSha256);
+        cipher.iv = [0xff; TLS13_IV_LEN];
+        cipher.seq = 0x01;
+        let nonce = cipher.nonce();
+        // The high 4 bytes are never XORed; replacing the whole nonce with
+        // [0; _] or [1; _] would change them.
+        assert_eq!(&nonce[..4], &[0xff; 4]);
+        // 0xff ^ 0x01 = 0xfe in the last byte distinguishes `^=` from `|=` (0xff).
+        assert_eq!(nonce[TLS13_IV_LEN - 1], 0xfe);
+        // With seq == 0 the iv must be returned unchanged: `&=` would zero the low
+        // 8 bytes (0xff & 0 == 0), so this pins `^=` against `&=`.
+        cipher.seq = 0;
+        assert_eq!(cipher.nonce(), [0xff; TLS13_IV_LEN]);
+    }
+
+    #[test]
+    fn record_cipher_round_trips_through_encrypt_decrypt() {
+        let mut enc = RecordCipher::new(TlsCipherSuite::Aes128GcmSha256, &[5_u8; 32]).unwrap();
+        let mut dec = RecordCipher::new(TlsCipherSuite::Aes128GcmSha256, &[5_u8; 32]).unwrap();
+
+        let r1 = enc
+            .encrypt_record(TLS_RECORD_HANDSHAKE, b"hello world")
+            .unwrap();
+        // An empty inner payload yields payload_len == AEAD_TAG_LEN + 1: this exact
+        // minimum must still decrypt, killing the `<`->`<=` mutant of the
+        // `payload_len < AEAD_TAG_LEN + 1` length guard.
+        let r2 = enc.encrypt_record(TLS_RECORD_HANDSHAKE, b"").unwrap();
+
+        let p1 = dec.decrypt_record(&r1).unwrap();
+        assert_eq!(p1.content_type, TLS_RECORD_HANDSHAKE);
+        assert_eq!(p1.plaintext, b"hello world");
+        let p2 = dec.decrypt_record(&r2).unwrap();
+        assert_eq!(p2.content_type, TLS_RECORD_HANDSHAKE);
+        assert!(p2.plaintext.is_empty());
+    }
+
+    #[test]
+    fn record_cipher_decrypt_rejects_truncated_record() {
+        let mut enc = RecordCipher::new(TlsCipherSuite::Aes128GcmSha256, &[5_u8; 32]).unwrap();
+        let mut dec = RecordCipher::new(TlsCipherSuite::Aes128GcmSha256, &[5_u8; 32]).unwrap();
+        let mut record = enc.encrypt_record(TLS_RECORD_HANDSHAKE, b"hello").unwrap();
+        record.pop(); // record.len() now < header.total_len
+        assert!(matches!(
+            dec.decrypt_record(&record),
+            Err(Safari26TlsError::Aead)
+        ));
+    }
+
+    #[test]
+    fn record_cipher_decrypt_rejects_undersized_payload() {
+        let mut dec = RecordCipher::new(TlsCipherSuite::Aes128GcmSha256, &[5_u8; 32]).unwrap();
+        // application-data record whose payload (4 bytes) is shorter than
+        // AEAD_TAG_LEN + 1: must be rejected before any AEAD work.
+        let mut record = vec![TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0x00, 0x04];
+        record.extend_from_slice(&[0xaa; 4]);
+        assert!(matches!(
+            dec.decrypt_record(&record),
+            Err(Safari26TlsError::Aead)
+        ));
+    }
+
+    // ---- reject_out_of_order_certificate ----
+
+    #[test]
+    fn reject_out_of_order_certificate_accepts_first_certificate() {
+        // Empty flight, no CertificateVerify yet: must be accepted. Kills the
+        // `delete !` mutant (which would reject the first, in-order Certificate).
+        reject_out_of_order_certificate(&ServerFlight::default()).unwrap();
+    }
+
+    #[test]
+    fn reject_out_of_order_certificate_rejects_duplicate_certificate() {
+        let flight = ServerFlight {
+            certificates: vec![vec![0xaa]],
+            ..ServerFlight::default()
+        };
+        assert!(reject_out_of_order_certificate(&flight).is_err());
+    }
+
+    #[test]
+    fn reject_out_of_order_certificate_rejects_after_certificate_verify() {
+        let flight = ServerFlight {
+            certificate_verify_seen: true,
+            ..ServerFlight::default()
+        };
+        // Together with the duplicate case, this pins the `||` (a `&&` mutant would
+        // accept each single-condition case) and the unconditional `Ok(())` mutant.
+        assert!(reject_out_of_order_certificate(&flight).is_err());
+    }
+
+    // ---- process_server_handshake_messages ----
+
+    #[test]
+    fn process_server_handshake_messages_waits_for_a_full_header() {
+        // Fewer than 4 bytes: must return Ok and leave the buffer untouched. Kills
+        // the `<`->`==`/`>` mutants of the `buf.len() < 4` guard (which would index
+        // past the end and panic).
+        let mut buf = vec![0x08, 0x00];
+        let mut flight = ServerFlight::default();
+        let mut transcript = HandshakeTranscript::new();
+        let mut keys = app_keys();
+        process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+            .unwrap();
+        assert_eq!(buf, vec![0x08, 0x00]);
+    }
+
+    #[test]
+    fn process_server_handshake_messages_processes_a_complete_zero_body_message() {
+        // A complete 4-byte message (declared body length 0) of an unknown type
+        // must be *processed* (and rejected as unsupported), not treated as a
+        // too-short header. Kills the `<`->`<=`/`==` mutants of `buf.len() < 4`.
+        let mut buf = vec![0xff, 0x00, 0x00, 0x00];
+        let mut flight = ServerFlight::default();
+        let mut transcript = HandshakeTranscript::new();
+        let mut keys = app_keys();
+        let err =
+            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+                .unwrap_err();
+        assert!(matches!(err, Safari26TlsError::Unsupported(_)));
+    }
+
+    #[test]
+    fn process_server_handshake_messages_rejects_oversized_length() {
+        // Declared length 0x080100 (524544) is just above MAX_ENCRYPTED_HANDSHAKE_
+        // MESSAGE (524288). The non-zero high and middle length bytes pin the
+        // `<< 16` / `<< 8` shifts and the `|` merges, and the value being strictly
+        // greater than the cap pins `>` against `==`/`<`.
+        let mut buf = vec![HANDSHAKE_ENCRYPTED_EXTENSIONS, 0x08, 0x01, 0x00];
+        let mut flight = ServerFlight::default();
+        let mut transcript = HandshakeTranscript::new();
+        let mut keys = app_keys();
+        let err =
+            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Handshake(ref m) if m.contains("exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn process_server_handshake_messages_allows_length_exactly_at_cap() {
+        // A declared length equal to the cap is allowed (the body may still
+        // arrive): with only the header buffered the call returns Ok and retains
+        // the bytes. Kills the `>`->`>=` mutant of the oversize check.
+        let max = MAX_ENCRYPTED_HANDSHAKE_MESSAGE;
+        let mut buf = vec![
+            HANDSHAKE_ENCRYPTED_EXTENSIONS,
+            ((max >> 16) & 0xff) as u8,
+            ((max >> 8) & 0xff) as u8,
+            (max & 0xff) as u8,
+        ];
+        let mut flight = ServerFlight::default();
+        let mut transcript = HandshakeTranscript::new();
+        let mut keys = app_keys();
+        process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+            .unwrap();
+        assert_eq!(buf.len(), 4); // header retained, nothing drained
+    }
 }
