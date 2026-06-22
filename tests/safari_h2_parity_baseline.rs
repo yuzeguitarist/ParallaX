@@ -1,26 +1,27 @@
 //! Regression baseline that locks the Safari 26 HTTP/2 fingerprint against a
-//! real Safari 26.4 (macOS Tahoe) capture of the connection preface.
+//! real Safari 26.4 (macOS Tahoe) main-document capture.
 //!
-//! The fixture under `tests/fixtures/safari26_h2_preface_localhost.bin` was
+//! The fixture under `tests/fixtures/safari26_h2_request_localhost.bin` was
 //! captured by terminating a TLS connection from Safari 26.4 with ALPN `h2`
-//! and dumping the first 4 KiB of plaintext. Two independent fresh-tab
-//! captures produced byte-identical bytes, so we commit one fixture and rely
-//! on Safari's deterministic preface for the parity check.
+//! and dumping the plaintext of a top-level navigation (GET /). It supersedes
+//! the earlier `safari26_h2_preface_localhost.bin`, a stale capture (UA
+//! Version/17.0, sub-resource headers, INITIAL_WINDOW_SIZE=4 MiB).
 //!
 //! The bytes we lock down are:
 //!
 //! * the 24-byte HTTP/2 connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`)
-//! * the SETTINGS frame: `ENABLE_PUSH=0`, `INITIAL_WINDOW_SIZE=4_194_304`,
-//!   `MAX_CONCURRENT_STREAMS=100`, `NO_RFC7540_PRIORITIES=1` in that order
-//! * the connection-level WINDOW_UPDATE increment of 10_485_760 (10 MiB)
+//! * the SETTINGS frame: `ENABLE_PUSH=0`, `MAX_CONCURRENT_STREAMS=100`,
+//!   `INITIAL_WINDOW_SIZE=2_097_152`, `NO_RFC7540_PRIORITIES=1` in that order
+//! * the connection-level WINDOW_UPDATE increment of 10_420_225 (-> 10 MiB)
 //! * the opening HEADERS frame on stream 1 with
 //!   `flags = END_STREAM | END_HEADERS`, pseudo-header order
-//!   `:method, :scheme, :path, :authority`, browser metadata headers, and
+//!   `:method, :scheme, :authority, :path`, the main-document browser metadata
+//!   (sec-fetch-dest/site/mode, accept text/html, priority u=0,i), and
 //!   HPACK-Huffman-encoded values where Safari uses Huffman.
 
 use parallax::fingerprint::http2::{Http2Fingerprint, SAFARI26_ACCEPT_LANGUAGE};
 
-const SAFARI_H2_FIXTURE: &[u8] = include_bytes!("fixtures/safari26_h2_preface_localhost.bin");
+const SAFARI_H2_FIXTURE: &[u8] = include_bytes!("fixtures/safari26_h2_request_localhost.bin");
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -31,9 +32,9 @@ const FRAME_HEADERS: u8 = 0x1;
 const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
 
-/// Authority used by both the fixture (Safari hit `https://localhost:8443/`)
+/// Authority used by both the fixture (Safari hit `https://localhost:8445/`)
 /// and the parallax-emitted comparison frame.
-const FIXTURE_AUTHORITY: &str = "localhost:8443";
+const FIXTURE_AUTHORITY: &str = "localhost:8445";
 
 #[derive(Debug)]
 struct H2Frame {
@@ -110,8 +111,8 @@ fn safari_h2_fixture_settings_match_known_shape() {
         entries,
         vec![
             (0x2, 0),         // ENABLE_PUSH
-            (0x4, 4_194_304), // INITIAL_WINDOW_SIZE = 4 MiB
             (0x3, 100),       // MAX_CONCURRENT_STREAMS
+            (0x4, 2_097_152), // INITIAL_WINDOW_SIZE = 2 MiB
             (0x9, 1),         // NO_RFC7540_PRIORITIES
         ],
         "Safari 26.4 SETTINGS list or order drifted from the captured baseline",
@@ -131,7 +132,7 @@ fn safari_h2_fixture_window_update_matches_known_increment() {
         u32::from_be_bytes([wu.payload[0], wu.payload[1], wu.payload[2], wu.payload[3]])
             & 0x7fff_ffff;
     assert_eq!(
-        increment, 10_485_760,
+        increment, 10_420_225,
         "Safari 26.4 connection-level WINDOW_UPDATE increment drifted"
     );
 }
@@ -150,37 +151,34 @@ fn safari_h2_fixture_opening_headers_match_known_shape() {
         "Safari sets END_STREAM | END_HEADERS on its initial GET / (no body)"
     );
 
-    // Pseudo-header section: indexed `:method GET` (#2), `:scheme https` (#7),
-    // `:path /` (#4), then literal-with-indexed-name `:authority` (#1) whose
-    // value is HPACK-Huffman-encoded (high bit of the length prefix set).
-    // The remaining byte ranges lock Safari's request metadata shape:
-    // `accept`, `user-agent`, `priority`, `accept-language`, and
-    // `accept-encoding` in that order.
+    // Main-document pseudo-header section: indexed `:method GET` (#2),
+    // `:scheme https` (#7), literal-with-indexed-name `:authority` (#1) with a
+    // Huffman value, then indexed `:path /` (#4). NOTE authority precedes path
+    // (the H2 main-document order; the old sub-resource fixture had path first).
     assert_eq!(
-        &headers.payload[..4],
-        &[0x82, 0x87, 0x84, 0x41],
-        "Safari pseudo-header order changed (expected :method, :scheme, :path, :authority)"
+        &headers.payload[..15],
+        &hex(b"8287418aa0e41d139d09b8f34d3784"),
+        "Safari main-document pseudo-header order / :authority huffman drifted"
     );
+    // sec-fetch-dest: document (literal new name + Huffman value).
     assert_eq!(
-        &headers.payload[4..15],
-        &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
-        "Safari 26.4 :authority huffman bytes for `localhost:8443` drifted"
+        &headers.payload[15..34],
+        &hex(b"408a4148b4a549275a42a13f8690e4b692d49f"),
+        "Safari 26.4 sec-fetch-dest bytes drifted"
     );
-    assert_eq!(&headers.payload[15..20], &[0x53, 0x03, b'*', b'/', b'*']);
+    // accept: text/html,... (indexed name #19 + Huffman value).
     assert_eq!(
-        &headers.payload[110..122],
-        &[0x40, 0x86, 0xae, 0xc3, 0x1e, 0xc3, 0x27, 0xd7, 0x03, b'u', b'=', b'3'],
-        "Safari 26.4 priority header shape drifted"
+        &headers.payload[124..174],
+        &hex(b"53b0497ca589d34d1f43aeba0c41a4c7a98f33a69a3fdf9a68fa1d75d0620d263d4c79a68fbed00177febe58f9fbed00177b"),
+        "Safari 26.4 accept (text/html main-document) bytes drifted"
     );
+    // priority `u=0, i` + accept-encoding `gzip, deflate, br, zstd` tail (after
+    // accept-language). accept-language itself (offset 209..227) is the
+    // capture's zh-CN and is intentionally not locked here.
     assert_eq!(
-        &headers.payload[122..140],
-        &hex(b"5190f73ad7b4fd7b9d6c63a91f7da002efff"),
-        "Safari 26.4 captured accept-language bytes drifted"
-    );
-    assert_eq!(
-        &headers.payload[140..],
-        &hex(b"508d9bd9abfa5242cb40d25fa523b3"),
-        "Safari 26.4 accept-encoding bytes drifted"
+        &headers.payload[227..],
+        &hex(b"4086aec31ec327d785b6007d286f50929bd9abfa5242cb40d25fa523b3e94f684c9f"),
+        "Safari 26.4 priority / accept-encoding bytes drifted"
     );
 }
 
@@ -260,14 +258,15 @@ fn parallax_safari_opening_headers_match_fixture_metadata_except_language() {
     // The provided Safari capture carries a Chinese accept-language setting.
     // ParallaX keeps the same HPACK/order shape but uses the project's
     // English-only default so deployments do not carry a locale-specific
-    // Chinese marker by default.
-    let before_language = 122;
-    let parallax_accept_encoding = 135;
-    let safari_accept_encoding = 140;
+    // Chinese marker by default. accept-language sits at offset 209 in the
+    // main-document layout (after sec-fetch-mode, before priority).
+    let before_language = 209;
+    let parallax_al_len = 13; // en-US,en;q=0.9 -> 0x51 0x8b + 11 Huffman bytes
+    let safari_al_end = 227; // the capture's zh-CN accept-language ends here
     assert_eq!(
         parallax_headers.payload.len(),
-        150,
-        "ParallaX HPACK payload must include Safari browser metadata with English language"
+        before_language + parallax_al_len + (safari_headers.payload.len() - safari_al_end),
+        "ParallaX HPACK payload length must match the main-document shape with English language"
     );
     assert_eq!(
         &parallax_headers.payload[..before_language],
@@ -275,14 +274,14 @@ fn parallax_safari_opening_headers_match_fixture_metadata_except_language() {
         "ParallaX Safari26 metadata before accept-language diverged from the capture"
     );
     assert_eq!(
-        &parallax_headers.payload[before_language..parallax_accept_encoding],
+        &parallax_headers.payload[before_language..before_language + parallax_al_len],
         &hex(b"518b2d4b70ddf45abefb4005df"),
         "ParallaX Safari26 accept-language must be HPACK-Huffman encoded English"
     );
     assert_eq!(
-        &parallax_headers.payload[parallax_accept_encoding..],
-        &safari_headers.payload[safari_accept_encoding..],
-        "ParallaX Safari26 accept-encoding diverged from the capture"
+        &parallax_headers.payload[before_language + parallax_al_len..],
+        &safari_headers.payload[safari_al_end..],
+        "ParallaX Safari26 priority/accept-encoding diverged from the capture"
     );
     assert_eq!(SAFARI26_ACCEPT_LANGUAGE, "en-US,en;q=0.9");
     assert!(!SAFARI26_ACCEPT_LANGUAGE.contains("zh"));

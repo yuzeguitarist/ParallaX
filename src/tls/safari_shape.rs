@@ -39,8 +39,9 @@ pub(crate) const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 pub(crate) const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
 pub(crate) const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
 pub(crate) const SIG_RSA_PKCS1_SHA512: u16 = 0x0601;
-/// Trailing ecdsa_sha1 in Apple's TCP `signature_algorithms`. Capture-gated for
-/// the H3 path (the QUIC enumeration may omit it); kept for the TCP fixture.
+/// Trailing ecdsa_sha1 in Apple's `signature_algorithms`. Confirmed present on
+/// BOTH the TCP and the QUIC/H3 1-RTT path (Safari emits all 10 schemes incl.
+/// this trailing 0x0201) — do NOT drop it.
 pub(crate) const SIG_ECDSA_SHA1: u16 = 0x0201;
 
 pub(crate) const MLKEM768_PUBLIC_KEY_LEN: usize = 1184;

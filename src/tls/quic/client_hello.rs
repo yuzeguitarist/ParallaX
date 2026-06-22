@@ -28,7 +28,6 @@ const TLS12_LEGACY_VERSION: u16 = 0x0303;
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_STATUS_REQUEST: u16 = 0x0005;
 const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
-const EXT_EC_POINT_FORMATS: u16 = 0x000b;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_SIGNED_CERTIFICATE_TIMESTAMP: u16 = 0x0012;
@@ -86,7 +85,6 @@ pub(crate) fn build_client_hello(params: &ClientHelloParams) -> Result<Vec<u8>, 
         EXT_SUPPORTED_GROUPS,
         &supported_groups_extension(params.grease.group),
     )?;
-    push_ext(&mut ext, EXT_EC_POINT_FORMATS, &[1, 0])?;
     push_ext(&mut ext, EXT_ALPN, &alpn_extension(params.alpn_protocols)?)?;
     push_ext(&mut ext, EXT_STATUS_REQUEST, &[1, 0, 0, 0, 0])?;
     push_ext(
@@ -289,7 +287,6 @@ mod tests {
             &[
                 0x0000, // server_name
                 0x000a, // supported_groups
-                0x000b, // ec_point_formats
                 0x0010, // ALPN
                 0x0005, // status_request
                 0x000d, // signature_algorithms

@@ -14,12 +14,18 @@ pub struct Http2Fingerprint {
 
 pub const SAFARI26_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
-     (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+     (KHTML, like Gecko) Version/26.4 Safari/605.1.15";
 pub const SAFARI26_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 
-const SAFARI26_ACCEPT: &str = "*/*";
-const SAFARI26_PRIORITY: &str = "u=3";
-const SAFARI26_ACCEPT_ENCODING: &str = "gzip, deflate, br";
+// Safari 26.4 main-document (navigation) request values. accept/priority are the
+// main-document shape (not the old sub-resource `*/*` / `u=3`), and
+// accept-encoding gained zstd. Ground truth: safari26_h2_request_localhost.bin.
+const SAFARI26_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+const SAFARI26_PRIORITY: &str = "u=0, i";
+const SAFARI26_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+const SAFARI26_SEC_FETCH_DEST: &str = "document";
+const SAFARI26_SEC_FETCH_SITE: &str = "none";
+const SAFARI26_SEC_FETCH_MODE: &str = "navigate";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum Http2FingerprintError {
@@ -38,24 +44,26 @@ pub struct Http2FrameHeader {
 impl Http2Fingerprint {
     pub fn safari26() -> Self {
         // Safari 26.4 (macOS Tahoe) HTTP/2 preface, observed against a local
-        // TLS-terminating capture (ALPN h2). The 4 SETTINGS, their order, and
-        // the 10 MiB connection-level WINDOW_UPDATE increment are byte-for-byte
-        // stable across fresh connections.
-        // Ground truth: `tests/fixtures/safari26_h2_preface_localhost.bin`.
+        // TLS-terminating capture (ALPN h2). The 4 SETTINGS (order ENABLE_PUSH,
+        // MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, NO_RFC7540_PRIORITIES) and
+        // the connection-level WINDOW_UPDATE increment of 10_420_225 (raising the
+        // 65535 default to 10 MiB) are byte-for-byte stable across fresh
+        // connections.
+        // Ground truth: `tests/fixtures/safari26_h2_request_localhost.bin`.
         Self {
             settings: vec![
                 Http2Setting { id: 0x2, value: 0 },
                 Http2Setting {
-                    id: 0x4,
-                    value: 4_194_304,
-                },
-                Http2Setting {
                     id: 0x3,
                     value: 100,
                 },
+                Http2Setting {
+                    id: 0x4,
+                    value: 2_097_152,
+                },
                 Http2Setting { id: 0x9, value: 1 },
             ],
-            initial_window_update: Some(10_485_760),
+            initial_window_update: Some(10_420_225),
         }
     }
 
@@ -90,16 +98,48 @@ impl Http2Fingerprint {
     }
 
     pub fn headers_frame(&self, authority: &str) -> Result<Vec<u8>, Http2FingerprintError> {
-        let mut payload = Vec::with_capacity(160 + authority.len());
+        // Safari 26.4 main-document request, field order as captured:
+        // :method :scheme :authority :path, then sec-fetch-dest, user-agent,
+        // accept, sec-fetch-site, sec-fetch-mode, accept-language, priority,
+        // accept-encoding. accept-language is the project's en-US default (the
+        // capture carries zh-CN); everything else matches the wire byte-for-byte.
+        let mut payload = Vec::with_capacity(260 + authority.len());
         payload.push(0x82); // :method: GET
         payload.push(0x87); // :scheme: https
-        payload.push(0x84); // :path: /
         push_hpack_literal_with_indexed_name(&mut payload, 1, authority.as_bytes(), true);
-        push_hpack_literal_with_indexed_name(&mut payload, 19, SAFARI26_ACCEPT.as_bytes(), false);
+        payload.push(0x84); // :path: /
+        push_hpack_literal_with_new_name(
+            &mut payload,
+            b"sec-fetch-dest",
+            true,
+            SAFARI26_SEC_FETCH_DEST.as_bytes(),
+            true,
+        );
         push_hpack_literal_with_indexed_name(
             &mut payload,
             58,
             SAFARI26_USER_AGENT.as_bytes(),
+            true,
+        );
+        push_hpack_literal_with_indexed_name(&mut payload, 19, SAFARI26_ACCEPT.as_bytes(), true);
+        push_hpack_literal_with_new_name(
+            &mut payload,
+            b"sec-fetch-site",
+            true,
+            SAFARI26_SEC_FETCH_SITE.as_bytes(),
+            true,
+        );
+        push_hpack_literal_with_new_name(
+            &mut payload,
+            b"sec-fetch-mode",
+            true,
+            SAFARI26_SEC_FETCH_MODE.as_bytes(),
+            true,
+        );
+        push_hpack_literal_with_indexed_name(
+            &mut payload,
+            17,
+            SAFARI26_ACCEPT_LANGUAGE.as_bytes(),
             true,
         );
         push_hpack_literal_with_new_name(
@@ -107,12 +147,6 @@ impl Http2Fingerprint {
             b"priority",
             true,
             SAFARI26_PRIORITY.as_bytes(),
-            false,
-        );
-        push_hpack_literal_with_indexed_name(
-            &mut payload,
-            17,
-            SAFARI26_ACCEPT_LANGUAGE.as_bytes(),
             true,
         );
         push_hpack_literal_with_indexed_name(
@@ -265,8 +299,8 @@ fn push_hpack_huffman_string(out: &mut Vec<u8>, value: &[u8]) {
 
 /// RFC 7541 Appendix B HPACK static Huffman table: `(code, bit_length)` indexed
 /// by the source byte 0..255. Verified by encoding `localhost:8443` and
-/// matching the bytes Safari 26.4 emitted in the captured H2 preface
-/// (`tests/fixtures/safari26_h2_preface_localhost.bin`).
+/// matching the bytes Safari 26.4 emitted in the captured H2 request
+/// (`tests/fixtures/safari26_h2_request_localhost.bin`).
 #[rustfmt::skip]
 const HPACK_HUFFMAN: [(u32, u8); 256] = [
     (0x1ff8, 13),     (0x7fffd8, 23),   (0xfffffe2, 28),  (0xfffffe3, 28),
@@ -346,14 +380,12 @@ mod tests {
     // the encoder's own output, which is why the test below ALSO checks it against
     // an independent RFC 7541 oracle rather than only against this constant.
     const SAFARI26_HEADERS_EXPECTED_HEX: &str = concat!(
-        "828784418aa0e41d139d09b8f34d33",
-        "53032a2f2a",
-        "7ad8d07f66a281b0dae053fad0321aa49d13fda992a49685340c8a6adca7e281",
-        "04416e277fb521aeba0bc8b1e63258700dae15c2da9fd66c7bf467fa528375",
-        "2a988a4ea7fed4e25b1063d4c05d5c0a6e1ca3b0cc3806d70ae16f",
-        "4086aec31ec327d703753d33",
-        "518b2d4b70ddf45abefb4005df",
-        "508d9bd9abfa5242cb40d25fa523b3",
+        "8287418aa0e41d139d09b8f34d3384408a4148b4a549275a42a13f8690e4b692d49f7ad8d07f66a281b0dae053",
+        "fad0321aa49d13fda992a49685340c8a6adca7e28104416e277fb521aeba0bc8b1e63258700dae15c2da9fd66c",
+        "7bf467fa5283752a988a4ea7fed4e25b1063d4c09c5da5370e51d8661c036b8570b753b0497ca589d34d1f43ae",
+        "ba0c41a4c7a98f33a69a3fdf9a68fa1d75d0620d263d4c79a68fbed00177febe58f9fbed00177b408a4148b4a5",
+        "49275906497f83a8f517408a4148b4a549275a93c85f86a87dcd30d25f518b2d4b70ddf45abefb4005df4086ae",
+        "c31ec327d785b6007d286f50929bd9abfa5242cb40d25fa523b3e94f684c9f",
     );
 
     #[test]
@@ -388,7 +420,11 @@ mod tests {
         assert_eq!(header.frame_type, 0x1);
         assert_eq!(header.flags, 0x5);
         assert_eq!(header.stream_id, 1);
-        assert_eq!(&frame[9..13], &[0x82, 0x87, 0x84, 0x41]);
+        assert_eq!(
+            &frame[9..12],
+            &[0x82, 0x87, 0x41],
+            "main-document pseudo order: :method :scheme :authority (authority before path)"
+        );
         assert!(
             header.len > 15,
             "Safari HEADERS must include browser metadata"
@@ -433,22 +469,24 @@ mod tests {
     /// Safari 26.4 emitted exactly these 11 bytes on the wire for the
     /// `:authority` literal of `localhost:8443`: `8a` (huffman | length=10)
     /// followed by `a0 e4 1d 13 9d 09 b8 f3 4d 33`. Capture: see
-    /// `tests/fixtures/safari26_h2_preface_localhost.bin`.
+    /// `tests/fixtures/safari26_h2_request_localhost.bin`.
     #[test]
     fn safari26_authority_matches_captured_huffman_bytes() {
         let fp = Http2Fingerprint::safari26();
         let frame = fp.headers_frame("localhost:8443").unwrap();
         let payload = &frame[9..];
+        // Main-document order: :method :scheme :authority :path.
         assert_eq!(
-            &payload[..4],
-            &[0x82, 0x87, 0x84, 0x41],
-            "pseudo-header section must precede :authority literal",
+            &payload[..3],
+            &[0x82, 0x87, 0x41],
+            ":method :scheme then :authority literal (authority precedes path)",
         );
         assert_eq!(
-            &payload[4..15],
-            &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33,],
+            &payload[3..14],
+            &[0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33],
             "Safari26 :authority huffman bytes drifted from captured baseline",
         );
+        assert_eq!(payload[14], 0x84, ":path / (indexed) follows :authority");
     }
 
     #[test]
@@ -458,7 +496,7 @@ mod tests {
         let (header, total) = Http2FrameHeader::parse_complete(&frame).unwrap();
         let payload = &frame[Http2FrameHeader::SIZE..total];
 
-        assert_eq!(header.len, 150);
+        assert_eq!(header.len, 256);
         assert_eq!(
             payload,
             hex(SAFARI26_HEADERS_EXPECTED_HEX.as_bytes()),

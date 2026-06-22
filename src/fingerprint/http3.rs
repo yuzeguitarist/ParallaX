@@ -30,9 +30,12 @@ pub use crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE;
 /// fingerprints stay in lockstep.
 pub use crate::fingerprint::http2::SAFARI26_USER_AGENT;
 
-const SAFARI26_ACCEPT: &str = "*/*";
-const SAFARI26_PRIORITY: &str = "u=3";
-const SAFARI26_ACCEPT_ENCODING: &str = "gzip, deflate, br";
+const SAFARI26_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+const SAFARI26_PRIORITY: &str = "u=0, i";
+const SAFARI26_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+const SAFARI26_SEC_FETCH_DEST: &str = "document";
+const SAFARI26_SEC_FETCH_SITE: &str = "none";
+const SAFARI26_SEC_FETCH_MODE: &str = "navigate";
 
 /// HTTP/3 frame type codes (RFC 9114 §7.2).
 pub const FRAME_TYPE_DATA: u64 = 0x00;
@@ -177,20 +180,38 @@ pub struct Http3Setting {
     pub value: u64,
 }
 
-/// GREASE SETTINGS identifier observed in Safari 26's H3 control stream. Of the
-/// reserved form `0x1f * N + 0x21` (RFC 9114 §7.2.4.1), so peers ignore it.
-pub const SETTINGS_GREASE_ID: u64 = 0x4057_616b0;
+/// GREASE SETTINGS ids are reserved as `0x1f * N + 0x21` (RFC 9114 §7.2.4.1), so
+/// peers ignore them. Safari emits a FRESH random GREASE id AND value on every H3
+/// connection (confirmed across independent captures), so a fixed pair would
+/// itself be a static, fingerprintable tell — generate per connection (see
+/// [`grease_setting_from_seed`]) and verify only the *form* on receipt (see
+/// [`is_grease_setting_id`]).
+const SETTINGS_GREASE_BASE: u64 = 0x21;
+const SETTINGS_GREASE_STRIDE: u64 = 0x1f;
 
-/// TODO(grease-value): the GREASE SETTINGS *value* Safari emits is not yet
-/// confirmed from a first-party capture. A reserved setting's value carries no
-/// meaning (peers MUST ignore it), so `0` is a safe, RFC-legal placeholder until
-/// the real captured value is folded in.
-pub const SETTINGS_GREASE_VALUE: u64 = 0;
+/// True iff `id` is a reserved GREASE SETTINGS id of the form `0x1f * N + 0x21`.
+pub fn is_grease_setting_id(id: u64) -> bool {
+    id >= SETTINGS_GREASE_BASE && (id - SETTINGS_GREASE_BASE) % SETTINGS_GREASE_STRIDE == 0
+}
 
-/// Safari 26 HTTP/3 SETTINGS, in the exact on-wire order observed on the control
-/// stream: QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS, then the GREASE
-/// setting. Notably Safari does NOT send MAX_FIELD_SECTION_SIZE (0x06).
-pub fn safari26_settings() -> [Http3Setting; 3] {
+/// Derive a per-connection GREASE SETTINGS from 8 random bytes: a reserved id
+/// (`0x1f * N + 0x21`, `N` from the first 4 bytes) and a random value (last 4
+/// bytes). Pure so it stays testable; the transport draws the seed from the system
+/// CSPRNG once per control stream. Both id and value vary per connection, matching
+/// Safari.
+pub fn grease_setting_from_seed(seed: [u8; 8]) -> Http3Setting {
+    let n = u64::from(u32::from_be_bytes([seed[0], seed[1], seed[2], seed[3]]));
+    let value = u64::from(u32::from_be_bytes([seed[4], seed[5], seed[6], seed[7]]));
+    Http3Setting {
+        id: SETTINGS_GREASE_STRIDE * n + SETTINGS_GREASE_BASE,
+        value,
+    }
+}
+
+/// Safari 26 HTTP/3 SETTINGS for one connection, in the exact on-wire order:
+/// QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS, then the per-connection
+/// `grease` setting. Notably Safari does NOT send MAX_FIELD_SECTION_SIZE (0x06).
+pub fn safari26_settings(grease: Http3Setting) -> [Http3Setting; 3] {
     [
         Http3Setting {
             id: SETTINGS_QPACK_MAX_TABLE_CAPACITY,
@@ -200,11 +221,25 @@ pub fn safari26_settings() -> [Http3Setting; 3] {
             id: SETTINGS_QPACK_BLOCKED_STREAMS,
             value: 100,
         },
-        Http3Setting {
-            id: SETTINGS_GREASE_ID,
-            value: SETTINGS_GREASE_VALUE,
-        },
+        grease,
     ]
+}
+
+/// Verify a peer advertised Safari-26-shaped H3 SETTINGS: the two fixed QPACK
+/// params (exact id+value), then exactly one GREASE setting (id form-checked, value
+/// free), and nothing else (no MAX_FIELD_SECTION_SIZE). The GREASE id/value are
+/// per-connection random, so this checks the SHAPE, not byte-equality with our own
+/// SETTINGS.
+pub fn is_safari26_settings(settings: &[Http3Setting]) -> bool {
+    matches!(
+        settings,
+        [cap, blocked, grease]
+            if cap.id == SETTINGS_QPACK_MAX_TABLE_CAPACITY
+                && cap.value == 16383
+                && blocked.id == SETTINGS_QPACK_BLOCKED_STREAMS
+                && blocked.value == 100
+                && is_grease_setting_id(grease.id)
+    )
 }
 
 /// Encode the SETTINGS frame payload (a sequence of `id value` varint pairs).
@@ -217,9 +252,10 @@ fn settings_payload(settings: &[Http3Setting]) -> Vec<u8> {
     payload
 }
 
-/// Build Safari 26's SETTINGS frame (the control stream's first frame).
-pub fn safari26_settings_frame() -> Result<Vec<u8>, Http3Error> {
-    let payload = settings_payload(&safari26_settings());
+/// Build Safari 26's SETTINGS frame (the control stream's first frame) with the
+/// given per-connection GREASE setting.
+pub fn safari26_settings_frame(grease: Http3Setting) -> Result<Vec<u8>, Http3Error> {
+    let payload = settings_payload(&safari26_settings(grease));
     encode_frame(FRAME_TYPE_SETTINGS, &payload)
 }
 
@@ -243,12 +279,11 @@ pub fn parse_settings_payload(mut payload: &[u8]) -> Result<Vec<Http3Setting>, H
 
 /// Build Safari 26's opening request HEADERS frame for `authority`.
 ///
-/// Field order is Safari-26's observed H3 order, which differs from the H2
-/// façade: the pseudo-headers are `:method :scheme :authority :path` (authority
-/// and path are swapped relative to H2's `:method :scheme :path :authority`),
-/// and the regular headers run `accept -> priority -> user-agent ->
-/// accept-language -> accept-encoding` (H2 places `user-agent` before
-/// `priority`).
+/// Field order is Safari-26's observed main-document H3 order, which is the same
+/// field sequence as the H2 main-document request (confirmed against real H3
+/// wire): pseudo-headers `:method :scheme :authority :path`, then
+/// `sec-fetch-dest, user-agent, accept, sec-fetch-site, sec-fetch-mode,
+/// accept-language, priority, accept-encoding`.
 pub fn safari26_headers_frame(authority: &str) -> Result<Vec<u8>, Http3Error> {
     let fields = safari26_request_fields(authority);
     let section = encode_field_section(&fields);
@@ -264,13 +299,25 @@ pub fn safari26_request_fields(authority: &str) -> Vec<(String, String)> {
         (":scheme".to_string(), "https".to_string()),
         (":authority".to_string(), authority.to_string()),
         (":path".to_string(), "/".to_string()),
-        ("accept".to_string(), SAFARI26_ACCEPT.to_string()),
-        ("priority".to_string(), SAFARI26_PRIORITY.to_string()),
+        (
+            "sec-fetch-dest".to_string(),
+            SAFARI26_SEC_FETCH_DEST.to_string(),
+        ),
         ("user-agent".to_string(), SAFARI26_USER_AGENT.to_string()),
+        ("accept".to_string(), SAFARI26_ACCEPT.to_string()),
+        (
+            "sec-fetch-site".to_string(),
+            SAFARI26_SEC_FETCH_SITE.to_string(),
+        ),
+        (
+            "sec-fetch-mode".to_string(),
+            SAFARI26_SEC_FETCH_MODE.to_string(),
+        ),
         (
             "accept-language".to_string(),
             SAFARI26_ACCEPT_LANGUAGE.to_string(),
         ),
+        ("priority".to_string(), SAFARI26_PRIORITY.to_string()),
         (
             "accept-encoding".to_string(),
             SAFARI26_ACCEPT_ENCODING.to_string(),
@@ -877,7 +924,7 @@ mod tests {
 
     #[test]
     fn frame_roundtrip_settings() {
-        let payload = settings_payload(&safari26_settings());
+        let payload = settings_payload(&safari26_settings(grease_setting_from_seed([0; 8])));
         let frame = encode_frame(FRAME_TYPE_SETTINGS, &payload).unwrap();
         let (hdr, body, total) = decode_frame(&frame).unwrap();
         assert_eq!(hdr.frame_type, FRAME_TYPE_SETTINGS);
@@ -1048,43 +1095,55 @@ mod tests {
 
     #[test]
     fn settings_match_safari26_ground_truth() {
-        let settings = safari26_settings();
+        let grease = grease_setting_from_seed([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        let settings = safari26_settings(grease);
         assert_eq!(settings.len(), 3);
-        // Exact id set + order.
+        // Exact id set + order for the two fixed QPACK params.
         assert_eq!(settings[0].id, SETTINGS_QPACK_MAX_TABLE_CAPACITY);
         assert_eq!(settings[0].value, 16383);
         assert_eq!(settings[1].id, SETTINGS_QPACK_BLOCKED_STREAMS);
         assert_eq!(settings[1].value, 100);
-        assert_eq!(settings[2].id, SETTINGS_GREASE_ID);
         // GREASE id must be of the reserved form 0x1f*N + 0x21.
-        assert_eq!((settings[2].id - 0x21) % 0x1f, 0);
+        assert!(is_grease_setting_id(settings[2].id));
         // Must NOT advertise MAX_FIELD_SECTION_SIZE (0x06).
         assert!(settings.iter().all(|s| s.id != 0x06));
+        // The whole set is accepted by the shape verifier.
+        assert!(is_safari26_settings(&settings));
+        // GREASE is per-connection random: a different seed yields a different id
+        // AND value (these two distinct seeds differ in every byte).
+        let other = grease_setting_from_seed([0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]);
+        assert_ne!(other.id, settings[2].id);
+        assert_ne!(other.value, settings[2].value);
+        assert!(is_grease_setting_id(other.id));
     }
 
     #[test]
     fn settings_frame_byte_layout_matches_safari26() {
-        let frame = safari26_settings_frame().unwrap();
+        let grease = grease_setting_from_seed([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        let frame = safari26_settings_frame(grease).unwrap();
         let (hdr, payload, total) = decode_frame(&frame).unwrap();
         assert_eq!(hdr.frame_type, FRAME_TYPE_SETTINGS);
         assert_eq!(total, frame.len());
 
         let parsed = parse_settings_payload(payload).unwrap();
-        assert_eq!(parsed.to_vec(), safari26_settings().to_vec());
+        assert!(is_safari26_settings(&parsed));
+        assert_eq!(parsed.to_vec(), safari26_settings(grease).to_vec());
 
-        // Byte-exact payload: 0x01 0x7fff (16383 as 2-byte varint), 0x07 0x40
-        // (100 as 1-byte... actually 100 < 0x40 is false, so 2-byte varint),
-        // then the 8-byte GREASE id varint and 0x00 value.
-        let mut expected = Vec::new();
-        put_varint(&mut expected, SETTINGS_QPACK_MAX_TABLE_CAPACITY);
-        put_varint(&mut expected, 16383);
-        put_varint(&mut expected, SETTINGS_QPACK_BLOCKED_STREAMS);
-        put_varint(&mut expected, 100);
-        put_varint(&mut expected, SETTINGS_GREASE_ID);
-        put_varint(&mut expected, SETTINGS_GREASE_VALUE);
-        assert_eq!(payload, &expected[..]);
-        // The 0x06 setting id byte must not appear anywhere in the payload.
-        assert!(!payload.contains(&0x06));
+        // The two fixed QPACK params are byte-exact and lead the payload: 0x01
+        // 0x7fff (16383 as 2-byte varint), then 0x07 0x40 0x64 (100 as 2-byte
+        // varint), followed by the per-connection GREASE id/value varints.
+        let mut fixed_prefix = Vec::new();
+        put_varint(&mut fixed_prefix, SETTINGS_QPACK_MAX_TABLE_CAPACITY);
+        put_varint(&mut fixed_prefix, 16383);
+        put_varint(&mut fixed_prefix, SETTINGS_QPACK_BLOCKED_STREAMS);
+        put_varint(&mut fixed_prefix, 100);
+        assert!(payload.starts_with(&fixed_prefix));
+        let mut grease_bytes = Vec::new();
+        put_varint(&mut grease_bytes, grease.id);
+        put_varint(&mut grease_bytes, grease.value);
+        assert_eq!(&payload[fixed_prefix.len()..], &grease_bytes[..]);
+        // No setting advertises MAX_FIELD_SECTION_SIZE (id 0x06).
+        assert!(parsed.iter().all(|s| s.id != 0x06));
     }
 
     // --- HEADERS: Safari-26 order, incl. the H2 divergence points ---------
@@ -1100,41 +1159,43 @@ mod tests {
                 ":scheme",
                 ":authority",
                 ":path",
-                "accept",
-                "priority",
+                "sec-fetch-dest",
                 "user-agent",
+                "accept",
+                "sec-fetch-site",
+                "sec-fetch-mode",
                 "accept-language",
+                "priority",
                 "accept-encoding",
             ],
         );
     }
 
     #[test]
-    fn headers_pseudo_order_differs_from_h2() {
-        // H3 pseudo order is :method :scheme :authority :path. The divergence
-        // from H2 is that :authority precedes :path (H2 sends :path then
-        // :authority).
+    fn headers_pseudo_order_matches_h2_main_document() {
+        // Main-document pseudo order is :method :scheme :authority :path on BOTH
+        // H3 and H2 (authority precedes path) — confirmed against real H3 wire.
         let fields = safari26_request_fields("example.com");
         let authority_pos = fields.iter().position(|(n, _)| n == ":authority").unwrap();
         let path_pos = fields.iter().position(|(n, _)| n == ":path").unwrap();
         assert!(
             authority_pos < path_pos,
-            "H3 must place :authority before :path (opposite of H2)"
+            "main-document :authority must precede :path"
         );
     }
 
     #[test]
-    fn headers_regular_order_differs_from_h2() {
-        // H3 regular order is accept -> priority -> user-agent. The divergence
-        // from H2 is that priority precedes user-agent (H2 sends user-agent then
-        // priority).
+    fn headers_regular_order_matches_h2_main_document() {
+        // Main-document regular order (H3 == H2): sec-fetch-dest, user-agent,
+        // accept, sec-fetch-site, sec-fetch-mode, accept-language, priority,
+        // accept-encoding. user-agent precedes priority (the main-document
+        // shape), and sec-fetch-dest leads the regular headers.
         let fields = safari26_request_fields("example.com");
-        let priority_pos = fields.iter().position(|(n, _)| n == "priority").unwrap();
-        let ua_pos = fields.iter().position(|(n, _)| n == "user-agent").unwrap();
-        assert!(
-            priority_pos < ua_pos,
-            "H3 must place priority before user-agent (opposite of H2)"
-        );
+        let pos = |name: &str| fields.iter().position(|(n, _)| n == name).unwrap();
+        assert!(pos("sec-fetch-dest") < pos("user-agent"));
+        assert!(pos("user-agent") < pos("accept"));
+        assert!(pos("accept") < pos("priority"));
+        assert!(pos("priority") < pos("accept-encoding"));
     }
 
     #[test]
@@ -1161,8 +1222,8 @@ mod tests {
     #[test]
     fn headers_reuse_http2_constants() {
         let fields = safari26_request_fields("example.com");
-        let ua = &fields[6].1;
-        let al = &fields[7].1;
+        let ua = &fields[5].1;
+        let al = &fields[9].1;
         assert_eq!(ua, SAFARI26_USER_AGENT);
         assert_eq!(al, SAFARI26_ACCEPT_LANGUAGE);
         // accept-language stays English-only, matching the H2 façade.

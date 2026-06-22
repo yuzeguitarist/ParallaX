@@ -2643,16 +2643,17 @@ async fn accept_probed_quic_from_peer(
     // Verified probe response, reports PX1P=Verified and the retention gate's
     // HardFail arm resets both ends cleanly.
     //
-    // LOCKSTEP: this requires the client's SETTINGS to be EXACTLY
-    // `safari26_settings()`. The client sends those (client runtime SETTINGS
-    // check). The mirror of this dependency lives on the client side, which
-    // requires the SERVER's SETTINGS to equal `safari26_settings()` too: when
-    // the `TODO(quic-active-probing)` gate above is lifted and this endpoint
+    // LOCKSTEP: this requires the client's SETTINGS to be Safari-26-SHAPED — the
+    // two QPACK params exact, the GREASE setting per-connection random so only its
+    // reserved form is checked (see `is_safari26_settings`). The client sends those
+    // (client runtime SETTINGS check). The mirror of this dependency lives on the
+    // client side, which requires the SERVER's SETTINGS to be Safari-26-shaped too:
+    // when the `TODO(quic-active-probing)` gate above is lifted and this endpoint
     // emits origin-shaped SETTINGS, the client's expectation must change in
     // lockstep (see client/runtime.rs SETTINGS check), or the client will
     // silently never verify the QUIC path.
     match crate::transport::udp::h3::read_peer_h3_settings(&conn).await {
-        Ok(settings) if settings == crate::fingerprint::http3::safari26_settings() => {}
+        Ok(settings) if crate::fingerprint::http3::is_safari26_settings(&settings) => {}
         _ => {
             tracing::debug!(
                 cid,

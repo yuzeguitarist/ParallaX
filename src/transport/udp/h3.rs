@@ -77,7 +77,17 @@ impl H3ControlStreams {
 pub(crate) async fn open_h3_control_stream(conn: &Connection) -> Result<SendStream, io::Error> {
     let mut control_send = conn.open_uni();
     let mut control_bytes = http3::encode_stream_type(STREAM_TYPE_CONTROL);
-    let settings = safari26_settings_frame()
+    // Safari draws a fresh GREASE SETTINGS (random id + value) on every H3
+    // connection; generate ours from the system CSPRNG so it is not a fixed tell.
+    let grease_seed = {
+        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+        let mut seed = [0u8; 8];
+        SystemRandom::new()
+            .fill(&mut seed)
+            .expect("system CSPRNG must be available");
+        seed
+    };
+    let settings = safari26_settings_frame(http3::grease_setting_from_seed(grease_seed))
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
     control_bytes.extend_from_slice(&settings);
     control_send
@@ -261,7 +271,7 @@ pub(crate) fn decode_buffered_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::http3::safari26_settings;
+    use crate::fingerprint::http3::is_safari26_settings;
     use crate::transport::udp::test_support::loopback_pair;
 
     /// Both ends open their H3 control set and each reads the OTHER's SETTINGS;
@@ -285,8 +295,8 @@ mod tests {
         };
         let ((_c_held, server_settings), (_s_held, client_settings)) = tokio::join!(client, server);
 
-        assert_eq!(server_settings, safari26_settings().to_vec());
-        assert_eq!(client_settings, safari26_settings().to_vec());
+        assert!(is_safari26_settings(&server_settings));
+        assert!(is_safari26_settings(&client_settings));
         assert!(client_conn.close_reason().is_none());
         assert!(server_conn.close_reason().is_none());
     }
@@ -343,7 +353,7 @@ mod tests {
 
     #[test]
     fn buffered_frame_decode_passthrough() {
-        let frame = safari26_settings_frame().unwrap();
+        let frame = safari26_settings_frame(http3::grease_setting_from_seed([0; 8])).unwrap();
         let (hdr, _payload, total) = decode_buffered_frame(&frame).unwrap();
         assert_eq!(hdr.frame_type, FRAME_TYPE_SETTINGS);
         assert_eq!(total, frame.len());

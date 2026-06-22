@@ -329,8 +329,8 @@ impl Census {
 //       -> tests/fixtures/safari26_apple_com_clienthello.bin
 //   B = "Safari 26.4 / macOS Tahoe (cloudflare.com capture)"
 //       -> tests/fixtures/safari26_cloudflare_com_clienthello.bin
-//   H = "Safari 26.4 / macOS Tahoe (localhost h2 capture)"
-//       -> tests/fixtures/safari26_h2_preface_localhost.bin
+//   H = "Safari 26.4 / macOS Tahoe (localhost h2 main-document capture)"
+//       -> tests/fixtures/safari26_h2_request_localhost.bin
 //
 // The ClientHello bands are corroborated by TWO independent captures (A and B):
 // both agree on every scalar/structural axis below (they differ only in SNI and
@@ -352,16 +352,16 @@ const PROV_CLIENTHELLO: &[Provenance] = &[
     },
 ];
 
-/// Provenance for the H2 bands: the localhost preface capture, plus the
+/// Provenance for the H2 bands: the localhost main-document capture, plus the
 /// source-of-record encoder calibrated against it. The encoder entry is NOT an
 /// independent capture — it carries `artifact: None` so it is never blessed as
 /// capture provenance, and its build string says so explicitly. Only the first
 /// entry is a real capture; promoting H2 to a genuine multi-capture band is
-/// future work pending a second independent Safari H2 preface capture.
+/// future work pending a second independent Safari H2 main-document capture.
 const PROV_H2: &[Provenance] = &[
     Provenance {
-        build: "Safari 26.4 / macOS Tahoe (localhost h2 capture)",
-        artifact: Some("tests/fixtures/safari26_h2_preface_localhost.bin"),
+        build: "Safari 26.4 / macOS Tahoe (localhost h2 main-document capture)",
+        artifact: Some("tests/fixtures/safari26_h2_request_localhost.bin"),
     },
     Provenance {
         build:
@@ -393,7 +393,7 @@ const SAFARI_SIG_ALG_ORDER: &[u16] = &[
 ];
 
 /// Real Safari 26.4 HTTP/2 SETTINGS id-set in wire order.
-const SAFARI_H2_SETTINGS_ID_ORDER: &[u16] = &[0x2, 0x4, 0x3, 0x9];
+const SAFARI_H2_SETTINGS_ID_ORDER: &[u16] = &[0x2, 0x3, 0x4, 0x9];
 
 /// Build the dated census. Free function (not `const`) so the band `members`
 /// can reference the `&'static` slices above without `const` promotion gymnastics.
@@ -462,7 +462,7 @@ pub fn safari_census() -> Census {
         },
         h2_window_update: FieldBand {
             axis: "h2_window_update",
-            members: &[10_485_760],
+            members: &[10_420_225],
             provenance: PROV_H2,
             trust: Trust::SingleFirstPartyCapture,
         },

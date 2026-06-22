@@ -1183,7 +1183,6 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         TOKEN_GREASE, // leading GREASE (len 0)
         0x0000,       // server_name
         0x000a,       // supported_groups
-        0x000b,       // ec_point_formats
         0x0010,       // ALPN (h3)
         0x0005,       // status_request
         0x000d,       // signature_algorithms (Apple's dup 0x0805 kept)

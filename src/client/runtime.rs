@@ -1291,12 +1291,13 @@ async fn run_client_udp_probe(
             // is already in flight; no deadlock). A peer that does not advertise
             // Safari-26's SETTINGS is a protocol divergence -> stay on TCP.
             //
-            // LOCKSTEP: this requires the server's SETTINGS to be EXACTLY
-            // `safari26_settings()`. The server currently sends those same
-            // client-shaped SETTINGS (see `TODO(quic-active-probing)` in
-            // handshake/server.rs). When that gate is lifted and the server switches
-            // to origin-shaped SETTINGS, THIS equality check must change in lockstep
-            // (to the server's new SETTINGS), or the client will reject every server
+            // LOCKSTEP: this requires the server's SETTINGS to be Safari-26-SHAPED
+            // — the two QPACK params exact, the GREASE setting per-connection random
+            // so only its reserved form is checked (see `is_safari26_settings`). The
+            // server currently sends those same client-shaped SETTINGS (see
+            // `TODO(quic-active-probing)` in handshake/server.rs). When that gate is
+            // lifted and the server switches to origin-shaped SETTINGS, THIS shape
+            // check must change in lockstep, or the client will reject every server
             // and silently never verify the QUIC path.
             match tokio::time::timeout(
                 probe_timeout,
@@ -1304,7 +1305,7 @@ async fn run_client_udp_probe(
             )
             .await
             {
-                Ok(Ok(settings)) if settings == crate::fingerprint::http3::safari26_settings() => {}
+                Ok(Ok(settings)) if crate::fingerprint::http3::is_safari26_settings(&settings) => {}
                 _ => return unreachable(),
             }
             ClientProbeResult {
