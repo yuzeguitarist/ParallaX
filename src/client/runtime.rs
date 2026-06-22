@@ -3117,11 +3117,13 @@ mod tests {
     /// construction; the test guards against a future divergence.
     #[test]
     fn residual_budget_covers_server_forward_limit() {
-        assert!(
-            MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE
-                >= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS,
-            "client residual-skip budget must cover the server's pre-PQ fallback forward limit"
-        );
+        const {
+            assert!(
+                MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE
+                    >= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS,
+                "client residual-skip budget must cover the server's pre-PQ fallback forward limit"
+            );
+        }
     }
 
     /// The UDP circuit breaker: starts closed, trips on an unusable outcome and
