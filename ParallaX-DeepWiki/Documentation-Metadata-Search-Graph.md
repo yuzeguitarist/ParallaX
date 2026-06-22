@@ -49,7 +49,7 @@ rg -n "ML-KEM|ML-DSA|identity proof|sandwich rekey" README.md ParallaX-DeepWiki 
 | Package | `parallax` | [`../Cargo.toml`](../Cargo.toml) |
 | Binaries | `parallax`, `plx` | [`../src/main.rs`](../src/main.rs), [`../src/bin/plx.rs`](../src/bin/plx.rs), [`../Cargo.toml`](../Cargo.toml) |
 | Toolchain | Recent stable Rust; the pinned `Cargo.lock` needs Cargo ≥ 1.85 (the `rust-version = 1.80` field is nominal) | [`../Cargo.toml`](../Cargo.toml), [`../Cargo.lock`](../Cargo.lock) |
-| CLI commands | `check`, `keygen`, `crypto-self-test`, `serve`, `client`, `speed`, `netmatrix`, `bench`, `config-template`, `probe`, `init` | [`../src/cli.rs`](../src/cli.rs), `plx --help` |
+| CLI commands | `check`, `keygen`, `crypto-self-test`, `serve`, `client`, `speed`, `netmatrix`, `bench`, `config-template`, `probe`, `init`, `seal` | [`../src/cli.rs`](../src/cli.rs), `plx --help` |
 | Default product transport | TCP with TLS-shaped camouflage records; experimental opt-in UDP/QUIC fast plane via `[udp].enabled` | [`../src/transport/tcp.rs`](../src/transport/tcp.rs), [`../src/transport/udp/`](../src/transport/udp/), [`Transport Layer`](Transport-Layer.md) |
 | Local ingress | Loopback-only SOCKS5 CONNECT | [`../src/client/socks.rs`](../src/client/socks.rs), [`Client Runtime & SOCKS5 Proxy`](Client-Runtime-&-SOCKS5-Proxy.md) |
 | Server probe behavior | Malformed, unauthorized, or partial traffic is relayed to fallback origin | [`../src/handshake/server.rs`](../src/handshake/server.rs), [`Server Runtime & Probing Resistance`](Server-Runtime-&-Probing-Resistance.md) |
