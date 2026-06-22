@@ -1140,11 +1140,12 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     let record = wrap_handshake_as_tls_record(&crypto[..declared]);
     let parsed = parse_client_hello(&record).expect("reassembled ClientHello parses");
 
-    // 2) Cipher suites: 20 Safari suites + 1 GREASE in slot 0 = 21 entries.
+    // 2) Cipher suites: QUIC prunes to TLS 1.3 — 3 AEAD suites + 1 GREASE in
+    //    slot 0 = 4 entries (NOT the TCP path's 21-suite 1.2+1.3 list).
     assert_eq!(
         parsed.cipher_suites.len(),
-        21,
-        "Safari-26 H3 advertises 20 cipher suites led by one GREASE value; got {:?}",
+        4,
+        "Safari-26 H3 advertises 3 TLS 1.3 cipher suites led by one GREASE value; got {:?}",
         parsed.cipher_suites
     );
     assert!(
@@ -1152,16 +1153,16 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         "cipher slot 0 must be a GREASE value; got {:#06x}",
         parsed.cipher_suites[0]
     );
-    // The three TLS 1.3 suites follow the GREASE lead, in Safari's order (no
-    // pruning to pure-1.3 — a legacy suite must survive).
+    // The three TLS 1.3 suites follow the GREASE lead, in Safari's order. QUIC
+    // prunes to pure-1.3, so NO TLS 1.2 legacy suite appears (unlike the TCP path).
     assert_eq!(
         &parsed.cipher_suites[1..4],
         &[0x1302, 0x1303, 0x1301],
         "TLS 1.3 suites must follow the GREASE lead in Safari order"
     );
     assert!(
-        parsed.cipher_suites.contains(&0x000a),
-        "legacy suite 0x000a must survive (no pure-1.3 pruning tell)"
+        !parsed.cipher_suites.contains(&0x000a),
+        "QUIC is TLS 1.3-only: no TLS 1.2 legacy suite (pruning to 1.3 is correct here)"
     );
 
     // 3) Extension order: the static Safari H3 table, GREASE matched by CLASS. The

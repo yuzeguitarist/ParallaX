@@ -115,6 +115,20 @@ pub(crate) fn safari_cipher_suites(grease: GreaseSet) -> [u16; 21] {
     ]
 }
 
+/// Safari-26 QUIC ClientHello cipher list: GREASE + the 3 TLS 1.3 AEAD suites
+/// ONLY. QUIC pins TLS 1.3, so the cipher_suites prune to 1.3 — UNLIKE the
+/// TCP/H2 path's 21-suite (1.2+1.3) [`safari_cipher_suites`] list. Reusing TCP's
+/// full list over QUIC is an instant tell (confirmed 2026-06-22 against real
+/// Safari 26.4 H3 wire: the QUIC ClientHello carries exactly GREASE,1302,1303,1301).
+pub(crate) fn safari_quic_cipher_suites(grease: GreaseSet) -> [u16; 4] {
+    [
+        grease.cipher,
+        TLS_AES_256_GCM_SHA384,
+        TLS_CHACHA20_POLY1305_SHA256,
+        TLS_AES_128_GCM_SHA256,
+    ]
+}
+
 /// `supported_groups` extension body: GREASE-led, then X25519MLKEM768, x25519,
 /// secp256r1/384/521.
 pub(crate) fn supported_groups_extension(grease_group: u16) -> Vec<u8> {

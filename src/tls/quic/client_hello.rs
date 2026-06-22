@@ -14,7 +14,7 @@
 //! unlike the TCP path's 32-byte id.
 
 use crate::tls::safari_shape::{
-    key_share_extension, safari_cipher_suites, signature_algorithms_extension,
+    key_share_extension, safari_quic_cipher_suites, signature_algorithms_extension,
     supported_groups_extension, supported_versions_extension_h3, GreaseSet,
     MLKEM768_PUBLIC_KEY_LEN,
 };
@@ -67,8 +67,9 @@ pub(crate) fn build_client_hello(params: &ClientHelloParams) -> Result<Vec<u8>, 
     // legacy_session_id: EMPTY in QUIC (no CCS middlebox-compat mode).
     body.push(0);
 
-    // cipher_suites (GREASE-led 21) + null compression.
-    push_u16_prefixed_u16s(&mut body, &safari_cipher_suites(params.grease));
+    // cipher_suites: GREASE + the 3 TLS 1.3 AEADs ONLY (QUIC prunes to 1.3, NOT
+    // the TCP path's 21-suite 1.2+1.3 list) + null compression.
+    push_u16_prefixed_u16s(&mut body, &safari_quic_cipher_suites(params.grease));
     body.push(1);
     body.push(0);
 
@@ -264,13 +265,14 @@ mod tests {
         // QUIC ClientHello carries an EMPTY legacy_session_id (no CCS compat).
         assert_eq!(sid_len, 0, "QUIC legacy_session_id must be empty");
 
-        // 21 cipher suites (20 + leading GREASE), GREASE-led, Safari TLS1.3 order.
-        assert_eq!(ciphers.len(), 21);
+        // 4 cipher suites: GREASE + the 3 TLS 1.3 AEADs ONLY. QUIC pins TLS 1.3
+        // so it prunes to 1.3 — unlike the TCP path's 21-suite 1.2+1.3 list.
+        assert_eq!(ciphers.len(), 4);
         assert!(is_grease(ciphers[0]));
         assert_eq!(&ciphers[1..4], &[0x1302, 0x1303, 0x1301]);
         assert!(
-            ciphers.contains(&0x000a),
-            "legacy suite survives (no 1.3 pruning)"
+            !ciphers.contains(&0x000a),
+            "no TLS 1.2 legacy suite (QUIC is 1.3-only)"
         );
 
         let types: Vec<u16> = order.iter().map(|(t, _)| *t).collect();
