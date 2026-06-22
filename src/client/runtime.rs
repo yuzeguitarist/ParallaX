@@ -62,7 +62,14 @@ use crate::{
 };
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
-const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize = 16;
+/// How many undecryptable (camouflage) records the client skips before the
+/// server's ParallaX key-exchange record. Bound to the shared
+/// [`crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] so it always
+/// covers the server's pre-PQ fallback forward cap; a smaller value (this was 16
+/// vs the server's 64) caused intermittent ~33-75% handshake failures on high-RTT
+/// links where the camouflage origin's response body leaks into this skip window.
+const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize =
+    crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
 /// Hard deadline for the whole post-connect authenticated establishment
 /// (camouflage TLS handshake + PQ rekey + identity verify). Mirrors the server's
 /// HANDSHAKE_TIMEOUT so a stalling/impersonating upstream cannot pin an
@@ -3029,6 +3036,93 @@ mod tests {
     };
 
     const PSK: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    /// A syntactically valid TLS ApplicationData record whose ciphertext is not a
+    /// ParallaX record, so the client's `open_*` fails with an AEAD error — exactly
+    /// what a forwarded camouflage-origin record looks like in the residual-skip
+    /// loop before the ParallaX key exchange.
+    fn camouflage_record(seed: u8) -> Vec<u8> {
+        let payload = vec![seed; 40];
+        let len = payload.len() as u16;
+        let mut rec = vec![0x17, 0x03, 0x03, (len >> 8) as u8, (len & 0xff) as u8];
+        rec.extend_from_slice(&payload);
+        rec
+    }
+
+    /// Regression for the high-RTT handshake-failure bug (client budget 16 vs
+    /// server forward limit 64): the client must skip as many camouflage records as
+    /// the server may forward before the key-exchange
+    /// (`MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`) and still accept the key
+    /// exchange. With the old budget this aborted with an AEAD/"residual budget"
+    /// error on the 17th camouflage record.
+    #[tokio::test]
+    async fn residual_skip_tolerates_full_server_forward_limit() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        use crate::{
+            config::TrafficConfig,
+            crypto::session::{derive_client_keys, CipherSuite},
+            handshake::client::ClientDataSession,
+        };
+
+        let client = X25519KeyPair::generate();
+        let server_static = X25519KeyPair::generate();
+        let transcript = [7_u8; 32];
+        let keys =
+            derive_client_keys(PSK, &client.private, &server_static.public, &transcript).unwrap();
+        let traffic = TrafficConfig::default();
+        let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Client builds its PQ rekey record; reconstruct the matching server
+        // key-exchange the same way an authenticated server would (mirrors the
+        // `pq_rekey_changes_client_session_keys` roundtrip in handshake::client).
+        let (pq_record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
+        let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
+        let request = PqRekeyRequest::decode(&server_open.open(&pq_record).unwrap()).unwrap();
+        let server_eph = X25519KeyPair::generate();
+        let encapsulation = pq::encapsulate(&request.client_mlkem_public_key).unwrap();
+        let (_, mut server_seal) = data_codecs(&keys, traffic).unwrap();
+        let kx_record = server_seal
+            .seal(
+                &ServerKeyExchange {
+                    server_x25519_public: server_eph.public,
+                    mlkem_ciphertext: encapsulation.ciphertext,
+                }
+                .encode_with_suite(CipherSuite::ChaCha20Poly1305)
+                .unwrap(),
+                &mut rng,
+            )
+            .unwrap();
+
+        // Prepend exactly the maximum number of camouflage records the server may
+        // forward, then the real key-exchange as the next record.
+        let mut stream = Vec::new();
+        for i in 0..crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS {
+            stream.extend_from_slice(&camouflage_record(i as u8));
+        }
+        stream.extend_from_slice(&kx_record);
+
+        let mut cursor: &[u8] = &stream;
+        apply_server_key_exchange_after_residuals(&mut cursor, &mut session, &pending, PSK)
+            .await
+            .expect(
+                "client must skip all forwarded camouflage records and accept the key exchange",
+            );
+    }
+
+    /// The client's residual-skip budget must always be at least the server's
+    /// pre-PQ fallback forward limit, or high-RTT handshakes intermittently abort
+    /// (the 16-vs-64 bug). Both are bound to the shared constant, so this holds by
+    /// construction; the test guards against a future divergence.
+    #[test]
+    fn residual_budget_covers_server_forward_limit() {
+        assert!(
+            MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE
+                >= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS,
+            "client residual-skip budget must cover the server's pre-PQ fallback forward limit"
+        );
+    }
 
     /// The UDP circuit breaker: starts closed, trips on an unusable outcome and
     /// suppresses negotiation until the TTL elapses, then lets exactly ONE

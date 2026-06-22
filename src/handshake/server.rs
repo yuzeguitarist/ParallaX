@@ -164,7 +164,12 @@ fn try_enter_cap_shed_fallback() -> Option<CapShedFallbackSlot> {
 const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
 const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
-const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
+// The client's residual-skip budget, mirrored here only for the operator-facing
+// warning logged when the forward cap is reached. Bound to the shared constant so
+// it can never drift from the client's actual budget again (the 16-vs-64 high-RTT
+// handshake-failure bug).
+const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize =
+    super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
 /// Cap on fallback-origin records forwarded to the client before the ParallaX PQ
 /// rekey arrives. This must comfortably cover a *full* fragmented TLS 1.3 server
 /// handshake flight (ServerHello + EncryptedExtensions + a possibly large,
@@ -173,7 +178,9 @@ const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize = 16;
 /// camouflage, so a limit smaller than the origin's record count deadlocks the
 /// session (the server stops forwarding, the client keeps waiting). 64 records
 /// (~1 MiB) is far above any real handshake flight while still bounding forwarding.
-const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = 64;
+/// Bound to the shared [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] so the
+/// client's residual-skip budget always covers exactly what this may forward.
+const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
 const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
 /// Server-side ceilings on an authenticated speed-test request. The on-wire
 /// format permits arbitrary u64 byte counts and a u16 sample count; without a
