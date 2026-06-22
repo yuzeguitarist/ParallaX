@@ -2362,12 +2362,16 @@ mod tests {
 
     #[test]
     fn hrr_random_returns_known_sentinel() {
-        // Pins the exact HelloRetryRequest sentinel; the empty / [0] / [1] return
-        // mutants all fail the length and first/last-byte assertions.
-        let r = hrr_random();
-        assert_eq!(r.len(), 32);
-        assert_eq!(r[0], 0xcf);
-        assert_eq!(r[31], 0x9c);
+        // Pins the full 32-byte HelloRetryRequest sentinel; the empty / [0] / [1]
+        // return mutants and any interior-byte mutation all fail this comparison.
+        assert_eq!(
+            hrr_random(),
+            &[
+                0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65,
+                0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+                0xc8, 0xa8, 0x33, 0x9c,
+            ]
+        );
     }
 
     // ---- TlsCipherSuite ----
@@ -2519,7 +2523,12 @@ mod tests {
             0,
             &valid_sh_extensions(),
         );
-        assert!(parse_safari_server_hello(&record).is_err());
+        assert!(matches!(
+            parse_safari_server_hello(&record),
+            Err(Safari26TlsError::ServerHello(
+                ServerHelloError::NotServerHello
+            ))
+        ));
     }
 
     #[test]
@@ -2533,7 +2542,10 @@ mod tests {
             0,
             &valid_sh_extensions(),
         );
-        assert!(parse_safari_server_hello(&record).is_err());
+        assert!(matches!(
+            parse_safari_server_hello(&record),
+            Err(Safari26TlsError::Handshake(_))
+        ));
     }
 
     #[test]
@@ -2568,7 +2580,10 @@ mod tests {
             0,
             &valid_sh_extensions(),
         );
-        assert!(parse_safari_server_hello(&record).is_err());
+        assert!(matches!(
+            parse_safari_server_hello(&record),
+            Err(Safari26TlsError::Handshake(_))
+        ));
     }
 
     #[test]
@@ -2582,7 +2597,10 @@ mod tests {
             1,
             &valid_sh_extensions(),
         );
-        assert!(parse_safari_server_hello(&record).is_err());
+        assert!(matches!(
+            parse_safari_server_hello(&record),
+            Err(Safari26TlsError::Handshake(_))
+        ));
     }
 
     #[test]
@@ -2769,6 +2787,7 @@ mod tests {
             process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
                 .unwrap_err();
         assert!(matches!(err, Safari26TlsError::Unsupported(_)));
+        assert!(buf.is_empty()); // the complete 4-byte frame was consumed before rejection
     }
 
     #[test]
