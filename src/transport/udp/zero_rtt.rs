@@ -15,8 +15,6 @@
 //! ticket lifetime (a ticket is replayable until it expires), so the caller
 //! constructs the cache with a window `>=` the issued ticket lifetime.
 
-#![allow(dead_code)] // constructed by the server endpoint wiring (S7b)
-
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};

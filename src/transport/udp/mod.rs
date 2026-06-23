@@ -94,8 +94,9 @@ use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-use crate::tls::quic::ServerCertVerifier;
+use crate::tls::quic::{ServerCertVerifier, ZeroRttGuard};
 
 /// ALPN for the masquerading HTTP/3 face: the UDP leg presents itself as h3.
 pub const UDP_ALPN: &[u8] = b"h3";
@@ -131,6 +132,28 @@ pub fn server_config(
         // anti-replay guard on the config (see the server runtime wiring).
         stek: None,
         replay_guard: None,
+    }))
+}
+
+/// Like [`server_config`] but enables 0-RTT resumption: the server issues
+/// NewSessionTickets sealed under `stek` and accepts a resumed ticket's early
+/// data, with `guard` enforcing single-use anti-replay across connections (a
+/// replayed ticket's 0-RTT is rejected and that connection falls back to a full
+/// 1-RTT handshake; RFC 8446 §8). `stek` MUST be a stable, server-only secret so
+/// a ticket issued by one per-session ephemeral endpoint still opens at the next
+/// (the server runtime derives it from the server's static private key).
+pub fn server_config_0rtt(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    stek: Zeroizing<[u8; 32]>,
+    guard: Arc<dyn ZeroRttGuard>,
+) -> Result<Arc<quic::endpoint::ServerConfig>, UdpTransportError> {
+    Ok(Arc::new(quic::endpoint::ServerConfig {
+        cert_chain: vec![cert.as_ref().to_vec()],
+        signing_key_pkcs8: key.secret_der().to_vec(),
+        alpn_protocols: vec![UDP_ALPN.to_vec()],
+        stek: Some(stek),
+        replay_guard: Some(guard),
     }))
 }
 
@@ -304,6 +327,58 @@ mod tests {
         assert_ne!(
             client_token, other_context_token,
             "the exporter-bound auth token must be bound to its context",
+        );
+    }
+
+    /// The production 0-RTT server bind path (`bind_server_endpoint_0rtt`) issues a
+    /// NewSessionTicket the client can take for a future resumption. This exercises
+    /// the transport-layer wiring the server runtime uses (STEK + shared guard on
+    /// the `ServerConfig`), end to end over the async endpoint.
+    #[tokio::test]
+    async fn zero_rtt_bound_server_issues_a_resumption_ticket() {
+        use crate::crypto::replay::ReplayCache;
+        use crate::tls::quic::derive_stek;
+        use crate::transport::udp::endpoint::{
+            bind_client_endpoint_accept_any, bind_server_endpoint_0rtt,
+        };
+        use crate::transport::udp::zero_rtt::ReplayCacheGuard;
+
+        let stek = derive_stek(&[7_u8; 32]);
+        let guard = Arc::new(ReplayCacheGuard::new(
+            ReplayCache::new(64).with_window_secs(604_800),
+        ));
+        let server =
+            bind_server_endpoint_0rtt("127.0.0.1:0".parse().unwrap(), "localhost", stek, guard)
+                .await
+                .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let conn = client.connect(server_addr, "localhost").await.unwrap();
+        let _server_conn = acceptor
+            .await
+            .unwrap()
+            .expect("server accepts the connection");
+
+        // The server sends its NewSessionTicket right after the handshake; poll
+        // briefly for it to reach the client driver, then take it.
+        let mut ticket = None;
+        for _ in 0..50 {
+            if let Some(t) = conn.take_session_ticket(1_000) {
+                ticket = Some(t);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            ticket.is_some(),
+            "client received a NewSessionTicket from the 0-RTT-enabled server"
         );
     }
 }

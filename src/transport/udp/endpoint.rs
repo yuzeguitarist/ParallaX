@@ -10,11 +10,12 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use zeroize::Zeroizing;
 
-use crate::tls::quic::{AcceptAnyServerCert, ServerCertVerifier};
+use crate::tls::quic::{AcceptAnyServerCert, ServerCertVerifier, ZeroRttGuard};
 use crate::transport::udp::quic::endpoint::Endpoint;
 
-use super::{client_config, server_config, UdpTransportError};
+use super::{client_config, server_config, server_config_0rtt, UdpTransportError};
 
 /// Generate an ephemeral self-signed certificate for the UDP QUIC server.
 pub fn ephemeral_self_signed(
@@ -35,6 +36,22 @@ pub async fn bind_server_endpoint(
 ) -> Result<Endpoint, UdpTransportError> {
     let (cert, key) = ephemeral_self_signed(sni)?;
     Ok(Endpoint::server(addr, server_config(cert, key)?).await?)
+}
+
+/// Bind a UDP QUIC server endpoint with 0-RTT resumption enabled: it issues
+/// NewSessionTickets sealed under `stek` and accepts a resumed ticket's early
+/// data, with `guard` enforcing single-use anti-replay across connections. See
+/// [`bind_server_endpoint`] for the cold-start (1-RTT-only) variant. `stek` must
+/// be stable + server-only so a ticket survives the per-session ephemeral
+/// endpoints (the server runtime derives it from the static private key).
+pub async fn bind_server_endpoint_0rtt(
+    addr: SocketAddr,
+    sni: &str,
+    stek: Zeroizing<[u8; 32]>,
+    guard: Arc<dyn ZeroRttGuard>,
+) -> Result<Endpoint, UdpTransportError> {
+    let (cert, key) = ephemeral_self_signed(sni)?;
+    Ok(Endpoint::server(addr, server_config_0rtt(cert, key, stek, guard)?).await?)
 }
 
 /// Bind a UDP QUIC client endpoint with the production wire shape.

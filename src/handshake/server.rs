@@ -357,6 +357,42 @@ enum FirstClientRead {
     FallbackPrefix(Vec<u8>),
 }
 
+/// Process-global 0-RTT enablement for the UDP fast plane, built once in [`run`]
+/// when `udp.enabled` (otherwise the plane stays cold-start / 1-RTT only). `run`
+/// is one-per-process, so a `OnceLock` is the right home — the same shape as
+/// [`TIMEOUT_TUNING`].
+///
+/// `stek` is derived from the server's stable static private key: server-only (a
+/// client cannot forge a ticket) and stable, so a ticket issued by one per-session
+/// ephemeral QUIC endpoint still opens at the next one. `guard` is the shared,
+/// persistent single-use anti-replay cache, so a replayed ticket's early data is
+/// rejected — including across a server restart — and that connection falls back
+/// to a full 1-RTT handshake.
+struct ServerZeroRtt {
+    stek: zeroize::Zeroizing<[u8; 32]>,
+    guard: Arc<crate::transport::udp::zero_rtt::ReplayCacheGuard>,
+}
+
+static SERVER_ZERO_RTT: OnceLock<ServerZeroRtt> = OnceLock::new();
+
+/// 0-RTT resumption-ticket lifetime (RFC 8446 §4.6.1): 7 days, matching the
+/// Safari-26 NewSessionTicket baseline. The anti-replay window is sized to this so
+/// a ticket stays replay-protected for exactly as long as it is valid.
+const ZERO_RTT_TICKET_LIFETIME_SECS: u64 = 604_800;
+
+/// The 0-RTT anti-replay cache path: a sibling of the auth-handshake replay cache
+/// (so an operator protects one directory), kept distinct because the two caches
+/// key different things (auth: handshake transcript fingerprint; 0-RTT: the
+/// resumption-ticket digest).
+fn zero_rtt_replay_cache_path(auth_cache_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = auth_cache_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("parallax-replay.cache"));
+    name.push(".0rtt");
+    auth_cache_path.with_file_name(name)
+}
+
 pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     if config.mode != Mode::Server {
         return Err(HandshakeServerError::WrongMode);
@@ -408,6 +444,44 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         )?,
     ));
     let secrets = ServerRuntimeSecrets::decode(&server)?;
+    // Enable 0-RTT on the experimental UDP fast plane: a STEK derived from the
+    // server's stable static private key (server-only, and stable across the
+    // per-session ephemeral QUIC endpoints) lets the server issue + accept
+    // resumption tickets, and a persistent single-use guard rejects a replayed
+    // ticket's early data (that connection then falls back to 1-RTT). Proxied
+    // outbound stays gated on the exporter-bound auth token (commit-late), so a
+    // replayed 0-RTT flight — which cannot complete 1-RTT and therefore cannot
+    // produce a valid token — never opens an outbound connection. Built only when
+    // udp is enabled; the plane (and thus 0-RTT) remains behind the experimental-
+    // UDP and TODO(quic-active-probing) gates. A cache-load failure degrades to
+    // cold-start (1-RTT only) rather than failing the server.
+    if udp.enabled {
+        let zr_path = zero_rtt_replay_cache_path(&server.replay_cache_path);
+        match ReplayCache::load_or_create_authenticated_with_window(
+            &zr_path,
+            server.replay_cache_capacity,
+            &psk,
+            ZERO_RTT_TICKET_LIFETIME_SECS,
+        ) {
+            Ok(cache) => {
+                let guard = Arc::new(crate::transport::udp::zero_rtt::ReplayCacheGuard::new(
+                    cache,
+                ));
+                let stek = crate::tls::quic::derive_stek(secrets.private_key());
+                if SERVER_ZERO_RTT.set(ServerZeroRtt { stek, guard }).is_err() {
+                    tracing::debug!(
+                        "0-RTT enablement already set; keeping the first configuration"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "0-RTT replay cache unavailable; UDP fast plane stays cold-start (1-RTT only)"
+                );
+            }
+        }
+    }
     let listener = TcpListener::bind(server.listen).await?;
     let connection_limit = relay_connection_limit(udp.enabled)?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
@@ -1610,7 +1684,9 @@ async fn run_authenticated_data_mode(
                                 UdpDecline, UdpOffer, UdpProbeAck, UDP_CC_BBR,
                                 UDP_DECLINE_DISABLED, UDP_FEC_ADAPTIVE,
                             };
-                            use crate::transport::udp::endpoint::bind_server_endpoint;
+                            use crate::transport::udp::endpoint::{
+                                bind_server_endpoint, bind_server_endpoint_0rtt,
+                            };
 
                             let offered = if udp.enabled {
                                 // Bind the probe endpoint on the same interface and
@@ -1630,12 +1706,31 @@ async fn run_authenticated_data_mode(
                                 // ClientHello SNI), never the literal "localhost" — a
                                 // QUIC Initial carrying SNI=localhost to a public IP is
                                 // a zero-false-positive censorship signature.
-                                match bind_server_endpoint(
-                                    std::net::SocketAddr::new(bind_ip, 0),
-                                    &handshake.client_hello.sni,
-                                )
-                                .await
-                                {
+                                let bind_addr = std::net::SocketAddr::new(bind_ip, 0);
+                                // When 0-RTT is enabled (process-wide, see `run`), this
+                                // ephemeral endpoint issues + accepts resumption tickets
+                                // under the shared STEK + single-use replay guard; a
+                                // ticket issued here still opens at a later session's
+                                // ephemeral endpoint because the STEK is host-stable.
+                                let bound = match SERVER_ZERO_RTT.get() {
+                                    Some(zr) => {
+                                        bind_server_endpoint_0rtt(
+                                            bind_addr,
+                                            &handshake.client_hello.sni,
+                                            zr.stek.clone(),
+                                            zr.guard.clone(),
+                                        )
+                                        .await
+                                    }
+                                    None => {
+                                        bind_server_endpoint(
+                                            bind_addr,
+                                            &handshake.client_hello.sni,
+                                        )
+                                        .await
+                                    }
+                                };
+                                match bound {
                                     Ok(ep) => ep.local_addr().ok().and_then(|addr| {
                                         let port = addr.port();
                                         if port == 0 {

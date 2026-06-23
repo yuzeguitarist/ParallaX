@@ -146,6 +146,7 @@ mod handshake;
 
 pub(crate) use schedule::initial_keys;
 pub(crate) use server::ServerHandshake;
+pub(crate) use ticket::derive_stek;
 pub use ticket::ClientTicket;
 
 /// Cross-connection 0-RTT anti-replay (single-use ticket; RFC 8446 §8). The server
