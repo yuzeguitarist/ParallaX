@@ -3,10 +3,8 @@
 //! The [`Controller`] trait is the connection↔CC seam: the connection feeds each
 //! ACK's outcome (newly-acked bytes, the latest RTT, a delivery-rate sample, and
 //! bytes-in-flight) and gates its send budget on [`Controller::window`] minus
-//! bytes-in-flight. Two controllers live behind it:
+//! bytes-in-flight. One controller lives behind it:
 //!
-//! - [`NewReno`] — the RFC 9002 §7 reference (slow start + AIMD, halve on loss). A
-//!   correctness scaffold; not the shipping default.
 //! - [`Bbr`] — a clean-room BBRv1 (Cardwell et al. / draft-cardwell-iccrg-bbr):
 //!   a model of the path (bottleneck bandwidth × round-trip propagation) drives a
 //!   window of `gain × BDP`, and — crucially for the cross-border links this UDP
@@ -24,8 +22,6 @@ use std::time::{Duration, Instant};
 const MAX_DATAGRAM_SIZE: u64 = 1200;
 /// Initial window: `min(10*mss, max(2*mss, 14720))` (RFC 9002 §7.2) = 12000.
 const INITIAL_WINDOW: u64 = 10 * MAX_DATAGRAM_SIZE;
-/// The window never shrinks below `2*mss` (RFC 9002 §7.2).
-const MINIMUM_WINDOW: u64 = 2 * MAX_DATAGRAM_SIZE;
 
 /// The outcome of one received ACK, fed to the congestion controller.
 #[derive(Debug, Clone, Copy)]
@@ -55,69 +51,6 @@ pub trait Controller: Send {
     fn on_congestion_event(&mut self, now: Instant);
     /// The current congestion window, in bytes.
     fn window(&self) -> u64;
-}
-
-/// RFC 9002 §7 NewReno: slow start until `ssthresh`, then congestion avoidance;
-/// a congestion event halves the window.
-#[derive(Debug, Clone)]
-pub struct NewReno {
-    window: u64,
-    ssthresh: u64,
-    /// Acked-bytes accumulator for congestion avoidance. The per-ack increment
-    /// `MSS * acked / cwnd` truncates to 0 once `cwnd > MSS * acked`, which stalls
-    /// growth at high windows; accumulating acked bytes and adding one MSS per
-    /// window keeps additive increase working (RFC 9002 §7.3.2).
-    bytes_acked: u64,
-}
-
-impl Default for NewReno {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NewReno {
-    pub fn new() -> Self {
-        Self {
-            window: INITIAL_WINDOW,
-            ssthresh: u64::MAX,
-            bytes_acked: 0,
-        }
-    }
-}
-
-impl Controller for NewReno {
-    fn on_ack(&mut self, info: &AckInfo) {
-        if info.app_limited {
-            return;
-        }
-        let bytes = info.bytes_acked;
-        if self.window < self.ssthresh {
-            // Slow start: exponential growth (RFC 9002 §7.3.1).
-            self.window += bytes;
-        } else {
-            // Congestion avoidance (RFC 9002 §7.3.2): ~1 MSS per RTT. Accumulate
-            // acked bytes and add one MSS per window so growth does not stall at
-            // high windows, where `MAX_DATAGRAM_SIZE * bytes / window` truncates
-            // to 0.
-            self.bytes_acked += bytes;
-            while self.bytes_acked >= self.window {
-                self.bytes_acked -= self.window;
-                self.window += MAX_DATAGRAM_SIZE;
-            }
-        }
-    }
-
-    fn on_congestion_event(&mut self, _now: Instant) {
-        // RFC 9002 §7.3.2: ssthresh = cwnd / 2 (loss reduction factor), floored.
-        self.ssthresh = (self.window / 2).max(MINIMUM_WINDOW);
-        self.window = self.ssthresh;
-        self.bytes_acked = 0;
-    }
-
-    fn window(&self) -> u64 {
-        self.window
-    }
 }
 
 /// BBR's high gain `2/ln(2) ≈ 2.885`: the startup pacing/cwnd gain that doubles the
@@ -349,63 +282,6 @@ impl Controller for Bbr {
 mod tests {
     use super::*;
 
-    fn ack(bytes: u64, app_limited: bool) -> AckInfo {
-        AckInfo {
-            now: Instant::now(),
-            bytes_acked: bytes,
-            rtt: Duration::from_millis(50),
-            delivery_rate: 0,
-            in_flight: 0,
-            delivered: 0,
-            app_limited,
-        }
-    }
-
-    #[test]
-    fn newreno_starts_at_the_rfc_initial_window() {
-        assert_eq!(NewReno::new().window(), 12_000);
-    }
-
-    #[test]
-    fn newreno_slow_start_grows_by_bytes_acked() {
-        let mut cc = NewReno::new();
-        cc.on_ack(&ack(MAX_DATAGRAM_SIZE, false));
-        assert_eq!(cc.window(), 12_000 + 1_200, "slow start adds bytes-acked");
-    }
-
-    #[test]
-    fn newreno_app_limited_acks_do_not_grow_the_window() {
-        let mut cc = NewReno::new();
-        cc.on_ack(&ack(MAX_DATAGRAM_SIZE, true));
-        assert_eq!(cc.window(), 12_000, "app-limited ack does not grow cwnd");
-    }
-
-    #[test]
-    fn newreno_congestion_event_halves_then_avoids() {
-        let now = Instant::now();
-        let mut cc = NewReno::new();
-        cc.on_congestion_event(now);
-        assert_eq!(cc.window(), 6_000, "loss halves the window");
-        for _ in 0..5 {
-            cc.on_ack(&ack(MAX_DATAGRAM_SIZE, false)); // 5 * 1200 == one 6000-byte window
-        }
-        assert_eq!(
-            cc.window(),
-            6_000 + MAX_DATAGRAM_SIZE,
-            "one MSS per window in CA"
-        );
-    }
-
-    #[test]
-    fn newreno_window_never_drops_below_minimum() {
-        let now = Instant::now();
-        let mut cc = NewReno::new();
-        for _ in 0..20 {
-            cc.on_congestion_event(now);
-        }
-        assert_eq!(cc.window(), MINIMUM_WINDOW, "cwnd floors at 2*mss");
-    }
-
     /// A delivery-rate sample at a known RTT yields `cwnd ≈ gain × BDP`.
     fn bbr_ack(rate: u64, rtt_ms: u64, delivered: u64, now: Instant) -> AckInfo {
         AckInfo {
@@ -441,7 +317,10 @@ mod tests {
             ));
         }
         let before = cc.window();
-        assert!(before > MINIMUM_WINDOW, "model lifted cwnd above the floor");
+        assert!(
+            before > BBR_MIN_PIPE_CWND,
+            "model lifted cwnd above the floor"
+        );
         cc.on_congestion_event(now + Duration::from_secs(3));
         assert_eq!(
             cc.window(),

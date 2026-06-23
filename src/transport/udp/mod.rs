@@ -14,85 +14,19 @@
 
 pub mod auth;
 pub mod endpoint;
-pub(crate) mod envelope;
 pub(crate) mod h3;
 pub mod probe;
-/// Hand-written, quinn-free QUIC transport stack (Phase 2 of de-vendoring).
-///
-/// Built clean-room from RFC 9000/9001/9002 to replace `quinn` + the vendored
-/// `quinn-proto` fork. Lands incrementally: each module is verified by its own
-/// RFC KAT / round-trip tests and is INERT (not yet wired into the live data
-/// path) until the cutover PR repoints the carrier off `quinn`. `#![allow(dead_code)]`
-/// in the module marks that staged, not-yet-referenced status.
+/// Hand-written, quinn-free QUIC transport stack (Phase 2 of de-vendoring): the
+/// live production carrier for the UDP fast plane, built clean-room from RFC
+/// 9000/9001/9002. The `quinn` + vendored `quinn-proto` fork it replaced are gone
+/// from the dependency tree; each module carries its own RFC KAT / round-trip tests.
 pub(crate) mod quic;
-pub(crate) mod reorder;
 /// Stable-:443 origin-splice QUIC carrier: a process-wide shared endpoint that
 /// marker-terminates authenticated ParallaX clients, splices every other Initial to
 /// the real origin, and routes accepted connections back to their session by DCID.
 pub(crate) mod stable;
 /// Persistent single-use 0-RTT anti-replay guard (backs `tls::quic::ZeroRttGuard`).
 pub(crate) mod zero_rtt;
-
-/// Fuzz-only re-exports of the internal TUDP wire parsers. Compiled ONLY under
-/// `--cfg fuzzing` (which cargo-fuzz sets); absent from normal `cargo build` /
-/// `cargo test` / CI. Returns std types so the external fuzz crate needs no
-/// access to the pub(crate) envelope types.
-#[cfg(fuzzing)]
-#[allow(clippy::result_unit_err)]
-pub mod fuzz {
-    use std::ops::Range;
-
-    /// Decode one envelope prefix → (seq, record byte-range within `input`, bytes consumed).
-    pub fn decode_envelope_prefix(input: &[u8]) -> Result<(u64, Range<usize>, usize), ()> {
-        super::envelope::decode_prefix(input)
-            .map(|e| (e.seq, e.record, e.consumed))
-            .map_err(|_| ())
-    }
-
-    /// Append one enveloped record to `out`.
-    pub fn encode_envelope_into(seq: u64, record: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
-        super::envelope::encode_into(seq, record, out).map_err(|_| ())
-    }
-
-    /// Drive a bounded ReorderBuffer with an attacker-derived op stream and
-    /// assert its hard memory bounds always hold (the anti-exhaustion guarantee:
-    /// a peer must never be able to push pending state past max_records/max_bytes).
-    pub fn reorder_drive(data: &[u8]) {
-        if data.len() < 11 {
-            return;
-        }
-        let start_seq = u64::from_be_bytes(data[0..8].try_into().expect("8 bytes checked"));
-        let max_records = 1 + (data[8] as usize % 64);
-        let max_bytes = 1 + (u16::from_be_bytes([data[9], data[10]]) as usize % 65536);
-        let mut buf = super::reorder::ReorderBuffer::new(start_seq, max_records, max_bytes);
-        let mut rest = &data[11..];
-        while !rest.is_empty() {
-            let op = rest[0];
-            rest = &rest[1..];
-            if op & 1 == 0 {
-                if rest.len() < 9 {
-                    break;
-                }
-                let seq = u64::from_be_bytes(rest[0..8].try_into().expect("8 bytes checked"));
-                let len = rest[8] as usize;
-                let take = len.min(rest.len() - 9);
-                let record = rest[9..9 + take].to_vec();
-                rest = &rest[9 + take..];
-                let _ = buf.insert(seq, record);
-            } else {
-                let _ = buf.pop_next();
-            }
-            assert!(
-                buf.pending_len() <= max_records,
-                "reorder pending_len exceeded its bound"
-            );
-            assert!(
-                buf.pending_bytes() <= max_bytes,
-                "reorder pending_bytes exceeded its bound"
-            );
-        }
-    }
-}
 
 use std::net::SocketAddr;
 use std::sync::Arc;

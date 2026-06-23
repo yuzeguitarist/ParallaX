@@ -1,12 +1,10 @@
 //! Owned QUIC transport parameters (RFC 9000 §18) for the hand-written stack.
 //!
-//! `quinn-proto`'s `TransportParameters` keeps every field `pub(crate)`, which
-//! forces the carrier to round-trip through `write()`/`read()` bytes just to read
-//! one field back (the deepest quinn-proto coupling — see
-//! [`crate::transport::udp::safari_crypto::encode_safari_transport_params`], which
-//! serializes quinn's blob only to re-parse it). This type exposes its fields
-//! directly, so one struct is the single source of truth for BOTH what we
-//! advertise on the wire AND what we enforce — no advertised-vs-actual gap.
+//! Unlike `quinn-proto`'s `TransportParameters` (every field `pub(crate)`, forcing
+//! a round-trip through `write()`/`read()` bytes just to read one field back), this
+//! type exposes its fields directly, so one struct is the single source of truth
+//! for BOTH what we advertise on the wire AND what we enforce — no
+//! advertised-vs-actual gap.
 //!
 //! The client encoder reproduces Safari-26 H3's exact `0x39` blob: the confirmed
 //! id set in STRICT ASCENDING order, then Apple's vendor/GREASE codepoint last,

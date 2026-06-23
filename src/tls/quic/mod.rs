@@ -3,20 +3,18 @@
 //! This is ParallaX's own TLS 1.3 client state machine. It owns the visible QUIC
 //! handshake wire image (a byte-faithful Safari-26 H3 ClientHello) and the full
 //! QUIC key schedule, with **no dependency on rustls and no dependency on quinn**.
-//! The crate's QUIC fast plane drives it through a thin adapter
-//! ([`crate::transport::udp::safari_crypto`]) that implements quinn-proto's
-//! `crypto::{ClientConfig, Session, PacketKey, HeaderKey}` traits over the types
-//! exported here.
+//! The crate's hand-written QUIC transport ([`crate::transport::udp::quic`])
+//! drives it directly through the transport-neutral API exported here.
 //!
 //! ## Why transport-agnostic
 //!
-//! The de-vendoring north star is two-phase: Phase 1 (this engine) removes the
-//! vendored rustls fork from the production QUIC client path; Phase 2 removes
-//! quinn itself in favour of a hand-written QUIC transport. To keep Phase 2
-//! cheap, the engine exposes a transport-neutral API ([`ClientHandshake`],
-//! [`Keys`], [`PacketKey`], [`HeaderProtectionKey`], the RFC 5705 exporter, retry
-//! validation) and never names a quinn or rustls type. The quinn glue is a
-//! separable adapter; Phase 2 replaces only that adapter.
+//! The de-vendoring north star was two-phase, both now landed: Phase 1 (this
+//! engine) removed the vendored rustls fork from the production QUIC client path;
+//! Phase 2 removed quinn itself in favour of the hand-written QUIC transport. The
+//! engine exposes a transport-neutral API ([`ClientHandshake`], [`Keys`],
+//! [`PacketKey`], [`HeaderProtectionKey`], the RFC 5705 exporter, retry
+//! validation) and never names a quinn or rustls type, so the transport binds to
+//! it with no adapter shim.
 //!
 //! ## What it does / does not verify
 //!
@@ -194,7 +192,10 @@ pub(crate) trait TlsSession: Send {
     fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError>;
     /// Emit outgoing CRYPTO bytes; return a [`KeyChange`] on a space transition.
     fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange>;
-    /// The next 1-RTT packet-key generation (RFC 9001 §6 key update).
+    /// The next 1-RTT packet-key generation (RFC 9001 §6 key update). Implemented +
+    /// tested; the relay closes at the AEAD limit rather than rotating, so no
+    /// production caller invokes it yet.
+    #[allow(dead_code)]
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>>;
     fn is_handshaking(&self) -> bool;
     /// The peer's raw `quic_transport_parameters` blob, once available.

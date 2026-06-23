@@ -11,10 +11,10 @@
 //! header length so the caller can feed it to the existing
 //! [`crate::tls::quic::PacketKey`] / [`crate::tls::quic::HeaderProtectionKey`].
 //!
-//! Scope: only the packet types the relay sends/receives on the happy path are
-//! decodable — Initial + Handshake (long) and 1-RTT (short). 0-RTT, Retry, and
-//! Version Negotiation are rejected with [`DecodeError::UnsupportedPacketType`]
-//! (the relay talks only to a controlled ParallaX peer that emits none of them).
+//! Scope: only the packet types the relay sends/receives are decodable — Initial,
+//! 0-RTT, and Handshake (long) plus 1-RTT (short). Retry and Version Negotiation
+//! are rejected with [`DecodeError::UnsupportedPacketType`] (the relay talks only
+//! to a controlled ParallaX peer that emits neither).
 
 use super::varint;
 
@@ -217,16 +217,6 @@ impl Header {
     pub fn pn_len(&self) -> usize {
         match self {
             Header::Long { pn_len, .. } | Header::Short { pn_len, .. } => *pn_len,
-        }
-    }
-
-    /// Overwrite the packet number — used after reconstructing the full value from
-    /// the truncated wire bytes (RFC 9000 Appendix A.3) during decode.
-    pub fn set_packet_number(&mut self, pn: u64) {
-        match self {
-            Header::Long { packet_number, .. } | Header::Short { packet_number, .. } => {
-                *packet_number = pn;
-            }
         }
     }
 

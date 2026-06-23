@@ -13,7 +13,7 @@
 //!
 //! The derivation is split so the crypto is unit-testable without a live QUIC
 //! connection: [`derive_udp_auth_token`] is pure (exporter secret + PSK), and
-//! [`export_udp_auth_token`] is the thin quinn adapter that obtains the exporter
+//! [`export_udp_auth_token`] is the thin wrapper that obtains the exporter
 //! secret bound to a caller-supplied context. These ARE called at runtime by the
 //! reachability probe ([`crate::transport::udp::probe`]): when `[udp].enabled` is
 //! set on both ends, the client and server each derive this exporter-bound token

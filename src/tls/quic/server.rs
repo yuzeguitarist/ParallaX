@@ -8,11 +8,6 @@
 //! REALITY-style — the server signs a CertificateVerify the client need not
 //! validate — but the server Finished MAC and the RFC 5705 exporter are real and
 //! MUST match the client byte-for-byte.
-//!
-//! The server engine is built incrementally; items are wired into the
-//! `ServerHandshake` state machine as the slices land, so unused-until-wired
-//! pieces are tolerated here.
-#![allow(dead_code)]
 
 use aws_lc_rs::kem::{EncapsulationKey, ML_KEM_768};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
@@ -612,6 +607,7 @@ impl ServerHandshake {
     }
 
     /// The next 1-RTT packet-key generation for a key update (RFC 9001 §6).
+    #[allow(dead_code)] // key-update keys: implemented + tested; the relay closes at the AEAD limit, not rotates
     pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
         // The schedule is side-agnostic (local = client, remote = server). The server
         // seals with the server key and opens with the client key, so swap — exactly
@@ -630,7 +626,7 @@ impl ServerHandshake {
     }
 
     /// Whether the server accepted 0-RTT for this connection (echoed `early_data`).
-    #[allow(dead_code)] // wired into the transport in S6
+    #[allow(dead_code)] // 0-RTT acceptance inspection; exercised by the server handshake tests
     pub fn is_early_data_accepted(&self) -> bool {
         self.early_data_accepted
     }

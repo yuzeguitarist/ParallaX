@@ -322,6 +322,7 @@ impl Stream {
 
 /// The relay's data stream: client-initiated bidirectional stream 0 (RFC 9000
 /// §2.1). The carrier opens it for the HTTP/3 request/response relay.
+#[allow(dead_code)] // named relay-stream id; used by the conn tests and the doc link below
 const RELAY_STREAM_ID: u64 = 0;
 
 /// Initial per-stream receive window we advertise (MAX_STREAM_DATA); extended as
@@ -539,6 +540,7 @@ impl Connection {
 
     /// Start a server connection. `scid` is the server's source CID; the Initial
     /// keys and the client's CID are learned from the first Initial datagram.
+    #[allow(dead_code)] // cold-start (no-STEK) server ctor; prod uses new_server_with_stek, tests use this
     pub fn new_server(
         cert_chain: Vec<Vec<u8>>,
         signing_key_pkcs8: &[u8],
@@ -667,6 +669,7 @@ impl Connection {
     /// only after it ACCEPTED a resumed ticket's 0-RTT (and can decrypt early data),
     /// so the server side reports "did we accept 0-RTT for this connection". A
     /// replayed/rejected/cold connection leaves it `false` (fell back to 1-RTT).
+    #[allow(dead_code)] // 0-RTT acceptance inspection; exercised by the resumption/replay tests
     pub fn zero_rtt_keys_installed(&self) -> bool {
         self.zero_rtt_keys.is_some()
     }
@@ -715,6 +718,7 @@ impl Connection {
 
     /// The next 1-RTT packet-key generation for a key update (RFC 9001 §6). MUST
     /// be `Some` once the connection has 1-RTT keys (the Data-space-entry contract).
+    #[allow(dead_code)] // key-update keys: implemented + tested; the relay closes at the AEAD limit, not rotates
     pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
         self.tls.next_1rtt_keys()
     }
