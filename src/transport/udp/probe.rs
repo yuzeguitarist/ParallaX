@@ -236,7 +236,6 @@ pub async fn probe_client_over_bidi(
     request.extend_from_slice(PROBE_REQUEST_MAGIC);
     request.extend_from_slice(&nonce);
 
-    let expected = probe_response(&token, &nonce);
     let started = Instant::now();
 
     match tokio::time::timeout(
@@ -248,29 +247,89 @@ pub async fn probe_client_over_bidi(
         Err(_) => Ok(ProbeOutcome::Unreachable),
         Ok(Err(ProbeError::ConnectionLost(_))) => Ok(ProbeOutcome::Unreachable),
         Ok(Err(other)) => Err(other),
-        Ok(Ok(reply)) => {
-            let authentic = reply.len() == PROBE_RESPONSE_WIRE_LEN
-                && &reply[..4] == PROBE_RESPONSE_MAGIC
-                && bool::from(reply[4..].ct_eq(&expected[..]));
-            if authentic {
-                Ok(ProbeOutcome::Verified {
-                    rtt: started.elapsed(),
-                })
-            } else {
-                Ok(ProbeOutcome::Failed)
-            }
-        }
+        Ok(Ok(reply)) => Ok(classify_probe_reply(
+            &reply,
+            &token,
+            &nonce,
+            started.elapsed(),
+        )),
     }
 }
 
-/// Write the H3 request (HEADERS + DATA(request)) on the bidi send half and read
-/// the server's H3 response (HEADERS + DATA), returning the response DATA body.
-async fn probe_client_bidi_round_trip(
+/// Send the H3 probe request (HEADERS + DATA(magic||nonce)) on the bidi send half,
+/// returning the freshly generated nonce. SENDING needs no exporter token (the
+/// token only gates response verification), so a resuming client sends this as
+/// 0-RTT early data BEFORE the handshake completes — it is non-sensitive (a random
+/// challenge), so sending it to a not-yet-authenticated server leaks nothing. The
+/// caller awaits the handshake, then verifies the response with
+/// [`probe_client_read_and_verify`] using the returned nonce.
+pub(crate) async fn probe_client_send_request_early(
     send: &mut SendStream,
+    authority: &str,
+) -> Result<[u8; PROBE_NONCE_LEN], ProbeError> {
+    let nonce: [u8; PROBE_NONCE_LEN] = rand::random();
+    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
+    request.extend_from_slice(PROBE_REQUEST_MAGIC);
+    request.extend_from_slice(&nonce);
+    probe_client_write_request(send, authority, &request).await?;
+    Ok(nonce)
+}
+
+/// Read + verify the server's probe response against the exporter-bound token
+/// (which requires the 1-RTT handshake to be complete). Pairs with
+/// [`probe_client_send_request_early`]; `nonce` must be the one it returned. The
+/// `Unreachable`/`Failed` classification matches [`probe_client_over_bidi`].
+pub(crate) async fn probe_client_read_and_verify(
+    connection: &Connection,
     recv: &mut RecvStream,
+    nonce: &[u8; PROBE_NONCE_LEN],
+    psk: &[u8],
+    context: &[u8],
+    timeout: Duration,
+) -> Result<ProbeOutcome, ProbeError> {
+    let token = export_udp_auth_token(connection, psk, context)?;
+    let started = Instant::now();
+    match tokio::time::timeout(timeout, read_probe_data_after_headers(recv)).await {
+        Err(_) => Ok(ProbeOutcome::Unreachable),
+        Ok(Err(ProbeError::ConnectionLost(_))) => Ok(ProbeOutcome::Unreachable),
+        Ok(Err(other)) => Err(other),
+        Ok(Ok(reply)) => Ok(classify_probe_reply(
+            &reply,
+            &token,
+            nonce,
+            started.elapsed(),
+        )),
+    }
+}
+
+/// Classify the server's probe reply against the exporter-bound token: a reply with
+/// the right magic + length whose body matches `probe_response(token, nonce)` in
+/// constant time is `Verified`; anything else is `Failed`. (An on-path echo /
+/// replayed Initial can copy the magic + length but cannot forge the token-bound
+/// body, so it classifies as `Failed`.)
+fn classify_probe_reply(
+    reply: &[u8],
+    token: &[u8; UDP_AUTH_TOKEN_LEN],
+    nonce: &[u8; PROBE_NONCE_LEN],
+    rtt: Duration,
+) -> ProbeOutcome {
+    let expected = probe_response(token, nonce);
+    let authentic = reply.len() == PROBE_RESPONSE_WIRE_LEN
+        && &reply[..4] == PROBE_RESPONSE_MAGIC
+        && bool::from(reply[4..].ct_eq(&expected[..]));
+    if authentic {
+        ProbeOutcome::Verified { rtt }
+    } else {
+        ProbeOutcome::Failed
+    }
+}
+
+/// Write the H3 request (HEADERS + DATA(request)) on the bidi send half.
+async fn probe_client_write_request(
+    send: &mut SendStream,
     authority: &str,
     request: &[u8],
-) -> Result<Vec<u8>, ProbeError> {
+) -> Result<(), ProbeError> {
     use crate::fingerprint::http3::{encode_frame, safari26_headers_frame, FRAME_TYPE_DATA};
 
     // TODO(h3-request-semantics): the HEADERS use method GET (Safari's opening
@@ -292,7 +351,18 @@ async fn probe_client_bidi_round_trip(
     send.write_all(&out)
         .await
         .map_err(|err| ProbeError::Send(err.to_string()))?;
+    Ok(())
+}
 
+/// Write the H3 request (HEADERS + DATA(request)) on the bidi send half and read
+/// the server's H3 response (HEADERS + DATA), returning the response DATA body.
+async fn probe_client_bidi_round_trip(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    authority: &str,
+    request: &[u8],
+) -> Result<Vec<u8>, ProbeError> {
+    probe_client_write_request(send, authority, request).await?;
     read_probe_data_after_headers(recv).await
 }
 
@@ -493,6 +563,45 @@ mod tests {
         assert!(
             matches!(outcome, ProbeOutcome::Verified { .. }),
             "expected Verified over the request bidi, got {outcome:?}"
+        );
+    }
+
+    /// The split probe primitives — `probe_client_send_request_early` (sendable as
+    /// 0-RTT early data, no token) then `probe_client_read_and_verify` (1-RTT,
+    /// token-bound) — round-trip to `Verified`, exactly like the combined
+    /// `probe_client_over_bidi`. This is the shape the resuming client runtime
+    /// drives: send the request early, await the handshake, then verify the reply.
+    #[tokio::test]
+    async fn split_probe_send_then_verify_round_trips() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        let server = async {
+            let (mut send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
+            serve_probe_over_bidi(&server_conn, &mut send, &mut recv, PSK, CTX)
+                .await
+                .expect("server serve_probe_over_bidi");
+            (send, recv)
+        };
+        let client = async {
+            let (mut send, mut recv) = client_conn.open_bi();
+            let nonce = probe_client_send_request_early(&mut send, AUTHORITY)
+                .await
+                .expect("send probe request early");
+            probe_client_read_and_verify(
+                &client_conn,
+                &mut recv,
+                &nonce,
+                PSK,
+                CTX,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("read and verify probe response")
+        };
+        let (_server_streams, outcome) = tokio::join!(server, client);
+        assert!(
+            matches!(outcome, ProbeOutcome::Verified { .. }),
+            "split send/verify must Verify like the combined path, got {outcome:?}"
         );
     }
 

@@ -1184,6 +1184,26 @@ struct ClientProbeResult {
     retained: Option<RetainedClientQuic>,
 }
 
+/// Current Unix time in milliseconds, for `obfuscated_ticket_age` and the ticket
+/// age epoch. A pre-1970 clock (impossible in practice) clamps to 0.
+fn current_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Process-wide single-slot cache of the most recent QUIC resumption ticket for the
+/// configured server. The client runtime is one-per-process with a single server,
+/// so one slot suffices (mirroring the server's process-wide 0-RTT state). Each
+/// 0-RTT connect CONSUMES the stored ticket (single-use); a successful session
+/// deposits a fresh one for the next.
+fn client_quic_ticket_slot() -> &'static std::sync::Mutex<Option<crate::tls::quic::ClientTicket>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<crate::tls::quic::ClientTicket>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 /// Probe the offered UDP fast plane over a fresh QUIC connection to the server's
 /// IP and the offered port. Never errors — failures map to Unreachable/Failed so
 /// the caller can always report a PX1P and keep the control stream aligned. On a
@@ -1234,43 +1254,107 @@ async fn run_client_udp_probe(
         return failed();
     };
     let udp_addr = std::net::SocketAddr::new(peer.ip(), offer.udp_port);
-    let conn = match tokio::time::timeout(probe_timeout, endpoint.connect(udp_addr, sni)).await {
-        Ok(Ok(conn)) => conn,
-        _ => return unreachable(),
-    };
-
-    // H3 stream order: control (SETTINGS) -> request bidi (probe) -> encoder.
-    // Timeout-bounded like the other post-connect H3 steps (open_bi/encoder
-    // open/SETTINGS read below): the client accepts any server cert during the
-    // probe handshake (AcceptAnyServerCert), so an on-path peer that completes the
-    // unauthenticated QUIC handshake but advertises `initial_max_streams_uni=0`
-    // and never sends MAX_STREAMS would otherwise stall this `open_uni` forever —
-    // the probe would never return, never write PX1P, never fall back to TCP. On
-    // timeout/error treat as Unreachable (stay on TCP).
-    let control_send = match tokio::time::timeout(
-        probe_timeout,
-        crate::transport::udp::h3::open_h3_control_stream(&conn),
-    )
-    .await
+    // 0-RTT resumption when a ticket from a prior session is cached: the connect
+    // returns BEFORE the handshake completes, so the H3 control SETTINGS and the
+    // probe request are sent as 0-RTT early data; we then await the handshake and
+    // verify the response under the 1-RTT exporter token. Only the non-sensitive
+    // probe request (a random challenge) rides 0-RTT — the relay payload waits for
+    // the verified (commit-late) 1-RTT path. The cached ticket is CONSUMED on use
+    // (single-use). With no ticket, a normal cold 1-RTT handshake + probe runs,
+    // byte-identical to before.
+    let stored_ticket = client_quic_ticket_slot().lock().unwrap().take();
+    let (conn, control_send, relay_send, relay_recv, outcome) = if let Some(ticket) = stored_ticket
     {
-        Ok(Ok(s)) => s,
-        _ => return unreachable(),
+        let conn = match tokio::time::timeout(
+            probe_timeout,
+            endpoint.connect_resumption_0rtt(udp_addr, sni, ticket, current_unix_millis()),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            _ => return unreachable(),
+        };
+        // Control SETTINGS as 0-RTT early data (same stream order as cold start).
+        let control_send = match tokio::time::timeout(
+            probe_timeout,
+            crate::transport::udp::h3::open_h3_control_stream(&conn),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => return unreachable(),
+        };
+        let (mut relay_send, mut relay_recv) = conn.open_bi();
+        // Probe request (HEADERS + DATA) as 0-RTT early data — no exporter token is
+        // needed to SEND it (the token only gates response verification).
+        let nonce = match crate::transport::udp::probe::probe_client_send_request_early(
+            &mut relay_send,
+            sni,
+        )
+        .await
+        {
+            Ok(nonce) => nonce,
+            Err(_) => return unreachable(),
+        };
+        // Await the 1-RTT handshake, then verify under the exporter token. If the
+        // server rejected 0-RTT, the early data was retransmitted under 1-RTT by loss
+        // recovery, so the server still has the request.
+        match tokio::time::timeout(probe_timeout, conn.wait_established()).await {
+            Ok(Ok(())) => {}
+            _ => return unreachable(),
+        }
+        let outcome = crate::transport::udp::probe::probe_client_read_and_verify(
+            &conn,
+            &mut relay_recv,
+            &nonce,
+            psk,
+            &offer.offer_id,
+            probe_timeout,
+        )
+        .await
+        .unwrap_or(ProbeOutcome::Failed);
+        (conn, control_send, relay_send, relay_recv, outcome)
+    } else {
+        let conn = match tokio::time::timeout(probe_timeout, endpoint.connect(udp_addr, sni)).await
+        {
+            Ok(Ok(conn)) => conn,
+            _ => return unreachable(),
+        };
+
+        // H3 stream order: control (SETTINGS) -> request bidi (probe) -> encoder.
+        // Timeout-bounded like the other post-connect H3 steps (open_bi/encoder
+        // open/SETTINGS read below): the client accepts any server cert during the
+        // probe handshake (AcceptAnyServerCert), so an on-path peer that completes the
+        // unauthenticated QUIC handshake but advertises `initial_max_streams_uni=0`
+        // and never sends MAX_STREAMS would otherwise stall this `open_uni` forever —
+        // the probe would never return, never write PX1P, never fall back to TCP. On
+        // timeout/error treat as Unreachable (stay on TCP).
+        let control_send = match tokio::time::timeout(
+            probe_timeout,
+            crate::transport::udp::h3::open_h3_control_stream(&conn),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => return unreachable(),
+        };
+        // The hand-rolled `open_bi` is synchronous and infallible (it allocates the
+        // stream id locally; flow-control is enforced when bytes are transmitted), so
+        // it neither awaits nor returns a Result.
+        let (mut relay_send, mut relay_recv) = conn.open_bi();
+        let outcome = crate::transport::udp::probe::probe_client_over_bidi(
+            &conn,
+            &mut relay_send,
+            &mut relay_recv,
+            sni,
+            psk,
+            &offer.offer_id,
+            probe_timeout,
+        )
+        .await
+        .unwrap_or(ProbeOutcome::Failed);
+        (conn, control_send, relay_send, relay_recv, outcome)
     };
-    // The hand-rolled `open_bi` is synchronous and infallible (it allocates the
-    // stream id locally; flow-control is enforced when bytes are transmitted), so
-    // it neither awaits nor returns a Result.
-    let (mut relay_send, mut relay_recv) = conn.open_bi();
-    let outcome = crate::transport::udp::probe::probe_client_over_bidi(
-        &conn,
-        &mut relay_send,
-        &mut relay_recv,
-        sni,
-        psk,
-        &offer.offer_id,
-        probe_timeout,
-    )
-    .await
-    .unwrap_or(ProbeOutcome::Failed);
 
     match outcome {
         ProbeOutcome::Verified { .. } => {
@@ -1314,6 +1398,13 @@ async fn run_client_udp_probe(
             {
                 Ok(Ok(settings)) if crate::fingerprint::http3::is_safari26_settings(&settings) => {}
                 _ => return unreachable(),
+            }
+            // Deposit a fresh single-use resumption ticket for the next session's
+            // 0-RTT (the prior ticket, if any, was consumed at connect). The server
+            // issues its NewSessionTicket post-handshake; if it has not arrived yet
+            // this is `None` and the next session simply starts cold.
+            if let Some(fresh) = conn.take_session_ticket(current_unix_millis()) {
+                *client_quic_ticket_slot().lock().unwrap() = Some(fresh);
             }
             ClientProbeResult {
                 outcome,
