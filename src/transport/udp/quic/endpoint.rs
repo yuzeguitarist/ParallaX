@@ -114,7 +114,7 @@ pub struct ServerConfig {
     /// any other v1 Initial (no/forged/replayed marker) is spliced to the origin.
     /// `None` keeps the current behaviour (every v1 Initial terminates locally), so
     /// the marker fork stays dormant until the server runtime supplies the key.
-    pub marker_key: Option<(Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>)>,
+    pub marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
 }
 
 /// Failure to establish a connection.

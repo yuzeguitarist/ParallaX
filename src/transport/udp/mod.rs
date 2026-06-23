@@ -185,7 +185,7 @@ pub fn server_config_stable(
     key: PrivateKeyDer<'static>,
     stek: Option<Zeroizing<[u8; 32]>>,
     guard: Option<Arc<dyn ZeroRttGuard>>,
-    marker_key: (Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>),
+    marker_key: crate::crypto::quic_marker::MarkerKey,
     origin_udp_addr: SocketAddr,
 ) -> Result<Arc<quic::endpoint::ServerConfig>, UdpTransportError> {
     Ok(Arc::new(quic::endpoint::ServerConfig {

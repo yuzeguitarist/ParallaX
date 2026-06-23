@@ -525,7 +525,7 @@ pub struct ServerHandshake {
     /// [`Self::marker_result`] for the endpoint's terminate-vs-splice fork. `None`
     /// leaves `marker_result` `None` (cold-start: the fork treats every flow as
     /// unauthenticated).
-    marker_key: Option<(Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>)>,
+    marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
     /// The marker recovered from this connection's ClientHello.random, if it carried
     /// a valid + fresh one. Set during ClientHello processing when `marker_key` is set.
     marker_result: Option<crate::crypto::quic_marker::Marker>,

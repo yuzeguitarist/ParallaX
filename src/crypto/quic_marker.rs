@@ -54,6 +54,11 @@ const AUTH_INFO: &[u8] = b"ParallaX v1 QUIC marker auth key";
 /// Domain-separation prefix for the HMAC tag input.
 const TAG_DOMAIN: &[u8] = b"ParallaX v1 QUIC marker tag";
 
+/// The server's origin-splice marker key material: `(psk, server static X25519
+/// private)`. Verifying (or forging) a marker requires BOTH secrets; each is held
+/// in `Zeroizing` so it scrubs on drop.
+pub type MarkerKey = (Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>);
+
 /// The freshness material recovered from a valid marker: the caller keys an
 /// Initial-time replay cache on `(nonce, timestamp)` (per source) so a captured
 /// valid marker replayed within its window routes to the splice, not termination.
