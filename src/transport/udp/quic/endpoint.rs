@@ -335,6 +335,29 @@ impl Endpoint {
             .await
     }
 
+    /// Like [`Self::connect_resumption`] but returns as soon as the connection is
+    /// constructed — BEFORE the handshake completes — so the caller can open streams
+    /// and write 0-RTT early data (sent under the 0-RTT keys until the handshake
+    /// installs 1-RTT keys; RFC 9001 §4.6). Await [`Connection::wait_established`]
+    /// before relying on 1-RTT-only facilities (the exporter, or reads of the peer's
+    /// 1-RTT response). If the server rejects the ticket, the early data is
+    /// retransmitted under 1-RTT by normal loss recovery — no data is lost.
+    pub async fn connect_resumption_0rtt(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        ticket: ClientTicket,
+        now_ms: u64,
+    ) -> Result<Connection, ConnectError> {
+        let shared = self
+            .submit_connect(addr, server_name, Some(ticket), now_ms)
+            .await?;
+        // 0-RTT keys are installed at construction (new_client_resumption), so the
+        // returned handle can send early data immediately; the handshake continues
+        // in the background.
+        Ok(Connection { shared })
+    }
+
     async fn connect_inner(
         &self,
         addr: SocketAddr,
@@ -342,6 +365,24 @@ impl Endpoint {
         ticket: Option<ClientTicket>,
         now_ms: u64,
     ) -> Result<Connection, ConnectError> {
+        let shared = self
+            .submit_connect(addr, server_name, ticket, now_ms)
+            .await?;
+        let conn = Connection { shared };
+        conn.wait_established().await?;
+        Ok(conn)
+    }
+
+    /// Submit a connect request to the driver and await the constructed connection
+    /// handle (0-RTT keys, if a ticket was offered, are installed at construction).
+    /// Shared by the handshake-awaiting connects and the 0-RTT early-data connect.
+    async fn submit_connect(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        ticket: Option<ClientTicket>,
+        now_ms: u64,
+    ) -> Result<Arc<ConnShared>, ConnectError> {
         let config = self
             .default_config
             .lock()
@@ -359,25 +400,9 @@ impl Endpoint {
                 reply,
             })
             .map_err(|_| ConnectError::EndpointClosed)?;
-        // Outer `?`: the driver dropped the sender (endpoint gone). Inner `?`: the
-        // driver reported a real client-init/TLS error (ConnectError::Tls).
-        let shared = reply_rx.await.map_err(|_| ConnectError::EndpointClosed)??;
-        // Drive until the handshake completes. Create the notification BEFORE the
-        // re-check so a wake-up between check and await is not lost, and never hold
-        // the borrow across the move into `Connection`.
-        loop {
-            if shared.is_closed() {
-                return Err(ConnectError::ConnectionClosed);
-            }
-            if !shared.is_handshaking() {
-                break;
-            }
-            let notified = shared.event.notified();
-            if shared.is_handshaking() && !shared.is_closed() {
-                notified.await;
-            }
-        }
-        Ok(Connection { shared })
+        // Outer `?`: the driver dropped the sender (endpoint gone). The remaining
+        // Result is the driver's own client-init/TLS outcome.
+        reply_rx.await.map_err(|_| ConnectError::EndpointClosed)?
     }
 
     /// Accept the next fully-established incoming connection (server endpoints).
@@ -633,6 +658,27 @@ impl Connection {
     /// completes to cache a ticket for a future 0-RTT reconnect.
     pub fn take_session_ticket(&self, now_ms: u64) -> Option<ClientTicket> {
         self.shared.core.lock().unwrap().take_session_ticket(now_ms)
+    }
+
+    /// Await handshake completion (or a connection close). A 0-RTT connect
+    /// ([`Endpoint::connect_resumption_0rtt`]) returns before the handshake so the
+    /// caller can send early data; it then awaits this before relying on 1-RTT-only
+    /// facilities (the RFC 5705 exporter, or reads of the peer's 1-RTT response).
+    pub async fn wait_established(&self) -> Result<(), ConnectError> {
+        // Create the notification BEFORE the re-check so a wake-up between check and
+        // await is not lost.
+        loop {
+            if self.shared.is_closed() {
+                return Err(ConnectError::ConnectionClosed);
+            }
+            if !self.shared.is_handshaking() {
+                return Ok(());
+            }
+            let notified = self.shared.event.notified();
+            if self.shared.is_handshaking() && !self.shared.is_closed() {
+                notified.await;
+            }
+        }
     }
 
     /// RFC 5705 exporter (backs the auth token).

@@ -381,4 +381,92 @@ mod tests {
             "client received a NewSessionTicket from the 0-RTT-enabled server"
         );
     }
+
+    /// End-to-end 0-RTT resumption over the async endpoint: a client takes a ticket
+    /// from a 0-RTT server, reconnects with `connect_resumption_0rtt`, writes early
+    /// data before awaiting the handshake, and the server receives it. Exercises the
+    /// async early-data send primitive the client runtime builds on (delivery holds
+    /// whether the server accepts 0-RTT or falls back to 1-RTT retransmit).
+    #[tokio::test]
+    async fn zero_rtt_resumption_delivers_early_data_over_the_async_endpoint() {
+        use crate::crypto::replay::ReplayCache;
+        use crate::tls::quic::derive_stek;
+        use crate::transport::udp::endpoint::{
+            bind_client_endpoint_accept_any, bind_server_endpoint_0rtt,
+        };
+        use crate::transport::udp::zero_rtt::ReplayCacheGuard;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let stek = derive_stek(&[9_u8; 32]);
+        let guard = Arc::new(ReplayCacheGuard::new(
+            ReplayCache::new(64).with_window_secs(604_800),
+        ));
+        let server =
+            bind_server_endpoint_0rtt("127.0.0.1:0".parse().unwrap(), "localhost", stek, guard)
+                .await
+                .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+
+        // Phase 1: cold connect, take a resumption ticket.
+        let ticket = {
+            let acceptor = {
+                let server = server.clone();
+                tokio::spawn(async move { server.accept().await })
+            };
+            let conn = client.connect(server_addr, "localhost").await.unwrap();
+            let _s = acceptor
+                .await
+                .unwrap()
+                .expect("server accepts cold connection");
+            let mut t = None;
+            for _ in 0..50 {
+                if let Some(ticket) = conn.take_session_ticket(1_000) {
+                    t = Some(ticket);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            t.expect("client took a resumption ticket")
+        };
+
+        // Phase 2: resume with 0-RTT and write early data before awaiting handshake.
+        // A FRESH client endpoint (new local port), mirroring production: each data
+        // session binds its own endpoint, so the resumption never collides with the
+        // dropped cold connection's 4-tuple.
+        let client2 = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server_for_relay = server.clone();
+        let srv = tokio::spawn(async move {
+            let conn = server_for_relay
+                .accept()
+                .await
+                .expect("server accepts resumption");
+            let (_send, mut recv) = conn.accept_bi().await.expect("server accepts bidi");
+            let mut got = Vec::new();
+            recv.read_to_end(&mut got)
+                .await
+                .expect("server reads early data");
+            got
+        });
+
+        let early = b"GET /0rtt early data over the async endpoint";
+        let conn = client2
+            .connect_resumption_0rtt(server_addr, "localhost", ticket, 2_000)
+            .await
+            .unwrap();
+        let (mut send, _recv) = conn.open_bi();
+        send.write_all(early).await.expect("write early data");
+        send.finish();
+        conn.wait_established().await.expect("handshake completes");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), srv)
+            .await
+            .expect("server task timed out")
+            .expect("server task panicked");
+        assert_eq!(got, early, "server received the resumed early data");
+    }
 }
