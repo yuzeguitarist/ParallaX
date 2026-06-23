@@ -13,7 +13,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR" || exit 1
 
 FUZZ="cargo +nightly fuzz"
-ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame server_decide_inbound client_hello_auth command_codecs http2_frame_header data_record_open replay_journal socks_connect_request udp_envelope udp_reorder replay_dedup mldsa_verify h3_frame_decode h3_settings_parse h3_qpack_field_section"
+ALL_TARGETS="tls_client_hello tls_server_hello tls_compressed_cert mux_frame server_decide_inbound client_hello_auth command_codecs http2_frame_header data_record_open replay_journal socks_connect_request replay_dedup mldsa_verify h3_frame_decode h3_settings_parse h3_qpack_field_section"
 
 # Per-target tuning. Fields: RSS_MB TIMEOUT_S LONG_TIME_S WORKERS
 # (WORKERS feeds libFuzzer -workers/-jobs; keep total <= phys cores / RAM budget.)

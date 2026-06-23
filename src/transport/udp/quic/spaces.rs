@@ -34,6 +34,7 @@ pub struct PacketNumberSpace {
 }
 
 impl PacketNumberSpace {
+    #[allow(dead_code)] // redundant with the derived Default; used by the spaces tests
     pub fn new() -> Self {
         Self { next: 0 }
     }
@@ -73,6 +74,7 @@ pub struct ReceivedPackets {
 }
 
 impl ReceivedPackets {
+    #[allow(dead_code)] // redundant with the derived Default; used by the spaces tests
     pub fn new() -> Self {
         Self {
             ranges: Vec::new(),
@@ -81,14 +83,10 @@ impl ReceivedPackets {
     }
 
     /// Whether `pn` has already been recorded (a duplicate / replay).
+    #[allow(dead_code)] // duplicate-check inspection accessor; exercised by the spaces tests
     pub fn contains(&self, pn: u64) -> bool {
         self.low_water.is_some_and(|w| pn <= w)
             || self.ranges.iter().any(|&(lo, hi)| lo <= pn && pn <= hi)
-    }
-
-    /// True until the first packet is recorded.
-    pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
     }
 
     /// The highest packet number recorded, if any.

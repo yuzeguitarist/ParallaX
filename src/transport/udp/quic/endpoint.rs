@@ -527,11 +527,6 @@ impl Endpoint {
         }?;
         Some(Connection { shared })
     }
-
-    /// Nudge the driver (used by connection handles after queuing outbound work).
-    fn wake(&self) {
-        self.wake.notify_one();
-    }
 }
 
 /// A held first-flight Initial awaiting the buffer-decide-then-route marker fork
@@ -1037,6 +1032,7 @@ impl Connection {
     /// ticket leaves it `false`, the connection having fallen back to 1-RTT); on a
     /// resuming client it is always `true`. Used by the resumption/replay tests to
     /// assert acceptance vs single-use rejection.
+    #[allow(dead_code)] // 0-RTT acceptance inspection; exercised by the resumption/replay tests
     pub(crate) fn zero_rtt_keys_installed(&self) -> bool {
         self.shared.core.lock().unwrap().zero_rtt_keys_installed()
     }

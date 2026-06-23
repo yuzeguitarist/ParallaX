@@ -1,10 +1,10 @@
 //! QUIC packet protection (AEAD) and header protection (RFC 9001 §5.3 / §5.4),
-//! plus the per-direction / per-space key aggregates the engine and adapter pass
-//! around.
+//! plus the per-direction / per-space key aggregates the engine and transport
+//! pass around.
 //!
-//! These are ParallaX-owned types with inherent methods; the quinn adapter
-//! implements quinn-proto's `crypto::{PacketKey, HeaderKey}` over them, so the
-//! engine names no quinn type. AEAD uses the RustCrypto `aes-gcm` /
+//! These are ParallaX-owned types with inherent methods used directly by the
+//! hand-written transport's packet/header protection; the engine names no quinn
+//! type. AEAD uses the RustCrypto `aes-gcm` /
 //! `chacha20poly1305` crates (the same backend the TCP path's record cipher uses);
 //! header-protection masks use a raw single-block AES-ECB (`aes`) or a ChaCha20
 //! keystream (`chacha20`).

@@ -12,7 +12,6 @@
 //! sealed ticket is padded to a fixed length inside Safari 26.4's observed
 //! resumption-ticket range (157–160 B) so the wire `pre_shared_key` identity
 //! length is browser-plausible, not a ParallaX constant.
-#![allow(dead_code)] // wired into the server (S3/S5) and client (S4) across the 0-RTT slices
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},

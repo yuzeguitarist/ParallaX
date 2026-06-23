@@ -257,7 +257,6 @@ impl KeySchedule {
     /// `resumption_master_secret = Derive-Secret(master, "res master", th)` where
     /// `transcript_hash` runs through the *client* Finished (RFC 8446 §7.1). The
     /// per-ticket PSK is then [`resumption_psk`] of this secret and a ticket nonce.
-    #[allow(dead_code)] // wired in S3/S4 (NewSessionTicket issue + client store)
     pub(crate) fn resumption_master_secret(
         &self,
         transcript_hash: &[u8],
@@ -275,7 +274,6 @@ impl KeySchedule {
 
 /// `resumption_psk = HKDF-Expand-Label(resumption_master, "resumption", ticket_nonce, Hash.len)`
 /// (RFC 8446 §4.6.1) — the PSK a NewSessionTicket resumes with.
-#[allow(dead_code)] // wired in S3/S5 (server ticket issue/consume)
 pub(crate) fn resumption_psk(
     suite: CipherSuite,
     resumption_master: &[u8],
@@ -292,7 +290,6 @@ pub(crate) fn resumption_psk(
 /// Early Secret from a resumption PSK: `HKDF-Extract(0, psk)` (RFC 8446 §7.1).
 /// The 0-RTT sender/receiver derive the binder key and the
 /// client_early_traffic_secret from this before the handshake (EC)DHE exists.
-#[allow(dead_code)] // wired in S4/S5 (0-RTT key derivation)
 pub(crate) fn early_secret_from_psk(suite: CipherSuite, psk: &[u8]) -> Zeroizing<Vec<u8>> {
     let zeros = vec![0_u8; suite.hash_len()];
     Zeroizing::new(suite.hkdf_extract(&zeros, psk))
@@ -301,7 +298,6 @@ pub(crate) fn early_secret_from_psk(suite: CipherSuite, psk: &[u8]) -> Zeroizing
 /// The PSK-binder "finished" key: `HKDF-Expand-Label(Derive-Secret(early, "res
 /// binder", ""), "finished", "", Hash.len)` (RFC 8446 §4.2.11.2). HMAC under this
 /// key over the truncated-ClientHello transcript yields the binder.
-#[allow(dead_code)] // wired in S4/S5 (PSK binder compute/verify)
 pub(crate) fn binder_finished_key(
     suite: CipherSuite,
     early_secret: &[u8],
@@ -319,7 +315,6 @@ pub(crate) fn binder_finished_key(
 /// The PSK binder: `HMAC(binder_finished_key, Transcript-Hash(Truncate(ClientHello)))`
 /// — the transcript runs over the ClientHello up to but excluding the binders list
 /// (RFC 8446 §4.2.11.2). `transcript_hash` is that truncated hash.
-#[allow(dead_code)] // wired in S4/S5 (PSK binder compute/verify)
 pub(crate) fn psk_binder(
     suite: CipherSuite,
     finished_key: &[u8],
@@ -332,7 +327,6 @@ pub(crate) fn psk_binder(
 /// (RFC 8446 §7.1). `transcript_hash` is over the *complete* ClientHello (binders
 /// included). 0-RTT packet-protection keys are built from this via
 /// `DirectionalKeys::from_secret`.
-#[allow(dead_code)] // wired in S4/S5/S6 (0-RTT packet keys)
 pub(crate) fn client_early_traffic_secret(
     suite: CipherSuite,
     early_secret: &[u8],

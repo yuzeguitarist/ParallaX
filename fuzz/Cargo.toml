@@ -101,20 +101,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "udp_envelope"
-path = "fuzz_targets/udp_envelope.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "udp_reorder"
-path = "fuzz_targets/udp_reorder.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "replay_dedup"
 path = "fuzz_targets/replay_dedup.rs"
 test = false

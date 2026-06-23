@@ -1,8 +1,8 @@
 //! The hand-written TLS 1.3 client handshake state machine for QUIC.
 //!
 //! Transport-agnostic: it consumes/produces raw CRYPTO-stream handshake bytes and
-//! emits [`KeyChange`]s with ParallaX-owned [`Keys`]. The quinn adapter drives it;
-//! a future hand-written QUIC transport will drive the same API unchanged.
+//! emits [`KeyChange`]s with ParallaX-owned [`Keys`]. The hand-written QUIC
+//! transport ([`crate::transport::udp::quic`]) drives it through this API.
 //!
 //! Flow (cold-start, no client auth, no 0-RTT):
 //! 1. [`ClientHandshake::new`] generates the X25519 + ML-KEM-768 hybrid key share
@@ -165,7 +165,6 @@ impl ClientHandshake {
     /// `pre_shared_key` + `early_data` and derives the 0-RTT write keys (emitted as
     /// [`KeyChange::ZeroRtt`] after the ClientHello). `now_ms` is the current Unix
     /// time in milliseconds, for `obfuscated_ticket_age`.
-    #[allow(dead_code)] // wired into the client runtime in S7
     pub(crate) fn new_resumption(
         config: Arc<ClientConfig>,
         version: u32,
@@ -349,7 +348,6 @@ impl ClientHandshake {
 
     /// Whether the server accepted 0-RTT (echoed `early_data` in EncryptedExtensions).
     /// Meaningful only on a resumption handshake; always false for cold-start.
-    #[allow(dead_code)] // wired into the transport in S6
     pub fn is_early_data_accepted(&self) -> bool {
         self.early_data_accepted
     }
@@ -417,7 +415,6 @@ impl ClientHandshake {
     /// (RFC 8446 §7.1). Available only after [`Self::write_handshake`] has emitted
     /// the client Finished (which appends it to the transcript). The per-ticket PSK
     /// the client stores is [`super::schedule::resumption_psk`] of this secret.
-    #[allow(dead_code)] // wired in S4 (client ticket store)
     pub fn resumption_master_secret(&self) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
         let suite = self
             .suite
@@ -460,7 +457,6 @@ impl ClientHandshake {
 
     /// Take the stored resumption ticket (if a NewSessionTicket was received),
     /// stamping `now_ms` (Unix ms) as its ticket-age epoch.
-    #[allow(dead_code)] // wired into the client runtime in S7
     pub(crate) fn take_session_ticket(&mut self, now_ms: u64) -> Option<ClientTicket> {
         let mut t = self.pending_session_ticket.take()?;
         t.received_at_ms = now_ms;
