@@ -1571,12 +1571,16 @@ async fn run_authenticated_data_mode(
                         let mut rng = StdRng::from_entropy();
                         // Split the key-exchange (PX1K) record across several
                         // variable-length chunks for the same reason as the client
-                        // PX1Q split (PAR-21): no fixed ~1632-byte single record.
-                        // Sealed into one buffer => one write => single flight.
-                        let kx_chunk_len = rng
-                            .gen_range(PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT..=PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT);
+                        // PX1Q split (PAR-21): no fixed ~1632-byte single record,
+                        // no equal-length run, no fixed per-session regime. Sealed
+                        // into one buffer => one write => single flight.
                         let mut key_exchange_record = Vec::new();
-                        for chunk in FramedChunk::encode_all(&key_exchange_payload, kx_chunk_len)? {
+                        for chunk in FramedChunk::encode_all_shaped(
+                            &key_exchange_payload,
+                            &mut rng,
+                            PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
+                            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT,
+                        )? {
                             server_seal.seal_into(&chunk, &mut rng, &mut key_exchange_record)?;
                         }
                         log_outer_write(

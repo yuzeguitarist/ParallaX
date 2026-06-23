@@ -161,13 +161,16 @@ impl ClientDataSession {
         let request = PqRekeyRequest::encode_borrowed(&x25519.public, &mlkem.public)?;
         // Split the rekey record across several variable-length data records so
         // the first client->server app-data burst is not a fixed ~1631-byte
-        // single record (PAR-21). The chunk size is drawn per session; the server
-        // reassembles by FramedChunk length headers. Emitted as one buffer => one
-        // write => single flight, so the establish path adds no extra round-trip.
-        let chunk_len =
-            rng.gen_range(PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT..=PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT);
+        // single record (PAR-21). Each chunk size is drawn fresh per chunk; the
+        // server reassembles by FramedChunk length headers. Emitted as one buffer
+        // => one write => single flight, so the establish path adds no round-trip.
         let mut record = Vec::new();
-        for chunk in FramedChunk::encode_all(&request, chunk_len)? {
+        for chunk in FramedChunk::encode_all_shaped(
+            &request,
+            rng,
+            PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
+            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT,
+        )? {
             self.seal_to_server.seal_into(&chunk, rng, &mut record)?;
         }
         Ok((
@@ -557,6 +560,7 @@ mod tests {
         };
         let traffic = TrafficConfig::default();
         let mut record_counts = std::collections::BTreeSet::new();
+        let mut record_sizes = std::collections::BTreeSet::new();
         for seed in 0..32_u64 {
             let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
             let mut rng = StdRng::seed_from_u64(seed);
@@ -570,6 +574,7 @@ mod tests {
                     u16::from_be_bytes([record[offset + 3], record[offset + 4]]) as usize;
                 offset += crate::tls::record::TLS_HEADER_LEN + payload_len;
                 count += 1;
+                record_sizes.insert(payload_len);
             }
             assert_eq!(offset, record.len(), "records must tile the buffer exactly");
             assert!(
@@ -586,6 +591,13 @@ mod tests {
         assert!(
             record_counts.len() >= 2,
             "per-session chunk size must vary the record count across sessions, got {record_counts:?}"
+        );
+        // Per-chunk randomization => many distinct record sizes across sessions
+        // (not a single per-session size, not an equal-length run).
+        assert!(
+            record_sizes.len() >= 8,
+            "per-chunk sizing must yield many distinct record sizes, got {}",
+            record_sizes.len()
         );
     }
 
