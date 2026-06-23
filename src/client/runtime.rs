@@ -37,8 +37,9 @@ use crate::{
     crypto::{auth::AuthError, identity, parallel, pq},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::{
-        ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind, MuxFrameRef,
-        MuxPayloadPool, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
+        ConnectRequest, ConnectRequestError, FramedReassembler, MuxFrame, MuxFrameError,
+        MuxFrameKind, MuxFrameRef, MuxPayloadPool, ServerIdentityChunk, ServerIdentityProof,
+        ServerKeyExchange, MAX_PQ_HANDSHAKE_FRAME,
     },
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
@@ -1693,7 +1694,11 @@ async fn resolve_client_server_addr(server_addr: &str) -> Result<SocketAddr, Cli
     })
 }
 
-async fn apply_server_key_exchange_after_residuals<R>(
+/// Reads the server's PQ key-exchange (PX1K), tolerating residual camouflage
+/// records the fallback origin may have raced ahead, and reassembling the
+/// key-exchange across its FramedChunk records (PAR-21). `pub(crate)` so the
+/// server-side loopback test harness can drive the real client receive path.
+pub(crate) async fn apply_server_key_exchange_after_residuals<R>(
     server: &mut R,
     data_session: &mut ClientDataSession,
     pending_rekey: &PendingPqRekey,
@@ -1705,6 +1710,11 @@ where
     let mut server_records = TlsRecordReader::new(server);
     let mut record = Vec::new();
     let mut skipped = 0;
+    // The server now splits PX1K across several FramedChunk records (PAR-21);
+    // accumulate them here. Residual camouflage records (the fallback origin's
+    // H2 response racing ahead) fail to open and are skipped up to the budget,
+    // exactly as before; the PX1K chunks arrive contiguously once they start.
+    let mut reassembler = FramedReassembler::default();
     loop {
         server_records.read_record_into(&mut record).await?;
         match apply_server_key_exchange_record_blocking(
@@ -1712,10 +1722,11 @@ where
             &mut record,
             pending_rekey,
             psk,
+            &mut reassembler,
         )
         .await
         {
-            Ok(()) => {
+            Ok(true) => {
                 if skipped > 0 {
                     tracing::warn!(
                         skipped,
@@ -1724,6 +1735,10 @@ where
                     );
                 }
                 return Ok(());
+            }
+            Ok(false) => {
+                // Accepted one PX1K chunk; keep reading until the frame completes.
+                continue;
             }
             Err(ClientRuntimeError::Handshake(err)) if is_residual_camouflage_record(&err) => {
                 if skipped < MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE {
@@ -1767,12 +1782,23 @@ async fn apply_server_key_exchange_record_blocking(
     record: &mut Vec<u8>,
     pending_rekey: &PendingPqRekey,
     psk: &[u8],
-) -> Result<(), ClientRuntimeError> {
-    let exchange_payload_range = data_session.open_server_record_in_place_payload_range(record)?;
-    let exchange_payload = &record[exchange_payload_range];
-    let (exchange, cipher_suite) = ServerKeyExchange::decode_ref_with_suite(exchange_payload)
+    reassembler: &mut FramedReassembler,
+) -> Result<bool, ClientRuntimeError> {
+    // Opening fails on a residual camouflage record; the caller treats that as
+    // skippable. A ParallaX record opens to a PX1K FramedChunk, which we
+    // accumulate until the whole key-exchange frame is recovered (Ok(false) =>
+    // need more chunks), then decode and apply the rekey once (Ok(true)).
+    let chunk_range = data_session.open_server_record_in_place_payload_range(record)?;
+    let exchange_payload = match reassembler
+        .push(&record[chunk_range], MAX_PQ_HANDSHAKE_FRAME)
+        .map_err(ClientHandshakeError::from)?
+    {
+        Some(payload) => payload,
+        None => return Ok(false),
+    };
+    let (exchange, cipher_suite) = ServerKeyExchange::decode_ref_with_suite(&exchange_payload)
         .map_err(ClientHandshakeError::from)?;
-    let pq_identity_binding = pending_rekey.identity_binding(exchange_payload);
+    let pq_identity_binding = pending_rekey.identity_binding(&exchange_payload);
     let x25519_shared =
         zeroize::Zeroizing::new(pending_rekey.x25519_shared_secret(&exchange.server_x25519_public));
     let mlkem_ciphertext = exchange.mlkem_ciphertext.to_vec();
@@ -1791,7 +1817,7 @@ async fn apply_server_key_exchange_record_blocking(
         psk,
         pq_identity_binding,
     )?;
-    Ok(())
+    Ok(true)
 }
 
 async fn verify_server_identity_payload_blocking(
@@ -3176,6 +3202,42 @@ mod tests {
         rec
     }
 
+    // Test helper: reassemble a PQ handshake frame (PX1Q/PX1K) from a buffer of
+    // concatenated sealed FramedChunk records, mirroring production (PAR-21).
+    fn open_framed_payload(codec: &mut DataRecordCodec, buf: &[u8]) -> Vec<u8> {
+        let mut reassembler = FramedReassembler::default();
+        let mut offset = 0;
+        while offset < buf.len() {
+            let payload_len = u16::from_be_bytes([buf[offset + 3], buf[offset + 4]]) as usize;
+            let end = offset + crate::tls::record::TLS_HEADER_LEN + payload_len;
+            let chunk = codec.open(&buf[offset..end]).unwrap();
+            if let Some(payload) = reassembler.push(&chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
+                assert_eq!(
+                    end,
+                    buf.len(),
+                    "framed payload completed before consuming all sealed records"
+                );
+                return payload;
+            }
+            offset = end;
+        }
+        panic!("framed payload did not complete");
+    }
+
+    // Test helper: seal a PQ handshake payload the way production does — split
+    // into several FramedChunk records (small chunk size to exercise reassembly).
+    fn seal_framed<R: rand::Rng + rand::RngCore + ?Sized>(
+        codec: &mut DataRecordCodec,
+        payload: &[u8],
+        rng: &mut R,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in crate::protocol::command::FramedChunk::encode_all(payload, 400).unwrap() {
+            codec.seal_into(&chunk, rng, &mut out).unwrap();
+        }
+        out
+    }
+
     /// Regression for the high-RTT handshake-failure bug (client budget 16 vs
     /// server forward limit 64): the client must skip as many camouflage records as
     /// the server may forward before the key-exchange
@@ -3206,21 +3268,21 @@ mod tests {
         // `pq_rekey_changes_client_session_keys` roundtrip in handshake::client).
         let (pq_record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
         let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
-        let request = PqRekeyRequest::decode(&server_open.open(&pq_record).unwrap()).unwrap();
+        let request =
+            PqRekeyRequest::decode(&open_framed_payload(&mut server_open, &pq_record)).unwrap();
         let server_eph = X25519KeyPair::generate();
         let encapsulation = pq::encapsulate(&request.client_mlkem_public_key).unwrap();
         let (_, mut server_seal) = data_codecs(&keys, traffic).unwrap();
-        let kx_record = server_seal
-            .seal(
-                &ServerKeyExchange {
-                    server_x25519_public: server_eph.public,
-                    mlkem_ciphertext: encapsulation.ciphertext,
-                }
-                .encode_with_suite(CipherSuite::ChaCha20Poly1305)
-                .unwrap(),
-                &mut rng,
-            )
-            .unwrap();
+        let kx_record = seal_framed(
+            &mut server_seal,
+            &ServerKeyExchange {
+                server_x25519_public: server_eph.public,
+                mlkem_ciphertext: encapsulation.ciphertext,
+            }
+            .encode_with_suite(CipherSuite::ChaCha20Poly1305)
+            .unwrap(),
+            &mut rng,
+        );
 
         // Prepend exactly the maximum number of camouflage records the server may
         // forward, then the real key-exchange as the next record.
@@ -3543,24 +3605,24 @@ mod tests {
 
         let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut rng).unwrap();
         let (mut server_open, mut server_seal) = data_codecs(&session_keys, traffic).unwrap();
-        let pq_request = PqRekeyRequest::decode(&server_open.open(&pq_record).unwrap()).unwrap();
+        let pq_request =
+            PqRekeyRequest::decode(&open_framed_payload(&mut server_open, &pq_record)).unwrap();
         let server_ephemeral = X25519KeyPair::generate();
         let x25519_ephemeral_shared = crate::crypto::session::x25519_shared_secret(
             &server_ephemeral.private,
             &pq_request.client_x25519_public,
         );
         let pq_encapsulation = pq::encapsulate(&pq_request.client_mlkem_public_key).unwrap();
-        let key_exchange_record = server_seal
-            .seal(
-                &ServerKeyExchange {
-                    server_x25519_public: server_ephemeral.public,
-                    mlkem_ciphertext: pq_encapsulation.ciphertext,
-                }
-                .encode_with_suite(crate::crypto::session::CipherSuite::ChaCha20Poly1305)
-                .unwrap(),
-                &mut rng,
-            )
-            .unwrap();
+        let key_exchange_record = seal_framed(
+            &mut server_seal,
+            &ServerKeyExchange {
+                server_x25519_public: server_ephemeral.public,
+                mlkem_ciphertext: pq_encapsulation.ciphertext,
+            }
+            .encode_with_suite(crate::crypto::session::CipherSuite::ChaCha20Poly1305)
+            .unwrap(),
+            &mut rng,
+        );
 
         let residual = record::wrap_application_data(b"residual camouflage TLS data").unwrap();
         let (mut client_side, mut server_side) = duplex(32 * 1024);
