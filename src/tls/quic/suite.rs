@@ -44,6 +44,15 @@ impl CipherSuite {
         }
     }
 
+    /// The wire codepoint for this suite (inverse of [`Self::from_u16`]).
+    pub(crate) fn to_u16(self) -> u16 {
+        match self {
+            Self::Aes128GcmSha256 => TLS_AES_128_GCM_SHA256,
+            Self::Aes256GcmSha384 => TLS_AES_256_GCM_SHA384,
+            Self::ChaCha20Poly1305Sha256 => TLS_CHACHA20_POLY1305_SHA256,
+        }
+    }
+
     /// Output length of the suite hash (and of every derived secret): 32 for
     /// SHA-256 suites, 48 for SHA-384.
     pub(crate) fn hash_len(self) -> usize {

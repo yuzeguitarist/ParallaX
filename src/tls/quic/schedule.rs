@@ -56,6 +56,10 @@ pub(crate) struct KeySchedule {
     server_hs_secret: Zeroizing<Vec<u8>>,
     /// `exporter_master_secret` (RFC 5705 exporter), set once 1-RTT is derived.
     exporter_master: Option<Zeroizing<Vec<u8>>>,
+    /// `master_secret`, retained so `resumption_master_secret` can be derived after
+    /// the client Finished is added to the transcript (RFC 8446 §7.1). `None` until
+    /// `derive_application` runs.
+    master_secret: Option<Zeroizing<Vec<u8>>>,
     /// The NEXT 1-RTT application secrets to hand out from
     /// [`Self::next_1rtt_packet_keys`] (already advanced one generation past the
     /// installed 1-RTT keys, matching the QUIC key-update contract).
@@ -69,11 +73,16 @@ impl KeySchedule {
     /// remote). `transcript_hash` is the hash over ClientHello..ServerHello.
     pub(crate) fn after_server_hello(
         suite: CipherSuite,
+        psk: Option<&[u8]>,
         shared_secret: &[u8],
         transcript_hash: &[u8],
     ) -> Result<(Self, Keys), QuicTlsError> {
         let zeros = vec![0_u8; suite.hash_len()];
-        let early_secret = suite.hkdf_extract(&zeros, &zeros);
+        // Early Secret = HKDF-Extract(0, PSK) (RFC 8446 §7.1). Cold-start uses an
+        // all-zero PSK; a resumed (0-RTT / PSK) handshake feeds the ticket-derived
+        // PSK so both ends chain the handshake + master secrets from the same early
+        // secret.
+        let early_secret = suite.hkdf_extract(&zeros, psk.unwrap_or(&zeros));
         let empty_hash = suite.digest(&[]);
         let derived = suite.derive_secret(&early_secret, "derived", &empty_hash)?;
         let handshake_secret = Zeroizing::new(suite.hkdf_extract(&derived, shared_secret));
@@ -98,6 +107,7 @@ impl KeySchedule {
                 client_hs_secret,
                 server_hs_secret,
                 exporter_master: None,
+                master_secret: None,
                 next_client_app_secret: None,
                 next_server_app_secret: None,
             },
@@ -165,6 +175,10 @@ impl KeySchedule {
             "exp master",
             transcript_hash,
         )?));
+        // Retain the master secret for a later resumption_master derivation, which
+        // is taken over the transcript through the *client* Finished (not yet
+        // available here).
+        self.master_secret = Some(master_secret);
 
         let keys = Keys {
             local: DirectionalKeys::from_secret(self.suite, &client_app)?,
@@ -239,6 +253,96 @@ impl KeySchedule {
         out.copy_from_slice(&material);
         Ok(())
     }
+
+    /// `resumption_master_secret = Derive-Secret(master, "res master", th)` where
+    /// `transcript_hash` runs through the *client* Finished (RFC 8446 §7.1). The
+    /// per-ticket PSK is then [`resumption_psk`] of this secret and a ticket nonce.
+    #[allow(dead_code)] // wired in S3/S4 (NewSessionTicket issue + client store)
+    pub(crate) fn resumption_master_secret(
+        &self,
+        transcript_hash: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
+        let master = self.master_secret.as_ref().ok_or_else(|| {
+            QuicTlsError::Crypto("resumption master requested before 1-RTT".into())
+        })?;
+        Ok(Zeroizing::new(self.suite.derive_secret(
+            master,
+            "res master",
+            transcript_hash,
+        )?))
+    }
+}
+
+/// `resumption_psk = HKDF-Expand-Label(resumption_master, "resumption", ticket_nonce, Hash.len)`
+/// (RFC 8446 §4.6.1) — the PSK a NewSessionTicket resumes with.
+#[allow(dead_code)] // wired in S3/S5 (server ticket issue/consume)
+pub(crate) fn resumption_psk(
+    suite: CipherSuite,
+    resumption_master: &[u8],
+    ticket_nonce: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
+    Ok(Zeroizing::new(suite.hkdf_expand_label(
+        resumption_master,
+        "resumption",
+        ticket_nonce,
+        suite.hash_len(),
+    )?))
+}
+
+/// Early Secret from a resumption PSK: `HKDF-Extract(0, psk)` (RFC 8446 §7.1).
+/// The 0-RTT sender/receiver derive the binder key and the
+/// client_early_traffic_secret from this before the handshake (EC)DHE exists.
+#[allow(dead_code)] // wired in S4/S5 (0-RTT key derivation)
+pub(crate) fn early_secret_from_psk(suite: CipherSuite, psk: &[u8]) -> Zeroizing<Vec<u8>> {
+    let zeros = vec![0_u8; suite.hash_len()];
+    Zeroizing::new(suite.hkdf_extract(&zeros, psk))
+}
+
+/// The PSK-binder "finished" key: `HKDF-Expand-Label(Derive-Secret(early, "res
+/// binder", ""), "finished", "", Hash.len)` (RFC 8446 §4.2.11.2). HMAC under this
+/// key over the truncated-ClientHello transcript yields the binder.
+#[allow(dead_code)] // wired in S4/S5 (PSK binder compute/verify)
+pub(crate) fn binder_finished_key(
+    suite: CipherSuite,
+    early_secret: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
+    let empty_hash = suite.digest(&[]);
+    let binder_key = suite.derive_secret(early_secret, "res binder", &empty_hash)?;
+    Ok(Zeroizing::new(suite.hkdf_expand_label(
+        &binder_key,
+        "finished",
+        &[],
+        suite.hash_len(),
+    )?))
+}
+
+/// The PSK binder: `HMAC(binder_finished_key, Transcript-Hash(Truncate(ClientHello)))`
+/// — the transcript runs over the ClientHello up to but excluding the binders list
+/// (RFC 8446 §4.2.11.2). `transcript_hash` is that truncated hash.
+#[allow(dead_code)] // wired in S4/S5 (PSK binder compute/verify)
+pub(crate) fn psk_binder(
+    suite: CipherSuite,
+    finished_key: &[u8],
+    transcript_hash: &[u8],
+) -> Result<Vec<u8>, QuicTlsError> {
+    suite.hmac(finished_key, transcript_hash)
+}
+
+/// `client_early_traffic_secret = Derive-Secret(early, "c e traffic", ClientHello)`
+/// (RFC 8446 §7.1). `transcript_hash` is over the *complete* ClientHello (binders
+/// included). 0-RTT packet-protection keys are built from this via
+/// `DirectionalKeys::from_secret`.
+#[allow(dead_code)] // wired in S4/S5/S6 (0-RTT packet keys)
+pub(crate) fn client_early_traffic_secret(
+    suite: CipherSuite,
+    early_secret: &[u8],
+    transcript_hash: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
+    Ok(Zeroizing::new(suite.derive_secret(
+        early_secret,
+        "c e traffic",
+        transcript_hash,
+    )?))
 }
 
 #[cfg(test)]
@@ -259,7 +363,8 @@ mod tests {
         let suite = CipherSuite::Aes128GcmSha256;
         let shared = [0x5a_u8; 32];
         let th = suite.digest(b"transcript-sh");
-        let (mut sched, _keys) = KeySchedule::after_server_hello(suite, &shared, &th).unwrap();
+        let (mut sched, _keys) =
+            KeySchedule::after_server_hello(suite, None, &shared, &th).unwrap();
         let th_sf = suite.digest(b"transcript-server-finished");
         let _ = sched.derive_application(&th_sf).unwrap();
 
@@ -284,7 +389,8 @@ mod tests {
         let suite = CipherSuite::Aes256GcmSha384;
         let shared = [0x33_u8; 32];
         let th = suite.digest(b"sh");
-        let (mut sched, _keys) = KeySchedule::after_server_hello(suite, &shared, &th).unwrap();
+        let (mut sched, _keys) =
+            KeySchedule::after_server_hello(suite, None, &shared, &th).unwrap();
         let _ = sched.derive_application(&suite.digest(b"sf")).unwrap();
         // Two successive generations must produce different packet keys (nonce-1
         // ciphertexts differ); exercised indirectly by encrypting a fixed input.
@@ -295,5 +401,86 @@ mod tests {
         g1.local.encrypt_in_place(0, b"h", &mut b1).unwrap();
         g2.local.encrypt_in_place(0, b"h", &mut b2).unwrap();
         assert_ne!(b1, b2, "successive key-update generations must differ");
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn early_secret_from_zero_psk_matches_extract_anchor() {
+        // A cold-start (all-zero) PSK must reproduce the well-known RFC 8448 §3
+        // Early Secret = HKDF-Extract(0, 0) for SHA-256.
+        let early = early_secret_from_psk(CipherSuite::Aes128GcmSha256, &[0_u8; 32]);
+        assert_eq!(
+            hex(&early),
+            "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
+        );
+    }
+
+    #[test]
+    fn binder_and_early_traffic_are_deterministic_and_distinct() {
+        let suite = CipherSuite::Aes128GcmSha256;
+        let psk = [0x5b_u8; 32];
+        let early = early_secret_from_psk(suite, &psk);
+
+        // Binder finished key + binder are deterministic; the binder is exactly the
+        // hash length, depends on the truncated-CH transcript, and the same inputs
+        // recompute equally (this is what lets the server re-verify the binder).
+        let fk = binder_finished_key(suite, &early).unwrap();
+        let th_a = suite.digest(b"truncated-clienthello-A");
+        let th_b = suite.digest(b"truncated-clienthello-B");
+        let binder_a = psk_binder(suite, &fk, &th_a).unwrap();
+        let binder_a2 = psk_binder(suite, &fk, &th_a).unwrap();
+        let binder_b = psk_binder(suite, &fk, &th_b).unwrap();
+        assert_eq!(binder_a.len(), suite.hash_len());
+        assert_eq!(
+            binder_a, binder_a2,
+            "binder is deterministic for fixed inputs"
+        );
+        assert_ne!(binder_a, binder_b, "binder is bound to the CH transcript");
+
+        // client_early_traffic_secret is deterministic, hash-length, and distinct
+        // from the binder finished key (label separation works).
+        let th_ch = suite.digest(b"full-clienthello");
+        let cet = client_early_traffic_secret(suite, &early, &th_ch).unwrap();
+        let cet2 = client_early_traffic_secret(suite, &early, &th_ch).unwrap();
+        assert_eq!(cet.len(), suite.hash_len());
+        assert_eq!(cet, cet2);
+        assert_ne!(
+            &cet[..],
+            &fk[..],
+            "early-traffic secret != binder finished key"
+        );
+    }
+
+    #[test]
+    fn resumption_master_and_psk_roundtrip() {
+        let suite = CipherSuite::Aes256GcmSha384;
+        let shared = [0x21_u8; 32];
+        let th_sh = suite.digest(b"ch..sh");
+        let (mut sched, _keys) =
+            KeySchedule::after_server_hello(suite, None, &shared, &th_sh).unwrap();
+        // resumption_master is unavailable until the application secrets are derived.
+        assert!(sched
+            .resumption_master_secret(&suite.digest(b"early"))
+            .is_err());
+        let _ = sched.derive_application(&suite.digest(b"ch..sf")).unwrap();
+
+        let th_cf = suite.digest(b"ch..client-finished");
+        let res_master = sched.resumption_master_secret(&th_cf).unwrap();
+        assert_eq!(res_master.len(), suite.hash_len());
+        // Same transcript -> same resumption master (both ends must agree).
+        let res_master2 = sched.resumption_master_secret(&th_cf).unwrap();
+        assert_eq!(res_master, res_master2);
+
+        // Distinct ticket nonces yield distinct PSKs; each is hash-length.
+        let psk0 = resumption_psk(suite, &res_master, &[]).unwrap();
+        let psk1 = resumption_psk(suite, &res_master, &[0x01]).unwrap();
+        assert_eq!(psk0.len(), suite.hash_len());
+        assert_ne!(psk0, psk1, "ticket nonce diversifies the PSK");
+        // The PSK feeds a usable early secret.
+        let early = early_secret_from_psk(suite, &psk0);
+        assert_eq!(early.len(), suite.hash_len());
     }
 }

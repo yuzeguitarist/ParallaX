@@ -31,10 +31,14 @@ use zeroize::Zeroizing;
 use crate::crypto::session::{x25519_shared_secret, X25519KeyPair};
 use crate::tls::safari_shape::{GreaseSet, GROUP_X25519, GROUP_X25519_MLKEM768, X25519_KEY_LEN};
 
-use super::client_hello::{build_client_hello, ClientHelloParams};
-use super::keys::{KeyPair, Keys, PacketKey};
-use super::schedule::{initial_keys, KeySchedule};
+use super::client_hello::{build_client_hello, ClientHelloParams, ResumptionParams};
+use super::keys::{DirectionalKeys, KeyPair, Keys, PacketKey};
+use super::schedule::{
+    binder_finished_key, client_early_traffic_secret, early_secret_from_psk, initial_keys,
+    KeySchedule,
+};
 use super::suite::CipherSuite;
+use super::ticket::ClientTicket;
 use super::{
     ClientConfig, QuicTlsError, Side, ALERT_BAD_CERTIFICATE, ALERT_DECODE_ERROR,
     ALERT_DECRYPT_ERROR, ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
@@ -53,6 +57,8 @@ const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
+const EXT_EARLY_DATA: u16 = 0x002a;
+const EXT_PRE_SHARED_KEY: u16 = 0x0029;
 
 const TLS13_LEGACY_VERSION: u16 = 0x0303;
 const TLS13_SELECTED_VERSION: u16 = 0x0304;
@@ -74,6 +80,11 @@ const HRR_RANDOM: [u8; 32] = [
 
 /// A change of QUIC packet-protection keys, emitted by [`ClientHandshake::write_handshake`].
 pub enum KeyChange {
+    /// Install 0-RTT (early-data) write keys. Emitted right after the resumption
+    /// ClientHello so the transport can send 0-RTT application data before the
+    /// handshake completes. Only `keys.local` is meaningful on the client (0-RTT is
+    /// client→server only); the server installs `keys.remote` to open it.
+    ZeroRtt { keys: Keys },
     /// Install Handshake-space keys.
     Handshake { keys: Keys },
     /// Install 1-RTT (Data-space) keys; the handshake is now complete.
@@ -120,17 +131,63 @@ pub struct ClientHandshake {
     server_certs: Vec<Vec<u8>>,
     alpn: Option<Vec<u8>>,
     peer_transport_params: Option<Vec<u8>>,
+
+    // 0-RTT resumption state (all inert for a cold-start handshake).
+    /// The resumption PSK offered in `pre_shared_key`; `Some` only when resuming.
+    /// Fed into the key schedule iff the server accepts the PSK (`psk_accepted`).
+    resumption_psk: Option<Zeroizing<Vec<u8>>>,
+    /// 0-RTT write keys, queued to emit as [`KeyChange::ZeroRtt`] after the CH.
+    pending_0rtt_keys: Option<Keys>,
+    /// The server echoed `pre_shared_key` in ServerHello — the PSK was accepted, so
+    /// the handshake is a resumption (no Certificate / CertificateVerify follow).
+    psk_accepted: bool,
+    /// The server echoed `early_data` in EncryptedExtensions — 0-RTT was accepted.
+    early_data_accepted: bool,
 }
 
 impl ClientHandshake {
-    /// Build a fresh client handshake for `server_name`, carrying `transport_params`
-    /// (the opaque QUIC 0x39 blob). Generates the ephemeral hybrid key share and
-    /// the Safari-26 H3 ClientHello.
+    /// Build a fresh (cold-start) client handshake for `server_name`, carrying
+    /// `transport_params` (the opaque QUIC 0x39 blob). See [`Self::new_resumption`]
+    /// for the 0-RTT variant.
     pub fn new(
         config: Arc<ClientConfig>,
         version: u32,
         server_name: &str,
         transport_params: Vec<u8>,
+    ) -> Result<Self, QuicTlsError> {
+        Self::new_inner(config, version, server_name, transport_params, None, 0)
+    }
+
+    /// Build a 0-RTT resumption client handshake: it offers `ticket` via
+    /// `pre_shared_key` + `early_data` and derives the 0-RTT write keys (emitted as
+    /// [`KeyChange::ZeroRtt`] after the ClientHello). `now_ms` is the current Unix
+    /// time in milliseconds, for `obfuscated_ticket_age`.
+    #[allow(dead_code)] // wired into the client runtime in S7
+    pub(crate) fn new_resumption(
+        config: Arc<ClientConfig>,
+        version: u32,
+        server_name: &str,
+        transport_params: Vec<u8>,
+        ticket: &ClientTicket,
+        now_ms: u64,
+    ) -> Result<Self, QuicTlsError> {
+        Self::new_inner(
+            config,
+            version,
+            server_name,
+            transport_params,
+            Some(ticket),
+            now_ms,
+        )
+    }
+
+    fn new_inner(
+        config: Arc<ClientConfig>,
+        version: u32,
+        server_name: &str,
+        transport_params: Vec<u8>,
+        ticket: Option<&ClientTicket>,
+        now_ms: u64,
     ) -> Result<Self, QuicTlsError> {
         if version != QUIC_VERSION_V1 {
             return Err(QuicTlsError::UnsupportedVersion);
@@ -162,15 +219,50 @@ impl ClientHandshake {
         let mut random = [0_u8; 32];
         OsRng.fill_bytes(&mut random);
 
-        let client_hello = build_client_hello(&ClientHelloParams {
-            server_name,
-            alpn_protocols: &config.alpn_protocols,
-            x25519_public: &x25519.public,
-            mlkem768_public: &mlkem_public,
-            transport_params: &transport_params,
-            grease,
-            random: &random,
-        })?;
+        let mut resumption_psk = None;
+        let mut pending_0rtt_keys = None;
+        let client_hello = if let Some(t) = ticket {
+            // 0-RTT: derive the early secret + binder finished key, build the
+            // resumption ClientHello (early_data + trailing pre_shared_key with a
+            // valid binder), then derive the 0-RTT write keys from
+            // client_early_traffic_secret over that exact ClientHello.
+            let suite = CipherSuite::from_u16(t.suite)?;
+            let early = early_secret_from_psk(suite, &t.psk);
+            let fk = binder_finished_key(suite, &early)?;
+            let ch = build_client_hello(&ClientHelloParams {
+                server_name,
+                alpn_protocols: &config.alpn_protocols,
+                x25519_public: &x25519.public,
+                mlkem768_public: &mlkem_public,
+                transport_params: &transport_params,
+                grease,
+                random: &random,
+                resumption: Some(ResumptionParams {
+                    ticket: t.ticket.as_slice(),
+                    obfuscated_ticket_age: t.obfuscated_ticket_age(now_ms),
+                    binder_finished_key: fk.as_slice(),
+                    suite,
+                }),
+            })?;
+            let cet = client_early_traffic_secret(suite, &early, &suite.digest(&ch))?;
+            pending_0rtt_keys = Some(Keys {
+                local: DirectionalKeys::from_secret(suite, &cet)?,
+                remote: DirectionalKeys::from_secret(suite, &cet)?,
+            });
+            resumption_psk = Some(Zeroizing::new(t.psk.to_vec()));
+            ch
+        } else {
+            build_client_hello(&ClientHelloParams {
+                server_name,
+                alpn_protocols: &config.alpn_protocols,
+                x25519_public: &x25519.public,
+                mlkem768_public: &mlkem_public,
+                transport_params: &transport_params,
+                grease,
+                random: &random,
+                resumption: None,
+            })?
+        };
 
         let transcript = client_hello.clone();
 
@@ -194,6 +286,10 @@ impl ClientHandshake {
             server_certs: Vec::new(),
             alpn: None,
             peer_transport_params: None,
+            resumption_psk,
+            pending_0rtt_keys,
+            psk_accepted: false,
+            early_data_accepted: false,
         })
     }
 
@@ -218,6 +314,13 @@ impl ClientHandshake {
         self.peer_transport_params.as_deref()
     }
 
+    /// Whether the server accepted 0-RTT (echoed `early_data` in EncryptedExtensions).
+    /// Meaningful only on a resumption handshake; always false for cold-start.
+    #[allow(dead_code)] // wired into the transport in S6
+    pub fn is_early_data_accepted(&self) -> bool {
+        self.early_data_accepted
+    }
+
     /// The server certificate chain (DER), once Certificate has been processed.
     pub fn peer_certificates(&self) -> Option<&[Vec<u8>]> {
         if self.server_certs.is_empty() {
@@ -236,11 +339,19 @@ impl ClientHandshake {
             // Initial keys are derived via `initial_keys`, not returned here.
             return None;
         }
+        if let Some(keys) = self.pending_0rtt_keys.take() {
+            // 0-RTT write keys, emitted right after the resumption ClientHello so
+            // the transport can send early data before the handshake completes.
+            return Some(KeyChange::ZeroRtt { keys });
+        }
         if let Some(keys) = self.pending_handshake_keys.take() {
             return Some(KeyChange::Handshake { keys });
         }
         if let Some(finished) = self.pending_client_finished.take() {
             out.extend_from_slice(&finished);
+            // Keep the transcript through the client Finished so a later
+            // `resumption_master_secret` matches the server (RFC 8446 §7.1).
+            self.transcript.extend_from_slice(&finished);
             let keys = self
                 .pending_1rtt_keys
                 .take()
@@ -267,6 +378,23 @@ impl ClientHandshake {
             .as_ref()
             .ok_or_else(|| QuicTlsError::Crypto("exporter before handshake".into()))?
             .export_keying_material(out, label, context)
+    }
+
+    /// `resumption_master_secret` over the transcript through the client Finished
+    /// (RFC 8446 §7.1). Available only after [`Self::write_handshake`] has emitted
+    /// the client Finished (which appends it to the transcript). The per-ticket PSK
+    /// the client stores is [`super::schedule::resumption_psk`] of this secret.
+    #[allow(dead_code)] // wired in S4 (client ticket store)
+    pub fn resumption_master_secret(&self) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
+        let suite = self
+            .suite
+            .ok_or_else(|| QuicTlsError::Crypto("resumption master before handshake".into()))?;
+        let schedule = self
+            .schedule
+            .as_ref()
+            .ok_or_else(|| QuicTlsError::Crypto("resumption master before schedule".into()))?;
+        let transcript_hash = suite.digest(&self.transcript);
+        schedule.resumption_master_secret(&transcript_hash)
     }
 
     /// Feed reassembled CRYPTO-stream bytes. Returns `Ok(true)` the first time
@@ -322,7 +450,13 @@ impl ClientHandshake {
             (ReadState::EncryptedExtensions, HANDSHAKE_ENCRYPTED_EXTENSIONS) => {
                 self.handle_encrypted_extensions(body)?;
                 self.transcript.extend_from_slice(message);
-                self.read_state = ReadState::Certificate;
+                // A resumed handshake (PSK accepted) sends no Certificate /
+                // CertificateVerify — the next message is the server Finished.
+                self.read_state = if self.psk_accepted {
+                    ReadState::Finished
+                } else {
+                    ReadState::Certificate
+                };
                 Ok(())
             }
             (ReadState::Certificate, HANDSHAKE_CERTIFICATE) => {
@@ -409,6 +543,7 @@ impl ClientHandshake {
         let mut tls13_selected = false;
         let mut key_share_group = None;
         let mut key_share = None;
+        let mut psk_selected = false;
         while e.remaining() > 0 {
             let ext_type = e.u16()?;
             let data = e.vec_u16()?;
@@ -449,9 +584,28 @@ impl ClientHandshake {
                     }
                 }
                 // RFC 8446 §4.2: a TLS 1.3 ServerHello carries only
-                // supported_versions + key_share (and pre_shared_key, which a
-                // cold-start client never offers). Reject anything else rather than
-                // silently tolerating it — silent leniency is an active-probe tell.
+                // supported_versions + key_share (plus pre_shared_key when the
+                // client offered one — handled above). Reject anything else rather
+                // than silently tolerating it — silent leniency is an active-probe
+                // tell.
+                EXT_PRE_SHARED_KEY => {
+                    // The server selects one of the PSK identities we offered. We
+                    // offer exactly one (index 0), so this is illegal unless we
+                    // resumed, and the selected_identity must be 0.
+                    if self.resumption_psk.is_none() {
+                        return Err(QuicTlsError::alert(
+                            ALERT_ILLEGAL_PARAMETER,
+                            "ServerHello pre_shared_key we did not offer",
+                        ));
+                    }
+                    if data.len() != 2 || u16::from_be_bytes([data[0], data[1]]) != 0 {
+                        return Err(QuicTlsError::alert(
+                            ALERT_ILLEGAL_PARAMETER,
+                            "ServerHello selected_identity is not our offered PSK",
+                        ));
+                    }
+                    psk_selected = true;
+                }
                 other => {
                     return Err(QuicTlsError::alert(
                         ALERT_UNSUPPORTED_EXTENSION,
@@ -460,6 +614,7 @@ impl ClientHandshake {
                 }
             }
         }
+        self.psk_accepted = psk_selected;
         if !tls13_selected {
             return Err(QuicTlsError::alert(
                 ALERT_MISSING_EXTENSION,
@@ -492,8 +647,28 @@ impl ClientHandshake {
         // ClientHello..ServerHello as the handshake-secret derivation requires.
         let transcript_hash = suite.digest(&self.transcript);
 
+        // On a resumed handshake (the server accepted our PSK) the key schedule
+        // chains from the ticket PSK; otherwise it uses the cold-start all-zero PSK.
+        let resumption_psk = self.resumption_psk.as_ref().map(|p| p.as_slice());
+        let psk = if self.psk_accepted {
+            let psk = resumption_psk.ok_or_else(|| {
+                QuicTlsError::alert(
+                    ALERT_ILLEGAL_PARAMETER,
+                    "server selected pre_shared_key we did not offer",
+                )
+            })?;
+            if psk.len() != suite.hash_len() {
+                return Err(QuicTlsError::alert(
+                    ALERT_ILLEGAL_PARAMETER,
+                    "resumed suite hash does not match the ticket PSK",
+                ));
+            }
+            Some(psk)
+        } else {
+            None
+        };
         let (schedule, keys) =
-            KeySchedule::after_server_hello(suite, &shared_secret, &transcript_hash)?;
+            KeySchedule::after_server_hello(suite, psk, &shared_secret, &transcript_hash)?;
         self.schedule = Some(schedule);
         self.pending_handshake_keys = Some(keys);
         Ok(())
@@ -605,6 +780,17 @@ impl ClientHandshake {
                         ));
                     }
                     self.peer_transport_params = Some(data.to_vec());
+                }
+                EXT_EARLY_DATA => {
+                    // The server echoing `early_data` accepts 0-RTT (RFC 8446
+                    // §4.2.10); its EncryptedExtensions body is empty.
+                    if !data.is_empty() {
+                        return Err(QuicTlsError::alert(
+                            ALERT_DECODE_ERROR,
+                            "EncryptedExtensions early_data must be empty",
+                        ));
+                    }
+                    self.early_data_accepted = true;
                 }
                 _ => {}
             }

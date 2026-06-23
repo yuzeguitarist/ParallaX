@@ -17,14 +17,22 @@
 use aws_lc_rs::kem::{EncapsulationKey, ML_KEM_768};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use super::schedule::KeySchedule;
+use super::schedule::{
+    binder_finished_key, client_early_traffic_secret, early_secret_from_psk, psk_binder,
+    resumption_psk, KeySchedule,
+};
 use super::suite::CipherSuite;
+use super::ticket::{
+    encode_new_session_ticket, open_ticket, seal_ticket, NewSessionTicket, TicketState,
+    QUIC_MAX_EARLY_DATA,
+};
 use super::{
-    KeyChange, KeyPair, Keys, PacketKey, QuicTlsError, ALERT_DECODE_ERROR, ALERT_DECRYPT_ERROR,
-    ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
+    DirectionalKeys, KeyChange, KeyPair, Keys, PacketKey, QuicTlsError, ALERT_DECODE_ERROR,
+    ALERT_DECRYPT_ERROR, ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
     ALERT_NO_APPLICATION_PROTOCOL, ALERT_UNEXPECTED_MESSAGE,
 };
 use crate::crypto::session::{x25519_shared_secret, X25519KeyPair};
@@ -92,6 +100,12 @@ fn server_hybrid_kex(client_share: &[u8]) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
+/// `pre_shared_key` (RFC 8446 §4.2.11): offered last by a resuming client; echoed
+/// in ServerHello (selected_identity) when the server accepts the PSK.
+const EXT_PRE_SHARED_KEY: u16 = 0x0029;
+/// `early_data` (RFC 8446 §4.2.10): offered (empty) by a 0-RTT client; echoed
+/// (empty) in EncryptedExtensions when the server accepts 0-RTT.
+const EXT_EARLY_DATA: u16 = 0x002a;
 /// Named-group codepoint for the X25519MLKEM768 hybrid (the only group the engine
 /// completes; the GREASE entry and the standalone X25519 share are ignored).
 const GROUP_X25519MLKEM768: u16 = 0x11ec;
@@ -112,6 +126,16 @@ struct ClientHelloSummary {
     /// The ALPN protocols the client offered (ext 0x10), in offer order. The
     /// server selects the first local protocol that appears here (RFC 7301).
     offered_alpn: Vec<Vec<u8>>,
+    /// The first `pre_shared_key` identity (the opaque ticket), if the client
+    /// offered a PSK (0-RTT resumption).
+    psk_identity: Option<Vec<u8>>,
+    /// The first PSK binder, paired with `psk_identity`.
+    psk_binder: Option<Vec<u8>>,
+    /// The wire length of the binders list content (= the `binders<>` vector
+    /// length), used to truncate the ClientHello for binder verification.
+    psk_binders_wire_len: Option<usize>,
+    /// Whether the client offered the `early_data` extension (0-RTT).
+    offers_early_data: bool,
 }
 
 /// Parse a ClientHello body (the handshake-message payload, i.e. WITHOUT the
@@ -140,6 +164,10 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
     let mut transport_params = None;
     let mut offered_alpn: Vec<Vec<u8>> = Vec::new();
     let mut offers_tls13 = false;
+    let mut psk_identity = None;
+    let mut psk_binder = None;
+    let mut psk_binders_wire_len = None;
+    let mut offers_early_data = false;
     while er.remaining() > 0 {
         let ext_type = er.u16()?;
         let ext_data = er.vec_u16()?;
@@ -174,6 +202,21 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
                     offered_alpn.push(lr.vec_u8()?.to_vec());
                 }
             }
+            EXT_PRE_SHARED_KEY => {
+                // OfferedPsks { identities<7..>, binders<33..> } (RFC 8446 §4.2.11.1).
+                // ParallaX offers exactly one identity + one binder; take the first.
+                let mut pr = Reader::new(ext_data);
+                let identities = pr.vec_u16()?;
+                let binders_blob = pr.vec_u16()?;
+                let mut ir = Reader::new(identities);
+                let id = ir.vec_u16()?; // PskIdentity.identity (the opaque ticket)
+                ir.take(4)?; // obfuscated_ticket_age (unused server-side)
+                psk_identity = Some(id.to_vec());
+                let mut br = Reader::new(binders_blob);
+                psk_binder = Some(br.vec_u8()?.to_vec()); // first PskBinderEntry
+                psk_binders_wire_len = Some(binders_blob.len());
+            }
+            EXT_EARLY_DATA => offers_early_data = true,
             _ => {}
         }
     }
@@ -193,6 +236,10 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
             QuicTlsError::alert(ALERT_MISSING_EXTENSION, "no quic_transport_parameters")
         })?,
         offered_alpn,
+        psk_identity,
+        psk_binder,
+        psk_binders_wire_len,
+        offers_early_data,
     })
 }
 
@@ -260,6 +307,9 @@ const TLS13_LEGACY_VERSION: u16 = 0x0303;
 const SIG_SCHEME_ECDSA_P256: u16 = 0x0403;
 /// Largest handshake message the server will buffer (the client Finished is tiny).
 const MAX_HANDSHAKE_MESSAGE: usize = 1 << 16;
+/// 0-RTT resumption-ticket lifetime: RFC 8446 §4.6.1's 7-day cap, matching the
+/// Safari 26.4 NewSessionTicket baseline.
+const TICKET_LIFETIME_SECS: u32 = 604_800;
 
 fn put_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_be_bytes());
@@ -301,6 +351,7 @@ fn build_server_hello(
     session_id_echo: &[u8],
     server_key_share: &[u8],
     random: &[u8; 32],
+    psk_selected: bool,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     put_u16(&mut body, TLS13_LEGACY_VERSION);
@@ -317,13 +368,20 @@ fn build_server_hello(
     put_vec_u16(&mut ks, server_key_share);
     put_u16(&mut exts, EXT_KEY_SHARE);
     put_vec_u16(&mut exts, &ks);
+    if psk_selected {
+        // pre_shared_key in ServerHello carries selected_identity; we offered exactly
+        // one identity, so the server selects index 0 (RFC 8446 §4.2.11).
+        put_u16(&mut exts, EXT_PRE_SHARED_KEY);
+        put_vec_u16(&mut exts, &0u16.to_be_bytes());
+    }
     put_vec_u16(&mut body, &exts);
 
     handshake_message(HANDSHAKE_SERVER_HELLO, &body)
 }
 
-/// EncryptedExtensions: the selected ALPN + the server's transport parameters.
-fn build_encrypted_extensions(alpn: &[u8], transport_params: &[u8]) -> Vec<u8> {
+/// EncryptedExtensions: the selected ALPN + the server's transport parameters, plus
+/// an (empty) `early_data` extension when the server accepts 0-RTT.
+fn build_encrypted_extensions(alpn: &[u8], transport_params: &[u8], early_data: bool) -> Vec<u8> {
     let mut exts = Vec::new();
     let mut alpn_list = Vec::new();
     put_vec_u8(&mut alpn_list, alpn);
@@ -333,6 +391,11 @@ fn build_encrypted_extensions(alpn: &[u8], transport_params: &[u8]) -> Vec<u8> {
     put_vec_u16(&mut exts, &alpn_ext);
     put_u16(&mut exts, EXT_QUIC_TRANSPORT_PARAMETERS);
     put_vec_u16(&mut exts, transport_params);
+    if early_data {
+        // Accept 0-RTT: echo an empty early_data extension (RFC 8446 §4.2.10).
+        put_u16(&mut exts, EXT_EARLY_DATA);
+        put_vec_u16(&mut exts, &[]);
+    }
     let mut body = Vec::new();
     put_vec_u16(&mut body, &exts);
     handshake_message(HANDSHAKE_ENCRYPTED_EXTENSIONS, &body)
@@ -412,6 +475,18 @@ pub struct ServerHandshake {
     expected_client_finished: Option<Vec<u8>>,
     handshake_complete: bool,
     inbound: Vec<u8>,
+    /// STEK for sealing 0-RTT resumption tickets. `None` disables ticket issuance,
+    /// so a cold-start-only server behaves exactly as before.
+    stek: Option<Zeroizing<[u8; 32]>>,
+    /// The ALPN selected from the ClientHello, retained for the resumption ticket.
+    selected_alpn: Option<Vec<u8>>,
+    /// Post-handshake (1-RTT) CRYPTO queued for emission (the NewSessionTicket).
+    pending_post_handshake: Vec<u8>,
+    /// 0-RTT (early-data) open keys, queued as [`KeyChange::ZeroRtt`] when the
+    /// server accepts 0-RTT; the transport installs `remote` to decrypt early data.
+    pending_0rtt_keys: Option<Keys>,
+    /// Whether the server accepted 0-RTT (echoed `early_data` in EE).
+    early_data_accepted: bool,
 }
 
 impl ServerHandshake {
@@ -424,6 +499,7 @@ impl ServerHandshake {
         signing_key_pkcs8: &[u8],
         alpn_protocols: Vec<Vec<u8>>,
         transport_params: Vec<u8>,
+        stek: Option<Zeroizing<[u8; 32]>>,
     ) -> Result<Self, QuicTlsError> {
         let signing_key =
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, signing_key_pkcs8)
@@ -445,6 +521,11 @@ impl ServerHandshake {
             expected_client_finished: None,
             handshake_complete: false,
             inbound: Vec::new(),
+            stek,
+            selected_alpn: None,
+            pending_post_handshake: Vec::new(),
+            pending_0rtt_keys: None,
+            early_data_accepted: false,
         })
     }
 
@@ -470,6 +551,12 @@ impl ServerHandshake {
         self.peer_transport_params.as_deref()
     }
 
+    /// Whether the server accepted 0-RTT for this connection (echoed `early_data`).
+    #[allow(dead_code)] // wired into the transport in S6
+    pub fn is_early_data_accepted(&self) -> bool {
+        self.early_data_accepted
+    }
+
     /// RFC 5705 exporter; available once the schedule reaches 1-RTT.
     pub fn export_keying_material(
         &self,
@@ -488,6 +575,11 @@ impl ServerHandshake {
     /// EncryptedExtensions/Certificate/CertificateVerify/Finished (Handshake) +
     /// 1-RTT keys.
     pub fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
+        if let Some(keys) = self.pending_0rtt_keys.take() {
+            // 0-RTT open keys, installed before the ServerHello so the transport can
+            // decrypt early-data packets that arrived alongside the ClientHello.
+            return Some(KeyChange::ZeroRtt { keys });
+        }
         if let Some(sh) = self.pending_server_hello.take() {
             out.extend_from_slice(&sh);
             return None;
@@ -502,6 +594,12 @@ impl ServerHandshake {
                 .take()
                 .expect("1-RTT keys derived with the server flight");
             return Some(KeyChange::OneRtt { keys });
+        }
+        if !self.pending_post_handshake.is_empty() {
+            // The NewSessionTicket rides 1-RTT CRYPTO, emitted after the OneRtt
+            // KeyChange so the connection seals it with the application keys.
+            out.append(&mut self.pending_post_handshake);
+            return None;
         }
         None
     }
@@ -546,6 +644,7 @@ impl ServerHandshake {
                 self.transcript.extend_from_slice(message);
                 self.state = ServerState::Complete;
                 self.handshake_complete = true;
+                self.issue_session_ticket()?;
                 Ok(())
             }
             (state, ty) => Err(QuicTlsError::alert(
@@ -558,20 +657,51 @@ impl ServerHandshake {
     fn process_client_hello(&mut self, message: &[u8]) -> Result<(), QuicTlsError> {
         let summary = parse_client_hello(&message[4..])?;
         let (server_share, shared) = server_hybrid_kex(&summary.hybrid_key_share)?;
-        self.peer_transport_params = Some(summary.transport_params);
+
+        // Decide 0-RTT resumption BEFORE consuming `summary`: validate the offered
+        // PSK (ticket unseal + binder over the truncated ClientHello).
+        let accepted_psk = self.try_accept_psk(&summary, message);
+        self.peer_transport_params = Some(summary.transport_params.clone());
 
         let mut random = [0u8; 32];
         SystemRandom::new()
             .fill(&mut random)
             .map_err(|_| QuicTlsError::Crypto("server random".into()))?;
 
-        // transcript: ClientHello, then ServerHello.
+        // transcript: ClientHello first.
         self.transcript.extend_from_slice(message);
-        let server_hello = build_server_hello(&summary.legacy_session_id, &server_share, &random);
+
+        // Accepting 0-RTT: derive the early-data open keys (client_early_traffic_secret
+        // over the full ClientHello) and queue them as a ZeroRtt KeyChange so the
+        // transport can decrypt the client's early data.
+        if let Some(psk) = accepted_psk.as_ref() {
+            let early = early_secret_from_psk(self.suite, psk);
+            let cet = client_early_traffic_secret(
+                self.suite,
+                &early,
+                &self.suite.digest(&self.transcript),
+            )?;
+            self.pending_0rtt_keys = Some(Keys {
+                local: DirectionalKeys::from_secret(self.suite, &cet)?,
+                remote: DirectionalKeys::from_secret(self.suite, &cet)?,
+            });
+            self.early_data_accepted = true;
+        }
+
+        let server_hello = build_server_hello(
+            &summary.legacy_session_id,
+            &server_share,
+            &random,
+            accepted_psk.is_some(),
+        );
         self.transcript.extend_from_slice(&server_hello);
         let hash_sh = self.suite.digest(&self.transcript);
-        let (mut schedule, hs_keys) =
-            KeySchedule::after_server_hello(self.suite, &shared, &hash_sh)?;
+        let (mut schedule, hs_keys) = KeySchedule::after_server_hello(
+            self.suite,
+            accepted_psk.as_ref().map(|p| p.as_slice()),
+            &shared,
+            &hash_sh,
+        )?;
 
         // RFC 7301: select the first local ALPN protocol the client actually
         // offered; a peer that shares none gets no_application_protocol rather than
@@ -587,37 +717,42 @@ impl ServerHandshake {
                     "no overlapping ALPN protocol",
                 )
             })?;
-        let ee = build_encrypted_extensions(&alpn, &self.transport_params);
+        self.selected_alpn = Some(alpn.clone());
+        let ee = build_encrypted_extensions(&alpn, &self.transport_params, accepted_psk.is_some());
         self.transcript.extend_from_slice(&ee);
-        let cert = build_certificate(&self.cert_chain);
-        self.transcript.extend_from_slice(&cert);
 
-        // CertificateVerify over Transcript-Hash(ClientHello..Certificate), signed
-        // with the cover cert's ECDSA P-256 key (RFC 8446 §4.4.3). The REALITY
+        let mut handshake_flight = ee;
+        // A resumed (PSK) handshake authenticates via the PSK: it sends NO
+        // Certificate / CertificateVerify (RFC 8446 §2.2). A full handshake signs
+        // both with the cover cert's ECDSA P-256 key (RFC 8446 §4.4.3); the REALITY
         // client (AcceptAnyServerCert) does not verify it, but a real verifier — or
         // the differential oracle — accepts the valid signature.
-        let hash_cert = self.suite.digest(&self.transcript);
-        let content = certificate_verify_content(&hash_cert);
-        let signature = self
-            .signing_key
-            .sign(&SystemRandom::new(), &content)
-            .map_err(|_| QuicTlsError::Crypto("CertificateVerify signing".into()))?;
-        let cv = build_certificate_verify(SIG_SCHEME_ECDSA_P256, signature.as_ref());
-        self.transcript.extend_from_slice(&cv);
+        if accepted_psk.is_none() {
+            let cert = build_certificate(&self.cert_chain);
+            self.transcript.extend_from_slice(&cert);
+            let hash_cert = self.suite.digest(&self.transcript);
+            let content = certificate_verify_content(&hash_cert);
+            let signature = self
+                .signing_key
+                .sign(&SystemRandom::new(), &content)
+                .map_err(|_| QuicTlsError::Crypto("CertificateVerify signing".into()))?;
+            let cv = build_certificate_verify(SIG_SCHEME_ECDSA_P256, signature.as_ref());
+            self.transcript.extend_from_slice(&cv);
+            handshake_flight.extend_from_slice(&cert);
+            handshake_flight.extend_from_slice(&cv);
+        }
 
-        let hash_cv = self.suite.digest(&self.transcript);
-        let server_verify = schedule.server_finished_verify_data(&hash_cv)?;
+        // Server Finished MAC over the transcript through the last flight message
+        // (CertificateVerify for a full handshake, EncryptedExtensions for a resumed).
+        let hash_pre_finished = self.suite.digest(&self.transcript);
+        let server_verify = schedule.server_finished_verify_data(&hash_pre_finished)?;
         let fin = build_finished(&server_verify);
         self.transcript.extend_from_slice(&fin);
+        handshake_flight.extend_from_slice(&fin);
 
         let hash_sf = self.suite.digest(&self.transcript);
         let onertt = schedule.derive_application(&hash_sf)?;
         self.expected_client_finished = Some(schedule.client_finished_verify_data(&hash_sf)?);
-
-        let mut handshake_flight = ee;
-        handshake_flight.extend_from_slice(&cert);
-        handshake_flight.extend_from_slice(&cv);
-        handshake_flight.extend_from_slice(&fin);
 
         self.schedule = Some(schedule);
         self.pending_server_hello = Some(server_hello);
@@ -625,6 +760,55 @@ impl ServerHandshake {
         self.pending_handshake_flight = Some(handshake_flight);
         self.pending_1rtt_keys = Some(swap(onertt));
         Ok(())
+    }
+
+    /// Validate a resuming client's `pre_shared_key` for 0-RTT: unseal the ticket
+    /// under the STEK, check expiry + suite + ALPN, and verify the PSK binder over
+    /// the ClientHello truncated before the binders (RFC 8446 §4.2.11.2). Returns the
+    /// resumption PSK on success, or `None` to fall back to a full handshake (no
+    /// STEK, no `early_data` offer, bad ticket, expired, or binder mismatch).
+    fn try_accept_psk(
+        &self,
+        summary: &ClientHelloSummary,
+        ch_message: &[u8],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        let stek = self.stek.as_ref()?;
+        // ParallaX only resumes for 0-RTT (the Safari case): a PSK without
+        // early_data falls back to a full handshake.
+        if !summary.offers_early_data {
+            return None;
+        }
+        let identity = summary.psk_identity.as_deref()?;
+        let binder = summary.psk_binder.as_deref()?;
+        let binders_wire_len = summary.psk_binders_wire_len?;
+
+        let ticket = open_ticket(stek, identity)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if ticket.is_expired(now) {
+            return None;
+        }
+        // The resumed suite must match the ticket's (binder + early keys use it).
+        if ticket.suite != self.suite.to_u16() {
+            return None;
+        }
+        // The client must still offer the ticket's ALPN.
+        if !summary.offered_alpn.iter().any(|a| a == &ticket.alpn) {
+            return None;
+        }
+        // Verify the binder over the ClientHello truncated before the binders list:
+        // remove binders_len(2) + the binders content.
+        let truncate_to = ch_message.len().checked_sub(2 + binders_wire_len)?;
+        let truncated = &ch_message[..truncate_to];
+        let early = early_secret_from_psk(self.suite, &ticket.psk);
+        let fk = binder_finished_key(self.suite, &early).ok()?;
+        let expected = psk_binder(self.suite, &fk, &self.suite.digest(truncated)).ok()?;
+        if !bool::from(expected.ct_eq(binder)) {
+            return None;
+        }
+        Some(Zeroizing::new(ticket.psk))
     }
 
     fn verify_client_finished(&mut self, verify_data: &[u8]) -> Result<(), QuicTlsError> {
@@ -637,6 +821,51 @@ impl ServerHandshake {
                 "client Finished verify_data mismatch",
             ));
         }
+        Ok(())
+    }
+
+    /// Once the handshake completes, seal a single-use resumption ticket and queue
+    /// the NewSessionTicket as post-handshake (1-RTT) CRYPTO. No-op when no STEK is
+    /// configured (cold-start-only server). `transcript` already runs through the
+    /// client Finished, so `resumption_master_secret` matches the client's.
+    fn issue_session_ticket(&mut self) -> Result<(), QuicTlsError> {
+        let Some(stek) = self.stek.as_ref() else {
+            return Ok(());
+        };
+        let schedule = self
+            .schedule
+            .as_ref()
+            .ok_or_else(|| QuicTlsError::Crypto("session ticket before schedule".into()))?;
+        let transcript_hash = self.suite.digest(&self.transcript);
+        let res_master = schedule.resumption_master_secret(&transcript_hash)?;
+        // Empty ticket nonce: Safari 26.4's NewSessionTicket carries nonce len 0.
+        let psk = resumption_psk(self.suite, &res_master, &[])?;
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut state = TicketState {
+            suite: self.suite.to_u16(),
+            alpn: self.selected_alpn.clone().unwrap_or_default(),
+            psk: psk.to_vec(),
+            issued_at,
+            lifetime_secs: TICKET_LIFETIME_SECS,
+        };
+        let sealed = seal_ticket(stek, &state)?;
+        // The plaintext PSK copy held in `state` is no longer needed; scrub it.
+        state.psk.zeroize();
+        let mut age_add = [0_u8; 4];
+        SystemRandom::new()
+            .fill(&mut age_add)
+            .map_err(|_| QuicTlsError::Crypto("ticket age_add".into()))?;
+        let nst = NewSessionTicket {
+            lifetime_secs: TICKET_LIFETIME_SECS,
+            age_add: u32::from_be_bytes(age_add),
+            nonce: Vec::new(),
+            ticket: sealed,
+            max_early_data: Some(QUIC_MAX_EARLY_DATA),
+        };
+        self.pending_post_handshake = encode_new_session_ticket(&nst)?;
         Ok(())
     }
 }
@@ -748,6 +977,7 @@ mod tests {
             key.as_ref(),
             vec![b"h3".to_vec()],
             server_tp.clone(),
+            None,
         )
         .unwrap();
 
@@ -828,6 +1058,260 @@ mod tests {
         assert_eq!(
             server.peer_transport_parameters(),
             Some([0xaa, 0xbb].as_ref())
+        );
+    }
+
+    #[test]
+    fn server_issues_resumption_ticket_both_ends_agree_on_psk() {
+        use crate::tls::quic::schedule::resumption_psk;
+        use crate::tls::quic::ticket::{
+            decode_new_session_ticket, open_ticket, HANDSHAKE_NEW_SESSION_TICKET,
+        };
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, QUIC_VERSION_V1,
+        };
+        use std::sync::Arc;
+
+        // Drain a handshake's write side, accumulating all CRYPTO bytes it emits.
+        fn drain(mut write: impl FnMut(&mut Vec<u8>) -> Option<KeyChange>) -> Vec<u8> {
+            let mut all = Vec::new();
+            loop {
+                let mut b = Vec::new();
+                let kc = write(&mut b);
+                if b.is_empty() && kc.is_none() {
+                    break;
+                }
+                all.extend_from_slice(&b);
+            }
+            all
+        }
+
+        let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        let key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let stek = Zeroizing::new([0x5c_u8; 32]);
+        let mut server = ServerHandshake::new(
+            cert_chain,
+            key.as_ref(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            Some(stek.clone()),
+        )
+        .unwrap();
+        let client_config = Arc::new(ClientConfig::new(
+            Arc::new(AcceptAnyServerCert),
+            vec![b"h3".to_vec()],
+        ));
+        let mut client = ClientHandshake::new(
+            client_config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0xaa, 0xbb],
+        )
+        .unwrap();
+
+        let ch = drain(|b| client.write_handshake(b));
+        server.read_handshake(&ch).unwrap();
+        let flight = drain(|b| server.write_handshake(b));
+        client.read_handshake(&flight).unwrap();
+        let client_fin = drain(|b| client.write_handshake(b));
+        server.read_handshake(&client_fin).unwrap();
+        assert!(!server.is_handshaking());
+        assert!(!client.is_handshaking());
+
+        // The server emits a NewSessionTicket as post-handshake (1-RTT) CRYPTO.
+        let post = drain(|b| server.write_handshake(b));
+        assert!(
+            !post.is_empty(),
+            "server emits a NewSessionTicket after completion"
+        );
+        assert_eq!(post[0], HANDSHAKE_NEW_SESSION_TICKET);
+        let body_len = ((post[1] as usize) << 16) | ((post[2] as usize) << 8) | (post[3] as usize);
+        let nst = decode_new_session_ticket(&post[4..4 + body_len]).unwrap();
+        assert_eq!(nst.lifetime_secs, 604_800);
+        assert!(nst.nonce.is_empty(), "Safari NST carries an empty nonce");
+        assert_eq!(nst.max_early_data, Some(0xFFFF_FFFF));
+
+        // Open the sealed ticket and confirm both ends derive the SAME resumption
+        // PSK — the property the whole 0-RTT resumption rests on.
+        let state = open_ticket(&stek, &nst.ticket).expect("ticket opens under the STEK");
+        assert_eq!(state.suite, 0x1301);
+        assert_eq!(state.alpn, b"h3");
+        assert_eq!(state.lifetime_secs, 604_800);
+        assert_eq!(state.psk.len(), 32);
+        let client_res_master = client.resumption_master_secret().unwrap();
+        let client_psk =
+            resumption_psk(CipherSuite::Aes128GcmSha256, &client_res_master, &[]).unwrap();
+        assert_eq!(
+            &client_psk[..],
+            &state.psk[..],
+            "client and server derive the same resumption PSK"
+        );
+    }
+
+    #[test]
+    fn full_0rtt_resumption_round_trip() {
+        use crate::tls::quic::keys::AEAD_TAG_LEN;
+        use crate::tls::quic::schedule::resumption_psk;
+        use crate::tls::quic::ticket::{decode_new_session_ticket, ClientTicket};
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, QUIC_VERSION_V1,
+        };
+        use std::sync::Arc;
+
+        // Drain a handshake's write side, accumulating CRYPTO bytes and capturing the
+        // first ZeroRtt KeyChange's keys (0-RTT write keys on the client, open keys
+        // on the server).
+        fn drain(
+            mut write: impl FnMut(&mut Vec<u8>) -> Option<KeyChange>,
+        ) -> (Vec<u8>, Option<Keys>) {
+            let mut all = Vec::new();
+            let mut zerortt = None;
+            loop {
+                let mut b = Vec::new();
+                let kc = write(&mut b);
+                let kc_is_none = kc.is_none();
+                if let Some(KeyChange::ZeroRtt { keys }) = kc {
+                    zerortt = Some(keys);
+                }
+                if b.is_empty() && kc_is_none {
+                    break;
+                }
+                all.extend_from_slice(&b);
+            }
+            (all, zerortt)
+        }
+
+        let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        let key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let stek = Zeroizing::new([0x5c_u8; 32]);
+        let server_tp = vec![0x01, 0x02, 0x03, 0x04];
+        let client_config = Arc::new(ClientConfig::new(
+            Arc::new(AcceptAnyServerCert),
+            vec![b"h3".to_vec()],
+        ));
+
+        // --- 1. Cold-start handshake to obtain a NewSessionTicket. -------------
+        let mut server = ServerHandshake::new(
+            cert_chain.clone(),
+            key.as_ref(),
+            vec![b"h3".to_vec()],
+            server_tp.clone(),
+            Some(stek.clone()),
+        )
+        .unwrap();
+        let mut client = ClientHandshake::new(
+            client_config.clone(),
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0xaa],
+        )
+        .unwrap();
+        let (ch, _) = drain(|b| client.write_handshake(b));
+        server.read_handshake(&ch).unwrap();
+        let (flight, _) = drain(|b| server.write_handshake(b));
+        client.read_handshake(&flight).unwrap();
+        let (client_fin, _) = drain(|b| client.write_handshake(b));
+        server.read_handshake(&client_fin).unwrap();
+        let (post, _) = drain(|b| server.write_handshake(b));
+        let body_len = ((post[1] as usize) << 16) | ((post[2] as usize) << 8) | (post[3] as usize);
+        let nst = decode_new_session_ticket(&post[4..4 + body_len]).unwrap();
+        let client_res_master = client.resumption_master_secret().unwrap();
+        let client_psk =
+            resumption_psk(CipherSuite::Aes128GcmSha256, &client_res_master, &nst.nonce).unwrap();
+        let ticket = ClientTicket {
+            ticket: nst.ticket.clone(),
+            psk: client_psk,
+            suite: 0x1301,
+            alpn: b"h3".to_vec(),
+            peer_transport_params: server_tp.clone(),
+            age_add: nst.age_add,
+            lifetime_secs: nst.lifetime_secs,
+            received_at_ms: 1_000_000,
+        };
+
+        // --- 2. 0-RTT resumption handshake using that ticket. -----------------
+        let mut server2 = ServerHandshake::new(
+            cert_chain,
+            key.as_ref(),
+            vec![b"h3".to_vec()],
+            server_tp.clone(),
+            Some(stek.clone()),
+        )
+        .unwrap();
+        let mut client2 = ClientHandshake::new_resumption(
+            client_config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0xaa],
+            &ticket,
+            1_005_000,
+        )
+        .unwrap();
+
+        let (ch2, client_0rtt) = drain(|b| client2.write_handshake(b));
+        assert!(
+            client_0rtt.is_some(),
+            "client emits 0-RTT write keys after the CH"
+        );
+        server2.read_handshake(&ch2).unwrap();
+        let (flight2, server_0rtt) = drain(|b| server2.write_handshake(b));
+        assert!(
+            server_0rtt.is_some(),
+            "server emits 0-RTT open keys (PSK accepted)"
+        );
+        client2.read_handshake(&flight2).unwrap();
+        let (client_fin2, _) = drain(|b| client2.write_handshake(b));
+        server2.read_handshake(&client_fin2).unwrap();
+
+        assert!(
+            !client2.is_handshaking(),
+            "client completed the resumed handshake"
+        );
+        assert!(
+            !server2.is_handshaking(),
+            "server completed the resumed handshake"
+        );
+        assert!(
+            client2.is_early_data_accepted(),
+            "client saw early_data accepted"
+        );
+        assert!(server2.is_early_data_accepted(), "server accepted 0-RTT");
+
+        // The 1-RTT exporter still agrees on the resumed handshake.
+        let mut ce = [0u8; 32];
+        let mut se = [0u8; 32];
+        client2
+            .export_keying_material(&mut ce, b"parallax tudp", b"ctx")
+            .unwrap();
+        server2
+            .export_keying_material(&mut se, b"parallax tudp", b"ctx")
+            .unwrap();
+        assert_eq!(ce, se, "resumed handshake exporters match");
+
+        // The 0-RTT keys agree: the client seals early data with its write key and
+        // the server opens it with its open key.
+        let client_0rtt = client_0rtt.unwrap();
+        let server_0rtt = server_0rtt.unwrap();
+        let plaintext = b"the 0-RTT early data";
+        let mut buf = plaintext.to_vec();
+        buf.extend_from_slice(&[0u8; AEAD_TAG_LEN]);
+        client_0rtt
+            .local
+            .packet
+            .encrypt_in_place(0, b"0-rtt-header", &mut buf)
+            .unwrap();
+        let opened = server_0rtt
+            .remote
+            .packet
+            .decrypt_in_place(0, b"0-rtt-header", &mut buf)
+            .unwrap();
+        assert_eq!(
+            opened, plaintext,
+            "server 0-RTT key opens the client's early data"
         );
     }
 }

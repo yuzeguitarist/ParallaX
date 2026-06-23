@@ -33,6 +33,7 @@ mod keys;
 mod schedule;
 mod server;
 mod suite;
+mod ticket;
 mod verify;
 
 pub use keys::{DirectionalKeys, HeaderProtectionKey, KeyPair, Keys, PacketKey};

@@ -307,7 +307,10 @@ impl Header {
         }
         if first & LONG_HEADER_FORM != 0 {
             let ty = LongType::from_first_byte(first);
-            if ty != LongType::Initial && ty != LongType::Handshake {
+            if !matches!(
+                ty,
+                LongType::Initial | LongType::ZeroRtt | LongType::Handshake
+            ) {
                 return Err(DecodeError::UnsupportedPacketType);
             }
             if first & LONG_RESERVED_BITS != 0 {
@@ -407,10 +410,14 @@ fn read_pn(buf: &[u8], pn_offset: usize, pn_len: usize) -> Result<u64, DecodeErr
     Ok(pn)
 }
 
-/// The three packet-number spaces a received packet can map to.
+/// The packet-number spaces a received packet can map to. `ZeroRtt` shares the
+/// `OneRtt` (Application Data) packet-number space (RFC 9000 §12.3) but is
+/// protected with the 0-RTT keys, so it is classified separately for key
+/// selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketSpace {
     Initial,
+    ZeroRtt,
     Handshake,
     OneRtt,
 }
@@ -418,7 +425,7 @@ pub enum PacketSpace {
 /// Classify a received datagram's first packet by space, from its (still
 /// HP-masked) first byte — the long-header form + type bits are not header-
 /// protected (RFC 9001 §5.4.2). Returns `None` for a clear fixed bit or an
-/// unsupported long type (0-RTT / Retry / Version Negotiation).
+/// unsupported long type (Retry / Version Negotiation).
 pub fn first_packet_space(datagram: &[u8]) -> Option<PacketSpace> {
     let first = *datagram.first()?;
     if first & FIXED_BIT == 0 {
@@ -429,8 +436,9 @@ pub fn first_packet_space(datagram: &[u8]) -> Option<PacketSpace> {
     }
     match LongType::from_first_byte(first) {
         LongType::Initial => Some(PacketSpace::Initial),
+        LongType::ZeroRtt => Some(PacketSpace::ZeroRtt),
         LongType::Handshake => Some(PacketSpace::Handshake),
-        LongType::ZeroRtt | LongType::Retry => None,
+        LongType::Retry => None,
     }
 }
 
@@ -465,7 +473,10 @@ pub fn long_packet_len(buf: &[u8]) -> Option<usize> {
         return None;
     }
     let ty = LongType::from_first_byte(first);
-    if ty != LongType::Initial && ty != LongType::Handshake {
+    if !matches!(
+        ty,
+        LongType::Initial | LongType::ZeroRtt | LongType::Handshake
+    ) {
         return None;
     }
     let mut c = Cursor::new(buf);
@@ -890,5 +901,32 @@ mod tests {
             pkt, plain,
             "removing header protection must restore the bytes"
         );
+    }
+
+    #[test]
+    fn zero_rtt_long_header_decodes_and_classifies() {
+        // A 0-RTT long header (type 0x1) carries no token (like Handshake) and must
+        // now decode + classify to the ZeroRtt space, not be rejected/dropped.
+        let hdr = Header::Long {
+            ty: LongType::ZeroRtt,
+            version: 1,
+            dcid: ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            scid: ConnectionId::new(&[]),
+            token: vec![],
+            length: 1 + 16,
+            packet_number: 3,
+            pn_len: 1,
+        };
+        let mut pkt = Vec::new();
+        let pn_offset = hdr.encode(&mut pkt);
+        pkt.extend_from_slice(&[0u8; 32]); // room for the pn + a protected payload
+                                           // Classification (from the unmasked first byte) maps to the ZeroRtt space.
+        assert_eq!(first_packet_space(&pkt), Some(PacketSpace::ZeroRtt));
+        // long_packet_len treats it like any long header (for coalescing).
+        assert!(long_packet_len(&pkt).is_some());
+        // Decode (header protection already removed) reconstructs the same header.
+        let (decoded, aad_len) = Header::decode(&pkt, 0, 0).unwrap();
+        assert_eq!(decoded, hdr);
+        assert_eq!(aad_len, pn_offset + 1);
     }
 }

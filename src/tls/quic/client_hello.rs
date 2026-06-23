@@ -19,6 +19,8 @@ use crate::tls::safari_shape::{
     MLKEM768_PUBLIC_KEY_LEN,
 };
 
+use super::schedule::psk_binder;
+use super::suite::CipherSuite;
 use super::QuicTlsError;
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
@@ -36,6 +38,22 @@ const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
+/// `early_data` (RFC 8446 §4.2.10): empty in a 0-RTT ClientHello. Sent right after
+/// `psk_key_exchange_modes`, matching the Safari 26.4 0-RTT wire order.
+const EXT_EARLY_DATA: u16 = 0x002a;
+/// `pre_shared_key` (RFC 8446 §4.2.11): MUST be the last extension, after the
+/// trailing GREASE, carrying the ticket identity + the PSK binder.
+const EXT_PRE_SHARED_KEY: u16 = 0x0029;
+
+/// The resumption inputs that turn a cold-start ClientHello into a 0-RTT one: the
+/// opaque ticket (sent as the PSK identity), its `obfuscated_ticket_age`, and the
+/// binder finished key + suite used to compute the PSK binder (RFC 8446 §4.2.11.2).
+pub(crate) struct ResumptionParams<'a> {
+    pub ticket: &'a [u8],
+    pub obfuscated_ticket_age: u32,
+    pub binder_finished_key: &'a [u8],
+    pub suite: CipherSuite,
+}
 
 /// Everything the ClientHello builder needs from the live handshake.
 pub(crate) struct ClientHelloParams<'a> {
@@ -53,6 +71,9 @@ pub(crate) struct ClientHelloParams<'a> {
     pub grease: GreaseSet,
     /// The 32-byte client random.
     pub random: &'a [u8; 32],
+    /// `Some` for a 0-RTT resumption ClientHello (adds `early_data` + a trailing
+    /// `pre_shared_key`); `None` for a cold-start ClientHello.
+    pub resumption: Option<ResumptionParams<'a>>,
 }
 
 /// Build the Safari-26 H3 ClientHello handshake message.
@@ -104,6 +125,11 @@ pub(crate) fn build_client_hello(params: &ClientHelloParams) -> Result<Vec<u8>, 
         ),
     )?;
     push_ext(&mut ext, EXT_PSK_KEY_EXCHANGE_MODES, &[1, 1])?;
+    // 0-RTT resumption: `early_data` sits right after psk_key_exchange_modes and
+    // before supported_versions (the Safari 26.4 0-RTT wire order); empty body.
+    if params.resumption.is_some() {
+        push_ext(&mut ext, EXT_EARLY_DATA, &[])?;
+    }
     push_ext(
         &mut ext,
         EXT_SUPPORTED_VERSIONS,
@@ -116,6 +142,15 @@ pub(crate) fn build_client_hello(params: &ClientHelloParams) -> Result<Vec<u8>, 
     )?;
     push_ext(&mut ext, EXT_COMPRESS_CERTIFICATE, &[2, 0, 1])?;
     push_ext(&mut ext, params.grease.final_extension, &[0])?;
+    // `pre_shared_key` MUST be the LAST extension (RFC 8446 §4.2.11) — after the
+    // trailing GREASE — with a zero-filled binder placeholder patched in below.
+    if let Some(r) = params.resumption.as_ref() {
+        push_ext(
+            &mut ext,
+            EXT_PRE_SHARED_KEY,
+            &pre_shared_key_placeholder(r)?,
+        )?;
+    }
 
     push_u16_vec(&mut body, &ext)?;
 
@@ -124,6 +159,20 @@ pub(crate) fn build_client_hello(params: &ClientHelloParams) -> Result<Vec<u8>, 
     msg.push(HANDSHAKE_CLIENT_HELLO);
     push_u24(&mut msg, body.len())?;
     msg.extend_from_slice(&body);
+
+    // Two-pass binder (RFC 8446 §4.2.11.2): HMAC over the message truncated to
+    // exclude the binders list, then patch the binder into the placeholder. All
+    // length fields above are already set as if the binder were present.
+    if let Some(r) = params.resumption.as_ref() {
+        let binder_len = r.suite.hash_len();
+        // binders field on the wire = binders_len(2) + binder_len(1) + binder bytes.
+        let binders_field_len = 2 + 1 + binder_len;
+        let truncated = &msg[..msg.len() - binders_field_len];
+        let transcript_hash = r.suite.digest(truncated);
+        let binder = psk_binder(r.suite, r.binder_finished_key, &transcript_hash)?;
+        let start = msg.len() - binder_len;
+        msg[start..].copy_from_slice(&binder);
+    }
     Ok(msg)
 }
 
@@ -154,6 +203,25 @@ fn alpn_extension(protocols: &[Vec<u8>]) -> Result<Vec<u8>, QuicTlsError> {
     }
     let mut out = Vec::with_capacity(2 + list.len());
     push_u16_vec(&mut out, &list)?;
+    Ok(out)
+}
+
+/// `pre_shared_key` extension body with a single identity and a zero-filled binder
+/// placeholder (RFC 8446 §4.2.11): `identities<...>` (one `(ticket,
+/// obfuscated_ticket_age)`) then `binders<...>` (one hash-length entry). The binder
+/// bytes — the trailing `hash_len` bytes of the whole ClientHello — are patched by
+/// the caller after the truncated-transcript hash.
+fn pre_shared_key_placeholder(r: &ResumptionParams) -> Result<Vec<u8>, QuicTlsError> {
+    let binder_len = r.suite.hash_len();
+    let mut identities = Vec::with_capacity(2 + r.ticket.len() + 4);
+    push_u16_vec(&mut identities, r.ticket)?; // identity_len(2) || ticket
+    identities.extend_from_slice(&r.obfuscated_ticket_age.to_be_bytes());
+    let mut binders = Vec::with_capacity(1 + binder_len);
+    binders.push(binder_len as u8); // PskBinderEntry length prefix
+    binders.resize(1 + binder_len, 0); // zero placeholder
+    let mut out = Vec::with_capacity(2 + identities.len() + 2 + binders.len());
+    push_u16_vec(&mut out, &identities)?; // identities_len(2) || identities
+    push_u16_vec(&mut out, &binders)?; // binders_len(2) || binders
     Ok(out)
 }
 
@@ -253,6 +321,7 @@ mod tests {
             transport_params: &tp,
             grease,
             random: &random,
+            resumption: None,
         })
         .unwrap()
     }
@@ -327,5 +396,85 @@ mod tests {
         let sigs = &order.iter().find(|(t, _)| *t == 0x000d).unwrap().1;
         let schemes: Vec<u16> = sigs[2..].chunks_exact(2).map(|c| read_u16(c, 0)).collect();
         assert_eq!(schemes.iter().filter(|&&s| s == 0x0805).count(), 2);
+    }
+
+    #[test]
+    fn resumption_clienthello_adds_early_data_and_trailing_psk_with_valid_binder() {
+        use crate::tls::quic::schedule::{binder_finished_key, early_secret_from_psk, psk_binder};
+
+        let grease = GreaseSet::from_seed([9, 8, 7, 6, 5]);
+        let x25519 = [0x11_u8; 32];
+        let mlkem = vec![0x22_u8; MLKEM768_PUBLIC_KEY_LEN];
+        let tp = vec![0x04, 0x04, 0x80, 0x10, 0x00, 0x00];
+        let random = [0x44_u8; 32];
+        let suite = CipherSuite::Aes128GcmSha256;
+        let psk = [0x5a_u8; 32];
+        let early = early_secret_from_psk(suite, &psk);
+        let fk = binder_finished_key(suite, &early).unwrap();
+        let ticket = vec![0xab_u8; 160];
+
+        let msg = build_client_hello(&ClientHelloParams {
+            server_name: "example.com",
+            alpn_protocols: &[b"h3".to_vec()],
+            x25519_public: &x25519,
+            mlkem768_public: &mlkem,
+            transport_params: &tp,
+            grease,
+            random: &random,
+            resumption: Some(ResumptionParams {
+                ticket: &ticket,
+                obfuscated_ticket_age: 0x0102_0304,
+                binder_finished_key: &fk,
+                suite,
+            }),
+        })
+        .unwrap();
+
+        let (ciphers, sid_len, order) = parse(&msg);
+        assert_eq!(sid_len, 0);
+        assert_eq!(ciphers.len(), 4);
+        let types: Vec<u16> = order.iter().map(|(t, _)| *t).collect();
+        // 15 extensions = the 13 cold-start slots + early_data + pre_shared_key.
+        assert_eq!(types.len(), 15);
+        // early_data (0x2a) immediately follows psk_key_exchange_modes (0x2d).
+        let psk_modes_idx = types.iter().position(|&t| t == 0x002d).unwrap();
+        assert_eq!(
+            types[psk_modes_idx + 1],
+            0x002a,
+            "early_data follows psk_key_exchange_modes"
+        );
+        // pre_shared_key (0x29) is the absolute last extension (RFC 8446 §4.2.11).
+        assert_eq!(*types.last().unwrap(), 0x0029, "pre_shared_key is last");
+        // early_data body is empty in a ClientHello.
+        assert!(order
+            .iter()
+            .find(|(t, _)| *t == 0x002a)
+            .unwrap()
+            .1
+            .is_empty());
+
+        // The embedded binder must verify: recompute over the message truncated
+        // before the binders list and compare to the trailing binder bytes.
+        let binder_len = suite.hash_len();
+        let truncated = &msg[..msg.len() - (2 + 1 + binder_len)];
+        let expected = psk_binder(suite, &fk, &suite.digest(truncated)).unwrap();
+        assert_eq!(
+            &msg[msg.len() - binder_len..],
+            &expected[..],
+            "embedded PSK binder verifies"
+        );
+
+        // The pre_shared_key extension carries our ticket + obfuscated_ticket_age.
+        let psk_ext = &order.iter().find(|(t, _)| *t == 0x0029).unwrap().1;
+        let id_len = read_u16(psk_ext, 2) as usize;
+        assert_eq!(id_len, ticket.len(), "identity is the ticket");
+        assert_eq!(&psk_ext[4..4 + id_len], &ticket[..]);
+        let age = u32::from_be_bytes([
+            psk_ext[4 + id_len],
+            psk_ext[5 + id_len],
+            psk_ext[6 + id_len],
+            psk_ext[7 + id_len],
+        ]);
+        assert_eq!(age, 0x0102_0304);
     }
 }

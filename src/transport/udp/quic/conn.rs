@@ -207,7 +207,9 @@ fn space_index(space: PacketSpace) -> usize {
     match space {
         PacketSpace::Initial => SPACE_INITIAL,
         PacketSpace::Handshake => SPACE_HANDSHAKE,
-        PacketSpace::OneRtt => SPACE_DATA,
+        // 0-RTT shares the Application Data packet-number space (RFC 9000 §12.3);
+        // only its protection keys differ.
+        PacketSpace::ZeroRtt | PacketSpace::OneRtt => SPACE_DATA,
     }
 }
 
@@ -381,6 +383,10 @@ pub struct Connection {
     ping_pending: bool,
     /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
     write_level: usize,
+    /// 0-RTT (early-data) keys, installed from [`KeyChange::ZeroRtt`]. The client
+    /// seals early-data packets with `local`; the server opens them with `remote`.
+    /// `None` outside a 0-RTT resumption. (Wired into the 0-RTT send/recv path in S6.)
+    zero_rtt_keys: Option<Keys>,
     /// All open streams, keyed by stream id (RFC 9000 §2.1).
     streams: BTreeMap<u64, Stream>,
     /// Next stream id this endpoint will allocate for an outgoing bidi / uni stream.
@@ -461,6 +467,7 @@ impl Connection {
             last_send_time: None,
             ping_pending: false,
             write_level: SPACE_INITIAL,
+            zero_rtt_keys: None,
             streams: BTreeMap::new(),
             // Client-initiated stream ids: bidi 0,4,8,…; uni 2,6,10,… (RFC 9000 §2.1).
             next_bidi: 0,
@@ -503,6 +510,7 @@ impl Connection {
             signing_key_pkcs8,
             alpn_protocols,
             transport_params,
+            None,
         )?;
         Ok(Self {
             side: Side::Server,
@@ -524,6 +532,7 @@ impl Connection {
             last_send_time: None,
             ping_pending: false,
             write_level: SPACE_INITIAL,
+            zero_rtt_keys: None,
             streams: BTreeMap::new(),
             // Server-initiated stream ids: bidi 1,5,9,…; uni 3,7,11,… (RFC 9000 §2.1).
             next_bidi: 1,
@@ -765,6 +774,11 @@ impl Connection {
                     .extend_from_slice(&buf);
             }
             match kc {
+                Some(KeyChange::ZeroRtt { keys }) => {
+                    // 0-RTT write keys (client resumption). Stored for the 0-RTT
+                    // send path; the CRYPTO write_level stays in its current space.
+                    self.zero_rtt_keys = Some(keys);
+                }
                 Some(KeyChange::Handshake { keys }) => {
                     self.spaces[SPACE_HANDSHAKE].keys = Some(keys);
                     self.write_level = SPACE_HANDSHAKE;
@@ -1626,12 +1640,21 @@ impl Connection {
         let local_cid_len = self.scid.len();
         let largest = self.spaces[space].recv.largest();
         let opened = {
-            let keys = match &pending_initial {
-                Some((_, k)) => &k.remote,
-                None => match self.spaces[space].keys.as_ref() {
+            let keys = if pspace == PacketSpace::ZeroRtt {
+                // 0-RTT opens with the early-data keys. If they are not installed
+                // (PSK not accepted, or the ClientHello not yet processed) the packet
+                // is dropped — the genuine client then falls back to 1-RTT.
+                match self.zero_rtt_keys.as_ref() {
+                    Some(k) => &k.remote,
+                    None => return Ok(()),
+                }
+            } else if let Some((_, k)) = &pending_initial {
+                &k.remote
+            } else {
+                match self.spaces[space].keys.as_ref() {
                     Some(k) => &k.remote,
                     None => return Ok(()), // no keys installed for this space yet: drop
-                },
+                }
             };
             open_packet(keys, pkt, local_cid_len, largest)
         };
