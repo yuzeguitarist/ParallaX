@@ -21,7 +21,9 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 use parallax::crypto::session::{AeadCodec, X25519KeyPair, AEAD_TAG_LEN};
 use parallax::crypto::{identity, pq};
-use parallax::protocol::command::{ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange};
+use parallax::protocol::command::{
+    FramedChunk, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
+};
 use parallax::protocol::data::{DataRecordCodec, SERVER_TO_CLIENT_AAD};
 use parallax::tls::record::TLS_HEADER_LEN;
 use parallax::tls::safari26::Safari26TlsCamouflage;
@@ -74,8 +76,9 @@ const IDENTITY_CHUNK_PLAINTEXT_LEN: usize = 1320;
 ///
 /// The authenticated server (see `run_authenticated_data_mode` in
 /// `src/handshake/server.rs`) emits, after the client's PQ rekey, exactly:
-///   1. one sealed `ServerKeyExchange` record (X25519 pub + ML-KEM-1024
-///      ciphertext + framing), then
+///   1. the `ServerKeyExchange` (X25519 pub + ML-KEM-1024 ciphertext + framing),
+///      now FramedChunk-split into several per-chunk-randomized records (PAR-21),
+///      then
 ///   2. the ML-DSA-87 identity proof, fragmented by
 ///      `ServerIdentityChunk::encode_all` into browser-sized records sealed one at
 ///      a time with >40 ms spacing.
@@ -149,10 +152,18 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
         record.len() - TLS_HEADER_LEN - AEAD_TAG_LEN
     };
 
-    // Same wire order as the server: ServerKeyExchange first, then the identity
-    // chunks. Same direction (server->client) as the original.
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(1 + identity_chunk_count);
-    payloads.push(key_exchange_payload);
+    // Same wire order as the server: the key exchange (now FramedChunk-split into
+    // per-chunk-randomized records, PAR-21) first, then the identity chunks. Same
+    // direction (server->client) as the original. Bounds 256/1024 mirror the
+    // pub(crate) PQ_HANDSHAKE_CHUNK_{MIN,MAX}_PLAINTEXT (unreachable from this
+    // external test crate).
+    let key_exchange_chunks =
+        FramedChunk::encode_all_shaped(&key_exchange_payload, &mut rng, 256, 1024)
+            .expect("chunk ServerKeyExchange");
+    let key_exchange_chunk_count = key_exchange_chunks.len();
+    let mut payloads: Vec<Vec<u8>> =
+        Vec::with_capacity(key_exchange_chunk_count + identity_chunk_count);
+    payloads.extend(key_exchange_chunks);
     payloads.extend(identity_chunks);
 
     // Synthesized deterministic arrival times: an ~8 ms intra-burst gap between the
@@ -191,8 +202,12 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
     );
     assert_eq!(
         series.len(),
-        1 + identity_chunk_count,
-        "series must be exactly one ServerKeyExchange record plus every identity chunk"
+        key_exchange_chunk_count + identity_chunk_count,
+        "series must be every key-exchange chunk plus every identity chunk"
+    );
+    assert!(
+        key_exchange_chunk_count >= 2,
+        "ServerKeyExchange must fragment into >= 2 FramedChunk records; got {key_exchange_chunk_count}"
     );
     series
 }

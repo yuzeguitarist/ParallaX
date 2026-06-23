@@ -1503,14 +1503,41 @@ async fn run_authenticated_data_mode(
                         // Accumulate PX1Q chunks; proceed only once the whole
                         // rekey frame is reassembled. Incomplete => wait for the
                         // next chunk (still bounded by pre_pq_deadline, which is
-                        // not reset by incoming records).
+                        // not reset by incoming records). Malformed framing/payload
+                        // from the (already authenticated) client tears down
+                        // gracefully (drain->FIN), never a bare-drop RST -- the
+                        // no-RST contract every other arm in this loop honors.
                         let first_payload = match pq_rekey_reassembler
-                            .push(&chunk_payload, MAX_PQ_HANDSHAKE_FRAME)?
+                            .push(&chunk_payload, MAX_PQ_HANDSHAKE_FRAME)
                         {
-                            Some(payload) => payload,
-                            None => continue,
+                            Ok(Some(payload)) => payload,
+                            Ok(None) => continue,
+                            Err(err) => {
+                                tracing::debug!(cid, error = %err, "malformed PX1Q chunk framing; graceful teardown");
+                                graceful_close_pre_pq(
+                                    client_records,
+                                    client_write,
+                                    fallback_records,
+                                    fallback_write,
+                                )
+                                .await;
+                                return Ok(());
+                            }
                         };
-                        let pq_rekey = PqRekeyRequest::decode_ref(first_payload.as_slice())?;
+                        let pq_rekey = match PqRekeyRequest::decode_ref(first_payload.as_slice()) {
+                            Ok(pq_rekey) => pq_rekey,
+                            Err(err) => {
+                                tracing::debug!(cid, error = %err, "malformed PX1Q payload; graceful teardown");
+                                graceful_close_pre_pq(
+                                    client_records,
+                                    client_write,
+                                    fallback_records,
+                                    fallback_write,
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                        };
                         let client_x25519_public = pq_rekey.client_x25519_public;
                         let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
                         if !commit_pending_replay_entry(&mut pending_replay).await? {
