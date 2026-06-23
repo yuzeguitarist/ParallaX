@@ -32,5 +32,8 @@ pub(crate) mod frame;
 pub(crate) mod packet;
 pub(crate) mod recovery;
 pub(crate) mod spaces;
+/// Verbatim UDP relay to the camouflage origin (the QUIC analogue of the TCP
+/// REALITY fallback splice). Probe / non-authenticated flows reach the true origin.
+pub(crate) mod splice;
 pub(crate) mod transport_params;
 pub(crate) mod varint;
