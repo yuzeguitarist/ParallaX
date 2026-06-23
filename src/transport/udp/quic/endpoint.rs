@@ -216,6 +216,13 @@ impl std::error::Error for ConnectionError {}
 struct ConnShared {
     core: Mutex<Core>,
     peer: SocketAddr,
+    /// The client-chosen Destination Connection ID from the first Initial: the value
+    /// the client put in its first packet's DCID field (on the server side, peeked off
+    /// the wire; on the client side, the CID it chose). A stable-:443 listener routes
+    /// an accepted connection back to its originating session by this id (the client
+    /// sets it to the session's `offer_id`), since the client's UDP 4-tuple is not
+    /// predictable in advance. See [`Connection::peer_initial_dcid`].
+    initial_dcid: ConnectionId,
     /// Fired whenever the connection state advances (handshake progress, new
     /// readable data, a newly-accepted stream, or teardown).
     event: Notify,
@@ -271,6 +278,10 @@ struct ConnectRequest {
     /// Current Unix time in milliseconds (for `obfuscated_ticket_age`); 0 when not
     /// resuming.
     now_ms: u64,
+    /// The client-chosen Destination Connection ID for the first Initial. `None` uses
+    /// a fresh random CID (the default). A stable-:443 carrier sets it to the session
+    /// `offer_id` so the server can route the accepted connection back to its session.
+    dcid: Option<ConnectionId>,
     reply: tokio::sync::oneshot::Sender<Result<Arc<ConnShared>, ConnectError>>,
 }
 
@@ -393,7 +404,7 @@ impl Endpoint {
         now_ms: u64,
     ) -> Result<Connection, ConnectError> {
         let shared = self
-            .submit_connect(addr, server_name, Some(ticket), now_ms)
+            .submit_connect(addr, server_name, Some(ticket), now_ms, None)
             .await?;
         // 0-RTT keys are installed at construction (new_client_resumption), so the
         // returned handle can send early data immediately; the handshake continues
@@ -409,7 +420,25 @@ impl Endpoint {
         now_ms: u64,
     ) -> Result<Connection, ConnectError> {
         let shared = self
-            .submit_connect(addr, server_name, ticket, now_ms)
+            .submit_connect(addr, server_name, ticket, now_ms, None)
+            .await?;
+        let conn = Connection { shared };
+        conn.wait_established().await?;
+        Ok(conn)
+    }
+
+    /// Open a client connection whose first Initial carries `dcid` as its Destination
+    /// Connection ID (instead of a random CID), awaiting handshake completion. A
+    /// stable-:443 carrier sets `dcid` to the session `offer_id` so the server can
+    /// route the accepted connection back to its originating session.
+    pub async fn connect_with_dcid(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        dcid: ConnectionId,
+    ) -> Result<Connection, ConnectError> {
+        let shared = self
+            .submit_connect(addr, server_name, None, 0, Some(dcid))
             .await?;
         let conn = Connection { shared };
         conn.wait_established().await?;
@@ -425,6 +454,7 @@ impl Endpoint {
         server_name: &str,
         ticket: Option<ClientTicket>,
         now_ms: u64,
+        dcid: Option<ConnectionId>,
     ) -> Result<Arc<ConnShared>, ConnectError> {
         let config = self
             .default_config
@@ -440,6 +470,7 @@ impl Endpoint {
                 config,
                 ticket,
                 now_ms,
+                dcid,
                 reply,
             })
             .map_err(|_| ConnectError::EndpointClosed)?;
@@ -649,6 +680,13 @@ impl Driver {
         let shared = Arc::new(ConnShared {
             core: Mutex::new(core),
             peer,
+            // The client's chosen DCID, peeked off the first Initial without decryption
+            // (a stable-:443 carrier routes the accepted connection back to its session
+            // by this id). Falls back to empty if the header cannot be parsed; the
+            // marker fork has already validated `looks_like_initial(data)` above.
+            initial_dcid: super::packet::peek_long_cids(data)
+                .map(|(dcid, _scid)| dcid)
+                .unwrap_or_else(|_| ConnectionId::new(&[])),
             event: Notify::new(),
             wake: self.wake.clone(),
             read_wakers: Mutex::new(Vec::new()),
@@ -800,7 +838,7 @@ impl Driver {
     }
 
     fn on_connect(&mut self, req: ConnectRequest) {
-        let dcid = random_cid();
+        let dcid = req.dcid.unwrap_or_else(random_cid);
         let core_result = match &req.ticket {
             Some(ticket) => Core::new_client_resumption(
                 req.config,
@@ -824,6 +862,7 @@ impl Driver {
         let shared = Arc::new(ConnShared {
             core: Mutex::new(core),
             peer: req.addr,
+            initial_dcid: dcid,
             event: Notify::new(),
             wake: self.wake.clone(),
             read_wakers: Mutex::new(Vec::new()),
@@ -902,6 +941,15 @@ impl Connection {
     /// server to filter an accepted connection against the authenticated peer's IP.
     pub fn remote_address(&self) -> SocketAddr {
         self.shared.peer
+    }
+
+    /// The client-chosen Destination Connection ID from the first Initial. On a
+    /// server endpoint this is the value the client put on the wire; a stable-:443
+    /// carrier routes an accepted connection back to its originating session by this
+    /// id (the client sets it to the session `offer_id` via
+    /// [`Endpoint::connect_with_dcid`]).
+    pub fn peer_initial_dcid(&self) -> &[u8] {
+        self.shared.initial_dcid.as_slice()
     }
 
     /// Take a resumption ticket received on this connection (client only; the server
@@ -1366,6 +1414,43 @@ mod tests {
             conn.peer_transport_parameters().is_some(),
             "client learned the server's transport parameters"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_with_dcid_is_visible_to_the_server_for_session_routing() {
+        // A stable-:443 carrier routes an accepted connection back to its session by
+        // the client-chosen DCID (= the session offer_id). Prove the server observes
+        // the exact DCID the client connected with.
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
+
+        let offer_id: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0x00,
+        ];
+        let accept = tokio::spawn(async move { server.accept().await });
+        let conn = client
+            .connect_with_dcid(server_addr, "example.com", ConnectionId::new(&offer_id))
+            .await
+            .expect("client handshake completes with an explicit DCID");
+        let server_conn = accept
+            .await
+            .unwrap()
+            .expect("server accepts the connection");
+
+        assert_eq!(
+            server_conn.peer_initial_dcid(),
+            &offer_id,
+            "server sees the client-chosen DCID verbatim (session-routing key)"
+        );
+        // The handshake still completes normally with a non-random DCID.
+        let mut ce = [0u8; 32];
+        conn.export_keying_material(&mut ce, b"parallax tudp", b"binding")
+            .unwrap();
+        assert_ne!(ce, [0u8; 32]);
     }
 
     #[tokio::test]
