@@ -25,7 +25,8 @@ use super::spaces::{PacketNumberSpace, ReceivedPackets};
 use super::transport_params::TransportParameters;
 use crate::tls::quic::{
     initial_keys, ClientConfig, ClientHandshake, ClientTicket, DirectionalKeys, KeyChange, KeyPair,
-    Keys, PacketKey, QuicTlsError, ServerHandshake, Side, TlsSession, QUIC_VERSION_V1,
+    Keys, PacketKey, QuicTlsError, ServerHandshake, Side, TlsSession, ZeroRttGuard,
+    QUIC_VERSION_V1,
 };
 use zeroize::Zeroizing;
 
@@ -628,6 +629,12 @@ impl Connection {
     /// the ticket-age epoch.
     pub fn take_session_ticket(&mut self, now_ms: u64) -> Option<ClientTicket> {
         self.tls.take_session_ticket(now_ms)
+    }
+
+    /// Install the cross-connection 0-RTT anti-replay guard (server only). Set right
+    /// after construction, before any datagram is processed.
+    pub fn set_zero_rtt_replay_guard(&mut self, guard: Arc<dyn ZeroRttGuard>) {
+        self.tls.set_zero_rtt_guard(guard);
     }
 
     /// Close the connection with an application error code + reason (RFC 9000
@@ -2690,6 +2697,123 @@ mod tests {
         assert!(
             !rclient.is_handshaking() && !rserver.is_handshaking(),
             "resumed handshake completes"
+        );
+    }
+
+    #[test]
+    fn single_use_ticket_rejects_a_0rtt_replay() {
+        use std::sync::Arc;
+
+        // A single-use guard shared across connections: the first presentation of a
+        // ticket is accepted, any replay of the same identity is rejected.
+        struct OnceGuard {
+            used: std::sync::Mutex<std::collections::HashSet<Vec<u8>>>,
+        }
+        impl ZeroRttGuard for OnceGuard {
+            fn accept_ticket(&self, identity: &[u8], _now_unix: u64) -> bool {
+                self.used.lock().unwrap().insert(identity.to_vec())
+            }
+        }
+        let guard: Arc<dyn ZeroRttGuard> = Arc::new(OnceGuard {
+            used: std::sync::Mutex::new(std::collections::HashSet::new()),
+        });
+
+        let stek = Zeroizing::new([0x55u8; 32]);
+        let cover = || vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+
+        // Mint a ticket via a cold-start handshake.
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x01; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let mut server = Connection::new_server_with_stek(
+            cover(),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xa1, 0xa2, 0xa3, 0xa4]),
+            Some(stek.clone()),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        let ticket = client
+            .take_session_ticket(1_000_000)
+            .expect("client received a resumption ticket");
+        let early = b"early data carried in a replayed 0-RTT flight";
+        let now = Instant::now();
+
+        // Attempt 1: a fresh ticket -> 0-RTT accepted.
+        let mut c1 = Connection::new_client_resumption(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x02; 8]),
+            ConnectionId::new(&[]),
+            &ticket,
+            1_001_000,
+        )
+        .unwrap();
+        let mut s1 = Connection::new_server_with_stek(
+            cover(),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xb1, 0xb2, 0xb3, 0xb4]),
+            Some(stek.clone()),
+        )
+        .unwrap();
+        s1.set_zero_rtt_replay_guard(guard.clone());
+        c1.send_stream(RELAY_STREAM_ID, early);
+        while let Some(dg) = c1.poll_transmit(now) {
+            s1.handle_datagram(&dg, now).unwrap();
+        }
+        assert!(s1.zero_rtt_keys.is_some(), "first use: 0-RTT accepted");
+        assert_eq!(
+            s1.read_stream(RELAY_STREAM_ID),
+            early,
+            "first use: early data delivered"
+        );
+
+        // Attempt 2: the SAME ticket replayed -> 0-RTT rejected by the guard.
+        let mut c2 = Connection::new_client_resumption(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x03; 8]),
+            ConnectionId::new(&[]),
+            &ticket,
+            1_002_000,
+        )
+        .unwrap();
+        let mut s2 = Connection::new_server_with_stek(
+            cover(),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xc1, 0xc2, 0xc3, 0xc4]),
+            Some(stek),
+        )
+        .unwrap();
+        s2.set_zero_rtt_replay_guard(guard);
+        c2.send_stream(RELAY_STREAM_ID, early);
+        while let Some(dg) = c2.poll_transmit(now) {
+            s2.handle_datagram(&dg, now).unwrap();
+        }
+        assert!(
+            s2.zero_rtt_keys.is_none(),
+            "replay: the single-use guard rejected 0-RTT"
+        );
+        assert!(
+            s2.read_stream(RELAY_STREAM_ID).is_empty(),
+            "replay: no early data accepted via 0-RTT"
+        );
+
+        // The replayed connection still completes a normal 1-RTT handshake.
+        drive(&mut c2, &mut s2);
+        assert!(
+            !c2.is_handshaking() && !s2.is_handshaking(),
+            "replayed connection falls back to a full 1-RTT handshake"
         );
     }
 

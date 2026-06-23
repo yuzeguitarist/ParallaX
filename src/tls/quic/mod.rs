@@ -148,6 +148,18 @@ pub(crate) use schedule::initial_keys;
 pub(crate) use server::ServerHandshake;
 pub(crate) use ticket::ClientTicket;
 
+/// Cross-connection 0-RTT anti-replay (single-use ticket; RFC 8446 §8). The server
+/// consults it before accepting a resumed ticket's early data: `accept_ticket`
+/// returns `true` to accept (the ticket is fresh and is now recorded as used) or
+/// `false` to reject (a replay — the connection falls back to a full 1-RTT
+/// handshake). The runtime backs it with the persistent replay cache; it MUST be
+/// safe to call concurrently from many connections.
+pub(crate) trait ZeroRttGuard: Send + Sync {
+    /// `ticket_identity` is the opaque `pre_shared_key` identity (the sealed
+    /// ticket); `now_unix` is the current time in seconds.
+    fn accept_ticket(&self, ticket_identity: &[u8], now_unix: u64) -> bool;
+}
+
 /// The TLS-session surface the hand-rolled QUIC connection drives. Both
 /// [`ClientHandshake`] and [`ServerHandshake`] implement it, so the connection
 /// state machine is role-generic over a `Box<dyn TlsSession>`. `Send` is required
@@ -174,6 +186,9 @@ pub(crate) trait TlsSession: Send {
     fn take_session_ticket(&mut self, _now_ms: u64) -> Option<ClientTicket> {
         None
     }
+    /// Install the cross-connection 0-RTT anti-replay guard (server only; the client
+    /// default is a no-op).
+    fn set_zero_rtt_guard(&mut self, _guard: Arc<dyn ZeroRttGuard>) {}
 }
 
 impl TlsSession for ClientHandshake {
@@ -228,5 +243,8 @@ impl TlsSession for ServerHandshake {
         context: &[u8],
     ) -> Result<(), QuicTlsError> {
         ServerHandshake::export_keying_material(self, out, label, context)
+    }
+    fn set_zero_rtt_guard(&mut self, guard: Arc<dyn ZeroRttGuard>) {
+        ServerHandshake::set_zero_rtt_guard(self, guard)
     }
 }

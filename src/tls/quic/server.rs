@@ -17,6 +17,7 @@
 use aws_lc_rs::kem::{EncapsulationKey, ML_KEM_768};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
@@ -31,9 +32,9 @@ use super::ticket::{
     QUIC_MAX_EARLY_DATA,
 };
 use super::{
-    DirectionalKeys, KeyChange, KeyPair, Keys, PacketKey, QuicTlsError, ALERT_DECODE_ERROR,
-    ALERT_DECRYPT_ERROR, ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
-    ALERT_NO_APPLICATION_PROTOCOL, ALERT_UNEXPECTED_MESSAGE,
+    DirectionalKeys, KeyChange, KeyPair, Keys, PacketKey, QuicTlsError, ZeroRttGuard,
+    ALERT_DECODE_ERROR, ALERT_DECRYPT_ERROR, ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER,
+    ALERT_MISSING_EXTENSION, ALERT_NO_APPLICATION_PROTOCOL, ALERT_UNEXPECTED_MESSAGE,
 };
 use crate::crypto::session::{x25519_shared_secret, X25519KeyPair};
 
@@ -487,6 +488,9 @@ pub struct ServerHandshake {
     pending_0rtt_keys: Option<Keys>,
     /// Whether the server accepted 0-RTT (echoed `early_data` in EE).
     early_data_accepted: bool,
+    /// Cross-connection single-use anti-replay guard for 0-RTT tickets (RFC 8446
+    /// §8). `None` disables the check (e.g. cold-start-only servers / unit tests).
+    replay_guard: Option<Arc<dyn ZeroRttGuard>>,
 }
 
 impl ServerHandshake {
@@ -526,7 +530,14 @@ impl ServerHandshake {
             pending_post_handshake: Vec::new(),
             pending_0rtt_keys: None,
             early_data_accepted: false,
+            replay_guard: None,
         })
+    }
+
+    /// Install the cross-connection 0-RTT anti-replay guard. Must be set before the
+    /// ClientHello is processed (the runtime sets it right after construction).
+    pub(crate) fn set_zero_rtt_guard(&mut self, guard: Arc<dyn ZeroRttGuard>) {
+        self.replay_guard = Some(guard);
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -807,6 +818,14 @@ impl ServerHandshake {
         let expected = psk_binder(self.suite, &fk, &self.suite.digest(truncated)).ok()?;
         if !bool::from(expected.ct_eq(binder)) {
             return None;
+        }
+        // Single-use anti-replay (RFC 8446 §8): consult the guard only AFTER the
+        // binder verifies, so a bad-binder probe cannot burn a ticket. A replayed
+        // (already-used) ticket is rejected here → the client falls back to 1-RTT.
+        if let Some(guard) = self.replay_guard.as_ref() {
+            if !guard.accept_ticket(identity, now) {
+                return None;
+            }
         }
         Some(Zeroizing::new(ticket.psk))
     }
