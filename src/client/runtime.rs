@@ -1226,6 +1226,7 @@ async fn run_client_udp_probe(
     server: &TcpStream,
     offer: &crate::protocol::command::UdpOffer,
     psk: &[u8],
+    server_public: &[u8; 32],
     sni: &str,
     probe_timeout: std::time::Duration,
 ) -> ClientProbeResult {
@@ -1253,6 +1254,21 @@ async fn run_client_udp_probe(
     else {
         return failed();
     };
+    // Emit the covert auth marker in ClientHello.random so the server's stable-:443
+    // carrier marker-terminates us (every unmarked Initial it splices to the real
+    // origin). The marker binds the shared PSK to an ECDH with the server's static
+    // X25519 key; an unauthenticated prober cannot forge it. Overrides the
+    // accept-any default config installed by the bind helper.
+    endpoint.set_default_client_config(std::sync::Arc::new(
+        crate::tls::quic::ClientConfig::new(
+            std::sync::Arc::new(crate::tls::quic::AcceptAnyServerCert),
+            vec![crate::transport::udp::UDP_ALPN.to_vec()],
+        )
+        .with_marker(crate::tls::quic::QuicMarkerConfig {
+            psk: zeroize::Zeroizing::new(psk.to_vec()),
+            server_static_public: *server_public,
+        }),
+    ));
     let udp_addr = std::net::SocketAddr::new(peer.ip(), offer.udp_port);
     // 0-RTT resumption when a ticket from a prior session is cached: the connect
     // returns BEFORE the handshake completes, so the H3 control SETTINGS and the
@@ -1267,7 +1283,13 @@ async fn run_client_udp_probe(
     {
         let conn = match tokio::time::timeout(
             probe_timeout,
-            endpoint.connect_resumption_0rtt(udp_addr, sni, ticket, current_unix_millis()),
+            endpoint.connect_resumption_0rtt_with_dcid(
+                udp_addr,
+                sni,
+                ticket,
+                current_unix_millis(),
+                crate::transport::udp::quic::packet::ConnectionId::new(&offer.offer_id),
+            ),
         )
         .await
         {
@@ -1315,7 +1337,15 @@ async fn run_client_udp_probe(
         .unwrap_or(ProbeOutcome::Failed);
         (conn, control_send, relay_send, relay_recv, outcome)
     } else {
-        let conn = match tokio::time::timeout(probe_timeout, endpoint.connect(udp_addr, sni)).await
+        let conn = match tokio::time::timeout(
+            probe_timeout,
+            endpoint.connect_with_dcid(
+                udp_addr,
+                sni,
+                crate::transport::udp::quic::packet::ConnectionId::new(&offer.offer_id),
+            ),
+        )
+        .await
         {
             Ok(Ok(conn)) => conn,
             _ => return unreachable(),
@@ -1544,9 +1574,15 @@ async fn establish_authenticated_data_session_inner(
                 Ok(offer) => {
                     let probe_timeout =
                         std::time::Duration::from_millis(u64::from(udp.probe_timeout_ms.max(1)));
-                    let probe =
-                        run_client_udp_probe(&server, &offer, psk, &config.sni, probe_timeout)
-                            .await;
+                    let probe = run_client_udp_probe(
+                        &server,
+                        &offer,
+                        psk,
+                        server_public,
+                        &config.sni,
+                        probe_timeout,
+                    )
+                    .await;
                     (offer.offer_id, probe)
                 }
                 Err(err) => {
@@ -4786,6 +4822,13 @@ mod tests {
         traffic: TrafficConfig,
         udp: UdpConfig,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        // run() builds the stable carrier at startup; these tests call
+        // handle_connection directly, so inject it here when the fast plane is on.
+        if udp.enabled {
+            if let Ok(carrier) = server::build_quic_carrier_for_test(&server_config, PSK).await {
+                server::set_quic_carrier_for_test(Some(carrier));
+            }
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -4805,6 +4848,11 @@ mod tests {
         traffic: TrafficConfig,
         udp: UdpConfig,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        if udp.enabled {
+            if let Ok(carrier) = server::build_quic_carrier_for_test(&server_config, PSK).await {
+                server::set_quic_carrier_for_test(Some(carrier));
+            }
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -5094,6 +5142,9 @@ mod tests {
         use crate::transport::udp::zero_rtt::ReplayCacheGuard;
 
         const PSK: &[u8] = b"run-client-udp-probe-0rtt-test-ps";
+        // The ephemeral test server sets no marker key, so it ignores the client's
+        // marker (cold-start terminates everyone); any server_public works here.
+        const SERVER_PUBLIC: [u8; 32] = [0x55; 32];
         let sni = "localhost";
         let timeout = Duration::from_secs(5);
 
@@ -5146,7 +5197,7 @@ mod tests {
         let tcp1 = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
         let ((accepted1, held1), probe1) = tokio::join!(
             serve_one(&server, PSK, &offer.offer_id),
-            run_client_udp_probe(&tcp1, &offer, PSK, sni, timeout),
+            run_client_udp_probe(&tcp1, &offer, PSK, &SERVER_PUBLIC, sni, timeout),
         );
         assert!(
             matches!(probe1.outcome, ProbeOutcome::Verified { .. }),
@@ -5165,7 +5216,7 @@ mod tests {
         let tcp2 = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
         let ((accepted2, held2), probe2) = tokio::join!(
             serve_one(&server, PSK, &offer.offer_id),
-            run_client_udp_probe(&tcp2, &offer, PSK, sni, timeout),
+            run_client_udp_probe(&tcp2, &offer, PSK, &SERVER_PUBLIC, sni, timeout),
         );
         assert!(
             matches!(probe2.outcome, ProbeOutcome::Verified { .. }),

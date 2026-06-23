@@ -80,6 +80,13 @@ impl QuicCarrier {
         self.endpoint.local_addr()
     }
 
+    /// A cloned handle on the carrier's endpoint. Used by the server runtime's
+    /// mid-relay-reset test hook to forcibly close the carrier (and thus the relay
+    /// connection) in flight; production code never closes the shared carrier.
+    pub(crate) fn endpoint_handle(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
     /// Register a session's `offer_id` and return a receiver for its connection. The
     /// session sends the client an offer carrying this id; the client connects to the
     /// carrier with the id as its first-Initial DCID, and the accept loop delivers the

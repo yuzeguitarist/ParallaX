@@ -412,6 +412,23 @@ impl Endpoint {
         Ok(Connection { shared })
     }
 
+    /// Like [`Self::connect_resumption_0rtt`] but the first Initial carries `dcid` as
+    /// its Destination Connection ID (= the session offer_id), so a stable-:443
+    /// carrier can route the resumed connection back to its session.
+    pub async fn connect_resumption_0rtt_with_dcid(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        ticket: ClientTicket,
+        now_ms: u64,
+        dcid: ConnectionId,
+    ) -> Result<Connection, ConnectError> {
+        let shared = self
+            .submit_connect(addr, server_name, Some(ticket), now_ms, Some(dcid))
+            .await?;
+        Ok(Connection { shared })
+    }
+
     async fn connect_inner(
         &self,
         addr: SocketAddr,
