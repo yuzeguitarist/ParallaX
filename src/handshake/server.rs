@@ -2775,6 +2775,21 @@ async fn accept_probed_quic_from_peer(
         drop(c); // silent: no CONNECTION_CLOSE on the wire (no response oracle)
     };
 
+    serve_probed_quic_on_conn(conn, sandwich_secret, offer_id, cid).await
+}
+
+/// Serve the H3 reachability probe on an already-accepted (and source-IP-validated)
+/// fast-plane connection: open the control stream, accept + serve the request bidi,
+/// open the encoder stream, verify the client's Safari-26 H3 SETTINGS, and return the
+/// retained streams. Shared by the per-session ephemeral accept path
+/// ([`accept_probed_quic_from_peer`]) and the stable carrier handoff (which performs
+/// its own source-IP check on the routed connection before calling this).
+async fn serve_probed_quic_on_conn(
+    conn: crate::transport::udp::quic::endpoint::Connection,
+    sandwich_secret: &[u8],
+    offer_id: &[u8; 16],
+    cid: u64,
+) -> Option<ServerProbedQuic> {
     // H3 stream order mirrors the client: open this endpoint's control stream
     // (SETTINGS) first, accept the client's request bidi and serve the bidi
     // probe (HEADERS + DATA), then open the QPACK encoder stream. The
