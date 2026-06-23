@@ -598,6 +598,15 @@ impl ServerHandshake {
         self.marker_result
     }
 
+    /// Whether the ClientHello has been consumed, so [`Self::marker_result`] is final
+    /// (a parsed CH that carried no valid marker) rather than merely "not parsed yet"
+    /// (an incomplete first flight). The endpoint's buffer-decide-then-route marker
+    /// fork waits for this before deciding terminate-vs-splice, since the Safari
+    /// ClientHello spans two Initials.
+    pub(crate) fn client_hello_processed(&self) -> bool {
+        self.state != ServerState::ExpectClientHello
+    }
+
     pub fn is_handshaking(&self) -> bool {
         !self.handshake_complete
     }

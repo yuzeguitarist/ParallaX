@@ -655,6 +655,13 @@ impl Connection {
         self.tls.marker_result()
     }
 
+    /// Whether the ClientHello has been processed, so [`Self::marker_result`] is final
+    /// (server only). The endpoint's buffer-decide-then-route marker fork waits for
+    /// this before deciding, since the Safari ClientHello spans two Initials.
+    pub fn client_hello_processed(&self) -> bool {
+        self.tls.client_hello_processed()
+    }
+
     /// Whether 0-RTT keys are installed on this connection. On a resuming CLIENT
     /// this is set at construction (it can send early data); on the SERVER it is set
     /// only after it ACCEPTED a resumed ticket's 0-RTT (and can decrypt early data),

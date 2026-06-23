@@ -226,6 +226,12 @@ pub(crate) trait TlsSession: Send {
     fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
         None
     }
+    /// Whether the ClientHello has been processed, so [`Self::marker_result`] is final
+    /// (server only; client default `false`). Gates the endpoint's
+    /// buffer-decide-then-route marker fork (the Safari CH spans two Initials).
+    fn client_hello_processed(&self) -> bool {
+        false
+    }
 }
 
 impl TlsSession for ClientHandshake {
@@ -293,5 +299,8 @@ impl TlsSession for ServerHandshake {
     }
     fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
         ServerHandshake::marker_result(self)
+    }
+    fn client_hello_processed(&self) -> bool {
+        ServerHandshake::client_hello_processed(self)
     }
 }

@@ -63,6 +63,17 @@ const SPLICE_IDLE: Duration = Duration::from_secs(30);
 /// local termination while it is still valid; entries older than this are evicted.
 const MARKER_REPLAY_TTL: Duration = Duration::from_secs(3600);
 
+/// Max Initials buffered for one pending marker decision before defaulting to a
+/// splice. The Safari-26 ClientHello spans two Initials (PQ-inflated), so the
+/// terminate-vs-splice fork can only decide once the full first flight is
+/// reassembled; the slack absorbs reordering without letting an Initial-shaped
+/// probe pin a held core indefinitely (past it, the flow is spliced to the origin).
+const MAX_PENDING_INITIALS: usize = 4;
+
+/// Idle lifetime of a held (pending-decision) Initial flight. A peer that sends a
+/// partial first flight then vanishes is reaped after this, freeing the held core.
+const PENDING_IDLE: Duration = Duration::from_secs(2);
+
 /// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
 /// packet in a datagram padded to the §14.1 minimum. A cheap pre-check so garbage,
 /// truncated, or non-Initial datagrams from unknown peers never allocate the
@@ -304,6 +315,7 @@ impl Endpoint {
             conns: HashMap::new(),
             splices: HashMap::new(),
             marker_replay: HashMap::new(),
+            pending: HashMap::new(),
             server,
             accept_tx,
             connect_rx,
@@ -452,6 +464,17 @@ impl Endpoint {
     }
 }
 
+/// A held first-flight Initial awaiting the buffer-decide-then-route marker fork
+/// (see [`Driver::pending`]). The core has been fed every datagram but never
+/// flushed (it is not in `conns`, so the run loop neither transmits nor times it
+/// out), so on a terminate decision it is promoted intact, and on a splice decision
+/// the raw `datagrams` are replayed to the origin verbatim.
+struct PendingInitial {
+    shared: Arc<ConnShared>,
+    datagrams: Vec<Vec<u8>>,
+    last: Instant,
+}
+
 /// The endpoint driver: owns the socket + all live connections, pumping them on
 /// every IO / timer / wake event.
 struct Driver {
@@ -467,6 +490,13 @@ struct Driver {
     /// sighting, so a captured-and-replayed marker (a later sighting) is spliced to
     /// the origin instead of re-exposing the local termination path.
     marker_replay: HashMap<([u8; 12], u64), Instant>,
+    /// Unknown-peer Initials held for the buffer-decide-then-route marker fork. The
+    /// Safari ClientHello spans two Initials, so terminate-vs-splice can only be
+    /// decided once the full first flight is reassembled. Each entry holds the
+    /// fed-but-never-flushed server core and the raw datagrams verbatim, so a splice
+    /// decision can replay them to the origin byte-for-byte. Only populated when
+    /// `marker_key` is set (otherwise the cold-start path terminates immediately).
+    pending: HashMap<SocketAddr, PendingInitial>,
     server: Option<Arc<ServerConfig>>,
     accept_tx: mpsc::UnboundedSender<Arc<ConnShared>>,
     connect_rx: mpsc::UnboundedReceiver<ConnectRequest>,
@@ -546,6 +576,13 @@ impl Driver {
             *last = now;
             return;
         }
+        // A datagram for an in-progress marker decision: feed it into the held core
+        // and re-evaluate the terminate-vs-splice fork (the Safari ClientHello spans
+        // two Initials, so the decision matures only once the whole CH is parsed).
+        if self.pending.contains_key(&peer) {
+            self.feed_pending(peer, data, now);
+            return;
+        }
         // A datagram from an unknown peer: open a server connection if configured.
         let Some(cfg) = self.server.clone() else {
             return;
@@ -562,10 +599,14 @@ impl Driver {
             }
             return;
         }
-        // Bound state creation (review finding #1): never beyond the hard cap. Floods
-        // past the cap are dropped before they can allocate a Box<ServerHandshake> +
-        // Bbr + spaces (unauthenticated DoS).
-        if self.conns.len() >= MAX_SERVER_CONNS {
+        // Reap held flights whose owner vanished mid-first-flight, before the cap
+        // check and any allocation (bounds held cores to active arrivals).
+        self.pending
+            .retain(|_, p| now.duration_since(p.last) < PENDING_IDLE);
+        // Bound state creation (review finding #1): held + active cores never exceed
+        // the hard cap. Floods past the cap are dropped before they can allocate a
+        // Box<ServerHandshake> + Bbr + spaces (unauthenticated DoS).
+        if self.conns.len() + self.pending.len() >= MAX_SERVER_CONNS {
             return;
         }
         // Random source connection id (RFC 9000 §5.1). A monotonic counter would make
@@ -615,35 +656,105 @@ impl Driver {
         });
         let _ = shared.core.lock().unwrap().handle_datagram(data, now);
 
-        // Origin-splice marker fork: with the marker key set, only a valid, fresh,
-        // non-replayed marker keeps the local termination (a real ParallaX client);
-        // every other v1 Initial (no / forged / replayed marker) is spliced to the
-        // origin. Nothing has been flushed yet — poll_transmit runs after on_datagram
-        // — so dropping `shared` here emits zero ParallaX bytes; the prober's original
-        // datagram then reaches the true origin verbatim.
-        //
-        // TODO(quic-marker-multidatagram): this decides on the FIRST Initial datagram,
-        // so `marker_result` is only ready when the whole ClientHello fits one Initial.
-        // The Safari-26 CH (PQ-inflated) spans TWO Initials, so a real marked client
-        // is currently mis-spliced. Before enabling the marker key in production, this
-        // must buffer-decide-then-route: reassemble the full first-flight CH (without
-        // emitting any ParallaX bytes) and only then fork. marker_key stays None in
-        // server_config / server_config_0rtt until that lands, so this path is dormant.
-        if cfg.marker_key.is_some() {
-            let marker = shared.core.lock().unwrap().marker_result();
-            let terminate = match marker {
-                Some(m) => self.marker_fresh(m, now),
-                None => false,
-            };
-            if !terminate {
-                drop(shared);
-                if let Some(origin) = cfg.origin_udp_addr {
-                    self.open_splice(peer, origin, data, now);
-                }
-                return;
-            }
+        // Cold-start (no marker key): terminate locally immediately, exactly as the
+        // pre-marker behaviour — no buffering, no added per-connection latency.
+        if cfg.marker_key.is_none() {
+            self.conns.insert(peer, shared);
+            return;
         }
-        self.conns.insert(peer, shared);
+
+        // Origin-splice marker fork — buffer-decide-then-route. The Safari-26
+        // ClientHello spans TWO Initials, and the marker's ECDH needs the client's
+        // X25519 share (carried in the SECOND Initial), so terminate-vs-splice cannot
+        // be decided on this first datagram. Hold the fed-but-never-flushed core plus
+        // the raw datagram: a held core is NOT in `conns`, so the run loop never
+        // transmits or times it out — zero ParallaX bytes escape while we wait. Once
+        // the full CH is reassembled, [`Self::decide_pending`] promotes a valid +
+        // fresh + non-replayed marker to a local termination, and splices everything
+        // else to the origin (replaying the buffered datagrams verbatim).
+        self.pending.insert(
+            peer,
+            PendingInitial {
+                shared,
+                datagrams: vec![data.to_vec()],
+                last: now,
+            },
+        );
+        self.decide_pending(peer, now);
+    }
+
+    /// Feed a follow-up datagram into a peer's held first flight, then re-run the
+    /// marker decision.
+    fn feed_pending(&mut self, peer: SocketAddr, data: &[u8], now: Instant) {
+        if let Some(p) = self.pending.get_mut(&peer) {
+            let _ = p.shared.core.lock().unwrap().handle_datagram(data, now);
+            p.datagrams.push(data.to_vec());
+            p.last = now;
+        }
+        self.decide_pending(peer, now);
+    }
+
+    /// Resolve a held first flight once enough of it has arrived. Promote it to a
+    /// local connection on a valid + fresh marker, or splice it to the origin
+    /// otherwise. While the ClientHello is still incomplete AND the buffer budget
+    /// remains, this is a no-op: nothing is emitted and the flight keeps buffering.
+    fn decide_pending(&mut self, peer: SocketAddr, now: Instant) {
+        let (processed, marker, count) = match self.pending.get(&peer) {
+            Some(p) => {
+                let core = p.shared.core.lock().unwrap();
+                (
+                    core.client_hello_processed(),
+                    core.marker_result(),
+                    p.datagrams.len(),
+                )
+            }
+            None => return,
+        };
+        // CH not yet parsed and budget remains: keep buffering, emit nothing.
+        if !processed && count < MAX_PENDING_INITIALS {
+            return;
+        }
+        let p = self.pending.remove(&peer).expect("pending entry present");
+        // Terminate ONLY on a parsed CH carrying a valid marker on its FIRST sighting;
+        // a replay (same nonce/ts) returns false and is spliced. `marker_fresh` runs
+        // at most once per flight (only here, when the CH is decided), so a buffered
+        // or replayed flight never pollutes the replay cache.
+        let terminate = processed && matches!(marker, Some(m) if self.marker_fresh(m, now));
+        if terminate {
+            // Promote intact: the buffered server flight flushes on the run loop's
+            // next `flush()`, right after this datagram is handled.
+            self.conns.insert(peer, p.shared);
+            return;
+        }
+        // Splice: drop the held core (no ParallaX bytes ever left it) and replay the
+        // buffered datagrams to the origin verbatim, so the prober reaches the TRUE
+        // origin. Dormant unless the runtime supplied `origin_udp_addr`.
+        drop(p.shared);
+        if let Some(origin) = self.server.as_ref().and_then(|c| c.origin_udp_addr) {
+            self.splice_pending(peer, origin, p.datagrams, now);
+        }
+    }
+
+    /// Open an origin-fallback relay for `peer` and replay the buffered first-flight
+    /// datagrams to `origin` verbatim, in arrival order.
+    fn splice_pending(
+        &mut self,
+        peer: SocketAddr,
+        origin: SocketAddr,
+        datagrams: Vec<Vec<u8>>,
+        now: Instant,
+    ) {
+        let mut it = datagrams.into_iter();
+        let Some(first) = it.next() else {
+            return;
+        };
+        self.open_splice(peer, origin, &first, now);
+        if let Some((flow, last)) = self.splices.get_mut(&peer) {
+            for d in it {
+                let _ = flow.forward(&d);
+            }
+            *last = now;
+        }
     }
 
     /// Record an auth marker's `(nonce, timestamp)` and report whether this is its
@@ -1377,14 +1488,11 @@ mod tests {
     /// is TERMINATED locally (the handshake completes), while an unmarked client's
     /// Initial is spliced verbatim to the origin (which receives the >=1200B Initial).
     ///
-    /// IGNORED — known limitation: the fork decides on the FIRST Initial datagram, but
-    /// the Safari-26 ClientHello spans TWO Initials (PQ-inflated), so `marker_result`
-    /// is not yet available when the first datagram is processed and a valid marked
-    /// client is mis-spliced (this test then hangs on the never-answered handshake).
-    /// The fix is buffer-decide-then-route: reassemble the full CH before the fork
-    /// (multi-datagram first-flight). Dormant in production (marker_key is None), so
-    /// this does not affect live traffic. See TODO at the on_datagram fork.
-    #[ignore = "needs multi-datagram buffer-decide-then-route (Safari CH spans 2 Initials)"]
+    /// Buffer-decide-then-route marker fork, end to end: a MARKED client (whose
+    /// PQ-inflated ClientHello spans two Initials) is held until the full first flight
+    /// is reassembled, then terminated locally (handshake completes); an UNMARKED
+    /// client's first flight is spliced to the origin verbatim. Exercises the
+    /// multi-datagram path that the single-datagram fork used to mis-splice.
     #[tokio::test]
     async fn marked_client_terminates_while_unmarked_initial_splices() {
         use crate::crypto::session::X25519KeyPair;
