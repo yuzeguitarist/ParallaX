@@ -375,6 +375,63 @@ struct ServerZeroRtt {
 
 static SERVER_ZERO_RTT: OnceLock<ServerZeroRtt> = OnceLock::new();
 
+/// Process-global stable origin-splice carrier (the shared QUIC `:server.listen`
+/// endpoint), built once in [`run`] when `udp.enabled`. `None` (never set) leaves
+/// the UDP fast plane on the per-session ephemeral path. See
+/// [`crate::transport::udp::stable::QuicCarrier`].
+static SERVER_QUIC_CARRIER: OnceLock<Arc<crate::transport::udp::stable::QuicCarrier>> =
+    OnceLock::new();
+
+/// Bind the stable origin-splice carrier: marker key = the shared PSK + the server's
+/// static X25519 private key (the same REALITY static key the TCP plane authenticates
+/// with), splice origin = the camouflage origin's UDP `:443` (resolved from
+/// `fallback_addr`), reusing the [`SERVER_ZERO_RTT`] STEK + guard if 0-RTT is enabled.
+/// The carrier binds UDP on `server.listen` so the QUIC port is the same stable port
+/// as the TCP face (an HTTP/3 origin shape), not a per-session ephemeral port.
+async fn build_quic_carrier(
+    server: &crate::config::ServerConfig,
+    psk: &[u8],
+    private_key: &[u8; 32],
+) -> Result<Arc<crate::transport::udp::stable::QuicCarrier>, crate::transport::udp::UdpTransportError>
+{
+    use crate::transport::udp::UdpTransportError;
+    // The camouflage origin's HTTP/3 endpoint: the fallback host on UDP :443.
+    let origin_ip = lookup_host(&server.fallback_addr)
+        .await?
+        .next()
+        .ok_or_else(|| {
+            UdpTransportError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "fallback_addr did not resolve",
+            ))
+        })?
+        .ip();
+    let origin = std::net::SocketAddr::new(origin_ip, 443);
+    // The fronted domain (host part of fallback_addr) backs the carrier's self-signed
+    // cert; our clients accept any cert (trust is the marker + exporter token) and GFW
+    // does not inspect QUIC certs, so only the SNI label matters cosmetically.
+    let front = server
+        .fallback_addr
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(server.fallback_addr.as_str());
+    let (cert, key) = crate::transport::udp::endpoint::ephemeral_self_signed(front)?;
+    let marker_key = (
+        zeroize::Zeroizing::new(psk.to_vec()),
+        zeroize::Zeroizing::new(*private_key),
+    );
+    let (stek, guard) = match SERVER_ZERO_RTT.get() {
+        Some(zr) => (
+            Some(zr.stek.clone()),
+            Some(zr.guard.clone() as Arc<dyn crate::tls::quic::ZeroRttGuard>),
+        ),
+        None => (None, None),
+    };
+    let config =
+        crate::transport::udp::server_config_stable(cert, key, stek, guard, marker_key, origin)?;
+    Ok(crate::transport::udp::stable::QuicCarrier::bind(server.listen, config).await?)
+}
+
 /// 0-RTT resumption-ticket lifetime (RFC 8446 §4.6.1): 7 days, matching the
 /// Safari-26 NewSessionTicket baseline. The anti-replay window is sized to this so
 /// a ticket stays replay-protected for exactly as long as it is valid.
@@ -478,6 +535,26 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 tracing::warn!(
                     error = %err,
                     "0-RTT replay cache unavailable; UDP fast plane stays cold-start (1-RTT only)"
+                );
+            }
+        }
+        // Bind the process-wide stable origin-splice carrier on the server's listen
+        // address (UDP), now that any 0-RTT STEK/guard above is set. It marker-
+        // terminates authenticated clients and splices every other Initial verbatim
+        // to the camouflage origin's UDP :443, so the stable QUIC port mirrors the
+        // real origin to an active prober. A resolve/bind failure degrades to no
+        // carrier (the plane stays on the per-session path) rather than failing the
+        // server.
+        match build_quic_carrier(&server, psk.as_slice(), secrets.private_key()).await {
+            Ok(carrier) => {
+                if SERVER_QUIC_CARRIER.set(carrier).is_err() {
+                    tracing::debug!("stable QUIC carrier already set; keeping the first");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "stable QUIC carrier unavailable; UDP fast plane stays on the per-session path"
                 );
             }
         }
