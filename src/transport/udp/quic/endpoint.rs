@@ -276,7 +276,6 @@ impl Endpoint {
             accept_tx,
             connect_rx,
             close_rx,
-            next_scid: 1,
         };
         tokio::spawn(driver.run());
         Ok(Endpoint {
@@ -431,8 +430,6 @@ struct Driver {
     accept_tx: mpsc::UnboundedSender<Arc<ConnShared>>,
     connect_rx: mpsc::UnboundedReceiver<ConnectRequest>,
     close_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
-    /// Source-connection-id counter for accepted server connections.
-    next_scid: u64,
 }
 
 impl Driver {
@@ -513,8 +510,17 @@ impl Driver {
         if self.conns.len() >= MAX_SERVER_CONNS || !looks_like_initial(data) {
             return;
         }
-        let scid = self.next_scid.to_be_bytes();
-        self.next_scid += 1;
+        // Random source connection id (RFC 9000 §5.1). A monotonic counter would make
+        // every connection accepted by one bind serially linkable (a present-tense
+        // fingerprint a real origin never exhibits — real servers use unpredictable
+        // CIDs). The header SCID and the `initial_source_connection_id` transport
+        // parameter both derive from this same value, so they stay consistent
+        // (RFC 9000 §7.3).
+        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+        let mut scid = [0u8; 8];
+        SystemRandom::new()
+            .fill(&mut scid)
+            .expect("system RNG available");
         let core = match Core::new_server_with_stek(
             cfg.cert_chain.clone(),
             &cfg.signing_key_pkcs8,
