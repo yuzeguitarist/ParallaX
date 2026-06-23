@@ -740,7 +740,12 @@ impl FramedChunk {
         if len == 0 {
             return Err(FramedChunkError::EmptyChunk);
         }
-        if input.len() != 16 + len {
+        // checked_add so a crafted `len` near u32::MAX cannot overflow `16 + len`
+        // on 32-bit targets (matches the offset arithmetic below).
+        let expected = 16usize
+            .checked_add(len)
+            .ok_or(FramedChunkError::InvalidChunkLength)?;
+        if input.len() != expected {
             return Err(FramedChunkError::InvalidChunkLength);
         }
         let end = offset
@@ -879,8 +884,14 @@ impl FramedReassembler {
         }
         self.assembled.extend_from_slice(chunk.bytes);
         if self.assembled.len() == total_len {
+            // Clear the expected-total latch as well as taking the buffer, so the
+            // reassembler carries no stale state if reused for a fresh frame.
+            self.expected_total = None;
             return Ok(Some(std::mem::take(&mut self.assembled)));
         }
+        // Defensive backstop: unreachable given decode_ref guarantees
+        // offset + len <= total_len and offset == assembled.len() above, but kept
+        // so a future invariant change fails closed rather than over-reading.
         if self.assembled.len() > total_len {
             return Err(FramedChunkError::OutOfOrder);
         }
@@ -1799,6 +1810,27 @@ mod tests {
             }
         }
         assert_eq!(assembled.unwrap().len(), MAX_PQ_HANDSHAKE_FRAME);
+    }
+
+    #[test]
+    fn framed_reassembler_is_reusable_after_completion() {
+        // After a frame completes, the reassembler must carry no stale
+        // expected-total state, so a second frame of a different total length
+        // reassembles cleanly on the same instance.
+        let mut reassembler = FramedReassembler::default();
+        let first = vec![1_u8; 700];
+        let second = vec![2_u8; 300];
+        let reassemble = |reassembler: &mut FramedReassembler, payload: &[u8]| {
+            let mut out = None;
+            for chunk in FramedChunk::encode_all(payload, 256).unwrap() {
+                if let Some(done) = reassembler.push(&chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
+                    out = Some(done);
+                }
+            }
+            out.unwrap()
+        };
+        assert_eq!(reassemble(&mut reassembler, &first), first);
+        assert_eq!(reassemble(&mut reassembler, &second), second);
     }
 
     #[test]
