@@ -79,10 +79,12 @@ impl RttEstimator {
     }
 
     /// The minimum RTT observed (RFC 9002 §5.2).
+    #[allow(dead_code)] // RTT inspection accessor; exercised by the recovery tests
     pub fn min(&self) -> Duration {
         self.min
     }
 
+    #[allow(dead_code)] // RTT inspection accessor; exercised by the recovery tests
     pub fn rttvar(&self) -> Duration {
         self.rttvar
     }
@@ -129,6 +131,7 @@ pub struct SentPackets {
 }
 
 impl SentPackets {
+    #[allow(dead_code)] // redundant with the derived Default; used by the recovery tests
     pub fn new() -> Self {
         Self::default()
     }
@@ -160,6 +163,7 @@ impl SentPackets {
         Some(p)
     }
 
+    #[allow(dead_code)] // largest-acked inspection accessor; exercised by the recovery tests
     pub fn largest_acked(&self) -> Option<u64> {
         self.largest_acked
     }

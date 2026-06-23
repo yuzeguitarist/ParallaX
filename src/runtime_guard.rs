@@ -519,6 +519,7 @@ mod tests {
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
+            transport: Default::default(),
             client: Some(ClientConfig {
                 listen: "127.0.0.1:1080".parse::<SocketAddr>().unwrap(),
                 server_addr: server_addr.to_owned(),

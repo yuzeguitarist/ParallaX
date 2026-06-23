@@ -1,8 +1,0 @@
-# udp_reorder: first 11 bytes = start_seq(u64) + max_records(u8) + max_bytes(u16);
-# then an op stream — even byte = insert seq(u64)+len(u8)+record, odd byte = pop_next.
-op_insert="\x00"
-op_pop="\x01"
-seq_zero="\x00\x00\x00\x00\x00\x00\x00\x00"
-seq_one="\x00\x00\x00\x00\x00\x00\x00\x01"
-# a config header (start_seq=0, max_records=8, max_bytes=4096) then one insert of seq 1:
-cfg_then_insert="\x00\x00\x00\x00\x00\x00\x00\x00\x08\x10\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02ab"

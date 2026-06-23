@@ -68,7 +68,7 @@ sha2 = "0.10"
 sha3 = { version = "0.10", features = ["zeroize"] }
 # Linux-only TCP/socket options rustix does not expose: TCP_NOTSENT_LOWAT and
 # SO_BUSY_POLL. The `all` feature un-gates these (platform-specific) setters.
-# Already transitive via tokio/quinn; the `all` feature is compile-time only.
+# Already transitive via tokio; the `all` feature is compile-time only.
 socket2 = { version = "0.6", features = ["all"] }
 subtle = "2.6"
 thiserror = "2"

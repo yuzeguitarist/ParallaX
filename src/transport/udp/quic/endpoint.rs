@@ -74,6 +74,28 @@ const MAX_PENDING_INITIALS: usize = 4;
 /// partial first flight then vanishes is reaped after this, freeing the held core.
 const PENDING_IDLE: Duration = Duration::from_secs(2);
 
+/// How long a held first flight may stay undecided before it is spliced to the
+/// origin instead of held silently. A real QUIC origin ACKs an ack-eliciting
+/// Initial within max_ack_delay (~25ms; see MAX_ACK_DELAY in conn.rs); holding
+/// silently past that (the prior behaviour held indefinitely until unrelated traffic
+/// swept it) is an active-probing distinguisher — a prober sending one incomplete
+/// Initial sees a real origin answer while ParallaX stays silent. Kept comfortably
+/// above a genuine Safari two-Initial burst's inter-arrival (sub-millisecond when not
+/// reordered) so real clients are decided locally before it fires.
+///
+/// RESIDUAL (documented, NOT closed): this turns an *infinite* silence into a *fixed*
+/// ~50ms one — the held core sits in `pending`, which `flush` never transmits, so its
+/// Initial ACK is withheld for the window, and 50ms is above max_ack_delay, so a
+/// prober crafting one decryptable, non-CH-completing v1 Initial still measures a
+/// bounded ~50ms+RTT offset versus the bare origin. This is irreducible in the
+/// buffer-decide design (splicing datagram-0 before the marker is visible could never
+/// terminate a marked client); an accepted, bounded tradeoff like the first-sighting
+/// `marker_fresh` race below. The 50ms value is a reliability choice — a smaller one
+/// (toward max_ack_delay) tightens the timing match but risks force-splicing a genuine
+/// client whose second Initial is merely reordered under load (such a client then
+/// fails closed on the origin cert and self-heals by redialing).
+const PENDING_DECIDE_DELAY: Duration = Duration::from_millis(50);
+
 /// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
 /// packet in a datagram padded to the §14.1 minimum. A cheap pre-check so garbage,
 /// truncated, or non-Initial datagrams from unknown peers never allocate the
@@ -505,11 +527,6 @@ impl Endpoint {
         }?;
         Some(Connection { shared })
     }
-
-    /// Nudge the driver (used by connection handles after queuing outbound work).
-    fn wake(&self) {
-        self.wake.notify_one();
-    }
 }
 
 /// A held first-flight Initial awaiting the buffer-decide-then-route marker fork
@@ -520,6 +537,10 @@ impl Endpoint {
 struct PendingInitial {
     shared: Arc<ConnShared>,
     datagrams: Vec<Vec<u8>>,
+    /// First-arrival time of this flight, fixed at creation. Drives the
+    /// [`PENDING_DECIDE_DELAY`] decision deadline so an undecided flight is spliced
+    /// to the origin rather than held silently (an active-probing tell).
+    created: Instant,
     last: Instant,
 }
 
@@ -590,35 +611,30 @@ impl Driver {
             // and timers do not grow without bound. App handles keep their own Arc.
             self.conns
                 .retain(|_, c| !c.core.lock().unwrap().is_drained());
-            // Reap idle origin-splice flows and held pending Initials on the same
-            // pass (their idle deadlines are armed in `next_deadline`, so this fires
-            // on schedule). A peer that opens flows/flights then goes silent therefore
-            // cannot pin upstream sockets + Box<ServerHandshake> cores until the hard
-            // cap. Both teardowns are wire-silent (UDP relay stop / unanswered Initial).
-            let now = Instant::now();
-            self.sweep_idle_splices(now);
-            self.pending
-                .retain(|_, p| now.duration_since(p.last) < PENDING_IDLE);
         }
     }
 
-    /// The earliest armed timer across all connections, plus the idle deadlines of
-    /// origin-splice flows and held pending Initials, so the driver wakes to reap them
-    /// even when no new datagrams arrive. Without this, a peer that opens splice flows
-    /// / partial first-flights then goes silent pins their sockets + handshake cores
-    /// until the hard cap, because the conns-only deadline never fires for them. Both
-    /// teardowns are wire-silent (a UDP relay just stops forwarding; a pending Initial
-    /// was never answered), so adding these deadlines changes no observable behavior —
-    /// it only makes the existing idle reap fire on schedule instead of opportunistically
-    /// on the next unrelated arrival.
+    /// The earliest armed timer across all connections, plus the idle-reap deadline of
+    /// origin-splice flows and the decision deadline of held pending Initials, so the
+    /// driver wakes for all three even when no new datagrams arrive. A conns-only
+    /// deadline would never fire for an idle splice (pinning its socket + pump task to
+    /// the hard cap) nor for an undecided pending flight (held silently past a real
+    /// origin's ACK — an active-probing tell).
     fn next_deadline(&self) -> Option<Instant> {
         let conn_timeouts = self
             .conns
             .values()
             .filter_map(|c| c.core.lock().unwrap().next_timeout());
+        // Origin-splice flows: idle-reap deadline so a peer that opens flows then goes
+        // silent cannot pin upstream sockets + pump tasks until the hard cap.
         let splice_idle = self.splices.values().map(|(_, last)| *last + SPLICE_IDLE);
-        let pending_idle = self.pending.values().map(|p| p.last + PENDING_IDLE);
-        conn_timeouts.chain(splice_idle).chain(pending_idle).min()
+        // Held first flights: wake at the decision deadline so an undecided flight is
+        // spliced to the origin instead of held silently.
+        let pending_decide = self
+            .pending
+            .values()
+            .map(|p| p.created + PENDING_DECIDE_DELAY);
+        conn_timeouts.chain(splice_idle).chain(pending_decide).min()
     }
 
     fn on_timeout(&mut self) {
@@ -628,6 +644,24 @@ impl Driver {
             if core.next_timeout().is_some_and(|t| t <= now) {
                 core.handle_timeout(now);
             }
+        }
+        // Reap origin-splice flows idle past SPLICE_IDLE (their deadline is armed in
+        // next_deadline) so a peer that opens flows then goes silent cannot pin upstream
+        // sockets + pump tasks to the hard cap. Wire-silent: a UDP relay just stops
+        // forwarding (SpliceFlow::drop aborts the pump), no teardown packet.
+        self.sweep_idle_splices(now);
+        // Resolve any held first flight whose decision deadline elapsed: decide_pending
+        // now falls through to a splice (the CH never completed), so an incomplete
+        // Initial reaches the origin instead of being held silently. Collect first to
+        // avoid borrowing `self.pending` across the `decide_pending` calls.
+        let overdue: Vec<SocketAddr> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.created) >= PENDING_DECIDE_DELAY)
+            .map(|(addr, _)| *addr)
+            .collect();
+        for peer in overdue {
+            self.decide_pending(peer, now);
         }
     }
 
@@ -752,6 +786,7 @@ impl Driver {
             PendingInitial {
                 shared,
                 datagrams: vec![data.to_vec()],
+                created: now,
                 last: now,
             },
         );
@@ -774,19 +809,23 @@ impl Driver {
     /// otherwise. While the ClientHello is still incomplete AND the buffer budget
     /// remains, this is a no-op: nothing is emitted and the flight keeps buffering.
     fn decide_pending(&mut self, peer: SocketAddr, now: Instant) {
-        let (processed, marker, count) = match self.pending.get(&peer) {
+        let (processed, marker, count, held_for) = match self.pending.get(&peer) {
             Some(p) => {
                 let core = p.shared.core.lock().unwrap();
                 (
                     core.client_hello_processed(),
                     core.marker_result(),
                     p.datagrams.len(),
+                    now.duration_since(p.created),
                 )
             }
             None => return,
         };
-        // CH not yet parsed and budget remains: keep buffering, emit nothing.
-        if !processed && count < MAX_PENDING_INITIALS {
+        // CH not yet parsed and budget remains: keep buffering, emit nothing — but
+        // only until the decision deadline. Past it, fall through to a splice so an
+        // incomplete first flight reaches the origin (which ACKs like a real origin)
+        // instead of being held silently, which is an active-probing distinguisher.
+        if !processed && count < MAX_PENDING_INITIALS && held_for < PENDING_DECIDE_DELAY {
             return;
         }
         let p = self.pending.remove(&peer).expect("pending entry present");
@@ -1001,6 +1040,7 @@ impl Connection {
     /// ticket leaves it `false`, the connection having fallen back to 1-RTT); on a
     /// resuming client it is always `true`. Used by the resumption/replay tests to
     /// assert acceptance vs single-use rejection.
+    #[allow(dead_code)] // 0-RTT acceptance inspection; exercised by the resumption/replay tests
     pub(crate) fn zero_rtt_keys_installed(&self) -> bool {
         self.shared.core.lock().unwrap().zero_rtt_keys_installed()
     }
@@ -1693,5 +1733,163 @@ mod tests {
             got >= MIN_INITIAL_DATAGRAM,
             "origin received a full v1 Initial ({got} bytes): the unmarked client was spliced"
         );
+    }
+
+    /// A LONE, incomplete first flight — a single well-formed v1 Initial whose
+    /// ClientHello never completes, so the marker can never be verified — must NOT be
+    /// held silently forever. The decision deadline ([`PENDING_DECIDE_DELAY`]) splices
+    /// it to the origin, so a single-Initial active prober sees the real origin answer
+    /// instead of the silence that would distinguish ParallaX from a bare origin.
+    /// Pre-fix the held core armed no timer, so this datagram never reached the origin.
+    #[tokio::test]
+    async fn lone_incomplete_initial_is_spliced_after_the_decision_deadline() {
+        use crate::crypto::session::X25519KeyPair;
+
+        let server_kp = X25519KeyPair::generate();
+        let psk = zeroize::Zeroizing::new(b"parallax-quic-lone-initial-splic".to_vec());
+
+        // Mock origin: report the size of any datagram it receives (the spliced Initial).
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            while let Ok((n, _)) = origin.recv_from(&mut b).await {
+                if otx.send(n).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_marker(origin_addr, psk, server_kp.private),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // One well-formed v1 long-header Initial padded to the §14.1 minimum: it passes
+        // looks_like_initial (so it is held for the marker decision) but its CRYPTO never
+        // assembles a ClientHello, so the flight stays undecided — the path that
+        // previously hung silently forever.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut initial = vec![0xc0u8, 0x00, 0x00, 0x00, 0x01];
+        initial.resize(MIN_INITIAL_DATAGRAM, 0);
+        client.send_to(&initial, server_addr).await.unwrap();
+
+        // The decision deadline must splice it to the origin (which receives the full
+        // >=1200B Initial), bounded well under the generous timeout.
+        let got = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("origin receives the timed-out lone Initial (spliced, not held silently)")
+            .expect("origin channel open");
+        assert!(
+            got >= MIN_INITIAL_DATAGRAM,
+            "origin received the full v1 Initial ({got} bytes): the lone undecided flight was spliced"
+        );
+    }
+
+    /// A genuine MARKED client whose SECOND Initial arrives after the decision deadline
+    /// is still spliced, NOT rescued into local termination: the deadline force-splices
+    /// the held first flight even though the marker would have validated had the full
+    /// ClientHello arrived in time. Pins the accepted fail-safe tradeoff (such a client
+    /// fails closed on the origin cert and self-heals by redialing — availability, not a
+    /// security regression). Sibling to `marked_client_terminates_while_unmarked_initial_splices`,
+    /// which sends both Initials back-to-back (decided locally before the deadline).
+    #[tokio::test]
+    async fn marked_client_with_late_second_initial_is_spliced() {
+        use crate::crypto::session::X25519KeyPair;
+        use crate::tls::quic::QuicMarkerConfig;
+
+        let server_kp = X25519KeyPair::generate();
+        let psk = zeroize::Zeroizing::new(b"parallax-quic-late-2nd-initial-p".to_vec());
+
+        // Mock origin: report the size of each datagram it receives (the spliced flight).
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            while let Ok((n, _)) = origin.recv_from(&mut b).await {
+                if otx.send(n).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_marker(origin_addr, psk.clone(), server_kp.private),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // A delay relay between client and server: forwards every client->server datagram,
+        // but holds the SECOND (the rest of the PQ ClientHello) well past
+        // PENDING_DECIDE_DELAY, so the server's decision deadline fires on the first
+        // Initial alone — before the marker (which needs the key_share in the 2nd) can be
+        // verified. One upstream socket, so the server sees a single peer/flow.
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_addr = relay.local_addr().unwrap();
+        tokio::spawn(async move {
+            let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            upstream.connect(server_addr).await.unwrap();
+            let mut count = 0u32;
+            let mut cbuf = vec![0u8; 2048];
+            loop {
+                let Ok((n, _from)) = relay.recv_from(&mut cbuf).await else {
+                    return;
+                };
+                count += 1;
+                let data = cbuf[..n].to_vec();
+                let up = upstream.clone();
+                if count == 2 {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(PENDING_DECIDE_DELAY * 3).await;
+                        let _ = up.send(&data).await;
+                    });
+                } else {
+                    let _ = up.send(&data).await;
+                }
+            }
+        });
+
+        let marked = Endpoint::client("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        marked.set_default_client_config(Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                QuicMarkerConfig {
+                    psk,
+                    server_static_public: server_kp.public,
+                },
+            ),
+        ));
+        // The connect never completes (the flight is spliced to the echo origin, not a
+        // real QUIC server), so bound it.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            marked.connect(relay_addr, "example.com"),
+        )
+        .await;
+
+        // The held first Initial is spliced to the origin at the deadline (a full
+        // >=1200B Initial); the late second Initial — arriving after the splice — is
+        // forwarded verbatim too. So the origin sees the marked client's whole flight: a
+        // valid marker did not rescue a flight that missed the deadline.
+        let first = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("origin receives the deadline-spliced first Initial")
+            .expect("origin channel open");
+        assert!(
+            first >= MIN_INITIAL_DATAGRAM,
+            "origin received the full first v1 Initial ({first} bytes): spliced at the deadline"
+        );
+        tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("the late second Initial is also forwarded to the origin (not rescued)")
+            .expect("origin channel open");
     }
 }

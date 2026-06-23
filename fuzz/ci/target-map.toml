@@ -148,20 +148,6 @@ max_len = 65536
 timeout = 25
 paths = ["src/crypto/replay.rs"]
 
-[targets.udp_envelope]
-sanitizer = "none"
-rss = 1024
-max_len = 65536
-timeout = 20
-paths = ["src/transport/udp/envelope.rs", "src/transport/udp/mod.rs"]
-
-[targets.udp_reorder]
-sanitizer = "none"
-rss = 1024
-max_len = 65536
-timeout = 20
-paths = ["src/transport/udp/reorder.rs", "src/transport/udp/mod.rs"]
-
 [targets.replay_dedup]
 sanitizer = "none"
 rss = 1024

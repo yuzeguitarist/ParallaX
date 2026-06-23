@@ -519,6 +519,10 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         tracing::debug!("timeout tuning already set; keeping the first configuration");
     }
     crate::transport::tcp::configure_congestion_control(server.tcp_congestion.as_deref());
+    crate::transport::tcp::configure_socket_buffers(
+        config.transport.tcp_send_buffer_bytes,
+        config.transport.tcp_recv_buffer_bytes,
+    );
     let traffic = config.traffic;
     let psk = decode_psk(config.crypto.psk.as_b64())?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
