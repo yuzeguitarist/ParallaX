@@ -149,6 +149,8 @@ pub struct Config {
     pub traffic: TrafficConfig,
     #[serde(default)]
     pub udp: UdpConfig,
+    #[serde(default)]
+    pub transport: TransportConfig,
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
 }
@@ -531,6 +533,38 @@ impl Default for TrafficConfig {
             max_concurrent_streams: default_max_concurrent_streams(),
         }
     }
+}
+
+/// Transport-layer tuning shared by client and server (the `[transport]` config
+/// section). Kernel/relay tuning that does not change any handshake/record bytes.
+/// `tcp_send_buffer_bytes` is fully wire-invisible; `tcp_recv_buffer_bytes` is NOT
+/// (it affects the advertised TCP window) and is applied only post-connect so the
+/// camouflage SYN stays Safari-identical — see its field doc. All fields default
+/// off (kernel autotuning = full Safari parity).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TransportConfig {
+    /// Explicit SO_SNDBUF for relay sockets, in bytes. `None`/`0` keeps kernel
+    /// autotuning (the safe default). Setting it DISABLES send-buffer autotuning
+    /// for the socket and is clamped by the OS maximum (`net.core.wmem_max` on
+    /// Linux, `kern.ipc.maxsockbuf` on macOS), so only raise it once that maximum
+    /// has been raised — otherwise the kernel may clamp BELOW what autotuning would
+    /// have reached (a logged warning surfaces such a clamp). Sized to the path
+    /// bandwidth-delay product, this lifts the client→server upload window on
+    /// high-RTT links where autotuning under-provisions it.
+    #[serde(default)]
+    pub tcp_send_buffer_bytes: Option<u32>,
+    /// Explicit SO_RCVBUF for relay sockets, in bytes. `None`/`0` keeps kernel
+    /// autotuning. Same clamp/maximum caveat as `tcp_send_buffer_bytes`
+    /// (`net.core.rmem_max` / `kern.ipc.maxsockbuf`). On the server this is the
+    /// upload SINK window; sizing it to the BDP helps asymmetric (slow-upload)
+    /// high-RTT links. COVERTNESS: unlike the send buffer, an explicit recv buffer
+    /// affects the advertised TCP window, so it is applied ONLY post-connect/accept
+    /// (never on the camouflage SYN) and a fixed value flattens the window curve vs
+    /// Safari's autotuning — prefer it on the server data-sink side; leave it `None`
+    /// on the client to keep full browser parity.
+    #[serde(default)]
+    pub tcp_recv_buffer_bytes: Option<u32>,
 }
 
 /// User-space congestion controller for the UDP fast plane.

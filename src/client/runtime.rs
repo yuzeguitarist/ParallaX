@@ -92,6 +92,23 @@ const MUX_FRAME_BATCH_LIMIT: usize = 64;
 /// Cap on the ciphertext bytes batched per mux read before opening, bounding
 /// scratch memory while leaving enough records for the crypto pool to fan out.
 const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
+/// How often the mux warm-keeper re-checks the shared tunnel's health.
+const MUX_WARM_KEEPER_INTERVAL: Duration = Duration::from_secs(5);
+/// The warm-keeper proactively rebuilds a DEAD shared mux tunnel only if a real
+/// local connection was served within this window. So an actively-used client
+/// always finds a warm tunnel (resilient to a mid-session RST/blackhole), while a
+/// genuinely idle client lets the tunnel idle out and does NOT re-handshake on a
+/// 24/7 timer — matching a browser that reconnects on use and idles otherwise
+/// (keeping the warm pool from becoming an always-on behavioral tell).
+const MUX_WARM_KEEPER_ACTIVE_WINDOW: Duration = Duration::from_secs(90);
+/// After this many consecutive FAILED proactive rebuilds the keeper goes dormant
+/// until fresh local activity, so a persistently blocked/blackholed server is not
+/// hammered on a fixed cadence — a clock-locked retry burst to a dead endpoint is
+/// itself a behavioral tell / active-probe confirmation. Real browsers back off a
+/// dead origin; so does this.
+const MUX_WARM_KEEPER_MAX_REBUILD_FAILURES: u32 = 4;
+/// Cap on the exponential backoff between failed proactive rebuild attempts.
+const MUX_WARM_KEEPER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -152,6 +169,13 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             );
         }
     }
+
+    // Process-wide socket-buffer sizing (wire-invisible kernel tuning), installed
+    // before any relay socket is created. First call wins (run() is one-per-process).
+    crate::transport::tcp::configure_socket_buffers(
+        config.transport.tcp_send_buffer_bytes,
+        config.transport.tcp_recv_buffer_bytes,
+    );
 
     let client = config
         .client
@@ -605,6 +629,10 @@ enum MuxState {
 #[derive(Clone)]
 struct ClientMuxPool {
     inner: Arc<Mutex<MuxState>>,
+    /// Monotonic ms of the last real connection served by `handle()`. The warm-
+    /// keeper consults it to refill a dead tunnel only during active-use windows
+    /// (so an idle client never re-handshakes on a 24/7 timer).
+    last_activity: Arc<AtomicU64>,
     config: Arc<ClientConfig>,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
@@ -682,6 +710,7 @@ impl ClientMuxPool {
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MuxState::Idle)),
+            last_activity: Arc::new(AtomicU64::new(0)),
             config,
             server_addr,
             traffic,
@@ -693,7 +722,15 @@ impl ClientMuxPool {
         }
     }
 
+    /// Records activity (so the warm-keeper keeps a tunnel ready during active
+    /// use), then returns a reusable mux session, building one if needed.
     async fn handle(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
+        self.last_activity
+            .store(relay_now_millis(), Ordering::Relaxed);
+        self.get_or_build().await
+    }
+
+    async fn get_or_build(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
         loop {
             let mut state = self.inner.lock().await;
             // Decide an action without awaiting under the lock. The match yields an
@@ -783,10 +820,92 @@ impl ClientMuxPool {
     }
 
     fn ensure_started(&self) {
-        let mux_pool = self.clone();
+        let pool = self.clone();
         tokio::spawn(async move {
-            if let Err(err) = mux_pool.handle().await {
+            // Initial warm at startup.
+            if let Err(err) = pool.get_or_build().await {
                 tracing::debug!(error = %err, "client mux warm session startup failed");
+            }
+            // Warm-keeper: during active-use windows, proactively rebuild a dead
+            // shared tunnel so the next local connection finds it warm (resilience
+            // to a mid-session RST/blackhole). Outside the active window, let it
+            // idle out — no 24/7 re-handshake churn. Uses get_or_build (not handle)
+            // so the keeper never bumps last_activity and thus never perpetuates
+            // itself past genuine idle.
+            //
+            // The 5s poll emits NO packets (a local lock check); only a rebuild
+            // ATTEMPT touches the network. So FAILED rebuilds (server blocked /
+            // blackholed) use exponential backoff + jitter and a hard attempt cap,
+            // after which the keeper goes dormant until fresh local activity — a
+            // clock-locked retry burst to a dead endpoint is itself a covert tell.
+            let mut failures: u32 = 0;
+            let mut next_rebuild_at: u64 = 0;
+            // last_activity value at which we gave up; stay dormant until it advances.
+            let mut dormant_after: Option<u64> = None;
+            loop {
+                sleep(MUX_WARM_KEEPER_INTERVAL).await;
+                let alive = {
+                    let state = pool.inner.lock().await;
+                    matches!(&*state, MuxState::Ready(handle) if handle.is_reusable())
+                };
+                if alive {
+                    failures = 0;
+                    next_rebuild_at = 0;
+                    dormant_after = None;
+                    continue;
+                }
+                let act = pool.last_activity.load(Ordering::Relaxed);
+                let now = relay_now_millis();
+                if now.saturating_sub(act) > MUX_WARM_KEEPER_ACTIVE_WINDOW.as_millis() as u64 {
+                    // Idled out cleanly (not an establishment failure): don't rebuild.
+                    failures = 0;
+                    next_rebuild_at = 0;
+                    dormant_after = None;
+                    continue;
+                }
+                // Dead + recently active. If we already gave up after repeated
+                // failures, stay dormant until a NEW local connection arrives
+                // (last_activity advances past the point we gave up).
+                if let Some(gave_up_at) = dormant_after {
+                    if act <= gave_up_at {
+                        continue;
+                    }
+                    dormant_after = None;
+                    failures = 0;
+                    next_rebuild_at = 0;
+                }
+                // Respect the exponential backoff between failed attempts.
+                if now < next_rebuild_at {
+                    continue;
+                }
+                match pool.get_or_build().await {
+                    Ok(_) => {
+                        failures = 0;
+                        next_rebuild_at = 0;
+                    }
+                    Err(err) => {
+                        failures += 1;
+                        let base_ms = MUX_WARM_KEEPER_INTERVAL.as_millis() as u64;
+                        let backoff_ms = base_ms
+                            .saturating_mul(1u64 << failures.min(4))
+                            .min(MUX_WARM_KEEPER_MAX_BACKOFF.as_millis() as u64);
+                        // +/-25% jitter (low bits of the ms clock; jitter only needs
+                        // to decorrelate retry timing, not be cryptographic) so the
+                        // attempts are not a fixed metronome.
+                        let spread = (backoff_ms / 2).max(1);
+                        let wait =
+                            backoff_ms.saturating_sub(spread / 2) + relay_now_millis() % spread;
+                        next_rebuild_at = relay_now_millis().saturating_add(wait);
+                        if failures >= MUX_WARM_KEEPER_MAX_REBUILD_FAILURES {
+                            dormant_after = Some(act);
+                        }
+                        tracing::debug!(
+                            error = %err,
+                            failures,
+                            "client mux warm refill failed; backing off"
+                        );
+                    }
+                }
             }
         });
     }
