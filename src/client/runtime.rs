@@ -1415,11 +1415,11 @@ async fn run_client_udp_probe(
             // LOCKSTEP: this requires the server's SETTINGS to be Safari-26-SHAPED
             // — the two QPACK params exact, the GREASE setting per-connection random
             // so only its reserved form is checked (see `is_safari26_settings`). The
-            // server currently sends those same client-shaped SETTINGS (see
-            // `TODO(quic-active-probing)` in handshake/server.rs). When that gate is
-            // lifted and the server switches to origin-shaped SETTINGS, THIS shape
-            // check must change in lockstep, or the client will reject every server
-            // and silently never verify the QUIC path.
+            // server sends those same Safari-26 SETTINGS, and keeps that shape: the
+            // server's stable carrier already splices every unauthenticated Initial to
+            // the real origin, so this SETTINGS exchange happens only between our own
+            // client and server (a prober sees the TRUE origin's SETTINGS via the
+            // splice). Both sides just have to agree on the Safari-26 shape — they do.
             match tokio::time::timeout(
                 probe_timeout,
                 crate::transport::udp::h3::read_peer_h3_settings(&conn),

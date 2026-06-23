@@ -29,17 +29,12 @@ use super::quic::endpoint::{Connection, Endpoint, ServerConfig};
 type OfferRegistry = Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Connection>>>>;
 
 /// The process-wide stable-:443 carrier (see the module docs).
-// STAGED: exercised by this module's test; wired into the server runtime in the
-// stable-:443 cutover slice (replacing the per-session ephemeral endpoint), at which
-// point this allow is removed.
-#[allow(dead_code)]
 pub(crate) struct QuicCarrier {
     registry: OfferRegistry,
     /// Held for the carrier's lifetime: dropping it stops the endpoint + accept loop.
     endpoint: Endpoint,
 }
 
-#[allow(dead_code)]
 impl QuicCarrier {
     /// Bind the carrier on `listen` (the real `:443/UDP`) with `config` (marker key +
     /// origin set, e.g. via [`super::server_config_stable`]) and spawn the accept loop
@@ -83,6 +78,7 @@ impl QuicCarrier {
     /// A cloned handle on the carrier's endpoint. Used by the server runtime's
     /// mid-relay-reset test hook to forcibly close the carrier (and thus the relay
     /// connection) in flight; production code never closes the shared carrier.
+    #[cfg(test)]
     pub(crate) fn endpoint_handle(&self) -> Endpoint {
         self.endpoint.clone()
     }

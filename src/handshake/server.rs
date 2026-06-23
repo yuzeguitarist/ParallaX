@@ -537,9 +537,9 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     // outbound stays gated on the exporter-bound auth token (commit-late), so a
     // replayed 0-RTT flight — which cannot complete 1-RTT and therefore cannot
     // produce a valid token — never opens an outbound connection. Built only when
-    // udp is enabled; the plane (and thus 0-RTT) remains behind the experimental-
-    // UDP and TODO(quic-active-probing) gates. A cache-load failure degrades to
-    // cold-start (1-RTT only) rather than failing the server.
+    // udp is enabled; the plane stays behind the experimental-UDP gate (active
+    // probing is handled by the stable carrier's origin splice). A cache-load
+    // failure degrades to cold-start (1-RTT only) rather than failing the server.
     if udp.enabled {
         let zr_path = zero_rtt_replay_cache_path(&server.replay_cache_path);
         match ReplayCache::load_or_create_authenticated_with_window(
@@ -2814,17 +2814,17 @@ async fn serve_probed_quic_on_conn(
     // carrier is H3 framing. A failure to open a control stream means the QUIC
     // connection is unusable for H3 — decline (stay on TCP).
     //
-    // TODO(quic-active-probing): HARD PRE-ENABLE GATE. This sends the SAME
-    // Safari-26 *client* SETTINGS (`safari26_settings_frame`, browser-shaped) as
-    // the server's control-stream first frame. A real H3 *origin* advertises a
-    // DIFFERENT, server-shaped SETTINGS set. An active prober that completes the
-    // TLS handshake can read this server 1-RTT SETTINGS frame BEFORE it fails
-    // authentication and we drop it — so reusing the client SETTINGS here is an
-    // active-probing tell (and the unconditional drop-on-auth-failure differs
-    // from how a real origin would respond). BEFORE enabling QUIC in production,
-    // the server must emit origin-shaped SETTINGS and, on auth failure, behave
-    // like the fronted origin rather than dropping. Gated on the camouflage-
-    // origin decision + a captured reference of the origin's H3 SETTINGS.
+    // ACTIVE-PROBING (resolved by the stable carrier): this is reached ONLY for a
+    // connection the carrier already marker-terminated — i.e. a genuine ParallaX
+    // client that proved knowledge of the PSK + the server's static X25519 key in its
+    // first Initial. Every unauthenticated v1 Initial (no / forged / replayed marker)
+    // is spliced verbatim to the real origin at datagram zero, BEFORE any ParallaX
+    // QUIC byte is emitted, so an active prober reads the TRUE origin's SETTINGS +
+    // auth-failure behaviour, never this code path. The Safari-26 *client* SETTINGS
+    // sent here are therefore seen only by our own client (which expects them — the
+    // LOCKSTEP below); they are not an origin-facing tell, and "drop on H3-probe
+    // failure" only ever drops our own misbehaving client (a prober was already
+    // spliced), so it matches no origin a prober can compare against.
     let control_send = crate::transport::udp::h3::open_h3_control_stream(&conn)
         .await
         .ok()?;
@@ -2857,12 +2857,11 @@ async fn serve_probed_quic_on_conn(
     // LOCKSTEP: this requires the client's SETTINGS to be Safari-26-SHAPED — the
     // two QPACK params exact, the GREASE setting per-connection random so only its
     // reserved form is checked (see `is_safari26_settings`). The client sends those
-    // (client runtime SETTINGS check). The mirror of this dependency lives on the
-    // client side, which requires the SERVER's SETTINGS to be Safari-26-shaped too:
-    // when the `TODO(quic-active-probing)` gate above is lifted and this endpoint
-    // emits origin-shaped SETTINGS, the client's expectation must change in
-    // lockstep (see client/runtime.rs SETTINGS check), or the client will
-    // silently never verify the QUIC path.
+    // (client runtime SETTINGS check). Both ends keep the Safari-26 client shape:
+    // since the carrier already spliced every unauthenticated Initial to the origin,
+    // this SETTINGS exchange happens only between our own client and server (a prober
+    // sees the TRUE origin's SETTINGS via the splice, never these), so the two sides
+    // simply have to agree — they do.
     match crate::transport::udp::h3::read_peer_h3_settings(&conn).await {
         Ok(settings) if crate::fingerprint::http3::is_safari26_settings(&settings) => {}
         _ => {
