@@ -32,8 +32,8 @@ const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
 /// chunk), so the wire shows a variable-length, browser-plausible burst with no
 /// equal-length record run and no fixed per-session regime — instead of the
 /// former fixed ~1631/1632 single record.
-pub(crate) const PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT: usize = 256;
-pub(crate) const PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT: usize = 1024;
+pub const PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT: usize = 256;
+pub const PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT: usize = 1024;
 /// Hard cap on a reassembled PQ handshake frame (rekey / key exchange). Both
 /// real frames are ~1608/1609 bytes (40/41-byte header + ML-KEM-1024 1568); this
 /// bounds a malicious peer's reassembly buffer well above the legitimate maximum
@@ -778,12 +778,14 @@ impl FramedChunk {
     }
 
     /// Like [`Self::encode_all`] but draws a FRESH random plaintext size in
-    /// `[min_chunk, max_chunk]` for every chunk, and merges a sub-`min_chunk`
-    /// final remainder into the previous chunk. This avoids (a) a run of
-    /// byte-identical record lengths, (b) a fixed per-session regime, and (c) a
-    /// tiny tail record — the residual low-entropy shape a single per-session
-    /// `chunk_len` would leave (PAR-21 review). Sizes tile the payload exactly;
-    /// the reassembler is size-agnostic, so the two ends need not agree on sizes.
+    /// `[min_chunk, max_chunk]` for every chunk, constraining each draw so the
+    /// remainder is always 0 or >= `min_chunk`. Every chunk therefore stays within
+    /// `[min_chunk, max_chunk]` (no sub-min tail, no collapse of a just-over-max
+    /// payload into one record), removing the residual low-entropy shape a single
+    /// per-session `chunk_len` would leave: no byte-identical record run, no fixed
+    /// per-session regime, no tiny tell record (PAR-21 review). Sizes tile the
+    /// payload exactly; the reassembler is size-agnostic, so the two ends need not
+    /// agree on sizes.
     pub fn encode_all_shaped<R: rand::Rng + ?Sized>(
         payload: &[u8],
         rng: &mut R,
@@ -798,28 +800,32 @@ impl FramedChunk {
             return Err(FramedChunkError::InvalidChunkLength);
         }
         let total_len = payload.len() as u32;
+        // Pick per-chunk sizes that tile the payload, constraining each draw so the
+        // remainder is always either 0 or >= min_chunk. This keeps every chunk
+        // within [min_chunk, max_chunk] -- no sub-min tail to merge, no collapse of
+        // a just-over-max payload into one record, no over-max merge -- while still
+        // varying every chunk size.
         let mut sizes: Vec<usize> = Vec::new();
         let mut consumed = 0_usize;
         while consumed < payload.len() {
             let remaining = payload.len() - consumed;
             if remaining <= max_chunk {
-                // Final chunk: merge a sub-min remainder into the previous chunk
-                // so the flight never ends in a tiny tell record. (Only when the
-                // whole payload is itself < min_chunk is a lone small chunk kept.)
-                if remaining < min_chunk {
-                    if let Some(last) = sizes.last_mut() {
-                        *last += remaining;
-                    } else {
-                        sizes.push(remaining);
-                    }
-                } else {
-                    sizes.push(remaining);
-                }
+                // Final chunk. Reached either via constrained draws (so remaining
+                // >= min_chunk) or directly when the whole payload is <= max_chunk
+                // (a lone chunk, < min_chunk only when the payload itself is that
+                // small -- not the case for PQ handshake records).
+                sizes.push(remaining);
                 break;
             }
-            // remaining > max_chunk, so take <= max_chunk < remaining and the
-            // offset never runs past the payload.
-            let take = rng.gen_range(min_chunk..=max_chunk);
+            // remaining > max_chunk: draw a size that leaves a >= min_chunk tail.
+            let hi = max_chunk.min(remaining - min_chunk);
+            let take = if hi >= min_chunk {
+                rng.gen_range(min_chunk..=hi)
+            } else {
+                // Only reachable for pathological bounds (max_chunk < 2*min_chunk)
+                // where no split can keep the tail >= min_chunk; emit one max chunk.
+                max_chunk
+            };
             sizes.push(take);
             consumed += take;
         }
@@ -1654,13 +1660,13 @@ mod tests {
             let mut assembled = None;
             for chunk in &chunks {
                 let decoded = FramedChunk::decode_ref(chunk).unwrap();
-                // Per-chunk floor: no record carries a sub-min tail or the whole frame.
+                // Constrained draw: every record stays within [min, max] -- no
+                // sub-min tail and never over-max -- and never carries the frame.
                 assert!(
-                    decoded.bytes.len() >= 256,
-                    "tiny tail: {}",
+                    (256..=1024).contains(&decoded.bytes.len()),
+                    "chunk out of [min,max]: {}",
                     decoded.bytes.len()
                 );
-                assert!(decoded.bytes.len() < payload.len());
                 sizes_seen.insert(decoded.bytes.len());
                 if let Some(done) = reassembler.push(chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
                     assembled = Some(done);
@@ -1673,6 +1679,40 @@ mod tests {
             "per-chunk sizing must vary record sizes, got {}",
             sizes_seen.len()
         );
+    }
+
+    #[test]
+    fn framed_chunk_encode_all_shaped_boundary_cases() {
+        use rand::{rngs::StdRng, SeedableRng};
+        // The constrained draw must hold at the boundaries regardless of the RNG:
+        // a payload just over max_chunk never collapses into one record (the draw
+        // always leaves a >= min_chunk tail), and a payload <= max_chunk is a lone
+        // chunk. Checked across seeds so a lucky draw cannot dodge the invariant.
+        for seed in 0..64_u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+
+            // max_chunk + 1: must be exactly 2 chunks, both within [min, max].
+            let just_over = vec![1_u8; 1025];
+            let chunks = FramedChunk::encode_all_shaped(&just_over, &mut rng, 256, 1024).unwrap();
+            assert_eq!(
+                chunks.len(),
+                2,
+                "max+1 payload must split into 2 chunks, seed={seed}"
+            );
+            for chunk in &chunks {
+                let len = FramedChunk::decode_ref(chunk).unwrap().bytes.len();
+                assert!(
+                    (256..=1024).contains(&len),
+                    "boundary chunk out of range: {len}"
+                );
+            }
+
+            // <= max_chunk: a single chunk carrying the whole payload.
+            let small = vec![2_u8; 1024];
+            let one = FramedChunk::encode_all_shaped(&small, &mut rng, 256, 1024).unwrap();
+            assert_eq!(one.len(), 1);
+            assert_eq!(FramedChunk::decode_ref(&one[0]).unwrap().bytes.len(), 1024);
+        }
     }
 
     #[test]

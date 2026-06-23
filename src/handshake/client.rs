@@ -535,6 +535,11 @@ mod tests {
             let end = offset + crate::tls::record::TLS_HEADER_LEN + payload_len;
             let chunk = codec.open(&buf[offset..end]).unwrap();
             if let Some(payload) = reassembler.push(&chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
+                assert_eq!(
+                    end,
+                    buf.len(),
+                    "framed payload completed before consuming all sealed records"
+                );
                 return payload;
             }
             offset = end;
@@ -564,7 +569,7 @@ mod tests {
         for seed in 0..32_u64 {
             let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
             let mut rng = StdRng::seed_from_u64(seed);
-            let (record, _pending) = session.build_pq_rekey_record(&mut rng).unwrap();
+            let (record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
 
             // Walk the concatenated sealed records by their TLS length headers.
             let mut offset = 0;
@@ -586,6 +591,9 @@ mod tests {
             // The server reassembles the exact original rekey request.
             let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
             let reassembled = open_framed_payload(&mut server_open, &record);
+            // Exact bytes, not just well-framed: catches sealing / chunk-ordering
+            // regressions that would still decode as a valid-looking PX1Q.
+            assert_eq!(reassembled, pending.request_payload);
             assert!(PqRekeyRequest::decode(&reassembled).is_ok());
         }
         assert!(

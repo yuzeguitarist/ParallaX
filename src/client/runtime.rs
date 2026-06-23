@@ -3176,6 +3176,11 @@ mod tests {
             let end = offset + crate::tls::record::TLS_HEADER_LEN + payload_len;
             let chunk = codec.open(&buf[offset..end]).unwrap();
             if let Some(payload) = reassembler.push(&chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
+                assert_eq!(
+                    end,
+                    buf.len(),
+                    "framed payload completed before consuming all sealed records"
+                );
                 return payload;
             }
             offset = end;

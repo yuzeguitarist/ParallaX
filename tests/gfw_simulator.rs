@@ -23,6 +23,7 @@ use parallax::crypto::session::{AeadCodec, X25519KeyPair, AEAD_TAG_LEN};
 use parallax::crypto::{identity, pq};
 use parallax::protocol::command::{
     FramedChunk, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
+    PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT, PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
 };
 use parallax::protocol::data::{DataRecordCodec, SERVER_TO_CLIENT_AAD};
 use parallax::tls::record::TLS_HEADER_LEN;
@@ -154,12 +155,15 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
 
     // Same wire order as the server: the key exchange (now FramedChunk-split into
     // per-chunk-randomized records, PAR-21) first, then the identity chunks. Same
-    // direction (server->client) as the original. Bounds 256/1024 mirror the
-    // pub(crate) PQ_HANDSHAKE_CHUNK_{MIN,MAX}_PLAINTEXT (unreachable from this
-    // external test crate).
-    let key_exchange_chunks =
-        FramedChunk::encode_all_shaped(&key_exchange_payload, &mut rng, 256, 1024)
-            .expect("chunk ServerKeyExchange");
+    // direction (server->client) as the original. Reuse the product chunk-size
+    // bounds so the model cannot drift from the wire.
+    let key_exchange_chunks = FramedChunk::encode_all_shaped(
+        &key_exchange_payload,
+        &mut rng,
+        PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
+        PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT,
+    )
+    .expect("chunk ServerKeyExchange");
     let key_exchange_chunk_count = key_exchange_chunks.len();
     let mut payloads: Vec<Vec<u8>> =
         Vec::with_capacity(key_exchange_chunk_count + identity_chunk_count);
