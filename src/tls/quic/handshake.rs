@@ -219,8 +219,37 @@ impl ClientHandshake {
         let mut grease_seed = [0_u8; 5];
         OsRng.fill_bytes(&mut grease_seed);
         let grease = GreaseSet::from_seed(grease_seed);
+        // `ClientHello.random`: a covert auth marker when a marker config is present
+        // (so the server's datagram-zero fork recognises a real ParallaX client and
+        // terminates locally, splicing everything else to the origin), otherwise a
+        // pure-random value (the cold-start shape). The marker is itself uniformly
+        // pseudo-random, so the wire shape is identical either way. ECDH binds the
+        // per-connection ephemeral key share; DCID binding is deferred (the
+        // Initial-time replay cache bounds replay), so the TLS engine needs no DCID.
         let mut random = [0_u8; 32];
-        OsRng.fill_bytes(&mut random);
+        match &config.marker {
+            Some(m) => {
+                let ss = crate::crypto::session::x25519_shared_secret(
+                    &x25519.private,
+                    &m.server_static_public,
+                );
+                let mut nonce = [0_u8; 12];
+                OsRng.fill_bytes(&mut nonce);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                random = crate::crypto::quic_marker::seal(
+                    &m.psk,
+                    &ss,
+                    server_name.as_bytes(),
+                    &[],
+                    now,
+                    &nonce,
+                );
+            }
+            None => OsRng.fill_bytes(&mut random),
+        }
 
         let mut resumption_psk = None;
         let mut pending_0rtt_keys = None;
@@ -1131,6 +1160,100 @@ mod tests {
             vec![b"h3".to_vec()],
         ));
         ClientHandshake::new(config, QUIC_VERSION_V1, "example.com", vec![0x0f, 0x00]).unwrap()
+    }
+
+    /// Extract the client's X25519 key_share (group 0x001d) from a ClientHello
+    /// handshake message — used by the marker test to recompute the server-side ECDH.
+    fn x25519_key_share(ch: &[u8]) -> [u8; 32] {
+        let mut p = 38usize; // msg type(1) + len(3) + legacy_version(2) + random(32)
+        let sid = ch[p] as usize;
+        p += 1 + sid;
+        let cs = u16::from_be_bytes([ch[p], ch[p + 1]]) as usize;
+        p += 2 + cs;
+        let comp = ch[p] as usize;
+        p += 1 + comp;
+        p += 2; // extensions total length
+        while p + 4 <= ch.len() {
+            let et = u16::from_be_bytes([ch[p], ch[p + 1]]);
+            let el = u16::from_be_bytes([ch[p + 2], ch[p + 3]]) as usize;
+            let data = &ch[p + 4..p + 4 + el];
+            if et == 0x0033 {
+                let mut q = 2usize; // client_shares length
+                while q + 4 <= data.len() {
+                    let group = u16::from_be_bytes([data[q], data[q + 1]]);
+                    let kl = u16::from_be_bytes([data[q + 2], data[q + 3]]) as usize;
+                    if group == 0x001d && kl == 32 {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(&data[q + 4..q + 4 + 32]);
+                        return k;
+                    }
+                    q += 4 + kl;
+                }
+            }
+            p += 4 + el;
+        }
+        panic!("no x25519 key_share in ClientHello");
+    }
+
+    /// With a marker config the client hides a valid auth marker in
+    /// `ClientHello.random` that the server recovers from the same PSK + the static
+    /// private key matching the configured public, recomputing the ECDH from the
+    /// client's on-wire X25519 share. A no-marker client's random does NOT verify.
+    #[test]
+    fn marker_config_emits_a_verifiable_clienthello_random() {
+        use crate::crypto::quic_marker;
+        use crate::crypto::session::{x25519_shared_secret, X25519KeyPair};
+
+        let server_kp = X25519KeyPair::generate();
+        let psk = zeroize::Zeroizing::new(b"parallax-quic-marker-emit-test--!".to_vec());
+        let config = Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                crate::tls::quic::QuicMarkerConfig {
+                    psk: psk.clone(),
+                    server_static_public: server_kp.public,
+                },
+            ),
+        );
+        let mut ch =
+            ClientHandshake::new(config, QUIC_VERSION_V1, "example.com", vec![0x0f, 0x00]).unwrap();
+        let mut out = Vec::new();
+        ch.write_handshake(&mut out);
+
+        let mut client_random = [0u8; 32];
+        client_random.copy_from_slice(&out[6..38]);
+        let client_share = x25519_key_share(&out);
+        let ss = x25519_shared_secret(&server_kp.private, &client_share);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            quic_marker::open(&psk, &ss, b"example.com", &[], &client_random, now, 604_800)
+                .is_some(),
+            "marker config must emit a server-verifiable ClientHello.random"
+        );
+
+        // A cold-start (no-marker) client's random must NOT verify as a marker.
+        let mut cold = handshake();
+        let mut cold_out = Vec::new();
+        cold.write_handshake(&mut cold_out);
+        let mut cold_random = [0u8; 32];
+        cold_random.copy_from_slice(&cold_out[6..38]);
+        let cold_share = x25519_key_share(&cold_out);
+        let cold_ss = x25519_shared_secret(&server_kp.private, &cold_share);
+        assert!(
+            quic_marker::open(
+                &psk,
+                &cold_ss,
+                b"example.com",
+                &[],
+                &cold_random,
+                now,
+                604_800
+            )
+            .is_none(),
+            "a no-marker client's random must not verify"
+        );
     }
 
     /// Wrap a body as a handshake message (`type || u24 len || body`).
