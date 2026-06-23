@@ -58,6 +58,11 @@ const MAX_SPLICE_FLOWS: usize = 1 << 12;
 /// long is reaped (its pump task aborted), bounding state to active relays.
 const SPLICE_IDLE: Duration = Duration::from_secs(30);
 
+/// Retention of an auth-marker `(nonce, timestamp)` in the replay cache. Must be at
+/// least the marker freshness window so a captured marker cannot be replayed into a
+/// local termination while it is still valid; entries older than this are evicted.
+const MARKER_REPLAY_TTL: Duration = Duration::from_secs(3600);
+
 /// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
 /// packet in a datagram padded to the §14.1 minimum. A cheap pre-check so garbage,
 /// truncated, or non-Initial datagrams from unknown peers never allocate the
@@ -92,6 +97,13 @@ pub struct ServerConfig {
     /// [`Driver::on_datagram`]). `None` keeps the current behaviour (drop), so the
     /// splice stays dormant until the server runtime supplies the resolved origin.
     pub origin_udp_addr: Option<SocketAddr>,
+    /// Origin-splice auth-marker key `(psk, server static X25519 private)`. When
+    /// `Some`, a well-formed v1 Initial whose ClientHello.random carries a valid,
+    /// fresh, non-replayed marker is TERMINATED locally (a real ParallaX client);
+    /// any other v1 Initial (no/forged/replayed marker) is spliced to the origin.
+    /// `None` keeps the current behaviour (every v1 Initial terminates locally), so
+    /// the marker fork stays dormant until the server runtime supplies the key.
+    pub marker_key: Option<(Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>)>,
 }
 
 /// Failure to establish a connection.
@@ -291,6 +303,7 @@ impl Endpoint {
             wake: wake.clone(),
             conns: HashMap::new(),
             splices: HashMap::new(),
+            marker_replay: HashMap::new(),
             server,
             accept_tx,
             connect_rx,
@@ -449,6 +462,11 @@ struct Driver {
     /// time for idle reaping. A flow here is NOT a ParallaX connection — its
     /// datagrams are forwarded verbatim to the origin (see [`Self::on_datagram`]).
     splices: HashMap<SocketAddr, (SpliceFlow, Instant)>,
+    /// Initial-time auth-marker replay cache, keyed on `(nonce, timestamp)` with the
+    /// insert time for window eviction: a marker is TERMINATED only on its first
+    /// sighting, so a captured-and-replayed marker (a later sighting) is spliced to
+    /// the origin instead of re-exposing the local termination path.
+    marker_replay: HashMap<([u8; 12], u64), Instant>,
     server: Option<Arc<ServerConfig>>,
     accept_tx: mpsc::UnboundedSender<Arc<ConnShared>>,
     connect_rx: mpsc::UnboundedReceiver<ConnectRequest>,
@@ -578,6 +596,11 @@ impl Driver {
                 if let Some(guard) = cfg.replay_guard.clone() {
                     core.set_zero_rtt_replay_guard(guard);
                 }
+                // Install the auth-marker key BEFORE the ClientHello is processed: the
+                // marker is verified during handle_datagram and read back below.
+                if let Some((psk, static_priv)) = &cfg.marker_key {
+                    core.set_marker_key(psk.clone(), static_priv.clone());
+                }
                 core
             }
             Err(_) => return,
@@ -591,7 +614,56 @@ impl Driver {
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
         let _ = shared.core.lock().unwrap().handle_datagram(data, now);
+
+        // Origin-splice marker fork: with the marker key set, only a valid, fresh,
+        // non-replayed marker keeps the local termination (a real ParallaX client);
+        // every other v1 Initial (no / forged / replayed marker) is spliced to the
+        // origin. Nothing has been flushed yet — poll_transmit runs after on_datagram
+        // — so dropping `shared` here emits zero ParallaX bytes; the prober's original
+        // datagram then reaches the true origin verbatim.
+        //
+        // TODO(quic-marker-multidatagram): this decides on the FIRST Initial datagram,
+        // so `marker_result` is only ready when the whole ClientHello fits one Initial.
+        // The Safari-26 CH (PQ-inflated) spans TWO Initials, so a real marked client
+        // is currently mis-spliced. Before enabling the marker key in production, this
+        // must buffer-decide-then-route: reassemble the full first-flight CH (without
+        // emitting any ParallaX bytes) and only then fork. marker_key stays None in
+        // server_config / server_config_0rtt until that lands, so this path is dormant.
+        if cfg.marker_key.is_some() {
+            let marker = shared.core.lock().unwrap().marker_result();
+            let terminate = match marker {
+                Some(m) => self.marker_fresh(m, now),
+                None => false,
+            };
+            if !terminate {
+                drop(shared);
+                if let Some(origin) = cfg.origin_udp_addr {
+                    self.open_splice(peer, origin, data, now);
+                }
+                return;
+            }
+        }
         self.conns.insert(peer, shared);
+    }
+
+    /// Record an auth marker's `(nonce, timestamp)` and report whether this is its
+    /// FIRST sighting (so the connection terminates locally). A repeat — a captured
+    /// marker replayed within its window — returns `false`, so that flow is spliced
+    /// to the origin instead of re-exposing the local termination path. (The first
+    /// sighting could itself be an attacker who raced the genuine client; that
+    /// residual is bounded by the short freshness window and is the documented QUIC
+    /// limit — the authenticated path cannot reach full TCP-REALITY parity.)
+    fn marker_fresh(&mut self, m: crate::crypto::quic_marker::Marker, now: Instant) -> bool {
+        self.marker_replay
+            .retain(|_, t| now.duration_since(*t) < MARKER_REPLAY_TTL);
+        use std::collections::hash_map::Entry;
+        match self.marker_replay.entry((m.nonce, m.timestamp)) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(now);
+                true
+            }
+        }
     }
 
     /// Open a verbatim origin-fallback relay for `peer` toward `origin`, forwarding
@@ -1051,6 +1123,7 @@ mod tests {
             stek: None,
             replay_guard: None,
             origin_udp_addr: None,
+            marker_key: None,
         })
     }
 
@@ -1069,6 +1142,7 @@ mod tests {
             stek: None,
             replay_guard: None,
             origin_udp_addr: Some(origin),
+            marker_key: None,
         })
     }
 
@@ -1273,6 +1347,121 @@ mod tests {
                 reason: b"bye".to_vec(),
             })),
             "the server observes the client's application close code + reason"
+        );
+    }
+
+    fn server_config_marker(
+        origin: SocketAddr,
+        psk: zeroize::Zeroizing<Vec<u8>>,
+        static_priv: [u8; 32],
+    ) -> Arc<ServerConfig> {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        let key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap()
+                .as_ref()
+                .to_vec();
+        Arc::new(ServerConfig {
+            cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            signing_key_pkcs8: key,
+            alpn_protocols: vec![b"h3".to_vec()],
+            stek: None,
+            replay_guard: None,
+            origin_udp_addr: Some(origin),
+            marker_key: Some((psk, zeroize::Zeroizing::new(static_priv))),
+        })
+    }
+
+    /// The marker fork: a client whose ClientHello.random carries a valid auth marker
+    /// is TERMINATED locally (the handshake completes), while an unmarked client's
+    /// Initial is spliced verbatim to the origin (which receives the >=1200B Initial).
+    ///
+    /// IGNORED — known limitation: the fork decides on the FIRST Initial datagram, but
+    /// the Safari-26 ClientHello spans TWO Initials (PQ-inflated), so `marker_result`
+    /// is not yet available when the first datagram is processed and a valid marked
+    /// client is mis-spliced (this test then hangs on the never-answered handshake).
+    /// The fix is buffer-decide-then-route: reassemble the full CH before the fork
+    /// (multi-datagram first-flight). Dormant in production (marker_key is None), so
+    /// this does not affect live traffic. See TODO at the on_datagram fork.
+    #[ignore = "needs multi-datagram buffer-decide-then-route (Safari CH spans 2 Initials)"]
+    #[tokio::test]
+    async fn marked_client_terminates_while_unmarked_initial_splices() {
+        use crate::crypto::session::X25519KeyPair;
+        use crate::tls::quic::QuicMarkerConfig;
+        use crate::transport::udp::endpoint::bind_client_endpoint_accept_any;
+
+        let server_kp = X25519KeyPair::generate();
+        let psk = zeroize::Zeroizing::new(b"parallax-quic-marker-fork-e2e-ps".to_vec());
+
+        // Mock origin: report the size of any datagram it receives (the spliced Initial).
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            while let Ok((n, _)) = origin.recv_from(&mut b).await {
+                if otx.send(n).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_marker(origin_addr, psk.clone(), server_kp.private),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // 1. A MARKED client terminates locally (the handshake completes).
+        let marked = Endpoint::client("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        marked.set_default_client_config(Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                QuicMarkerConfig {
+                    psk: psk.clone(),
+                    server_static_public: server_kp.public,
+                },
+            ),
+        ));
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            marked.connect(server_addr, "example.com"),
+        )
+        .await
+        .expect("marked client handshake must not hang (marker accepted -> terminate)")
+        .expect("marked client must terminate locally (handshake completes)");
+        let _server_conn = acceptor
+            .await
+            .unwrap()
+            .expect("server accepts the marked client");
+        drop(conn);
+
+        // 2. An UNMARKED client's Initial is spliced to the origin (which receives a
+        // full >=1200B v1 Initial). Its connect never completes (the echo origin is
+        // not a QUIC server), so it is timeout-bounded.
+        let unmarked = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            unmarked.connect(server_addr, "example.com"),
+        )
+        .await;
+        let got = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("origin receives the spliced Initial in time")
+            .expect("origin channel open");
+        assert!(
+            got >= MIN_INITIAL_DATAGRAM,
+            "origin received a full v1 Initial ({got} bytes): the unmarked client was spliced"
         );
     }
 }

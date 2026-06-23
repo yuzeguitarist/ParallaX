@@ -136,6 +136,9 @@ pub fn server_config(
         // resolved camouflage-origin UDP address (the gating brick); cold-start drops
         // non-Initial probe traffic, the prior behaviour.
         origin_udp_addr: None,
+        // Marker fork dormant until the server runtime supplies the key; every v1
+        // Initial terminates locally (the prior behaviour).
+        marker_key: None,
     }))
 }
 
@@ -160,6 +163,8 @@ pub fn server_config_0rtt(
         replay_guard: Some(guard),
         // Splice dormant until the server runtime supplies the origin address.
         origin_udp_addr: None,
+        // Marker fork dormant until the server runtime supplies the key.
+        marker_key: None,
     }))
 }
 

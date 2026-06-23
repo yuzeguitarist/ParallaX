@@ -214,6 +214,18 @@ pub(crate) trait TlsSession: Send {
     /// Install the cross-connection 0-RTT anti-replay guard (server only; the client
     /// default is a no-op).
     fn set_zero_rtt_guard(&mut self, _guard: Arc<dyn ZeroRttGuard>) {}
+    /// Install the origin-splice auth-marker key (server only; client default no-op).
+    fn set_marker_key(
+        &mut self,
+        _psk: zeroize::Zeroizing<Vec<u8>>,
+        _static_priv: zeroize::Zeroizing<[u8; 32]>,
+    ) {
+    }
+    /// The auth marker recovered from this connection's ClientHello.random, if valid
+    /// + fresh (server only; client default `None`).
+    fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
+        None
+    }
 }
 
 impl TlsSession for ClientHandshake {
@@ -271,5 +283,15 @@ impl TlsSession for ServerHandshake {
     }
     fn set_zero_rtt_guard(&mut self, guard: Arc<dyn ZeroRttGuard>) {
         ServerHandshake::set_zero_rtt_guard(self, guard)
+    }
+    fn set_marker_key(
+        &mut self,
+        psk: zeroize::Zeroizing<Vec<u8>>,
+        static_priv: zeroize::Zeroizing<[u8; 32]>,
+    ) {
+        ServerHandshake::set_marker_key(self, psk, static_priv)
+    }
+    fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
+        ServerHandshake::marker_result(self)
     }
 }

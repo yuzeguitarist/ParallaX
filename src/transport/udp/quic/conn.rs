@@ -637,6 +637,24 @@ impl Connection {
         self.tls.set_zero_rtt_guard(guard);
     }
 
+    /// Install the origin-splice auth-marker key (server only). Set right after
+    /// construction, before the ClientHello is processed; the server then verifies
+    /// `ClientHello.random` and exposes the result via [`Self::marker_result`].
+    pub fn set_marker_key(
+        &mut self,
+        psk: zeroize::Zeroizing<Vec<u8>>,
+        static_priv: zeroize::Zeroizing<[u8; 32]>,
+    ) {
+        self.tls.set_marker_key(psk, static_priv);
+    }
+
+    /// The origin-splice auth marker recovered from this connection's
+    /// ClientHello.random, if valid + fresh (server only; `None` otherwise). The
+    /// endpoint driver consults this for the terminate-vs-splice fork.
+    pub fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
+        self.tls.marker_result()
+    }
+
     /// Whether 0-RTT keys are installed on this connection. On a resuming CLIENT
     /// this is set at construction (it can send early data); on the SERVER it is set
     /// only after it ACCEPTED a resumed ticket's 0-RTT (and can decrypt early data),
