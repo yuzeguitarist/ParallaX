@@ -35,10 +35,10 @@ use super::client_hello::{build_client_hello, ClientHelloParams, ResumptionParam
 use super::keys::{DirectionalKeys, KeyPair, Keys, PacketKey};
 use super::schedule::{
     binder_finished_key, client_early_traffic_secret, early_secret_from_psk, initial_keys,
-    KeySchedule,
+    resumption_psk, KeySchedule,
 };
 use super::suite::CipherSuite;
-use super::ticket::ClientTicket;
+use super::ticket::{decode_new_session_ticket, ClientTicket};
 use super::{
     ClientConfig, QuicTlsError, Side, ALERT_BAD_CERTIFICATE, ALERT_DECODE_ERROR,
     ALERT_DECRYPT_ERROR, ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
@@ -143,6 +143,9 @@ pub struct ClientHandshake {
     psk_accepted: bool,
     /// The server echoed `early_data` in EncryptedExtensions — 0-RTT was accepted.
     early_data_accepted: bool,
+    /// A resumption ticket parsed from a post-handshake NewSessionTicket, awaiting
+    /// [`Self::take_session_ticket`]. `None` until one arrives.
+    pending_session_ticket: Option<ClientTicket>,
 }
 
 impl ClientHandshake {
@@ -290,6 +293,7 @@ impl ClientHandshake {
             pending_0rtt_keys,
             psk_accepted: false,
             early_data_accepted: false,
+            pending_session_ticket: None,
         })
     }
 
@@ -397,6 +401,43 @@ impl ClientHandshake {
         schedule.resumption_master_secret(&transcript_hash)
     }
 
+    /// Parse a post-handshake NewSessionTicket and store a [`ClientTicket`] for a
+    /// future 0-RTT resumption. Best-effort: a malformed or premature ticket is
+    /// silently ignored (the next connection just falls back to cold-start).
+    fn store_session_ticket(&mut self, body: &[u8]) {
+        let Some(nst) = decode_new_session_ticket(body) else {
+            return;
+        };
+        let (Some(suite), Some(alpn)) = (self.suite, self.alpn.clone()) else {
+            return;
+        };
+        let Ok(res_master) = self.resumption_master_secret() else {
+            return;
+        };
+        let Ok(psk) = resumption_psk(suite, &res_master, &nst.nonce) else {
+            return;
+        };
+        self.pending_session_ticket = Some(ClientTicket {
+            ticket: nst.ticket,
+            psk,
+            suite: suite.to_u16(),
+            alpn,
+            peer_transport_params: self.peer_transport_params.clone().unwrap_or_default(),
+            age_add: nst.age_add,
+            lifetime_secs: nst.lifetime_secs,
+            received_at_ms: 0,
+        });
+    }
+
+    /// Take the stored resumption ticket (if a NewSessionTicket was received),
+    /// stamping `now_ms` (Unix ms) as its ticket-age epoch.
+    #[allow(dead_code)] // wired into the client runtime in S7
+    pub(crate) fn take_session_ticket(&mut self, now_ms: u64) -> Option<ClientTicket> {
+        let mut t = self.pending_session_ticket.take()?;
+        t.received_at_ms = now_ms;
+        Some(t)
+    }
+
     /// Feed reassembled CRYPTO-stream bytes. Returns `Ok(true)` the first time
     /// handshake data (ALPN / completion) becomes available, else `Ok(false)`.
     pub fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
@@ -489,9 +530,12 @@ impl ClientHandshake {
                 self.read_state = ReadState::Complete;
                 Ok(())
             }
-            // Post-handshake NewSessionTickets (1-RTT CRYPTO) are accepted and
-            // ignored — ParallaX does not resume.
-            (ReadState::Complete, HANDSHAKE_NEW_SESSION_TICKET) => Ok(()),
+            // Post-handshake NewSessionTicket (1-RTT CRYPTO): parse + store a
+            // resumption ticket for a future 0-RTT connection.
+            (ReadState::Complete, HANDSHAKE_NEW_SESSION_TICKET) => {
+                self.store_session_ticket(body);
+                Ok(())
+            }
             (state, ty) => Err(QuicTlsError::alert(
                 ALERT_UNEXPECTED_MESSAGE,
                 format!("unexpected handshake message {ty:#04x} in state {state:?}"),

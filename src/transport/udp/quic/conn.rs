@@ -24,9 +24,10 @@ use super::recovery::{RttEstimator, SentPacket, SentPackets};
 use super::spaces::{PacketNumberSpace, ReceivedPackets};
 use super::transport_params::TransportParameters;
 use crate::tls::quic::{
-    initial_keys, ClientConfig, ClientHandshake, DirectionalKeys, KeyChange, KeyPair, Keys,
-    PacketKey, QuicTlsError, ServerHandshake, Side, TlsSession, QUIC_VERSION_V1,
+    initial_keys, ClientConfig, ClientHandshake, ClientTicket, DirectionalKeys, KeyChange, KeyPair,
+    Keys, PacketKey, QuicTlsError, ServerHandshake, Side, TlsSession, QUIC_VERSION_V1,
 };
+use zeroize::Zeroizing;
 
 /// Why a connection is no longer usable (RFC 9000 §10), reported by
 /// [`Connection::close_reason`].
@@ -505,12 +506,32 @@ impl Connection {
         transport_params: Vec<u8>,
         scid: ConnectionId,
     ) -> Result<Self, QuicTlsError> {
+        Self::new_server_with_stek(
+            cert_chain,
+            signing_key_pkcs8,
+            alpn_protocols,
+            transport_params,
+            scid,
+            None,
+        )
+    }
+
+    /// Like [`Self::new_server`] but with a Session-Ticket Encryption Key (STEK) so
+    /// the server issues + accepts 0-RTT resumption tickets (RFC 8446 §4.6.1).
+    pub fn new_server_with_stek(
+        cert_chain: Vec<Vec<u8>>,
+        signing_key_pkcs8: &[u8],
+        alpn_protocols: Vec<Vec<u8>>,
+        transport_params: Vec<u8>,
+        scid: ConnectionId,
+        stek: Option<Zeroizing<[u8; 32]>>,
+    ) -> Result<Self, QuicTlsError> {
         let tls = ServerHandshake::new(
             cert_chain,
             signing_key_pkcs8,
             alpn_protocols,
             transport_params,
-            None,
+            stek,
         )?;
         Ok(Self {
             side: Side::Server,
@@ -561,6 +582,13 @@ impl Connection {
 
     pub fn is_handshaking(&self) -> bool {
         self.tls.is_handshaking()
+    }
+
+    /// Take a resumption ticket received on this connection via a post-handshake
+    /// NewSessionTicket (client only; the server returns `None`). `now_ms` stamps
+    /// the ticket-age epoch.
+    pub fn take_session_ticket(&mut self, now_ms: u64) -> Option<ClientTicket> {
+        self.tls.take_session_ticket(now_ms)
     }
 
     /// Close the connection with an application error code + reason (RFC 9000
@@ -2395,6 +2423,43 @@ mod tests {
             server.next_1rtt_keys().is_some(),
             "server 1-RTT key update ready"
         );
+    }
+
+    #[test]
+    fn client_receives_a_session_ticket_from_a_stek_server() {
+        let dcid = ConnectionId::new(&[0x5e; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let stek = Zeroizing::new([0x33u8; 32]);
+        let mut server = Connection::new_server_with_stek(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x12, 0x34, 0x56, 0x78]),
+            Some(stek),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // The server issued a NewSessionTicket post-handshake; the client parsed it
+        // into a resumption ticket usable for a future 0-RTT connection.
+        let ticket = client
+            .take_session_ticket(1_000_000)
+            .expect("client received a resumption ticket");
+        assert_eq!(ticket.suite, 0x1301);
+        assert_eq!(ticket.alpn, b"h3");
+        assert_eq!(ticket.psk.len(), 32);
+        assert!(!ticket.ticket.is_empty(), "opaque ticket present");
+        assert!(
+            !ticket.is_expired(1_000_000),
+            "freshly issued ticket is live"
+        );
+        assert_eq!(ticket.received_at_ms, 1_000_000);
+        // The ticket is single-use: a second take yields nothing.
+        assert!(client.take_session_ticket(1_000_000).is_none());
     }
 
     #[test]

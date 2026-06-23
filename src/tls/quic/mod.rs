@@ -146,6 +146,7 @@ mod handshake;
 
 pub(crate) use schedule::initial_keys;
 pub(crate) use server::ServerHandshake;
+pub(crate) use ticket::ClientTicket;
 
 /// The TLS-session surface the hand-rolled QUIC connection drives. Both
 /// [`ClientHandshake`] and [`ServerHandshake`] implement it, so the connection
@@ -168,6 +169,11 @@ pub(crate) trait TlsSession: Send {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), QuicTlsError>;
+    /// Take a resumption ticket received via NewSessionTicket (client only; the
+    /// server returns `None`). `now_ms` stamps the ticket-age epoch.
+    fn take_session_ticket(&mut self, _now_ms: u64) -> Option<ClientTicket> {
+        None
+    }
 }
 
 impl TlsSession for ClientHandshake {
@@ -193,6 +199,9 @@ impl TlsSession for ClientHandshake {
         context: &[u8],
     ) -> Result<(), QuicTlsError> {
         ClientHandshake::export_keying_material(self, out, label, context)
+    }
+    fn take_session_ticket(&mut self, now_ms: u64) -> Option<ClientTicket> {
+        ClientHandshake::take_session_ticket(self, now_ms)
     }
 }
 
