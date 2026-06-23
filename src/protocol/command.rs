@@ -10,6 +10,12 @@ const PQ_REKEY_MAGIC: &[u8; 4] = b"PX1Q";
 const SERVER_KEY_EXCHANGE_MAGIC: &[u8; 4] = b"PX1K";
 const SERVER_IDENTITY_MAGIC: &[u8; 4] = b"PX1S";
 const SERVER_IDENTITY_CHUNK_MAGIC: &[u8; 4] = b"PX1I";
+/// Generic framed-chunk carrier for variable-length splitting of the PQ
+/// handshake records (PX1Q rekey, PX1K key exchange) across several data
+/// records, so neither side emits a single fixed-size first record. The inner
+/// payload keeps its own PX1Q/PX1K magic, which disambiguates the message type
+/// after reassembly.
+const FRAMED_CHUNK_MAGIC: &[u8; 4] = b"PX1F";
 const SPEED_TEST_MAGIC: &[u8; 4] = b"PX1T";
 const SPEED_WARMUP_DOWNLOAD_DONE_MAGIC: &[u8; 4] = b"PX1W";
 const SPEED_WARMUP_UPLOAD_DONE_MAGIC: &[u8; 4] = b"PX1V";
@@ -19,6 +25,21 @@ const MUX_FRAME_MAGIC: &[u8; 4] = b"PX1M";
 const MAX_HOST_LEN: usize = 255;
 const CONNECT_FIXED_LEN: usize = 4 + 2 + 2 + 4;
 const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
+
+/// Per-session plaintext chunk size bound for [`FramedChunk`] splitting of the
+/// PQ handshake records. The sender draws one size in this range per session and
+/// emits the record across several chunks of that size (plus a remainder), so
+/// the wire shows a variable-length, browser-plausible burst instead of the
+/// former fixed ~1631/1632 single record.
+pub(crate) const PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT: usize = 256;
+pub(crate) const PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT: usize = 1024;
+/// Hard cap on a reassembled PQ handshake frame (rekey / key exchange). Both
+/// real frames are ~1608/1609 bytes (40/41-byte header + ML-KEM-1024 1568); this
+/// bounds a malicious peer's reassembly buffer well above the legitimate maximum
+/// while still rejecting absurd totals. The strict length checks in
+/// `PqRekeyRequest` / `ServerKeyExchange` decode then reject anything not exactly
+/// the right size.
+pub(crate) const MAX_PQ_HANDSHAKE_FRAME: usize = 4096;
 
 // UDP fast-plane (TUDP) control commands, carried over the TCP control plane
 // alongside the other PX1* commands. Fixed-length wire formats.
@@ -639,6 +660,163 @@ impl ServerIdentityChunk {
             )?);
         }
         Ok(chunks)
+    }
+}
+
+/// One chunk of a [`FramedChunk`]-carried payload. Wire layout mirrors
+/// [`ServerIdentityChunk`]: `magic(4) | total_len(4) | offset(4) | len(4) | bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramedChunk {
+    pub total_len: u32,
+    pub offset: u32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramedChunkRef<'a> {
+    pub total_len: u32,
+    pub offset: u32,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum FramedChunkError {
+    #[error("framed chunk is truncated")]
+    Truncated,
+    #[error("framed chunk magic mismatch")]
+    BadMagic,
+    #[error("framed chunk is empty")]
+    EmptyChunk,
+    #[error("framed chunk length is invalid")]
+    InvalidChunkLength,
+    #[error("framed chunk offset is invalid")]
+    InvalidOffset,
+    #[error("framed payload exceeds the maximum permitted size")]
+    TooLarge,
+    #[error("framed chunk total length is inconsistent across chunks")]
+    InconsistentTotal,
+    #[error("framed chunk arrived out of order")]
+    OutOfOrder,
+}
+
+impl FramedChunk {
+    fn encode_borrowed(
+        total_len: u32,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, FramedChunkError> {
+        if bytes.is_empty() {
+            return Err(FramedChunkError::EmptyChunk);
+        }
+        let end = offset
+            .checked_add(bytes.len() as u32)
+            .ok_or(FramedChunkError::InvalidOffset)?;
+        if total_len == 0 || end > total_len {
+            return Err(FramedChunkError::InvalidOffset);
+        }
+        let mut out = Vec::with_capacity(16 + bytes.len());
+        out.extend_from_slice(FRAMED_CHUNK_MAGIC);
+        out.extend_from_slice(&total_len.to_be_bytes());
+        out.extend_from_slice(&offset.to_be_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(bytes);
+        Ok(out)
+    }
+
+    pub fn decode_ref(input: &[u8]) -> Result<FramedChunkRef<'_>, FramedChunkError> {
+        if input.len() < 4 {
+            return Err(FramedChunkError::Truncated);
+        }
+        if &input[..4] != FRAMED_CHUNK_MAGIC {
+            return Err(FramedChunkError::BadMagic);
+        }
+        if input.len() < 16 {
+            return Err(FramedChunkError::Truncated);
+        }
+        let total_len = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
+        let offset = u32::from_be_bytes([input[8], input[9], input[10], input[11]]);
+        let len = u32::from_be_bytes([input[12], input[13], input[14], input[15]]) as usize;
+        if len == 0 {
+            return Err(FramedChunkError::EmptyChunk);
+        }
+        if input.len() != 16 + len {
+            return Err(FramedChunkError::InvalidChunkLength);
+        }
+        let end = offset
+            .checked_add(len as u32)
+            .ok_or(FramedChunkError::InvalidOffset)?;
+        if total_len == 0 || end > total_len {
+            return Err(FramedChunkError::InvalidOffset);
+        }
+        Ok(FramedChunkRef {
+            total_len,
+            offset,
+            bytes: &input[16..],
+        })
+    }
+
+    /// Split `payload` into a sequence of chunk records, each carrying at most
+    /// `chunk_len` plaintext bytes. The caller picks `chunk_len` per session
+    /// (e.g. `rng.gen_range(PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT..=MAX)`), so the
+    /// emitted record sizes vary across connections. Mirrors
+    /// [`ServerIdentityChunk::encode_all`].
+    pub fn encode_all(payload: &[u8], chunk_len: usize) -> Result<Vec<Vec<u8>>, FramedChunkError> {
+        if payload.is_empty() || chunk_len == 0 || payload.len() > u32::MAX as usize {
+            return Err(FramedChunkError::InvalidChunkLength);
+        }
+        let total_len = payload.len() as u32;
+        let mut chunks = Vec::with_capacity(payload.len().div_ceil(chunk_len));
+        for (idx, bytes) in payload.chunks(chunk_len).enumerate() {
+            chunks.push(Self::encode_borrowed(
+                total_len,
+                (idx * chunk_len) as u32,
+                bytes,
+            )?);
+        }
+        Ok(chunks)
+    }
+}
+
+/// Stateful reassembler for a [`FramedChunk`] sequence. Mirrors the in-order,
+/// total-length-bounded accumulation that `read_server_identity_payload` already
+/// uses for the identity proof: every chunk must agree on `total_len`, chunks
+/// must arrive in offset order, and `total_len` must not exceed `cap` (a
+/// memory-DoS bound). [`Self::push`] returns `Some(payload)` once the whole
+/// frame is assembled, `None` while more chunks are needed.
+#[derive(Debug, Default)]
+pub struct FramedReassembler {
+    expected_total: Option<usize>,
+    assembled: Vec<u8>,
+}
+
+impl FramedReassembler {
+    pub fn push(&mut self, chunk: &[u8], cap: usize) -> Result<Option<Vec<u8>>, FramedChunkError> {
+        let chunk = FramedChunk::decode_ref(chunk)?;
+        let total_len = chunk.total_len as usize;
+        if total_len == 0 || total_len > cap {
+            return Err(FramedChunkError::TooLarge);
+        }
+        match self.expected_total {
+            Some(expected) if expected != total_len => {
+                return Err(FramedChunkError::InconsistentTotal);
+            }
+            None => {
+                self.expected_total = Some(total_len);
+                self.assembled.reserve(total_len);
+            }
+            _ => {}
+        }
+        if chunk.offset as usize != self.assembled.len() {
+            return Err(FramedChunkError::OutOfOrder);
+        }
+        self.assembled.extend_from_slice(chunk.bytes);
+        if self.assembled.len() == total_len {
+            return Ok(Some(std::mem::take(&mut self.assembled)));
+        }
+        if self.assembled.len() > total_len {
+            return Err(FramedChunkError::OutOfOrder);
+        }
+        Ok(None)
     }
 }
 
@@ -1328,6 +1506,75 @@ impl UdpDecline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_chunk_round_trips_through_reassembler() {
+        let payload: Vec<u8> = (0..1608u32).map(|i| (i % 251) as u8).collect();
+        for chunk_len in [256usize, 512, 1024, 1608, 2000] {
+            let chunks = FramedChunk::encode_all(&payload, chunk_len).unwrap();
+            let mut reassembler = FramedReassembler::default();
+            let mut assembled = None;
+            for chunk in &chunks {
+                if let Some(done) = reassembler.push(chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
+                    assembled = Some(done);
+                }
+            }
+            assert_eq!(assembled.unwrap(), payload, "chunk_len={chunk_len}");
+        }
+    }
+
+    #[test]
+    fn framed_chunk_count_varies_and_never_carries_whole_payload() {
+        // The anti-single-point property: a smaller chunk size yields more
+        // records, and no single chunk carries the entire payload (the former
+        // fixed ~1631/1632 first-record tell).
+        let payload = vec![0x5A_u8; 1608];
+        let few = FramedChunk::encode_all(&payload, 1024).unwrap();
+        let many = FramedChunk::encode_all(&payload, 256).unwrap();
+        assert!(few.len() >= 2);
+        assert!(many.len() > few.len());
+        for chunk in many.iter().chain(few.iter()) {
+            let decoded = FramedChunk::decode_ref(chunk).unwrap();
+            assert!(decoded.bytes.len() < payload.len());
+            assert_eq!(decoded.total_len as usize, payload.len());
+        }
+    }
+
+    #[test]
+    fn framed_reassembler_rejects_total_over_cap() {
+        let oversized =
+            FramedChunk::encode_borrowed(MAX_PQ_HANDSHAKE_FRAME as u32 + 1, 0, &[0_u8; 8]).unwrap();
+        let mut reassembler = FramedReassembler::default();
+        assert!(matches!(
+            reassembler.push(&oversized, MAX_PQ_HANDSHAKE_FRAME),
+            Err(FramedChunkError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn framed_reassembler_rejects_out_of_order_chunk() {
+        let payload = vec![7_u8; 300];
+        let chunks = FramedChunk::encode_all(&payload, 100).unwrap();
+        let mut reassembler = FramedReassembler::default();
+        assert!(reassembler
+            .push(&chunks[0], MAX_PQ_HANDSHAKE_FRAME)
+            .unwrap()
+            .is_none());
+        // Skipping chunk[1] (offset 100) and pushing chunk[2] (offset 200) must
+        // be rejected, not silently accepted into the wrong position.
+        assert!(matches!(
+            reassembler.push(&chunks[2], MAX_PQ_HANDSHAKE_FRAME),
+            Err(FramedChunkError::OutOfOrder)
+        ));
+    }
+
+    #[test]
+    fn framed_chunk_decode_rejects_bad_magic() {
+        assert!(matches!(
+            FramedChunk::decode_ref(b"PX1X"),
+            Err(FramedChunkError::BadMagic)
+        ));
+    }
 
     #[test]
     fn connect_request_round_trip() {

@@ -14,9 +14,10 @@ use crate::{
     },
     protocol::{
         command::{
-            ConnectRequest, ConnectRequestError, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
-            ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
-            ServerKeyExchange, ServerKeyExchangeError,
+            ConnectRequest, ConnectRequestError, FramedChunk, FramedChunkError, PqRekeyError,
+            PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError, ServerIdentityProof,
+            ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError,
+            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT, PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
         },
         data::{
             DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD,
@@ -42,6 +43,8 @@ pub enum ClientHandshakeError {
     Pq(#[from] PqError),
     #[error("PQ rekey command error: {0}")]
     PqCommand(#[from] PqRekeyError),
+    #[error("framed chunk command error: {0}")]
+    FramedChunk(#[from] FramedChunkError),
     #[error("server key exchange command error: {0}")]
     ServerKeyExchange(#[from] ServerKeyExchangeError),
     #[error("server identity proof command error: {0}")]
@@ -156,7 +159,17 @@ impl ClientDataSession {
         crate::process_hardening::protect_secret_bytes("pq_rekey.x25519_private", &x25519.private);
         crate::process_hardening::protect_secret_bytes("pq_rekey.mlkem_secret", &mlkem.secret);
         let request = PqRekeyRequest::encode_borrowed(&x25519.public, &mlkem.public)?;
-        let record = self.seal_to_server.seal(&request, rng)?;
+        // Split the rekey record across several variable-length data records so
+        // the first client->server app-data burst is not a fixed ~1631-byte
+        // single record (PAR-21). The chunk size is drawn per session; the server
+        // reassembles by FramedChunk length headers. Emitted as one buffer => one
+        // write => single flight, so the establish path adds no extra round-trip.
+        let chunk_len =
+            rng.gen_range(PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT..=PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT);
+        let mut record = Vec::new();
+        for chunk in FramedChunk::encode_all(&request, chunk_len)? {
+            self.seal_to_server.seal_into(&chunk, rng, &mut record)?;
+        }
         Ok((
             record,
             PendingPqRekey {
@@ -507,6 +520,75 @@ mod tests {
         assert_eq!(ConnectRequest::decode(&payload).unwrap(), request);
     }
 
+    // Test helper: reassemble a PQ handshake frame (PX1Q/PX1K) from a buffer of
+    // one or more concatenated sealed FramedChunk records, mirroring the
+    // production reassembly path (PAR-21).
+    fn open_framed_payload(codec: &mut DataRecordCodec, buf: &[u8]) -> Vec<u8> {
+        use crate::protocol::command::{FramedReassembler, MAX_PQ_HANDSHAKE_FRAME};
+        let mut reassembler = FramedReassembler::default();
+        let mut offset = 0;
+        while offset < buf.len() {
+            let payload_len = u16::from_be_bytes([buf[offset + 3], buf[offset + 4]]) as usize;
+            let end = offset + crate::tls::record::TLS_HEADER_LEN + payload_len;
+            let chunk = codec.open(&buf[offset..end]).unwrap();
+            if let Some(payload) = reassembler.push(&chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
+                return payload;
+            }
+            offset = end;
+        }
+        panic!("framed payload did not complete");
+    }
+
+    /// PAR-21 core property: the PQ rekey (PX1Q) record is no longer a single
+    /// fixed ~1631-byte record. It is split into >= 2 variable-length records
+    /// (no single record carries the whole frame), the record count varies
+    /// across sessions, and the server still reassembles it byte-for-byte.
+    #[test]
+    fn pq_rekey_record_is_split_into_variable_chunks() {
+        let keys = SessionKeys {
+            client_key: [9_u8; 32],
+            server_key: [8_u8; 32],
+            client_nonce: [7_u8; NONCE_LEN],
+            server_nonce: [6_u8; NONCE_LEN],
+            chain_secret: [5_u8; 32],
+            epoch: 0,
+            transcript_hash: [4_u8; 32],
+            x25519_shared_secret: [3_u8; 32],
+        };
+        let traffic = TrafficConfig::default();
+        let mut record_counts = std::collections::BTreeSet::new();
+        for seed in 0..32_u64 {
+            let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (record, _pending) = session.build_pq_rekey_record(&mut rng).unwrap();
+
+            // Walk the concatenated sealed records by their TLS length headers.
+            let mut offset = 0;
+            let mut count = 0;
+            while offset < record.len() {
+                let payload_len =
+                    u16::from_be_bytes([record[offset + 3], record[offset + 4]]) as usize;
+                offset += crate::tls::record::TLS_HEADER_LEN + payload_len;
+                count += 1;
+            }
+            assert_eq!(offset, record.len(), "records must tile the buffer exactly");
+            assert!(
+                count >= 2,
+                "rekey must split into >= 2 records, got {count}"
+            );
+            record_counts.insert(count);
+
+            // The server reassembles the exact original rekey request.
+            let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
+            let reassembled = open_framed_payload(&mut server_open, &record);
+            assert!(PqRekeyRequest::decode(&reassembled).is_ok());
+        }
+        assert!(
+            record_counts.len() >= 2,
+            "per-session chunk size must vary the record count across sessions, got {record_counts:?}"
+        );
+    }
+
     #[test]
     fn pq_rekey_changes_client_session_keys() {
         let keys = SessionKeys {
@@ -525,7 +607,8 @@ mod tests {
 
         let (record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
         let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
-        let request = PqRekeyRequest::decode(&server_open.open(&record).unwrap()).unwrap();
+        let request =
+            PqRekeyRequest::decode(&open_framed_payload(&mut server_open, &record)).unwrap();
         let server_x25519 = X25519KeyPair::generate();
         let x25519_shared =
             x25519_shared_secret(&server_x25519.private, &request.client_x25519_public);
@@ -583,7 +666,8 @@ mod tests {
 
         let (record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
         let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
-        let request = PqRekeyRequest::decode(&server_open.open(&record).unwrap()).unwrap();
+        let request =
+            PqRekeyRequest::decode(&open_framed_payload(&mut server_open, &record)).unwrap();
         let server_x25519 = X25519KeyPair::generate();
         let x25519_shared =
             x25519_shared_secret(&server_x25519.private, &request.client_x25519_public);

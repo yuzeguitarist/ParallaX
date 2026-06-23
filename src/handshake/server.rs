@@ -52,11 +52,12 @@ use crate::{
     },
     protocol::{
         command::{
-            ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind,
-            MuxFrameRef, MuxPayloadPool, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
-            ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
-            ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest,
-            SpeedTestRequestError,
+            ConnectRequest, ConnectRequestError, FramedChunk, FramedChunkError, FramedReassembler,
+            MuxFrame, MuxFrameError, MuxFrameKind, MuxFrameRef, MuxPayloadPool, PqRekeyError,
+            PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError, ServerIdentityProof,
+            ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck,
+            SpeedTestRequest, SpeedTestRequestError, MAX_PQ_HANDSHAKE_FRAME,
+            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT, PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
@@ -272,6 +273,8 @@ pub enum HandshakeServerError {
     MuxFrame(#[from] MuxFrameError),
     #[error("PQ rekey command error: {0}")]
     PqRekey(#[from] PqRekeyError),
+    #[error("framed chunk command error: {0}")]
+    FramedChunk(#[from] FramedChunkError),
     #[error("server key exchange command error: {0}")]
     ServerKeyExchange(#[from] ServerKeyExchangeError),
     #[error("PQ crypto error: {0}")]
@@ -1436,6 +1439,12 @@ async fn run_authenticated_data_mode(
     let mut client_camouflage_bytes_before_pq = 0usize;
     let mut fallback_records_before_pq = 0usize;
     let mut fallback_bytes_before_pq = 0usize;
+    // Reassembles the client's PQ rekey (PX1Q), now split across several
+    // variable-length FramedChunk records (PAR-21). On this direction no
+    // camouflage interleaves after the handshake — the client writes all chunks
+    // contiguously in one flight — so successive opened records accumulate here
+    // until the full rekey frame is recovered.
+    let mut pq_rekey_reassembler = FramedReassembler::default();
 
     tracing::info!(
         cid,
@@ -1490,7 +1499,17 @@ async fn run_authenticated_data_mode(
                 );
 
                 match client_open.open(&client_record) {
-                    Ok(first_payload) => {
+                    Ok(chunk_payload) => {
+                        // Accumulate PX1Q chunks; proceed only once the whole
+                        // rekey frame is reassembled. Incomplete => wait for the
+                        // next chunk (still bounded by pre_pq_deadline, which is
+                        // not reset by incoming records).
+                        let first_payload = match pq_rekey_reassembler
+                            .push(&chunk_payload, MAX_PQ_HANDSHAKE_FRAME)?
+                        {
+                            Some(payload) => payload,
+                            None => continue,
+                        };
                         let pq_rekey = PqRekeyRequest::decode_ref(first_payload.as_slice())?;
                         let client_x25519_public = pq_rekey.client_x25519_public;
                         let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
@@ -1550,8 +1569,16 @@ async fn run_authenticated_data_mode(
                             &*pq_shared_secret,
                         );
                         let mut rng = StdRng::from_entropy();
-                        let key_exchange_record =
-                            server_seal.seal(&key_exchange_payload, &mut rng)?;
+                        // Split the key-exchange (PX1K) record across several
+                        // variable-length chunks for the same reason as the client
+                        // PX1Q split (PAR-21): no fixed ~1632-byte single record.
+                        // Sealed into one buffer => one write => single flight.
+                        let kx_chunk_len = rng
+                            .gen_range(PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT..=PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT);
+                        let mut key_exchange_record = Vec::new();
+                        for chunk in FramedChunk::encode_all(&key_exchange_payload, kx_chunk_len)? {
+                            server_seal.seal_into(&chunk, &mut rng, &mut key_exchange_record)?;
+                        }
                         log_outer_write(
                             cid,
                             "server->client",
@@ -6363,10 +6390,16 @@ mod tests {
         let mut data_session = ClientDataSession::new(session_keys, traffic).unwrap();
         let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut rng).unwrap();
         client.write_all(&pq_record).await.unwrap();
-        let key_exchange_record = read_record(&mut client).await.unwrap();
-        data_session
-            .apply_server_key_exchange_record(&key_exchange_record, &pending_rekey, PSK)
-            .unwrap();
+        // Drive the real client receive path: skips residual camouflage and
+        // reassembles the server's chunked PX1K (PAR-21), against the real server.
+        crate::client::runtime::apply_server_key_exchange_after_residuals(
+            &mut client,
+            &mut data_session,
+            &pending_rekey,
+            PSK,
+        )
+        .await
+        .unwrap();
         let mut identity_payload = Vec::new();
         loop {
             let identity_record = read_record(&mut client).await.unwrap();
