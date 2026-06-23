@@ -2832,12 +2832,20 @@ mod tests {
     // ---- shard 6/8: EncryptedExtensions / Certificate / verify path ----
 
     fn u8_len_prefixed(data: &[u8]) -> Vec<u8> {
+        assert!(
+            u8::try_from(data.len()).is_ok(),
+            "u8 length prefix overflow"
+        );
         let mut out = vec![data.len() as u8];
         out.extend_from_slice(data);
         out
     }
 
     fn u16_len_prefixed(data: &[u8]) -> Vec<u8> {
+        assert!(
+            u16::try_from(data.len()).is_ok(),
+            "u16 length prefix overflow"
+        );
         let mut out = (data.len() as u16).to_be_bytes().to_vec();
         out.extend_from_slice(data);
         out
