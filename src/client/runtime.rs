@@ -5073,4 +5073,110 @@ mod tests {
             .unwrap(),
         )
     }
+
+    /// Drives the REAL `run_client_udp_probe` (the production client probe function,
+    /// including its process-wide ticket cache and the resumption branch) over
+    /// loopback against a real 0-RTT server: the FIRST call is cold (the cache is
+    /// empty) and deposits a ticket; the SECOND call picks that ticket up and resumes
+    /// with 0-RTT, which the server ACCEPTS. This is the most faithful reproduction
+    /// of the runtime 0-RTT path short of the full TCP/SOCKS control wrapper (which
+    /// is orthogonal to 0-RTT). No other test calls `run_client_udp_probe`, so the
+    /// process-wide ticket slot is exercised in isolation here.
+    #[tokio::test]
+    async fn run_client_udp_probe_resumes_with_0rtt_on_the_second_session() {
+        use crate::crypto::replay::ReplayCache;
+        use crate::protocol::command::UdpOffer;
+        use crate::tls::quic::derive_stek;
+        use crate::transport::udp::endpoint::bind_server_endpoint_0rtt;
+        use crate::transport::udp::h3::{open_h3_control_stream, open_h3_encoder_stream};
+        use crate::transport::udp::probe::{serve_probe_over_bidi, ProbeOutcome};
+        use crate::transport::udp::quic::endpoint::Endpoint;
+        use crate::transport::udp::zero_rtt::ReplayCacheGuard;
+
+        const PSK: &[u8] = b"run-client-udp-probe-0rtt-test-ps";
+        let sni = "localhost";
+        let timeout = Duration::from_secs(5);
+
+        // Real 0-RTT server endpoint (production builder).
+        let guard = Arc::new(ReplayCacheGuard::new(
+            ReplayCache::new(64).with_window_secs(604_800),
+        ));
+        let server = bind_server_endpoint_0rtt(
+            "127.0.0.1:0".parse().unwrap(),
+            sni,
+            derive_stek(&[0x71; 32]),
+            guard,
+        )
+        .await
+        .unwrap();
+        let udp_port = server.local_addr().unwrap().port();
+        let offer = UdpOffer {
+            offer_id: [0x42; 16],
+            udp_port,
+            port_hop_seed: 0,
+            cc: 0,
+            fec_profile: 0,
+            ignore_client_bandwidth: false,
+        };
+
+        // A throwaway loopback TCP connection so `run_client_udp_probe` can read the
+        // server IP (127.0.0.1) off `peer_addr()`; it reuses `offer.udp_port`. The
+        // listener accepts in a loop so both sessions' connects succeed.
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let _tcp_accept = tokio::spawn(async move { while tcp_listener.accept().await.is_ok() {} });
+
+        // Server mirror of `accept_probed_quic_from_peer`: accept, open the control
+        // stream (Safari-26 SETTINGS the client verifies), serve one bidi probe, open
+        // the encoder. Returns whether it accepted 0-RTT plus the held streams (kept
+        // alive by `join!` until the client finishes reading).
+        async fn serve_one(server: &Endpoint, psk: &[u8], offer_id: &[u8]) -> (bool, impl Send) {
+            let conn = server.accept().await.expect("server accepts");
+            let control = open_h3_control_stream(&conn).await.expect("server control");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("server accept_bi");
+            serve_probe_over_bidi(&conn, &mut send, &mut recv, psk, offer_id)
+                .await
+                .expect("server serve_probe_over_bidi");
+            let encoder = open_h3_encoder_stream(&conn).await.ok();
+            let accepted = conn.zero_rtt_keys_installed();
+            (accepted, (conn, send, recv, control, encoder))
+        }
+
+        // Session 1: cold (empty cache) -> Verified, deposits a ticket.
+        let tcp1 = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
+        let ((accepted1, held1), probe1) = tokio::join!(
+            serve_one(&server, PSK, &offer.offer_id),
+            run_client_udp_probe(&tcp1, &offer, PSK, sni, timeout),
+        );
+        assert!(
+            matches!(probe1.outcome, ProbeOutcome::Verified { .. }),
+            "cold probe must Verify, got {:?}",
+            probe1.outcome
+        );
+        assert!(
+            !accepted1,
+            "cold session offers no ticket, so the server must NOT accept 0-RTT"
+        );
+        // Close both ends of session 1 before session 2 (fresh connections).
+        drop(held1);
+        drop(probe1);
+
+        // Session 2: the cached ticket drives a 0-RTT resumption the server ACCEPTS.
+        let tcp2 = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
+        let ((accepted2, held2), probe2) = tokio::join!(
+            serve_one(&server, PSK, &offer.offer_id),
+            run_client_udp_probe(&tcp2, &offer, PSK, sni, timeout),
+        );
+        assert!(
+            matches!(probe2.outcome, ProbeOutcome::Verified { .. }),
+            "resumed probe must Verify, got {:?}",
+            probe2.outcome
+        );
+        assert!(
+            accepted2,
+            "second session must resume via the cached ticket and the server ACCEPTS 0-RTT"
+        );
+        drop(held2);
+        drop(probe2);
+    }
 }
