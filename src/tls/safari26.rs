@@ -2828,4 +2828,234 @@ mod tests {
             .unwrap();
         assert_eq!(buf.len(), 4); // header retained, nothing drained
     }
+
+    // ---- shard 6/8: EncryptedExtensions / Certificate / verify path ----
+
+    fn u8_len_prefixed(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![data.len() as u8];
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn u16_len_prefixed(data: &[u8]) -> Vec<u8> {
+        let mut out = (data.len() as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn u24_len_prefixed(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u24(&mut out, data.len()).unwrap();
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// `ProtocolNameList`: a u16-length-prefixed list of u8-length-prefixed names.
+    fn alpn_selection(proto: &[u8]) -> Vec<u8> {
+        u16_len_prefixed(&u8_len_prefixed(proto))
+    }
+
+    #[test]
+    fn parse_selected_alpn_returns_the_negotiated_protocol() {
+        // A concrete protocol name must be returned verbatim, which kills the
+        // `-> Ok(Vec::leak(empty/[0]/[1]))` body mutants.
+        let data = alpn_selection(b"h2");
+        assert_eq!(parse_selected_alpn(&data).unwrap(), b"h2");
+    }
+
+    #[test]
+    fn parse_encrypted_extensions_records_the_negotiated_alpn() {
+        // One ALPN extension carrying "h2". The original parses it and stores the
+        // protocol; the `-> Ok(())` body mutant, the `ext_type == EXT_ALPN`->`!=`
+        // mutant, and every `e.remaining() > 0` loop-guard mutant either skip the
+        // store (alpn stays None) or run the cursor off the end (Err) — both fail
+        // the assertion below.
+        let mut ext = EXT_ALPN.to_be_bytes().to_vec();
+        ext.extend_from_slice(&u16_len_prefixed(&alpn_selection(b"h2")));
+        let body = u16_len_prefixed(&ext);
+
+        let mut keys = app_keys();
+        parse_encrypted_extensions(&body, &mut keys).unwrap();
+        assert_eq!(keys.negotiated_alpn.as_deref(), Some(b"h2".as_slice()));
+    }
+
+    fn certificate_entry(cert: &[u8]) -> Vec<u8> {
+        let mut entry = u24_len_prefixed(cert);
+        entry.extend_from_slice(&u16_len_prefixed(&[])); // empty cert extensions
+        entry
+    }
+
+    fn certificate_body(certs: &[&[u8]]) -> Vec<u8> {
+        let mut list = Vec::new();
+        for cert in certs {
+            list.extend_from_slice(&certificate_entry(cert));
+        }
+        let mut body = u8_len_prefixed(&[]); // empty certificate_request_context
+        body.extend_from_slice(&u24_len_prefixed(&list));
+        body
+    }
+
+    #[test]
+    fn parse_certificate_body_returns_each_certificate_in_order() {
+        // Two distinct certs pin the `-> Ok(vec![...])` body mutants (none of the
+        // constant replacements equal this list) and force the
+        // `l.remaining() > 0` loop to iterate exactly twice, killing the
+        // ==/</>= guard mutants (which would read zero certs or run off the end).
+        let body = certificate_body(&[&[0xAA, 0xBB], &[0xCC]]);
+        let certs = parse_certificate_body(&body).unwrap();
+        assert_eq!(certs, vec![vec![0xAA, 0xBB], vec![0xCC]]);
+    }
+
+    #[test]
+    fn parse_compressed_certificate_body_accepts_a_chain_exactly_at_the_cap() {
+        // Build a valid certificate body whose total length is EXACTLY
+        // MAX_DECOMPRESSED_CERT_CHAIN and declare that same length. The original's
+        // bounds are strict `>`, so a chain sitting on the boundary is accepted;
+        // the `>`->`>=` mutants at the declared-length (1499) and inflated-length
+        // (1513) guards would wrongly reject it, and the `!=`->`==` length-match
+        // mutant (1518) would reject the matching lengths.
+        let max = MAX_DECOMPRESSED_CERT_CHAIN;
+        let cert = vec![0_u8; max - 9];
+        let plaintext = certificate_body(&[&cert]);
+        assert_eq!(plaintext.len(), max); // exactly on the boundary
+
+        let body = build_compressed_cert_body(max, &plaintext);
+        let certs = parse_compressed_certificate_body(&body).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].len(), max - 9);
+    }
+
+    fn finished_message(verify_data: &[u8]) -> Vec<u8> {
+        let mut msg = vec![HANDSHAKE_FINISHED];
+        push_u24(&mut msg, verify_data.len()).unwrap();
+        msg.extend_from_slice(verify_data);
+        msg
+    }
+
+    fn authenticated_flight() -> ServerFlight {
+        ServerFlight {
+            encrypted_extensions_seen: true,
+            certificates: vec![vec![1]],
+            certificate_verify_seen: true,
+            finished: false,
+        }
+    }
+
+    #[test]
+    fn process_handshake_rejects_finished_before_encrypted_extensions() {
+        // Only `encrypted_extensions_seen` is missing. The original's
+        // `!encrypted_extensions_seen` term makes the guard fire; deleting that
+        // `!` (mutant 1421) lets the Finished through to the verify_data check,
+        // which then reports a *different* error — so the message assertion fails.
+        let mut buf = finished_message(&[0_u8; 32]);
+        let mut flight = ServerFlight {
+            encrypted_extensions_seen: false,
+            ..authenticated_flight()
+        };
+        let mut transcript = HandshakeTranscript::new();
+        let mut keys = app_keys();
+        let err =
+            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Handshake(ref m) if m.contains("before the authenticated flight")
+        ));
+    }
+
+    #[test]
+    fn process_handshake_rejects_finished_before_certificate_verify() {
+        // Symmetric to the test above, isolating the `!certificate_verify_seen`
+        // term so deleting its `!` (mutant 1423) is observable.
+        let mut buf = finished_message(&[0_u8; 32]);
+        let mut flight = ServerFlight {
+            certificate_verify_seen: false,
+            ..authenticated_flight()
+        };
+        let mut transcript = HandshakeTranscript::new();
+        let mut keys = app_keys();
+        let err =
+            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Handshake(ref m) if m.contains("before the authenticated flight")
+        ));
+    }
+
+    #[test]
+    fn process_handshake_accepts_finished_with_correct_verify_data() {
+        // A fully authenticated flight plus the *correct* server verify_data must
+        // be accepted. The `body != expected`->`==` mutant (1430) would reject
+        // matching data, so `.unwrap()` would panic.
+        let mut flight = authenticated_flight();
+        let mut transcript = HandshakeTranscript::new();
+        transcript.push(&[HANDSHAKE_ENCRYPTED_EXTENSIONS, 0, 0, 0]);
+        let mut keys = app_keys();
+        let expected = keys.server_finished_verify_data(&transcript).unwrap();
+        let mut buf = finished_message(&expected);
+
+        process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+            .unwrap();
+        assert!(flight.finished);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn process_handshake_rejects_finished_with_wrong_verify_data() {
+        // The other direction of the `!=` comparison: bogus verify_data must be
+        // rejected. The `==` mutant (1430) would accept it and mark the flight
+        // finished.
+        let mut flight = authenticated_flight();
+        let mut transcript = HandshakeTranscript::new();
+        let mut keys = app_keys();
+        let mut buf = finished_message(&[0xAB; 32]);
+
+        let err =
+            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Handshake(ref m) if m.contains("verify_data mismatch")
+        ));
+        assert!(!flight.finished);
+    }
+
+    #[test]
+    fn verify_certificate_verify_requires_a_leaf_certificate() {
+        // With no certificate in the flight the function must error out before any
+        // signature work. The whole-body `-> Ok(())` mutant (1532) would silently
+        // accept an unauthenticated flight.
+        let flight = ServerFlight::default();
+        let transcript = HandshakeTranscript::new();
+        let keys = app_keys();
+        let err = verify_certificate_verify(&[], &flight, &transcript, &keys).unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Handshake(ref m) if m.contains("missing server certificate")
+        ));
+    }
+
+    #[test]
+    fn certificate_verify_algorithm_maps_every_supported_scheme() {
+        // Each registered signature scheme must resolve to a verification
+        // algorithm; an unknown scheme must not. Deleting any match arm
+        // (mutants 1557–1564) drops that scheme to the `_ => Err` fallback.
+        for scheme in [
+            SIG_ECDSA_SECP256R1_SHA256,
+            SIG_RSA_PSS_RSAE_SHA256,
+            SIG_RSA_PKCS1_SHA256,
+            SIG_ECDSA_SECP384R1_SHA384,
+            SIG_RSA_PSS_RSAE_SHA384,
+            SIG_RSA_PKCS1_SHA384,
+            SIG_RSA_PSS_RSAE_SHA512,
+            SIG_RSA_PKCS1_SHA512,
+        ] {
+            assert!(
+                certificate_verify_algorithm(scheme).is_ok(),
+                "scheme {scheme:#06x} must be supported"
+            );
+        }
+        assert!(certificate_verify_algorithm(0x0000).is_err());
+    }
 }
