@@ -149,6 +149,8 @@ pub struct Config {
     pub traffic: TrafficConfig,
     #[serde(default)]
     pub udp: UdpConfig,
+    #[serde(default)]
+    pub transport: TransportConfig,
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
 }
@@ -531,6 +533,32 @@ impl Default for TrafficConfig {
             max_concurrent_streams: default_max_concurrent_streams(),
         }
     }
+}
+
+/// Transport-layer tuning shared by client and server (the `[transport]` config
+/// section). Every field is wire-invisible kernel/relay tuning — none change an
+/// observable handshake or record byte — so they are safe to adjust for
+/// throughput without touching the camouflage fingerprint.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TransportConfig {
+    /// Explicit SO_SNDBUF for relay sockets, in bytes. `None`/`0` keeps kernel
+    /// autotuning (the safe default). Setting it DISABLES send-buffer autotuning
+    /// for the socket and is clamped by the OS maximum (`net.core.wmem_max` on
+    /// Linux, `kern.ipc.maxsockbuf` on macOS), so only raise it once that maximum
+    /// has been raised — otherwise the kernel may clamp BELOW what autotuning would
+    /// have reached (a logged warning surfaces such a clamp). Sized to the path
+    /// bandwidth-delay product, this lifts the client→server upload window on
+    /// high-RTT links where autotuning under-provisions it.
+    #[serde(default)]
+    pub tcp_send_buffer_bytes: Option<u32>,
+    /// Explicit SO_RCVBUF for relay sockets, in bytes. `None`/`0` keeps kernel
+    /// autotuning. Same clamp/maximum caveat as `tcp_send_buffer_bytes`
+    /// (`net.core.rmem_max` / `kern.ipc.maxsockbuf`). On the server this is the
+    /// upload SINK window; sizing it to the BDP is the main covert-safe lever for
+    /// asymmetric (slow-upload) high-RTT links.
+    #[serde(default)]
+    pub tcp_recv_buffer_bytes: Option<u32>,
 }
 
 /// User-space congestion controller for the UDP fast plane.

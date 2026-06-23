@@ -91,6 +91,15 @@ const MUX_FRAME_BATCH_LIMIT: usize = 64;
 /// Cap on the ciphertext bytes batched per mux read before opening, bounding
 /// scratch memory while leaving enough records for the crypto pool to fan out.
 const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
+/// How often the mux warm-keeper re-checks the shared tunnel's health.
+const MUX_WARM_KEEPER_INTERVAL: Duration = Duration::from_secs(5);
+/// The warm-keeper proactively rebuilds a DEAD shared mux tunnel only if a real
+/// local connection was served within this window. So an actively-used client
+/// always finds a warm tunnel (resilient to a mid-session RST/blackhole), while a
+/// genuinely idle client lets the tunnel idle out and does NOT re-handshake on a
+/// 24/7 timer — matching a browser that reconnects on use and idles otherwise
+/// (keeping the warm pool from becoming an always-on behavioral tell).
+const MUX_WARM_KEEPER_ACTIVE_WINDOW: Duration = Duration::from_secs(90);
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -151,6 +160,13 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             );
         }
     }
+
+    // Process-wide socket-buffer sizing (wire-invisible kernel tuning), installed
+    // before any relay socket is created. First call wins (run() is one-per-process).
+    crate::transport::tcp::configure_socket_buffers(
+        config.transport.tcp_send_buffer_bytes,
+        config.transport.tcp_recv_buffer_bytes,
+    );
 
     let client = config
         .client
@@ -604,6 +620,10 @@ enum MuxState {
 #[derive(Clone)]
 struct ClientMuxPool {
     inner: Arc<Mutex<MuxState>>,
+    /// Monotonic ms of the last real connection served by `handle()`. The warm-
+    /// keeper consults it to refill a dead tunnel only during active-use windows
+    /// (so an idle client never re-handshakes on a 24/7 timer).
+    last_activity: Arc<AtomicU64>,
     config: Arc<ClientConfig>,
     server_addr: ServerAddrResolver,
     traffic: TrafficConfig,
@@ -681,6 +701,7 @@ impl ClientMuxPool {
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MuxState::Idle)),
+            last_activity: Arc::new(AtomicU64::new(relay_now_millis())),
             config,
             server_addr,
             traffic,
@@ -692,7 +713,15 @@ impl ClientMuxPool {
         }
     }
 
+    /// Records activity (so the warm-keeper keeps a tunnel ready during active
+    /// use), then returns a reusable mux session, building one if needed.
     async fn handle(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
+        self.last_activity
+            .store(relay_now_millis(), Ordering::Relaxed);
+        self.get_or_build().await
+    }
+
+    async fn get_or_build(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
         loop {
             let mut state = self.inner.lock().await;
             // Decide an action without awaiting under the lock. The match yields an
@@ -782,10 +811,35 @@ impl ClientMuxPool {
     }
 
     fn ensure_started(&self) {
-        let mux_pool = self.clone();
+        let pool = self.clone();
         tokio::spawn(async move {
-            if let Err(err) = mux_pool.handle().await {
+            // Initial warm at startup.
+            if let Err(err) = pool.get_or_build().await {
                 tracing::debug!(error = %err, "client mux warm session startup failed");
+            }
+            // Warm-keeper: during active-use windows, proactively rebuild a dead
+            // shared tunnel so the next local connection finds it warm (resilience
+            // to a mid-session RST/blackhole). Outside the active window, let it
+            // idle out — no 24/7 re-handshake churn. Uses get_or_build (not handle)
+            // so the keeper never bumps last_activity and thus never perpetuates
+            // itself past genuine idle.
+            loop {
+                sleep(MUX_WARM_KEEPER_INTERVAL).await;
+                let alive = {
+                    let state = pool.inner.lock().await;
+                    matches!(&*state, MuxState::Ready(handle) if handle.is_reusable())
+                };
+                if alive {
+                    continue;
+                }
+                let idle_ms =
+                    relay_now_millis().saturating_sub(pool.last_activity.load(Ordering::Relaxed));
+                if idle_ms > MUX_WARM_KEEPER_ACTIVE_WINDOW.as_millis() as u64 {
+                    continue;
+                }
+                if let Err(err) = pool.get_or_build().await {
+                    tracing::debug!(error = %err, "client mux warm refill failed");
+                }
             }
         });
     }

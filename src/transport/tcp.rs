@@ -186,6 +186,7 @@ fn tuned_tcp_socket(addr: SocketAddr) -> io::Result<TcpSocket> {
     };
     socket.set_nodelay(true)?;
     socket.set_keepalive(true)?;
+    set_socket_buffers(&socket);
     tune_tcp_socket_before_connect(&socket);
     Ok(socket)
 }
@@ -193,6 +194,7 @@ fn tuned_tcp_socket(addr: SocketAddr) -> io::Result<TcpSocket> {
 pub fn tune_tcp_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     set_low_latency_congestion(stream);
+    set_socket_buffers(stream);
     set_notsent_lowat(stream);
     set_busy_poll(stream);
     set_incoming_cpu(stream);
@@ -343,6 +345,89 @@ pub fn configure_congestion_control(algorithm: Option<&str>) {
         tracing::debug!("congestion control override already set; keeping the first value");
     }
 }
+
+/// Process-wide explicit TCP socket buffer sizes, set once at startup. Either
+/// field `None` keeps kernel autotuning for that direction (the safe default).
+/// An explicit SO_SNDBUF/SO_RCVBUF DISABLES autotuning for the socket and is
+/// clamped by the OS maximum (`net.core.{w,r}mem_max` on Linux,
+/// `kern.ipc.maxsockbuf` on macOS), so only set these when that maximum has been
+/// raised. Wire-invisible (window scaling is negotiated regardless); a kernel-side
+/// throughput tuning for high-BDP links where autotuning under-provisions the
+/// upload window.
+static SOCKET_BUFFER_OVERRIDE: std::sync::OnceLock<SocketBuffers> = std::sync::OnceLock::new();
+
+#[derive(Clone, Copy, Default)]
+struct SocketBuffers {
+    send: Option<u32>,
+    recv: Option<u32>,
+}
+
+/// Sets the explicit SO_SNDBUF/SO_RCVBUF requested on relay sockets, process
+/// wide. Call once at startup before any socket is tuned. A `Some(0)` is treated
+/// as `None` (keep autotuning). First call wins.
+pub fn configure_socket_buffers(send_bytes: Option<u32>, recv_bytes: Option<u32>) {
+    let bufs = SocketBuffers {
+        send: send_bytes.filter(|&b| b > 0),
+        recv: recv_bytes.filter(|&b| b > 0),
+    };
+    if SOCKET_BUFFER_OVERRIDE.set(bufs).is_err() {
+        tracing::debug!("socket buffer override already set; keeping the first value");
+    }
+}
+
+#[cfg(unix)]
+fn set_socket_buffers<S>(socket: &S)
+where
+    S: std::os::fd::AsFd,
+{
+    use socket2::SockRef;
+
+    let Some(bufs) = SOCKET_BUFFER_OVERRIDE.get() else {
+        return;
+    };
+    if bufs.send.is_none() && bufs.recv.is_none() {
+        return;
+    }
+    let sock = SockRef::from(socket);
+    // Best-effort, with a getsockopt read-back: the kernel silently clamps to the
+    // OS max, and a clamp BELOW the request means autotuning would likely have done
+    // better, so surface it (the same diagnostic shape as the congestion read-back).
+    if let Some(send) = bufs.send {
+        match sock.set_send_buffer_size(send as usize) {
+            Ok(()) => {
+                if let Ok(applied) = sock.send_buffer_size() {
+                    if applied < send as usize {
+                        tracing::warn!(
+                            requested = send,
+                            applied,
+                            "kernel clamped SO_SNDBUF (raise net.core.wmem_max / kern.ipc.maxsockbuf)"
+                        );
+                    }
+                }
+            }
+            Err(_) => tracing::trace!("SO_SNDBUF request failed; keeping kernel default"),
+        }
+    }
+    if let Some(recv) = bufs.recv {
+        match sock.set_recv_buffer_size(recv as usize) {
+            Ok(()) => {
+                if let Ok(applied) = sock.recv_buffer_size() {
+                    if applied < recv as usize {
+                        tracing::warn!(
+                            requested = recv,
+                            applied,
+                            "kernel clamped SO_RCVBUF (raise net.core.rmem_max / kern.ipc.maxsockbuf)"
+                        );
+                    }
+                }
+            }
+            Err(_) => tracing::trace!("SO_RCVBUF request failed; keeping kernel default"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn set_socket_buffers<S>(_socket: &S) {}
 
 #[cfg(target_os = "linux")]
 fn set_low_latency_congestion(stream: &TcpStream) {

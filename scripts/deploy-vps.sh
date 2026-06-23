@@ -1156,6 +1156,8 @@ $sudo_prefix install -d -m 0755 /etc/modules-load.d /etc/sysctl.d
 printf '%s\n' tcp_bbr | $sudo_prefix tee /etc/modules-load.d/parallax-bbr.conf >/dev/null
 cat <<'PARALLAX_BBR_SYSCTL' | $sudo_prefix tee /etc/sysctl.d/99-parallax-bbr.conf >/dev/null
 net.core.default_qdisc=fq
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_rmem=4096 87380 67108864
 net.ipv4.tcp_wmem=4096 65536 67108864

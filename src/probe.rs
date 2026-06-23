@@ -670,6 +670,7 @@ mod tests {
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
+            transport: Default::default(),
             client: Some(ClientConfig {
                 listen: "127.0.0.1:1080".parse().unwrap(),
                 server_addr: "example.com:443".to_owned(),
@@ -689,6 +690,7 @@ mod tests {
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
+            transport: Default::default(),
             client: None,
             server: Some(ServerConfig {
                 listen: "127.0.0.1:8443".parse().unwrap(),

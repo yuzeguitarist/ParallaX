@@ -988,6 +988,7 @@ mod tests {
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
+            transport: Default::default(),
             client: None,
             server: Some(ServerConfig {
                 listen: "127.0.0.1:8443".parse::<SocketAddr>().unwrap(),
@@ -1021,6 +1022,7 @@ mod tests {
             },
             traffic: TrafficConfig::default(),
             udp: UdpConfig::default(),
+            transport: Default::default(),
             client: None,
             server: None,
         }
