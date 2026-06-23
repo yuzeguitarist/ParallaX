@@ -38,8 +38,12 @@ plx client -c target/parallax-deploy/<host>/parallax.client.toml
 curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 ```
 
-`plx init` writes `parallax.server.toml` and `parallax.client.toml` with mode
-`0600` on Unix and refuses to overwrite either file.
+By default `plx init` writes `parallax.server.toml` and `parallax.client.toml`
+plus their `parallax.server.secrets.toml` / `parallax.client.secrets.toml` 0600
+sidecar files, so the secrets stay out of the config files and a leaked config
+alone is not a credential. Pass `--inline-secrets` to write the legacy
+all-in-one configs instead. All files are created with mode `0600` on Unix and
+`init` refuses to overwrite existing files.
 
 ## Command summary
 
@@ -55,7 +59,8 @@ curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 | `plx bench [--quick] [--json]` | Run the fixed CPU benchmark suite. | `--quick` is a smoke profile, not a custom benchmark knob. |
 | `plx config-template ...` | Print paired server/client TOML templates to stdout. | Advanced mode; no file writes. |
 | `plx probe [DEST] [-c FILE]` | Probe an explicit or config-derived camouflage target. | Accepts `domain`, `domain:port`, or `https://domain`. |
-| `plx init <DEST> ...` | Generate paired config files with fresh key material. | Use `-o DIR` to choose the output directory. |
+| `plx init <DEST> ...` | Generate paired config files with fresh key material. | Secrets go into 0600 sidecar files by default; `--inline-secrets` writes the legacy all-in-one config. Use `-o DIR` to choose the output directory. |
+| `plx seal [-c FILE] [--output BUNDLE] [--host-key PATH]` | Encrypt a config's secrets into a machine-bound sealed bundle and rewrite the config to reference it. | Default bundle `<config-dir>/parallax.secrets.enc`; config + bundle are useless on any other machine. |
 
 There is no `--quic` CLI flag; the experimental UDP/QUIC fast plane is enabled via `[udp].enabled` in config, not the CLI.
 
@@ -69,6 +74,7 @@ plx init <DEST>
   --server-listen <ADDR:PORT>    server bind address, default 0.0.0.0:443
   --client-listen <ADDR:PORT>    local SOCKS address, default 127.0.0.1:1080
   -o, --output <DIR>             output directory, default .
+  --inline-secrets               write secrets inline (legacy) instead of 0600 sidecars
 ```
 
 ### `plx probe`

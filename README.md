@@ -58,7 +58,7 @@ enabling it is for experimentation, not censorship-resistant production use.
 
 | Area | Current behavior | Main code |
 |---|---|---|
-| CLI and config | `check`, `keygen`, `crypto-self-test`, `serve`, `client`, `speed`, `netmatrix`, `bench`, `config-template`, `probe`, `init`; TOML config with secret-permission checks. | `src/cli.rs`, `src/config.rs` |
+| CLI and config | `check`, `keygen`, `crypto-self-test`, `serve`, `client`, `speed`, `netmatrix`, `bench`, `config-template`, `probe`, `init`, `seal`; TOML config with secret-permission checks. | `src/cli.rs`, `src/config.rs` |
 | Client runtime | Loopback-only SOCKS5 listener, authenticated server connection, PQ rekey, ML-DSA identity verification, bidirectional relay. | `src/client/runtime.rs`, `src/client/socks.rs` |
 | Server runtime | First-record classification, authorized-SNI check, fallback passthrough, authenticated data relay, fixed `server.data_target` support. | `src/handshake/server.rs` |
 | TLS camouflage | Handwritten Safari 26 TLS 1.3 client state machine with Safari cipher/group/extension ordering, GREASE, ALPN, ClientHello authentication fields, certificate verification, and HTTP/2 preface support. | `src/tls/safari26.rs`, `src/tls/client_hello.rs`, `src/fingerprint/http2.rs` |
