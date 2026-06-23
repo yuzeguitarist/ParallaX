@@ -26,6 +26,10 @@ pub mod probe;
 /// in the module marks that staged, not-yet-referenced status.
 pub(crate) mod quic;
 pub(crate) mod reorder;
+/// Stable-:443 origin-splice QUIC carrier: a process-wide shared endpoint that
+/// marker-terminates authenticated ParallaX clients, splices every other Initial to
+/// the real origin, and routes accepted connections back to their session by DCID.
+pub(crate) mod stable;
 /// Persistent single-use 0-RTT anti-replay guard (backs `tls::quic::ZeroRttGuard`).
 pub(crate) mod zero_rtt;
 
@@ -90,6 +94,7 @@ pub mod fuzz {
     }
 }
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -165,6 +170,32 @@ pub fn server_config_0rtt(
         origin_udp_addr: None,
         // Marker fork dormant until the server runtime supplies the key.
         marker_key: None,
+    }))
+}
+
+/// Build a server config for the **stable-:443 origin-splice carrier**: the marker
+/// fork and origin fallback are LIVE. Every v1 Initial whose ClientHello.random is
+/// not a valid + fresh + non-replayed auth marker is spliced verbatim to
+/// `origin_udp_addr` (the resolved camouflage origin's UDP :443), so an active
+/// prober reaches the TRUE origin and ParallaX emits nothing of its own; only a
+/// marked client terminates locally. `marker_key` is `(psk, server static X25519
+/// private)` and `stek`/`guard` enable 0-RTT resumption as in [`server_config_0rtt`].
+pub fn server_config_stable(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    stek: Option<Zeroizing<[u8; 32]>>,
+    guard: Option<Arc<dyn ZeroRttGuard>>,
+    marker_key: (Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>),
+    origin_udp_addr: SocketAddr,
+) -> Result<Arc<quic::endpoint::ServerConfig>, UdpTransportError> {
+    Ok(Arc::new(quic::endpoint::ServerConfig {
+        cert_chain: vec![cert.as_ref().to_vec()],
+        signing_key_pkcs8: key.secret_der().to_vec(),
+        alpn_protocols: vec![UDP_ALPN.to_vec()],
+        stek,
+        replay_guard: guard,
+        origin_udp_addr: Some(origin_udp_addr),
+        marker_key: Some(marker_key),
     }))
 }
 
