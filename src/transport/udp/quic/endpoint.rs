@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
@@ -30,6 +30,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::conn::{CloseReason, Connection as Core};
 use super::packet::{first_packet_space, ConnectionId, PacketSpace};
+use super::splice::SpliceFlow;
 use crate::tls::quic::{ClientConfig, ClientTicket, QuicTlsError, ZeroRttGuard, QUIC_VERSION_V1};
 use zeroize::Zeroizing;
 
@@ -46,6 +47,16 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 /// a cap an off-path attacker spraying spoofed Initials could allocate connection
 /// state without bound. (Finer-grained per-address Retry validation is future work.)
 const MAX_SERVER_CONNS: usize = 1 << 16;
+
+/// Hard cap on concurrently-spliced flows (the QUIC origin-fallback relay). A DoS
+/// backstop: spoofed sources could otherwise drive unbounded upstream sockets at the
+/// origin. Past the cap, new probe flows are dropped — degrading like a real origin
+/// shedding under a UDP flood, never amplifying (the relay is 1:1).
+const MAX_SPLICE_FLOWS: usize = 1 << 12;
+
+/// Idle lifetime of a spliced flow. A flow with no client→origin datagram for this
+/// long is reaped (its pump task aborted), bounding state to active relays.
+const SPLICE_IDLE: Duration = Duration::from_secs(30);
 
 /// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
 /// packet in a datagram padded to the §14.1 minimum. A cheap pre-check so garbage,
@@ -74,6 +85,13 @@ pub struct ServerConfig {
     /// Cross-connection single-use 0-RTT anti-replay guard, installed on every
     /// accepted connection. Should be `Some` whenever `stek` is `Some`.
     pub replay_guard: Option<Arc<dyn ZeroRttGuard>>,
+    /// Camouflage origin's UDP/443 address for the REALITY-style fallback splice.
+    /// When `Some`, a datagram from an unknown peer that is NOT a well-formed v1
+    /// Initial (a probe, garbage, non-v1, version-negotiation-eliciting) is relayed
+    /// verbatim to the origin so the prober reaches the TRUE origin (see
+    /// [`Driver::on_datagram`]). `None` keeps the current behaviour (drop), so the
+    /// splice stays dormant until the server runtime supplies the resolved origin.
+    pub origin_udp_addr: Option<SocketAddr>,
 }
 
 /// Failure to establish a connection.
@@ -272,6 +290,7 @@ impl Endpoint {
             socket: socket.clone(),
             wake: wake.clone(),
             conns: HashMap::new(),
+            splices: HashMap::new(),
             server,
             accept_tx,
             connect_rx,
@@ -426,6 +445,10 @@ struct Driver {
     socket: Arc<UdpSocket>,
     wake: Arc<Notify>,
     conns: HashMap<SocketAddr, Arc<ConnShared>>,
+    /// Active origin-fallback relays, keyed by client 4-tuple, with last-activity
+    /// time for idle reaping. A flow here is NOT a ParallaX connection — its
+    /// datagrams are forwarded verbatim to the origin (see [`Self::on_datagram`]).
+    splices: HashMap<SocketAddr, (SpliceFlow, Instant)>,
     server: Option<Arc<ServerConfig>>,
     accept_tx: mpsc::UnboundedSender<Arc<ConnShared>>,
     connect_rx: mpsc::UnboundedReceiver<ConnectRequest>,
@@ -499,15 +522,32 @@ impl Driver {
             c.wake_handles();
             return;
         }
+        // An established origin-fallback relay for this peer: forward verbatim.
+        if let Some((flow, last)) = self.splices.get_mut(&peer) {
+            let _ = flow.forward(data);
+            *last = now;
+            return;
+        }
         // A datagram from an unknown peer: open a server connection if configured.
         let Some(cfg) = self.server.clone() else {
             return;
         };
-        // Bound state creation (review finding #1): only a well-formed Initial may
-        // create a connection, and never beyond the hard cap. Garbage / truncated /
-        // non-Initial datagrams, and floods past the cap, are dropped before they can
-        // allocate a Box<ServerHandshake> + Bbr + spaces (unauthenticated DoS).
-        if self.conns.len() >= MAX_SERVER_CONNS || !looks_like_initial(data) {
+        // Not a well-formed v1 Initial from an unknown peer ⇒ not a ParallaX client
+        // (a probe, garbage, non-v1, or version-negotiation-eliciting packet). The
+        // QUIC analogue of the TCP REALITY fallback: relay it verbatim to the real
+        // origin so an active prober reaches the TRUE origin and ParallaX emits
+        // nothing of its own. Dormant (drop, the prior behaviour) until the server
+        // runtime supplies `origin_udp_addr`.
+        if !looks_like_initial(data) {
+            if let Some(origin) = cfg.origin_udp_addr {
+                self.open_splice(peer, origin, data, now);
+            }
+            return;
+        }
+        // Bound state creation (review finding #1): never beyond the hard cap. Floods
+        // past the cap are dropped before they can allocate a Box<ServerHandshake> +
+        // Bbr + spaces (unauthenticated DoS).
+        if self.conns.len() >= MAX_SERVER_CONNS {
             return;
         }
         // Random source connection id (RFC 9000 §5.1). A monotonic counter would make
@@ -552,6 +592,28 @@ impl Driver {
         });
         let _ = shared.core.lock().unwrap().handle_datagram(data, now);
         self.conns.insert(peer, shared);
+    }
+
+    /// Open a verbatim origin-fallback relay for `peer` toward `origin`, forwarding
+    /// `first` now. Idle relays are reaped first (bounding state to active flows),
+    /// and the global splice budget is enforced — past it, the datagram is dropped,
+    /// degrading like a real origin shedding under a UDP flood (the relay is 1:1, so
+    /// there is no amplification, only state to bound).
+    fn open_splice(&mut self, peer: SocketAddr, origin: SocketAddr, first: &[u8], now: Instant) {
+        self.sweep_idle_splices(now);
+        if self.splices.len() >= MAX_SPLICE_FLOWS {
+            return;
+        }
+        if let Ok(flow) = SpliceFlow::open(self.socket.clone(), peer, origin, first) {
+            self.splices.insert(peer, (flow, now));
+        }
+    }
+
+    /// Drop relays with no client→origin datagram for [`SPLICE_IDLE`]. Removing the
+    /// entry drops its [`SpliceFlow`], which aborts the origin→client pump task.
+    fn sweep_idle_splices(&mut self, now: Instant) {
+        self.splices
+            .retain(|_, (_, last)| now.duration_since(*last) < SPLICE_IDLE);
     }
 
     fn on_connect(&mut self, req: ConnectRequest) {
@@ -988,7 +1050,77 @@ mod tests {
             alpn_protocols: vec![b"h3".to_vec()],
             stek: None,
             replay_guard: None,
+            origin_udp_addr: None,
         })
+    }
+
+    fn server_config_splicing(origin: SocketAddr) -> Arc<ServerConfig> {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        let key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap()
+                .as_ref()
+                .to_vec();
+        Arc::new(ServerConfig {
+            cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            signing_key_pkcs8: key,
+            alpn_protocols: vec![b"h3".to_vec()],
+            stek: None,
+            replay_guard: None,
+            origin_udp_addr: Some(origin),
+        })
+    }
+
+    /// A datagram from an unknown peer that is NOT a well-formed v1 Initial (a probe
+    /// or garbage) is spliced verbatim to the configured origin, and the origin's
+    /// reply is relayed back to the client — the QUIC analogue of the TCP REALITY
+    /// origin fallback. (With no origin configured the same datagram is dropped, the
+    /// cold-start default exercised by every other test here.)
+    #[tokio::test]
+    async fn unknown_non_initial_datagram_splices_to_origin() {
+        // Mock origin: echo one datagram back with a suffix (proves both directions).
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            let (n, from) = origin.recv_from(&mut b).await.unwrap();
+            let mut reply = b[..n].to_vec();
+            reply.extend_from_slice(b"-origin");
+            origin.send_to(&reply, from).await.unwrap();
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_splicing(origin_addr),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // A raw client sends a non-Initial datagram (25 bytes: fails looks_like_initial,
+        // which requires a >=1200B v1 Initial). The driver must splice it to the origin.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"not-a-quic-initial-packet", server_addr)
+            .await
+            .unwrap();
+
+        // The origin's echo returns to the client FROM the server's listen address.
+        let mut rb = vec![0u8; 2048];
+        let (rn, from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut rb))
+            .await
+            .expect("origin reply relayed back in time")
+            .unwrap();
+        assert_eq!(
+            from, server_addr,
+            "reply comes from the QUIC listener address"
+        );
+        assert_eq!(
+            &rb[..rn],
+            b"not-a-quic-initial-packet-origin",
+            "datagram spliced verbatim to the origin and the reply relayed back"
+        );
     }
 
     #[test]

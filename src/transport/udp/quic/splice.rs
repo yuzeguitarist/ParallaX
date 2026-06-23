@@ -15,8 +15,6 @@
 //! parses, decrypts, or reframes QUIC — it preserves datagram boundaries verbatim,
 //! so it cannot itself become a fingerprint distinct from a transparent forwarder.
 
-#![allow(dead_code)] // relay engine; wired into the endpoint driver's splice fork (next brick)
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -29,7 +27,12 @@ const MAX_RELAY_PAYLOAD: usize = 2048;
 /// task pumping origin→client replies back through the listening socket. Dropping
 /// it aborts the pump and closes the upstream socket (the relay ends).
 pub(crate) struct SpliceFlow {
-    to_origin: Arc<UdpSocket>,
+    /// Connected, non-blocking std socket toward the origin, for synchronous
+    /// client→origin sends from the driver's `on_datagram`. A direct non-blocking
+    /// syscall avoids tokio's cached-readiness `try_send`, which can spuriously
+    /// report `WouldBlock` on a freshly registered socket and silently drop the
+    /// first forwarded datagram.
+    send_sock: std::net::UdpSocket,
     pump: tokio::task::JoinHandle<()>,
 }
 
@@ -45,23 +48,40 @@ impl SpliceFlow {
     /// `listen` (the QUIC listener socket, so replies carry the address the client
     /// sent to). The upstream socket is `connect()`ed to `origin`, so only the
     /// origin's datagrams are received and a stray off-path sender cannot inject.
-    pub(crate) async fn open(
+    ///
+    /// Synchronous (no `.await`) so the endpoint driver's synchronous `on_datagram`
+    /// fork can open a relay inline: a `connect()`ed UDP socket needs no network
+    /// round-trip, and the first `send` only queues into the socket buffer. Must be
+    /// called from within a Tokio runtime (the driver task) — `from_std` registers
+    /// the recv half with the reactor and the pump is spawned there.
+    pub(crate) fn open(
         listen: Arc<UdpSocket>,
         client: SocketAddr,
         origin: SocketAddr,
         first: &[u8],
     ) -> std::io::Result<SpliceFlow> {
-        let to_origin = Arc::new(UdpSocket::bind(unspecified_for(origin)).await?);
-        to_origin.connect(origin).await?;
+        let recv_std = std::net::UdpSocket::bind(unspecified_for(origin))?;
+        recv_std.connect(origin)?;
+        // Non-blocking is required by `UdpSocket::from_std` and is shared with the
+        // cloned send half (O_NONBLOCK is a per-open-file-description flag).
+        recv_std.set_nonblocking(true)?;
+        let send_sock = recv_std.try_clone()?;
         // Verbatim: exact bytes, single datagram, no coalesce/split/reframe.
-        to_origin.send(first).await?;
-        let pump = tokio::spawn(pump_origin_to_client(to_origin.clone(), listen, client));
-        Ok(SpliceFlow { to_origin, pump })
+        send_sock.send(first)?;
+        let to_origin = Arc::new(UdpSocket::from_std(recv_std)?);
+        let pump = tokio::spawn(pump_origin_to_client(to_origin, listen, client));
+        Ok(SpliceFlow { send_sock, pump })
     }
 
-    /// Forward a subsequent client→origin datagram verbatim.
-    pub(crate) async fn forward(&self, data: &[u8]) -> std::io::Result<()> {
-        self.to_origin.send(data).await.map(|_| ())
+    /// Forward a subsequent client→origin datagram verbatim (non-blocking). A
+    /// `WouldBlock` (origin socket buffer full) drops this datagram, which is benign
+    /// for a relay — the client's QUIC stack treats it as ordinary packet loss.
+    pub(crate) fn forward(&self, data: &[u8]) -> std::io::Result<()> {
+        match self.send_sock.send(data) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -131,9 +151,7 @@ mod tests {
         let mut b = vec![0u8; MAX_RELAY_PAYLOAD];
         let (n, peer) = listen.recv_from(&mut b).await.unwrap();
         assert_eq!(peer, client_addr);
-        let flow = SpliceFlow::open(listen.clone(), peer, origin_addr, &b[..n])
-            .await
-            .unwrap();
+        let flow = SpliceFlow::open(listen.clone(), peer, origin_addr, &b[..n]).unwrap();
 
         // The origin's echo must arrive at the client, verbatim, from the listener.
         let mut rb = vec![0u8; MAX_RELAY_PAYLOAD];
@@ -154,10 +172,8 @@ mod tests {
         // A subsequent client→origin datagram also forwards verbatim.
         let origin2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let origin2_addr = origin2.local_addr().unwrap();
-        let flow2 = SpliceFlow::open(listen.clone(), client_addr, origin2_addr, b"d0")
-            .await
-            .unwrap();
-        flow2.forward(b"d1").await.unwrap();
+        let flow2 = SpliceFlow::open(listen.clone(), client_addr, origin2_addr, b"d0").unwrap();
+        flow2.forward(b"d1").unwrap();
         let mut ob = vec![0u8; MAX_RELAY_PAYLOAD];
         let (on, _) = origin2.recv_from(&mut ob).await.unwrap();
         assert_eq!(&ob[..on], b"d0", "first datagram forwarded verbatim");
@@ -178,9 +194,7 @@ mod tests {
         let origin_addr = origin.local_addr().unwrap();
         let listen = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let client: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let flow = SpliceFlow::open(listen, client, origin_addr, b"x")
-            .await
-            .unwrap();
+        let flow = SpliceFlow::open(listen, client, origin_addr, b"x").unwrap();
         let handle = flow.pump.abort_handle();
         drop(flow);
         // Give the runtime a tick to process the abort.

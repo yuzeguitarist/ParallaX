@@ -132,6 +132,10 @@ pub fn server_config(
         // anti-replay guard on the config (see the server runtime wiring).
         stek: None,
         replay_guard: None,
+        // The origin-fallback splice is dormant until the server runtime supplies the
+        // resolved camouflage-origin UDP address (the gating brick); cold-start drops
+        // non-Initial probe traffic, the prior behaviour.
+        origin_udp_addr: None,
     }))
 }
 
@@ -154,6 +158,8 @@ pub fn server_config_0rtt(
         alpn_protocols: vec![UDP_ALPN.to_vec()],
         stek: Some(stek),
         replay_guard: Some(guard),
+        // Splice dormant until the server runtime supplies the origin address.
+        origin_udp_addr: None,
     }))
 }
 
