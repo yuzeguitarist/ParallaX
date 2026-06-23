@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
@@ -30,6 +30,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::conn::{CloseReason, Connection as Core};
 use super::packet::{first_packet_space, ConnectionId, PacketSpace};
+use super::splice::SpliceFlow;
 use crate::tls::quic::{ClientConfig, ClientTicket, QuicTlsError, ZeroRttGuard, QUIC_VERSION_V1};
 use zeroize::Zeroizing;
 
@@ -46,6 +47,32 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 /// a cap an off-path attacker spraying spoofed Initials could allocate connection
 /// state without bound. (Finer-grained per-address Retry validation is future work.)
 const MAX_SERVER_CONNS: usize = 1 << 16;
+
+/// Hard cap on concurrently-spliced flows (the QUIC origin-fallback relay). A DoS
+/// backstop: spoofed sources could otherwise drive unbounded upstream sockets at the
+/// origin. Past the cap, new probe flows are dropped — degrading like a real origin
+/// shedding under a UDP flood, never amplifying (the relay is 1:1).
+const MAX_SPLICE_FLOWS: usize = 1 << 12;
+
+/// Idle lifetime of a spliced flow. A flow with no client→origin datagram for this
+/// long is reaped (its pump task aborted), bounding state to active relays.
+const SPLICE_IDLE: Duration = Duration::from_secs(30);
+
+/// Retention of an auth-marker `(nonce, timestamp)` in the replay cache. Must be at
+/// least the marker freshness window so a captured marker cannot be replayed into a
+/// local termination while it is still valid; entries older than this are evicted.
+const MARKER_REPLAY_TTL: Duration = Duration::from_secs(3600);
+
+/// Max Initials buffered for one pending marker decision before defaulting to a
+/// splice. The Safari-26 ClientHello spans two Initials (PQ-inflated), so the
+/// terminate-vs-splice fork can only decide once the full first flight is
+/// reassembled; the slack absorbs reordering without letting an Initial-shaped
+/// probe pin a held core indefinitely (past it, the flow is spliced to the origin).
+const MAX_PENDING_INITIALS: usize = 4;
+
+/// Idle lifetime of a held (pending-decision) Initial flight. A peer that sends a
+/// partial first flight then vanishes is reaped after this, freeing the held core.
+const PENDING_IDLE: Duration = Duration::from_secs(2);
 
 /// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
 /// packet in a datagram padded to the §14.1 minimum. A cheap pre-check so garbage,
@@ -74,6 +101,20 @@ pub struct ServerConfig {
     /// Cross-connection single-use 0-RTT anti-replay guard, installed on every
     /// accepted connection. Should be `Some` whenever `stek` is `Some`.
     pub replay_guard: Option<Arc<dyn ZeroRttGuard>>,
+    /// Camouflage origin's UDP/443 address for the REALITY-style fallback splice.
+    /// When `Some`, a datagram from an unknown peer that is NOT a well-formed v1
+    /// Initial (a probe, garbage, non-v1, version-negotiation-eliciting) is relayed
+    /// verbatim to the origin so the prober reaches the TRUE origin (see
+    /// [`Driver::on_datagram`]). `None` keeps the current behaviour (drop), so the
+    /// splice stays dormant until the server runtime supplies the resolved origin.
+    pub origin_udp_addr: Option<SocketAddr>,
+    /// Origin-splice auth-marker key `(psk, server static X25519 private)`. When
+    /// `Some`, a well-formed v1 Initial whose ClientHello.random carries a valid,
+    /// fresh, non-replayed marker is TERMINATED locally (a real ParallaX client);
+    /// any other v1 Initial (no/forged/replayed marker) is spliced to the origin.
+    /// `None` keeps the current behaviour (every v1 Initial terminates locally), so
+    /// the marker fork stays dormant until the server runtime supplies the key.
+    pub marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
 }
 
 /// Failure to establish a connection.
@@ -175,6 +216,13 @@ impl std::error::Error for ConnectionError {}
 struct ConnShared {
     core: Mutex<Core>,
     peer: SocketAddr,
+    /// The client-chosen Destination Connection ID from the first Initial: the value
+    /// the client put in its first packet's DCID field (on the server side, peeked off
+    /// the wire; on the client side, the CID it chose). A stable-:443 listener routes
+    /// an accepted connection back to its originating session by this id (the client
+    /// sets it to the session's `offer_id`), since the client's UDP 4-tuple is not
+    /// predictable in advance. See [`Connection::peer_initial_dcid`].
+    initial_dcid: ConnectionId,
     /// Fired whenever the connection state advances (handshake progress, new
     /// readable data, a newly-accepted stream, or teardown).
     event: Notify,
@@ -230,6 +278,10 @@ struct ConnectRequest {
     /// Current Unix time in milliseconds (for `obfuscated_ticket_age`); 0 when not
     /// resuming.
     now_ms: u64,
+    /// The client-chosen Destination Connection ID for the first Initial. `None` uses
+    /// a fresh random CID (the default). A stable-:443 carrier sets it to the session
+    /// `offer_id` so the server can route the accepted connection back to its session.
+    dcid: Option<ConnectionId>,
     reply: tokio::sync::oneshot::Sender<Result<Arc<ConnShared>, ConnectError>>,
 }
 
@@ -272,11 +324,13 @@ impl Endpoint {
             socket: socket.clone(),
             wake: wake.clone(),
             conns: HashMap::new(),
+            splices: HashMap::new(),
+            marker_replay: HashMap::new(),
+            pending: HashMap::new(),
             server,
             accept_tx,
             connect_rx,
             close_rx,
-            next_scid: 1,
         };
         tokio::spawn(driver.run());
         Ok(Endpoint {
@@ -350,11 +404,28 @@ impl Endpoint {
         now_ms: u64,
     ) -> Result<Connection, ConnectError> {
         let shared = self
-            .submit_connect(addr, server_name, Some(ticket), now_ms)
+            .submit_connect(addr, server_name, Some(ticket), now_ms, None)
             .await?;
         // 0-RTT keys are installed at construction (new_client_resumption), so the
         // returned handle can send early data immediately; the handshake continues
         // in the background.
+        Ok(Connection { shared })
+    }
+
+    /// Like [`Self::connect_resumption_0rtt`] but the first Initial carries `dcid` as
+    /// its Destination Connection ID (= the session offer_id), so a stable-:443
+    /// carrier can route the resumed connection back to its session.
+    pub async fn connect_resumption_0rtt_with_dcid(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        ticket: ClientTicket,
+        now_ms: u64,
+        dcid: ConnectionId,
+    ) -> Result<Connection, ConnectError> {
+        let shared = self
+            .submit_connect(addr, server_name, Some(ticket), now_ms, Some(dcid))
+            .await?;
         Ok(Connection { shared })
     }
 
@@ -366,7 +437,25 @@ impl Endpoint {
         now_ms: u64,
     ) -> Result<Connection, ConnectError> {
         let shared = self
-            .submit_connect(addr, server_name, ticket, now_ms)
+            .submit_connect(addr, server_name, ticket, now_ms, None)
+            .await?;
+        let conn = Connection { shared };
+        conn.wait_established().await?;
+        Ok(conn)
+    }
+
+    /// Open a client connection whose first Initial carries `dcid` as its Destination
+    /// Connection ID (instead of a random CID), awaiting handshake completion. A
+    /// stable-:443 carrier sets `dcid` to the session `offer_id` so the server can
+    /// route the accepted connection back to its originating session.
+    pub async fn connect_with_dcid(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        dcid: ConnectionId,
+    ) -> Result<Connection, ConnectError> {
+        let shared = self
+            .submit_connect(addr, server_name, None, 0, Some(dcid))
             .await?;
         let conn = Connection { shared };
         conn.wait_established().await?;
@@ -382,6 +471,7 @@ impl Endpoint {
         server_name: &str,
         ticket: Option<ClientTicket>,
         now_ms: u64,
+        dcid: Option<ConnectionId>,
     ) -> Result<Arc<ConnShared>, ConnectError> {
         let config = self
             .default_config
@@ -397,6 +487,7 @@ impl Endpoint {
                 config,
                 ticket,
                 now_ms,
+                dcid,
                 reply,
             })
             .map_err(|_| ConnectError::EndpointClosed)?;
@@ -421,18 +512,43 @@ impl Endpoint {
     }
 }
 
+/// A held first-flight Initial awaiting the buffer-decide-then-route marker fork
+/// (see [`Driver::pending`]). The core has been fed every datagram but never
+/// flushed (it is not in `conns`, so the run loop neither transmits nor times it
+/// out), so on a terminate decision it is promoted intact, and on a splice decision
+/// the raw `datagrams` are replayed to the origin verbatim.
+struct PendingInitial {
+    shared: Arc<ConnShared>,
+    datagrams: Vec<Vec<u8>>,
+    last: Instant,
+}
+
 /// The endpoint driver: owns the socket + all live connections, pumping them on
 /// every IO / timer / wake event.
 struct Driver {
     socket: Arc<UdpSocket>,
     wake: Arc<Notify>,
     conns: HashMap<SocketAddr, Arc<ConnShared>>,
+    /// Active origin-fallback relays, keyed by client 4-tuple, with last-activity
+    /// time for idle reaping. A flow here is NOT a ParallaX connection — its
+    /// datagrams are forwarded verbatim to the origin (see [`Self::on_datagram`]).
+    splices: HashMap<SocketAddr, (SpliceFlow, Instant)>,
+    /// Initial-time auth-marker replay cache, keyed on `(nonce, timestamp)` with the
+    /// insert time for window eviction: a marker is TERMINATED only on its first
+    /// sighting, so a captured-and-replayed marker (a later sighting) is spliced to
+    /// the origin instead of re-exposing the local termination path.
+    marker_replay: HashMap<([u8; 12], u64), Instant>,
+    /// Unknown-peer Initials held for the buffer-decide-then-route marker fork. The
+    /// Safari ClientHello spans two Initials, so terminate-vs-splice can only be
+    /// decided once the full first flight is reassembled. Each entry holds the
+    /// fed-but-never-flushed server core and the raw datagrams verbatim, so a splice
+    /// decision can replay them to the origin byte-for-byte. Only populated when
+    /// `marker_key` is set (otherwise the cold-start path terminates immediately).
+    pending: HashMap<SocketAddr, PendingInitial>,
     server: Option<Arc<ServerConfig>>,
     accept_tx: mpsc::UnboundedSender<Arc<ConnShared>>,
     connect_rx: mpsc::UnboundedReceiver<ConnectRequest>,
     close_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
-    /// Source-connection-id counter for accepted server connections.
-    next_scid: u64,
 }
 
 impl Driver {
@@ -502,19 +618,56 @@ impl Driver {
             c.wake_handles();
             return;
         }
+        // An established origin-fallback relay for this peer: forward verbatim.
+        if let Some((flow, last)) = self.splices.get_mut(&peer) {
+            let _ = flow.forward(data);
+            *last = now;
+            return;
+        }
+        // A datagram for an in-progress marker decision: feed it into the held core
+        // and re-evaluate the terminate-vs-splice fork (the Safari ClientHello spans
+        // two Initials, so the decision matures only once the whole CH is parsed).
+        if self.pending.contains_key(&peer) {
+            self.feed_pending(peer, data, now);
+            return;
+        }
         // A datagram from an unknown peer: open a server connection if configured.
         let Some(cfg) = self.server.clone() else {
             return;
         };
-        // Bound state creation (review finding #1): only a well-formed Initial may
-        // create a connection, and never beyond the hard cap. Garbage / truncated /
-        // non-Initial datagrams, and floods past the cap, are dropped before they can
-        // allocate a Box<ServerHandshake> + Bbr + spaces (unauthenticated DoS).
-        if self.conns.len() >= MAX_SERVER_CONNS || !looks_like_initial(data) {
+        // Not a well-formed v1 Initial from an unknown peer ⇒ not a ParallaX client
+        // (a probe, garbage, non-v1, or version-negotiation-eliciting packet). The
+        // QUIC analogue of the TCP REALITY fallback: relay it verbatim to the real
+        // origin so an active prober reaches the TRUE origin and ParallaX emits
+        // nothing of its own. Dormant (drop, the prior behaviour) until the server
+        // runtime supplies `origin_udp_addr`.
+        if !looks_like_initial(data) {
+            if let Some(origin) = cfg.origin_udp_addr {
+                self.open_splice(peer, origin, data, now);
+            }
             return;
         }
-        let scid = self.next_scid.to_be_bytes();
-        self.next_scid += 1;
+        // Reap held flights whose owner vanished mid-first-flight, before the cap
+        // check and any allocation (bounds held cores to active arrivals).
+        self.pending
+            .retain(|_, p| now.duration_since(p.last) < PENDING_IDLE);
+        // Bound state creation (review finding #1): held + active cores never exceed
+        // the hard cap. Floods past the cap are dropped before they can allocate a
+        // Box<ServerHandshake> + Bbr + spaces (unauthenticated DoS).
+        if self.conns.len() + self.pending.len() >= MAX_SERVER_CONNS {
+            return;
+        }
+        // Random source connection id (RFC 9000 §5.1). A monotonic counter would make
+        // every connection accepted by one bind serially linkable (a present-tense
+        // fingerprint a real origin never exhibits — real servers use unpredictable
+        // CIDs). The header SCID and the `initial_source_connection_id` transport
+        // parameter both derive from this same value, so they stay consistent
+        // (RFC 9000 §7.3).
+        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+        let mut scid = [0u8; 8];
+        SystemRandom::new()
+            .fill(&mut scid)
+            .expect("system RNG available");
         let core = match Core::new_server_with_stek(
             cfg.cert_chain.clone(),
             &cfg.signing_key_pkcs8,
@@ -532,6 +685,11 @@ impl Driver {
                 if let Some(guard) = cfg.replay_guard.clone() {
                     core.set_zero_rtt_replay_guard(guard);
                 }
+                // Install the auth-marker key BEFORE the ClientHello is processed: the
+                // marker is verified during handle_datagram and read back below.
+                if let Some((psk, static_priv)) = &cfg.marker_key {
+                    core.set_marker_key(psk.clone(), static_priv.clone());
+                }
                 core
             }
             Err(_) => return,
@@ -539,17 +697,165 @@ impl Driver {
         let shared = Arc::new(ConnShared {
             core: Mutex::new(core),
             peer,
+            // The client's chosen DCID, peeked off the first Initial without decryption
+            // (a stable-:443 carrier routes the accepted connection back to its session
+            // by this id). Falls back to empty if the header cannot be parsed; the
+            // marker fork has already validated `looks_like_initial(data)` above.
+            initial_dcid: super::packet::peek_long_cids(data)
+                .map(|(dcid, _scid)| dcid)
+                .unwrap_or_else(|_| ConnectionId::new(&[])),
             event: Notify::new(),
             wake: self.wake.clone(),
             read_wakers: Mutex::new(Vec::new()),
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
         let _ = shared.core.lock().unwrap().handle_datagram(data, now);
-        self.conns.insert(peer, shared);
+
+        // Cold-start (no marker key): terminate locally immediately, exactly as the
+        // pre-marker behaviour — no buffering, no added per-connection latency.
+        if cfg.marker_key.is_none() {
+            self.conns.insert(peer, shared);
+            return;
+        }
+
+        // Origin-splice marker fork — buffer-decide-then-route. The Safari-26
+        // ClientHello spans TWO Initials, and the marker's ECDH needs the client's
+        // X25519 share (carried in the SECOND Initial), so terminate-vs-splice cannot
+        // be decided on this first datagram. Hold the fed-but-never-flushed core plus
+        // the raw datagram: a held core is NOT in `conns`, so the run loop never
+        // transmits or times it out — zero ParallaX bytes escape while we wait. Once
+        // the full CH is reassembled, [`Self::decide_pending`] promotes a valid +
+        // fresh + non-replayed marker to a local termination, and splices everything
+        // else to the origin (replaying the buffered datagrams verbatim).
+        self.pending.insert(
+            peer,
+            PendingInitial {
+                shared,
+                datagrams: vec![data.to_vec()],
+                last: now,
+            },
+        );
+        self.decide_pending(peer, now);
+    }
+
+    /// Feed a follow-up datagram into a peer's held first flight, then re-run the
+    /// marker decision.
+    fn feed_pending(&mut self, peer: SocketAddr, data: &[u8], now: Instant) {
+        if let Some(p) = self.pending.get_mut(&peer) {
+            let _ = p.shared.core.lock().unwrap().handle_datagram(data, now);
+            p.datagrams.push(data.to_vec());
+            p.last = now;
+        }
+        self.decide_pending(peer, now);
+    }
+
+    /// Resolve a held first flight once enough of it has arrived. Promote it to a
+    /// local connection on a valid + fresh marker, or splice it to the origin
+    /// otherwise. While the ClientHello is still incomplete AND the buffer budget
+    /// remains, this is a no-op: nothing is emitted and the flight keeps buffering.
+    fn decide_pending(&mut self, peer: SocketAddr, now: Instant) {
+        let (processed, marker, count) = match self.pending.get(&peer) {
+            Some(p) => {
+                let core = p.shared.core.lock().unwrap();
+                (
+                    core.client_hello_processed(),
+                    core.marker_result(),
+                    p.datagrams.len(),
+                )
+            }
+            None => return,
+        };
+        // CH not yet parsed and budget remains: keep buffering, emit nothing.
+        if !processed && count < MAX_PENDING_INITIALS {
+            return;
+        }
+        let p = self.pending.remove(&peer).expect("pending entry present");
+        // Terminate ONLY on a parsed CH carrying a valid marker on its FIRST sighting;
+        // a replay (same nonce/ts) returns false and is spliced. `marker_fresh` runs
+        // at most once per flight (only here, when the CH is decided), so a buffered
+        // or replayed flight never pollutes the replay cache.
+        let terminate = processed && matches!(marker, Some(m) if self.marker_fresh(m, now));
+        if terminate {
+            // Promote intact: the buffered server flight flushes on the run loop's
+            // next `flush()`, right after this datagram is handled.
+            self.conns.insert(peer, p.shared);
+            return;
+        }
+        // Splice: drop the held core (no ParallaX bytes ever left it) and replay the
+        // buffered datagrams to the origin verbatim, so the prober reaches the TRUE
+        // origin. Dormant unless the runtime supplied `origin_udp_addr`.
+        drop(p.shared);
+        if let Some(origin) = self.server.as_ref().and_then(|c| c.origin_udp_addr) {
+            self.splice_pending(peer, origin, p.datagrams, now);
+        }
+    }
+
+    /// Open an origin-fallback relay for `peer` and replay the buffered first-flight
+    /// datagrams to `origin` verbatim, in arrival order.
+    fn splice_pending(
+        &mut self,
+        peer: SocketAddr,
+        origin: SocketAddr,
+        datagrams: Vec<Vec<u8>>,
+        now: Instant,
+    ) {
+        let mut it = datagrams.into_iter();
+        let Some(first) = it.next() else {
+            return;
+        };
+        self.open_splice(peer, origin, &first, now);
+        if let Some((flow, last)) = self.splices.get_mut(&peer) {
+            for d in it {
+                let _ = flow.forward(&d);
+            }
+            *last = now;
+        }
+    }
+
+    /// Record an auth marker's `(nonce, timestamp)` and report whether this is its
+    /// FIRST sighting (so the connection terminates locally). A repeat — a captured
+    /// marker replayed within its window — returns `false`, so that flow is spliced
+    /// to the origin instead of re-exposing the local termination path. (The first
+    /// sighting could itself be an attacker who raced the genuine client; that
+    /// residual is bounded by the short freshness window and is the documented QUIC
+    /// limit — the authenticated path cannot reach full TCP-REALITY parity.)
+    fn marker_fresh(&mut self, m: crate::crypto::quic_marker::Marker, now: Instant) -> bool {
+        self.marker_replay
+            .retain(|_, t| now.duration_since(*t) < MARKER_REPLAY_TTL);
+        use std::collections::hash_map::Entry;
+        match self.marker_replay.entry((m.nonce, m.timestamp)) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(now);
+                true
+            }
+        }
+    }
+
+    /// Open a verbatim origin-fallback relay for `peer` toward `origin`, forwarding
+    /// `first` now. Idle relays are reaped first (bounding state to active flows),
+    /// and the global splice budget is enforced — past it, the datagram is dropped,
+    /// degrading like a real origin shedding under a UDP flood (the relay is 1:1, so
+    /// there is no amplification, only state to bound).
+    fn open_splice(&mut self, peer: SocketAddr, origin: SocketAddr, first: &[u8], now: Instant) {
+        self.sweep_idle_splices(now);
+        if self.splices.len() >= MAX_SPLICE_FLOWS {
+            return;
+        }
+        if let Ok(flow) = SpliceFlow::open(self.socket.clone(), peer, origin, first) {
+            self.splices.insert(peer, (flow, now));
+        }
+    }
+
+    /// Drop relays with no client→origin datagram for [`SPLICE_IDLE`]. Removing the
+    /// entry drops its [`SpliceFlow`], which aborts the origin→client pump task.
+    fn sweep_idle_splices(&mut self, now: Instant) {
+        self.splices
+            .retain(|_, (_, last)| now.duration_since(*last) < SPLICE_IDLE);
     }
 
     fn on_connect(&mut self, req: ConnectRequest) {
-        let dcid = random_cid();
+        let dcid = req.dcid.unwrap_or_else(random_cid);
         let core_result = match &req.ticket {
             Some(ticket) => Core::new_client_resumption(
                 req.config,
@@ -573,6 +879,7 @@ impl Driver {
         let shared = Arc::new(ConnShared {
             core: Mutex::new(core),
             peer: req.addr,
+            initial_dcid: dcid,
             event: Notify::new(),
             wake: self.wake.clone(),
             read_wakers: Mutex::new(Vec::new()),
@@ -651,6 +958,15 @@ impl Connection {
     /// server to filter an accepted connection against the authenticated peer's IP.
     pub fn remote_address(&self) -> SocketAddr {
         self.shared.peer
+    }
+
+    /// The client-chosen Destination Connection ID from the first Initial. On a
+    /// server endpoint this is the value the client put on the wire; a stable-:443
+    /// carrier routes an accepted connection back to its originating session by this
+    /// id (the client sets it to the session `offer_id` via
+    /// [`Endpoint::connect_with_dcid`]).
+    pub fn peer_initial_dcid(&self) -> &[u8] {
+        self.shared.initial_dcid.as_slice()
     }
 
     /// Take a resumption ticket received on this connection (client only; the server
@@ -982,7 +1298,79 @@ mod tests {
             alpn_protocols: vec![b"h3".to_vec()],
             stek: None,
             replay_guard: None,
+            origin_udp_addr: None,
+            marker_key: None,
         })
+    }
+
+    fn server_config_splicing(origin: SocketAddr) -> Arc<ServerConfig> {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        let key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap()
+                .as_ref()
+                .to_vec();
+        Arc::new(ServerConfig {
+            cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            signing_key_pkcs8: key,
+            alpn_protocols: vec![b"h3".to_vec()],
+            stek: None,
+            replay_guard: None,
+            origin_udp_addr: Some(origin),
+            marker_key: None,
+        })
+    }
+
+    /// A datagram from an unknown peer that is NOT a well-formed v1 Initial (a probe
+    /// or garbage) is spliced verbatim to the configured origin, and the origin's
+    /// reply is relayed back to the client — the QUIC analogue of the TCP REALITY
+    /// origin fallback. (With no origin configured the same datagram is dropped, the
+    /// cold-start default exercised by every other test here.)
+    #[tokio::test]
+    async fn unknown_non_initial_datagram_splices_to_origin() {
+        // Mock origin: echo one datagram back with a suffix (proves both directions).
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            let (n, from) = origin.recv_from(&mut b).await.unwrap();
+            let mut reply = b[..n].to_vec();
+            reply.extend_from_slice(b"-origin");
+            origin.send_to(&reply, from).await.unwrap();
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_splicing(origin_addr),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // A raw client sends a non-Initial datagram (25 bytes: fails looks_like_initial,
+        // which requires a >=1200B v1 Initial). The driver must splice it to the origin.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"not-a-quic-initial-packet", server_addr)
+            .await
+            .unwrap();
+
+        // The origin's echo returns to the client FROM the server's listen address.
+        let mut rb = vec![0u8; 2048];
+        let (rn, from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut rb))
+            .await
+            .expect("origin reply relayed back in time")
+            .unwrap();
+        assert_eq!(
+            from, server_addr,
+            "reply comes from the QUIC listener address"
+        );
+        assert_eq!(
+            &rb[..rn],
+            b"not-a-quic-initial-packet-origin",
+            "datagram spliced verbatim to the origin and the reply relayed back"
+        );
     }
 
     #[test]
@@ -1043,6 +1431,43 @@ mod tests {
             conn.peer_transport_parameters().is_some(),
             "client learned the server's transport parameters"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_with_dcid_is_visible_to_the_server_for_session_routing() {
+        // A stable-:443 carrier routes an accepted connection back to its session by
+        // the client-chosen DCID (= the session offer_id). Prove the server observes
+        // the exact DCID the client connected with.
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
+
+        let offer_id: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0x00,
+        ];
+        let accept = tokio::spawn(async move { server.accept().await });
+        let conn = client
+            .connect_with_dcid(server_addr, "example.com", ConnectionId::new(&offer_id))
+            .await
+            .expect("client handshake completes with an explicit DCID");
+        let server_conn = accept
+            .await
+            .unwrap()
+            .expect("server accepts the connection");
+
+        assert_eq!(
+            server_conn.peer_initial_dcid(),
+            &offer_id,
+            "server sees the client-chosen DCID verbatim (session-routing key)"
+        );
+        // The handshake still completes normally with a non-random DCID.
+        let mut ce = [0u8; 32];
+        conn.export_keying_material(&mut ce, b"parallax tudp", b"binding")
+            .unwrap();
+        assert_ne!(ce, [0u8; 32]);
     }
 
     #[tokio::test]
@@ -1135,6 +1560,118 @@ mod tests {
                 reason: b"bye".to_vec(),
             })),
             "the server observes the client's application close code + reason"
+        );
+    }
+
+    fn server_config_marker(
+        origin: SocketAddr,
+        psk: zeroize::Zeroizing<Vec<u8>>,
+        static_priv: [u8; 32],
+    ) -> Arc<ServerConfig> {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        let key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap()
+                .as_ref()
+                .to_vec();
+        Arc::new(ServerConfig {
+            cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            signing_key_pkcs8: key,
+            alpn_protocols: vec![b"h3".to_vec()],
+            stek: None,
+            replay_guard: None,
+            origin_udp_addr: Some(origin),
+            marker_key: Some((psk, zeroize::Zeroizing::new(static_priv))),
+        })
+    }
+
+    /// The marker fork: a client whose ClientHello.random carries a valid auth marker
+    /// is TERMINATED locally (the handshake completes), while an unmarked client's
+    /// Initial is spliced verbatim to the origin (which receives the >=1200B Initial).
+    ///
+    /// Buffer-decide-then-route marker fork, end to end: a MARKED client (whose
+    /// PQ-inflated ClientHello spans two Initials) is held until the full first flight
+    /// is reassembled, then terminated locally (handshake completes); an UNMARKED
+    /// client's first flight is spliced to the origin verbatim. Exercises the
+    /// multi-datagram path that the single-datagram fork used to mis-splice.
+    #[tokio::test]
+    async fn marked_client_terminates_while_unmarked_initial_splices() {
+        use crate::crypto::session::X25519KeyPair;
+        use crate::tls::quic::QuicMarkerConfig;
+        use crate::transport::udp::endpoint::bind_client_endpoint_accept_any;
+
+        let server_kp = X25519KeyPair::generate();
+        let psk = zeroize::Zeroizing::new(b"parallax-quic-marker-fork-e2e-ps".to_vec());
+
+        // Mock origin: report the size of any datagram it receives (the spliced Initial).
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            while let Ok((n, _)) = origin.recv_from(&mut b).await {
+                if otx.send(n).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_marker(origin_addr, psk.clone(), server_kp.private),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // 1. A MARKED client terminates locally (the handshake completes).
+        let marked = Endpoint::client("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        marked.set_default_client_config(Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                QuicMarkerConfig {
+                    psk: psk.clone(),
+                    server_static_public: server_kp.public,
+                },
+            ),
+        ));
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            marked.connect(server_addr, "example.com"),
+        )
+        .await
+        .expect("marked client handshake must not hang (marker accepted -> terminate)")
+        .expect("marked client must terminate locally (handshake completes)");
+        let _server_conn = acceptor
+            .await
+            .unwrap()
+            .expect("server accepts the marked client");
+        drop(conn);
+
+        // 2. An UNMARKED client's Initial is spliced to the origin (which receives a
+        // full >=1200B v1 Initial). Its connect never completes (the echo origin is
+        // not a QUIC server), so it is timeout-bounded.
+        let unmarked = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            unmarked.connect(server_addr, "example.com"),
+        )
+        .await;
+        let got = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("origin receives the spliced Initial in time")
+            .expect("origin channel open");
+        assert!(
+            got >= MIN_INITIAL_DATAGRAM,
+            "origin received a full v1 Initial ({got} bytes): the unmarked client was spliced"
         );
     }
 }

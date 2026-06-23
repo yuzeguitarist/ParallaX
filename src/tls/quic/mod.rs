@@ -128,15 +128,39 @@ pub struct ClientConfig {
     pub alpn_protocols: Vec<Vec<u8>>,
     /// Server-certificate trust policy. Production uses [`AcceptAnyServerCert`].
     pub verifier: Arc<dyn ServerCertVerifier>,
+    /// When `Some`, the client hides a covert authentication marker in its
+    /// `ClientHello.random` (see [`crate::crypto::quic_marker`]) so the server's
+    /// datagram-zero fork can recognise a real ParallaX client on the first Initial
+    /// and terminate locally, while everything else is spliced to the origin. `None`
+    /// (the default) emits a pure-random `ClientHello.random`, the cold-start shape.
+    pub marker: Option<QuicMarkerConfig>,
+}
+
+/// Client-side material for the QUIC `ClientHello.random` authentication marker:
+/// the deployment PSK and the server's static X25519 public key (the same
+/// REALITY-style relationship the TCP plane uses). With these plus the client's
+/// per-connection ephemeral X25519 share, the client derives the marker the server
+/// verifies with its static private key + the same PSK.
+#[derive(Clone)]
+pub struct QuicMarkerConfig {
+    pub psk: zeroize::Zeroizing<Vec<u8>>,
+    pub server_static_public: [u8; 32],
 }
 
 impl ClientConfig {
-    /// Build a config with the given verifier and ALPN list.
+    /// Build a config with the given verifier and ALPN list (no marker).
     pub fn new(verifier: Arc<dyn ServerCertVerifier>, alpn_protocols: Vec<Vec<u8>>) -> Self {
         Self {
             alpn_protocols,
             verifier,
+            marker: None,
         }
+    }
+
+    /// Enable the covert ClientHello.random authentication marker.
+    pub fn with_marker(mut self, marker: QuicMarkerConfig) -> Self {
+        self.marker = Some(marker);
+        self
     }
 }
 
@@ -190,6 +214,24 @@ pub(crate) trait TlsSession: Send {
     /// Install the cross-connection 0-RTT anti-replay guard (server only; the client
     /// default is a no-op).
     fn set_zero_rtt_guard(&mut self, _guard: Arc<dyn ZeroRttGuard>) {}
+    /// Install the origin-splice auth-marker key (server only; client default no-op).
+    fn set_marker_key(
+        &mut self,
+        _psk: zeroize::Zeroizing<Vec<u8>>,
+        _static_priv: zeroize::Zeroizing<[u8; 32]>,
+    ) {
+    }
+    /// The auth marker recovered from this connection's ClientHello.random, if valid
+    /// + fresh (server only; client default `None`).
+    fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
+        None
+    }
+    /// Whether the ClientHello has been processed, so [`Self::marker_result`] is final
+    /// (server only; client default `false`). Gates the endpoint's
+    /// buffer-decide-then-route marker fork (the Safari CH spans two Initials).
+    fn client_hello_processed(&self) -> bool {
+        false
+    }
 }
 
 impl TlsSession for ClientHandshake {
@@ -247,5 +289,18 @@ impl TlsSession for ServerHandshake {
     }
     fn set_zero_rtt_guard(&mut self, guard: Arc<dyn ZeroRttGuard>) {
         ServerHandshake::set_zero_rtt_guard(self, guard)
+    }
+    fn set_marker_key(
+        &mut self,
+        psk: zeroize::Zeroizing<Vec<u8>>,
+        static_priv: zeroize::Zeroizing<[u8; 32]>,
+    ) {
+        ServerHandshake::set_marker_key(self, psk, static_priv)
+    }
+    fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
+        ServerHandshake::marker_result(self)
+    }
+    fn client_hello_processed(&self) -> bool {
+        ServerHandshake::client_hello_processed(self)
     }
 }

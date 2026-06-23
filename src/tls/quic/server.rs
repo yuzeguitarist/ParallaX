@@ -98,8 +98,14 @@ fn server_hybrid_kex(client_share: &[u8]) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>
 // --- ClientHello ingest (RFC 8446 §4.1.2) --------------------------------------
 
 /// TLS extension codepoints the server reads off the ClientHello.
+const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+/// Freshness window for the origin-splice auth marker (seconds): how old a marker
+/// may be (also the retention an Initial-time replay cache needs). Generous enough
+/// for client/server clock skew (so a real client is not mis-spliced), bounded
+/// enough to limit a captured marker's capture-and-replay-later window.
+const MARKER_WINDOW_SECS: u64 = 3600;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
 /// `pre_shared_key` (RFC 8446 §4.2.11): offered last by a resuming client; echoed
 /// in ServerHello (selected_identity) when the server accepts the PSK.
@@ -119,6 +125,10 @@ const TLS13_VERSION: u16 = 0x0304;
 struct ClientHelloSummary {
     /// Echoed verbatim into the ServerHello (empty for the QUIC client).
     legacy_session_id: Vec<u8>,
+    /// The `ClientHello.random` (carries the covert origin-splice auth marker).
+    client_random: [u8; 32],
+    /// The client's SNI host_name (server_name ext), bound by the auth marker.
+    sni: Vec<u8>,
     /// The client's X25519MLKEM768 key_share (ML-KEM-768 encapsulation key ‖
     /// X25519 public).
     hybrid_key_share: Vec<u8>,
@@ -146,7 +156,8 @@ struct ClientHelloSummary {
 fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
     let mut r = Reader::new(body);
     let _legacy_version = r.u16()?;
-    r.take(32)?; // random
+    let mut client_random = [0u8; 32];
+    client_random.copy_from_slice(r.take(32)?);
     let legacy_session_id = r.vec_u8()?.to_vec();
     let cipher_suites = r.vec_u16()?;
     if !cipher_suites
@@ -162,6 +173,7 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
 
     let mut er = Reader::new(r.vec_u16()?);
     let mut hybrid_key_share = None;
+    let mut sni: Vec<u8> = Vec::new();
     let mut transport_params = None;
     let mut offered_alpn: Vec<Vec<u8>> = Vec::new();
     let mut offers_tls13 = false;
@@ -173,6 +185,20 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
         let ext_type = er.u16()?;
         let ext_data = er.vec_u16()?;
         match ext_type {
+            EXT_SERVER_NAME => {
+                // ServerNameList: u16 list_len, then [name_type(1) u16 name_len name].
+                // Take the first host_name (type 0x00); the marker is bound to it.
+                let mut nr = Reader::new(ext_data);
+                let mut list = Reader::new(nr.vec_u16()?);
+                while list.remaining() > 0 {
+                    let name_type = list.u8()?;
+                    let name = list.vec_u16()?;
+                    if name_type == 0 {
+                        sni = name.to_vec();
+                        break;
+                    }
+                }
+            }
             EXT_KEY_SHARE => {
                 let mut kr = Reader::new(ext_data);
                 let mut sr = Reader::new(kr.vec_u16()?);
@@ -230,6 +256,8 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
     }
     Ok(ClientHelloSummary {
         legacy_session_id,
+        client_random,
+        sni,
         hybrid_key_share: hybrid_key_share.ok_or_else(|| {
             QuicTlsError::alert(ALERT_MISSING_EXTENSION, "no X25519MLKEM768 key_share")
         })?,
@@ -491,6 +519,16 @@ pub struct ServerHandshake {
     /// Cross-connection single-use anti-replay guard for 0-RTT tickets (RFC 8446
     /// §8). `None` disables the check (e.g. cold-start-only servers / unit tests).
     replay_guard: Option<Arc<dyn ZeroRttGuard>>,
+    /// Origin-splice auth-marker key: `(psk, server static X25519 private)`. When
+    /// set, the ClientHello.random is verified as a covert marker
+    /// ([`crate::crypto::quic_marker`]); the recovered marker (if any) is exposed via
+    /// [`Self::marker_result`] for the endpoint's terminate-vs-splice fork. `None`
+    /// leaves `marker_result` `None` (cold-start: the fork treats every flow as
+    /// unauthenticated).
+    marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
+    /// The marker recovered from this connection's ClientHello.random, if it carried
+    /// a valid + fresh one. Set during ClientHello processing when `marker_key` is set.
+    marker_result: Option<crate::crypto::quic_marker::Marker>,
 }
 
 impl ServerHandshake {
@@ -531,6 +569,8 @@ impl ServerHandshake {
             pending_0rtt_keys: None,
             early_data_accepted: false,
             replay_guard: None,
+            marker_key: None,
+            marker_result: None,
         })
     }
 
@@ -538,6 +578,33 @@ impl ServerHandshake {
     /// ClientHello is processed (the runtime sets it right after construction).
     pub(crate) fn set_zero_rtt_guard(&mut self, guard: Arc<dyn ZeroRttGuard>) {
         self.replay_guard = Some(guard);
+    }
+
+    /// Install the origin-splice auth-marker key `(psk, server static X25519
+    /// private)`. Must be set before the ClientHello is processed; the server then
+    /// verifies `ClientHello.random` as a covert marker and exposes the result via
+    /// [`Self::marker_result`].
+    pub(crate) fn set_marker_key(
+        &mut self,
+        psk: Zeroizing<Vec<u8>>,
+        static_priv: Zeroizing<[u8; 32]>,
+    ) {
+        self.marker_key = Some((psk, static_priv));
+    }
+
+    /// The marker recovered from this connection's ClientHello.random, if valid +
+    /// fresh (only ever `Some` when [`Self::set_marker_key`] was set before the CH).
+    pub(crate) fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
+        self.marker_result
+    }
+
+    /// Whether the ClientHello has been consumed, so [`Self::marker_result`] is final
+    /// (a parsed CH that carried no valid marker) rather than merely "not parsed yet"
+    /// (an incomplete first flight). The endpoint's buffer-decide-then-route marker
+    /// fork waits for this before deciding terminate-vs-splice, since the Safari
+    /// ClientHello spans two Initials.
+    pub(crate) fn client_hello_processed(&self) -> bool {
+        self.state != ServerState::ExpectClientHello
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -667,6 +734,38 @@ impl ServerHandshake {
 
     fn process_client_hello(&mut self, message: &[u8]) -> Result<(), QuicTlsError> {
         let summary = parse_client_hello(&message[4..])?;
+
+        // Origin-splice auth marker: when a marker key is set, verify the covert
+        // marker in ClientHello.random; the endpoint's terminate-vs-splice fork
+        // consults [`Self::marker_result`]. The client's ephemeral X25519 public is
+        // the trailing 32 bytes of the X25519MLKEM768 key_share, and the ECDH mirrors
+        // the client's (server static private x client ephemeral). Constant-work: a
+        // full X25519 (zero share when the key_share is too short) + the marker open
+        // always run, so a failed verify takes the same path as a success (no
+        // terminate-vs-splice timing fork). DCID binding is deferred (empty dcid),
+        // matching the client.
+        if let Some((psk, static_priv)) = &self.marker_key {
+            let mut client_x25519 = [0u8; 32];
+            let share = &summary.hybrid_key_share;
+            if share.len() >= 32 {
+                client_x25519.copy_from_slice(&share[share.len() - 32..]);
+            }
+            let ss = crate::crypto::session::x25519_shared_secret(static_priv, &client_x25519);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            self.marker_result = crate::crypto::quic_marker::open(
+                psk,
+                &ss,
+                &summary.sni,
+                &[],
+                &summary.client_random,
+                now,
+                MARKER_WINDOW_SECS,
+            );
+        }
+
         let (server_share, shared) = server_hybrid_kex(&summary.hybrid_key_share)?;
 
         // Decide 0-RTT resumption BEFORE consuming `summary`: validate the offered

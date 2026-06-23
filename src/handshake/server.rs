@@ -52,11 +52,12 @@ use crate::{
     },
     protocol::{
         command::{
-            ConnectRequest, ConnectRequestError, MuxFrame, MuxFrameError, MuxFrameKind,
-            MuxFrameRef, MuxPayloadPool, PqRekeyError, PqRekeyRequest, ServerIdentityChunk,
-            ServerIdentityChunkError, ServerIdentityProof, ServerIdentityProofError,
-            ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck, SpeedTestRequest,
-            SpeedTestRequestError,
+            ConnectRequest, ConnectRequestError, FramedChunk, FramedChunkError, FramedReassembler,
+            MuxFrame, MuxFrameError, MuxFrameKind, MuxFrameRef, MuxPayloadPool, PqRekeyError,
+            PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError, ServerIdentityProof,
+            ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck,
+            SpeedTestRequest, SpeedTestRequestError, MAX_PQ_HANDSHAKE_FRAME,
+            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT, PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
@@ -272,6 +273,8 @@ pub enum HandshakeServerError {
     MuxFrame(#[from] MuxFrameError),
     #[error("PQ rekey command error: {0}")]
     PqRekey(#[from] PqRekeyError),
+    #[error("framed chunk command error: {0}")]
+    FramedChunk(#[from] FramedChunkError),
     #[error("server key exchange command error: {0}")]
     ServerKeyExchange(#[from] ServerKeyExchangeError),
     #[error("PQ crypto error: {0}")]
@@ -375,6 +378,91 @@ struct ServerZeroRtt {
 
 static SERVER_ZERO_RTT: OnceLock<ServerZeroRtt> = OnceLock::new();
 
+/// Process-global stable origin-splice carrier (the shared QUIC `:server.listen`
+/// endpoint), built once in [`run`] when `udp.enabled`. `None` (never set) leaves
+/// the UDP fast plane on the per-session ephemeral path. A `Mutex` (not a `OnceLock`)
+/// so tests that drive [`handle_connection`] directly — bypassing `run`'s startup —
+/// can inject a carrier; production sets it exactly once at startup. See
+/// [`crate::transport::udp::stable::QuicCarrier`].
+static SERVER_QUIC_CARRIER: Mutex<Option<Arc<crate::transport::udp::stable::QuicCarrier>>> =
+    Mutex::new(None);
+
+/// Test-only injector for [`SERVER_QUIC_CARRIER`]: lets a test that calls
+/// [`handle_connection`] directly supply a stable carrier (production sets it in
+/// [`run`]).
+#[cfg(test)]
+pub(crate) fn set_quic_carrier_for_test(
+    carrier: Option<Arc<crate::transport::udp::stable::QuicCarrier>>,
+) {
+    *SERVER_QUIC_CARRIER
+        .lock()
+        .expect("quic carrier mutex poisoned") = carrier;
+}
+
+/// Bind the stable origin-splice carrier: marker key = the shared PSK + the server's
+/// static X25519 private key (the same REALITY static key the TCP plane authenticates
+/// with), splice origin = the camouflage origin's UDP `:443` (resolved from
+/// `fallback_addr`), reusing the [`SERVER_ZERO_RTT`] STEK + guard if 0-RTT is enabled.
+/// The carrier binds UDP on `server.listen` so the QUIC port is the same stable port
+/// as the TCP face (an HTTP/3 origin shape), not a per-session ephemeral port.
+async fn build_quic_carrier(
+    server: &crate::config::ServerConfig,
+    psk: &[u8],
+    private_key: &[u8; 32],
+) -> Result<Arc<crate::transport::udp::stable::QuicCarrier>, crate::transport::udp::UdpTransportError>
+{
+    use crate::transport::udp::UdpTransportError;
+    // The camouflage origin's HTTP/3 endpoint: the fallback host on UDP :443.
+    let origin_ip = lookup_host(&server.fallback_addr)
+        .await?
+        .next()
+        .ok_or_else(|| {
+            UdpTransportError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "fallback_addr did not resolve",
+            ))
+        })?
+        .ip();
+    let origin = std::net::SocketAddr::new(origin_ip, 443);
+    // The fronted domain (host part of fallback_addr) backs the carrier's self-signed
+    // cert; our clients accept any cert (trust is the marker + exporter token) and GFW
+    // does not inspect QUIC certs, so only the SNI label matters cosmetically.
+    let front = server
+        .fallback_addr
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(server.fallback_addr.as_str());
+    let (cert, key) = crate::transport::udp::endpoint::ephemeral_self_signed(front)?;
+    let marker_key = (
+        zeroize::Zeroizing::new(psk.to_vec()),
+        zeroize::Zeroizing::new(*private_key),
+    );
+    let (stek, guard) = match SERVER_ZERO_RTT.get() {
+        Some(zr) => (
+            Some(zr.stek.clone()),
+            Some(zr.guard.clone() as Arc<dyn crate::tls::quic::ZeroRttGuard>),
+        ),
+        None => (None, None),
+    };
+    let config =
+        crate::transport::udp::server_config_stable(cert, key, stek, guard, marker_key, origin)?;
+    Ok(crate::transport::udp::stable::QuicCarrier::bind(server.listen, config).await?)
+}
+
+/// Test-only carrier builder for suites that drive [`handle_connection`] directly
+/// (bypassing `run`): decodes the static X25519 private key from `server` and binds
+/// a carrier under `psk`, so the UDP fast plane is offered exactly as in production.
+#[cfg(test)]
+pub(crate) async fn build_quic_carrier_for_test(
+    server: &crate::config::ServerConfig,
+    psk: &[u8],
+) -> Result<Arc<crate::transport::udp::stable::QuicCarrier>, crate::transport::udp::UdpTransportError>
+{
+    let private_key = decode_key32_secret("server.private_key", server.private_key.as_b64())
+        .map_err(|e| crate::transport::udp::UdpTransportError::TlsConfig(e.to_string()))?;
+    build_quic_carrier(server, psk, &private_key).await
+}
+
 /// 0-RTT resumption-ticket lifetime (RFC 8446 §4.6.1): 7 days, matching the
 /// Safari-26 NewSessionTicket baseline. The anti-replay window is sized to this so
 /// a ticket stays replay-protected for exactly as long as it is valid.
@@ -452,9 +540,9 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     // outbound stays gated on the exporter-bound auth token (commit-late), so a
     // replayed 0-RTT flight — which cannot complete 1-RTT and therefore cannot
     // produce a valid token — never opens an outbound connection. Built only when
-    // udp is enabled; the plane (and thus 0-RTT) remains behind the experimental-
-    // UDP and TODO(quic-active-probing) gates. A cache-load failure degrades to
-    // cold-start (1-RTT only) rather than failing the server.
+    // udp is enabled; the plane stays behind the experimental-UDP gate (active
+    // probing is handled by the stable carrier's origin splice). A cache-load
+    // failure degrades to cold-start (1-RTT only) rather than failing the server.
     if udp.enabled {
         let zr_path = zero_rtt_replay_cache_path(&server.replay_cache_path);
         match ReplayCache::load_or_create_authenticated_with_window(
@@ -478,6 +566,26 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 tracing::warn!(
                     error = %err,
                     "0-RTT replay cache unavailable; UDP fast plane stays cold-start (1-RTT only)"
+                );
+            }
+        }
+        // Bind the process-wide stable origin-splice carrier on the server's listen
+        // address (UDP), now that any 0-RTT STEK/guard above is set. It marker-
+        // terminates authenticated clients and splices every other Initial verbatim
+        // to the camouflage origin's UDP :443, so the stable QUIC port mirrors the
+        // real origin to an active prober. A resolve/bind failure degrades to no
+        // carrier (the plane stays on the per-session path) rather than failing the
+        // server.
+        match build_quic_carrier(&server, psk.as_slice(), secrets.private_key()).await {
+            Ok(carrier) => {
+                *SERVER_QUIC_CARRIER
+                    .lock()
+                    .expect("quic carrier mutex poisoned") = Some(carrier);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "stable QUIC carrier unavailable; UDP fast plane stays on the per-session path"
                 );
             }
         }
@@ -1436,6 +1544,12 @@ async fn run_authenticated_data_mode(
     let mut client_camouflage_bytes_before_pq = 0usize;
     let mut fallback_records_before_pq = 0usize;
     let mut fallback_bytes_before_pq = 0usize;
+    // Reassembles the client's PQ rekey (PX1Q), now split across several
+    // variable-length FramedChunk records (PAR-21). On this direction no
+    // camouflage interleaves after the handshake — the client writes all chunks
+    // contiguously in one flight — so successive opened records accumulate here
+    // until the full rekey frame is recovered.
+    let mut pq_rekey_reassembler = FramedReassembler::default();
 
     tracing::info!(
         cid,
@@ -1490,8 +1604,45 @@ async fn run_authenticated_data_mode(
                 );
 
                 match client_open.open(&client_record) {
-                    Ok(first_payload) => {
-                        let pq_rekey = PqRekeyRequest::decode_ref(first_payload.as_slice())?;
+                    Ok(chunk_payload) => {
+                        // Accumulate PX1Q chunks; proceed only once the whole
+                        // rekey frame is reassembled. Incomplete => wait for the
+                        // next chunk (still bounded by pre_pq_deadline, which is
+                        // not reset by incoming records). Malformed framing/payload
+                        // from the (already authenticated) client tears down
+                        // gracefully (drain->FIN), never a bare-drop RST -- the
+                        // no-RST contract every other arm in this loop honors.
+                        let first_payload = match pq_rekey_reassembler
+                            .push(&chunk_payload, MAX_PQ_HANDSHAKE_FRAME)
+                        {
+                            Ok(Some(payload)) => payload,
+                            Ok(None) => continue,
+                            Err(err) => {
+                                tracing::debug!(cid, error = %err, "malformed PX1Q chunk framing; graceful teardown");
+                                graceful_close_pre_pq(
+                                    client_records,
+                                    client_write,
+                                    fallback_records,
+                                    fallback_write,
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                        };
+                        let pq_rekey = match PqRekeyRequest::decode_ref(first_payload.as_slice()) {
+                            Ok(pq_rekey) => pq_rekey,
+                            Err(err) => {
+                                tracing::debug!(cid, error = %err, "malformed PX1Q payload; graceful teardown");
+                                graceful_close_pre_pq(
+                                    client_records,
+                                    client_write,
+                                    fallback_records,
+                                    fallback_write,
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                        };
                         let client_x25519_public = pq_rekey.client_x25519_public;
                         let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
                         if !commit_pending_replay_entry(&mut pending_replay).await? {
@@ -1550,8 +1701,20 @@ async fn run_authenticated_data_mode(
                             &*pq_shared_secret,
                         );
                         let mut rng = StdRng::from_entropy();
-                        let key_exchange_record =
-                            server_seal.seal(&key_exchange_payload, &mut rng)?;
+                        // Split the key-exchange (PX1K) record across several
+                        // variable-length chunks for the same reason as the client
+                        // PX1Q split (PAR-21): no fixed ~1632-byte single record,
+                        // no equal-length run, no fixed per-session regime. Sealed
+                        // into one buffer => one write => single flight.
+                        let mut key_exchange_record = Vec::new();
+                        for chunk in FramedChunk::encode_all_shaped(
+                            &key_exchange_payload,
+                            &mut rng,
+                            PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
+                            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT,
+                        )? {
+                            server_seal.seal_into(&chunk, &mut rng, &mut key_exchange_record)?;
+                        }
                         log_outer_write(
                             cid,
                             "server->client",
@@ -1666,10 +1829,7 @@ async fn run_authenticated_data_mode(
                         // over a reliable bidi stream. `None` on every other path
                         // (declined, probe not Verified, or udp.enabled=false), in
                         // which case the relay stays byte-identical on TCP.
-                        let mut retained_quic: Option<(
-                            crate::transport::udp::quic::endpoint::Endpoint,
-                            ServerProbedQuic,
-                        )> = None;
+                        let mut retained_quic: Option<ServerProbedQuic> = None;
 
                         // Client-initiated, fail-soft UDP negotiation (PX1G). The
                         // server NEVER offers UDP unsolicited. When udp.enabled it
@@ -1684,68 +1844,39 @@ async fn run_authenticated_data_mode(
                                 UdpDecline, UdpOffer, UdpProbeAck, UDP_CC_BBR,
                                 UDP_DECLINE_DISABLED, UDP_FEC_ADAPTIVE,
                             };
-                            use crate::transport::udp::endpoint::{
-                                bind_server_endpoint, bind_server_endpoint_0rtt,
-                            };
 
                             let offered = if udp.enabled {
-                                // Bind the probe endpoint on the same interface and
-                                // address family the client reached us on (the TCP
-                                // connection's local address), not the IPv4 wildcard:
-                                // a 0.0.0.0 bind is unreachable for any client that
-                                // arrived over IPv6, and it ignores an operator's
-                                // interface-scoped listen address.
-                                let bind_ip = client_write
-                                    .local_addr()
-                                    .map(|addr| addr.ip())
-                                    .unwrap_or(std::net::IpAddr::V4(
-                                        std::net::Ipv4Addr::UNSPECIFIED,
-                                    ));
-                                // Present the ephemeral cert under the same front
-                                // domain this connection is camouflaged as (the REALITY
-                                // ClientHello SNI), never the literal "localhost" — a
-                                // QUIC Initial carrying SNI=localhost to a public IP is
-                                // a zero-false-positive censorship signature.
-                                let bind_addr = std::net::SocketAddr::new(bind_ip, 0);
-                                // When 0-RTT is enabled (process-wide, see `run`), this
-                                // ephemeral endpoint issues + accepts resumption tickets
-                                // under the shared STEK + single-use replay guard; a
-                                // ticket issued here still opens at a later session's
-                                // ephemeral endpoint because the STEK is host-stable.
-                                let bound = match SERVER_ZERO_RTT.get() {
-                                    Some(zr) => {
-                                        bind_server_endpoint_0rtt(
-                                            bind_addr,
-                                            &handshake.client_hello.sni,
-                                            zr.stek.clone(),
-                                            zr.guard.clone(),
-                                        )
-                                        .await
-                                    }
-                                    None => {
-                                        bind_server_endpoint(
-                                            bind_addr,
-                                            &handshake.client_hello.sni,
-                                        )
-                                        .await
-                                    }
-                                };
-                                match bound {
-                                    Ok(ep) => ep.local_addr().ok().and_then(|addr| {
-                                        let port = addr.port();
-                                        if port == 0 {
-                                            return None;
+                                // Route through the process-wide stable carrier (bound
+                                // on the server's listen address in `run`): register
+                                // this session's offer_id and hand the client the
+                                // stable QUIC port. The carrier marker-terminates the
+                                // client and delivers the connection here by offer_id
+                                // (the client sets it as its first-Initial DCID),
+                                // splicing every unauthenticated Initial to the origin.
+                                // No per-session endpoint is bound.
+                                let carrier = SERVER_QUIC_CARRIER
+                                    .lock()
+                                    .expect("quic carrier mutex poisoned")
+                                    .clone();
+                                match carrier {
+                                    Some(carrier) => match carrier.local_addr() {
+                                        Ok(addr) if addr.port() != 0 => {
+                                            let offer_id: [u8; 16] = rand::random();
+                                            let rx = carrier.register(offer_id);
+                                            // The client connects QUIC to the same
+                                            // stable host:port it reached us on over
+                                            // TCP (the carrier's bound port).
+                                            Some((carrier, offer_id, addr.port(), rx))
                                         }
-                                        let offer_id: [u8; 16] = rand::random();
-                                        Some((ep, offer_id, port))
-                                    }),
-                                    Err(_) => None,
+                                        _ => None,
+                                    },
+                                    None => None,
                                 }
                             } else {
                                 None
                             };
 
-                            if let Some((udp_ep, offer_id, port)) = offered {
+                            if let Some((carrier, offer_id, port, rx)) = offered {
                                 let offer = UdpOffer {
                                     offer_id,
                                     udp_port: port,
@@ -1796,27 +1927,47 @@ async fn run_authenticated_data_mode(
                                 // regardless; here we additionally keep it for the
                                 // data path when the client confirms Verified.
                                 // Accept the probe QUIC connection ONLY from the
-                                // authenticated TCP peer's source IP (L-6): the
-                                // ephemeral endpoint is reachable by anyone who
-                                // learns the port, so a racing/off-path connector
-                                // could otherwise steal the single accept slot and
-                                // force a TCP downgrade. peer_addr() reads it off
-                                // the live socket; None fails closed (the callee
-                                // declines QUIC and the session stays on TCP).
+                                // authenticated TCP peer's source IP (L-6): the carrier
+                                // is reachable by anyone, and although the marker fork
+                                // already gates termination, the source-IP check keeps
+                                // a racing/off-path connector that somehow learned the
+                                // offer_id from stealing the slot. peer_addr() reads it
+                                // off the live socket; None fails closed (decline QUIC,
+                                // stay on TCP).
                                 let expect_ip = client_write.peer_addr().ok().map(|a| a.ip());
-                                let probed_conn: Option<ServerProbedQuic> = tokio::time::timeout(
-                                    probe_budget,
-                                    accept_probed_quic_from_peer(
-                                        &udp_ep,
-                                        expect_ip,
-                                        sandwich_secret,
-                                        &offer_id,
-                                        cid,
-                                    ),
-                                )
-                                .await
-                                .ok()
-                                .flatten();
+                                // Await the carrier's handoff for this offer_id (bounded
+                                // by the probe budget), then serve the probe on the
+                                // routed connection. A timeout / dropped sender means no
+                                // client connected in time — unregister so the offer_id
+                                // does not leak, and stay on TCP.
+                                let probed_conn: Option<ServerProbedQuic> =
+                                    match tokio::time::timeout(probe_budget, rx).await {
+                                        Ok(Ok(conn))
+                                            if expect_ip
+                                                .is_some_and(|ip| conn.remote_address().ip() == ip) =>
+                                        {
+                                            serve_probed_quic_on_conn(
+                                                conn,
+                                                sandwich_secret,
+                                                &offer_id,
+                                                cid,
+                                            )
+                                            .await
+                                        }
+                                        Ok(Ok(conn)) => {
+                                            tracing::debug!(
+                                                cid,
+                                                peer = %conn.remote_address(),
+                                                "declining fast-plane QUIC (source IP / fail-closed)"
+                                            );
+                                            drop(conn);
+                                            None
+                                        }
+                                        _ => {
+                                            carrier.unregister(&offer_id);
+                                            None
+                                        }
+                                    };
 
                                 client_record.clear();
                                 // BOUNDED read: we are holding the ephemeral QUIC
@@ -1840,7 +1991,6 @@ async fn run_authenticated_data_mode(
                                             if let Some(probed) = probed_conn {
                                                 probed.conn.close(0u32.into(), b"px1p-eof");
                                             }
-                                            udp_ep.close(0u32.into(), b"px1p-eof");
                                             return Ok(());
                                         }
                                         Err(err) => return Err(HandshakeServerError::Io(err)),
@@ -1848,12 +1998,11 @@ async fn run_authenticated_data_mode(
                                     Err(_) => {
                                         tracing::warn!(
                                             cid,
-                                            "udp PX1P ack read timed out; releasing QUIC endpoint"
+                                            "udp PX1P ack read timed out; releasing QUIC connection"
                                         );
                                         if let Some(probed) = probed_conn {
                                             probed.conn.close(0u32.into(), b"px1p-timeout");
                                         }
-                                        udp_ep.close(0u32.into(), b"px1p-timeout");
                                         return Err(HandshakeServerError::Io(io::Error::new(
                                             io::ErrorKind::TimedOut,
                                             "udp PX1P ack read timed out",
@@ -1912,25 +2061,23 @@ async fn run_authenticated_data_mode(
                                             *RETAINED_QUIC_CONN_FOR_TEST
                                                 .lock()
                                                 .expect("retained quic test hook poisoned") =
-                                                Some(udp_ep.clone());
+                                                Some(carrier.endpoint_handle());
                                         }
-                                        retained_quic = Some((udp_ep, probed));
+                                        retained_quic = Some(probed);
                                     }
                                     UdpRetentionDecision::HardFail => {
                                         // Verified ack but we no longer hold the
                                         // probed connection (the probe budget elapsed
                                         // after serve_probe queued its echo). The
                                         // client has committed its relay to QUIC and
-                                        // will reset, so close the endpoint and fail
-                                        // identically instead of silently diverging
-                                        // onto TCP. Same close-then-Err shape as the
-                                        // PX1P-ack / real-command timeouts. (L-7)
+                                        // will reset, so fail identically instead of
+                                        // silently diverging onto TCP. The shared
+                                        // carrier persists for other sessions. (L-7)
                                         tracing::warn!(
                                             cid,
                                             "Verified PX1P ack but server lost the probed QUIC \
                                              connection; resetting to stay aligned with the client"
                                         );
-                                        udp_ep.close(0u32.into(), b"px1p-verified-no-conn");
                                         return Err(HandshakeServerError::Io(io::Error::new(
                                             io::ErrorKind::ConnectionAborted,
                                             "Verified PX1P ack with no retained QUIC connection",
@@ -1938,9 +2085,11 @@ async fn run_authenticated_data_mode(
                                     }
                                     UdpRetentionDecision::StayOnTcp => {
                                         // Not Verified: the client also stays on TCP.
-                                        // Drop any accepted connection (closing it) and
-                                        // close the endpoint, exactly as before.
-                                        udp_ep.close(0u32.into(), b"done");
+                                        // Close any accepted connection (the shared
+                                        // carrier itself persists for other sessions).
+                                        if let Some(probed) = probed_conn {
+                                            probed.conn.close(0u32.into(), b"done");
+                                        }
                                     }
                                 }
                             } else {
@@ -2600,10 +2749,7 @@ struct DataRelay {
     /// stream set) when the client's probe was Verified. `Some` => carry the relay
     /// over the SAME request bidi (DATA-framed); `None` => the relay stays on the
     /// TCP record legs exactly as before this slice.
-    retained_quic: Option<(
-        crate::transport::udp::quic::endpoint::Endpoint,
-        ServerProbedQuic,
-    )>,
+    retained_quic: Option<ServerProbedQuic>,
     cid: u64,
 }
 
@@ -2659,6 +2805,12 @@ struct ServerProbedQuic {
     relay_recv: crate::transport::udp::quic::endpoint::RecvStream,
 }
 
+/// Per-session ephemeral accept path: loop `accept()` with the L-6 source-IP filter
+/// to pick the authenticated peer's connection, then serve the probe on it. Retained
+/// as a focused test of the accept-loop + [`serve_probed_quic_on_conn`]; the live
+/// runtime now routes through the stable carrier (which does its own IP check before
+/// calling `serve_probed_quic_on_conn`), so this is exercised only by tests.
+#[cfg(test)]
 async fn accept_probed_quic_from_peer(
     udp_ep: &crate::transport::udp::quic::endpoint::Endpoint,
     expect_ip: Option<std::net::IpAddr>,
@@ -2698,6 +2850,21 @@ async fn accept_probed_quic_from_peer(
         drop(c); // silent: no CONNECTION_CLOSE on the wire (no response oracle)
     };
 
+    serve_probed_quic_on_conn(conn, sandwich_secret, offer_id, cid).await
+}
+
+/// Serve the H3 reachability probe on an already-accepted (and source-IP-validated)
+/// fast-plane connection: open the control stream, accept + serve the request bidi,
+/// open the encoder stream, verify the client's Safari-26 H3 SETTINGS, and return the
+/// retained streams. Shared by the per-session ephemeral accept path
+/// ([`accept_probed_quic_from_peer`]) and the stable carrier handoff (which performs
+/// its own source-IP check on the routed connection before calling this).
+async fn serve_probed_quic_on_conn(
+    conn: crate::transport::udp::quic::endpoint::Connection,
+    sandwich_secret: &[u8],
+    offer_id: &[u8; 16],
+    cid: u64,
+) -> Option<ServerProbedQuic> {
     // H3 stream order mirrors the client: open this endpoint's control stream
     // (SETTINGS) first, accept the client's request bidi and serve the bidi
     // probe (HEADERS + DATA), then open the QPACK encoder stream. The
@@ -2705,17 +2872,17 @@ async fn accept_probed_quic_from_peer(
     // carrier is H3 framing. A failure to open a control stream means the QUIC
     // connection is unusable for H3 — decline (stay on TCP).
     //
-    // TODO(quic-active-probing): HARD PRE-ENABLE GATE. This sends the SAME
-    // Safari-26 *client* SETTINGS (`safari26_settings_frame`, browser-shaped) as
-    // the server's control-stream first frame. A real H3 *origin* advertises a
-    // DIFFERENT, server-shaped SETTINGS set. An active prober that completes the
-    // TLS handshake can read this server 1-RTT SETTINGS frame BEFORE it fails
-    // authentication and we drop it — so reusing the client SETTINGS here is an
-    // active-probing tell (and the unconditional drop-on-auth-failure differs
-    // from how a real origin would respond). BEFORE enabling QUIC in production,
-    // the server must emit origin-shaped SETTINGS and, on auth failure, behave
-    // like the fronted origin rather than dropping. Gated on the camouflage-
-    // origin decision + a captured reference of the origin's H3 SETTINGS.
+    // ACTIVE-PROBING (resolved by the stable carrier): this is reached ONLY for a
+    // connection the carrier already marker-terminated — i.e. a genuine ParallaX
+    // client that proved knowledge of the PSK + the server's static X25519 key in its
+    // first Initial. Every unauthenticated v1 Initial (no / forged / replayed marker)
+    // is spliced verbatim to the real origin at datagram zero, BEFORE any ParallaX
+    // QUIC byte is emitted, so an active prober reads the TRUE origin's SETTINGS +
+    // auth-failure behaviour, never this code path. The Safari-26 *client* SETTINGS
+    // sent here are therefore seen only by our own client (which expects them — the
+    // LOCKSTEP below); they are not an origin-facing tell, and "drop on H3-probe
+    // failure" only ever drops our own misbehaving client (a prober was already
+    // spliced), so it matches no origin a prober can compare against.
     let control_send = crate::transport::udp::h3::open_h3_control_stream(&conn)
         .await
         .ok()?;
@@ -2748,12 +2915,11 @@ async fn accept_probed_quic_from_peer(
     // LOCKSTEP: this requires the client's SETTINGS to be Safari-26-SHAPED — the
     // two QPACK params exact, the GREASE setting per-connection random so only its
     // reserved form is checked (see `is_safari26_settings`). The client sends those
-    // (client runtime SETTINGS check). The mirror of this dependency lives on the
-    // client side, which requires the SERVER's SETTINGS to be Safari-26-shaped too:
-    // when the `TODO(quic-active-probing)` gate above is lifted and this endpoint
-    // emits origin-shaped SETTINGS, the client's expectation must change in
-    // lockstep (see client/runtime.rs SETTINGS check), or the client will
-    // silently never verify the QUIC path.
+    // (client runtime SETTINGS check). Both ends keep the Safari-26 client shape:
+    // since the carrier already spliced every unauthenticated Initial to the origin,
+    // this SETTINGS exchange happens only between our own client and server (a prober
+    // sees the TRUE origin's SETTINGS via the splice, never these), so the two sides
+    // simply have to agree — they do.
     match crate::transport::udp::h3::read_peer_h3_settings(&conn).await {
         Ok(settings) if crate::fingerprint::http3::is_safari26_settings(&settings) => {}
         _ => {
@@ -2776,16 +2942,11 @@ async fn accept_probed_quic_from_peer(
 /// application-closing the connection promptly so no idle fast-plane connection
 /// lingers when a dispatch path (Mux/SpeedTest) stays on TCP. A bare drop would
 /// also close it, but the explicit close gives the peer an immediate
-/// CONNECTION_CLOSE rather than waiting for an idle timeout.
-fn drop_retained_quic(
-    retained: Option<(
-        crate::transport::udp::quic::endpoint::Endpoint,
-        ServerProbedQuic,
-    )>,
-) {
-    if let Some((endpoint, probed)) = retained {
+/// CONNECTION_CLOSE rather than waiting for an idle timeout. The shared carrier
+/// endpoint is process-wide and is never closed here.
+fn drop_retained_quic(retained: Option<ServerProbedQuic>) {
+    if let Some(probed) = retained {
         probed.conn.close(0u32.into(), b"tcp-path");
-        endpoint.close(0u32.into(), b"tcp-path");
     }
 }
 
@@ -2986,17 +3147,16 @@ impl DataRelay {
         // server->client, recv = client->server), so server_download (server->
         // client) writes the SendStream and server_upload (client->server) reads
         // the RecvStream.
-        if let Some((udp_ep, probed)) = retained_quic {
+        if let Some(probed) = retained_quic {
             let ServerProbedQuic {
                 conn,
                 h3_control,
                 relay_send,
                 relay_recv,
             } = probed;
-            // Hold the endpoint + connection + H3 control streams alive across the
-            // relay. `_udp_ep` / `_h3_control` must not drop early (the control/
-            // encoder uni streams must stay open per RFC 9114 §6.2.1).
-            let _udp_ep = udp_ep;
+            // Hold the connection + H3 control streams alive across the relay.
+            // `_h3_control` must not drop early (the control/encoder uni streams must
+            // stay open per RFC 9114 §6.2.1). The carrier endpoint is process-wide.
             let _h3_control = h3_control;
             // Keep the TCP control halves alive for the relay's duration so the
             // outer TCP connection stays open (the client likewise holds its TCP
@@ -6363,10 +6523,16 @@ mod tests {
         let mut data_session = ClientDataSession::new(session_keys, traffic).unwrap();
         let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut rng).unwrap();
         client.write_all(&pq_record).await.unwrap();
-        let key_exchange_record = read_record(&mut client).await.unwrap();
-        data_session
-            .apply_server_key_exchange_record(&key_exchange_record, &pending_rekey, PSK)
-            .unwrap();
+        // Drive the real client receive path: skips residual camouflage and
+        // reassembles the server's chunked PX1K (PAR-21), against the real server.
+        crate::client::runtime::apply_server_key_exchange_after_residuals(
+            &mut client,
+            &mut data_session,
+            &pending_rekey,
+            PSK,
+        )
+        .await
+        .unwrap();
         let mut identity_payload = Vec::new();
         loop {
             let identity_record = read_record(&mut client).await.unwrap();
