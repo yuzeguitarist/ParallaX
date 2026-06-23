@@ -127,6 +127,10 @@ pub fn server_config(
         // — exactly what the hand-rolled ServerHandshake's signer expects.
         signing_key_pkcs8: key.secret_der().to_vec(),
         alpn_protocols: vec![UDP_ALPN.to_vec()],
+        // Cold-start only here; the server runtime enables 0-RTT by setting a STEK +
+        // anti-replay guard on the config (see the server runtime wiring).
+        stek: None,
+        replay_guard: None,
     }))
 }
 

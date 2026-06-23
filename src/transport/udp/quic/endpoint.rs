@@ -30,7 +30,8 @@ use tokio::sync::{mpsc, Notify};
 
 use super::conn::{CloseReason, Connection as Core};
 use super::packet::{first_packet_space, ConnectionId, PacketSpace};
-use crate::tls::quic::{ClientConfig, QuicTlsError, QUIC_VERSION_V1};
+use crate::tls::quic::{ClientConfig, ClientTicket, QuicTlsError, ZeroRttGuard, QUIC_VERSION_V1};
+use zeroize::Zeroizing;
 
 /// Maximum UDP payload we will read in one datagram (a generous ceiling above the
 /// path MTU; oversized datagrams are truncated, which fails AEAD and is dropped).
@@ -67,6 +68,12 @@ pub struct ServerConfig {
     pub signing_key_pkcs8: Vec<u8>,
     /// Offered ALPN protocols (the relay offers exactly `h3`).
     pub alpn_protocols: Vec<Vec<u8>>,
+    /// STEK for issuing + accepting 0-RTT resumption tickets. `None` keeps the
+    /// server cold-start-only (no NewSessionTicket, no 0-RTT acceptance).
+    pub stek: Option<Zeroizing<[u8; 32]>>,
+    /// Cross-connection single-use 0-RTT anti-replay guard, installed on every
+    /// accepted connection. Should be `Some` whenever `stek` is `Some`.
+    pub replay_guard: Option<Arc<dyn ZeroRttGuard>>,
 }
 
 /// Failure to establish a connection.
@@ -217,6 +224,12 @@ struct ConnectRequest {
     addr: SocketAddr,
     server_name: String,
     config: Arc<ClientConfig>,
+    /// `Some` for a 0-RTT resumption connect: the client offers this ticket and
+    /// installs 0-RTT keys so early data can be sent before the handshake completes.
+    ticket: Option<ClientTicket>,
+    /// Current Unix time in milliseconds (for `obfuscated_ticket_age`); 0 when not
+    /// resuming.
+    now_ms: u64,
     reply: tokio::sync::oneshot::Sender<Result<Arc<ConnShared>, ConnectError>>,
 }
 
@@ -303,6 +316,32 @@ impl Endpoint {
         addr: SocketAddr,
         server_name: &str,
     ) -> Result<Connection, ConnectError> {
+        self.connect_inner(addr, server_name, None, 0).await
+    }
+
+    /// Like [`Self::connect`] but offers `ticket` for a 0-RTT resumption: any data
+    /// written to a stream before the handshake completes is sent under the 0-RTT
+    /// keys (early data). `now_ms` is the current Unix time in milliseconds (for
+    /// `obfuscated_ticket_age`). Falls back transparently to a full 1-RTT handshake
+    /// if the server rejects the ticket.
+    pub async fn connect_resumption(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        ticket: ClientTicket,
+        now_ms: u64,
+    ) -> Result<Connection, ConnectError> {
+        self.connect_inner(addr, server_name, Some(ticket), now_ms)
+            .await
+    }
+
+    async fn connect_inner(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        ticket: Option<ClientTicket>,
+        now_ms: u64,
+    ) -> Result<Connection, ConnectError> {
         let config = self
             .default_config
             .lock()
@@ -315,6 +354,8 @@ impl Endpoint {
                 addr,
                 server_name: server_name.to_string(),
                 config,
+                ticket,
+                now_ms,
                 reply,
             })
             .map_err(|_| ConnectError::EndpointClosed)?;
@@ -449,7 +490,7 @@ impl Driver {
         }
         let scid = self.next_scid.to_be_bytes();
         self.next_scid += 1;
-        let core = match Core::new_server(
+        let core = match Core::new_server_with_stek(
             cfg.cert_chain.clone(),
             &cfg.signing_key_pkcs8,
             cfg.alpn_protocols.clone(),
@@ -458,8 +499,16 @@ impl Driver {
             // (RFC 9000 §7.3) instead of a stale config-time placeholder.
             super::transport_params::TransportParameters::server(&scid).encode_server(),
             ConnectionId::new(&scid),
+            cfg.stek.clone(),
         ) {
-            Ok(core) => core,
+            Ok(mut core) => {
+                // Install the shared single-use 0-RTT anti-replay guard so a replayed
+                // ticket on any connection is rejected (falls back to 1-RTT).
+                if let Some(guard) = cfg.replay_guard.clone() {
+                    core.set_zero_rtt_replay_guard(guard);
+                }
+                core
+            }
             Err(_) => return,
         };
         let shared = Arc::new(ConnShared {
@@ -476,16 +525,26 @@ impl Driver {
 
     fn on_connect(&mut self, req: ConnectRequest) {
         let dcid = random_cid();
-        let core =
-            match Core::new_client(req.config, &req.server_name, dcid, ConnectionId::new(&[])) {
-                Ok(core) => core,
-                Err(err) => {
-                    // Surface the real TLS/init failure to connect() instead of
-                    // letting the dropped sender masquerade as EndpointClosed.
-                    let _ = req.reply.send(Err(ConnectError::Tls(err)));
-                    return;
-                }
-            };
+        let core_result = match &req.ticket {
+            Some(ticket) => Core::new_client_resumption(
+                req.config,
+                &req.server_name,
+                dcid,
+                ConnectionId::new(&[]),
+                ticket,
+                req.now_ms,
+            ),
+            None => Core::new_client(req.config, &req.server_name, dcid, ConnectionId::new(&[])),
+        };
+        let core = match core_result {
+            Ok(core) => core,
+            Err(err) => {
+                // Surface the real TLS/init failure to connect() instead of
+                // letting the dropped sender masquerade as EndpointClosed.
+                let _ = req.reply.send(Err(ConnectError::Tls(err)));
+                return;
+            }
+        };
         let shared = Arc::new(ConnShared {
             core: Mutex::new(core),
             peer: req.addr,
@@ -567,6 +626,13 @@ impl Connection {
     /// server to filter an accepted connection against the authenticated peer's IP.
     pub fn remote_address(&self) -> SocketAddr {
         self.shared.peer
+    }
+
+    /// Take a resumption ticket received on this connection (client only; the server
+    /// returns `None`). `now_ms` stamps the ticket-age epoch. Call after the relay
+    /// completes to cache a ticket for a future 0-RTT reconnect.
+    pub fn take_session_ticket(&self, now_ms: u64) -> Option<ClientTicket> {
+        self.shared.core.lock().unwrap().take_session_ticket(now_ms)
     }
 
     /// RFC 5705 exporter (backs the auth token).
@@ -859,6 +925,8 @@ mod tests {
             cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
             signing_key_pkcs8: key,
             alpn_protocols: vec![b"h3".to_vec()],
+            stek: None,
+            replay_guard: None,
         })
     }
 

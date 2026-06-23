@@ -146,7 +146,7 @@ mod handshake;
 
 pub(crate) use schedule::initial_keys;
 pub(crate) use server::ServerHandshake;
-pub(crate) use ticket::ClientTicket;
+pub use ticket::ClientTicket;
 
 /// Cross-connection 0-RTT anti-replay (single-use ticket; RFC 8446 §8). The server
 /// consults it before accepting a resumed ticket's early data: `accept_ticket`
@@ -154,7 +154,7 @@ pub(crate) use ticket::ClientTicket;
 /// `false` to reject (a replay — the connection falls back to a full 1-RTT
 /// handshake). The runtime backs it with the persistent replay cache; it MUST be
 /// safe to call concurrently from many connections.
-pub(crate) trait ZeroRttGuard: Send + Sync {
+pub trait ZeroRttGuard: Send + Sync {
     /// `ticket_identity` is the opaque `pre_shared_key` identity (the sealed
     /// ticket); `now_unix` is the current time in seconds.
     fn accept_ticket(&self, ticket_identity: &[u8], now_unix: u64) -> bool;

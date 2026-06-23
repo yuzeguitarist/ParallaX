@@ -259,7 +259,7 @@ pub(crate) fn decode_new_session_ticket(body: &[u8]) -> Option<NewSessionTicket>
 
 /// A ticket the client retains to drive a later 0-RTT resumption. Single-use: the
 /// client offers it once, then drops it (S8 anti-replay relies on this).
-pub(crate) struct ClientTicket {
+pub struct ClientTicket {
     /// The opaque ticket bytes, sent back verbatim as the `pre_shared_key` identity.
     pub ticket: Vec<u8>,
     /// The resumption PSK the client derived (= the server's sealed PSK).
