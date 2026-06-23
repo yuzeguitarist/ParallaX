@@ -1156,8 +1156,6 @@ $sudo_prefix install -d -m 0755 /etc/modules-load.d /etc/sysctl.d
 printf '%s\n' tcp_bbr | $sudo_prefix tee /etc/modules-load.d/parallax-bbr.conf >/dev/null
 cat <<'PARALLAX_BBR_SYSCTL' | $sudo_prefix tee /etc/sysctl.d/99-parallax-bbr.conf >/dev/null
 net.core.default_qdisc=fq
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_rmem=4096 87380 67108864
 net.ipv4.tcp_wmem=4096 65536 67108864
@@ -1178,6 +1176,26 @@ echo "BBR/fq enabled: tcp_congestion_control=\$current_cc default_qdisc=\$curren
 REMOTE_BBR
 )
   fi
+  # Socket-buffer maxima (net.core.{r,w}mem_max) are a prerequisite for the
+  # [transport] tcp_send_buffer_bytes / tcp_recv_buffer_bytes feature REGARDLESS of
+  # BBR — without them an explicit SO_*BUF is silently clamped to the ~208 KiB
+  # kernel default. Written unconditionally (a separate drop-in from the BBR one) so
+  # the buffer feature works even with --no-enable-bbr. Linux-only; skipped (not
+  # fatal) elsewhere. Only raises the caps; autotuning is unaffected unless an
+  # explicit buffer is actually configured.
+  local net_buffer_sysctl_script
+  net_buffer_sysctl_script=$(cat <<REMOTE_NETBUF
+if [[ "\$(uname -s)" == "Linux" ]]; then
+  echo "Configuring VPS socket-buffer maxima (net.core.{r,w}mem_max)..."
+  $sudo_prefix install -d -m 0755 /etc/sysctl.d
+  cat <<'PARALLAX_NETBUF_SYSCTL' | $sudo_prefix tee /etc/sysctl.d/99-parallax-netbuf.conf >/dev/null
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+PARALLAX_NETBUF_SYSCTL
+  $sudo_prefix sysctl --system >/dev/null 2>&1 || true
+fi
+REMOTE_NETBUF
+)
   local profile_install_script=""
   if profiling_enabled; then
     profile_install_script=$(cat <<REMOTE_PROFILE
@@ -1285,6 +1303,7 @@ cleanup_remote_tmp() {
   rm -rf $q_tmp
 }
 trap cleanup_remote_tmp EXIT
+$net_buffer_sysctl_script
 $bbr_install_script
 $sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir /var/lib/parallax
 $sudo_prefix install -m 0755 $q_tmp/plx $q_remote_bin

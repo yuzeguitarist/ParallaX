@@ -186,7 +186,11 @@ fn tuned_tcp_socket(addr: SocketAddr) -> io::Result<TcpSocket> {
     };
     socket.set_nodelay(true)?;
     socket.set_keepalive(true)?;
-    set_socket_buffers(&socket);
+    // NB: socket buffers are deliberately NOT set here (pre-connect). On Linux the
+    // SYN's TCP window-scale shift count is derived from SO_RCVBUF at connect time,
+    // so an explicit recv buffer on this camouflage dial would shift the window
+    // scale away from Safari/macOS autotuning — an observable, ClientHello-adjacent
+    // fingerprint on the SYN. Buffers are applied post-connect via tune_tcp_stream.
     tune_tcp_socket_before_connect(&socket);
     Ok(socket)
 }
@@ -347,13 +351,21 @@ pub fn configure_congestion_control(algorithm: Option<&str>) {
 }
 
 /// Process-wide explicit TCP socket buffer sizes, set once at startup. Either
-/// field `None` keeps kernel autotuning for that direction (the safe default).
-/// An explicit SO_SNDBUF/SO_RCVBUF DISABLES autotuning for the socket and is
-/// clamped by the OS maximum (`net.core.{w,r}mem_max` on Linux,
-/// `kern.ipc.maxsockbuf` on macOS), so only set these when that maximum has been
-/// raised. Wire-invisible (window scaling is negotiated regardless); a kernel-side
-/// throughput tuning for high-BDP links where autotuning under-provisions the
-/// upload window.
+/// field `None` keeps kernel autotuning for that direction (the safe default,
+/// which preserves full Safari parity). An explicit SO_SNDBUF/SO_RCVBUF DISABLES
+/// autotuning for the socket and is clamped by the OS maximum
+/// (`net.core.{w,r}mem_max` on Linux, `kern.ipc.maxsockbuf` on macOS), so only set
+/// these when that maximum has been raised.
+///
+/// Covertness note: SO_SNDBUF is wire-invisible (it does not affect the advertised
+/// receive window). SO_RCVBUF is NOT fully invisible — on Linux it sets the SYN's
+/// TCP window-scale shift and the advertised window. To keep the camouflage SYN
+/// Safari-identical, buffers are applied ONLY post-connect/accept (via
+/// `tune_tcp_stream`), never on the pre-connect dial (see `tuned_tcp_socket`); even
+/// then, a fixed recv buffer flattens the advertised-window curve vs Safari's
+/// autotuning, so the recv knob is for data-sink (server) tuning — opt-in, off by
+/// default. A kernel-side throughput tuning for high-BDP links where autotuning
+/// under-provisions the upload window.
 static SOCKET_BUFFER_OVERRIDE: std::sync::OnceLock<SocketBuffers> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, Default)]
