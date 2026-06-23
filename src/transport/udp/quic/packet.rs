@@ -381,7 +381,7 @@ pub fn locate_pn_offset(buf: &[u8], local_cid_len: usize) -> Result<usize, Decod
         return Ok(1 + local_cid_len);
     }
     match LongType::from_first_byte(first) {
-        LongType::Initial | LongType::Handshake => {}
+        LongType::Initial | LongType::ZeroRtt | LongType::Handshake => {}
         _ => return Err(DecodeError::UnsupportedPacketType),
     }
     let ty = LongType::from_first_byte(first);

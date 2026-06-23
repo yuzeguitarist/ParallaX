@@ -431,21 +431,54 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Start a client connection. `dcid` is the client-chosen destination
-    /// connection id for the first Initial; `scid` is our (zero-length) source CID.
+    /// Start a cold-start client connection. `dcid` is the client-chosen
+    /// destination connection id for the first Initial; `scid` is our (zero-length)
+    /// source CID.
     pub fn new_client(
         config: Arc<ClientConfig>,
         server_name: &str,
         dcid: ConnectionId,
         scid: ConnectionId,
     ) -> Result<Self, QuicTlsError> {
+        Self::new_client_inner(config, server_name, dcid, scid, None, 0)
+    }
+
+    /// Start a 0-RTT resumption client connection: offers `ticket` (PSK +
+    /// early_data) and installs the 0-RTT keys so early data can be sent before the
+    /// handshake completes. `now_ms` is the current Unix time in milliseconds (for
+    /// `obfuscated_ticket_age`).
+    pub fn new_client_resumption(
+        config: Arc<ClientConfig>,
+        server_name: &str,
+        dcid: ConnectionId,
+        scid: ConnectionId,
+        ticket: &ClientTicket,
+        now_ms: u64,
+    ) -> Result<Self, QuicTlsError> {
+        Self::new_client_inner(config, server_name, dcid, scid, Some(ticket), now_ms)
+    }
+
+    fn new_client_inner(
+        config: Arc<ClientConfig>,
+        server_name: &str,
+        dcid: ConnectionId,
+        scid: ConnectionId,
+        ticket: Option<&ClientTicket>,
+        now_ms: u64,
+    ) -> Result<Self, QuicTlsError> {
         let tp = TransportParameters::safari_client(scid.as_slice());
-        let tls = ClientHandshake::new(
-            config,
-            QUIC_VERSION_V1,
-            server_name,
-            tp.encode_safari_client(),
-        )?;
+        let tp_blob = tp.encode_safari_client();
+        let tls = match ticket {
+            Some(t) => ClientHandshake::new_resumption(
+                config,
+                QUIC_VERSION_V1,
+                server_name,
+                tp_blob,
+                t,
+                now_ms,
+            )?,
+            None => ClientHandshake::new(config, QUIC_VERSION_V1, server_name, tp_blob)?,
+        };
         let mut spaces = [Space::default(), Space::default(), Space::default()];
         spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
         let mut conn = Self {
@@ -493,7 +526,13 @@ impl Connection {
             peer_msd_bidi_remote: 0,
             peer_msd_uni: 0,
         };
-        conn.pump_write(); // pull the ClientHello into the Initial CRYPTO stream
+        // 0-RTT: seed flow control from the remembered transport parameters so
+        // early data can be sent before the server's parameters arrive (RFC 9001
+        // §7.4.1). ensure_peer_flow later overwrites with the server's actual TP.
+        if let Some(t) = ticket {
+            conn.apply_remembered_transport_params(&t.peer_transport_params);
+        }
+        conn.pump_write(); // pull the ClientHello (and install 0-RTT keys on resumption)
         Ok(conn)
     }
 
@@ -749,6 +788,20 @@ impl Connection {
         (id & 0x1) != our_bit
     }
 
+    /// Seed flow-control limits from a resumption ticket's remembered transport
+    /// parameters (RFC 9001 §7.4.1) so a 0-RTT client can send early data before the
+    /// server's parameters arrive. Leaves `peer_flow_applied` false so
+    /// [`Self::ensure_peer_flow`] later re-applies the server's actual parameters.
+    fn apply_remembered_transport_params(&mut self, blob: &[u8]) {
+        let Ok(tp) = TransportParameters::read(blob) else {
+            return;
+        };
+        self.send_max_data = tp.initial_max_data;
+        self.peer_msd_bidi_local = tp.initial_max_stream_data_bidi_local;
+        self.peer_msd_bidi_remote = tp.initial_max_stream_data_bidi_remote;
+        self.peer_msd_uni = tp.initial_max_stream_data_uni;
+    }
+
     /// Parse the peer's transport parameters once (available after the handshake
     /// exchanges them) and apply their flow-control limits: the connection MAX_DATA
     /// and each open stream's initial MAX_STREAM_DATA send window (RFC 9000 §4.1).
@@ -902,6 +955,15 @@ impl Connection {
                         || sp.crypto_send_off < sp.crypto_send.len())
                 {
                     let dg = self.build_crypto_packet(space, now);
+                    self.probe_pending = self.probe_pending.saturating_sub(1);
+                    return Some(dg);
+                }
+            }
+            // 0-RTT early data: before 1-RTT keys exist, a resuming client sends app
+            // stream data under the 0-RTT keys (same Application Data PN space).
+            if self.spaces[SPACE_DATA].keys.is_none() && self.zero_rtt_keys.is_some() {
+                if let Some(id) = self.next_stream_to_send() {
+                    let dg = self.build_zero_rtt_stream_packet(id, now);
                     self.probe_pending = self.probe_pending.saturating_sub(1);
                     return Some(dg);
                 }
@@ -1585,6 +1647,87 @@ impl Connection {
             s.retransmit.remove(0);
         } else {
             // Fresh bytes consume connection-level flow-control credit.
+            self.send_data_total += end - s.send_off;
+            s.send_off = end;
+            if fin {
+                s.fin_sent = true;
+            }
+        }
+        datagram
+    }
+
+    /// The 0-RTT long header (RFC 9000 §17.2.3) for an outgoing early-data packet.
+    fn make_zero_rtt_header(&self, pn: u64, pn_len: usize) -> Header {
+        Header::Long {
+            ty: LongType::ZeroRtt,
+            version: self.version,
+            dcid: self.dcid,
+            scid: self.scid,
+            token: Vec::new(),
+            length: MIN_INITIAL_DATAGRAM as u64, // placeholder; seal_packet fixes it
+            packet_number: pn,
+            pn_len,
+        }
+    }
+
+    /// Build a 0-RTT packet carrying STREAM data for `id`, sealed with the early-data
+    /// keys (client resumption). Mirrors [`Self::build_stream_packet`] but uses the
+    /// 0-RTT keys + a 0-RTT long header; the packet number comes from the shared
+    /// Application Data space (RFC 9000 §12.3). A lost 0-RTT packet's bytes stay
+    /// buffered in the stream and are retransmitted in 1-RTT.
+    fn build_zero_rtt_stream_packet(&mut self, id: u64, now: Instant) -> Vec<u8> {
+        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let tag_len = self
+            .zero_rtt_keys
+            .as_ref()
+            .expect("0-RTT keys present")
+            .local
+            .packet
+            .tag_len();
+        let header = self.make_zero_rtt_header(pn, pn_len);
+        let mut probe = Vec::new();
+        let pn_offset = header.encode(&mut probe);
+
+        let s = &self.streams[&id];
+        let (offset, end, fin, is_retransmit) = if let Some(&(off, len, fin)) = s.retransmit.first()
+        {
+            (off, off + len, fin, true)
+        } else {
+            let offset = s.send_off;
+            let frame_hdr = 1 + super::varint::size(id) + super::varint::size(offset) + 2;
+            let budget = MAX_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
+            let remaining = s.send.len() - offset as usize;
+            let conn_window = self.send_max_data.saturating_sub(self.send_data_total);
+            let fc_window = s.send_max.saturating_sub(offset).min(conn_window) as usize;
+            let chunk = remaining.min(budget.max(1)).min(fc_window);
+            let end = offset + chunk as u64;
+            let fin = s.fin && !s.fin_sent && end as usize == s.send.len();
+            (offset, end, fin, false)
+        };
+
+        let datagram = {
+            let frame = Frame::Stream {
+                id,
+                offset,
+                fin,
+                data: &self.streams[&id].send[offset as usize..end as usize],
+            };
+            let keys = self.zero_rtt_keys.as_ref().expect("0-RTT keys present");
+            seal_packet(&keys.local, header, &[frame])
+        };
+
+        let content = SentContent {
+            crypto: Vec::new(),
+            stream: vec![(id, offset, end - offset, fin)],
+            handshake_done: false,
+            ..Default::default()
+        };
+        self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
+        let s = self.streams.get_mut(&id).unwrap();
+        if is_retransmit {
+            s.retransmit.remove(0);
+        } else {
             self.send_data_total += end - s.send_off;
             s.send_off = end;
             if fin {
@@ -2460,6 +2603,94 @@ mod tests {
         assert_eq!(ticket.received_at_ms, 1_000_000);
         // The ticket is single-use: a second take yields nothing.
         assert!(client.take_session_ticket(1_000_000).is_none());
+    }
+
+    #[test]
+    fn zero_rtt_early_data_flows_to_the_server() {
+        let stek = Zeroizing::new([0x44u8; 32]);
+        let cover = || vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+
+        // 1. Cold-start handshake to obtain a resumption ticket.
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x01; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let mut server = Connection::new_server_with_stek(
+            cover(),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xaa, 0xbb, 0xcc, 0xdd]),
+            Some(stek.clone()),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        let ticket = client
+            .take_session_ticket(1_000_000)
+            .expect("client received a resumption ticket");
+
+        // 2. A resumption connection that writes early data BEFORE the handshake.
+        let mut rclient = Connection::new_client_resumption(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x02; 8]),
+            ConnectionId::new(&[]),
+            &ticket,
+            1_001_000,
+        )
+        .unwrap();
+        let mut rserver = Connection::new_server_with_stek(
+            cover(),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x11, 0x22, 0x33, 0x44]),
+            Some(stek),
+        )
+        .unwrap();
+        let early = b"GET /?0rtt early data over the resumed 0-RTT stream";
+        rclient.send_stream(RELAY_STREAM_ID, early);
+
+        // 3. Deliver the client's first flight (Initial ClientHello + 0-RTT) to the
+        // server. At least one datagram MUST be a 0-RTT packet (long type 0x1).
+        let now = Instant::now();
+        let mut saw_zero_rtt = false;
+        while let Some(dg) = rclient.poll_transmit(now) {
+            if dg[0] & 0x80 != 0 && dg[0] & 0x30 == 0x10 {
+                saw_zero_rtt = true;
+            }
+            rserver.handle_datagram(&dg, now).unwrap();
+        }
+        assert!(
+            saw_zero_rtt,
+            "client emitted a 0-RTT (long type 0x1) packet"
+        );
+
+        // 4. The server decrypted the 0-RTT early data with its 0-RTT keys — before
+        // its own handshake flight even completes.
+        assert!(
+            rserver.zero_rtt_keys.is_some(),
+            "server accepted the PSK and installed 0-RTT keys"
+        );
+        assert!(
+            rserver.is_handshaking(),
+            "server has not yet completed 1-RTT"
+        );
+        assert_eq!(
+            rserver.read_stream(RELAY_STREAM_ID),
+            early,
+            "server received the 0-RTT early data"
+        );
+
+        // 5. The resumed handshake still completes cleanly afterwards.
+        drive(&mut rclient, &mut rserver);
+        assert!(
+            !rclient.is_handshaking() && !rserver.is_handshaking(),
+            "resumed handshake completes"
+        );
     }
 
     #[test]
