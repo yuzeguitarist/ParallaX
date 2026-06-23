@@ -2501,6 +2501,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn integrity_limit_forces_close_with_no_error_at_the_limit() {
+        // RFC 9001 §6.6: once 1-RTT AEAD-open failures reach the cipher's integrity
+        // limit, the connection must close. Verify the `>=` boundary and that the close
+        // mirrors the confidentiality-limit close exactly (NO_ERROR / code 0), so it
+        // introduces no externally distinct fingerprint.
+        let mut conn = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x5a, 0x5a, 0x5a, 0x5a]),
+        )
+        .unwrap();
+        // Install 1-RTT (Data-space) keys so the integrity limit is defined.
+        conn.spaces[SPACE_DATA].keys = Some(Keys {
+            local: test_keys(),
+            remote: test_keys(),
+        });
+        let limit = conn.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .unwrap()
+            .remote
+            .packet
+            .integrity_limit();
+
+        // One below the limit: no close.
+        conn.data_packets_open_failed = limit - 1;
+        conn.enforce_aead_integrity_limit();
+        assert!(
+            !conn.is_closed(),
+            "below the integrity limit must not close"
+        );
+
+        // At the limit: force-close with NO_ERROR (code 0), like the confidentiality close.
+        conn.data_packets_open_failed = limit;
+        conn.enforce_aead_integrity_limit();
+        assert!(conn.is_closed(), "reaching the integrity limit must close");
+        assert!(
+            matches!(conn.close_reason(), Some(CloseReason::LocalApp(0, _))),
+            "integrity-limit close must use NO_ERROR (code 0), matching the confidentiality close"
+        );
+    }
+
     fn client_config() -> Arc<ClientConfig> {
         use crate::tls::quic::AcceptAnyServerCert;
         Arc::new(ClientConfig::new(

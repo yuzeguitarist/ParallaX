@@ -511,18 +511,20 @@ impl DataRecordCodec {
     where
         R: Rng + rand::RngCore + ?Sized,
     {
+        // Contract: record_lens must sum to plaintext.len(). Checked first — before the
+        // empty-batch early-return and `ensure_usable` — so an empty `record_lens` with a
+        // non-empty plaintext is rejected consistently with the serial `seal_records_into`
+        // instead of being silently sealed as nothing. (Also prevents an OOB panic on the
+        // `plaintext[byte_offset..byte_offset + span]` slice below in release, where the
+        // prior debug_assert was compiled out.)
+        if record_lens.iter().sum::<usize>() != plaintext.len() {
+            return Err(DataRecordError::InvalidRecordLens);
+        }
         let record_count = record_lens.len();
         if record_count == 0 {
             return Ok(());
         }
         self.aead.ensure_usable()?;
-        // Contract: record_lens must sum to plaintext.len(). Enforce at runtime in
-        // every build so the release path cannot OOB-panic on
-        // `plaintext[byte_offset..byte_offset + span]` below when a caller passes
-        // mismatched lengths (the prior debug_assert was compiled out in release).
-        if record_lens.iter().sum::<usize>() != plaintext.len() {
-            return Err(DataRecordError::InvalidRecordLens);
-        }
         let group_count = pool.width().max(1).min(record_count);
 
         let cipher = self.aead.cipher();
