@@ -26,6 +26,8 @@ pub mod probe;
 /// in the module marks that staged, not-yet-referenced status.
 pub(crate) mod quic;
 pub(crate) mod reorder;
+/// Persistent single-use 0-RTT anti-replay guard (backs `tls::quic::ZeroRttGuard`).
+pub(crate) mod zero_rtt;
 
 /// Fuzz-only re-exports of the internal TUDP wire parsers. Compiled ONLY under
 /// `--cfg fuzzing` (which cargo-fuzz sets); absent from normal `cargo build` /
