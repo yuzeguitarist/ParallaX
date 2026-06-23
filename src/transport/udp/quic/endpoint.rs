@@ -660,6 +660,15 @@ impl Connection {
         self.shared.core.lock().unwrap().take_session_ticket(now_ms)
     }
 
+    /// Whether 0-RTT keys are installed on this connection. On the SERVER side this
+    /// reports whether the resumed ticket's 0-RTT was ACCEPTED (a replayed/rejected
+    /// ticket leaves it `false`, the connection having fallen back to 1-RTT); on a
+    /// resuming client it is always `true`. Used by the resumption/replay tests to
+    /// assert acceptance vs single-use rejection.
+    pub(crate) fn zero_rtt_keys_installed(&self) -> bool {
+        self.shared.core.lock().unwrap().zero_rtt_keys_installed()
+    }
+
     /// Await handshake completion (or a connection close). A 0-RTT connect
     /// ([`Endpoint::connect_resumption_0rtt`]) returns before the handshake so the
     /// caller can send early data; it then awaits this before relying on 1-RTT-only

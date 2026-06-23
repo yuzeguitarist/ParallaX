@@ -637,6 +637,15 @@ impl Connection {
         self.tls.set_zero_rtt_guard(guard);
     }
 
+    /// Whether 0-RTT keys are installed on this connection. On a resuming CLIENT
+    /// this is set at construction (it can send early data); on the SERVER it is set
+    /// only after it ACCEPTED a resumed ticket's 0-RTT (and can decrypt early data),
+    /// so the server side reports "did we accept 0-RTT for this connection". A
+    /// replayed/rejected/cold connection leaves it `false` (fell back to 1-RTT).
+    pub fn zero_rtt_keys_installed(&self) -> bool {
+        self.zero_rtt_keys.is_some()
+    }
+
     /// Close the connection with an application error code + reason (RFC 9000
     /// §19.19): an APPLICATION_CLOSE is queued for transmission. Idempotent.
     pub fn close(&mut self, error_code: u64, reason: &[u8]) {

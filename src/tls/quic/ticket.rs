@@ -258,7 +258,11 @@ pub(crate) fn decode_new_session_ticket(body: &[u8]) -> Option<NewSessionTicket>
 }
 
 /// A ticket the client retains to drive a later 0-RTT resumption. Single-use: the
-/// client offers it once, then drops it (S8 anti-replay relies on this).
+/// client offers it once, then drops it (S8 anti-replay relies on this). `Clone` is
+/// derived so a replay scenario (an attacker resending a captured flight, or a test
+/// presenting the same ticket twice) can be modelled; single-use is enforced by the
+/// server's anti-replay guard, not by this type.
+#[derive(Clone)]
 pub struct ClientTicket {
     /// The opaque ticket bytes, sent back verbatim as the `pre_shared_key` identity.
     pub ticket: Vec<u8>,

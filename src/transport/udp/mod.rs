@@ -470,3 +470,263 @@ mod tests {
         assert_eq!(got, early, "server received the resumed early data");
     }
 }
+
+/// Realistic two-session 0-RTT resumption tests. These drive the PRODUCTION QUIC
+/// endpoints (`bind_server_endpoint_0rtt` / `bind_client_endpoint_accept_any`) and
+/// the REAL H3 probe (`probe_client_*` / `serve_probe_over_bidi`) across two
+/// sessions over loopback UDP — exactly as `client::runtime::run_client_udp_probe`
+/// does, minus only the TCP/SOCKS control wrapper (orthogonal to 0-RTT). They prove
+/// the ticket rotation, that the server ACCEPTS a fresh ticket's 0-RTT early data,
+/// that a REPLAYED ticket's 0-RTT is rejected (single-use) with a graceful 1-RTT
+/// fallback, and that the single-use property PERSISTS across a server restart.
+#[cfg(test)]
+mod zero_rtt_resumption {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::crypto::replay::ReplayCache;
+    use crate::tls::quic::{derive_stek, ClientTicket};
+    use crate::transport::udp::endpoint::{
+        bind_client_endpoint_accept_any, bind_server_endpoint_0rtt,
+    };
+    use crate::transport::udp::probe::{
+        probe_client_over_bidi, probe_client_read_and_verify, probe_client_send_request_early,
+        serve_probe_over_bidi, ProbeOutcome,
+    };
+    use crate::transport::udp::quic::endpoint::{Connection, Endpoint, RecvStream, SendStream};
+    use crate::transport::udp::zero_rtt::ReplayCacheGuard;
+
+    const ZR_PSK: &[u8] = b"parallax-0rtt-resumption-test-psk";
+    const ZR_CTX: &[u8] = b"0rtt-resumption-offer-context";
+    const ZR_LIFETIME: u64 = 604_800;
+    const ZR_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    async fn client() -> Endpoint {
+        bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// Accept one connection and serve one H3 probe round-trip on it, returning the
+    /// server connection (so the caller can query `zero_rtt_keys_installed`) plus the
+    /// probe streams (held so the queued reply flushes before they drop).
+    async fn accept_and_serve_probe(server: &Endpoint) -> (Connection, SendStream, RecvStream) {
+        let conn = server.accept().await.expect("server accepts");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("server accept_bi");
+        serve_probe_over_bidi(&conn, &mut send, &mut recv, ZR_PSK, ZR_CTX)
+            .await
+            .expect("server serve_probe_over_bidi");
+        (conn, send, recv)
+    }
+
+    /// One COLD session (client probe + server serve, concurrent); returns a
+    /// resumption ticket the client took from the post-handshake NewSessionTicket.
+    async fn cold_session_take_ticket(
+        client: &Endpoint,
+        server: &Endpoint,
+        addr: SocketAddr,
+    ) -> ClientTicket {
+        let srv = accept_and_serve_probe(server);
+        let cli = async {
+            let conn = client
+                .connect(addr, "localhost")
+                .await
+                .expect("cold connect");
+            let _control = crate::transport::udp::h3::open_h3_control_stream(&conn)
+                .await
+                .expect("client control stream");
+            let (mut send, mut recv) = conn.open_bi();
+            let outcome = probe_client_over_bidi(
+                &conn,
+                &mut send,
+                &mut recv,
+                "localhost",
+                ZR_PSK,
+                ZR_CTX,
+                ZR_TIMEOUT,
+            )
+            .await
+            .expect("client cold probe");
+            (conn, outcome)
+        };
+        let (_held, (conn, outcome)) = tokio::join!(srv, cli);
+        assert!(
+            matches!(outcome, ProbeOutcome::Verified { .. }),
+            "cold session must Verify, got {outcome:?}"
+        );
+        // The NST arrives post-handshake (before the probe round-trip completes);
+        // poll briefly for it.
+        for _ in 0..50 {
+            if let Some(ticket) = conn.take_session_ticket(unix_ms()) {
+                return ticket;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("cold session issued no resumption ticket");
+    }
+
+    /// One RESUMED session: the client sends the H3 control SETTINGS and the probe
+    /// request as 0-RTT early data, awaits the handshake, then verifies the response.
+    /// Returns `(server_accepted_0rtt, client_outcome)`. Mirrors the resumption branch
+    /// of `run_client_udp_probe`.
+    async fn resume_session(
+        client: &Endpoint,
+        server: &Endpoint,
+        addr: SocketAddr,
+        ticket: ClientTicket,
+    ) -> (bool, ProbeOutcome) {
+        let srv = accept_and_serve_probe(server);
+        let cli = async {
+            let conn = client
+                .connect_resumption_0rtt(addr, "localhost", ticket, unix_ms())
+                .await
+                .expect("resumption connect");
+            let _control = crate::transport::udp::h3::open_h3_control_stream(&conn)
+                .await
+                .expect("control stream (0-RTT)");
+            let (mut send, mut recv) = conn.open_bi();
+            let nonce = probe_client_send_request_early(&mut send, "localhost")
+                .await
+                .expect("send probe request (0-RTT)");
+            conn.wait_established().await.expect("handshake completes");
+            let outcome =
+                probe_client_read_and_verify(&conn, &mut recv, &nonce, ZR_PSK, ZR_CTX, ZR_TIMEOUT)
+                    .await
+                    .expect("read + verify probe response");
+            outcome
+        };
+        let ((server_conn, _s, _r), outcome) = tokio::join!(srv, cli);
+        (server_conn.zero_rtt_keys_installed(), outcome)
+    }
+
+    async fn in_memory_server(stek_seed: [u8; 32]) -> (Endpoint, SocketAddr) {
+        let guard = Arc::new(ReplayCacheGuard::new(
+            ReplayCache::new(64).with_window_secs(ZR_LIFETIME),
+        ));
+        let server = bind_server_endpoint_0rtt(
+            "127.0.0.1:0".parse().unwrap(),
+            "localhost",
+            derive_stek(&stek_seed),
+            guard,
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        (server, addr)
+    }
+
+    /// Two sessions: a cold session deposits a ticket; the next session resumes with
+    /// it and the server ACCEPTS the fresh ticket's 0-RTT early data.
+    #[tokio::test]
+    async fn two_session_resumption_accepts_early_data() {
+        let (server, addr) = in_memory_server([0x5a; 32]).await;
+
+        let ticket = cold_session_take_ticket(&client().await, &server, addr).await;
+
+        let (accepted, outcome) = resume_session(&client().await, &server, addr, ticket).await;
+        assert!(
+            matches!(outcome, ProbeOutcome::Verified { .. }),
+            "resumed session must Verify, got {outcome:?}"
+        );
+        assert!(
+            accepted,
+            "server must ACCEPT a fresh ticket's 0-RTT early data"
+        );
+    }
+
+    /// A REPLAYED ticket (the same ticket offered twice) is accepted once, then its
+    /// 0-RTT is rejected by the single-use guard — the replay falls back to a full
+    /// 1-RTT handshake and still Verifies (no data loss, no double 0-RTT accept).
+    #[tokio::test]
+    async fn replayed_ticket_is_rejected_and_falls_back_to_1rtt() {
+        let (server, addr) = in_memory_server([0x5b; 32]).await;
+
+        let ticket = cold_session_take_ticket(&client().await, &server, addr).await;
+
+        let (accepted1, outcome1) =
+            resume_session(&client().await, &server, addr, ticket.clone()).await;
+        assert!(accepted1, "first use: 0-RTT accepted");
+        assert!(matches!(outcome1, ProbeOutcome::Verified { .. }));
+
+        // Replay the SAME ticket: single-use guard rejects the 0-RTT.
+        let (accepted2, outcome2) = resume_session(&client().await, &server, addr, ticket).await;
+        assert!(!accepted2, "replay: 0-RTT REJECTED by the single-use guard");
+        assert!(
+            matches!(outcome2, ProbeOutcome::Verified { .. }),
+            "replay still Verifies via the 1-RTT fallback, got {outcome2:?}"
+        );
+    }
+
+    /// The single-use property survives a server restart: a ticket accepted before
+    /// the restart is rejected (0-RTT) after it, because the anti-replay record is in
+    /// the persistent cache. The restarted server keeps the SAME STEK (so it can
+    /// still OPEN the ticket) and reloads the SAME cache file.
+    #[tokio::test]
+    async fn single_use_persists_across_server_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("zero-rtt-replay.cache");
+        let mac_key = b"persistent-0rtt-guard-mac-key";
+        let stek_seed = [0x5c; 32];
+
+        let load_guard = || {
+            Arc::new(ReplayCacheGuard::new(
+                ReplayCache::load_or_create_authenticated_with_window(
+                    &cache_path,
+                    64,
+                    mac_key,
+                    ZR_LIFETIME,
+                )
+                .unwrap(),
+            ))
+        };
+
+        // Server 1 (file-backed guard): cold session deposits a ticket, then a first
+        // resumption is accepted (recording the ticket in the persistent cache).
+        let server1 = bind_server_endpoint_0rtt(
+            "127.0.0.1:0".parse().unwrap(),
+            "localhost",
+            derive_stek(&stek_seed),
+            load_guard(),
+        )
+        .await
+        .unwrap();
+        let addr1 = server1.local_addr().unwrap();
+        let ticket = cold_session_take_ticket(&client().await, &server1, addr1).await;
+        let (accepted1, _o1) =
+            resume_session(&client().await, &server1, addr1, ticket.clone()).await;
+        assert!(accepted1, "before restart: fresh ticket's 0-RTT accepted");
+
+        // "Restart": drop server 1, rebuild on a fresh ephemeral endpoint with the
+        // SAME STEK and a guard RELOADED from the same persistent cache file.
+        drop(server1);
+        let server2 = bind_server_endpoint_0rtt(
+            "127.0.0.1:0".parse().unwrap(),
+            "localhost",
+            derive_stek(&stek_seed),
+            load_guard(),
+        )
+        .await
+        .unwrap();
+        let addr2 = server2.local_addr().unwrap();
+
+        // Replay the same ticket against the restarted server: the persisted record
+        // rejects the 0-RTT; the session falls back to 1-RTT and still Verifies.
+        let (accepted2, outcome2) = resume_session(&client().await, &server2, addr2, ticket).await;
+        assert!(
+            !accepted2,
+            "after restart: replayed ticket's 0-RTT REJECTED (persistent single-use)"
+        );
+        assert!(
+            matches!(outcome2, ProbeOutcome::Verified { .. }),
+            "restart replay still Verifies via 1-RTT, got {outcome2:?}"
+        );
+    }
+}
