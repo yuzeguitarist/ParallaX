@@ -590,15 +590,35 @@ impl Driver {
             // and timers do not grow without bound. App handles keep their own Arc.
             self.conns
                 .retain(|_, c| !c.core.lock().unwrap().is_drained());
+            // Reap idle origin-splice flows and held pending Initials on the same
+            // pass (their idle deadlines are armed in `next_deadline`, so this fires
+            // on schedule). A peer that opens flows/flights then goes silent therefore
+            // cannot pin upstream sockets + Box<ServerHandshake> cores until the hard
+            // cap. Both teardowns are wire-silent (UDP relay stop / unanswered Initial).
+            let now = Instant::now();
+            self.sweep_idle_splices(now);
+            self.pending
+                .retain(|_, p| now.duration_since(p.last) < PENDING_IDLE);
         }
     }
 
-    /// The earliest armed timer across all connections.
+    /// The earliest armed timer across all connections, plus the idle deadlines of
+    /// origin-splice flows and held pending Initials, so the driver wakes to reap them
+    /// even when no new datagrams arrive. Without this, a peer that opens splice flows
+    /// / partial first-flights then goes silent pins their sockets + handshake cores
+    /// until the hard cap, because the conns-only deadline never fires for them. Both
+    /// teardowns are wire-silent (a UDP relay just stops forwarding; a pending Initial
+    /// was never answered), so adding these deadlines changes no observable behavior —
+    /// it only makes the existing idle reap fire on schedule instead of opportunistically
+    /// on the next unrelated arrival.
     fn next_deadline(&self) -> Option<Instant> {
-        self.conns
+        let conn_timeouts = self
+            .conns
             .values()
-            .filter_map(|c| c.core.lock().unwrap().next_timeout())
-            .min()
+            .filter_map(|c| c.core.lock().unwrap().next_timeout());
+        let splice_idle = self.splices.values().map(|(_, last)| *last + SPLICE_IDLE);
+        let pending_idle = self.pending.values().map(|p| p.last + PENDING_IDLE);
+        conn_timeouts.chain(splice_idle).chain(pending_idle).min()
     }
 
     fn on_timeout(&mut self) {

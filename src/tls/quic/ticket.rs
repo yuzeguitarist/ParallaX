@@ -74,8 +74,11 @@ pub(crate) struct TicketState {
     pub suite: u16,
     /// Negotiated ALPN (e.g. `b"h3"`); the resumed ClientHello must still offer it.
     pub alpn: Vec<u8>,
-    /// The resumption PSK (`resumption_psk`), hash-length (32 or 48 B).
-    pub psk: Vec<u8>,
+    /// The resumption PSK (`resumption_psk`), hash-length (32 or 48 B). Wrapped in
+    /// `Zeroizing` so the decrypted PSK is scrubbed when a `TicketState` is dropped —
+    /// covering every `try_accept_psk` reject path (expired / suite / ALPN / binder /
+    /// replay), where the state is dropped without an explicit scrub.
+    pub psk: Zeroizing<Vec<u8>>,
     /// Unix seconds when the ticket was issued (freshness / expiry).
     pub issued_at: u64,
     /// Ticket lifetime in seconds (RFC 8446 §4.6.1 caps at 604800 = 7 d).
@@ -175,7 +178,7 @@ fn parse_ticket_state(plaintext: &[u8]) -> Option<TicketState> {
     }
     let suite = c.u16()?;
     let alpn = c.vec_u8()?.to_vec();
-    let psk = c.vec_u8()?.to_vec();
+    let psk = Zeroizing::new(c.vec_u8()?.to_vec());
     let issued_at = c.u64()?;
     let lifetime_secs = c.u32()?;
     if c.remaining() != 0 {
@@ -394,7 +397,7 @@ mod tests {
         TicketState {
             suite: 0x1301,
             alpn: b"h3".to_vec(),
-            psk: vec![0x5a_u8; 32],
+            psk: Zeroizing::new(vec![0x5a_u8; 32]),
             issued_at: 1_700_000_000,
             lifetime_secs: 604_800,
         }
@@ -420,7 +423,7 @@ mod tests {
         let state = TicketState {
             suite: 0x1302,
             alpn: b"h3".to_vec(),
-            psk: vec![0x77_u8; 48],
+            psk: Zeroizing::new(vec![0x77_u8; 48]),
             issued_at: 1_700_000_500,
             lifetime_secs: 7200,
         };

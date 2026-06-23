@@ -374,6 +374,12 @@ pub struct Connection {
     /// the AEAD confidentiality limit (RFC 9001 §6.6). Without 1-RTT key update we
     /// force-close before exceeding it rather than overrun the AEAD safety margin.
     data_packets_sealed: u64,
+    /// Count of 1-RTT (Data-space) packets that FAILED to AEAD-open, to enforce the
+    /// AEAD integrity limit (RFC 9001 §6.6). Without 1-RTT key update we force-close
+    /// once forged-packet attempts reach the AEAD's forgery margin, mirroring the
+    /// confidentiality-limit handling. Initial/Handshake/0-RTT open failures are
+    /// excluded (public/short-lived keys).
+    data_packets_open_failed: u64,
     /// The server queues HANDSHAKE_DONE once its handshake completes; resent if lost.
     handshake_done_pending: bool,
     /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
@@ -497,6 +503,7 @@ impl Connection {
             pto_count: 0,
             probe_pending: 0,
             data_packets_sealed: 0,
+            data_packets_open_failed: 0,
             handshake_done_pending: false,
             handshake_confirmed: false,
             last_send_time: None,
@@ -588,6 +595,7 @@ impl Connection {
             pto_count: 0,
             probe_pending: 0,
             data_packets_sealed: 0,
+            data_packets_open_failed: 0,
             handshake_done_pending: false,
             handshake_confirmed: false,
             last_send_time: None,
@@ -949,6 +957,28 @@ impl Connection {
         }
     }
 
+    /// Enforce the AEAD integrity limit (RFC 9001 §6.6): once the number of 1-RTT
+    /// packets that failed to AEAD-open reaches the cipher's integrity limit, the
+    /// key's forgery-resistance margin is spent. With no 1-RTT key update the only
+    /// spec-permitted action is to close — mirroring `enforce_aead_confidentiality_limit`
+    /// (same close shape, same NO_ERROR code) so this adds no externally distinct
+    /// behavior. The limit (2^36 for ChaCha20-Poly1305, 2^52 for AES-GCM) is never
+    /// reached in normal operation.
+    fn enforce_aead_integrity_limit(&mut self) {
+        if self.closed.is_some() {
+            return;
+        }
+        let limit = self.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .map(|k| k.remote.packet.integrity_limit());
+        if let Some(limit) = limit {
+            if self.data_packets_open_failed >= limit {
+                self.close(0, b"AEAD integrity limit reached");
+            }
+        }
+    }
+
     /// Produce the next datagram to send, or `None` when idle (or congestion-window
     /// limited). Priority: a pending ACK (lowest space first; never gated), then
     /// CRYPTO (retransmits before fresh bytes, lowest space first), then 1-RTT relay
@@ -960,6 +990,7 @@ impl Connection {
         // update, once we have sealed the cipher's safe number of 1-RTT packets we
         // MUST stop using the key — force-close rather than overrun the AEAD margin.
         self.enforce_aead_confidentiality_limit();
+        self.enforce_aead_integrity_limit();
         // Once closed (locally, by the peer, or on idle) the connection enters the
         // closing/draining state (RFC 9000 §10.2): it sends at most a single
         // CONNECTION_CLOSE (for a local close) and is otherwise silent — no ACKs,
@@ -1872,7 +1903,19 @@ impl Connection {
         };
         let (header, range) = match opened {
             Ok(v) => v,
-            Err(_) => return Ok(()), // undecryptable: drop, do NOT fail the connection
+            Err(_) => {
+                // RFC 9001 §6.6: count 1-RTT AEAD decryption failures toward the
+                // integrity limit. Only the long-lived 1-RTT key matters (0-RTT has a
+                // separate short-lived key; Initial/Handshake forgeries are expected —
+                // public keys). enforce_aead_integrity_limit() (run from poll_transmit,
+                // like the confidentiality check) force-closes once the count reaches
+                // the cipher's forgery margin — unreachable in normal operation, and
+                // the same close a conformant QUIC stack performs.
+                if space == SPACE_DATA && pspace != PacketSpace::ZeroRtt {
+                    self.data_packets_open_failed = self.data_packets_open_failed.saturating_add(1);
+                }
+                return Ok(()); // undecryptable: drop, do NOT fail the connection
+            }
         };
 
         // The packet authenticated — only NOW is it safe to commit state derived
