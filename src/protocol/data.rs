@@ -408,7 +408,11 @@ impl DataRecordCodec {
         // mismatch then OOB-panicked on `&plaintext[offset..offset + len]` (sum too
         // large) or silently under-sealed the tail (sum too small). Internal callers
         // always satisfy this; the guard turns a contract violation into a clean error.
-        if record_lens.iter().sum::<usize>() != plaintext.len() {
+        let sum = record_lens
+            .iter()
+            .try_fold(0usize, |acc, &len| acc.checked_add(len))
+            .ok_or(DataRecordError::InvalidRecordLens)?;
+        if sum != plaintext.len() {
             return Err(DataRecordError::InvalidRecordLens);
         }
         let mut offset = 0;
@@ -517,7 +521,11 @@ impl DataRecordCodec {
         // instead of being silently sealed as nothing. (Also prevents an OOB panic on the
         // `plaintext[byte_offset..byte_offset + span]` slice below in release, where the
         // prior debug_assert was compiled out.)
-        if record_lens.iter().sum::<usize>() != plaintext.len() {
+        let sum = record_lens
+            .iter()
+            .try_fold(0usize, |acc, &len| acc.checked_add(len))
+            .ok_or(DataRecordError::InvalidRecordLens)?;
+        if sum != plaintext.len() {
             return Err(DataRecordError::InvalidRecordLens);
         }
         let record_count = record_lens.len();

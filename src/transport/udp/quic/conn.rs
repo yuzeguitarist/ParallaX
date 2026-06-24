@@ -1917,6 +1917,7 @@ impl Connection {
                 // the same close a conformant QUIC stack performs.
                 if space == SPACE_DATA && pspace != PacketSpace::ZeroRtt {
                     self.data_packets_open_failed = self.data_packets_open_failed.saturating_add(1);
+                    self.enforce_aead_integrity_limit();
                 }
                 return Ok(()); // undecryptable: drop, do NOT fail the connection
             }
