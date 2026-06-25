@@ -360,8 +360,8 @@ pub struct Connection {
     spaces: [Space; 3],
     /// Connection-wide RTT estimator (RFC 9002 §5 keeps one across all spaces).
     rtt: RttEstimator,
-    /// Congestion controller behind the CC seam (clean-room BBRv1; NewReno also
-    /// implements the trait for tests / fallback).
+    /// Congestion controller behind the CC seam (clean-room BBRv1; the only
+    /// wired controller).
     cc: Box<dyn Controller>,
     /// Connection-wide cumulative delivered (acknowledged) bytes — the BBR /
     /// delivery-rate "delivered" counter (draft-cheng-iccrg-delivery-rate-est).

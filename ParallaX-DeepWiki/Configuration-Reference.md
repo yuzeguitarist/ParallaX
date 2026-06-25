@@ -13,6 +13,7 @@ Unix rejects group/world-readable secret files.
 | `mode` | `"client"` or `"server"` | yes | Selects which section must be present. |
 | `[crypto]` | table | yes | Shared cryptographic material. |
 | `[traffic]` | table | no | Padding, timing, cover traffic, and stream-count settings. Defaults are speed-first. |
+| `[transport]` | table | no | TCP socket-buffer overrides for relay sockets. Off by default (kernel autotuning); see the `[transport]` section below. |
 | `[udp]` | table | no | Experimental UDP/QUIC fast plane. Off by default; see the `[udp]` section below. |
 | `[client]` | table | client mode | Local SOCKS and remote server settings. |
 | `[server]` | table | server mode | Listener, fallback, target, replay, and server secrets. |
@@ -62,6 +63,23 @@ Generated configs set every traffic-shaping value to `0` except
 `max_concurrent_streams = 4`. This keeps the default path speed-first while
 allowing several browser-originated SOCKS streams to share one authenticated
 ParallaX session.
+
+## `[transport]`
+
+Optional TCP socket-buffer overrides for the relay sockets, shared by client and
+server. Both fields are `Option<u32>` (bytes) and default unset, which keeps
+kernel autotuning — the safe default that preserves full Safari parity. Setting a
+value disables autotuning for that socket and is clamped by the OS maximum
+(`net.core.wmem_max` / `net.core.rmem_max` on Linux, `kern.ipc.maxsockbuf` on
+macOS), so only raise it once that maximum has been raised — otherwise the kernel
+may clamp it *below* what autotuning would have reached (a logged warning surfaces
+such a clamp). See [Deployment](Deployment.md) for the `net.core.*mem_max`
+prerequisite.
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `tcp_send_buffer_bytes` | unset | Explicit `SO_SNDBUF` for relay sockets. Wire-invisible. Sized to the path bandwidth-delay product, it lifts the client→server upload window on high-RTT links where autotuning under-provisions it. |
+| `tcp_recv_buffer_bytes` | unset | Explicit `SO_RCVBUF` for relay sockets. **NOT wire-invisible** — it affects the advertised TCP window, so it is applied only post-connect/accept (never on the camouflage SYN) and a fixed value flattens the window curve vs Safari's autotuning. Prefer it on the server data-sink side; leave it unset on the client to keep full browser parity. |
 
 ## `[client]`
 
@@ -113,9 +131,9 @@ startup warning so an inert knob is not mistaken for an active one).
 | `brutal_down_mbps` | `0` | RESERVED | Declared downlink Mbps for Brutal; `0` means unset. |
 | `ignore_client_bandwidth` | `false` | RESERVED | Let the server override the client-declared Brutal bandwidth. |
 | `fec_profile` | `"adaptive"` | RESERVED | Forward error correction: `"off"`, `"adaptive"` (loss×RTT-gated), or `"rs"` (Reed-Solomon). Phase 3. |
-| `port_hop` | `false` | RESERVED | UDP port hopping (Phase 2 camouflage). |
-| `masque_front` | unset | RESERVED | SNI/host to front the masquerading HTTP/3 face on; unset keeps the TCP `sni`. Phase 2. |
-| `ech` | `false` | RESERVED | Encrypted ClientHello for the QUIC face (Phase 2). |
+| `port_hop` | `false` | RESERVED | UDP port hopping. Dropped Phase-2 camouflage (not planned); inert no-op kept only so existing configs still parse. |
+| `masque_front` | unset | RESERVED | SNI/host to front the masquerading HTTP/3 face on; unset keeps the TCP `sni`. Dropped Phase-2 camouflage (not planned); inert no-op. |
+| `ech` | `false` | RESERVED | Encrypted ClientHello for the QUIC face. Dropped Phase-2 camouflage (not planned); inert no-op. |
 
 Validation only runs when `enabled = true`: `probe_timeout_ms` must be non-zero,
 `cc = "brutal"` requires the two Brutal bandwidths (unless

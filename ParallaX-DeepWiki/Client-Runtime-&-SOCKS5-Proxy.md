@@ -76,6 +76,11 @@ authenticated ParallaX session, instead of one session per connection. Setting
 `max_concurrent_streams = 1` falls back to a `WarmSessionPool` of
 one-stream-per-session connections.
 
+A warm-keeper proactively rebuilds a dead shared mux tunnel *during active use*
+(resilience to a mid-session RST/blackhole), but only within a short activity
+window (`MUX_WARM_KEEPER_ACTIVE_WINDOW`, 90 s after the last stream) — so an idle
+client does not re-handshake on a timer, which would be a behavioral tell.
+
 **UDP/QUIC fast plane (experimental, opt-in).** When `[udp].enabled = true`, the
 client additionally tries to negotiate the QUIC fast plane for the single-Connect
 relay before falling back to TCP:

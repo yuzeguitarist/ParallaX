@@ -50,7 +50,7 @@ modes:
 
 ## Network tuning
 
-By default the script attempts to enable:
+By default the script attempts to enable, in `/etc/sysctl.d/99-parallax-bbr.conf`:
 
 ```text
 tcp_bbr
@@ -58,6 +58,18 @@ net.core.default_qdisc=fq
 ```
 
 Use `--no-enable-bbr` to skip this step.
+
+Separately, it always writes `/etc/sysctl.d/99-parallax-netbuf.conf` (even with
+`--no-enable-bbr`, on Linux), raising the socket-buffer maxima to 64 MiB:
+
+```text
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+```
+
+These are the prerequisite for the `[transport]` `tcp_send_buffer_bytes` /
+`tcp_recv_buffer_bytes` overrides — without them an explicit `SO_*BUF` is clamped
+to the kernel default. Raising the caps does not change autotuning on its own.
 
 If UFW is active, the script allows `443/tcp` with a ParallaX comment.
 

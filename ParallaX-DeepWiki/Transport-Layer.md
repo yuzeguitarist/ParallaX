@@ -25,12 +25,12 @@ context in [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 
 | Layer | Code | Responsibility |
 |---|---|---|
-| TCP socket helpers | `src/transport/tcp.rs` | `TCP_NODELAY`, cross-platform TCP keepalive (SO_KEEPALIVE), fd-limit derived relay caps. |
+| TCP socket helpers | `src/transport/tcp.rs` | `TCP_NODELAY`, cross-platform TCP keepalive (SO_KEEPALIVE), fd-limit derived relay caps, optional post-connect `SO_SNDBUF`/`SO_RCVBUF` overrides (`[transport]` config). |
 | TLS record layer | `src/tls/record.rs` | Read/write exact TLS records and parse headers. |
 | Data record layer | `src/protocol/data.rs` | AEAD-sealed payloads inside TLS ApplicationData. |
 | Client/server relay | `src/client/runtime.rs`, `src/handshake/server.rs` | Bidirectional application relay. |
 | Transport leg abstraction | `src/transport/leg.rs` | Uniform reader/writer over either a TCP or a QUIC stream leg. |
-| UDP/QUIC fast plane (experimental, off by default) | `src/transport/udp/` | QUIC endpoint, Happy-Eyeballs probe, datagram envelope, reordering, and exporter-bound auth. |
+| UDP/QUIC fast plane (experimental, off by default) | `src/transport/udp/` | Clean-room QUIC endpoint (`quic/` submodule), Happy-Eyeballs probe, 0-RTT resumption, BBR congestion control, and exporter-bound auth. |
 
 ## Why TCP is the default
 

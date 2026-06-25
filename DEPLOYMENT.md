@@ -78,7 +78,7 @@ During remote install it:
 6. fails the deploy if `tcp_congestion_control=bbr` or `default_qdisc=fq`
    cannot be verified.
 
-The sysctl file contains:
+The `/etc/sysctl.d/99-parallax-bbr.conf` file contains:
 
 ```text
 net.core.default_qdisc=fq
@@ -88,7 +88,23 @@ net.ipv4.tcp_wmem=4096 65536 67108864
 net.ipv4.tcp_mtu_probing=1
 ```
 
-Skip remote system tuning explicitly:
+The script also writes a second, separate drop-in,
+`/etc/sysctl.d/99-parallax-netbuf.conf`, **unconditionally** (even with
+`--no-enable-bbr`, on Linux):
+
+```text
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+```
+
+These raise the socket-buffer maxima to 64 MiB. They are a prerequisite for the
+`[transport]` `tcp_send_buffer_bytes` / `tcp_recv_buffer_bytes` overrides: without
+them an explicit `SO_SNDBUF`/`SO_RCVBUF` is silently clamped to the kernel default
+(~208 KiB). Raising the caps alone does not change autotuning — it only takes
+effect when a `[transport]` buffer is actually configured.
+
+Skip remote system tuning explicitly (this skips BBR only; the socket-buffer
+maxima are still written):
 
 ```bash
 bash scripts/deploy-vps.sh --no-enable-bbr root@YOUR_VPS_IP cloudflare.com

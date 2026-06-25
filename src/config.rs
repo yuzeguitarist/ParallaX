@@ -600,12 +600,12 @@ pub enum UdpFecProfile {
 /// single-Connect relay path): `enabled` and `probe_timeout_ms`. Enabling
 /// requires matched binaries on both ends.
 ///
-/// RESERVED knobs (parsed + validated for forward-compatibility but NOT yet
-/// honored — they take effect in later slices): `cc` / `brutal_*` /
-/// `ignore_client_bandwidth` (congestion control — Phase 3), `fec_profile` (FEC —
-/// Phase 3), `port_hop` / `masque_front` / `ech` (camouflage — Phase 2). Setting
-/// one today is a no-op; the runtime logs a warning at startup so it is not
-/// mistaken for active.
+/// RESERVED knobs (parsed + validated for forward-compatibility but NOT
+/// honored): `cc` / `brutal_*` / `ignore_client_bandwidth` (congestion control —
+/// Phase 3, deferred), `fec_profile` (FEC — Phase 3, deferred), `port_hop` /
+/// `masque_front` / `ech` (camouflage — dropped, not planned; kept as inert
+/// no-ops only so existing configs still parse). Setting one today is a no-op;
+/// the runtime logs a warning at startup so it is not mistaken for active.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UdpConfig {
@@ -630,14 +630,16 @@ pub struct UdpConfig {
     /// LIVE. Happy-Eyeballs UDP probe timeout before committing to TCP-only.
     #[serde(default = "default_udp_probe_timeout_ms")]
     pub probe_timeout_ms: u16,
-    /// RESERVED (UDP port hopping, Phase 2 camouflage) — not yet honored.
+    /// RESERVED (UDP port hopping — dropped Phase 2 camouflage, not planned).
+    /// Inert no-op kept only so existing configs still parse.
     #[serde(default)]
     pub port_hop: bool,
-    /// RESERVED (Phase 2 camouflage). SNI/host to front the masquerading HTTP/3
-    /// face on; `None` keeps the TCP `sni`. Not yet honored.
+    /// RESERVED (dropped Phase 2 camouflage, not planned). SNI/host to front the
+    /// masquerading HTTP/3 face on; `None` keeps the TCP `sni`. Inert no-op.
     #[serde(default)]
     pub masque_front: Option<String>,
-    /// RESERVED (Encrypted ClientHello, Phase 2 camouflage) — not yet honored.
+    /// RESERVED (Encrypted ClientHello — dropped Phase 2 camouflage, not planned).
+    /// Inert no-op kept only so existing configs still parse.
     #[serde(default)]
     pub ech: bool,
 }

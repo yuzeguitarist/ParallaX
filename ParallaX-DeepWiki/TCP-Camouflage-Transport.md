@@ -15,11 +15,16 @@ The runtime applies:
 - `TCP_NODELAY`
 - cross-platform TCP keepalive (SO_KEEPALIVE) on the socket
 - best-effort `RLIMIT_NOFILE` soft-limit bump for long-lived processes
+- optional explicit `SO_SNDBUF` / `SO_RCVBUF` on relay sockets, applied
+  post-connect/accept (never on the camouflage SYN), when the `[transport]`
+  config section sets them — off by default (kernel autotuning)
 
 The deploy script can also configure the VPS for:
 
 - `tcp_bbr`
 - `net.core.default_qdisc=fq`
+- `net.core.rmem_max` / `net.core.wmem_max` = 64 MiB (written unconditionally;
+  the prerequisite for the `[transport]` socket-buffer overrides)
 
 ## Relay capacity
 
@@ -42,10 +47,12 @@ direction closing while the other direction still drains.
 
 ## Buffering
 
-The record/data layer targets 64 KiB relay buffers. Fixed socket-buffer tuning
-is not part of current `main`; throughput-sensitive changes should be measured
-on the real `plx client` + `plx serve` path and not assumed from synthetic
-microbenchmarks alone.
+The record/data layer targets 64 KiB relay buffers. Explicit kernel socket-buffer
+tuning is opt-in via the `[transport]` `tcp_send_buffer_bytes` /
+`tcp_recv_buffer_bytes` config knobs (off by default = kernel autotuning); see the
+[Configuration Reference](Configuration-Reference.md#transport). Throughput-
+sensitive changes should be measured on the real `plx client` + `plx serve` path
+and not assumed from synthetic microbenchmarks alone.
 
 Related pages: [Client Runtime & SOCKS5 Proxy](Client-Runtime-&-SOCKS5-Proxy.md),
 [Server Runtime & Probing Resistance](Server-Runtime-&-Probing-Resistance.md), and
