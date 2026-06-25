@@ -91,7 +91,7 @@ bash scripts/uninstall-vps.sh --host root@1.2.3.4 --yes
 ```
 
 The uninstaller can remove the service, binary, config, local deploy directory,
-BBR sysctl files, UFW rule, and optionally parca-agent.
+BBR + socket-buffer sysctl files, UFW rule, and optionally parca-agent.
 
 Related pages: [VPS Deployment Script](VPS-Deployment-Script.md) and
 [Systemd Service & Security Hardening](Systemd-Service-&-Security-Hardening.md).

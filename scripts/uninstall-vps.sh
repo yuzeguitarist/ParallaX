@@ -23,8 +23,8 @@ Options:
   --local-dir <path>               Local deploy directory. Defaults to target/parallax-deploy/<host>/.
   --remove-local                   Remove the local deploy directory. Default.
   --keep-local                     Keep the local deploy directory.
-  --remove-bbr                     Remove ParallaX BBR sysctl persistence files. Default.
-  --keep-bbr                       Keep ParallaX BBR sysctl persistence files.
+  --remove-bbr                     Remove ParallaX BBR + socket-buffer sysctl persistence files. Default.
+  --keep-bbr                       Keep ParallaX BBR + socket-buffer sysctl persistence files.
   --remove-parca-agent             Also remove the parca-agent snap package if installed.
   --keep-parca-agent               Keep the parca-agent snap package. Default.
   --remove-ufw-rule                Remove UFW rules that have the ParallaX comment. Default.
@@ -271,7 +271,7 @@ interactive_configure() {
     REMOVE_LOCAL="0"
   fi
 
-  if prompt_yes_no "Remove ParallaX BBR sysctl persistence files from the VPS?" "y"; then
+  if prompt_yes_no "Remove ParallaX BBR + socket-buffer sysctl persistence files from the VPS?" "y"; then
     REMOVE_BBR="1"
   else
     REMOVE_BBR="0"
@@ -296,7 +296,7 @@ Uninstall plan:
   Remote binary:          $REMOTE_BIN
   Remote config:          $REMOTE_CONFIG
   Remote sudo:            ${REMOTE_SUDO:-none}
-  Remove BBR files:       $REMOVE_BBR
+  Remove sysctl files:    $REMOVE_BBR
   Remove Parca Agent:     $REMOVE_PARCA_AGENT
   Remove UFW rules:       $REMOVE_UFW_RULE
   Remove local configs:   $REMOVE_LOCAL
@@ -438,6 +438,9 @@ remove_bbr_files() {
   [[ "$REMOVE_BBR" == "1" ]] || return 0
   remove_file /etc/modules-load.d/parallax-bbr.conf
   remove_file /etc/sysctl.d/99-parallax-bbr.conf
+  # The socket-buffer drop-in is written unconditionally by deploy-vps.sh (even
+  # with --no-enable-bbr); clean it up under the same sysctl-persistence toggle.
+  remove_file /etc/sysctl.d/99-parallax-netbuf.conf
   if command -v sysctl >/dev/null 2>&1; then
     run_root sysctl --system >/dev/null 2>&1 || true
   fi
