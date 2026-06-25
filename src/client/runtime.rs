@@ -3218,9 +3218,16 @@ where
         }
     } else {
         // Fan the bulk seal across the crypto pool when the batch clears the
-        // parallel threshold; the parallel path is proven byte-identical and
-        // sequence-equivalent to the serial one (see data.rs equivalence tests),
-        // so the wire bytes, record sizes, and padding are unchanged. Small
+        // parallel threshold. The parallel path produces the SAME record
+        // boundaries and advances the sequence counter identically to the serial
+        // path, and each record's padding length is drawn from the identical
+        // per-record distribution (`sample_padding_len` is a pure per-record draw),
+        // so on-wire record sizes and the size/count histogram are unchanged.
+        // NOTE: the two paths consume the RNG differently (the parallel path
+        // re-seeds a per-group StdRng), so the concrete padding BYTES are not
+        // bit-identical to the serial path for the same starting RNG — they are
+        // only distributionally equivalent. That is fine because seal output is
+        // written exactly once (no re-seal/resume relies on byte-identity). Small
         // batches stay on the low-latency serial path.
         let record_count = payload.len().div_ceil(max_chunk_len).max(1);
         if should_parallelize_aead(record_count, payload.len()) {

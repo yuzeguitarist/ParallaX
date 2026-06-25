@@ -4631,19 +4631,10 @@ where
             }
         }
 
-        // Open the batch (or single record), then write the concatenated
-        // plaintext to the target under the same bounded write as before. NOTE:
-        // this per-write timeout reliably fires only when the relay is otherwise
-        // progressing (the download direction keeps bumping `activity`); in the
-        // pure "client keeps sending, target accepts-then-stalls, no download
-        // traffic" case the shared idle-watchdog (anchored to the last activity
-        // bump, hence an equal-or-earlier deadline) wins the race and tears the
-        // relay down at the idle backstop. Either way the connection is reclaimed
-        // within ~idle_timeout (the resource-pinning DoS is closed); the residual
-        // is that in that narrow case the partial body is FIN'd to the target
-        // rather than surfaced as a Timeout error — a pre-existing behavior a
-        // fully deterministic fix would need to address by distinguishing "stuck
-        // write" from "idle" in the watchdog.
+        // Open the batch (or single record). The batch-open fans the AEAD across
+        // the crypto pool, but the *write* below is deliberately re-split into
+        // per-record-sized slices so the bounded write + activity-bump cadence is
+        // identical to the pre-batch per-record loop (see the write loop's NOTE).
         let payload: &[u8] = if record_count == 1 {
             let range = client_open
                 .open_in_place_payload_range(&mut client_record)
@@ -4668,11 +4659,31 @@ where
             }
             batch_plaintext.as_slice()
         };
+        // Write in per-record-sized slices, each under its OWN idle_timeout and
+        // bumping `activity` per slice — restoring the exact bounded-write
+        // semantics of the pre-batch per-record loop. Wrapping the whole batch
+        // (up to MUX_OPEN_BATCH_BYTES) in a single timeout would force a
+        // slow-but-alive target to absorb ~1 MiB within one idle_timeout instead
+        // of ~16 KiB, tearing down legitimately-progressing relays at aggressive
+        // (low but valid) idle floors. NOTE: this per-write timeout reliably fires
+        // only when the relay is otherwise progressing (the download direction
+        // keeps bumping `activity`); in the pure "client keeps sending, target
+        // accepts-then-stalls, no download traffic" case the shared idle-watchdog
+        // (anchored to the last activity bump, hence an equal-or-earlier deadline)
+        // wins the race and tears the relay down at the idle backstop. Either way
+        // the connection is reclaimed within ~idle_timeout (the resource-pinning
+        // DoS is closed); the residual is that in that narrow case the partial body
+        // is FIN'd to the target rather than surfaced as a Timeout error — a
+        // pre-existing behavior a fully deterministic fix would need to address by
+        // distinguishing "stuck write" from "idle" in the watchdog.
         if !payload.is_empty() {
-            timeout(idle_timeout, target_write.write_all(payload))
-                .await
-                .map_err(|_| HandshakeServerError::Timeout)??;
-            bump_relay_activity(&activity);
+            let write_slice = client_open.max_plaintext_len().max(1);
+            for slice in payload.chunks(write_slice) {
+                timeout(idle_timeout, target_write.write_all(slice))
+                    .await
+                    .map_err(|_| HandshakeServerError::Timeout)??;
+                bump_relay_activity(&activity);
+            }
         }
     }
 }
@@ -4808,9 +4819,16 @@ where
         }
     } else {
         // Fan the bulk seal across the crypto pool when the batch clears the
-        // parallel threshold; the parallel path is proven byte-identical and
-        // sequence-equivalent to the serial one (see data.rs equivalence tests),
-        // so the wire bytes, record sizes, and padding are unchanged. Small
+        // parallel threshold. The parallel path produces the SAME record
+        // boundaries and advances the sequence counter identically to the serial
+        // path, and each record's padding length is drawn from the identical
+        // per-record distribution (`sample_padding_len` is a pure per-record draw),
+        // so on-wire record sizes and the size/count histogram are unchanged.
+        // NOTE: the two paths consume the RNG differently (the parallel path
+        // re-seeds a per-group StdRng), so the concrete padding BYTES are not
+        // bit-identical to the serial path for the same starting RNG — they are
+        // only distributionally equivalent. That is fine because seal output is
+        // written exactly once (no re-seal/resume relies on byte-identity). Small
         // batches stay on the low-latency serial path.
         let record_count = payload.len().div_ceil(max_chunk_len).max(1);
         if should_parallelize_aead(record_count, payload.len()) {

@@ -24,13 +24,20 @@ pub const OUTER_TLS_RECORD_LIMIT: usize = record::MAX_TLS_RECORD_PAYLOAD;
 /// pool workers in one dispatch (16 full records here vs 4 at 64 KiB), better
 /// amortizing the pool's per-batch lock/dispatch cost on multi-core machines.
 ///
-/// This is purely a read-coalescing/CPU-batching knob: records are still capped
-/// at `max_plaintext_len` each, so the on-wire record sizes, count-per-byte,
-/// padding, and timing are unchanged — only how many records are sealed/written
-/// per relay cycle changes (and TCP already coalesces segments regardless). The
-/// worst-case up-front `out.reserve` for one read stays bounded: with the
-/// `MIN_USABLE_PLAINTEXT_LEN` floor a 256 KiB read is at most ~256 records, a
-/// few MiB of reserve even under near-record-sized padding.
+/// This is a read-coalescing/CPU-batching knob: records are still capped at
+/// `max_plaintext_len` each, so the on-wire record sizes, count-per-byte, and
+/// padding are unchanged — only how many records are sealed/written per relay
+/// cycle changes (and TCP already coalesces segments regardless). With the
+/// default config (timing jitter off, `max_delay_ms = 0`) the externally
+/// observable behavior is identical. CAVEAT: when an operator enables timing
+/// jitter, the server download loop samples one `TimingProfile::sample_delay`
+/// per read burst, so a larger burst spaces the same per-burst pause over more
+/// bytes — the inter-burst delay cadence under that opt-in knob does shift. That
+/// shaping mechanism is an explicitly-deferred area; this knob does not aim to
+/// change it and leaves the default (off) untouched. The worst-case up-front
+/// `out.reserve` for one read stays bounded: with the `MIN_USABLE_PLAINTEXT_LEN`
+/// floor a 256 KiB read is at most ~256 records, a few MiB of reserve even under
+/// near-record-sized padding.
 pub const RELAY_READ_BUFFER_TARGET: usize = 256 * 1024;
 
 const PADDING_LEN_FIELD: usize = 2;
