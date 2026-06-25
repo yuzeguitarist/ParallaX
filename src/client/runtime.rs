@@ -1352,17 +1352,25 @@ const UDP_PROBE_RTT_MULTIPLE: u32 = 6;
 /// server's offer-hold contract.
 ///
 /// The server bounds its own wait for the client's PX1P ack at `2 × probe_timeout_ms`
-/// (see `run_authenticated_data_mode` in `src/handshake/server.rs`), and its clock
-/// starts one offer-propagation earlier than the client's. So the client's budget MUST
-/// stay strictly under `2 × config` (we use `2× − 1 floor` as a propagation margin),
-/// or on a high-RTT path the client would still be probing after the server has timed
-/// out and released the QUIC connection (desync). `config_ms` remains a hard minimum.
+/// (see `run_authenticated_data_mode` in `src/handshake/server.rs`), its clock starting
+/// one offer-propagation earlier than the client's. Capping the client at `1.75 × floor`
+/// keeps it strictly under that `2×` wait (a 0.25×-floor propagation margin) so the
+/// server outlasts the client and the probe does not desync.
+///
+/// NOTE: both budgets derive from each side's OWN `probe_timeout_ms`. The
+/// server-outlasts-client property therefore holds whenever the two ends use the same
+/// (or the server a larger) UDP timeout — the default and the recommended config (the
+/// paired configs `plx init` writes share it). It is NOT a wire-negotiated invariant:
+/// an operator who sets a SMALLER server timeout than the client could still make the
+/// server time out first. The offer carries no timeout field, so the client cannot
+/// know the server's value to clamp against it without a protocol change; this cap is
+/// the strongest bound available client-side and strictly improves on the prior
+/// uncapped `max(floor, 6×rtt)`. `config_ms` remains a hard minimum.
 fn udp_probe_budget(config_ms: u16, control_rtt: std::time::Duration) -> std::time::Duration {
     let floor = std::time::Duration::from_millis(u64::from(config_ms.max(1)));
-    // Ceiling = 1.75 × floor: strictly below the server's 2× wait, leaving a 0.25×
-    // floor of offer-propagation margin so the server always outlasts the client.
-    // Adaptivity lives in [floor, 1.75×floor]; an operator on a very high-RTT path
-    // raises `probe_timeout_ms` (which lifts BOTH this ceiling and the server's wait).
+    // Ceiling = 1.75 × floor (see the matched-config note above). Adaptivity lives in
+    // [floor, 1.75×floor]; an operator on a very high-RTT path raises probe_timeout_ms
+    // on BOTH ends, which lifts this ceiling and the server's wait together.
     let ceiling = floor.saturating_mul(7) / 4;
     let rtt_based = control_rtt.saturating_mul(UDP_PROBE_RTT_MULTIPLE);
     rtt_based.clamp(floor, ceiling)
