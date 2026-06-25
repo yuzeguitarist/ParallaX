@@ -33,6 +33,15 @@ concurrency:
 
 jobs:
   autofix:
+    # workflow_run runs in the base-repo context with a write token, so gate it:
+    # only act on a SUCCESSFUL upstream run that originated from the default branch.
+    # Today nightly-mutants has no pull_request trigger, so its artifact always comes
+    # from our own main -- but this guard makes that explicit and fail-closed, so if a
+    # PR trigger is ever added upstream, an untrusted fork run can never drive this
+    # write-capable job (defense in depth: the prompt also treats the input as untrusted).
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
     permissions:
       contents: write
       issues: write
@@ -71,9 +80,12 @@ jobs:
           echo "shard=$shard" >> "$GITHUB_OUTPUT"
           ref=""
           [ -n "$issue" ] && ref="Reference issue #$issue in the PR body. "
-          # Multi-line prompt via a heredoc-delimited step output.
+          # Multi-line prompt via a heredoc-delimited step output. The delimiter is
+          # RANDOM per run so a line in the (untrusted) missed.txt cannot match it,
+          # prematurely close the heredoc, and inject extra key=value step outputs.
+          eof="MUTANTS_PROMPT_EOF_$(openssl rand -hex 16)"
           {
-            echo "prompt<<MUTANTS_PROMPT_EOF"
+            echo "prompt<<$eof"
             echo "cargo-mutants (the nightly-mutants job, shard $shard/8) found SURVIVING mutants:"
             echo "deliberate small changes to the source below that NO test caught. A survivor"
             echo "means the test suite does not actually pin the behaviour the mutation breaks."
@@ -94,7 +106,7 @@ jobs:
             echo ""
             echo "Surviving mutants (file:line:col: mutation in function):"
             cat "$d/missed.txt"
-            echo "MUTANTS_PROMPT_EOF"
+            echo "$eof"
           } >> "$GITHUB_OUTPUT"
 
       - name: Rust toolchain
