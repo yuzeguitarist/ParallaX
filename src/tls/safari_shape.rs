@@ -56,9 +56,10 @@ pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
 /// GREASE codepoints chosen for one ClientHello: independent values for the
 /// cipher, the first (len-0) extension, the supported_groups/key_share/
 /// supported_versions lead, and the last (len-1) extension. Only the first and
-/// last extension GREASE are forced to differ from each other (mirroring
-/// BoringSSL); every other surface is drawn freely, matching the value space real
-/// Safari occupies.
+/// last extension GREASE are forced to differ, and on collision the last is
+/// derived by `value ^ 0x1010` — exactly BoringSSL's `ssl_get_grease_value`
+/// rule, the engine real Safari runs. Every other surface is drawn freely,
+/// matching the value space real Safari occupies.
 #[derive(Clone, Copy)]
 pub(crate) struct GreaseSet {
     pub(crate) cipher: u16,
@@ -70,18 +71,23 @@ pub(crate) struct GreaseSet {
 
 impl GreaseSet {
     pub(crate) fn from_seed(seed: [u8; 5]) -> Self {
-        let cipher_index = seed[0] as usize % BROWSER_GREASE_VALUES.len();
-        let extension_index = seed[1] as usize % BROWSER_GREASE_VALUES.len();
-        let mut final_extension_index = seed[4] as usize % BROWSER_GREASE_VALUES.len();
-        if final_extension_index == extension_index {
-            final_extension_index = (final_extension_index + 1) % BROWSER_GREASE_VALUES.len();
+        let extension = BROWSER_GREASE_VALUES[seed[1] as usize % BROWSER_GREASE_VALUES.len()];
+        let mut final_extension =
+            BROWSER_GREASE_VALUES[seed[4] as usize % BROWSER_GREASE_VALUES.len()];
+        // Byte-for-byte BoringSSL `ssl_get_grease_value`: the two fake extensions
+        // must not share a value, and on collision BoringSSL XORs the value (not
+        // the index) with 0x1010 — never a `(idx+1) % 16` increment. The XOR is a
+        // closed involution over the RFC 8701 0x?a?a set, so the result is always
+        // another valid GREASE value distinct from `extension`.
+        if final_extension == extension {
+            final_extension ^= 0x1010;
         }
         Self {
-            cipher: BROWSER_GREASE_VALUES[cipher_index],
-            extension: BROWSER_GREASE_VALUES[extension_index],
+            cipher: BROWSER_GREASE_VALUES[seed[0] as usize % BROWSER_GREASE_VALUES.len()],
+            extension,
             group: BROWSER_GREASE_VALUES[seed[2] as usize % BROWSER_GREASE_VALUES.len()],
             version: BROWSER_GREASE_VALUES[seed[3] as usize % BROWSER_GREASE_VALUES.len()],
-            final_extension: BROWSER_GREASE_VALUES[final_extension_index],
+            final_extension,
         }
     }
 }
@@ -270,6 +276,17 @@ mod tests {
                 assert!(is_grease(g.final_extension));
             }
         }
+    }
+
+    #[test]
+    fn grease_collision_resolves_with_boringssl_xor_0x1010() {
+        // BoringSSL `ssl_get_grease_value`: on a first/last extension collision the
+        // last value is `extension ^ 0x1010`, NOT a `(idx+1) % 16` index bump.
+        // Seed bytes 1 and 4 share index 0 here, forcing the collision branch.
+        let g = GreaseSet::from_seed([0, 0, 0, 0, 0]);
+        assert_eq!(g.extension, BROWSER_GREASE_VALUES[0]);
+        assert_eq!(g.final_extension, g.extension ^ 0x1010);
+        assert!(is_grease(g.final_extension));
     }
 
     #[test]
