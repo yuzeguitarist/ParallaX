@@ -186,15 +186,42 @@ const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 /// the timer arithmetic; 2^8 = 256× the base PTO is far beyond any live path.
 const MAX_PTO_BACKOFF: u32 = 8;
 
-/// Keep-alive period: send a PING if the connection has been idle this long, to
-/// stop the peer's idle timer from tearing down a held-open relay (matches the
-/// `keep_alive_interval` the quinn carrier configured).
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// Keep-alive period bounds: send a PING once the connection has been idle for a
+/// per-cycle random interval drawn uniformly from `[MIN, MAX]`, to stop the peer's
+/// idle timer from tearing down a held-open relay.
+///
+/// A FIXED interval (the old constant 15.000s) is a passive distinguisher: an idle
+/// connection emits a `[PING, PADDING]` packet at an exact, jitter-free period, so
+/// the inter-arrival series has a single sharp autocorrelation spike — a textbook
+/// "periodic handshake" tell, made worse because it sat at exactly IDLE_TIMEOUT/2.
+/// Re-rolling the interval every cycle smears that spike across the band. The mean
+/// (~15s) is preserved so liveness/throughput are unchanged, and MAX stays well
+/// under [`IDLE_TIMEOUT`] so the PING always reaches the peer before its idle timer
+/// fires, even on a high-RTT path.
+const KEEP_ALIVE_MIN: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_MAX: Duration = Duration::from_secs(20);
 
 /// Idle timeout (RFC 9000 §10.1): tear the connection down after this long with no
-/// received packet. Larger than [`KEEP_ALIVE_INTERVAL`] so a live peer's keep-alive
-/// PING refreshes it.
+/// received packet. Larger than [`KEEP_ALIVE_MAX`] so a live peer's keep-alive PING
+/// refreshes it with margin to spare.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Draw a fresh keep-alive interval uniformly from `[KEEP_ALIVE_MIN, KEEP_ALIVE_MAX]`.
+/// Sourced from the system CSPRNG so the period is unpredictable to an observer (a
+/// low-entropy PRNG would leave a recoverable schedule). The range is small (10s),
+/// so modulo bias over a u64 draw is negligible.
+fn random_keep_alive_interval() -> Duration {
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0_u8; 8];
+    // A failed RNG draw is not a reason to abort a live connection; fall back to the
+    // midpoint, which is still a valid keep-alive interval (just not jittered).
+    if SystemRandom::new().fill(&mut bytes).is_err() {
+        return (KEEP_ALIVE_MIN + KEEP_ALIVE_MAX) / 2;
+    }
+    let span_ms = (KEEP_ALIVE_MAX - KEEP_ALIVE_MIN).as_millis() as u64;
+    let offset_ms = u64::from_le_bytes(bytes) % (span_ms + 1);
+    KEEP_ALIVE_MIN + Duration::from_millis(offset_ms)
+}
 
 /// Transport error code APPLICATION_ERROR (RFC 9000 §20.1), used for a transport
 /// CONNECTION_CLOSE (0x1c) emitted before 1-RTT keys exist in place of an
@@ -388,6 +415,12 @@ pub struct Connection {
     handshake_confirmed: bool,
     /// When any packet was last sent (drives the keep-alive timer).
     last_send_time: Option<Instant>,
+    /// The current keep-alive cycle's interval, drawn fresh from
+    /// `[KEEP_ALIVE_MIN, KEEP_ALIVE_MAX]` and re-rolled each time a keep-alive PING
+    /// is queued, so the idle-PING period carries no fixed-cadence fingerprint. Read
+    /// identically by `next_timeout` (to arm the timer) and `handle_timeout` (to
+    /// fire it), so the armed deadline and the fire condition never disagree.
+    keepalive_interval: Duration,
     /// A keep-alive (or PTO-fallback) PING is queued for the 1-RTT space.
     ping_pending: bool,
     /// The space the next `write_handshake` bytes belong to (advances on KeyChange).
@@ -508,6 +541,7 @@ impl Connection {
             handshake_done_pending: false,
             handshake_confirmed: false,
             last_send_time: None,
+            keepalive_interval: random_keep_alive_interval(),
             ping_pending: false,
             write_level: SPACE_INITIAL,
             zero_rtt_keys: None,
@@ -601,6 +635,7 @@ impl Connection {
             handshake_done_pending: false,
             handshake_confirmed: false,
             last_send_time: None,
+            keepalive_interval: random_keep_alive_interval(),
             ping_pending: false,
             write_level: SPACE_INITIAL,
             zero_rtt_keys: None,
@@ -1136,10 +1171,11 @@ impl Connection {
                 }
             }
         }
-        // Keep-alive: once confirmed, schedule a PING after an idle interval.
+        // Keep-alive: once confirmed, schedule a PING after this cycle's (jittered)
+        // idle interval. handle_timeout fires on the SAME field, so arm and fire agree.
         if self.handshake_confirmed {
             if let Some(last) = self.last_send_time {
-                earliest(last + KEEP_ALIVE_INTERVAL);
+                earliest(last + self.keepalive_interval);
             }
         }
         // Idle timeout (RFC 9000 §10.1): tear down after no receipt for too long.
@@ -1216,14 +1252,18 @@ impl Connection {
             }
         }
 
-        // Keep-alive: if the connection has been idle past the interval, queue a
-        // PING so the peer's idle timer does not tear down a held-open relay.
+        // Keep-alive: if the connection has been idle past this cycle's interval,
+        // queue a PING so the peer's idle timer does not tear down a held-open relay,
+        // then re-roll the interval so the NEXT idle period uses a fresh random
+        // period (no fixed cadence to autocorrelate). Sending the PING refreshes
+        // last_send_time, so the new interval governs the next cycle.
         if self.handshake_confirmed
             && self
                 .last_send_time
-                .is_some_and(|last| now >= last + KEEP_ALIVE_INTERVAL)
+                .is_some_and(|last| now >= last + self.keepalive_interval)
         {
             self.ping_pending = true;
+            self.keepalive_interval = random_keep_alive_interval();
         }
     }
 
@@ -3389,7 +3429,9 @@ mod tests {
             client.poll_transmit(now).is_none(),
             "connection is idle after the handshake"
         );
-        now += KEEP_ALIVE_INTERVAL + Duration::from_secs(1);
+        // Advance past the worst-case (max) jittered interval so the keep-alive
+        // fires regardless of this connection's random draw.
+        now += KEEP_ALIVE_MAX + Duration::from_secs(1);
         client.handle_timeout(now);
         let ping = client
             .poll_transmit(now)
@@ -3400,6 +3442,30 @@ mod tests {
         assert!(
             server.poll_transmit(now).is_some(),
             "the server ACKs the keep-alive PING — the connection stays live"
+        );
+    }
+
+    #[test]
+    fn keep_alive_interval_is_jittered_within_bounds() {
+        // Every draw must stay inside [MIN, MAX] (so the PING never trips the 30s
+        // idle timeout and never fires absurdly early), and the value must vary
+        // across draws (a fixed cadence is the fingerprint we are removing).
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..256 {
+            let interval = random_keep_alive_interval();
+            assert!(
+                interval >= KEEP_ALIVE_MIN && interval <= KEEP_ALIVE_MAX,
+                "interval {interval:?} out of [{KEEP_ALIVE_MIN:?}, {KEEP_ALIVE_MAX:?}]"
+            );
+            assert!(
+                interval < IDLE_TIMEOUT,
+                "keep-alive interval must stay under the idle timeout"
+            );
+            seen.insert(interval.as_millis());
+        }
+        assert!(
+            seen.len() > 1,
+            "keep-alive interval must be jittered, not a single fixed value"
         );
     }
 
