@@ -4566,51 +4566,113 @@ where
     R: LegReader,
 {
     let mut client_record = Vec::new();
+    // Scratch reused across iterations for the opportunistic batch-open path
+    // (mirrors the mux reader): extra-record staging, concatenated records, and
+    // concatenated plaintext.
+    let mut extra_record = Vec::new();
+    let mut batch_records = Vec::new();
+    let mut batch_plaintext = Vec::new();
+    let mut deferred_read_error: Option<io::Error> = None;
 
     loop {
-        match client_records.read_record_into(&mut client_record).await {
-            Ok(()) => {}
-            Err(err) if client_records.is_clean_close(&err) => {
+        match deferred_read_error.take() {
+            Some(err) if client_records.is_clean_close(&err) => {
                 let _ = target_write.shutdown().await;
                 return Ok(client_open);
             }
-            Err(err) => return Err(HandshakeServerError::Io(err)),
-        };
+            Some(err) => return Err(HandshakeServerError::Io(err)),
+            None => match client_records.read_record_into(&mut client_record).await {
+                Ok(()) => {}
+                Err(err) if client_records.is_clean_close(&err) => {
+                    let _ = target_write.shutdown().await;
+                    return Ok(client_open);
+                }
+                Err(err) => return Err(HandshakeServerError::Io(err)),
+            },
+        }
         log_record_read(
             cid,
             "client->server",
             "server-data-client-reader",
             &client_record,
         );
-        match client_open.open_in_place_payload_range(&mut client_record) {
-            Ok(plaintext) => {
-                if !plaintext.is_empty() {
-                    // Bound the target write so a stuck upstream cannot pin this
-                    // relay indefinitely. NOTE: this per-write timeout reliably
-                    // fires only when the relay is otherwise progressing (the
-                    // download direction keeps bumping `activity`); in the pure
-                    // "client keeps sending, target accepts-then-stalls, no
-                    // download traffic" case the shared idle-watchdog (anchored to
-                    // the last activity bump, hence an equal-or-earlier deadline)
-                    // wins the race and tears the relay down at the idle backstop.
-                    // Either way the connection is reclaimed within ~idle_timeout
-                    // (the resource-pinning DoS is closed); the residual is that in
-                    // that narrow case the partial body is FIN'd to the target
-                    // rather than surfaced as a Timeout error — a pre-existing
-                    // behavior a fully deterministic fix would need to address by
-                    // distinguishing "stuck write" from "idle" in the watchdog.
-                    timeout(
-                        idle_timeout,
-                        target_write.write_all(&client_record[plaintext]),
-                    )
-                    .await
-                    .map_err(|_| HandshakeServerError::Timeout)??;
-                    bump_relay_activity(&activity);
+
+        // Opportunistically drain any already-buffered records so a bulk burst is
+        // opened across the crypto pool instead of pinning every open on this
+        // task. A would-block (`None`) ends the drain with partial reader state
+        // intact; a read error is deferred and surfaced on the next iteration,
+        // after the records that did arrive have been relayed. The bytes written
+        // to the target are identical to opening each record in order — only the
+        // CPU placement of the AEAD changes.
+        let mut record_count = 1_usize;
+        batch_records.clear();
+        let mut batch_bytes = client_record.len();
+        while batch_bytes < MUX_OPEN_BATCH_BYTES {
+            match client_records.try_read_record_into(&mut extra_record).await {
+                None => break,
+                Some(Ok(())) => {
+                    log_record_read(
+                        cid,
+                        "client->server",
+                        "server-data-client-reader",
+                        &extra_record,
+                    );
+                    if record_count == 1 {
+                        batch_records.extend_from_slice(&client_record);
+                    }
+                    batch_records.extend_from_slice(&extra_record);
+                    batch_bytes += extra_record.len();
+                    record_count += 1;
+                }
+                Some(Err(err)) => {
+                    deferred_read_error = Some(err);
+                    break;
                 }
             }
-            Err(err) => {
-                return Err(HandshakeServerError::DataRecord(err));
+        }
+
+        // Open the batch (or single record), then write the concatenated
+        // plaintext to the target under the same bounded write as before. NOTE:
+        // this per-write timeout reliably fires only when the relay is otherwise
+        // progressing (the download direction keeps bumping `activity`); in the
+        // pure "client keeps sending, target accepts-then-stalls, no download
+        // traffic" case the shared idle-watchdog (anchored to the last activity
+        // bump, hence an equal-or-earlier deadline) wins the race and tears the
+        // relay down at the idle backstop. Either way the connection is reclaimed
+        // within ~idle_timeout (the resource-pinning DoS is closed); the residual
+        // is that in that narrow case the partial body is FIN'd to the target
+        // rather than surfaced as a Timeout error — a pre-existing behavior a
+        // fully deterministic fix would need to address by distinguishing "stuck
+        // write" from "idle" in the watchdog.
+        let payload: &[u8] = if record_count == 1 {
+            let range = client_open
+                .open_in_place_payload_range(&mut client_record)
+                .map_err(HandshakeServerError::DataRecord)?;
+            &client_record[range]
+        } else {
+            batch_plaintext.clear();
+            let payload_bytes =
+                batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
+            if should_parallelize_aead(record_count, payload_bytes) {
+                client_open
+                    .open_concat_records_parallel(
+                        parallel::global(),
+                        &batch_records,
+                        &mut batch_plaintext,
+                    )
+                    .map_err(HandshakeServerError::DataRecord)?;
+            } else {
+                client_open
+                    .open_concat_records(&mut batch_records, &mut batch_plaintext)
+                    .map_err(HandshakeServerError::DataRecord)?;
             }
+            batch_plaintext.as_slice()
+        };
+        if !payload.is_empty() {
+            timeout(idle_timeout, target_write.write_all(payload))
+                .await
+                .map_err(|_| HandshakeServerError::Timeout)??;
+            bump_relay_activity(&activity);
         }
     }
 }

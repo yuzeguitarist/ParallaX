@@ -2512,27 +2512,90 @@ where
     R: LegReader,
 {
     let mut server_record = Vec::new();
+    // Scratch reused across iterations for the opportunistic batch-open path
+    // (mirrors the mux reader): one extra-record staging buffer, one concatenated
+    // record buffer, and one concatenated plaintext buffer.
+    let mut extra_record = Vec::new();
+    let mut batch_records = Vec::new();
+    let mut batch_plaintext = Vec::new();
+    let mut deferred_read_error: Option<io::Error> = None;
 
     loop {
-        match server_records.read_record_into(&mut server_record).await {
-            Ok(()) => {}
-            Err(err) if server_records.is_clean_close(&err) => {
+        match deferred_read_error.take() {
+            Some(err) if server_records.is_clean_close(&err) => {
                 let _ = local_write.shutdown().await;
                 return Ok(open_from_server);
             }
-            Err(err) => return Err(ClientRuntimeError::Io(err)),
-        };
+            Some(err) => return Err(ClientRuntimeError::Io(err)),
+            None => match server_records.read_record_into(&mut server_record).await {
+                Ok(()) => {}
+                Err(err) if server_records.is_clean_close(&err) => {
+                    let _ = local_write.shutdown().await;
+                    return Ok(open_from_server);
+                }
+                Err(err) => return Err(ClientRuntimeError::Io(err)),
+            },
+        }
         log_record_read(cid, "server->client", "client-outer-reader", &server_record);
 
-        match open_from_server.open_in_place_payload_range(&mut server_record) {
-            Ok(plaintext) => {
-                if !plaintext.is_empty() {
-                    bump_client_relay_activity(&activity);
-                    local_write.write_all(&server_record[plaintext]).await?;
+        // Opportunistically grab any records already buffered so a bulk burst is
+        // opened across the crypto pool instead of pinning every open on this
+        // task. A would-block (`None`) ends the drain with partial reader state
+        // intact; a read error is deferred and surfaced on the next iteration,
+        // after the records that did arrive have been relayed. The on-wire and
+        // app-visible bytes are identical to opening each record in order — only
+        // the CPU placement of the AEAD changes.
+        let mut record_count = 1_usize;
+        batch_records.clear();
+        let mut batch_bytes = server_record.len();
+        while batch_bytes < MUX_OPEN_BATCH_BYTES {
+            match server_records.try_read_record_into(&mut extra_record).await {
+                None => break,
+                Some(Ok(())) => {
+                    log_record_read(cid, "server->client", "client-outer-reader", &extra_record);
+                    if record_count == 1 {
+                        batch_records.extend_from_slice(&server_record);
+                    }
+                    batch_records.extend_from_slice(&extra_record);
+                    batch_bytes += extra_record.len();
+                    record_count += 1;
+                }
+                Some(Err(err)) => {
+                    deferred_read_error = Some(err);
+                    break;
                 }
             }
-            Err(err) => {
-                return Err(ClientRuntimeError::Handshake(err.into()));
+        }
+
+        if record_count == 1 {
+            match open_from_server.open_in_place_payload_range(&mut server_record) {
+                Ok(plaintext) => {
+                    if !plaintext.is_empty() {
+                        bump_client_relay_activity(&activity);
+                        local_write.write_all(&server_record[plaintext]).await?;
+                    }
+                }
+                Err(err) => {
+                    return Err(ClientRuntimeError::Handshake(err.into()));
+                }
+            }
+        } else {
+            batch_plaintext.clear();
+            let payload_bytes =
+                batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
+            let opened = if should_parallelize_aead(record_count, payload_bytes) {
+                open_from_server.open_concat_records_parallel(
+                    parallel::global(),
+                    &batch_records,
+                    &mut batch_plaintext,
+                )
+            } else {
+                open_from_server.open_concat_records(&mut batch_records, &mut batch_plaintext)
+            };
+            opened.map_err(|err| ClientRuntimeError::Handshake(err.into()))?;
+            if !batch_plaintext.is_empty() {
+                bump_client_relay_activity(&activity);
+                local_write.write_all(&batch_plaintext).await?;
             }
         }
     }
