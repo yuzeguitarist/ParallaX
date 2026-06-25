@@ -3217,9 +3217,26 @@ where
             );
         }
     } else {
-        codec
-            .seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)
-            .map_err(ClientHandshakeError::from)?;
+        // Fan the bulk seal across the crypto pool when the batch clears the
+        // parallel threshold; the parallel path is proven byte-identical and
+        // sequence-equivalent to the serial one (see data.rs equivalence tests),
+        // so the wire bytes, record sizes, and padding are unchanged. Small
+        // batches stay on the low-latency serial path.
+        let record_count = payload.len().div_ceil(max_chunk_len).max(1);
+        if should_parallelize_aead(record_count, payload.len()) {
+            codec
+                .seal_chunks_into_parallel(
+                    parallel::global(),
+                    payload,
+                    rng,
+                    &mut scratch.records_buf,
+                )
+                .map_err(ClientHandshakeError::from)?;
+        } else {
+            codec
+                .seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)
+                .map_err(ClientHandshakeError::from)?;
+        }
     }
     writer.write_records(scratch.records_buf.as_slice()).await?;
     Ok(())
