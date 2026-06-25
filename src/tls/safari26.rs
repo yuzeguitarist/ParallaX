@@ -1987,13 +1987,25 @@ mod tests {
             let _ = session.complete(&mut client).await;
         });
 
+        // Bound both reads: if the CCS write ever regresses, the second record never
+        // arrives (complete() then blocks on the ServerHello), so an unbounded read
+        // would hang CI instead of failing. A timeout turns that into a clear failure.
+        let read_timeout = Duration::from_secs(5);
         let mut first = Vec::new();
         let mut second = Vec::new();
         let mut reader = TlsRecordReader::new(&mut peer);
-        reader.read_record_into(&mut first).await.unwrap();
-        reader.read_record_into(&mut second).await.unwrap();
+        timeout(read_timeout, reader.read_record_into(&mut first))
+            .await
+            .expect("timed out reading the ClientHello record")
+            .unwrap();
+        timeout(read_timeout, reader.read_record_into(&mut second))
+            .await
+            .expect("timed out reading the second client record (compat CCS missing?)")
+            .unwrap();
         drop(peer);
-        let _ = handshake.await;
+        // Surface a panic in the spawned handshake task (a normal Err from complete()
+        // after the peer drop is expected and lives inside the task, not the JoinError).
+        handshake.await.expect("handshake task panicked");
 
         // First record: a handshake (ClientHello) record.
         assert_eq!(
