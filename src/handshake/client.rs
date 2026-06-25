@@ -17,7 +17,6 @@ use crate::{
             ConnectRequest, ConnectRequestError, FramedChunk, FramedChunkError, PqRekeyError,
             PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError, ServerIdentityProof,
             ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError,
-            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT, PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
         },
         data::{
             DataRecordCodec, DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD,
@@ -159,20 +158,18 @@ impl ClientDataSession {
         crate::process_hardening::protect_secret_bytes("pq_rekey.x25519_private", &x25519.private);
         crate::process_hardening::protect_secret_bytes("pq_rekey.mlkem_secret", &mlkem.secret);
         let request = PqRekeyRequest::encode_borrowed(&x25519.public, &mlkem.public)?;
-        // Split the rekey record across several variable-length data records so
-        // the first client->server app-data burst is not a fixed ~1631-byte
-        // single record (PAR-21). Each chunk size is drawn fresh per chunk; the
-        // server reassembles by FramedChunk length headers. Emitted as one buffer
-        // => one write => single flight, so the establish path adds no round-trip.
+        // Shape the rekey record into a browser-modeled record-size distribution and
+        // apply per-session aggregate decorrelation padding (PAR-35), so the
+        // client->server PQ burst falls inside the Safari H2 page-traffic distribution
+        // instead of reading as a second, heavier PQ key exchange than the ML-KEM-768
+        // the outer ClientHello advertised. (Supersedes the PAR-21 uniform [256,1024]
+        // split; same one-buffer => one write => single flight, no added round-trip.)
+        // The server reassembles by FramedChunk length headers; the aggregate pad is
+        // stripped transparently by the per-record padding trailer.
         let mut record = Vec::new();
-        for chunk in FramedChunk::encode_all_shaped(
-            &request,
-            rng,
-            PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
-            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT,
-        )? {
-            self.seal_to_server.seal_into(&chunk, rng, &mut record)?;
-        }
+        let chunks = FramedChunk::encode_all_browser_shaped(&request, rng)?;
+        self.seal_to_server
+            .seal_pq_flight(&chunks, rng, &mut record)?;
         Ok((
             record,
             PendingPqRekey {

@@ -83,6 +83,30 @@ impl PaddingProfile {
         self.write_padding_suffix(pad_len, rng, out);
     }
 
+    /// Append a padding suffix whose length is this profile's normal sampled padding
+    /// for `payload_len` PLUS `extra_pad` bytes, written as one suffix (random pad
+    /// bytes + the 2-byte length trailer). Used by the PQ handshake flight's aggregate
+    /// decorrelation padding (PAR-35): the per-session `extra_pad` rides ON TOP of
+    /// whatever this codec's configured profile would add, so a deployment that enables
+    /// padding still gets profile padding on this record AND the aggregate pad — and a
+    /// default (0/0) profile yields exactly `extra_pad`. The receiver strips the whole
+    /// suffix via the same self-describing trailer, so no decode change is needed.
+    pub fn write_extra_padded_suffix_into<R>(
+        &self,
+        payload_len: usize,
+        extra_pad: usize,
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) where
+        R: Rng + RngCore + ?Sized,
+    {
+        let profile_pad = self.sample_padding_len(payload_len, rng) as usize;
+        // Clamp the combined length to the u16 trailer's range so it can never
+        // disagree with the byte count it pads.
+        let pad_len = profile_pad.saturating_add(extra_pad).min(u16::MAX as usize);
+        self.write_padding_suffix(pad_len, rng, out);
+    }
+
     fn write_padding_suffix<R>(&self, pad_len: usize, rng: &mut R, out: &mut Vec<u8>)
     where
         R: Rng + RngCore + ?Sized,

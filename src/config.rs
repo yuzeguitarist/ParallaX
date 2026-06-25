@@ -1342,7 +1342,12 @@ const fn default_max_concurrent_streams() -> u8 {
 }
 
 const fn default_udp_probe_timeout_ms() -> u16 {
-    300
+    // Floor for the UDP-probe budget. The effective budget is RTT-aware
+    // (`udp_probe_budget` = max(this, 6 × observed control-plane RTT), PAR-11), so on
+    // a fast path it stays near this value and on a high-RTT path it grows with the
+    // path. The floor is set above a single transcontinental RTT (~300ms) with margin,
+    // so even before the RTT sample is applied the probe is not starved mid-handshake.
+    1000
 }
 
 fn default_replay_cache_path() -> PathBuf {
@@ -1505,7 +1510,7 @@ authorized_sni = ["example.com"]
         assert!(!udp.enabled);
         assert_eq!(udp.cc, UdpCongestionControl::Bbr);
         assert_eq!(udp.fec_profile, UdpFecProfile::Adaptive);
-        assert_eq!(udp.probe_timeout_ms, 300);
+        assert_eq!(udp.probe_timeout_ms, 1000);
         assert_eq!(udp.brutal_up_mbps, 0);
         assert_eq!(udp.brutal_down_mbps, 0);
         assert!(!udp.ignore_client_bandwidth);

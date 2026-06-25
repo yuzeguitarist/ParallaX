@@ -1338,6 +1338,44 @@ fn client_quic_ticket_slot() -> &'static std::sync::Mutex<Option<crate::tls::qui
 /// request -> encoder stream order. The exporter-bound auth is unchanged; only the
 /// carrier is H3 framing.
 ///
+/// How many path round-trips the UDP probe needs end to end: a QUIC handshake plus
+/// the H3 control/request/encoder stream setup and the bidi probe round-trip add up
+/// to several RTTs, so the budget must be a healthy multiple of one path RTT — a
+/// fixed 300ms that equals a single transcontinental RTT is exactly the flaky-probe
+/// footgun PAR-11 describes.
+const UDP_PROBE_RTT_MULTIPLE: u32 = 6;
+
+/// Derive the UDP-probe timeout from the configured floor and the observed
+/// control-plane RTT (PAR-11). The result is `clamp(MULTIPLE × rtt, floor, ceiling)`,
+/// so the probe scales with the path — staying at the (small) floor on a fast link
+/// and growing to cover the multi-RTT probe on a high-RTT link — but NEVER exceeds the
+/// server's offer-hold contract.
+///
+/// The server bounds its own wait for the client's PX1P ack at `2 × probe_timeout_ms`
+/// (see `run_authenticated_data_mode` in `src/handshake/server.rs`), its clock starting
+/// one offer-propagation earlier than the client's. Capping the client at `1.75 × floor`
+/// keeps it strictly under that `2×` wait (a 0.25×-floor propagation margin) so the
+/// server outlasts the client and the probe does not desync.
+///
+/// NOTE: both budgets derive from each side's OWN `probe_timeout_ms`. The
+/// server-outlasts-client property therefore holds whenever the two ends use the same
+/// (or the server a larger) UDP timeout — the default and the recommended config (the
+/// paired configs `plx init` writes share it). It is NOT a wire-negotiated invariant:
+/// an operator who sets a SMALLER server timeout than the client could still make the
+/// server time out first. The offer carries no timeout field, so the client cannot
+/// know the server's value to clamp against it without a protocol change; this cap is
+/// the strongest bound available client-side and strictly improves on the prior
+/// uncapped `max(floor, 6×rtt)`. `config_ms` remains a hard minimum.
+fn udp_probe_budget(config_ms: u16, control_rtt: std::time::Duration) -> std::time::Duration {
+    let floor = std::time::Duration::from_millis(u64::from(config_ms.max(1)));
+    // Ceiling = 1.75 × floor (see the matched-config note above). Adaptivity lives in
+    // [floor, 1.75×floor]; an operator on a very high-RTT path raises probe_timeout_ms
+    // on BOTH ends, which lifts this ceiling and the server's wait together.
+    let ceiling = floor.saturating_mul(7) / 4;
+    let rtt_based = control_rtt.saturating_mul(UDP_PROBE_RTT_MULTIPLE);
+    rtt_based.clamp(floor, ceiling)
+}
+
 /// `sni` is the camouflage front domain (the client's REALITY SNI), used as both
 /// the QUIC ClientHello server name AND the request's `:authority`; it is never
 /// the literal "localhost", which would be a zero-false-positive censorship
@@ -1677,6 +1715,11 @@ async fn establish_authenticated_data_session_inner(
         }
         .encode();
         let request_record = data_session.seal_payload(&request, &mut OsRng)?;
+        // The UdpRequest->UdpOffer exchange is one control-plane TCP round-trip on the
+        // exact path the UDP probe will use, so it doubles as a live RTT sample: time
+        // it and size the probe budget off it (PAR-11), instead of a fixed 300ms that
+        // a single transcontinental RTT already exhausts.
+        let control_rtt_start = std::time::Instant::now();
         server.write_all(&request_record).await?;
 
         let mut response = Vec::new();
@@ -1684,6 +1727,7 @@ async fn establish_authenticated_data_session_inner(
             let mut reader = crate::tls::record::TlsRecordReader::new(&mut server);
             reader.read_record_into(&mut response).await?;
         }
+        let control_rtt = control_rtt_start.elapsed();
         data_session.open_server_record_in_place(&mut response)?;
 
         if UdpOffer::has_magic(&response) {
@@ -1692,8 +1736,12 @@ async fn establish_authenticated_data_session_inner(
             // stream stays aligned regardless of the probe result.
             let (offer_id, probe) = match UdpOffer::decode(&response) {
                 Ok(offer) => {
-                    let probe_timeout =
-                        std::time::Duration::from_millis(u64::from(udp.probe_timeout_ms.max(1)));
+                    let probe_timeout = udp_probe_budget(udp.probe_timeout_ms, control_rtt);
+                    tracing::debug!(
+                        control_rtt_ms = control_rtt.as_millis() as u64,
+                        probe_budget_ms = probe_timeout.as_millis() as u64,
+                        "UDP probe budget derived from the observed control-plane RTT"
+                    );
                     let probe = run_client_udp_probe(
                         &server,
                         &offer,
@@ -3331,6 +3379,43 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn udp_probe_budget_is_rtt_aware_with_a_floor() {
+        use std::time::Duration as StdDuration;
+        // Fast path: a tiny RTT keeps the budget at the configured floor.
+        let fast = udp_probe_budget(1000, StdDuration::from_millis(5));
+        assert_eq!(
+            fast,
+            StdDuration::from_millis(1000),
+            "floor wins on a fast path"
+        );
+        // High-RTT path: ~280ms transcontinental RTT → 6× = 1680ms > floor, so the
+        // budget grows with the path instead of starving the multi-RTT probe.
+        let high = udp_probe_budget(1000, StdDuration::from_millis(280));
+        assert_eq!(
+            high,
+            StdDuration::from_millis(1680),
+            "RTT multiple wins on a slow path"
+        );
+        // Very high RTT: 6× would exceed the ceiling, so it is capped at 1.75×floor —
+        // strictly below the server's 2×floor wait, so the server never times out
+        // first (no desync between the client probe and the server's offer hold).
+        let capped = udp_probe_budget(1000, StdDuration::from_millis(500));
+        assert_eq!(
+            capped,
+            StdDuration::from_millis(1750),
+            "capped below the server's 2x wait"
+        );
+        // The floor is a hard minimum: a near-zero RTT sample can never shrink it.
+        let tiny = udp_probe_budget(1000, StdDuration::from_micros(1));
+        assert_eq!(tiny, StdDuration::from_millis(1000));
+        // config_ms is clamped to >= 1; the ceiling is relative to the floor, so a
+        // pathological 0 floor (→ 1ms) caps the budget at 1.75ms rather than letting it
+        // run unbounded past the server's wait.
+        let zero_floor = udp_probe_budget(0, StdDuration::from_millis(100));
+        assert_eq!(zero_floor, StdDuration::from_micros(1750));
+    }
 
     // --- Track A1: lock-free relay activity clock — watchdog semantics ---
     // Below the `mod tests` boundary, so the no-timeout static ratchet is

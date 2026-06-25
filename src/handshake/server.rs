@@ -57,7 +57,6 @@ use crate::{
             PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError, ServerIdentityProof,
             ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck,
             SpeedTestRequest, SpeedTestRequestError, MAX_PQ_HANDSHAKE_FRAME,
-            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT, PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
@@ -185,8 +184,6 @@ fn try_enter_cap_shed_fallback() -> Option<CapShedFallbackSlot> {
         Some(CapShedFallbackSlot(()))
     }
 }
-const SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT: usize = 960;
-const SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT: usize = 1320;
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 // The client's residual-skip budget, mirrored here only for the operator-facing
 // warning logged when the forward cap is reached. Bound to the shared constant so
@@ -1803,20 +1800,20 @@ async fn run_authenticated_data_mode(
                             &*pq_shared_secret,
                         );
                         let mut rng = StdRng::from_entropy();
-                        // Split the key-exchange (PX1K) record across several
-                        // variable-length chunks for the same reason as the client
-                        // PX1Q split (PAR-21): no fixed ~1632-byte single record,
-                        // no equal-length run, no fixed per-session regime. Sealed
-                        // into one buffer => one write => single flight.
+                        // Shape the key-exchange (PX1K) record into the SAME
+                        // browser-modeled distribution + aggregate decorrelation pad as
+                        // the client PX1Q and the identity proof below (PAR-35), so the
+                        // whole post-handshake burst shares one coherent H2-page-like
+                        // regime instead of reading as a second, heavier PQ exchange.
+                        // Sealed into one buffer => one write => single flight.
                         let mut key_exchange_record = Vec::new();
-                        for chunk in FramedChunk::encode_all_shaped(
-                            &key_exchange_payload,
+                        let key_exchange_chunks =
+                            FramedChunk::encode_all_browser_shaped(&key_exchange_payload, &mut rng)?;
+                        server_seal.seal_pq_flight(
+                            &key_exchange_chunks,
                             &mut rng,
-                            PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
-                            PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT,
-                        )? {
-                            server_seal.seal_into(&chunk, &mut rng, &mut key_exchange_record)?;
-                        }
+                            &mut key_exchange_record,
+                        )?;
                         log_outer_write(
                             cid,
                             "server->client",
@@ -1857,10 +1854,14 @@ async fn run_authenticated_data_mode(
                             signature: identity_signature,
                         }
                         .encode()?;
-                        let identity_chunk_plaintext =
-                            server_identity_chunk_plaintext_len(&mut rng);
-                        let identity_chunks =
-                            ServerIdentityChunk::encode_all(&identity_payload, identity_chunk_plaintext)?;
+                        // Shape the identity proof into the SAME browser-modeled
+                        // record-size distribution as PX1Q/PX1K (PAR-35), so the whole
+                        // server burst is one coherent regime with no observable
+                        // [256,1024]->[960,1320] switch to segment on.
+                        let identity_chunks = ServerIdentityChunk::encode_all_browser_shaped(
+                            &identity_payload,
+                            &mut rng,
+                        )?;
                         write_server_identity_chunks(
                             &mut client_write,
                             &mut server_seal,
@@ -2777,13 +2778,6 @@ where
     }
 }
 
-fn server_identity_chunk_plaintext_len<R>(rng: &mut R) -> usize
-where
-    R: Rng + ?Sized,
-{
-    rng.gen_range(SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT..=SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT)
-}
-
 async fn write_server_identity_chunks<W, R>(
     client_write: &mut W,
     server_seal: &mut DataRecordCodec,
@@ -2796,10 +2790,23 @@ where
     W: AsyncWrite + Unpin,
     R: Rng + rand::RngCore + ?Sized,
 {
+    // Per-session aggregate decorrelation pad (PAR-35), applied to the LAST identity
+    // record so the identity flight's total on-wire size varies across sessions.
+    // Stripped transparently by the client's per-record padding trailer; never touches
+    // the relay codec.
+    let aggregate_pad = FramedChunk::aggregate_pad_len(rng);
+    let last = identity_chunks.len().saturating_sub(1);
+
     if timing.is_enabled() {
         let identity_chunk_count = identity_chunks.len();
         for (idx, chunk) in identity_chunks.into_iter().enumerate() {
-            let identity_record = server_seal.seal(&chunk, rng)?;
+            let identity_record = if idx == last {
+                let mut buf = Vec::new();
+                server_seal.seal_into_extra_padded(&chunk, aggregate_pad, rng, &mut buf)?;
+                buf
+            } else {
+                server_seal.seal(&chunk, rng)?
+            };
             log_outer_write(
                 cid,
                 "server->client",
@@ -2818,13 +2825,21 @@ where
         return Ok(());
     }
 
+    // Reservation hint only (a loose over-estimate is harmless): the sealed records
+    // plus the aggregate pad and its 2-byte length trailer on the last record.
     let capacity = identity_chunks
         .iter()
         .map(|chunk| server_seal.max_sealed_len(chunk.len()))
-        .sum();
+        .sum::<usize>()
+        + aggregate_pad
+        + 2;
     let mut identity_records = Vec::with_capacity(capacity);
-    for chunk in identity_chunks {
-        let range = server_seal.seal_into(&chunk, rng, &mut identity_records)?;
+    for (idx, chunk) in identity_chunks.iter().enumerate() {
+        let range = if idx == last {
+            server_seal.seal_into_extra_padded(chunk, aggregate_pad, rng, &mut identity_records)?
+        } else {
+            server_seal.seal_into(chunk, rng, &mut identity_records)?
+        };
         log_outer_write(
             cid,
             "server->client",
@@ -5151,24 +5166,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn identity_chunk_plaintext_len_jitters_without_timing_delay() {
-        let mut rng = StdRng::seed_from_u64(104);
-        let mut saw_different = false;
-        let first = server_identity_chunk_plaintext_len(&mut rng);
-
-        for _ in 0..64 {
-            let len = server_identity_chunk_plaintext_len(&mut rng);
-            assert!(
-                (SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT..=SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT)
-                    .contains(&len)
-            );
-            saw_different |= len != first;
-        }
-
-        assert!(saw_different);
-    }
-
     #[tokio::test]
     async fn speed_first_identity_writer_batches_chunks_into_one_write() {
         let traffic = TrafficConfig::default();
@@ -5184,17 +5181,20 @@ mod tests {
             padding,
             SERVER_TO_CLIENT_AAD,
         );
-        let payload = vec![0x42_u8; SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT * 2 + 1];
-        let chunks =
-            ServerIdentityChunk::encode_all(&payload, SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT).unwrap();
-        let expected_chunks = chunks.clone();
+        let payload = vec![0x42_u8; 4096];
         let mut rng = StdRng::seed_from_u64(103);
+        let chunks = ServerIdentityChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+        let expected_chunks = chunks.clone();
         let mut writer = CountingWriter::default();
 
         write_server_identity_chunks(&mut writer, &mut server_seal, chunks, &mut rng, timing, 7)
             .await
             .unwrap();
 
+        // Speed-first (timing disabled) path batches the whole identity flight into a
+        // single write; the per-record padding (incl. the aggregate decorrelation pad
+        // on the last record) is stripped transparently by client_open, so the opened
+        // chunks equal the FramedChunk records that went in.
         assert_eq!(writer.writes, 1);
         let mut opened_chunks = Vec::new();
         let mut offset = 0;
