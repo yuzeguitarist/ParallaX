@@ -155,6 +155,16 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
     client_random.copy_from_slice(r.take(32)?);
     let legacy_session_id = r.vec_u8()?.to_vec();
     let cipher_suites = r.vec_u16()?;
+    // RFC 8446 §4.1.2: cipher_suites is a vector of 2-byte values, so an odd length
+    // is malformed. chunks_exact(2) would silently drop the trailing odd byte; reject
+    // it instead, matching the client-side parser's strictness (a lenient server is an
+    // active-probe distinguisher from a real TLS stack).
+    if cipher_suites.len() % 2 != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "odd-length cipher_suites",
+        ));
+    }
     if !cipher_suites
         .chunks_exact(2)
         .any(|c| u16::from_be_bytes([c[0], c[1]]) == TLS_AES_128_GCM_SHA256)
@@ -197,6 +207,15 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
             EXT_KEY_SHARE => {
                 let mut kr = Reader::new(ext_data);
                 let mut sr = Reader::new(kr.vec_u16()?);
+                // The KeyShareClientHello is exactly the u16-length client_shares list;
+                // reject trailing bytes after it (client-side parser strictness — a
+                // real TLS stack does not leave garbage after the key_share vector).
+                if kr.remaining() != 0 {
+                    return Err(QuicTlsError::alert(
+                        ALERT_DECODE_ERROR,
+                        "trailing bytes after key_share client_shares",
+                    ));
+                }
                 while sr.remaining() > 0 {
                     let group = sr.u16()?;
                     let key_exchange = sr.vec_u16()?;
@@ -241,6 +260,15 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
             EXT_EARLY_DATA => offers_early_data = true,
             _ => {}
         }
+    }
+    // The extensions vector is the last field of the ClientHello body; reject any
+    // trailing bytes after it (the client-side parser rejects the symmetric case as an
+    // active-probe distinguisher — handshake.rs:710 — so the server must too).
+    if r.remaining() != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "trailing bytes after ClientHello extensions",
+        ));
     }
 
     if !offers_tls13 {
@@ -1081,6 +1109,73 @@ mod tests {
         let (server_share, secret) = server_hybrid_kex(&summary.hybrid_key_share).unwrap();
         assert_eq!(server_share.len(), MLKEM768_CIPHERTEXT_LEN + X25519_LEN);
         assert_eq!(secret.len(), HYBRID_SHARED_LEN);
+    }
+
+    /// Build a real QUIC ClientHello body (handshake message minus the 4-byte
+    /// header), for malformed-input strictness tests below.
+    fn real_client_hello_body() -> Vec<u8> {
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, QUIC_VERSION_V1,
+        };
+        use std::sync::Arc;
+        let config = Arc::new(ClientConfig::new(
+            Arc::new(AcceptAnyServerCert),
+            vec![b"h3".to_vec()],
+        ));
+        let mut engine = ClientHandshake::new(
+            config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0xde, 0xad, 0xbe, 0xef],
+            &[],
+        )
+        .unwrap();
+        let mut msg = Vec::new();
+        let _ = engine.write_handshake(&mut msg);
+        msg[4..].to_vec()
+    }
+
+    #[test]
+    fn parser_rejects_trailing_bytes_after_extensions() {
+        // PAR-26: a real TLS stack does not leave bytes after the extensions vector;
+        // the client-side parser rejects this, so the server must too (active-probe
+        // distinguisher otherwise). The clean body parses; the same body with one
+        // trailing byte is a decode error.
+        let body = real_client_hello_body();
+        assert!(parse_client_hello(&body).is_ok(), "clean body parses");
+        let mut trailing = body.clone();
+        trailing.push(0x00);
+        let Err(err) = parse_client_hello(&trailing) else {
+            panic!("trailing-byte ClientHello must be rejected");
+        };
+        assert_eq!(err.alert_description(), Some(ALERT_DECODE_ERROR));
+    }
+
+    #[test]
+    fn parser_rejects_odd_length_cipher_suites() {
+        // PAR-26: cipher_suites is a vector of 2-byte values; an odd length is
+        // malformed and must be rejected rather than silently dropping the last byte
+        // via chunks_exact(2). We locate the cipher_suites length field in a real
+        // ClientHello and bump it by one (claiming an odd byte count), then add the
+        // stray byte so the outer framing still parses up to the cipher_suites field.
+        let body = real_client_hello_body();
+        // Body layout: legacy_version(2) | random(32) | session_id(u8-len + bytes) |
+        // cipher_suites(u16-len + bytes) | ...
+        let sid_len = body[34] as usize;
+        let cs_len_off = 2 + 32 + 1 + sid_len; // offset of the cipher_suites u16 length
+        let cs_len = u16::from_be_bytes([body[cs_len_off], body[cs_len_off + 1]]) as usize;
+        // Construct a malformed body: prefix up to and including the cipher_suites
+        // bytes, but with the length field set to an ODD value (cs_len + 1) and one
+        // extra byte appended to the cipher_suites region so `take` succeeds and the
+        // odd-length check is what fires.
+        let mut bad = body.clone();
+        let odd = (cs_len + 1) as u16;
+        bad[cs_len_off..cs_len_off + 2].copy_from_slice(&odd.to_be_bytes());
+        bad.insert(cs_len_off + 2 + cs_len, 0x00); // the stray odd byte
+        let Err(err) = parse_client_hello(&bad) else {
+            panic!("odd-length cipher_suites must be rejected");
+        };
+        assert_eq!(err.alert_description(), Some(ALERT_DECODE_ERROR));
     }
 
     #[test]
