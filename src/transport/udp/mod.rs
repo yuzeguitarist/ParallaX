@@ -15,6 +15,8 @@
 pub mod auth;
 pub mod endpoint;
 pub(crate) mod h3;
+/// Persistent single-use anti-replay guard for the origin-splice auth marker.
+pub(crate) mod marker_replay;
 pub mod probe;
 /// Hand-written, quinn-free QUIC transport stack (Phase 2 of de-vendoring): the
 /// live production carrier for the UDP fast plane, built clean-room from RFC
@@ -78,6 +80,9 @@ pub fn server_config(
         // Marker fork dormant until the server runtime supplies the key; every v1
         // Initial terminates locally (the prior behaviour).
         marker_key: None,
+        marker_replay_guard: None,
+        // 0 => use the built-in default recv cap (issue #75).
+        max_udp_payload: 0,
     }))
 }
 
@@ -104,6 +109,9 @@ pub fn server_config_0rtt(
         origin_udp_addr: None,
         // Marker fork dormant until the server runtime supplies the key.
         marker_key: None,
+        marker_replay_guard: None,
+        // 0 => use the built-in default recv cap (issue #75).
+        max_udp_payload: 0,
     }))
 }
 
@@ -114,13 +122,19 @@ pub fn server_config_0rtt(
 /// prober reaches the TRUE origin and ParallaX emits nothing of its own; only a
 /// marked client terminates locally. `marker_key` is `(psk, server static X25519
 /// private)` and `stek`/`guard` enable 0-RTT resumption as in [`server_config_0rtt`].
+/// `marker_replay_guard` makes the accepted-marker single-use property persistent
+/// across restarts (issue #74); `None` falls back to the in-memory cache.
+/// `max_udp_payload` is the inbound recv cap (`0` => default; issue #75).
+#[allow(clippy::too_many_arguments)]
 pub fn server_config_stable(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
     stek: Option<Zeroizing<[u8; 32]>>,
     guard: Option<Arc<dyn ZeroRttGuard>>,
     marker_key: crate::crypto::quic_marker::MarkerKey,
+    marker_replay_guard: Option<Arc<marker_replay::MarkerReplayGuard>>,
     origin_udp_addr: SocketAddr,
+    max_udp_payload: usize,
 ) -> Result<Arc<quic::endpoint::ServerConfig>, UdpTransportError> {
     Ok(Arc::new(quic::endpoint::ServerConfig {
         cert_chain: vec![cert.as_ref().to_vec()],
@@ -130,6 +144,8 @@ pub fn server_config_stable(
         replay_guard: guard,
         origin_udp_addr: Some(origin_udp_addr),
         marker_key: Some(marker_key),
+        marker_replay_guard,
+        max_udp_payload,
     }))
 }
 

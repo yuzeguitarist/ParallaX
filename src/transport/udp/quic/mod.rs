@@ -21,6 +21,10 @@ pub(crate) mod congestion;
 pub(crate) mod conn;
 pub(crate) mod endpoint;
 pub(crate) mod frame;
+/// Deterministic loss/reorder network simulator + transport invariants (test-only,
+/// issue #76). Drives two sans-IO `Connection`s over a virtual link.
+#[cfg(test)]
+mod netsim;
 pub(crate) mod packet;
 pub(crate) mod recovery;
 pub(crate) mod spaces;

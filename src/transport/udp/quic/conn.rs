@@ -515,10 +515,17 @@ impl Connection {
                 QUIC_VERSION_V1,
                 server_name,
                 tp_blob,
+                dcid.as_slice(),
                 t,
                 now_ms,
             )?,
-            None => ClientHandshake::new(config, QUIC_VERSION_V1, server_name, tp_blob)?,
+            None => ClientHandshake::new(
+                config,
+                QUIC_VERSION_V1,
+                server_name,
+                tp_blob,
+                dcid.as_slice(),
+            )?,
         };
         let mut spaces = [Space::default(), Space::default(), Space::default()];
         spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
@@ -689,8 +696,9 @@ impl Connection {
         &mut self,
         psk: zeroize::Zeroizing<Vec<u8>>,
         static_priv: zeroize::Zeroizing<[u8; 32]>,
+        bound_dcid: Vec<u8>,
     ) {
-        self.tls.set_marker_key(psk, static_priv);
+        self.tls.set_marker_key(psk, static_priv, bound_dcid);
     }
 
     /// The origin-splice auth marker recovered from this connection's
@@ -3801,6 +3809,51 @@ mod tests {
         assert!(
             server.last_recv_time.is_none(),
             "a garbage datagram must not start/refresh the idle timer"
+        );
+    }
+
+    /// Issue #75: a datagram at / above / well past the inbound recv cap must fail
+    /// safe — no panic, no unbounded allocation, no state created. The kernel
+    /// truncates anything larger than the recv buffer to the cap before it reaches
+    /// `handle_datagram`; either way an un-openable slice AEAD-fails and is dropped.
+    /// Here we exercise `handle_datagram` directly at sizes straddling the 2048
+    /// default (and well beyond it) to prove the parse/decrypt path is bounds-safe.
+    #[test]
+    fn oversized_and_boundary_datagrams_fail_safe() {
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x75, 0x75, 0x75, 0x75]),
+        )
+        .unwrap();
+        // Sizes around the 2048 default cap, plus far beyond it. A long-header byte
+        // (0xc0) makes the parser attempt the long-header path; the rest is garbage,
+        // so it cannot AEAD-open and must be dropped without panic.
+        for &len in &[1199_usize, 1200, 1500, 2047, 2048, 2049, 4096, 8192, 65535] {
+            let mut dg = vec![0xff; len];
+            dg[0] = 0xc0; // long-header form bit + fixed bit
+            let before = server.last_recv_time;
+            // Must not panic and must report a clean drop (Ok) — never an error that
+            // would tear the connection down on attacker-chosen junk.
+            assert!(
+                server.handle_datagram(&dg, Instant::now()).is_ok(),
+                "a {len}-byte un-openable datagram is dropped cleanly"
+            );
+            assert_eq!(
+                server.last_recv_time, before,
+                "an un-openable {len}-byte datagram must not refresh the idle timer"
+            );
+        }
+        // No connection / stream state was created by any of the junk datagrams.
+        assert!(
+            server.is_handshaking(),
+            "no handshake progressed on garbage"
+        );
+        assert!(
+            server.streams.is_empty(),
+            "no stream state allocated from oversized garbage"
         );
     }
 

@@ -157,8 +157,17 @@ impl ClientHandshake {
         version: u32,
         server_name: &str,
         transport_params: Vec<u8>,
+        marker_dcid: &[u8],
     ) -> Result<Self, QuicTlsError> {
-        Self::new_inner(config, version, server_name, transport_params, None, 0)
+        Self::new_inner(
+            config,
+            version,
+            server_name,
+            transport_params,
+            marker_dcid,
+            None,
+            0,
+        )
     }
 
     /// Build a 0-RTT resumption client handshake: it offers `ticket` via
@@ -170,6 +179,7 @@ impl ClientHandshake {
         version: u32,
         server_name: &str,
         transport_params: Vec<u8>,
+        marker_dcid: &[u8],
         ticket: &ClientTicket,
         now_ms: u64,
     ) -> Result<Self, QuicTlsError> {
@@ -178,6 +188,7 @@ impl ClientHandshake {
             version,
             server_name,
             transport_params,
+            marker_dcid,
             Some(ticket),
             now_ms,
         )
@@ -188,6 +199,7 @@ impl ClientHandshake {
         version: u32,
         server_name: &str,
         transport_params: Vec<u8>,
+        marker_dcid: &[u8],
         ticket: Option<&ClientTicket>,
         now_ms: u64,
     ) -> Result<Self, QuicTlsError> {
@@ -223,8 +235,10 @@ impl ClientHandshake {
         // terminates locally, splicing everything else to the origin), otherwise a
         // pure-random value (the cold-start shape). The marker is itself uniformly
         // pseudo-random, so the wire shape is identical either way. ECDH binds the
-        // per-connection ephemeral key share; DCID binding is deferred (the
-        // Initial-time replay cache bounds replay), so the TLS engine needs no DCID.
+        // per-connection ephemeral key share; `marker_dcid` (the first Initial's
+        // Destination Connection ID, == the carrier `offer_id`) binds the marker to
+        // this connection's routing identity, so a captured marker lifted onto a
+        // different DCID fails to verify (issue #74).
         let mut random = [0_u8; 32];
         match &config.marker {
             Some(m) => {
@@ -242,7 +256,7 @@ impl ClientHandshake {
                     &m.psk,
                     &ss,
                     server_name.as_bytes(),
-                    &[],
+                    marker_dcid,
                     now,
                     &nonce,
                 );
@@ -1155,7 +1169,14 @@ mod tests {
             Arc::new(AcceptAnyServerCert),
             vec![b"h3".to_vec()],
         ));
-        ClientHandshake::new(config, QUIC_VERSION_V1, "example.com", vec![0x0f, 0x00]).unwrap()
+        ClientHandshake::new(
+            config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x0f, 0x00],
+            &[],
+        )
+        .unwrap()
     }
 
     /// Extract the client's X25519 key_share (group 0x001d) from a ClientHello
@@ -1210,8 +1231,14 @@ mod tests {
                 },
             ),
         );
-        let mut ch =
-            ClientHandshake::new(config, QUIC_VERSION_V1, "example.com", vec![0x0f, 0x00]).unwrap();
+        let mut ch = ClientHandshake::new(
+            config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x0f, 0x00],
+            &[],
+        )
+        .unwrap();
         let mut out = Vec::new();
         ch.write_handshake(&mut out);
 

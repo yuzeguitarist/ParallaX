@@ -729,6 +729,83 @@ mod tests {
         assert_eq!(auth.nonce, Some(TEST_NONCE));
     }
 
+    // ---- Issue #54: kill surviving cargo-mutants in the auth-key / tail / mask
+    // derivation helpers. These pin the *content* of values whose constant-return
+    // mutants (Ok([0;..]) / Ok([1;..])) the field-level tests above did not catch.
+
+    #[test]
+    fn build_auth_tail_embeds_a_live_timestamp_and_random_nonce() {
+        // Kills `build_auth_tail -> Ok([0;..])` / `Ok([1;..])` and
+        // `current_unix_timestamp -> Ok(0)` / `Ok(1)`: the tail's leading 8 bytes are
+        // the real Unix time (well past 2021), and the nonce bytes are not constant.
+        use rand::rngs::OsRng;
+        let tail = build_auth_tail(&mut OsRng).unwrap();
+        let ts = u64::from_be_bytes(tail[..AUTH_TIMESTAMP_LEN].try_into().unwrap());
+        assert!(
+            ts > 1_600_000_000,
+            "tail timestamp must be the live clock, not 0/1 (got {ts})"
+        );
+        // The all-0 / all-1 constant-return mutants would make the whole tail uniform.
+        assert!(
+            tail.iter().any(|&b| b != 0) && tail.iter().any(|&b| b != 1),
+            "the tail is not a constant array"
+        );
+        // Two draws share the (second-granularity) timestamp prefix but differ in the
+        // random nonce suffix — a constant-return mutant could not produce that.
+        let tail2 = build_auth_tail(&mut OsRng).unwrap();
+        assert_ne!(
+            tail[AUTH_TIMESTAMP_LEN..],
+            tail2[AUTH_TIMESTAMP_LEN..],
+            "the nonce suffix is freshly random per call"
+        );
+    }
+
+    #[test]
+    fn derived_auth_key_is_nonconstant_and_binds_the_shared_secret() {
+        // Kills `derive_auth_key_from_shared -> Ok([0;32])` / `Ok([1;32])`: the key is
+        // neither constant nor independent of the X25519 shared secret.
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let k1 = derive_client_auth_key_from_shared(psk, &[0x11_u8; 32]).unwrap();
+        let k2 = derive_client_auth_key_from_shared(psk, &[0x22_u8; 32]).unwrap();
+        assert_ne!(*k1, [0_u8; 32], "key is not the all-zero constant mutant");
+        assert_ne!(*k1, [1_u8; 32], "key is not the all-one constant mutant");
+        assert_ne!(
+            *k1, *k2,
+            "a different shared secret yields a different auth key"
+        );
+    }
+
+    #[test]
+    fn client_random_mask_is_nonconstant_and_binds_the_tail() {
+        // Kills `stateful_client_random_mask -> Ok([1;32])`: masking the SAME public
+        // key under two different tails yields two different carriers, which a
+        // constant mask could not do (XOR with a constant would preserve the
+        // difference, but a CONSTANT mask makes both encode to `public ^ const`,
+        // i.e. identical for identical `public`).
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let mask_ecdh = [0x55_u8; 32];
+        let public = [0x22_u8; 32];
+        let mut tail_a = [0_u8; STATEFUL_AUTH_TAIL_LEN];
+        tail_a[..AUTH_TIMESTAMP_LEN].copy_from_slice(&1_700_000_000_u64.to_be_bytes());
+        let mut tail_b = tail_a;
+        tail_b[AUTH_TIMESTAMP_LEN] ^= 0xFF; // differ only in the nonce
+        let enc_a =
+            build_masked_stateful_client_random(psk, &mask_ecdh, "example.com", &public, &tail_a)
+                .unwrap();
+        let enc_b =
+            build_masked_stateful_client_random(psk, &mask_ecdh, "example.com", &public, &tail_b)
+                .unwrap();
+        assert_ne!(
+            enc_a, enc_b,
+            "the mask binds the tail: a constant mask would make these equal"
+        );
+        // And the mask actually hides the public key (carrier != raw public).
+        assert_ne!(
+            enc_a, public,
+            "the carrier is masked, not the raw public key"
+        );
+    }
+
     #[test]
     fn empty_auth_key_is_rejected() {
         // An empty auth key short-circuits to EmptyPsk before any recovered

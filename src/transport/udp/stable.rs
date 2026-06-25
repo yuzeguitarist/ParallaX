@@ -130,7 +130,9 @@ mod tests {
             None,
             None,
             (psk.clone(), zeroize::Zeroizing::new(server_kp.private)),
+            None,
             origin,
+            0,
         )
         .unwrap();
         let carrier = QuicCarrier::bind("127.0.0.1:0".parse().unwrap(), config)

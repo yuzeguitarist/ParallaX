@@ -137,6 +137,18 @@ pub struct ServerConfig {
     /// `None` keeps the current behaviour (every v1 Initial terminates locally), so
     /// the marker fork stays dormant until the server runtime supplies the key.
     pub marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
+    /// Persistent single-use anti-replay for accepted markers (issue #74). When
+    /// `Some`, a marker's first sighting is recorded in the crash-safe replay cache
+    /// so a captured marker replayed after a process / carrier restart is still
+    /// spliced to the origin, not re-terminated. `None` falls back to the in-memory
+    /// first-sighting cache (cold-start / tests), which is lost on restart.
+    pub marker_replay_guard: Option<Arc<crate::transport::udp::marker_replay::MarkerReplayGuard>>,
+    /// Maximum UDP payload read per datagram on this endpoint — the inbound recv
+    /// buffer size and the origin-splice relay buffer size (issue #75). Oversized
+    /// datagrams are truncated, which fails AEAD and is dropped. `0` means use the
+    /// built-in default ([`MAX_UDP_PAYLOAD`]); the server runtime resolves it from
+    /// `udp.max_udp_payload_bytes`.
+    pub max_udp_payload: usize,
 }
 
 /// Failure to establish a connection.
@@ -573,8 +585,18 @@ struct Driver {
 }
 
 impl Driver {
+    /// The effective inbound recv-buffer ceiling: the server config's resolved cap
+    /// when present and non-zero, else the built-in default. A client endpoint (no
+    /// server config) always uses the default. See issue #75.
+    fn recv_cap(&self) -> usize {
+        match self.server.as_ref().map(|c| c.max_udp_payload) {
+            Some(n) if n != 0 => n,
+            _ => MAX_UDP_PAYLOAD,
+        }
+    }
+
     async fn run(mut self) {
-        let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
+        let mut buf = vec![0u8; self.recv_cap()];
         loop {
             let socket = self.socket.clone();
             let wake = self.wake.clone();
@@ -722,6 +744,14 @@ impl Driver {
         SystemRandom::new()
             .fill(&mut scid)
             .expect("system RNG available");
+        // The client's chosen DCID, peeked off the first Initial without decryption: a
+        // stable-:443 carrier routes the accepted connection back to its session by this
+        // id, and it is bound into the auth-marker MAC (issue #74) so a captured marker
+        // cannot be lifted onto a different DCID. Falls back to empty if the header
+        // cannot be parsed; the marker fork has already validated `looks_like_initial`.
+        let initial_dcid = super::packet::peek_long_cids(data)
+            .map(|(dcid, _scid)| dcid)
+            .unwrap_or_else(|_| ConnectionId::new(&[]));
         let core = match Core::new_server_with_stek(
             cfg.cert_chain.clone(),
             &cfg.signing_key_pkcs8,
@@ -740,9 +770,14 @@ impl Driver {
                     core.set_zero_rtt_replay_guard(guard);
                 }
                 // Install the auth-marker key BEFORE the ClientHello is processed: the
-                // marker is verified during handle_datagram and read back below.
+                // marker is verified during handle_datagram and read back below. The
+                // first-Initial DCID is bound into the marker MAC (issue #74).
                 if let Some((psk, static_priv)) = &cfg.marker_key {
-                    core.set_marker_key(psk.clone(), static_priv.clone());
+                    core.set_marker_key(
+                        psk.clone(),
+                        static_priv.clone(),
+                        initial_dcid.as_slice().to_vec(),
+                    );
                 }
                 core
             }
@@ -751,13 +786,7 @@ impl Driver {
         let shared = Arc::new(ConnShared {
             core: Mutex::new(core),
             peer,
-            // The client's chosen DCID, peeked off the first Initial without decryption
-            // (a stable-:443 carrier routes the accepted connection back to its session
-            // by this id). Falls back to empty if the header cannot be parsed; the
-            // marker fork has already validated `looks_like_initial(data)` above.
-            initial_dcid: super::packet::peek_long_cids(data)
-                .map(|(dcid, _scid)| dcid)
-                .unwrap_or_else(|_| ConnectionId::new(&[])),
+            initial_dcid,
             event: Notify::new(),
             wake: self.wake.clone(),
             read_wakers: Mutex::new(Vec::new()),
@@ -878,7 +907,29 @@ impl Driver {
     /// sighting could itself be an attacker who raced the genuine client; that
     /// residual is bounded by the short freshness window and is the documented QUIC
     /// limit — the authenticated path cannot reach full TCP-REALITY parity.)
+    ///
+    /// When the server config supplies a persistent [`MarkerReplayGuard`] (issue #74)
+    /// the first-sighting record lives in the crash-safe replay cache, so a marker
+    /// captured before a process / carrier restart is still spliced after it. Without
+    /// one (cold-start / tests) it falls back to the in-memory cache, which is lost on
+    /// restart.
     fn marker_fresh(&mut self, m: crate::crypto::quic_marker::Marker, now: Instant) -> bool {
+        if let Some(guard) = self
+            .server
+            .as_ref()
+            .and_then(|c| c.marker_replay_guard.clone())
+        {
+            // Persistent path: the cache keys on `(nonce, timestamp)` via SHA-256 and
+            // retains by the marker's own timestamp, so the in-memory map is unused.
+            // A clock-read failure FAILS CLOSED (splice, not terminate): feeding a 0
+            // "now" would let `prune_expired` later evict a recorded entry once the
+            // clock recovers, reopening a replay window. A genuine client merely
+            // fails to terminate this once and self-heals by redialing.
+            let Ok(now_unix) = crate::crypto::replay::current_unix_timestamp() else {
+                return false;
+            };
+            return guard.first_sighting(&m, now_unix);
+        }
         self.marker_replay
             .retain(|_, t| now.duration_since(*t) < MARKER_REPLAY_TTL);
         use std::collections::hash_map::Entry;
@@ -901,7 +952,8 @@ impl Driver {
         if self.splices.len() >= MAX_SPLICE_FLOWS {
             return;
         }
-        if let Ok(flow) = SpliceFlow::open(self.socket.clone(), peer, origin, first) {
+        let cap = self.recv_cap();
+        if let Ok(flow) = SpliceFlow::open(self.socket.clone(), peer, origin, first, cap) {
             self.splices.insert(peer, (flow, now));
         }
     }
@@ -1360,6 +1412,8 @@ mod tests {
             replay_guard: None,
             origin_udp_addr: None,
             marker_key: None,
+            marker_replay_guard: None,
+            max_udp_payload: 0,
         })
     }
 
@@ -1379,6 +1433,8 @@ mod tests {
             replay_guard: None,
             origin_udp_addr: Some(origin),
             marker_key: None,
+            marker_replay_guard: None,
+            max_udp_payload: 0,
         })
     }
 
@@ -1643,6 +1699,8 @@ mod tests {
             replay_guard: None,
             origin_udp_addr: Some(origin),
             marker_key: Some((psk, zeroize::Zeroizing::new(static_priv))),
+            marker_replay_guard: None,
+            max_udp_payload: 0,
         })
     }
 
