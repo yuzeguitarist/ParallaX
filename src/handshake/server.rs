@@ -669,7 +669,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
             Ok(carrier) => {
                 *SERVER_QUIC_CARRIER
                     .lock()
-                    .expect("quic carrier mutex poisoned") = Some(carrier);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(carrier);
             }
             Err(err) => {
                 tracing::warn!(
@@ -1958,7 +1958,7 @@ async fn run_authenticated_data_mode(
                                 // No per-session endpoint is bound.
                                 let carrier = SERVER_QUIC_CARRIER
                                     .lock()
-                                    .expect("quic carrier mutex poisoned")
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .clone();
                                 match carrier {
                                     Some(carrier) => match carrier.local_addr() {
