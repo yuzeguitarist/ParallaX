@@ -467,8 +467,42 @@ async fn build_quic_carrier(
         ),
         None => (None, None),
     };
-    let config =
-        crate::transport::udp::server_config_stable(cert, key, stek, guard, marker_key, origin)?;
+    // Persistent single-use anti-replay for accepted origin-splice markers (issue
+    // #74): a sibling `.marker` of the auth-handshake replay cache, keyed by the same
+    // PSK, with a window >= the marker freshness window so a captured marker stays
+    // replay-protected for as long as it is valid. A cache-load failure degrades to
+    // the in-memory first-sighting cache (lost on restart) rather than failing the
+    // carrier, mirroring the 0-RTT cache's failure handling.
+    let marker_replay_guard = {
+        let mpath = marker_replay_cache_path(&server.replay_cache_path);
+        match ReplayCache::load_or_create_authenticated_with_window(
+            &mpath,
+            server.replay_cache_capacity,
+            psk,
+            MARKER_REPLAY_WINDOW_SECS,
+        ) {
+            Ok(cache) => Some(Arc::new(
+                crate::transport::udp::marker_replay::MarkerReplayGuard::new(cache),
+            )),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "marker replay cache load failed; falling back to in-memory \
+                     first-sighting (not persistent across restart)"
+                );
+                None
+            }
+        }
+    };
+    let config = crate::transport::udp::server_config_stable(
+        cert,
+        key,
+        stek,
+        guard,
+        marker_key,
+        marker_replay_guard,
+        origin,
+    )?;
     Ok(crate::transport::udp::stable::QuicCarrier::bind(server.listen, config).await?)
 }
 
@@ -501,6 +535,24 @@ fn zero_rtt_replay_cache_path(auth_cache_path: &std::path::Path) -> std::path::P
         .map(|n| n.to_os_string())
         .unwrap_or_else(|| std::ffi::OsString::from("parallax-replay.cache"));
     name.push(".0rtt");
+    auth_cache_path.with_file_name(name)
+}
+
+/// Retention window for the persistent origin-splice marker replay cache (issue #74).
+/// MUST be `>=` the marker freshness window (`MARKER_WINDOW_SECS` in
+/// `crate::tls::quic::server`, currently 3600s) so a captured marker stays
+/// replay-protected for at least as long as the server would still accept it.
+const MARKER_REPLAY_WINDOW_SECS: u64 = 3600;
+
+/// The marker replay cache path: a sibling `.marker` of the auth-handshake replay
+/// cache, kept distinct because it keys the marker `(nonce, timestamp)` rather than a
+/// handshake transcript fingerprint or a resumption ticket.
+fn marker_replay_cache_path(auth_cache_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = auth_cache_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("parallax-replay.cache"));
+    name.push(".marker");
     auth_cache_path.with_file_name(name)
 }
 

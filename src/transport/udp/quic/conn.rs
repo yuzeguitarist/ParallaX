@@ -515,10 +515,17 @@ impl Connection {
                 QUIC_VERSION_V1,
                 server_name,
                 tp_blob,
+                dcid.as_slice(),
                 t,
                 now_ms,
             )?,
-            None => ClientHandshake::new(config, QUIC_VERSION_V1, server_name, tp_blob)?,
+            None => ClientHandshake::new(
+                config,
+                QUIC_VERSION_V1,
+                server_name,
+                tp_blob,
+                dcid.as_slice(),
+            )?,
         };
         let mut spaces = [Space::default(), Space::default(), Space::default()];
         spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
@@ -689,8 +696,9 @@ impl Connection {
         &mut self,
         psk: zeroize::Zeroizing<Vec<u8>>,
         static_priv: zeroize::Zeroizing<[u8; 32]>,
+        bound_dcid: Vec<u8>,
     ) {
-        self.tls.set_marker_key(psk, static_priv);
+        self.tls.set_marker_key(psk, static_priv, bound_dcid);
     }
 
     /// The origin-splice auth marker recovered from this connection's

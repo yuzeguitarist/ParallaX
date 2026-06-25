@@ -216,10 +216,13 @@ pub(crate) trait TlsSession: Send {
     /// default is a no-op).
     fn set_zero_rtt_guard(&mut self, _guard: Arc<dyn ZeroRttGuard>) {}
     /// Install the origin-splice auth-marker key (server only; client default no-op).
+    /// `bound_dcid` is this connection's first-Initial Destination Connection ID; the
+    /// marker MAC commits to it so a captured marker cannot be lifted onto another DCID.
     fn set_marker_key(
         &mut self,
         _psk: zeroize::Zeroizing<Vec<u8>>,
         _static_priv: zeroize::Zeroizing<[u8; 32]>,
+        _bound_dcid: Vec<u8>,
     ) {
     }
     /// The auth marker recovered from this connection's ClientHello.random, if valid
@@ -295,8 +298,9 @@ impl TlsSession for ServerHandshake {
         &mut self,
         psk: zeroize::Zeroizing<Vec<u8>>,
         static_priv: zeroize::Zeroizing<[u8; 32]>,
+        bound_dcid: Vec<u8>,
     ) {
-        ServerHandshake::set_marker_key(self, psk, static_priv)
+        ServerHandshake::set_marker_key(self, psk, static_priv, bound_dcid)
     }
     fn marker_result(&self) -> Option<crate::crypto::quic_marker::Marker> {
         ServerHandshake::marker_result(self)

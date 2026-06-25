@@ -130,6 +130,7 @@ mod tests {
             None,
             None,
             (psk.clone(), zeroize::Zeroizing::new(server_kp.private)),
+            None,
             origin,
         )
         .unwrap();

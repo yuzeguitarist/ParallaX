@@ -521,6 +521,10 @@ pub struct ServerHandshake {
     /// leaves `marker_result` `None` (cold-start: the fork treats every flow as
     /// unauthenticated).
     marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
+    /// This connection's first-Initial Destination Connection ID, bound into the
+    /// marker MAC (issue #74). A marker minted for one DCID fails to verify when
+    /// replayed onto a different DCID / routing identity. Empty until set.
+    marker_dcid: Vec<u8>,
     /// The marker recovered from this connection's ClientHello.random, if it carried
     /// a valid + fresh one. Set during ClientHello processing when `marker_key` is set.
     marker_result: Option<crate::crypto::quic_marker::Marker>,
@@ -565,6 +569,7 @@ impl ServerHandshake {
             early_data_accepted: false,
             replay_guard: None,
             marker_key: None,
+            marker_dcid: Vec::new(),
             marker_result: None,
         })
     }
@@ -583,8 +588,10 @@ impl ServerHandshake {
         &mut self,
         psk: Zeroizing<Vec<u8>>,
         static_priv: Zeroizing<[u8; 32]>,
+        bound_dcid: Vec<u8>,
     ) {
         self.marker_key = Some((psk, static_priv));
+        self.marker_dcid = bound_dcid;
     }
 
     /// The marker recovered from this connection's ClientHello.random, if valid +
@@ -738,8 +745,9 @@ impl ServerHandshake {
         // the client's (server static private x client ephemeral). Constant-work: a
         // full X25519 (zero share when the key_share is too short) + the marker open
         // always run, so a failed verify takes the same path as a success (no
-        // terminate-vs-splice timing fork). DCID binding is deferred (empty dcid),
-        // matching the client.
+        // terminate-vs-splice timing fork). `marker_dcid` (this Initial's DCID, set by
+        // the endpoint before the CH is processed) is bound into the MAC so a marker
+        // captured for one DCID fails to verify on another (issue #74).
         if let Some((psk, static_priv)) = &self.marker_key {
             let mut client_x25519 = [0u8; 32];
             let share = &summary.hybrid_key_share;
@@ -755,7 +763,7 @@ impl ServerHandshake {
                 psk,
                 &ss,
                 &summary.sni,
-                &[],
+                &self.marker_dcid,
                 &summary.client_random,
                 now,
                 MARKER_WINDOW_SECS,
@@ -1049,7 +1057,8 @@ mod tests {
         ));
         let tp_blob = vec![0xde, 0xad, 0xbe, 0xef];
         let mut engine =
-            ClientHandshake::new(config, QUIC_VERSION_V1, "example.com", tp_blob.clone()).unwrap();
+            ClientHandshake::new(config, QUIC_VERSION_V1, "example.com", tp_blob.clone(), &[])
+                .unwrap();
 
         // Pull the real ClientHello handshake message and strip its 4-byte header.
         let mut msg = Vec::new();
@@ -1106,6 +1115,7 @@ mod tests {
             QUIC_VERSION_V1,
             "example.com",
             vec![0xaa, 0xbb],
+            &[],
         )
         .unwrap();
 
@@ -1224,6 +1234,7 @@ mod tests {
             QUIC_VERSION_V1,
             "example.com",
             vec![0xaa, 0xbb],
+            &[],
         )
         .unwrap();
 
@@ -1324,6 +1335,7 @@ mod tests {
             QUIC_VERSION_V1,
             "example.com",
             vec![0xaa],
+            &[],
         )
         .unwrap();
         let (ch, _) = drain(|b| client.write_handshake(b));
@@ -1363,6 +1375,7 @@ mod tests {
             QUIC_VERSION_V1,
             "example.com",
             vec![0xaa],
+            &[],
             &ticket,
             1_005_000,
         )
@@ -1428,6 +1441,92 @@ mod tests {
         assert_eq!(
             opened, plaintext,
             "server 0-RTT key opens the client's early data"
+        );
+    }
+
+    /// Issue #74: the auth marker is cryptographically bound to the first-Initial
+    /// DCID. A marker minted by a client for DCID-A verifies only against a server
+    /// that bound the SAME DCID; binding a different DCID (a captured marker lifted
+    /// onto another routing identity) yields no marker (the endpoint then splices it).
+    #[test]
+    fn marker_is_bound_to_the_initial_dcid() {
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, QuicMarkerConfig, QUIC_VERSION_V1,
+        };
+        use std::sync::Arc;
+
+        fn drain_client(h: &mut ClientHandshake) -> Vec<u8> {
+            let mut all = Vec::new();
+            loop {
+                let mut b = Vec::new();
+                let kc = h.write_handshake(&mut b);
+                if b.is_empty() && kc.is_none() {
+                    break;
+                }
+                all.extend_from_slice(&b);
+            }
+            all
+        }
+
+        const DCID_A: &[u8] = &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        const DCID_B: &[u8] = &[0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00];
+
+        let server_kp = X25519KeyPair::generate();
+        let psk: Zeroizing<Vec<u8>> = Zeroizing::new(b"parallax-quic-marker-dcid-bind".to_vec());
+
+        // A client that hides a marker in its ClientHello.random, sealed against DCID_A.
+        let client_config = Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                QuicMarkerConfig {
+                    psk: psk.clone(),
+                    server_static_public: server_kp.public,
+                },
+            ),
+        );
+        let mut client = ClientHandshake::new(
+            client_config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x01, 0x02, 0x03, 0x04],
+            DCID_A,
+        )
+        .unwrap();
+        let ch = drain_client(&mut client);
+
+        let build_server = |bound_dcid: &[u8]| {
+            let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+            let key =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                    .unwrap();
+            let mut server = ServerHandshake::new(
+                cert_chain,
+                key.as_ref(),
+                vec![b"h3".to_vec()],
+                vec![0x05, 0x06, 0x07, 0x08],
+                None,
+            )
+            .unwrap();
+            server.set_marker_key(
+                psk.clone(),
+                Zeroizing::new(server_kp.private),
+                bound_dcid.to_vec(),
+            );
+            server.read_handshake(&ch).unwrap();
+            server
+        };
+
+        // Matching DCID: the marker verifies (a real, correctly-routed ParallaX client).
+        let server_match = build_server(DCID_A);
+        assert!(
+            server_match.marker_result().is_some(),
+            "marker bound to DCID_A verifies against a server that bound DCID_A"
+        );
+
+        // Wrong DCID: the same ClientHello yields no marker, so the endpoint splices it.
+        let server_wrong = build_server(DCID_B);
+        assert!(
+            server_wrong.marker_result().is_none(),
+            "marker bound to DCID_A is rejected when verified against DCID_B (issue #74)"
         );
     }
 }
