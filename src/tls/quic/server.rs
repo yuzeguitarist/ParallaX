@@ -922,7 +922,9 @@ impl ServerHandshake {
                 return None;
             }
         }
-        Some(Zeroizing::new(ticket.psk))
+        // `ticket.psk` is already `Zeroizing<Vec<u8>>`; move it out (TicketState has
+        // no Drop, so the move is allowed) and the caller's copy scrubs on drop.
+        Some(ticket.psk)
     }
 
     fn verify_client_finished(&mut self, verify_data: &[u8]) -> Result<(), QuicTlsError> {
@@ -961,7 +963,7 @@ impl ServerHandshake {
         let mut state = TicketState {
             suite: self.suite.to_u16(),
             alpn: self.selected_alpn.clone().unwrap_or_default(),
-            psk: psk.to_vec(),
+            psk: Zeroizing::new(psk.to_vec()),
             issued_at,
             lifetime_secs: TICKET_LIFETIME_SECS,
         };

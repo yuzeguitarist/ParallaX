@@ -614,24 +614,27 @@ impl Driver {
         }
     }
 
-    /// The earliest armed timer across all connections.
+    /// The earliest armed timer across all connections, plus the idle-reap deadline of
+    /// origin-splice flows and the decision deadline of held pending Initials, so the
+    /// driver wakes for all three even when no new datagrams arrive. A conns-only
+    /// deadline would never fire for an idle splice (pinning its socket + pump task to
+    /// the hard cap) nor for an undecided pending flight (held silently past a real
+    /// origin's ACK — an active-probing tell).
     fn next_deadline(&self) -> Option<Instant> {
-        let conns = self
+        let conn_timeouts = self
             .conns
             .values()
-            .filter_map(|c| c.core.lock().unwrap().next_timeout())
-            .min();
-        // Held first flights must wake the loop at their decision deadline so an
-        // undecided flight is spliced to the origin (not held silently).
-        let pending = self
+            .filter_map(|c| c.core.lock().unwrap().next_timeout());
+        // Origin-splice flows: idle-reap deadline so a peer that opens flows then goes
+        // silent cannot pin upstream sockets + pump tasks until the hard cap.
+        let splice_idle = self.splices.values().map(|(_, last)| *last + SPLICE_IDLE);
+        // Held first flights: wake at the decision deadline so an undecided flight is
+        // spliced to the origin instead of held silently.
+        let pending_decide = self
             .pending
             .values()
-            .map(|p| p.created + PENDING_DECIDE_DELAY)
-            .min();
-        match (conns, pending) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+            .map(|p| p.created + PENDING_DECIDE_DELAY);
+        conn_timeouts.chain(splice_idle).chain(pending_decide).min()
     }
 
     fn on_timeout(&mut self) {
@@ -642,6 +645,11 @@ impl Driver {
                 core.handle_timeout(now);
             }
         }
+        // Reap origin-splice flows idle past SPLICE_IDLE (their deadline is armed in
+        // next_deadline) so a peer that opens flows then goes silent cannot pin upstream
+        // sockets + pump tasks to the hard cap. Wire-silent: a UDP relay just stops
+        // forwarding (SpliceFlow::drop aborts the pump), no teardown packet.
+        self.sweep_idle_splices(now);
         // Resolve any held first flight whose decision deadline elapsed: decide_pending
         // now falls through to a splice (the CH never completed), so an incomplete
         // Initial reaches the origin instead of being held silently. Collect first to

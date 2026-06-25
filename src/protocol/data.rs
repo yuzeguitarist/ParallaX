@@ -32,6 +32,8 @@ pub enum DataRecordError {
     Aead(#[from] SessionError),
     #[error("traffic shaping error: {0}")]
     Traffic(#[from] TrafficError),
+    #[error("record_lens do not sum to plaintext length")]
+    InvalidRecordLens,
 }
 
 pub struct DataRecordCodec {
@@ -401,7 +403,18 @@ impl DataRecordCodec {
     where
         R: Rng + rand::RngCore + ?Sized,
     {
-        debug_assert_eq!(record_lens.iter().sum::<usize>(), plaintext.len());
+        // Contract: record_lens must sum to plaintext.len(). Enforce it at runtime in
+        // every build — the previous debug_assert was compiled out in release, where a
+        // mismatch then OOB-panicked on `&plaintext[offset..offset + len]` (sum too
+        // large) or silently under-sealed the tail (sum too small). Internal callers
+        // always satisfy this; the guard turns a contract violation into a clean error.
+        let sum = record_lens
+            .iter()
+            .try_fold(0usize, |acc, &len| acc.checked_add(len))
+            .ok_or(DataRecordError::InvalidRecordLens)?;
+        if sum != plaintext.len() {
+            return Err(DataRecordError::InvalidRecordLens);
+        }
         let mut offset = 0;
         for &len in record_lens {
             self.seal_into(&plaintext[offset..offset + len], rng, out)?;
@@ -502,12 +515,24 @@ impl DataRecordCodec {
     where
         R: Rng + rand::RngCore + ?Sized,
     {
+        // Contract: record_lens must sum to plaintext.len(). Checked first — before the
+        // empty-batch early-return and `ensure_usable` — so an empty `record_lens` with a
+        // non-empty plaintext is rejected consistently with the serial `seal_records_into`
+        // instead of being silently sealed as nothing. (Also prevents an OOB panic on the
+        // `plaintext[byte_offset..byte_offset + span]` slice below in release, where the
+        // prior debug_assert was compiled out.)
+        let sum = record_lens
+            .iter()
+            .try_fold(0usize, |acc, &len| acc.checked_add(len))
+            .ok_or(DataRecordError::InvalidRecordLens)?;
+        if sum != plaintext.len() {
+            return Err(DataRecordError::InvalidRecordLens);
+        }
         let record_count = record_lens.len();
         if record_count == 0 {
             return Ok(());
         }
         self.aead.ensure_usable()?;
-        debug_assert_eq!(record_lens.iter().sum::<usize>(), plaintext.len());
         let group_count = pool.width().max(1).min(record_count);
 
         let cipher = self.aead.cipher();
@@ -981,6 +1006,38 @@ mod tests {
 
         let record = enc.seal(b"hello", &mut rng).unwrap();
         assert_eq!(dec.open(&record).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn seal_records_into_rejects_mismatched_record_lens() {
+        // Internal contract: record_lens must sum to plaintext.len(). A violation must
+        // return a clean Err in EVERY build, not OOB-panic on the per-record slice in
+        // release (the prior debug_assert was compiled out there). Not attacker-
+        // reachable today, but the release path must never panic on a caller bug.
+        let key = [1_u8; KEY_LEN];
+        let nonce = [2_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(4, 4).unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+
+        // sum (5) > plaintext.len() (4): would OOB-slice without the guard.
+        let mut out = Vec::new();
+        assert!(matches!(
+            enc.seal_records_into(b"abcd", &[2, 3], &mut rng, &mut out),
+            Err(DataRecordError::InvalidRecordLens)
+        ));
+        // sum (2) < plaintext.len() (4): would silently under-seal without the guard.
+        let mut out2 = Vec::new();
+        assert!(matches!(
+            enc.seal_records_into(b"abcd", &[1, 1], &mut rng, &mut out2),
+            Err(DataRecordError::InvalidRecordLens)
+        ));
+        // The matching partition still seals fine.
+        let mut out3 = Vec::new();
+        assert!(enc
+            .seal_records_into(b"abcd", &[1, 3], &mut rng, &mut out3)
+            .is_ok());
     }
 
     #[test]
