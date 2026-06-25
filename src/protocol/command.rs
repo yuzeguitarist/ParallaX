@@ -34,6 +34,36 @@ const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
 /// former fixed ~1631/1632 single record.
 pub const PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT: usize = 256;
 pub const PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT: usize = 1024;
+
+/// Browser-modeled record-size targets for the PQ handshake flight (PAR-35 ⭐2),
+/// drawn from the real Safari-26 H2 data-plane capture (see the
+/// `safari26-tcp-dataplane-packetization` notes): a small webpage response after a
+/// GET is a handful of records whose sizes cluster in the sub-1.5 KiB band, not a
+/// uniform `[256,1024]` blob. Shaping the PQ/identity chunks toward THIS one
+/// coherent distribution — used identically for the up (PX1Q) and down (PX1K, PX1S)
+/// sides — makes the post-handshake burst fall inside the page-load distribution the
+/// outer camouflage GET already justifies, instead of reading as a second, heavier
+/// PQ key exchange. The values are the measured Safari small/medium H2 record sizes
+/// (a subset of `traffic::OBSERVED_PACKET_TARGETS`, the same provenance), kept here
+/// so the protocol layer carries no dependency on the traffic module.
+const PQ_FLIGHT_RECORD_TARGETS: [usize; 12] =
+    [144, 191, 286, 339, 469, 519, 569, 713, 735, 911, 1180, 1353];
+
+/// Lower bound on a shaped PQ record so the flight never emits a tiny tell record,
+/// and so the record COUNT stays bounded (a ~4.6 KiB identity proof must not shatter
+/// into many sub-100-byte records — that would be a latency/throughput regression on
+/// the establishment path, the disqualifier called out in the PAR-21/PAR-28 triage).
+const PQ_FLIGHT_RECORD_MIN: usize = 144;
+
+/// Per-session aggregate pad bounds (plaintext bytes appended as a final shaped
+/// record) so the TOTAL on-wire size of the PQ flight VARIES across sessions, killing
+/// the constant-aggregate cross-session correlation (PAR-28 Low-1). A variable —
+/// never constant — pad length keeps the pad itself browser-plausible rather than a
+/// new fixed-overhead tell. Bounded to a few hundred bytes: enough to decorrelate the
+/// aggregate, small enough to be free on the one-time establishment flight (it never
+/// touches the steady-state relay path).
+const PQ_FLIGHT_AGGREGATE_PAD_MIN: usize = 64;
+const PQ_FLIGHT_AGGREGATE_PAD_MAX: usize = 512;
 /// Hard cap on a reassembled PQ handshake frame (rekey / key exchange). Both
 /// real frames are ~1608/1609 bytes (40/41-byte header + ML-KEM-1024 1568); this
 /// bounds a malicious peer's reassembly buffer well above the legitimate maximum
@@ -662,6 +692,36 @@ impl ServerIdentityChunk {
         }
         Ok(chunks)
     }
+
+    /// Split the identity proof into records sized from the SAME browser-modeled
+    /// distribution as the PQ key-exchange chunks (PAR-35), so the server->client
+    /// PX1K + PX1S burst shares one coherent H2-page-like record-size regime instead
+    /// of a visible `[256,1024]`-then-`[960,1320]` regime switch a passive observer
+    /// could segment on. Sizes tile the payload exactly and the count stays bounded
+    /// (each record `>= PQ_FLIGHT_RECORD_MIN`); the client reassembler is offset-based
+    /// and size-agnostic, so it recovers the proof regardless of how it was chunked.
+    pub fn encode_all_browser_shaped<R: rand::Rng + ?Sized>(
+        payload: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<Vec<u8>>, ServerIdentityChunkError> {
+        if payload.is_empty() || payload.len() > u32::MAX as usize {
+            return Err(ServerIdentityChunkError::InvalidChunkLength);
+        }
+        let total_len = payload.len() as u32;
+        let mut chunks = Vec::new();
+        let mut offset = 0_usize;
+        for size in browser_shaped_sizes(payload.len(), rng) {
+            let end = offset + size;
+            chunks.push(Self::encode_borrowed(
+                total_len,
+                offset as u32,
+                &payload[offset..end],
+            )?);
+            offset = end;
+        }
+        debug_assert_eq!(offset, payload.len());
+        Ok(chunks)
+    }
 }
 
 /// One chunk of a [`FramedChunk`]-carried payload. Wire layout mirrors
@@ -848,6 +908,105 @@ impl FramedChunk {
         debug_assert_eq!(offset, payload.len());
         Ok(chunks)
     }
+
+    /// Split `payload` into records whose sizes are drawn from the browser-modeled
+    /// [`PQ_FLIGHT_RECORD_TARGETS`] distribution (PAR-35 ⭐2), instead of the uniform
+    /// `[256,1024]` of [`Self::encode_all_shaped`]. Used for BOTH the PQ key-exchange
+    /// (PX1Q/PX1K) and the identity proof (PX1S), so the whole post-handshake burst
+    /// shares ONE coherent record-size regime that matches a real Safari H2 page
+    /// response — no intra-flight regime discontinuity to segment on, and no
+    /// constant-shaped PQ blob to recognize.
+    ///
+    /// Like `encode_all_shaped` the sizes tile the payload exactly and every chunk
+    /// stays `>= PQ_FLIGHT_RECORD_MIN` (no tiny tell record); the reassembler is
+    /// size-agnostic so the two ends need not agree on sizes. The record COUNT is
+    /// bounded by construction (each chunk carries at least `PQ_FLIGHT_RECORD_MIN`
+    /// bytes), so a large identity proof never shatters into many tiny records — the
+    /// latency/throughput disqualifier from the PAR-21/PAR-28 triage. Aggregate
+    /// (flight-level) decorrelation padding is applied separately at the seal layer
+    /// via the per-record padding suffix, so it stays fully decode-transparent and
+    /// this splitter remains a pure function of `(payload, rng)`.
+    pub fn encode_all_browser_shaped<R: rand::Rng + ?Sized>(
+        payload: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<Vec<u8>>, FramedChunkError> {
+        if payload.is_empty() || payload.len() > u32::MAX as usize {
+            return Err(FramedChunkError::InvalidChunkLength);
+        }
+        let total_len = payload.len() as u32;
+        let mut chunks = Vec::new();
+        let mut offset = 0_usize;
+        for size in browser_shaped_sizes(payload.len(), rng) {
+            let end = offset + size;
+            chunks.push(Self::encode_borrowed(
+                total_len,
+                offset as u32,
+                &payload[offset..end],
+            )?);
+            offset = end;
+        }
+        debug_assert_eq!(offset, payload.len());
+        Ok(chunks)
+    }
+
+    /// Per-session aggregate pad length (plaintext bytes) for the PQ flight, drawn
+    /// uniformly from `[PQ_FLIGHT_AGGREGATE_PAD_MIN, PQ_FLIGHT_AGGREGATE_PAD_MAX]`, so
+    /// the flight's TOTAL on-wire size varies across sessions (decorrelation, PAR-28
+    /// Low-1). Applied by the seal layer as extra per-record padding-suffix bytes,
+    /// which the receiver strips transparently — so the wire frame and the reassembler
+    /// are unchanged. A variable (never constant) length keeps the pad itself
+    /// browser-plausible rather than a new fixed-overhead tell.
+    pub fn aggregate_pad_len<R: rand::Rng + ?Sized>(rng: &mut R) -> usize {
+        rng.gen_range(PQ_FLIGHT_AGGREGATE_PAD_MIN..=PQ_FLIGHT_AGGREGATE_PAD_MAX)
+    }
+}
+
+/// Tile a payload of `payload_len` bytes into record sizes drawn from the
+/// browser-modeled [`PQ_FLIGHT_RECORD_TARGETS`] distribution, shared by the PQ
+/// key-exchange chunks ([`FramedChunk::encode_all_browser_shaped`]) and the identity
+/// proof chunks ([`ServerIdentityChunk::encode_all_browser_shaped`]) so the whole PQ
+/// flight uses ONE coherent regime (PAR-35). The sizes tile the payload exactly, and
+/// every record carries `>= PQ_FLIGHT_RECORD_MIN` bytes except possibly a lone tiny
+/// payload (not the case for any PQ/identity frame) — so the record COUNT stays
+/// bounded (no shatter-into-many-records latency regression) and there is no tiny
+/// tell record.
+fn browser_shaped_sizes<R: rand::Rng + ?Sized>(payload_len: usize, rng: &mut R) -> Vec<usize> {
+    let max_target = *PQ_FLIGHT_RECORD_TARGETS
+        .iter()
+        .max()
+        .expect("PQ_FLIGHT_RECORD_TARGETS is non-empty");
+    let mut sizes = Vec::new();
+    let mut consumed = 0_usize;
+    while consumed < payload_len {
+        let remaining = payload_len - consumed;
+        if remaining <= max_target {
+            // Final record carries the whole remainder.
+            sizes.push(remaining);
+            break;
+        }
+        // remaining > max_target: pick a target that leaves a >= MIN tail.
+        let hi = max_target.min(remaining - PQ_FLIGHT_RECORD_MIN);
+        let take = pick_target_size(rng, hi);
+        sizes.push(take);
+        consumed += take;
+    }
+    sizes
+}
+
+/// Draw a record size from [`PQ_FLIGHT_RECORD_TARGETS`] that is `<= hi` (so the
+/// constrained tail invariant holds). Falls back to `hi` clamped up to
+/// `PQ_FLIGHT_RECORD_MIN` when no target fits — only reachable when `hi` is below the
+/// smallest target, i.e. the penultimate record of a short tail.
+fn pick_target_size<R: rand::Rng + ?Sized>(rng: &mut R, hi: usize) -> usize {
+    let choices: Vec<usize> = PQ_FLIGHT_RECORD_TARGETS
+        .iter()
+        .copied()
+        .filter(|&t| t <= hi)
+        .collect();
+    if choices.is_empty() {
+        return hi.max(PQ_FLIGHT_RECORD_MIN);
+    }
+    choices[rng.gen_range(0..choices.len())]
 }
 
 /// Stateful reassembler for a [`FramedChunk`] sequence. Mirrors the in-order,
@@ -1748,6 +1907,113 @@ mod tests {
         };
         assert_eq!(reassemble(&fixed), payload);
         assert_eq!(reassemble(&shaped), payload);
+    }
+
+    #[test]
+    fn browser_shaped_round_trips_and_sizes_track_the_target_distribution() {
+        // PAR-35: the browser shaper must (a) reassemble exactly, (b) draw record
+        // sizes from PQ_FLIGHT_RECORD_TARGETS (every non-final record is a target
+        // value), and (c) keep every record >= PQ_FLIGHT_RECORD_MIN (no tiny tell).
+        use rand::{rngs::StdRng, SeedableRng};
+        // ML-KEM-1024 PX1Q/PX1K (~1.6 KB) and the ML-DSA-87 identity proof (~4.6 KB).
+        for payload_len in [1608_usize, 1609, 4635, 6243] {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+            let mut sizes_seen = std::collections::BTreeSet::new();
+            for seed in 0..40_u64 {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let chunks = FramedChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+                let max_target = *PQ_FLIGHT_RECORD_TARGETS.iter().max().unwrap();
+                let mut reassembler = FramedReassembler::default();
+                let mut assembled = None;
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    let decoded = FramedChunk::decode_ref(chunk).unwrap();
+                    let len = decoded.bytes.len();
+                    assert!(len >= PQ_FLIGHT_RECORD_MIN, "tiny tell record: {len}");
+                    assert!(len <= max_target, "record over max target: {len}");
+                    // Every non-final record is exactly one of the browser targets.
+                    if idx + 1 < chunks.len() {
+                        assert!(
+                            PQ_FLIGHT_RECORD_TARGETS.contains(&len),
+                            "non-final record {len} not a browser target"
+                        );
+                    }
+                    sizes_seen.insert(len);
+                    if let Some(done) = reassembler.push(chunk, MAX_PQ_HANDSHAKE_FRAME * 2).unwrap()
+                    {
+                        assembled = Some(done);
+                    }
+                }
+                assert_eq!(assembled.unwrap(), payload, "seed={seed}");
+            }
+            assert!(
+                sizes_seen.len() >= 4,
+                "browser shaper must vary record sizes; got {}",
+                sizes_seen.len()
+            );
+        }
+    }
+
+    #[test]
+    fn browser_shaped_record_count_is_bounded_no_shatter() {
+        // The disqualifier from the PAR-21/PAR-28 triage: a large identity proof must
+        // NOT shatter into many sub-record fragments (latency regression). With every
+        // record >= PQ_FLIGHT_RECORD_MIN, the count is bounded by ceil(len / MIN).
+        use rand::{rngs::StdRng, SeedableRng};
+        let payload = vec![0x5A_u8; 4635]; // ML-DSA-87-sized identity proof
+        for seed in 0..32_u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let chunks = FramedChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+            let bound = payload.len().div_ceil(PQ_FLIGHT_RECORD_MIN);
+            assert!(
+                chunks.len() <= bound,
+                "record count {} exceeds bound {bound} (shatter regression)",
+                chunks.len()
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_pad_len_varies_within_bounds() {
+        // PAR-28 Low-1 decorrelation: the per-session aggregate pad must vary across
+        // sessions (kills the constant-aggregate correlation) and stay in [MIN, MAX]
+        // (a variable, never-constant, sub-record pad — not a new fixed tell).
+        use rand::{rngs::StdRng, SeedableRng};
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..256_u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let pad = FramedChunk::aggregate_pad_len(&mut rng);
+            assert!(
+                (PQ_FLIGHT_AGGREGATE_PAD_MIN..=PQ_FLIGHT_AGGREGATE_PAD_MAX).contains(&pad),
+                "pad {pad} out of bounds"
+            );
+            seen.insert(pad);
+        }
+        assert!(seen.len() > 1, "aggregate pad must vary across sessions");
+    }
+
+    #[test]
+    fn identity_browser_shaped_round_trips_and_is_size_agnostic() {
+        // The identity proof uses the SAME browser distribution; its offset-based
+        // reassembly must recover the proof regardless of how it was chunked.
+        use rand::{rngs::StdRng, SeedableRng};
+        let payload: Vec<u8> = (0..4635_u32).map(|i| (i % 97) as u8).collect();
+        for seed in 0..24_u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let chunks =
+                ServerIdentityChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+            assert!(chunks.len() >= 2, "identity proof must fragment");
+            let mut assembled = Vec::new();
+            for chunk in &chunks {
+                let c = ServerIdentityChunk::decode_ref(chunk).unwrap();
+                assert_eq!(c.offset as usize, assembled.len(), "in-order tiling");
+                assert!(
+                    c.bytes.len() >= PQ_FLIGHT_RECORD_MIN,
+                    "no tiny identity record"
+                );
+                assembled.extend_from_slice(c.bytes);
+            }
+            assert_eq!(assembled, payload, "seed={seed}");
+        }
     }
 
     #[test]

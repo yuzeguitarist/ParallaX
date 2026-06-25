@@ -167,6 +167,107 @@ impl DataRecordCodec {
         Ok(record_start..out.len())
     }
 
+    /// Seal one record carrying `payload` plus exactly `extra_pad` extra
+    /// padding-suffix bytes, on TOP of whatever this codec's [`PaddingProfile`] would
+    /// add. Used by the PQ handshake flight (PAR-35) to apply per-session aggregate
+    /// decorrelation padding to a single record without enabling padding on the shared
+    /// relay codec (whose profile stays 0/0, so the steady-state hot path is
+    /// untouched). The receiver strips it transparently via the self-describing 2-byte
+    /// pad-length trailer — no wire-format or decode change. Bounded by the outer TLS
+    /// record limit exactly like a normal seal.
+    pub fn seal_into_extra_padded<R>(
+        &mut self,
+        payload: &[u8],
+        extra_pad: usize,
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        out.reserve(record_capacity(
+            payload.len() + extra_pad,
+            self.padding.max_len(),
+        ));
+        let record_start = out.len();
+        out.extend_from_slice(&[
+            TLS_CONTENT_APPLICATION_DATA,
+            TLS_LEGACY_VERSION[0],
+            TLS_LEGACY_VERSION[1],
+            0,
+            0,
+        ]);
+        out.extend_from_slice(payload);
+        // Write one padding suffix = this codec's normal sampled padding PLUS the
+        // per-session `extra_pad` (the self-describing 2-byte trailer makes the
+        // receiver strip the whole thing). With the default 0/0 profile this is exactly
+        // `extra_pad`; with a configured profile the record still honors the profile
+        // and adds the aggregate pad on top. Only PQ-handshake records take this path,
+        // so the relay hot path is unaffected.
+        let ciphertext_start = record_start + record::TLS_HEADER_LEN;
+        self.padding
+            .write_extra_padded_suffix_into(payload.len(), extra_pad, rng, out);
+        let padded_len = out.len() - ciphertext_start;
+        if padded_len + AEAD_TAG_LEN > OUTER_TLS_RECORD_LIMIT {
+            out[ciphertext_start..].zeroize();
+            out.truncate(record_start);
+            return Err(record::TlsRecordError::PayloadTooLarge(padded_len + AEAD_TAG_LEN).into());
+        }
+        crate::process_hardening::exclude_transient_from_core_dump(
+            "data_record.seal_plaintext",
+            &out[ciphertext_start..],
+        );
+        let tag = match self
+            .aead
+            .seal_in_place_detached(&mut out[ciphertext_start..], self.aad)
+        {
+            Ok(tag) => tag,
+            Err(err) => {
+                out[ciphertext_start..].zeroize();
+                out.truncate(record_start);
+                return Err(err.into());
+            }
+        };
+        out.extend_from_slice(&tag);
+        let tls_payload_len = out.len() - ciphertext_start;
+        let len = (tls_payload_len as u16).to_be_bytes();
+        out[record_start + 3] = len[0];
+        out[record_start + 4] = len[1];
+        Ok(record_start..out.len())
+    }
+
+    /// Seal a browser-shaped PQ handshake flight (PAR-35): each `FramedChunk` record
+    /// in `chunks` is sealed in order into `out`, and a single per-session aggregate
+    /// decorrelation pad (`crate::protocol::command::FramedChunk::aggregate_pad_len`)
+    /// is applied to ONE record so the flight's total on-wire size varies across
+    /// sessions. All records are written into one buffer => one write => one flight
+    /// (no added round trip). The pad is decode-transparent (stripped by the receiver's
+    /// per-record trailer) and never touches the steady-state relay codec.
+    ///
+    /// The padded record is the LAST one: padding the tail keeps every earlier record
+    /// at its shaped browser-modeled size, and a tail record that runs a little larger
+    /// matches a real H2 response whose final DATA frame need not be full.
+    pub fn seal_pq_flight<R>(
+        &mut self,
+        chunks: &[Vec<u8>],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        let aggregate_pad = crate::protocol::command::FramedChunk::aggregate_pad_len(rng);
+        let last = chunks.len().saturating_sub(1);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            if idx == last {
+                self.seal_into_extra_padded(chunk, aggregate_pad, rng, out)?;
+            } else {
+                self.seal_into(chunk, rng, out)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn seal_chunks_into<R>(
         &mut self,
         payload: &[u8],
@@ -1006,6 +1107,82 @@ mod tests {
 
         let record = enc.seal(b"hello", &mut rng).unwrap();
         assert_eq!(dec.open(&record).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn seal_into_extra_padded_is_decode_transparent_on_a_zero_profile_codec() {
+        // PAR-35: the aggregate decorrelation pad is applied via seal_into_extra_padded
+        // on a codec whose PaddingProfile is 0/0 (the relay codec's setting). The
+        // receiver must recover the EXACT original payload regardless of the extra pad,
+        // and the on-wire record must be larger by exactly (extra_pad + 2-byte trailer).
+        let key = [9_u8; KEY_LEN];
+        let nonce = [3_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap(); // relay/PQ codec setting
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+
+        let payload = vec![0x42_u8; 700];
+        // Baseline: same payload with no extra pad.
+        let mut base = Vec::new();
+        enc.seal_into_extra_padded(&payload, 0, &mut rng, &mut base)
+            .unwrap();
+        // Reset the AEAD sequence by rebuilding enc so the two records use the same
+        // nonce position (we only compare lengths, not the decrypt of `base`).
+        let mut enc2 =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut padded = Vec::new();
+        let extra = 257_usize;
+        enc2.seal_into_extra_padded(&payload, extra, &mut rng, &mut padded)
+            .unwrap();
+        assert_eq!(
+            padded.len(),
+            base.len() + extra,
+            "extra pad must grow the record by exactly `extra` bytes (the 2-byte trailer is present in both)"
+        );
+        // The receiver recovers the exact payload, pad stripped.
+        assert_eq!(dec.open(&padded).unwrap(), payload);
+    }
+
+    #[test]
+    fn seal_pq_flight_round_trips_every_chunk_with_one_aggregate_pad() {
+        // The whole PQ flight seals into one buffer; each FramedChunk record opens back
+        // to its exact bytes (the aggregate pad on the last record is stripped). Proves
+        // the seal-side shaping does not corrupt any chunk.
+        use crate::protocol::command::{FramedChunk, FramedReassembler, MAX_PQ_HANDSHAKE_FRAME};
+        let key = [5_u8; KEY_LEN];
+        let nonce = [6_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+
+        let payload: Vec<u8> = (0..1609_u32).map(|i| (i % 251) as u8).collect();
+        let chunks = FramedChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+        let mut sealed = Vec::new();
+        enc.seal_pq_flight(&chunks, &mut rng, &mut sealed).unwrap();
+
+        // Open each record off the wire and reassemble the original payload.
+        let mut reassembler = FramedReassembler::default();
+        let mut assembled = None;
+        let mut offset = 0usize;
+        while offset < sealed.len() {
+            let header = record::parse_header(&sealed[offset..]).unwrap();
+            let end = offset + header.total_len;
+            let chunk = dec.open(&sealed[offset..end]).unwrap();
+            if let Some(done) = reassembler
+                .push(&chunk, MAX_PQ_HANDSHAKE_FRAME * 2)
+                .unwrap()
+            {
+                assembled = Some(done);
+            }
+            offset = end;
+        }
+        assert_eq!(assembled.unwrap(), payload);
     }
 
     #[test]
