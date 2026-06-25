@@ -120,6 +120,51 @@ sysctl net.core.default_qdisc
 
 ---
 
+## Optional: socket-buffer override for high-RTT / high-BDP links
+
+Off by default. On a long intercontinental path the kernel's TCP autotuning can
+under-provision the send/receive window, capping a single flow well below the
+link's bandwidth-delay product (BDP). The `[transport]` section lets an operator
+pin an explicit window when that happens. **Leave it unset unless you have
+measured that autotuning is the bottleneck** — the default (autotuning) is what
+keeps full Safari window parity.
+
+Two prerequisites and one covertness rule:
+
+1. The kernel maxima must already be raised (`net.core.wmem_max` /
+   `net.core.rmem_max`); the deploy script writes 64 MiB unconditionally on
+   Linux (see above). Without that, an explicit buffer is silently clamped to the
+   ~208 KiB default — possibly *below* what autotuning would have reached.
+2. Size the buffer to the path BDP: `BDP_bytes ≈ bandwidth_bytes_per_sec × RTT_sec`.
+   Example: 100 Mbit/s × 300 ms ≈ 3.75 MiB, so `4 * 1024 * 1024` is a reasonable
+   start. Over-sizing wastes memory and can add bufferbloat; under-sizing leaves
+   throughput on the table.
+3. **Covertness:** `tcp_send_buffer_bytes` is wire-invisible (it never changes any
+   advertised value). `tcp_recv_buffer_bytes` *does* affect the advertised TCP
+   window, so set it only on the **server** (the upload data-sink) and leave it
+   unset on the client, where a fixed receive window would flatten the
+   autotuning curve away from Safari's. The recv buffer is applied post-accept
+   only, so the camouflage SYN is unaffected either way.
+
+Server config (`/etc/parallax/parallax.toml`), to lift a slow client→server
+upload on a high-RTT link:
+
+```toml
+[transport]
+tcp_send_buffer_bytes = 4194304   # 4 MiB, wire-invisible
+tcp_recv_buffer_bytes = 4194304   # 4 MiB, server-side upload sink only
+```
+
+Client config: prefer leaving `[transport]` unset for full browser parity. If a
+slow server→client download is the measured bottleneck, only
+`tcp_send_buffer_bytes` is safe to set on the client (it is wire-invisible);
+keep `tcp_recv_buffer_bytes` unset.
+
+A logged warning is emitted if the OS clamps the requested buffer below the
+value asked for (the usual cause is an un-raised `*mem_max`).
+
+---
+
 ## Local build modes
 
 On **Linux**, the script uses native `cargo build --release` by default.
