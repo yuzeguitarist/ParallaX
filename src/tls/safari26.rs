@@ -31,7 +31,8 @@ use zeroize::Zeroizing;
 
 use super::{
     record::{
-        parse_header, read_record, TlsRecordReader, TLS_CONTENT_ALERT, TLS_CONTENT_APPLICATION_DATA,
+        change_cipher_spec, parse_header, read_record, TlsRecordReader, TLS_CONTENT_ALERT,
+        TLS_CONTENT_APPLICATION_DATA,
     },
     safari_shape::{
         key_share_extension, signature_algorithms_extension, supported_groups_extension,
@@ -311,6 +312,20 @@ impl Safari26TlsSession {
         let client_hello = self.client_hello.clone();
         self.tap_records(RecordDirection::Outbound, &client_hello);
         stream.write_all(&self.client_hello).await?;
+
+        // TLS 1.3 middlebox-compatibility ChangeCipherSpec (RFC 8446 §D.4). Our
+        // ClientHello always carries a non-empty (32-byte) legacy_session_id, and
+        // BoringSSL/Safari emit `14 03 03 00 01 01` immediately after such a
+        // ClientHello, in the same flight (before reading the ServerHello). Omitting
+        // it is a passive distinguisher: a session_id-bearing flight that never sends
+        // the compat CCS matches no BoringSSL handshake. The CCS is a non-handshake
+        // record, so it is written straight to the socket and deliberately NOT folded
+        // into the handshake transcript (which must remain CH || SH || ... for the
+        // Finished verify_data). The server treats it as undecryptable camouflage and
+        // forwards it verbatim to the origin, so no server-side change is required.
+        let ccs = change_cipher_spec();
+        self.tap_records(RecordDirection::Outbound, &ccs);
+        stream.write_all(&ccs).await?;
 
         let server_hello_record = self.read_server_hello_record(stream).await?;
         transcript.push_handshake_record(&server_hello_record)?;
@@ -1953,6 +1968,44 @@ mod tests {
         Safari26TlsCamouflage
             .start("example.com".to_owned(), psk, &server.public)
             .unwrap()
+    }
+
+    /// The client flight's first two records, in order, MUST be the ClientHello
+    /// followed by the TLS 1.3 middlebox-compatibility ChangeCipherSpec
+    /// (`14 03 03 00 01 01`). Our ClientHello carries a non-empty legacy_session_id,
+    /// so BoringSSL/Safari always emit this CCS in the same flight; omitting it is a
+    /// passive distinguisher. `complete()` blocks reading the ServerHello after this
+    /// flight, so the peer reads exactly the two records, asserts them, and drops —
+    /// the resulting read error on the client side is irrelevant to this assertion.
+    #[tokio::test]
+    async fn client_flight_emits_compat_change_cipher_spec_after_client_hello() {
+        let session = test_session();
+        let (mut client, mut peer) = loopback().await;
+
+        let handshake = tokio::spawn(async move {
+            // Errors once the peer drops mid-handshake; we only care about the flight.
+            let _ = session.complete(&mut client).await;
+        });
+
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let mut reader = TlsRecordReader::new(&mut peer);
+        reader.read_record_into(&mut first).await.unwrap();
+        reader.read_record_into(&mut second).await.unwrap();
+        drop(peer);
+        let _ = handshake.await;
+
+        // First record: a handshake (ClientHello) record.
+        assert_eq!(
+            first[0], TLS_RECORD_HANDSHAKE,
+            "first client record must be the ClientHello handshake record"
+        );
+        // Second record: the exact TLS 1.3 compat ChangeCipherSpec.
+        assert_eq!(
+            second,
+            change_cipher_spec(),
+            "second client record must be `14 03 03 00 01 01` (compat CCS)"
+        );
     }
 
     async fn loopback() -> (TcpStream, TcpStream) {
