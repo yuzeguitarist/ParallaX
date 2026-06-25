@@ -143,6 +143,12 @@ pub struct ServerConfig {
     /// spliced to the origin, not re-terminated. `None` falls back to the in-memory
     /// first-sighting cache (cold-start / tests), which is lost on restart.
     pub marker_replay_guard: Option<Arc<crate::transport::udp::marker_replay::MarkerReplayGuard>>,
+    /// Maximum UDP payload read per datagram on this endpoint — the inbound recv
+    /// buffer size and the origin-splice relay buffer size (issue #75). Oversized
+    /// datagrams are truncated, which fails AEAD and is dropped. `0` means use the
+    /// built-in default ([`MAX_UDP_PAYLOAD`]); the server runtime resolves it from
+    /// `udp.max_udp_payload_bytes`.
+    pub max_udp_payload: usize,
 }
 
 /// Failure to establish a connection.
@@ -579,8 +585,18 @@ struct Driver {
 }
 
 impl Driver {
+    /// The effective inbound recv-buffer ceiling: the server config's resolved cap
+    /// when present and non-zero, else the built-in default. A client endpoint (no
+    /// server config) always uses the default. See issue #75.
+    fn recv_cap(&self) -> usize {
+        match self.server.as_ref().map(|c| c.max_udp_payload) {
+            Some(n) if n != 0 => n,
+            _ => MAX_UDP_PAYLOAD,
+        }
+    }
+
     async fn run(mut self) {
-        let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
+        let mut buf = vec![0u8; self.recv_cap()];
         loop {
             let socket = self.socket.clone();
             let wake = self.wake.clone();
@@ -930,7 +946,8 @@ impl Driver {
         if self.splices.len() >= MAX_SPLICE_FLOWS {
             return;
         }
-        if let Ok(flow) = SpliceFlow::open(self.socket.clone(), peer, origin, first) {
+        let cap = self.recv_cap();
+        if let Ok(flow) = SpliceFlow::open(self.socket.clone(), peer, origin, first, cap) {
             self.splices.insert(peer, (flow, now));
         }
     }
@@ -1390,6 +1407,7 @@ mod tests {
             origin_udp_addr: None,
             marker_key: None,
             marker_replay_guard: None,
+            max_udp_payload: 0,
         })
     }
 
@@ -1410,6 +1428,7 @@ mod tests {
             origin_udp_addr: Some(origin),
             marker_key: None,
             marker_replay_guard: None,
+            max_udp_payload: 0,
         })
     }
 
@@ -1675,6 +1694,7 @@ mod tests {
             origin_udp_addr: Some(origin),
             marker_key: Some((psk, zeroize::Zeroizing::new(static_priv))),
             marker_replay_guard: None,
+            max_udp_payload: 0,
         })
     }
 

@@ -20,7 +20,10 @@ use std::sync::Arc;
 
 use tokio::net::UdpSocket;
 
-/// Maximum UDP payload relayed in one datagram (matches the endpoint's read cap).
+/// Default maximum UDP payload relayed in one datagram (matches the endpoint's
+/// default read cap). The driver passes its resolved recv cap to [`SpliceFlow::open`]
+/// so the relay buffer tracks `udp.max_udp_payload_bytes` (issue #75); this is the
+/// fallback when a caller passes `0`.
 const MAX_RELAY_PAYLOAD: usize = 2048;
 
 /// One spliced flow: a connected UDP socket toward the origin plus the background
@@ -59,6 +62,7 @@ impl SpliceFlow {
         client: SocketAddr,
         origin: SocketAddr,
         first: &[u8],
+        recv_cap: usize,
     ) -> std::io::Result<SpliceFlow> {
         let recv_std = std::net::UdpSocket::bind(unspecified_for(origin))?;
         recv_std.connect(origin)?;
@@ -69,7 +73,12 @@ impl SpliceFlow {
         // Verbatim: exact bytes, single datagram, no coalesce/split/reframe.
         send_sock.send(first)?;
         let to_origin = Arc::new(UdpSocket::from_std(recv_std)?);
-        let pump = tokio::spawn(pump_origin_to_client(to_origin, listen, client));
+        let cap = if recv_cap != 0 {
+            recv_cap
+        } else {
+            MAX_RELAY_PAYLOAD
+        };
+        let pump = tokio::spawn(pump_origin_to_client(to_origin, listen, client, cap));
         Ok(SpliceFlow { send_sock, pump })
     }
 
@@ -92,8 +101,9 @@ async fn pump_origin_to_client(
     to_origin: Arc<UdpSocket>,
     listen: Arc<UdpSocket>,
     client: SocketAddr,
+    recv_cap: usize,
 ) {
-    let mut buf = vec![0u8; MAX_RELAY_PAYLOAD];
+    let mut buf = vec![0u8; recv_cap];
     loop {
         match to_origin.recv(&mut buf).await {
             Ok(n) => {
@@ -151,7 +161,7 @@ mod tests {
         let mut b = vec![0u8; MAX_RELAY_PAYLOAD];
         let (n, peer) = listen.recv_from(&mut b).await.unwrap();
         assert_eq!(peer, client_addr);
-        let flow = SpliceFlow::open(listen.clone(), peer, origin_addr, &b[..n]).unwrap();
+        let flow = SpliceFlow::open(listen.clone(), peer, origin_addr, &b[..n], 0).unwrap();
 
         // The origin's echo must arrive at the client, verbatim, from the listener.
         let mut rb = vec![0u8; MAX_RELAY_PAYLOAD];
@@ -172,7 +182,7 @@ mod tests {
         // A subsequent client→origin datagram also forwards verbatim.
         let origin2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let origin2_addr = origin2.local_addr().unwrap();
-        let flow2 = SpliceFlow::open(listen.clone(), client_addr, origin2_addr, b"d0").unwrap();
+        let flow2 = SpliceFlow::open(listen.clone(), client_addr, origin2_addr, b"d0", 0).unwrap();
         flow2.forward(b"d1").unwrap();
         let mut ob = vec![0u8; MAX_RELAY_PAYLOAD];
         let (on, _) = origin2.recv_from(&mut ob).await.unwrap();
@@ -194,7 +204,7 @@ mod tests {
         let origin_addr = origin.local_addr().unwrap();
         let listen = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let client: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let flow = SpliceFlow::open(listen, client, origin_addr, b"x").unwrap();
+        let flow = SpliceFlow::open(listen, client, origin_addr, b"x", 0).unwrap();
         let handle = flow.pump.abort_handle();
         drop(flow);
         // Give the runtime a tick to process the abort.

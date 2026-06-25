@@ -90,6 +90,8 @@ pub enum ConfigError {
          unless udp.ignore_client_bandwidth is set"
     )]
     UdpBrutalMissingBandwidth,
+    #[error("udp.max_udp_payload_bytes must be at least {MIN_UDP_PAYLOAD_BYTES} (the RFC 9000 §14.1 Initial minimum)")]
+    UdpMaxPayloadTooSmall,
     #[error(
         "client.listen must bind to a loopback address because SOCKS5 has no authentication: {0}"
     )]
@@ -630,6 +632,14 @@ pub struct UdpConfig {
     /// LIVE. Happy-Eyeballs UDP probe timeout before committing to TCP-only.
     #[serde(default = "default_udp_probe_timeout_ms")]
     pub probe_timeout_ms: u16,
+    /// LIVE. Maximum UDP payload the QUIC carrier reads in one datagram (the inbound
+    /// receive-buffer ceiling and the origin-splice relay buffer). `None`/unset keeps
+    /// the conservative default (2048, ~1.6x the largest datagram ParallaX emits).
+    /// Oversized datagrams are truncated-and-dropped (truncation fails AEAD); this
+    /// caps per-datagram memory. Must be `>=` the RFC 9000 §14.1 Initial minimum
+    /// (1200) so a legal Initial is always receivable. See issue #75.
+    #[serde(default)]
+    pub max_udp_payload_bytes: Option<u32>,
     /// RESERVED (UDP port hopping — dropped Phase 2 camouflage, not planned).
     /// Inert no-op kept only so existing configs still parse.
     #[serde(default)]
@@ -654,12 +664,23 @@ impl Default for UdpConfig {
             ignore_client_bandwidth: false,
             fec_profile: UdpFecProfile::Adaptive,
             probe_timeout_ms: default_udp_probe_timeout_ms(),
+            max_udp_payload_bytes: None,
             port_hop: false,
             masque_front: None,
             ech: false,
         }
     }
 }
+
+/// Default maximum UDP payload read per datagram (the inbound recv ceiling), when
+/// `udp.max_udp_payload_bytes` is unset. A generous ceiling above the path MTU and
+/// ~1.6x the largest datagram ParallaX itself emits; oversized inbound datagrams are
+/// truncated, which fails AEAD and is dropped. See issue #75.
+pub const DEFAULT_MAX_UDP_PAYLOAD_BYTES: u32 = 2048;
+
+/// Lower bound for `udp.max_udp_payload_bytes`: the RFC 9000 §14.1 minimum Initial
+/// datagram size. A cap below this could not receive a legal client Initial.
+pub const MIN_UDP_PAYLOAD_BYTES: u32 = 1200;
 
 impl UdpConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -674,6 +695,11 @@ impl UdpConfig {
         if self.probe_timeout_ms == 0 {
             return Err(ConfigError::InvalidUdpProbeTimeout);
         }
+        if let Some(cap) = self.max_udp_payload_bytes {
+            if cap < MIN_UDP_PAYLOAD_BYTES {
+                return Err(ConfigError::UdpMaxPayloadTooSmall);
+            }
+        }
         if self.cc == UdpCongestionControl::Brutal
             && !self.ignore_client_bandwidth
             && (self.brutal_up_mbps == 0 || self.brutal_down_mbps == 0)
@@ -684,6 +710,14 @@ impl UdpConfig {
             require_non_empty("udp.masque_front", front)?;
         }
         Ok(())
+    }
+
+    /// The effective maximum UDP payload read per datagram (the inbound recv-buffer
+    /// ceiling), resolving `max_udp_payload_bytes` to its default when unset. Always
+    /// `>= MIN_UDP_PAYLOAD_BYTES` (enforced by [`Self::validate`]).
+    pub fn effective_max_udp_payload(&self) -> usize {
+        self.max_udp_payload_bytes
+            .unwrap_or(DEFAULT_MAX_UDP_PAYLOAD_BYTES) as usize
     }
 
     /// Names of RESERVED knobs (see the struct docs) that an operator has set away
@@ -1518,6 +1552,7 @@ brutal_up_mbps = 50
 brutal_down_mbps = 200
 fec_profile = "rs"
 probe_timeout_ms = 250
+max_udp_payload_bytes = 4096
 port_hop = true
 masque_front = "cdn.example.com"
 ech = true
@@ -1531,9 +1566,45 @@ ech = true
         assert_eq!(cfg.udp.brutal_down_mbps, 200);
         assert_eq!(cfg.udp.fec_profile, UdpFecProfile::Rs);
         assert_eq!(cfg.udp.probe_timeout_ms, 250);
+        assert_eq!(cfg.udp.max_udp_payload_bytes, Some(4096));
+        assert_eq!(cfg.udp.effective_max_udp_payload(), 4096);
         assert!(cfg.udp.port_hop);
         assert_eq!(cfg.udp.masque_front.as_deref(), Some("cdn.example.com"));
         assert!(cfg.udp.ech);
+    }
+
+    #[test]
+    fn udp_max_payload_defaults_and_validates() {
+        // Unset => the conservative built-in default.
+        let d = UdpConfig::default();
+        assert_eq!(d.max_udp_payload_bytes, None);
+        assert_eq!(
+            d.effective_max_udp_payload(),
+            DEFAULT_MAX_UDP_PAYLOAD_BYTES as usize
+        );
+
+        // At / above the §14.1 floor is accepted.
+        let ok = UdpConfig {
+            enabled: true,
+            max_udp_payload_bytes: Some(MIN_UDP_PAYLOAD_BYTES),
+            ..UdpConfig::default()
+        };
+        ok.validate().unwrap();
+        assert_eq!(
+            ok.effective_max_udp_payload(),
+            MIN_UDP_PAYLOAD_BYTES as usize
+        );
+
+        // Below the floor (a cap that could not receive a legal Initial) is rejected.
+        let too_small = UdpConfig {
+            enabled: true,
+            max_udp_payload_bytes: Some(MIN_UDP_PAYLOAD_BYTES - 1),
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            too_small.validate().unwrap_err(),
+            ConfigError::UdpMaxPayloadTooSmall
+        ));
     }
 
     #[test]

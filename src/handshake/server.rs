@@ -432,6 +432,7 @@ async fn build_quic_carrier(
     server: &crate::config::ServerConfig,
     psk: &[u8],
     private_key: &[u8; 32],
+    max_udp_payload: usize,
 ) -> Result<Arc<crate::transport::udp::stable::QuicCarrier>, crate::transport::udp::UdpTransportError>
 {
     use crate::transport::udp::UdpTransportError;
@@ -502,6 +503,7 @@ async fn build_quic_carrier(
         marker_key,
         marker_replay_guard,
         origin,
+        max_udp_payload,
     )?;
     Ok(crate::transport::udp::stable::QuicCarrier::bind(server.listen, config).await?)
 }
@@ -517,7 +519,8 @@ pub(crate) async fn build_quic_carrier_for_test(
 {
     let private_key = decode_key32_secret("server.private_key", server.private_key.as_b64())
         .map_err(|e| crate::transport::udp::UdpTransportError::TlsConfig(e.to_string()))?;
-    build_quic_carrier(server, psk, &private_key).await
+    // Tests exercise the default recv cap (0 => built-in default).
+    build_quic_carrier(server, psk, &private_key, 0).await
 }
 
 /// 0-RTT resumption-ticket lifetime (RFC 8446 §4.6.1): 7 days, matching the
@@ -655,7 +658,14 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         // real origin to an active prober. A resolve/bind failure degrades to no
         // carrier (the plane stays on the per-session path) rather than failing the
         // server.
-        match build_quic_carrier(&server, psk.as_slice(), secrets.private_key()).await {
+        match build_quic_carrier(
+            &server,
+            psk.as_slice(),
+            secrets.private_key(),
+            udp.effective_max_udp_payload(),
+        )
+        .await
+        {
             Ok(carrier) => {
                 *SERVER_QUIC_CARRIER
                     .lock()
