@@ -146,7 +146,7 @@ Two prerequisites and one covertness rule:
    autotuning curve away from Safari's. The recv buffer is applied post-accept
    only, so the camouflage SYN is unaffected either way.
 
-Server config (`/etc/parallax/server.toml`), to lift a slow client→server
+Server config (`/etc/parallax/parallax.toml`), to lift a slow client→server
 upload on a high-RTT link:
 
 ```toml
