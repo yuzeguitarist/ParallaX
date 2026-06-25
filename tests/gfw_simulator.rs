@@ -23,7 +23,6 @@ use parallax::crypto::session::{AeadCodec, X25519KeyPair, AEAD_TAG_LEN};
 use parallax::crypto::{identity, pq};
 use parallax::protocol::command::{
     FramedChunk, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
-    PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT, PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
 };
 use parallax::protocol::data::{DataRecordCodec, SERVER_TO_CLIENT_AAD};
 use parallax::tls::record::TLS_HEADER_LEN;
@@ -64,25 +63,18 @@ fn synthetic_random_payload(seed: u64, len: usize) -> Vec<u8> {
     bytes
 }
 
-/// Server-side identity-proof chunk plaintext size. The product server draws this
-/// per connection from `rng.gen_range(SERVER_IDENTITY_CHUNK_MIN_PLAINTEXT
-/// ..=SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT)` (960..=1320) in `server.rs`. We pin the
-/// high end of that real range here so the reconstruction is deterministic while
-/// still being a value the server actually emits; it also matches the in-tree
-/// `server.rs` chunking test that exercises `SERVER_IDENTITY_CHUNK_MAX_PLAINTEXT`.
-const IDENTITY_CHUNK_PLAINTEXT_LEN: usize = 1320;
-
 /// Reconstruct scenario_4's server->client length series from the REAL product
 /// encoders instead of hand-typed magic numbers.
 ///
 /// The authenticated server (see `run_authenticated_data_mode` in
 /// `src/handshake/server.rs`) emits, after the client's PQ rekey, exactly:
 ///   1. the `ServerKeyExchange` (X25519 pub + ML-KEM-1024 ciphertext + framing),
-///      now FramedChunk-split into several per-chunk-randomized records (PAR-21),
-///      then
-///   2. the ML-DSA-87 identity proof, fragmented by
-///      `ServerIdentityChunk::encode_all` into browser-sized records sealed one at
-///      a time with >40 ms spacing.
+///      shaped by `FramedChunk::encode_all_browser_shaped` into browser-modeled
+///      record sizes (PAR-35), then
+///   2. the ML-DSA-87 identity proof, shaped by
+///      `ServerIdentityChunk::encode_all_browser_shaped` into the SAME browser
+///      distribution, with a per-session aggregate decorrelation pad on the last
+///      record of each flight.
 ///
 /// We drive those same public encoders here, seal each frame with the real
 /// `DataRecordCodec` (default `TrafficConfig` padding: min=max=0), and report each
@@ -127,10 +119,6 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
     }
     .encode()
     .expect("encode ServerIdentityProof");
-    let identity_chunks =
-        ServerIdentityChunk::encode_all(&identity_payload, IDENTITY_CHUNK_PLAINTEXT_LEN)
-            .expect("chunk ServerIdentityProof");
-    let identity_chunk_count = identity_chunks.len();
 
     // Real server->client record sealer with the default padding profile the
     // product server uses (TrafficConfig::default => min=max=0). The AEAD key/nonce
@@ -143,32 +131,41 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
     );
     let mut rng = StdRng::seed_from_u64(0x5EA1);
 
-    // The detector defines `length` as the record length after the 5-byte TLS
-    // header is stripped and before the AEAD tag, i.e. the padded plaintext. Derive
-    // it from the REAL sealed record so a future framing/padding change is reflected.
-    let sealed_plaintext_len = |codec: &mut DataRecordCodec, payload: &[u8], rng: &mut StdRng| {
-        let record = codec
-            .seal(payload, rng)
-            .expect("seal server->client record");
-        record.len() - TLS_HEADER_LEN - AEAD_TAG_LEN
-    };
+    let identity_chunks =
+        ServerIdentityChunk::encode_all_browser_shaped(&identity_payload, &mut rng)
+            .expect("chunk ServerIdentityProof");
+    let identity_chunk_count = identity_chunks.len();
 
-    // Same wire order as the server: the key exchange (now FramedChunk-split into
-    // per-chunk-randomized records, PAR-21) first, then the identity chunks. Same
-    // direction (server->client) as the original. Reuse the product chunk-size
-    // bounds so the model cannot drift from the wire.
-    let key_exchange_chunks = FramedChunk::encode_all_shaped(
-        &key_exchange_payload,
-        &mut rng,
-        PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT,
-        PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT,
-    )
-    .expect("chunk ServerKeyExchange");
+    // Same wire order as the server: the key exchange shaped by the browser-modeled
+    // splitter (PAR-35) first, then the identity chunks. Each flight is sealed by the
+    // real `DataRecordCodec::seal_pq_flight`, which applies the per-session aggregate
+    // decorrelation pad to its last record -- so the modeled lengths reflect the exact
+    // bytes the wire carries, including the pad. The detector defines `length` as the
+    // record length after the 5-byte TLS header and before the AEAD tag; we recover it
+    // by re-parsing the sealed buffer so a future framing/padding change is reflected.
+    let key_exchange_chunks =
+        FramedChunk::encode_all_browser_shaped(&key_exchange_payload, &mut rng)
+            .expect("chunk ServerKeyExchange");
     let key_exchange_chunk_count = key_exchange_chunks.len();
-    let mut payloads: Vec<Vec<u8>> =
-        Vec::with_capacity(key_exchange_chunk_count + identity_chunk_count);
-    payloads.extend(key_exchange_chunks);
-    payloads.extend(identity_chunks);
+
+    let mut sealed = Vec::new();
+    server_seal
+        .seal_pq_flight(&key_exchange_chunks, &mut rng, &mut sealed)
+        .expect("seal key-exchange flight");
+    server_seal
+        .seal_pq_flight(&identity_chunks, &mut rng, &mut sealed)
+        .expect("seal identity flight");
+
+    // Walk the sealed buffer record-by-record to get each on-wire record's
+    // padded-plaintext length (total_len - tag), the value the burst detector reads.
+    let mut record_lengths: Vec<usize> = Vec::new();
+    let mut offset = 0usize;
+    while offset < sealed.len() {
+        let header = parallax::tls::record::parse_header(&sealed[offset..])
+            .expect("parse sealed record header");
+        record_lengths.push(header.total_len - TLS_HEADER_LEN - AEAD_TAG_LEN);
+        offset += header.total_len;
+    }
 
     // Synthesized deterministic arrival times: an ~8 ms intra-burst gap between the
     // first two records, then >BURST_GAP (40 ms) spacing so each later chunk lands
@@ -182,11 +179,11 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
     };
 
     let start = Instant::now();
-    let series: Vec<LengthObservation> = payloads
+    let series: Vec<LengthObservation> = record_lengths
         .iter()
         .enumerate()
-        .map(|(idx, payload)| LengthObservation {
-            length: sealed_plaintext_len(&mut server_seal, payload, &mut rng),
+        .map(|(idx, &length)| LengthObservation {
+            length,
             at: start + Duration::from_millis(arrival_offsets_ms(idx)),
             client_to_server: false,
         })
@@ -199,9 +196,8 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
     assert!(!series.is_empty(), "length series must be non-empty");
     assert!(
         identity_chunk_count >= 2,
-        "ML-DSA-87 proof ({} B) must fragment into multiple records at chunk size {}; got {}",
+        "ML-DSA-87 proof ({} B) must fragment into multiple browser-shaped records; got {}",
         identity_payload.len(),
-        IDENTITY_CHUNK_PLAINTEXT_LEN,
         identity_chunk_count
     );
     assert_eq!(
