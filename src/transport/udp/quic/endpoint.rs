@@ -1102,19 +1102,27 @@ impl Connection {
     /// caller can send early data; it then awaits this before relying on 1-RTT-only
     /// facilities (the RFC 5705 exporter, or reads of the peer's 1-RTT response).
     pub async fn wait_established(&self) -> Result<(), ConnectError> {
-        // Create the notification BEFORE the re-check so a wake-up between check and
-        // await is not lost.
         loop {
+            // Arm the waiter BEFORE checking the handshake state. tokio's `notified()`
+            // does NOT register the waiter until first poll / `enable()`, and the
+            // driver wakes via `notify_waiters()`, which wakes only already-registered
+            // waiters and stores NO permit for a future one. Merely creating the future
+            // before the check (the old code) does not register it, so a driver that
+            // flips `is_handshaking → false` and calls `notify_waiters()` between our
+            // check and our `.await` would have its wake-up lost — leaving `connect()`
+            // parked on an already-fired notification until some unrelated later wake.
+            // `pin! + enable()` registers the waiter up front, exactly as `await_accept`
+            // does, so a wake racing the state check still wakes us.
+            let notified = self.shared.event.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.shared.is_closed() {
                 return Err(ConnectError::ConnectionClosed);
             }
             if !self.shared.is_handshaking() {
                 return Ok(());
             }
-            let notified = self.shared.event.notified();
-            if self.shared.is_handshaking() && !self.shared.is_closed() {
-                notified.await;
-            }
+            notified.await;
         }
     }
 
@@ -1547,6 +1555,39 @@ mod tests {
             conn.peer_transport_parameters().is_some(),
             "client learned the server's transport parameters"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_returns_promptly_without_follow_up_traffic() {
+        // PAR-25 regression: wait_established must register its waiter (pin! + enable())
+        // BEFORE re-checking is_handshaking, or a driver flipping handshake→done +
+        // notify_waiters() between the check and the .await loses the wake-up, parking
+        // connect() until some unrelated later wake. The failure is "no immediate
+        // follow-up datagram after the handshake" — so we drive ONLY the handshake and
+        // assert connect() resolves within a tight bound (it would otherwise hang for
+        // seconds-to-minutes until the keep-alive/idle timer). Multi-thread runtime so
+        // the driver and connect() race on separate threads, as in production.
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
+
+        let accept = tokio::spawn(async move { server.accept().await });
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.connect(server_addr, "example.com"),
+        )
+        .await;
+        let conn = connected
+            .expect("connect() must resolve promptly after the handshake, not park on a lost wake")
+            .expect("client handshake completes");
+        let _server_conn = accept.await.unwrap().expect("server accepts");
+
+        let mut ce = [0u8; 32];
+        conn.export_keying_material(&mut ce, b"parallax tudp", b"binding")
+            .unwrap();
+        assert_ne!(ce, [0u8; 32], "the handshake really completed");
     }
 
     #[tokio::test]
