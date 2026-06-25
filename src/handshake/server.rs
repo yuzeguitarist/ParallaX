@@ -131,16 +131,24 @@ const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(60);
 /// a casual prober always lands inside it; only a genuine flood sees FINs, which a
 /// real origin under flood also produces.
 const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
-/// Idle bound for cap-shed fallback relays (H-1). These exist only to return the
-/// origin ServerHello to a prober, not to serve a session, so they use a tight
-/// bound instead of FALLBACK_IDLE_TIMEOUT_FLOOR (600s); this recycles the small
-/// budget in seconds even under slow/idle attackers.
+/// Idle floor (lower edge) for cap-shed fallback relays (H-1). These exist only to
+/// return the origin ServerHello to a prober, not to serve a session, so they use a
+/// tight bound instead of FALLBACK_IDLE_TIMEOUT_FLOOR (600s); this recycles the small
+/// budget in seconds even under slow/idle attackers. The actual idle is this floor
+/// plus a WIDE jitter ([`CAP_SHED_FALLBACK_IDLE_JITTER`]) so the close time is not a
+/// stable, probe-measurable constant; the floor keeps the fastest recycle unchanged.
 const CAP_SHED_FALLBACK_IDLE: Duration = Duration::from_secs(10);
-/// Small upward jitter on the cap-shed idle so a saturated-cap prober does not see
-/// a fixed, round 10.000s close on the cap-shed relay (the same fixed-constant tell
-/// M-3 removed from the main idle backstop). Kept tiny to preserve the tight
-/// anti-DoS-amplification bound.
-const CAP_SHED_FALLBACK_IDLE_JITTER: Duration = Duration::from_secs(2);
+/// Upward jitter on the cap-shed idle. Sized WIDE (not a token few seconds) so the
+/// per-relay close time is drawn from a broad 10..90s spread rather than clustering
+/// at a stable ~10s constant: a saturated-cap prober that opens a silent relay and
+/// times our close can no longer read a sharp, reproducible value to infer "this box
+/// is at its cap" (the residual M-4 state tell — see hardening-no-observable-fingerprint).
+/// The anti-DoS-amplification bound is preserved by construction: the hard
+/// [`MAX_CONCURRENT_CAP_SHED_FALLBACKS`] (64) concurrency cap is unchanged and the
+/// upper edge stays bounded (≤ floor + jitter), so the worst case is still 64 relays
+/// each held ≤90s — bounded, no growth, no amplification — while the 10s floor keeps
+/// the fastest recycle time identical to before.
+const CAP_SHED_FALLBACK_IDLE_JITTER: Duration = Duration::from_secs(80);
 
 static ACTIVE_CAP_SHED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
@@ -6184,12 +6192,18 @@ mod tests {
 
     /// H-1: pins the tight cap-shed idle bound so a future edit cannot silently
     /// raise it to the 600s legit backstop and re-open the cap-as-DoS-amplifier.
+    /// The actual idle is `floor + [0, jitter]`; the jitter is intentionally WIDE
+    /// (M-4: blurs the saturated-cap close-time tell), so the invariant guarded
+    /// here is the real UPPER edge (`floor + jitter`), which must still sit far
+    /// below the 600s legit backstop to keep the anti-DoS-amplification bound.
     #[test]
     fn cap_shed_fallback_idle_is_tight() {
         assert_eq!(CAP_SHED_FALLBACK_IDLE, Duration::from_secs(10));
+        let max_idle = CAP_SHED_FALLBACK_IDLE + CAP_SHED_FALLBACK_IDLE_JITTER;
         assert!(
-            CAP_SHED_FALLBACK_IDLE < FALLBACK_IDLE_TIMEOUT_FLOOR,
-            "cap-shed relays must use a tight idle bound, not the 600s legit backstop",
+            max_idle < FALLBACK_IDLE_TIMEOUT_FLOOR,
+            "cap-shed relays' max idle (floor + jitter) must stay well below the \
+             600s legit backstop, not re-open the cap-as-DoS-amplifier",
         );
     }
 
