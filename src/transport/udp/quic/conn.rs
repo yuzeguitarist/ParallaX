@@ -150,6 +150,81 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 /// whole Handshake flight in practice).
 const MAX_DATAGRAM: usize = 1252;
 
+/// Packets allowed to leave back-to-back without pacing when the connection starts or
+/// resumes from quiescence (idle). Matches quiche's `INITIAL_UNPACED_BURST`: a small
+/// burst out of quiescence is what a real stack does and is what keeps pacing from
+/// adding latency to interactive / bursty flows. Replenished whenever the pipe is
+/// empty (nothing in flight).
+const PACING_BURST_PACKETS: u32 = 10;
+
+/// Below this pacing rate, do not pace at all — a single full-size datagram already
+/// represents ~10ms of transmit time at this rate, so pacing buys nothing and only
+/// risks under-utilizing the link. Mirrors quiche's lumpy-pacing low-bandwidth
+/// bypass (~1.2 Mbps). 150_000 B/s ≈ 1.2 Mbit/s.
+const PACING_MIN_RATE_BYTES_PER_SEC: u64 = 150_000;
+
+/// Smooths a full-window line-rate burst into a stream paced at the congestion
+/// controller's target rate (`bytes / pacing_rate` between packets), so the send
+/// curve matches a real BBR stack instead of cwnd-gated bursts. Purely additive: it
+/// only ever DELAYS a packet the cwnd would already allow, never sends more, and is
+/// fully bypassed before a bandwidth model exists, below the min rate, and while
+/// burst tokens remain — so it cannot reduce throughput.
+#[derive(Debug, Clone)]
+struct Pacer {
+    /// Earliest instant the next paced (ack-eliciting DATA) packet may be sent.
+    /// `None` = no restriction (send immediately).
+    next_send_time: Option<Instant>,
+    /// Remaining unpaced "leaving quiescence" burst credit.
+    burst_tokens: u32,
+}
+
+impl Pacer {
+    fn new() -> Self {
+        Self {
+            next_send_time: None,
+            burst_tokens: PACING_BURST_PACKETS,
+        }
+    }
+
+    /// May a paced DATA packet be sent at `now`? True if bursting, unpaced, or the
+    /// pacing deadline has passed.
+    fn can_send(&self, now: Instant) -> bool {
+        if self.burst_tokens > 0 {
+            return true;
+        }
+        // MSRV 1.80: `map_or(true, ...)` instead of the 1.82 `is_none_or`.
+        self.next_send_time.map_or(true, |t| now >= t)
+    }
+
+    /// Account for one sent DATA packet of `size` bytes at rate `pacing_rate`
+    /// (bytes/sec). `in_flight_before` is bytes in flight BEFORE this packet — zero
+    /// means the connection just left quiescence, which replenishes the burst.
+    fn on_sent(&mut self, now: Instant, size: usize, pacing_rate: u64, in_flight_before: u64) {
+        // Leaving quiescence (idle → active): refill the burst so a bursty/interactive
+        // flow is never throttled on its first packets.
+        if in_flight_before == 0 {
+            self.burst_tokens = PACING_BURST_PACKETS;
+        }
+        if self.burst_tokens > 0 {
+            self.burst_tokens -= 1;
+            // While bursting, do not arm a pacing deadline.
+            self.next_send_time = None;
+            return;
+        }
+        // Unpaced (no model yet) or low-bandwidth bypass: never throttle.
+        if pacing_rate == u64::MAX || pacing_rate < PACING_MIN_RATE_BYTES_PER_SEC {
+            self.next_send_time = None;
+            return;
+        }
+        // Advance the deadline by this packet's transfer time = size / rate.
+        let delay = Duration::from_secs_f64(size as f64 / pacing_rate as f64);
+        // Pace forward from max(now, prior deadline) so a late send does not let the
+        // pacer "bank" credit and then burst to catch up.
+        let base = self.next_send_time.map_or(now, |t| t.max(now));
+        self.next_send_time = Some(base + delay);
+    }
+}
+
 /// Cap on out-of-order CRYPTO bytes buffered per space. The handshake transcript
 /// is small; since Initial keys derive from the public DCID, an unbounded buffer
 /// is a memory-exhaustion DoS (anyone can mint Initials carrying CRYPTO frames at
@@ -390,6 +465,11 @@ pub struct Connection {
     /// Congestion controller behind the CC seam (clean-room BBRv1; the only
     /// wired controller).
     cc: Box<dyn Controller>,
+    /// Packet pacer: spreads ack-eliciting DATA packets at the controller's target
+    /// rate instead of bursting a full window. Additive — only delays packets the
+    /// cwnd already allows; bypassed before a model exists / below the min rate /
+    /// while burst tokens remain.
+    pacer: Pacer,
     /// Connection-wide cumulative delivered (acknowledged) bytes — the BBR /
     /// delivery-rate "delivered" counter (draft-cheng-iccrg-delivery-rate-est).
     delivered: u64,
@@ -540,6 +620,7 @@ impl Connection {
             spaces,
             rtt: RttEstimator::new(),
             cc: Box::new(Bbr::new()),
+            pacer: Pacer::new(),
             delivered: 0,
             pto_count: 0,
             probe_pending: 0,
@@ -634,6 +715,7 @@ impl Connection {
             spaces: [Space::default(), Space::default(), Space::default()],
             rtt: RttEstimator::new(),
             cc: Box::new(Bbr::new()),
+            pacer: Pacer::new(),
             delivered: 0,
             pto_count: 0,
             probe_pending: 0,
@@ -1065,6 +1147,13 @@ impl Connection {
         let probing = self.probe_pending > 0;
         let congestion_ok =
             probing || self.bytes_in_flight() + MAX_DATAGRAM as u64 <= self.cc.window();
+        // Packet pacing gate (PAR-23): spread bulk DATA-stream packets at the
+        // controller's target rate. A PTO probe bypasses pacing (forward progress);
+        // so do pure ACKs, handshake CRYPTO, HANDSHAKE_DONE, flow-control updates,
+        // RESET_STREAM, and keep-alive PINGs below — only the 1-RTT/0-RTT *stream
+        // data* sends consult `pacing_ok`. Bypassed entirely before a model exists,
+        // below the min rate, and while burst tokens remain (see `Pacer`).
+        let pacing_ok = probing || self.pacer.can_send(now);
         if congestion_ok {
             // CRYPTO (handshake) from the lowest space with retransmits or fresh bytes.
             for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
@@ -1080,7 +1169,7 @@ impl Connection {
             }
             // 0-RTT early data: before 1-RTT keys exist, a resuming client sends app
             // stream data under the 0-RTT keys (same Application Data PN space).
-            if self.spaces[SPACE_DATA].keys.is_none() && self.zero_rtt_keys.is_some() {
+            if pacing_ok && self.spaces[SPACE_DATA].keys.is_none() && self.zero_rtt_keys.is_some() {
                 if let Some(id) = self.next_stream_to_send() {
                     let dg = self.build_zero_rtt_stream_packet(id, now);
                     self.probe_pending = self.probe_pending.saturating_sub(1);
@@ -1110,8 +1199,8 @@ impl Connection {
                 }
             }
             // 1-RTT relay data: once Data keys are installed, resend losses then
-            // drain whichever stream has bytes (or a pending FIN) to send.
-            if self.spaces[SPACE_DATA].keys.is_some() {
+            // drain whichever stream has bytes (or a pending FIN) to send. Paced.
+            if pacing_ok && self.spaces[SPACE_DATA].keys.is_some() {
                 if let Some(id) = self.next_stream_to_send() {
                     let dg = self.build_stream_packet(id, now);
                     self.probe_pending = self.probe_pending.saturating_sub(1);
@@ -1184,6 +1273,19 @@ impl Connection {
         if self.handshake_confirmed {
             if let Some(last) = self.last_send_time {
                 earliest(last + self.keepalive_interval);
+            }
+        }
+        // Pacing deadline (PAR-23): if a paced DATA packet is being held back by the
+        // pacer, wake the driver at the release time so it is sent then — otherwise a
+        // deferred packet would wait for an unrelated timer (added latency). Only arm
+        // it when there is actually data to send and the cwnd would allow it, so an
+        // idle connection is not woken.
+        if let Some(t) = self.pacer.next_send_time {
+            let has_data = self.spaces[SPACE_DATA].keys.is_some()
+                && self.bytes_in_flight() + MAX_DATAGRAM as u64 <= self.cc.window()
+                && self.next_stream_to_send().is_some();
+            if has_data {
+                earliest(t);
             }
         }
         // Idle timeout (RFC 9000 §10.1): tear down after no receipt for too long.
@@ -1381,6 +1483,16 @@ impl Connection {
                 delivered: self.delivered,
             },
         );
+        // Advance the pacer for ack-eliciting DATA packets (the bulk stream flow that
+        // poll_transmit paces). `sent.on_sent` above already folded this packet into
+        // the space, so subtract its size to recover bytes-in-flight BEFORE it — a
+        // zero there means we just left quiescence and the burst is refilled. Pacing
+        // the DATA space only (not Initial/Handshake) keeps the handshake unthrottled.
+        if ack_eliciting && space == SPACE_DATA {
+            let in_flight_before = self.bytes_in_flight().saturating_sub(size as u64);
+            let rate = self.cc.pacing_rate();
+            self.pacer.on_sent(now, size, rate, in_flight_before);
+        }
         if ack_eliciting {
             self.spaces[space].sent_content.insert(pn, content);
             self.spaces[space].last_ack_eliciting = Some(now);
@@ -2593,6 +2705,45 @@ mod tests {
             matches!(conn.close_reason(), Some(CloseReason::LocalApp(0, _))),
             "integrity-limit close must use NO_ERROR (code 0), matching the confidentiality close"
         );
+    }
+
+    #[test]
+    fn pacer_bursts_then_paces_then_bypasses() {
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new();
+        let rate = 1_000_000u64; // 1 MB/s, well above the low-bandwidth bypass
+        let pkt = 1200usize;
+
+        // Burst phase: the first PACING_BURST_PACKETS may send back-to-back at t0,
+        // each consuming a token, with no pacing deadline armed.
+        for _ in 0..PACING_BURST_PACKETS {
+            assert!(pacer.can_send(t0), "burst packet sends immediately");
+            pacer.on_sent(t0, pkt, rate, 1); // in_flight_before > 0 (not quiescence)
+            assert!(pacer.next_send_time.is_none(), "no deadline while bursting");
+        }
+
+        // Tokens exhausted → now paced: the next packet arms a deadline transfer_time
+        // ahead, and can_send is false until that deadline.
+        pacer.on_sent(t0, pkt, rate, pkt as u64);
+        let deadline = pacer.next_send_time.expect("paced once burst is spent");
+        let expected = t0 + Duration::from_secs_f64(pkt as f64 / rate as f64);
+        assert_eq!(deadline, expected, "deadline = transfer_time ahead");
+        assert!(!pacer.can_send(t0), "blocked before the pacing deadline");
+        assert!(pacer.can_send(deadline), "unblocked at the deadline");
+
+        // Leaving quiescence (in_flight_before == 0) refills the burst → unpaced again.
+        pacer.on_sent(deadline, pkt, rate, 0);
+        assert!(pacer.can_send(deadline), "quiescence refilled the burst");
+
+        // Unpaced sentinel and sub-min rate never arm a deadline (no-regression paths).
+        let mut p2 = Pacer::new();
+        for _ in 0..PACING_BURST_PACKETS {
+            p2.on_sent(t0, pkt, u64::MAX, 1);
+        }
+        p2.on_sent(t0, pkt, u64::MAX, pkt as u64);
+        assert!(p2.next_send_time.is_none(), "u64::MAX rate is unpaced");
+        p2.on_sent(t0, pkt, PACING_MIN_RATE_BYTES_PER_SEC - 1, pkt as u64);
+        assert!(p2.next_send_time.is_none(), "sub-min rate bypasses pacing");
     }
 
     fn client_config() -> Arc<ClientConfig> {

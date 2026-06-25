@@ -51,6 +51,14 @@ pub trait Controller: Send {
     fn on_congestion_event(&mut self, now: Instant);
     /// The current congestion window, in bytes.
     fn window(&self) -> u64;
+    /// Target send rate in bytes/sec for packet pacing. The connection spreads
+    /// outgoing data packets at this rate (`transfer_time = bytes / rate`) instead of
+    /// bursting a whole window at line rate. The default is `u64::MAX` (unpaced), so a
+    /// controller that does not model a rate — or has not built its model yet — never
+    /// throttles. [`Bbr`] overrides this with `pacing_gain × BtlBw`.
+    fn pacing_rate(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 /// BBR's high gain `2/ln(2) ≈ 2.885`: the startup pacing/cwnd gain that doubles the
@@ -58,6 +66,15 @@ pub trait Controller: Send {
 const BBR_HIGH_GAIN: f64 = 2.885;
 /// Steady-state cwnd gain in ProbeBW (two BDPs of headroom).
 const BBR_CWND_GAIN: f64 = 2.0;
+/// Pacing gain in Startup: pace ABOVE the bottleneck so the rate doubles each round
+/// until the pipe fills (matches the high cwnd gain). Same value Cardwell et al. /
+/// quiche use for the startup pacer.
+const BBR_STARTUP_PACING_GAIN: f64 = BBR_HIGH_GAIN;
+/// Pacing gain in ProbeBW / ProbeRTT: pace AT the estimated bottleneck bandwidth
+/// (gain 1.0). BBRv1's ProbeBW gain cycle averages to ~1.0; pacing at the bottleneck
+/// rate is the steady-state behavior that smooths a full-window burst into a stream
+/// without reducing average throughput.
+const BBR_STEADY_PACING_GAIN: f64 = 1.0;
 /// Minimum cwnd (4 packets), used as the floor and during ProbeRTT (RFC/draft).
 const BBR_MIN_PIPE_CWND: u64 = 4 * MAX_DATAGRAM_SIZE;
 /// RTprop min-filter window: re-take the minimum RTT at least this often.
@@ -276,6 +293,27 @@ impl Controller for Bbr {
     fn window(&self) -> u64 {
         self.cwnd
     }
+
+    fn pacing_rate(&self) -> u64 {
+        // No bandwidth model yet (handshake / first RTTs, or a path so fast no sample
+        // has landed) → do NOT throttle: return the unpaced sentinel so the initial
+        // ramp and loopback transfers burst exactly as before. This is the key
+        // no-regression property: pacing only engages once BtlBw is measured.
+        if self.btlbw == 0 {
+            return u64::MAX;
+        }
+        let gain = match self.mode {
+            BbrMode::Startup => BBR_STARTUP_PACING_GAIN,
+            BbrMode::ProbeBw | BbrMode::ProbeRtt => BBR_STEADY_PACING_GAIN,
+        };
+        // gain × BtlBw, saturating to the unpaced sentinel on overflow.
+        let rate = gain * self.btlbw as f64;
+        if rate >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            (rate as u64).max(1)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +417,41 @@ mod tests {
             }
         }
         assert!(checked, "the pipe should fill within the run");
+    }
+
+    #[test]
+    fn bbr_pacing_rate_is_unpaced_until_the_model_exists_then_tracks_btlbw() {
+        // No model yet → unpaced sentinel (the no-regression property: the initial
+        // ramp / loopback never throttles).
+        let mut cc = Bbr::new();
+        assert_eq!(
+            cc.pacing_rate(),
+            u64::MAX,
+            "unpaced before any BtlBw sample"
+        );
+
+        // Build the model up to ProbeBW, then pacing_rate ≈ BtlBw (steady gain 1.0).
+        let now = Instant::now();
+        let mut delivered = 0;
+        for i in 0..40 {
+            delivered += 500_000;
+            cc.on_ack(&bbr_ack(
+                10_000_000,
+                50,
+                delivered,
+                now + Duration::from_millis(i * 50),
+            ));
+        }
+        assert!(cc.btlbw > 0, "model built");
+        let rate = cc.pacing_rate();
+        assert_ne!(rate, u64::MAX, "paced once the model exists");
+        // Steady-state pace at ~BtlBw (gain 1.0); allow Startup's higher gain if the
+        // run did not fully reach ProbeBW.
+        assert!(
+            rate >= cc.btlbw && rate as f64 <= cc.btlbw as f64 * BBR_HIGH_GAIN + 1.0,
+            "pacing_rate ({rate}) tracks BtlBw ({}) × gain",
+            cc.btlbw
+        );
     }
 
     #[test]
