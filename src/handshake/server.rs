@@ -4648,8 +4648,8 @@ where
 
         // Open the batch (or single record). The batch-open fans the AEAD across
         // the crypto pool, but the *write* below is deliberately re-split into
-        // per-record-sized slices so the bounded write + activity-bump cadence is
-        // identical to the pre-batch per-record loop (see the write loop's NOTE).
+        // <= max_plaintext_len slices so each bounded write stays the same size as
+        // the pre-batch per-record write (see the write loop's NOTE).
         let payload: &[u8] = if record_count == 1 {
             let range = client_open
                 .open_in_place_payload_range(&mut client_record)
@@ -4674,13 +4674,17 @@ where
             }
             batch_plaintext.as_slice()
         };
-        // Write in per-record-sized slices, each under its OWN idle_timeout and
-        // bumping `activity` per slice — restoring the exact bounded-write
-        // semantics of the pre-batch per-record loop. Wrapping the whole batch
-        // (up to MUX_OPEN_BATCH_BYTES) in a single timeout would force a
-        // slow-but-alive target to absorb ~1 MiB within one idle_timeout instead
-        // of ~16 KiB, tearing down legitimately-progressing relays at aggressive
-        // (low but valid) idle floors. NOTE: this per-write timeout reliably fires
+        // Write in <= max_plaintext_len slices, each under its OWN idle_timeout
+        // and bumping `activity` per slice. Records are sealed at most
+        // max_plaintext_len of plaintext each, so a slice never splits a record;
+        // it may coalesce several small adjacent records into one write, but every
+        // write stays bounded by the same max_plaintext_len the pre-batch
+        // per-record write was bounded by — so the per-write timeout budget is
+        // unchanged. Wrapping the whole batch (up to MUX_OPEN_BATCH_BYTES) in a
+        // single timeout would instead force a slow-but-alive target to absorb
+        // ~1 MiB within one idle_timeout instead of ~16 KiB, tearing down
+        // legitimately-progressing relays at aggressive (low but valid) idle
+        // floors. NOTE: this per-write timeout reliably fires
         // only when the relay is otherwise progressing (the download direction
         // keeps bumping `activity`); in the pure "client keeps sending, target
         // accepts-then-stalls, no download traffic" case the shared idle-watchdog
