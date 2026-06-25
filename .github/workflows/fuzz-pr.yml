@@ -37,6 +37,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0 # need merge-base with the PR base for the diff
+          persist-credentials: false
       - name: Validate target map (fails if a fuzz target is unmapped)
         run: python3 fuzz/ci/select_targets.py --check
       - name: Select targets from the PR diff
@@ -62,7 +63,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: nightly-2026-06-10
           components: rust-src

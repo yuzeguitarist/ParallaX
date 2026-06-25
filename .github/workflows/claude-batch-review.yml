@@ -41,6 +41,7 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       # Cheap gate: decide whether enough has changed to warrant a review.
       - id: gate
