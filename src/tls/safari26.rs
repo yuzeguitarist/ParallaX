@@ -2404,6 +2404,78 @@ mod tests {
         assert!(!rendered.contains("9, 9, 9")); // raw secret bytes never printed
     }
 
+    // ---- Issue #54: tls_shared_secret group dispatch + length guards ----
+
+    fn server_hello_with(group: u16, key_share: Vec<u8>) -> ParsedServerHello {
+        ParsedServerHello {
+            cipher_suite: TlsCipherSuite::Aes128GcmSha256,
+            key_share_group: group,
+            key_share,
+        }
+    }
+
+    #[test]
+    fn tls_shared_secret_x25519_returns_a_deterministic_32_byte_secret() {
+        // Kills the GROUP_X25519 delete-arm, the constant-return mutants
+        // (Ok(vec![])/[0]/[1]), and the length-guard `!=`->`==`: a valid 32-byte
+        // server share yields a 32-byte secret that depends on the share.
+        let session = test_session();
+        let server_a = X25519KeyPair::generate();
+        let server_b = X25519KeyPair::generate();
+        let sa = session
+            .tls_shared_secret(&server_hello_with(GROUP_X25519, server_a.public.to_vec()))
+            .unwrap();
+        assert_eq!(sa.len(), 32, "X25519 shared secret is 32 bytes (not empty)");
+        assert_ne!(&sa[..], &[0_u8; 32], "secret is not the all-zero mutant");
+        // The same share is deterministic; a different share gives a different secret.
+        let sa2 = session
+            .tls_shared_secret(&server_hello_with(GROUP_X25519, server_a.public.to_vec()))
+            .unwrap();
+        assert_eq!(sa, sa2, "deterministic for a fixed server share");
+        let sb = session
+            .tls_shared_secret(&server_hello_with(GROUP_X25519, server_b.public.to_vec()))
+            .unwrap();
+        assert_ne!(sa, sb, "the secret binds the server key_share");
+    }
+
+    #[test]
+    fn tls_shared_secret_rejects_wrong_length_and_unknown_groups() {
+        // Kills the length-guard `!=`->`==` for BOTH groups, the `+`->`-`/`*`
+        // mutants on `MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN`, and proves the
+        // group match is exhaustive (an unknown group is Unsupported, not silently
+        // accepted by a deleted arm).
+        let session = test_session();
+        // X25519 with a 31-byte (wrong) share is rejected.
+        assert!(matches!(
+            session.tls_shared_secret(&server_hello_with(GROUP_X25519, vec![0u8; 31])),
+            Err(Safari26TlsError::Handshake(_))
+        ));
+        // X25519MLKEM768 requires exactly 1088 + 32 bytes; one short is rejected.
+        assert!(matches!(
+            session.tls_shared_secret(&server_hello_with(
+                GROUP_X25519_MLKEM768,
+                vec![0u8; MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN - 1],
+            )),
+            Err(Safari26TlsError::Handshake(_) | Safari26TlsError::MlKem)
+        ));
+        // An unknown group is Unsupported.
+        assert!(matches!(
+            session.tls_shared_secret(&server_hello_with(0x4242, vec![0u8; 32])),
+            Err(Safari26TlsError::Unsupported(_))
+        ));
+    }
+
+    // ---- Issue #54: byte-limit constants (kill the `*`->`+`/`/` mutants) ----
+
+    #[test]
+    fn handshake_byte_limit_constants_are_exact() {
+        // The `* 1024` / `* 1024` factors define memory bounds; a `*`->`+` or `*`->`/`
+        // mutation would silently shrink them. Pin the exact values.
+        assert_eq!(H2_FRAME_BUFFER_LIMIT, 64 * 1024);
+        assert_eq!(MAX_DECOMPRESSED_CERT_CHAIN, 256 * 1024);
+        assert_eq!(MAX_ENCRYPTED_HANDSHAKE_MESSAGE, 512 * 1024);
+    }
+
     // ---- push_u24 ----
 
     #[test]
