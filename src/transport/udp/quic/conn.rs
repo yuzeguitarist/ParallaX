@@ -353,6 +353,12 @@ struct Space {
     sent_content: BTreeMap<u64, SentContent>,
     /// An ack-eliciting packet has been received and not yet acknowledged.
     ack_pending: bool,
+    /// When the first ack-eliciting packet of the current (not-yet-sent) ACK was
+    /// received, for computing the `ack_delay` field (RFC 9000 §19.3): the time the
+    /// ACK is delayed relative to the packet that triggered it. Set when `ack_pending`
+    /// first flips true, cleared when the ACK is sent. A real QUIC stack reports a
+    /// non-zero delay here; hard-coding 0 (the old behavior) is a passive tell.
+    first_ack_eliciting_recv: Option<Instant>,
     /// CRYPTO byte ranges to RESEND (lost packets) before any fresh CRYPTO.
     retransmit_crypto: Vec<(u64, u64)>,
     /// Earliest armed time-threshold loss deadline (RFC 9002 §6.1.2), if any.
@@ -1510,9 +1516,30 @@ impl Connection {
     fn build_ack_packet(&mut self, space: usize, now: Instant) -> Vec<u8> {
         let pn = self.spaces[space].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
+        // ack_delay (RFC 9000 §19.3): how long the ACK was held since the first
+        // ack-eliciting packet it covers, capped at max_ack_delay (25ms) and encoded
+        // as the raw value (microseconds >> ack_delay_exponent). The peer multiplies
+        // it back by 2^exponent. A real QUIC stack reports this; the old hard-coded 0
+        // is a passive distinguisher (an ACK that always claims zero delay). NOTE:
+        // ACK *coalescing* (~2:1) is a separate, deferred change (PAR-22) pending a
+        // sustained-flow Safari QUIC capture to validate the exact ratio.
+        // Only the Application (1-RTT) space reports a real ack_delay: Initial and
+        // Handshake ACKs are sent immediately (the peer must not apply max_ack_delay
+        // there, RFC 9000 §13.2.1 / §17.2.5), so they keep delay 0.
+        let ack_delay_raw = if space == SPACE_DATA {
+            self.spaces[space]
+                .first_ack_eliciting_recv
+                .map(|recv| {
+                    let held = now.saturating_duration_since(recv).min(MAX_ACK_DELAY);
+                    (held.as_micros() as u64) >> ACK_DELAY_EXPONENT
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let ack = self.spaces[space]
             .recv
-            .to_ack(0)
+            .to_ack(ack_delay_raw)
             .expect("ack_pending is only set after receiving an ack-eliciting packet");
         let header = self.make_header(space, pn, pn_len);
         let datagram = {
@@ -1520,6 +1547,7 @@ impl Connection {
             seal_packet(&keys.local, header, &[Frame::Ack(ack)])
         };
         self.spaces[space].ack_pending = false;
+        self.spaces[space].first_ack_eliciting_recv = None;
         self.record_sent(
             space,
             pn,
@@ -2215,6 +2243,12 @@ impl Connection {
             }
         }
         if ack_eliciting {
+            // Stamp the receive time of the FIRST ack-eliciting packet covered by the
+            // pending ACK (not overwritten by later packets) so build_ack_packet can
+            // report the real ack_delay.
+            if !self.spaces[space].ack_pending {
+                self.spaces[space].first_ack_eliciting_recv = Some(now);
+            }
             self.spaces[space].ack_pending = true;
         }
         self.pump_write();
@@ -3601,6 +3635,71 @@ mod tests {
         assert!(
             server.poll_transmit(now).is_some(),
             "the server ACKs the keep-alive PING — the connection stays live"
+        );
+    }
+
+    #[test]
+    fn one_rtt_ack_encodes_the_real_nonzero_ack_delay() {
+        // PAR-22: a 1-RTT ACK must carry the real time the ACK was held since the
+        // packet it acknowledges, not a hard-coded 0. The server receives an
+        // ack-eliciting PING, holds the ACK 8ms, then sends it; we decrypt that ACK
+        // with the client's keys and read the delay field off the wire. 8ms encodes as
+        // 8000us >> ack_delay_exponent(3) = 1000; the old hard-coded behavior would
+        // decode to 0.
+        let dcid = ConnectionId::new(&[0x41; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xcd, 0xdc, 0xcd, 0xdc]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(client.handshake_confirmed && server.handshake_confirmed);
+
+        // Client emits a 1-RTT keep-alive PING.
+        let t0 = Instant::now();
+        client.last_send_time = Some(t0);
+        client.keepalive_interval = Duration::from_secs(1);
+        let mut t = t0 + Duration::from_secs(2);
+        client.handle_timeout(t);
+        let ping = client
+            .poll_transmit(t)
+            .expect("client queues a 1-RTT keep-alive PING");
+
+        // Server receives the PING, holds the ACK 8ms, then sends it.
+        server.handle_datagram(&ping, t).unwrap();
+        t += Duration::from_millis(8);
+        let mut ack = server
+            .poll_transmit(t)
+            .expect("server emits the (held) ACK of the PING");
+
+        // Decrypt the server's 1-RTT ACK with the client's receive keys and read the
+        // delay field. raw 1000 << exponent(3) = 8000us = 8ms. Use the client's real
+        // local CID length and largest-received PN so packet-number reconstruction
+        // matches handle_datagram.
+        let local_cid_len = client.scid.len();
+        let largest = client.spaces[SPACE_DATA].recv.largest();
+        let keys = client.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .expect("client has 1-RTT keys");
+        let (_hdr, range) =
+            open_packet(&keys.remote, &mut ack, local_cid_len, largest).expect("ACK opens");
+        let delay = Iter::new(&ack[range])
+            .filter_map(|f| match f {
+                Ok(Frame::Ack(a)) => Some(a.delay),
+                _ => None,
+            })
+            .next()
+            .expect("the server packet carries an ACK frame");
+        assert_eq!(
+            delay, 1000,
+            "ack_delay must encode the 8ms hold (8000us >> 3 = 1000), not 0"
         );
     }
 
