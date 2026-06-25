@@ -18,7 +18,20 @@ use crate::{
 };
 
 pub const OUTER_TLS_RECORD_LIMIT: usize = record::MAX_TLS_RECORD_PAYLOAD;
-pub const RELAY_READ_BUFFER_TARGET: usize = 64 * 1024;
+/// Target size of a single relay read (`drain_ready_tcp_read` coalesces all
+/// immediately-ready bytes up to this bound before sealing). Larger reads gather
+/// more plaintext per cycle, so the bulk seal/open fans out across more crypto
+/// pool workers in one dispatch (16 full records here vs 4 at 64 KiB), better
+/// amortizing the pool's per-batch lock/dispatch cost on multi-core machines.
+///
+/// This is purely a read-coalescing/CPU-batching knob: records are still capped
+/// at `max_plaintext_len` each, so the on-wire record sizes, count-per-byte,
+/// padding, and timing are unchanged — only how many records are sealed/written
+/// per relay cycle changes (and TCP already coalesces segments regardless). The
+/// worst-case up-front `out.reserve` for one read stays bounded: with the
+/// `MIN_USABLE_PLAINTEXT_LEN` floor a 256 KiB read is at most ~256 records, a
+/// few MiB of reserve even under near-record-sized padding.
+pub const RELAY_READ_BUFFER_TARGET: usize = 256 * 1024;
 
 const PADDING_LEN_FIELD: usize = 2;
 
@@ -956,10 +969,11 @@ pub fn max_plaintext_len(max_padding: u16) -> usize {
 /// Minimum plaintext bytes that must remain per record after padding overhead.
 /// Configs whose `max_padding` drives `max_plaintext_len` below this are rejected
 /// at validation: a near-record-sized padding (e.g. leaving 1 plaintext byte)
-/// makes a single 64 KiB relay read split into tens of thousands of records, and
-/// the up-front `out.reserve(...)` for that would attempt a ~1 GiB allocation
-/// (an availability footgun). 1 KiB still permits very heavy padding (>90% of the
-/// record) while bounding worst-case buffering to a few MiB per relay read.
+/// makes a single `RELAY_READ_BUFFER_TARGET`-sized relay read split into tens of
+/// thousands of records, and the up-front `out.reserve(...)` for that would
+/// attempt a multi-GiB allocation (an availability footgun). 1 KiB still permits
+/// very heavy padding (>90% of the record) while bounding worst-case buffering to
+/// a few MiB per relay read.
 pub const MIN_USABLE_PLAINTEXT_LEN: usize = 1024;
 
 pub fn relay_read_buffer_len(max_payload_chunk_len: usize) -> usize {
