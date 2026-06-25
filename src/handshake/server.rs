@@ -150,6 +150,21 @@ const CAP_SHED_FALLBACK_IDLE: Duration = Duration::from_secs(10);
 /// the fastest recycle time identical to before.
 const CAP_SHED_FALLBACK_IDLE_JITTER: Duration = Duration::from_secs(80);
 
+/// Replayed-ClientHello close is detected only AFTER the full PQ exchange, so a
+/// replay's teardown lands at a near-fixed moment in the handshake (no server PQ
+/// response, then FIN) that a holder of the deployment PSK who recorded a genuine
+/// client could time to confirm it was flagged as a replay (M-5). This residual is
+/// invisible to a keyless censor (a non-PSK peer never reaches this arm; it splices
+/// at the first record), so the bar is already very high — but to blur the one
+/// measurable signal that remains, hold the connection for a WIDE jittered delay
+/// before the graceful FIN, drawn from `[0, jitter]` so there is no fixed lower edge
+/// that itself becomes a new constant. The connection is otherwise inert during the
+/// wait (nothing is forwarded to the origin, unlike a relay), so there is no
+/// origin-side DoS-amplification cost — it is a local socket held a little longer,
+/// and replays are rare by construction.
+const REPLAY_CLOSE_DELAY_FLOOR: Duration = Duration::from_secs(0);
+const REPLAY_CLOSE_DELAY_JITTER: Duration = Duration::from_secs(60);
+
 static ACTIVE_CAP_SHED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
 /// RAII slot for a cap-shed fallback relay; releases the budget on drop.
@@ -1659,6 +1674,19 @@ async fn run_authenticated_data_mode(
                         let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
                         if !commit_pending_replay_entry(&mut pending_replay).await? {
                             tracing::warn!(cid, "closing on replayed ClientHello after data proof");
+                            // Blur the replay close-time tell (M-5): hold the inert
+                            // connection for a WIDE jittered delay before tearing it
+                            // down, so the FIN no longer lands at a near-fixed moment
+                            // a PSK-holding observer could time to confirm a replay
+                            // was flagged. Drawn from [0, jitter] so there is no fixed
+                            // lower edge. Nothing is forwarded during the wait (no
+                            // origin-side cost); replays are rare, so this never
+                            // affects throughput.
+                            sleep(jittered_timeout(
+                                REPLAY_CLOSE_DELAY_FLOOR,
+                                REPLAY_CLOSE_DELAY_JITTER,
+                            ))
+                            .await;
                             // Graceful drain->FIN instead of a bare drop (M-1). At
                             // this point the fallback origin's read half (and any
                             // client RX buffered in the record reader) may hold
