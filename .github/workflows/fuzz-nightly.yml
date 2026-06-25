@@ -38,7 +38,7 @@ jobs:
       targets: ${{ steps.sel.outputs.targets }}
       empty: ${{ steps.sel.outputs.empty }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0 # need history back to the VPS pin for the diff
       - name: Select targets (changed since VPS pin, then date-rotation fill)
@@ -69,7 +69,9 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
@@ -86,7 +88,7 @@ jobs:
           fi
 
       - name: Cache cargo-fuzz binary
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: ~/.cargo/bin/cargo-fuzz
           key: cargo-fuzz-0.13.2-${{ runner.os }}
@@ -100,7 +102,7 @@ jobs:
         run: command -v cargo-fuzz >/dev/null || cargo +nightly-2026-06-10 install cargo-fuzz --version 0.13.2 --locked
 
       - name: Restore GHA-grown corpus
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: gha-fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
