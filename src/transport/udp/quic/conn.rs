@@ -207,21 +207,31 @@ impl Pacer {
         }
         if self.burst_tokens > 0 {
             self.burst_tokens -= 1;
-            // While bursting, do not arm a pacing deadline.
-            self.next_send_time = None;
+            // Spend the token. Only AFTER the last token is spent do we start pacing,
+            // so arm the deadline now (rather than leaving it None) — otherwise the
+            // first post-burst packet would also see `next_send_time == None` and slip
+            // through unpaced, making the effective burst PACING_BURST_PACKETS + 1.
+            if self.burst_tokens == 0 {
+                self.next_send_time = self.armed_deadline(now, size, pacing_rate);
+            } else {
+                self.next_send_time = None;
+            }
             return;
         }
-        // Unpaced (no model yet) or low-bandwidth bypass: never throttle.
+        self.next_send_time = self.armed_deadline(now, size, pacing_rate);
+    }
+
+    /// The pacing deadline after sending a `size`-byte packet at `pacing_rate`: `None`
+    /// (unpaced) before a model exists or below the min rate, else `base + size/rate`
+    /// where `base = max(now, prior deadline)` so a late send cannot bank credit and
+    /// then burst to catch up.
+    fn armed_deadline(&self, now: Instant, size: usize, pacing_rate: u64) -> Option<Instant> {
         if pacing_rate == u64::MAX || pacing_rate < PACING_MIN_RATE_BYTES_PER_SEC {
-            self.next_send_time = None;
-            return;
+            return None;
         }
-        // Advance the deadline by this packet's transfer time = size / rate.
         let delay = Duration::from_secs_f64(size as f64 / pacing_rate as f64);
-        // Pace forward from max(now, prior deadline) so a late send does not let the
-        // pacer "bank" credit and then burst to catch up.
         let base = self.next_send_time.map_or(now, |t| t.max(now));
-        self.next_send_time = Some(base + delay);
+        Some(base + delay)
     }
 }
 
@@ -353,12 +363,14 @@ struct Space {
     sent_content: BTreeMap<u64, SentContent>,
     /// An ack-eliciting packet has been received and not yet acknowledged.
     ack_pending: bool,
-    /// When the first ack-eliciting packet of the current (not-yet-sent) ACK was
-    /// received, for computing the `ack_delay` field (RFC 9000 §19.3): the time the
-    /// ACK is delayed relative to the packet that triggered it. Set when `ack_pending`
-    /// first flips true, cleared when the ACK is sent. A real QUIC stack reports a
-    /// non-zero delay here; hard-coding 0 (the old behavior) is a passive tell.
-    first_ack_eliciting_recv: Option<Instant>,
+    /// When the LARGEST-numbered ack-eliciting packet covered by the current
+    /// (not-yet-sent) ACK was received, for the `ack_delay` field (RFC 9000 §13.2.5:
+    /// ack_delay is measured from the receipt of the largest acknowledged packet, NOT
+    /// the first one in the batch — using the first would overreport the delay by the
+    /// packets' inter-arrival gap and inflate the peer's RTT). Updated whenever a
+    /// newly-received ack-eliciting packet becomes the new largest; cleared when the
+    /// ACK is sent. A real QUIC stack reports this; hard-coding 0 was a passive tell.
+    ack_eliciting_largest_recv: Option<Instant>,
     /// CRYPTO byte ranges to RESEND (lost packets) before any fresh CRYPTO.
     retransmit_crypto: Vec<(u64, u64)>,
     /// Earliest armed time-threshold loss deadline (RFC 9002 §6.1.2), if any.
@@ -1489,12 +1501,15 @@ impl Connection {
                 delivered: self.delivered,
             },
         );
-        // Advance the pacer for ack-eliciting DATA packets (the bulk stream flow that
-        // poll_transmit paces). `sent.on_sent` above already folded this packet into
-        // the space, so subtract its size to recover bytes-in-flight BEFORE it — a
-        // zero there means we just left quiescence and the burst is refilled. Pacing
-        // the DATA space only (not Initial/Handshake) keeps the handshake unthrottled.
-        if ack_eliciting && space == SPACE_DATA {
+        // Advance the pacer ONLY for DATA-space packets that actually carry STREAM
+        // data — the bulk flow `poll_transmit` gates on `pacing_ok`. Control packets
+        // (PING, HANDSHAKE_DONE, MAX_DATA/MAX_STREAM_DATA, RESET_STREAM) bypass the
+        // pacing gate, so they must not consume burst tokens or arm the deadline here,
+        // or they would wrongly delay subsequent stream data. `sent.on_sent` above
+        // already folded this packet in, so subtract its size to recover
+        // bytes-in-flight BEFORE it — zero there means we left quiescence (burst
+        // refill). DATA space only keeps the handshake unthrottled.
+        if ack_eliciting && space == SPACE_DATA && !content.stream.is_empty() {
             let in_flight_before = self.bytes_in_flight().saturating_sub(size as u64);
             let rate = self.cc.pacing_rate();
             self.pacer.on_sent(now, size, rate, in_flight_before);
@@ -1528,7 +1543,7 @@ impl Connection {
         // there, RFC 9000 §13.2.1 / §17.2.5), so they keep delay 0.
         let ack_delay_raw = if space == SPACE_DATA {
             self.spaces[space]
-                .first_ack_eliciting_recv
+                .ack_eliciting_largest_recv
                 .map(|recv| {
                     let held = now.saturating_duration_since(recv).min(MAX_ACK_DELAY);
                     (held.as_micros() as u64) >> ACK_DELAY_EXPONENT
@@ -1547,7 +1562,7 @@ impl Connection {
             seal_packet(&keys.local, header, &[Frame::Ack(ack)])
         };
         self.spaces[space].ack_pending = false;
-        self.spaces[space].first_ack_eliciting_recv = None;
+        self.spaces[space].ack_eliciting_largest_recv = None;
         self.record_sent(
             space,
             pn,
@@ -2243,11 +2258,14 @@ impl Connection {
             }
         }
         if ack_eliciting {
-            // Stamp the receive time of the FIRST ack-eliciting packet covered by the
-            // pending ACK (not overwritten by later packets) so build_ack_packet can
-            // report the real ack_delay.
-            if !self.spaces[space].ack_pending {
-                self.spaces[space].first_ack_eliciting_recv = Some(now);
+            // Stamp the receive time of the LARGEST ack-eliciting packet covered by the
+            // pending ACK (RFC 9000 §13.2.5), so build_ack_packet reports the delay
+            // from THAT packet, not the first in the batch. `recv.insert` above already
+            // folded this packet in, so it is the new largest iff its PN equals
+            // recv.largest(). A reordered (smaller-PN) ack-eliciting packet does not
+            // move the stamp.
+            if self.spaces[space].recv.largest() == Some(header.packet_number()) {
+                self.spaces[space].ack_eliciting_largest_recv = Some(now);
             }
             self.spaces[space].ack_pending = true;
         }
@@ -2748,22 +2766,38 @@ mod tests {
         let rate = 1_000_000u64; // 1 MB/s, well above the low-bandwidth bypass
         let pkt = 1200usize;
 
-        // Burst phase: the first PACING_BURST_PACKETS may send back-to-back at t0,
-        // each consuming a token, with no pacing deadline armed.
-        for _ in 0..PACING_BURST_PACKETS {
-            assert!(pacer.can_send(t0), "burst packet sends immediately");
+        // Burst phase: EXACTLY PACING_BURST_PACKETS may send back-to-back at t0. Each
+        // sends immediately; the deadline stays unset until the LAST token is spent,
+        // which arms pacing so the very next packet is throttled (no off-by-one extra
+        // unpaced packet).
+        for i in 0..PACING_BURST_PACKETS {
+            assert!(pacer.can_send(t0), "burst packet {i} sends immediately");
             pacer.on_sent(t0, pkt, rate, 1); // in_flight_before > 0 (not quiescence)
-            assert!(pacer.next_send_time.is_none(), "no deadline while bursting");
+            if i + 1 < PACING_BURST_PACKETS {
+                assert!(pacer.next_send_time.is_none(), "no deadline mid-burst");
+            }
         }
 
-        // Tokens exhausted → now paced: the next packet arms a deadline transfer_time
-        // ahead, and can_send is false until that deadline.
-        pacer.on_sent(t0, pkt, rate, pkt as u64);
-        let deadline = pacer.next_send_time.expect("paced once burst is spent");
+        // The last burst token armed the deadline transfer_time ahead, so the NEXT
+        // packet is already blocked — the burst is exactly PACING_BURST_PACKETS, not
+        // one more.
+        let deadline = pacer.next_send_time.expect("last burst token arms pacing");
         let expected = t0 + Duration::from_secs_f64(pkt as f64 / rate as f64);
         assert_eq!(deadline, expected, "deadline = transfer_time ahead");
-        assert!(!pacer.can_send(t0), "blocked before the pacing deadline");
+        assert!(
+            !pacer.can_send(t0),
+            "the post-burst packet is blocked, no off-by-one"
+        );
         assert!(pacer.can_send(deadline), "unblocked at the deadline");
+
+        // The next paced send advances the deadline by another transfer_time.
+        pacer.on_sent(deadline, pkt, rate, pkt as u64);
+        let deadline2 = pacer.next_send_time.expect("still paced");
+        assert_eq!(
+            deadline2,
+            deadline + Duration::from_secs_f64(pkt as f64 / rate as f64)
+        );
+        let deadline = deadline2;
 
         // Leaving quiescence (in_flight_before == 0) refills the burst → unpaced again.
         pacer.on_sent(deadline, pkt, rate, 0);

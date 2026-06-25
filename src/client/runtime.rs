@@ -1346,15 +1346,26 @@ fn client_quic_ticket_slot() -> &'static std::sync::Mutex<Option<crate::tls::qui
 const UDP_PROBE_RTT_MULTIPLE: u32 = 6;
 
 /// Derive the UDP-probe timeout from the configured floor and the observed
-/// control-plane RTT (PAR-11). The result is `max(config_floor, MULTIPLE × rtt)`, so
-/// the probe scales with the path: on a fast link it stays at the (small) floor, and
-/// on a high-RTT link it grows to cover the multi-RTT probe instead of timing out
-/// mid-handshake. `config_ms` is the operator's floor (also a hard minimum so a
-/// near-zero RTT sample can never shrink the budget below it).
+/// control-plane RTT (PAR-11). The result is `clamp(MULTIPLE × rtt, floor, ceiling)`,
+/// so the probe scales with the path — staying at the (small) floor on a fast link
+/// and growing to cover the multi-RTT probe on a high-RTT link — but NEVER exceeds the
+/// server's offer-hold contract.
+///
+/// The server bounds its own wait for the client's PX1P ack at `2 × probe_timeout_ms`
+/// (see `run_authenticated_data_mode` in `src/handshake/server.rs`), and its clock
+/// starts one offer-propagation earlier than the client's. So the client's budget MUST
+/// stay strictly under `2 × config` (we use `2× − 1 floor` as a propagation margin),
+/// or on a high-RTT path the client would still be probing after the server has timed
+/// out and released the QUIC connection (desync). `config_ms` remains a hard minimum.
 fn udp_probe_budget(config_ms: u16, control_rtt: std::time::Duration) -> std::time::Duration {
     let floor = std::time::Duration::from_millis(u64::from(config_ms.max(1)));
+    // Ceiling = 1.75 × floor: strictly below the server's 2× wait, leaving a 0.25×
+    // floor of offer-propagation margin so the server always outlasts the client.
+    // Adaptivity lives in [floor, 1.75×floor]; an operator on a very high-RTT path
+    // raises `probe_timeout_ms` (which lifts BOTH this ceiling and the server's wait).
+    let ceiling = floor.saturating_mul(7) / 4;
     let rtt_based = control_rtt.saturating_mul(UDP_PROBE_RTT_MULTIPLE);
-    floor.max(rtt_based)
+    rtt_based.clamp(floor, ceiling)
 }
 
 /// `sni` is the camouflage front domain (the client's REALITY SNI), used as both
@@ -3292,12 +3303,23 @@ mod tests {
             StdDuration::from_millis(1680),
             "RTT multiple wins on a slow path"
         );
+        // Very high RTT: 6× would exceed the ceiling, so it is capped at 1.75×floor —
+        // strictly below the server's 2×floor wait, so the server never times out
+        // first (no desync between the client probe and the server's offer hold).
+        let capped = udp_probe_budget(1000, StdDuration::from_millis(500));
+        assert_eq!(
+            capped,
+            StdDuration::from_millis(1750),
+            "capped below the server's 2x wait"
+        );
         // The floor is a hard minimum: a near-zero RTT sample can never shrink it.
         let tiny = udp_probe_budget(1000, StdDuration::from_micros(1));
         assert_eq!(tiny, StdDuration::from_millis(1000));
-        // config_ms is clamped to >= 1 so a 0 floor still yields a usable budget.
+        // config_ms is clamped to >= 1; the ceiling is relative to the floor, so a
+        // pathological 0 floor (→ 1ms) caps the budget at 1.75ms rather than letting it
+        // run unbounded past the server's wait.
         let zero_floor = udp_probe_budget(0, StdDuration::from_millis(100));
-        assert_eq!(zero_floor, StdDuration::from_millis(600));
+        assert_eq!(zero_floor, StdDuration::from_micros(1750));
     }
 
     // --- Track A1: lock-free relay activity clock — watchdog semantics ---
