@@ -920,8 +920,14 @@ impl Driver {
             .and_then(|c| c.marker_replay_guard.clone())
         {
             // Persistent path: the cache keys on `(nonce, timestamp)` via SHA-256 and
-            // retains for its freshness window, so the in-memory map is unused here.
-            let now_unix = crate::crypto::replay::current_unix_timestamp().unwrap_or(0);
+            // retains by the marker's own timestamp, so the in-memory map is unused.
+            // A clock-read failure FAILS CLOSED (splice, not terminate): feeding a 0
+            // "now" would let `prune_expired` later evict a recorded entry once the
+            // clock recovers, reopening a replay window. A genuine client merely
+            // fails to terminate this once and self-heals by redialing.
+            let Ok(now_unix) = crate::crypto::replay::current_unix_timestamp() else {
+                return false;
+            };
             return guard.first_sighting(&m, now_unix);
         }
         self.marker_replay

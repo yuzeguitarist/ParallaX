@@ -54,10 +54,16 @@ impl MarkerReplayGuard {
         nonce.copy_from_slice(&digest[..8]);
         let mut transcript_fingerprint = [0_u8; 32];
         transcript_fingerprint.copy_from_slice(&digest);
-        // `timestamp = now` so the entry is always within the freshness window at
-        // insert; the window governs how long it is RETAINED for replay detection.
+        // Retain the entry by the MARKER's own timestamp, not the observation time, so
+        // replay protection lasts exactly as long as the marker would still be
+        // accepted. Timestamping by `now` could expire the entry while the marker is
+        // still valid (e.g. a marker first seen near mint time, retained only until
+        // `now+window`, but acceptable until `marker.ts+window+skew`), reopening a
+        // brief replay gap in the validity tail. The cache window is sized `>=` the
+        // marker freshness window so `is_fresh` keeps the entry for the marker's whole
+        // life (its future/past skew bounds mirror the marker's own).
         let entry = ReplayEntry {
-            timestamp: now_unix,
+            timestamp: m.timestamp,
             nonce,
             transcript_fingerprint,
         };
@@ -77,7 +83,10 @@ impl MarkerReplayGuard {
 mod tests {
     use super::*;
 
-    const MARKER_WINDOW_SECS: u64 = 604_800;
+    // Mirror the production retention window (`MARKER_REPLAY_WINDOW_SECS` ==
+    // `crate::tls::quic::server::MARKER_WINDOW_SECS`), so the tests exercise the real
+    // marker validity envelope rather than an arbitrarily long one.
+    const MARKER_WINDOW_SECS: u64 = 3600;
 
     fn marker(nonce_byte: u8, timestamp: u64) -> Marker {
         Marker {
@@ -104,8 +113,27 @@ mod tests {
             "replayed marker is spliced, not terminated"
         );
         assert!(
-            !g.first_sighting(&m, now + 600_000),
-            "replay within the freshness window still rejected"
+            !g.first_sighting(&m, now + MARKER_WINDOW_SECS - 1),
+            "replay anywhere within the marker's validity window is still rejected"
+        );
+    }
+
+    #[test]
+    fn replay_in_the_validity_tail_is_rejected() {
+        // Regression (cubic P1): a marker first seen at its mint time must stay
+        // replay-protected for its WHOLE validity window — the entry is retained by
+        // the marker's own timestamp, not the observation time, so a replay at the
+        // very end of the window (where `open()` would still accept a fresh marker)
+        // is still caught.
+        let g = guard();
+        let mint = 1_900_000_000;
+        let m = marker(0x77, mint);
+        // First seen right at mint.
+        assert!(g.first_sighting(&m, mint), "first sighting accepted");
+        // Replayed at the last second the marker is still valid.
+        assert!(
+            !g.first_sighting(&m, mint + MARKER_WINDOW_SECS),
+            "a replay at the end of the validity window is rejected (no tail gap)"
         );
     }
 

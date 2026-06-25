@@ -92,6 +92,8 @@ pub enum ConfigError {
     UdpBrutalMissingBandwidth,
     #[error("udp.max_udp_payload_bytes must be at least {MIN_UDP_PAYLOAD_BYTES} (the RFC 9000 §14.1 Initial minimum)")]
     UdpMaxPayloadTooSmall,
+    #[error("udp.max_udp_payload_bytes must be at most {MAX_UDP_PAYLOAD_BYTES} (the maximum UDP datagram payload)")]
+    UdpMaxPayloadTooLarge,
     #[error(
         "client.listen must bind to a loopback address because SOCKS5 has no authentication: {0}"
     )]
@@ -682,6 +684,12 @@ pub const DEFAULT_MAX_UDP_PAYLOAD_BYTES: u32 = 2048;
 /// datagram size. A cap below this could not receive a legal client Initial.
 pub const MIN_UDP_PAYLOAD_BYTES: u32 = 1200;
 
+/// Upper bound for `udp.max_udp_payload_bytes`: the largest a single UDP datagram
+/// payload can be (65535 - 8-byte UDP header). The recv buffer is sized from this
+/// value, so a ceiling bounds the per-endpoint allocation — an operator typo cannot
+/// request a multi-GB buffer.
+pub const MAX_UDP_PAYLOAD_BYTES: u32 = 65_527;
+
 impl UdpConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         // RESERVED/LIVE knobs only take effect when the plane is on; with
@@ -698,6 +706,9 @@ impl UdpConfig {
         if let Some(cap) = self.max_udp_payload_bytes {
             if cap < MIN_UDP_PAYLOAD_BYTES {
                 return Err(ConfigError::UdpMaxPayloadTooSmall);
+            }
+            if cap > MAX_UDP_PAYLOAD_BYTES {
+                return Err(ConfigError::UdpMaxPayloadTooLarge);
             }
         }
         if self.cc == UdpCongestionControl::Brutal
@@ -1604,6 +1615,24 @@ ech = true
         assert!(matches!(
             too_small.validate().unwrap_err(),
             ConfigError::UdpMaxPayloadTooSmall
+        ));
+
+        // At the ceiling is accepted; above it (an operator typo that would size a
+        // multi-GB recv buffer) is rejected.
+        let at_max = UdpConfig {
+            enabled: true,
+            max_udp_payload_bytes: Some(MAX_UDP_PAYLOAD_BYTES),
+            ..UdpConfig::default()
+        };
+        at_max.validate().unwrap();
+        let too_large = UdpConfig {
+            enabled: true,
+            max_udp_payload_bytes: Some(MAX_UDP_PAYLOAD_BYTES + 1),
+            ..UdpConfig::default()
+        };
+        assert!(matches!(
+            too_large.validate().unwrap_err(),
+            ConfigError::UdpMaxPayloadTooLarge
         ));
     }
 

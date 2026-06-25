@@ -8,7 +8,10 @@
 //! lives in the async `endpoint` driver), so this harness drives two `Connection`s
 //! directly over a virtual link — no sockets, no tokio, no `Instant::now()` inside
 //! the pump — and scripts packet loss, reordering, duplication, and delay against a
-//! seeded RNG. Failures are reproducible from `(seed, policy)`.
+//! seeded RNG. The network model (which datagrams drop/reorder/duplicate and when)
+//! is fully determined by `(seed, policy)`, so a failure reproduces from those alone.
+//! (The cover-certificate signing key is the one fresh-per-process input; it is
+//! behaviourally inert — see `server_key` — so it never affects a reproduction.)
 //!
 //! ## Oracle (internal, by design)
 //!
@@ -283,13 +286,27 @@ fn cover_cert() -> Vec<Vec<u8>> {
     vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]
 }
 
+/// The cover-certificate signing key, generated ONCE per process and shared by
+/// every `Link`. The key only signs the server's CertificateVerify, which the
+/// client accepts unconditionally (`AcceptAnyServerCert`); no assertion in this
+/// module inspects the certificate or signature bytes, so the key is behaviourally
+/// inert. Caching it (rather than minting one per `Link`) keeps a run's handshake
+/// path identical across seeds, so the only varying input is the seeded
+/// loss/reorder/dup/delay policy — which is what reproducibility from `(seed,
+/// policy)` actually depends on. (aws-lc-rs `SecureRandom` is a sealed trait, so a
+/// seeded key source is not available; this cache is the deterministic substitute.)
 fn server_key() -> Vec<u8> {
-    use aws_lc_rs::rand::SystemRandom;
-    use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
-    EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
-        .unwrap()
-        .as_ref()
-        .to_vec()
+    use std::sync::OnceLock;
+    static KEY: OnceLock<Vec<u8>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    })
+    .clone()
 }
 
 fn server_tp() -> Vec<u8> {
