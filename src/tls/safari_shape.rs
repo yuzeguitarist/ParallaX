@@ -66,7 +66,7 @@ pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
 /// a per-ClientHello seed-derived (non-constant) stride rather than a fixed
 /// transform.
 ///
-/// The collision stride is derived from its OWN dedicated seed byte (`seed[5]`),
+/// The collision stride is derived from DEDICATED seed bytes (`seed[4]`/`seed[5]`),
 /// NOT from a byte that already determines another on-wire GREASE value. An
 /// earlier version reused `seed[0]` (which also picks the cipher GREASE) for the
 /// stride, which made the resolved first->last delta a deterministic function of
@@ -74,7 +74,9 @@ pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
 /// per-connection correlation that real Safari (independent draws) does not have.
 /// The stride spans the full `1..=len-1` range (any non-zero stride is < len so it
 /// always lands on a different index; no `| 1` odd-only forcing, which would skew
-/// the delta distribution toward odd values).
+/// the delta distribution toward odd values). See [`GreaseSet::from_seed`] for why
+/// the stride reduces a 16-bit value rather than a single byte (modulo-skew
+/// headroom).
 #[derive(Clone, Copy)]
 pub(crate) struct GreaseSet {
     pub(crate) cipher: u16,
@@ -91,13 +93,24 @@ impl GreaseSet {
         let mut final_extension_index = seed[4] as usize % len;
         if final_extension_index == extension_index {
             // Independent re-draw, not a fixed first->last transform: advance by a
-            // stride derived from a DEDICATED seed byte (`seed[5]`) that drives no
-            // other on-wire value, so the resolved last GREASE stays uncorrelated
-            // with the cipher / first-extension GREASE. The stride is in `1..=len-1`
-            // (non-zero and < len), so `(idx + stride) % len` always lands on a
-            // different index — keeping the first/last pair indistinguishable from
-            // two independent draws, as observed on the wire.
-            let stride = (seed[5] as usize % (len - 1)) + 1;
+            // stride derived from DEDICATED seed bytes (`seed[4]`/`seed[5]`) that
+            // drive no other on-wire value, so the resolved last GREASE stays
+            // uncorrelated with the cipher / first-extension GREASE. The stride is
+            // in `1..=len-1` (non-zero and < len), so `(idx + stride) % len` always
+            // lands on a different index — keeping the first/last pair
+            // indistinguishable from two independent draws, as observed on the wire.
+            //
+            // The stride is reduced from a 16-bit value (`seed[4] << 8 | seed[5]`)
+            // rather than a single byte: a single `u8 % 15` has a 1-in-256 modulo
+            // skew (256 = 15·17 + 1, so stride 1 is over-represented 18/256 vs
+            // 17/256). Folding in `seed[4]` — already consumed as the (colliding)
+            // last-extension index here, so it carries no other meaning on this
+            // branch — drops that skew to 1-in-65536 (65536 = 15·4369 + 1), i.e. a
+            // marginal on-wire P(delta) deviation < 1e-6, far below any RNG/capture
+            // noise floor. Fully removing it would need rejection sampling (no 2^n
+            // is divisible by 15), which would force an RNG redraw and break this
+            // function's pure-from-fixed-seed property; not worth it at this scale.
+            let stride = (((seed[4] as usize) << 8 | seed[5] as usize) % (len - 1)) + 1;
             final_extension_index = (final_extension_index + stride) % len;
         }
         Self {
