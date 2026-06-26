@@ -297,6 +297,55 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_rekey_ikm_fixed_len_matches_written_prefix() {
+        // HYBRID_REKEY_IKM_FIXED_LEN is the byte length the IKM writer emits BEFORE
+        // the variable-length symmetric secret: it must equal the sum of the fixed
+        // framing the writer actually produces ("x25519:" + 32 + "|mlkem1024:" + 32
+        // + "|psk:" + 4-byte length prefix). It drives the stack-vs-heap branch in
+        // hybrid_sandwich_rekey, so if the constant under-counts, a symmetric secret
+        // sized to the boundary is mis-routed to the fixed stack buffer and the
+        // writer overruns it (panic). Pin the constant directly against the writer.
+        let mut ikm = [0_u8; HYBRID_REKEY_IKM_STACK_LEN];
+        let written = write_hybrid_rekey_ikm(&mut ikm, &[1; 32], &[2; 32], b"");
+        assert_eq!(
+            written, HYBRID_REKEY_IKM_FIXED_LEN,
+            "fixed-len constant must equal the writer's fixed prefix length"
+        );
+        // Independent recomputation of the framing so a wrong constant is caught
+        // even if the writer itself were changed in lockstep.
+        let expected = b"x25519:".len() + 32 + b"|mlkem1024:".len() + 32 + b"|psk:".len() + 4;
+        assert_eq!(HYBRID_REKEY_IKM_FIXED_LEN, expected);
+    }
+
+    #[test]
+    fn hybrid_sandwich_rekey_is_correct_across_the_stack_heap_boundary() {
+        // The stack path uses a fixed [u8; HYBRID_REKEY_IKM_STACK_LEN] buffer and is
+        // taken when HYBRID_REKEY_IKM_FIXED_LEN + symmetric.len() <= STACK_LEN. Sweep
+        // symmetric-secret lengths straddling that exact boundary: every length must
+        // round-trip to the SAME value an independent heap computation produces, and
+        // must not panic. If the fixed-len constant is under-counted (e.g. a `+`
+        // turned into `-`), a boundary length is wrongly routed to the stack buffer
+        // and write_hybrid_rekey_ikm overruns it -> panic -> this test fails.
+        let boundary = HYBRID_REKEY_IKM_STACK_LEN - HYBRID_REKEY_IKM_FIXED_LEN; // first heap len
+        for sym_len in (boundary.saturating_sub(3))..=(boundary + 3) {
+            let sym = vec![0x5A_u8; sym_len];
+            let got = hybrid_sandwich_rekey(&[7; 32], &[8; 32], &[9; 32], &sym).unwrap();
+
+            // Independent reference via the explicit heap writer + HKDF-Extract.
+            let mut ikm = Vec::new();
+            write_hybrid_rekey_ikm_vec(&mut ikm, &[8; 32], &[9; 32], &sym);
+            let (prk, _) = Hkdf::<Sha256>::extract(Some(&[7_u8; 32]), &ikm);
+            let mut want = [0_u8; 32];
+            want.copy_from_slice(&prk);
+
+            assert_eq!(
+                got, want,
+                "rekey output must match the reference at symmetric len {sym_len}"
+            );
+        }
+    }
+
+    #[test]
     fn encapsulate_rejects_malformed_public_key() {
         let err = encapsulate(&[0_u8; 4]).unwrap_err();
         assert!(matches!(err, PqError::InvalidPublicKey));

@@ -336,6 +336,83 @@ mod tests {
     }
 
     #[test]
+    fn width_reports_the_configured_worker_count() {
+        // The public accessor must report the actual worker count, not a constant:
+        // callers size their fan-out batch to it. A pool of N (>=1) reports N.
+        assert_eq!(CryptoPool::new(4).width(), 4);
+        assert_eq!(CryptoPool::new(1).width(), 1);
+        // new() floors at 1, so a 0 request still yields a usable single worker.
+        assert_eq!(CryptoPool::new(0).width(), 1);
+    }
+
+    #[test]
+    fn default_width_is_at_least_one() {
+        // The global pool seeds CryptoPool::new with this; it must be >= 1 so the
+        // floor in new() never has to rescue a zero-width pool (and so a process
+        // with an unknowable parallelism still gets a working pool).
+        assert!(default_width() >= 1);
+    }
+
+    #[test]
+    fn inline_path_runs_jobs_on_the_caller_thread() {
+        // The documented contract: when width <= 1 OR n == 1, run_ordered takes the
+        // INLINE path and executes every job on the caller's own thread (no fan-out
+        // to workers). This pins the path-selection predicate `self.width <= 1 ||
+        // n == 1`: a mutation that flips it (e.g. <= -> >, || -> &&, == -> !=) would
+        // route these cases to the worker threads, so the captured job thread id
+        // would differ from the caller's. Results alone cannot catch that (both
+        // paths return the same ordered output), so we assert the EXECUTING THREAD.
+        let caller = thread::current().id();
+
+        // width == 1 with several jobs -> inline (covers the `self.width <= 1` term
+        // and the `||`). Each job reports the thread it ran on.
+        let pool1 = CryptoPool::new(1);
+        let jobs: Vec<_> = (0..4usize)
+            .map(|_| move || thread::current().id())
+            .collect();
+        let where_ran = pool1.run_ordered(jobs);
+        assert_eq!(where_ran.len(), 4);
+        for tid in where_ran {
+            assert_eq!(
+                tid, caller,
+                "a width-1 pool must run jobs inline on the caller thread"
+            );
+        }
+
+        // width >= 2 with a SINGLE job -> inline via the `n == 1` term. A wider pool
+        // ensures the `self.width <= 1` term is false, so only `n == 1` can select
+        // the inline path here -- pinning the `==` operator specifically.
+        let pool2 = CryptoPool::new(2);
+        let single = pool2.run_ordered(vec![move || thread::current().id()]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            single[0], caller,
+            "a single job must run inline on the caller thread regardless of width"
+        );
+    }
+
+    #[test]
+    fn multi_job_wide_pool_uses_worker_threads() {
+        // Complement to the inline test: with width >= 2 AND n >= 2 the parallel
+        // path must engage, so at least one job runs OFF the caller thread. This
+        // pins the other direction of the same predicate -- a mutation forcing the
+        // inline path (e.g. `||` -> always-true, or widening the n check) would run
+        // everything on the caller and fail this. The first job still runs inline on
+        // the caller by design, so we only require that SOME job left the caller.
+        let caller = thread::current().id();
+        let pool = CryptoPool::new(4);
+        let jobs: Vec<_> = (0..32usize)
+            .map(|_| move || thread::current().id())
+            .collect();
+        let where_ran = pool.run_ordered(jobs);
+        assert_eq!(where_ran.len(), 32);
+        assert!(
+            where_ran.iter().any(|&tid| tid != caller),
+            "a wide pool with many jobs must fan out to worker threads"
+        );
+    }
+
+    #[test]
     fn run_ordered_is_correct_under_concurrent_submitters() {
         // Hammer the shared pool from many threads at once: this is the real
         // cross-tunnel contract the A3 batched submit must satisfy. Each call's
