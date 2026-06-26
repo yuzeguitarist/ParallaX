@@ -1059,7 +1059,11 @@ fn random_cid() -> ConnectionId {
     ConnectionId::new(&bytes)
 }
 
-/// An established connection handle.
+/// An established connection handle. A cheap `Arc` wrapper: cloning yields another
+/// handle to the SAME connection (close is explicit via [`Connection::close`], not
+/// on drop), so the mux-over-QUIC path can share one connection across many
+/// concurrent substream tasks that each `open_bi`.
+#[derive(Clone)]
 pub struct Connection {
     shared: Arc<ConnShared>,
 }
@@ -1179,6 +1183,20 @@ impl Connection {
     /// Whether the connection has closed.
     pub fn is_closed(&self) -> bool {
         self.shared.core.lock().unwrap().is_closed()
+    }
+
+    /// Abruptly reset a stream's send half by id (RFC 9000 §19.4), without needing
+    /// the owning [`SendStream`] handle. The mux-over-QUIC substream relay uses this
+    /// to RESET_STREAM on an error/idle teardown after the send half was moved into
+    /// the relay writer, so the peer sees a prompt reset rather than waiting on the
+    /// connection idle-timeout. A no-op if the stream is already closed/finished.
+    pub fn reset_stream(&self, id: u64, error_code: VarInt) {
+        self.shared
+            .core
+            .lock()
+            .unwrap()
+            .reset_stream(id, error_code.into_inner());
+        self.shared.nudge();
     }
 
     /// Open an outgoing bidirectional stream (RFC 9000 §2.1).

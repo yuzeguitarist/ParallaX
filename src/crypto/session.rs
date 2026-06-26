@@ -240,6 +240,85 @@ pub fn expand_epoch_keys(
     Ok(out)
 }
 
+/// Derives an INDEPENDENT `(key, nonce_base)` pair per direction for one mux
+/// substream carried on its own QUIC stream, from the live session's
+/// `chain_secret`/`epoch`/`transcript_hash`. Each concurrent QUIC bidi has its
+/// own ordered record stream, so it CANNOT share a `DataRecordCodec` with another
+/// substream (the per-record nonce is `nonce_base XOR sequence` with a per-codec
+/// monotonic `sequence` bound to one ordered stream — two streams sharing one base
+/// would reuse nonces). This derives a fresh base per `stream_id` so each
+/// substream is its own nonce epoch.
+///
+/// Domain separation (why this never collides with the session/epoch keys nor
+/// across substreams):
+/// - The HKDF labels here (`b"... mux substream ..."`) are DISTINCT from the
+///   epoch labels (`b"client appdata key"` etc.) used by [`expand_epoch_keys`], so
+///   a substream base can never equal an epoch base.
+/// - `stream_id` is folded into the info, so two distinct `stream_id`s under the
+///   same `(chain_secret, epoch)` expand under distinct info and yield distinct
+///   bases. (Proven over the nonce-base derivation by the Kani harness below.)
+///
+/// The result reuses the [`SessionKeys`] shape so the existing codec construction
+/// (`data_codecs` / the server's inline `AeadCodec::new`) builds the per-substream
+/// pair unchanged; only `client_key/server_key/client_nonce/server_nonce` are
+/// substream-specific (the carried `chain_secret`/`x25519_shared_secret` mirror
+/// the parent so the returned struct stays self-consistent and zeroizes the same).
+pub fn expand_substream_keys(
+    session_keys: &SessionKeys,
+    stream_id: u64,
+) -> Result<SessionKeys, SessionError> {
+    let chain_secret = Zeroizing::new(session_keys.chain_secret);
+    let hk = Hkdf::<Sha256>::from_prk(chain_secret.as_slice()).map_err(|_| SessionError::Hkdf)?;
+
+    let mut out = SessionKeys {
+        client_key: [0; KEY_LEN],
+        server_key: [0; KEY_LEN],
+        client_nonce: [0; NONCE_LEN],
+        server_nonce: [0; NONCE_LEN],
+        chain_secret: *chain_secret,
+        epoch: session_keys.epoch,
+        transcript_hash: session_keys.transcript_hash,
+        x25519_shared_secret: session_keys.x25519_shared_secret,
+    };
+
+    let epoch = session_keys.epoch;
+    let transcript_hash = session_keys.transcript_hash;
+    expand_substream(
+        &hk,
+        b"ParallaX v1 mux substream client key",
+        epoch,
+        stream_id,
+        &transcript_hash,
+        &mut out.client_key,
+    )?;
+    expand_substream(
+        &hk,
+        b"ParallaX v1 mux substream server key",
+        epoch,
+        stream_id,
+        &transcript_hash,
+        &mut out.server_key,
+    )?;
+    expand_substream(
+        &hk,
+        b"ParallaX v1 mux substream client nonce",
+        epoch,
+        stream_id,
+        &transcript_hash,
+        &mut out.client_nonce,
+    )?;
+    expand_substream(
+        &hk,
+        b"ParallaX v1 mux substream server nonce",
+        epoch,
+        stream_id,
+        &transcript_hash,
+        &mut out.server_nonce,
+    )?;
+
+    Ok(out)
+}
+
 fn initial_chain_secret(
     psk: &[u8],
     x25519_shared_secret: &[u8; KEY_LEN],
@@ -307,6 +386,55 @@ fn write_epoch_hkdf_info(
     write_bytes(out, &mut offset, &(label.len() as u16).to_be_bytes());
     write_bytes(out, &mut offset, label);
     write_bytes(out, &mut offset, &epoch.to_be_bytes());
+    write_bytes(
+        out,
+        &mut offset,
+        &(transcript_hash.len() as u16).to_be_bytes(),
+    );
+    write_bytes(out, &mut offset, transcript_hash);
+    offset
+}
+
+/// HKDF-Expand for a per-substream key/nonce. Identical to [`expand`] but folds
+/// the `stream_id` into the info between `epoch` and the transcript hash, so the
+/// derivation is unique per `(epoch, stream_id)`. The substream labels are
+/// distinct from the epoch labels, so this never aliases an epoch key. The info
+/// layout (substream labels are short; `2 + label + 8 + 8 + 2 + 32`) always fits
+/// `HKDF_INFO_STACK_LEN`, so no heap fallback is needed.
+fn expand_substream(
+    hk: &Hkdf<Sha256>,
+    label: &[u8],
+    epoch: u64,
+    stream_id: u64,
+    transcript_hash: &[u8; KEY_LEN],
+    out: &mut [u8],
+) -> Result<(), SessionError> {
+    let mut info = [0_u8; HKDF_INFO_STACK_LEN];
+    let used = write_substream_hkdf_info(&mut info, label, epoch, stream_id, transcript_hash);
+    hk.expand(&info[..used], out)
+        .map_err(|_| SessionError::Hkdf)
+}
+
+/// Builds the substream HKDF info into `out`, returning the byte length written.
+/// Length-prefixing the variable-length `label` and `transcript_hash` (and fixing
+/// the widths of `epoch`/`stream_id`) makes the encoding injective in
+/// `(label, epoch, stream_id, transcript_hash)`: no two distinct tuples produce
+/// the same info string. The Kani proof below pins the property HKDF relies on —
+/// distinct `stream_id` ⇒ distinct info ⇒ (under HKDF collision resistance)
+/// distinct substream keys ⇒ distinct nonce bases ⇒ no cross-substream nonce
+/// reuse.
+fn write_substream_hkdf_info(
+    out: &mut [u8; HKDF_INFO_STACK_LEN],
+    label: &[u8],
+    epoch: u64,
+    stream_id: u64,
+    transcript_hash: &[u8; KEY_LEN],
+) -> usize {
+    let mut offset = 0;
+    write_bytes(out, &mut offset, &(label.len() as u16).to_be_bytes());
+    write_bytes(out, &mut offset, label);
+    write_bytes(out, &mut offset, &epoch.to_be_bytes());
+    write_bytes(out, &mut offset, &stream_id.to_be_bytes());
     write_bytes(
         out,
         &mut offset,
@@ -408,7 +536,9 @@ pub(crate) fn record_nonce_from(nonce_base: &[u8; NONCE_LEN], sequence: u64) -> 
 /// `cargo kani` (which sets `cfg(kani)`); absent from a normal build/test.
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{record_nonce_from, NONCE_LEN};
+    use super::{
+        record_nonce_from, write_substream_hkdf_info, HKDF_INFO_STACK_LEN, KEY_LEN, NONCE_LEN,
+    };
 
     /// The catastrophic-failure guard: within one epoch (a fixed `nonce_base`)
     /// the per-record nonce MUST be unique per sequence number, or AEAD security
@@ -423,6 +553,38 @@ mod kani_proofs {
         let s2: u64 = kani::any();
         if record_nonce_from(&base, s1) == record_nonce_from(&base, s2) {
             assert_eq!(s1, s2, "equal nonces must imply equal sequences (no reuse)");
+        }
+    }
+
+    /// Cross-substream guard: two mux substreams on one session each derive their
+    /// own `(key, nonce_base)` via `expand_substream`, whose only varying input is
+    /// `stream_id` (the label/epoch/transcript are fixed within one direction of
+    /// one session). HKDF gives distinct outputs for distinct info under collision
+    /// resistance, so the safety property reduces to: the info encoding is
+    /// INJECTIVE in `stream_id`. Proven here over all `stream_id` pairs and all
+    /// transcript hashes for a fixed substream label — equal info ⇒ equal
+    /// `stream_id`, so two distinct substreams never share a derived base (hence
+    /// never reuse a nonce across streams).
+    #[kani::proof]
+    fn substream_info_is_injective_in_stream_id() {
+        // A fixed direction's label + epoch (the inputs that are constant across
+        // substreams of one session); the transcript hash is left unconstrained.
+        const LABEL: &[u8] = b"ParallaX v1 mux substream client nonce";
+        let epoch: u64 = kani::any();
+        let transcript_hash: [u8; KEY_LEN] = kani::any();
+        let id1: u64 = kani::any();
+        let id2: u64 = kani::any();
+
+        let mut info1 = [0_u8; HKDF_INFO_STACK_LEN];
+        let mut info2 = [0_u8; HKDF_INFO_STACK_LEN];
+        let len1 = write_substream_hkdf_info(&mut info1, LABEL, epoch, id1, &transcript_hash);
+        let len2 = write_substream_hkdf_info(&mut info2, LABEL, epoch, id2, &transcript_hash);
+
+        if len1 == len2 && info1[..len1] == info2[..len2] {
+            assert_eq!(
+                id1, id2,
+                "equal substream HKDF info must imply equal stream_id (no shared base)"
+            );
         }
     }
 }
@@ -997,5 +1159,83 @@ mod tests {
             derive_client_keys_from_shared(TEST_PSK, &shared, &transcript_hash),
             Err(SessionError::DegenerateSharedSecret)
         ));
+    }
+
+    fn session_keys_fixture() -> SessionKeys {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        derive_client_keys(TEST_PSK, &client.private, &server.public, &[7_u8; 32]).unwrap()
+    }
+
+    #[test]
+    fn substream_keys_are_deterministic_and_match_across_ends() {
+        // Both ends derive from the SAME `SessionKeys` (they agree on it after the
+        // handshake), so a given stream_id must yield identical substream keys on
+        // each end — otherwise the substream codecs could never interoperate.
+        let keys = session_keys_fixture();
+        let a = expand_substream_keys(&keys, 1).unwrap();
+        let b = expand_substream_keys(&keys, 1).unwrap();
+        assert_eq!(a, b, "same session + same stream_id must be deterministic");
+    }
+
+    #[test]
+    fn substream_keys_differ_per_stream_id() {
+        // Distinct substreams must get independent (key, nonce_base) pairs in BOTH
+        // directions, or two concurrent QUIC streams would reuse nonces.
+        let keys = session_keys_fixture();
+        let s1 = expand_substream_keys(&keys, 1).unwrap();
+        let s3 = expand_substream_keys(&keys, 3).unwrap();
+        assert_ne!(s1.client_key, s3.client_key);
+        assert_ne!(s1.server_key, s3.server_key);
+        assert_ne!(s1.client_nonce, s3.client_nonce);
+        assert_ne!(s1.server_nonce, s3.server_nonce);
+    }
+
+    #[test]
+    fn substream_keys_differ_from_session_epoch_keys() {
+        // Label domain separation: a substream base must never alias the session's
+        // own epoch base (which carries the single-connect relay's records).
+        let keys = session_keys_fixture();
+        let sub = expand_substream_keys(&keys, 1).unwrap();
+        assert_ne!(sub.client_key, keys.client_key);
+        assert_ne!(sub.server_key, keys.server_key);
+        assert_ne!(sub.client_nonce, keys.client_nonce);
+        assert_ne!(sub.server_nonce, keys.server_nonce);
+    }
+
+    #[test]
+    fn substream_carries_parent_derivation_material_unchanged() {
+        // The returned struct mirrors the parent's chain_secret/epoch/transcript so
+        // it stays self-consistent (and zeroizes the same); only the four AEAD
+        // key/nonce fields are substream-specific.
+        let keys = session_keys_fixture();
+        let sub = expand_substream_keys(&keys, 42).unwrap();
+        assert_eq!(sub.chain_secret, keys.chain_secret);
+        assert_eq!(sub.epoch, keys.epoch);
+        assert_eq!(sub.transcript_hash, keys.transcript_hash);
+        assert_eq!(sub.x25519_shared_secret, keys.x25519_shared_secret);
+    }
+
+    #[test]
+    fn cross_substream_codecs_cannot_open_each_others_records() {
+        // The end-to-end safety property at the AEAD layer: a record sealed under
+        // substream 1's client key must NOT open under substream 2's client key.
+        let keys = session_keys_fixture();
+        let s1 = expand_substream_keys(&keys, 1).unwrap();
+        let s2 = expand_substream_keys(&keys, 2).unwrap();
+        const AAD: &[u8] = b"ParallaX v1 client appdata";
+
+        let mut seal1 = AeadCodec::new(s1.client_key, s1.client_nonce);
+        let mut open1 = AeadCodec::new(s1.client_key, s1.client_nonce);
+        let mut open2 = AeadCodec::new(s2.client_key, s2.client_nonce);
+
+        let record = seal1.seal(b"substream-isolation-probe", AAD).unwrap();
+
+        // The matching substream key opens it; a sibling substream's key rejects it.
+        assert_eq!(
+            open1.open(&record, AAD).unwrap(),
+            b"substream-isolation-probe"
+        );
+        assert!(open2.open(&record, AAD).is_err());
     }
 }

@@ -86,11 +86,18 @@ const WINDOW: usize = 6;
 /// Reflects (top to bottom): the userspace fallback relay's two `select!` reads
 /// (bounded by an `idle_sleep` branch, not `timeout(`); the pre-PQ data loop's
 /// client- and fallback-reader `select!` arms (bounded by a `sleep_until`
-/// deadline branch); and the three relay-loop reads — `server_upload_loop`'s
+/// deadline branch); the three relay-loop reads — `server_upload_loop`'s
 /// client read, plus `server_download_loop`'s target reads in both its
 /// no-cover and cover-traffic branches — each bounded only by the external
-/// `relay_idle_watchdog` future raced in a sibling `select!` arm.
-const EXPECTED_UNTIMED_SERVER: usize = 7;
+/// `relay_idle_watchdog` future raced in a sibling `select!` arm; and the
+/// mux-over-QUIC session-end watcher's one-shot TCP read
+/// (`run_authenticated_mux_quic_data_mode`): not a relay loop and holds no
+/// per-substream resources (each substream has its own `relay_idle_watchdog`),
+/// so an unbounded wait here only delays the whole-session end until the QUIC
+/// connection's own idle-timeout closes it — no per-read DoS to bound. The
+/// substream's ConnectRequest read IS bounded (`PX1_CONTROL_READ_TIMEOUT`) and
+/// classifies as TIMED, so it does not appear here.
+const EXPECTED_UNTIMED_SERVER: usize = 8;
 
 /// Untimed inbound-read sites in `src/client/runtime.rs` production code.
 ///
@@ -281,12 +288,15 @@ fn combined_inbound_read_census_is_pinned() {
         server.iter().filter(|s| s.timed).count() + runtime.iter().filter(|s| s.timed).count();
     let untimed = total - timed;
 
-    // Total inbound-read call sites across both production files today: 16
-    // (server) + 10 (runtime) = 26. This catches a *removed* read site too,
+    // Total inbound-read call sites across both production files today: 18
+    // (server) + 10 (runtime) = 28. This catches a *removed* read site too,
     // which would otherwise slip past the per-file untimed-only assertions.
-    const EXPECTED_TOTAL_SITES: usize = 26;
-    // Timed sites: 9 (server) + 3 (runtime) = 12.
-    const EXPECTED_TIMED_SITES: usize = 12;
+    // (+2 server vs the pre-mux-over-QUIC baseline of 26: the substream
+    // ConnectRequest read (TIMED) and the session-end watcher read (UNTIMED).)
+    const EXPECTED_TOTAL_SITES: usize = 28;
+    // Timed sites: 10 (server) + 3 (runtime) = 13. (+1 server: the mux-over-QUIC
+    // substream ConnectRequest read, bounded by `PX1_CONTROL_READ_TIMEOUT`.)
+    const EXPECTED_TIMED_SITES: usize = 13;
 
     assert_eq!(
         total, EXPECTED_TOTAL_SITES,
