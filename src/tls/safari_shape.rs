@@ -55,11 +55,16 @@ pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
 
 /// GREASE codepoints chosen for one ClientHello: independent values for the
 /// cipher, the first (len-0) extension, the supported_groups/key_share/
-/// supported_versions lead, and the last (len-1) extension. Only the first and
-/// last extension GREASE are forced to differ, and on collision the last is
-/// derived by `value ^ 0x1010` — exactly BoringSSL's `ssl_get_grease_value`
-/// rule, the engine real Safari runs. Every other surface is drawn freely,
-/// matching the value space real Safari occupies.
+/// supported_versions lead, and the last (len-1) extension. The first and last
+/// extension GREASE are drawn INDEPENDENTLY at random and only forced to differ
+/// — matching real Safari 26 wire behavior. Measured first/last index deltas
+/// across confirmed Safari ClientHellos span {1, 4, 6, 15} (captures
+/// `~/Desktop/safari-tcp`), so the last is NOT a fixed derivation of the first:
+/// neither a `value ^ 0x1010` (current BoringSSL master) nor a `(idx+1) % 16`
+/// relationship holds. Any fixed first->last relationship would itself be a
+/// distinguishable tell, so on the rare collision we reshuffle the last index by
+/// a per-ClientHello seed-derived (non-constant) stride rather than a fixed
+/// transform.
 #[derive(Clone, Copy)]
 pub(crate) struct GreaseSet {
     pub(crate) cipher: u16,
@@ -71,23 +76,24 @@ pub(crate) struct GreaseSet {
 
 impl GreaseSet {
     pub(crate) fn from_seed(seed: [u8; 5]) -> Self {
-        let extension = BROWSER_GREASE_VALUES[seed[1] as usize % BROWSER_GREASE_VALUES.len()];
-        let mut final_extension =
-            BROWSER_GREASE_VALUES[seed[4] as usize % BROWSER_GREASE_VALUES.len()];
-        // Byte-for-byte BoringSSL `ssl_get_grease_value`: the two fake extensions
-        // must not share a value, and on collision BoringSSL XORs the value (not
-        // the index) with 0x1010 — never a `(idx+1) % 16` increment. The XOR is a
-        // closed involution over the RFC 8701 0x?a?a set, so the result is always
-        // another valid GREASE value distinct from `extension`.
-        if final_extension == extension {
-            final_extension ^= 0x1010;
+        let len = BROWSER_GREASE_VALUES.len();
+        let extension_index = seed[1] as usize % len;
+        let mut final_extension_index = seed[4] as usize % len;
+        if final_extension_index == extension_index {
+            // Independent re-draw, not a fixed first->last transform: advance by a
+            // seed-derived odd stride so the resolved value varies per ClientHello
+            // (an odd stride is coprime to 16, so it always lands on a different
+            // index). This keeps the first/last pair indistinguishable from two
+            // independent draws, as observed on the wire.
+            let stride = (seed[0] as usize | 1) % len;
+            final_extension_index = (final_extension_index + stride) % len;
         }
         Self {
-            cipher: BROWSER_GREASE_VALUES[seed[0] as usize % BROWSER_GREASE_VALUES.len()],
-            extension,
-            group: BROWSER_GREASE_VALUES[seed[2] as usize % BROWSER_GREASE_VALUES.len()],
-            version: BROWSER_GREASE_VALUES[seed[3] as usize % BROWSER_GREASE_VALUES.len()],
-            final_extension,
+            cipher: BROWSER_GREASE_VALUES[seed[0] as usize % len],
+            extension: BROWSER_GREASE_VALUES[extension_index],
+            group: BROWSER_GREASE_VALUES[seed[2] as usize % len],
+            version: BROWSER_GREASE_VALUES[seed[3] as usize % len],
+            final_extension: BROWSER_GREASE_VALUES[final_extension_index],
         }
     }
 }
@@ -279,14 +285,48 @@ mod tests {
     }
 
     #[test]
-    fn grease_collision_resolves_with_boringssl_xor_0x1010() {
-        // BoringSSL `ssl_get_grease_value`: on a first/last extension collision the
-        // last value is `extension ^ 0x1010`, NOT a `(idx+1) % 16` index bump.
-        // Seed bytes 1 and 4 share index 0 here, forcing the collision branch.
-        let g = GreaseSet::from_seed([0, 0, 0, 0, 0]);
-        assert_eq!(g.extension, BROWSER_GREASE_VALUES[0]);
-        assert_eq!(g.final_extension, g.extension ^ 0x1010);
-        assert!(is_grease(g.final_extension));
+    fn grease_collision_resolves_without_fixed_first_to_last_relationship() {
+        // Real Safari draws the first/last extension GREASE independently and only
+        // forces them to differ; measured index deltas span {1,4,6,15}, so the
+        // last is NOT a fixed transform of the first. On the collision branch we
+        // must therefore avoid pinning a constant relationship: in particular the
+        // result must NOT always equal `extension ^ 0x1010` (current BoringSSL
+        // master) nor a constant `(idx+1) % 16` bump. Sweep every colliding seed
+        // and assert distinctness plus that no single fixed transform explains all
+        // resolutions.
+        let mut all_xor = true;
+        let mut all_inc = true;
+        for s0 in 0..=u8::MAX {
+            for idx in 0..u8::MAX {
+                // Force seed[1] == seed[4] (same index) to hit the collision branch.
+                let g = GreaseSet::from_seed([s0, idx, 0, 0, idx]);
+                assert_ne!(
+                    g.extension, g.final_extension,
+                    "collision not resolved for seed0={s0} idx={idx}"
+                );
+                assert!(is_grease(g.final_extension));
+                if g.final_extension != g.extension ^ 0x1010 {
+                    all_xor = false;
+                }
+                let fi = BROWSER_GREASE_VALUES
+                    .iter()
+                    .position(|&v| v == g.extension)
+                    .unwrap();
+                if g.final_extension
+                    != BROWSER_GREASE_VALUES[(fi + 1) % BROWSER_GREASE_VALUES.len()]
+                {
+                    all_inc = false;
+                }
+            }
+        }
+        assert!(
+            !all_xor,
+            "collision resolution must not be a constant ^0x1010"
+        );
+        assert!(
+            !all_inc,
+            "collision resolution must not be a constant (idx+1)"
+        );
     }
 
     #[test]
