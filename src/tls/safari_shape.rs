@@ -53,6 +53,21 @@ pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
     0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
 
+/// The collision-branch stride in [`GreaseSet::from_seed`] is load-bearing on this
+/// length being a power of two: it splits `seed[4]` into a low nibble (pinned to the
+/// first-extension index `k = seed[4] % len` by the branch predicate) and a free high
+/// nibble (`seed[4] >> 4`) used for the stride. That split equals `% len` vs the
+/// complementary free bits ONLY when `len` is a power of two. For a non-power-of-two
+/// `len`, `seed[4] % len` is not the low nibble, `seed[4] >> 4` would overlap the
+/// pinned bits, and the resolved first->last GREASE delta would re-couple to `k` (a
+/// censor-observable correlation, ~17x worse than the modulo skew the split removes).
+/// RFC 8701 fixes exactly 16 GREASE values, so this holds by spec — assert it so a
+/// future edit to the table cannot silently reintroduce the coupling.
+const _: () = assert!(
+    BROWSER_GREASE_VALUES.len().is_power_of_two(),
+    "GREASE collision-stride nibble split requires a power-of-two table length"
+);
+
 /// GREASE codepoints chosen for one ClientHello: independent values for the
 /// cipher, the first (len-0) extension, the supported_groups/key_share/
 /// supported_versions lead, and the last (len-1) extension. The first and last
@@ -111,11 +126,16 @@ impl GreaseSet {
             // folded with `seed[5]`. This widens the reduction input beyond a single
             // byte to shrink the `% (len-1)` modulo skew — a bare `seed[5] % 15` over-
             // represents stride 1 (18/256, since 256 = 15·17 + 1) — while keeping the
-            // delta exactly k-independent (verified exhaustively in
-            // `grease_collision_stride_is_independent_of_cipher_grease`). Folding the
-            // WHOLE `seed[4]` byte instead would leak `k` (its low nibble) into the
-            // delta; the high nibble alone does not. Residual skew is a benign per-k-
-            // identical frequency wobble (~2.4e-4), not a cross-value correlation.
+            // delta exactly k-independent (proven exhaustively in
+            // `grease_collision_delta_distribution_is_identical_across_first_ext_index`,
+            // which compares the full per-k delta HISTOGRAMS; the set-coverage test
+            // `grease_collision_stride_is_independent_of_cipher_grease` cannot detect
+            // this coupling, as the buggy whole-byte form also produced all 15 deltas
+            // for every k and only their frequencies differed). Folding the WHOLE
+            // `seed[4]` byte instead would leak `k` (its low nibble) into the delta;
+            // the high nibble alone does not (see the power-of-two assert by
+            // `BROWSER_GREASE_VALUES`). Residual skew is a benign per-k-identical
+            // frequency wobble (~2.4e-4), not a cross-value correlation.
             let stride = ((((seed[4] >> 4) as usize) << 8 | seed[5] as usize) % (len - 1)) + 1;
             final_extension_index = (final_extension_index + stride) % len;
         }
@@ -375,7 +395,7 @@ mod tests {
     /// caller passes the colliding `last_byte`). Returns `(final - first) mod 16`.
     fn collision_delta(cipher: u8, first_byte: u8, last_byte: u8, stride_byte: u8) -> usize {
         let len = BROWSER_GREASE_VALUES.len();
-        debug_assert_eq!(
+        assert_eq!(
             first_byte as usize % len,
             last_byte as usize % len,
             "caller must force the collision (seed[1] ≡ seed[4] mod 16)"
@@ -415,6 +435,13 @@ mod tests {
         }
     }
 
+    /// LOAD-BEARING — do NOT delete as redundant with the set-coverage test above.
+    /// This is the SOLE guard of the stride's k-independence: the set-coverage test
+    /// `grease_collision_stride_is_independent_of_cipher_grease` only checks that all
+    /// 15 deltas appear, which the buggy whole-`seed[4]` stride also satisfied (it
+    /// differed only in delta FREQUENCIES). Only this histogram comparison catches a
+    /// regression back to a k-coupled stride.
+    ///
     /// The strongest anti-tell invariant: on the collision branch the resolved
     /// first->last delta distribution must be IDENTICAL for every first-extension
     /// GREASE index `k` — otherwise a censor who reads the (observable) first-
