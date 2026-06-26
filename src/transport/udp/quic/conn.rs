@@ -2188,6 +2188,14 @@ impl Connection {
         // A packet is ack-eliciting (RFC 9002 §2) if it carries any frame other
         // than ACK / PADDING / CONNECTION_CLOSE — such a packet schedules an ACK.
         let mut ack_eliciting = false;
+        // SECURITY INVARIANT: reaching the frame parser means this packet belongs to
+        // a TERMINATED ParallaX<->ParallaX tunnel (we are a `Connection`), never a
+        // spliced real-origin flow (those are forwarded verbatim as a `SpliceFlow`
+        // and never decoded). This is what makes the parser's deliberate omissions
+        // sound — unknown/GREASE/DATAGRAM frames as a hard decode error and no 1-RTT
+        // key-update handling would be fingerprints/interop breaks against a real
+        // origin, but a ParallaX peer never sends them. See frame.rs's invariant note
+        // before pointing this path at any non-ParallaX peer.
         for frame in Iter::new(&payload) {
             let frame =
                 frame.map_err(|e| QuicTlsError::Crypto(format!("frame decode failed: {e:?}")))?;

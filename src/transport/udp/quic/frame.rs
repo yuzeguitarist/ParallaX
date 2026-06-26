@@ -9,6 +9,24 @@
 //! Out of scope (never on ParallaX's wire): DATAGRAM (0x30/0x31, datagrams are
 //! disabled), ACK_FREQUENCY / IMMEDIATE_ACK. An unknown frame type is a decode
 //! error rather than being skipped.
+//!
+//! SECURITY INVARIANT — this parser only ever sees frames from a TERMINATED
+//! ParallaX<->ParallaX tunnel (a [`super::conn::Connection`]), NEVER frames from a
+//! real camouflage origin. The endpoint splices every unauthenticated / origin
+//! flow verbatim as a [`super::splice::SpliceFlow`] and never constructs a
+//! `Connection` for it, so origin frames are forwarded byte-for-byte and are never
+//! decoded here. Several behaviors that would be RFC-noncompliant against a real
+//! peer are SOUND ONLY because of this invariant: unknown / GREASE / DATAGRAM frame
+//! types are a hard decode error rather than the RFC 9000 §19.1 "ignore" (a real H3
+//! origin would send these), and 1-RTT key update is not handled on receive (a real
+//! peer key-updates periodically; see `conn.rs`).
+//!
+//! If a future change ever points this parser at real-origin frames (e.g. lets a
+//! ParallaX QUIC client terminate a genuine H3 connection), these become hard
+//! fingerprints / interop breaks and MUST be addressed first. The invariant is
+//! enforced by construction (type separation: `SpliceFlow` carries origin bytes,
+//! `Connection` carries ParallaX frames), and re-stated at the sole receive-path
+//! call site in `Connection::process_packet`.
 
 use super::varint;
 
