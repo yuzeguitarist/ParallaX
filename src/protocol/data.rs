@@ -271,6 +271,71 @@ impl DataRecordCodec {
         Ok(record_start..out.len())
     }
 
+    /// Seal one record carrying `payload` with EXACTLY `total_pad` padding-suffix
+    /// bytes, ignoring this codec's [`PaddingProfile`] sampling entirely. Unlike
+    /// [`Self::seal_into_extra_padded`] (which adds the profile's sampled padding
+    /// ON TOP), this writes a deterministic, caller-controlled pad so the on-wire
+    /// record length is exactly `TLS_HEADER_LEN + payload.len() + total_pad +
+    /// PADDING_LEN_FIELD + AEAD_TAG_LEN`. Used by the CONNECT shaping (C3), which
+    /// must land the record on a precise size band regardless of any configured
+    /// `TrafficConfig` padding — letting the profile also sample here would push
+    /// the record off its band. The receiver strips the whole suffix via the same
+    /// self-describing 2-byte trailer, so no decode change is needed.
+    pub fn seal_into_exact_padded<R>(
+        &mut self,
+        payload: &[u8],
+        total_pad: usize,
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        out.reserve(
+            record::TLS_HEADER_LEN + payload.len() + total_pad + PADDING_LEN_FIELD + AEAD_TAG_LEN,
+        );
+        let record_start = out.len();
+        out.extend_from_slice(&[
+            TLS_CONTENT_APPLICATION_DATA,
+            TLS_LEGACY_VERSION[0],
+            TLS_LEGACY_VERSION[1],
+            0,
+            0,
+        ]);
+        out.extend_from_slice(payload);
+        let ciphertext_start = record_start + record::TLS_HEADER_LEN;
+        // Exactly `total_pad` random pad bytes + the 2-byte length trailer — no
+        // profile sampling, so the wire size is fully determined by the caller.
+        self.padding.write_exact_padding_suffix(total_pad, rng, out);
+        let padded_len = out.len() - ciphertext_start;
+        if padded_len + AEAD_TAG_LEN > OUTER_TLS_RECORD_LIMIT {
+            out[ciphertext_start..].zeroize();
+            out.truncate(record_start);
+            return Err(record::TlsRecordError::PayloadTooLarge(padded_len + AEAD_TAG_LEN).into());
+        }
+        crate::process_hardening::exclude_transient_from_core_dump(
+            "data_record.seal_plaintext",
+            &out[ciphertext_start..],
+        );
+        let tag = match self
+            .aead
+            .seal_in_place_detached(&mut out[ciphertext_start..], self.aad)
+        {
+            Ok(tag) => tag,
+            Err(err) => {
+                out[ciphertext_start..].zeroize();
+                out.truncate(record_start);
+                return Err(err.into());
+            }
+        };
+        out.extend_from_slice(&tag);
+        let tls_payload_len = out.len() - ciphertext_start;
+        let len = (tls_payload_len as u16).to_be_bytes();
+        out[record_start + 3] = len[0];
+        out[record_start + 4] = len[1];
+        Ok(record_start..out.len())
+    }
+
     /// Seal a browser-shaped PQ handshake flight (PAR-35): each `FramedChunk` record
     /// in `chunks` is sealed in order into `out`, and a single per-session aggregate
     /// decorrelation pad (`crate::protocol::command::FramedChunk::aggregate_pad_len`)

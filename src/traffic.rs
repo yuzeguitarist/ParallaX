@@ -107,6 +107,19 @@ impl PaddingProfile {
         self.write_padding_suffix(pad_len, rng, out);
     }
 
+    /// Append a padding suffix of EXACTLY `pad_len` random bytes plus the 2-byte
+    /// length trailer, ignoring this profile's `[min,max]` sampling. The CONNECT
+    /// shaping (C3) uses this to hit a precise size band; sampling here would push
+    /// the record off its band under a non-default `TrafficConfig`. `pad_len` is
+    /// clamped to the u16 trailer's range so it can never disagree with the byte
+    /// count it pads.
+    pub fn write_exact_padding_suffix<R>(&self, pad_len: usize, rng: &mut R, out: &mut Vec<u8>)
+    where
+        R: Rng + RngCore + ?Sized,
+    {
+        self.write_padding_suffix(pad_len.min(u16::MAX as usize), rng, out);
+    }
+
     fn write_padding_suffix<R>(&self, pad_len: usize, rng: &mut R, out: &mut Vec<u8>)
     where
         R: Rng + RngCore + ?Sized,
