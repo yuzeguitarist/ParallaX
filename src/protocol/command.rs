@@ -2224,6 +2224,134 @@ mod tests {
     }
 
     #[test]
+    fn encoded_len_matches_the_actual_encoded_byte_count() {
+        // encoded_len() is computed from CONNECT_FIXED_LEN (4 magic + 2 host-len +
+        // 2 port + 4 payload-len = 12) + host + payload, and encode() writes exactly
+        // those literal bytes. They MUST agree, or encode()'s Vec::with_capacity is
+        // wrong and max_initial_payload_len mis-budgets. Pins CONNECT_FIXED_LEN: any
+        // arithmetic mutation of its `4 + 2 + 2 + 4` sum makes encoded_len() diverge
+        // from the real encoded length.
+        for (host, payload_len) in [
+            ("a.io", 0usize),
+            ("example.com", 17),
+            (&"h".repeat(120), 300),
+        ] {
+            let request = ConnectRequest {
+                host: host.to_owned(),
+                port: 443,
+                initial_payload: vec![0x41; payload_len],
+            };
+            let encoded = request.encode().unwrap();
+            assert_eq!(
+                encoded.len(),
+                request.encoded_len(),
+                "encoded_len() must equal the real encoded byte count (host={host:?})"
+            );
+            // And the fixed framing really is 12 bytes beyond host+payload.
+            assert_eq!(encoded.len(), 12 + host.len() + payload_len);
+        }
+    }
+
+    #[test]
+    fn pq_flight_max_chunk_size_reserves_header_plus_aggregate_pad() {
+        // The cap subtracts (PQ_CHUNK_FRAME_HEADER_LEN + PQ_FLIGHT_AGGREGATE_PAD_MAX)
+        // = 16 + 512 = 528 from the sealed-plaintext budget so every shaped record
+        // (any of which may be the last, carrying the aggregate pad) stays within the
+        // record limit. Assert the exact value: a `+` -> `*` on the reservation would
+        // subtract 16*512 = 8192 instead, badly under-sizing the chunk.
+        let budget = 10_000usize;
+        assert_eq!(
+            pq_flight_max_chunk_size(budget),
+            budget - (PQ_CHUNK_FRAME_HEADER_LEN + PQ_FLIGHT_AGGREGATE_PAD_MAX)
+        );
+        assert_eq!(pq_flight_max_chunk_size(10_000), 10_000 - 528);
+        // Below the reservation the saturating_sub floors to PQ_FLIGHT_RECORD_MIN.
+        assert_eq!(pq_flight_max_chunk_size(100), PQ_FLIGHT_RECORD_MIN);
+    }
+
+    #[test]
+    fn shaping_extra_pad_respects_a_tight_max_extra_pad() {
+        // The fitting filter requires `band - raw_wire <= max_extra_pad`. With a
+        // small request and a TIGHT cap, only the bands within reach of that cap may
+        // be chosen, and the returned pad must never exceed it. This pins the
+        // subtraction: `-` -> `+` shrinks the reachable set to just the smallest
+        // band, and `-` -> `/` makes (almost) every band "fit" — both change the
+        // reachable band set away from the exact expected pair below.
+        use rand::{rngs::StdRng, SeedableRng};
+        use std::collections::BTreeSet;
+
+        let request = ConnectRequest {
+            host: "example.com".to_owned(), // encoded_len 23 -> raw_wire 41
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        let raw_wire = request.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
+        let max_extra_pad = 500usize;
+
+        // Correct fitting set: bands with band >= raw_wire and band - raw_wire <= 500.
+        // raw_wire = 41 -> {286, 469} (569-41=528 > 500 is excluded).
+        let expected: BTreeSet<usize> = CONNECT_RECORD_SIZE_BANDS
+            .iter()
+            .copied()
+            .filter(|&b| b >= raw_wire && b - raw_wire <= max_extra_pad)
+            .collect();
+        assert_eq!(
+            expected,
+            BTreeSet::from([286usize, 469usize]),
+            "fixture sanity: tight cap should admit exactly these two bands"
+        );
+
+        let mut reached = BTreeSet::new();
+        for seed in 0..512u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let pad = request.shaping_extra_pad(max_extra_pad, &mut rng);
+            assert!(
+                pad <= max_extra_pad,
+                "pad {pad} must not exceed the cap {max_extra_pad}"
+            );
+            let wire = raw_wire + pad;
+            assert!(
+                CONNECT_RECORD_SIZE_BANDS.contains(&wire),
+                "padded wire {wire} must still land on a band"
+            );
+            reached.insert(wire);
+        }
+        assert_eq!(
+            reached, expected,
+            "with a tight cap the reachable band set must be exactly the fitting bands"
+        );
+    }
+
+    #[test]
+    fn encode_accepts_host_of_exactly_max_len_and_rejects_one_over() {
+        // The length guard is `host.len() > MAX_HOST_LEN` (255): a host of EXACTLY
+        // 255 bytes is valid and must encode; 256 must be rejected. Pins the `>`
+        // boundary so a `>` -> `>=` mutation (which would reject the legal 255-byte
+        // host) is caught.
+        let at_limit = "a".repeat(MAX_HOST_LEN);
+        let req = ConnectRequest {
+            host: at_limit,
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        assert!(
+            req.encode().is_ok(),
+            "a host of exactly MAX_HOST_LEN must encode"
+        );
+
+        let over = "a".repeat(MAX_HOST_LEN + 1);
+        let req_over = ConnectRequest {
+            host: over,
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        assert!(matches!(
+            req_over.encode(),
+            Err(ConnectRequestError::HostTooLong)
+        ));
+    }
+
+    #[test]
     fn shaping_extra_pad_lands_on_a_band() {
         // The padded wire size (raw plaintext + overhead + extra_pad) must equal
         // one of the configured bands, for many seeds and several request sizes.
