@@ -66,17 +66,19 @@ pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
 /// a per-ClientHello seed-derived (non-constant) stride rather than a fixed
 /// transform.
 ///
-/// The collision stride is derived from DEDICATED seed bytes (`seed[4]`/`seed[5]`),
-/// NOT from a byte that already determines another on-wire GREASE value. An
-/// earlier version reused `seed[0]` (which also picks the cipher GREASE) for the
-/// stride, which made the resolved first->last delta a deterministic function of
-/// the cipher GREASE on every colliding ClientHello — an externally observable
-/// per-connection correlation that real Safari (independent draws) does not have.
-/// The stride spans the full `1..=len-1` range (any non-zero stride is < len so it
-/// always lands on a different index; no `| 1` odd-only forcing, which would skew
-/// the delta distribution toward odd values). See [`GreaseSet::from_seed`] for why
-/// the stride reduces a 16-bit value rather than a single byte (modulo-skew
-/// headroom).
+/// The collision stride is derived ONLY from seed bits that are free on the
+/// collision branch — `seed[5]` and the high nibble of `seed[4]` — never from a
+/// bit that already determines another on-wire GREASE value. An earlier version
+/// reused `seed[0]` (which also picks the cipher GREASE) for the stride, which
+/// made the resolved first->last delta a deterministic function of the cipher
+/// GREASE on every colliding ClientHello — an externally observable per-connection
+/// correlation that real Safari (independent draws) does not have. The stride
+/// spans the full `1..=len-1` range (any non-zero stride is < len so it always
+/// lands on a different index; no `| 1` odd-only forcing, which would skew the
+/// delta distribution toward odd values). See [`GreaseSet::from_seed`] for why it
+/// uses the high nibble of `seed[4]` rather than the whole byte (the low nibble
+/// carries the first-extension index `k` on this branch, so feeding it would
+/// re-couple the delta to the first-extension GREASE).
 #[derive(Clone, Copy)]
 pub(crate) struct GreaseSet {
     pub(crate) cipher: u16,
@@ -93,24 +95,28 @@ impl GreaseSet {
         let mut final_extension_index = seed[4] as usize % len;
         if final_extension_index == extension_index {
             // Independent re-draw, not a fixed first->last transform: advance by a
-            // stride derived from DEDICATED seed bytes (`seed[4]`/`seed[5]`) that
-            // drive no other on-wire value, so the resolved last GREASE stays
-            // uncorrelated with the cipher / first-extension GREASE. The stride is
-            // in `1..=len-1` (non-zero and < len), so `(idx + stride) % len` always
-            // lands on a different index — keeping the first/last pair
-            // indistinguishable from two independent draws, as observed on the wire.
+            // stride so the resolved last GREASE stays uncorrelated with the cipher
+            // and first-extension GREASE. The stride is in `1..=len-1` (non-zero and
+            // < len), so `(idx + stride) % len` always lands on a different index —
+            // keeping the first/last pair indistinguishable from two independent
+            // draws, as observed on the wire. On this branch the resolved index delta
+            // equals the stride exactly (final = (idx + stride) % len), so the stride
+            // distribution IS the observable first->last delta distribution.
             //
-            // The stride is reduced from a 16-bit value (`seed[4] << 8 | seed[5]`)
-            // rather than a single byte: a single `u8 % 15` has a 1-in-256 modulo
-            // skew (256 = 15·17 + 1, so stride 1 is over-represented 18/256 vs
-            // 17/256). Folding in `seed[4]` — already consumed as the (colliding)
-            // last-extension index here, so it carries no other meaning on this
-            // branch — drops that skew to 1-in-65536 (65536 = 15·4369 + 1), i.e. a
-            // marginal on-wire P(delta) deviation < 1e-6, far below any RNG/capture
-            // noise floor. Fully removing it would need rejection sampling (no 2^n
-            // is divisible by 15), which would force an RNG redraw and break this
-            // function's pure-from-fixed-seed property; not worth it at this scale.
-            let stride = (((seed[4] as usize) << 8 | seed[5] as usize) % (len - 1)) + 1;
+            // The stride MUST stay independent of the first-extension GREASE index
+            // `k = seed[1] % len`. The branch predicate already pins the LOW nibble
+            // of `seed[4]` to `k` (it fired because `seed[4] % len == k`), so the low
+            // nibble carries `k` and must NOT feed the stride. Use only the FREE high
+            // nibble `seed[4] >> 4` (uniform and independent of `k` on this branch),
+            // folded with `seed[5]`. This widens the reduction input beyond a single
+            // byte to shrink the `% (len-1)` modulo skew — a bare `seed[5] % 15` over-
+            // represents stride 1 (18/256, since 256 = 15·17 + 1) — while keeping the
+            // delta exactly k-independent (verified exhaustively in
+            // `grease_collision_stride_is_independent_of_cipher_grease`). Folding the
+            // WHOLE `seed[4]` byte instead would leak `k` (its low nibble) into the
+            // delta; the high nibble alone does not. Residual skew is a benign per-k-
+            // identical frequency wobble (~2.4e-4), not a cross-value correlation.
+            let stride = ((((seed[4] >> 4) as usize) << 8 | seed[5] as usize) % (len - 1)) + 1;
             final_extension_index = (final_extension_index + stride) % len;
         }
         Self {
@@ -354,38 +360,51 @@ mod tests {
         );
     }
 
-    /// Regression: the collision-branch stride must come from its OWN seed byte,
-    /// not from a byte that already drives another on-wire GREASE value. A prior
-    /// version derived the stride from `seed[0]` (which also picks the cipher
-    /// GREASE), so on every colliding ClientHello the resolved (first->last)
-    /// extension-GREASE index delta equaled `cipher_idx | 1` — an externally
-    /// observable per-connection correlation real Safari's independent draws do
-    /// not have. Holding `seed[0]` (cipher) and the colliding extension index
-    /// fixed, varying ONLY the stride byte must still produce MULTIPLE distinct
-    /// final indices; if the stride were a function of `seed[0]`, the delta would
-    /// be pinned to a single value.
+    /// Index of `value` in [`BROWSER_GREASE_VALUES`] (panics if absent — every
+    /// GREASE field is by construction one of the 16 table entries).
+    fn grease_index(value: u16) -> usize {
+        BROWSER_GREASE_VALUES
+            .iter()
+            .position(|&v| v == value)
+            .expect("GREASE value is a table entry")
+    }
+
+    /// Resolved first->last extension-GREASE index delta for a forced-collision
+    /// seed. `first_byte` is seed[1] (the first-extension index source), and the
+    /// branch is forced by setting seed[4] to a value congruent to it mod 16 (the
+    /// caller passes the colliding `last_byte`). Returns `(final - first) mod 16`.
+    fn collision_delta(cipher: u8, first_byte: u8, last_byte: u8, stride_byte: u8) -> usize {
+        let len = BROWSER_GREASE_VALUES.len();
+        debug_assert_eq!(
+            first_byte as usize % len,
+            last_byte as usize % len,
+            "caller must force the collision (seed[1] ≡ seed[4] mod 16)"
+        );
+        let g = GreaseSet::from_seed([cipher, first_byte, 0, 0, last_byte, stride_byte]);
+        let first = grease_index(g.extension);
+        let last = grease_index(g.final_extension);
+        (last + len - first) % len
+    }
+
+    /// Regression: the collision-branch stride must come only from seed bits that
+    /// drive no other on-wire GREASE value. A prior version derived the stride from
+    /// `seed[0]` (which also picks the cipher GREASE), so on every colliding
+    /// ClientHello the resolved (first->last) extension-GREASE index delta equaled
+    /// `cipher_idx | 1` — an externally observable per-connection correlation real
+    /// Safari's independent draws do not have. Holding `seed[0]` (cipher) and the
+    /// colliding extension index fixed, varying ONLY the stride source must still
+    /// produce every non-zero delta; if the stride were a function of `seed[0]`, the
+    /// delta would be pinned to a single value.
     #[test]
     fn grease_collision_stride_is_independent_of_cipher_grease() {
         let len = BROWSER_GREASE_VALUES.len();
         for cipher_seed in 0..=u8::MAX {
             for idx in 0..(len as u8) {
-                let ext_index = idx as usize % len;
                 let mut deltas = std::collections::HashSet::new();
                 for stride_byte in 0..=u8::MAX {
-                    // seed[0]=cipher_seed (cipher GREASE), seed[1]==seed[4]=idx
-                    // (force collision), seed[5]=stride_byte (the stride source).
-                    let g = GreaseSet::from_seed([cipher_seed, idx, 0, 0, idx, stride_byte]);
-                    let fi = BROWSER_GREASE_VALUES
-                        .iter()
-                        .position(|&v| v == g.final_extension)
-                        .unwrap();
-                    deltas.insert((fi + len - ext_index) % len);
+                    // seed[1] ≡ seed[4] = idx forces the collision; sweep seed[5].
+                    deltas.insert(collision_delta(cipher_seed, idx, idx, stride_byte));
                 }
-                // The full stride domain is 1..=len-1, so a stride drawn solely
-                // from seed[5] must yield every non-zero delta — and in particular
-                // FAR more than one, proving the delta is not a function of the
-                // (fixed) cipher seed. This fails if the stride is ever re-coupled
-                // to seed[0].
                 assert_eq!(
                     deltas.len(),
                     len - 1,
@@ -393,6 +412,48 @@ mod tests {
                      cipher seed (cipher_seed={cipher_seed}, idx={idx}); got {deltas:?}"
                 );
             }
+        }
+    }
+
+    /// The strongest anti-tell invariant: on the collision branch the resolved
+    /// first->last delta distribution must be IDENTICAL for every first-extension
+    /// GREASE index `k` — otherwise a censor who reads the (observable) first-
+    /// extension GREASE can predict something about the (observable) last-extension
+    /// GREASE, a cross-value correlation real Safari (independent draws) lacks.
+    ///
+    /// This guards a subtle trap: the branch predicate pins the LOW nibble of
+    /// `seed[4]` to `k`, so any stride that consumes the whole `seed[4]` byte leaks
+    /// `k` into the delta. The fix uses only `seed[4] >> 4` (free of `k`). We build
+    /// the full delta histogram for each `k` by sweeping every free seed bit —
+    /// `seed[4]`'s high nibble (16 values) and `seed[5]` (256 values) — and assert
+    /// all 16 histograms are bit-for-bit equal. Reverting the stride to consume the
+    /// whole `seed[4]` byte makes the histograms differ and reds this test.
+    #[test]
+    fn grease_collision_delta_distribution_is_identical_across_first_ext_index() {
+        let len = BROWSER_GREASE_VALUES.len();
+        let histogram_for = |k: u8| -> Vec<u32> {
+            let mut hist = vec![0_u32; len];
+            for hi in 0..16_u8 {
+                // seed[4] ≡ k (mod 16) keeps the collision; its high nibble `hi` is
+                // the only free part. seed[4] = hi*16 + k.
+                let last_byte = hi.wrapping_mul(16).wrapping_add(k);
+                for stride_byte in 0..=u8::MAX {
+                    let d = collision_delta(0, k, last_byte, stride_byte);
+                    hist[d] += 1;
+                }
+            }
+            hist
+        };
+        let reference = histogram_for(0);
+        // delta 0 must never occur (forced-distinct); every mass sits in 1..=len-1.
+        assert_eq!(reference[0], 0, "collision must never yield delta 0");
+        for k in 1..(len as u8) {
+            assert_eq!(
+                histogram_for(k),
+                reference,
+                "collision delta histogram for first-ext index k={k} differs from \
+                 k=0 — the stride leaks the first-extension GREASE index"
+            );
         }
     }
 
