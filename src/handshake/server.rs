@@ -122,32 +122,21 @@ const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(60);
 /// Bounds concurrent cap-shed fallback relays (H-1). When the per-source or global
 /// connection cap rejects a connection we must still look like the origin (relay
 /// its ServerHello) rather than emit a bare ServerHello-less FIN, which a prober
-/// could use to count our cap. But a cap-rejected connection that opened a full
-/// 600s relay would turn the cap into an origin-DoS amplifier, so cap-shed relays
-/// draw from this small SEPARATE budget (the main slots are already exhausted) and
-/// use a tight idle bound. 64 userspace relays ~= 128 fds: a fixed reservation
-/// that cannot itself exhaust fds. Past the budget we degrade to a graceful FIN —
-/// a casual prober always lands inside it; only a genuine flood sees FINs, which a
-/// real origin under flood also produces.
+/// could use to count our cap. Cap-shed relays draw from this small SEPARATE budget
+/// (the main slots are already exhausted). This hard concurrency ceiling — NOT a
+/// tightened idle bound — is the real anti-amplification backstop: it bounds the
+/// number of concurrent cap-shed origin connections at 64 regardless of flood
+/// volume, so even though each relay now uses the SAME idle distribution as a
+/// healthy splice ([`fallback_idle_timeout`], [600s, 660s]) the worst case is 64
+/// idle origin connections — negligible for any real origin, bounded, no growth.
+/// Unifying the idle band (vs. the prior tight [10s, 90s] band, which was disjoint
+/// from the healthy [600s, 660s] band and thus a probe-separable "box at cap" state
+/// tell) is what keeps a cap-shed close indistinguishable from a healthy one. 64
+/// userspace relays ~= 128 fds: a fixed reservation that cannot itself exhaust fds.
+/// Past the budget we degrade to a graceful FIN — a casual prober always lands
+/// inside it; only a genuine flood sees FINs, which a real origin under flood also
+/// produces.
 const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
-/// Idle floor (lower edge) for cap-shed fallback relays (H-1). These exist only to
-/// return the origin ServerHello to a prober, not to serve a session, so they use a
-/// tight bound instead of FALLBACK_IDLE_TIMEOUT_FLOOR (600s); this recycles the small
-/// budget in seconds even under slow/idle attackers. The actual idle is this floor
-/// plus a WIDE jitter ([`CAP_SHED_FALLBACK_IDLE_JITTER`]) so the close time is not a
-/// stable, probe-measurable constant; the floor keeps the fastest recycle unchanged.
-const CAP_SHED_FALLBACK_IDLE: Duration = Duration::from_secs(10);
-/// Upward jitter on the cap-shed idle. Sized WIDE (not a token few seconds) so the
-/// per-relay close time is drawn from a broad 10..90s spread rather than clustering
-/// at a stable ~10s constant: a saturated-cap prober that opens a silent relay and
-/// times our close can no longer read a sharp, reproducible value to infer "this box
-/// is at its cap" (the residual M-4 state tell — see hardening-no-observable-fingerprint).
-/// The anti-DoS-amplification bound is preserved by construction: the hard
-/// [`MAX_CONCURRENT_CAP_SHED_FALLBACKS`] (64) concurrency cap is unchanged and the
-/// upper edge stays bounded (≤ floor + jitter), so the worst case is still 64 relays
-/// each held ≤90s — bounded, no growth, no amplification — while the 10s floor keeps
-/// the fastest recycle time identical to before.
-const CAP_SHED_FALLBACK_IDLE_JITTER: Duration = Duration::from_secs(80);
 
 /// Replayed-ClientHello close is detected only AFTER the full PQ exchange, so a
 /// replay's teardown lands at a near-fixed moment in the handshake (no server PQ
@@ -1206,12 +1195,22 @@ async fn cap_shed_fallback_or_fin(client: TcpStream, fallback_addr: String) {
     };
     match connect_and_forward_to_fallback(&fallback_addr, &[]).await {
         Ok(fallback) => {
-            let _ = relay_fallback_with_idle_timeout(
-                client,
-                fallback,
-                jittered_timeout(CAP_SHED_FALLBACK_IDLE, CAP_SHED_FALLBACK_IDLE_JITTER),
-            )
-            .await;
+            // Draw the idle backstop from the SAME distribution as a healthy splice
+            // ([`fallback_idle_timeout`], [600s, 660s]) rather than a separate tight
+            // band. A separate band ([10s, 90s]) was disjoint from the healthy band,
+            // so a prober that timed our server-originated FIN on a silent relay could
+            // separate the two populations in a handful of samples and read "this box
+            // is at its cap" — a threshold-triggered, externally observable state tell
+            // (a real origin's idle policy does not switch on THIS front box's permit
+            // accounting). Unifying the band removes the tell entirely. The cap-as-DoS
+            // -amplifier concern is still defused by construction: the hard
+            // [`MAX_CONCURRENT_CAP_SHED_FALLBACKS`] (64) ceiling bounds concurrent
+            // cap-shed relays regardless of flood volume, so the worst case is 64 idle
+            // origin connections — negligible for any real origin, no growth, no
+            // amplification — and that fixed bound, not a tightened idle, is the actual
+            // resource backstop.
+            let _ =
+                relay_fallback_with_idle_timeout(client, fallback, fallback_idle_timeout()).await;
         }
         Err(_) => graceful_close_tcp_stream(client).await,
     }
@@ -6395,21 +6394,30 @@ mod tests {
         drop(held);
     }
 
-    /// H-1: pins the tight cap-shed idle bound so a future edit cannot silently
-    /// raise it to the 600s legit backstop and re-open the cap-as-DoS-amplifier.
-    /// The actual idle is `floor + [0, jitter]`; the jitter is intentionally WIDE
-    /// (M-4: blurs the saturated-cap close-time tell), so the invariant guarded
-    /// here is the real UPPER edge (`floor + jitter`), which must still sit far
-    /// below the 600s legit backstop to keep the anti-DoS-amplification bound.
+    /// H-1 / M-4: a cap-shed close must be indistinguishable from a healthy splice
+    /// close. The prior design gave cap-shed relays a SEPARATE tight idle band
+    /// ([10s, 90s]) that was disjoint from the healthy band ([600s, 660s]); a prober
+    /// timing our server-originated FIN on a silent relay could separate the two
+    /// populations in a few samples and read "this box is at its cap". This pins the
+    /// fix: cap-shed idle is drawn from the SAME distribution as the healthy splice,
+    /// so the close-time band is identical and there is no separable state tell. The
+    /// anti-amplification bound is now carried solely by the 64-concurrency ceiling.
     #[test]
-    fn cap_shed_fallback_idle_is_tight() {
-        assert_eq!(CAP_SHED_FALLBACK_IDLE, Duration::from_secs(10));
-        let max_idle = CAP_SHED_FALLBACK_IDLE + CAP_SHED_FALLBACK_IDLE_JITTER;
-        assert!(
-            max_idle < FALLBACK_IDLE_TIMEOUT_FLOOR,
-            "cap-shed relays' max idle (floor + jitter) must stay well below the \
-             600s legit backstop, not re-open the cap-as-DoS-amplifier",
-        );
+    fn cap_shed_fallback_idle_matches_healthy_band() {
+        // Sample both distributions; every cap-shed idle value must be a value the
+        // healthy splice could also produce (same floor, same band).
+        for _ in 0..256 {
+            let idle = fallback_idle_timeout();
+            assert!(
+                idle >= FALLBACK_IDLE_TIMEOUT_FLOOR
+                    && idle <= FALLBACK_IDLE_TIMEOUT_FLOOR + FALLBACK_IDLE_TIMEOUT_JITTER,
+                "cap-shed idle must sit inside the healthy splice band so the close \
+                 time is not a separable 'box at cap' tell",
+            );
+        }
+        // The anti-DoS-amplification backstop is the hard concurrency ceiling, not a
+        // tightened idle; pin it so a future edit cannot quietly remove it.
+        assert_eq!(MAX_CONCURRENT_CAP_SHED_FALLBACKS, 64);
     }
 
     #[tokio::test]
