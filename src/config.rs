@@ -955,8 +955,10 @@ impl Config {
             Mode::Server => {
                 let server = self.server.as_ref().ok_or(ConfigError::MissingServer)?;
                 require_host_port("server.fallback_addr", &server.fallback_addr)?;
+                warn_if_outbound_literal_is_internal("server.fallback_addr", &server.fallback_addr);
                 if let Some(data_target) = &server.data_target {
                     require_host_port("server.data_target", data_target)?;
+                    warn_if_outbound_literal_is_internal("server.data_target", data_target);
                 }
                 if server.authorized_sni.is_empty() {
                     return Err(ConfigError::EmptyAuthorizedSni);
@@ -1304,6 +1306,52 @@ fn require_host_port(field: &'static str, value: &str) -> Result<(), ConfigError
         });
     }
     Ok(())
+}
+
+/// Classifies an `host:port` outbound literal as internal/special, returning the
+/// offending IP, or `None` when the host is not an IP literal (a hostname, left to
+/// runtime resolution) or is a normal public address. Split out from the warning so
+/// the classification is unit-testable. Covers loopback, private, link-local (which
+/// includes the cloud metadata endpoint 169.254.169.254), and unspecified.
+fn outbound_literal_internal_ip(value: &str) -> Option<std::net::IpAddr> {
+    let (host, _port) = value.rsplit_once(':')?;
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
+    let ip = host.parse::<std::net::IpAddr>().ok()?;
+    let internal = match ip {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (ip.segments()[0] & 0xffc0) == 0xfe80 // unicast link-local
+                || (ip.segments()[0] & 0xfe00) == 0xfc00 // unique-local
+        }
+    };
+    internal.then_some(ip)
+}
+
+/// Warn (never fail) when an operator-configured outbound target is an internal IP
+/// literal (C-1). Unlike a client-selected forward target (screened and hard-denied
+/// at runtime by `is_denied_outbound_ip`), `fallback_addr` / `data_target` are
+/// operator-chosen and a client can never influence them, so this is not a remotely
+/// reachable SSRF — it is a consistency / footgun guard. It stays a WARNING, not a
+/// hard error, because a private/LAN value can be a deliberate, valid deployment (a
+/// co-located camouflage origin or an internal `data_target`); failing the load
+/// would break those. Hostnames are left to runtime resolution (resolving them here
+/// would need blocking DNS in config validation and break an offline `plx check`).
+fn warn_if_outbound_literal_is_internal(field: &str, value: &str) {
+    if let Some(ip) = outbound_literal_internal_ip(value) {
+        tracing::warn!(
+            %field,
+            %ip,
+            "configured outbound target is an internal/special IP literal (loopback, \
+             private, link-local incl. the cloud metadata endpoint, or unspecified); \
+             ensure this is intentional — for the camouflage origin this should \
+             normally be a public address"
+        );
+    }
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -2305,6 +2353,39 @@ authorized_sni = ["example.com"]
             ConfigError::InvalidSocket { .. }
         ));
         assert!(require_non_empty("client.sni", "example.com").is_ok());
+    }
+
+    #[test]
+    fn outbound_literal_internal_ip_flags_internal_literals_only() {
+        // Internal / special literals are flagged (incl. the cloud metadata endpoint).
+        for v in [
+            "127.0.0.1:443",
+            "10.0.0.5:443",
+            "192.168.1.1:8443",
+            "169.254.169.254:80", // cloud metadata
+            "0.0.0.0:443",
+            "[::1]:443",
+            "[fe80::1]:443",
+            "[fc00::1]:443",
+        ] {
+            assert!(
+                outbound_literal_internal_ip(v).is_some(),
+                "{v} must be flagged as internal",
+            );
+        }
+        // Public literals and hostnames are not flagged (hostnames -> runtime).
+        for v in [
+            "1.1.1.1:443",
+            "93.184.216.34:443",
+            "[2606:4700:4700::1111]:443",
+            "cloudflare.com:443",
+            "example.com:8443",
+        ] {
+            assert!(
+                outbound_literal_internal_ip(v).is_none(),
+                "{v} must NOT be flagged",
+            );
+        }
     }
 
     #[test]

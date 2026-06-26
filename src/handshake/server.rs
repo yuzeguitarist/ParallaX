@@ -122,32 +122,22 @@ const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(60);
 /// Bounds concurrent cap-shed fallback relays (H-1). When the per-source or global
 /// connection cap rejects a connection we must still look like the origin (relay
 /// its ServerHello) rather than emit a bare ServerHello-less FIN, which a prober
-/// could use to count our cap. But a cap-rejected connection that opened a full
-/// 600s relay would turn the cap into an origin-DoS amplifier, so cap-shed relays
-/// draw from this small SEPARATE budget (the main slots are already exhausted) and
-/// use a tight idle bound. 64 userspace relays ~= 128 fds: a fixed reservation
-/// that cannot itself exhaust fds. Past the budget we degrade to a graceful FIN —
-/// a casual prober always lands inside it; only a genuine flood sees FINs, which a
-/// real origin under flood also produces.
+/// could use to count our cap. Cap-shed relays draw from this small SEPARATE budget
+/// (the main slots are already exhausted). This hard concurrency ceiling — NOT a
+/// tightened idle bound — is the real anti-amplification backstop: it bounds the
+/// number of concurrent cap-shed origin connections at 64 regardless of flood
+/// volume, so even though each relay now uses the SAME idle distribution as a
+/// healthy splice ([`fallback_idle_timeout`], [600s, 660s]) the worst case is 64
+/// idle origin connections — negligible for any real origin, bounded, no growth.
+/// Unifying the idle band (vs. the prior tight [10s, 90s] band, which was disjoint
+/// from the healthy [600s, 660s] band and thus a probe-separable "box at cap" state
+/// tell) is what keeps a cap-shed close's IDLE TIME indistinguishable from a healthy
+/// one (a pre-existing handshake-start dial-RTT difference is separate and unchanged).
+/// 64 userspace relays ~= 128 fds: a fixed reservation that cannot itself exhaust fds.
+/// Past the budget we degrade to a graceful FIN — a casual prober always lands
+/// inside it; only a genuine flood sees FINs, which a real origin under flood also
+/// produces.
 const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
-/// Idle floor (lower edge) for cap-shed fallback relays (H-1). These exist only to
-/// return the origin ServerHello to a prober, not to serve a session, so they use a
-/// tight bound instead of FALLBACK_IDLE_TIMEOUT_FLOOR (600s); this recycles the small
-/// budget in seconds even under slow/idle attackers. The actual idle is this floor
-/// plus a WIDE jitter ([`CAP_SHED_FALLBACK_IDLE_JITTER`]) so the close time is not a
-/// stable, probe-measurable constant; the floor keeps the fastest recycle unchanged.
-const CAP_SHED_FALLBACK_IDLE: Duration = Duration::from_secs(10);
-/// Upward jitter on the cap-shed idle. Sized WIDE (not a token few seconds) so the
-/// per-relay close time is drawn from a broad 10..90s spread rather than clustering
-/// at a stable ~10s constant: a saturated-cap prober that opens a silent relay and
-/// times our close can no longer read a sharp, reproducible value to infer "this box
-/// is at its cap" (the residual M-4 state tell — see hardening-no-observable-fingerprint).
-/// The anti-DoS-amplification bound is preserved by construction: the hard
-/// [`MAX_CONCURRENT_CAP_SHED_FALLBACKS`] (64) concurrency cap is unchanged and the
-/// upper edge stays bounded (≤ floor + jitter), so the worst case is still 64 relays
-/// each held ≤90s — bounded, no growth, no amplification — while the 10s floor keeps
-/// the fastest recycle time identical to before.
-const CAP_SHED_FALLBACK_IDLE_JITTER: Duration = Duration::from_secs(80);
 
 /// Replayed-ClientHello close is detected only AFTER the full PQ exchange, so a
 /// replay's teardown lands at a near-fixed moment in the handshake (no server PQ
@@ -716,7 +706,9 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 );
                 // Relay to the camouflage origin (H-1) so a prober still sees the
                 // origin ServerHello and cannot count our cap by the missing one;
-                // bounded budget + tight idle, degrading to a graceful FIN past the
+                // bounded by the 64-relay concurrency ceiling, with idle drawn from
+                // the SAME band as a healthy splice (so the close time is not a probe-
+                // separable "box at cap" tell), degrading to a graceful FIN past the
                 // budget. Detached so a flood at the cap cannot stall the loop.
                 tokio::spawn(cap_shed_fallback_or_fin(
                     client,
@@ -735,9 +727,10 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 );
                 // Relay to the camouflage origin (H-1) so a prober still sees the
                 // origin ServerHello and cannot count our cap by the missing one.
-                // Bounded budget + tight idle (cap_shed_fallback_or_fin), degrading
-                // to a graceful FIN past the budget. Detached so a connection flood
-                // at the limit cannot stall the accept loop.
+                // Bounded by the 64-relay concurrency ceiling, with idle unified with
+                // the healthy splice band (cap_shed_fallback_or_fin), degrading to a
+                // graceful FIN past the budget. Detached so a connection flood at the
+                // limit cannot stall the accept loop.
                 tokio::spawn(cap_shed_fallback_or_fin(
                     client,
                     server.fallback_addr.clone(),
@@ -1114,12 +1107,16 @@ pub async fn accept_authenticated(
 
     let forwarded = read_forwarded_server_hello(&mut fallback).await?;
     if config.strict_tls13 && !forwarded.parsed.tls13_selected {
-        // Mirror the origin's ServerHello to the client, then close it the same
-        // drain->FIN way every other exit does so a strict-TLS1.3 reject is a FIN,
-        // never a RST. Swallow a write error here: we tear the connection down
+        // Mirror the origin's ServerHello to the client, then close BOTH sockets the
+        // same drain->FIN way every other exit does so a strict-TLS1.3 reject is a
+        // FIN, never a RST. The origin (`fallback`) side matters too: dropping it bare
+        // with bytes still queued (e.g. the rest of its handshake flight) makes the
+        // kernel RST the origin, an asymmetry no other teardown produces — drain->FIN
+        // it like the client. Swallow a write error here: we tear the connection down
         // regardless and must still FIN.
         let _ = write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await;
         graceful_close_tcp_stream(client).await;
+        graceful_close_tcp_stream(fallback).await;
         return Err(HandshakeServerError::Tls13Required);
     }
     write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await?;
@@ -1194,11 +1191,12 @@ async fn graceful_close_tcp_stream(stream: TcpStream) {
 }
 
 /// Cap-rejection close that stays indistinguishable from the origin (H-1): relay
-/// to the camouflage origin so the client still gets a real ServerHello, under a
-/// small bounded budget + tight idle bound; if the budget is full or the origin
-/// dial fails, fall back to a graceful FIN (the prior behavior). We never read the
-/// ClientHello at admission time, so the prefix is empty — the client's own
-/// ClientHello then splices straight through to the origin.
+/// to the camouflage origin so the client still gets a real ServerHello, bounded by
+/// the 64-relay concurrency ceiling with the idle drawn from the SAME band as a
+/// healthy splice; if the budget is full or the origin dial fails, fall back to a
+/// graceful FIN (the prior behavior). We never read the ClientHello at admission
+/// time, so the prefix is empty — the client's own ClientHello then splices straight
+/// through to the origin.
 async fn cap_shed_fallback_or_fin(client: TcpStream, fallback_addr: String) {
     let Some(_slot) = try_enter_cap_shed_fallback() else {
         graceful_close_tcp_stream(client).await;
@@ -1206,12 +1204,29 @@ async fn cap_shed_fallback_or_fin(client: TcpStream, fallback_addr: String) {
     };
     match connect_and_forward_to_fallback(&fallback_addr, &[]).await {
         Ok(fallback) => {
-            let _ = relay_fallback_with_idle_timeout(
-                client,
-                fallback,
-                jittered_timeout(CAP_SHED_FALLBACK_IDLE, CAP_SHED_FALLBACK_IDLE_JITTER),
-            )
-            .await;
+            // Draw the idle backstop from the SAME distribution as a healthy splice
+            // ([`fallback_idle_timeout`], [600s, 660s]) rather than a separate tight
+            // band. A separate band ([10s, 90s]) was disjoint from the healthy band,
+            // so a prober that timed our server-originated FIN on a silent relay could
+            // separate the two populations in a handful of samples and read "this box
+            // is at its cap" — a threshold-triggered, externally observable state tell
+            // (a real origin's idle policy does not switch on THIS front box's permit
+            // accounting). Unifying the band removes that idle-close-time tell. (A
+            // silent prober can still observe the pre-existing handshake-start
+            // difference — cap-shed dials the origin BEFORE reading a ClientHello,
+            // healthy splice dials after — but that is unchanged by this fix and
+            // shared with the first-record-wait residual.)
+            //
+            // The cap-as-DoS-amplifier concern is still defused by construction: the
+            // hard [`MAX_CONCURRENT_CAP_SHED_FALLBACKS`] (64) ceiling bounds the
+            // CONCURRENCY of cap-shed relays regardless of flood volume (the idle
+            // resets on every byte, so a trickling prober can hold a slot past 660s —
+            // exactly as a healthy splice can — but never more than 64 at once). 64
+            // idle origin connections is negligible for any real origin: bounded, no
+            // growth. That fixed concurrency bound, not a tightened idle, is the
+            // actual resource backstop.
+            let _ =
+                relay_fallback_with_idle_timeout(client, fallback, cap_shed_fallback_idle()).await;
         }
         Err(_) => graceful_close_tcp_stream(client).await,
     }
@@ -1401,6 +1416,16 @@ fn first_record_wait_timeout() -> Duration {
 fn fallback_idle_timeout() -> Duration {
     let t = timeout_tuning();
     jittered_timeout(t.fallback_idle_floor, t.fallback_idle_jitter)
+}
+
+/// Idle backstop for a cap-shed fallback relay. Deliberately the SAME distribution
+/// as a healthy splice ([`fallback_idle_timeout`]) so a cap-shed close time is not a
+/// probe-separable "box at cap" tell (the anti-amplification bound is carried by the
+/// [`MAX_CONCURRENT_CAP_SHED_FALLBACKS`] concurrency ceiling, not a tighter idle).
+/// A named indirection so the test pins THIS — a future revert to a separate tight
+/// band fails the guard instead of silently re-opening the disjoint-band tell.
+fn cap_shed_fallback_idle() -> Duration {
+    fallback_idle_timeout()
 }
 
 /// Replay freshness window sized to outlast the pre-PQ phase. The ClientHello
@@ -6749,21 +6774,34 @@ mod tests {
         drop(held);
     }
 
-    /// H-1: pins the tight cap-shed idle bound so a future edit cannot silently
-    /// raise it to the 600s legit backstop and re-open the cap-as-DoS-amplifier.
-    /// The actual idle is `floor + [0, jitter]`; the jitter is intentionally WIDE
-    /// (M-4: blurs the saturated-cap close-time tell), so the invariant guarded
-    /// here is the real UPPER edge (`floor + jitter`), which must still sit far
-    /// below the 600s legit backstop to keep the anti-DoS-amplification bound.
+    /// H-1 / M-4: a cap-shed close's IDLE-CLOSE TIME must not be separable from a
+    /// healthy splice's. The prior design gave cap-shed relays a SEPARATE tight idle
+    /// band ([10s, 90s]) that was disjoint from the healthy band ([600s, 660s]); a
+    /// prober timing our server-originated FIN on a silent relay could separate the
+    /// two populations in a few samples and read "this box is at its cap". This pins
+    /// the fix: the cap-shed call site draws its idle from [`cap_shed_fallback_idle`],
+    /// which must stay inside the healthy splice band. Sampling the actual call-site
+    /// helper (not `fallback_idle_timeout` directly) means a future revert that points
+    /// cap-shed at a separate tight band fails HERE. The anti-amplification bound is
+    /// carried solely by the 64-concurrency ceiling. (A pre-existing handshake-START
+    /// timing difference — cap-shed dials before reading the ClientHello — is out of
+    /// scope here and unchanged by the fix.)
     #[test]
-    fn cap_shed_fallback_idle_is_tight() {
-        assert_eq!(CAP_SHED_FALLBACK_IDLE, Duration::from_secs(10));
-        let max_idle = CAP_SHED_FALLBACK_IDLE + CAP_SHED_FALLBACK_IDLE_JITTER;
-        assert!(
-            max_idle < FALLBACK_IDLE_TIMEOUT_FLOOR,
-            "cap-shed relays' max idle (floor + jitter) must stay well below the \
-             600s legit backstop, not re-open the cap-as-DoS-amplifier",
-        );
+    fn cap_shed_fallback_idle_matches_healthy_band() {
+        // Sample the cap-shed call site's own idle helper: every value it can produce
+        // must be a value the healthy splice band ([floor, floor + jitter]) contains.
+        for _ in 0..256 {
+            let idle = cap_shed_fallback_idle();
+            assert!(
+                idle >= FALLBACK_IDLE_TIMEOUT_FLOOR
+                    && idle <= FALLBACK_IDLE_TIMEOUT_FLOOR + FALLBACK_IDLE_TIMEOUT_JITTER,
+                "cap-shed idle must sit inside the healthy splice band so the close \
+                 time is not a separable 'box at cap' tell",
+            );
+        }
+        // The anti-DoS-amplification backstop is the hard concurrency ceiling, not a
+        // tightened idle; pin it so a future edit cannot quietly remove it.
+        assert_eq!(MAX_CONCURRENT_CAP_SHED_FALLBACKS, 64);
     }
 
     #[tokio::test]
