@@ -1215,6 +1215,63 @@ mod tests {
     }
 
     #[test]
+    fn record_overhead_is_header_plus_maxpad_plus_trailer_plus_tag() {
+        // record_overhead governs the up-front out.reserve() for a sealed record, so
+        // it must equal TLS_HEADER_LEN + max_padding + PADDING_LEN_FIELD + AEAD_TAG_LEN
+        // exactly (=5 + max + 2 + 16). Pin it for two distinct padding profiles so any
+        // arithmetic mutation of the sum (or a `-> 0` / `-> 1` body) is caught.
+        let fixed = record::TLS_HEADER_LEN + PADDING_LEN_FIELD + AEAD_TAG_LEN; // 23
+        let p0 = PaddingProfile::new(0, 0).unwrap();
+        assert_eq!(record_overhead(&p0), fixed);
+        let p128 = PaddingProfile::new(0, 128).unwrap();
+        assert_eq!(record_overhead(&p128), fixed + 128);
+    }
+
+    #[test]
+    fn record_capacity_adds_payload_and_overhead() {
+        // record_capacity must be TLS_HEADER_LEN + payload + max_padding +
+        // PADDING_LEN_FIELD + AEAD_TAG_LEN. Pin exact values across payload/padding so
+        // the `+` chain and the `-> 0` / `-> 1` mutations are all caught.
+        let fixed = record::TLS_HEADER_LEN + PADDING_LEN_FIELD + AEAD_TAG_LEN; // 23
+        assert_eq!(record_capacity(0, 0), fixed);
+        assert_eq!(record_capacity(100, 0), fixed + 100);
+        assert_eq!(record_capacity(100, 64), fixed + 100 + 64);
+    }
+
+    #[test]
+    fn chunk_count_is_div_ceil_with_empty_special_case() {
+        // An empty payload still produces ONE record; otherwise it is ceil(payload /
+        // max_chunk). Pins the `payload_len == 0` guard (kills `== -> !=`, which would
+        // make the empty case fall through to div_ceil(0)=0) and the `-> 0` / `-> 1`
+        // body replacements.
+        assert_eq!(
+            chunk_count(0, 100),
+            1,
+            "empty payload -> exactly one record"
+        );
+        assert_eq!(chunk_count(1, 100), 1);
+        assert_eq!(chunk_count(100, 100), 1, "exact multiple -> no extra chunk");
+        assert_eq!(chunk_count(101, 100), 2, "one byte over -> a second chunk");
+        assert_eq!(chunk_count(250, 100), 3);
+    }
+
+    #[test]
+    fn chunked_records_capacity_is_payload_plus_per_record_overhead() {
+        // chunked_records_capacity = payload + record_count * (TLS_HEADER_LEN +
+        // max_padding + PADDING_LEN_FIELD + AEAD_TAG_LEN). Pin exact values so the
+        // outer `+`, the inner `*`, the inner `+` chain, and the `-> 0`/`-> 1` bodies
+        // are all caught.
+        let per_record = record::TLS_HEADER_LEN + PADDING_LEN_FIELD + AEAD_TAG_LEN; // 23
+        assert_eq!(chunked_records_capacity(0, 0, 0), 0);
+        assert_eq!(chunked_records_capacity(500, 1, 0), 500 + per_record);
+        assert_eq!(chunked_records_capacity(500, 3, 0), 500 + 3 * per_record);
+        assert_eq!(
+            chunked_records_capacity(500, 3, 64),
+            500 + 3 * (per_record + 64)
+        );
+    }
+
+    #[test]
     fn seal_into_extra_padded_is_decode_transparent_on_a_zero_profile_codec() {
         // PAR-35: the aggregate decorrelation pad is applied via seal_into_extra_padded
         // on a codec whose PaddingProfile is 0/0 (the relay codec's setting). The

@@ -2323,6 +2323,138 @@ mod tests {
     }
 
     #[test]
+    fn decode_ref_accepts_host_of_exactly_max_len_and_rejects_one_over() {
+        // decode_ref's host bound is `host_len > MAX_HOST_LEN`: a 255-byte host is
+        // valid and must decode; 256 must be HostTooLong. Pins the `>` boundary on
+        // the DECODE path (a `> -> >=` would reject the legal 255-byte host).
+        let at_limit = ConnectRequest {
+            host: "a".repeat(MAX_HOST_LEN),
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        let encoded = at_limit.encode().unwrap();
+        assert_eq!(
+            ConnectRequest::decode(&encoded).unwrap().host.len(),
+            MAX_HOST_LEN
+        );
+
+        // Hand-craft a record claiming a 256-byte host (one over the limit): magic +
+        // host_len=256 + 256 host bytes + port + payload_len=0. decode_ref must reject
+        // it as HostTooLong before reading the host.
+        let mut over = Vec::new();
+        over.extend_from_slice(CONNECT_MAGIC);
+        over.extend_from_slice(&((MAX_HOST_LEN as u16) + 1).to_be_bytes());
+        over.extend_from_slice(&vec![b'a'; MAX_HOST_LEN + 1]);
+        over.extend_from_slice(&443u16.to_be_bytes());
+        over.extend_from_slice(&0u32.to_be_bytes());
+        assert!(matches!(
+            ConnectRequest::decode(&over),
+            Err(ConnectRequestError::HostTooLong)
+        ));
+    }
+
+    #[test]
+    fn connect_record_size_is_shaped_rejects_non_band_sizes() {
+        // The helper must answer truthfully per band membership, not constant-true.
+        // Pin a clearly off-band size to false (kills `-> true`) and a real band to
+        // true.
+        assert!(!connect_record_size_is_shaped(0));
+        assert!(!connect_record_size_is_shaped(1));
+        assert!(!connect_record_size_is_shaped(
+            CONNECT_RECORD_SIZE_BANDS[0] - 1
+        ));
+        assert!(connect_record_size_is_shaped(CONNECT_RECORD_SIZE_BANDS[0]));
+        assert!(connect_record_size_is_shaped(
+            CONNECT_RECORD_SIZE_BANDS[CONNECT_RECORD_SIZE_BANDS.len() - 1]
+        ));
+    }
+
+    #[test]
+    fn pq_rekey_request_decode_length_boundary() {
+        // decode_ref has a `input.len() < 40` truncation guard before parsing the
+        // fixed header. An input of EXACTLY 40 bytes (valid magic) must pass that
+        // guard and fail LATER (not as a length-40 Truncated), while 39 bytes must be
+        // Truncated. This distinguishes `< 40` from `<= 40` / `== 40`.
+        let mut at = Vec::new();
+        at.extend_from_slice(PQ_REKEY_MAGIC);
+        at.resize(40, 0); // 40 bytes: passes `< 40`, then len==0 -> EmptyPublicKey
+        assert!(matches!(
+            PqRekeyRequest::decode_ref(&at),
+            Err(PqRekeyError::EmptyPublicKey)
+        ));
+        let mut short = Vec::new();
+        short.extend_from_slice(PQ_REKEY_MAGIC);
+        short.resize(39, 0);
+        assert!(matches!(
+            PqRekeyRequest::decode_ref(&short),
+            Err(PqRekeyError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn server_key_exchange_decode_length_boundary() {
+        // `input.len() < 40` guard: a 40-byte input must pass it (and fail later as a
+        // length error, not Truncated), 39 must be Truncated.
+        let mut at = Vec::new();
+        at.extend_from_slice(SERVER_KEY_EXCHANGE_MAGIC);
+        at.resize(40, 0); // len field == 0 -> EmptyCiphertext, NOT Truncated
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&at),
+            Err(ServerKeyExchangeError::EmptyCiphertext)
+        ));
+        let mut short = Vec::new();
+        short.extend_from_slice(SERVER_KEY_EXCHANGE_MAGIC);
+        short.resize(39, 0);
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&short),
+            Err(ServerKeyExchangeError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn server_identity_proof_signature_length_boundary() {
+        // `input.len() < 8` guard: 8 bytes passes it (len==0 -> EmptySignature), 7 is
+        // Truncated.
+        let mut at = Vec::new();
+        at.extend_from_slice(SERVER_IDENTITY_MAGIC);
+        at.resize(8, 0);
+        assert!(matches!(
+            ServerIdentityProof::signature(&at),
+            Err(ServerIdentityProofError::EmptySignature)
+        ));
+        let mut short = Vec::new();
+        short.extend_from_slice(SERVER_IDENTITY_MAGIC);
+        short.resize(7, 0);
+        assert!(matches!(
+            ServerIdentityProof::signature(&short),
+            Err(ServerIdentityProofError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn server_identity_chunk_decode_length_boundary() {
+        // `input.len() < 16` guard: 16 bytes passes it (then fails on the body
+        // length fields), 15 is Truncated.
+        let mut at = Vec::new();
+        at.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
+        at.resize(16, 0);
+        assert!(
+            !matches!(
+                ServerIdentityChunk::decode_ref(&at),
+                Err(ServerIdentityChunkError::Truncated)
+            ),
+            "a 16-byte input must pass the `< 16` guard (fail later, not as Truncated)"
+        );
+        let mut short = Vec::new();
+        short.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
+        short.resize(15, 0);
+        assert!(matches!(
+            ServerIdentityChunk::decode_ref(&short),
+            Err(ServerIdentityChunkError::Truncated)
+        ));
+    }
+
+    #[test]
     fn encode_accepts_host_of_exactly_max_len_and_rejects_one_over() {
         // The length guard is `host.len() > MAX_HOST_LEN` (255): a host of EXACTLY
         // 255 bytes is valid and must encode; 256 must be rejected. Pins the `>`
