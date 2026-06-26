@@ -450,6 +450,154 @@ mod tests {
         );
     }
 
+    /// A minimal SpeedReport for exercising the render paths. Only the fields the
+    /// renderers read (handshake.elapsed, the two median_mbps) carry meaningful
+    /// values; the rest are filler. Built from public fields so speed.rs is
+    /// untouched.
+    fn sample_report() -> SpeedReport {
+        use crate::speed::{
+            DirectionReport, DirectionSummary, PhaseMeasurement, SpeedPlan, TrafficEvidence,
+        };
+        let summary = |median: f64| DirectionSummary {
+            sample_count: 1,
+            total_bytes: 1,
+            median_mbps: median,
+            mean_mbps: median,
+            min_mbps: median,
+            max_mbps: median,
+            stddev_mbps: 0.0,
+        };
+        let dir = |median: f64| DirectionReport {
+            samples: Vec::new(),
+            summary: summary(median),
+        };
+        let zero = PhaseMeasurement {
+            bytes: 0,
+            elapsed: Duration::ZERO,
+        };
+        SpeedReport {
+            schema: "x",
+            generated_unix_ms: 0,
+            protocol_name: "x",
+            protocol_version: 0,
+            binary_version: "x",
+            config_fingerprint: String::new(),
+            server_addr: String::new(),
+            sni: String::new(),
+            traffic: TrafficEvidence {
+                min_padding: 0,
+                max_padding: 0,
+                min_delay_ms: 0,
+                max_delay_ms: 0,
+                cover_min_interval_ms: 0,
+                cover_max_interval_ms: 0,
+                max_concurrent_streams: 1,
+            },
+            max_payload_chunk_len: 0,
+            plan: SpeedPlan::default(),
+            handshake: PhaseMeasurement {
+                bytes: 0,
+                elapsed: Duration::from_millis(42),
+            },
+            warmup_download: zero,
+            warmup_upload: zero,
+            download: dir(123.5),
+            upload: dir(67.25),
+        }
+    }
+
+    #[test]
+    fn render_text_reports_ok_and_err_cells() {
+        let cells = vec![
+            NetCell {
+                imp: MATRIX[4], // rtt-160ms-bw-50: Some(50) bandwidth
+                outcome: Ok(sample_report()),
+            },
+            NetCell {
+                imp: MATRIX[0], // clean-0ms: None bandwidth -> "inf"
+                outcome: Err("boom".to_string()),
+            },
+        ];
+        let text = render_text("vps.example:443", &cells);
+        assert!(text.contains("upstream server: vps.example:443"));
+        // Locate the Ok cell's row and assert its exact column layout, so a
+        // regression in the bandwidth column can't pass on an incidental "50"
+        // substring elsewhere (e.g. inside the 123.50 median).
+        let ok_row = text
+            .lines()
+            .find(|l| l.starts_with("rtt-160ms-bw-50"))
+            .expect("Ok cell row must be present");
+        // Format mirrors render_text: "{:<18} {:>9} {:>12} {:>14.2} {:>14.2}".
+        assert_eq!(
+            ok_row,
+            format!(
+                "{:<18} {:>9} {:>12} {:>14.2} {:>14.2}",
+                "rtt-160ms-bw-50", 160, "50", 123.5, 67.25
+            )
+        );
+        // None bandwidth renders as the literal "inf", and the Err branch renders
+        // its message inline. Pin the Err row exactly too (label + rtt + inf + msg).
+        let err_row = text
+            .lines()
+            .find(|l| l.starts_with("clean-0ms"))
+            .expect("Err cell row must be present");
+        assert_eq!(
+            err_row,
+            format!(
+                "{:<18} {:>9} {:>12}  ERROR: {}",
+                "clean-0ms", 0, "inf", "boom"
+            )
+        );
+    }
+
+    #[test]
+    fn render_json_reports_ok_and_err_cells() {
+        let cells = vec![
+            NetCell {
+                imp: MATRIX[4], // Some(50)
+                outcome: Ok(sample_report()),
+            },
+            NetCell {
+                imp: MATRIX[0], // None -> null
+                outcome: Err("he said \"hi\"\n".to_string()),
+            },
+        ];
+        let json = render_json("a\\b", &cells);
+        assert!(json.contains("\"schema\": \"parallax.netmatrix.v1\""));
+        assert!(json.contains("\"upstream\": \"a\\\\b\"")); // backslash escaped
+        assert!(json.contains("\"bandwidth_mbit\": 50,"));
+        assert!(json.contains("\"bandwidth_mbit\": null,")); // None -> null
+        assert!(json.contains("\"handshake_ms\": 42.000,"));
+        assert!(json.contains("\"download_median_mbps\": 123.5000,"));
+        assert!(json.contains("\"upload_median_mbps\": 67.2500"));
+        // Err branch: the quote and newline in the message must be JSON-escaped.
+        assert!(json.contains(r#""error": "he said \"hi\"\n""#));
+        // The Ok cell (not last) is comma-terminated; the Err cell (last) is NOT.
+        assert!(
+            json.contains("    },\n"),
+            "Ok cell must be comma-terminated"
+        );
+        // The last cell's closing brace must be immediately followed by the array
+        // close, with NO comma — guards against a trailing-comma regression that
+        // would produce invalid JSON.
+        assert!(
+            json.contains("    }\n  ]"),
+            "last cell must close without a trailing comma"
+        );
+        assert!(
+            !json.contains("    },\n  ]"),
+            "last cell must not be comma-terminated"
+        );
+        assert!(json.trim_end().ends_with('}')); // document closes cleanly
+    }
+
+    #[test]
+    fn json_escape_covers_all_specials() {
+        assert_eq!(json_escape("\"\\\n\r\t plain"), "\\\"\\\\\\n\\r\\t plain");
+        assert_eq!(json_escape(""), "");
+        assert_eq!(json_escape("none"), "none");
+    }
+
     #[tokio::test]
     async fn shaper_caps_upload_direction_throughput() {
         // Guards the 96288aec ingress-pacing fix by timing the CLIENT's write of
