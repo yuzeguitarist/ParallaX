@@ -1215,8 +1215,18 @@ mod tests {
         assert_eq!(assembled.unwrap(), payload);
     }
 
+    /// Largest `max_padding` the config validator (`TrafficConfig::validate`) accepts:
+    /// the value just before `max_plaintext_len` drops below `MIN_USABLE_PLAINTEXT_LEN`.
+    /// Derived so the tests track the real bound rather than a hard-coded number.
+    fn max_valid_padding() -> u16 {
+        (0_u16..=u16::MAX)
+            .rev()
+            .find(|&p| max_plaintext_len(p) >= MIN_USABLE_PLAINTEXT_LEN)
+            .expect("some padding leaves room for the usable-plaintext floor")
+    }
+
     #[test]
-    fn seal_pq_flight_fits_the_record_limit_under_max_valid_padding() {
+    fn seal_pq_flight_fits_the_record_limit_under_worst_case_padding() {
         // Regression: the browser-shaped PQ records (targets up to 1353 B) are sealed
         // with the operator's configured PaddingProfile, NOT 0/0. Before the fix, a
         // large-but-valid `max_padding` could push a shaped record (its profile pad,
@@ -1224,25 +1234,31 @@ mod tests {
         // OUTER_TLS_RECORD_LIMIT, failing the seal and so the whole handshake. The
         // chunk-size cap (`pq_flight_max_chunk_size`) must keep EVERY record sealable
         // at the heaviest padding the config layer accepts.
+        //
+        // This drives the WORST case DETERMINISTICALLY rather than hoping a seed hits it
+        // (an earlier 200-seed random sweep was a false-green: the heavy-tail pad draw
+        // first overflows the uncapped path only around seed 540): a degenerate
+        // `min == max == max_valid_padding` profile makes `sample_padding_len` return the
+        // max on EVERY record (traffic.rs short-circuits min==max), and the largest
+        // possible aggregate pad (PQ_FLIGHT_AGGREGATE_PAD_MAX) is forced onto the last
+        // record. The "teeth" sub-test below proves this configuration WOULD overflow if
+        // the cap were removed, so a silent revert of the cap is caught.
         use crate::protocol::command::{
             pq_flight_max_chunk_size, FramedChunk, FramedReassembler, MAX_PQ_HANDSHAKE_FRAME,
         };
-        // Largest `max_padding` the config validator accepts: the value just before
-        // `max_plaintext_len` drops below MIN_USABLE_PLAINTEXT_LEN. Derived here so the
-        // test tracks the real bound rather than a hard-coded number.
-        let max_valid_padding = (0_u16..=u16::MAX)
-            .rev()
-            .find(|&p| max_plaintext_len(p) >= MIN_USABLE_PLAINTEXT_LEN)
-            .expect("some padding leaves room for the usable-plaintext floor");
-        let padding = PaddingProfile::new(0, max_valid_padding).unwrap();
+        let pad = max_valid_padding();
+        // min == max: every record's profile pad is exactly `pad` (the worst case),
+        // deterministically — no reliance on a lucky heavy-tail RNG draw.
+        let padding = PaddingProfile::new(pad, pad).unwrap();
 
         // ML-KEM-1024 key-exchange (~1.6 KB) and the ML-DSA-87 identity proof (~4.6 KB),
         // both well above a single shaped record so the flight always fragments.
         for payload_len in [1609_usize, 4635] {
             let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
-            // Many seeds so the worst-case profile-pad draw (the heavy-tail span branch)
-            // and aggregate-pad draw are both exercised against the last record.
-            for seed in 0..200_u64 {
+            // A few seeds only vary the shaped record boundaries; the worst-case pad is
+            // already forced by the degenerate profile, so coverage no longer hinges on
+            // the seed range.
+            for seed in 0..16_u64 {
                 let key = [0x11_u8; KEY_LEN];
                 let nonce = [0x22_u8; NONCE_LEN];
                 let mut enc =
@@ -1282,6 +1298,46 @@ mod tests {
                 }
                 assert_eq!(assembled.unwrap(), payload, "seed={seed}");
             }
+        }
+
+        // Teeth: prove the cap is load-bearing — WITHOUT it (the pre-fix behavior,
+        // modeled by passing usize::MAX so `browser_shaped_sizes` is uncapped) the SAME
+        // worst-case profile MUST overflow, so a silent revert/weakening of the cap would
+        // make the assertions above fail. Under min==max==max_valid_padding the shaper's
+        // largest target (1353) yields a ~1369-plaintext record that, with the profile
+        // pad, blows past the TLS limit on the FIRST seed — deterministic, no seed
+        // lottery (the original 200-seed random sweep relied on luck and was false-green).
+        for payload_len in [1609_usize, 4635] {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+            let mut overflowed = false;
+            for seed in 0..16_u64 {
+                let mut enc = DataRecordCodec::new(
+                    AeadCodec::new([0x11_u8; KEY_LEN], [0x22_u8; NONCE_LEN]),
+                    padding,
+                    SERVER_TO_CLIENT_AAD,
+                );
+                let mut rng = StdRng::seed_from_u64(seed);
+                // usize::MAX => uncapped shaping (the pre-fix path).
+                let chunks =
+                    FramedChunk::encode_all_browser_shaped(&payload, usize::MAX, &mut rng).unwrap();
+                let mut sealed = Vec::new();
+                if let Err(err) = enc.seal_pq_flight(&chunks, &mut rng, &mut sealed) {
+                    assert!(
+                        matches!(
+                            err,
+                            DataRecordError::TlsRecord(record::TlsRecordError::PayloadTooLarge(_))
+                        ),
+                        "uncapped overflow must be PayloadTooLarge, got {err:?}"
+                    );
+                    overflowed = true;
+                    break;
+                }
+            }
+            assert!(
+                overflowed,
+                "the uncapped (pre-fix) shaper MUST overflow under worst-case padding for \
+                 payload_len={payload_len} — if it does not, this test has no teeth"
+            );
         }
     }
 

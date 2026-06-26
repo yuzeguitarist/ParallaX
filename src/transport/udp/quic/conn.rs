@@ -301,7 +301,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// exactly the constant-cadence autocorrelation tell this jitter exists to remove.
 /// The fallback therefore walks a process-local counter across the span so successive
 /// intervals still differ, with no wall-clock read (the sans-IO core stays
-/// time-input-free) and no predictable-PRNG schedule leaked to a passive observer.
+/// time-input-free). This trades unpredictability for liveness ONLY on the degraded
+/// path where the CSPRNG is non-functional: the counter walk is itself a predictable
+/// sequence (an active prober who knew the counter origin could extrapolate it), but it
+/// still removes the fixed-cadence autocorrelation spike that is the primary passive
+/// tell, and it is strictly better than the constant value it replaces. On a healthy
+/// host this branch is unreachable.
 fn random_keep_alive_interval() -> Duration {
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
     let span_ms = (KEEP_ALIVE_MAX - KEEP_ALIVE_MIN).as_millis() as u64;
@@ -381,14 +386,17 @@ struct Space {
     sent_content: BTreeMap<u64, SentContent>,
     /// An ack-eliciting packet has been received and not yet acknowledged.
     ack_pending: bool,
-    /// When the LARGEST-numbered ack-eliciting packet covered by the current
-    /// (not-yet-sent) ACK was received, for the `ack_delay` field (RFC 9000 §13.2.5:
-    /// ack_delay is measured from the receipt of the largest acknowledged packet, NOT
-    /// the first one in the batch — using the first would overreport the delay by the
-    /// packets' inter-arrival gap and inflate the peer's RTT). Updated whenever a
-    /// newly-received ack-eliciting packet becomes the new largest; cleared when the
-    /// ACK is sent. A real QUIC stack reports this; hard-coding 0 was a passive tell.
-    ack_eliciting_largest_recv: Option<Instant>,
+    /// When the LARGEST-numbered packet covered by the current (not-yet-sent) ACK was
+    /// received, for the `ack_delay` field (RFC 9000 §13.2.5: ack_delay is measured from
+    /// the receipt of the largest ACKNOWLEDGED packet, NOT the first one in the batch —
+    /// using the first would overreport the delay by the packets' inter-arrival gap and
+    /// inflate the peer's RTT). The ACK's Largest Acknowledged is `recv.largest()`, which
+    /// may be a NON-ack-eliciting packet (e.g. a pure ACK whose PN exceeds a later,
+    /// reordered ack-eliciting packet), so this is updated whenever ANY newly-received
+    /// packet becomes the new largest — NOT gated on ack-eliciting (gating it there left
+    /// a stale, too-old stamp in that interleaving). Cleared when the ACK is sent. A real
+    /// QUIC stack reports this; hard-coding 0 was a passive tell.
+    largest_recv_time: Option<Instant>,
     /// CRYPTO byte ranges to RESEND (lost packets) before any fresh CRYPTO.
     retransmit_crypto: Vec<(u64, u64)>,
     /// Earliest armed time-threshold loss deadline (RFC 9002 §6.1.2), if any.
@@ -1562,7 +1570,7 @@ impl Connection {
         // there, RFC 9000 §13.2.1 / §17.2.5), so they keep delay 0.
         let ack_delay_raw = if space == SPACE_DATA {
             self.spaces[space]
-                .ack_eliciting_largest_recv
+                .largest_recv_time
                 .map(|recv| {
                     let held = now.saturating_duration_since(recv).min(MAX_ACK_DELAY);
                     (held.as_micros() as u64) >> ACK_DELAY_EXPONENT
@@ -1581,7 +1589,7 @@ impl Connection {
             seal_packet(&keys.local, header, &[Frame::Ack(ack)])
         };
         self.spaces[space].ack_pending = false;
-        self.spaces[space].ack_eliciting_largest_recv = None;
+        self.spaces[space].largest_recv_time = None;
         self.record_sent(
             space,
             pn,
@@ -2287,7 +2295,7 @@ impl Connection {
         // this packet in, so it is the new largest iff its PN equals `recv.largest()`; a
         // reordered (smaller-PN) packet does not move the stamp.
         if self.spaces[space].recv.largest() == Some(header.packet_number()) {
-            self.spaces[space].ack_eliciting_largest_recv = Some(now);
+            self.spaces[space].largest_recv_time = Some(now);
         }
         if ack_eliciting {
             self.spaces[space].ack_pending = true;
