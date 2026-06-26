@@ -20,6 +20,31 @@ on:
     # Off-peak; deliberately avoids minute 0/30 to dodge cron stampede.
     - cron: '17 4 * * *'
   workflow_dispatch:
+    # Manual sweeps over a broader module than the nightly's 2-file scope.
+    # When `module` is anything other than `nightly`, the run mutates every file
+    # under that module's `src/<module>/` glob (still `--lib`-scoped tests) and
+    # shards by `shard_total` so each job stays under GitHub's 6h cap. Leaving the
+    # defaults reproduces the original nightly behaviour exactly.
+    inputs:
+      module:
+        description: 'Module to sweep (nightly = original 2-file scope)'
+        type: choice
+        default: nightly
+        options:
+          - nightly
+          - crypto
+          - fingerprint
+          - handshake
+          - protocol
+          - transport
+      shard_index:
+        description: 'Shard index for this run (0-based; ignored when module=nightly)'
+        type: string
+        default: '0'
+      shard_total:
+        description: 'Total shards to split the module into (ignored when module=nightly)'
+        type: string
+        default: '4'
 
 # Least-privilege: only needs to read the repo to build/mutate/test.
 permissions:
@@ -102,18 +127,40 @@ jobs:
         # --config explicitly for clarity. Do NOT add a CLI --timeout (it would
         # override the baseline-relative config timeout). --no-shuffle makes each
         # shard a fixed, reproducible partition.
+        #
+        # MANUAL MODULE SWEEP (workflow_dispatch with module != nightly): mutate
+        # every file under src/<module>/** instead of the 2 nightly files, sharded
+        # by the dispatched shard_index/shard_total. The per-mutant test scope
+        # (--lib + oracles) still comes from .cargo/mutants.toml, so the slow
+        # liveness/relay integration tests stay excluded (no hangs). The -f glob
+        # below overrides the config's examine_globs (CLI wins).
+        env:
+          MUT_MODULE: ${{ github.event.inputs.module || 'nightly' }}
+          MUT_SHARD_INDEX: ${{ github.event.inputs.shard_index || '0' }}
+          MUT_SHARD_TOTAL: ${{ github.event.inputs.shard_total || '4' }}
         run: |
           ulimit -v 12582912   # 12 GiB address-space cap per process
-          shard=$(( 10#$(date -u +%j) % 8 ))
-          echo "MUT_SHARD=$shard" >> "$GITHUB_ENV"
-          echo "Testing mutation shard $shard/8 (rotates daily; full surface every 8 days)"
-          cargo mutants \
-            --config .cargo/mutants.toml \
-            --in-place \
-            --no-shuffle \
-            --shard "$shard/8" \
-            -f src/tls/safari26.rs \
-            -f src/crypto/auth.rs
+          if [ "$MUT_MODULE" = "nightly" ]; then
+            shard=$(( 10#$(date -u +%j) % 8 ))
+            echo "MUT_SHARD=$shard" >> "$GITHUB_ENV"
+            echo "Testing mutation shard $shard/8 (rotates daily; full surface every 8 days)"
+            cargo mutants \
+              --config .cargo/mutants.toml \
+              --in-place \
+              --no-shuffle \
+              --shard "$shard/8" \
+              -f src/tls/safari26.rs \
+              -f src/crypto/auth.rs
+          else
+            echo "MUT_SHARD=${MUT_MODULE}-${MUT_SHARD_INDEX}of${MUT_SHARD_TOTAL}" >> "$GITHUB_ENV"
+            echo "Sweeping module src/${MUT_MODULE}/** shard ${MUT_SHARD_INDEX}/${MUT_SHARD_TOTAL}"
+            cargo mutants \
+              --config .cargo/mutants.toml \
+              --in-place \
+              --no-shuffle \
+              --shard "${MUT_SHARD_INDEX}/${MUT_SHARD_TOTAL}" \
+              -f "src/${MUT_MODULE}/**"
+          fi
 
       - name: Upload mutants.out report
         if: always()
