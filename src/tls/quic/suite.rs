@@ -197,6 +197,42 @@ mod tests {
     }
 
     #[test]
+    fn to_u16_is_inverse_of_from_u16() {
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            assert_eq!(CipherSuite::from_u16(suite.to_u16()).unwrap(), suite);
+        }
+        assert_eq!(CipherSuite::Aes128GcmSha256.to_u16(), 0x1301);
+        assert_eq!(CipherSuite::Aes256GcmSha384.to_u16(), 0x1302);
+        assert_eq!(CipherSuite::ChaCha20Poly1305Sha256.to_u16(), 0x1303);
+    }
+
+    #[test]
+    fn sha384_digest_and_hmac_known_answers() {
+        let suite = CipherSuite::Aes256GcmSha384;
+        // SHA-384("") known digest (FIPS 180-4 / NIST example).
+        let empty = suite.digest(&[]);
+        let empty_hex: String = empty.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            empty_hex,
+            "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da\
+             274edebfe76f65fbd51ad2f14898b95b"
+        );
+        assert_eq!(empty.len(), 48);
+        // RFC 4231 HMAC-SHA-384 test case 1: key=0x0b x20, data="Hi There".
+        let mac = suite.hmac(&[0x0b; 20], b"Hi There").unwrap();
+        let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            mac_hex,
+            "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c\
+             faea9ea9076ede7f4af152e8b2fa9cb6"
+        );
+    }
+
+    #[test]
     fn hkdf_expand_label_matches_rfc8448_empty_hash_derive() {
         // RFC 8448 §3: Early Secret = HKDF-Extract(0, 0) for SHA-256,
         // then derived = Derive-Secret(Early, "derived", "") which is well-known:
