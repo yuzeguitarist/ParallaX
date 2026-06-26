@@ -312,7 +312,9 @@ impl Header {
             let dcid = c.cid()?;
             let scid = c.cid()?;
             let token = if ty == LongType::Initial {
-                let tlen = c.varint()? as usize;
+                // try_from, not `as usize`: a >usize varint must fail closed, not
+                // silently truncate on a 32-bit target (matches `long_packet_len`).
+                let tlen = usize::try_from(c.varint()?).map_err(|_| DecodeError::Truncated)?;
                 c.take(tlen)?.to_vec()
             } else {
                 Vec::new()
@@ -381,7 +383,9 @@ pub fn locate_pn_offset(buf: &[u8], local_cid_len: usize) -> Result<usize, Decod
     let _dcid = c.cid()?;
     let _scid = c.cid()?;
     if ty == LongType::Initial {
-        let tlen = c.varint()? as usize;
+        // try_from, not `as usize`: fail closed on a >usize varint rather than
+        // silently truncate on a 32-bit target (matches `long_packet_len`).
+        let tlen = usize::try_from(c.varint()?).map_err(|_| DecodeError::Truncated)?;
         c.skip(tlen)?;
     }
     let _length = c.varint()?;
