@@ -1807,8 +1807,20 @@ async fn run_authenticated_data_mode(
                         // regime instead of reading as a second, heavier PQ exchange.
                         // Sealed into one buffer => one write => single flight.
                         let mut key_exchange_record = Vec::new();
-                        let key_exchange_chunks =
-                            FramedChunk::encode_all_browser_shaped(&key_exchange_payload, &mut rng)?;
+                        // Cap the shaped chunk size to what `server_seal` can seal under
+                        // its padding profile so a heavy `max_padding` config cannot push
+                        // a shaped record past the TLS record limit (the aggregate pad on
+                        // the last record is reserved too). The padding profile is
+                        // unchanged by the PQ rekey below, so this cap also governs the
+                        // identity flight.
+                        let max_pq_chunk = crate::protocol::command::pq_flight_max_chunk_size(
+                            server_seal.max_plaintext_len(),
+                        );
+                        let key_exchange_chunks = FramedChunk::encode_all_browser_shaped(
+                            &key_exchange_payload,
+                            max_pq_chunk,
+                            &mut rng,
+                        )?;
                         server_seal.seal_pq_flight(
                             &key_exchange_chunks,
                             &mut rng,
@@ -1860,6 +1872,7 @@ async fn run_authenticated_data_mode(
                         // [256,1024]->[960,1320] switch to segment on.
                         let identity_chunks = ServerIdentityChunk::encode_all_browser_shaped(
                             &identity_payload,
+                            max_pq_chunk,
                             &mut rng,
                         )?;
                         write_server_identity_chunks(
@@ -5187,7 +5200,10 @@ mod tests {
         );
         let payload = vec![0x42_u8; 4096];
         let mut rng = StdRng::seed_from_u64(103);
-        let chunks = ServerIdentityChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+        let max_chunk =
+            crate::protocol::command::pq_flight_max_chunk_size(server_seal.max_plaintext_len());
+        let chunks =
+            ServerIdentityChunk::encode_all_browser_shaped(&payload, max_chunk, &mut rng).unwrap();
         let expected_chunks = chunks.clone();
         let mut writer = CountingWriter::default();
 

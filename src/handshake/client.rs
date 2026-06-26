@@ -167,7 +167,13 @@ impl ClientDataSession {
         // The server reassembles by FramedChunk length headers; the aggregate pad is
         // stripped transparently by the per-record padding trailer.
         let mut record = Vec::new();
-        let chunks = FramedChunk::encode_all_browser_shaped(&request, rng)?;
+        // Cap the shaped chunk size to what this codec can seal under its padding
+        // profile, so a heavy `max_padding` config cannot push a shaped record past the
+        // TLS record limit (the aggregate pad on the last record is reserved too).
+        let max_chunk = crate::protocol::command::pq_flight_max_chunk_size(
+            self.seal_to_server.max_plaintext_len(),
+        );
+        let chunks = FramedChunk::encode_all_browser_shaped(&request, max_chunk, rng)?;
         self.seal_to_server
             .seal_pq_flight(&chunks, rng, &mut record)?;
         Ok((

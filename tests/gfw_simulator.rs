@@ -131,8 +131,13 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
     );
     let mut rng = StdRng::seed_from_u64(0x5EA1);
 
+    // The shaped-chunk size cap the product server passes (derived from the codec's
+    // max_plaintext_len), so the modeled lengths match the wire under any padding.
+    let max_chunk =
+        parallax::protocol::command::pq_flight_max_chunk_size(server_seal.max_plaintext_len());
+
     let identity_chunks =
-        ServerIdentityChunk::encode_all_browser_shaped(&identity_payload, &mut rng)
+        ServerIdentityChunk::encode_all_browser_shaped(&identity_payload, max_chunk, &mut rng)
             .expect("chunk ServerIdentityProof");
     let identity_chunk_count = identity_chunks.len();
 
@@ -144,7 +149,7 @@ fn pfs_rekey_fragmented_identity_lengths() -> Vec<LengthObservation> {
     // record length after the 5-byte TLS header and before the AEAD tag; we recover it
     // by re-parsing the sealed buffer so a future framing/padding change is reflected.
     let key_exchange_chunks =
-        FramedChunk::encode_all_browser_shaped(&key_exchange_payload, &mut rng)
+        FramedChunk::encode_all_browser_shaped(&key_exchange_payload, max_chunk, &mut rng)
             .expect("chunk ServerKeyExchange");
     let key_exchange_chunk_count = key_exchange_chunks.len();
 
