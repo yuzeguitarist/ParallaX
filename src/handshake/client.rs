@@ -215,7 +215,20 @@ impl ClientDataSession {
     {
         request.protect_plaintext_memory();
         let payload = Zeroizing::new(request.encode()?);
-        Ok(self.seal_to_server.seal(payload.as_slice(), rng)?)
+        // C3: snap the CONNECT record onto a randomly chosen browser-magnitude
+        // size band so its on-wire length leaks neither the target host length
+        // nor the captured 0-RTT payload size. The extra pad rides the existing
+        // self-describing 2-byte trailer (decode-transparent, no wire-format
+        // change) and is bounded so the padded record still fits one TLS record.
+        let max_extra_pad = self
+            .seal_to_server
+            .max_plaintext_len()
+            .saturating_sub(payload.len());
+        let extra_pad = request.shaping_extra_pad(max_extra_pad, rng);
+        let mut out = Vec::new();
+        self.seal_to_server
+            .seal_into_extra_padded(payload.as_slice(), extra_pad, rng, &mut out)?;
+        Ok(out)
     }
 
     pub fn seal_payload<R>(
@@ -517,7 +530,18 @@ mod tests {
         let (mut open_from_client, _) = data_codecs(&keys, traffic).unwrap();
         let payload = open_from_client.open(&record).unwrap();
 
+        // The C3 shaping pad is stripped transparently on open, so the CONNECT
+        // decodes byte-for-byte despite the on-wire record being padded to a band.
         assert_eq!(ConnectRequest::decode(&payload).unwrap(), request);
+
+        // C3: the on-wire record size must be one of the shaping bands, not the
+        // raw `CONNECT_FIXED_LEN + host + payload` size that would leak the target.
+        let header = crate::tls::record::parse_header(&record).unwrap();
+        assert!(
+            crate::protocol::command::connect_record_size_is_shaped(header.payload_len),
+            "CONNECT wire size {} is not a shaping band",
+            header.payload_len
+        );
     }
 
     // Test helper: reassemble a PQ handshake frame (PX1Q/PX1K) from a buffer of
