@@ -50,9 +50,14 @@ on:
 permissions:
   contents: read
 
-# Cancel an in-flight nightly run if a newer one starts (e.g. manual dispatch).
+# Cancel an in-flight run only when a NEWER run of the SAME (ref, module, shard)
+# starts. The module+shard suffix is essential for the manual fan-out: dispatching
+# many module sweeps on one branch must NOT cancel each other (a bare ref-only
+# group made every dispatch cancel the previous, leaving only the last alive).
+# For the scheduled nightly the inputs are empty, so the group collapses back to
+# the per-ref behaviour (re-dispatch supersedes an in-flight nightly).
 concurrency:
-  group: nightly-mutants-${{ github.ref }}
+  group: nightly-mutants-${{ github.ref }}-${{ github.event.inputs.module || 'nightly' }}-${{ github.event.inputs.shard_index || '0' }}-${{ github.event.inputs.shard_total || '4' }}
   cancel-in-progress: true
 
 env:
