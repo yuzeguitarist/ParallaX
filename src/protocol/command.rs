@@ -26,6 +26,27 @@ const MAX_HOST_LEN: usize = 255;
 const CONNECT_FIXED_LEN: usize = 4 + 2 + 2 + 4;
 const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
 
+/// Per-record wire overhead a sealed data record adds on top of its plaintext:
+/// the 2-byte self-describing pad-length trailer + the AEAD tag. So a CONNECT
+/// record's on-wire TLS `length` field = plaintext + this. Used to translate a
+/// target wire size into an `extra_pad` plaintext-suffix length.
+const DATA_RECORD_WIRE_OVERHEAD: usize = 2 + 16;
+
+/// Quantized wire-size bands the CONNECT record is padded up to (C3). The raw
+/// CONNECT record length is `CONNECT_FIXED_LEN + host_len + initial_payload_len`
+/// plus overhead, which directly leaks the target host length and the captured
+/// 0-RTT payload size — a small, variable, self-custom control record unlike any
+/// browser request. We snap the record to ONE randomly chosen band so the
+/// observable size carries no host_len signal, is never a tiny control packet,
+/// and is never a single fixed peak. The bands sit in the same sub-2 KiB
+/// browser-request magnitude as the measured Safari first-request burst
+/// (SETTINGS+WINDOW_UPDATE+HEADERS ~368 B and follow-on requests), WITHOUT
+/// pinning to Safari's exact 368 — a fixed Safari value would itself become a
+/// cluster signature once ParallaX is being hunted. Reusing the measured-Safari
+/// provenance of `PQ_FLIGHT_RECORD_TARGETS`, spread across the realistic CONNECT
+/// range so the random choice dominates the size.
+const CONNECT_RECORD_SIZE_BANDS: [usize; 8] = [286, 469, 569, 735, 911, 1180, 1353, 1600];
+
 /// Per-chunk plaintext size bounds for [`FramedChunk::encode_all_shaped`]
 /// splitting of the PQ handshake records. A fresh size in this range is drawn
 /// for every chunk (with a sub-min final remainder merged into the previous
@@ -343,6 +364,39 @@ impl ConnectRequest {
         CONNECT_FIXED_LEN + self.host.len() + self.initial_payload.len()
     }
 
+    /// Extra plaintext-suffix padding (C3) to snap this CONNECT record's on-wire
+    /// size onto one randomly chosen [`CONNECT_RECORD_SIZE_BANDS`] band, so the
+    /// observable record length leaks neither the target host length nor the
+    /// captured 0-RTT payload size.
+    ///
+    /// A band is chosen UNIFORMLY AT RANDOM among those large enough to hold this
+    /// record, then the pad fills the gap. Choosing among all fitting bands (not
+    /// "the next band up") is what severs the size→payload correlation: for the
+    /// common case (raw size below the smallest band) the result is one of the
+    /// full band set regardless of host_len, so two different targets produce the
+    /// same size distribution. `max_extra_pad` caps the pad so the padded record
+    /// still fits one outer TLS record; if even the natural size already exceeds
+    /// the largest band (only reachable with a near-maximal captured 0-RTT
+    /// payload) no band fits and we add no extra pad — a rare tail, and that
+    /// record's size is dominated by the large payload, not by host_len.
+    pub fn shaping_extra_pad<R>(&self, max_extra_pad: usize, rng: &mut R) -> usize
+    where
+        R: rand::Rng + ?Sized,
+    {
+        let raw_wire = self.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
+        let mut fitting = CONNECT_RECORD_SIZE_BANDS
+            .iter()
+            .copied()
+            .filter(|&band| band >= raw_wire && band - raw_wire <= max_extra_pad)
+            .peekable();
+        if fitting.peek().is_none() {
+            return 0;
+        }
+        let candidates: Vec<usize> = fitting.collect();
+        let band = candidates[rng.gen_range(0..candidates.len())];
+        band - raw_wire
+    }
+
     pub fn target(&self) -> String {
         connect_target(&self.host, self.port)
     }
@@ -445,6 +499,13 @@ impl ConnectRequestRef<'_> {
             self.initial_payload,
         );
     }
+}
+
+/// Whether a CONNECT record's on-wire TLS payload length is one of the C3
+/// shaping bands. Diagnostic/test helper so the shaping invariant can be checked
+/// from other modules without exposing the band table.
+pub fn connect_record_size_is_shaped(wire_payload_len: usize) -> bool {
+    CONNECT_RECORD_SIZE_BANDS.contains(&wire_payload_len)
 }
 
 fn connect_target(host: &str, port: u16) -> String {
@@ -2160,6 +2221,62 @@ mod tests {
 
         let encoded = request.encode().unwrap();
         assert_eq!(ConnectRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn shaping_extra_pad_lands_on_a_band() {
+        // The padded wire size (raw plaintext + overhead + extra_pad) must equal
+        // one of the configured bands, for many seeds and several request sizes.
+        use rand::{rngs::StdRng, SeedableRng};
+        for payload_len in [0_usize, 17, 300, 700] {
+            let request = ConnectRequest {
+                host: "example.com".to_owned(),
+                port: 443,
+                initial_payload: vec![0x41; payload_len],
+            };
+            let raw_wire = request.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
+            for seed in 0..64 {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let pad = request.shaping_extra_pad(16_000, &mut rng);
+                let wire = raw_wire + pad;
+                assert!(
+                    CONNECT_RECORD_SIZE_BANDS.contains(&wire),
+                    "wire {wire} (raw {raw_wire} + pad {pad}) not on a band"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shaping_extra_pad_decorrelates_from_host_len() {
+        // Two requests with very different host lengths but small payloads must be
+        // able to reach the SAME set of band sizes — so the observable record size
+        // carries no host-length signal. Sweep all seeds and collect the band each
+        // can land on; the achievable band sets must be identical.
+        use rand::{rngs::StdRng, SeedableRng};
+        use std::collections::BTreeSet;
+
+        let bands_for = |host: &str| -> BTreeSet<usize> {
+            let request = ConnectRequest {
+                host: host.to_owned(),
+                port: 443,
+                initial_payload: Vec::new(),
+            };
+            let raw_wire = request.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
+            (0..512)
+                .map(|seed| {
+                    let mut rng = StdRng::seed_from_u64(seed);
+                    raw_wire + request.shaping_extra_pad(16_000, &mut rng)
+                })
+                .collect()
+        };
+
+        let short = bands_for("a.io");
+        let long = bands_for(&"x".repeat(200));
+        // Both short and long hosts are below the smallest band, so every band is
+        // reachable for both — identical sets, zero host_len leak.
+        assert_eq!(short, long);
+        assert_eq!(short, CONNECT_RECORD_SIZE_BANDS.iter().copied().collect());
     }
 
     #[test]
