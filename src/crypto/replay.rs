@@ -138,7 +138,7 @@ impl ReplayCache {
             return Ok(cache);
         }
 
-        let raw = fs::read_to_string(&path)?;
+        let raw = read_cache_file(&path)?;
         for line in raw.lines().filter(|line| !line.trim().is_empty()) {
             let entry = parse_entry(line)?;
             cache.insert_loaded(entry);
@@ -190,7 +190,7 @@ impl ReplayCache {
             return Ok(cache);
         }
 
-        let raw = fs::read_to_string(&path)?;
+        let raw = read_cache_file(&path)?;
         // A crash during the FIRST append can materialize a 0-byte (or, via a
         // partial write, whitespace-only) file before the empty header is written
         // and synced. Treat that the same as "no file": a fresh, empty, loadable
@@ -437,6 +437,31 @@ impl ReplayCache {
         fsync_parent_dir(path);
         self.auth_journal = Some(journal);
         Ok(())
+    }
+}
+
+/// Read the replay-cache journal, refusing to follow a symlinked final path
+/// component on unix (`O_NOFOLLOW`), matching the project's secret-file discipline
+/// (`config::read_secret_config_file`, the cache write helpers' 0600). The journal
+/// is MAC-authenticated so a swapped file already fails verification, but reading
+/// through a symlink an attacker planted is exactly the path-vs-read race that
+/// discipline closes everywhere else; the read path should not be the one exception.
+fn read_cache_file(path: &Path) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)?;
+        Ok(raw)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::read_to_string(path)
     }
 }
 
@@ -1068,6 +1093,38 @@ mod tests {
         assert_eq!(
             fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_load_refuses_to_follow_a_symlinked_path() {
+        // O_NOFOLLOW (C-2): a cache path whose final component is a symlink must
+        // fail to load rather than read through to the symlink target, matching the
+        // secret-file discipline used everywhere else.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let mut cache = ReplayCache::load_or_create_authenticated(&real, 8, key).unwrap();
+        assert!(cache
+            .insert_new(
+                ReplayEntry {
+                    timestamp: now,
+                    nonce: [9; 8],
+                    transcript_fingerprint: [9; 32],
+                },
+                now,
+            )
+            .unwrap());
+
+        let link = dir.path().join("link.cache");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = ReplayCache::load_or_create_authenticated(&link, 8, key)
+            .expect_err("loading through a symlinked cache path must fail closed");
+        assert!(
+            matches!(err, ReplayCacheError::Io(_)),
+            "symlinked cache path must surface an I/O error (O_NOFOLLOW), got {err:?}",
         );
     }
 
