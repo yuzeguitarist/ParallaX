@@ -520,12 +520,34 @@ mod tests {
         ];
         let text = render_text("vps.example:443", &cells);
         assert!(text.contains("upstream server: vps.example:443"));
-        assert!(text.contains("rtt-160ms-bw-50"));
-        assert!(text.contains("50")); // bandwidth column for the Ok cell
-        assert!(text.contains("123.50")); // download median
-        assert!(text.contains("67.25")); // upload median
-        assert!(text.contains("inf")); // None bandwidth renders as inf
-        assert!(text.contains("ERROR: boom")); // Err branch
+        // Locate the Ok cell's row and assert its exact column layout, so a
+        // regression in the bandwidth column can't pass on an incidental "50"
+        // substring elsewhere (e.g. inside the 123.50 median).
+        let ok_row = text
+            .lines()
+            .find(|l| l.starts_with("rtt-160ms-bw-50"))
+            .expect("Ok cell row must be present");
+        // Format mirrors render_text: "{:<18} {:>9} {:>12} {:>14.2} {:>14.2}".
+        assert_eq!(
+            ok_row,
+            format!(
+                "{:<18} {:>9} {:>12} {:>14.2} {:>14.2}",
+                "rtt-160ms-bw-50", 160, "50", 123.5, 67.25
+            )
+        );
+        // None bandwidth renders as the literal "inf", and the Err branch renders
+        // its message inline. Pin the Err row exactly too (label + rtt + inf + msg).
+        let err_row = text
+            .lines()
+            .find(|l| l.starts_with("clean-0ms"))
+            .expect("Err cell row must be present");
+        assert_eq!(
+            err_row,
+            format!(
+                "{:<18} {:>9} {:>12}  ERROR: {}",
+                "clean-0ms", 0, "inf", "boom"
+            )
+        );
     }
 
     #[test]
@@ -550,8 +572,22 @@ mod tests {
         assert!(json.contains("\"upload_median_mbps\": 67.2500"));
         // Err branch: the quote and newline in the message must be JSON-escaped.
         assert!(json.contains(r#""error": "he said \"hi\"\n""#));
-        // The Ok cell (not last) is comma-terminated; the Err cell (last) is not.
-        assert!(json.contains("    },\n")); // trailing comma after Ok cell
+        // The Ok cell (not last) is comma-terminated; the Err cell (last) is NOT.
+        assert!(
+            json.contains("    },\n"),
+            "Ok cell must be comma-terminated"
+        );
+        // The last cell's closing brace must be immediately followed by the array
+        // close, with NO comma — guards against a trailing-comma regression that
+        // would produce invalid JSON.
+        assert!(
+            json.contains("    }\n  ]"),
+            "last cell must close without a trailing comma"
+        );
+        assert!(
+            !json.contains("    },\n  ]"),
+            "last cell must not be comma-terminated"
+        );
         assert!(json.trim_end().ends_with('}')); // document closes cleanly
     }
 
