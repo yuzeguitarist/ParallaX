@@ -1103,12 +1103,16 @@ pub async fn accept_authenticated(
 
     let forwarded = read_forwarded_server_hello(&mut fallback).await?;
     if config.strict_tls13 && !forwarded.parsed.tls13_selected {
-        // Mirror the origin's ServerHello to the client, then close it the same
-        // drain->FIN way every other exit does so a strict-TLS1.3 reject is a FIN,
-        // never a RST. Swallow a write error here: we tear the connection down
+        // Mirror the origin's ServerHello to the client, then close BOTH sockets the
+        // same drain->FIN way every other exit does so a strict-TLS1.3 reject is a
+        // FIN, never a RST. The origin (`fallback`) side matters too: dropping it bare
+        // with bytes still queued (e.g. the rest of its handshake flight) makes the
+        // kernel RST the origin, an asymmetry no other teardown produces — drain->FIN
+        // it like the client. Swallow a write error here: we tear the connection down
         // regardless and must still FIN.
         let _ = write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await;
         graceful_close_tcp_stream(client).await;
+        graceful_close_tcp_stream(fallback).await;
         return Err(HandshakeServerError::Tls13Required);
     }
     write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await?;
