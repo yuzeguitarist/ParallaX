@@ -6863,6 +6863,52 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_fingerprint_is_sha256_of_the_record() {
+        // The fingerprint feeds the replay cache key, so it must be the real SHA-256
+        // of the first record, not a constant. A `-> [0;32]` / `-> [1;32]` body
+        // replacement would collapse every distinct ClientHello to the same key
+        // (breaking replay detection); pin it to the actual digest and require it to
+        // vary across inputs.
+        let record = b"\x16\x03\x01\x00\x05hello";
+        let fp = client_hello_fingerprint(record);
+        assert_eq!(fp, <[u8; 32]>::from(Sha256::digest(record)));
+        assert_ne!(fp, [0_u8; 32]);
+        assert_ne!(fp, [1_u8; 32]);
+        // Distinct records must yield distinct fingerprints.
+        assert_ne!(fp, client_hello_fingerprint(b"a different record"));
+    }
+
+    #[test]
+    fn server_runtime_secrets_getters_return_the_decoded_keys() {
+        // The private/public getters must return the decoded key material, not a
+        // fixed [0;32]/[1;32]. Decode a config built from a known X25519 keypair and
+        // assert the getters match (and that the public key is the X25519 image of
+        // the private key, which is how decode() derives it).
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let fallback_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_dir.path().join("parallax-replay.cache"),
+        );
+
+        let secrets = ServerRuntimeSecrets::decode(&config).unwrap();
+        assert_eq!(secrets.private_key(), &server_keys.private);
+        assert_eq!(secrets.server_public_key(), server_keys.public);
+        // Cross-check the derivation: public == X25519(private).
+        assert_eq!(
+            secrets.server_public_key(),
+            x25519_public_from_private(secrets.private_key())
+        );
+        // Sanity: the real keys are not the mutant's degenerate constants.
+        assert_ne!(secrets.private_key(), &[0_u8; 32]);
+        assert_ne!(secrets.private_key(), &[1_u8; 32]);
+    }
+
+    #[test]
     fn replay_freshness_window_outlasts_the_prepq_deadline() {
         // The replay freshness window must be the pre-PQ idle floor PLUS the default
         // replay window (clock-skew slack), so a slow-but-legitimate client whose
