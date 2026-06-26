@@ -1215,6 +1215,56 @@ mod tests {
     }
 
     #[test]
+    fn open_accepts_exact_length_empty_payload_record() {
+        // open() / open_in_place_payload_range() reject an incomplete record with
+        // `record.len() < header.total_len`. An empty-payload record has
+        // record.len() EXACTLY equal to total_len (no trailing bytes), so it sits on
+        // that boundary and must open to empty. Kills `< -> >` (which would reject
+        // the exact-length record). Both the copying and in-place payload-range paths
+        // are exercised.
+        let key = [4_u8; KEY_LEN];
+        let nonce = [5_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap(); // no padding -> minimal record
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let record = enc.seal(b"", &mut rng).unwrap();
+        let header = record::parse_header(&record).unwrap();
+        assert_eq!(
+            record.len(),
+            header.total_len,
+            "an empty-payload record has no trailing bytes -> sits on the < total_len boundary"
+        );
+
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        assert_eq!(dec.open(&record).unwrap(), b"");
+
+        // And the in-place payload-range path opens the same boundary record.
+        let mut dec2 =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut owned = record.clone();
+        let range = dec2.open_in_place_payload_range(&mut owned).unwrap();
+        assert!(range.is_empty(), "empty payload -> empty plaintext range");
+    }
+
+    #[test]
+    fn max_sealed_len_equals_record_capacity() {
+        // max_sealed_len must be record_capacity(payload, max_padding); a `-> 0` /
+        // `-> 1` body replacement would mis-size the seal buffer. Pin it against the
+        // helper for a non-trivial payload and padding profile.
+        let key = [6_u8; KEY_LEN];
+        let nonce = [8_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 64).unwrap();
+        let codec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        assert_eq!(
+            codec.max_sealed_len(200),
+            record_capacity(200, padding.max_len())
+        );
+        assert!(codec.max_sealed_len(200) > 1);
+    }
+
+    #[test]
     fn record_overhead_is_header_plus_maxpad_plus_trailer_plus_tag() {
         // record_overhead governs the up-front out.reserve() for a sealed record, so
         // it must equal TLS_HEADER_LEN + max_padding + PADDING_LEN_FIELD + AEAD_TAG_LEN

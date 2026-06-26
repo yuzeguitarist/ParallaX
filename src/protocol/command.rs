@@ -2823,6 +2823,186 @@ mod tests {
     }
 
     #[test]
+    fn speed_test_request_has_magic_is_exact() {
+        // has_magic = len >= 4 && [..4] == MAGIC. Pin all three terms: a valid
+        // prefix is true; too-short is false; a 4-byte wrong magic is false. Kills
+        // `-> true`/`-> false`, `>= -> <`, `&& -> ||`, `== -> !=`.
+        let mut good = SPEED_TEST_MAGIC.to_vec();
+        good.extend_from_slice(&[0_u8; 26]);
+        assert!(SpeedTestRequest::has_magic(&good));
+        assert!(!SpeedTestRequest::has_magic(&SPEED_TEST_MAGIC[..3]));
+        assert!(!SpeedTestRequest::has_magic(b"ZZZZ"));
+        assert!(!SpeedTestRequest::has_magic(b""));
+    }
+
+    #[test]
+    fn speed_test_request_decode_length_boundary() {
+        // decode guards: `< 4` then `< 30` then `!= 30`. A valid 30-byte request
+        // decodes; 29 bytes (valid magic) is Truncated; a 31-byte input is
+        // InvalidLength. Pins `< 30` vs `<= 30`/`== 30` and the `!= 30` exact check.
+        let valid = SpeedTestRequest {
+            warmup_bytes: 1,
+            download_bytes: 1,
+            upload_bytes: 1,
+            sample_count: 1,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(valid.len(), 30);
+        assert!(SpeedTestRequest::decode(&valid).is_ok());
+
+        let mut short = SPEED_TEST_MAGIC.to_vec();
+        short.resize(29, 0);
+        assert!(matches!(
+            SpeedTestRequest::decode(&short),
+            Err(SpeedTestRequestError::Truncated)
+        ));
+
+        let mut long = valid.clone();
+        long.push(0);
+        assert!(matches!(
+            SpeedTestRequest::decode(&long),
+            Err(SpeedTestRequestError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn speed_test_ack_decode_length_boundary_and_every_magic() {
+        // Each ack kind's magic must be recognized (pins the per-magic match guards,
+        // e.g. SPEED_UPLOAD_DONE_MAGIC), and the `< 12` length guard: a 12-byte ack
+        // decodes, 11 (valid magic) is Truncated.
+        for ack in [
+            SpeedTestAck::warmup_download_done(1),
+            SpeedTestAck::warmup_upload_done(2),
+            SpeedTestAck::download_done(3),
+            SpeedTestAck::upload_done(4),
+        ] {
+            let encoded = ack.encode();
+            assert_eq!(encoded.len(), 12);
+            assert_eq!(SpeedTestAck::decode(&encoded).unwrap(), ack);
+            assert!(matches!(
+                SpeedTestAck::decode(&encoded[..11]),
+                Err(SpeedTestAckError::Truncated)
+            ));
+        }
+    }
+
+    #[test]
+    fn mux_frame_kind_from_wire_round_trips_every_variant() {
+        // from_wire must map each wire byte back to its kind; deleting an arm (e.g.
+        // Reset=4 or Cover=5) would turn that byte into InvalidKind. Round-trip every
+        // variant through to_wire/from_wire and confirm an unknown byte is rejected.
+        for kind in [
+            MuxFrameKind::Open,
+            MuxFrameKind::Data,
+            MuxFrameKind::Fin,
+            MuxFrameKind::Reset,
+            MuxFrameKind::Cover,
+        ] {
+            assert_eq!(MuxFrameKind::from_wire(kind.to_wire()).unwrap(), kind);
+        }
+        assert!(matches!(
+            MuxFrameKind::from_wire(0),
+            Err(MuxFrameError::InvalidKind)
+        ));
+        assert!(matches!(
+            MuxFrameKind::from_wire(6),
+            Err(MuxFrameError::InvalidKind)
+        ));
+    }
+
+    #[test]
+    fn mux_frame_has_magic_and_payload_sizing_are_exact() {
+        // has_magic: valid prefix true, short/wrong false (kills the same family as
+        // SpeedTestRequest::has_magic).
+        let mut good = MUX_FRAME_MAGIC.to_vec();
+        good.extend_from_slice(&[0_u8; 9]);
+        assert!(MuxFrame::has_magic(&good));
+        assert!(!MuxFrame::has_magic(&MUX_FRAME_MAGIC[..3]));
+        assert!(!MuxFrame::has_magic(b"ZZZZ"));
+
+        // max_payload_len = max_encoded_len - MUX_FRAME_FIXED_LEN (13). Pin the exact
+        // subtraction (kills `-> 0` / `-> 1`).
+        assert_eq!(MuxFrame::max_payload_len(1000), 1000 - 13);
+        assert_eq!(MuxFrame::max_payload_len(13), 0);
+        assert_eq!(
+            MuxFrame::max_payload_len(0),
+            0,
+            "saturating, never underflows"
+        );
+
+        // max_open_initial_payload_len subtracts the CONNECT fixed framing + host on
+        // top of the mux payload budget; pin it against the explicit composition.
+        let host = "example.com";
+        let expected = ConnectRequest::max_initial_payload_len(host, 1000 - 13);
+        assert_eq!(MuxFrame::max_open_initial_payload_len(host, 1000), expected);
+        assert!(expected > 1, "fixture sanity: budget far exceeds 1");
+    }
+
+    #[test]
+    fn validate_mux_stream_enforces_cover_zero_and_others_nonzero() {
+        // Control-plane invariant: a Cover frame MUST carry stream_id 0, every other
+        // kind MUST carry a non-zero stream_id. Pins the `stream_id == 0` guard (kills
+        // `== 0 with false`, which would make Cover always invalid) and the `!= 0`
+        // guard for the data-bearing kinds.
+        assert!(MuxFrame::encode_borrowed(0, MuxFrameKind::Cover, &[]).is_ok());
+        assert!(matches!(
+            MuxFrame::encode_borrowed(1, MuxFrameKind::Cover, &[]),
+            Err(MuxFrameError::InvalidStreamId)
+        ));
+        for kind in [
+            MuxFrameKind::Open,
+            MuxFrameKind::Data,
+            MuxFrameKind::Fin,
+            MuxFrameKind::Reset,
+        ] {
+            assert!(
+                MuxFrame::encode_borrowed(7, kind, &[]).is_ok(),
+                "{kind:?} with a non-zero stream id must be valid"
+            );
+            assert!(
+                matches!(
+                    MuxFrame::encode_borrowed(0, kind, &[]),
+                    Err(MuxFrameError::InvalidStreamId)
+                ),
+                "{kind:?} with stream id 0 must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_offer_and_decline_has_magic_are_exact() {
+        // Same has_magic shape as SpeedTestRequest/MuxFrame: len >= 4 && prefix ==
+        // MAGIC. Pin each so `-> true`/`-> false`, `>= -> <`, `&& -> ||`, `== -> !=`
+        // are caught for both UdpOffer and UdpDecline.
+        let mut offer = UDP_OFFER_MAGIC.to_vec();
+        offer.extend_from_slice(&[0_u8; 8]);
+        assert!(UdpOffer::has_magic(&offer));
+        assert!(!UdpOffer::has_magic(&UDP_OFFER_MAGIC[..3]));
+        assert!(!UdpOffer::has_magic(UDP_DECLINE_MAGIC)); // wrong 4-byte magic
+
+        let mut decline = UDP_DECLINE_MAGIC.to_vec();
+        decline.push(0);
+        assert!(UdpDecline::has_magic(&decline));
+        assert!(!UdpDecline::has_magic(&UDP_DECLINE_MAGIC[..3]));
+        assert!(!UdpDecline::has_magic(UDP_OFFER_MAGIC));
+    }
+
+    #[test]
+    fn mux_frame_decode_ref_prefix_length_boundary() {
+        // decode_ref_prefix's `< 4` and `< MUX_FRAME_FIXED_LEN (13)` guards: a full
+        // header (13 bytes, zero payload) decodes; 12 bytes (valid magic) is
+        // Truncated. Pins the `< 13` guard vs `== 13`.
+        let header = MuxFrame::encode_borrowed(0, MuxFrameKind::Cover, &[]).unwrap();
+        assert_eq!(header.len(), 13);
+        assert!(MuxFrame::decode_ref_prefix(&header).is_ok());
+        assert!(matches!(
+            MuxFrame::decode_ref_prefix(&header[..12]),
+            Err(MuxFrameError::Truncated)
+        ));
+    }
+
+    #[test]
     fn speed_test_ack_round_trip() {
         let warmup_download = SpeedTestAck::warmup_download_done(111);
         let warmup_upload = SpeedTestAck::warmup_upload_done(222);
