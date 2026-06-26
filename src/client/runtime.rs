@@ -990,8 +990,12 @@ impl ClientMuxPool {
             drop(relay_recv);
 
             // Capture the per-substream derivation root before consuming the session
-            // into its codecs below.
-            let session_keys = Arc::new(data_session.session_keys().clone());
+            // into its codecs below. This long-lived clone holds the `chain_secret`
+            // for every substream's key derivation, so pin its secret pages (the
+            // derived per-substream codecs are protected in `mux.rs`).
+            let session_keys = data_session.session_keys().clone();
+            session_keys.protect_secret_memory();
+            let session_keys = Arc::new(session_keys);
 
             // Signal mux mode to the server over TCP, exactly as the TCP-mux path
             // does (the server selects its data mode off the first TCP record's
@@ -1295,9 +1299,20 @@ async fn client_mux_quic_substream(
     match outcome {
         // Both directions finished cleanly: the upload loop already finished the
         // send half (shutdown on local EOF), and the download saw the server's
-        // clean stream finish. Nothing more to do — the bidi quiesces.
-        Some(Ok(_)) | None => Ok(()),
-        Some(Err(err)) => Err(err),
+        // clean stream finish. The bidi quiesces; no reset needed.
+        Some(Ok(_)) => Ok(()),
+        // Idle teardown or a relay error: RESET_STREAM both halves so the server's
+        // substream task recovers promptly instead of waiting on the connection
+        // idle-timeout. (The send half was moved into the relay writer, so reset by
+        // id via the connection.) `stop` the recv half too.
+        None => {
+            conn.reset_stream(stream_id, VarInt::from_u32(0));
+            Ok(())
+        }
+        Some(Err(err)) => {
+            conn.reset_stream(stream_id, VarInt::from_u32(0));
+            Err(err)
+        }
     }
 }
 

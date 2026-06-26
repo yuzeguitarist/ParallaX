@@ -402,7 +402,9 @@ impl ClientDataSession {
     /// The post-handshake (post-PQ-rekey) session keys, the derivation root for
     /// per-substream mux-over-QUIC codecs (`expand_substream_keys`). Read-only:
     /// callers derive substream keys without disturbing the session's own codecs.
-    pub fn session_keys(&self) -> &SessionKeys {
+    /// `pub(crate)`: `SessionKeys` carries copyable secret material, and the only
+    /// caller is the in-crate client runtime — never exposed on the public API.
+    pub(crate) fn session_keys(&self) -> &SessionKeys {
         &self.keys
     }
 

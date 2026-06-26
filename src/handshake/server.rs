@@ -1860,6 +1860,10 @@ async fn run_authenticated_data_mode(
                         // this, substream codecs would derive from the stale epoch-0
                         // chain secret and every substream AEAD-open would fail.
                         handshake.session_keys = rekeyed_keys.clone();
+                        // The stored clone is a distinct heap copy of the live
+                        // derivation root (mux-over-QUIC substreams key off it), so
+                        // pin its secret pages too — not just the local `rekeyed_keys`.
+                        handshake.session_keys.protect_secret_memory();
                         let identity_signature = sign_server_identity_blocking(
                             identity_secret_key,
                             rekeyed_keys.transcript_hash,
@@ -2288,28 +2292,40 @@ async fn run_authenticated_data_mode(
 
                         if MuxFrame::has_magic(first_payload) {
                             let first_frames = MuxFrame::decode_all(first_payload)?;
-                            // Mux-over-QUIC fast plane: the probe Verified and we hold
-                            // the retained QUIC connection, so multiplex each substream
-                            // over its own QUIC bidi (native multiplexing). The TCP
-                            // first record was only the mux-mode signal (a zero-stream
-                            // Cover frame); the substreams themselves arrive as QUIC
-                            // bidis. The TCP connection is parked alive for the session.
-                            if let Some(probed) = retained_quic {
-                                return run_authenticated_mux_quic_data_mode(
-                                    client_records,
-                                    client_write,
-                                    probed,
-                                    ServerMuxQuicContext {
-                                        session_keys: &handshake.session_keys,
-                                        traffic,
-                                        fixed_data_target,
-                                        cid,
-                                    },
-                                )
-                                .await;
+                            // Mux-over-QUIC fast plane: enter ONLY when we hold the
+                            // retained QUIC connection AND the TCP first record is
+                            // exactly the mux-mode signal — a single zero-stream Cover
+                            // frame carrying no substream. A real client on the QUIC
+                            // fast plane sends precisely that and then opens substreams
+                            // as QUIC bidis. If instead the frames carry actual Open
+                            // requests (a version mismatch or a hostile peer mixing TCP
+                            // Opens with a Verified probe), do NOT switch to QUIC — that
+                            // would silently drop those Opens. Release the retained QUIC
+                            // and fall through to the TCP mux path, which relays them.
+                            if is_mux_quic_signal(&first_frames) {
+                                if let Some(probed) = retained_quic {
+                                    return run_authenticated_mux_quic_data_mode(
+                                        client_records,
+                                        client_write,
+                                        probed,
+                                        ServerMuxQuicContext {
+                                            session_keys: &handshake.session_keys,
+                                            traffic,
+                                            fixed_data_target,
+                                            cid,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                // The signal arrived but we hold no retained QUIC
+                                // (config asymmetry / probe not Verified): fall
+                                // through to the TCP mux path below, which treats the
+                                // lone Cover frame as a no-op.
                             }
-                            // No retained QUIC: mux stays on TCP, byte-identical to
-                            // before.
+                            // Not the QUIC fast plane (no retained QUIC, or the first
+                            // record is real TCP mux frames): release any retained QUIC
+                            // and relay over TCP mux, byte-identical to before.
+                            drop_retained_quic(retained_quic);
                             return run_authenticated_mux_data_mode(
                                 client_records,
                                 client_write,
@@ -3645,6 +3661,23 @@ async fn run_authenticated_mux_data_mode(
     Ok(())
 }
 
+/// Whether the TCP first record is the mux-over-QUIC mode signal: exactly one
+/// zero-stream `Cover` frame and nothing else. The client emits precisely this to
+/// say "I am multiplexing over QUIC bidis; expect no further TCP mux frames". Any
+/// other shape (real `Open`/`Data` frames, extra frames) is NOT the signal, so the
+/// server must stay on the TCP mux path and relay those frames rather than silently
+/// dropping them by switching to QUIC.
+fn is_mux_quic_signal(frames: &[MuxFrame]) -> bool {
+    matches!(
+        frames,
+        [MuxFrame {
+            stream_id: 0,
+            kind: MuxFrameKind::Cover,
+            ..
+        }]
+    )
+}
+
 /// Context for the mux-over-QUIC data mode: the per-substream key-derivation root
 /// plus the target-resolution config. Mirrors the fields [`ServerMuxContext`] needs
 /// that still apply when each substream is its own QUIC bidi (no shared frame
@@ -3747,9 +3780,11 @@ async fn run_authenticated_mux_quic_data_mode(
         let traffic = context.traffic;
         let fixed_data_target = context.fixed_data_target.map(str::to_owned);
         let cid = context.cid;
+        let substream_conn = conn.clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(err) = serve_mux_quic_substream(
+                substream_conn,
                 send,
                 recv,
                 client_open,
@@ -3773,6 +3808,47 @@ async fn run_authenticated_mux_quic_data_mode(
 /// clean finish on the server's send half, a `RESET_STREAM` on error.
 #[allow(clippy::too_many_arguments)]
 async fn serve_mux_quic_substream(
+    conn: crate::transport::udp::quic::endpoint::Connection,
+    send: crate::transport::udp::quic::endpoint::SendStream,
+    recv: crate::transport::udp::quic::endpoint::RecvStream,
+    client_open: DataRecordCodec,
+    server_seal: DataRecordCodec,
+    traffic: TrafficConfig,
+    fixed_data_target: Option<&str>,
+    cid: u64,
+    stream_id: u64,
+) -> Result<(), HandshakeServerError> {
+    // Any failure (a withheld/garbled ConnectRequest, a target-connect error, a
+    // mid-relay fault, or an idle teardown) must RESET_STREAM so the peer sees a
+    // prompt reset instead of waiting on the connection idle-timeout. The send half
+    // is moved into the relay writer below, so reset by id via the connection. A
+    // clean relay finish already FINs the stream inside the download loop, so the
+    // reset on the Ok path is a no-op.
+    let result = serve_mux_quic_substream_inner(
+        send,
+        recv,
+        client_open,
+        server_seal,
+        traffic,
+        fixed_data_target,
+        cid,
+        stream_id,
+    )
+    .await;
+    // Reset unless the relay finished cleanly (`Ok(true)`): an error or an idle
+    // teardown (`Ok(false)`) RESET_STREAMs so the peer recovers promptly.
+    let clean_finish = matches!(result, Ok(true));
+    if !clean_finish {
+        conn.reset_stream(
+            stream_id,
+            crate::transport::udp::quic::endpoint::VarInt::from_u32(0),
+        );
+    }
+    result.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_mux_quic_substream_inner(
     send: crate::transport::udp::quic::endpoint::SendStream,
     recv: crate::transport::udp::quic::endpoint::RecvStream,
     mut client_open: DataRecordCodec,
@@ -3781,7 +3857,7 @@ async fn serve_mux_quic_substream(
     fixed_data_target: Option<&str>,
     cid: u64,
     stream_id: u64,
-) -> Result<(), HandshakeServerError> {
+) -> Result<bool, HandshakeServerError> {
     let chunk_size = max_plaintext_len(traffic.max_padding);
     let mut client_reader = H3DataFrameLegReader::buffered(recv);
 
@@ -3850,7 +3926,12 @@ async fn serve_mux_quic_substream(
         }
     };
     match outcome {
-        Some(Ok(_)) | None => Ok(()),
+        // Both directions finished cleanly: the download loop already FINned the
+        // send half. `true` => no reset needed.
+        Some(Ok(_)) => Ok(true),
+        // Idle teardown: the relay was forced down, so the caller resets the stream
+        // (`false`) — a genuinely-idle substream has nothing left to drain.
+        None => Ok(false),
         Some(Err(err)) => Err(err),
     }
 }
@@ -5226,6 +5307,44 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+
+    #[test]
+    fn mux_quic_signal_accepts_only_lone_zero_stream_cover() {
+        let cover = |sid: u32| MuxFrame {
+            stream_id: sid,
+            kind: MuxFrameKind::Cover,
+            payload: Vec::new(),
+        };
+        let open = MuxFrame {
+            stream_id: 1,
+            kind: MuxFrameKind::Open,
+            payload: b"connect".to_vec(),
+        };
+
+        // The canonical signal: exactly one zero-stream Cover frame.
+        let lone_cover = vec![cover(0)];
+        assert!(is_mux_quic_signal(&lone_cover));
+
+        // Anything else must NOT be treated as the QUIC mux signal (so the server
+        // stays on TCP mux and never silently drops real frames):
+        let empty: Vec<MuxFrame> = Vec::new();
+        let lone_open = vec![open.clone()];
+        let cover_plus_open = vec![cover(0), open];
+        let two_covers = vec![cover(0), cover(0)];
+        assert!(!is_mux_quic_signal(&empty), "empty is not the signal");
+        assert!(
+            !is_mux_quic_signal(&lone_open),
+            "a real Open is not the signal"
+        );
+        assert!(
+            !is_mux_quic_signal(&cover_plus_open),
+            "Cover plus a real frame is not the signal"
+        );
+        assert!(
+            !is_mux_quic_signal(&two_covers),
+            "two frames are not the signal"
+        );
+    }
 
     // --- Track A1: lock-free relay activity clock — watchdog semantics ---
     // Below the `mod tests` boundary, so the no-timeout static ratchet (which
