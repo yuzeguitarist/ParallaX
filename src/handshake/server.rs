@@ -6819,4 +6819,128 @@ mod tests {
         let response = data_session.open_server_record(&response_record).unwrap();
         assert_eq!(response, b"pong");
     }
+
+    #[test]
+    fn zero_rtt_replay_cache_path_is_a_sibling_with_0rtt_suffix() {
+        // The 0-RTT cache path must be the auth cache path with ".0rtt" appended to
+        // its file name (same directory). A `-> Default::default()` body replacement
+        // would yield an empty path; pin the exact derivation.
+        let auth = std::path::Path::new("/var/lib/parallax/replay.cache");
+        let zero = zero_rtt_replay_cache_path(auth);
+        assert_eq!(
+            zero,
+            std::path::PathBuf::from("/var/lib/parallax/replay.cache.0rtt")
+        );
+        // Same parent directory, distinct file name.
+        assert_eq!(zero.parent(), auth.parent());
+        assert_ne!(zero, auth.to_path_buf());
+
+        // A path with no file name falls back to the default base name + suffix.
+        let fallback = zero_rtt_replay_cache_path(std::path::Path::new("/"));
+        assert!(fallback
+            .to_string_lossy()
+            .ends_with("parallax-replay.cache.0rtt"));
+    }
+
+    #[test]
+    fn marker_replay_cache_path_is_a_sibling_with_marker_suffix() {
+        // Mirror of the 0-RTT path test for the origin-splice marker cache: the path
+        // must be the auth cache path with ".marker" appended (same directory). Kills
+        // the `-> Default::default()` body replacement.
+        let auth = std::path::Path::new("/var/lib/parallax/replay.cache");
+        let marker = marker_replay_cache_path(auth);
+        assert_eq!(
+            marker,
+            std::path::PathBuf::from("/var/lib/parallax/replay.cache.marker")
+        );
+        assert_eq!(marker.parent(), auth.parent());
+        assert_ne!(marker, auth.to_path_buf());
+
+        let fallback = marker_replay_cache_path(std::path::Path::new("/"));
+        assert!(fallback
+            .to_string_lossy()
+            .ends_with("parallax-replay.cache.marker"));
+    }
+
+    #[test]
+    fn speed_test_dos_ceilings_match_their_documented_values() {
+        // These are SECURITY ceilings that bound an authenticated client's speed-test
+        // request (a malicious client could otherwise request terabytes of generated
+        // download or a never-ending upload to pin bandwidth/CPU/a connection slot).
+        // The wire format allows arbitrary u64/u16 values, so the only thing standing
+        // between the server and that abuse is these constants. Freeze their exact
+        // documented magnitudes so an arithmetic typo (e.g. `1024 * 1024 * 1024`
+        // becoming `1024 + 1024 * 1024`) cannot silently shrink or balloon a ceiling.
+        // Expected values written as plain decimal literals (no `*`) so the check is
+        // independent of the constants' own arithmetic.
+        assert_eq!(
+            MAX_SPEED_TEST_BYTES_PER_PHASE,
+            1_073_741_824, // 1 GiB
+            "per-phase ceiling must be exactly 1 GiB"
+        );
+        assert_eq!(
+            MAX_SPEED_TEST_TOTAL_BYTES,
+            4_294_967_296, // 4 GiB
+            "aggregate ceiling must be exactly 4 GiB"
+        );
+        assert_eq!(
+            MAX_SPEED_TEST_SAMPLES, 32,
+            "sample-count ceiling must be 32"
+        );
+        assert_eq!(
+            MUX_OPEN_BATCH_BYTES,
+            1_048_576, // 1 MiB
+            "mux open batch must be exactly 1 MiB"
+        );
+    }
+
+    #[test]
+    fn cap_shed_fallback_admission_enforces_budget_and_releases_on_drop() {
+        // RAII admission control for cap-shed fallback relays. This is the ONLY unit
+        // test that touches the process-global ACTIVE_CAP_SHED_FALLBACKS counter, so
+        // there is no intra-binary race; we still measure relative to the baseline
+        // and restore it. Pins three things:
+        //   - a slot is granted while under budget (kills `-> None` and `>=` -> `<`),
+        //   - the counter rises by exactly one per granted slot,
+        //   - Drop releases the slot (kills the no-op Drop replacement).
+        let baseline = ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire);
+        assert_eq!(baseline, 0, "test fixture expects a quiescent counter");
+
+        // Under budget: the first entry must succeed and bump the counter to 1.
+        let slot = try_enter_cap_shed_fallback().expect("under budget -> Some");
+        assert_eq!(ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire), 1);
+
+        // Dropping the slot must release the budget back to the baseline. A no-op
+        // Drop would leave the counter at 1.
+        drop(slot);
+        assert_eq!(
+            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            baseline,
+            "dropping a slot must release the budget"
+        );
+
+        // Saturate the budget: MAX_CONCURRENT_CAP_SHED_FALLBACKS slots are grantable,
+        // the next is refused (None), and the counter never exceeds the cap.
+        let mut slots = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CAP_SHED_FALLBACKS {
+            slots.push(try_enter_cap_shed_fallback().expect("within budget -> Some"));
+        }
+        assert_eq!(
+            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            MAX_CONCURRENT_CAP_SHED_FALLBACKS
+        );
+        assert!(
+            try_enter_cap_shed_fallback().is_none(),
+            "at the cap a further entry must be refused"
+        );
+        // The refused attempt must not have leaked budget (its fetch_add was undone).
+        assert_eq!(
+            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            MAX_CONCURRENT_CAP_SHED_FALLBACKS
+        );
+
+        // Release everything; the counter returns to baseline.
+        drop(slots);
+        assert_eq!(ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire), baseline);
+    }
 }
