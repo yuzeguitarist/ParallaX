@@ -101,8 +101,12 @@ impl PaddingProfile {
         R: Rng + RngCore + ?Sized,
     {
         let profile_pad = self.sample_padding_len(payload_len, rng) as usize;
-        // Clamp the combined length to the u16 trailer's range so it can never
-        // disagree with the byte count it pads.
+        // Clamp the combined length to the u16 trailer's range so it can never disagree
+        // with the byte count it pads. NOTE: this clamp is ONLY for trailer
+        // self-consistency — it does NOT bound the record to OUTER_TLS_RECORD_LIMIT.
+        // Keeping the whole record within that limit is the caller's responsibility
+        // (the seal returns PayloadTooLarge otherwise); the PQ flight ensures it by
+        // capping the chunk size via `pq_flight_max_chunk_size`.
         let pad_len = profile_pad.saturating_add(extra_pad).min(u16::MAX as usize);
         self.write_padding_suffix(pad_len, rng, out);
     }

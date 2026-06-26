@@ -56,7 +56,7 @@ const CONNECT_RECORD_SIZE_BANDS: [usize; 8] = [286, 469, 569, 735, 911, 1180, 13
 pub const PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT: usize = 256;
 pub const PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT: usize = 1024;
 
-/// Browser-modeled record-size targets for the PQ handshake flight (PAR-35 ⭐2),
+/// Browser-modeled record-size targets for the PQ handshake flight (PAR-35 star2),
 /// drawn from the real Safari-26 H2 data-plane capture (see the
 /// `safari26-tcp-dataplane-packetization` notes): a small webpage response after a
 /// GET is a handful of records whose sizes cluster in the sub-1.5 KiB band, not a
@@ -85,6 +85,29 @@ const PQ_FLIGHT_RECORD_MIN: usize = 144;
 /// touches the steady-state relay path).
 const PQ_FLIGHT_AGGREGATE_PAD_MIN: usize = 64;
 const PQ_FLIGHT_AGGREGATE_PAD_MAX: usize = 512;
+
+/// Wire-frame header bytes a [`FramedChunk`] / [`ServerIdentityChunk`] prepends to
+/// each chunk's payload: `magic(4) | total_len(4) | offset(4) | len(4)`. The sealed
+/// record plaintext for a shaped chunk is therefore `this + chunk_payload_len`, so
+/// the per-chunk size cap must leave room for it under the record limit.
+const PQ_CHUNK_FRAME_HEADER_LEN: usize = 16;
+
+/// The largest shaped-chunk PAYLOAD size that always seals within the TLS record
+/// limit, given the codec's `max_plaintext_len` (`max_sealed_plaintext`: the sealed
+/// plaintext budget that already reserves room for the codec's `max_padding`). A
+/// shaped chunk seals `PQ_CHUNK_FRAME_HEADER_LEN + size` plaintext bytes; the LAST
+/// record additionally carries up to `PQ_FLIGHT_AGGREGATE_PAD_MAX` aggregate-pad
+/// bytes. Reserving both keeps EVERY shaped record (any of which may end up last)
+/// within the limit even under a heavy-but-valid `max_padding` profile — mirroring the
+/// relay path, which chunks at `max_plaintext_len`. Clamped to `>= PQ_FLIGHT_RECORD_MIN`
+/// so the tiling invariants (no tiny tell record, bounded count) always hold; for any
+/// config the runtime accepts (`max_plaintext_len >= MIN_USABLE_PLAINTEXT_LEN`, 1024)
+/// the cap stays well above the floor.
+pub fn pq_flight_max_chunk_size(max_sealed_plaintext: usize) -> usize {
+    max_sealed_plaintext
+        .saturating_sub(PQ_CHUNK_FRAME_HEADER_LEN + PQ_FLIGHT_AGGREGATE_PAD_MAX)
+        .max(PQ_FLIGHT_RECORD_MIN)
+}
 /// Hard cap on a reassembled PQ handshake frame (rekey / key exchange). Both
 /// real frames are ~1608/1609 bytes (40/41-byte header + ML-KEM-1024 1568); this
 /// bounds a malicious peer's reassembly buffer well above the legitimate maximum
@@ -761,8 +784,14 @@ impl ServerIdentityChunk {
     /// could segment on. Sizes tile the payload exactly and the count stays bounded
     /// (each record `>= PQ_FLIGHT_RECORD_MIN`); the client reassembler is offset-based
     /// and size-agnostic, so it recovers the proof regardless of how it was chunked.
+    ///
+    /// `max_record_size` caps each chunk's payload so the sealed record fits the TLS
+    /// record limit under the codec's `max_padding` (see
+    /// [`FramedChunk::encode_all_browser_shaped`]); pass
+    /// [`pq_flight_max_chunk_size`]`(codec.max_plaintext_len())`.
     pub fn encode_all_browser_shaped<R: rand::Rng + ?Sized>(
         payload: &[u8],
+        max_record_size: usize,
         rng: &mut R,
     ) -> Result<Vec<Vec<u8>>, ServerIdentityChunkError> {
         if payload.is_empty() || payload.len() > u32::MAX as usize {
@@ -771,7 +800,7 @@ impl ServerIdentityChunk {
         let total_len = payload.len() as u32;
         let mut chunks = Vec::new();
         let mut offset = 0_usize;
-        for size in browser_shaped_sizes(payload.len(), rng) {
+        for size in browser_shaped_sizes(payload.len(), max_record_size, rng) {
             let end = offset + size;
             chunks.push(Self::encode_borrowed(
                 total_len,
@@ -971,7 +1000,7 @@ impl FramedChunk {
     }
 
     /// Split `payload` into records whose sizes are drawn from the browser-modeled
-    /// [`PQ_FLIGHT_RECORD_TARGETS`] distribution (PAR-35 ⭐2), instead of the uniform
+    /// [`PQ_FLIGHT_RECORD_TARGETS`] distribution (PAR-35 star2), instead of the uniform
     /// `[256,1024]` of [`Self::encode_all_shaped`]. Used for BOTH the PQ key-exchange
     /// (PX1Q/PX1K) and the identity proof (PX1S), so the whole post-handshake burst
     /// shares ONE coherent record-size regime that matches a real Safari H2 page
@@ -986,9 +1015,17 @@ impl FramedChunk {
     /// latency/throughput disqualifier from the PAR-21/PAR-28 triage. Aggregate
     /// (flight-level) decorrelation padding is applied separately at the seal layer
     /// via the per-record padding suffix, so it stays fully decode-transparent and
-    /// this splitter remains a pure function of `(payload, rng)`.
+    /// this splitter remains a pure function of `(payload, max_record_size, rng)`.
+    ///
+    /// `max_record_size` caps each shaped chunk's payload so the sealed record
+    /// (`PQ_CHUNK_FRAME_HEADER_LEN + chunk` plaintext, plus the aggregate pad on the
+    /// last record) always fits the TLS record limit under the codec's `max_padding`;
+    /// callers pass [`pq_flight_max_chunk_size`]`(codec.max_plaintext_len())`. Under the
+    /// default / light-padding profile the cap is far above the target distribution, so
+    /// the on-wire shape is unchanged.
     pub fn encode_all_browser_shaped<R: rand::Rng + ?Sized>(
         payload: &[u8],
+        max_record_size: usize,
         rng: &mut R,
     ) -> Result<Vec<Vec<u8>>, FramedChunkError> {
         if payload.is_empty() || payload.len() > u32::MAX as usize {
@@ -997,7 +1034,7 @@ impl FramedChunk {
         let total_len = payload.len() as u32;
         let mut chunks = Vec::new();
         let mut offset = 0_usize;
-        for size in browser_shaped_sizes(payload.len(), rng) {
+        for size in browser_shaped_sizes(payload.len(), max_record_size, rng) {
             let end = offset + size;
             chunks.push(Self::encode_borrowed(
                 total_len,
@@ -1031,11 +1068,21 @@ impl FramedChunk {
 /// payload (not the case for any PQ/identity frame) — so the record COUNT stays
 /// bounded (no shatter-into-many-records latency regression) and there is no tiny
 /// tell record.
-fn browser_shaped_sizes<R: rand::Rng + ?Sized>(payload_len: usize, rng: &mut R) -> Vec<usize> {
-    let max_target = *PQ_FLIGHT_RECORD_TARGETS
+fn browser_shaped_sizes<R: rand::Rng + ?Sized>(
+    payload_len: usize,
+    max_record_size: usize,
+    rng: &mut R,
+) -> Vec<usize> {
+    let target_max = *PQ_FLIGHT_RECORD_TARGETS
         .iter()
         .max()
         .expect("PQ_FLIGHT_RECORD_TARGETS is non-empty");
+    // Cap the largest emitted record at the codec's safe ceiling so every shaped
+    // record (each of which may end up the padded last one) seals within the TLS
+    // record limit even under a heavy `max_padding` profile. `max_record_size` is
+    // >= PQ_FLIGHT_RECORD_MIN (the caller clamps via `pq_flight_max_chunk_size`), so
+    // the tiling/`>= MIN`-tail invariants below are unaffected.
+    let max_target = target_max.min(max_record_size.max(PQ_FLIGHT_RECORD_MIN));
     let mut sizes = Vec::new();
     let mut consumed = 0_usize;
     while consumed < payload_len {
@@ -1982,7 +2029,9 @@ mod tests {
             let mut sizes_seen = std::collections::BTreeSet::new();
             for seed in 0..40_u64 {
                 let mut rng = StdRng::seed_from_u64(seed);
-                let chunks = FramedChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+                // usize::MAX => no codec cap; the shaper uses the full target range.
+                let chunks =
+                    FramedChunk::encode_all_browser_shaped(&payload, usize::MAX, &mut rng).unwrap();
                 let max_target = *PQ_FLIGHT_RECORD_TARGETS.iter().max().unwrap();
                 let mut reassembler = FramedReassembler::default();
                 let mut assembled = None;
@@ -2023,7 +2072,8 @@ mod tests {
         let payload = vec![0x5A_u8; 4635]; // ML-DSA-87-sized identity proof
         for seed in 0..32_u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let chunks = FramedChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+            let chunks =
+                FramedChunk::encode_all_browser_shaped(&payload, usize::MAX, &mut rng).unwrap();
             let bound = payload.len().div_ceil(PQ_FLIGHT_RECORD_MIN);
             assert!(
                 chunks.len() <= bound,
@@ -2061,7 +2111,8 @@ mod tests {
         for seed in 0..24_u64 {
             let mut rng = StdRng::seed_from_u64(seed);
             let chunks =
-                ServerIdentityChunk::encode_all_browser_shaped(&payload, &mut rng).unwrap();
+                ServerIdentityChunk::encode_all_browser_shaped(&payload, usize::MAX, &mut rng)
+                    .unwrap();
             assert!(chunks.len() >= 2, "identity proof must fragment");
             let mut assembled = Vec::new();
             for chunk in &chunks {

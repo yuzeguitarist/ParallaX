@@ -295,17 +295,40 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Sourced from the system CSPRNG so the period is unpredictable to an observer (a
 /// low-entropy PRNG would leave a recoverable schedule). The range is small (10s),
 /// so modulo bias over a u64 draw is negligible.
+///
+/// If the CSPRNG draw fails (should never happen on a live host), the fallback must
+/// still VARY the period: returning a fixed value (e.g. the midpoint) would re-create
+/// exactly the constant-cadence autocorrelation tell this jitter exists to remove.
+/// The fallback therefore walks a process-local counter across the span so successive
+/// intervals still differ, with no wall-clock read (the sans-IO core stays
+/// time-input-free). This trades unpredictability for liveness ONLY on the degraded
+/// path where the CSPRNG is non-functional: the counter walk is itself a predictable
+/// sequence (an active prober who knew the counter origin could extrapolate it), but it
+/// still removes the fixed-cadence autocorrelation spike that is the primary passive
+/// tell, and it is strictly better than the constant value it replaces. On a healthy
+/// host this branch is unreachable.
 fn random_keep_alive_interval() -> Duration {
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-    let mut bytes = [0_u8; 8];
-    // A failed RNG draw is not a reason to abort a live connection; fall back to the
-    // midpoint, which is still a valid keep-alive interval (just not jittered).
-    if SystemRandom::new().fill(&mut bytes).is_err() {
-        return (KEEP_ALIVE_MIN + KEEP_ALIVE_MAX) / 2;
-    }
     let span_ms = (KEEP_ALIVE_MAX - KEEP_ALIVE_MIN).as_millis() as u64;
-    let offset_ms = u64::from_le_bytes(bytes) % (span_ms + 1);
+    let mut bytes = [0_u8; 8];
+    let offset_ms = if SystemRandom::new().fill(&mut bytes).is_ok() {
+        u64::from_le_bytes(bytes) % (span_ms + 1)
+    } else {
+        // Degraded fallback: a fixed value would be a fixed-cadence fingerprint, so
+        // step a static counter through the span instead. Non-clock, non-constant.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FALLBACK_STEP: AtomicU64 = AtomicU64::new(0);
+        let step = FALLBACK_STEP.fetch_add(1, Ordering::Relaxed);
+        fallback_keep_alive_offset_ms(step, span_ms)
+    };
     KEEP_ALIVE_MIN + Duration::from_millis(offset_ms)
+}
+
+/// The CSPRNG-failure fallback offset (ms into the keep-alive span) for the `step`-th
+/// call. Walking the counter across `[0, span_ms]` keeps successive intervals varying
+/// (no fixed-cadence tell) without reading the clock. Pure, so it is unit-testable.
+fn fallback_keep_alive_offset_ms(step: u64, span_ms: u64) -> u64 {
+    step % (span_ms + 1)
 }
 
 /// Transport error code APPLICATION_ERROR (RFC 9000 §20.1), used for a transport
@@ -363,14 +386,17 @@ struct Space {
     sent_content: BTreeMap<u64, SentContent>,
     /// An ack-eliciting packet has been received and not yet acknowledged.
     ack_pending: bool,
-    /// When the LARGEST-numbered ack-eliciting packet covered by the current
-    /// (not-yet-sent) ACK was received, for the `ack_delay` field (RFC 9000 §13.2.5:
-    /// ack_delay is measured from the receipt of the largest acknowledged packet, NOT
-    /// the first one in the batch — using the first would overreport the delay by the
-    /// packets' inter-arrival gap and inflate the peer's RTT). Updated whenever a
-    /// newly-received ack-eliciting packet becomes the new largest; cleared when the
-    /// ACK is sent. A real QUIC stack reports this; hard-coding 0 was a passive tell.
-    ack_eliciting_largest_recv: Option<Instant>,
+    /// When the LARGEST-numbered packet covered by the current (not-yet-sent) ACK was
+    /// received, for the `ack_delay` field (RFC 9000 §13.2.5: ack_delay is measured from
+    /// the receipt of the largest ACKNOWLEDGED packet, NOT the first one in the batch —
+    /// using the first would overreport the delay by the packets' inter-arrival gap and
+    /// inflate the peer's RTT). The ACK's Largest Acknowledged is `recv.largest()`, which
+    /// may be a NON-ack-eliciting packet (e.g. a pure ACK whose PN exceeds a later,
+    /// reordered ack-eliciting packet), so this is updated whenever ANY newly-received
+    /// packet becomes the new largest — NOT gated on ack-eliciting (gating it there left
+    /// a stale, too-old stamp in that interleaving). Cleared when the ACK is sent. A real
+    /// QUIC stack reports this; hard-coding 0 was a passive tell.
+    largest_recv_time: Option<Instant>,
     /// CRYPTO byte ranges to RESEND (lost packets) before any fresh CRYPTO.
     retransmit_crypto: Vec<(u64, u64)>,
     /// Earliest armed time-threshold loss deadline (RFC 9002 §6.1.2), if any.
@@ -1531,11 +1557,12 @@ impl Connection {
     fn build_ack_packet(&mut self, space: usize, now: Instant) -> Vec<u8> {
         let pn = self.spaces[space].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
-        // ack_delay (RFC 9000 §19.3): how long the ACK was held since the first
-        // ack-eliciting packet it covers, capped at max_ack_delay (25ms) and encoded
-        // as the raw value (microseconds >> ack_delay_exponent). The peer multiplies
-        // it back by 2^exponent. A real QUIC stack reports this; the old hard-coded 0
-        // is a passive distinguisher (an ACK that always claims zero delay). NOTE:
+        // ack_delay (RFC 9000 §19.3): how long the ACK was held since the LARGEST
+        // acknowledged packet was received (§13.2.5), capped at max_ack_delay (25ms) and
+        // encoded as the raw value (microseconds >> ack_delay_exponent). The peer
+        // multiplies it back by 2^exponent. A real QUIC stack reports this; the old
+        // hard-coded 0 is a passive distinguisher (an ACK that always claims zero
+        // delay). NOTE:
         // ACK *coalescing* (~2:1) is a separate, deferred change (PAR-22) pending a
         // sustained-flow Safari QUIC capture to validate the exact ratio.
         // Only the Application (1-RTT) space reports a real ack_delay: Initial and
@@ -1543,7 +1570,7 @@ impl Connection {
         // there, RFC 9000 §13.2.1 / §17.2.5), so they keep delay 0.
         let ack_delay_raw = if space == SPACE_DATA {
             self.spaces[space]
-                .ack_eliciting_largest_recv
+                .largest_recv_time
                 .map(|recv| {
                     let held = now.saturating_duration_since(recv).min(MAX_ACK_DELAY);
                     (held.as_micros() as u64) >> ACK_DELAY_EXPONENT
@@ -1562,7 +1589,7 @@ impl Connection {
             seal_packet(&keys.local, header, &[Frame::Ack(ack)])
         };
         self.spaces[space].ack_pending = false;
-        self.spaces[space].ack_eliciting_largest_recv = None;
+        self.spaces[space].largest_recv_time = None;
         self.record_sent(
             space,
             pn,
@@ -2257,16 +2284,20 @@ impl Connection {
                 _ => ack_eliciting = true,
             }
         }
+        // Stamp the receive time of the packet bearing the LARGEST acknowledged packet
+        // number (RFC 9000 §13.2.5: ack_delay is measured from when the largest-acked
+        // packet was received, NOT the first one the pending ACK covers). `to_ack`
+        // names `recv.largest()` as the ACK's largest, so the stamp must track whichever
+        // packet IS the largest received — which can be a non-ack-eliciting one (e.g. a
+        // pure ACK whose PN exceeds a later ack-eliciting packet's). Gating this on
+        // `ack_eliciting` (as the prior code did) left a stale, too-old stamp in exactly
+        // that interleaving, over-reporting the delay. `recv.insert` above already folded
+        // this packet in, so it is the new largest iff its PN equals `recv.largest()`; a
+        // reordered (smaller-PN) packet does not move the stamp.
+        if self.spaces[space].recv.largest() == Some(header.packet_number()) {
+            self.spaces[space].largest_recv_time = Some(now);
+        }
         if ack_eliciting {
-            // Stamp the receive time of the LARGEST ack-eliciting packet covered by the
-            // pending ACK (RFC 9000 §13.2.5), so build_ack_packet reports the delay
-            // from THAT packet, not the first in the batch. `recv.insert` above already
-            // folded this packet in, so it is the new largest iff its PN equals
-            // recv.largest(). A reordered (smaller-PN) ack-eliciting packet does not
-            // move the stamp.
-            if self.spaces[space].recv.largest() == Some(header.packet_number()) {
-                self.spaces[space].ack_eliciting_largest_recv = Some(now);
-            }
             self.spaces[space].ack_pending = true;
         }
         self.pump_write();
@@ -3738,6 +3769,88 @@ mod tests {
     }
 
     #[test]
+    fn ack_delay_is_measured_from_the_largest_even_when_it_is_not_ack_eliciting() {
+        // Regression: ack_delay must be measured from the receipt of the LARGEST
+        // acknowledged packet (RFC 9000 §13.2.5), which may be a NON-ack-eliciting
+        // packet (e.g. a pure ACK / padding-only) whose PN exceeds a later, reordered
+        // ack-eliciting packet's. The prior code gated the stamp on `ack_eliciting`, so
+        // in this interleaving the stamp was never set for the largest packet and the
+        // emitted ACK reported delay 0 (or a stale, too-old value). Here a padding-only
+        // PN=100 arrives first, then a reordered PING PN=50 triggers the ACK 20ms later;
+        // the ACK must report ~20ms (measured from PN=100's receipt), not 0.
+        let dcid = ConnectionId::new(&[0x4a; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xac, 0xeb, 0xac, 0xeb]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(client.handshake_confirmed && server.handshake_confirmed);
+
+        // Craft two 1-RTT packets with the CLIENT's local 1-RTT keys (the server opens
+        // them with the client's keys as its remote), choosing the packet numbers so the
+        // non-ack-eliciting one is the larger. seal_packet needs the client's routing
+        // header (self.dcid -> the server) and the chosen PN.
+        let craft = |conn: &Connection, pn: u64, frames: &[Frame]| -> Vec<u8> {
+            let (_, pn_len) = packet::encode_packet_number(pn, None);
+            let header = conn.make_header(SPACE_DATA, pn, pn_len);
+            let keys = conn.spaces[SPACE_DATA]
+                .keys
+                .as_ref()
+                .expect("client has 1-RTT keys");
+            seal_packet(&keys.local, header, frames)
+        };
+        // PN=100: a padding-only (NON-ack-eliciting) packet — the new largest.
+        let larger_non_eliciting = craft(&client, 100, &[Frame::Padding(20)]);
+        // PN=50: a reordered ack-eliciting PING that triggers the ACK.
+        let smaller_eliciting = craft(&client, 50, &[Frame::Ping, Frame::Padding(3)]);
+
+        let t0 = Instant::now();
+        // Largest (PN=100) received first; it owes no ACK by itself but sets the stamp.
+        server.handle_datagram(&larger_non_eliciting, t0).unwrap();
+        assert!(
+            !server.spaces[SPACE_DATA].ack_pending,
+            "a padding-only packet is not ack-eliciting (no ACK owed yet)"
+        );
+        // 20ms later the reordered PING arrives and triggers the held ACK.
+        let t1 = t0 + Duration::from_millis(20);
+        server.handle_datagram(&smaller_eliciting, t1).unwrap();
+        let mut ack = server
+            .poll_transmit(t1)
+            .expect("server emits the ACK triggered by the PING");
+
+        // Decrypt the ACK with the client's receive keys and read the delay. The largest
+        // acked is PN=100 (received at t0); the ACK is sent at t1, so the delay is 20ms.
+        // 20ms = 20000us >> ack_delay_exponent(3) = 2500. The buggy (gated-stamp) code
+        // would have reported 0.
+        let local_cid_len = client.scid.len();
+        let largest = client.spaces[SPACE_DATA].recv.largest();
+        let keys = client.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .expect("client has 1-RTT keys");
+        let (_hdr, range) =
+            open_packet(&keys.remote, &mut ack, local_cid_len, largest).expect("ACK opens");
+        let delay = Iter::new(&ack[range])
+            .filter_map(|f| match f {
+                Ok(Frame::Ack(a)) => Some(a.delay),
+                _ => None,
+            })
+            .next()
+            .expect("the server packet carries an ACK frame");
+        assert_eq!(
+            delay, 2500,
+            "ack_delay must be measured from the largest packet's receipt (20ms => 2500), not 0"
+        );
+    }
+
+    #[test]
     fn keep_alive_interval_is_jittered_within_bounds() {
         // Every draw must stay inside [MIN, MAX] (so the PING never trips the 30s
         // idle timeout and never fires absurdly early), and the value must vary
@@ -3758,6 +3871,34 @@ mod tests {
         assert!(
             seen.len() > 1,
             "keep-alive interval must be jittered, not a single fixed value"
+        );
+    }
+
+    #[test]
+    fn keep_alive_fallback_varies_and_stays_in_bounds() {
+        // CSPRNG-failure fallback: it must NOT collapse to a single fixed value (which
+        // would re-create the constant-cadence tell jitter exists to remove), and every
+        // offset must stay within the span so the resulting interval is still in
+        // [MIN, MAX] (and thus under IDLE_TIMEOUT). Walking the counter across the span
+        // yields a varying, in-bounds sequence with no clock read.
+        let span_ms = (KEEP_ALIVE_MAX - KEEP_ALIVE_MIN).as_millis() as u64;
+        let mut seen = std::collections::BTreeSet::new();
+        for step in 0..(span_ms * 3) {
+            let offset = fallback_keep_alive_offset_ms(step, span_ms);
+            assert!(
+                offset <= span_ms,
+                "fallback offset {offset} exceeds the span"
+            );
+            let interval = KEEP_ALIVE_MIN + Duration::from_millis(offset);
+            assert!(
+                interval >= KEEP_ALIVE_MIN && interval <= KEEP_ALIVE_MAX,
+                "fallback interval {interval:?} out of bounds"
+            );
+            seen.insert(offset);
+        }
+        assert!(
+            seen.len() > 1,
+            "the fallback must vary across cycles, not be a single fixed value"
         );
     }
 
