@@ -1059,7 +1059,11 @@ fn random_cid() -> ConnectionId {
     ConnectionId::new(&bytes)
 }
 
-/// An established connection handle.
+/// An established connection handle. A cheap `Arc` wrapper: cloning yields another
+/// handle to the SAME connection (close is explicit via [`Connection::close`], not
+/// on drop), so the mux-over-QUIC path can share one connection across many
+/// concurrent substream tasks that each `open_bi`.
+#[derive(Clone)]
 pub struct Connection {
     shared: Arc<ConnShared>,
 }

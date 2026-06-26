@@ -1588,7 +1588,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn run_authenticated_data_mode(
-    handshake: AuthenticatedHandshake,
+    mut handshake: AuthenticatedHandshake,
     fixed_data_target: Option<&str>,
     identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
     sandwich_secret: &[u8],
@@ -1854,6 +1854,12 @@ async fn run_authenticated_data_mode(
                             sandwich_secret,
                         )?;
                         rekeyed_keys.protect_secret_memory();
+                        // Advance the session's live keys to the post-rekey epoch so
+                        // any later derivation root (mux-over-QUIC per-substream keys)
+                        // matches the client's post-rekey `data_session` keys. Without
+                        // this, substream codecs would derive from the stale epoch-0
+                        // chain secret and every substream AEAD-open would fail.
+                        handshake.session_keys = rekeyed_keys.clone();
                         let identity_signature = sign_server_identity_blocking(
                             identity_secret_key,
                             rekeyed_keys.transcript_hash,
@@ -2281,10 +2287,29 @@ async fn run_authenticated_data_mode(
                         }
 
                         if MuxFrame::has_magic(first_payload) {
-                            // Mux stays on TCP in this slice; release any retained
-                            // QUIC connection.
-                            drop_retained_quic(retained_quic);
                             let first_frames = MuxFrame::decode_all(first_payload)?;
+                            // Mux-over-QUIC fast plane: the probe Verified and we hold
+                            // the retained QUIC connection, so multiplex each substream
+                            // over its own QUIC bidi (native multiplexing). The TCP
+                            // first record was only the mux-mode signal (a zero-stream
+                            // Cover frame); the substreams themselves arrive as QUIC
+                            // bidis. The TCP connection is parked alive for the session.
+                            if let Some(probed) = retained_quic {
+                                return run_authenticated_mux_quic_data_mode(
+                                    client_records,
+                                    client_write,
+                                    probed,
+                                    ServerMuxQuicContext {
+                                        session_keys: &handshake.session_keys,
+                                        traffic,
+                                        fixed_data_target,
+                                        cid,
+                                    },
+                                )
+                                .await;
+                            }
+                            // No retained QUIC: mux stays on TCP, byte-identical to
+                            // before.
                             return run_authenticated_mux_data_mode(
                                 client_records,
                                 client_write,
@@ -3618,6 +3643,216 @@ async fn run_authenticated_mux_data_mode(
     );
     let ((), ()) = tokio::try_join!(reader, writer)?;
     Ok(())
+}
+
+/// Context for the mux-over-QUIC data mode: the per-substream key-derivation root
+/// plus the target-resolution config. Mirrors the fields [`ServerMuxContext`] needs
+/// that still apply when each substream is its own QUIC bidi (no shared frame
+/// channel / cover / chunk plumbing — those are per-substream concerns here).
+struct ServerMuxQuicContext<'a> {
+    session_keys: &'a crate::crypto::session::SessionKeys,
+    traffic: TrafficConfig,
+    fixed_data_target: Option<&'a str>,
+    cid: u64,
+}
+
+/// Mux-over-QUIC data mode: accept business substreams as QUIC bidis on the probed
+/// connection and relay each independently (native multiplexing — no head-of-line
+/// blocking). The TCP connection (`_client_records`/`_client_write`) is parked alive
+/// for the session so the authenticated channel stays up; all relay traffic is on
+/// QUIC. Each accepted bidi derives its own per-substream codec from the bidi's wire
+/// stream id (matching the client), reads the `ConnectRequest` as its first record,
+/// connects the target, and relays over the H3 DATA-frame legs.
+///
+/// A per-connection ceiling (`max_streams`) bounds concurrent substreams; excess
+/// bidis are reset. The accept loop ends when the client closes the connection.
+async fn run_authenticated_mux_quic_data_mode(
+    client_records: BufferedTlsRecordReader<OwnedReadHalf>,
+    client_write: OwnedWriteHalf,
+    probed: ServerProbedQuic,
+    context: ServerMuxQuicContext<'_>,
+) -> Result<(), HandshakeServerError> {
+    let ServerProbedQuic {
+        conn,
+        h3_control,
+        mut relay_send,
+        relay_recv,
+    } = probed;
+    // The probe bidi carried raw H3 probe DATA; the client does not reuse it, so
+    // quiesce it (finish our send half, drop the recv half). Business substreams
+    // arrive as fresh bidis below.
+    relay_send.finish();
+    drop(relay_recv);
+    // Hold the H3 control set alive for the session's duration.
+    let _h3_control = h3_control;
+
+    // Bind the session lifetime to the parked TCP control connection: when the
+    // client drops the mux session, its TCP read half hits EOF, and this watcher
+    // closes the QUIC connection so the `accept_bi` loop below returns `None` and
+    // the session ends. Per-substream teardown is independent (QUIC stream
+    // FIN/RESET); this only governs the whole-session end. The write half is held
+    // by the watcher too so the outer TCP connection stays open until then.
+    let mut client_read = client_records.into_inner().into_inner();
+    let watch_conn = conn.clone();
+    let tcp_watch = tokio::spawn(async move {
+        let _client_write = client_write;
+        let mut buf = [0_u8; 1];
+        // A real client sends no further TCP bytes after the mux-mode signal, so
+        // any read result (EOF, a stray byte, or an error) ends the session.
+        let _ = client_read.read(&mut buf).await;
+        watch_conn.close(0u32.into(), b"mux-session-end");
+    });
+
+    let max_streams = (context.traffic.max_concurrent_streams as usize).min(SERVER_MUX_MAX_STREAMS);
+    let live = Arc::new(Semaphore::new(max_streams));
+    tracing::info!(
+        cid = context.cid,
+        "ParallaX mux-over-QUIC data mode started"
+    );
+
+    loop {
+        let Some((send, recv)) = conn.accept_bi().await else {
+            // The QUIC connection closed (client dropped the session, surfaced via
+            // the TCP watcher, or a transport close): no further substreams.
+            tcp_watch.abort();
+            return Ok(());
+        };
+        let stream_id = recv.id();
+        // Admission: cap concurrent substreams per connection. If full, reset the
+        // excess bidi (release the client's slot) rather than queue it.
+        let Ok(permit) = Arc::clone(&live).try_acquire_owned() else {
+            let mut send = send;
+            send.reset(crate::transport::udp::quic::endpoint::VarInt::from_u32(0));
+            tracing::debug!(
+                cid = context.cid,
+                stream_id,
+                "mux-over-QUIC substream cap reached; resetting bidi"
+            );
+            continue;
+        };
+        let (client_open, server_seal) =
+            match crate::transport::udp::quic::mux::server_substream_codecs(
+                context.session_keys,
+                context.traffic,
+                stream_id,
+            ) {
+                Ok(codecs) => codecs,
+                Err(err) => {
+                    tracing::warn!(cid = context.cid, stream_id, error = %err, "substream codec derivation failed");
+                    let mut send = send;
+                    send.reset(crate::transport::udp::quic::endpoint::VarInt::from_u32(0));
+                    continue;
+                }
+            };
+        let traffic = context.traffic;
+        let fixed_data_target = context.fixed_data_target.map(str::to_owned);
+        let cid = context.cid;
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(err) = serve_mux_quic_substream(
+                send,
+                recv,
+                client_open,
+                server_seal,
+                traffic,
+                fixed_data_target.as_deref(),
+                cid,
+                stream_id,
+            )
+            .await
+            {
+                tracing::debug!(cid, stream_id, error = %err, "mux-over-QUIC substream ended");
+            }
+        });
+    }
+}
+
+/// Relay one mux-over-QUIC substream: read the `ConnectRequest` first record off
+/// the bidi (under the per-substream codec), connect the target, then run the
+/// upload/download loops over the H3 DATA-frame legs. Teardown is per-stream: a
+/// clean finish on the server's send half, a `RESET_STREAM` on error.
+#[allow(clippy::too_many_arguments)]
+async fn serve_mux_quic_substream(
+    send: crate::transport::udp::quic::endpoint::SendStream,
+    recv: crate::transport::udp::quic::endpoint::RecvStream,
+    mut client_open: DataRecordCodec,
+    server_seal: DataRecordCodec,
+    traffic: TrafficConfig,
+    fixed_data_target: Option<&str>,
+    cid: u64,
+    stream_id: u64,
+) -> Result<(), HandshakeServerError> {
+    let chunk_size = max_plaintext_len(traffic.max_padding);
+    let mut client_reader = H3DataFrameLegReader::buffered(recv);
+
+    // First record on the substream: the ConnectRequest (mirrors MuxFrame::Open).
+    // BOUNDED: a client that opens a bidi but withholds its ConnectRequest would
+    // otherwise pin this task + its admission permit indefinitely. Same bound the
+    // TCP path's real-first-command read uses (`PX1_CONTROL_READ_TIMEOUT`).
+    let mut first_record = Vec::new();
+    match tokio::time::timeout(
+        PX1_CONTROL_READ_TIMEOUT,
+        client_reader.read_record_into(&mut first_record),
+    )
+    .await
+    {
+        Ok(res) => res.map_err(HandshakeServerError::Io)?,
+        Err(_) => {
+            return Err(HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mux-over-QUIC substream ConnectRequest read timed out",
+            )));
+        }
+    }
+    let first_range = client_open.open_in_place_payload_range(&mut first_record)?;
+    let (target_addr, initial_payload) =
+        resolve_connect_target(&mut first_record[first_range], fixed_data_target)?;
+    let mut target = connect_outbound_target(&target_addr, fixed_data_target.is_some()).await?;
+    tune_tcp_stream(&target)?;
+    if !initial_payload.is_empty() {
+        target.write_all(initial_payload).await?;
+        initial_payload.zeroize();
+    }
+    let (target_read, target_write) = target.into_split();
+
+    let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+    let idle_timeout = fallback_idle_timeout();
+    let timing = TimingProfile::from_config(traffic);
+    let cover = CoverTrafficProfile::from_config(traffic);
+    let target_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+
+    // Direction mapping mirrors the single-Connect QUIC relay: the bidi's recv is
+    // client->server (upload to target), its send is server->client (download).
+    let upload = server_upload_loop(
+        client_reader,
+        target_write,
+        client_open,
+        activity.clone(),
+        cid,
+        idle_timeout,
+    );
+    let download = server_download_loop(
+        target_read,
+        H3DataFrameLegWriter(send),
+        server_seal,
+        target_buf,
+        timing,
+        cover,
+        activity.clone(),
+        cid,
+    );
+    let relay = async { tokio::try_join!(upload, download) };
+    let outcome = tokio::select! {
+        joined = relay => Some(joined),
+        _ = relay_idle_watchdog(activity, idle_timeout) => {
+            tracing::debug!(cid, stream_id, "mux-over-QUIC substream idle backstop reached");
+            None
+        }
+    };
+    match outcome {
+        Some(Ok(_)) | None => Ok(()),
+        Some(Err(err)) => Err(err),
+    }
 }
 
 async fn server_mux_client_reader_loop<R>(

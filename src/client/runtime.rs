@@ -34,7 +34,7 @@ use crate::{
         decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
         TrafficConfig, UdpConfig,
     },
-    crypto::{auth::AuthError, identity, parallel, pq},
+    crypto::{auth::AuthError, identity, parallel, pq, session::SessionKeys},
     handshake::client::{self, ClientDataSession, ClientHandshakeError, PendingPqRekey},
     protocol::command::{
         ConnectRequest, ConnectRequestError, FramedReassembler, MuxFrame, MuxFrameError,
@@ -645,25 +645,67 @@ struct ClientMuxPool {
 
 #[derive(Clone)]
 struct ClientMuxHandle {
-    frame_tx: mpsc::Sender<MuxFrame>,
-    register_tx: mpsc::Sender<ClientStreamControl>,
     next_stream_id: Arc<AtomicU32>,
     stream_slots: Arc<Semaphore>,
     chunk_size: usize,
-    payload_pool: MuxPayloadPool,
+    carrier: MuxCarrier,
+}
+
+/// The transport a mux session multiplexes substreams over. `Tcp` is the existing
+/// path: every substream's [`MuxFrame`]s are serialized onto one TLS-record stream
+/// and dispatched by `stream_id` via the reader/writer loops. `Quic` is the
+/// mux-over-QUIC fast plane: each substream gets its OWN QUIC bidi (native
+/// multiplexing, no head-of-line blocking), so there are no per-session frame
+/// channels — each local connection opens a bidi on the shared `Connection` and
+/// derives its own per-substream codec from `session_keys` (see
+/// [`crate::transport::udp::quic::mux`]).
+#[derive(Clone)]
+enum MuxCarrier {
+    Tcp {
+        frame_tx: mpsc::Sender<MuxFrame>,
+        register_tx: mpsc::Sender<ClientStreamControl>,
+        payload_pool: MuxPayloadPool,
+    },
+    Quic {
+        conn: crate::transport::udp::quic::endpoint::Connection,
+        /// Per-substream key-derivation root (shared, read-only).
+        session_keys: Arc<SessionKeys>,
+        traffic: TrafficConfig,
+        /// Held alive for the session's duration: the QUIC endpoint + H3 control
+        /// streams must outlive every substream (RFC 9114 §6.2.1).
+        _endpoint: Arc<crate::transport::udp::quic::endpoint::Endpoint>,
+        _h3_control: Arc<crate::transport::udp::h3::H3ControlStreams>,
+        /// The parked outer TCP connection halves. Held (never read/written after
+        /// the mux-mode signal) so the authenticated TCP channel stays open for the
+        /// session's life — its close is the server's session-end signal. Dropping
+        /// the last carrier clone closes the TCP connection, ending the session.
+        _tcp_read: Arc<OwnedReadHalf>,
+        _tcp_write: Arc<OwnedWriteHalf>,
+    },
 }
 
 impl ClientMuxHandle {
-    /// A cached mux session may be reused only if BOTH of its background tasks
-    /// are still alive. `frame_tx`'s receiver (`frame_rx`) is owned by the WRITER
-    /// task; `register_tx`'s receiver (`register_rx`) is owned by the READER task.
-    /// Either task can exit independently (most importantly, the reader returns
-    /// `Ok` on a clean server->client half-close FIN while a cover-disabled writer
-    /// keeps blocking on `frame_rx.recv()`), so both channels must be checked —
-    /// otherwise a half-dead session is handed out and every new local connection
-    /// fails at `register_tx.send`.
+    /// A cached mux session may be reused only if its carrier is still live.
+    ///
+    /// TCP: both background tasks must be alive. `frame_tx`'s receiver is owned by
+    /// the WRITER task; `register_tx`'s by the READER task. Either can exit
+    /// independently (most importantly, the reader returns `Ok` on a clean
+    /// server->client half-close FIN while a cover-disabled writer keeps blocking
+    /// on `frame_rx.recv()`), so both channels are checked — otherwise a half-dead
+    /// session is handed out and every new local connection fails at
+    /// `register_tx.send`.
+    ///
+    /// QUIC: the shared connection must not be closed (a closed connection yields
+    /// no further `open_bi`, so the session must be rebuilt).
     fn is_reusable(&self) -> bool {
-        !self.frame_tx.is_closed() && !self.register_tx.is_closed()
+        match &self.carrier {
+            MuxCarrier::Tcp {
+                frame_tx,
+                register_tx,
+                ..
+            } => !frame_tx.is_closed() && !register_tx.is_closed(),
+            MuxCarrier::Quic { conn, .. } => !conn.is_closed(),
+        }
     }
 }
 
@@ -923,20 +965,75 @@ impl ClientMuxPool {
                 Arc::clone(&self.server_identity_public),
             )
             .await?;
-        // Mux stays on TCP in this slice: close any retained QUIC connection.
+        let stream_limit = self.traffic.max_concurrent_streams as usize;
+        let chunk_size = max_plaintext_len(self.traffic.max_padding);
+
+        // Mux-over-QUIC fast plane: the UDP probe Verified, so multiplex each
+        // substream over its OWN QUIC bidi instead of serializing MuxFrames onto the
+        // TCP record stream. The probe bidi carried raw H3 probe DATA (no record
+        // codec), so it is NOT reused as a substream — every business substream opens
+        // a fresh bidi with its own per-substream codec. Finish the probe bidi (it is
+        // idle now) and hold the connection + endpoint + H3 control set alive for the
+        // session via the carrier.
         if let Some(retained) = retained_quic {
-            retained.close();
+            let RetainedClientQuic {
+                endpoint,
+                conn,
+                h3_control,
+                mut relay_send,
+                relay_recv,
+            } = retained;
+            // The probe round-trip is complete; finish our send half and drop the
+            // recv half so the probe bidi quiesces. Each business substream opens a
+            // fresh bidi below.
+            relay_send.finish();
+            drop(relay_recv);
+
+            // Capture the per-substream derivation root before consuming the session
+            // into its codecs below.
+            let session_keys = Arc::new(data_session.session_keys().clone());
+
+            // Signal mux mode to the server over TCP, exactly as the TCP-mux path
+            // does (the server selects its data mode off the first TCP record's
+            // magic). A zero-stream `Cover` frame is the canonical mux no-op: it
+            // carries no substream, so it is a pure "enter mux mode" marker. The
+            // server, seeing mux magic AND holding its own retained QUIC, runs the
+            // QUIC accept loop; the substreams themselves then flow over QUIC bidis.
+            let (server_read_half, mut server_write_half) = server.into_split();
+            let (mut seal_to_server, _open_from_server) = data_session.into_data_codecs();
+            let signal = MuxFrame::encode_borrowed(0, MuxFrameKind::Cover, &[])?;
+            let signal_record = seal_to_server
+                .seal(&signal, &mut OsRng)
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            server_write_half.write_all(&signal_record).await?;
+
+            return Ok(ClientMuxHandle {
+                next_stream_id: Arc::new(AtomicU32::new(1)),
+                stream_slots: Arc::new(Semaphore::new(stream_limit)),
+                chunk_size,
+                carrier: MuxCarrier::Quic {
+                    conn,
+                    session_keys,
+                    traffic: self.traffic,
+                    _endpoint: Arc::new(endpoint),
+                    _h3_control: Arc::new(h3_control),
+                    // Keep the outer TCP connection alive for the session's duration
+                    // (its close is the server's session-end signal).
+                    _tcp_read: Arc::new(server_read_half),
+                    _tcp_write: Arc::new(server_write_half),
+                },
+            });
         }
+
+        // No Verified UDP path: the mux stays on TCP, byte-identical to before.
         let (server_read, server_write) = server.into_split();
         let (seal_to_server, open_from_server) = data_session.into_data_codecs();
-        let stream_limit = self.traffic.max_concurrent_streams as usize;
         let channel_capacity = stream_limit
             .saturating_mul(MUX_FRAME_CHANNEL_PER_STREAM)
             .max(1);
         let (frame_tx, frame_rx) = mpsc::channel(channel_capacity);
         let (register_tx, register_rx) = mpsc::channel(stream_limit.max(1));
         let session_cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-        let chunk_size = max_plaintext_len(self.traffic.max_padding);
         let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
         tokio::spawn(async move {
             if let Err(err) = client_mux_reader_loop(
@@ -969,12 +1066,14 @@ impl ClientMuxPool {
         });
 
         Ok(ClientMuxHandle {
-            frame_tx,
-            register_tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),
             stream_slots: Arc::new(Semaphore::new(stream_limit)),
             chunk_size,
-            payload_pool,
+            carrier: MuxCarrier::Tcp {
+                frame_tx,
+                register_tx,
+                payload_pool,
+            },
         })
     }
 }
@@ -1005,7 +1104,6 @@ async fn handle_local_mux_connection_with_cid(
         .acquire_owned()
         .await
         .map_err(|_| io::Error::other("client mux stream limiter was closed"))?;
-    let stream_id = next_mux_stream_id(&mux.next_stream_id);
     let initial_payload_cap = MuxFrame::max_open_initial_payload_len(&request.host, mux.chunk_size);
     let initial_payload = initial_payload::read_initial_payload(&mut local, initial_payload_cap)
         .await
@@ -1015,6 +1113,37 @@ async fn handle_local_mux_connection_with_cid(
         port: request.port,
         initial_payload,
     };
+
+    // QUIC fast plane: open a dedicated bidi for this substream and relay it
+    // natively (its own per-substream codec), independent of every other substream.
+    if let MuxCarrier::Quic {
+        conn,
+        session_keys,
+        traffic,
+        ..
+    } = &mux.carrier
+    {
+        return client_mux_quic_substream(
+            local,
+            conn.clone(),
+            session_keys,
+            *traffic,
+            connect_request,
+            cid,
+        )
+        .await;
+    }
+
+    // TCP path: serialize this substream's frames onto the shared record stream.
+    let MuxCarrier::Tcp {
+        frame_tx,
+        register_tx,
+        payload_pool,
+    } = &mux.carrier
+    else {
+        unreachable!("QUIC carrier handled above");
+    };
+    let stream_id = next_mux_stream_id(&mux.next_stream_id);
     let connect_payload = connect_request.encode()?;
     let open_frame = MuxFrame {
         stream_id,
@@ -1026,8 +1155,7 @@ async fn handle_local_mux_connection_with_cid(
     let (outcome_tx, outcome_rx) = oneshot::channel();
     // Register the download half with the reader before announcing the stream,
     // so an immediate server response can never race ahead of the write half.
-    if mux
-        .register_tx
+    if register_tx
         .send(ClientStreamControl::Register(ClientStreamRegistration {
             stream_id,
             local_write,
@@ -1038,13 +1166,12 @@ async fn handle_local_mux_connection_with_cid(
     {
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client mux reader is gone").into());
     }
-    if let Err(err) = mux.frame_tx.send(open_frame).await {
+    if let Err(err) = frame_tx.send(open_frame).await {
         // Register succeeded but the Open frame never reached the server:
         // deregister the just-registered stream so the reader drops its cached
         // write half + outcome_tx instead of leaking them (no Fin/Reset will ever
         // arrive for a stream the server never saw).
-        let _ = mux
-            .register_tx
+        let _ = register_tx
             .send(ClientStreamControl::Deregister(stream_id))
             .await;
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into());
@@ -1052,11 +1179,11 @@ async fn handle_local_mux_connection_with_cid(
 
     let upload = client_mux_upload_loop(
         local_read,
-        mux.frame_tx.clone(),
+        frame_tx.clone(),
         stream_id,
         mux.chunk_size,
         cid,
-        mux.payload_pool.clone(),
+        payload_pool.clone(),
     );
     let download = client_mux_await_download(outcome_rx, cid);
     // Wait for BOTH halves. A clean server Fin (DownloadOutcome::Fin -> Ok)
@@ -1075,8 +1202,7 @@ async fn handle_local_mux_connection_with_cid(
     // always deregister so the reader drops the local write half. Both are
     // idempotent no-ops if the stream was already removed via a server Fin/Reset.
     if result.is_err() {
-        let _ = mux
-            .frame_tx
+        let _ = frame_tx
             .send(MuxFrame {
                 stream_id,
                 kind: MuxFrameKind::Reset,
@@ -1084,8 +1210,7 @@ async fn handle_local_mux_connection_with_cid(
             })
             .await;
     }
-    let _ = mux
-        .register_tx
+    let _ = register_tx
         .send(ClientStreamControl::Deregister(stream_id))
         .await;
     result
@@ -1093,6 +1218,87 @@ async fn handle_local_mux_connection_with_cid(
 
 fn next_mux_stream_id(next: &AtomicU32) -> u32 {
     next.fetch_add(2, Ordering::Relaxed) | 1
+}
+
+/// Relays one mux substream over its OWN QUIC bidi (native multiplexing). Opens a
+/// fresh bidi on the shared connection, derives a per-substream record codec keyed
+/// by the bidi's wire stream id (so the server derives the matching codec from the
+/// id it sees on `accept_bi`), seals the `ConnectRequest` as the first record, then
+/// runs the upload/download loops over the H3 DATA-frame legs — identical record
+/// carrier to the single-Connect QUIC relay, just one per substream. Teardown is
+/// per-stream: a clean finish on the send half, a `RESET_STREAM` on error.
+async fn client_mux_quic_substream(
+    local: TcpStream,
+    conn: crate::transport::udp::quic::endpoint::Connection,
+    session_keys: &SessionKeys,
+    traffic: TrafficConfig,
+    connect_request: ConnectRequest,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    use crate::transport::udp::quic::endpoint::VarInt;
+    use crate::transport::udp::quic::mux::client_substream_codecs;
+
+    // Open the dedicated bidi and derive its per-substream codecs from the wire
+    // stream id (both ends observe the same id for this bidi).
+    let (send, recv) = conn.open_bi();
+    let stream_id = send.id();
+    let (mut seal_to_server, open_from_server) =
+        client_substream_codecs(session_keys, traffic, stream_id)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+    let chunk_size = max_plaintext_len(traffic.max_padding);
+
+    let mut server_write = H3DataFrameLegWriter(send);
+    // First record on the substream: the ConnectRequest, sealed under the
+    // substream codec and DATA-framed (the server reads it as the substream's
+    // opening command, mirroring MuxFrame::Open on the TCP path).
+    let connect_payload = connect_request.encode()?;
+    let connect_record = seal_to_server
+        .seal(&connect_payload, &mut OsRng)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    if let Err(err) = server_write.write_records(&connect_record).await {
+        server_write.0.reset(VarInt::from_u32(0));
+        return Err(ClientRuntimeError::Io(err));
+    }
+
+    let (local_read, local_write) = local.into_split();
+    let local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+    let activity: ClientRelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+    // Cover profile from config, exactly like the single-Connect QUIC path: when
+    // cover is disabled (the default) the upload loop is a plain copy; when enabled
+    // each substream shapes its own upload, consistent with per-bidi independence.
+    let cover = CoverTrafficProfile::from_config(traffic);
+
+    let upload = client_upload_loop(
+        local_read,
+        server_write,
+        seal_to_server,
+        local_buf,
+        cover,
+        activity.clone(),
+        cid,
+    );
+    let download = client_download_loop(
+        H3DataFrameLegReader::buffered(recv),
+        local_write,
+        open_from_server,
+        activity.clone(),
+        cid,
+    );
+    let relay = async { tokio::try_join!(upload, download) };
+    let outcome = tokio::select! {
+        joined = relay => Some(joined),
+        _ = client_relay_idle_watchdog(activity, CLIENT_RELAY_IDLE_TIMEOUT) => {
+            tracing::debug!(cid, stream_id, "client mux-over-QUIC substream idle backstop reached");
+            None
+        }
+    };
+    match outcome {
+        // Both directions finished cleanly: the upload loop already finished the
+        // send half (shutdown on local EOF), and the download saw the server's
+        // clean stream finish. Nothing more to do — the bidi quiesces.
+        Some(Ok(_)) | None => Ok(()),
+        Some(Err(err)) => Err(err),
+    }
 }
 
 async fn handle_local_connection_with_cid(
@@ -3664,12 +3870,14 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(4);
         let (register_tx, register_rx) = mpsc::channel(4);
         let handle = ClientMuxHandle {
-            frame_tx,
-            register_tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),
             stream_slots: Arc::new(Semaphore::new(4)),
             chunk_size: 1024,
-            payload_pool: MuxPayloadPool::with_capacity(1024),
+            carrier: MuxCarrier::Tcp {
+                frame_tx,
+                register_tx,
+                payload_pool: MuxPayloadPool::with_capacity(1024),
+            },
         };
         (handle, frame_rx, register_rx)
     }
@@ -4603,6 +4811,92 @@ mod tests {
         wait_for_task("fallback", fallback_task).await;
     }
 
+    /// Mux-over-QUIC: with `udp.enabled` and `max_concurrent_streams > 1`, several
+    /// concurrent SOCKS streams must each round-trip BYTE-EXACT over their OWN QUIC
+    /// bidi (native multiplexing). The `QUIC_LEG_BYTES_WRITTEN` instrument confirms
+    /// the relay data actually traversed QUIC (it would stay flat if the mux had
+    /// fallen back to TCP), and distinct per-stream payloads prove no cross-talk
+    /// between substreams (each derives its own per-substream codec).
+    #[tokio::test]
+    #[ignore = "requires loopback UDP+TCP sockets"]
+    async fn mux_over_quic_concurrent_streams_round_trip_without_crosstalk() {
+        use crate::transport::leg::QUIC_LEG_BYTES_WRITTEN;
+        use std::sync::atomic::Ordering;
+
+        // Serialize against the other QUIC fast-plane e2e tests (shared globals).
+        let _serial = quic_e2e_guard().await;
+        const STREAMS: usize = 4;
+
+        let enabled_udp = UdpConfig {
+            enabled: true,
+            ..UdpConfig::default()
+        };
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_multi_echo_target(STREAMS).await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        // Observe THIS connection's retained carrier.
+        *server::retained_quic_conn_for_test()
+            .lock()
+            .expect("retained quic test hook poisoned") = None;
+
+        let mux_traffic = TrafficConfig {
+            max_concurrent_streams: STREAMS as u8,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) = spawn_parallax_server_with_traffic_and_udp(
+            server_config,
+            mux_traffic,
+            enabled_udp.clone(),
+        )
+        .await;
+        let (local_addr, client_task) = spawn_mux_local_client_with_udp(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys,
+            STREAMS,
+            enabled_udp,
+        )
+        .await;
+
+        let before = QUIC_LEG_BYTES_WRITTEN.load(Ordering::Relaxed);
+
+        // Open all substreams concurrently, each with a DISTINCT payload so a
+        // cross-stream leak (wrong codec / wrong target socket) shows up as a
+        // mismatch rather than being masked by identical bytes.
+        let mut round_trips = Vec::with_capacity(STREAMS);
+        for i in 0..STREAMS {
+            let app = connect_socks_target(local_addr, target_addr).await;
+            let payload = format!("mux-over-quic-stream-{i}").into_bytes();
+            round_trips.push(tokio::spawn(assert_payload_round_trip(app, payload)));
+        }
+        for rt in round_trips {
+            rt.await.expect("substream round-trip task");
+        }
+
+        let after = QUIC_LEG_BYTES_WRITTEN.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "expected mux relay bytes to traverse QUIC bidis (before={before}, after={after})"
+        );
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
     /// Regression cover for the mux data path: one stream carrying many small,
     /// consecutive payloads must deliver every byte in order in both directions,
     /// and a half-close FIN must never overtake queued DATA. This drives the
@@ -5221,6 +5515,23 @@ mod tests {
         server_identity_keys: &identity::MlDsaKeyPair,
         stream_count: usize,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_mux_local_client_with_udp(
+            parallax_addr,
+            server_keys,
+            server_identity_keys,
+            stream_count,
+            UdpConfig::default(),
+        )
+        .await
+    }
+
+    async fn spawn_mux_local_client_with_udp(
+        parallax_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+        stream_count: usize,
+        udp: UdpConfig,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let client_config = Arc::new(ClientConfig {
@@ -5241,7 +5552,7 @@ mod tests {
             Arc::clone(&client_config),
             server_addr,
             traffic,
-            Arc::new(UdpConfig::default()),
+            Arc::new(udp),
             Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL)),
             Arc::new(zeroize::Zeroizing::new(PSK.to_vec())),
             server_keys.public,

@@ -399,6 +399,13 @@ impl ClientDataSession {
         self.keys.epoch
     }
 
+    /// The post-handshake (post-PQ-rekey) session keys, the derivation root for
+    /// per-substream mux-over-QUIC codecs (`expand_substream_keys`). Read-only:
+    /// callers derive substream keys without disturbing the session's own codecs.
+    pub fn session_keys(&self) -> &SessionKeys {
+        &self.keys
+    }
+
     pub fn pq_identity_binding(&self) -> Result<[u8; 32], ClientHandshakeError> {
         self.pq_identity_binding
             .ok_or(ClientHandshakeError::MissingPqIdentityBinding)
