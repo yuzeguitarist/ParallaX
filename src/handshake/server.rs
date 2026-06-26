@@ -6863,6 +6863,154 @@ mod tests {
     }
 
     #[test]
+    fn replay_freshness_window_outlasts_the_prepq_deadline() {
+        // The replay freshness window must be the pre-PQ idle floor PLUS the default
+        // replay window (clock-skew slack), so a slow-but-legitimate client whose
+        // ClientHello timestamp is committed up to the floor later is not rejected as
+        // Stale. A `-> 0` / `-> 1` body replacement would collapse the window and
+        // re-introduce that rejection; pin it to the real sum (which far exceeds 1).
+        let expected = timeout_tuning().fallback_idle_floor.as_secs() + DEFAULT_REPLAY_WINDOW_SECS;
+        assert_eq!(replay_freshness_window_secs(), expected);
+        assert!(
+            replay_freshness_window_secs() >= DEFAULT_REPLAY_WINDOW_SECS,
+            "the window must never be smaller than the skew slack"
+        );
+        assert!(replay_freshness_window_secs() > 1);
+    }
+
+    #[test]
+    fn outbound_egress_filter_denies_every_special_range() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        // SSRF / egress policy: each address below is denied by EXACTLY one rule in
+        // is_denied_outbound_ipv4 / is_denied_outbound_ip, so a mutation that breaks
+        // that rule (|| -> &&, == -> !=, && -> ||) re-opens the corresponding range
+        // and this assertion catches it. Security-critical: a hole here lets an
+        // authenticated client reach loopback/RFC1918/cloud-metadata-adjacent space.
+        let denied_v4: &[(Ipv4Addr, &str)] = &[
+            (Ipv4Addr::new(127, 0, 0, 1), "loopback"),
+            (Ipv4Addr::new(10, 0, 0, 1), "private 10/8"),
+            (Ipv4Addr::new(172, 16, 0, 1), "private 172.16/12"),
+            (Ipv4Addr::new(192, 168, 1, 1), "private 192.168/16"),
+            (
+                Ipv4Addr::new(169, 254, 0, 1),
+                "link-local (incl. cloud metadata)",
+            ),
+            (Ipv4Addr::new(0, 0, 0, 0), "unspecified / octets[0]==0"),
+            (Ipv4Addr::new(0, 1, 2, 3), "octets[0]==0 'this network'"),
+            (Ipv4Addr::new(224, 0, 0, 1), "multicast"),
+            (Ipv4Addr::new(255, 255, 255, 255), "broadcast"),
+            (
+                Ipv4Addr::new(240, 0, 0, 1),
+                "octets[0]>=240 (reserved class E)",
+            ),
+            (Ipv4Addr::new(100, 64, 0, 1), "CGNAT 100.64/10 low"),
+            (Ipv4Addr::new(100, 127, 255, 1), "CGNAT 100.64/10 high"),
+            (
+                Ipv4Addr::new(192, 0, 0, 1),
+                "192.0.0/24 IETF protocol assignments",
+            ),
+            (Ipv4Addr::new(192, 0, 2, 1), "192.0.2/24 TEST-NET-1"),
+            (Ipv4Addr::new(198, 18, 0, 1), "198.18/15 benchmark low"),
+            (Ipv4Addr::new(198, 19, 0, 1), "198.18/15 benchmark high"),
+            (Ipv4Addr::new(198, 51, 100, 1), "198.51.100/24 TEST-NET-2"),
+            (Ipv4Addr::new(203, 0, 113, 1), "203.0.113/24 TEST-NET-3"),
+        ];
+        for (ip, why) in denied_v4 {
+            assert!(is_denied_outbound_ipv4(*ip), "{ip} must be denied ({why})");
+            assert!(
+                is_denied_outbound_ip(IpAddr::V4(*ip)),
+                "{ip} must be denied via is_denied_outbound_ip ({why})"
+            );
+        }
+
+        // Normal, routable public IPv4 must be ALLOWED: this is what proves the
+        // filter is not a blanket deny (a `|| -> &&` somewhere that made the whole
+        // chain collapse to false would be missed without an allow case; conversely
+        // a `&& -> ||` that broadened a special range would wrongly deny these).
+        let allowed_v4 = [
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(93, 184, 216, 34),  // example.com
+            Ipv4Addr::new(100, 63, 255, 255), // just below CGNAT
+            Ipv4Addr::new(100, 128, 0, 1),    // just above CGNAT
+            Ipv4Addr::new(192, 0, 1, 1),      // adjacent to 192.0.0/24 and .2/24
+            Ipv4Addr::new(198, 20, 0, 1),     // just above the benchmark range
+            Ipv4Addr::new(203, 0, 114, 1),    // adjacent to TEST-NET-3
+        ];
+        for ip in allowed_v4 {
+            assert!(
+                !is_denied_outbound_ipv4(ip),
+                "{ip} is a normal public address and must be allowed"
+            );
+            assert!(
+                !is_denied_outbound_ip(IpAddr::V4(ip)),
+                "{ip} must be allowed"
+            );
+        }
+
+        // IPv6 special ranges, each denied by one rule.
+        let denied_v6: &[(Ipv6Addr, &str)] = &[
+            (Ipv6Addr::LOCALHOST, "::1 loopback"),
+            (Ipv6Addr::UNSPECIFIED, ":: unspecified"),
+            (Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), "multicast"),
+            (
+                Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1),
+                "unique local fc00::/7",
+            ),
+            (
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                "link-local fe80::/10",
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                "documentation 2001:db8::/32",
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1),
+                "teredo 2001:0::/32",
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 1),
+                "NAT64 64:ff9b::/96",
+            ),
+            // v4-mapped private address must be screened by the IPv4 policy.
+            (
+                Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001),
+                "::ffff:10.0.0.1 v4-mapped private",
+            ),
+        ];
+        for (ip, why) in denied_v6 {
+            assert!(
+                is_denied_outbound_ip(IpAddr::V6(*ip)),
+                "{ip} must be denied ({why})"
+            );
+        }
+
+        // The targeted IPv6 classifiers, pinned positive/negative so the `&&` and
+        // `==` inside them cannot be flipped without detection.
+        assert!(is_ipv6_documentation(Ipv6Addr::new(
+            0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_ipv6_documentation(Ipv6Addr::new(
+            0x2001, 0x0db9, 0, 0, 0, 0, 0, 1
+        )));
+        assert!(is_ipv6_teredo(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1)));
+        assert!(!is_ipv6_teredo(Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1)));
+        assert!(is_ipv6_nat64(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_ipv6_nat64(Ipv6Addr::new(
+            0x0064, 0xff9c, 0, 0, 0, 0, 0, 1
+        )));
+
+        // A normal public IPv6 must be allowed.
+        assert!(!is_denied_outbound_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111
+        ))));
+    }
+
+    #[test]
     fn speed_test_dos_ceilings_match_their_documented_values() {
         // These are SECURITY ceilings that bound an authenticated client's speed-test
         // request (a malicious client could otherwise request terabytes of generated
