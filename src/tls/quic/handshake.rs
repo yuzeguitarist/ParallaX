@@ -227,7 +227,7 @@ impl ClientHandshake {
                 .to_vec(),
         );
 
-        let mut grease_seed = [0_u8; 5];
+        let mut grease_seed = [0_u8; 6];
         OsRng.fill_bytes(&mut grease_seed);
         let grease = GreaseSet::from_seed(grease_seed);
         // `ClientHello.random`: a covert auth marker when a marker config is present

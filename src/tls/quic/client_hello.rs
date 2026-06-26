@@ -308,7 +308,7 @@ mod tests {
     }
 
     fn sample_client_hello() -> Vec<u8> {
-        let grease = GreaseSet::from_seed([1, 2, 3, 4, 5]);
+        let grease = GreaseSet::from_seed([1, 2, 3, 4, 5, 6]);
         let x25519 = [0x11_u8; 32];
         let mlkem = vec![0x22_u8; MLKEM768_PUBLIC_KEY_LEN];
         let tp = vec![0x04, 0x04, 0x80, 0x10, 0x00, 0x00];
@@ -402,7 +402,7 @@ mod tests {
     fn resumption_clienthello_adds_early_data_and_trailing_psk_with_valid_binder() {
         use crate::tls::quic::schedule::{binder_finished_key, early_secret_from_psk, psk_binder};
 
-        let grease = GreaseSet::from_seed([9, 8, 7, 6, 5]);
+        let grease = GreaseSet::from_seed([9, 8, 7, 6, 5, 4]);
         let x25519 = [0x11_u8; 32];
         let mlkem = vec![0x22_u8; MLKEM768_PUBLIC_KEY_LEN];
         let tp = vec![0x04, 0x04, 0x80, 0x10, 0x00, 0x00];

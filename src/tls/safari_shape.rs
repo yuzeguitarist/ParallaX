@@ -65,6 +65,16 @@ pub(crate) const BROWSER_GREASE_VALUES: [u16; 16] = [
 /// distinguishable tell, so on the rare collision we reshuffle the last index by
 /// a per-ClientHello seed-derived (non-constant) stride rather than a fixed
 /// transform.
+///
+/// The collision stride is derived from its OWN dedicated seed byte (`seed[5]`),
+/// NOT from a byte that already determines another on-wire GREASE value. An
+/// earlier version reused `seed[0]` (which also picks the cipher GREASE) for the
+/// stride, which made the resolved first->last delta a deterministic function of
+/// the cipher GREASE on every colliding ClientHello — an externally observable
+/// per-connection correlation that real Safari (independent draws) does not have.
+/// The stride spans the full `1..=len-1` range (any non-zero stride is < len so it
+/// always lands on a different index; no `| 1` odd-only forcing, which would skew
+/// the delta distribution toward odd values).
 #[derive(Clone, Copy)]
 pub(crate) struct GreaseSet {
     pub(crate) cipher: u16,
@@ -75,17 +85,19 @@ pub(crate) struct GreaseSet {
 }
 
 impl GreaseSet {
-    pub(crate) fn from_seed(seed: [u8; 5]) -> Self {
+    pub(crate) fn from_seed(seed: [u8; 6]) -> Self {
         let len = BROWSER_GREASE_VALUES.len();
         let extension_index = seed[1] as usize % len;
         let mut final_extension_index = seed[4] as usize % len;
         if final_extension_index == extension_index {
             // Independent re-draw, not a fixed first->last transform: advance by a
-            // seed-derived odd stride so the resolved value varies per ClientHello
-            // (an odd stride is coprime to 16, so it always lands on a different
-            // index). This keeps the first/last pair indistinguishable from two
-            // independent draws, as observed on the wire.
-            let stride = (seed[0] as usize | 1) % len;
+            // stride derived from a DEDICATED seed byte (`seed[5]`) that drives no
+            // other on-wire value, so the resolved last GREASE stays uncorrelated
+            // with the cipher / first-extension GREASE. The stride is in `1..=len-1`
+            // (non-zero and < len), so `(idx + stride) % len` always lands on a
+            // different index — keeping the first/last pair indistinguishable from
+            // two independent draws, as observed on the wire.
+            let stride = (seed[5] as usize % (len - 1)) + 1;
             final_extension_index = (final_extension_index + stride) % len;
         }
         Self {
@@ -263,7 +275,7 @@ mod tests {
     }
 
     fn grease() -> GreaseSet {
-        GreaseSet::from_seed([1, 2, 3, 4, 5])
+        GreaseSet::from_seed([1, 2, 3, 4, 5, 6])
     }
 
     #[test]
@@ -273,7 +285,7 @@ mod tests {
         // adversarial seed where both indices collide.
         for a in 0..=u8::MAX {
             for b in 0..=u8::MAX {
-                let g = GreaseSet::from_seed([0, a, 0, 0, b]);
+                let g = GreaseSet::from_seed([0, a, 0, 0, b, a ^ b]);
                 assert_ne!(
                     g.extension, g.final_extension,
                     "first/last GREASE collided for seed bytes {a},{b}"
@@ -292,17 +304,17 @@ mod tests {
         // must therefore avoid pinning a constant relationship: in particular the
         // result must NOT always equal `extension ^ 0x1010` (current BoringSSL
         // master) nor a constant `(idx+1) % 16` bump. Sweep every colliding seed
-        // and assert distinctness plus that no single fixed transform explains all
-        // resolutions.
+        // (including the dedicated stride byte `seed[5]`) and assert distinctness
+        // plus that no single fixed transform explains all resolutions.
         let mut all_xor = true;
         let mut all_inc = true;
-        for s0 in 0..=u8::MAX {
+        for stride_byte in 0..=u8::MAX {
             for idx in 0..u8::MAX {
                 // Force seed[1] == seed[4] (same index) to hit the collision branch.
-                let g = GreaseSet::from_seed([s0, idx, 0, 0, idx]);
+                let g = GreaseSet::from_seed([0, idx, 0, 0, idx, stride_byte]);
                 assert_ne!(
                     g.extension, g.final_extension,
-                    "collision not resolved for seed0={s0} idx={idx}"
+                    "collision not resolved for stride_byte={stride_byte} idx={idx}"
                 );
                 assert!(is_grease(g.final_extension));
                 if g.final_extension != g.extension ^ 0x1010 {
@@ -327,6 +339,48 @@ mod tests {
             !all_inc,
             "collision resolution must not be a constant (idx+1)"
         );
+    }
+
+    /// Regression: the collision-branch stride must come from its OWN seed byte,
+    /// not from a byte that already drives another on-wire GREASE value. A prior
+    /// version derived the stride from `seed[0]` (which also picks the cipher
+    /// GREASE), so on every colliding ClientHello the resolved (first->last)
+    /// extension-GREASE index delta equaled `cipher_idx | 1` — an externally
+    /// observable per-connection correlation real Safari's independent draws do
+    /// not have. Holding `seed[0]` (cipher) and the colliding extension index
+    /// fixed, varying ONLY the stride byte must still produce MULTIPLE distinct
+    /// final indices; if the stride were a function of `seed[0]`, the delta would
+    /// be pinned to a single value.
+    #[test]
+    fn grease_collision_stride_is_independent_of_cipher_grease() {
+        let len = BROWSER_GREASE_VALUES.len();
+        for cipher_seed in 0..=u8::MAX {
+            for idx in 0..(len as u8) {
+                let ext_index = idx as usize % len;
+                let mut deltas = std::collections::HashSet::new();
+                for stride_byte in 0..=u8::MAX {
+                    // seed[0]=cipher_seed (cipher GREASE), seed[1]==seed[4]=idx
+                    // (force collision), seed[5]=stride_byte (the stride source).
+                    let g = GreaseSet::from_seed([cipher_seed, idx, 0, 0, idx, stride_byte]);
+                    let fi = BROWSER_GREASE_VALUES
+                        .iter()
+                        .position(|&v| v == g.final_extension)
+                        .unwrap();
+                    deltas.insert((fi + len - ext_index) % len);
+                }
+                // The full stride domain is 1..=len-1, so a stride drawn solely
+                // from seed[5] must yield every non-zero delta — and in particular
+                // FAR more than one, proving the delta is not a function of the
+                // (fixed) cipher seed. This fails if the stride is ever re-coupled
+                // to seed[0].
+                assert_eq!(
+                    deltas.len(),
+                    len - 1,
+                    "collision delta must span all non-zero strides independent of \
+                     cipher seed (cipher_seed={cipher_seed}, idx={idx}); got {deltas:?}"
+                );
+            }
+        }
     }
 
     #[test]

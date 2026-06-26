@@ -249,7 +249,7 @@ impl Safari26TlsCamouflage {
                 .as_ref()
                 .to_vec(),
         );
-        let mut grease_seed = [0_u8; 5];
+        let mut grease_seed = [0_u8; 6];
         OsRng.fill_bytes(&mut grease_seed);
         let grease = GreaseSet::from_seed(grease_seed);
         let client_hello = build_safari_client_hello(
