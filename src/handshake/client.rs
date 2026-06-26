@@ -215,7 +215,27 @@ impl ClientDataSession {
     {
         request.protect_plaintext_memory();
         let payload = Zeroizing::new(request.encode()?);
-        Ok(self.seal_to_server.seal(payload.as_slice(), rng)?)
+        // C3: snap the CONNECT record onto a randomly chosen browser-magnitude
+        // size band so its on-wire length leaks neither the target host length
+        // nor the captured 0-RTT payload size. The pad rides the existing
+        // self-describing 2-byte trailer (decode-transparent, no wire-format
+        // change) and is bounded so the padded record still fits one TLS record.
+        // `seal_into_exact_padded` writes EXACTLY this pad and bypasses the
+        // codec's profile sampling, so the record lands on its band even when a
+        // non-default TrafficConfig padding profile is configured.
+        let max_extra_pad = self
+            .seal_to_server
+            .max_plaintext_len()
+            .saturating_sub(payload.len());
+        let shaping_pad = request.shaping_extra_pad(max_extra_pad, rng);
+        let mut out = Vec::new();
+        self.seal_to_server.seal_into_exact_padded(
+            payload.as_slice(),
+            shaping_pad,
+            rng,
+            &mut out,
+        )?;
+        Ok(out)
     }
 
     pub fn seal_payload<R>(
@@ -517,7 +537,66 @@ mod tests {
         let (mut open_from_client, _) = data_codecs(&keys, traffic).unwrap();
         let payload = open_from_client.open(&record).unwrap();
 
+        // The C3 shaping pad is stripped transparently on open, so the CONNECT
+        // decodes byte-for-byte despite the on-wire record being padded to a band.
         assert_eq!(ConnectRequest::decode(&payload).unwrap(), request);
+
+        // C3: the on-wire record size must be one of the shaping bands, not the
+        // raw `CONNECT_FIXED_LEN + host + payload` size that would leak the target.
+        let header = crate::tls::record::parse_header(&record).unwrap();
+        assert!(
+            crate::protocol::command::connect_record_size_is_shaped(header.payload_len),
+            "CONNECT wire size {} is not a shaping band",
+            header.payload_len
+        );
+    }
+
+    #[test]
+    fn connect_record_lands_on_band_even_with_nonzero_traffic_padding() {
+        // C3 regression: with a non-default TrafficConfig padding profile, the
+        // CONNECT record must STILL land exactly on a shaping band (the seal path
+        // bypasses profile sampling for shaping). If it added profile padding on
+        // top, the size would drift off-band and re-expose a size signal.
+        let keys = SessionKeys {
+            client_key: [9_u8; 32],
+            server_key: [8_u8; 32],
+            client_nonce: [7_u8; NONCE_LEN],
+            server_nonce: [6_u8; NONCE_LEN],
+            chain_secret: [5_u8; 32],
+            epoch: 0,
+            transcript_hash: [4_u8; 32],
+            x25519_shared_secret: [3_u8; 32],
+        };
+        let traffic = TrafficConfig {
+            min_padding: 32,
+            max_padding: 512,
+            min_delay_ms: 0,
+            max_delay_ms: 0,
+            cover_min_interval_ms: 0,
+            cover_max_interval_ms: 0,
+            max_concurrent_streams: 1,
+        };
+        let request = ConnectRequest {
+            host: "example.com".to_owned(),
+            port: 443,
+            initial_payload: b"hello".to_vec(),
+        };
+        for seed in 0..32 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+            let record = session
+                .build_connect_record(request.clone(), &mut rng)
+                .unwrap();
+            let header = crate::tls::record::parse_header(&record).unwrap();
+            assert!(
+                crate::protocol::command::connect_record_size_is_shaped(header.payload_len),
+                "CONNECT wire size {} drifted off-band under non-zero padding (seed {seed})",
+                header.payload_len
+            );
+            let (mut open_from_client, _) = data_codecs(&keys, traffic).unwrap();
+            let payload = open_from_client.open(&record).unwrap();
+            assert_eq!(ConnectRequest::decode(&payload).unwrap(), request);
+        }
     }
 
     // Test helper: reassemble a PQ handshake frame (PX1Q/PX1K) from a buffer of

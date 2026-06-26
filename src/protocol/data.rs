@@ -17,7 +17,22 @@ use crate::{
     traffic::{PaddingProfile, TrafficError},
 };
 
-pub const OUTER_TLS_RECORD_LIMIT: usize = record::MAX_TLS_RECORD_PAYLOAD;
+/// Maximum on-wire TLS record payload (the record `length` field: encrypted
+/// content + AEAD tag) the data plane emits. Real Safari 26 over TLS 1.3 emits
+/// full application-data records of exactly **16401** bytes — `16384` plaintext
+/// `+ 1` TLS 1.3 inner content-type `+ 16` AEAD tag — measured across a bulk
+/// download (`~/Desktop/safari-tcp/big.pcap`, sole full-record bucket). The
+/// camouflage handshake/H2 path already emits 16401 (see
+/// `Tls13Keys::encrypt_record`). The data plane must match so a length
+/// classifier sees ONE record-size regime across the whole connection rather
+/// than the camouflage→data `16401`→`16384` switch that was uniquely ParallaX
+/// (A1). This caps the wire `length` field; with ParallaX's 2-byte self-pad
+/// trailer a full record carries 16383 plaintext (16383 + 2 + 16 = 16401) — the
+/// 1-byte-less-than-Safari plaintext split is invisible on the wire, only the
+/// 16401 `length` field is observable. Deliberately NOT aliased to
+/// `record::MAX_TLS_RECORD_PAYLOAD` (16384), which is the camouflage path's
+/// *plaintext* chunk size and must stay 16384.
+pub const OUTER_TLS_RECORD_LIMIT: usize = record::MAX_TLS_RECORD_PAYLOAD + 17;
 /// Target size of a single relay read (`drain_ready_tcp_read` coalesces all
 /// immediately-ready bytes up to this bound before sealing). Larger reads gather
 /// more plaintext per cycle, so the bulk seal/open fans out across more crypto
@@ -187,28 +202,29 @@ impl DataRecordCodec {
         Ok(record_start..out.len())
     }
 
-    /// Seal one record carrying `payload` plus exactly `extra_pad` extra
-    /// padding-suffix bytes, on TOP of whatever this codec's [`PaddingProfile`] would
-    /// add. Used by the PQ handshake flight (PAR-35) to apply per-session aggregate
-    /// decorrelation padding to a single record without enabling padding on the shared
-    /// relay codec (whose profile stays 0/0, so the steady-state hot path is
-    /// untouched). The receiver strips it transparently via the self-describing 2-byte
-    /// pad-length trailer — no wire-format or decode change. Bounded by the outer TLS
-    /// record limit exactly like a normal seal.
-    pub fn seal_into_extra_padded<R>(
+    /// Shared single-record seal core: writes the TLS header, appends `payload`,
+    /// lets `write_suffix` append the padding suffix (pad bytes + 2-byte trailer),
+    /// enforces the outer record limit, seals in place, and back-patches the
+    /// length field. The ONLY thing that varies between the public seal-with-pad
+    /// variants is how the suffix is chosen, so that is the sole injected step —
+    /// keeping the security-sensitive framing/overflow/AEAD path in exactly one
+    /// place. `reserve_pad` is an upper bound on the suffix's pad bytes used only
+    /// to pre-size `out`.
+    fn seal_record_with_suffix<R, F>(
         &mut self,
         payload: &[u8],
-        extra_pad: usize,
+        reserve_pad: usize,
         rng: &mut R,
         out: &mut Vec<u8>,
+        write_suffix: F,
     ) -> Result<std::ops::Range<usize>, DataRecordError>
     where
         R: rand::Rng + rand::RngCore + ?Sized,
+        F: FnOnce(&PaddingProfile, usize, &mut R, &mut Vec<u8>),
     {
-        out.reserve(record_capacity(
-            payload.len() + extra_pad,
-            self.padding.max_len(),
-        ));
+        out.reserve(
+            record::TLS_HEADER_LEN + payload.len() + reserve_pad + PADDING_LEN_FIELD + AEAD_TAG_LEN,
+        );
         let record_start = out.len();
         out.extend_from_slice(&[
             TLS_CONTENT_APPLICATION_DATA,
@@ -218,15 +234,8 @@ impl DataRecordCodec {
             0,
         ]);
         out.extend_from_slice(payload);
-        // Write one padding suffix = this codec's normal sampled padding PLUS the
-        // per-session `extra_pad` (the self-describing 2-byte trailer makes the
-        // receiver strip the whole thing). With the default 0/0 profile this is exactly
-        // `extra_pad`; with a configured profile the record still honors the profile
-        // and adds the aggregate pad on top. Only PQ-handshake records take this path,
-        // so the relay hot path is unaffected.
         let ciphertext_start = record_start + record::TLS_HEADER_LEN;
-        self.padding
-            .write_extra_padded_suffix_into(payload.len(), extra_pad, rng, out);
+        write_suffix(&self.padding, payload.len(), rng, out);
         let padded_len = out.len() - ciphertext_start;
         if padded_len + AEAD_TAG_LEN > OUTER_TLS_RECORD_LIMIT {
             out[ciphertext_start..].zeroize();
@@ -254,6 +263,73 @@ impl DataRecordCodec {
         out[record_start + 3] = len[0];
         out[record_start + 4] = len[1];
         Ok(record_start..out.len())
+    }
+
+    /// Seal one record carrying `payload` plus exactly `extra_pad` extra
+    /// padding-suffix bytes, on TOP of whatever this codec's [`PaddingProfile`] would
+    /// add. Used by the PQ handshake flight (PAR-35) to apply per-session aggregate
+    /// decorrelation padding to a single record without enabling padding on the shared
+    /// relay codec (whose profile stays 0/0, so the steady-state hot path is
+    /// untouched). The receiver strips it transparently via the self-describing 2-byte
+    /// pad-length trailer — no wire-format or decode change. Bounded by the outer TLS
+    /// record limit exactly like a normal seal.
+    pub fn seal_into_extra_padded<R>(
+        &mut self,
+        payload: &[u8],
+        extra_pad: usize,
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        // Suffix = this codec's normal sampled padding PLUS the per-session
+        // `extra_pad`. With the default 0/0 profile this is exactly `extra_pad`;
+        // with a configured profile the record honors the profile and adds the
+        // aggregate pad on top. Reserve includes the profile's max for sizing.
+        let reserve_pad = extra_pad + self.padding.max_len() as usize;
+        self.seal_record_with_suffix(
+            payload,
+            reserve_pad,
+            rng,
+            out,
+            |padding, payload_len, rng, out| {
+                padding.write_extra_padded_suffix_into(payload_len, extra_pad, rng, out);
+            },
+        )
+    }
+
+    /// Seal one record carrying `payload` with EXACTLY `total_pad` padding-suffix
+    /// bytes, ignoring this codec's [`PaddingProfile`] sampling entirely. Unlike
+    /// [`Self::seal_into_extra_padded`] (which adds the profile's sampled padding
+    /// ON TOP), this writes a deterministic, caller-controlled pad so the on-wire
+    /// record length is exactly `TLS_HEADER_LEN + payload.len() + total_pad +
+    /// PADDING_LEN_FIELD + AEAD_TAG_LEN`. Used by the CONNECT shaping (C3), which
+    /// must land the record on a precise size band regardless of any configured
+    /// `TrafficConfig` padding — letting the profile also sample here would push
+    /// the record off its band. The receiver strips the whole suffix via the same
+    /// self-describing 2-byte trailer, so no decode change is needed.
+    pub fn seal_into_exact_padded<R>(
+        &mut self,
+        payload: &[u8],
+        total_pad: usize,
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, DataRecordError>
+    where
+        R: rand::Rng + rand::RngCore + ?Sized,
+    {
+        self.seal_record_with_suffix(
+            payload,
+            total_pad,
+            rng,
+            out,
+            |padding, _payload_len, rng, out| {
+                // Exactly `total_pad` random pad bytes + the 2-byte length trailer
+                // — no profile sampling, so the wire size is caller-determined.
+                padding.write_exact_padding_suffix(total_pad, rng, out);
+            },
+        )
     }
 
     /// Seal a browser-shaped PQ handshake flight (PAR-35): each `FramedChunk` record
@@ -1502,6 +1578,41 @@ mod tests {
     }
 
     #[test]
+    fn full_data_record_wire_length_matches_safari_16401() {
+        // A1: a full data record's on-wire TLS `length` field must equal 16401 —
+        // identical to real Safari 26 (16384 plaintext + 1 inner-type + 16 tag)
+        // and to ParallaX's own camouflage path — so no camouflage→data record-size
+        // switch is observable. With the default (0,0) padding profile a full
+        // record carries `max_plaintext_len()` = 16383 plaintext, then +2 self-pad
+        // trailer +16 tag = 16401 on the wire.
+        let key = [5_u8; KEY_LEN];
+        let nonce = [6_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut enc =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        assert_eq!(enc.max_plaintext_len(), 16383);
+
+        // Two full records' worth of payload, so the first record is full-size.
+        let payload = vec![0xab_u8; enc.max_plaintext_len() * 2];
+        let mut rng = StdRng::seed_from_u64(99);
+        let records = enc.seal_chunks(&payload, &mut rng).unwrap();
+
+        let header = record::parse_header(&records[0]).unwrap();
+        assert_eq!(
+            header.payload_len, 16401,
+            "full data record wire length must be 16401 (Safari-matched)"
+        );
+
+        let mut dec =
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD);
+        let mut opened = Vec::new();
+        for record in &records {
+            opened.extend_from_slice(&dec.open(record).unwrap());
+        }
+        assert_eq!(opened, payload);
+    }
+
+    #[test]
     fn seal_chunks_round_trips_5mb_in_both_directions() {
         let payload = (0..5 * 1024 * 1024)
             .map(|idx| (idx % 251) as u8)
@@ -2056,14 +2167,12 @@ mod tests {
     fn max_plaintext_len_saturates_when_padding_exceeds_record_capacity() {
         assert_eq!(max_plaintext_len(u16::MAX), 0);
         assert_eq!(
-            max_plaintext_len(
-                (record::MAX_TLS_RECORD_PAYLOAD - AEAD_TAG_LEN - PADDING_LEN_FIELD) as u16
-            ),
+            max_plaintext_len((OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN - PADDING_LEN_FIELD) as u16),
             0
         );
         assert_eq!(
             max_plaintext_len(
-                (record::MAX_TLS_RECORD_PAYLOAD - AEAD_TAG_LEN - PADDING_LEN_FIELD - 1) as u16
+                (OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN - PADDING_LEN_FIELD - 1) as u16
             ),
             1
         );
