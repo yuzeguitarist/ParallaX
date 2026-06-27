@@ -3874,8 +3874,8 @@ async fn serve_mux_quic_substream(
 
 #[allow(clippy::too_many_arguments)]
 async fn serve_mux_quic_substream_inner(
-    send: crate::transport::udp::quic::endpoint::SendStream,
-    recv: crate::transport::udp::quic::endpoint::RecvStream,
+    mut send: crate::transport::udp::quic::endpoint::SendStream,
+    mut recv: crate::transport::udp::quic::endpoint::RecvStream,
     mut client_open: DataRecordCodec,
     server_seal: DataRecordCodec,
     traffic: TrafficConfig,
@@ -3883,7 +3883,32 @@ async fn serve_mux_quic_substream_inner(
     cid: u64,
     stream_id: u64,
 ) -> Result<bool, HandshakeServerError> {
+    use crate::transport::udp::h3::{
+        read_business_request_headers, write_business_response_headers,
+    };
+
     let chunk_size = max_plaintext_len(traffic.max_padding);
+
+    // A business bidi opens with a Safari-26 request HEADERS frame (browser-plausible
+    // HTTP/3 request lifecycle) before its relay DATA frames. Read+validate it off
+    // the raw recv BEFORE wrapping the rest of the stream in the DATA-frame de-framer.
+    // BOUNDED by the same control-read timeout as the ConnectRequest below: a client
+    // that opens a bidi but never sends HEADERS must not pin this task + its permit.
+    match tokio::time::timeout(
+        PX1_CONTROL_READ_TIMEOUT,
+        read_business_request_headers(&mut recv),
+    )
+    .await
+    {
+        Ok(res) => res.map_err(HandshakeServerError::Io)?,
+        Err(_) => {
+            return Err(HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mux-over-QUIC substream request HEADERS read timed out",
+            )));
+        }
+    }
+
     let mut client_reader = H3DataFrameLegReader::buffered(recv);
 
     // First record on the substream: the ConnectRequest (mirrors MuxFrame::Open).
@@ -3915,6 +3940,15 @@ async fn serve_mux_quic_substream_inner(
         initial_payload.zeroize();
     }
     let (target_read, target_write) = target.into_split();
+
+    // Answer with the `:status 200` response HEADERS frame before the download DATA
+    // frames, completing the browser-plausible request/response lifecycle (the
+    // client opened the bidi with request HEADERS). Sent only after the target
+    // connect succeeds, mirroring a real origin emitting response headers once it
+    // has something to serve.
+    write_business_response_headers(&mut send)
+        .await
+        .map_err(HandshakeServerError::Io)?;
 
     let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
     let idle_timeout = fallback_idle_timeout();

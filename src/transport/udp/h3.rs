@@ -35,7 +35,8 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::fingerprint::http3::{
-    self, parse_settings_payload, safari26_settings_frame, Http3Setting, FRAME_TYPE_SETTINGS,
+    self, parse_settings_payload, response_status_200_headers_frame, safari26_headers_frame,
+    safari26_settings_frame, Http3Setting, FRAME_TYPE_HEADERS, FRAME_TYPE_SETTINGS,
     STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER, STREAM_TYPE_QPACK_ENCODER,
 };
 use crate::transport::udp::quic::endpoint::{Connection, RecvStream, SendStream};
@@ -258,6 +259,79 @@ pub(crate) async fn read_one_h3_frame(
     Ok((frame_type, payload))
 }
 
+/// Defensive cap on a business-bidi request/response HEADERS frame. Safari's
+/// request field section is a few hundred bytes and the `:status 200` response
+/// section is two; this bounds a hostile peer's HEADERS allocation, mirroring the
+/// probe path's `MAX_PROBE_H3_FRAME_LEN`.
+const MAX_BUSINESS_HEADERS_FRAME_LEN: usize = 4096;
+
+/// Write the Safari-26 request HEADERS frame (method GET, `:authority = authority`)
+/// as the FIRST frame on a fresh mux-over-QUIC business bidi, so the bidi opens
+/// with a browser-plausible HTTP/3 request lifecycle (HEADERS then DATA) instead of
+/// starting directly with a DATA frame. The encrypted ParallaX records follow as
+/// DATA frames (written by [`crate::transport::leg::H3DataFrameLegWriter`]). Mirrors
+/// the request-bidi probe's opening HEADERS (see [`crate::transport::udp::probe`]),
+/// so a business bidi is on-wire indistinguishable from the probe bidi: a normal H3
+/// request stream.
+pub(crate) async fn write_business_request_headers(
+    send: &mut SendStream,
+    authority: &str,
+) -> Result<(), io::Error> {
+    let headers = safari26_headers_frame(authority)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    send.write_all(&headers)
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
+}
+
+/// Read and validate the request HEADERS frame a business bidi opens with, before
+/// its relay DATA frames. The field section is NOT interpreted (ParallaX derives
+/// the target from the encrypted `ConnectRequest`, not the camouflage headers): this
+/// only asserts the bidi follows the HEADERS-then-DATA request shape and consumes
+/// the HEADERS frame so the caller can wrap the REMAINING stream in the DATA-frame
+/// de-framer ([`crate::transport::leg::H3DataFrameLegReader`]). Fail-closed on a
+/// non-HEADERS first frame, an over-cap length, or truncation.
+pub(crate) async fn read_business_request_headers(recv: &mut RecvStream) -> Result<(), io::Error> {
+    let (frame_type, _section) = read_one_h3_frame(recv, MAX_BUSINESS_HEADERS_FRAME_LEN).await?;
+    if frame_type != FRAME_TYPE_HEADERS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("business bidi first frame is not HEADERS (type {frame_type:#x})"),
+        ));
+    }
+    Ok(())
+}
+
+/// Write the `:status 200` response HEADERS frame as the FIRST frame the SERVER
+/// sends back on a business bidi, before its download DATA frames — completing the
+/// browser-plausible request/response lifecycle (the client opened with request
+/// HEADERS). Mirrors the probe's response HEADERS.
+pub(crate) async fn write_business_response_headers(
+    send: &mut SendStream,
+) -> Result<(), io::Error> {
+    let headers = response_status_200_headers_frame()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    send.write_all(&headers)
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
+}
+
+/// Read and validate the server's `:status 200` response HEADERS frame the CLIENT
+/// sees on a business bidi before the download DATA frames. Like the request side,
+/// the field section is not interpreted; this only consumes the HEADERS frame so
+/// the remaining stream can be wrapped in the DATA-frame de-framer. Fail-closed on a
+/// non-HEADERS first frame, an over-cap length, or truncation.
+pub(crate) async fn read_business_response_headers(recv: &mut RecvStream) -> Result<(), io::Error> {
+    let (frame_type, _section) = read_one_h3_frame(recv, MAX_BUSINESS_HEADERS_FRAME_LEN).await?;
+    if frame_type != FRAME_TYPE_HEADERS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("business bidi first response frame is not HEADERS (type {frame_type:#x})"),
+        ));
+    }
+    Ok(())
+}
+
 /// Decode a self-describing H3 frame already fully buffered (used by tests and by
 /// the relay-bidi slice). Thin pass-through to the codec's [`decode_frame`] so
 /// callers in this module need not import the codec directly.
@@ -357,5 +431,55 @@ mod tests {
         let (hdr, _payload, total) = decode_buffered_frame(&frame).unwrap();
         assert_eq!(hdr.frame_type, FRAME_TYPE_SETTINGS);
         assert_eq!(total, frame.len());
+    }
+
+    /// A business bidi opens with the Safari request HEADERS frame and the server
+    /// answers with `:status 200` HEADERS — both sides accept the other's HEADERS,
+    /// so the per-bidi request/response lifecycle round-trips over a real QUIC bidi.
+    #[tokio::test]
+    async fn business_bidi_headers_round_trip_over_loopback() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        let client = async move {
+            let (mut send, mut recv) = client_conn.open_bi();
+            write_business_request_headers(&mut send, "example.com")
+                .await
+                .unwrap();
+            // A DATA frame would normally follow; here we only assert the HEADERS
+            // handshake, so read the server's response HEADERS and finish.
+            read_business_response_headers(&mut recv).await.unwrap();
+            client_conn
+        };
+        let server = async {
+            let (mut send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
+            read_business_request_headers(&mut recv).await.unwrap();
+            write_business_response_headers(&mut send).await.unwrap();
+        };
+        let (_keepalive, ()) = tokio::join!(client, server);
+    }
+
+    /// A business bidi that starts directly with a DATA frame (the pre-hardening
+    /// shape) MUST be rejected by the server's HEADERS read: a fresh request bidi
+    /// has to open with HEADERS, never DATA.
+    #[tokio::test]
+    async fn business_bidi_data_first_is_rejected() {
+        use crate::fingerprint::http3::{encode_frame, FRAME_TYPE_DATA};
+
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        let bad = async move {
+            let (mut send, _recv) = client_conn.open_bi();
+            let data = encode_frame(FRAME_TYPE_DATA, b"records-without-headers").unwrap();
+            send.write_all(&data).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            client_conn
+        };
+        let reader = async {
+            let (_send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
+            read_business_request_headers(&mut recv).await
+        };
+        let (_keepalive, result) = tokio::join!(bad, reader);
+        let err = result.expect_err("a DATA-first business bidi must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
