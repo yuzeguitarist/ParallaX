@@ -80,7 +80,8 @@ use crate::{
         },
         tcp::{
             connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
-            is_fd_exhaustion_error, relay_connection_limit, tune_tcp_stream,
+            is_fd_exhaustion_error, is_transient_accept_error, relay_connection_limit,
+            tune_tcp_stream,
         },
     },
 };
@@ -704,6 +705,16 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                     "accept() ran out of file descriptors; backing off 100ms"
                 );
                 sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(err) if is_transient_accept_error(&err) => {
+                // A remote peer can induce ECONNABORTED (RST between SYN and
+                // accept) at will; treating it as fatal would let any peer shut
+                // the listener down. Drop the would-be connection and keep serving.
+                tracing::debug!(
+                    error = %err,
+                    "transient accept() error; dropping connection and continuing"
+                );
                 continue;
             }
             Err(err) => return Err(err.into()),

@@ -286,6 +286,41 @@ pub fn is_fd_exhaustion_error(err: &io::Error) -> bool {
     }
 }
 
+/// Whether an `accept()` error is a transient, per-connection condition that the
+/// accept loop must survive rather than treat as fatal.
+///
+/// These errors describe the *incoming* connection (a peer that reset between SYN
+/// and accept, a signal interrupting the syscall, a transient network/protocol
+/// hiccup), not the listening socket, so the loop should drop the would-be
+/// connection and keep serving. Returning `Err` on any of these would let a remote
+/// peer shut the listener down by, e.g., RST-ing after SYN to induce
+/// `ECONNABORTED`. Fd exhaustion is handled separately (it warrants a backoff).
+pub fn is_transient_accept_error(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::Interrupted {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::ECONNABORTED)
+                | Some(libc::EINTR)
+                | Some(libc::EPROTO)
+                | Some(libc::ENONET)
+                | Some(libc::ENETDOWN)
+                | Some(libc::ENETUNREACH)
+                | Some(libc::EHOSTDOWN)
+                | Some(libc::EHOSTUNREACH)
+        )
+    }
+
+    #[cfg(not(unix))]
+    {
+        err.kind() == io::ErrorKind::ConnectionAborted
+    }
+}
+
 pub fn relay_connection_limit(udp_enabled: bool) -> io::Result<usize> {
     relay_connection_limit_from_nofile(nofile_soft_limit()?, udp_enabled).ok_or_else(|| {
         io::Error::other(format!(
