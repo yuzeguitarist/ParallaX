@@ -50,14 +50,24 @@ where
     Ok(request)
 }
 
-async fn negotiate_no_auth<S>(stream: &mut S) -> Result<(), SocksError>
+/// Read and validate the leading SOCKS version byte, which must be 5 (RFC 1928).
+/// Shared by the greeting and the connect-request parsers.
+async fn read_socks5_version<S>(stream: &mut S) -> Result<(), SocksError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + Unpin,
 {
     let version = stream.read_u8().await?;
     if version != 5 {
         return Err(SocksError::UnsupportedVersion(version));
     }
+    Ok(())
+}
+
+async fn negotiate_no_auth<S>(stream: &mut S) -> Result<(), SocksError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    read_socks5_version(stream).await?;
 
     let method_count = stream.read_u8().await?;
     if method_count == 0 {
@@ -79,10 +89,7 @@ async fn read_connect_request<S>(stream: &mut S) -> Result<SocksRequest, SocksEr
 where
     S: AsyncRead + Unpin,
 {
-    let version = stream.read_u8().await?;
-    if version != 5 {
-        return Err(SocksError::UnsupportedVersion(version));
-    }
+    read_socks5_version(stream).await?;
 
     let command = stream.read_u8().await?;
     if command != 1 {
