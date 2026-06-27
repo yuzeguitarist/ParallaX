@@ -482,4 +482,37 @@ mod tests {
         let err = result.expect_err("a DATA-first business bidi must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
+
+    /// A peer that opens the bidi but never sends the response HEADERS must NOT pin
+    /// the reader forever: `read_business_response_headers` blocks pending bytes, so
+    /// the caller bounds it with a timeout (CLIENT_ESTABLISH_TIMEOUT in the client
+    /// substream path). This asserts that contract — the bare read does not return on
+    /// its own under a silent peer, and the wrapping timeout fires instead.
+    #[tokio::test]
+    async fn business_bidi_response_headers_read_is_bounded_by_timeout() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+
+        let silent_peer = async move {
+            // Accept the bidi but send nothing: the client's response-HEADERS read
+            // has no bytes to make progress on.
+            let (_send, _recv) = server_conn.accept_bi().await.expect("accept_bi");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            server_conn
+        };
+        let reader = async {
+            let (mut _send, mut recv) = client_conn.open_bi();
+            // Nudge the bidi open so the peer's accept_bi resolves.
+            _send.write_all(b"\x00").await.ok();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                read_business_response_headers(&mut recv),
+            )
+            .await
+        };
+        let (_keepalive, result) = tokio::join!(silent_peer, reader);
+        assert!(
+            result.is_err(),
+            "an unbounded read against a silent peer must hit the wrapping timeout"
+        );
+    }
 }

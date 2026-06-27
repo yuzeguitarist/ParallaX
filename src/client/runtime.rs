@@ -1287,10 +1287,29 @@ async fn client_mux_quic_substream(
     // Read the server's `:status 200` response HEADERS frame before the download
     // DATA frames, completing the request/response lifecycle. A failure here means
     // the server diverged from the agreed shape (or the bidi was lost): reset and
-    // surface it.
-    if let Err(err) = read_business_response_headers(&mut recv).await {
-        conn.reset_stream(stream_id, VarInt::from_u32(0));
-        return Err(ClientRuntimeError::Io(err));
+    // surface it. BOUNDED by CLIENT_ESTABLISH_TIMEOUT (mirroring the server's
+    // symmetric request-HEADERS read under PX1_CONTROL_READ_TIMEOUT): this await
+    // precedes the relay idle watchdog, so without a bound a server that accepts
+    // the bidi but withholds response HEADERS would pin this SOCKS connection and
+    // its stream permit until the whole QUIC connection idles out.
+    match tokio::time::timeout(
+        CLIENT_ESTABLISH_TIMEOUT,
+        read_business_response_headers(&mut recv),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            conn.reset_stream(stream_id, VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(err));
+        }
+        Err(_) => {
+            conn.reset_stream(stream_id, VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mux-over-QUIC substream response HEADERS read timed out",
+            )));
+        }
     }
 
     let (local_read, local_write) = local.into_split();
