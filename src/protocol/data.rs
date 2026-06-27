@@ -91,6 +91,47 @@ pub struct RecordBuilder {
     record_start: usize,
 }
 
+/// Parse and validate the prologue of one sealed application-data record at
+/// `buf[offset..]`: it must parse as a TLS record header, be application-data,
+/// have its full body present within `buf`, and carry at least an AEAD tag.
+/// Shared by every `open*` path; the returned header bounds the ciphertext the
+/// caller then decrypts in place. Errors are identical to the inlined checks.
+fn validate_record_header(
+    buf: &[u8],
+    offset: usize,
+) -> Result<record::TlsRecordHeader, DataRecordError> {
+    let header = record::parse_header(&buf[offset..])?;
+    if header.content_type != TLS_CONTENT_APPLICATION_DATA {
+        return Err(DataRecordError::NotApplicationData);
+    }
+    if buf.len() < offset + header.total_len {
+        return Err(record::TlsRecordError::IncompletePayload.into());
+    }
+    if header.payload_len < AEAD_TAG_LEN {
+        return Err(SessionError::Aead.into());
+    }
+    Ok(header)
+}
+
+/// Enforce the record-partition contract shared by the serial and parallel
+/// seal paths: `record_lens` must sum (without overflow) to exactly
+/// `plaintext_len`. A violation would otherwise OOB-panic on the per-record
+/// slice in release (where the previous debug_assert was compiled out) or
+/// silently under-seal the tail; this turns it into a clean error.
+fn validate_record_lens(
+    record_lens: &[usize],
+    plaintext_len: usize,
+) -> Result<(), DataRecordError> {
+    let sum = record_lens
+        .iter()
+        .try_fold(0usize, |acc, &len| acc.checked_add(len))
+        .ok_or(DataRecordError::InvalidRecordLens)?;
+    if sum != plaintext_len {
+        return Err(DataRecordError::InvalidRecordLens);
+    }
+    Ok(())
+}
+
 impl DataRecordCodec {
     pub fn new(aead: AeadCodec, padding: PaddingProfile, aad: &'static [u8]) -> Self {
         Self { aead, padding, aad }
@@ -485,16 +526,7 @@ impl DataRecordCodec {
     }
 
     pub fn open(&mut self, record: &[u8]) -> Result<Vec<u8>, DataRecordError> {
-        let header = record::parse_header(record)?;
-        if header.content_type != TLS_CONTENT_APPLICATION_DATA {
-            return Err(DataRecordError::NotApplicationData);
-        }
-        if record.len() < header.total_len {
-            return Err(record::TlsRecordError::IncompletePayload.into());
-        }
-        if header.payload_len < AEAD_TAG_LEN {
-            return Err(SessionError::Aead.into());
-        }
+        let header = validate_record_header(record, 0)?;
 
         let payload = &record[record::TLS_HEADER_LEN..header.total_len];
         let mut padded = payload.to_vec();
@@ -532,16 +564,7 @@ impl DataRecordCodec {
         &mut self,
         record: &mut Vec<u8>,
     ) -> Result<std::ops::Range<usize>, DataRecordError> {
-        let header = record::parse_header(record)?;
-        if header.content_type != TLS_CONTENT_APPLICATION_DATA {
-            return Err(DataRecordError::NotApplicationData);
-        }
-        if record.len() < header.total_len {
-            return Err(record::TlsRecordError::IncompletePayload.into());
-        }
-        if header.payload_len < AEAD_TAG_LEN {
-            return Err(SessionError::Aead.into());
-        }
+        let header = validate_record_header(record, 0)?;
 
         record.truncate(header.total_len);
         let ciphertext_start = record::TLS_HEADER_LEN;
@@ -608,18 +631,9 @@ impl DataRecordCodec {
     where
         R: Rng + rand::RngCore + ?Sized,
     {
-        // Contract: record_lens must sum to plaintext.len(). Enforce it at runtime in
-        // every build — the previous debug_assert was compiled out in release, where a
-        // mismatch then OOB-panicked on `&plaintext[offset..offset + len]` (sum too
-        // large) or silently under-sealed the tail (sum too small). Internal callers
-        // always satisfy this; the guard turns a contract violation into a clean error.
-        let sum = record_lens
-            .iter()
-            .try_fold(0usize, |acc, &len| acc.checked_add(len))
-            .ok_or(DataRecordError::InvalidRecordLens)?;
-        if sum != plaintext.len() {
-            return Err(DataRecordError::InvalidRecordLens);
-        }
+        // Contract: record_lens must sum to plaintext.len(). Internal callers always
+        // satisfy this; the guard turns a contract violation into a clean error.
+        validate_record_lens(record_lens, plaintext.len())?;
         let mut offset = 0;
         for &len in record_lens {
             self.seal_into(&plaintext[offset..offset + len], rng, out)?;
@@ -723,16 +737,8 @@ impl DataRecordCodec {
         // Contract: record_lens must sum to plaintext.len(). Checked first — before the
         // empty-batch early-return and `ensure_usable` — so an empty `record_lens` with a
         // non-empty plaintext is rejected consistently with the serial `seal_records_into`
-        // instead of being silently sealed as nothing. (Also prevents an OOB panic on the
-        // `plaintext[byte_offset..byte_offset + span]` slice below in release, where the
-        // prior debug_assert was compiled out.)
-        let sum = record_lens
-            .iter()
-            .try_fold(0usize, |acc, &len| acc.checked_add(len))
-            .ok_or(DataRecordError::InvalidRecordLens)?;
-        if sum != plaintext.len() {
-            return Err(DataRecordError::InvalidRecordLens);
-        }
+        // instead of being silently sealed as nothing.
+        validate_record_lens(record_lens, plaintext.len())?;
         let record_count = record_lens.len();
         if record_count == 0 {
             return Ok(());
@@ -818,16 +824,7 @@ impl DataRecordCodec {
     ) -> Result<(), DataRecordError> {
         let mut offset = 0;
         while offset < records.len() {
-            let header = record::parse_header(&records[offset..])?;
-            if header.content_type != TLS_CONTENT_APPLICATION_DATA {
-                return Err(DataRecordError::NotApplicationData);
-            }
-            if records.len() < offset + header.total_len {
-                return Err(record::TlsRecordError::IncompletePayload.into());
-            }
-            if header.payload_len < AEAD_TAG_LEN {
-                return Err(SessionError::Aead.into());
-            }
+            let header = validate_record_header(records, offset)?;
             let ciphertext =
                 &mut records[offset + record::TLS_HEADER_LEN..offset + header.total_len];
             crate::process_hardening::exclude_transient_from_core_dump(
@@ -883,16 +880,7 @@ impl DataRecordCodec {
         let mut bounds: Vec<(usize, usize)> = Vec::new();
         let mut offset = 0;
         while offset < records.len() {
-            let header = record::parse_header(&records[offset..])?;
-            if header.content_type != TLS_CONTENT_APPLICATION_DATA {
-                return Err(DataRecordError::NotApplicationData);
-            }
-            if records.len() < offset + header.total_len {
-                return Err(record::TlsRecordError::IncompletePayload.into());
-            }
-            if header.payload_len < AEAD_TAG_LEN {
-                return Err(SessionError::Aead.into());
-            }
+            let header = validate_record_header(records, offset)?;
             bounds.push((offset, header.total_len));
             offset += header.total_len;
         }
