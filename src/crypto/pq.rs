@@ -326,7 +326,9 @@ mod tests {
         // must not panic. If the fixed-len constant is under-counted (e.g. a `+`
         // turned into `-`), a boundary length is wrongly routed to the stack buffer
         // and write_hybrid_rekey_ikm overruns it -> panic -> this test fails.
-        let boundary = HYBRID_REKEY_IKM_STACK_LEN - HYBRID_REKEY_IKM_FIXED_LEN; // first heap len
+        // Largest sym_len still on the stack path (stack iff sym_len <= this); the
+        // first heap length is boundary + 1. The sweep below straddles both sides.
+        let boundary = HYBRID_REKEY_IKM_STACK_LEN - HYBRID_REKEY_IKM_FIXED_LEN; // max stack len
         for sym_len in (boundary.saturating_sub(3))..=(boundary + 3) {
             let sym = vec![0x5A_u8; sym_len];
             let got = hybrid_sandwich_rekey(&[7; 32], &[8; 32], &[9; 32], &sym).unwrap();
