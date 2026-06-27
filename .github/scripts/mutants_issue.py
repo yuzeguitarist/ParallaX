@@ -31,7 +31,10 @@ TITLE = "Mutation testing: surviving mutants"
 NSHARDS = 8
 # Cap the survivor list stored+shown per shard so the issue body stays well under
 # GitHub's 65536-char limit even if every shard is full; the run link has the rest.
-PER_SHARD_CAP = 30
+# Sized so the full real survivor set (largest shard ~50) is stored without
+# truncation -- the stored list is what the reopen logic diffs against, so a low
+# cap would make dropped-but-still-surviving mutants look "new" next run.
+PER_SHARD_CAP = 200
 STATE_RE = re.compile(r"<!-- mutants-state\s*(\{.*?\})\s*-->", re.S)
 
 
@@ -113,6 +116,13 @@ def main():
             except json.JSONDecodeError:
                 state = {}
 
+    # Diff this shard's survivors against what we last stored for it, so a
+    # *reopen* means genuine new news (a survivor this shard didn't have before),
+    # not merely that the standing backlog across all shards is nonzero. Compared
+    # before we overwrite state[shard] with tonight's entry.
+    prev_missed = set(state.get(str(shard), {}).get("missed", []))
+    new_survivors = [x for x in missed if x not in prev_missed]
+
     state[str(shard)] = entry
     total = sum(v.get("missed_total", len(v.get("missed", []))) for v in state.values())
 
@@ -134,10 +144,16 @@ def main():
         gh("issue", "close", num, "--repo", REPO,
            "--comment", "All reported shards are clean -- closing. Reopens automatically if a later shard surfaces survivors.")
         print("closed (no survivors)")
+    elif issue["state"].upper() == "CLOSED" and new_survivors:
+        # Only reopen on genuine new news -- a survivor this shard didn't have
+        # last run. A nonzero standing backlog alone keeps it closed once the
+        # maintainer has closed it, so it won't nag every night.
+        gh("issue", "reopen", num, "--repo", REPO,
+           "--comment", f"Reopening: shard {shard} surfaced {len(new_survivors)} new surviving mutant(s) since last run.")
+        print(f"reopened issue #{num} ({len(new_survivors)} new survivors this shard)")
     else:
-        if issue["state"].upper() == "CLOSED":
-            gh("issue", "reopen", num, "--repo", REPO)
-        print(f"updated issue #{num} ({total} survivors)")
+        print(f"updated issue #{num} ({total} survivors, {len(new_survivors)} new this shard; "
+              f"state={issue['state']})")
 
 
 if __name__ == "__main__":
