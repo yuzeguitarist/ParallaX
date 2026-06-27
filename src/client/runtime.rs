@@ -377,7 +377,14 @@ impl UdpReachability {
     /// another connection reclaim (self-healing); a Verified outcome clears the
     /// breaker via `record_usable`, a failure re-trips it via `record_unusable`.
     fn should_attempt_at(&self, now: std::time::Instant) -> bool {
-        let mut guard = self.blocked_since.lock().expect("reachability mutex");
+        // Recover from a poisoned lock rather than panicking: the guarded state
+        // is a single Option<Instant> with no broken invariant, and the rest of
+        // the codebase (e.g. SourceLimiter) is uniformly poison-tolerant. A panic
+        // here would otherwise propagate to every subsequent connection.
+        let mut guard = self
+            .blocked_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match *guard {
             // Usable (or never tripped): every connection negotiates so they all
             // use the fast plane while it works — no claim, no state change.
@@ -402,12 +409,18 @@ impl UdpReachability {
     /// Record that the UDP path is unusable (probe Unreachable or Failed): trip
     /// the breaker so subsequent connections skip negotiation for the TTL.
     pub(crate) fn record_unusable(&self) {
-        *self.blocked_since.lock().expect("reachability mutex") = Some(std::time::Instant::now());
+        *self
+            .blocked_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::time::Instant::now());
     }
 
     /// Record that the UDP path works (probe Verified): clear the breaker.
     pub(crate) fn record_usable(&self) {
-        *self.blocked_since.lock().expect("reachability mutex") = None;
+        *self
+            .blocked_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
