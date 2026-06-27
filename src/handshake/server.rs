@@ -61,7 +61,7 @@ use crate::{
         data::{
             max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
             DataRecordError, SealedRecord, CLIENT_TO_SERVER_AAD, QUIC_RELAY_DONE_MARKER,
-            RELAY_IDLE_CLOSE_CODE, SERVER_TO_CLIENT_AAD,
+            RELAY_IDLE_CLOSE_CODE, SERVER_TO_CLIENT_AAD, SPEED_QUIC_DONE_MARKER,
         },
     },
     tls::{
@@ -2326,10 +2326,10 @@ async fn run_authenticated_data_mode(
 
                         let first_payload = &mut client_record[first_payload_range];
                         if SpeedTestRequest::has_magic(first_payload) {
-                            // Speed test stays on TCP in this slice; release any
-                            // retained QUIC connection so no idle fast-plane
-                            // connection lingers.
-                            drop_retained_quic(retained_quic);
+                            // Speed test: always measure TCP, then QUIC when the probe
+                            // Verified (the retained bidi the relay would use). The
+                            // request just decoded is the TCP run's opener; the QUIC
+                            // run sends its own request on the bidi.
                             let request = SpeedTestRequest::decode(first_payload)?;
                             return run_authenticated_speed_test_mode(
                                 client_records,
@@ -2338,6 +2338,9 @@ async fn run_authenticated_data_mode(
                                 server_seal,
                                 request,
                                 max_plaintext_len(traffic.max_padding),
+                                retained_quic,
+                                &handshake.session_keys,
+                                traffic,
                                 cid,
                             )
                             .await;
@@ -4699,32 +4702,12 @@ async fn send_server_mux_frame(
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into())
 }
 
-async fn run_authenticated_speed_test_mode(
-    mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
-    client_write: OwnedWriteHalf,
-    mut client_open: DataRecordCodec,
-    mut server_seal: DataRecordCodec,
-    request: SpeedTestRequest,
-    chunk_size: usize,
+/// Validate a speed request against the server's per-phase and aggregate ceilings.
+/// Applied to EACH transport run (TCP and QUIC each send their own request).
+fn validate_speed_request(
+    request: &SpeedTestRequest,
     cid: u64,
 ) -> Result<(), HandshakeServerError> {
-    tracing::info!(
-        cid,
-        warmup_bytes = request.warmup_bytes,
-        download_bytes = request.download_bytes,
-        upload_bytes = request.upload_bytes,
-        sample_count = request.sample_count,
-        "ParallaX speed test mode started"
-    );
-    if chunk_size == 0 {
-        return Err(HandshakeServerError::DataRecord(
-            crate::tls::record::TlsRecordError::PayloadTooLarge(0).into(),
-        ));
-    }
-    // Reject requests beyond the server's ceilings. The wire format allows any
-    // non-zero u64/u16 values; a malicious authenticated client could otherwise
-    // request unbounded generated download or a never-ending upload to pin a
-    // connection slot and bandwidth/CPU.
     if request.warmup_bytes > MAX_SPEED_TEST_BYTES_PER_PHASE
         || request.download_bytes > MAX_SPEED_TEST_BYTES_PER_PHASE
         || request.upload_bytes > MAX_SPEED_TEST_BYTES_PER_PHASE
@@ -4760,25 +4743,276 @@ async fn run_authenticated_speed_test_mode(
             "speed test request exceeds server aggregate limit",
         )));
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_authenticated_speed_test_mode(
+    mut client_records: BufferedTlsRecordReader<OwnedReadHalf>,
+    mut client_write: OwnedWriteHalf,
+    mut client_open: DataRecordCodec,
+    mut server_seal: DataRecordCodec,
+    request: SpeedTestRequest,
+    chunk_size: usize,
+    retained_quic: Option<ServerProbedQuic>,
+    session_keys: &crate::crypto::session::SessionKeys,
+    traffic: TrafficConfig,
+    cid: u64,
+) -> Result<(), HandshakeServerError> {
+    tracing::info!(
+        cid,
+        warmup_bytes = request.warmup_bytes,
+        download_bytes = request.download_bytes,
+        upload_bytes = request.upload_bytes,
+        sample_count = request.sample_count,
+        quic = retained_quic.is_some(),
+        "ParallaX speed test mode started"
+    );
+    if chunk_size == 0 {
+        drop_retained_quic(retained_quic);
+        return Err(HandshakeServerError::DataRecord(
+            crate::tls::record::TlsRecordError::PayloadTooLarge(0).into(),
+        ));
+    }
+    // The TCP request was already decoded; reject (releasing QUIC) before measuring.
+    if let Err(err) = validate_speed_request(&request, cid) {
+        drop_retained_quic(retained_quic);
+        return Err(err);
+    }
 
     let mut rng = StdRng::from_entropy();
     let mut scratch = RelaySealScratch::with_payload_capacity(chunk_size);
     let batch_len = relay_read_buffer_len(chunk_size);
     let payload = vec![0xA5; batch_len];
-    let mut client_write = TcpLegWriter(client_write);
+
+    // TCP run: the request just decoded opens it.
+    {
+        let mut tcp_reader = TcpLegReader(client_records);
+        let mut tcp_writer = TcpLegWriter(client_write);
+        run_speed_phases_over_legs(
+            &mut tcp_reader,
+            &mut tcp_writer,
+            &mut client_open,
+            &mut server_seal,
+            &mut rng,
+            &mut scratch,
+            &payload,
+            &request,
+            cid,
+        )
+        .await?;
+        client_records = tcp_reader.0;
+        client_write = tcp_writer.0;
+    }
+
+    // QUIC run: when the probe Verified, continue on the retained single-Connect
+    // bidi. The client sends a fresh request on the bidi as the first record; we
+    // read it, validate, and run the same phases — a fair same-stream comparison.
+    if let Some(probed) = retained_quic {
+        let ServerProbedQuic {
+            conn,
+            h3_control,
+            relay_send,
+            relay_recv,
+        } = probed;
+        let _h3_control = h3_control;
+        // The QUIC run uses an INDEPENDENT codec derived from the bidi's stream id
+        // (mux-over-QUIC mechanism), NOT the shared TCP-run codec: the two
+        // transports' record/ack streams are not byte-symmetric, so a shared AEAD
+        // sequence would desync. Both ends derive the same codec by stream id.
+        let stream_id = relay_recv.id();
+        let result = match crate::transport::udp::quic::mux::server_substream_codecs(
+            session_keys,
+            traffic,
+            stream_id,
+        ) {
+            Ok((mut quic_open, mut quic_seal)) => {
+                run_quic_speed_run(
+                    &mut quic_open,
+                    &mut quic_seal,
+                    &mut rng,
+                    &mut scratch,
+                    &payload,
+                    relay_send,
+                    relay_recv,
+                    chunk_size,
+                    cid,
+                )
+                .await
+            }
+            Err(err) => Err(HandshakeServerError::Io(io::Error::other(err.to_string()))),
+        };
+        result?;
+        // Race-free teardown over the RELIABLE TCP control connection (held alive on
+        // both ends): read the client's DONE marker, which the client sends only
+        // AFTER it has received the QUIC final ack. This proves nothing is in flight,
+        // so closing the QUIC connection now cannot truncate a buffered ack. The DONE
+        // continues the TCP-run's AEAD sequence on the shared codecs.
+        let mut tcp_reader = TcpLegReader(client_records);
+        let done = read_speed_tcp_done(&mut tcp_reader, &mut client_open, cid).await;
+        client_records = tcp_reader.0;
+        conn.close(0u32.into(), b"speed-done");
+        done?;
+    }
+
+    // Keep the TCP control halves alive until here so the connection is not torn
+    // down before the QUIC run + teardown complete.
+    let _client_records = client_records;
+    let _client_write = client_write;
+
+    tracing::info!(cid, "ParallaX speed test mode finished");
+    Ok(())
+}
+
+/// Read the client's speed QUIC-run DONE marker off the TCP control connection,
+/// bounded so a vanished client cannot pin the server.
+async fn read_speed_tcp_done<R>(
+    reader: &mut R,
+    client_open: &mut DataRecordCodec,
+    cid: u64,
+) -> Result<(), HandshakeServerError>
+where
+    R: LegReader,
+{
+    let mut record = Vec::new();
+    let mut consecutive_empty: u32 = 0;
+    loop {
+        match tokio::time::timeout(
+            QUIC_RELAY_DONE_BACKSTOP,
+            reader.read_record_into(&mut record),
+        )
+        .await
+        {
+            Ok(res) => res.map_err(HandshakeServerError::Io)?,
+            Err(_) => {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "speed QUIC-run TCP DONE read timed out",
+                )))
+            }
+        }
+        let range = client_open.open_in_place_payload_range(&mut record)?;
+        if range.is_empty() {
+            // Padding-only record carries no progress. Bound how many may arrive
+            // back-to-back so a client streaming only empty records cannot reset the
+            // per-read timeout forever and pin the teardown (the same cap the upload
+            // phase applies).
+            consecutive_empty += 1;
+            if consecutive_empty > MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed QUIC-run TCP DONE sent too many consecutive empty records",
+                )));
+            }
+            continue;
+        }
+        if &record[range] != SPEED_QUIC_DONE_MARKER {
+            tracing::warn!(cid, "speed QUIC-run TCP DONE marker mismatch");
+            return Err(HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "speed QUIC-run TCP DONE marker mismatch",
+            )));
+        }
+        return Ok(());
+    }
+}
+
+/// Read + validate the QUIC run's opening request off the bidi, then run the speed
+/// phases over the H3 DATA-frame legs (same protocol as TCP).
+#[allow(clippy::too_many_arguments)]
+async fn run_quic_speed_run(
+    client_open: &mut DataRecordCodec,
+    server_seal: &mut DataRecordCodec,
+    rng: &mut StdRng,
+    scratch: &mut RelaySealScratch,
+    payload: &[u8],
+    relay_send: crate::transport::udp::quic::endpoint::SendStream,
+    relay_recv: crate::transport::udp::quic::endpoint::RecvStream,
+    chunk_size: usize,
+    cid: u64,
+) -> Result<(), HandshakeServerError> {
+    let mut quic_reader = H3DataFrameLegReader::buffered(relay_recv);
+    let mut quic_writer = H3DataFrameLegWriter(relay_send);
+
+    // The QUIC run's opening SpeedTestRequest, bounded so a client that opens the
+    // bidi but withholds the request cannot pin this task.
+    let mut request_record = Vec::new();
+    match tokio::time::timeout(
+        PX1_CONTROL_READ_TIMEOUT,
+        quic_reader.read_record_into(&mut request_record),
+    )
+    .await
+    {
+        Ok(res) => res.map_err(HandshakeServerError::Io)?,
+        Err(_) => {
+            return Err(HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "speed QUIC-run request read timed out",
+            )))
+        }
+    }
+    let range = client_open.open_in_place_payload_range(&mut request_record)?;
+    if !SpeedTestRequest::has_magic(&request_record[range.clone()]) {
+        return Err(HandshakeServerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "speed QUIC-run first record is not a SpeedTestRequest",
+        )));
+    }
+    let request = SpeedTestRequest::decode(&request_record[range])?;
+    validate_speed_request(&request, cid)?;
+    let _ = chunk_size; // chunk_size is the same as the TCP run's; payload reused.
+
+    run_speed_phases_over_legs(
+        &mut quic_reader,
+        &mut quic_writer,
+        client_open,
+        server_seal,
+        rng,
+        scratch,
+        payload,
+        &request,
+        cid,
+    )
+    .await?;
+    // FIN our send half so the final ack is DELIVERED (quinn `finish` flushes
+    // buffered data, unlike `close`). The deterministic teardown handshake then
+    // happens over the reliable TCP control connection (see the caller), not on the
+    // QUIC streams, so it is race-free.
+    quic_writer.0.finish();
+    Ok(())
+}
+
+/// The transport-agnostic speed measurement: warmup + sample sets in both
+/// directions over a `LegReader`/`LegWriter` pair. Shared by the TCP and QUIC runs.
+#[allow(clippy::too_many_arguments)]
+async fn run_speed_phases_over_legs<Reader, Writer>(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    client_open: &mut DataRecordCodec,
+    server_seal: &mut DataRecordCodec,
+    rng: &mut StdRng,
+    scratch: &mut RelaySealScratch,
+    payload: &[u8],
+    request: &SpeedTestRequest,
+    cid: u64,
+) -> Result<(), HandshakeServerError>
+where
+    Reader: LegReader,
+    Writer: LegWriter,
+{
     let mut io = SpeedServerIo {
-        client_records: &mut client_records,
-        client_write: &mut client_write,
-        client_open: &mut client_open,
-        server_seal: &mut server_seal,
-        rng: &mut rng,
-        scratch: &mut scratch,
+        client_records: reader,
+        client_write: writer,
+        client_open,
+        server_seal,
+        rng,
+        scratch,
         cid,
     };
 
     write_speed_download_phase(
         &mut io,
-        &payload,
+        payload,
         request.warmup_bytes,
         SpeedTestAck::warmup_download_done(request.warmup_bytes),
         fallback_idle_timeout(),
@@ -4794,7 +5028,7 @@ async fn run_authenticated_speed_test_mode(
     for _ in 0..request.sample_count {
         write_speed_download_phase(
             &mut io,
-            &payload,
+            payload,
             request.download_bytes,
             SpeedTestAck::download_done(request.download_bytes),
             fallback_idle_timeout(),
@@ -4809,14 +5043,12 @@ async fn run_authenticated_speed_test_mode(
         )
         .await?;
     }
-
-    tracing::info!(cid, "ParallaX speed test mode finished");
     Ok(())
 }
 
-struct SpeedServerIo<'a, R: ?Sized> {
-    client_records: &'a mut BufferedTlsRecordReader<OwnedReadHalf>,
-    client_write: &'a mut TcpLegWriter,
+struct SpeedServerIo<'a, Reader, Writer, R: ?Sized> {
+    client_records: &'a mut Reader,
+    client_write: &'a mut Writer,
     client_open: &'a mut DataRecordCodec,
     server_seal: &'a mut DataRecordCodec,
     rng: &'a mut R,
@@ -4824,14 +5056,16 @@ struct SpeedServerIo<'a, R: ?Sized> {
     cid: u64,
 }
 
-async fn write_speed_download_phase<R>(
-    io: &mut SpeedServerIo<'_, R>,
+async fn write_speed_download_phase<Reader, Writer, R>(
+    io: &mut SpeedServerIo<'_, Reader, Writer, R>,
     payload: &[u8],
     bytes: u64,
     ack: SpeedTestAck,
     idle: Duration,
 ) -> Result<(), HandshakeServerError>
 where
+    Reader: LegReader,
+    Writer: LegWriter,
     R: Rng + rand::RngCore + ?Sized,
 {
     let mut remaining = bytes;
@@ -4868,12 +5102,14 @@ where
     .map_err(|_| HandshakeServerError::Timeout)?
 }
 
-async fn read_speed_upload_phase<R>(
-    io: &mut SpeedServerIo<'_, R>,
+async fn read_speed_upload_phase<Reader, Writer, R>(
+    io: &mut SpeedServerIo<'_, Reader, Writer, R>,
     bytes: u64,
     ack: SpeedTestAck,
 ) -> Result<(), HandshakeServerError>
 where
+    Reader: LegReader,
+    Writer: LegWriter,
     R: Rng + rand::RngCore + ?Sized,
 {
     let mut uploaded = 0_u64;
@@ -6645,7 +6881,7 @@ mod tests {
 
         let (server_stream, _) = listener.accept().await.unwrap();
         let (read_half, write_half) = server_stream.into_split();
-        let mut client_records = TlsRecordReader::buffered(read_half);
+        let mut client_records = TcpLegReader::buffered(read_half);
         let mut client_write = TcpLegWriter(write_half);
         let chunk = max_plaintext_len(0);
         let mut server_seal = DataRecordCodec::new(

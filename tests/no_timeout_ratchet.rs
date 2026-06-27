@@ -288,15 +288,16 @@ fn combined_inbound_read_census_is_pinned() {
         server.iter().filter(|s| s.timed).count() + runtime.iter().filter(|s| s.timed).count();
     let untimed = total - timed;
 
-    // Total inbound-read call sites across both production files today: 18
-    // (server) + 10 (runtime) = 28. This catches a *removed* read site too,
+    // Total inbound-read call sites across both production files today: 20
+    // (server) + 10 (runtime) = 30. This catches a *removed* read site too,
     // which would otherwise slip past the per-file untimed-only assertions.
-    // (+2 server vs the pre-mux-over-QUIC baseline of 26: the substream
-    // ConnectRequest read (TIMED) and the session-end watcher read (UNTIMED).)
-    const EXPECTED_TOTAL_SITES: usize = 28;
-    // Timed sites: 10 (server) + 3 (runtime) = 13. (+1 server: the mux-over-QUIC
-    // substream ConnectRequest read, bounded by `PX1_CONTROL_READ_TIMEOUT`.)
-    const EXPECTED_TIMED_SITES: usize = 13;
+    // (+2 server vs the mux-over-QUIC baseline of 28: the speed QUIC-run request
+    // read and the speed QUIC-run TCP DONE read — both TIMED.)
+    const EXPECTED_TOTAL_SITES: usize = 30;
+    // Timed sites: 12 (server) + 3 (runtime) = 15. (+2 server: the speed QUIC-run
+    // request read and the TCP DONE read, both bounded by `QUIC_RELAY_DONE_BACKSTOP`
+    // / `PX1_CONTROL_READ_TIMEOUT`.)
+    const EXPECTED_TIMED_SITES: usize = 15;
 
     assert_eq!(
         total, EXPECTED_TOTAL_SITES,
