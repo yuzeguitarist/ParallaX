@@ -13,6 +13,7 @@
 | What ParallaX is and what it is not | [ParallaX Overview](ParallaX-Overview.md) |
 | How to build, generate configs, run, and verify | [Getting Started & CLI Reference](Getting-Started-&-CLI-Reference.md) |
 | How the client, server, TLS camouflage, crypto, and relay fit together | [Core Architecture](Core-Architecture.md) |
+| How the experimental UDP/QUIC fast plane works (off by default) | [QUIC Fast Plane](QUIC-Fast-Plane.md) |
 | What every TOML field means | [Configuration Reference](Configuration-Reference.md) |
 | How pages, concepts, source files, and search terms relate | [Documentation Metadata & Search Graph](Documentation-Metadata-Search-Graph.md) |
 | How VPS deployment works | [Deployment](Deployment.md) and [VPS Deployment Script](VPS-Deployment-Script.md) |
@@ -57,6 +58,13 @@
 6. [Padding & Timing Profiles](<Padding-&-Timing-Profiles.md>)
 7. [Cover Traffic](Cover-Traffic.md)
 
+### Experimental QUIC fast plane
+
+1. [Transport Layer](Transport-Layer.md)
+2. [QUIC Fast Plane](QUIC-Fast-Plane.md)
+3. [QUIC Origin-Splice & Active-Probing Resistance](QUIC-Origin-Splice-&-Active-Probing-Resistance.md)
+4. [HTTP/3 Fingerprint Façade](HTTP-3-Fingerprint-Facade.md)
+
 ### Validation and research path
 
 1. [Probing & Benchmarking](<Probing-&-Benchmarking.md>)
@@ -88,16 +96,21 @@
 - [ClientHello Authentication (PSK + X25519)](<ClientHello-Authentication-(PSK-+-X25519).md>)
 - [Session Key Derivation & AEAD Transport](Session-Key-Derivation-&-AEAD-Transport.md)
 - [Post-Quantum Cryptography (ML-KEM & ML-DSA)](<Post-Quantum-Cryptography-(ML-KEM-&-ML-DSA).md>)
+- [Hand-Rolled ML-DSA-87](Hand-Rolled-ML-DSA-87.md)
 - [Replay Protection](Replay-Protection.md)
+- [Secret Store & Sealed Configs](Secret-Store-&-Sealed-Configs.md)
 - [TLS Camouflage Layer](TLS-Camouflage-Layer.md)
 - [ClientHello Builder & Browser Profiles](ClientHello-Builder-&-Browser-Profiles.md)
 - [Stateful Safari TLS Camouflage Backend](Stateful-Safari-TLS-Camouflage-Backend.md)
 - [HTTP/2 Fingerprinting](HTTP-2-Fingerprinting.md)
+- [HTTP/3 Fingerprint Façade](HTTP-3-Fingerprint-Facade.md)
 - [Traffic Obfuscation](Traffic-Obfuscation.md)
 - [Padding & Timing Profiles](<Padding-&-Timing-Profiles.md>)
 - [Cover Traffic](Cover-Traffic.md)
 - [Transport Layer](Transport-Layer.md)
 - [TCP Camouflage Transport](TCP-Camouflage-Transport.md)
+- [QUIC Fast Plane](QUIC-Fast-Plane.md)
+- [QUIC Origin-Splice & Active-Probing Resistance](QUIC-Origin-Splice-&-Active-Probing-Resistance.md)
 - [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>)
 - [Probing & Benchmarking](<Probing-&-Benchmarking.md>)
 - [Camouflage Target Probe](Camouflage-Target-Probe.md)

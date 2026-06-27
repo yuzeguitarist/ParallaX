@@ -10,9 +10,10 @@
 | X25519/session keys | `src/crypto/session.rs` | Derive initial directional AEAD keys and nonce bases. |
 | AEAD transport | `src/crypto/session.rs`, `src/protocol/data.rs` | Seal/open framed data records. |
 | Parallel AEAD pool | `src/crypto/parallel.rs` | Process-wide worker pool that fans bulk seal/open across cores. |
-| ML-KEM-1024 | `src/crypto/pq.rs` | Post-quantum shared secret for rekeying. |
-| ML-DSA-87 | `src/crypto/identity.rs` | Server identity proof pinned by client config. |
+| ML-KEM-1024 | `src/crypto/pq.rs` | Post-quantum shared secret for rekeying (`aws-lc-rs` backend). |
+| ML-DSA-87 | `src/crypto/identity.rs`, `src/crypto/mldsa/` | Server identity proof pinned by client config; signature is a hand-rolled FIPS 204 implementation. See [Hand-Rolled ML-DSA-87](Hand-Rolled-ML-DSA-87.md). |
 | Replay cache | `src/crypto/replay.rs` | Reject captured/replayed authenticated handshakes. |
+| Secret store | `src/secret_store.rs` | Machine-bound sealing of config secrets. See [Secret Store & Sealed Configs](Secret-Store-&-Sealed-Configs.md). |
 | Process hardening | `src/process_hardening.rs` | Best-effort key memory protection and dump suppression. |
 
 ## Handshake phases
@@ -46,4 +47,6 @@
 - [ClientHello Authentication (PSK + X25519)](<ClientHello-Authentication-(PSK-+-X25519).md>)
 - [Session Key Derivation & AEAD Transport](Session-Key-Derivation-&-AEAD-Transport.md)
 - [Post-Quantum Cryptography (ML-KEM & ML-DSA)](<Post-Quantum-Cryptography-(ML-KEM-&-ML-DSA).md>)
+- [Hand-Rolled ML-DSA-87](Hand-Rolled-ML-DSA-87.md)
 - [Replay Protection](Replay-Protection.md)
+- [Secret Store & Sealed Configs](Secret-Store-&-Sealed-Configs.md)

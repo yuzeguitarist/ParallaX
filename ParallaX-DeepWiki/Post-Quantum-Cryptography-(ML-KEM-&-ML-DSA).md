@@ -6,8 +6,8 @@
 
 | Component | Algorithm | Code | Role |
 |---|---|---|---|
-| PQ KEM | ML-KEM-1024 | `src/crypto/pq.rs` | Shared secret for data-plane rekey. |
-| Server identity | ML-DSA-87 | `src/crypto/identity.rs` | Pinned server identity proof. |
+| PQ KEM | ML-KEM-1024 | `src/crypto/pq.rs` | Shared secret for data-plane rekey (`aws-lc-rs` backend). |
+| Server identity | ML-DSA-87 | `src/crypto/identity.rs`, `src/crypto/mldsa/` | Pinned server identity proof. The signature primitive is a hand-rolled FIPS 204 implementation — see [Hand-Rolled ML-DSA-87](Hand-Rolled-ML-DSA-87.md). |
 | Classical ECDH | X25519 | `src/crypto/session.rs` | Hybrid rekey input. |
 | Symmetric input | PSK | `src/config.rs` | Sandwich rekey binding. |
 
