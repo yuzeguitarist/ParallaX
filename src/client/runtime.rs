@@ -1458,7 +1458,7 @@ pub(crate) async fn establish_authenticated_data_session(
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: &[u8],
-) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
+) -> Result<(TcpStream, ClientDataSession, Option<SpeedQuicCarrier>), ClientRuntimeError> {
     let server_addr = ServerAddrResolver::new(&config.server_addr).await?;
     let server_identity_public =
         Arc::<[u8]>::from(server_identity_public.to_vec().into_boxed_slice());
@@ -1476,12 +1476,28 @@ pub(crate) async fn establish_authenticated_data_session(
         server_identity_public,
     )
     .await?;
-    // This public seam feeds the speed-test path, which stays on TCP in this
-    // slice: close any retained QUIC connection rather than leaving it idle.
-    if let Some(retained) = retained_quic {
-        retained.close();
-    }
-    Ok((server, data_session))
+    // The speed test measures TCP always (over `server`), and QUIC additionally
+    // when the probe Verified: hand the retained QUIC bidi to the caller as a
+    // `SpeedQuicCarrier` so it can run a second measurement on the SAME bidi the
+    // relay would use, then close it. With udp off / probe not Verified this is
+    // `None` and the speed test runs TCP-only, byte-identical to before.
+    let speed_quic = retained_quic.map(|retained| {
+        let RetainedClientQuic {
+            endpoint,
+            conn,
+            h3_control,
+            relay_send,
+            relay_recv,
+        } = retained;
+        SpeedQuicCarrier {
+            endpoint,
+            conn,
+            h3_control,
+            relay_send,
+            relay_recv,
+        }
+    });
+    Ok((server, data_session, speed_quic))
 }
 
 /// A QUIC fast-plane connection the client has retained for the data relay after
@@ -1504,14 +1520,71 @@ struct RetainedClientQuic {
     relay_recv: crate::transport::udp::quic::endpoint::RecvStream,
 }
 
-impl RetainedClientQuic {
-    /// Promptly application-closes the retained connection (and its endpoint) when
-    /// a non-single-Connect path (Mux/SpeedTest) keeps the relay on TCP, so no
-    /// idle fast-plane connection lingers. A bare drop also closes it; this just
-    /// makes the CONNECTION_CLOSE immediate.
-    fn close(self) {
-        self.conn.close(0u32.into(), b"tcp-path");
-        self.endpoint.close(0u32.into(), b"tcp-path");
+/// A retained QUIC fast-plane connection handed to the speed test so it can
+/// measure the SAME single-Connect QUIC bidi the relay would use. The probe ran
+/// over this bidi (`relay_send`/`relay_recv`); the speed transfer continues on it,
+/// DATA-framed (identical carrier to [`ClientRelay`]'s QUIC path). The endpoint,
+/// connection, and H3 control streams are held alive for the measurement's
+/// duration; [`SpeedQuicCarrier::close`] application-closes them when done.
+pub(crate) struct SpeedQuicCarrier {
+    endpoint: crate::transport::udp::quic::endpoint::Endpoint,
+    conn: crate::transport::udp::quic::endpoint::Connection,
+    h3_control: crate::transport::udp::h3::H3ControlStreams,
+    relay_send: crate::transport::udp::quic::endpoint::SendStream,
+    relay_recv: crate::transport::udp::quic::endpoint::RecvStream,
+}
+
+impl SpeedQuicCarrier {
+    /// The QUIC bidi's wire stream id — the derivation input for the QUIC-run's
+    /// independent codec (both ends observe the same id, mirroring mux-over-QUIC).
+    pub(crate) fn stream_id(&self) -> u64 {
+        self.relay_send.id()
+    }
+
+    /// Split into the H3 relay legs plus a keep-alive guard that owns the endpoint,
+    /// connection, and H3 control streams for the measurement's duration.
+    pub(crate) fn into_legs(
+        self,
+    ) -> (
+        crate::transport::leg::H3DataFrameLegWriter,
+        crate::transport::leg::H3DataFrameLegReader,
+        SpeedQuicKeepAlive,
+    ) {
+        let SpeedQuicCarrier {
+            endpoint,
+            conn,
+            h3_control,
+            relay_send,
+            relay_recv,
+        } = self;
+        let writer = crate::transport::leg::H3DataFrameLegWriter(relay_send);
+        let reader = crate::transport::leg::H3DataFrameLegReader::buffered(relay_recv);
+        (
+            writer,
+            reader,
+            SpeedQuicKeepAlive {
+                endpoint,
+                conn,
+                _h3_control: h3_control,
+            },
+        )
+    }
+}
+
+/// Holds the QUIC endpoint + connection + H3 control streams alive while the speed
+/// test measures over the bidi legs. Closing it application-closes the connection.
+pub(crate) struct SpeedQuicKeepAlive {
+    endpoint: crate::transport::udp::quic::endpoint::Endpoint,
+    conn: crate::transport::udp::quic::endpoint::Connection,
+    _h3_control: crate::transport::udp::h3::H3ControlStreams,
+}
+
+impl SpeedQuicKeepAlive {
+    /// Promptly application-closes the connection and endpoint after the QUIC speed
+    /// measurement completes.
+    pub(crate) fn close(self) {
+        self.conn.close(0u32.into(), b"speed-done");
+        self.endpoint.close(0u32.into(), b"speed-done");
     }
 }
 
@@ -4420,6 +4493,155 @@ mod tests {
         wait_for_task("server", server_task).await;
         wait_for_task("target", target_task).await;
         wait_for_task("fallback", fallback_task).await;
+    }
+
+    /// Builds a client `Config` (with the [`crate::speed`] entry point's required
+    /// shape) pointing at `parallax_addr`, using the test PSK and keys.
+    fn speed_client_config(
+        parallax_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+        udp: UdpConfig,
+    ) -> crate::config::Config {
+        crate::config::Config {
+            mode: crate::config::Mode::Client,
+            crypto: crate::config::CryptoConfig {
+                psk: STANDARD.encode(PSK).into(),
+            },
+            traffic: TrafficConfig::default(),
+            udp,
+            transport: Default::default(),
+            client: Some(ClientConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server_addr: parallax_addr.to_string(),
+                sni: "example.com".to_owned(),
+                server_public_key: STANDARD.encode(server_keys.public),
+                server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+            }),
+            server: None,
+        }
+    }
+
+    /// A small speed plan so the loopback e2e runs fast while still exercising every
+    /// phase (warmup + one sample, both directions).
+    fn tiny_speed_plan() -> crate::speed::SpeedPlan {
+        crate::speed::SpeedPlan {
+            warmup_bytes: 64 * 1024,
+            download_bytes: 256 * 1024,
+            upload_bytes: 256 * 1024,
+            sample_count: 1,
+        }
+    }
+
+    /// `parallax speed` with `udp.enabled`: the report must contain BOTH a TCP run
+    /// and a QUIC run (the probe Verifies on loopback), each with positive
+    /// throughput. Proves the speed path now measures the QUIC fast plane, not just
+    /// TCP, and that both planes are reported for a fair comparison.
+    #[tokio::test]
+    #[ignore = "requires loopback UDP+TCP sockets"]
+    async fn speed_measures_both_tcp_and_quic_when_udp_enabled() {
+        use crate::speed::Transport;
+
+        let _serial = quic_e2e_guard().await;
+        let enabled_udp = UdpConfig {
+            enabled: true,
+            ..UdpConfig::default()
+        };
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        // Speed generates its own data; the target is unused but the config needs one.
+        let (target_addr, target_task) = spawn_echo_target().await;
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server_with_traffic_and_udp(
+            server_config,
+            TrafficConfig::default(),
+            enabled_udp.clone(),
+        )
+        .await;
+
+        let config = speed_client_config(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys,
+            enabled_udp,
+        );
+        let report = crate::speed::run_with_plan(config, tiny_speed_plan())
+            .await
+            .expect("speed run with udp enabled");
+
+        assert_eq!(
+            report.runs.len(),
+            2,
+            "udp-enabled speed must measure both TCP and QUIC"
+        );
+        let tcp = report.run(Transport::Tcp).expect("tcp run present");
+        let quic = report.run(Transport::Quic).expect("quic run present");
+        assert!(
+            tcp.download.summary.median_mbps > 0.0 && tcp.upload.summary.median_mbps > 0.0,
+            "tcp run must have positive throughput"
+        );
+        assert!(
+            quic.download.summary.median_mbps > 0.0 && quic.upload.summary.median_mbps > 0.0,
+            "quic run must have positive throughput"
+        );
+
+        wait_for_task("server", server_task).await;
+        target_task.abort();
+        fallback_task.abort();
+    }
+
+    /// `parallax speed` with udp disabled: the report must contain ONLY the TCP run
+    /// (byte-identical to before this feature).
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn speed_measures_tcp_only_when_udp_disabled() {
+        use crate::speed::Transport;
+
+        let _serial = quic_e2e_guard().await;
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+        let (target_addr, target_task) = spawn_echo_target().await;
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_with_traffic(server_config, TrafficConfig::default()).await;
+
+        let config = speed_client_config(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys,
+            UdpConfig::default(),
+        );
+        let report = crate::speed::run_with_plan(config, tiny_speed_plan())
+            .await
+            .expect("speed run with udp disabled");
+
+        assert_eq!(report.runs.len(), 1, "udp-disabled speed must be TCP-only");
+        assert_eq!(report.runs[0].transport, Transport::Tcp);
+        assert!(report.run(Transport::Quic).is_none());
+
+        wait_for_task("server", server_task).await;
+        target_task.abort();
+        fallback_task.abort();
     }
 
     /// Full UDP negotiation, single-connect: after the QUIC relay is carrying a

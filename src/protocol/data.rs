@@ -1130,6 +1130,13 @@ pub const SERVER_TO_CLIENT_AAD: &[u8] = b"ParallaX v1 server appdata";
 /// skip). Follows the PX1* command convention used elsewhere on the wire.
 pub const QUIC_RELAY_DONE_MARKER: &[u8] = b"PX1Z-quic-relay-done";
 
+/// Fixed plaintext of the `parallax speed` QUIC-run teardown DONE marker. After the
+/// QUIC speed run completes, the client sends this over the reliable TCP control
+/// connection; the server reads it before closing the QUIC connection, so the close
+/// cannot truncate a buffered final ack (a race-free teardown). Same wire shape and
+/// monotonic-sequence discipline as [`QUIC_RELAY_DONE_MARKER`].
+pub const SPEED_QUIC_DONE_MARKER: &[u8] = b"PX1Z-speed-quic-done";
+
 /// QUIC application close code for a graceful, mutually-recognized idle teardown
 /// of the fast-plane relay. Code 0 stays the generic/abrupt close; when one side's
 /// idle watchdog fires it closes the connection with this code so the peer can

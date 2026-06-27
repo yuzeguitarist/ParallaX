@@ -6,7 +6,7 @@ use std::{
 
 use rand::rngs::OsRng;
 use thiserror::Error;
-use tokio::{io::AsyncWriteExt, net::TcpStream, time::Instant};
+use tokio::time::Instant;
 
 use crate::{
     client::runtime::{self, ClientRuntimeError},
@@ -17,9 +17,9 @@ use crate::{
     protocol::command::{
         SpeedTestAck, SpeedTestAckError, SpeedTestAckKind, SpeedTestRequest, SpeedTestRequestError,
     },
-    protocol::data::relay_read_buffer_len,
+    protocol::data::{relay_read_buffer_len, SPEED_QUIC_DONE_MARKER},
     runtime_guard::client_config_fingerprint,
-    tls::record::TlsRecordReader,
+    transport::leg::{LegReader, LegWriter, TcpLegReader, TcpLegWriter},
     PROTOCOL_NAME, PROTOCOL_VERSION,
 };
 
@@ -153,6 +153,39 @@ pub struct DirectionReport {
     pub summary: DirectionSummary,
 }
 
+/// Which transport plane a [`TransportRun`] measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The TCP plane (always measured).
+    Tcp,
+    /// The UDP/QUIC fast plane (measured only when `udp.enabled` AND the UDP probe
+    /// Verified, so the same single-Connect QUIC bidi the relay would use carries
+    /// the speed transfer).
+    Quic,
+}
+
+impl Transport {
+    fn label(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Quic => "quic",
+        }
+    }
+}
+
+/// One full speed measurement over a single transport plane: the warmup phases
+/// plus the per-direction sample sets. `parallax speed` measures TCP always, and
+/// QUIC additionally when the fast plane is available, so both planes can be
+/// compared fairly (same single-stream, same plan).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransportRun {
+    pub transport: Transport,
+    pub warmup_download: PhaseMeasurement,
+    pub warmup_upload: PhaseMeasurement,
+    pub download: DirectionReport,
+    pub upload: DirectionReport,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeedReport {
     pub schema: &'static str,
@@ -167,13 +200,26 @@ pub struct SpeedReport {
     pub max_payload_chunk_len: usize,
     pub plan: SpeedPlan,
     pub handshake: PhaseMeasurement,
-    pub warmup_download: PhaseMeasurement,
-    pub warmup_upload: PhaseMeasurement,
-    pub download: DirectionReport,
-    pub upload: DirectionReport,
+    /// One entry per measured transport: TCP first, then QUIC when the fast plane
+    /// was exercised. Never empty (TCP is always measured).
+    pub runs: Vec<TransportRun>,
 }
 
 impl SpeedReport {
+    /// The primary (TCP) transport run — always present, always first. Callers that
+    /// want a single headline figure (e.g. the netmatrix benchmark) use this; the
+    /// QUIC run, when measured, is the second entry in [`Self::runs`].
+    pub fn primary_run(&self) -> &TransportRun {
+        self.runs
+            .first()
+            .expect("a SpeedReport always has at least the TCP run")
+    }
+
+    /// The run for a specific transport, if it was measured.
+    pub fn run(&self, transport: Transport) -> Option<&TransportRun> {
+        self.runs.iter().find(|r| r.transport == transport)
+    }
+
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "ParallaX speed evidence report");
@@ -208,10 +254,18 @@ impl SpeedReport {
             self.max_payload_chunk_len
         );
         let _ = writeln!(out, "handshake_ms: {:.3}", millis(self.handshake.elapsed));
-        write_phase(&mut out, "warmup_download", self.warmup_download);
-        write_phase(&mut out, "warmup_upload", self.warmup_upload);
-        write_direction(&mut out, "download", &self.download);
-        write_direction(&mut out, "upload", &self.upload);
+        for run in &self.runs {
+            let t = run.transport.label();
+            let _ = writeln!(out, "[transport={t}]");
+            write_phase(
+                &mut out,
+                &format!("{t}.warmup_download"),
+                run.warmup_download,
+            );
+            write_phase(&mut out, &format!("{t}.warmup_upload"), run.warmup_upload);
+            write_direction(&mut out, &format!("{t}.download"), &run.download);
+            write_direction(&mut out, &format!("{t}.upload"), &run.upload);
+        }
         out
     }
 
@@ -254,20 +308,49 @@ impl SpeedReport {
         );
         write_json_plan(&mut out, 1, "plan", self.plan, true);
         write_json_phase(&mut out, 1, "handshake", self.handshake, true);
-        write_json_phase(&mut out, 1, "warmup_download", self.warmup_download, true);
-        write_json_phase(&mut out, 1, "warmup_upload", self.warmup_upload, true);
-        write_json_direction(&mut out, 1, "download", &self.download, true);
-        write_json_direction(&mut out, 1, "upload", &self.upload, false);
+        write_json_runs(&mut out, 1, "runs", &self.runs, false);
         let _ = writeln!(out, "}}");
         out
     }
+}
+
+fn write_json_runs(
+    out: &mut String,
+    indent: usize,
+    key: &str,
+    runs: &[TransportRun],
+    trailing_comma: bool,
+) {
+    let pad = "  ".repeat(indent);
+    let _ = writeln!(out, "{pad}\"{key}\": [");
+    for (idx, run) in runs.iter().enumerate() {
+        let _ = writeln!(out, "{}{{", "  ".repeat(indent + 1));
+        write_json_str(out, indent + 2, "transport", run.transport.label(), true);
+        write_json_phase(
+            out,
+            indent + 2,
+            "warmup_download",
+            run.warmup_download,
+            true,
+        );
+        write_json_phase(out, indent + 2, "warmup_upload", run.warmup_upload, true);
+        write_json_direction(out, indent + 2, "download", &run.download, true);
+        write_json_direction(out, indent + 2, "upload", &run.upload, false);
+        let _ = write!(out, "{}}}", "  ".repeat(indent + 1));
+        write_json_comma_newline(out, idx + 1 < runs.len());
+    }
+    let _ = write!(out, "{pad}]");
+    write_json_comma_newline(out, trailing_comma);
 }
 
 pub async fn run(config: Config) -> Result<SpeedReport, SpeedError> {
     run_with_plan(config, SpeedPlan::default()).await
 }
 
-async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, SpeedError> {
+pub(crate) async fn run_with_plan(
+    config: Config,
+    plan: SpeedPlan,
+) -> Result<SpeedReport, SpeedError> {
     if config.mode != Mode::Client {
         return Err(SpeedError::WrongMode);
     }
@@ -288,7 +371,7 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
 
     let generated_unix_ms = unix_millis()?;
     let handshake_start = Instant::now();
-    let (mut server, mut data_session) = runtime::establish_authenticated_data_session(
+    let (server, mut data_session, quic_carrier) = runtime::establish_authenticated_data_session(
         &client,
         config.traffic,
         &config.udp,
@@ -304,59 +387,66 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     let max_payload_chunk_len = data_session.max_payload_chunk_len();
 
     let request = plan.request();
-    // C6: snap this PX1T onto a browser-magnitude CONNECT size band (reusing C3
-    // shaping) so it is not a tiny fixed-size control record on the wire.
-    let request_record = data_session.seal_payload_band_shaped(&request.encode()?, &mut OsRng)?;
-    server.write_all(&request_record).await?;
 
-    let warmup_download = {
-        let mut records = TlsRecordReader::new(&mut server);
-        read_download_phase(
-            &mut records,
+    // Always measure TCP first, over the authenticated TCP connection. Split it so
+    // the same `LegReader`/`LegWriter` seam drives both planes. The halves are held
+    // alive past the QUIC run below (the server keeps the TCP control connection up
+    // for the whole session), so closing TCP cannot race the QUIC measurement.
+    let mut runs = Vec::with_capacity(2);
+    let (read_half, write_half) = server.into_split();
+    let mut tcp_writer = TcpLegWriter(write_half);
+    let mut tcp_reader = TcpLegReader::buffered(read_half);
+    runs.push(
+        measure_run(
+            Transport::Tcp,
+            &mut tcp_writer,
+            &mut tcp_reader,
             &mut data_session,
-            SpeedTestAckKind::WarmupDownloadDone,
-            request.warmup_bytes,
+            request,
         )
-        .await?
-    };
-    let warmup_upload = write_upload_phase(
-        &mut server,
-        &mut data_session,
-        SpeedTestAckKind::WarmupUploadDone,
-        request.warmup_bytes,
-    )
-    .await?;
+        .await?,
+    );
 
-    let mut download_samples = Vec::with_capacity(request.sample_count as usize);
-    {
-        let mut records = TlsRecordReader::new(&mut server);
-        for index in 1..=request.sample_count {
-            download_samples.push(SpeedSample {
-                index,
-                measurement: read_download_phase(
-                    &mut records,
-                    &mut data_session,
-                    SpeedTestAckKind::DownloadDone,
-                    request.download_bytes,
-                )
-                .await?,
-            });
+    // Then measure QUIC, when the probe Verified and handed us the fast-plane bidi.
+    // Same single-stream, same plan — a fair side-by-side comparison. With udp off
+    // or the probe not Verified, `quic_carrier` is `None` and the report is TCP-only.
+    if let Some(carrier) = quic_carrier {
+        // The QUIC run uses an INDEPENDENT codec derived from the bidi's stream id
+        // (the mux-over-QUIC mechanism), NOT the shared `data_session` codec: the
+        // two transports' record/ack streams are not byte-symmetric, so a shared
+        // monotonic AEAD sequence would desync. A fresh per-stream session gives the
+        // QUIC run its own sequence, matched on both ends by the same stream id.
+        let stream_id = carrier.stream_id();
+        let quic_keys =
+            crate::crypto::session::expand_substream_keys(data_session.session_keys(), stream_id)
+                .map_err(|err| SpeedError::Io(io::Error::other(err.to_string())))?;
+        let mut quic_session = ClientDataSession::new(quic_keys, config.traffic)?;
+        let (mut quic_writer, mut quic_reader, keep_alive) = carrier.into_legs();
+        let quic_run = measure_run(
+            Transport::Quic,
+            &mut quic_writer,
+            &mut quic_reader,
+            &mut quic_session,
+            request,
+        )
+        .await;
+        // Race-free teardown over the RELIABLE TCP control connection (still held):
+        // having received the QUIC final ack (the run completed), send a DONE marker
+        // over TCP. The server reads it before closing the QUIC connection, so the
+        // close cannot truncate a buffered ack. Only after the DONE is sent do we
+        // release the QUIC carrier. The DONE continues the TCP-run's AEAD sequence.
+        if quic_run.is_ok() {
+            quic_writer.0.finish();
+            let done = data_session.seal_payload(SPEED_QUIC_DONE_MARKER, &mut OsRng)?;
+            tcp_writer.write_records(&done).await?;
         }
+        let _ = quic_reader;
+        keep_alive.close();
+        runs.push(quic_run?);
     }
-
-    let mut upload_samples = Vec::with_capacity(request.sample_count as usize);
-    for index in 1..=request.sample_count {
-        upload_samples.push(SpeedSample {
-            index,
-            measurement: write_upload_phase(
-                &mut server,
-                &mut data_session,
-                SpeedTestAckKind::UploadDone,
-                request.upload_bytes,
-            )
-            .await?,
-        });
-    }
+    // The TCP control connection stays open through the QUIC run; drop it now.
+    drop(tcp_reader);
+    drop(tcp_writer);
 
     Ok(SpeedReport {
         schema: REPORT_SCHEMA,
@@ -371,6 +461,79 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
         max_payload_chunk_len,
         plan,
         handshake,
+        runs,
+    })
+}
+
+/// Run the full speed protocol over one transport's legs: send the request as the
+/// first record, then warmup + sample sets in both directions. The QUIC carrier
+/// reuses the SAME `data_session` codecs as TCP (single-Connect QUIC), so no extra
+/// key derivation is needed — the AEAD sequence simply continues on a fresh leg.
+async fn measure_run<W, R>(
+    transport: Transport,
+    writer: &mut W,
+    reader: &mut R,
+    data_session: &mut ClientDataSession,
+    request: SpeedTestRequest,
+) -> Result<TransportRun, SpeedError>
+where
+    W: LegWriter,
+    R: LegReader,
+{
+    // The request opens each transport's measurement: the server reads it as the
+    // first record on this leg and runs its mirror speed protocol. C6: snap this
+    // PX1T onto a browser-magnitude CONNECT size band (reusing C3 shaping) so it is
+    // not a tiny fixed-size control record on the wire.
+    let request_record = data_session.seal_payload_band_shaped(&request.encode()?, &mut OsRng)?;
+    writer.write_records(&request_record).await?;
+
+    let warmup_download = read_download_phase(
+        reader,
+        data_session,
+        SpeedTestAckKind::WarmupDownloadDone,
+        request.warmup_bytes,
+    )
+    .await?;
+    let warmup_upload = write_upload_phase(
+        writer,
+        reader,
+        data_session,
+        SpeedTestAckKind::WarmupUploadDone,
+        request.warmup_bytes,
+    )
+    .await?;
+
+    let mut download_samples = Vec::with_capacity(request.sample_count as usize);
+    for index in 1..=request.sample_count {
+        download_samples.push(SpeedSample {
+            index,
+            measurement: read_download_phase(
+                reader,
+                data_session,
+                SpeedTestAckKind::DownloadDone,
+                request.download_bytes,
+            )
+            .await?,
+        });
+    }
+
+    let mut upload_samples = Vec::with_capacity(request.sample_count as usize);
+    for index in 1..=request.sample_count {
+        upload_samples.push(SpeedSample {
+            index,
+            measurement: write_upload_phase(
+                writer,
+                reader,
+                data_session,
+                SpeedTestAckKind::UploadDone,
+                request.upload_bytes,
+            )
+            .await?,
+        });
+    }
+
+    Ok(TransportRun {
+        transport,
         warmup_download,
         warmup_upload,
         download: DirectionReport::new(download_samples),
@@ -414,20 +577,20 @@ impl DirectionSummary {
 }
 
 async fn read_download_phase<R>(
-    records: &mut TlsRecordReader<R>,
+    reader: &mut R,
     data_session: &mut ClientDataSession,
     expected_ack: SpeedTestAckKind,
     expected_bytes: u64,
 ) -> Result<PhaseMeasurement, SpeedError>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: LegReader,
 {
     let mut start: Option<Instant> = None;
     let mut received = 0_u64;
     let mut record = Vec::new();
 
     while received < expected_bytes {
-        records.read_record_into(&mut record).await?;
+        reader.read_record_into(&mut record).await?;
         let payload = data_session.open_server_record_in_place_payload_range(&mut record)?;
         if payload.is_empty() {
             continue;
@@ -444,7 +607,7 @@ where
     }
     let elapsed = start.map(|s| s.elapsed()).unwrap_or_default();
 
-    read_ack_from_records(records, data_session, expected_ack, expected_bytes).await?;
+    read_ack_from_records(reader, data_session, expected_ack, expected_bytes).await?;
 
     Ok(PhaseMeasurement {
         bytes: received,
@@ -452,12 +615,17 @@ where
     })
 }
 
-async fn write_upload_phase(
-    server: &mut TcpStream,
+async fn write_upload_phase<W, R>(
+    writer: &mut W,
+    reader: &mut R,
     data_session: &mut ClientDataSession,
     expected_ack: SpeedTestAckKind,
     expected_bytes: u64,
-) -> Result<PhaseMeasurement, SpeedError> {
+) -> Result<PhaseMeasurement, SpeedError>
+where
+    W: LegWriter,
+    R: LegReader,
+{
     let chunk_len = data_session.max_payload_chunk_len();
     if chunk_len == 0 {
         return Err(SpeedError::Io(io::Error::new(
@@ -476,17 +644,16 @@ async fn write_upload_phase(
         let len = remaining.min(payload.len() as u64) as usize;
         sealed.clear();
         data_session.seal_payload_chunks_into_untracked(&payload[..len], &mut rng, &mut sealed)?;
-        server.write_all(&sealed).await?;
+        writer.write_records(&sealed).await?;
         remaining -= len as u64;
     }
-    server.flush().await?;
     // Stop the upload clock as soon as the last byte is on the wire — BEFORE the
     // ack round-trip, which would otherwise count one RTT + ack decrypt as upload
-    // time and understate throughput.
+    // time and understate throughput. (`write_records` folds in the flush for TCP;
+    // the QUIC leg writes into the stream buffer the driver flushes.)
     let elapsed = start.elapsed();
 
-    let mut ack_reader = TlsRecordReader::new(server);
-    read_ack_from_records(&mut ack_reader, data_session, expected_ack, expected_bytes).await?;
+    read_ack_from_records(reader, data_session, expected_ack, expected_bytes).await?;
 
     Ok(PhaseMeasurement {
         bytes: expected_bytes,
@@ -495,17 +662,17 @@ async fn write_upload_phase(
 }
 
 async fn read_ack_from_records<R>(
-    records: &mut TlsRecordReader<R>,
+    reader: &mut R,
     data_session: &mut ClientDataSession,
     expected_kind: SpeedTestAckKind,
     expected_bytes: u64,
 ) -> Result<SpeedTestAck, SpeedError>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: LegReader,
 {
     let mut record = Vec::new();
     loop {
-        records.read_record_into(&mut record).await?;
+        reader.read_record_into(&mut record).await?;
         let payload = data_session.open_server_record_in_place_payload_range(&mut record)?;
         if payload.is_empty() {
             continue;
@@ -905,10 +1072,13 @@ mod tests {
             max_payload_chunk_len: 16_366,
             plan: SpeedPlan::default(),
             handshake: measurement(0, 50),
-            warmup_download: measurement(1024 * 1024, 100),
-            warmup_upload: measurement(1024 * 1024, 120),
-            download: DirectionReport::new(samples.clone()),
-            upload: DirectionReport::new(samples),
+            runs: vec![TransportRun {
+                transport: Transport::Tcp,
+                warmup_download: measurement(1024 * 1024, 100),
+                warmup_upload: measurement(1024 * 1024, 120),
+                download: DirectionReport::new(samples.clone()),
+                upload: DirectionReport::new(samples),
+            }],
         }
     }
 
@@ -935,8 +1105,9 @@ mod tests {
         assert!(text.contains("ParallaX speed evidence report"));
         assert!(text.contains("schema: parallax.speed.evidence.v1"));
         assert!(text.contains("config_fingerprint: abc123"));
-        assert!(text.contains("download_summary: samples=3"));
-        assert!(text.contains("upload_summary: samples=3"));
+        assert!(text.contains("[transport=tcp]"));
+        assert!(text.contains("tcp.download_summary: samples=3"));
+        assert!(text.contains("tcp.upload_summary: samples=3"));
     }
 
     #[test]
@@ -948,6 +1119,8 @@ mod tests {
         assert!(json.contains("\"config_fingerprint\": \"abc123\""));
         assert!(json.contains("\"median_mbps\": 40.000000"));
         assert!(json.contains("\"max_payload_chunk_len\": 16366"));
+        assert!(json.contains("\"transport\": \"tcp\""));
+        assert!(json.contains("\"runs\": ["));
     }
 
     #[test]

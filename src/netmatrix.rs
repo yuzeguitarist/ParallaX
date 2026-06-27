@@ -277,8 +277,8 @@ fn render_text(upstream: &str, cells: &[NetCell]) -> String {
                     cell.imp.label,
                     cell.imp.rtt_ms,
                     bw,
-                    report.download.summary.median_mbps,
-                    report.upload.summary.median_mbps,
+                    report.primary_run().download.summary.median_mbps,
+                    report.primary_run().upload.summary.median_mbps,
                 );
             }
             Err(err) => {
@@ -320,12 +320,12 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
                 let _ = writeln!(
                     out,
                     "      \"download_median_mbps\": {:.4},",
-                    report.download.summary.median_mbps
+                    report.primary_run().download.summary.median_mbps
                 );
                 let _ = writeln!(
                     out,
                     "      \"upload_median_mbps\": {:.4}",
-                    report.upload.summary.median_mbps
+                    report.primary_run().upload.summary.median_mbps
                 );
                 let _ = writeln!(out, "    }}{comma}");
             }
@@ -457,6 +457,7 @@ mod tests {
     fn sample_report() -> SpeedReport {
         use crate::speed::{
             DirectionReport, DirectionSummary, PhaseMeasurement, SpeedPlan, TrafficEvidence,
+            Transport, TransportRun,
         };
         let summary = |median: f64| DirectionSummary {
             sample_count: 1,
@@ -499,10 +500,13 @@ mod tests {
                 bytes: 0,
                 elapsed: Duration::from_millis(42),
             },
-            warmup_download: zero,
-            warmup_upload: zero,
-            download: dir(123.5),
-            upload: dir(67.25),
+            runs: vec![TransportRun {
+                transport: Transport::Tcp,
+                warmup_download: zero,
+                warmup_upload: zero,
+                download: dir(123.5),
+                upload: dir(67.25),
+            }],
         }
     }
 
