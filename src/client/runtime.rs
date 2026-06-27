@@ -57,7 +57,7 @@ use crate::{
         },
         tcp::{
             connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
-            relay_connection_limit, tune_tcp_stream,
+            is_transient_accept_error, relay_connection_limit, tune_tcp_stream,
         },
     },
 };
@@ -256,6 +256,13 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                 sleep(Duration::from_millis(100)).await;
                 continue;
             }
+            Err(err) if is_transient_accept_error(&err) => {
+                tracing::debug!(
+                    error = %err,
+                    "transient accept() error; dropping connection and continuing"
+                );
+                continue;
+            }
             Err(err) => return Err(err.into()),
         };
         let connection_permit = match Arc::clone(&connection_slots).try_acquire_owned() {
@@ -377,7 +384,10 @@ impl UdpReachability {
     /// another connection reclaim (self-healing); a Verified outcome clears the
     /// breaker via `record_usable`, a failure re-trips it via `record_unusable`.
     fn should_attempt_at(&self, now: std::time::Instant) -> bool {
-        let mut guard = self.blocked_since.lock().expect("reachability mutex");
+        let mut guard = self
+            .blocked_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match *guard {
             // Usable (or never tripped): every connection negotiates so they all
             // use the fast plane while it works — no claim, no state change.
@@ -402,12 +412,18 @@ impl UdpReachability {
     /// Record that the UDP path is unusable (probe Unreachable or Failed): trip
     /// the breaker so subsequent connections skip negotiation for the TTL.
     pub(crate) fn record_unusable(&self) {
-        *self.blocked_since.lock().expect("reachability mutex") = Some(std::time::Instant::now());
+        *self
+            .blocked_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::time::Instant::now());
     }
 
     /// Record that the UDP path works (probe Verified): clear the breaker.
     pub(crate) fn record_usable(&self) {
-        *self.blocked_since.lock().expect("reachability mutex") = None;
+        *self
+            .blocked_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
