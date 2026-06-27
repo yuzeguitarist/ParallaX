@@ -302,12 +302,17 @@ pub fn is_transient_accept_error(err: &io::Error) -> bool {
 
     #[cfg(unix)]
     {
+        // ENONET is Linux-only (absent from macOS/BSD libc), so handle it separately.
+        #[cfg(target_os = "linux")]
+        if err.raw_os_error() == Some(libc::ENONET) {
+            return true;
+        }
+
         matches!(
             err.raw_os_error(),
             Some(libc::ECONNABORTED)
                 | Some(libc::EINTR)
                 | Some(libc::EPROTO)
-                | Some(libc::ENONET)
                 | Some(libc::ENETDOWN)
                 | Some(libc::ENETUNREACH)
                 | Some(libc::EHOSTDOWN)
