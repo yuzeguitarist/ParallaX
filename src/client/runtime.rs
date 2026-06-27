@@ -687,6 +687,10 @@ enum MuxCarrier {
         /// Per-substream key-derivation root (shared, read-only).
         session_keys: Arc<SessionKeys>,
         traffic: TrafficConfig,
+        /// The camouflage front domain (REALITY SNI), used as the `:authority` of
+        /// each business bidi's request HEADERS frame so every substream opens with
+        /// a browser-plausible H3 request lifecycle. Shared, read-only.
+        authority: Arc<str>,
         /// Held alive for the session's duration: the QUIC endpoint + H3 control
         /// streams must outlive every substream (RFC 9114 §6.2.1).
         _endpoint: Arc<crate::transport::udp::quic::endpoint::Endpoint>,
@@ -1035,6 +1039,7 @@ impl ClientMuxPool {
                     conn,
                     session_keys,
                     traffic: self.traffic,
+                    authority: Arc::from(self.config.sni.as_str()),
                     _endpoint: Arc::new(endpoint),
                     _h3_control: Arc::new(h3_control),
                     // Keep the outer TCP connection alive for the session's duration
@@ -1140,6 +1145,7 @@ async fn handle_local_mux_connection_with_cid(
         conn,
         session_keys,
         traffic,
+        authority,
         ..
     } = &mux.carrier
     {
@@ -1149,6 +1155,7 @@ async fn handle_local_mux_connection_with_cid(
             session_keys,
             *traffic,
             connect_request,
+            authority,
             cid,
         )
         .await;
@@ -1253,19 +1260,32 @@ async fn client_mux_quic_substream(
     session_keys: &SessionKeys,
     traffic: TrafficConfig,
     connect_request: ConnectRequest,
+    authority: &str,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
+    use crate::transport::udp::h3::{
+        read_business_response_headers, write_business_request_headers,
+    };
     use crate::transport::udp::quic::endpoint::VarInt;
     use crate::transport::udp::quic::mux::client_substream_codecs;
 
     // Open the dedicated bidi and derive its per-substream codecs from the wire
     // stream id (both ends observe the same id for this bidi).
-    let (send, recv) = conn.open_bi();
+    let (mut send, mut recv) = conn.open_bi();
     let stream_id = send.id();
     let (mut seal_to_server, open_from_server) =
         client_substream_codecs(session_keys, traffic, stream_id)
             .map_err(|err| io::Error::other(err.to_string()))?;
     let chunk_size = max_plaintext_len(traffic.max_padding);
+
+    // Open the bidi with a Safari-26 request HEADERS frame so it presents a
+    // browser-plausible HTTP/3 request lifecycle (HEADERS then DATA) instead of
+    // starting directly with a DATA frame — the encrypted records ride the DATA
+    // frames that follow, exactly like the probe bidi.
+    if let Err(err) = write_business_request_headers(&mut send, authority).await {
+        send.reset(VarInt::from_u32(0));
+        return Err(ClientRuntimeError::Io(err));
+    }
 
     let mut server_write = H3DataFrameLegWriter(send);
     // First record on the substream: the ConnectRequest, sealed under the
@@ -1278,6 +1298,34 @@ async fn client_mux_quic_substream(
     if let Err(err) = server_write.write_records(&connect_record).await {
         server_write.0.reset(VarInt::from_u32(0));
         return Err(ClientRuntimeError::Io(err));
+    }
+
+    // Read the server's `:status 200` response HEADERS frame before the download
+    // DATA frames, completing the request/response lifecycle. A failure here means
+    // the server diverged from the agreed shape (or the bidi was lost): reset and
+    // surface it. BOUNDED by CLIENT_ESTABLISH_TIMEOUT (mirroring the server's
+    // symmetric request-HEADERS read under PX1_CONTROL_READ_TIMEOUT): this await
+    // precedes the relay idle watchdog, so without a bound a server that accepts
+    // the bidi but withholds response HEADERS would pin this SOCKS connection and
+    // its stream permit until the whole QUIC connection idles out.
+    match tokio::time::timeout(
+        CLIENT_ESTABLISH_TIMEOUT,
+        read_business_response_headers(&mut recv),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            conn.reset_stream(stream_id, VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(err));
+        }
+        Err(_) => {
+            conn.reset_stream(stream_id, VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mux-over-QUIC substream response HEADERS read timed out",
+            )));
+        }
     }
 
     let (local_read, local_write) = local.into_split();
