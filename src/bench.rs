@@ -1538,7 +1538,14 @@ where
     F: Future<Output = Result<T>>,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        // block_in_place is only valid on a multi-thread runtime; on the
+        // current-thread flavor it panics. The bench entrypoints run on a
+        // multi-thread runtime, so the current-thread arm is a guard against
+        // misuse rather than a path the suite takes.
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        Ok(_) => anyhow::bail!("blocking bench wrapper requires a multi-thread tokio runtime"),
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(fut),

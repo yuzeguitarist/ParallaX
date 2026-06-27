@@ -241,8 +241,13 @@ fn encode_offset_chunk(
     if bytes.is_empty() {
         return Err(OffsetChunkError::EmptyChunk);
     }
+    // Checked usize -> u32 so the shared encoder is self-contained: a future caller
+    // that skips the payload-length guard the chunk types apply cannot silently
+    // truncate a >4 GiB chunk into a different on-wire length. Existing callers tile
+    // a u32-bounded payload, so this branch is never taken for them.
+    let len = u32::try_from(bytes.len()).map_err(|_| OffsetChunkError::InvalidChunkLength)?;
     let end = offset
-        .checked_add(bytes.len() as u32)
+        .checked_add(len)
         .ok_or(OffsetChunkError::InvalidOffset)?;
     if total_len == 0 || end > total_len {
         return Err(OffsetChunkError::InvalidOffset);
@@ -251,7 +256,7 @@ fn encode_offset_chunk(
     out.extend_from_slice(magic);
     out.extend_from_slice(&total_len.to_be_bytes());
     out.extend_from_slice(&offset.to_be_bytes());
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(out)
 }
