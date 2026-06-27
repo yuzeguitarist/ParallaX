@@ -4185,8 +4185,7 @@ async fn process_server_mux_frame(
             if streams.writes.contains_key(&frame.stream_id)
                 || streams.readers.contains_key(&frame.stream_id)
             {
-                send_server_mux_frame(frame_tx, frame.stream_id, MuxFrameKind::Reset, Vec::new())
-                    .await?;
+                reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                 return Ok(());
             }
             if streams.live_count() >= context.max_streams {
@@ -4201,8 +4200,7 @@ async fn process_server_mux_frame(
                     max_streams = context.max_streams,
                     "mux stream cap reached; resetting"
                 );
-                send_server_mux_frame(frame_tx, frame.stream_id, MuxFrameKind::Reset, Vec::new())
-                    .await?;
+                reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                 return Ok(());
             }
             let mut payload = frame.payload.to_vec();
@@ -4224,13 +4222,7 @@ async fn process_server_mux_frame(
                             stream_id = frame.stream_id,
                             "mux connect target resolve failed; resetting stream"
                         );
-                        send_server_mux_frame(
-                            frame_tx,
-                            frame.stream_id,
-                            MuxFrameKind::Reset,
-                            Vec::new(),
-                        )
-                        .await?;
+                        reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                         return Ok(());
                     }
                 };
@@ -4245,13 +4237,7 @@ async fn process_server_mux_frame(
                             stream_id = frame.stream_id,
                             "mux outbound connect failed; resetting stream"
                         );
-                        send_server_mux_frame(
-                            frame_tx,
-                            frame.stream_id,
-                            MuxFrameKind::Reset,
-                            Vec::new(),
-                        )
-                        .await?;
+                        reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                         return Ok(());
                     }
                 };
@@ -4261,8 +4247,7 @@ async fn process_server_mux_frame(
                     stream_id = frame.stream_id,
                     "mux target tune failed; resetting stream"
                 );
-                send_server_mux_frame(frame_tx, frame.stream_id, MuxFrameKind::Reset, Vec::new())
-                    .await?;
+                reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                 return Ok(());
             }
             if !initial_payload.is_empty() {
@@ -4285,13 +4270,7 @@ async fn process_server_mux_frame(
                             stream_id = frame.stream_id,
                             "mux target initial-payload write failed; resetting stream"
                         );
-                        send_server_mux_frame(
-                            frame_tx,
-                            frame.stream_id,
-                            MuxFrameKind::Reset,
-                            Vec::new(),
-                        )
-                        .await?;
+                        reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                         return Ok(());
                     }
                     Err(_) => {
@@ -4300,13 +4279,7 @@ async fn process_server_mux_frame(
                             stream_id = frame.stream_id,
                             "mux target initial-payload write stalled; resetting stream"
                         );
-                        send_server_mux_frame(
-                            frame_tx,
-                            frame.stream_id,
-                            MuxFrameKind::Reset,
-                            Vec::new(),
-                        )
-                        .await?;
+                        reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                         return Ok(());
                     }
                 }
@@ -4745,6 +4718,18 @@ async fn send_server_mux_frame(
         })
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into())
+}
+
+/// Shed a substream that failed setup before anything was registered for it
+/// (duplicate id, stream cap, resolve/connect/tune failure, initial-payload
+/// write failure). Enqueues an empty RESET for `stream_id`; the caller then
+/// `return`s, dropping any half-built target. Centralizes the
+/// `Reset + empty payload` shape every such arm repeats so they cannot drift.
+async fn reset_unregistered_stream(
+    frame_tx: &mpsc::Sender<MuxFrame>,
+    stream_id: u32,
+) -> Result<(), HandshakeServerError> {
+    send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new()).await
 }
 
 /// Validate a speed request against the server's per-phase and aggregate ceilings.
