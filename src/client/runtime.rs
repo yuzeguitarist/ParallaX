@@ -57,7 +57,7 @@ use crate::{
         },
         tcp::{
             connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
-            relay_connection_limit, tune_tcp_stream,
+            is_transient_accept_error, relay_connection_limit, tune_tcp_stream,
         },
     },
 };
@@ -254,6 +254,14 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                     "accept() ran out of file descriptors; backing off 100ms"
                 );
                 sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(err) if is_transient_accept_error(&err) => {
+                // Per-connection condition (e.g. a peer RST between SYN and
+                // accept -> ECONNABORTED, or an interrupted syscall). A remote
+                // peer can induce these at will; tearing down the listener here
+                // would be a remotely-triggerable shutdown. Skip this one.
+                tracing::debug!(error = %err, "transient accept() error; skipping connection");
                 continue;
             }
             Err(err) => return Err(err.into()),

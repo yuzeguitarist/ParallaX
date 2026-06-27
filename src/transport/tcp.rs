@@ -286,6 +286,38 @@ pub fn is_fd_exhaustion_error(err: &io::Error) -> bool {
     }
 }
 
+/// Whether an `accept()` error is a transient, per-connection condition that
+/// must NOT tear down the whole listener. These are caused by the remote peer
+/// (e.g. a RST between SYN and `accept`, yielding `ECONNABORTED`) or by signal
+/// delivery, and a remote peer can induce some of them at will — returning them
+/// out of the accept loop would let any peer shut the proxy down. The accept
+/// loop should `continue` on these and only propagate genuinely unrecoverable
+/// listener errors. fd exhaustion is handled separately (it backs off rather
+/// than spins) via [`is_fd_exhaustion_error`].
+pub fn is_transient_accept_error(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::Interrupted {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::ECONNABORTED)
+                | Some(libc::EINTR)
+                | Some(libc::EPROTO)
+                | Some(libc::ENONET)
+                | Some(libc::ENETDOWN)
+                | Some(libc::EHOSTUNREACH)
+                | Some(libc::ENETUNREACH)
+        )
+    }
+
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 pub fn relay_connection_limit(udp_enabled: bool) -> io::Result<usize> {
     relay_connection_limit_from_nofile(nofile_soft_limit()?, udp_enabled).ok_or_else(|| {
         io::Error::other(format!(
@@ -832,6 +864,39 @@ mod tests {
         assert_eq!(after.0, before.0 + 1, "kernel-splice counter");
         assert_eq!(after.1, before.1 + 1, "userspace cap-hit counter");
         assert_eq!(after.2, before.2 + 1, "userspace non-linux counter");
+    }
+
+    #[test]
+    fn transient_accept_errors_do_not_kill_the_listener() {
+        // Interrupted is transient on every platform.
+        assert!(is_transient_accept_error(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
+        #[cfg(unix)]
+        {
+            for code in [
+                libc::ECONNABORTED,
+                libc::EINTR,
+                libc::EPROTO,
+                libc::ENONET,
+                libc::ENETDOWN,
+                libc::EHOSTUNREACH,
+                libc::ENETUNREACH,
+            ] {
+                assert!(
+                    is_transient_accept_error(&io::Error::from_raw_os_error(code)),
+                    "expected {code} to be classified transient"
+                );
+            }
+            // fd exhaustion is handled by its own (backoff) arm, not this one.
+            assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
+                libc::EMFILE
+            )));
+            // A genuinely fatal listener error must still propagate.
+            assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
+                libc::EBADF
+            )));
+        }
     }
 
     #[test]
