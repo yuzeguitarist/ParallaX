@@ -255,6 +255,33 @@ impl ClientDataSession {
         Ok(self.seal_to_server.seal(payload, rng)?)
     }
 
+    /// Seal a fixed-length in-band control frame (C4 PX1G/PX1P, C6 PX1T) onto a
+    /// randomly chosen CONNECT size band, instead of its tiny fixed wire size.
+    /// Reuses the CONNECT (C3) shaping primitives — `control_frame_shaping_pad`
+    /// picks the band, `seal_into_exact_padded` writes EXACTLY that pad and
+    /// bypasses the codec's profile sampling so the record lands on its band even
+    /// under a non-default padding profile. The pad rides the self-describing
+    /// 2-byte trailer, so the receiver decodes the exact `payload` unchanged.
+    pub fn seal_payload_band_shaped<R>(
+        &mut self,
+        payload: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, ClientHandshakeError>
+    where
+        R: RngCore + CryptoRng + rand::Rng + ?Sized,
+    {
+        let max_extra_pad = self
+            .seal_to_server
+            .max_plaintext_len()
+            .saturating_sub(payload.len());
+        let shaping_pad =
+            crate::protocol::command::control_frame_shaping_pad(payload.len(), max_extra_pad, rng);
+        let mut out = Vec::new();
+        self.seal_to_server
+            .seal_into_exact_padded(payload, shaping_pad, rng, &mut out)?;
+        Ok(out)
+    }
+
     pub fn seal_payload_chunks<R>(
         &mut self,
         payload: &[u8],
