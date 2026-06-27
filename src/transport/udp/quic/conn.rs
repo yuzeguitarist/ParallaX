@@ -488,6 +488,44 @@ fn is_uni(id: u64) -> bool {
     id & 0x2 != 0
 }
 
+/// Reassemble an in-order fragment and any buffered fragments it makes
+/// contiguous, appending the recovered bytes to `sink` and advancing
+/// `recv_off`. Shared by CRYPTO ([`Connection::recv_crypto`]) and STREAM
+/// ([`Connection::recv_stream`]) reassembly, which differ only in their
+/// `pending`/`recv_off`/`sink` storage.
+///
+/// Preconditions: `offset <= *recv_off` (the caller has already routed strictly
+/// future fragments into `pending`). The function:
+///   1. appends the non-duplicate tail of `(offset, data)`,
+///   2. drains every buffered fragment that now straddles `recv_off`, then
+///   3. evicts buffered fragments that fell fully below `recv_off` so they stop
+///      counting against the reassembly budget (see the inline notes that this
+///      replaced — a fragment an overlapping fill jumped entirely past matches
+///      no removal path and would otherwise linger forever).
+fn drain_contiguous(
+    pending: &mut Vec<(u64, Vec<u8>)>,
+    recv_off: &mut u64,
+    offset: u64,
+    data: &[u8],
+    sink: &mut Vec<u8>,
+) {
+    let skip = (*recv_off - offset) as usize;
+    if skip < data.len() {
+        sink.extend_from_slice(&data[skip..]);
+        *recv_off += (data.len() - skip) as u64;
+    }
+    while let Some(i) = pending
+        .iter()
+        .position(|(o, d)| *o <= *recv_off && *o + d.len() as u64 > *recv_off)
+    {
+        let (o, d) = pending.remove(i);
+        let s = (*recv_off - o) as usize;
+        sink.extend_from_slice(&d[s..]);
+        *recv_off += (d.len() - s) as u64;
+    }
+    pending.retain(|(o, d)| *o + d.len() as u64 > *recv_off);
+}
+
 /// A hand-rolled QUIC v1 connection (client or server), carried to handshake
 /// completion. Role-generic over a [`TlsSession`].
 pub struct Connection {
@@ -1651,22 +1689,34 @@ impl Connection {
         Some(datagram)
     }
 
-    /// Build a 1-RTT packet carrying HANDSHAKE_DONE (RFC 9001 §4.1.2). Ack-eliciting
-    /// and tracked so it is resent if lost; clears the pending flag. PADDING brings
-    /// the payload up to the 4 bytes header protection needs for its sample (RFC
-    /// 9001 §5.4.2): a lone 1-byte HANDSHAKE_DONE would be too short to sample.
-    fn build_handshake_done_packet(&mut self, now: Instant) -> Vec<u8> {
+    /// Seal a 1-RTT (`SPACE_DATA`) packet from `frames` and record it for loss
+    /// recovery. Centralizes the allocate-pn → encode-pn → make-header →
+    /// seal_packet → record_sent sequence shared by the small control-frame
+    /// builders. The caller owns any pending-flag clearing and content payload;
+    /// the emitted bytes are identical to the inlined sequence it replaces.
+    fn seal_data_packet(
+        &mut self,
+        frames: &[Frame],
+        ack_eliciting: bool,
+        content: SentContent,
+        now: Instant,
+    ) -> Vec<u8> {
         let pn = self.spaces[SPACE_DATA].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let header = self.make_header(SPACE_DATA, pn, pn_len);
         let datagram = {
             let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
-            seal_packet(
-                &keys.local,
-                header,
-                &[Frame::HandshakeDone, Frame::Padding(3)],
-            )
+            seal_packet(&keys.local, header, frames)
         };
+        self.record_sent(SPACE_DATA, pn, datagram.len(), ack_eliciting, content, now);
+        datagram
+    }
+
+    /// Build a 1-RTT packet carrying HANDSHAKE_DONE (RFC 9001 §4.1.2). Ack-eliciting
+    /// and tracked so it is resent if lost; clears the pending flag. PADDING brings
+    /// the payload up to the 4 bytes header protection needs for its sample (RFC
+    /// 9001 §5.4.2): a lone 1-byte HANDSHAKE_DONE would be too short to sample.
+    fn build_handshake_done_packet(&mut self, now: Instant) -> Vec<u8> {
         self.handshake_done_pending = false;
         let content = SentContent {
             crypto: Vec::new(),
@@ -1674,31 +1724,25 @@ impl Connection {
             handshake_done: true,
             ..Default::default()
         };
-        self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
-        datagram
+        self.seal_data_packet(
+            &[Frame::HandshakeDone, Frame::Padding(3)],
+            true,
+            content,
+            now,
+        )
     }
 
     /// Build a 1-RTT PING packet (keep-alive or PTO fallback). Ack-eliciting so it
     /// elicits an ACK; PADDING brings it up to the header-protection sample size. It
     /// carries no retransmittable content (a fresh PING is sent if a probe is lost).
     fn build_ping_packet(&mut self, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[SPACE_DATA].send.allocate();
-        let (_, pn_len) = packet::encode_packet_number(pn, None);
-        let header = self.make_header(SPACE_DATA, pn, pn_len);
-        let datagram = {
-            let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
-            seal_packet(&keys.local, header, &[Frame::Ping, Frame::Padding(3)])
-        };
         self.ping_pending = false;
-        self.record_sent(
-            SPACE_DATA,
-            pn,
-            datagram.len(),
+        self.seal_data_packet(
+            &[Frame::Ping, Frame::Padding(3)],
             true,
             SentContent::default(),
             now,
-        );
-        datagram
+        )
     }
 
     /// Whether any receive window has grown enough to owe the peer a MAX_DATA or
@@ -2457,30 +2501,13 @@ impl Connection {
                 }
                 sp.crypto_pending.push((offset, data.to_vec()));
             } else {
-                let skip = (sp.crypto_recv_off - offset) as usize;
-                if skip < data.len() {
-                    to_feed.extend_from_slice(&data[skip..]);
-                    sp.crypto_recv_off += (data.len() - skip) as u64;
-                }
-                // Drain any buffered fragments that are now contiguous.
-                while let Some(i) = sp.crypto_pending.iter().position(|(o, d)| {
-                    *o <= sp.crypto_recv_off && *o + d.len() as u64 > sp.crypto_recv_off
-                }) {
-                    let (o, d) = sp.crypto_pending.remove(i);
-                    let s = (sp.crypto_recv_off - o) as usize;
-                    to_feed.extend_from_slice(&d[s..]);
-                    sp.crypto_recv_off += (d.len() - s) as u64;
-                }
-                // Evict fragments now fully below the receive offset. The drain
-                // loop above only matches fragments that STRADDLE recv_off; a
-                // fragment that an overlapping in-order fill jumped entirely past
-                // (`o + len <= recv_off`) matches neither it nor any other removal
-                // path, so it would linger forever while still counting toward the
-                // MAX_CRYPTO_REASSEMBLY budget. A peer could exploit that to wedge
-                // the budget and stall the (off-path-injectable, Initial-space)
-                // handshake; drop the already-consumed bytes instead.
-                sp.crypto_pending
-                    .retain(|(o, d)| *o + d.len() as u64 > sp.crypto_recv_off);
+                drain_contiguous(
+                    &mut sp.crypto_pending,
+                    &mut sp.crypto_recv_off,
+                    offset,
+                    data,
+                    &mut to_feed,
+                );
             }
         }
         if !to_feed.is_empty() {
@@ -2555,27 +2582,13 @@ impl Connection {
             }
             return Ok(());
         }
-        let skip = (s.recv_off - offset) as usize;
-        if skip < data.len() {
-            s.recv.extend_from_slice(&data[skip..]);
-            s.recv_off += (data.len() - skip) as u64;
-        }
-        while let Some(i) = s
-            .recv_pending
-            .iter()
-            .position(|(o, d)| *o <= s.recv_off && *o + d.len() as u64 > s.recv_off)
-        {
-            let (o, d) = s.recv_pending.remove(i);
-            let sk = (s.recv_off - o) as usize;
-            s.recv.extend_from_slice(&d[sk..]);
-            s.recv_off += (d.len() - sk) as u64;
-        }
-        // Evict fragments now fully below the receive offset (see recv_crypto):
-        // the drain loop only removes fragments straddling recv_off, so one that an
-        // overlapping in-order fill jumped entirely past would otherwise linger and
-        // permanently consume the MAX_STREAM_REASSEMBLY budget.
-        s.recv_pending
-            .retain(|(o, d)| *o + d.len() as u64 > s.recv_off);
+        drain_contiguous(
+            &mut s.recv_pending,
+            &mut s.recv_off,
+            offset,
+            data,
+            &mut s.recv,
+        );
         Ok(())
     }
 
