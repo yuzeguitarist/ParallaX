@@ -577,6 +577,70 @@ impl Connection {
         Self::new_client_inner(config, server_name, dcid, scid, Some(ticket), now_ms)
     }
 
+    /// Construct a `Connection` with every role-independent field at its initial
+    /// value. The client and server constructors supply only the fields that
+    /// genuinely differ (`side`, the CIDs, the boxed TLS session, and the
+    /// initial stream-id counters), so a newly added field is initialized in one
+    /// place instead of two struct literals that could silently drift apart.
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        side: Side,
+        tls: Box<dyn TlsSession>,
+        initial_dcid: ConnectionId,
+        dcid: ConnectionId,
+        scid: ConnectionId,
+        next_bidi: u64,
+        next_uni: u64,
+    ) -> Self {
+        Self {
+            side,
+            version: QUIC_VERSION_V1,
+            initial_dcid,
+            dcid,
+            scid,
+            peer_cid_adopted: false,
+            tls,
+            spaces: [Space::default(), Space::default(), Space::default()],
+            rtt: RttEstimator::new(),
+            cc: Box::new(Bbr::new()),
+            pacer: Pacer::new(),
+            delivered: 0,
+            pto_count: 0,
+            probe_pending: 0,
+            data_packets_sealed: 0,
+            data_packets_open_failed: 0,
+            handshake_done_pending: false,
+            handshake_confirmed: false,
+            last_send_time: None,
+            keepalive_interval: random_keep_alive_interval(),
+            ping_pending: false,
+            write_level: SPACE_INITIAL,
+            zero_rtt_keys: None,
+            streams: BTreeMap::new(),
+            next_bidi,
+            next_uni,
+            accept_bidi: VecDeque::new(),
+            accept_uni: VecDeque::new(),
+            closed: None,
+            app_close_pending: None,
+            app_close_sent: false,
+            close_time: None,
+            drained: false,
+            last_recv_time: None,
+            send_max_data: 0,
+            send_data_total: 0,
+            recv_max_data: CONN_RECV_WINDOW,
+            recv_max_data_sent: CONN_RECV_WINDOW,
+            recv_data_total: 0,
+            recv_data_consumed: 0,
+            need_max_data: false,
+            peer_flow_applied: false,
+            peer_msd_bidi_local: 0,
+            peer_msd_bidi_remote: 0,
+            peer_msd_uni: 0,
+        }
+    }
+
     fn new_client_inner(
         config: Arc<ClientConfig>,
         server_name: &str,
@@ -605,56 +669,9 @@ impl Connection {
                 dcid.as_slice(),
             )?,
         };
-        let mut spaces = [Space::default(), Space::default(), Space::default()];
-        spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
-        let mut conn = Self {
-            side: Side::Client,
-            version: QUIC_VERSION_V1,
-            initial_dcid: dcid,
-            dcid,
-            scid,
-            peer_cid_adopted: false,
-            tls: Box::new(tls),
-            spaces,
-            rtt: RttEstimator::new(),
-            cc: Box::new(Bbr::new()),
-            pacer: Pacer::new(),
-            delivered: 0,
-            pto_count: 0,
-            probe_pending: 0,
-            data_packets_sealed: 0,
-            data_packets_open_failed: 0,
-            handshake_done_pending: false,
-            handshake_confirmed: false,
-            last_send_time: None,
-            keepalive_interval: random_keep_alive_interval(),
-            ping_pending: false,
-            write_level: SPACE_INITIAL,
-            zero_rtt_keys: None,
-            streams: BTreeMap::new(),
-            // Client-initiated stream ids: bidi 0,4,8,…; uni 2,6,10,… (RFC 9000 §2.1).
-            next_bidi: 0,
-            next_uni: 2,
-            accept_bidi: VecDeque::new(),
-            accept_uni: VecDeque::new(),
-            closed: None,
-            app_close_pending: None,
-            app_close_sent: false,
-            close_time: None,
-            drained: false,
-            last_recv_time: None,
-            send_max_data: 0,
-            send_data_total: 0,
-            recv_max_data: CONN_RECV_WINDOW,
-            recv_max_data_sent: CONN_RECV_WINDOW,
-            recv_data_total: 0,
-            recv_data_consumed: 0,
-            need_max_data: false,
-            peer_flow_applied: false,
-            peer_msd_bidi_local: 0,
-            peer_msd_bidi_remote: 0,
-            peer_msd_uni: 0,
-        };
+        // Client-initiated stream ids: bidi 0,4,8,…; uni 2,6,10,… (RFC 9000 §2.1).
+        let mut conn = Self::new_inner(Side::Client, Box::new(tls), dcid, dcid, scid, 0, 2);
+        conn.spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
         // 0-RTT: seed flow control from the remembered transport parameters so
         // early data can be sent before the server's parameters arrive (RFC 9001
         // §7.4.1). ensure_peer_flow later overwrites with the server's actual TP.
@@ -702,54 +719,17 @@ impl Connection {
             transport_params,
             stek,
         )?;
-        Ok(Self {
-            side: Side::Server,
-            version: QUIC_VERSION_V1,
-            initial_dcid: ConnectionId::new(&[]),
-            dcid: ConnectionId::new(&[]),
+        // Server-initiated stream ids: bidi 1,5,9,…; uni 3,7,11,… (RFC 9000 §2.1).
+        // The initial/dcid CIDs are learned from the first Initial datagram.
+        Ok(Self::new_inner(
+            Side::Server,
+            Box::new(tls),
+            ConnectionId::new(&[]),
+            ConnectionId::new(&[]),
             scid,
-            peer_cid_adopted: false,
-            tls: Box::new(tls),
-            spaces: [Space::default(), Space::default(), Space::default()],
-            rtt: RttEstimator::new(),
-            cc: Box::new(Bbr::new()),
-            pacer: Pacer::new(),
-            delivered: 0,
-            pto_count: 0,
-            probe_pending: 0,
-            data_packets_sealed: 0,
-            data_packets_open_failed: 0,
-            handshake_done_pending: false,
-            handshake_confirmed: false,
-            last_send_time: None,
-            keepalive_interval: random_keep_alive_interval(),
-            ping_pending: false,
-            write_level: SPACE_INITIAL,
-            zero_rtt_keys: None,
-            streams: BTreeMap::new(),
-            // Server-initiated stream ids: bidi 1,5,9,…; uni 3,7,11,… (RFC 9000 §2.1).
-            next_bidi: 1,
-            next_uni: 3,
-            accept_bidi: VecDeque::new(),
-            accept_uni: VecDeque::new(),
-            closed: None,
-            app_close_pending: None,
-            app_close_sent: false,
-            close_time: None,
-            drained: false,
-            last_recv_time: None,
-            send_max_data: 0,
-            send_data_total: 0,
-            recv_max_data: CONN_RECV_WINDOW,
-            recv_max_data_sent: CONN_RECV_WINDOW,
-            recv_data_total: 0,
-            recv_data_consumed: 0,
-            need_max_data: false,
-            peer_flow_applied: false,
-            peer_msd_bidi_local: 0,
-            peer_msd_bidi_remote: 0,
-            peer_msd_uni: 0,
-        })
+            1,
+            3,
+        ))
     }
 
     pub fn is_handshaking(&self) -> bool {
