@@ -7211,4 +7211,322 @@ mod tests {
         let response = data_session.open_server_record(&response_record).unwrap();
         assert_eq!(response, b"pong");
     }
+
+    #[test]
+    fn zero_rtt_replay_cache_path_is_a_sibling_with_0rtt_suffix() {
+        // The 0-RTT cache path must be the auth cache path with ".0rtt" appended to
+        // its file name (same directory). A `-> Default::default()` body replacement
+        // would yield an empty path; pin the exact derivation.
+        let auth = std::path::Path::new("/var/lib/parallax/replay.cache");
+        let zero = zero_rtt_replay_cache_path(auth);
+        assert_eq!(
+            zero,
+            std::path::PathBuf::from("/var/lib/parallax/replay.cache.0rtt")
+        );
+        // Same parent directory, distinct file name.
+        assert_eq!(zero.parent(), auth.parent());
+        assert_ne!(zero, auth.to_path_buf());
+
+        // A path with no file name falls back to the default base name + suffix.
+        let fallback = zero_rtt_replay_cache_path(std::path::Path::new("/"));
+        assert!(fallback
+            .to_string_lossy()
+            .ends_with("parallax-replay.cache.0rtt"));
+    }
+
+    #[test]
+    fn marker_replay_cache_path_is_a_sibling_with_marker_suffix() {
+        // Mirror of the 0-RTT path test for the origin-splice marker cache: the path
+        // must be the auth cache path with ".marker" appended (same directory). Kills
+        // the `-> Default::default()` body replacement.
+        let auth = std::path::Path::new("/var/lib/parallax/replay.cache");
+        let marker = marker_replay_cache_path(auth);
+        assert_eq!(
+            marker,
+            std::path::PathBuf::from("/var/lib/parallax/replay.cache.marker")
+        );
+        assert_eq!(marker.parent(), auth.parent());
+        assert_ne!(marker, auth.to_path_buf());
+
+        let fallback = marker_replay_cache_path(std::path::Path::new("/"));
+        assert!(fallback
+            .to_string_lossy()
+            .ends_with("parallax-replay.cache.marker"));
+    }
+
+    #[test]
+    fn client_hello_fingerprint_is_sha256_of_the_record() {
+        // The fingerprint feeds the replay cache key, so it must be the real SHA-256
+        // of the first record, not a constant. A `-> [0;32]` / `-> [1;32]` body
+        // replacement would collapse every distinct ClientHello to the same key
+        // (breaking replay detection); pin it to the actual digest and require it to
+        // vary across inputs.
+        let record = b"\x16\x03\x01\x00\x05hello";
+        let fp = client_hello_fingerprint(record);
+        assert_eq!(fp, <[u8; 32]>::from(Sha256::digest(record)));
+        assert_ne!(fp, [0_u8; 32]);
+        assert_ne!(fp, [1_u8; 32]);
+        // Distinct records must yield distinct fingerprints.
+        assert_ne!(fp, client_hello_fingerprint(b"a different record"));
+    }
+
+    #[test]
+    fn server_runtime_secrets_getters_return_the_decoded_keys() {
+        // The private/public getters must return the decoded key material, not a
+        // fixed [0;32]/[1;32]. Decode a config built from a known X25519 keypair and
+        // assert the getters match (and that the public key is the X25519 image of
+        // the private key, which is how decode() derives it).
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let fallback_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_dir.path().join("parallax-replay.cache"),
+        );
+
+        let secrets = ServerRuntimeSecrets::decode(&config).unwrap();
+        assert_eq!(secrets.private_key(), &server_keys.private);
+        assert_eq!(secrets.server_public_key(), server_keys.public);
+        // Cross-check the derivation: public == X25519(private).
+        assert_eq!(
+            secrets.server_public_key(),
+            x25519_public_from_private(secrets.private_key())
+        );
+        // Sanity: the real keys are not the mutant's degenerate constants.
+        assert_ne!(secrets.private_key(), &[0_u8; 32]);
+        assert_ne!(secrets.private_key(), &[1_u8; 32]);
+    }
+
+    #[test]
+    fn replay_freshness_window_outlasts_the_prepq_deadline() {
+        // The replay freshness window must be the pre-PQ idle floor PLUS the default
+        // replay window (clock-skew slack), so a slow-but-legitimate client whose
+        // ClientHello timestamp is committed up to the floor later is not rejected as
+        // Stale. A `-> 0` / `-> 1` body replacement would collapse the window and
+        // re-introduce that rejection; pin it to the real sum (which far exceeds 1).
+        let expected = timeout_tuning().fallback_idle_floor.as_secs() + DEFAULT_REPLAY_WINDOW_SECS;
+        assert_eq!(replay_freshness_window_secs(), expected);
+        assert!(
+            replay_freshness_window_secs() >= DEFAULT_REPLAY_WINDOW_SECS,
+            "the window must never be smaller than the skew slack"
+        );
+        assert!(replay_freshness_window_secs() > 1);
+    }
+
+    #[test]
+    fn outbound_egress_filter_denies_every_special_range() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        // SSRF / egress policy: each address below is denied by EXACTLY one rule in
+        // is_denied_outbound_ipv4 / is_denied_outbound_ip, so a mutation that breaks
+        // that rule (|| -> &&, == -> !=, && -> ||) re-opens the corresponding range
+        // and this assertion catches it. Security-critical: a hole here lets an
+        // authenticated client reach loopback/RFC1918/cloud-metadata-adjacent space.
+        let denied_v4: &[(Ipv4Addr, &str)] = &[
+            (Ipv4Addr::new(127, 0, 0, 1), "loopback"),
+            (Ipv4Addr::new(10, 0, 0, 1), "private 10/8"),
+            (Ipv4Addr::new(172, 16, 0, 1), "private 172.16/12"),
+            (Ipv4Addr::new(192, 168, 1, 1), "private 192.168/16"),
+            (
+                Ipv4Addr::new(169, 254, 0, 1),
+                "link-local (incl. cloud metadata)",
+            ),
+            (Ipv4Addr::new(0, 0, 0, 0), "unspecified / octets[0]==0"),
+            (Ipv4Addr::new(0, 1, 2, 3), "octets[0]==0 'this network'"),
+            (Ipv4Addr::new(224, 0, 0, 1), "multicast"),
+            (Ipv4Addr::new(255, 255, 255, 255), "broadcast"),
+            (
+                Ipv4Addr::new(240, 0, 0, 1),
+                "octets[0]>=240 (reserved class E)",
+            ),
+            (Ipv4Addr::new(100, 64, 0, 1), "CGNAT 100.64/10 low"),
+            (Ipv4Addr::new(100, 127, 255, 1), "CGNAT 100.64/10 high"),
+            (
+                Ipv4Addr::new(192, 0, 0, 1),
+                "192.0.0/24 IETF protocol assignments",
+            ),
+            (Ipv4Addr::new(192, 0, 2, 1), "192.0.2/24 TEST-NET-1"),
+            (Ipv4Addr::new(198, 18, 0, 1), "198.18/15 benchmark low"),
+            (Ipv4Addr::new(198, 19, 0, 1), "198.18/15 benchmark high"),
+            (Ipv4Addr::new(198, 51, 100, 1), "198.51.100/24 TEST-NET-2"),
+            (Ipv4Addr::new(203, 0, 113, 1), "203.0.113/24 TEST-NET-3"),
+        ];
+        for (ip, why) in denied_v4 {
+            assert!(is_denied_outbound_ipv4(*ip), "{ip} must be denied ({why})");
+            assert!(
+                is_denied_outbound_ip(IpAddr::V4(*ip)),
+                "{ip} must be denied via is_denied_outbound_ip ({why})"
+            );
+        }
+
+        // Normal, routable public IPv4 must be ALLOWED: this is what proves the
+        // filter is not a blanket deny (a `|| -> &&` somewhere that made the whole
+        // chain collapse to false would be missed without an allow case; conversely
+        // a `&& -> ||` that broadened a special range would wrongly deny these).
+        let allowed_v4 = [
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(93, 184, 216, 34),  // example.com
+            Ipv4Addr::new(100, 63, 255, 255), // just below CGNAT
+            Ipv4Addr::new(100, 128, 0, 1),    // just above CGNAT
+            Ipv4Addr::new(192, 0, 1, 1),      // adjacent to 192.0.0/24 and .2/24
+            Ipv4Addr::new(198, 20, 0, 1),     // just above the benchmark range
+            Ipv4Addr::new(203, 0, 114, 1),    // adjacent to TEST-NET-3
+        ];
+        for ip in allowed_v4 {
+            assert!(
+                !is_denied_outbound_ipv4(ip),
+                "{ip} is a normal public address and must be allowed"
+            );
+            assert!(
+                !is_denied_outbound_ip(IpAddr::V4(ip)),
+                "{ip} must be allowed"
+            );
+        }
+
+        // IPv6 special ranges, each denied by one rule.
+        let denied_v6: &[(Ipv6Addr, &str)] = &[
+            (Ipv6Addr::LOCALHOST, "::1 loopback"),
+            (Ipv6Addr::UNSPECIFIED, ":: unspecified"),
+            (Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), "multicast"),
+            (
+                Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1),
+                "unique local fc00::/7",
+            ),
+            (
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                "link-local fe80::/10",
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                "documentation 2001:db8::/32",
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1),
+                "teredo 2001:0::/32",
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 1),
+                "NAT64 64:ff9b::/96",
+            ),
+            // v4-mapped private address must be screened by the IPv4 policy.
+            (
+                Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001),
+                "::ffff:10.0.0.1 v4-mapped private",
+            ),
+        ];
+        for (ip, why) in denied_v6 {
+            assert!(
+                is_denied_outbound_ip(IpAddr::V6(*ip)),
+                "{ip} must be denied ({why})"
+            );
+        }
+
+        // The targeted IPv6 classifiers, pinned positive/negative so the `&&` and
+        // `==` inside them cannot be flipped without detection.
+        assert!(is_ipv6_documentation(Ipv6Addr::new(
+            0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_ipv6_documentation(Ipv6Addr::new(
+            0x2001, 0x0db9, 0, 0, 0, 0, 0, 1
+        )));
+        assert!(is_ipv6_teredo(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1)));
+        assert!(!is_ipv6_teredo(Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1)));
+        assert!(is_ipv6_nat64(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_ipv6_nat64(Ipv6Addr::new(
+            0x0064, 0xff9c, 0, 0, 0, 0, 0, 1
+        )));
+
+        // A normal public IPv6 must be allowed.
+        assert!(!is_denied_outbound_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111
+        ))));
+    }
+
+    #[test]
+    fn speed_test_dos_ceilings_match_their_documented_values() {
+        // These are SECURITY ceilings that bound an authenticated client's speed-test
+        // request (a malicious client could otherwise request terabytes of generated
+        // download or a never-ending upload to pin bandwidth/CPU/a connection slot).
+        // The wire format allows arbitrary u64/u16 values, so the only thing standing
+        // between the server and that abuse is these constants. Freeze their exact
+        // documented magnitudes so an arithmetic typo (e.g. `1024 * 1024 * 1024`
+        // becoming `1024 + 1024 * 1024`) cannot silently shrink or balloon a ceiling.
+        // Expected values written as plain decimal literals (no `*`) so the check is
+        // independent of the constants' own arithmetic.
+        assert_eq!(
+            MAX_SPEED_TEST_BYTES_PER_PHASE,
+            1_073_741_824, // 1 GiB
+            "per-phase ceiling must be exactly 1 GiB"
+        );
+        assert_eq!(
+            MAX_SPEED_TEST_TOTAL_BYTES,
+            4_294_967_296, // 4 GiB
+            "aggregate ceiling must be exactly 4 GiB"
+        );
+        assert_eq!(
+            MAX_SPEED_TEST_SAMPLES, 32,
+            "sample-count ceiling must be 32"
+        );
+        assert_eq!(
+            MUX_OPEN_BATCH_BYTES,
+            1_048_576, // 1 MiB
+            "mux open batch must be exactly 1 MiB"
+        );
+    }
+
+    #[test]
+    fn cap_shed_fallback_admission_enforces_budget_and_releases_on_drop() {
+        // RAII admission control for cap-shed fallback relays. This is the ONLY unit
+        // test that touches the process-global ACTIVE_CAP_SHED_FALLBACKS counter, so
+        // there is no intra-binary race; we still measure relative to the baseline
+        // and restore it. Pins three things:
+        //   - a slot is granted while under budget (kills `-> None` and `>=` -> `<`),
+        //   - the counter rises by exactly one per granted slot,
+        //   - Drop releases the slot (kills the no-op Drop replacement).
+        let baseline = ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire);
+        assert_eq!(baseline, 0, "test fixture expects a quiescent counter");
+
+        // Under budget: the first entry must succeed and bump the counter to 1.
+        let slot = try_enter_cap_shed_fallback().expect("under budget -> Some");
+        assert_eq!(ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire), 1);
+
+        // Dropping the slot must release the budget back to the baseline. A no-op
+        // Drop would leave the counter at 1.
+        drop(slot);
+        assert_eq!(
+            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            baseline,
+            "dropping a slot must release the budget"
+        );
+
+        // Saturate the budget: MAX_CONCURRENT_CAP_SHED_FALLBACKS slots are grantable,
+        // the next is refused (None), and the counter never exceeds the cap.
+        let mut slots = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CAP_SHED_FALLBACKS {
+            slots.push(try_enter_cap_shed_fallback().expect("within budget -> Some"));
+        }
+        assert_eq!(
+            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            MAX_CONCURRENT_CAP_SHED_FALLBACKS
+        );
+        assert!(
+            try_enter_cap_shed_fallback().is_none(),
+            "at the cap a further entry must be refused"
+        );
+        // The refused attempt must not have leaked budget (its fetch_add was undone).
+        assert_eq!(
+            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            MAX_CONCURRENT_CAP_SHED_FALLBACKS
+        );
+
+        // Release everything; the counter returns to baseline.
+        drop(slots);
+        assert_eq!(ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire), baseline);
+    }
 }

@@ -1024,6 +1024,153 @@ mod tests {
     }
 
     #[test]
+    fn max_payload_chunk_len_matches_the_seal_codec_budget() {
+        // The accessor must report the seal codec's real max_plaintext_len (used to
+        // size shaped chunks), not a constant. `> 0` alone cannot catch a `-> 1`
+        // body replacement (1 > 0), so pin it to the codec's actual budget, which is
+        // far larger than 1.
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let expected = data_codecs(&keys, traffic).unwrap().0.max_plaintext_len();
+        assert_eq!(session.max_payload_chunk_len(), expected);
+        assert!(
+            expected > 1,
+            "fixture sanity: the budget is much larger than 1"
+        );
+    }
+
+    #[test]
+    fn epoch_reports_the_session_epoch() {
+        // epoch() must reflect keys.epoch, not a constant. Use a distinctive epoch
+        // (7) so a `-> 1` (or `-> 0`) body replacement is caught.
+        let mut keys = test_session_keys();
+        keys.epoch = 7;
+        let traffic = TrafficConfig::default();
+        let session = ClientDataSession::new(keys, traffic).unwrap();
+        assert_eq!(session.epoch(), 7);
+    }
+
+    #[test]
+    fn pq_identity_binding_is_err_before_rekey() {
+        // A fresh session has no PQ identity binding (set only by the rekey), so the
+        // accessor must surface MissingPqIdentityBinding. The `-> Ok([0;32])` /
+        // `-> Ok([1;32])` body replacements would falsely report a binding; assert
+        // the error to kill them.
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let session = ClientDataSession::new(keys, traffic).unwrap();
+        assert!(matches!(
+            session.pq_identity_binding(),
+            Err(ClientHandshakeError::MissingPqIdentityBinding)
+        ));
+    }
+
+    #[test]
+    fn pq_identity_binding_returns_the_bound_value_after_rekey() {
+        // After a rekey the accessor must return the stored binding bytes, not a
+        // fixed [0;32]/[1;32]. apply_test_pq_rekey returns the binding it installed.
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let mut rng = StdRng::seed_from_u64(91);
+        let (session, binding) = apply_test_pq_rekey(keys, traffic, &mut rng);
+        assert_eq!(session.pq_identity_binding().unwrap(), binding);
+    }
+
+    #[test]
+    fn seal_payload_chunks_into_reusing_actually_seals() {
+        // The `_reusing` body must seal into `out` and append SealedRecord spans; a
+        // `-> Ok(())` replacement would leave both untouched. Assert records were
+        // produced and the sealed bytes round-trip through the paired server codec.
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let mut client = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(101);
+
+        let mut out = Vec::new();
+        let mut records = Vec::new();
+        client
+            .seal_payload_chunks_into_reusing(b"reusing-payload", &mut rng, &mut out, &mut records)
+            .unwrap();
+        assert!(!records.is_empty(), "at least one sealed record expected");
+        assert!(!out.is_empty(), "sealed bytes must be written to out");
+
+        // The first sealed record's byte span must open to a non-empty plaintext
+        // chunk, proving real records (not a no-op) were written into `out`.
+        let first = &out[records[0].range.clone()];
+        let opened = server_open.open(first).unwrap();
+        assert!(
+            !opened.is_empty(),
+            "a sealed record must carry real plaintext"
+        );
+        assert!(
+            b"reusing-payload"
+                .windows(opened.len())
+                .any(|w| w == opened.as_slice()),
+            "the opened chunk must be a slice of the original payload"
+        );
+    }
+
+    #[test]
+    fn seal_payload_chunks_into_untracked_actually_seals() {
+        // The `_untracked` body must seal into `out`; a `-> Ok(())` replacement would
+        // leave it empty. Assert bytes were written and open back to the payload.
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let mut client = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(102);
+
+        let mut out = Vec::new();
+        client
+            .seal_payload_chunks_into_untracked(b"untracked", &mut rng, &mut out)
+            .unwrap();
+        assert!(!out.is_empty(), "sealed bytes must be written to out");
+        // A single small payload seals to one record; it must open to the payload.
+        let opened = server_open.open(&out).unwrap();
+        assert_eq!(opened, b"untracked");
+    }
+
+    #[test]
+    fn verify_server_identity_record_does_not_blindly_accept() {
+        // verify_server_identity_record opens the record then verifies; with no PQ
+        // identity binding installed it MUST fail (MissingPqIdentityBinding), proving
+        // it really runs the verification rather than returning Ok unconditionally
+        // (the `-> Ok(())` body replacement).
+        let keys = test_session_keys();
+        let traffic = TrafficConfig::default();
+        let mut client = ClientDataSession::new(keys.clone(), traffic).unwrap();
+        let (_server_open, mut server_seal) = data_codecs(&keys, traffic).unwrap();
+        let mut rng = StdRng::seed_from_u64(103);
+
+        // Seal a SYNTACTICALLY VALID ServerIdentityProof so open() and the proof
+        // decode (ServerIdentityProof::signature) both succeed, and the failure comes
+        // from the verification step proper -- specifically the missing PQ identity
+        // binding (a fresh session has none). This pins the real branch: the
+        // `-> Ok(())` body replacement would skip it and falsely accept.
+        let proof_payload = ServerIdentityProof {
+            signature: vec![0xAB; 64],
+        }
+        .encode()
+        .unwrap();
+        let record = server_seal.seal(&proof_payload, &mut rng).unwrap();
+        let server_identity_public_key = [0_u8; 32];
+        let server_x25519_public_key = [0_u8; 32];
+        assert!(
+            matches!(
+                client.verify_server_identity_record(
+                    &record,
+                    &server_identity_public_key,
+                    &server_x25519_public_key,
+                ),
+                Err(ClientHandshakeError::MissingPqIdentityBinding)
+            ),
+            "verification must reach the missing-binding check, not accept unconditionally"
+        );
+    }
+
+    #[test]
     fn into_data_codecs_exposes_underlying_codecs() {
         let keys = test_session_keys();
         let traffic = TrafficConfig::default();

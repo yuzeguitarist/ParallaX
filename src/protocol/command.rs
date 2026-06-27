@@ -2224,6 +2224,267 @@ mod tests {
     }
 
     #[test]
+    fn encoded_len_matches_the_actual_encoded_byte_count() {
+        // encoded_len() is computed from CONNECT_FIXED_LEN (4 magic + 2 host-len +
+        // 2 port + 4 payload-len = 12) + host + payload, and encode() writes exactly
+        // those literal bytes. They MUST agree, or encode()'s Vec::with_capacity is
+        // wrong and max_initial_payload_len mis-budgets. Pins CONNECT_FIXED_LEN: any
+        // arithmetic mutation of its `4 + 2 + 2 + 4` sum makes encoded_len() diverge
+        // from the real encoded length.
+        for (host, payload_len) in [
+            ("a.io", 0usize),
+            ("example.com", 17),
+            (&"h".repeat(120), 300),
+        ] {
+            let request = ConnectRequest {
+                host: host.to_owned(),
+                port: 443,
+                initial_payload: vec![0x41; payload_len],
+            };
+            let encoded = request.encode().unwrap();
+            assert_eq!(
+                encoded.len(),
+                request.encoded_len(),
+                "encoded_len() must equal the real encoded byte count (host={host:?})"
+            );
+            // And the fixed framing really is 12 bytes beyond host+payload.
+            assert_eq!(encoded.len(), 12 + host.len() + payload_len);
+        }
+    }
+
+    #[test]
+    fn pq_flight_max_chunk_size_reserves_header_plus_aggregate_pad() {
+        // The cap subtracts (PQ_CHUNK_FRAME_HEADER_LEN + PQ_FLIGHT_AGGREGATE_PAD_MAX)
+        // = 16 + 512 = 528 from the sealed-plaintext budget so every shaped record
+        // (any of which may be the last, carrying the aggregate pad) stays within the
+        // record limit. Assert the exact value: a `+` -> `*` on the reservation would
+        // subtract 16*512 = 8192 instead, badly under-sizing the chunk.
+        let budget = 10_000usize;
+        assert_eq!(
+            pq_flight_max_chunk_size(budget),
+            budget - (PQ_CHUNK_FRAME_HEADER_LEN + PQ_FLIGHT_AGGREGATE_PAD_MAX)
+        );
+        assert_eq!(pq_flight_max_chunk_size(10_000), 10_000 - 528);
+        // Below the reservation the saturating_sub floors to PQ_FLIGHT_RECORD_MIN.
+        assert_eq!(pq_flight_max_chunk_size(100), PQ_FLIGHT_RECORD_MIN);
+    }
+
+    #[test]
+    fn shaping_extra_pad_respects_a_tight_max_extra_pad() {
+        // The fitting filter requires `band - raw_wire <= max_extra_pad`. With a
+        // small request and a TIGHT cap, only the bands within reach of that cap may
+        // be chosen, and the returned pad must never exceed it. This pins the
+        // subtraction: `-` -> `+` shrinks the reachable set to just the smallest
+        // band, and `-` -> `/` makes (almost) every band "fit" — both change the
+        // reachable band set away from the exact expected pair below.
+        use rand::{rngs::StdRng, SeedableRng};
+        use std::collections::BTreeSet;
+
+        let request = ConnectRequest {
+            host: "example.com".to_owned(), // encoded_len 23 -> raw_wire 41
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        let raw_wire = request.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
+        let max_extra_pad = 500usize;
+
+        // Correct fitting set: bands with band >= raw_wire and band - raw_wire <= 500.
+        // raw_wire = 41 -> {286, 469} (569-41=528 > 500 is excluded).
+        let expected: BTreeSet<usize> = CONNECT_RECORD_SIZE_BANDS
+            .iter()
+            .copied()
+            .filter(|&b| b >= raw_wire && b - raw_wire <= max_extra_pad)
+            .collect();
+        assert_eq!(
+            expected,
+            BTreeSet::from([286usize, 469usize]),
+            "fixture sanity: tight cap should admit exactly these two bands"
+        );
+
+        let mut reached = BTreeSet::new();
+        for seed in 0..512u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let pad = request.shaping_extra_pad(max_extra_pad, &mut rng);
+            assert!(
+                pad <= max_extra_pad,
+                "pad {pad} must not exceed the cap {max_extra_pad}"
+            );
+            let wire = raw_wire + pad;
+            assert!(
+                CONNECT_RECORD_SIZE_BANDS.contains(&wire),
+                "padded wire {wire} must still land on a band"
+            );
+            reached.insert(wire);
+        }
+        assert_eq!(
+            reached, expected,
+            "with a tight cap the reachable band set must be exactly the fitting bands"
+        );
+    }
+
+    #[test]
+    fn decode_ref_accepts_host_of_exactly_max_len_and_rejects_one_over() {
+        // decode_ref's host bound is `host_len > MAX_HOST_LEN`: a 255-byte host is
+        // valid and must decode; 256 must be HostTooLong. Pins the `>` boundary on
+        // the DECODE path (a `> -> >=` would reject the legal 255-byte host).
+        let at_limit = ConnectRequest {
+            host: "a".repeat(MAX_HOST_LEN),
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        let encoded = at_limit.encode().unwrap();
+        assert_eq!(
+            ConnectRequest::decode(&encoded).unwrap().host.len(),
+            MAX_HOST_LEN
+        );
+
+        // Hand-craft a record claiming a 256-byte host (one over the limit): magic +
+        // host_len=256 + 256 host bytes + port + payload_len=0. decode_ref must reject
+        // it as HostTooLong before reading the host.
+        let mut over = Vec::new();
+        over.extend_from_slice(CONNECT_MAGIC);
+        over.extend_from_slice(&((MAX_HOST_LEN as u16) + 1).to_be_bytes());
+        over.extend_from_slice(&vec![b'a'; MAX_HOST_LEN + 1]);
+        over.extend_from_slice(&443u16.to_be_bytes());
+        over.extend_from_slice(&0u32.to_be_bytes());
+        assert!(matches!(
+            ConnectRequest::decode(&over),
+            Err(ConnectRequestError::HostTooLong)
+        ));
+    }
+
+    #[test]
+    fn connect_record_size_is_shaped_rejects_non_band_sizes() {
+        // The helper must answer truthfully per band membership, not constant-true.
+        // Pin a clearly off-band size to false (kills `-> true`) and a real band to
+        // true.
+        assert!(!connect_record_size_is_shaped(0));
+        assert!(!connect_record_size_is_shaped(1));
+        assert!(!connect_record_size_is_shaped(
+            CONNECT_RECORD_SIZE_BANDS[0] - 1
+        ));
+        assert!(connect_record_size_is_shaped(CONNECT_RECORD_SIZE_BANDS[0]));
+        assert!(connect_record_size_is_shaped(
+            CONNECT_RECORD_SIZE_BANDS[CONNECT_RECORD_SIZE_BANDS.len() - 1]
+        ));
+    }
+
+    #[test]
+    fn pq_rekey_request_decode_length_boundary() {
+        // decode_ref has a `input.len() < 40` truncation guard before parsing the
+        // fixed header. An input of EXACTLY 40 bytes (valid magic) must pass that
+        // guard and fail LATER (not as a length-40 Truncated), while 39 bytes must be
+        // Truncated. This distinguishes `< 40` from `<= 40` / `== 40`.
+        let mut at = Vec::new();
+        at.extend_from_slice(PQ_REKEY_MAGIC);
+        at.resize(40, 0); // 40 bytes: passes `< 40`, then len==0 -> EmptyPublicKey
+        assert!(matches!(
+            PqRekeyRequest::decode_ref(&at),
+            Err(PqRekeyError::EmptyPublicKey)
+        ));
+        let mut short = Vec::new();
+        short.extend_from_slice(PQ_REKEY_MAGIC);
+        short.resize(39, 0);
+        assert!(matches!(
+            PqRekeyRequest::decode_ref(&short),
+            Err(PqRekeyError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn server_key_exchange_decode_length_boundary() {
+        // `input.len() < 40` guard: a 40-byte input must pass it (and fail later as a
+        // length error, not Truncated), 39 must be Truncated.
+        let mut at = Vec::new();
+        at.extend_from_slice(SERVER_KEY_EXCHANGE_MAGIC);
+        at.resize(40, 0); // len field == 0 -> EmptyCiphertext, NOT Truncated
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&at),
+            Err(ServerKeyExchangeError::EmptyCiphertext)
+        ));
+        let mut short = Vec::new();
+        short.extend_from_slice(SERVER_KEY_EXCHANGE_MAGIC);
+        short.resize(39, 0);
+        assert!(matches!(
+            ServerKeyExchange::decode_ref_with_suite(&short),
+            Err(ServerKeyExchangeError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn server_identity_proof_signature_length_boundary() {
+        // `input.len() < 8` guard: 8 bytes passes it (len==0 -> EmptySignature), 7 is
+        // Truncated.
+        let mut at = Vec::new();
+        at.extend_from_slice(SERVER_IDENTITY_MAGIC);
+        at.resize(8, 0);
+        assert!(matches!(
+            ServerIdentityProof::signature(&at),
+            Err(ServerIdentityProofError::EmptySignature)
+        ));
+        let mut short = Vec::new();
+        short.extend_from_slice(SERVER_IDENTITY_MAGIC);
+        short.resize(7, 0);
+        assert!(matches!(
+            ServerIdentityProof::signature(&short),
+            Err(ServerIdentityProofError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn server_identity_chunk_decode_length_boundary() {
+        // `input.len() < 16` guard: a 16-byte input (valid magic, all-zero body)
+        // passes that guard and reaches the body-length checks, where the parsed
+        // len == 0 yields EmptyChunk -- NOT Truncated. Asserting the exact later
+        // error pins the "passes the guard, fails on the body" contract (a `< 16`
+        // turned into `<= 16` / `== 16` would return Truncated instead). 15 bytes is
+        // Truncated.
+        let mut at = Vec::new();
+        at.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
+        at.resize(16, 0);
+        assert!(matches!(
+            ServerIdentityChunk::decode_ref(&at),
+            Err(ServerIdentityChunkError::EmptyChunk)
+        ));
+        let mut short = Vec::new();
+        short.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
+        short.resize(15, 0);
+        assert!(matches!(
+            ServerIdentityChunk::decode_ref(&short),
+            Err(ServerIdentityChunkError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn encode_accepts_host_of_exactly_max_len_and_rejects_one_over() {
+        // The length guard is `host.len() > MAX_HOST_LEN` (255): a host of EXACTLY
+        // 255 bytes is valid and must encode; 256 must be rejected. Pins the `>`
+        // boundary so a `>` -> `>=` mutation (which would reject the legal 255-byte
+        // host) is caught.
+        let at_limit = "a".repeat(MAX_HOST_LEN);
+        let req = ConnectRequest {
+            host: at_limit,
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        assert!(
+            req.encode().is_ok(),
+            "a host of exactly MAX_HOST_LEN must encode"
+        );
+
+        let over = "a".repeat(MAX_HOST_LEN + 1);
+        let req_over = ConnectRequest {
+            host: over,
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        assert!(matches!(
+            req_over.encode(),
+            Err(ConnectRequestError::HostTooLong)
+        ));
+    }
+
+    #[test]
     fn shaping_extra_pad_lands_on_a_band() {
         // The padded wire size (raw plaintext + overhead + extra_pad) must equal
         // one of the configured bands, for many seeds and several request sizes.
@@ -2560,6 +2821,186 @@ mod tests {
 
         let encoded = request.encode().unwrap();
         assert_eq!(SpeedTestRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn speed_test_request_has_magic_is_exact() {
+        // has_magic = len >= 4 && [..4] == MAGIC. Pin all three terms: a valid
+        // prefix is true; too-short is false; a 4-byte wrong magic is false. Kills
+        // `-> true`/`-> false`, `>= -> <`, `&& -> ||`, `== -> !=`.
+        let mut good = SPEED_TEST_MAGIC.to_vec();
+        good.extend_from_slice(&[0_u8; 26]);
+        assert!(SpeedTestRequest::has_magic(&good));
+        assert!(!SpeedTestRequest::has_magic(&SPEED_TEST_MAGIC[..3]));
+        assert!(!SpeedTestRequest::has_magic(b"ZZZZ"));
+        assert!(!SpeedTestRequest::has_magic(b""));
+    }
+
+    #[test]
+    fn speed_test_request_decode_length_boundary() {
+        // decode guards: `< 4` then `< 30` then `!= 30`. A valid 30-byte request
+        // decodes; 29 bytes (valid magic) is Truncated; a 31-byte input is
+        // InvalidLength. Pins `< 30` vs `<= 30`/`== 30` and the `!= 30` exact check.
+        let valid = SpeedTestRequest {
+            warmup_bytes: 1,
+            download_bytes: 1,
+            upload_bytes: 1,
+            sample_count: 1,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(valid.len(), 30);
+        assert!(SpeedTestRequest::decode(&valid).is_ok());
+
+        let mut short = SPEED_TEST_MAGIC.to_vec();
+        short.resize(29, 0);
+        assert!(matches!(
+            SpeedTestRequest::decode(&short),
+            Err(SpeedTestRequestError::Truncated)
+        ));
+
+        let mut long = valid.clone();
+        long.push(0);
+        assert!(matches!(
+            SpeedTestRequest::decode(&long),
+            Err(SpeedTestRequestError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn speed_test_ack_decode_length_boundary_and_every_magic() {
+        // Each ack kind's magic must be recognized (pins the per-magic match guards,
+        // e.g. SPEED_UPLOAD_DONE_MAGIC), and the `< 12` length guard: a 12-byte ack
+        // decodes, 11 (valid magic) is Truncated.
+        for ack in [
+            SpeedTestAck::warmup_download_done(1),
+            SpeedTestAck::warmup_upload_done(2),
+            SpeedTestAck::download_done(3),
+            SpeedTestAck::upload_done(4),
+        ] {
+            let encoded = ack.encode();
+            assert_eq!(encoded.len(), 12);
+            assert_eq!(SpeedTestAck::decode(&encoded).unwrap(), ack);
+            assert!(matches!(
+                SpeedTestAck::decode(&encoded[..11]),
+                Err(SpeedTestAckError::Truncated)
+            ));
+        }
+    }
+
+    #[test]
+    fn mux_frame_kind_from_wire_round_trips_every_variant() {
+        // from_wire must map each wire byte back to its kind; deleting an arm (e.g.
+        // Reset=4 or Cover=5) would turn that byte into InvalidKind. Round-trip every
+        // variant through to_wire/from_wire and confirm an unknown byte is rejected.
+        for kind in [
+            MuxFrameKind::Open,
+            MuxFrameKind::Data,
+            MuxFrameKind::Fin,
+            MuxFrameKind::Reset,
+            MuxFrameKind::Cover,
+        ] {
+            assert_eq!(MuxFrameKind::from_wire(kind.to_wire()).unwrap(), kind);
+        }
+        assert!(matches!(
+            MuxFrameKind::from_wire(0),
+            Err(MuxFrameError::InvalidKind)
+        ));
+        assert!(matches!(
+            MuxFrameKind::from_wire(6),
+            Err(MuxFrameError::InvalidKind)
+        ));
+    }
+
+    #[test]
+    fn mux_frame_has_magic_and_payload_sizing_are_exact() {
+        // has_magic: valid prefix true, short/wrong false (kills the same family as
+        // SpeedTestRequest::has_magic).
+        let mut good = MUX_FRAME_MAGIC.to_vec();
+        good.extend_from_slice(&[0_u8; 9]);
+        assert!(MuxFrame::has_magic(&good));
+        assert!(!MuxFrame::has_magic(&MUX_FRAME_MAGIC[..3]));
+        assert!(!MuxFrame::has_magic(b"ZZZZ"));
+
+        // max_payload_len = max_encoded_len - MUX_FRAME_FIXED_LEN (13). Pin the exact
+        // subtraction (kills `-> 0` / `-> 1`).
+        assert_eq!(MuxFrame::max_payload_len(1000), 1000 - 13);
+        assert_eq!(MuxFrame::max_payload_len(13), 0);
+        assert_eq!(
+            MuxFrame::max_payload_len(0),
+            0,
+            "saturating, never underflows"
+        );
+
+        // max_open_initial_payload_len subtracts the CONNECT fixed framing + host on
+        // top of the mux payload budget; pin it against the explicit composition.
+        let host = "example.com";
+        let expected = ConnectRequest::max_initial_payload_len(host, 1000 - 13);
+        assert_eq!(MuxFrame::max_open_initial_payload_len(host, 1000), expected);
+        assert!(expected > 1, "fixture sanity: budget far exceeds 1");
+    }
+
+    #[test]
+    fn validate_mux_stream_enforces_cover_zero_and_others_nonzero() {
+        // Control-plane invariant: a Cover frame MUST carry stream_id 0, every other
+        // kind MUST carry a non-zero stream_id. Pins the `stream_id == 0` guard (kills
+        // `== 0 with false`, which would make Cover always invalid) and the `!= 0`
+        // guard for the data-bearing kinds.
+        assert!(MuxFrame::encode_borrowed(0, MuxFrameKind::Cover, &[]).is_ok());
+        assert!(matches!(
+            MuxFrame::encode_borrowed(1, MuxFrameKind::Cover, &[]),
+            Err(MuxFrameError::InvalidStreamId)
+        ));
+        for kind in [
+            MuxFrameKind::Open,
+            MuxFrameKind::Data,
+            MuxFrameKind::Fin,
+            MuxFrameKind::Reset,
+        ] {
+            assert!(
+                MuxFrame::encode_borrowed(7, kind, &[]).is_ok(),
+                "{kind:?} with a non-zero stream id must be valid"
+            );
+            assert!(
+                matches!(
+                    MuxFrame::encode_borrowed(0, kind, &[]),
+                    Err(MuxFrameError::InvalidStreamId)
+                ),
+                "{kind:?} with stream id 0 must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_offer_and_decline_has_magic_are_exact() {
+        // Same has_magic shape as SpeedTestRequest/MuxFrame: len >= 4 && prefix ==
+        // MAGIC. Pin each so `-> true`/`-> false`, `>= -> <`, `&& -> ||`, `== -> !=`
+        // are caught for both UdpOffer and UdpDecline.
+        let mut offer = UDP_OFFER_MAGIC.to_vec();
+        offer.extend_from_slice(&[0_u8; 8]);
+        assert!(UdpOffer::has_magic(&offer));
+        assert!(!UdpOffer::has_magic(&UDP_OFFER_MAGIC[..3]));
+        assert!(!UdpOffer::has_magic(UDP_DECLINE_MAGIC)); // wrong 4-byte magic
+
+        let mut decline = UDP_DECLINE_MAGIC.to_vec();
+        decline.push(0);
+        assert!(UdpDecline::has_magic(&decline));
+        assert!(!UdpDecline::has_magic(&UDP_DECLINE_MAGIC[..3]));
+        assert!(!UdpDecline::has_magic(UDP_OFFER_MAGIC));
+    }
+
+    #[test]
+    fn mux_frame_decode_ref_prefix_length_boundary() {
+        // decode_ref_prefix's `< 4` and `< MUX_FRAME_FIXED_LEN (13)` guards: a full
+        // header (13 bytes, zero payload) decodes; 12 bytes (valid magic) is
+        // Truncated. Pins the `< 13` guard vs `== 13`.
+        let header = MuxFrame::encode_borrowed(0, MuxFrameKind::Cover, &[]).unwrap();
+        assert_eq!(header.len(), 13);
+        assert!(MuxFrame::decode_ref_prefix(&header).is_ok());
+        assert!(matches!(
+            MuxFrame::decode_ref_prefix(&header[..12]),
+            Err(MuxFrameError::Truncated)
+        ));
     }
 
     #[test]

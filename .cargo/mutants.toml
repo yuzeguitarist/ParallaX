@@ -30,9 +30,17 @@ examine_globs = [
 ]
 
 # Never mutate test or fuzz harness code — those are the oracles, not the target.
+# Also exclude the ML-DSA polynomial math (src/crypto/mldsa/**): it is verified by
+# the dedicated differential + ACVP oracles (tests/mldsa_differential.rs,
+# tests/mldsa_acvp.rs against the pqcrypto reference), NOT by the `--lib`-only test
+# scope used here, so its mutants would surface as false MISSED signal under a
+# crypto-module sweep. This exclude is inert for the nightly run (which only
+# examines safari26.rs + auth.rs) and only matters for a manual `module=crypto`
+# dispatch of nightly-mutants.yml.
 exclude_globs = [
     "tests/**",
     "fuzz/**",
+    "src/crypto/mldsa/**",
 ]
 
 # Match the repo-wide `--locked` convention (CI always builds/tests `--locked`):

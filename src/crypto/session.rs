@@ -1070,6 +1070,38 @@ mod tests {
     }
 
     #[test]
+    fn aead_open_accepts_exactly_tag_len_and_rejects_shorter() {
+        // open()'s length guard is `ciphertext.len() < AEAD_TAG_LEN`. A record of an
+        // EMPTY payload seals to exactly AEAD_TAG_LEN (16) bytes — the lone tag — and
+        // MUST open back to empty. Pins the `<` boundary: a `< -> ==` or `< -> <=`
+        // mutation would reject the valid 16-byte empty-payload record.
+        let key = [7_u8; KEY_LEN];
+        let nonce = [9_u8; NONCE_LEN];
+        let mut enc = AeadCodec::new(key, nonce);
+        let mut dec = AeadCodec::new(key, nonce);
+
+        let empty = enc.seal(b"", b"tls-appdata").unwrap();
+        assert_eq!(
+            empty.len(),
+            AEAD_TAG_LEN,
+            "empty payload seals to just the tag"
+        );
+        assert_eq!(
+            dec.open(&empty, b"tls-appdata").unwrap(),
+            b"",
+            "a record of exactly AEAD_TAG_LEN bytes must open to an empty payload"
+        );
+
+        // Anything shorter than the tag is structurally impossible and must be
+        // rejected (the lower side of the `<` guard).
+        let mut dec2 = AeadCodec::new(key, nonce);
+        assert!(matches!(
+            dec2.open(&[0_u8; AEAD_TAG_LEN - 1], b"tls-appdata"),
+            Err(SessionError::Aead)
+        ));
+    }
+
+    #[test]
     fn aead_opens_in_place() {
         let key = [7_u8; KEY_LEN];
         let nonce = [9_u8; NONCE_LEN];
