@@ -204,6 +204,100 @@ pub struct ServerIdentityProof {
     pub signature: Vec<u8>,
 }
 
+/// Header length of an offset-addressed chunk record:
+/// `magic(4) | total_len(4) | offset(4) | len(4)`.
+const OFFSET_CHUNK_HEADER_LEN: usize = 16;
+
+/// Failure modes of the shared offset-chunk codec. Each chunk type maps these
+/// onto its own public error enum so the observable error surface is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetChunkError {
+    Truncated,
+    BadMagic,
+    EmptyChunk,
+    InvalidChunkLength,
+    InvalidOffset,
+}
+
+/// Borrowed view over a decoded offset-chunk: the parsed header fields plus the
+/// payload slice. Shared by every `magic | total_len | offset | len | bytes`
+/// record type ([`ServerIdentityChunk`], [`FramedChunk`]).
+#[derive(Debug, Clone, Copy)]
+struct OffsetChunkRef<'a> {
+    total_len: u32,
+    offset: u32,
+    bytes: &'a [u8],
+}
+
+/// Encode one offset-addressed chunk record. The byte layout is identical for
+/// every chunk type; only `magic` differs. Validates that `bytes` is non-empty
+/// and that `[offset, offset+len)` fits within `total_len`.
+fn encode_offset_chunk(
+    magic: &[u8; 4],
+    total_len: u32,
+    offset: u32,
+    bytes: &[u8],
+) -> Result<Vec<u8>, OffsetChunkError> {
+    if bytes.is_empty() {
+        return Err(OffsetChunkError::EmptyChunk);
+    }
+    let end = offset
+        .checked_add(bytes.len() as u32)
+        .ok_or(OffsetChunkError::InvalidOffset)?;
+    if total_len == 0 || end > total_len {
+        return Err(OffsetChunkError::InvalidOffset);
+    }
+    let mut out = Vec::with_capacity(OFFSET_CHUNK_HEADER_LEN + bytes.len());
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&total_len.to_be_bytes());
+    out.extend_from_slice(&offset.to_be_bytes());
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+/// Decode one offset-addressed chunk record, validating the magic, the exact
+/// total length, and the `[offset, offset+len)` bound against `total_len`.
+fn decode_offset_chunk<'a>(
+    magic: &[u8; 4],
+    input: &'a [u8],
+) -> Result<OffsetChunkRef<'a>, OffsetChunkError> {
+    if input.len() < 4 {
+        return Err(OffsetChunkError::Truncated);
+    }
+    if &input[..4] != magic {
+        return Err(OffsetChunkError::BadMagic);
+    }
+    if input.len() < OFFSET_CHUNK_HEADER_LEN {
+        return Err(OffsetChunkError::Truncated);
+    }
+    let total_len = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
+    let offset = u32::from_be_bytes([input[8], input[9], input[10], input[11]]);
+    let len = u32::from_be_bytes([input[12], input[13], input[14], input[15]]) as usize;
+    if len == 0 {
+        return Err(OffsetChunkError::EmptyChunk);
+    }
+    // checked_add so a crafted `len` near u32::MAX cannot overflow the header+len
+    // sum on 32-bit targets.
+    let expected = OFFSET_CHUNK_HEADER_LEN
+        .checked_add(len)
+        .ok_or(OffsetChunkError::InvalidChunkLength)?;
+    if input.len() != expected {
+        return Err(OffsetChunkError::InvalidChunkLength);
+    }
+    let end = offset
+        .checked_add(len as u32)
+        .ok_or(OffsetChunkError::InvalidOffset)?;
+    if total_len == 0 || end > total_len {
+        return Err(OffsetChunkError::InvalidOffset);
+    }
+    Ok(OffsetChunkRef {
+        total_len,
+        offset,
+        bytes: &input[OFFSET_CHUNK_HEADER_LEN..],
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerIdentityChunk {
     pub total_len: u32,
@@ -313,6 +407,18 @@ pub enum ServerIdentityChunkError {
     InvalidChunkLength,
     #[error("server identity chunk offset is invalid")]
     InvalidOffset,
+}
+
+impl From<OffsetChunkError> for ServerIdentityChunkError {
+    fn from(err: OffsetChunkError) -> Self {
+        match err {
+            OffsetChunkError::Truncated => Self::Truncated,
+            OffsetChunkError::BadMagic => Self::BadMagic,
+            OffsetChunkError::EmptyChunk => Self::EmptyChunk,
+            OffsetChunkError::InvalidChunkLength => Self::InvalidChunkLength,
+            OffsetChunkError::InvalidOffset => Self::InvalidOffset,
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -738,23 +844,12 @@ impl ServerIdentityChunk {
         offset: u32,
         bytes: &[u8],
     ) -> Result<Vec<u8>, ServerIdentityChunkError> {
-        if bytes.is_empty() {
-            return Err(ServerIdentityChunkError::EmptyChunk);
-        }
-        let end = offset
-            .checked_add(bytes.len() as u32)
-            .ok_or(ServerIdentityChunkError::InvalidOffset)?;
-        if total_len == 0 || end > total_len {
-            return Err(ServerIdentityChunkError::InvalidOffset);
-        }
-
-        let mut out = Vec::with_capacity(16 + bytes.len());
-        out.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
-        out.extend_from_slice(&total_len.to_be_bytes());
-        out.extend_from_slice(&offset.to_be_bytes());
-        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        out.extend_from_slice(bytes);
-        Ok(out)
+        Ok(encode_offset_chunk(
+            SERVER_IDENTITY_CHUNK_MAGIC,
+            total_len,
+            offset,
+            bytes,
+        )?)
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, ServerIdentityChunkError> {
@@ -769,34 +864,11 @@ impl ServerIdentityChunk {
     pub fn decode_ref(
         input: &[u8],
     ) -> Result<ServerIdentityChunkRef<'_>, ServerIdentityChunkError> {
-        if input.len() < 4 {
-            return Err(ServerIdentityChunkError::Truncated);
-        }
-        if &input[..4] != SERVER_IDENTITY_CHUNK_MAGIC {
-            return Err(ServerIdentityChunkError::BadMagic);
-        }
-        if input.len() < 16 {
-            return Err(ServerIdentityChunkError::Truncated);
-        }
-        let total_len = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
-        let offset = u32::from_be_bytes([input[8], input[9], input[10], input[11]]);
-        let len = u32::from_be_bytes([input[12], input[13], input[14], input[15]]) as usize;
-        if len == 0 {
-            return Err(ServerIdentityChunkError::EmptyChunk);
-        }
-        if input.len() != 16 + len {
-            return Err(ServerIdentityChunkError::InvalidChunkLength);
-        }
-        let end = offset
-            .checked_add(len as u32)
-            .ok_or(ServerIdentityChunkError::InvalidOffset)?;
-        if total_len == 0 || end > total_len {
-            return Err(ServerIdentityChunkError::InvalidOffset);
-        }
+        let chunk = decode_offset_chunk(SERVER_IDENTITY_CHUNK_MAGIC, input)?;
         Ok(ServerIdentityChunkRef {
-            total_len,
-            offset,
-            bytes: &input[16..],
+            total_len: chunk.total_len,
+            offset: chunk.offset,
+            bytes: chunk.bytes,
         })
     }
 
@@ -892,64 +964,38 @@ pub enum FramedChunkError {
     OutOfOrder,
 }
 
+impl From<OffsetChunkError> for FramedChunkError {
+    fn from(err: OffsetChunkError) -> Self {
+        match err {
+            OffsetChunkError::Truncated => Self::Truncated,
+            OffsetChunkError::BadMagic => Self::BadMagic,
+            OffsetChunkError::EmptyChunk => Self::EmptyChunk,
+            OffsetChunkError::InvalidChunkLength => Self::InvalidChunkLength,
+            OffsetChunkError::InvalidOffset => Self::InvalidOffset,
+        }
+    }
+}
+
 impl FramedChunk {
     fn encode_borrowed(
         total_len: u32,
         offset: u32,
         bytes: &[u8],
     ) -> Result<Vec<u8>, FramedChunkError> {
-        if bytes.is_empty() {
-            return Err(FramedChunkError::EmptyChunk);
-        }
-        let end = offset
-            .checked_add(bytes.len() as u32)
-            .ok_or(FramedChunkError::InvalidOffset)?;
-        if total_len == 0 || end > total_len {
-            return Err(FramedChunkError::InvalidOffset);
-        }
-        let mut out = Vec::with_capacity(16 + bytes.len());
-        out.extend_from_slice(FRAMED_CHUNK_MAGIC);
-        out.extend_from_slice(&total_len.to_be_bytes());
-        out.extend_from_slice(&offset.to_be_bytes());
-        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        out.extend_from_slice(bytes);
-        Ok(out)
+        Ok(encode_offset_chunk(
+            FRAMED_CHUNK_MAGIC,
+            total_len,
+            offset,
+            bytes,
+        )?)
     }
 
     pub fn decode_ref(input: &[u8]) -> Result<FramedChunkRef<'_>, FramedChunkError> {
-        if input.len() < 4 {
-            return Err(FramedChunkError::Truncated);
-        }
-        if &input[..4] != FRAMED_CHUNK_MAGIC {
-            return Err(FramedChunkError::BadMagic);
-        }
-        if input.len() < 16 {
-            return Err(FramedChunkError::Truncated);
-        }
-        let total_len = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
-        let offset = u32::from_be_bytes([input[8], input[9], input[10], input[11]]);
-        let len = u32::from_be_bytes([input[12], input[13], input[14], input[15]]) as usize;
-        if len == 0 {
-            return Err(FramedChunkError::EmptyChunk);
-        }
-        // checked_add so a crafted `len` near u32::MAX cannot overflow `16 + len`
-        // on 32-bit targets (matches the offset arithmetic below).
-        let expected = 16usize
-            .checked_add(len)
-            .ok_or(FramedChunkError::InvalidChunkLength)?;
-        if input.len() != expected {
-            return Err(FramedChunkError::InvalidChunkLength);
-        }
-        let end = offset
-            .checked_add(len as u32)
-            .ok_or(FramedChunkError::InvalidOffset)?;
-        if total_len == 0 || end > total_len {
-            return Err(FramedChunkError::InvalidOffset);
-        }
+        let chunk = decode_offset_chunk(FRAMED_CHUNK_MAGIC, input)?;
         Ok(FramedChunkRef {
-            total_len,
-            offset,
-            bytes: &input[16..],
+            total_len: chunk.total_len,
+            offset: chunk.offset,
+            bytes: chunk.bytes,
         })
     }
 
