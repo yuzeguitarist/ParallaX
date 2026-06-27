@@ -192,6 +192,20 @@ const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize =
 /// Bound to the shared [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] so the
 /// client's residual-skip budget always covers exactly what this may forward.
 const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
+/// Byte ceiling on the origin->client camouflage forward in the authenticated
+/// pre-PQ phase (D5). That direction now forwards the origin's bytes VERBATIM —
+/// preserving its native TCP segmentation — instead of re-framing each TLS record
+/// into its own write (a "one record, one segment" shape that no direct-to-origin
+/// connection and no `relay_fallback` byte pump produces, making the authenticated
+/// splice separable from both). Because the forward is byte-oriented now, the
+/// resource backstop is byte-oriented too: it is the record cap expressed in
+/// bytes (a full-size TLS record is header + max payload), so it bounds exactly
+/// the same "~1 MiB / 64 full records" envelope as before. The CLIENT still
+/// enforces its own [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] residual
+/// *record* budget on the reassembled stream, so the logical-record contract is
+/// unchanged; this cap is purely the server-side abuse/resource ceiling.
+const PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT: usize = PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT
+    * (crate::tls::record::MAX_TLS_RECORD_PAYLOAD + crate::tls::record::TLS_HEADER_LEN);
 const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
 /// Server-side ceilings on an authenticated speed-test request. The on-wire
 /// format permits arbitrary u64 byte counts and a u16 sample count; without a
@@ -1650,10 +1664,13 @@ async fn run_authenticated_data_mode(
     let mut client_records = TlsRecordReader::buffered(client_read);
     let mut fallback_records = TlsRecordReader::buffered(fallback_read);
     let mut client_record = Vec::new();
-    let mut fallback_record = Vec::new();
+    // Raw byte scratch for the origin->client camouflage forward (D5). The origin
+    // direction is now a verbatim byte pump (preserving the origin's native TCP
+    // segmentation) rather than a per-record re-frame, so it reads into a fixed
+    // buffer exactly like `relay_fallback_userspace_loop`, not into a record Vec.
+    let mut fallback_relay_buf = vec![0_u8; relay_read_buffer_len(max_plaintext_len(0))];
     let mut client_camouflage_records_before_pq = 0usize;
     let mut client_camouflage_bytes_before_pq = 0usize;
-    let mut fallback_records_before_pq = 0usize;
     let mut fallback_bytes_before_pq = 0usize;
     // Reassembles the client's PQ rekey (PX1Q), now split across several
     // variable-length FramedChunk records (PAR-21). On this direction no
@@ -1864,7 +1881,6 @@ async fn run_authenticated_data_mode(
                             cid,
                             client_camouflage_records_before_pq,
                             client_camouflage_bytes_before_pq,
-                            fallback_records_before_pq,
                             fallback_bytes_before_pq,
                             key_exchange_record_len = key_exchange_record.len(),
                             "server key exchange record written"
@@ -1970,7 +1986,7 @@ async fn run_authenticated_data_mode(
                         tracing::info!(
                             cid,
                             client_camouflage_records_before_pq,
-                            fallback_records_before_pq,
+                            fallback_bytes_before_pq,
                             "ParallaX data mode switch confirmed"
                         );
 
@@ -2482,61 +2498,52 @@ async fn run_authenticated_data_mode(
                     Err(err) => return Err(HandshakeServerError::DataRecord(err)),
                 }
             }
-            read = fallback_records.read_record_into(&mut fallback_record),
-                if fallback_records_before_pq < PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT => {
-                match read {
-                    Ok(()) => {}
-                    Err(err) if is_clean_close(&err) => return Ok(()),
+            // D5: forward the origin's camouflage handshake to the client as a
+            // VERBATIM byte stream, preserving its native TCP segmentation — the
+            // same byte-pump shape `relay_fallback_userspace_loop` produces on the
+            // unauthenticated splice. The prior per-record `read_record_into` +
+            // per-record `write_all` re-framed the origin flight into "one TLS
+            // record, one segment", a shape neither a direct-to-origin connection
+            // nor the fallback splice emits, which made the authenticated splice
+            // separable from both. Reading raw bytes off the buffered reader drains
+            // any already-buffered bytes first, so nothing the record path left
+            // behind is lost (we never read records off this half again in pre-PQ).
+            // The cap is byte-oriented to match (see PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT).
+            read = fallback_records.get_mut().read(&mut fallback_relay_buf),
+                if fallback_bytes_before_pq < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT => {
+                let n = match read {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => n,
+                    Err(ref err) if is_clean_close(err) => return Ok(()),
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
-                log_record_read(
-                    cid,
-                    "fallback->server",
-                    "server-predata-fallback-reader",
-                    &fallback_record,
-                );
-                fallback_records_before_pq += 1;
-                fallback_bytes_before_pq += fallback_record.len();
-                if let Ok(header) = crate::tls::record::parse_header(&fallback_record) {
-                    if fallback_records_before_pq == 1 {
-                        tracing::info!(
-                            cid,
-                            direction = "fallback->client",
-                            task_name = "server-camouflage-writer",
-                            fallback_records_before_pq,
-                            fallback_bytes_before_pq,
-                            outer_tls_payload_len = header.payload_len,
-                            tls_content_type = header.content_type,
-                            "forwarding fallback camouflage record before ParallaX PQ rekey"
-                        );
-                    } else if fallback_records_before_pq == PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT {
-                        tracing::warn!(
-                            cid,
-                            direction = "fallback->client",
-                            task_name = "server-camouflage-writer",
-                            fallback_records_before_pq,
-                            fallback_bytes_before_pq,
-                            outer_tls_payload_len = header.payload_len,
-                            tls_content_type = header.content_type,
-                            client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
-                            pre_pq_forward_limit = PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT,
-                            "pre-PQ fallback camouflage forward limit reached; pausing fallback \
-                             reads until ParallaX PQ rekey"
-                        );
-                    }
-                } else if fallback_records_before_pq == PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT {
+                let before = fallback_bytes_before_pq;
+                fallback_bytes_before_pq += n;
+                if before == 0 {
+                    tracing::info!(
+                        cid,
+                        direction = "fallback->client",
+                        task_name = "server-camouflage-writer",
+                        forwarded_bytes = n,
+                        "forwarding fallback camouflage bytes before ParallaX PQ rekey"
+                    );
+                } else if before < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
+                    && fallback_bytes_before_pq >= PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
+                {
                     tracing::warn!(
                         cid,
-                        fallback_records_before_pq,
+                        direction = "fallback->client",
+                        task_name = "server-camouflage-writer",
                         fallback_bytes_before_pq,
-                        record_len = fallback_record.len(),
                         client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
-                        pre_pq_forward_limit = PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT,
-                        "pre-PQ fallback camouflage forward limit reached with unparsed TLS \
-                         record; pausing fallback reads until ParallaX PQ rekey"
+                        pre_pq_forward_byte_limit = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT,
+                        "pre-PQ fallback camouflage forward byte limit reached; pausing fallback \
+                         reads until ParallaX PQ rekey"
                     );
                 }
-                match timeout_at(pre_pq_deadline, client_write.write_all(&fallback_record)).await {
+                match timeout_at(pre_pq_deadline, client_write.write_all(&fallback_relay_buf[..n]))
+                    .await
+                {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) if is_write_peer_close(&err) => {
                         // The client closed; the fallback origin is still live, so
