@@ -304,7 +304,9 @@ async fn run_with_plan(config: Config, plan: SpeedPlan) -> Result<SpeedReport, S
     let max_payload_chunk_len = data_session.max_payload_chunk_len();
 
     let request = plan.request();
-    let request_record = data_session.seal_payload(&request.encode()?, &mut OsRng)?;
+    // C6: snap this PX1T onto a browser-magnitude CONNECT size band (reusing C3
+    // shaping) so it is not a tiny fixed-size control record on the wire.
+    let request_record = data_session.seal_payload_band_shaped(&request.encode()?, &mut OsRng)?;
     server.write_all(&request_record).await?;
 
     let warmup_download = {

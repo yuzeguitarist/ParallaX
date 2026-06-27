@@ -1935,7 +1935,9 @@ async fn establish_authenticated_data_session_inner(
             version: UDP_NEGOTIATION_VERSION,
         }
         .encode();
-        let request_record = data_session.seal_payload(&request, &mut OsRng)?;
+        // C4: snap this PX1G onto a browser-magnitude CONNECT size band (reusing
+        // C3's shaping) so it is not a tiny fixed-size control record on the wire.
+        let request_record = data_session.seal_payload_band_shaped(&request, &mut OsRng)?;
         // The UdpRequest->UdpOffer exchange is one control-plane TCP round-trip on the
         // exact path the UDP probe will use, so it doubles as a live RTT sample: time
         // it and size the probe budget off it (PAR-11), instead of a fixed 300ms that
@@ -2009,7 +2011,8 @@ async fn establish_authenticated_data_session_inner(
                 rtt_micros,
             }
             .encode();
-            let ack_record = data_session.seal_payload(&ack, &mut OsRng)?;
+            // C4: snap this PX1P onto a CONNECT size band (reuses C3 shaping).
+            let ack_record = data_session.seal_payload_band_shaped(&ack, &mut OsRng)?;
             server.write_all(&ack_record).await?;
             // Retain the connection (Verified only) for the data relay. The server
             // retains on the SAME signal (the PX1P status just sent), so both ends

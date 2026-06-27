@@ -2038,7 +2038,13 @@ async fn run_authenticated_data_mode(
                                 }
                                 .encode()
                                 .expect("valid udp offer");
-                                let offer_record = server_seal.seal(&offer, &mut rng)?;
+                                // C4: snap this PX1O onto a CONNECT size band (reuses
+                                // C3 shaping) instead of a tiny fixed control record.
+                                let offer_record = seal_control_frame_band_shaped(
+                                    &mut server_seal,
+                                    &offer,
+                                    &mut rng,
+                                )?;
                                 write_all_with_handshake_timeout(&mut client_write, &offer_record)
                                     .await?;
 
@@ -2248,7 +2254,13 @@ async fn run_authenticated_data_mode(
                                     reason: UDP_DECLINE_DISABLED,
                                 }
                                 .encode();
-                                let decline_record = server_seal.seal(&decline, &mut rng)?;
+                                // C6: snap this PX1N onto a CONNECT size band (reuses
+                                // C3 shaping) instead of a tiny fixed control record.
+                                let decline_record = seal_control_frame_band_shaped(
+                                    &mut server_seal,
+                                    &decline,
+                                    &mut rng,
+                                )?;
                                 write_all_with_handshake_timeout(
                                     &mut client_write,
                                     &decline_record,
@@ -4838,16 +4850,12 @@ where
         remaining -= len as u64;
     }
     let ack = ack.encode();
+    // C6: band-shape the PX1*-done ack onto a CONNECT size band (reuses C3
+    // shaping) instead of a tiny fixed control record. Keep the same idle stall
+    // backstop the bulk download writes use.
     timeout(
         idle,
-        write_server_data_records_chunked(
-            io.client_write,
-            io.server_seal,
-            &ack,
-            io.rng,
-            io.scratch,
-            RelayWriteLog::new(io.cid, "server->client", "server-speed-download-done"),
-        ),
+        write_server_control_frame_band_shaped(io.client_write, io.server_seal, &ack, io.rng),
     )
     .await
     .map_err(|_| HandshakeServerError::Timeout)?
@@ -4908,15 +4916,8 @@ where
     }
 
     let ack = ack.encode();
-    write_server_data_records_chunked(
-        io.client_write,
-        io.server_seal,
-        &ack,
-        io.rng,
-        io.scratch,
-        RelayWriteLog::new(io.cid, "server->client", "server-speed-upload-done"),
-    )
-    .await
+    // C6: band-shape the PX1*-done ack onto a CONNECT size band (reuses C3 shaping).
+    write_server_control_frame_band_shaped(io.client_write, io.server_seal, &ack, io.rng).await
 }
 
 /// Drains the client->server direction to the target. Returns the owned
@@ -5152,6 +5153,50 @@ where
             }
         }
     }
+}
+
+/// Seal a fixed-length server->client in-band control frame (C4 PX1O offer /
+/// PX1N decline; C6 the PX1W/PX1V/PX1D/PX1U speed acks) onto a randomly chosen
+/// CONNECT size band, instead of its tiny fixed wire size. Reuses the CONNECT
+/// (C3) shaping primitives: `control_frame_shaping_pad` picks the band, and
+/// `seal_into_exact_padded` writes EXACTLY that pad while bypassing the codec's
+/// profile sampling so the record lands on its band even under a non-default
+/// padding profile. The pad rides the self-describing 2-byte trailer, so the
+/// client decodes the exact `payload` unchanged.
+fn seal_control_frame_band_shaped<R>(
+    codec: &mut DataRecordCodec,
+    payload: &[u8],
+    rng: &mut R,
+) -> Result<Vec<u8>, HandshakeServerError>
+where
+    R: rand::Rng + rand::RngCore + ?Sized,
+{
+    let max_extra_pad = codec.max_plaintext_len().saturating_sub(payload.len());
+    let shaping_pad =
+        crate::protocol::command::control_frame_shaping_pad(payload.len(), max_extra_pad, rng);
+    let mut out = Vec::new();
+    codec.seal_into_exact_padded(payload, shaping_pad, rng, &mut out)?;
+    Ok(out)
+}
+
+/// Band-shape a single server->client control frame (the C6 PX1W/PX1V/PX1D/PX1U
+/// speed acks) and write it out as one record. Used in place of
+/// [`write_server_data_records_chunked`] for the speed-test acks specifically, so
+/// the tiny fixed-length ack lands on a CONNECT size band instead of a constant
+/// tiny record; the bulk speed payload keeps using the chunked writer unchanged.
+async fn write_server_control_frame_band_shaped<W, R>(
+    writer: &mut W,
+    codec: &mut DataRecordCodec,
+    payload: &[u8],
+    rng: &mut R,
+) -> Result<(), HandshakeServerError>
+where
+    W: LegWriter,
+    R: rand::Rng + rand::RngCore + ?Sized,
+{
+    let record = seal_control_frame_band_shaped(codec, payload, rng)?;
+    writer.write_records(record.as_slice()).await?;
+    Ok(())
 }
 
 async fn write_server_data_records_chunked<W, R>(

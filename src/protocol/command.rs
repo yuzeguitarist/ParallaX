@@ -383,18 +383,7 @@ impl ConnectRequest {
     where
         R: rand::Rng + ?Sized,
     {
-        let raw_wire = self.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
-        let mut fitting = CONNECT_RECORD_SIZE_BANDS
-            .iter()
-            .copied()
-            .filter(|&band| band >= raw_wire && band - raw_wire <= max_extra_pad)
-            .peekable();
-        if fitting.peek().is_none() {
-            return 0;
-        }
-        let candidates: Vec<usize> = fitting.collect();
-        let band = candidates[rng.gen_range(0..candidates.len())];
-        band - raw_wire
+        band_shaping_pad(self.encoded_len(), max_extra_pad, rng)
     }
 
     pub fn target(&self) -> String {
@@ -501,11 +490,64 @@ impl ConnectRequestRef<'_> {
     }
 }
 
-/// Whether a CONNECT record's on-wire TLS payload length is one of the C3
-/// shaping bands. Diagnostic/test helper so the shaping invariant can be checked
-/// from other modules without exposing the band table.
+/// Whether a record's on-wire TLS payload length is one of the C3/C4/C6 shaping
+/// bands. Diagnostic/test helper so the shaping invariant can be checked from
+/// other modules without exposing the band table. Named for its CONNECT origin
+/// (C3); the in-band control frames (C4/C6) snap onto the SAME band set.
 pub fn connect_record_size_is_shaped(wire_payload_len: usize) -> bool {
     CONNECT_RECORD_SIZE_BANDS.contains(&wire_payload_len)
+}
+
+/// Core of the C3/C4/C6 record-size shaping: given a record's raw plaintext
+/// `encoded_len`, return the EXACT extra padding-suffix length that snaps its
+/// on-wire TLS payload length onto one randomly chosen [`CONNECT_RECORD_SIZE_BANDS`]
+/// band. The raw on-wire size is `encoded_len + DATA_RECORD_WIRE_OVERHEAD` (the
+/// 2-byte self-pad trailer + AEAD tag a sealed record adds); a band is chosen
+/// UNIFORMLY AT RANDOM among those large enough to hold the record and reachable
+/// within `max_extra_pad`, then the pad fills the gap. Choosing among ALL fitting
+/// bands (not "the next band up") is what removes any size→content correlation.
+/// Returns 0 when no band fits within `max_extra_pad` (only reachable when the raw
+/// size already exceeds the largest band) — the caller then emits the record
+/// unshaped. The pad rides the seal layer's self-describing 2-byte trailer, so it
+/// is fully decode-transparent.
+fn band_shaping_pad<R>(encoded_len: usize, max_extra_pad: usize, rng: &mut R) -> usize
+where
+    R: rand::Rng + ?Sized,
+{
+    let raw_wire = encoded_len + DATA_RECORD_WIRE_OVERHEAD;
+    let candidates: Vec<usize> = CONNECT_RECORD_SIZE_BANDS
+        .iter()
+        .copied()
+        .filter(|&band| band >= raw_wire && band - raw_wire <= max_extra_pad)
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+    let band = candidates[rng.gen_range(0..candidates.len())];
+    band - raw_wire
+}
+
+/// Extra padding-suffix length that snaps a fixed-length in-band control frame
+/// (C4: PX1G/PX1O/PX1P UDP negotiation; C6: PX1N decline, PX1T speed request,
+/// the PX1W/PX1V/PX1D/PX1U speed acks) onto a randomly chosen
+/// [`CONNECT_RECORD_SIZE_BANDS`] band, instead of its tiny fixed wire size.
+///
+/// These frames sit in the same handshake-adjacent wire position as the CONNECT
+/// record (C3) and, unshaped, each seal to a single deterministic tiny record —
+/// a self-custom control-packet tell unlike any browser request. Reusing the
+/// SAME band set as CONNECT folds them into the one browser-request-magnitude
+/// size distribution the camouflage path already justifies, adding no new
+/// observable size bucket. `encoded_len` is the frame's `encode()` length;
+/// `max_extra_pad` is the seal codec's `max_plaintext_len() - encoded_len` so the
+/// padded record still fits one TLS record. Pair with
+/// [`crate::protocol::data::DataRecordCodec::seal_into_exact_padded`] (the C3
+/// primitive), which writes EXACTLY this pad and bypasses profile sampling so the
+/// record lands on its band even under a non-default padding profile.
+pub fn control_frame_shaping_pad<R>(encoded_len: usize, max_extra_pad: usize, rng: &mut R) -> usize
+where
+    R: rand::Rng + ?Sized,
+{
+    band_shaping_pad(encoded_len, max_extra_pad, rng)
 }
 
 fn connect_target(host: &str, port: u16) -> String {

@@ -2452,4 +2452,128 @@ mod tests {
         )));
         assert!(!is_relay_idle_close_reason(None));
     }
+
+    #[test]
+    fn band_shaped_control_frames_round_trip_and_land_on_a_band() {
+        // C4/C6: every fixed-length in-band control frame, when sealed via the
+        // CONNECT (C3) band-shaping primitive (`control_frame_shaping_pad` +
+        // `seal_into_exact_padded`), must (a) land its on-wire TLS payload length
+        // on one of the CONNECT shaping bands — never its tiny fixed size — and
+        // (b) decode back to the EXACT original frame (the pad is stripped by the
+        // self-describing trailer, so the wire frame layout is unchanged).
+        use crate::protocol::command::{
+            connect_record_size_is_shaped, control_frame_shaping_pad, SpeedTestAck,
+            SpeedTestRequest, UdpDecline, UdpOffer, UdpProbeAck, UdpProbeStatus, UdpRequest,
+            UDP_CC_BBR, UDP_DECLINE_DISABLED, UDP_FEC_ADAPTIVE, UDP_NEGOTIATION_VERSION,
+        };
+
+        // One sample of each C4/C6 control frame's encoded bytes.
+        let frames: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "PX1G",
+                UdpRequest {
+                    version: UDP_NEGOTIATION_VERSION,
+                }
+                .encode(),
+            ),
+            (
+                "PX1O",
+                UdpOffer {
+                    offer_id: [7_u8; 16],
+                    udp_port: 4433,
+                    port_hop_seed: 0,
+                    cc: UDP_CC_BBR,
+                    fec_profile: UDP_FEC_ADAPTIVE,
+                    ignore_client_bandwidth: false,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                "PX1P",
+                UdpProbeAck {
+                    offer_id: [7_u8; 16],
+                    status: UdpProbeStatus::Verified,
+                    rtt_micros: 12_345,
+                }
+                .encode(),
+            ),
+            (
+                "PX1N",
+                UdpDecline {
+                    reason: UDP_DECLINE_DISABLED,
+                }
+                .encode(),
+            ),
+            (
+                "PX1T",
+                SpeedTestRequest {
+                    warmup_bytes: 1 << 20,
+                    download_bytes: 1 << 22,
+                    upload_bytes: 1 << 22,
+                    sample_count: 3,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            ("PX1D", SpeedTestAck::download_done(1 << 22).encode()),
+            ("PX1U", SpeedTestAck::upload_done(1 << 22).encode()),
+        ];
+
+        // Exercise both the default (0/0) profile and a non-default one: the C3
+        // primitive must land the record on its band regardless of the codec's
+        // padding profile (seal_into_exact_padded bypasses profile sampling).
+        for (min_pad, max_pad) in [(0_u16, 0_u16), (16, 200)] {
+            let padding = PaddingProfile::new(min_pad, max_pad).unwrap();
+            let mut bands_seen = std::collections::BTreeSet::new();
+            for (name, frame) in &frames {
+                // Across seeds the random band choice must vary and every choice
+                // must be a real band, with a decode-transparent round trip.
+                for seed in 0..32_u64 {
+                    let key = [0x33_u8; KEY_LEN];
+                    let nonce = [0x44_u8; NONCE_LEN];
+                    let mut enc = DataRecordCodec::new(
+                        AeadCodec::new(key, nonce),
+                        padding,
+                        CLIENT_TO_SERVER_AAD,
+                    );
+                    let mut dec = DataRecordCodec::new(
+                        AeadCodec::new(key, nonce),
+                        padding,
+                        CLIENT_TO_SERVER_AAD,
+                    );
+                    let mut rng = StdRng::seed_from_u64(seed);
+
+                    let max_extra_pad = enc.max_plaintext_len().saturating_sub(frame.len());
+                    let pad = control_frame_shaping_pad(frame.len(), max_extra_pad, &mut rng);
+                    let mut sealed = Vec::new();
+                    enc.seal_into_exact_padded(frame, pad, &mut rng, &mut sealed)
+                        .unwrap();
+
+                    let header = record::parse_header(&sealed).unwrap();
+                    assert!(
+                        connect_record_size_is_shaped(header.payload_len),
+                        "{name} (profile {min_pad}/{max_pad}, seed {seed}): wire payload \
+                         {} is not a shaping band",
+                        header.payload_len
+                    );
+                    bands_seen.insert(header.payload_len);
+
+                    // Decode-transparent: the receiver recovers the exact frame.
+                    let opened = dec.open(&sealed).unwrap();
+                    assert_eq!(
+                        &opened, frame,
+                        "{name}: band-shaped frame must decode unchanged"
+                    );
+                }
+            }
+            // The random choice must actually spread across multiple bands (no
+            // collapse to a single fixed size — the very tell C4/C6 removes).
+            assert!(
+                bands_seen.len() >= 3,
+                "band shaping must spread control frames across bands; saw {}",
+                bands_seen.len()
+            );
+        }
+    }
 }
