@@ -4875,6 +4875,7 @@ where
     R: LegReader,
 {
     let mut record = Vec::new();
+    let mut consecutive_empty: u32 = 0;
     loop {
         match tokio::time::timeout(
             QUIC_RELAY_DONE_BACKSTOP,
@@ -4892,7 +4893,18 @@ where
         }
         let range = client_open.open_in_place_payload_range(&mut record)?;
         if range.is_empty() {
-            continue; // padding-only record
+            // Padding-only record carries no progress. Bound how many may arrive
+            // back-to-back so a client streaming only empty records cannot reset the
+            // per-read timeout forever and pin the teardown (the same cap the upload
+            // phase applies).
+            consecutive_empty += 1;
+            if consecutive_empty > MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed QUIC-run TCP DONE sent too many consecutive empty records",
+                )));
+            }
+            continue;
         }
         if &record[range] != SPEED_QUIC_DONE_MARKER {
             tracing::warn!(cid, "speed QUIC-run TCP DONE marker mismatch");

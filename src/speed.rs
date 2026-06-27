@@ -354,12 +354,13 @@ pub(crate) async fn run_with_plan(
     if config.mode != Mode::Client {
         return Err(SpeedError::WrongMode);
     }
-    // The UDP-negotiation parameters live on `config.udp` and are threaded into
-    // the data-session seam so `parallax speed` runs the SAME UDP probe/offer
-    // negotiation as `client` when enabled. The speed test itself, however,
-    // measures the TCP plane: `establish_authenticated_data_session` closes any
-    // retained QUIC fast-plane connection (the speed path stays on TCP in this
-    // slice), so the UDP probe runs but the measured data transfer is over TCP.
+    // The UDP-negotiation parameters live on `config.udp` and are threaded into the
+    // data-session seam so `parallax speed` runs the SAME UDP probe/offer negotiation
+    // as `client` when enabled. When the probe Verifies,
+    // `establish_authenticated_data_session` hands back a `quic_carrier` so the QUIC
+    // fast plane is measured as a SECOND transport run (alongside TCP, for a fair
+    // comparison); with udp off / the probe not Verified it is `None` and the report
+    // stays TCP-only.
     let client = config.client.clone().ok_or(SpeedError::MissingClient)?;
     let psk = decode_psk(config.crypto.psk.as_b64())?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
@@ -466,9 +467,11 @@ pub(crate) async fn run_with_plan(
 }
 
 /// Run the full speed protocol over one transport's legs: send the request as the
-/// first record, then warmup + sample sets in both directions. The QUIC carrier
-/// reuses the SAME `data_session` codecs as TCP (single-Connect QUIC), so no extra
-/// key derivation is needed — the AEAD sequence simply continues on a fresh leg.
+/// first record, then warmup + sample sets in both directions. The `data_session`
+/// passed in is per-transport: the TCP run uses the session's own codecs, while the
+/// QUIC run uses a FRESH `quic_session` the caller derives via `expand_substream_keys`
+/// (the two transports' record/ack streams are not byte-symmetric, so a shared AEAD
+/// sequence would desync — each plane needs its own).
 async fn measure_run<W, R>(
     transport: Transport,
     writer: &mut W,

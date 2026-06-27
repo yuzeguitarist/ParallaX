@@ -1523,9 +1523,10 @@ struct RetainedClientQuic {
 /// A retained QUIC fast-plane connection handed to the speed test so it can
 /// measure the SAME single-Connect QUIC bidi the relay would use. The probe ran
 /// over this bidi (`relay_send`/`relay_recv`); the speed transfer continues on it,
-/// DATA-framed (identical carrier to [`ClientRelay`]'s QUIC path). The endpoint,
-/// connection, and H3 control streams are held alive for the measurement's
-/// duration; [`SpeedQuicCarrier::close`] application-closes them when done.
+/// DATA-framed (identical carrier to [`ClientRelay`]'s QUIC path). [`Self::into_legs`]
+/// splits it into the relay legs plus a [`SpeedQuicKeepAlive`] guard that holds the
+/// endpoint, connection, and H3 control streams alive for the measurement and
+/// application-closes them via [`SpeedQuicKeepAlive::close`] when done.
 pub(crate) struct SpeedQuicCarrier {
     endpoint: crate::transport::udp::quic::endpoint::Endpoint,
     conn: crate::transport::udp::quic::endpoint::Connection,
