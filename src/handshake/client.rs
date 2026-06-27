@@ -1135,22 +1135,29 @@ mod tests {
         let (_server_open, mut server_seal) = data_codecs(&keys, traffic).unwrap();
         let mut rng = StdRng::seed_from_u64(103);
 
-        // A validly-sealed (but identity-irrelevant) record: open() succeeds, so the
-        // failure comes from the verification step, not the decode.
-        let record = server_seal
-            .seal(b"not-a-real-identity-proof", &mut rng)
-            .unwrap();
+        // Seal a SYNTACTICALLY VALID ServerIdentityProof so open() and the proof
+        // decode (ServerIdentityProof::signature) both succeed, and the failure comes
+        // from the verification step proper -- specifically the missing PQ identity
+        // binding (a fresh session has none). This pins the real branch: the
+        // `-> Ok(())` body replacement would skip it and falsely accept.
+        let proof_payload = ServerIdentityProof {
+            signature: vec![0xAB; 64],
+        }
+        .encode()
+        .unwrap();
+        let record = server_seal.seal(&proof_payload, &mut rng).unwrap();
         let server_identity_public_key = [0_u8; 32];
         let server_x25519_public_key = [0_u8; 32];
         assert!(
-            client
-                .verify_server_identity_record(
+            matches!(
+                client.verify_server_identity_record(
                     &record,
                     &server_identity_public_key,
                     &server_x25519_public_key,
-                )
-                .is_err(),
-            "verification must not unconditionally accept"
+                ),
+                Err(ClientHandshakeError::MissingPqIdentityBinding)
+            ),
+            "verification must reach the missing-binding check, not accept unconditionally"
         );
     }
 

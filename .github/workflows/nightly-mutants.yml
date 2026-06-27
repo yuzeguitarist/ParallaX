@@ -42,9 +42,15 @@ on:
         type: string
         default: '0'
       shard_total:
-        description: 'Total shards to split the module into (ignored when module=nightly)'
+        # Default 8 keeps each shard well under the 75-min job cap. The nightly is
+        # tuned to ~60 mutants/shard; a large module (crypto ~440, protocol ~890,
+        # transport ~1650 mutants) split only 4 ways runs ~200 mutants/shard, which
+        # approaches the cap and -- because this job is continue-on-error -- a
+        # timeout-kill would silently upload a PARTIAL mutants.out. Raise this for
+        # the largest modules (e.g. transport: 16) rather than lower it.
+        description: 'Total shards (ignored when module=nightly). Raise for big modules; do not lower below 8.'
         type: string
-        default: '4'
+        default: '8'
 
 # Least-privilege: only needs to read the repo to build/mutate/test.
 permissions:
@@ -57,7 +63,7 @@ permissions:
 # For the scheduled nightly the inputs are empty, so the group collapses back to
 # the per-ref behaviour (re-dispatch supersedes an in-flight nightly).
 concurrency:
-  group: nightly-mutants-${{ github.ref }}-${{ github.event.inputs.module || 'nightly' }}-${{ github.event.inputs.shard_index || '0' }}-${{ github.event.inputs.shard_total || '4' }}
+  group: nightly-mutants-${{ github.ref }}-${{ github.event.inputs.module || 'nightly' }}-${{ github.event.inputs.shard_index || '0' }}-${{ github.event.inputs.shard_total || '8' }}
   cancel-in-progress: true
 
 env:
@@ -142,7 +148,7 @@ jobs:
         env:
           MUT_MODULE: ${{ github.event.inputs.module || 'nightly' }}
           MUT_SHARD_INDEX: ${{ github.event.inputs.shard_index || '0' }}
-          MUT_SHARD_TOTAL: ${{ github.event.inputs.shard_total || '4' }}
+          MUT_SHARD_TOTAL: ${{ github.event.inputs.shard_total || '8' }}
         run: |
           ulimit -v 12582912   # 12 GiB address-space cap per process
           if [ "$MUT_MODULE" = "nightly" ]; then

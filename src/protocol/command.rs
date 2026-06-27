@@ -2433,18 +2433,19 @@ mod tests {
 
     #[test]
     fn server_identity_chunk_decode_length_boundary() {
-        // `input.len() < 16` guard: 16 bytes passes it (then fails on the body
-        // length fields), 15 is Truncated.
+        // `input.len() < 16` guard: a 16-byte input (valid magic, all-zero body)
+        // passes that guard and reaches the body-length checks, where the parsed
+        // len == 0 yields EmptyChunk -- NOT Truncated. Asserting the exact later
+        // error pins the "passes the guard, fails on the body" contract (a `< 16`
+        // turned into `<= 16` / `== 16` would return Truncated instead). 15 bytes is
+        // Truncated.
         let mut at = Vec::new();
         at.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
         at.resize(16, 0);
-        assert!(
-            !matches!(
-                ServerIdentityChunk::decode_ref(&at),
-                Err(ServerIdentityChunkError::Truncated)
-            ),
-            "a 16-byte input must pass the `< 16` guard (fail later, not as Truncated)"
-        );
+        assert!(matches!(
+            ServerIdentityChunk::decode_ref(&at),
+            Err(ServerIdentityChunkError::EmptyChunk)
+        ));
         let mut short = Vec::new();
         short.extend_from_slice(SERVER_IDENTITY_CHUNK_MAGIC);
         short.resize(15, 0);
