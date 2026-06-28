@@ -367,7 +367,7 @@ const MAX_HANDSHAKE_MESSAGE: usize = 1 << 16;
 /// Safari 26.4 NewSessionTicket baseline.
 ///
 /// `pub(crate)` so `handshake::server` can bind its 0-RTT replay-window invariant
-/// (`ZERO_RTT_TICKET_LIFETIME_SECS == TICKET_LIFETIME_SECS`) to this value at
+/// (`ZERO_RTT_TICKET_LIFETIME_SECS >= TICKET_LIFETIME_SECS`) to this value at
 /// compile time rather than via a comment that can silently drift.
 pub(crate) const TICKET_LIFETIME_SECS: u32 = 604_800;
 
