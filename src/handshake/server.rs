@@ -5205,26 +5205,6 @@ where
             Err(err) if is_clean_close(&err) => return Ok(()),
             Err(err) => return Err(HandshakeServerError::Io(err)),
         };
-        // Minimum-throughput floor: the empty-record caps above and the per-read
-        // idle timeout can all be reset indefinitely by a slow data-record dribble,
-        // so they do not bound the wall-clock slot hold. Past a startup grace,
-        // require the average upload rate to stay above a floor far below any honest
-        // speed test; a deliberate trickle trips this and is torn down. Checked once
-        // per record so it also catches a pure empty-record stall. Reuses the
-        // existing InvalidData teardown shape (no new close behavior). This path is
-        // reached only by an AUTHENTICATED peer, so it adds no externally probeable
-        // signal.
-        let elapsed = phase_start.elapsed();
-        if elapsed > UPLOAD_RATE_GRACE {
-            let active = elapsed - UPLOAD_RATE_GRACE;
-            let floor = MIN_UPLOAD_BYTES_PER_SEC.saturating_mul(active.as_secs());
-            if uploaded < floor {
-                return Err(HandshakeServerError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "speed upload fell below the minimum throughput floor",
-                )));
-            }
-        }
         log_record_read(
             io.cid,
             "client->server",
@@ -5256,16 +5236,38 @@ where
                     "speed upload sent too many empty records",
                 )));
             }
-            continue;
+        } else {
+            consecutive_empty = 0;
+            if uploaded + len > bytes {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed upload sent more bytes than requested",
+                )));
+            }
+            uploaded += len;
         }
-        consecutive_empty = 0;
-        if uploaded + len > bytes {
-            return Err(HandshakeServerError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "speed upload sent more bytes than requested",
-            )));
+        // Minimum-throughput floor: the empty-record caps above and the per-read
+        // idle timeout can all be reset indefinitely by a slow data-record dribble,
+        // so they do not bound the wall-clock slot hold. Past a startup grace,
+        // require the average upload rate to stay above a floor far below any honest
+        // speed test; a deliberate trickle trips this and is torn down. Evaluated
+        // AFTER crediting this record's bytes (so a valid record that arrives just
+        // past the grace boundary is not rejected on the stale prior total), and on
+        // every record so a pure empty-record stall is caught too. Reuses the
+        // existing InvalidData teardown shape (no new close behavior). This path is
+        // reached only by an AUTHENTICATED peer, so it adds no externally probeable
+        // signal.
+        let elapsed = phase_start.elapsed();
+        if elapsed > UPLOAD_RATE_GRACE {
+            let active = elapsed - UPLOAD_RATE_GRACE;
+            let floor = MIN_UPLOAD_BYTES_PER_SEC.saturating_mul(active.as_secs());
+            if uploaded < floor {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed upload fell below the minimum throughput floor",
+                )));
+            }
         }
-        uploaded += len;
     }
 
     let ack = ack.encode();
@@ -7186,6 +7188,50 @@ mod tests {
         read_speed_upload_phase(&mut io, total, SpeedTestAck::upload_done(total))
             .await
             .expect("a healthy fast upload must complete without tripping the floor");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_phase_credits_the_current_record_before_the_floor() {
+        // Boundary case: a client sends almost nothing during the grace window,
+        // then a full record arrives just AFTER the grace boundary. Counting that
+        // record's own bytes, it clears the (tiny, ~1 s of active time) floor — so
+        // it must NOT be rejected on the stale pre-record total. Reaching the
+        // requested byte count and returning Ok proves the credit-then-check order.
+        let (sealer, opener) = upload_floor_io_codecs();
+        let chunk = max_plaintext_len(0); // ~16 KiB, far above the ~4 KiB floor at 1 s active
+        let total = chunk as u64; // exactly one record satisfies the request
+        let mut client_records = TrickleLegReader {
+            sealer,
+            rng: StdRng::seed_from_u64(5),
+            // The single read jumps just past the 15 s grace (active ~= 1 s, floor
+            // ~= 4 KiB); the record's own ~16 KiB clears it once credited. With the
+            // pre-fix stale-total order, uploaded would still be 0 here and reject.
+            payload: vec![0x37; chunk],
+            advance_per_read: Duration::from_secs(16),
+            remaining: 4,
+        };
+        let mut client_write = NullLegWriter;
+        let mut client_open = opener;
+        let mut server_seal = DataRecordCodec::new(
+            AeadCodec::new([0x11; 32], [0x22; 12]),
+            PaddingProfile::new(0, 0).unwrap(),
+            SERVER_TO_CLIENT_AAD,
+        );
+        let mut rng = StdRng::seed_from_u64(6);
+        let mut scratch = RelaySealScratch::with_payload_capacity(chunk);
+        let mut io = SpeedServerIo {
+            client_records: &mut client_records,
+            client_write: &mut client_write,
+            client_open: &mut client_open,
+            server_seal: &mut server_seal,
+            rng: &mut rng,
+            scratch: &mut scratch,
+            cid: 1,
+        };
+
+        read_speed_upload_phase(&mut io, total, SpeedTestAck::upload_done(total))
+            .await
+            .expect("a full record crossing the grace boundary must be credited, not rejected");
     }
 
     #[tokio::test]
