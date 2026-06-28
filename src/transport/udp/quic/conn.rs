@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::congestion::{AckInfo, Bbr, Controller};
 use super::frame::{Ack, Frame, Iter};
+use super::pacer::Pacer;
 use super::packet::{self, ConnectionId, Header, LongType, PacketSpace};
 use super::recovery::{RttEstimator, SentPacket, SentPackets};
 use super::spaces::{PacketNumberSpace, ReceivedPackets};
@@ -149,91 +150,6 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 /// A conservative max UDP payload for non-Initial packets (one datagram holds the
 /// whole Handshake flight in practice).
 const MAX_DATAGRAM: usize = 1252;
-
-/// Packets allowed to leave back-to-back without pacing when the connection starts or
-/// resumes from quiescence (idle). Matches quiche's `INITIAL_UNPACED_BURST`: a small
-/// burst out of quiescence is what a real stack does and is what keeps pacing from
-/// adding latency to interactive / bursty flows. Replenished whenever the pipe is
-/// empty (nothing in flight).
-const PACING_BURST_PACKETS: u32 = 10;
-
-/// Below this pacing rate, do not pace at all — a single full-size datagram already
-/// represents ~10ms of transmit time at this rate, so pacing buys nothing and only
-/// risks under-utilizing the link. Mirrors quiche's lumpy-pacing low-bandwidth
-/// bypass (~1.2 Mbps). 150_000 B/s ≈ 1.2 Mbit/s.
-const PACING_MIN_RATE_BYTES_PER_SEC: u64 = 150_000;
-
-/// Smooths a full-window line-rate burst into a stream paced at the congestion
-/// controller's target rate (`bytes / pacing_rate` between packets), so the send
-/// curve matches a real BBR stack instead of cwnd-gated bursts. Purely additive: it
-/// only ever DELAYS a packet the cwnd would already allow, never sends more, and is
-/// fully bypassed before a bandwidth model exists, below the min rate, and while
-/// burst tokens remain — so it cannot reduce throughput.
-#[derive(Debug, Clone)]
-struct Pacer {
-    /// Earliest instant the next paced (ack-eliciting DATA) packet may be sent.
-    /// `None` = no restriction (send immediately).
-    next_send_time: Option<Instant>,
-    /// Remaining unpaced "leaving quiescence" burst credit.
-    burst_tokens: u32,
-}
-
-impl Pacer {
-    fn new() -> Self {
-        Self {
-            next_send_time: None,
-            burst_tokens: PACING_BURST_PACKETS,
-        }
-    }
-
-    /// May a paced DATA packet be sent at `now`? True if bursting, unpaced, or the
-    /// pacing deadline has passed.
-    fn can_send(&self, now: Instant) -> bool {
-        if self.burst_tokens > 0 {
-            return true;
-        }
-        // MSRV 1.80: `map_or(true, ...)` instead of the 1.82 `is_none_or`.
-        self.next_send_time.map_or(true, |t| now >= t)
-    }
-
-    /// Account for one sent DATA packet of `size` bytes at rate `pacing_rate`
-    /// (bytes/sec). `in_flight_before` is bytes in flight BEFORE this packet — zero
-    /// means the connection just left quiescence, which replenishes the burst.
-    fn on_sent(&mut self, now: Instant, size: usize, pacing_rate: u64, in_flight_before: u64) {
-        // Leaving quiescence (idle → active): refill the burst so a bursty/interactive
-        // flow is never throttled on its first packets.
-        if in_flight_before == 0 {
-            self.burst_tokens = PACING_BURST_PACKETS;
-        }
-        if self.burst_tokens > 0 {
-            self.burst_tokens -= 1;
-            // Spend the token. Only AFTER the last token is spent do we start pacing,
-            // so arm the deadline now (rather than leaving it None) — otherwise the
-            // first post-burst packet would also see `next_send_time == None` and slip
-            // through unpaced, making the effective burst PACING_BURST_PACKETS + 1.
-            if self.burst_tokens == 0 {
-                self.next_send_time = self.armed_deadline(now, size, pacing_rate);
-            } else {
-                self.next_send_time = None;
-            }
-            return;
-        }
-        self.next_send_time = self.armed_deadline(now, size, pacing_rate);
-    }
-
-    /// The pacing deadline after sending a `size`-byte packet at `pacing_rate`: `None`
-    /// (unpaced) before a model exists or below the min rate, else `base + size/rate`
-    /// where `base = max(now, prior deadline)` so a late send cannot bank credit and
-    /// then burst to catch up.
-    fn armed_deadline(&self, now: Instant, size: usize, pacing_rate: u64) -> Option<Instant> {
-        if pacing_rate == u64::MAX || pacing_rate < PACING_MIN_RATE_BYTES_PER_SEC {
-            return None;
-        }
-        let delay = Duration::from_secs_f64(size as f64 / pacing_rate as f64);
-        let base = self.next_send_time.map_or(now, |t| t.max(now));
-        Some(base + delay)
-    }
-}
 
 /// Cap on out-of-order CRYPTO bytes buffered per space. The handshake transcript
 /// is small; since Initial keys derive from the public DCID, an unbounded buffer
@@ -488,6 +404,44 @@ fn is_uni(id: u64) -> bool {
     id & 0x2 != 0
 }
 
+/// Reassemble an in-order fragment and any buffered fragments it makes
+/// contiguous, appending the recovered bytes to `sink` and advancing
+/// `recv_off`. Shared by CRYPTO ([`Connection::recv_crypto`]) and STREAM
+/// ([`Connection::recv_stream`]) reassembly, which differ only in their
+/// `pending`/`recv_off`/`sink` storage.
+///
+/// Preconditions: `offset <= *recv_off` (the caller has already routed strictly
+/// future fragments into `pending`). The function:
+///   1. appends the non-duplicate tail of `(offset, data)`,
+///   2. drains every buffered fragment that now straddles `recv_off`, then
+///   3. evicts buffered fragments that fell fully below `recv_off` so they stop
+///      counting against the reassembly budget (see the inline notes that this
+///      replaced — a fragment an overlapping fill jumped entirely past matches
+///      no removal path and would otherwise linger forever).
+fn drain_contiguous(
+    pending: &mut Vec<(u64, Vec<u8>)>,
+    recv_off: &mut u64,
+    offset: u64,
+    data: &[u8],
+    sink: &mut Vec<u8>,
+) {
+    let skip = (*recv_off - offset) as usize;
+    if skip < data.len() {
+        sink.extend_from_slice(&data[skip..]);
+        *recv_off += (data.len() - skip) as u64;
+    }
+    while let Some(i) = pending
+        .iter()
+        .position(|(o, d)| *o <= *recv_off && *o + d.len() as u64 > *recv_off)
+    {
+        let (o, d) = pending.remove(i);
+        let s = (*recv_off - o) as usize;
+        sink.extend_from_slice(&d[s..]);
+        *recv_off += (d.len() - s) as u64;
+    }
+    pending.retain(|(o, d)| *o + d.len() as u64 > *recv_off);
+}
+
 /// A hand-rolled QUIC v1 connection (client or server), carried to handshake
 /// completion. Role-generic over a [`TlsSession`].
 pub struct Connection {
@@ -623,6 +577,70 @@ impl Connection {
         Self::new_client_inner(config, server_name, dcid, scid, Some(ticket), now_ms)
     }
 
+    /// Construct a `Connection` with every role-independent field at its initial
+    /// value. The client and server constructors supply only the fields that
+    /// genuinely differ (`side`, the CIDs, the boxed TLS session, and the
+    /// initial stream-id counters), so a newly added field is initialized in one
+    /// place instead of two struct literals that could silently drift apart.
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        side: Side,
+        tls: Box<dyn TlsSession>,
+        initial_dcid: ConnectionId,
+        dcid: ConnectionId,
+        scid: ConnectionId,
+        next_bidi: u64,
+        next_uni: u64,
+    ) -> Self {
+        Self {
+            side,
+            version: QUIC_VERSION_V1,
+            initial_dcid,
+            dcid,
+            scid,
+            peer_cid_adopted: false,
+            tls,
+            spaces: [Space::default(), Space::default(), Space::default()],
+            rtt: RttEstimator::new(),
+            cc: Box::new(Bbr::new()),
+            pacer: Pacer::new(),
+            delivered: 0,
+            pto_count: 0,
+            probe_pending: 0,
+            data_packets_sealed: 0,
+            data_packets_open_failed: 0,
+            handshake_done_pending: false,
+            handshake_confirmed: false,
+            last_send_time: None,
+            keepalive_interval: random_keep_alive_interval(),
+            ping_pending: false,
+            write_level: SPACE_INITIAL,
+            zero_rtt_keys: None,
+            streams: BTreeMap::new(),
+            next_bidi,
+            next_uni,
+            accept_bidi: VecDeque::new(),
+            accept_uni: VecDeque::new(),
+            closed: None,
+            app_close_pending: None,
+            app_close_sent: false,
+            close_time: None,
+            drained: false,
+            last_recv_time: None,
+            send_max_data: 0,
+            send_data_total: 0,
+            recv_max_data: CONN_RECV_WINDOW,
+            recv_max_data_sent: CONN_RECV_WINDOW,
+            recv_data_total: 0,
+            recv_data_consumed: 0,
+            need_max_data: false,
+            peer_flow_applied: false,
+            peer_msd_bidi_local: 0,
+            peer_msd_bidi_remote: 0,
+            peer_msd_uni: 0,
+        }
+    }
+
     fn new_client_inner(
         config: Arc<ClientConfig>,
         server_name: &str,
@@ -651,56 +669,9 @@ impl Connection {
                 dcid.as_slice(),
             )?,
         };
-        let mut spaces = [Space::default(), Space::default(), Space::default()];
-        spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
-        let mut conn = Self {
-            side: Side::Client,
-            version: QUIC_VERSION_V1,
-            initial_dcid: dcid,
-            dcid,
-            scid,
-            peer_cid_adopted: false,
-            tls: Box::new(tls),
-            spaces,
-            rtt: RttEstimator::new(),
-            cc: Box::new(Bbr::new()),
-            pacer: Pacer::new(),
-            delivered: 0,
-            pto_count: 0,
-            probe_pending: 0,
-            data_packets_sealed: 0,
-            data_packets_open_failed: 0,
-            handshake_done_pending: false,
-            handshake_confirmed: false,
-            last_send_time: None,
-            keepalive_interval: random_keep_alive_interval(),
-            ping_pending: false,
-            write_level: SPACE_INITIAL,
-            zero_rtt_keys: None,
-            streams: BTreeMap::new(),
-            // Client-initiated stream ids: bidi 0,4,8,…; uni 2,6,10,… (RFC 9000 §2.1).
-            next_bidi: 0,
-            next_uni: 2,
-            accept_bidi: VecDeque::new(),
-            accept_uni: VecDeque::new(),
-            closed: None,
-            app_close_pending: None,
-            app_close_sent: false,
-            close_time: None,
-            drained: false,
-            last_recv_time: None,
-            send_max_data: 0,
-            send_data_total: 0,
-            recv_max_data: CONN_RECV_WINDOW,
-            recv_max_data_sent: CONN_RECV_WINDOW,
-            recv_data_total: 0,
-            recv_data_consumed: 0,
-            need_max_data: false,
-            peer_flow_applied: false,
-            peer_msd_bidi_local: 0,
-            peer_msd_bidi_remote: 0,
-            peer_msd_uni: 0,
-        };
+        // Client-initiated stream ids: bidi 0,4,8,…; uni 2,6,10,… (RFC 9000 §2.1).
+        let mut conn = Self::new_inner(Side::Client, Box::new(tls), dcid, dcid, scid, 0, 2);
+        conn.spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
         // 0-RTT: seed flow control from the remembered transport parameters so
         // early data can be sent before the server's parameters arrive (RFC 9001
         // §7.4.1). ensure_peer_flow later overwrites with the server's actual TP.
@@ -748,54 +719,17 @@ impl Connection {
             transport_params,
             stek,
         )?;
-        Ok(Self {
-            side: Side::Server,
-            version: QUIC_VERSION_V1,
-            initial_dcid: ConnectionId::new(&[]),
-            dcid: ConnectionId::new(&[]),
+        // Server-initiated stream ids: bidi 1,5,9,…; uni 3,7,11,… (RFC 9000 §2.1).
+        // The initial/dcid CIDs are learned from the first Initial datagram.
+        Ok(Self::new_inner(
+            Side::Server,
+            Box::new(tls),
+            ConnectionId::new(&[]),
+            ConnectionId::new(&[]),
             scid,
-            peer_cid_adopted: false,
-            tls: Box::new(tls),
-            spaces: [Space::default(), Space::default(), Space::default()],
-            rtt: RttEstimator::new(),
-            cc: Box::new(Bbr::new()),
-            pacer: Pacer::new(),
-            delivered: 0,
-            pto_count: 0,
-            probe_pending: 0,
-            data_packets_sealed: 0,
-            data_packets_open_failed: 0,
-            handshake_done_pending: false,
-            handshake_confirmed: false,
-            last_send_time: None,
-            keepalive_interval: random_keep_alive_interval(),
-            ping_pending: false,
-            write_level: SPACE_INITIAL,
-            zero_rtt_keys: None,
-            streams: BTreeMap::new(),
-            // Server-initiated stream ids: bidi 1,5,9,…; uni 3,7,11,… (RFC 9000 §2.1).
-            next_bidi: 1,
-            next_uni: 3,
-            accept_bidi: VecDeque::new(),
-            accept_uni: VecDeque::new(),
-            closed: None,
-            app_close_pending: None,
-            app_close_sent: false,
-            close_time: None,
-            drained: false,
-            last_recv_time: None,
-            send_max_data: 0,
-            send_data_total: 0,
-            recv_max_data: CONN_RECV_WINDOW,
-            recv_max_data_sent: CONN_RECV_WINDOW,
-            recv_data_total: 0,
-            recv_data_consumed: 0,
-            need_max_data: false,
-            peer_flow_applied: false,
-            peer_msd_bidi_local: 0,
-            peer_msd_bidi_remote: 0,
-            peer_msd_uni: 0,
-        })
+            1,
+            3,
+        ))
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -1324,7 +1258,7 @@ impl Connection {
         // deferred packet would wait for an unrelated timer (added latency). Only arm
         // it when there is actually data to send and the cwnd would allow it, so an
         // idle connection is not woken.
-        if let Some(t) = self.pacer.next_send_time {
+        if let Some(t) = self.pacer.next_send_time() {
             let has_data = self.spaces[SPACE_DATA].keys.is_some()
                 && self.bytes_in_flight() + MAX_DATAGRAM as u64 <= self.cc.window()
                 && self.next_stream_to_send().is_some();
@@ -1651,22 +1585,34 @@ impl Connection {
         Some(datagram)
     }
 
-    /// Build a 1-RTT packet carrying HANDSHAKE_DONE (RFC 9001 §4.1.2). Ack-eliciting
-    /// and tracked so it is resent if lost; clears the pending flag. PADDING brings
-    /// the payload up to the 4 bytes header protection needs for its sample (RFC
-    /// 9001 §5.4.2): a lone 1-byte HANDSHAKE_DONE would be too short to sample.
-    fn build_handshake_done_packet(&mut self, now: Instant) -> Vec<u8> {
+    /// Seal a 1-RTT (`SPACE_DATA`) packet from `frames` and record it for loss
+    /// recovery. Centralizes the allocate-pn → encode-pn → make-header →
+    /// seal_packet → record_sent sequence shared by the small control-frame
+    /// builders. The caller owns any pending-flag clearing and content payload;
+    /// the emitted bytes are identical to the inlined sequence it replaces.
+    fn seal_data_packet(
+        &mut self,
+        frames: &[Frame],
+        ack_eliciting: bool,
+        content: SentContent,
+        now: Instant,
+    ) -> Vec<u8> {
         let pn = self.spaces[SPACE_DATA].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let header = self.make_header(SPACE_DATA, pn, pn_len);
         let datagram = {
             let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
-            seal_packet(
-                &keys.local,
-                header,
-                &[Frame::HandshakeDone, Frame::Padding(3)],
-            )
+            seal_packet(&keys.local, header, frames)
         };
+        self.record_sent(SPACE_DATA, pn, datagram.len(), ack_eliciting, content, now);
+        datagram
+    }
+
+    /// Build a 1-RTT packet carrying HANDSHAKE_DONE (RFC 9001 §4.1.2). Ack-eliciting
+    /// and tracked so it is resent if lost; clears the pending flag. PADDING brings
+    /// the payload up to the 4 bytes header protection needs for its sample (RFC
+    /// 9001 §5.4.2): a lone 1-byte HANDSHAKE_DONE would be too short to sample.
+    fn build_handshake_done_packet(&mut self, now: Instant) -> Vec<u8> {
         self.handshake_done_pending = false;
         let content = SentContent {
             crypto: Vec::new(),
@@ -1674,31 +1620,25 @@ impl Connection {
             handshake_done: true,
             ..Default::default()
         };
-        self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
-        datagram
+        self.seal_data_packet(
+            &[Frame::HandshakeDone, Frame::Padding(3)],
+            true,
+            content,
+            now,
+        )
     }
 
     /// Build a 1-RTT PING packet (keep-alive or PTO fallback). Ack-eliciting so it
     /// elicits an ACK; PADDING brings it up to the header-protection sample size. It
     /// carries no retransmittable content (a fresh PING is sent if a probe is lost).
     fn build_ping_packet(&mut self, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[SPACE_DATA].send.allocate();
-        let (_, pn_len) = packet::encode_packet_number(pn, None);
-        let header = self.make_header(SPACE_DATA, pn, pn_len);
-        let datagram = {
-            let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
-            seal_packet(&keys.local, header, &[Frame::Ping, Frame::Padding(3)])
-        };
         self.ping_pending = false;
-        self.record_sent(
-            SPACE_DATA,
-            pn,
-            datagram.len(),
+        self.seal_data_packet(
+            &[Frame::Ping, Frame::Padding(3)],
             true,
             SentContent::default(),
             now,
-        );
-        datagram
+        )
     }
 
     /// Whether any receive window has grown enough to owe the peer a MAX_DATA or
@@ -2457,30 +2397,13 @@ impl Connection {
                 }
                 sp.crypto_pending.push((offset, data.to_vec()));
             } else {
-                let skip = (sp.crypto_recv_off - offset) as usize;
-                if skip < data.len() {
-                    to_feed.extend_from_slice(&data[skip..]);
-                    sp.crypto_recv_off += (data.len() - skip) as u64;
-                }
-                // Drain any buffered fragments that are now contiguous.
-                while let Some(i) = sp.crypto_pending.iter().position(|(o, d)| {
-                    *o <= sp.crypto_recv_off && *o + d.len() as u64 > sp.crypto_recv_off
-                }) {
-                    let (o, d) = sp.crypto_pending.remove(i);
-                    let s = (sp.crypto_recv_off - o) as usize;
-                    to_feed.extend_from_slice(&d[s..]);
-                    sp.crypto_recv_off += (d.len() - s) as u64;
-                }
-                // Evict fragments now fully below the receive offset. The drain
-                // loop above only matches fragments that STRADDLE recv_off; a
-                // fragment that an overlapping in-order fill jumped entirely past
-                // (`o + len <= recv_off`) matches neither it nor any other removal
-                // path, so it would linger forever while still counting toward the
-                // MAX_CRYPTO_REASSEMBLY budget. A peer could exploit that to wedge
-                // the budget and stall the (off-path-injectable, Initial-space)
-                // handshake; drop the already-consumed bytes instead.
-                sp.crypto_pending
-                    .retain(|(o, d)| *o + d.len() as u64 > sp.crypto_recv_off);
+                drain_contiguous(
+                    &mut sp.crypto_pending,
+                    &mut sp.crypto_recv_off,
+                    offset,
+                    data,
+                    &mut to_feed,
+                );
             }
         }
         if !to_feed.is_empty() {
@@ -2555,27 +2478,13 @@ impl Connection {
             }
             return Ok(());
         }
-        let skip = (s.recv_off - offset) as usize;
-        if skip < data.len() {
-            s.recv.extend_from_slice(&data[skip..]);
-            s.recv_off += (data.len() - skip) as u64;
-        }
-        while let Some(i) = s
-            .recv_pending
-            .iter()
-            .position(|(o, d)| *o <= s.recv_off && *o + d.len() as u64 > s.recv_off)
-        {
-            let (o, d) = s.recv_pending.remove(i);
-            let sk = (s.recv_off - o) as usize;
-            s.recv.extend_from_slice(&d[sk..]);
-            s.recv_off += (d.len() - sk) as u64;
-        }
-        // Evict fragments now fully below the receive offset (see recv_crypto):
-        // the drain loop only removes fragments straddling recv_off, so one that an
-        // overlapping in-order fill jumped entirely past would otherwise linger and
-        // permanently consume the MAX_STREAM_REASSEMBLY budget.
-        s.recv_pending
-            .retain(|(o, d)| *o + d.len() as u64 > s.recv_off);
+        drain_contiguous(
+            &mut s.recv_pending,
+            &mut s.recv_off,
+            offset,
+            data,
+            &mut s.recv,
+        );
         Ok(())
     }
 
@@ -2796,61 +2705,6 @@ mod tests {
             matches!(conn.close_reason(), Some(CloseReason::LocalApp(0, _))),
             "integrity-limit close must use NO_ERROR (code 0), matching the confidentiality close"
         );
-    }
-
-    #[test]
-    fn pacer_bursts_then_paces_then_bypasses() {
-        let t0 = Instant::now();
-        let mut pacer = Pacer::new();
-        let rate = 1_000_000u64; // 1 MB/s, well above the low-bandwidth bypass
-        let pkt = 1200usize;
-
-        // Burst phase: EXACTLY PACING_BURST_PACKETS may send back-to-back at t0. Each
-        // sends immediately; the deadline stays unset until the LAST token is spent,
-        // which arms pacing so the very next packet is throttled (no off-by-one extra
-        // unpaced packet).
-        for i in 0..PACING_BURST_PACKETS {
-            assert!(pacer.can_send(t0), "burst packet {i} sends immediately");
-            pacer.on_sent(t0, pkt, rate, 1); // in_flight_before > 0 (not quiescence)
-            if i + 1 < PACING_BURST_PACKETS {
-                assert!(pacer.next_send_time.is_none(), "no deadline mid-burst");
-            }
-        }
-
-        // The last burst token armed the deadline transfer_time ahead, so the NEXT
-        // packet is already blocked — the burst is exactly PACING_BURST_PACKETS, not
-        // one more.
-        let deadline = pacer.next_send_time.expect("last burst token arms pacing");
-        let expected = t0 + Duration::from_secs_f64(pkt as f64 / rate as f64);
-        assert_eq!(deadline, expected, "deadline = transfer_time ahead");
-        assert!(
-            !pacer.can_send(t0),
-            "the post-burst packet is blocked, no off-by-one"
-        );
-        assert!(pacer.can_send(deadline), "unblocked at the deadline");
-
-        // The next paced send advances the deadline by another transfer_time.
-        pacer.on_sent(deadline, pkt, rate, pkt as u64);
-        let deadline2 = pacer.next_send_time.expect("still paced");
-        assert_eq!(
-            deadline2,
-            deadline + Duration::from_secs_f64(pkt as f64 / rate as f64)
-        );
-        let deadline = deadline2;
-
-        // Leaving quiescence (in_flight_before == 0) refills the burst → unpaced again.
-        pacer.on_sent(deadline, pkt, rate, 0);
-        assert!(pacer.can_send(deadline), "quiescence refilled the burst");
-
-        // Unpaced sentinel and sub-min rate never arm a deadline (no-regression paths).
-        let mut p2 = Pacer::new();
-        for _ in 0..PACING_BURST_PACKETS {
-            p2.on_sent(t0, pkt, u64::MAX, 1);
-        }
-        p2.on_sent(t0, pkt, u64::MAX, pkt as u64);
-        assert!(p2.next_send_time.is_none(), "u64::MAX rate is unpaced");
-        p2.on_sent(t0, pkt, PACING_MIN_RATE_BYTES_PER_SEC - 1, pkt as u64);
-        assert!(p2.next_send_time.is_none(), "sub-min rate bypasses pacing");
     }
 
     fn client_config() -> Arc<ClientConfig> {

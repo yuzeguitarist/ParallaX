@@ -2911,6 +2911,54 @@ where
 /// peer's DONE marker on the SAME receive-direction codec, sequence
 /// uninterrupted). On a mid-download ERROR it returns Err and drops the write half
 /// into a graceful FIN -- a mid-download failure breaks the app connection.
+/// Opportunistically drain records already buffered behind `first_record` into
+/// `batch_records`, so a bulk server burst is opened across the crypto pool in
+/// one batch instead of pinning every AEAD-open on the reader task. Returns the
+/// total record count (1 if nothing extra was ready) and any read error hit
+/// mid-drain (deferred so the records that did arrive are relayed first).
+///
+/// `batch_records` is only populated when count > 1: the first extra record
+/// triggers copying `first_record` in, so the count==1 fast path can keep
+/// opening `first_record` in place. The on-wire and app-visible bytes are
+/// identical to opening each record in order — only the AEAD's CPU placement
+/// changes. Shared by the download and mux-download readers, which differ only
+/// in their `task_name` log tag.
+async fn drain_buffered_download_batch<R>(
+    server_records: &mut R,
+    first_record: &[u8],
+    extra_record: &mut Vec<u8>,
+    batch_records: &mut Vec<u8>,
+    task_name: &'static str,
+    cid: u64,
+) -> (usize, Option<io::Error>)
+where
+    R: LegReader,
+{
+    let mut record_count = 1_usize;
+    batch_records.clear();
+    let mut batch_bytes = first_record.len();
+    let mut deferred_read_error = None;
+    while batch_bytes < MUX_OPEN_BATCH_BYTES {
+        match server_records.try_read_record_into(extra_record).await {
+            None => break,
+            Some(Ok(())) => {
+                log_record_read(cid, "server->client", task_name, extra_record);
+                if record_count == 1 {
+                    batch_records.extend_from_slice(first_record);
+                }
+                batch_records.extend_from_slice(extra_record);
+                batch_bytes += extra_record.len();
+                record_count += 1;
+            }
+            Some(Err(err)) => {
+                deferred_read_error = Some(err);
+                break;
+            }
+        }
+    }
+    (record_count, deferred_read_error)
+}
+
 async fn client_download_loop<R>(
     mut server_records: R,
     mut local_write: OwnedWriteHalf,
@@ -2949,33 +2997,17 @@ where
         log_record_read(cid, "server->client", "client-outer-reader", &server_record);
 
         // Opportunistically grab any records already buffered so a bulk burst is
-        // opened across the crypto pool instead of pinning every open on this
-        // task. A would-block (`None`) ends the drain with partial reader state
-        // intact; a read error is deferred and surfaced on the next iteration,
-        // after the records that did arrive have been relayed. The on-wire and
-        // app-visible bytes are identical to opening each record in order — only
-        // the CPU placement of the AEAD changes.
-        let mut record_count = 1_usize;
-        batch_records.clear();
-        let mut batch_bytes = server_record.len();
-        while batch_bytes < MUX_OPEN_BATCH_BYTES {
-            match server_records.try_read_record_into(&mut extra_record).await {
-                None => break,
-                Some(Ok(())) => {
-                    log_record_read(cid, "server->client", "client-outer-reader", &extra_record);
-                    if record_count == 1 {
-                        batch_records.extend_from_slice(&server_record);
-                    }
-                    batch_records.extend_from_slice(&extra_record);
-                    batch_bytes += extra_record.len();
-                    record_count += 1;
-                }
-                Some(Err(err)) => {
-                    deferred_read_error = Some(err);
-                    break;
-                }
-            }
-        }
+        // opened across the crypto pool instead of pinning every open on this task.
+        let (record_count, deferred) = drain_buffered_download_batch(
+            &mut server_records,
+            &server_record,
+            &mut extra_record,
+            &mut batch_records,
+            "client-outer-reader",
+            cid,
+        )
+        .await;
+        deferred_read_error = deferred;
 
         if record_count == 1 {
             match open_from_server.open_in_place_payload_range(&mut server_record) {
@@ -3176,37 +3208,19 @@ where
             &server_record,
         );
 
-        // Opportunistically grab any records that are already buffered so a
-        // bulk burst can be opened across the crypto pool instead of pinning
-        // every open on this task. A would-block leaves partial reader state
-        // intact; a read error is surfaced on the next iteration, after the
-        // records that did arrive have been relayed.
-        let mut record_count = 1_usize;
-        batch_records.clear();
-        let mut batch_bytes = server_record.len();
-        while batch_bytes < MUX_OPEN_BATCH_BYTES {
-            match server_records.try_read_record_into(&mut extra_record).await {
-                None => break,
-                Some(Ok(())) => {
-                    log_record_read(
-                        cid,
-                        "server->client",
-                        "client-mux-outer-reader",
-                        &extra_record,
-                    );
-                    if record_count == 1 {
-                        batch_records.extend_from_slice(&server_record);
-                    }
-                    batch_records.extend_from_slice(&extra_record);
-                    batch_bytes += extra_record.len();
-                    record_count += 1;
-                }
-                Some(Err(err)) => {
-                    deferred_read_error = Some(err);
-                    break;
-                }
-            }
-        }
+        // Opportunistically grab any records that are already buffered so a bulk
+        // burst can be opened across the crypto pool instead of pinning every open
+        // on this task.
+        let (record_count, deferred) = drain_buffered_download_batch(
+            &mut server_records,
+            &server_record,
+            &mut extra_record,
+            &mut batch_records,
+            "client-mux-outer-reader",
+            cid,
+        )
+        .await;
+        deferred_read_error = deferred;
 
         // Absorb any control messages queued alongside these records so a
         // stream's write half is always present before its first Data, and a

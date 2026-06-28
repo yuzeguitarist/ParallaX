@@ -13,6 +13,8 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::util::hex::push_hex;
+
 pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 2 * 60;
 /// Maximum clock skew tolerated on a client-supplied (MAC-bound) handshake
 /// timestamp dated in the FUTURE. The past bound stays at `window_secs`, but the
@@ -799,14 +801,6 @@ fn cache_journal_entry_mac(
     mac.update(transcript_fingerprint);
     mac.update(previous_mac);
     mac.finalize().into_bytes().into()
-}
-
-fn push_hex(out: &mut String, bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
 }
 
 fn decode_hex_exact(input: &str, out: &mut [u8]) -> Result<(), ReplayCacheError> {

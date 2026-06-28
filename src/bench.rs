@@ -18,6 +18,7 @@
 
 use std::{
     fmt::Write as _,
+    future::Future,
     hint::black_box,
     io,
     pin::Pin,
@@ -1323,13 +1324,21 @@ fn bench_aead_round_trip_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> 
 // record.pipeline
 // ---------------------------------------------------------------------------
 
-fn bench_record_seal_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
-    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut codec = DataRecordCodec::new(
+/// Fixed-key [`DataRecordCodec`] fixture for the record-pipeline benchmarks. The
+/// key/nonce are deterministic constants (the benches measure throughput, not
+/// secrecy) so every record case shares one setup; only the padding profile
+/// varies per case.
+fn bench_record_codec(padding: PaddingProfile) -> DataRecordCodec {
+    DataRecordCodec::new(
         AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
         padding,
         CLIENT_TO_SERVER_AAD,
-    );
+    )
+}
+
+fn bench_record_seal_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
+    let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
+    let mut codec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1K];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     run_case(
@@ -1346,16 +1355,8 @@ fn bench_record_seal_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
 
 fn bench_record_round_trip_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
-    let mut dec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
+    let mut dec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1K];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     run_case(
@@ -1376,16 +1377,8 @@ fn bench_record_round_trip_1k(options: BenchmarkOptions) -> Result<BenchmarkCase
 
 fn bench_record_open_in_place_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
-    let mut dec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
+    let mut dec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1K];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let (iterations, warmup) = effective_tier(TIER_FAST, options);
@@ -1413,16 +1406,8 @@ fn bench_record_open_in_place_1k(options: BenchmarkOptions) -> Result<BenchmarkC
 
 fn bench_record_open_payload_range_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
-    let mut dec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
+    let mut dec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1K];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let (iterations, warmup) = effective_tier(TIER_FAST, options);
@@ -1450,16 +1435,8 @@ fn bench_record_open_payload_range_1k(options: BenchmarkOptions) -> Result<Bench
 
 fn bench_record_round_trip_default_1k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(0, 0)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
-    let mut dec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
+    let mut dec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1K];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     run_case(
@@ -1480,11 +1457,7 @@ fn bench_record_round_trip_default_1k(options: BenchmarkOptions) -> Result<Bench
 
 fn bench_record_relay_seal_tracked_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut codec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut codec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_64K];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let max_chunk_len = codec.max_plaintext_len();
@@ -1507,11 +1480,7 @@ fn bench_record_relay_seal_tracked_64k(options: BenchmarkOptions) -> Result<Benc
 
 fn bench_record_relay_seal_untracked_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut codec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut codec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_64K];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut buf: Vec<u8> = Vec::with_capacity(SIZE_64K * 2);
@@ -1560,6 +1529,29 @@ fn bench_mux_batch_seal_64k(options: BenchmarkOptions) -> Result<BenchmarkCase> 
     )
 }
 
+/// Drive an async fixture to completion from a synchronous bench body: reuse the
+/// ambient multi-thread runtime via `block_in_place` when one is running (the
+/// `plx bench` path), otherwise spin up a throwaway current-thread runtime (the
+/// `#[test]` / standalone path). Shared by every `*_blocking` bench wrapper.
+fn block_on_current_or_fresh<F, T>(fut: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match tokio::runtime::Handle::try_current() {
+        // block_in_place is only valid on a multi-thread runtime; on the
+        // current-thread flavor it panics. The bench entrypoints run on a
+        // multi-thread runtime, so the current-thread arm is a guard against
+        // misuse rather than a path the suite takes.
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        Ok(_) => anyhow::bail!("blocking bench wrapper requires a multi-thread tokio runtime"),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(fut),
+    }
+}
+
 fn mux_batch_seal_blocking(
     codec: &mut DataRecordCodec,
     frame_payload_len: usize,
@@ -1568,28 +1560,14 @@ fn mux_batch_seal_blocking(
     out: &mut Vec<u8>,
     pool: &MuxPayloadPool,
 ) -> Result<u64> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(mux_batch_seal_once(
-                codec,
-                frame_payload_len,
-                rng,
-                scratch,
-                out,
-                pool,
-            ))
-        }),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .build()?
-            .block_on(mux_batch_seal_once(
-                codec,
-                frame_payload_len,
-                rng,
-                scratch,
-                out,
-                pool,
-            )),
-    }
+    block_on_current_or_fresh(mux_batch_seal_once(
+        codec,
+        frame_payload_len,
+        rng,
+        scratch,
+        out,
+        pool,
+    ))
 }
 
 /// In-memory [`LegWriter`] sink for the mux-batch benchmark: appends sealed
@@ -1657,16 +1635,8 @@ async fn mux_batch_seal_once(
 
 fn bench_record_bulk_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
-    let mut dec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
+    let mut dec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1M];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M * 2);
@@ -1698,16 +1668,8 @@ fn bench_record_bulk_1mb(options: BenchmarkOptions) -> Result<BenchmarkCase> {
 
 fn bench_record_bulk_1mb_in_place_open(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
-    let mut dec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
+    let mut dec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1M];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M * 2);
@@ -1742,16 +1704,8 @@ fn bench_record_bulk_1mb_in_place_open(options: BenchmarkOptions) -> Result<Benc
 
 fn bench_record_bulk_1mb_payload_range(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(RECORD_PADDING_MIN, RECORD_PADDING_MAX)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
-    let mut dec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
+    let mut dec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1M];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M * 2);
@@ -1786,16 +1740,8 @@ fn bench_record_bulk_1mb_payload_range(options: BenchmarkOptions) -> Result<Benc
 
 fn bench_record_bulk_1mb_default(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(0, 0)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
-    let mut dec = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
+    let mut dec = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1M];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M + 2048);
@@ -1832,11 +1778,7 @@ fn bench_record_bulk_1mb_default(options: BenchmarkOptions) -> Result<BenchmarkC
 
 fn bench_record_seal_bulk_1mb_default_metadata(options: BenchmarkOptions) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(0, 0)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1M];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M + 2048);
@@ -1859,11 +1801,7 @@ fn bench_record_seal_bulk_1mb_default_untracked(
     options: BenchmarkOptions,
 ) -> Result<BenchmarkCase> {
     let padding = PaddingProfile::new(0, 0)?;
-    let mut enc = DataRecordCodec::new(
-        AeadCodec::new([0x07; KEY_LEN], [0x09; NONCE_LEN]),
-        padding,
-        CLIENT_TO_SERVER_AAD,
-    );
+    let mut enc = bench_record_codec(padding);
     let payload = vec![0x42_u8; SIZE_1M];
     let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let mut buf: Vec<u8> = Vec::with_capacity(SIZE_1M + 2048);
@@ -2060,14 +1998,7 @@ fn tls_record_reader_fixture(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn read_tls_record_fixture_blocking(input: &[u8], max_chunk: usize) -> Result<usize> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(read_tls_record_fixture(input, max_chunk))
-        }),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .build()?
-            .block_on(read_tls_record_fixture(input, max_chunk)),
-    }
+    block_on_current_or_fresh(read_tls_record_fixture(input, max_chunk))
 }
 
 async fn read_tls_record_fixture(input: &[u8], max_chunk: usize) -> Result<usize> {

@@ -1422,7 +1422,12 @@ mod tests {
         ))
     }
 
-    fn server_config() -> Arc<ServerConfig> {
+    /// Build a test `ServerConfig` with a fresh ECDSA key and the standard test
+    /// cert/ALPN, varying only the two fields the individual builders care about.
+    fn base_server_config(
+        origin_udp_addr: Option<SocketAddr>,
+        marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
+    ) -> Arc<ServerConfig> {
         use aws_lc_rs::rand::SystemRandom;
         use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
         let key =
@@ -1436,32 +1441,19 @@ mod tests {
             alpn_protocols: vec![b"h3".to_vec()],
             stek: None,
             replay_guard: None,
-            origin_udp_addr: None,
-            marker_key: None,
+            origin_udp_addr,
+            marker_key,
             marker_replay_guard: None,
             max_udp_payload: 0,
         })
     }
 
+    fn server_config() -> Arc<ServerConfig> {
+        base_server_config(None, None)
+    }
+
     fn server_config_splicing(origin: SocketAddr) -> Arc<ServerConfig> {
-        use aws_lc_rs::rand::SystemRandom;
-        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
-        let key =
-            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
-                .unwrap()
-                .as_ref()
-                .to_vec();
-        Arc::new(ServerConfig {
-            cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
-            signing_key_pkcs8: key,
-            alpn_protocols: vec![b"h3".to_vec()],
-            stek: None,
-            replay_guard: None,
-            origin_udp_addr: Some(origin),
-            marker_key: None,
-            marker_replay_guard: None,
-            max_udp_payload: 0,
-        })
+        base_server_config(Some(origin), None)
     }
 
     /// A datagram from an unknown peer that is NOT a well-formed v1 Initial (a probe
@@ -1743,24 +1735,10 @@ mod tests {
         psk: zeroize::Zeroizing<Vec<u8>>,
         static_priv: [u8; 32],
     ) -> Arc<ServerConfig> {
-        use aws_lc_rs::rand::SystemRandom;
-        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
-        let key =
-            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
-                .unwrap()
-                .as_ref()
-                .to_vec();
-        Arc::new(ServerConfig {
-            cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
-            signing_key_pkcs8: key,
-            alpn_protocols: vec![b"h3".to_vec()],
-            stek: None,
-            replay_guard: None,
-            origin_udp_addr: Some(origin),
-            marker_key: Some((psk, zeroize::Zeroizing::new(static_priv))),
-            marker_replay_guard: None,
-            max_udp_payload: 0,
-        })
+        base_server_config(
+            Some(origin),
+            Some((psk, zeroize::Zeroizing::new(static_priv))),
+        )
     }
 
     /// The marker fork: a client whose ClientHello.random carries a valid auth marker

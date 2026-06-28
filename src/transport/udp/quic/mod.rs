@@ -28,6 +28,7 @@ pub(crate) mod mux;
 /// issue #76). Drives two sans-IO `Connection`s over a virtual link.
 #[cfg(test)]
 mod netsim;
+pub(crate) mod pacer;
 pub(crate) mod packet;
 pub(crate) mod recovery;
 pub(crate) mod spaces;

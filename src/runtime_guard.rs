@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::{ClientConfig, Config, Mode};
+use crate::util::hex::hex_lower;
 
 #[derive(Debug, Error)]
 pub enum RuntimeGuardError {
@@ -492,16 +493,6 @@ fn hash_field(hasher: &mut Sha256, name: &str, value: &str) {
     hasher.update([0]);
     hasher.update(value.as_bytes());
     hasher.update([0]);
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]
