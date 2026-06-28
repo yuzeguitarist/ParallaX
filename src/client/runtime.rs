@@ -2859,24 +2859,61 @@ where
 {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
     let mut rng = StdRng::from_entropy();
+    // Default hot path: no cover traffic. Read-ahead pipeline the next local read
+    // against the in-flight server write so a high-BDP link keeps draining the
+    // local app socket while `write_records` is throttled by TCP_NOTSENT_LOWAT/cwnd.
+    // The seal runs to completion BEFORE the concurrent read, so the codec stays
+    // strictly sequential and the on-wire bytes are unchanged.
     if !cover.is_enabled() {
+        // Spare scratch holds the previous iteration's sealed bytes while they are
+        // being written, so the next seal does not clobber the in-flight write
+        // buffer. Spare read buffer receives the read-ahead while the current
+        // payload is sealed+written.
+        let mut spare_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
+        let mut spare_buf = vec![0_u8; local_buf.len()];
+
+        // Prime: read the first burst before entering the pipeline.
+        let mut n = local_read.read(&mut local_buf).await?;
+        if n == 0 {
+            let _ = server_write.shutdown().await;
+            return Ok(seal_to_server);
+        }
+        bump_client_relay_activity(&activity);
+        n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+
         loop {
-            let n = local_read.read(&mut local_buf).await?;
-            if n == 0 {
-                let _ = server_write.shutdown().await;
-                return Ok(seal_to_server);
-            }
-            bump_client_relay_activity(&activity);
-            let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
-            write_client_data_records_chunked(
-                &mut server_write,
+            // Seal the current burst (sequential; codec state advances here, never
+            // inside the concurrent read below).
+            seal_client_data_records_chunked(
                 &mut seal_to_server,
                 &local_buf[..n],
                 &mut rng,
                 &mut seal_scratch,
                 RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
-            )
-            .await?;
+            )?;
+
+            // Overlap: flush the sealed batch to the server while reading the next
+            // local burst into the spare buffer. The two borrows are disjoint
+            // (write touches `server_write` + `seal_scratch.records_buf`; read
+            // touches `local_read` + `spare_buf`), so neither aliases the codec.
+            let (write_res, read_res) = tokio::join!(
+                server_write.write_records(seal_scratch.records_buf.as_slice()),
+                local_read.read(&mut spare_buf),
+            );
+            write_res?;
+            let next_n = read_res?;
+            if next_n == 0 {
+                let _ = server_write.shutdown().await;
+                return Ok(seal_to_server);
+            }
+            bump_client_relay_activity(&activity);
+            let next_n = drain_ready_tcp_read(&local_read, &mut spare_buf, next_n)?;
+
+            // Swap: the just-read spare becomes the current burst; the just-written
+            // scratch becomes the spare seal buffer for the next iteration.
+            std::mem::swap(&mut local_buf, &mut spare_buf);
+            std::mem::swap(&mut seal_scratch, &mut spare_scratch);
+            n = next_n;
         }
     }
 
@@ -3633,6 +3670,29 @@ where
     W: LegWriter,
     R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
 {
+    seal_client_data_records_chunked(codec, payload, rng, scratch, log)?;
+    writer.write_records(scratch.records_buf.as_slice()).await?;
+    Ok(())
+}
+
+/// Seal `payload` into `scratch.records_buf` (clearing it first) using the same
+/// chunking, parallel-AEAD, and debug-logging policy as
+/// [`write_client_data_records_chunked`], but WITHOUT writing. Splitting the seal
+/// from the write lets the bulk upload loop overlap the next local read with the
+/// in-flight server write (read-ahead pipelining): the codec stays strictly
+/// sequential (this runs to completion before any concurrent read), so record
+/// boundaries, sequence order, padding distribution, and the on-wire byte stream
+/// are unchanged.
+fn seal_client_data_records_chunked<R>(
+    codec: &mut DataRecordCodec,
+    payload: &[u8],
+    rng: &mut R,
+    scratch: &mut RelaySealScratch,
+    log: RelayWriteLog,
+) -> Result<(), ClientRuntimeError>
+where
+    R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
+{
     let max_chunk_len = codec.max_plaintext_len();
     if max_chunk_len == 0 {
         return Err(ClientRuntimeError::TlsRecord(
@@ -3683,7 +3743,6 @@ where
                 .map_err(ClientHandshakeError::from)?;
         }
     }
-    writer.write_records(scratch.records_buf.as_slice()).await?;
     Ok(())
 }
 
@@ -6226,5 +6285,107 @@ mod tests {
         );
         drop(held2);
         drop(probe2);
+    }
+
+    /// Read-ahead pipelining regression: the bulk `client_upload_loop` overlaps the
+    /// next local read with the in-flight server write, ping-ponging two read
+    /// buffers and two seal scratches. This proves the pipeline relays every byte
+    /// exactly once, in order, with NO loss, reordering, or duplication across the
+    /// buffer swaps — including bursts large enough to trigger the parallel-AEAD
+    /// path — and that a clean local EOF is propagated as a FIN to the server side.
+    #[tokio::test]
+    async fn upload_pipeline_relays_bytes_byte_exact_across_buffer_swaps() {
+        use rand::{rngs::StdRng, RngCore, SeedableRng};
+
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{DataRecordCodec, CLIENT_TO_SERVER_AAD};
+        use crate::traffic::PaddingProfile;
+
+        // Matched seal (loop) / open (verifier) codec pair: same key + nonce base,
+        // client->server direction, zero padding so the opened plaintext is exactly
+        // the source bytes.
+        fn codec() -> DataRecordCodec {
+            let key = [0x33_u8; KEY_LEN];
+            let nonce = [0x44_u8; NONCE_LEN];
+            let padding = PaddingProfile::new(0, 0).unwrap();
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD)
+        }
+
+        // Source bytes: several MiB of deterministic pseudo-random data so multiple
+        // 256 KiB relay reads (and hence multiple buffer swaps + parallel seals)
+        // occur.
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let mut payload = vec![0_u8; 6 * 1024 * 1024 + 1234];
+        rng.fill_bytes(&mut payload);
+
+        // local app -> client upload loop: a real TCP pair, so `drain_ready_tcp_read`
+        // and the `OwnedReadHalf` read path are exercised exactly as in production.
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        let payload_for_feeder = payload.clone();
+        let feeder = tokio::spawn(async move {
+            let mut app = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+            app.write_all(&payload_for_feeder).await.unwrap();
+            // Drop closes the write half -> the upload loop reads EOF and FINs.
+        });
+        let (local_for_loop, _) = local_listener.accept().await.unwrap();
+        let (local_read, _local_write_unused) = local_for_loop.into_split();
+
+        // client upload loop -> server side: a second TCP pair carrying the sealed
+        // records, captured by the server end which opens them in order.
+        let server_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let collector = tokio::spawn(async move {
+            let (server_side, _) = server_listener.accept().await.unwrap();
+            let (server_read, _server_write_unused) = server_side.into_split();
+            let mut reader = TcpLegReader::buffered(server_read);
+            let mut open = codec();
+            let mut record = Vec::new();
+            let mut plaintext = Vec::new();
+            loop {
+                match reader.read_record_into(&mut record).await {
+                    Ok(()) => {
+                        let range = open.open_in_place_payload_range(&mut record).unwrap();
+                        plaintext.extend_from_slice(&record[range]);
+                    }
+                    Err(err) if reader.is_clean_close(&err) => break,
+                    Err(err) => panic!("unexpected reader error: {err}"),
+                }
+            }
+            plaintext
+        });
+        let server_for_loop = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let (_server_read_unused, server_write) = server_for_loop.into_split();
+
+        let local_buf = vec![0_u8; relay_read_buffer_len(max_plaintext_len(0))];
+        let activity: ClientRelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let upload = client_upload_loop(
+            local_read,
+            TcpLegWriter(server_write),
+            codec(),
+            local_buf,
+            CoverTrafficProfile::from_config(TrafficConfig::default()),
+            activity,
+            7,
+        );
+
+        let (loop_res, feeder_res, collected) = timeout(Duration::from_secs(30), async {
+            tokio::join!(upload, feeder, collector)
+        })
+        .await
+        .expect("pipeline relay must complete promptly");
+        loop_res.expect("upload loop returns Ok on clean EOF");
+        feeder_res.expect("feeder task");
+        let collected = collected.expect("collector task");
+
+        assert_eq!(
+            collected.len(),
+            payload.len(),
+            "pipeline must relay exactly the source byte count (no loss/duplication)"
+        );
+        assert!(
+            collected == payload,
+            "pipeline must relay every byte in order, byte-exact across buffer swaps"
+        );
     }
 }

@@ -5559,6 +5559,68 @@ where
 {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
     let mut rng = StdRng::from_entropy();
+    // Default hot path: no cover traffic and no timing jitter. Read-ahead pipeline
+    // the next source read against the in-flight client write so a high-BDP link
+    // keeps draining the origin socket while `write_records` is throttled by
+    // TCP_NOTSENT_LOWAT/cwnd. The seal runs to completion BEFORE the concurrent
+    // read, so the codec stays strictly sequential and the on-wire bytes are
+    // unchanged. Timing jitter (opt-in) keeps the original serial loop so its
+    // per-burst delay cadence is untouched.
+    if !cover.is_enabled() && !timing.is_enabled() {
+        // Spare scratch holds the previous iteration's sealed bytes while they are
+        // being written, so the next seal does not clobber the in-flight write
+        // buffer. Spare read buffer receives the read-ahead while the current
+        // payload is sealed+written.
+        let mut spare_scratch = RelaySealScratch::with_payload_capacity(target_buf.len());
+        let mut spare_buf = vec![0_u8; target_buf.len()];
+
+        // Prime: read the first burst before entering the pipeline.
+        let mut n = target_read.read(&mut target_buf).await?;
+        if n == 0 {
+            let _ = client_write.shutdown().await;
+            return Ok(server_seal);
+        }
+        bump_relay_activity(&activity);
+        n = drain_ready_tcp_read(&target_read, &mut target_buf, n)?;
+
+        loop {
+            // Seal the current burst into `seal_scratch` (sequential; codec state
+            // advances here, never inside the concurrent read below).
+            seal_server_data_records_chunked(
+                &mut server_seal,
+                &target_buf[..n],
+                &mut rng,
+                &mut seal_scratch,
+                RelayWriteLog::new(cid, "server->client", "server-download-writer"),
+            )?;
+
+            // Overlap: flush the sealed batch to the client while reading the next
+            // source burst into the spare buffer. The two borrows are disjoint
+            // (write touches `client_write` + `seal_scratch.records_buf`; read
+            // touches `target_read` + `spare_buf`), so neither aliases the codec.
+            let (write_res, read_res) = tokio::join!(
+                client_write.write_records(seal_scratch.records_buf.as_slice()),
+                target_read.read(&mut spare_buf),
+            );
+            // Surface a write error first (mirrors the serial path, where the write
+            // is awaited before the next read is even issued).
+            write_res?;
+            let next_n = read_res?;
+            if next_n == 0 {
+                let _ = client_write.shutdown().await;
+                return Ok(server_seal);
+            }
+            bump_relay_activity(&activity);
+            let next_n = drain_ready_tcp_read(&target_read, &mut spare_buf, next_n)?;
+
+            // Swap: the just-read spare becomes the current burst; the just-written
+            // scratch becomes the spare seal buffer for the next iteration.
+            std::mem::swap(&mut target_buf, &mut spare_buf);
+            std::mem::swap(&mut seal_scratch, &mut spare_scratch);
+            n = next_n;
+        }
+    }
+
     if !cover.is_enabled() {
         loop {
             let n = target_read.read(&mut target_buf).await?;
@@ -5688,6 +5750,29 @@ where
     W: LegWriter,
     R: rand::Rng + rand::RngCore + ?Sized,
 {
+    seal_server_data_records_chunked(codec, payload, rng, scratch, log)?;
+    writer.write_records(scratch.records_buf.as_slice()).await?;
+    Ok(())
+}
+
+/// Seal `payload` into `scratch.records_buf` (clearing it first) using the same
+/// chunking, parallel-AEAD, and debug-logging policy as
+/// [`write_server_data_records_chunked`], but WITHOUT writing. Splitting the seal
+/// from the write lets the bulk download loop overlap the next source read with
+/// the in-flight client write (read-ahead pipelining): the codec stays strictly
+/// sequential (this runs to completion before any concurrent read), so record
+/// boundaries, sequence order, padding distribution, and the on-wire byte stream
+/// are unchanged.
+fn seal_server_data_records_chunked<R>(
+    codec: &mut DataRecordCodec,
+    payload: &[u8],
+    rng: &mut R,
+    scratch: &mut RelaySealScratch,
+    log: RelayWriteLog,
+) -> Result<(), HandshakeServerError>
+where
+    R: rand::Rng + rand::RngCore + ?Sized,
+{
     let max_chunk_len = codec.max_plaintext_len();
     if max_chunk_len == 0 {
         return Err(HandshakeServerError::DataRecord(
@@ -5737,7 +5822,6 @@ where
             codec.seal_chunks_into_untracked(payload, rng, &mut scratch.records_buf)?;
         }
     }
-    writer.write_records(scratch.records_buf.as_slice()).await?;
     Ok(())
 }
 
@@ -8612,5 +8696,107 @@ mod tests {
         // Release everything; the counter returns to baseline.
         drop(slots);
         assert_eq!(ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire), baseline);
+    }
+
+    /// Read-ahead pipelining regression: the bulk `server_download_loop` overlaps
+    /// the next origin read with the in-flight client write, ping-ponging two read
+    /// buffers and two seal scratches. This proves the pipeline relays every byte
+    /// exactly once, in order, with NO loss, reordering, or duplication across the
+    /// buffer swaps — including bursts large enough to trigger the parallel-AEAD
+    /// path — and that a clean origin EOF is propagated as a FIN to the client side.
+    #[tokio::test]
+    async fn download_pipeline_relays_bytes_byte_exact_across_buffer_swaps() {
+        use rand::{rngs::StdRng, RngCore, SeedableRng};
+        use tokio::time::{timeout, Duration};
+
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordCodec};
+
+        // Matched seal (loop) / open (verifier) codec pair: same key + nonce base,
+        // server->client direction, zero padding so the opened plaintext is exactly
+        // the origin bytes.
+        fn codec() -> DataRecordCodec {
+            let key = [0x55_u8; KEY_LEN];
+            let nonce = [0x66_u8; NONCE_LEN];
+            let padding = PaddingProfile::new(0, 0).unwrap();
+            DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD)
+        }
+
+        // Several MiB of deterministic data so multiple 256 KiB relay reads (and
+        // hence multiple buffer swaps + parallel seals) occur.
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
+        let mut payload = vec![0_u8; 6 * 1024 * 1024 + 4321];
+        rng.fill_bytes(&mut payload);
+
+        // origin/target -> server download loop: a real TCP pair.
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let payload_for_origin = payload.clone();
+        let origin = tokio::spawn(async move {
+            let mut target = tokio::net::TcpStream::connect(origin_addr).await.unwrap();
+            target.write_all(&payload_for_origin).await.unwrap();
+            // Drop closes the write half -> the download loop reads EOF and FINs.
+        });
+        let (origin_for_loop, _) = origin_listener.accept().await.unwrap();
+        let (target_read, _target_write_unused) = origin_for_loop.into_split();
+
+        // server download loop -> client side: a second TCP pair carrying sealed
+        // records, opened in order by the client end.
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let collector = tokio::spawn(async move {
+            let (client_side, _) = client_listener.accept().await.unwrap();
+            let (client_read, _client_write_unused) = client_side.into_split();
+            let mut reader = crate::transport::leg::TcpLegReader::buffered(client_read);
+            let mut open = codec();
+            let mut record = Vec::new();
+            let mut plaintext = Vec::new();
+            loop {
+                match reader.read_record_into(&mut record).await {
+                    Ok(()) => {
+                        let range = open.open_in_place_payload_range(&mut record).unwrap();
+                        plaintext.extend_from_slice(&record[range]);
+                    }
+                    Err(err) if reader.is_clean_close(&err) => break,
+                    Err(err) => panic!("unexpected reader error: {err}"),
+                }
+            }
+            plaintext
+        });
+        let client_for_loop = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+        let (_client_read_unused, client_write) = client_for_loop.into_split();
+
+        let target_buf = vec![0_u8; relay_read_buffer_len(max_plaintext_len(0))];
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let traffic = TrafficConfig::default();
+        let download = server_download_loop(
+            target_read,
+            crate::transport::leg::TcpLegWriter(client_write),
+            codec(),
+            target_buf,
+            TimingProfile::from_config(traffic),
+            CoverTrafficProfile::from_config(traffic),
+            activity,
+            9,
+        );
+
+        let (loop_res, origin_res, collected) = timeout(Duration::from_secs(30), async {
+            tokio::join!(download, origin, collector)
+        })
+        .await
+        .expect("pipeline relay must complete promptly");
+        loop_res.expect("download loop returns Ok on clean EOF");
+        origin_res.expect("origin task");
+        let collected = collected.expect("collector task");
+
+        assert_eq!(
+            collected.len(),
+            payload.len(),
+            "pipeline must relay exactly the origin byte count (no loss/duplication)"
+        );
+        assert!(
+            collected == payload,
+            "pipeline must relay every byte in order, byte-exact across buffer swaps"
+        );
     }
 }
