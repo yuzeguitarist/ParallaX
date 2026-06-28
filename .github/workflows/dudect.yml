@@ -87,8 +87,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       # Lint the dudect-gated code too, so the feature-gated test cannot rot.
+      # Matches the repo convention (--all-targets, as in lint/ci-pr).
       - name: cargo clippy --features dudect
-        run: cargo clippy --features dudect --locked --lib --tests -- -D warnings
+        run: cargo clippy --features dudect --all-targets --locked -- -D warnings
 
       # The hard gate. Single-threaded so the timing loop is not perturbed by
       # other test threads sharing the runner's cores.

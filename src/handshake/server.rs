@@ -6896,10 +6896,27 @@ mod tests {
     fn rejection_path_timing_is_constant_dudect() {
         let server = X25519KeyPair::generate();
 
-        let samples: usize = std::env::var("DUDECT_SAMPLES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100_000);
+        // Minimum sample count for the gate to have statistical power. A tiny (or
+        // zero) sample count would make the loop below run too few iterations for
+        // the mean/variance to be meaningful — and `DUDECT_SAMPLES=0` would skip
+        // sampling entirely, leaving the accumulators empty and the assertions
+        // vacuously green. Reject anything below the floor LOUDLY rather than
+        // silently clamping, so the load-bearing gate cannot be neutered via env.
+        const MIN_DUDECT_SAMPLES: usize = 1_000;
+        let samples: usize = match std::env::var("DUDECT_SAMPLES") {
+            Ok(v) => {
+                let n: usize = v
+                    .parse()
+                    .unwrap_or_else(|_| panic!("DUDECT_SAMPLES={v:?} is not a valid usize"));
+                assert!(
+                    n >= MIN_DUDECT_SAMPLES,
+                    "DUDECT_SAMPLES={n} is below the {MIN_DUDECT_SAMPLES} floor; too few \
+                     samples would make this load-bearing constant-time gate vacuous"
+                );
+                n
+            }
+            Err(_) => 100_000,
+        };
 
         // The three parseable reject shapes, matching the REJECT_DH_OPS counter
         // tests' coverage exactly (B / recover==None / D).
