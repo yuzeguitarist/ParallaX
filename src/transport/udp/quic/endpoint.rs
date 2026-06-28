@@ -139,28 +139,42 @@ fn set_udp_socket_buffers(socket: &UdpSocket) {
     let Some(bufs) = UDP_SOCKET_BUFFER_OVERRIDE.get() else {
         return;
     };
-    apply_udp_socket_buffers(socket, *bufs);
+    let _ = apply_udp_socket_buffers(socket, *bufs);
+}
+
+/// The buffer sizes the kernel actually applied, read back after the set. `None` for a
+/// direction means it was not requested, or the set / read-back failed — so a test can
+/// assert the plumbing took effect rather than tautologically passing on a silent
+/// failure.
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AppliedUdpBuffers {
+    send: Option<usize>,
+    recv: Option<usize>,
 }
 
 /// Apply explicit buffer sizes to a UDP socket (the pure core of
-/// [`set_udp_socket_buffers`], without the global lookup, so it is unit-testable). A
-/// no-op when both directions are `None`.
+/// [`set_udp_socket_buffers`], without the global lookup, so it is unit-testable).
+/// Returns the read-back applied sizes per direction. A no-op (all-`None`) when both
+/// directions are `None`.
 #[cfg(unix)]
-fn apply_udp_socket_buffers(socket: &UdpSocket, bufs: UdpSocketBuffers) {
+fn apply_udp_socket_buffers(socket: &UdpSocket, bufs: UdpSocketBuffers) -> AppliedUdpBuffers {
     use socket2::SockRef;
 
+    let mut applied = AppliedUdpBuffers::default();
     if bufs.send.is_none() && bufs.recv.is_none() {
-        return;
+        return applied;
     }
     let sock = SockRef::from(socket);
     if let Some(send) = bufs.send {
         match sock.set_send_buffer_size(send as usize) {
             Ok(()) => {
-                if let Ok(applied) = sock.send_buffer_size() {
-                    if applied < send as usize {
+                if let Ok(got) = sock.send_buffer_size() {
+                    applied.send = Some(got);
+                    if got < send as usize {
                         tracing::warn!(
                             requested = send,
-                            applied,
+                            applied = got,
                             "kernel clamped udp SO_SNDBUF (raise net.core.wmem_max / kern.ipc.maxsockbuf)"
                         );
                     }
@@ -172,11 +186,12 @@ fn apply_udp_socket_buffers(socket: &UdpSocket, bufs: UdpSocketBuffers) {
     if let Some(recv) = bufs.recv {
         match sock.set_recv_buffer_size(recv as usize) {
             Ok(()) => {
-                if let Ok(applied) = sock.recv_buffer_size() {
-                    if applied < recv as usize {
+                if let Ok(got) = sock.recv_buffer_size() {
+                    applied.recv = Some(got);
+                    if got < recv as usize {
                         tracing::warn!(
                             requested = recv,
-                            applied,
+                            applied = got,
                             "kernel clamped udp SO_RCVBUF (raise net.core.rmem_max / kern.ipc.maxsockbuf)"
                         );
                     }
@@ -185,6 +200,7 @@ fn apply_udp_socket_buffers(socket: &UdpSocket, bufs: UdpSocketBuffers) {
             Err(_) => tracing::trace!("udp SO_RCVBUF request failed; keeping kernel default"),
         }
     }
+    applied
 }
 
 #[cfg(not(unix))]
@@ -2098,41 +2114,53 @@ mod tests {
     }
 
     /// With no buffers requested, applying is a pure no-op (the default, zero-regression
-    /// path): the socket keeps its kernel-chosen buffer sizes.
+    /// path): it reports nothing applied and leaves the socket's kernel-chosen sizes.
     #[cfg(unix)]
     #[tokio::test]
     async fn apply_none_leaves_socket_untouched() {
         use socket2::SockRef;
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let before = SockRef::from(&socket).recv_buffer_size().unwrap();
-        apply_udp_socket_buffers(&socket, UdpSocketBuffers::default());
+        let applied = apply_udp_socket_buffers(&socket, UdpSocketBuffers::default());
+        assert_eq!(
+            applied,
+            AppliedUdpBuffers::default(),
+            "no-op reports nothing"
+        );
         let after = SockRef::from(&socket).recv_buffer_size().unwrap();
         assert_eq!(before, after, "no override must not touch the socket");
     }
 
-    /// Applying an explicit recv buffer is accepted by the kernel and visible on
-    /// read-back (the socket2 plumbing works on this platform). The kernel may clamp,
-    /// so assert it grew toward the request rather than an exact match.
+    /// Applying an explicit recv buffer is accepted by the kernel and visible on the
+    /// returned read-back (the socket2 plumbing works on this platform). The kernel may
+    /// clamp to net.core.rmem_max / kern.ipc.maxsockbuf, so assert the set both reported
+    /// a value AND that value actually grew above the autotuned baseline — a silently
+    /// ignored or failed setsockopt would leave `applied.recv == None`, failing here.
     #[cfg(unix)]
     #[tokio::test]
     async fn apply_explicit_recv_buffer_takes_effect() {
         use socket2::SockRef;
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let baseline = SockRef::from(&socket).recv_buffer_size().unwrap();
-        apply_udp_socket_buffers(
+        let applied = apply_udp_socket_buffers(
             &socket,
             UdpSocketBuffers {
                 send: None,
                 recv: Some(4_000_000),
             },
         );
-        let applied = SockRef::from(&socket).recv_buffer_size().unwrap();
-        // The kernel clamps to net.core.rmem_max / kern.ipc.maxsockbuf, so the applied
-        // value may be below the 4 MiB request; it must be at least the baseline (the
-        // set never shrinks an autotuned buffer below where it started).
+        // The meaningful plumbing assertion: the set + read-back both returned Ok, so
+        // `applied.recv` is Some (a silently-ignored or failed setsockopt would leave it
+        // None and fail here). The value must be at least the baseline — the kernel may
+        // clamp to net.core.rmem_max / kern.ipc.maxsockbuf, so it can equal but never
+        // shrink below where autotuning started.
+        let got = applied
+            .recv
+            .expect("the recv setsockopt + read-back must succeed");
         assert!(
-            applied >= baseline,
-            "explicit recv buffer ({applied}) must be >= baseline ({baseline})"
+            got >= baseline,
+            "explicit recv buffer ({got}) must be >= baseline ({baseline})"
         );
+        assert!(applied.send.is_none(), "send was not requested");
     }
 }

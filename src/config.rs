@@ -601,8 +601,10 @@ pub enum UdpFecProfile {
 /// choose TCP vs UDP.
 ///
 /// LIVE knobs in this version (QUIC reliable-stream fast plane for the
-/// single-Connect relay path): `enabled` and `probe_timeout_ms`. Enabling
-/// requires matched binaries on both ends.
+/// single-Connect relay path): `enabled`, `probe_timeout_ms`,
+/// `max_udp_payload_bytes`, and the wire-invisible carrier-socket buffer knobs
+/// `send_buffer_bytes` / `recv_buffer_bytes`. Enabling requires matched binaries
+/// on both ends.
 ///
 /// RESERVED knobs (parsed + validated for forward-compatibility but NOT
 /// honored): `cc` / `brutal_*` / `ignore_client_bandwidth` (congestion control —
