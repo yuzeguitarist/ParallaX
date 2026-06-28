@@ -89,7 +89,7 @@ const WINDOW: usize = 6;
 /// deadline branch); the relay-loop reads — `server_upload_loop`'s
 /// client read, plus `server_download_loop`'s target reads in its no-cover and
 /// cover-traffic branches AND the two reads of its read-ahead pipeline (the
-/// prime read and the `tokio::join!` read-ahead), each bounded only by the
+/// prime read and the `write_batch_with_read_ahead` read-ahead), each bounded only by the
 /// external `relay_idle_watchdog` future raced in a sibling `select!` arm and by
 /// the loop's own EOF termination; and the mux-over-QUIC session-end watcher's
 /// one-shot TCP read (`run_authenticated_mux_quic_data_mode`): not a relay loop
@@ -100,7 +100,7 @@ const WINDOW: usize = 6;
 /// and classifies as TIMED, so it does not appear here.
 ///
 /// +2 vs the prior baseline of 8: `server_download_loop`'s read-ahead pipeline
-/// adds a prime read and a `tokio::join!` read-ahead. Both are inbound origin
+/// adds a prime read and a `write_batch_with_read_ahead` read-ahead. Both are inbound origin
 /// reads in the same loop, bounded identically to the loop's other reads (EOF
 /// termination + the external `relay_idle_watchdog`), so they are a conscious
 /// no-new-DoS bump, not a new untimed DoS surface.
@@ -112,14 +112,14 @@ const EXPECTED_UNTIMED_SERVER: usize = 10;
 /// key-exchange-after-residuals loop, the server-identity reassembly loop), the
 /// `client_upload_loop` reads of the *local* SOCKS app socket (loopback, not
 /// network-facing, but matched by the same `.read(` token) — the two reads of its
-/// read-ahead pipeline (prime + `tokio::join!` read-ahead) plus the cover-traffic
+/// read-ahead pipeline (prime + `write_batch_with_read_ahead` read-ahead) plus the cover-traffic
 /// branch read — the `client_mux_upload_loop` local read, and
 /// `client_download_loop`'s server read — the client-side mirror of the server
 /// relay loop, bounded only by `client_relay_idle_watchdog`.
 ///
 /// +1 vs the prior baseline of 7: `client_upload_loop`'s non-cover branch now
 /// read-ahead pipelines — its single serial local read is replaced by a prime read
-/// and a `tokio::join!` read-ahead (net +1 read site). Both are loopback reads
+/// and a `write_batch_with_read_ahead` read-ahead (net +1 read site). Both are loopback reads
 /// bounded by the loop's EOF termination and the external
 /// `client_relay_idle_watchdog`, so this is a conscious no-new-DoS bump.
 const EXPECTED_UNTIMED_RUNTIME: usize = 8;
