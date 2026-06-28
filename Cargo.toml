@@ -81,6 +81,11 @@ zeroize = { version = "1.7", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: enables tokio's paused-clock controls (`time::pause`/`advance`,
+# `#[tokio::test(start_paused = true)]`) so time-dependent paths (e.g. the
+# speed-test upload throughput floor) can be tested deterministically without
+# real waits. Feature-unified with the runtime tokio dep; adds no runtime code.
+tokio = { version = "1.37", features = ["test-util"] }
 # ML-DSA-87 differential oracle (tests/mldsa_differential.rs only): the PQClean C
 # FFI implementation the hand-rolled `crypto::mldsa` is cross-checked against. The
 # production identity signer is `crypto::mldsa`; these are test-only since the
