@@ -50,12 +50,17 @@ pub fn record_lengths(payload: &[u8]) -> Vec<u32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x9a1c_2026);
     let sealed = codec.seal_chunks(payload, &mut rng).expect("seal_chunks");
 
-    // Each element is one complete on-wire TLS record. Parse its cleartext
-    // 5-byte header for the record length — the value a passive observer reads.
+    // Each element is one complete on-wire TLS record that the production
+    // encoder just sealed, so every header MUST parse — a failure means the
+    // encoder produced a malformed record, which is a real bug we want to surface
+    // loudly rather than silently drop (which would understate the record count).
     sealed
         .iter()
-        .filter_map(|rec| record::parse_header(rec).ok())
-        .map(|header| (header.total_len - TLS_HEADER_LEN) as u32)
+        .map(|rec| {
+            let header = record::parse_header(rec)
+                .expect("production seal_chunks emitted an unparsable TLS record");
+            (header.total_len - TLS_HEADER_LEN) as u32
+        })
         .collect()
 }
 
@@ -105,5 +110,11 @@ mod tests {
             "non-uniform full records: {:?}",
             &lens[..lens.len().min(6)]
         );
+        // Pin the actual value the test name promises: 16401 is ParallaX's full
+        // on-wire record length and exactly the Safari uplink full-record bucket
+        // (see `data::OUTER_TLS_RECORD_LIMIT` and the big-POST fixture). Asserted
+        // as a literal — not the production constant — so a regression that
+        // shifts the regime (e.g. to 16400) is caught instead of tracked.
+        assert_eq!(full, 16401, "ParallaX full-record length is not 16401");
     }
 }
