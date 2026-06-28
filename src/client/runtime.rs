@@ -52,8 +52,8 @@ use crate::{
     traffic::CoverTrafficProfile,
     transport::{
         leg::{
-            H3DataFrameLegReader, H3DataFrameLegWriter, LegReader, LegWriter, TcpLegReader,
-            TcpLegWriter,
+            write_batch_with_read_ahead, H3DataFrameLegReader, H3DataFrameLegWriter, LegReader,
+            LegWriter, TcpLegReader, TcpLegWriter,
         },
         tcp::{
             connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
@@ -2896,12 +2896,14 @@ where
             // local burst into the spare buffer. The two borrows are disjoint
             // (write touches `server_write` + `seal_scratch.records_buf`; read
             // touches `local_read` + `spare_buf`), so neither aliases the codec.
-            let (write_res, read_res) = tokio::join!(
-                server_write.write_records(seal_scratch.records_buf.as_slice()),
+            // A write error short-circuits immediately (the read is cancelled),
+            // matching the serial path's "write error before next read" ordering.
+            let next_n = write_batch_with_read_ahead(
+                &mut server_write,
+                seal_scratch.records_buf.as_slice(),
                 local_read.read(&mut spare_buf),
-            );
-            write_res?;
-            let next_n = read_res?;
+            )
+            .await?;
             if next_n == 0 {
                 let _ = server_write.shutdown().await;
                 return Ok(seal_to_server);
