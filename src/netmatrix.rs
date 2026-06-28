@@ -137,7 +137,10 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
-    let half_rtt = Duration::from_millis(imp.rtt_ms / 2);
+    // Half the RTT, computed in microseconds so an odd `rtt_ms` is not truncated
+    // by integer division (e.g. 5 ms -> 2 ms instead of 2.5 ms). The MATRIX values
+    // are all even today, so this only future-proofs odd entries.
+    let half_rtt = Duration::from_micros(imp.rtt_ms * 500);
     let (tx, mut rx) = mpsc::channel::<(Instant, Vec<u8>)>(1024);
 
     let read_task = tokio::spawn(async move {
@@ -345,6 +348,7 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
 }
 
 fn json_escape(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -353,6 +357,11 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // JSON requires every U+0000..=U+001F control character to be escaped;
+            // emit the remaining ones as \u00XX so the output is always valid JSON.
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }

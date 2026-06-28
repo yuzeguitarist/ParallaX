@@ -236,6 +236,16 @@ const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
 /// only empty records cannot loop forever (the per-read idle timeout resets on
 /// every record and so never fires under that input).
 const MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS: u32 = 1024;
+/// Phase-level cap on the TOTAL zero-length records the upload phase tolerates,
+/// counted cumulatively and never reset. The consecutive cap above is reset by
+/// any progress-bearing record, so a client alternating a burst of empty records
+/// with a single 1-byte data record keeps both that cap AND the per-read idle
+/// timeout from ever firing, pinning the connection slot for ~`bytes` 1-byte
+/// iterations. This cumulative cap bounds that input regardless of interleaving.
+/// A legitimate upload carries its bytes in full ~16 KiB records and emits
+/// essentially no empty records, so this is orders of magnitude above any honest
+/// value while keeping the abusive case strictly bounded.
+const MAX_TOTAL_EMPTY_UPLOAD_RECORDS: u64 = 256 * 1024;
 
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -529,6 +539,17 @@ pub(crate) async fn build_quic_carrier_for_test(
 /// Safari-26 NewSessionTicket baseline. The anti-replay window is sized to this so
 /// a ticket stays replay-protected for exactly as long as it is valid.
 const ZERO_RTT_TICKET_LIFETIME_SECS: u64 = 604_800;
+/// Bind the cross-file invariant at compile time: the replay window here must be
+/// `>=` the ticket lifetime advertised by the QUIC server (`TICKET_LIFETIME_SECS`
+/// in `crate::tls::quic::server`). Ticket expiry is enforced separately by the
+/// lifetime check, so a window LONGER than the lifetime is strictly safer (more
+/// replay coverage, no downside); only a window SHORTER than the lifetime is a
+/// hole — a still-valid ticket would lose replay protection. Mirrors the marker
+/// `>=` invariant above.
+const _: () = assert!(
+    ZERO_RTT_TICKET_LIFETIME_SECS >= crate::tls::quic::TICKET_LIFETIME_SECS as u64,
+    "0-RTT replay window must outlast the advertised ticket lifetime"
+);
 
 /// The 0-RTT anti-replay cache path: a sibling of the auth-handshake replay cache
 /// (so an operator protects one directory), kept distinct because the two caches
@@ -545,9 +566,17 @@ fn zero_rtt_replay_cache_path(auth_cache_path: &std::path::Path) -> std::path::P
 
 /// Retention window for the persistent origin-splice marker replay cache (issue #74).
 /// MUST be `>=` the marker freshness window (`MARKER_WINDOW_SECS` in
-/// `crate::tls::quic::server`, currently 3600s) so a captured marker stays
-/// replay-protected for at least as long as the server would still accept it.
+/// `crate::tls::quic::server`) so a captured marker stays replay-protected for at
+/// least as long as the server would still accept it.
 const MARKER_REPLAY_WINDOW_SECS: u64 = 3600;
+/// Bind the cross-file invariant at compile time: if a future change raises the
+/// marker freshness window past the replay window, a captured marker would be
+/// accepted after it left the replay cache (a validity-tail replay hole). A bare
+/// comment cannot catch that drift; this assertion does.
+const _: () = assert!(
+    MARKER_REPLAY_WINDOW_SECS >= crate::tls::quic::MARKER_WINDOW_SECS,
+    "marker replay window must outlast the marker freshness window"
+);
 
 /// The marker replay cache path: a sibling `.marker` of the auth-handshake replay
 /// cache, kept distinct because it keys the marker `(nonce, timestamp)` rather than a
@@ -5144,6 +5173,7 @@ where
 {
     let mut uploaded = 0_u64;
     let mut consecutive_empty: u32 = 0;
+    let mut total_empty: u64 = 0;
     let mut client_record = Vec::new();
     let idle = fallback_idle_timeout();
     while uploaded < bytes {
@@ -5174,6 +5204,16 @@ where
                 return Err(HandshakeServerError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "speed upload sent too many consecutive empty records",
+                )));
+            }
+            // Cumulative cap: the consecutive cap below is reset by any data
+            // record, so an empty/1-byte alternation never trips it. Counting all
+            // empty records across the phase bounds that interleaving too.
+            total_empty += 1;
+            if total_empty > MAX_TOTAL_EMPTY_UPLOAD_RECORDS {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed upload sent too many empty records",
                 )));
             }
             continue;

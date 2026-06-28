@@ -59,7 +59,16 @@ impl QuicCarrier {
                 let Ok(offer_id) = <[u8; 16]>::try_from(conn.peer_initial_dcid()) else {
                     continue;
                 };
-                let waiter = accept_reg.lock().unwrap().remove(&offer_id);
+                // Recover from a poisoned registry rather than unwrap-panicking: this
+                // is the process-wide accept task, so a panic here would silently kill
+                // demuxing for ALL future connections (a much larger blast radius than
+                // one connection). The map only ever holds plain oneshot senders, so a
+                // recovered guard is consistent. Matches the poison-tolerant locking in
+                // `handshake::source_limit` and keeps register/unregister consistent.
+                let waiter = accept_reg
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&offer_id);
                 if let Some(tx) = waiter {
                     // Receiver gone (session timed out) → the connection drops here.
                     let _ = tx.send(conn);
@@ -90,13 +99,19 @@ impl QuicCarrier {
     /// [`Self::unregister`] so a no-show registration does not leak.
     pub(crate) fn register(&self, offer_id: [u8; 16]) -> oneshot::Receiver<Connection> {
         let (tx, rx) = oneshot::channel();
-        self.registry.lock().unwrap().insert(offer_id, tx);
+        self.registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(offer_id, tx);
         rx
     }
 
     /// Drop a pending registration (the session gave up before the client connected).
     pub(crate) fn unregister(&self, offer_id: &[u8; 16]) {
-        self.registry.lock().unwrap().remove(offer_id);
+        self.registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(offer_id);
     }
 }
 
