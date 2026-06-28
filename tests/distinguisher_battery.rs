@@ -218,12 +218,16 @@ fn self_test_safari_is_indistinguishable_from_itself() {
         ks.p_value
     );
 
-    // Classifier AUC near chance.
+    // Classifier AUC must sit in the documented indistinguishability gate. This
+    // is the contract from the module header and PR — no fallback escape hatch.
+    // Deterministic (fixed LCG seed + fixed corpus), so the measured AUC is
+    // stable rather than flaky; `separability` is reported for diagnostics only.
     let samples = samples_from(&a, &b);
     let auc = cross_validated_auc(&samples, FOLDS);
     assert!(
-        (0.45..=0.55).contains(&auc) || separability(&samples, FOLDS) < 0.12,
-        "self-test AUC not near chance: {auc} (n={})",
+        (0.45..=0.55).contains(&auc),
+        "self-test AUC not near chance: {auc} (separability={:.4}, n={})",
+        separability(&samples, FOLDS),
         samples.len()
     );
 }
@@ -330,25 +334,34 @@ fn parallax_vs_safari_uplink_length_distribution() {
         ks.p_value
     );
 
-    // Hard assertion: ParallaX's full records must sit in the SAME size bucket
-    // as Safari's full records (the deliberately-matched 16401 regime). This is
-    // the one length claim we can gate without flakiness.
-    if parallax_full > 0 && safari_full > 0 {
-        let safari_full_size = safari_c2s
-            .iter()
-            .cloned()
-            .filter(|&l| l >= 16000.0)
-            .fold(0.0, f64::max);
-        let parallax_full_size = parallax_c2s
-            .iter()
-            .cloned()
-            .filter(|&l| l >= 16000.0)
-            .fold(0.0, f64::max);
-        assert_eq!(
-            safari_full_size, parallax_full_size,
-            "ParallaX full-record size {parallax_full_size} != Safari {safari_full_size}"
-        );
-    }
+    // Hard assertions on the deliberately-matched 16401 full-record regime.
+    //
+    // We pin the literal 16401 as the *modal* (most-common) record length in
+    // both corpora, rather than requiring every >=16000 record to equal it.
+    // Both corpora legitimately carry non-16401 near-full records: Safari's H2
+    // DATA framing leaves a tail of 16340..16400, and ParallaX's `seal_chunks`
+    // emits one short remainder record at the end of the payload. The matched
+    // regime claim is that the *full* record — the dominant bucket — is exactly
+    // 16401 on both sides, byte-for-byte.
+    const FULL_RECORD_LEN: u32 = 16401;
+    let modal_len = |lens: &[f64]| -> (u32, usize) {
+        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for &l in lens {
+            *counts.entry(l as u32).or_default() += 1;
+        }
+        counts.into_iter().max_by_key(|&(_, c)| c).unwrap_or((0, 0))
+    };
+    let (safari_modal, safari_modal_n) = modal_len(&safari_c2s);
+    let (parallax_modal, parallax_modal_n) = modal_len(&parallax_c2s);
+
+    assert_eq!(
+        parallax_modal, FULL_RECORD_LEN,
+        "ParallaX modal record length {parallax_modal} (×{parallax_modal_n}) != {FULL_RECORD_LEN}"
+    );
+    assert_eq!(
+        safari_modal, FULL_RECORD_LEN,
+        "Safari modal record length {safari_modal} (×{safari_modal_n}) != {FULL_RECORD_LEN}"
+    );
 }
 
 /// Tier 4 (socket): the full timing + direction comparison needs a live
