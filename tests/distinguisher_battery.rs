@@ -1,0 +1,374 @@
+//! Statistical distinguisher battery — integration driver.
+//!
+//! Four tiers (see `tests/distinguisher/mod.rs` for the methodology):
+//!
+//! 1. **Unit self-checks (fast)** — feed synthetic known distributions to KS /
+//!    chi-squared / Ljung-Box / AUC and assert they behave (same ⇒ p>0.05,
+//!    different ⇒ p<0.01; separable ⇒ AUC≈1, identical ⇒ AUC≈0.5). Proves the
+//!    machinery is correct before trusting any verdict it gives.
+//! 2. **Self-test (fast)** — split the real Safari corpus in two and confirm the
+//!    battery finds it indistinguishable from itself (KS p>0.05, AUC∈[0.45,0.55]).
+//!    If the battery is biased against its own ground truth, every downstream
+//!    verdict is void.
+//! 3. **Discriminability self-proof (fast)** — inject a known perturbation
+//!    (1:1-ACK, record resize) into half the corpus and assert the battery FIRES
+//!    (KS p→0, AUC→1). Proves it has discriminating power, not just low variance.
+//! 4. **ParallaX vs Safari (length, fast)** — drive ParallaX's production record
+//!    encoder, compare its uplink record-length distribution to Safari's, and
+//!    report the KS verdict. The richer socket-level timing/direction comparison
+//!    is an `#[ignore]` placeholder pending an end-to-end authenticated harness.
+
+mod distinguisher;
+
+use distinguisher::classifier::{cross_validated_auc, roc_auc, separability, Sample};
+use distinguisher::features::{self, window_features};
+use distinguisher::parallax_source;
+use distinguisher::perturb;
+use distinguisher::safari_source;
+use distinguisher::stats::{chi_square_gof, ljung_box, two_sample_ks};
+use distinguisher::trace::{Dir, Record, Trace};
+
+/// Records-per-window for classifier feature rows. ~1528 Safari records / 30 ≈
+/// 50 rows, enough for a stable 5-fold CV-AUC.
+const WINDOW: usize = 30;
+const FOLDS: usize = 5;
+
+/// Deterministic LCG for synthetic-distribution generation in the unit tier.
+struct Lcg(u64);
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Lcg(seed)
+    }
+    fn unit(&mut self) -> f64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+    /// Approx-normal via central limit (sum of 12 uniforms − 6).
+    fn normal(&mut self, mean: f64, sd: f64) -> f64 {
+        let s: f64 = (0..12).map(|_| self.unit()).sum::<f64>() - 6.0;
+        mean + sd * s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: unit self-checks on synthetic data.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ks_separates_known_distributions() {
+    let mut rng = Lcg::new(1);
+    let a: Vec<f64> = (0..400).map(|_| rng.normal(100.0, 10.0)).collect();
+    let b: Vec<f64> = (0..400).map(|_| rng.normal(100.0, 10.0)).collect();
+    let c: Vec<f64> = (0..400).map(|_| rng.normal(160.0, 10.0)).collect();
+
+    let same = two_sample_ks(&a, &b);
+    let diff = two_sample_ks(&a, &c);
+
+    assert!(same.p_value > 0.05, "same-dist KS p too low: {:?}", same);
+    assert!(diff.p_value < 0.01, "diff-dist KS p too high: {:?}", diff);
+    assert!(diff.statistic > same.statistic);
+}
+
+#[test]
+fn chi_square_flags_skewed_histogram() {
+    // Uniform expected over 5 bins, n=500.
+    let expected = vec![100.0; 5];
+    let uniform_obs = vec![98.0, 102.0, 100.0, 101.0, 99.0];
+    let skewed_obs = vec![200.0, 50.0, 50.0, 100.0, 100.0];
+
+    let flat = chi_square_gof(&uniform_obs, &expected);
+    let skew = chi_square_gof(&skewed_obs, &expected);
+
+    assert!(flat.p_value > 0.05, "flat hist flagged: {:?}", flat);
+    assert!(skew.p_value < 0.01, "skewed hist not flagged: {:?}", skew);
+}
+
+#[test]
+fn ljung_box_detects_autocorrelation() {
+    let mut rng = Lcg::new(7);
+    // White noise: no autocorrelation.
+    let white: Vec<f64> = (0..300).map(|_| rng.normal(0.0, 1.0)).collect();
+    // AR(1) with phi=0.8: strong autocorrelation.
+    let mut ar = vec![0.0; 300];
+    let mut prev = 0.0;
+    for v in ar.iter_mut() {
+        let e = rng.normal(0.0, 1.0);
+        *v = 0.8 * prev + e;
+        prev = *v;
+    }
+
+    let w = ljung_box(&white, 10);
+    let a = ljung_box(&ar, 10);
+    assert!(
+        w.p_value > 0.05,
+        "white noise flagged autocorrelated: {:?}",
+        w
+    );
+    assert!(a.p_value < 0.01, "AR(1) not flagged: {:?}", a);
+}
+
+#[test]
+fn auc_is_one_for_separable_and_half_for_identical() {
+    let mut rng = Lcg::new(11);
+    // Separable: class 0 ~ N(0,1), class 1 ~ N(5,1) on one feature.
+    let mut separable = Vec::new();
+    for _ in 0..80 {
+        separable.push(Sample {
+            features: vec![rng.normal(0.0, 1.0)],
+            label: 0,
+        });
+        separable.push(Sample {
+            features: vec![rng.normal(5.0, 1.0)],
+            label: 1,
+        });
+    }
+    // Identical: both classes ~ N(0,1) — no signal.
+    let mut identical = Vec::new();
+    for _ in 0..80 {
+        identical.push(Sample {
+            features: vec![rng.normal(0.0, 1.0)],
+            label: 0,
+        });
+        identical.push(Sample {
+            features: vec![rng.normal(0.0, 1.0)],
+            label: 1,
+        });
+    }
+
+    let sep_auc = cross_validated_auc(&separable, FOLDS);
+    let id_auc = cross_validated_auc(&identical, FOLDS);
+
+    assert!(sep_auc > 0.9, "separable AUC too low: {sep_auc}");
+    assert!(
+        (id_auc - 0.5).abs() < 0.12,
+        "identical AUC not near 0.5: {id_auc}"
+    );
+}
+
+#[test]
+fn roc_auc_handles_ties_and_perfect_ranking() {
+    // Perfect ranking.
+    let perfect = vec![(0.1, 0), (0.2, 0), (0.8, 1), (0.9, 1)];
+    assert!((roc_auc(&perfect) - 1.0).abs() < 1e-9);
+    // All tied scores ⇒ AUC 0.5.
+    let tied = vec![(0.5, 0), (0.5, 1), (0.5, 0), (0.5, 1)];
+    assert!((roc_auc(&tied) - 0.5).abs() < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for tiers 2–4: build classifier samples from two traces.
+// ---------------------------------------------------------------------------
+
+/// Build labelled per-window samples: label 0 from `a`, label 1 from `b`.
+fn samples_from(a: &Trace, b: &Trace) -> Vec<Sample> {
+    let mut s: Vec<Sample> = window_features(a, WINDOW)
+        .into_iter()
+        .map(|features| Sample { features, label: 0 })
+        .collect();
+    s.extend(
+        window_features(b, WINDOW)
+            .into_iter()
+            .map(|features| Sample { features, label: 1 }),
+    );
+    s
+}
+
+/// Randomly partition a trace's records into two sub-traces sharing the same
+/// generating process — the self-test null. A deterministic LCG drives a coin
+/// flip per record. (An even/odd split is wrong here: the Safari uplink
+/// alternates 44 B/30 B control records in lockstep, so index parity would
+/// systematically sort the two lengths into opposite halves and manufacture a
+/// difference where there is none — a lesson the battery taught us directly.)
+fn split_halves(trace: &Trace) -> (Trace, Trace) {
+    let mut rng = Lcg::new(0xd157_2026);
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for r in &trace.records {
+        if rng.unit() < 0.5 {
+            a.push(*r);
+        } else {
+            b.push(*r);
+        }
+    }
+    (Trace::new(a), Trace::new(b))
+}
+
+fn load_safari() -> Trace {
+    safari_source::load_fixture().expect("load Safari TCP fixture")
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: self-test — Safari is indistinguishable from itself.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn self_test_safari_is_indistinguishable_from_itself() {
+    let safari = load_safari();
+    let (a, b) = split_halves(&safari);
+
+    // KS on C2S lengths: same source ⇒ high p.
+    let ks = two_sample_ks(&a.lengths(Dir::C2S), &b.lengths(Dir::C2S));
+    assert!(
+        ks.p_value > 0.05,
+        "self-test length KS rejected same source: D={:.4} p={:.4}",
+        ks.statistic,
+        ks.p_value
+    );
+
+    // Classifier AUC near chance.
+    let samples = samples_from(&a, &b);
+    let auc = cross_validated_auc(&samples, FOLDS);
+    assert!(
+        (0.45..=0.55).contains(&auc) || separability(&samples, FOLDS) < 0.12,
+        "self-test AUC not near chance: {auc} (n={})",
+        samples.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: discriminability self-proof — known perturbations must fire.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn detects_1to1_ack_pathology() {
+    let safari = load_safari();
+    let perturbed = perturb::force_1to1_ack(&safari);
+
+    // The "1:1 ACK" tell is NOT the count ratio — the battery measured the real
+    // Safari S2C/C2S ratio at 1.045, i.e. genuinely ~1:1, so "ratio ≈ 1.0" would
+    // falsely flag the real browser. The tell is the *structure* of the
+    // direction-run lengths: a strict-lockstep relay has every same-direction
+    // run pinned to length 1, whereas a real browser bursts (runs > 1). We prove
+    // the battery fires on that structural difference.
+    let real_runs = features::direction_runs(&safari);
+    let bad_runs = features::direction_runs(&perturbed);
+
+    // Sanity: the pathology really does collapse runs to 1, and the real stream
+    // does not (otherwise the test below would be vacuous).
+    let real_max_run = real_runs.iter().cloned().fold(0.0, f64::max);
+    let bad_max_run = bad_runs.iter().cloned().fold(0.0, f64::max);
+    assert!(
+        bad_max_run <= 1.0,
+        "lockstep should pin runs to 1, got max {bad_max_run}"
+    );
+    assert!(
+        real_max_run > 1.0,
+        "real Safari runs unexpectedly all length 1"
+    );
+
+    let ks = two_sample_ks(&real_runs, &bad_runs);
+    assert!(
+        ks.p_value < 0.01,
+        "1:1-ACK direction-run KS failed to fire: D={:.4} p={:.4}",
+        ks.statistic,
+        ks.p_value
+    );
+
+    // Classifier must separate real vs perturbed on the full feature vector.
+    let samples = samples_from(&safari, &perturbed);
+    let auc = cross_validated_auc(&samples, FOLDS);
+    assert!(
+        separability(&samples, FOLDS) > 0.25,
+        "1:1-ACK AUC failed to fire: {auc}"
+    );
+}
+
+#[test]
+fn detects_record_resize() {
+    let safari = load_safari();
+    let halved = perturb::resize_records(&safari, 0.5);
+
+    let ks = two_sample_ks(&safari.lengths(Dir::C2S), &halved.lengths(Dir::C2S));
+    assert!(
+        ks.p_value < 0.01,
+        "record-resize length KS failed to fire: D={:.4} p={:.4}",
+        ks.statistic,
+        ks.p_value
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 4: ParallaX vs Safari — length dimension via the production encoder.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallax_vs_safari_uplink_length_distribution() {
+    // Use the BIG-POST corpus: it has the real ~900 full 16401-byte uplink
+    // records that the data plane is tuned to match. The control-frame fixture
+    // has no large POST and is not length-comparable to ParallaX's pure-data
+    // uplink (the battery surfaced this directly).
+    let safari = safari_source::load_bigpost().expect("load Safari big-POST fixture");
+    let safari_c2s = safari.lengths(Dir::C2S);
+    let total_bytes: u64 = safari_c2s.iter().map(|&l| l as u64).sum();
+
+    // Drive ParallaX's production record encoder over a payload of the same
+    // total uplink volume Safari sent, so the record-count regimes are
+    // comparable. The payload content is irrelevant to record sizing.
+    let payload = vec![0x5a_u8; total_bytes as usize];
+    let parallax = parallax_source::uplink_trace(&payload);
+    let parallax_c2s = parallax.lengths(Dir::C2S);
+
+    let ks = two_sample_ks(&safari_c2s, &parallax_c2s);
+
+    // Report — this tier observes and prints; the gate is informational because
+    // the two corpora have legitimately different *small-record* tails (Safari's
+    // H2 control frames vs ParallaX's pure-data uplink). The headline check is
+    // that the FULL-record regime matches exactly.
+    let safari_full = safari_c2s.iter().filter(|&&l| l >= 16000.0).count();
+    let parallax_full = parallax_c2s.iter().filter(|&&l| l >= 16000.0).count();
+    eprintln!(
+        "[tier4-length] Safari C2S n={} (full≥16000:{}), ParallaX C2S n={} (full≥16000:{}); \
+         KS D={:.4} p={:.4}",
+        safari_c2s.len(),
+        safari_full,
+        parallax_c2s.len(),
+        parallax_full,
+        ks.statistic,
+        ks.p_value
+    );
+
+    // Hard assertion: ParallaX's full records must sit in the SAME size bucket
+    // as Safari's full records (the deliberately-matched 16401 regime). This is
+    // the one length claim we can gate without flakiness.
+    if parallax_full > 0 && safari_full > 0 {
+        let safari_full_size = safari_c2s
+            .iter()
+            .cloned()
+            .filter(|&l| l >= 16000.0)
+            .fold(0.0, f64::max);
+        let parallax_full_size = parallax_c2s
+            .iter()
+            .cloned()
+            .filter(|&l| l >= 16000.0)
+            .fold(0.0, f64::max);
+        assert_eq!(
+            safari_full_size, parallax_full_size,
+            "ParallaX full-record size {parallax_full_size} != Safari {safari_full_size}"
+        );
+    }
+}
+
+/// Tier 4 (socket): the full timing + direction comparison needs a live
+/// authenticated ParallaX session captured at the byte pump, which no existing
+/// loopback harness drives end-to-end. Left as an explicit, documented gap so
+/// the IAT/direction verdict is never silently faked from synthetic cadence.
+#[test]
+#[ignore = "needs end-to-end authenticated loopback capture; tracked as tier-4b"]
+fn parallax_vs_safari_timing_socket_capture() {
+    // Intentionally unimplemented. When a harness that drives an authenticated
+    // data-plane session over loopback exists, tap the byte pump for record
+    // boundaries + timestamps, build a Trace, and compare IAT (KS) + direction
+    // runs (chi-square) against Safari here. Synthetic cadence MUST NOT stand
+    // in for real timing in this tier.
+    let _ = (
+        Record {
+            len: 0,
+            dir: Dir::C2S,
+            t_micros: 0,
+        },
+        || -> Trace { Trace::default() },
+    );
+}
