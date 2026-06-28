@@ -1,6 +1,6 @@
 # Transport Layer
 
-> Navigation: [Index](README.md) | [TCP Transport](TCP-Camouflage-Transport.md) | [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>)
+> Navigation: [Index](README.md) | [TCP Transport](TCP-Camouflage-Transport.md) | [QUIC Fast Plane](QUIC-Fast-Plane.md) | [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>)
 
 ## Transport plane
 
@@ -30,7 +30,7 @@ context in [GFW Simulator & QUIC Research](<GFW-Simulator-&-QUIC-Research.md>).
 | Data record layer | `src/protocol/data.rs` | AEAD-sealed payloads inside TLS ApplicationData. |
 | Client/server relay | `src/client/runtime.rs`, `src/handshake/server.rs` | Bidirectional application relay. |
 | Transport leg abstraction | `src/transport/leg.rs` | Uniform reader/writer over either a TCP or a QUIC stream leg. |
-| UDP/QUIC fast plane (experimental, off by default) | `src/transport/udp/` | Clean-room QUIC endpoint (`quic/` submodule), Happy-Eyeballs probe, 0-RTT resumption, BBR congestion control, and exporter-bound auth. |
+| UDP/QUIC fast plane (experimental, off by default) | `src/transport/udp/`, `src/tls/quic/` | Clean-room QUIC endpoint (`quic/` submodule), Happy-Eyeballs probe, 0-RTT resumption, BBR congestion control, mux-over-QUIC, origin splice, and exporter-bound auth. See [QUIC Fast Plane](QUIC-Fast-Plane.md). |
 
 ## Why TCP is the default
 

@@ -118,7 +118,7 @@ prerequisite.
 The experimental UDP/QUIC fast plane. It is **off by default**; with
 `enabled = false` the runtime is byte-identical to TCP-only, so this whole table
 can be omitted (generated configs do not include it). Enabling requires matched
-binaries on both ends. Only two knobs are LIVE today; the rest are parsed and
+binaries on both ends. Only three knobs are LIVE today; the rest are parsed and
 validated for forward-compatibility but **not yet honored** (setting one logs a
 startup warning so an inert knob is not mistaken for an active one).
 
@@ -126,6 +126,7 @@ startup warning so an inert knob is not mistaken for an active one).
 |---|---:|---|---|
 | `enabled` | `false` | LIVE | Turn the UDP/QUIC fast plane on (both ends). |
 | `probe_timeout_ms` | `300` | LIVE | Happy-Eyeballs UDP probe timeout before committing to TCP-only. Must be ≥ 1 when enabled. |
+| `max_udp_payload_bytes` | unset (`2048`) | LIVE | Largest UDP datagram the QUIC carrier reads in one recv (and the origin-splice relay buffer ceiling). Unset keeps the conservative `2048` default (~1.6× the largest datagram ParallaX emits). Oversized datagrams are truncated-and-dropped (truncation fails AEAD), so this caps per-datagram memory. Must be in `1200..=65527` — the floor is the RFC 9000 §14.1 Initial minimum so a legal Initial is always receivable. |
 | `cc` | `"bbr"` | RESERVED | Congestion controller: `"bbr"` (safe default) or `"brutal"` (Hysteria-style, opt-in, detectable). Phase 3. |
 | `brutal_up_mbps` | `0` | RESERVED | Declared uplink Mbps for Brutal; `0` means unset. Required with `brutal_down_mbps` when `cc = "brutal"` unless `ignore_client_bandwidth` is set. |
 | `brutal_down_mbps` | `0` | RESERVED | Declared downlink Mbps for Brutal; `0` means unset. |
@@ -136,8 +137,9 @@ startup warning so an inert knob is not mistaken for an active one).
 | `ech` | `false` | RESERVED | Encrypted ClientHello for the QUIC face. Dropped Phase-2 camouflage (not planned); inert no-op. |
 
 Validation only runs when `enabled = true`: `probe_timeout_ms` must be non-zero,
-`cc = "brutal"` requires the two Brutal bandwidths (unless
-`ignore_client_bandwidth`), and `masque_front` (if set) must be non-empty. The
+`max_udp_payload_bytes` (if set) must fall in `1200..=65527`, `cc = "brutal"`
+requires the two Brutal bandwidths (unless `ignore_client_bandwidth`), and
+`masque_front` (if set) must be non-empty. The
 QUIC client already emits a Safari-26 H3-shaped ClientHello by default, but the
 fast plane stays off by default and is not yet a production-ready operator mode,
 so enabling it is for throughput experimentation, not censorship-resistant
