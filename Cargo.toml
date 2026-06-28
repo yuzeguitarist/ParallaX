@@ -20,6 +20,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 # DEFAULT QUIC client backend in `udp::client_config`. The QUIC plane itself is
 # gated at the config level by `[udp].enabled = false`, which is the real off-switch.)
 
+# `dudect`: gate for the load-bearing constant-time WALL-CLOCK proof of the
+# inbound-reject path (src/handshake/server.rs, `mod tests`). It runs a
+# dudect-style Welch t-test over ~1e5–1e6 timed samples per reject shape, which is
+# far too slow for the default `cargo test`. Default `cargo test` skips it; the
+# dedicated `dudect.yml` CI job builds with `--features dudect` so a regression in
+# the rejection path's data-dependent timing turns the build RED (a hard gate,
+# not an #[ignore]d advisory). Sample count is tunable via the DUDECT_SAMPLES env
+# var (default 1e5 for the PR lane; nightly raises it to 1e6).
+dudect = []
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"
