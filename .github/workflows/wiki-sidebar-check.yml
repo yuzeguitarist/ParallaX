@@ -1,0 +1,38 @@
+name: Wiki Sidebar Check
+
+# Guard: every page under ParallaX-DeepWiki/ must be listed in _Sidebar.md.
+# ci-pr.yml path-ignores the docs, so a docs-only PR runs no other check; this
+# lightweight job is what catches a new wiki page that was never added to the
+# hand-curated sidebar. Stdlib-only python, no toolchain needed.
+on:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "ParallaX-DeepWiki/**"
+      - "scripts/wiki_sync/check_sidebar.py"
+      - ".github/workflows/wiki-sidebar-check.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "ParallaX-DeepWiki/**"
+      - "scripts/wiki_sync/check_sidebar.py"
+      - ".github/workflows/wiki-sidebar-check.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wiki-sidebar-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Every wiki page is in the sidebar
+        run: python3 scripts/wiki_sync/check_sidebar.py
