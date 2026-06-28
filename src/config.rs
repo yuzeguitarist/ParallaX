@@ -642,6 +642,26 @@ pub struct UdpConfig {
     /// (1200) so a legal Initial is always receivable. See issue #75.
     #[serde(default)]
     pub max_udp_payload_bytes: Option<u32>,
+    /// LIVE. Explicit SO_SNDBUF for the UDP carrier socket, in bytes. `None`/`0`
+    /// keeps kernel autotuning (the safe default; byte-identical to today). Setting
+    /// it DISABLES send-buffer autotuning for the socket and is clamped by the OS
+    /// maximum (`net.core.wmem_max` on Linux, `kern.ipc.maxsockbuf` on macOS), so
+    /// only raise it once that maximum has been raised — otherwise the kernel may
+    /// clamp BELOW what autotuning would have reached (a logged warning surfaces
+    /// such a clamp). Sized to the path bandwidth-delay product, this lifts the
+    /// upload window on high-RTT links where autotuning under-provisions it.
+    /// COVERTNESS: unlike TCP, a UDP socket has no advertised receive window or
+    /// window scale, so SO_SNDBUF/SO_RCVBUF are entirely wire-invisible here.
+    #[serde(default)]
+    pub send_buffer_bytes: Option<u32>,
+    /// LIVE. Explicit SO_RCVBUF for the UDP carrier socket, in bytes. `None`/`0`
+    /// keeps kernel autotuning. Same clamp/maximum caveat as `send_buffer_bytes`
+    /// (`net.core.rmem_max` / `kern.ipc.maxsockbuf`). A larger kernel recv buffer
+    /// lets the single-threaded driver absorb inbound bursts without socket-layer
+    /// drops while it is busy; it is independent of `max_udp_payload_bytes` (the
+    /// per-datagram read ceiling). Wire-invisible (see `send_buffer_bytes`).
+    #[serde(default)]
+    pub recv_buffer_bytes: Option<u32>,
     /// RESERVED (UDP port hopping — dropped Phase 2 camouflage, not planned).
     /// Inert no-op kept only so existing configs still parse.
     #[serde(default)]
@@ -667,6 +687,8 @@ impl Default for UdpConfig {
             fec_profile: UdpFecProfile::Adaptive,
             probe_timeout_ms: default_udp_probe_timeout_ms(),
             max_udp_payload_bytes: None,
+            send_buffer_bytes: None,
+            recv_buffer_bytes: None,
             port_hop: false,
             masque_front: None,
             ech: false,
@@ -1562,6 +1584,8 @@ authorized_sni = ["example.com"]
         assert_eq!(udp.brutal_up_mbps, 0);
         assert_eq!(udp.brutal_down_mbps, 0);
         assert!(!udp.ignore_client_bandwidth);
+        assert!(udp.send_buffer_bytes.is_none());
+        assert!(udp.recv_buffer_bytes.is_none());
         assert!(!udp.port_hop);
         assert!(udp.masque_front.is_none());
         assert!(!udp.ech);

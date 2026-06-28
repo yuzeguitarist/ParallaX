@@ -651,6 +651,15 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         config.transport.tcp_send_buffer_bytes,
         config.transport.tcp_recv_buffer_bytes,
     );
+    // Same idea for the UDP carrier socket (wire-invisible: UDP has no advertised
+    // window). Installed only when the fast plane is on; a no-op unless an operator
+    // set the buffers, and the override is read at endpoint bind time.
+    if udp.enabled {
+        crate::transport::udp::quic::endpoint::configure_udp_socket_buffers(
+            udp.send_buffer_bytes,
+            udp.recv_buffer_bytes,
+        );
+    }
     let traffic = config.traffic;
     let psk = decode_psk(config.crypto.psk.as_b64())?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
