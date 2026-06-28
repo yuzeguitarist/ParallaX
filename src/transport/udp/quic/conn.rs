@@ -2424,36 +2424,53 @@ impl Connection {
         fin: bool,
         data: &[u8],
     ) -> Result<(), QuicTlsError> {
-        self.ensure_stream(id)?;
-        let end = offset + data.len() as u64;
-        let s = self.streams.get_mut(&id).expect("just ensured");
+        // `end` overflowing u64 is a protocol violation, not arithmetic to wrap:
+        // such an offset can never fall inside any receive window (debug builds
+        // would panic, release builds would wrap to a small `end` and bypass the
+        // window check below). Reject before touching connection state.
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| QuicTlsError::Protocol("STREAM frame offset overflows u64".into()))?;
+        // Validate against the stream's current state (or a fresh stream's defaults
+        // if this frame would open it) BEFORE `ensure_stream` inserts and accept-
+        // queues the stream: a flow-control / final-size violation must not leave a
+        // zombie stream behind (RFC 9000 §4.6 stream limit, §4.5 final size). A new
+        // stream starts at recv_fin=None, recv_high=0, recv_max=STREAM_RECV_WINDOW.
+        let (cur_fin, cur_high, cur_max) = self
+            .streams
+            .get(&id)
+            .map(|s| (s.recv_fin, s.recv_high, s.recv_max))
+            .unwrap_or((None, 0, STREAM_RECV_WINDOW));
         // FINAL_SIZE validation (RFC 9000 §4.5): once a final size is known it is
         // immutable, no data may arrive beyond it, and a FIN must not retroactively
         // place the final size below data already received.
-        if let Some(final_size) = s.recv_fin {
+        if let Some(final_size) = cur_fin {
             if end > final_size || (fin && end != final_size) {
                 return Err(QuicTlsError::Protocol(
                     "STREAM frame violates the stream's final size".into(),
                 ));
             }
         }
-        if fin && end < s.recv_high {
+        if fin && end < cur_high {
             return Err(QuicTlsError::Protocol(
                 "FIN final size below data already received".into(),
             ));
         }
-        if end > s.recv_max {
+        if end > cur_max {
             return Err(QuicTlsError::Crypto(
                 "peer exceeded the stream receive window".into(),
             ));
         }
-        let new_high = end.max(s.recv_high);
-        let delta = new_high - s.recv_high;
+        let new_high = end.max(cur_high);
+        let delta = new_high - cur_high;
         if self.recv_data_total + delta > self.recv_max_data {
             return Err(QuicTlsError::Crypto(
                 "peer exceeded the connection receive window".into(),
             ));
         }
+        // All checks passed: now it is safe to create + accept-queue the stream.
+        self.ensure_stream(id)?;
+        let s = self.streams.get_mut(&id).expect("just ensured");
         s.recv_high = new_high;
         self.recv_data_total += delta;
         if fin {
@@ -2497,32 +2514,43 @@ impl Connection {
         error_code: u64,
         final_size: u64,
     ) -> Result<(), QuicTlsError> {
-        self.ensure_stream(id)?;
-        let s = self.streams.get_mut(&id).expect("just ensured");
+        // Validate against the stream's current state (or a fresh stream's defaults
+        // if this RESET would open it) BEFORE `ensure_stream` inserts and accept-
+        // queues the stream, so a flow-control / final-size violation leaves no
+        // zombie stream behind. A new stream starts at recv_fin=None, recv_high=0,
+        // recv_max=STREAM_RECV_WINDOW.
+        let (cur_fin, cur_high, cur_max) = self
+            .streams
+            .get(&id)
+            .map(|s| (s.recv_fin, s.recv_high, s.recv_max))
+            .unwrap_or((None, 0, STREAM_RECV_WINDOW));
         // RFC 9000 §4.5: the reset's final size must agree with any known final
         // size and must not be below data already received; the bytes up to it count
         // toward connection-level flow control (they are considered delivered).
-        if s.recv_fin.is_some_and(|known| known != final_size) {
+        if cur_fin.is_some_and(|known| known != final_size) {
             return Err(QuicTlsError::Protocol(
                 "RESET_STREAM final size conflicts with a known final size".into(),
             ));
         }
-        if final_size < s.recv_high {
+        if final_size < cur_high {
             return Err(QuicTlsError::Protocol(
                 "RESET_STREAM final size below data already received".into(),
             ));
         }
-        if final_size > s.recv_max {
+        if final_size > cur_max {
             return Err(QuicTlsError::Crypto(
                 "RESET_STREAM exceeded the stream receive window".into(),
             ));
         }
-        let delta = final_size - s.recv_high;
+        let delta = final_size - cur_high;
         if self.recv_data_total + delta > self.recv_max_data {
             return Err(QuicTlsError::Crypto(
                 "RESET_STREAM exceeded the connection receive window".into(),
             ));
         }
+        // All checks passed: now it is safe to create + accept-queue the stream.
+        self.ensure_stream(id)?;
+        let s = self.streams.get_mut(&id).expect("just ensured");
         s.recv_high = final_size;
         s.recv_fin = Some(final_size);
         s.recv_reset = Some(error_code);
@@ -4012,6 +4040,59 @@ mod tests {
         assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
         // A consistent reset (final size >= received) is accepted.
         server.recv_reset_stream(0, 7, 200).unwrap();
+    }
+
+    #[test]
+    fn flow_control_violation_opening_a_stream_leaves_no_zombie() {
+        // A STREAM frame that would OPEN a fresh peer stream but violates flow
+        // control must be rejected WITHOUT inserting or accept-queuing the stream
+        // (RFC 9000 §4.1: a flow-control violation is connection-fatal, not a quiet
+        // half-open). Otherwise a peer cycling fresh stream ids could pile zombie
+        // streams up to the per-peer limit.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x5a, 0x5a, 0x5a, 0x5a]),
+        )
+        .unwrap();
+        // end = STREAM_RECV_WINDOW + 2 exceeds a fresh stream's receive window.
+        let err = server
+            .recv_stream(0, STREAM_RECV_WINDOW + 1, false, b"x")
+            .expect_err("exceeding a fresh stream's window is rejected");
+        assert!(matches!(err, QuicTlsError::Crypto(_)), "got {err:?}");
+        assert!(
+            !server.streams.contains_key(&0),
+            "a rejected opening STREAM must not leave the stream inserted"
+        );
+        assert!(
+            server.accept_bidi.is_empty(),
+            "a rejected opening STREAM must not enqueue an acceptable stream"
+        );
+    }
+
+    #[test]
+    fn stream_offset_overflow_is_rejected_without_opening() {
+        // offset + len overflowing u64 is a protocol violation (the offset can
+        // never fall inside any window). It must be rejected before any state
+        // mutation — and must not panic (debug) or wrap past the window (release).
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x5b, 0x5b, 0x5b, 0x5b]),
+        )
+        .unwrap();
+        let err = server
+            .recv_stream(0, u64::MAX, false, b"xx")
+            .expect_err("an offset that overflows u64 is rejected");
+        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert!(
+            !server.streams.contains_key(&0),
+            "an overflowing STREAM must not leave the stream inserted"
+        );
     }
 
     #[test]

@@ -100,7 +100,11 @@ const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 /// may be (also the retention an Initial-time replay cache needs). Generous enough
 /// for client/server clock skew (so a real client is not mis-spliced), bounded
 /// enough to limit a captured marker's capture-and-replay-later window.
-const MARKER_WINDOW_SECS: u64 = 3600;
+///
+/// `pub(crate)` so `handshake::server` can bind its replay-window invariant
+/// (`MARKER_REPLAY_WINDOW_SECS >= MARKER_WINDOW_SECS`) to this value at compile
+/// time rather than via a comment that can silently drift.
+pub(crate) const MARKER_WINDOW_SECS: u64 = 3600;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
 /// `pre_shared_key` (RFC 8446 §4.2.11): offered last by a resuming client; echoed
 /// in ServerHello (selected_identity) when the server accepts the PSK.
@@ -361,7 +365,11 @@ const SIG_SCHEME_ECDSA_P256: u16 = 0x0403;
 const MAX_HANDSHAKE_MESSAGE: usize = 1 << 16;
 /// 0-RTT resumption-ticket lifetime: RFC 8446 §4.6.1's 7-day cap, matching the
 /// Safari 26.4 NewSessionTicket baseline.
-const TICKET_LIFETIME_SECS: u32 = 604_800;
+///
+/// `pub(crate)` so `handshake::server` can bind its 0-RTT replay-window invariant
+/// (`ZERO_RTT_TICKET_LIFETIME_SECS >= TICKET_LIFETIME_SECS`) to this value at
+/// compile time rather than via a comment that can silently drift.
+pub(crate) const TICKET_LIFETIME_SECS: u32 = 604_800;
 
 fn put_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_be_bytes());

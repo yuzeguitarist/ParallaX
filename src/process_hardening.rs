@@ -35,10 +35,8 @@ pub fn harden_current_process() {
 /// Anti-debug hardening is on unless `PARALLAX_DISABLE_ANTI_DEBUG` is truthy.
 fn anti_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var(DISABLE_ANTI_DEBUG_ENV)
-            .is_ok_and(|v| transient_plaintext_setting_enabled(&v))
-    })
+    *ENABLED
+        .get_or_init(|| !std::env::var(DISABLE_ANTI_DEBUG_ENV).is_ok_and(|v| env_flag_truthy(&v)))
 }
 
 /// Mark key material as excluded from core dumps and try to pin its pages.
@@ -128,6 +126,14 @@ fn transient_plaintext_setting_from_env(value: Result<String, std::env::VarError
 }
 
 fn transient_plaintext_setting_enabled(value: &str) -> bool {
+    env_flag_truthy(value)
+}
+
+/// Whether an environment-variable value reads as a truthy boolean flag. Shared by
+/// every `PARALLAX_*` on/off toggle so they accept the same spellings; named
+/// neutrally (not after any one toggle) since it backs more than the transient
+/// plaintext setting.
+fn env_flag_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"

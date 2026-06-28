@@ -37,6 +37,10 @@ mod verify;
 pub use keys::{DirectionalKeys, HeaderProtectionKey, KeyPair, Keys, PacketKey};
 pub use suite::CipherSuite;
 pub use verify::{AcceptAnyServerCert, CertVerifyError, ServerCertVerifier};
+// Re-exported for `handshake::server` to bind its replay-window invariants to
+// these source-of-truth values via compile-time assertions (issue: cross-file
+// window constants drifting apart).
+pub(crate) use server::{MARKER_WINDOW_SECS, TICKET_LIFETIME_SECS};
 
 use std::sync::Arc;
 
