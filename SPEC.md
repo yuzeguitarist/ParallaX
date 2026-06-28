@@ -370,13 +370,17 @@ offset  size  field
 - The handshake (`0x16`) records carry the camouflaged ClientHello/ServerHello.
   The client emits a ChangeCipherSpec record — the exact 6 bytes
   `14 03 03 00 01 01` (content type `0x14` = change_cipher_spec, version
-  `0x0303`, length 1, body `0x01`) — as the **second record of its first flight,
-  immediately after the ClientHello and before reading the ServerHello**. This is REQUIRED for
-  middlebox-compat parity: a 32-byte-`session_id` ClientHello that never sends
-  the compat CCS matches no BoringSSL/Safari handshake and is a passive
-  distinguisher. The CCS is a non-handshake record and is **NOT folded into the
-  transcript hash** (the transcript stays `client_hello_record ||
-  server_hello_record`, §5.3); the server forwards it verbatim.
+  `0x0303`, length 1, body `0x01`) — in its **second flight, after reading the
+  ServerHello and immediately before the encrypted Finished** (RFC 8446 §D.4).
+  Our ClientHello offers neither `early_data` nor `pre_shared_key`, so it is a
+  full handshake whose second flight is the post-ServerHello Finished; the CCS
+  belongs there, not after the ClientHello (the after-ClientHello position only
+  matches a 0-RTT/early-data handshake). This is REQUIRED for middlebox-compat
+  parity: a 32-byte-`session_id` ClientHello that never sends the compat CCS
+  matches no BoringSSL/Safari handshake and is a passive distinguisher. The CCS
+  is a non-handshake record and is **NOT folded into the transcript hash** (the
+  transcript stays `client_hello_record || server_hello_record`, §5.3); the
+  server forwards it verbatim.
 - After the handshake completes, all ParallaX inner traffic travels in
   application-data records (`0x17`). The `length` field MUST be ≤
   `MAX_TLS_RECORD_PAYLOAD + 256` on parse; a conforming sealer never produces a
@@ -923,22 +927,22 @@ CLIENT                          PARALLAX SERVER                      FALLBACK OR
   │                                   │ connect origin, forward CH ======>│
   │                                   │◄═══════════ ServerHello ══════════│ origin's real SH
   │◄═══════════ ServerHello ══════════│transcript = CH || origin SH (§5.3)│
-  │══ ChangeCipherSpec ══════════════════════ (client's flight) ═════════►│
   │◄═══ EncryptedExtensions, Certificate, CertificateVerify, Finished ════│ origin's real
   │       (client verifies ORIGIN cert vs sni)                            │  cert + flight
-  │── Finished ══════════════════════════════════════════════════════════►│
+  │══ ChangeCipherSpec ═══════════════ (client's 2nd flight, before ═════►│
+  │══ Finished ════════════════════════ the encrypted Finished) ═════════►│
   │                                   │                                   │
   │== both derive chain_secret + epoch-0 keys from the ParallaX auth ECDH │
   │   (§5.3/§5.4; independent of the TLS secrets; ServerHello is origin's)│
   │                                   │                                   │
-  │ Phase B — PQ hybrid + identity (sealed, inside the established TLS)   │
+  │  Phase B — PQ hybrid + identity (sealed, inside the established TLS)  │
   │─ PX1Q PqRekeyRequest(PX1F chunks)►│ first valid PX1Q ──► server STOPS │
   │                                   │  relaying, drops origin ────────╳ │ (origin closed)
   │                                   │  and answers as ParallaX itself:  │
-  │◄── PX1K ServerKeyExchange (+tag) ─│                                    
+  │◄── PX1K ServerKeyExchange (+tag) ─│                                  ───
   │◄── PX1S/PX1I ServerIdentityProof ─│ (ML-DSA-87 signature)             
-  │== rekey: epoch=1, seq=0, new keys │  (§5.7)                           
-  │   (client verifies ML-DSA sig; FAIL ─► abort)                          
+  │== rekey: epoch=1, seq=0, new keys │ (§5.7)                           
+  │(client verifies ML-DSA sig; FAIL ─► abort)                          
   │                                   │                                    
   │ Phase C — command (sealed)        │                                    
   │── PX1C CONNECT host:port(+0-RTT) ►│ server dials the real target      
