@@ -2002,7 +2002,20 @@ impl Connection {
             // BEFORE `process_packet` decrypts in place. `None` ⇒ a short header
             // (or unparseable) which runs to the datagram end: process it, stop.
             let advance = packet::long_packet_len(&buf[pos..]);
-            self.process_packet(&mut buf[pos..], now)?;
+            // A post-authentication protocol/flow-control violation surfaced by
+            // process_packet is connection-fatal (RFC 9000 §4.1, §11): close the
+            // connection instead of letting the error propagate to the endpoint
+            // driver, which discards it (`let _ = handle_datagram(...)`). Without
+            // this the violating connection would linger to the idle timeout and
+            // any stream the offending frame already queued for `accept_*` would
+            // remain a zombie. `process_packet` already drops (returns Ok) on
+            // undecryptable/duplicate packets, so an Err here is always a genuine
+            // violation by an authenticated peer. `close` is idempotent and the
+            // queued CONNECTION_CLOSE is emitted by the next poll_transmit.
+            if let Err(err) = self.process_packet(&mut buf[pos..], now) {
+                self.close(APPLICATION_ERROR, err.to_string().as_bytes());
+                return Err(err);
+            }
             match advance {
                 Some(n) if n != 0 && pos.checked_add(n).is_some_and(|e| e <= buf.len()) => {
                     pos += n;
@@ -2424,8 +2437,19 @@ impl Connection {
         fin: bool,
         data: &[u8],
     ) -> Result<(), QuicTlsError> {
+        // `offset` is attacker-controlled; compute the end offset BEFORE creating
+        // any stream state so an overflowing frame never leaves a zombie behind.
+        // A wrapping `offset + len` would (debug) panic or (release) wrap to a small
+        // `end` that slips past the `end > recv_max` window check below. RFC 9000
+        // §4.5 also caps any offset at 2^62-1, so reject anything that overflows or
+        // exceeds that as a connection-fatal FRAME_ENCODING/FLOW_CONTROL violation.
+        let end = offset
+            .checked_add(data.len() as u64)
+            .filter(|&end| end <= super::varint::MAX)
+            .ok_or_else(|| {
+                QuicTlsError::Protocol("STREAM frame offset + length overflows 2^62-1".into())
+            })?;
         self.ensure_stream(id)?;
-        let end = offset + data.len() as u64;
         let s = self.streams.get_mut(&id).expect("just ensured");
         // FINAL_SIZE validation (RFC 9000 §4.5): once a final size is known it is
         // immutable, no data may arrive beyond it, and a FIN must not retroactively

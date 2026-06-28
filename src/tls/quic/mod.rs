@@ -168,6 +168,11 @@ mod handshake;
 
 pub(crate) use schedule::initial_keys;
 pub(crate) use server::ServerHandshake;
+// Re-exported so the persistent replay-cache windows in `handshake::server` can
+// statically assert (via a `const` `assert!`) that they retain entries for at
+// least as long as the corresponding freshness / ticket-lifetime window, catching
+// cross-file constant drift at compile time.
+pub(crate) use server::{MARKER_WINDOW_SECS, TICKET_LIFETIME_SECS};
 pub(crate) use ticket::derive_stek;
 pub use ticket::ClientTicket;
 

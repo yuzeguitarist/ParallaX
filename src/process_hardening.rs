@@ -36,8 +36,7 @@ pub fn harden_current_process() {
 fn anti_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        !std::env::var(DISABLE_ANTI_DEBUG_ENV)
-            .is_ok_and(|v| transient_plaintext_setting_enabled(&v))
+        !std::env::var(DISABLE_ANTI_DEBUG_ENV).is_ok_and(|v| env_value_is_truthy(&v))
     })
 }
 
@@ -121,13 +120,17 @@ fn transient_plaintext_hardening_enabled() -> bool {
 }
 
 /// Pure decision for the transient-hardening toggle: an absent var is off, a
-/// present var is truthy per [`transient_plaintext_setting_enabled`]. Extracted
-/// so it can be tested with synthesized inputs (no ambient env / global state).
+/// present var is truthy per [`env_value_is_truthy`]. Extracted so it can be
+/// tested with synthesized inputs (no ambient env / global state).
 fn transient_plaintext_setting_from_env(value: Result<String, std::env::VarError>) -> bool {
-    value.is_ok_and(|value| transient_plaintext_setting_enabled(&value))
+    value.is_ok_and(|value| env_value_is_truthy(&value))
 }
 
-fn transient_plaintext_setting_enabled(value: &str) -> bool {
+/// Whether an environment variable's value reads as truthy (`1`/`true`/`yes`/`on`,
+/// case- and whitespace-insensitive). A generic helper shared by the boolean env
+/// toggles in this module (transient-plaintext hardening and the anti-debug
+/// opt-out); it is not specific to either.
+fn env_value_is_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
@@ -298,8 +301,7 @@ fn page_aligned_range_with_size(
 #[cfg(test)]
 mod tests {
     use super::{
-        page_aligned_range_with_size, transient_plaintext_setting_enabled,
-        transient_plaintext_setting_from_env,
+        env_value_is_truthy, page_aligned_range_with_size, transient_plaintext_setting_from_env,
     };
 
     #[test]
@@ -326,10 +328,10 @@ mod tests {
     #[test]
     fn transient_plaintext_setting_requires_explicit_enable() {
         for enabled in ["1", "true", "TRUE", "yes", "on", " on "] {
-            assert!(transient_plaintext_setting_enabled(enabled));
+            assert!(env_value_is_truthy(enabled));
         }
         for disabled in ["", "0", "false", "off", "no", "random"] {
-            assert!(!transient_plaintext_setting_enabled(disabled));
+            assert!(!env_value_is_truthy(disabled));
         }
     }
 

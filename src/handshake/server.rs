@@ -237,6 +237,18 @@ const MUX_OPEN_BATCH_BYTES: usize = 1024 * 1024;
 /// every record and so never fires under that input).
 const MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS: u32 = 1024;
 
+/// Max TOTAL (not just consecutive) zero-length upload records tolerated across a
+/// whole speed-test upload phase. The consecutive cap alone is defeated by
+/// interleaving one tiny data record between bursts of empty records: each data
+/// record resets `consecutive_empty` to 0 and the per-read idle timeout resets on
+/// every record, so an authenticated client requesting a large `upload_bytes`
+/// could pin the connection slot / per-source permit / fds for an arbitrarily long
+/// time at negligible throughput. A cumulative ceiling caps that wasted work: a
+/// legitimate upload carries its bytes in data records, not in a flood of empties,
+/// so even a generous multiple of the consecutive cap is never hit in practice
+/// while bounding the abuse to a fixed, small number of empty records per phase.
+const MAX_TOTAL_EMPTY_UPLOAD_RECORDS: u64 = MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS as u64 * 16;
+
 static NEXT_SERVER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Test-only publication of the server's retained QUIC fast-plane endpoint so a
@@ -530,6 +542,16 @@ pub(crate) async fn build_quic_carrier_for_test(
 /// a ticket stays replay-protected for exactly as long as it is valid.
 const ZERO_RTT_TICKET_LIFETIME_SECS: u64 = 604_800;
 
+/// Compile-time guard: the 0-RTT anti-replay cache window MUST be `>=` the lifetime
+/// of the tickets it protects, or a still-valid ticket could be replayed after its
+/// replay record is evicted. This binds the two cross-file constants together so a
+/// future change to the issued ticket lifetime that forgets to widen the replay
+/// window fails the build instead of silently reopening a replay gap.
+const _: () = assert!(
+    ZERO_RTT_TICKET_LIFETIME_SECS >= crate::tls::quic::TICKET_LIFETIME_SECS as u64,
+    "0-RTT replay window must be >= the issued ticket lifetime"
+);
+
 /// The 0-RTT anti-replay cache path: a sibling of the auth-handshake replay cache
 /// (so an operator protects one directory), kept distinct because the two caches
 /// key different things (auth: handshake transcript fingerprint; 0-RTT: the
@@ -548,6 +570,17 @@ fn zero_rtt_replay_cache_path(auth_cache_path: &std::path::Path) -> std::path::P
 /// `crate::tls::quic::server`, currently 3600s) so a captured marker stays
 /// replay-protected for at least as long as the server would still accept it.
 const MARKER_REPLAY_WINDOW_SECS: u64 = 3600;
+
+/// Compile-time guard binding this retention window to the marker freshness window
+/// it must cover. If the freshness window (`MARKER_WINDOW_SECS`) is ever widened
+/// past this retention window, a marker could still verify as fresh after its
+/// replay record has been evicted — reopening the validity-tail replay gap this
+/// cache exists to close. Asserting it here fails the build on drift rather than
+/// relying on the two hand-maintained constants staying in sync by comment alone.
+const _: () = assert!(
+    MARKER_REPLAY_WINDOW_SECS >= crate::tls::quic::MARKER_WINDOW_SECS,
+    "marker replay window must be >= the marker freshness window"
+);
 
 /// The marker replay cache path: a sibling `.marker` of the auth-handshake replay
 /// cache, kept distinct because it keys the marker `(nonce, timestamp)` rather than a
@@ -5144,6 +5177,7 @@ where
 {
     let mut uploaded = 0_u64;
     let mut consecutive_empty: u32 = 0;
+    let mut total_empty: u64 = 0;
     let mut client_record = Vec::new();
     let idle = fallback_idle_timeout();
     while uploaded < bytes {
@@ -5174,6 +5208,18 @@ where
                 return Err(HandshakeServerError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "speed upload sent too many consecutive empty records",
+                )));
+            }
+            // The consecutive cap above is defeated by interleaving one tiny data
+            // record between bursts of empties (each data record resets it to 0 and
+            // the idle timeout resets on every record). A cumulative ceiling bounds
+            // the total wasted work so neither backstop can be sidestepped to pin
+            // the connection at negligible throughput.
+            total_empty += 1;
+            if total_empty > MAX_TOTAL_EMPTY_UPLOAD_RECORDS {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed upload sent too many empty records in total",
                 )));
             }
             continue;

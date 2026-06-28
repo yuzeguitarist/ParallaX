@@ -137,7 +137,10 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
-    let half_rtt = Duration::from_millis(imp.rtt_ms / 2);
+    // Half the RTT, added once in each direction. Use microseconds so an odd
+    // `rtt_ms` is not silently truncated by integer division (25ms would otherwise
+    // apply 12ms each way = 24ms total); `rtt_ms * 500` µs == rtt_ms/2 ms exactly.
+    let half_rtt = Duration::from_micros(imp.rtt_ms * 500);
     let (tx, mut rx) = mpsc::channel::<(Instant, Vec<u8>)>(1024);
 
     let read_task = tokio::spawn(async move {
@@ -353,6 +356,13 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // The JSON spec (RFC 8259 §7) requires every U+0000–U+001F control
+            // character to be escaped; the named escapes above cover the common
+            // ones, the rest take the generic `\u00XX` form. Without this a stray
+            // control byte in an upstream/error string would emit invalid JSON.
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
             c => out.push(c),
         }
     }
