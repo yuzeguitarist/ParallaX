@@ -69,10 +69,9 @@ pub fn server_config(
         // — exactly what the hand-rolled ServerHandshake's signer expects.
         signing_key_pkcs8: key.secret_der().to_vec(),
         alpn_protocols: vec![UDP_ALPN.to_vec()],
-        // Cold-start only here; the server runtime enables 0-RTT by setting a STEK +
-        // anti-replay guard on the config (see the server runtime wiring).
-        stek: None,
-        replay_guard: None,
+        // Cold-start only here; the server runtime enables 0-RTT by setting the
+        // STEK + anti-replay guard pair on the config (see the server runtime wiring).
+        zero_rtt: None,
         // The origin-fallback splice is dormant until the server runtime supplies the
         // resolved camouflage-origin UDP address (the gating brick); cold-start drops
         // non-Initial probe traffic, the prior behaviour.
@@ -103,8 +102,7 @@ pub fn server_config_0rtt(
         cert_chain: vec![cert.as_ref().to_vec()],
         signing_key_pkcs8: key.secret_der().to_vec(),
         alpn_protocols: vec![UDP_ALPN.to_vec()],
-        stek: Some(stek),
-        replay_guard: Some(guard),
+        zero_rtt: Some(quic::endpoint::ZeroRttKeys { stek, guard }),
         // Splice dormant until the server runtime supplies the origin address.
         origin_udp_addr: None,
         // Marker fork dormant until the server runtime supplies the key.
@@ -129,8 +127,7 @@ pub fn server_config_0rtt(
 pub fn server_config_stable(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
-    stek: Option<Zeroizing<[u8; 32]>>,
-    guard: Option<Arc<dyn ZeroRttGuard>>,
+    zero_rtt: Option<quic::endpoint::ZeroRttKeys>,
     marker_key: crate::crypto::quic_marker::MarkerKey,
     marker_replay_guard: Option<Arc<marker_replay::MarkerReplayGuard>>,
     origin_udp_addr: SocketAddr,
@@ -140,8 +137,7 @@ pub fn server_config_stable(
         cert_chain: vec![cert.as_ref().to_vec()],
         signing_key_pkcs8: key.secret_der().to_vec(),
         alpn_protocols: vec![UDP_ALPN.to_vec()],
-        stek,
-        replay_guard: guard,
+        zero_rtt,
         origin_udp_addr: Some(origin_udp_addr),
         marker_key: Some(marker_key),
         marker_replay_guard,
