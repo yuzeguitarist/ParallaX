@@ -313,20 +313,6 @@ impl Safari26TlsSession {
         self.tap_records(RecordDirection::Outbound, &client_hello);
         stream.write_all(&self.client_hello).await?;
 
-        // TLS 1.3 middlebox-compatibility ChangeCipherSpec (RFC 8446 §D.4). Our
-        // ClientHello always carries a non-empty (32-byte) legacy_session_id, and
-        // BoringSSL/Safari emit `14 03 03 00 01 01` immediately after such a
-        // ClientHello, in the same flight (before reading the ServerHello). Omitting
-        // it is a passive distinguisher: a session_id-bearing flight that never sends
-        // the compat CCS matches no BoringSSL handshake. The CCS is a non-handshake
-        // record, so it is written straight to the socket and deliberately NOT folded
-        // into the handshake transcript (which must remain CH || SH || ... for the
-        // Finished verify_data). The server treats it as undecryptable camouflage and
-        // forwards it verbatim to the origin, so no server-side change is required.
-        let ccs = change_cipher_spec();
-        self.tap_records(RecordDirection::Outbound, &ccs);
-        stream.write_all(&ccs).await?;
-
         let server_hello_record = self.read_server_hello_record(stream).await?;
         transcript.push_handshake_record(&server_hello_record)?;
         let server_hello = parse_safari_server_hello(&server_hello_record)?;
@@ -497,6 +483,22 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
         transcript: &mut HandshakeTranscript,
     ) -> Result<(), Safari26TlsError> {
+        // TLS 1.3 middlebox-compatibility ChangeCipherSpec (RFC 8446 §D.4). Our
+        // ClientHello always carries a non-empty (32-byte) legacy_session_id and
+        // offers neither early_data nor pre_shared_key (a full handshake), so a real
+        // BoringSSL/Safari client sends `14 03 03 00 01 01` immediately before its
+        // SECOND flight — the encrypted Finished — i.e. AFTER the ServerHello, not
+        // after the ClientHello (that earlier position only matches a 0-RTT/early-data
+        // handshake, which this is not, and is itself a passive distinguisher).
+        // Omitting it entirely is also a distinguisher. The CCS is a non-handshake
+        // record, so it is written straight to the socket and deliberately NOT folded
+        // into the handshake transcript (which must remain CH || SH || ... for the
+        // Finished verify_data). The server treats it as undecryptable camouflage and
+        // forwards it verbatim to the origin, so no server-side change is required.
+        let ccs = change_cipher_spec();
+        self.tap_records(RecordDirection::Outbound, &ccs);
+        stream.write_all(&ccs).await?;
+
         let verify_data = keys.client_finished_verify_data(transcript)?;
         let mut message = Vec::with_capacity(4 + verify_data.len());
         message.push(HANDSHAKE_FINISHED);
@@ -1970,53 +1972,50 @@ mod tests {
             .unwrap()
     }
 
-    /// The client flight's first two records, in order, MUST be the ClientHello
-    /// followed by the TLS 1.3 middlebox-compatibility ChangeCipherSpec
-    /// (`14 03 03 00 01 01`). Our ClientHello carries a non-empty legacy_session_id,
-    /// so BoringSSL/Safari always emit this CCS in the same flight; omitting it is a
-    /// passive distinguisher. `complete()` blocks reading the ServerHello after this
-    /// flight, so the peer reads exactly the two records, asserts them, and drops —
-    /// the resulting read error on the client side is irrelevant to this assertion.
+    /// The client's SECOND flight, in order, MUST be the TLS 1.3 middlebox-
+    /// compatibility ChangeCipherSpec (`14 03 03 00 01 01`) immediately followed by
+    /// the encrypted (application-data record type) Finished. Per RFC 8446 §D.4 a
+    /// client offering neither early_data nor a PSK (our full-handshake CH) sends the
+    /// dummy CCS immediately before its second flight — i.e. AFTER the ServerHello —
+    /// not after the ClientHello (that earlier position only matches a 0-RTT
+    /// handshake and is itself a distinguisher). `write_client_finished` is the second
+    /// flight, so we drive it directly and assert the two records.
     #[tokio::test]
-    async fn client_flight_emits_compat_change_cipher_spec_after_client_hello() {
-        let session = test_session();
+    async fn client_second_flight_emits_compat_ccs_then_encrypted_finished() {
+        let mut session = test_session();
+        let mut keys = app_keys();
+        let mut transcript = HandshakeTranscript::new();
         let (mut client, mut peer) = loopback().await;
 
-        let handshake = tokio::spawn(async move {
-            // Errors once the peer drops mid-handshake; we only care about the flight.
-            let _ = session.complete(&mut client).await;
-        });
+        session
+            .write_client_finished(&mut client, &mut keys, &mut transcript)
+            .await
+            .expect("write_client_finished");
+        drop(client);
 
-        // Bound both reads: if the CCS write ever regresses, the second record never
-        // arrives (complete() then blocks on the ServerHello), so an unbounded read
-        // would hang CI instead of failing. A timeout turns that into a clear failure.
         let read_timeout = Duration::from_secs(5);
         let mut first = Vec::new();
         let mut second = Vec::new();
         let mut reader = TlsRecordReader::new(&mut peer);
         timeout(read_timeout, reader.read_record_into(&mut first))
             .await
-            .expect("timed out reading the ClientHello record")
+            .expect("timed out reading the compat CCS record")
             .unwrap();
         timeout(read_timeout, reader.read_record_into(&mut second))
             .await
-            .expect("timed out reading the second client record (compat CCS missing?)")
+            .expect("timed out reading the encrypted Finished record")
             .unwrap();
-        drop(peer);
-        // Surface a panic in the spawned handshake task (a normal Err from complete()
-        // after the peer drop is expected and lives inside the task, not the JoinError).
-        handshake.await.expect("handshake task panicked");
 
-        // First record: a handshake (ClientHello) record.
+        // First record of the second flight: the exact TLS 1.3 compat CCS.
         assert_eq!(
-            first[0], TLS_RECORD_HANDSHAKE,
-            "first client record must be the ClientHello handshake record"
-        );
-        // Second record: the exact TLS 1.3 compat ChangeCipherSpec.
-        assert_eq!(
-            second,
+            first,
             change_cipher_spec(),
-            "second client record must be `14 03 03 00 01 01` (compat CCS)"
+            "second flight must lead with `14 03 03 00 01 01` (compat CCS)"
+        );
+        // Second record: the encrypted Finished, carried as an application-data record.
+        assert_eq!(
+            second[0], TLS_RECORD_APPLICATION_DATA,
+            "the Finished must be an encrypted application-data record, after the CCS"
         );
     }
 
