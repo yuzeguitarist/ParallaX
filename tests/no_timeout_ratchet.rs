@@ -87,42 +87,46 @@ const WINDOW: usize = 6;
 /// (bounded by an `idle_sleep` branch, not `timeout(`); the pre-PQ data loop's
 /// client- and fallback-reader `select!` arms (bounded by a `sleep_until`
 /// deadline branch); the relay-loop reads — `server_upload_loop`'s
-/// client read, plus `server_download_loop`'s target reads in its no-cover and
-/// cover-traffic branches AND the two reads of its read-ahead pipeline (the
-/// prime read and the `write_batch_with_read_ahead` read-ahead), each bounded only by the
-/// external `relay_idle_watchdog` future raced in a sibling `select!` arm and by
-/// the loop's own EOF termination; and the mux-over-QUIC session-end watcher's
-/// one-shot TCP read (`run_authenticated_mux_quic_data_mode`): not a relay loop
-/// and holds no per-substream resources (each substream has its own
-/// `relay_idle_watchdog`), so an unbounded wait here only delays the whole-session
-/// end until the QUIC connection's own idle-timeout closes it — no per-read DoS to
-/// bound. The substream's ConnectRequest read IS bounded (`PX1_CONTROL_READ_TIMEOUT`)
-/// and classifies as TIMED, so it does not appear here.
+/// client read, plus `server_download_loop`'s target reads in its cover-traffic
+/// branch AND the three reads of its saturated-gate read-ahead pipeline (the prime
+/// read, the `write_batch_with_read_ahead` read-ahead in the saturated branch, and
+/// the serial read in the non-saturated branch), each bounded only by the external
+/// `relay_idle_watchdog` future raced in a sibling `select!` arm and by the loop's
+/// own EOF termination; and the mux-over-QUIC session-end watcher's one-shot TCP
+/// read (`run_authenticated_mux_quic_data_mode`): not a relay loop and holds no
+/// per-substream resources (each substream has its own `relay_idle_watchdog`), so
+/// an unbounded wait here only delays the whole-session end until the QUIC
+/// connection's own idle-timeout closes it — no per-read DoS to bound. The
+/// substream's ConnectRequest read IS bounded (`PX1_CONTROL_READ_TIMEOUT`) and
+/// classifies as TIMED, so it does not appear here.
 ///
-/// +2 vs the prior baseline of 8: `server_download_loop`'s read-ahead pipeline
-/// adds a prime read and a `write_batch_with_read_ahead` read-ahead. Both are inbound origin
-/// reads in the same loop, bounded identically to the loop's other reads (EOF
-/// termination + the external `relay_idle_watchdog`), so they are a conscious
-/// no-new-DoS bump, not a new untimed DoS surface.
-const EXPECTED_UNTIMED_SERVER: usize = 10;
+/// +3 vs the prior baseline of 8: `server_download_loop`'s saturated-gate
+/// read-ahead pipeline adds a prime read, a `write_batch_with_read_ahead`
+/// read-ahead (saturated branch), and a serial read (non-saturated branch). All
+/// three are inbound origin reads in the same loop, bounded identically to the
+/// loop's other reads (EOF termination + the external `relay_idle_watchdog`), so
+/// they are a conscious no-new-DoS bump, not a new untimed DoS surface.
+const EXPECTED_UNTIMED_SERVER: usize = 11;
 
 /// Untimed inbound-read sites in `src/client/runtime.rs` production code.
 ///
 /// Reflects: the three handshake reads (UDP-negotiation response read, the
 /// key-exchange-after-residuals loop, the server-identity reassembly loop), the
 /// `client_upload_loop` reads of the *local* SOCKS app socket (loopback, not
-/// network-facing, but matched by the same `.read(` token) — the two reads of its
-/// read-ahead pipeline (prime + `write_batch_with_read_ahead` read-ahead) plus the cover-traffic
-/// branch read — the `client_mux_upload_loop` local read, and
-/// `client_download_loop`'s server read — the client-side mirror of the server
+/// network-facing, but matched by the same `.read(` token) — the three reads of its
+/// saturated-gate read-ahead pipeline (prime + `write_batch_with_read_ahead`
+/// read-ahead in the saturated branch + serial read in the non-saturated branch)
+/// plus the cover-traffic branch read — the `client_mux_upload_loop` local read,
+/// and `client_download_loop`'s server read — the client-side mirror of the server
 /// relay loop, bounded only by `client_relay_idle_watchdog`.
 ///
-/// +1 vs the prior baseline of 7: `client_upload_loop`'s non-cover branch now
-/// read-ahead pipelines — its single serial local read is replaced by a prime read
-/// and a `write_batch_with_read_ahead` read-ahead (net +1 read site). Both are loopback reads
-/// bounded by the loop's EOF termination and the external
+/// +2 vs the prior baseline of 7: `client_upload_loop`'s non-cover branch now
+/// runs the saturated-gate read-ahead pipeline — its single serial local read is
+/// replaced by a prime read, a `write_batch_with_read_ahead` read-ahead (saturated
+/// branch), and a serial read (non-saturated branch), a net +2 read sites. All are
+/// loopback reads bounded by the loop's EOF termination and the external
 /// `client_relay_idle_watchdog`, so this is a conscious no-new-DoS bump.
-const EXPECTED_UNTIMED_RUNTIME: usize = 8;
+const EXPECTED_UNTIMED_RUNTIME: usize = 9;
 
 /// One classified inbound-read call site.
 struct ReadSite {
@@ -303,16 +307,17 @@ fn combined_inbound_read_census_is_pinned() {
         server.iter().filter(|s| s.timed).count() + runtime.iter().filter(|s| s.timed).count();
     let untimed = total - timed;
 
-    // Total inbound-read call sites across both production files today: 22
-    // (server) + 11 (runtime) = 33. This catches a *removed* read site too,
+    // Total inbound-read call sites across both production files today: 23
+    // (server) + 12 (runtime) = 35. This catches a *removed* read site too,
     // which would otherwise slip past the per-file untimed-only assertions.
     // (+2 server vs the mux-over-QUIC baseline of 28: the speed QUIC-run request
-    // read and the speed QUIC-run TCP DONE read — both TIMED. +3 for the
-    // read-ahead pipeline: server_download_loop adds 2 (it keeps the serial
-    // no-cover read as the timing-jitter fallback, then adds prime + read-ahead),
-    // and client_upload_loop adds a net 1 (its serial no-cover read is replaced by
-    // prime + read-ahead) — all UNTIMED, all in their existing relay loops.)
-    const EXPECTED_TOTAL_SITES: usize = 33;
+    // read and the speed QUIC-run TCP DONE read — both TIMED. +5 for the
+    // saturated-gate read-ahead pipeline: server_download_loop adds 3 (it keeps the
+    // serial cover-traffic read, then adds prime + saturated read-ahead + the
+    // non-saturated serial read), and client_upload_loop adds a net 2 (its serial
+    // no-cover read is replaced by prime + saturated read-ahead + non-saturated
+    // serial read) — all UNTIMED, all in their existing relay loops.)
+    const EXPECTED_TOTAL_SITES: usize = 35;
     // Timed sites: 12 (server) + 3 (runtime) = 15. (+2 server: the speed QUIC-run
     // request read and the TCP DONE read, both bounded by `QUIC_RELAY_DONE_BACKSTOP`
     // / `PX1_CONTROL_READ_TIMEOUT`.)

@@ -2862,17 +2862,28 @@ where
     // Default hot path: no cover traffic. Read-ahead pipeline the next local read
     // against the in-flight server write so a high-BDP link keeps draining the
     // local app socket while `write_records` is throttled by TCP_NOTSENT_LOWAT/cwnd.
-    // The seal runs to completion BEFORE the concurrent read, so the codec stays
-    // strictly sequential and the on-wire bytes are unchanged.
+    //
+    // Covertness gate: read-ahead is engaged ONLY while the source saturates the
+    // whole read buffer (`drain_ready_tcp_read` filled it to capacity). When the
+    // source is saturated the serial path ALSO reads full buffer -> full buffer, so
+    // concurrently prefetching the next burst does not change the burst
+    // segmentation (hence not the record-size/count histogram). A non-full burst
+    // (short flow, interactive traffic, the tail of a transfer) takes the serial
+    // write below and is NOT prefetched, so its segmentation is byte-for-byte the
+    // serial path's. This confines the pipeline to the saturated-bulk case it
+    // targets, where it is segmentation-equivalent, and avoids the distribution
+    // drift a buffer-unconditional prefetch would introduce. The seal always runs
+    // to completion before the concurrent read, so the codec stays strictly
+    // sequential.
     if !cover.is_enabled() {
-        // Spare scratch holds the previous iteration's sealed bytes while they are
-        // being written, so the next seal does not clobber the in-flight write
-        // buffer. Spare read buffer receives the read-ahead while the current
-        // payload is sealed+written.
-        let mut spare_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
-        let mut spare_buf = vec![0_u8; local_buf.len()];
+        let cap = local_buf.len();
+        // Spare buffers for the pipeline, allocated lazily on the first full-buffer
+        // burst: a short flow that never saturates the buffer never pays the extra
+        // ~256 KiB read buffer + seal scratch.
+        let mut spare_buf: Option<Vec<u8>> = None;
+        let mut spare_scratch: Option<RelaySealScratch> = None;
 
-        // Prime: read the first burst before entering the pipeline.
+        // Prime: read the first burst.
         let mut n = local_read.read(&mut local_buf).await?;
         if n == 0 {
             let _ = server_write.shutdown().await;
@@ -2892,30 +2903,49 @@ where
                 RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
             )?;
 
-            // Overlap: flush the sealed batch to the server while reading the next
-            // local burst into the spare buffer. The two borrows are disjoint
-            // (write touches `server_write` + `seal_scratch.records_buf`; read
-            // touches `local_read` + `spare_buf`), so neither aliases the codec.
-            // A write error short-circuits immediately (the read is cancelled),
-            // matching the serial path's "write error before next read" ordering.
-            let next_n = write_batch_with_read_ahead(
-                &mut server_write,
-                seal_scratch.records_buf.as_slice(),
-                local_read.read(&mut spare_buf),
-            )
-            .await?;
-            if next_n == 0 {
-                let _ = server_write.shutdown().await;
-                return Ok(seal_to_server);
-            }
-            bump_client_relay_activity(&activity);
-            let next_n = drain_ready_tcp_read(&local_read, &mut spare_buf, next_n)?;
+            if n == cap {
+                // Saturated bulk: overlap the flush of this batch with reading the
+                // next burst into the spare buffer (lazily allocated). The borrows
+                // are disjoint (write: `server_write` + `seal_scratch.records_buf`;
+                // read: `local_read` + `spare`), so neither aliases the codec. A
+                // write error short-circuits immediately (the read is cancelled),
+                // matching the serial path's "write error before next read" order.
+                let spare = spare_buf.get_or_insert_with(|| vec![0_u8; cap]);
+                let next_n = write_batch_with_read_ahead(
+                    &mut server_write,
+                    seal_scratch.records_buf.as_slice(),
+                    local_read.read(spare),
+                )
+                .await?;
+                if next_n == 0 {
+                    let _ = server_write.shutdown().await;
+                    return Ok(seal_to_server);
+                }
+                bump_client_relay_activity(&activity);
+                let next_n = drain_ready_tcp_read(&local_read, spare, next_n)?;
 
-            // Swap: the just-read spare becomes the current burst; the just-written
-            // scratch becomes the spare seal buffer for the next iteration.
-            std::mem::swap(&mut local_buf, &mut spare_buf);
-            std::mem::swap(&mut seal_scratch, &mut spare_scratch);
-            n = next_n;
+                // Swap: the just-read spare becomes the current burst; the
+                // just-written scratch becomes the spare seal buffer.
+                let scratch_slot = spare_scratch
+                    .get_or_insert_with(|| RelaySealScratch::with_payload_capacity(cap));
+                std::mem::swap(&mut local_buf, spare_buf.as_mut().unwrap());
+                std::mem::swap(&mut seal_scratch, scratch_slot);
+                n = next_n;
+            } else {
+                // Non-saturated burst: write serially (no prefetch), so this burst's
+                // segmentation is identical to the pure serial loop. Then read the
+                // next burst serially too.
+                server_write
+                    .write_records(seal_scratch.records_buf.as_slice())
+                    .await?;
+                let next_n = local_read.read(&mut local_buf).await?;
+                if next_n == 0 {
+                    let _ = server_write.shutdown().await;
+                    return Ok(seal_to_server);
+                }
+                bump_client_relay_activity(&activity);
+                n = drain_ready_tcp_read(&local_read, &mut local_buf, next_n)?;
+            }
         }
     }
 
