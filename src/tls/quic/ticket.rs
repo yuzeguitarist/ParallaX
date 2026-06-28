@@ -23,6 +23,7 @@ use sha2::Sha256;
 use std::fmt;
 use zeroize::Zeroizing;
 
+use super::server::TICKET_LIFETIME_SECS;
 use super::QuicTlsError;
 
 /// XChaCha20-Poly1305 nonce length.
@@ -98,8 +99,18 @@ impl fmt::Debug for TicketState {
 
 impl TicketState {
     /// Whether the ticket is past its lifetime at `now_unix` (seconds).
+    ///
+    /// Defensive clamps on the sealed-plaintext fields (an attacker cannot forge
+    /// them past the STEK, but these keep the anti-replay window bounded if the
+    /// signing clock ever moves backward or the lifetime field is widened):
+    /// a ticket issued in the future is treated as expired, and the lifetime is
+    /// capped at the RFC 8446 §4.6.1 maximum (`TICKET_LIFETIME_SECS`, 7 d).
     pub fn is_expired(&self, now_unix: u64) -> bool {
-        now_unix >= self.issued_at.saturating_add(u64::from(self.lifetime_secs))
+        if self.issued_at > now_unix {
+            return true;
+        }
+        let lifetime = self.lifetime_secs.min(TICKET_LIFETIME_SECS);
+        now_unix >= self.issued_at.saturating_add(u64::from(lifetime))
     }
 }
 
@@ -400,6 +411,29 @@ mod tests {
             issued_at: 1_700_000_000,
             lifetime_secs: 604_800,
         }
+    }
+
+    #[test]
+    fn ticket_state_expiry_clamps_future_issue_and_overlong_lifetime() {
+        let issued = 1_700_000_000;
+        // sample_state()'s lifetime_secs == TICKET_LIFETIME_SECS (7 d).
+        // Live one second before expiry, expired at the boundary.
+        let state = sample_state();
+        assert!(!state.is_expired(issued + u64::from(TICKET_LIFETIME_SECS) - 1));
+        assert!(state.is_expired(issued + u64::from(TICKET_LIFETIME_SECS)));
+
+        // A ticket whose issue time is in the future (e.g. clock moved backward
+        // after signing) is treated as expired rather than indefinitely live.
+        assert!(state.is_expired(issued - 1));
+
+        // An over-long lifetime is clamped to the RFC 8446 §4.6.1 maximum, so it
+        // cannot stretch the anti-replay window past 7 days.
+        let overlong = TicketState {
+            lifetime_secs: u32::MAX,
+            ..sample_state()
+        };
+        assert!(!overlong.is_expired(issued + u64::from(TICKET_LIFETIME_SECS) - 1));
+        assert!(overlong.is_expired(issued + u64::from(TICKET_LIFETIME_SECS)));
     }
 
     #[test]

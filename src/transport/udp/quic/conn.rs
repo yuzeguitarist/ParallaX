@@ -2463,10 +2463,16 @@ impl Connection {
         }
         let new_high = end.max(cur_high);
         let delta = new_high - cur_high;
-        if self.recv_data_total + delta > self.recv_max_data {
-            return Err(QuicTlsError::Crypto(
-                "peer exceeded the connection receive window".into(),
-            ));
+        // `checked_add` keeps the bound robust against u64 wrap (a release-mode
+        // overflow would otherwise wrap to a small value and bypass the window);
+        // treat overflow as a flow-control violation, like exceeding the window.
+        match self.recv_data_total.checked_add(delta) {
+            Some(total) if total <= self.recv_max_data => {}
+            _ => {
+                return Err(QuicTlsError::Crypto(
+                    "peer exceeded the connection receive window".into(),
+                ));
+            }
         }
         // All checks passed: now it is safe to create + accept-queue the stream.
         self.ensure_stream(id)?;
@@ -2543,10 +2549,14 @@ impl Connection {
             ));
         }
         let delta = final_size - cur_high;
-        if self.recv_data_total + delta > self.recv_max_data {
-            return Err(QuicTlsError::Crypto(
-                "RESET_STREAM exceeded the connection receive window".into(),
-            ));
+        // See `recv_stream`: guard the connection-window check against u64 wrap.
+        match self.recv_data_total.checked_add(delta) {
+            Some(total) if total <= self.recv_max_data => {}
+            _ => {
+                return Err(QuicTlsError::Crypto(
+                    "RESET_STREAM exceeded the connection receive window".into(),
+                ));
+            }
         }
         // All checks passed: now it is safe to create + accept-queue the stream.
         self.ensure_stream(id)?;
