@@ -37,25 +37,115 @@ pub const INITIAL_SALT_V1: [u8; 20] = [
     0xcc, 0xbb, 0x7f, 0x0a,
 ];
 
-/// Older draft-29 Initial salt; the simulator only accepts v1, but the constant
-/// is kept for cross-reference.
+/// draft-29..32 Initial salt.
 pub const INITIAL_SALT_DRAFT_29: [u8; 20] = [
     0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0,
     0x43, 0x90, 0xa8, 0x99,
 ];
 
+/// draft-22 and earlier Initial salt.
+pub const INITIAL_SALT_DRAFT_22: [u8; 20] = [
+    0x7f, 0xbc, 0xdb, 0x0e, 0x7c, 0x66, 0xbb, 0xe9, 0x19, 0x3a, 0x96, 0xcd, 0x21, 0x51, 0x9e, 0xbd,
+    0x7a, 0x02, 0x64, 0x4a,
+];
+
+/// draft-23..28 Initial salt.
+pub const INITIAL_SALT_DRAFT_23: [u8; 20] = [
+    0xc3, 0xee, 0xf7, 0x12, 0xc7, 0x2e, 0xbb, 0x5a, 0x11, 0xa7, 0xd2, 0x43, 0x2b, 0xb4, 0x63, 0x65,
+    0xbe, 0xf9, 0xf5, 0x02,
+];
+
+/// gQUIC Q050 Initial salt.
+pub const INITIAL_SALT_GQUIC_Q050: [u8; 20] = [
+    0x50, 0x45, 0x74, 0xef, 0xd0, 0x66, 0xfe, 0x2f, 0x9d, 0x94, 0x5c, 0xfc, 0xdb, 0xd3, 0xa7, 0xf0,
+    0xd3, 0xb5, 0x6b, 0x45,
+];
+
+/// gQUIC T050 Initial salt.
+pub const INITIAL_SALT_GQUIC_T050: [u8; 20] = [
+    0x7f, 0xf5, 0x79, 0xe5, 0xac, 0xd0, 0x72, 0x91, 0x55, 0x80, 0x30, 0x4c, 0x43, 0xa2, 0x36, 0x7c,
+    0x60, 0x48, 0x83, 0x10,
+];
+
+/// gQUIC T051 Initial salt.
+pub const INITIAL_SALT_GQUIC_T051: [u8; 20] = [
+    0x7a, 0x4e, 0xde, 0xf4, 0xe7, 0xcc, 0xee, 0x5f, 0xa4, 0x50, 0x6c, 0x19, 0x12, 0x4f, 0xc8, 0xcc,
+    0xda, 0x6e, 0x03, 0x3d,
+];
+
 pub const QUIC_VERSION_V1: u32 = 0x0000_0001;
+/// QUIC v2 (RFC 9369). A border inspector that only carries the v1/draft/gQUIC
+/// salt table cannot derive v2 Initial keys, so v2 Initials decrypt to garbage
+/// and the SNI is never recovered. The simulator models this as an unsupported
+/// version rather than silently succeeding.
+pub const QUIC_VERSION_V2: u32 = 0x6b33_43cf;
+pub const QUIC_VERSION_GQUIC_Q050: u32 = 0x5130_3530;
+pub const QUIC_VERSION_GQUIC_T050: u32 = 0x5430_3530;
+pub const QUIC_VERSION_GQUIC_T051: u32 = 0x5430_3531;
+
+/// Datagrams carrying an Initial packet are required to be at least 1200 bytes
+/// (RFC 9000 §14.1). A border inspector rejects anything smaller before
+/// attempting decryption.
+pub const QUIC_MIN_INITIAL_SIZE: usize = 1200;
+
+/// Upper bound on the reassembled CRYPTO stream when reconstructing a
+/// ClientHello that spans multiple Initial packets.
+pub const MAX_CLIENT_HELLO_CHUNK_SIZE: usize = 4096;
+
+/// Maximum number of Initial packets inspected per connection while hunting for
+/// a complete ClientHello. A ClientHello fragmented beyond this budget escapes.
+pub const MAX_PARSE_PKT_NUM: usize = 3;
+
+/// Infer the QUIC draft number for a long-header version, or `None` for a
+/// non-draft version. `0xff0000xx` encodes draft `xx`; the version-negotiation
+/// "forcing" pattern `0x?a?a?a?a` is treated as draft-29.
+pub fn draft_version(version: u32) -> Option<u8> {
+    if version & 0xffff_ff00 == 0xff00_0000 {
+        return Some((version & 0xff) as u8);
+    }
+    if version & 0x0f0f_0f0f == 0x0a0a_0a0a {
+        return Some(29);
+    }
+    None
+}
+
+/// Select the Initial salt for a QUIC version. Returns `None` for versions the
+/// inspector cannot key (notably QUIC v2), which therefore cannot be decrypted.
+pub fn salt_for_version(version: u32) -> Option<&'static [u8; 20]> {
+    match version {
+        QUIC_VERSION_V1 => return Some(&INITIAL_SALT_V1),
+        QUIC_VERSION_V2 => return None,
+        QUIC_VERSION_GQUIC_Q050 => return Some(&INITIAL_SALT_GQUIC_Q050),
+        QUIC_VERSION_GQUIC_T050 => return Some(&INITIAL_SALT_GQUIC_T050),
+        QUIC_VERSION_GQUIC_T051 => return Some(&INITIAL_SALT_GQUIC_T051),
+        _ => {}
+    }
+    match draft_version(version) {
+        Some(d) if d <= 22 => Some(&INITIAL_SALT_DRAFT_22),
+        Some(d) if (23..=28).contains(&d) => Some(&INITIAL_SALT_DRAFT_23),
+        Some(d) if (29..=32).contains(&d) => Some(&INITIAL_SALT_DRAFT_29),
+        // draft-33 and later share the v1 salt.
+        Some(_) => Some(&INITIAL_SALT_V1),
+        None => None,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuicInitialError {
     #[error("packet too short for QUIC long header")]
     Truncated,
+    #[error("Initial datagram below the 1200-byte minimum")]
+    TooSmall,
     #[error("not a long-header packet")]
     NotLongHeader,
     #[error("not an Initial packet")]
     NotInitial,
     #[error("unsupported QUIC version {0:#010x}")]
     UnsupportedVersion(u32),
+    #[error("reserved header bits were set (protocol violation)")]
+    ReservedBitsSet,
+    #[error("Initial packet decrypted to an empty payload")]
+    EmptyPayload,
     #[error("malformed length field")]
     BadLength,
     #[error("HKDF expand failed")]
@@ -115,14 +205,25 @@ fn hkdf_expand_label(
     hk.expand(&info, out).map_err(|_| QuicInitialError::Hkdf)
 }
 
-/// Re-derive the client Initial keys *without* the dummy `extract_prk` helper,
-/// avoiding an unimplemented call. We compute HKDF-Extract manually using the
-/// inner HMAC, then run HKDF-Expand-Label off that PRK.
+/// Derive the client Initial keys using the v1 salt. Kept for callers and tests
+/// that work exclusively with QUIC v1; new code should prefer
+/// [`derive_client_initial_keys_for_version`].
 pub fn derive_client_initial_keys_v2(dcid: &[u8]) -> Result<InitialKeys, QuicInitialError> {
+    derive_client_initial_keys_for_version(dcid, QUIC_VERSION_V1)
+}
+
+/// Derive the client Initial keys for a specific QUIC version, selecting the
+/// matching Initial salt. Returns [`QuicInitialError::UnsupportedVersion`] if
+/// the version has no salt the inspector can key (e.g. QUIC v2).
+pub fn derive_client_initial_keys_for_version(
+    dcid: &[u8],
+    version: u32,
+) -> Result<InitialKeys, QuicInitialError> {
     use hkdf::hmac::{Hmac, Mac};
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&INITIAL_SALT_V1)
-        .map_err(|_| QuicInitialError::Hkdf)?;
+    let salt = salt_for_version(version).ok_or(QuicInitialError::UnsupportedVersion(version))?;
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(salt).map_err(|_| QuicInitialError::Hkdf)?;
     mac.update(dcid);
     let initial_secret_prk = mac.finalize().into_bytes();
     let initial_hk =
@@ -160,7 +261,9 @@ pub fn parse_protected_long_header(bytes: &[u8]) -> Result<InitialHeader, QuicIn
         return Err(QuicInitialError::NotInitial);
     }
     let version = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-    if version != QUIC_VERSION_V1 {
+    // Accept any version the inspector holds an Initial salt for. Versions
+    // without a salt (QUIC v2 among them) cannot be keyed and are rejected.
+    if salt_for_version(version).is_none() {
         return Err(QuicInitialError::UnsupportedVersion(version));
     }
     let mut cur = 5;
@@ -259,6 +362,11 @@ pub fn unprotect_header(
 
     // Unprotect first byte (low 4 bits for long headers).
     packet[0] ^= mask[0] & 0x0f;
+    // After header protection is removed, the two reserved bits (0x0c) of a
+    // long header must be zero; a non-zero value is a protocol violation.
+    if packet[0] & 0x0c != 0 {
+        return Err(QuicInitialError::ReservedBitsSet);
+    }
     let pn_length = ((packet[0] & 0x03) as usize) + 1;
     // Unprotect packet number bytes.
     for i in 0..pn_length {
@@ -311,9 +419,13 @@ pub fn decrypt_payload(
     let nonce = Nonce::from_slice(&nonce_bytes);
     let aad = &packet[..header.payload_offset];
     let ct = &packet[header.payload_offset..header.payload_offset + header.payload_len];
-    cipher
+    let plaintext = cipher
         .decrypt(nonce, Payload { msg: ct, aad })
-        .map_err(|_| QuicInitialError::Aead)
+        .map_err(|_| QuicInitialError::Aead)?;
+    if plaintext.is_empty() {
+        return Err(QuicInitialError::EmptyPayload);
+    }
+    Ok(plaintext)
 }
 
 // ---------------------- frame parsing ----------------------
@@ -540,34 +652,92 @@ impl QuicInitialDetector {
                 };
             }
         }
-        let mut packet = packet.to_vec();
-        let mut header = match parse_protected_long_header(&packet) {
-            Ok(h) => h,
-            Err(e) => return QuicInitialVerdict::Failed(format!("{e}")),
-        };
-        let keys = match derive_client_initial_keys_v2(&header.dcid) {
-            Ok(k) => k,
-            Err(e) => return QuicInitialVerdict::Failed(format!("{e}")),
-        };
-        if let Err(e) = unprotect_header(&mut packet, &mut header, &keys) {
-            return QuicInitialVerdict::Failed(format!("{e}"));
+        if packet.len() < QUIC_MIN_INITIAL_SIZE {
+            return QuicInitialVerdict::Failed(format!("{}", QuicInitialError::TooSmall));
         }
-        let payload = match decrypt_payload(&packet, &header, &keys) {
-            Ok(p) => p,
+        let decrypted = match decrypt_initial_packet(packet) {
+            Ok(d) => d,
             Err(e) => return QuicInitialVerdict::Failed(format!("{e}")),
         };
-        let frames = match parse_initial_frames(&payload) {
-            Ok(f) => f,
-            Err(e) => return QuicInitialVerdict::Failed(format!("{e}")),
-        };
-        let crypto = reassemble_crypto_stream(&frames);
+        let crypto = reassemble_crypto_stream(&decrypted.frames);
         let parsed_ch = match parse_tls_handshake_clienthello(&crypto) {
             Ok(rec) => rec,
             Err(e) => return QuicInitialVerdict::Failed(format!("{e}")),
         };
-        let sni = match parsed_ch.sni {
+        self.classify_sni(parsed_ch.sni, decrypted.dcid, triple)
+    }
+
+    /// Inspect a sequence of Initial packets belonging to one connection,
+    /// reassembling a ClientHello that is fragmented across several datagrams.
+    /// The inspector only spends [`MAX_PARSE_PKT_NUM`] packets and reassembles
+    /// at most [`MAX_CLIENT_HELLO_CHUNK_SIZE`] bytes; a ClientHello fragmented
+    /// beyond either bound is never recovered (and thus escapes).
+    pub fn inspect_multi(&self, packets: &[(Vec<u8>, Option<QuicTriple>)]) -> QuicInitialVerdict {
+        if let Some((_, Some(triple))) = packets.first() {
+            if self.is_dropped(triple) {
+                return QuicInitialVerdict::BlockSni {
+                    sni: String::from("<residual-drop>"),
+                    matched_rule: String::from("<residual-3tuple>"),
+                    dcid: Vec::new(),
+                };
+            }
+        }
+        let mut reassembler = QuicChloReassembler::default();
+        let mut last_dcid = Vec::new();
+        let mut last_triple = None;
+        for (packet, triple) in packets {
+            if packet.len() < QUIC_MIN_INITIAL_SIZE {
+                return QuicInitialVerdict::Failed(format!("{}", QuicInitialError::TooSmall));
+            }
+            let decrypted = match decrypt_initial_packet(packet) {
+                Ok(d) => d,
+                Err(e) => return QuicInitialVerdict::Failed(format!("{e}")),
+            };
+            last_dcid = decrypted.dcid.clone();
+            last_triple = triple.clone();
+            let chunks: Vec<(u64, Vec<u8>)> = decrypted
+                .frames
+                .iter()
+                .filter_map(|f| match f {
+                    InitialFrame::Crypto { offset, data } => Some((*offset, data.clone())),
+                    _ => None,
+                })
+                .collect();
+            match reassembler.accept(&decrypted.dcid, &chunks) {
+                ChloStatus::Complete(crypto) => {
+                    let parsed_ch = match parse_tls_handshake_clienthello(&crypto) {
+                        Ok(rec) => rec,
+                        Err(e) => return QuicInitialVerdict::Failed(format!("{e}")),
+                    };
+                    return self.classify_sni(parsed_ch.sni, decrypted.dcid, triple.clone());
+                }
+                ChloStatus::Fragmented => continue,
+                ChloStatus::BudgetExceeded => {
+                    return QuicInitialVerdict::Failed(String::from(
+                        "ClientHello fragmented beyond the inspection budget",
+                    ));
+                }
+                ChloStatus::Unsupported => {
+                    return QuicInitialVerdict::Failed(String::from(
+                        "leading CRYPTO chunk is not a ClientHello",
+                    ));
+                }
+            }
+        }
+        let _ = last_triple;
+        // Ran out of packets without completing a ClientHello.
+        QuicInitialVerdict::NoSni { dcid: last_dcid }
+    }
+
+    fn classify_sni(
+        &self,
+        sni: Option<String>,
+        dcid: Vec<u8>,
+        triple: Option<QuicTriple>,
+    ) -> QuicInitialVerdict {
+        let sni = match sni {
             Some(s) => s,
-            None => return QuicInitialVerdict::NoSni { dcid: header.dcid },
+            None => return QuicInitialVerdict::NoSni { dcid },
         };
         if let Some(rule) = self.blocklist.matched_rule(&sni) {
             if let Some(triple) = triple {
@@ -576,13 +746,10 @@ impl QuicInitialDetector {
             QuicInitialVerdict::BlockSni {
                 sni,
                 matched_rule: rule,
-                dcid: header.dcid,
+                dcid,
             }
         } else {
-            QuicInitialVerdict::AllowSni {
-                sni,
-                dcid: header.dcid,
-            }
+            QuicInitialVerdict::AllowSni { sni, dcid }
         }
     }
 
@@ -595,6 +762,101 @@ impl QuicInitialDetector {
 
     pub fn drop_window(&self) -> Duration {
         self.drop_window
+    }
+}
+
+/// A single Initial packet after header unprotection and AEAD decryption.
+#[derive(Debug, Clone)]
+pub struct DecryptedInitial {
+    pub dcid: Vec<u8>,
+    pub version: u32,
+    pub frames: Vec<InitialFrame>,
+}
+
+/// Parse, unprotect and decrypt one Initial packet, returning its frames. The
+/// Initial salt is selected from the packet's own version field so that
+/// non-v1 (and gQUIC Q050/T050/T051) Initials decrypt correctly.
+pub fn decrypt_initial_packet(packet: &[u8]) -> Result<DecryptedInitial, QuicInitialError> {
+    let mut packet = packet.to_vec();
+    let mut header = parse_protected_long_header(&packet)?;
+    let keys = derive_client_initial_keys_for_version(&header.dcid, header.version)?;
+    unprotect_header(&mut packet, &mut header, &keys)?;
+    let payload = decrypt_payload(&packet, &header, &keys)?;
+    let frames = parse_initial_frames(&payload)?;
+    Ok(DecryptedInitial {
+        dcid: header.dcid,
+        version: header.version,
+        frames,
+    })
+}
+
+/// Status of a cross-datagram ClientHello reassembly attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChloStatus {
+    /// A complete ClientHello handshake message was reconstructed.
+    Complete(Vec<u8>),
+    /// More Initial packets are needed; the ClientHello is still partial.
+    Fragmented,
+    /// The reassembly budget was exhausted before the ClientHello completed.
+    BudgetExceeded,
+    /// The leading CRYPTO byte is not a ClientHello handshake type.
+    Unsupported,
+}
+
+/// Reassembles a ClientHello that is fragmented across several Initial packets.
+/// CRYPTO chunks are written at their declared offsets (out-of-order tolerated)
+/// into a single buffer; completion is detected once the buffer holds the full
+/// handshake message indicated by its own 3-byte length field.
+#[derive(Debug, Default)]
+pub struct QuicChloReassembler {
+    buffer: Vec<u8>,
+    high_water: usize,
+    packets_seen: usize,
+}
+
+impl QuicChloReassembler {
+    /// Fold one packet's CRYPTO chunks into the reassembly buffer for `_dcid`.
+    /// The `_dcid` argument keys the connection in callers that multiplex
+    /// several handshakes through one reassembler instance per connection.
+    pub fn accept(&mut self, _dcid: &[u8], chunks: &[(u64, Vec<u8>)]) -> ChloStatus {
+        self.packets_seen += 1;
+        if self.packets_seen > MAX_PARSE_PKT_NUM {
+            return ChloStatus::BudgetExceeded;
+        }
+        for (offset, data) in chunks {
+            let start = *offset as usize;
+            let end = start + data.len();
+            if end > MAX_CLIENT_HELLO_CHUNK_SIZE {
+                return ChloStatus::BudgetExceeded;
+            }
+            if self.buffer.len() < end {
+                self.buffer.resize(end, 0);
+            }
+            self.buffer[start..end].copy_from_slice(data);
+            if end > self.high_water {
+                self.high_water = end;
+            }
+        }
+        if self.high_water < 4 {
+            return ChloStatus::Fragmented;
+        }
+        if self.buffer[0] != 0x01 {
+            return ChloStatus::Unsupported;
+        }
+        let hs_len = (usize::from(self.buffer[1]) << 16)
+            | (usize::from(self.buffer[2]) << 8)
+            | usize::from(self.buffer[3]);
+        let needed = 4 + hs_len;
+        if needed > MAX_CLIENT_HELLO_CHUNK_SIZE {
+            return ChloStatus::BudgetExceeded;
+        }
+        if self.high_water >= needed {
+            ChloStatus::Complete(self.buffer[..needed].to_vec())
+        } else if self.packets_seen >= MAX_PARSE_PKT_NUM {
+            ChloStatus::BudgetExceeded
+        } else {
+            ChloStatus::Fragmented
+        }
     }
 }
 
@@ -641,15 +903,38 @@ pub(crate) fn build_test_initial_packet(
     packet_number: u32,
     total_len: usize,
 ) -> Result<Vec<u8>, QuicInitialError> {
+    build_test_initial_packet_ext(
+        dcid,
+        scid,
+        handshake_bytes,
+        0,
+        packet_number,
+        total_len,
+        QUIC_VERSION_V1,
+    )
+}
+
+/// Like [`build_test_initial_packet`] but lets a test choose the CRYPTO-frame
+/// offset (to fragment a ClientHello across packets) and the QUIC version.
+#[cfg(test)]
+pub(crate) fn build_test_initial_packet_ext(
+    dcid: &[u8],
+    scid: &[u8],
+    handshake_bytes: &[u8],
+    crypto_offset: u64,
+    packet_number: u32,
+    total_len: usize,
+    version: u32,
+) -> Result<Vec<u8>, QuicInitialError> {
     use aes_gcm::aead::Aead as AeadEnc;
 
-    let keys = derive_client_initial_keys_v2(dcid)?;
+    let keys = derive_client_initial_keys_for_version(dcid, version)?;
 
     // Construct unprotected header (without packet number length set yet).
     let mut header = Vec::new();
     let pn_len = 4_usize; // always 4 bytes for simplicity
     header.push(0xc0 | ((pn_len - 1) as u8));
-    header.extend_from_slice(&QUIC_VERSION_V1.to_be_bytes());
+    header.extend_from_slice(&version.to_be_bytes());
     header.push(dcid.len() as u8);
     header.extend_from_slice(dcid);
     header.push(scid.len() as u8);
@@ -658,7 +943,7 @@ pub(crate) fn build_test_initial_packet(
 
     let mut frames = Vec::new();
     frames.push(0x06); // CRYPTO
-    frames.extend_from_slice(&encode_varint(0)); // offset
+    frames.extend_from_slice(&encode_varint(crypto_offset)); // offset
     frames.extend_from_slice(&encode_varint(handshake_bytes.len() as u64));
     frames.extend_from_slice(handshake_bytes);
 
@@ -797,6 +1082,135 @@ mod tests {
         match det.inspect(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06], None) {
             QuicInitialVerdict::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn draft_version_is_inferred() {
+        assert_eq!(draft_version(0xff00_001d), Some(29));
+        assert_eq!(draft_version(0xff00_0016), Some(22));
+        assert_eq!(draft_version(0x0a0a_0a0a), Some(29));
+        assert_eq!(draft_version(QUIC_VERSION_V1), None);
+    }
+
+    #[test]
+    fn salt_table_covers_supported_versions_and_rejects_v2() {
+        assert!(salt_for_version(QUIC_VERSION_V1).is_some());
+        assert!(salt_for_version(QUIC_VERSION_GQUIC_Q050).is_some());
+        assert!(salt_for_version(QUIC_VERSION_GQUIC_T050).is_some());
+        assert!(salt_for_version(QUIC_VERSION_GQUIC_T051).is_some());
+        assert!(salt_for_version(0xff00_0019).is_some()); // draft-25
+                                                          // QUIC v2 has no Initial salt the inspector can key.
+        assert!(salt_for_version(QUIC_VERSION_V2).is_none());
+    }
+
+    #[test]
+    fn quic_v2_initial_is_unsupported() {
+        let record = synthetic_tls13_client_hello("cloudflare.com", 13);
+        let handshake = record[5..].to_vec();
+        // Build a v1 packet, then rewrite the version bytes to QUIC v2. The
+        // inspector must reject it rather than mis-decrypt.
+        let mut packet = build_test_initial_packet(b"01234567", b"abcd", &handshake, 0, 1200)
+            .expect("build packet");
+        packet[1..5].copy_from_slice(&QUIC_VERSION_V2.to_be_bytes());
+        let det = QuicInitialDetector::default();
+        match det.inspect(&packet, None) {
+            QuicInitialVerdict::Failed(msg) => assert!(msg.contains("unsupported")),
+            other => panic!("expected Failed(unsupported), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sub_1200_initial_is_rejected() {
+        let record = synthetic_tls13_client_hello("cloudflare.com", 13);
+        let handshake = record[5..].to_vec();
+        let packet =
+            build_test_initial_packet(b"01234567", b"abcd", &handshake, 0, 800).expect("build");
+        assert!(packet.len() < QUIC_MIN_INITIAL_SIZE);
+        let det = QuicInitialDetector::default();
+        match det.inspect(&packet, None) {
+            QuicInitialVerdict::Failed(msg) => assert!(msg.contains("1200")),
+            other => panic!("expected Failed(too small), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reserved_bits_set_is_rejected() {
+        let record = synthetic_tls13_client_hello("cloudflare.com", 13);
+        let handshake = record[5..].to_vec();
+        let mut packet = build_test_initial_packet(b"01234567", b"abcd", &handshake, 0, 1200)
+            .expect("build packet");
+        // Re-derive keys, recover the HP mask, and flip a reserved bit under
+        // protection so the unprotected first byte carries a reserved-bit set.
+        let header = parse_protected_long_header(&packet).unwrap();
+        let keys = derive_client_initial_keys_v2(&header.dcid).unwrap();
+        let sample_start = header.packet_number_offset + 4;
+        let mut sample = [0_u8; 16];
+        sample.copy_from_slice(&packet[sample_start..sample_start + 16]);
+        let mask = hp_mask(&keys.hp, &sample);
+        // Current protected low nibble unmasks to the real first byte; inject a
+        // reserved bit (0x08) into the to-be-unprotected value.
+        packet[0] ^= 0x08;
+        let _ = mask;
+        let det = QuicInitialDetector::default();
+        match det.inspect(&packet, None) {
+            QuicInitialVerdict::Failed(msg) => {
+                assert!(msg.contains("reserved") || msg.contains("authentication"))
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_packet_clienthello_is_reassembled() {
+        // Split a ClientHello handshake message into two CRYPTO fragments
+        // carried by two separate Initial packets.
+        let record = synthetic_tls13_client_hello("relay7.shadowsocks.io", 13);
+        let handshake = record[5..].to_vec();
+        let split = handshake.len() / 2;
+        let (a, b) = handshake.split_at(split);
+        let dcid = b"01234567";
+        let p1 = build_test_initial_packet_ext(dcid, b"abcd", a, 0, 0, 1200, QUIC_VERSION_V1)
+            .expect("p1");
+        let p2 =
+            build_test_initial_packet_ext(dcid, b"abcd", b, split as u64, 1, 1200, QUIC_VERSION_V1)
+                .expect("p2");
+        let det = QuicInitialDetector::default();
+        match det.inspect_multi(&[(p1, None), (p2, None)]) {
+            QuicInitialVerdict::BlockSni { sni, .. } => {
+                assert_eq!(sni, "relay7.shadowsocks.io")
+            }
+            other => panic!("expected BlockSni from reassembly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clienthello_fragmented_beyond_budget_escapes() {
+        // Four single-byte CRYPTO fragments exceed the 3-packet budget before
+        // the ClientHello can complete: it escapes inspection.
+        let record = synthetic_tls13_client_hello("relay7.shadowsocks.io", 13);
+        let handshake = record[5..].to_vec();
+        let dcid = b"01234567";
+        let mut packets = Vec::new();
+        let chunk = handshake.len() / 4 + 1;
+        for (i, frag) in handshake.chunks(chunk).enumerate() {
+            let p = build_test_initial_packet_ext(
+                dcid,
+                b"abcd",
+                frag,
+                (i * chunk) as u64,
+                i as u32,
+                1200,
+                QUIC_VERSION_V1,
+            )
+            .expect("frag packet");
+            packets.push((p, None));
+        }
+        assert!(packets.len() >= 4);
+        let det = QuicInitialDetector::default();
+        match det.inspect_multi(&packets) {
+            QuicInitialVerdict::Failed(msg) => assert!(msg.contains("budget")),
+            other => panic!("expected budget-exceeded escape, got {other:?}"),
         }
     }
 }

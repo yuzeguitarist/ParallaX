@@ -32,11 +32,41 @@ pub const EXT_ENCRYPTED_SERVER_NAME: u16 = 0xffce;
 
 pub const TLS13_VERSION: u16 = 0x0304;
 
+/// Record-layer protocol families an inspector distinguishes by the record
+/// header version field. TLS 1.3 still advertises a legacy 0x0303 record
+/// version, so the family is read from the record header, not the negotiated
+/// version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordProtocol {
+    Ssl3,
+    Tls10,
+    Tls11,
+    Tls12,
+    /// GM/T national-standard transport layer security (TLCP 1.1, 0x0101).
+    Tlcp,
+    /// DTLS 1.0 (0xfeff) / DTLS 1.2 (0xfefd).
+    Dtls,
+    Unknown,
+}
+
+/// Classify a record-header version field into a [`RecordProtocol`] family.
+pub fn record_protocol(record_version: u16) -> RecordProtocol {
+    match record_version {
+        0x0300 => RecordProtocol::Ssl3,
+        0x0301 => RecordProtocol::Tls10,
+        0x0302 => RecordProtocol::Tls11,
+        0x0303 => RecordProtocol::Tls12,
+        0x0101 => RecordProtocol::Tlcp,
+        0xfeff | 0xfefd => RecordProtocol::Dtls,
+        _ => RecordProtocol::Unknown,
+    }
+}
+
 // ---------------------- Parser ----------------------
 
 /// All fields recovered from a TLS ClientHello, retaining wire order so that
 /// JA3 / JA4 hashing in [`super::tls_fingerprint`] can stay byte-faithful.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedClientHello {
     pub record_len: usize,
     pub legacy_version: u16,
@@ -441,6 +471,77 @@ impl<'a> Cursor<'a> {
     }
 }
 
+// ---------------------- Cross-segment reassembly ----------------------
+
+/// Upper bound on bytes buffered while waiting for a ClientHello that is split
+/// across several TCP segments. A handshake larger than this is abandoned.
+pub const MAX_RECORD_CACHE_LEN: usize = 10240;
+
+/// Status of a segment fed to [`ClientHelloReassembler`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReassemblyStatus {
+    /// A complete first TLS record is buffered and parsed.
+    Complete(Box<ParsedClientHello>),
+    /// The record header or body is still incomplete; more segments are needed.
+    NeedMore,
+    /// The buffered prefix is not a TLS handshake record at all.
+    NotTls,
+    /// The buffer grew past [`MAX_RECORD_CACHE_LEN`] without completing.
+    Overflow,
+}
+
+/// Stateful reassembler that reconstructs a ClientHello delivered across
+/// multiple TCP segments. A border inspector that holds segments until the
+/// first record is whole defeats the "fragment the ClientHello" evasion: only a
+/// handshake larger than the cache, or never completed, slips past.
+#[derive(Debug, Default)]
+pub struct ClientHelloReassembler {
+    buffer: Vec<u8>,
+    /// Number of original segments held while waiting for completion. Mirrors
+    /// the "detained fragment" count a real middlebox tracks.
+    pub detained_segments: usize,
+}
+
+impl ClientHelloReassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append one TCP segment and attempt to parse a complete ClientHello.
+    pub fn push_segment(&mut self, segment: &[u8]) -> ReassemblyStatus {
+        if self.buffer.len() + segment.len() > MAX_RECORD_CACHE_LEN {
+            return ReassemblyStatus::Overflow;
+        }
+        self.buffer.extend_from_slice(segment);
+        self.detained_segments += 1;
+
+        // Need the 5-byte record header before we can know the record length.
+        if self.buffer.len() < 5 {
+            return ReassemblyStatus::NeedMore;
+        }
+        if self.buffer[0] != TLS_CONTENT_HANDSHAKE {
+            return ReassemblyStatus::NotTls;
+        }
+        let record_len = u16::from_be_bytes([self.buffer[3], self.buffer[4]]) as usize;
+        let total = 5 + record_len;
+        if self.buffer.len() < total {
+            return ReassemblyStatus::NeedMore;
+        }
+        match parse_client_hello(&self.buffer[..total]) {
+            Ok(parsed) => ReassemblyStatus::Complete(Box::new(parsed)),
+            Err(ClientHelloParseError::NotHandshake(_)) => ReassemblyStatus::NotTls,
+            // A length/EOF error on an otherwise-complete record means the
+            // handshake message itself spans further bytes we have not seen.
+            Err(_) => ReassemblyStatus::NeedMore,
+        }
+    }
+
+    /// Bytes currently buffered (for tests / introspection).
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
 // ---------------------- Filter logic ----------------------
 
 /// Output of a single SNI-filter pass.
@@ -628,5 +729,77 @@ mod tests {
         // Stage labels carry no behaviour on their own but make verdicts more
         // useful in logs; ensure the enum is wired up.
         assert_ne!(MiddleboxStage::Mbra, MiddleboxStage::Mbr);
+    }
+
+    #[test]
+    fn reassembler_joins_clienthello_split_across_segments() {
+        let record = parallax_client_hello("relay7.shadowsocks.io");
+        let mid = record.len() / 2;
+        let mut reasm = ClientHelloReassembler::new();
+        // First half: header is present but body incomplete.
+        match reasm.push_segment(&record[..mid]) {
+            ReassemblyStatus::NeedMore => {}
+            other => panic!("expected NeedMore on first segment, got {other:?}"),
+        }
+        // Second half completes the record.
+        match reasm.push_segment(&record[mid..]) {
+            ReassemblyStatus::Complete(parsed) => {
+                assert_eq!(parsed.sni.as_deref(), Some("relay7.shadowsocks.io"));
+            }
+            other => panic!("expected Complete on second segment, got {other:?}"),
+        }
+        assert_eq!(reasm.detained_segments, 2);
+    }
+
+    #[test]
+    fn reassembler_handles_byte_at_a_time_delivery() {
+        let record = parallax_client_hello("cloudflare.com");
+        let mut reasm = ClientHelloReassembler::new();
+        let mut completed = None;
+        for b in &record {
+            if let ReassemblyStatus::Complete(parsed) = reasm.push_segment(&[*b]) {
+                completed = Some(parsed);
+                break;
+            }
+        }
+        assert_eq!(
+            completed.expect("reassembled").sni.as_deref(),
+            Some("cloudflare.com")
+        );
+    }
+
+    #[test]
+    fn reassembler_overflows_on_oversized_buffer() {
+        let mut reasm = ClientHelloReassembler::new();
+        // A handshake record header announcing a body far larger than the cache.
+        let mut seg = vec![TLS_CONTENT_HANDSHAKE, 0x03, 0x03, 0xff, 0xff];
+        seg.resize(64, 0);
+        // Keep feeding until the cache overflows.
+        let mut overflowed = false;
+        for _ in 0..400 {
+            if reasm.push_segment(&seg) == ReassemblyStatus::Overflow {
+                overflowed = true;
+                break;
+            }
+        }
+        assert!(overflowed, "buffer should overflow past the cache limit");
+    }
+
+    #[test]
+    fn reassembler_rejects_non_tls_prefix() {
+        let mut reasm = ClientHelloReassembler::new();
+        assert_eq!(
+            reasm.push_segment(b"GET / HTTP/1.1\r\n"),
+            ReassemblyStatus::NotTls
+        );
+    }
+
+    #[test]
+    fn record_protocol_classifies_families() {
+        assert_eq!(record_protocol(0x0303), RecordProtocol::Tls12);
+        assert_eq!(record_protocol(0x0101), RecordProtocol::Tlcp);
+        assert_eq!(record_protocol(0xfeff), RecordProtocol::Dtls);
+        assert_eq!(record_protocol(0xfefd), RecordProtocol::Dtls);
+        assert_eq!(record_protocol(0x9999), RecordProtocol::Unknown);
     }
 }

@@ -343,6 +343,208 @@ impl BurstDetector {
     }
 }
 
+// ---------------------- CICFlow one-class anomaly scoring ----------------------
+//
+// The Mahalanobis path above is *closed-world*: it measures distance to known
+// proxy centroids, so a genuinely novel protocol (no centroid) reads as clean.
+// A complementary *open-world* path learns the statistics of benign flows only
+// and scores how far a flow sits from that learned envelope, flagging anything
+// unfamiliar. The feature set is a subset of the CICFlowMeter flow statistics:
+// inter-arrival timing, directional packet-length moments, and the down/up
+// byte ratio.
+
+/// IP protocol number for TCP (the only protocol the one-class model scores).
+pub const PROTO_TCP: u8 = 6;
+
+/// Flows with fewer than this many packets are not scored (too little signal).
+pub const MIN_FLOW_PACKETS: usize = 5;
+
+/// A subset of CICFlowMeter flow-statistics features.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CicflowFeatures {
+    pub flow_iat_mean: f64,
+    pub flow_iat_std: f64,
+    pub flow_iat_max: f64,
+    pub flow_iat_min: f64,
+    pub fwd_pkt_len_mean: f64,
+    pub bwd_pkt_len_mean: f64,
+    pub pkt_len_std: f64,
+    pub down_up_ratio: f64,
+    pub fwd_packets: f64,
+    pub bwd_packets: f64,
+}
+
+impl CicflowFeatures {
+    /// Order features into a fixed-length array for model scoring.
+    pub fn to_array(self) -> [f64; 10] {
+        [
+            self.flow_iat_mean,
+            self.flow_iat_std,
+            self.flow_iat_max,
+            self.flow_iat_min,
+            self.fwd_pkt_len_mean,
+            self.bwd_pkt_len_mean,
+            self.pkt_len_std,
+            self.down_up_ratio,
+            self.fwd_packets,
+            self.bwd_packets,
+        ]
+    }
+}
+
+/// Extract CICFlow-style features from a flow's length/direction/timing series.
+/// "Fwd" is client→server, "Bwd" is server→client. Returns `None` if the flow
+/// is below the minimum packet count (the CICFlowMeter pre-filter).
+pub fn extract_cicflow_features(
+    records: &[LengthObservation],
+    proto: u8,
+) -> Option<CicflowFeatures> {
+    if proto != PROTO_TCP || records.len() < MIN_FLOW_PACKETS {
+        return None;
+    }
+
+    // Inter-arrival times across the whole flow (microseconds).
+    let mut iats = Vec::with_capacity(records.len().saturating_sub(1));
+    for pair in records.windows(2) {
+        let dt = pair[1].at.saturating_duration_since(pair[0].at);
+        iats.push(dt.as_secs_f64() * 1e6);
+    }
+    let (iat_mean, iat_std) = mean_std(&iats);
+    let iat_max = iats.iter().cloned().fold(0.0_f64, f64::max);
+    let iat_min = iats.iter().cloned().fold(f64::INFINITY, f64::min);
+    let iat_min = if iat_min.is_finite() { iat_min } else { 0.0 };
+
+    let fwd: Vec<f64> = records
+        .iter()
+        .filter(|r| r.client_to_server)
+        .map(|r| r.length as f64)
+        .collect();
+    let bwd: Vec<f64> = records
+        .iter()
+        .filter(|r| !r.client_to_server)
+        .map(|r| r.length as f64)
+        .collect();
+    let all: Vec<f64> = records.iter().map(|r| r.length as f64).collect();
+
+    let (fwd_mean, _) = mean_std(&fwd);
+    let (bwd_mean, _) = mean_std(&bwd);
+    let (_, pkt_std) = mean_std(&all);
+    let fwd_bytes: f64 = fwd.iter().sum();
+    let bwd_bytes: f64 = bwd.iter().sum();
+    let down_up_ratio = if fwd_bytes > 0.0 {
+        bwd_bytes / fwd_bytes
+    } else {
+        0.0
+    };
+
+    Some(CicflowFeatures {
+        flow_iat_mean: iat_mean,
+        flow_iat_std: iat_std,
+        flow_iat_max: iat_max,
+        flow_iat_min: iat_min,
+        fwd_pkt_len_mean: fwd_mean,
+        bwd_pkt_len_mean: bwd_mean,
+        pkt_len_std: pkt_std,
+        down_up_ratio,
+        fwd_packets: fwd.len() as f64,
+        bwd_packets: bwd.len() as f64,
+    })
+}
+
+fn mean_std(xs: &[f64]) -> (f64, f64) {
+    if xs.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = xs.len() as f64;
+    let mean = xs.iter().sum::<f64>() / n;
+    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    (mean, var.sqrt())
+}
+
+/// Verdict from the open-world one-class scorer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OneClassVerdict {
+    /// Too few packets to score (CICFlowMeter pre-filter rejected the flow).
+    Skipped,
+    /// The flow sits inside the learned benign envelope.
+    Normal { score: f64 },
+    /// The flow is far from the benign envelope: an unfamiliar protocol.
+    Anomalous { score: f64 },
+}
+
+/// A one-class model trained on benign flows only. It stores the per-feature
+/// mean and standard deviation of the benign training set; the anomaly score is
+/// the root-mean-square z-score across features (a linear-kernel one-class
+/// surrogate). Scores above the threshold are flagged as novel/anomalous.
+#[derive(Debug, Clone)]
+pub struct OneClassModel {
+    mean: [f64; 10],
+    std: [f64; 10],
+    pub threshold: f64,
+}
+
+impl OneClassModel {
+    /// Fit the model to a set of benign flow feature vectors.
+    pub fn fit(benign: &[CicflowFeatures], threshold: f64) -> Self {
+        let mut mean = [0.0_f64; 10];
+        let mut std = [1.0_f64; 10];
+        if !benign.is_empty() {
+            let n = benign.len() as f64;
+            for f in benign {
+                let a = f.to_array();
+                for (m, ai) in mean.iter_mut().zip(a) {
+                    *m += ai;
+                }
+            }
+            for m in &mut mean {
+                *m /= n;
+            }
+            let mut var = [0.0_f64; 10];
+            for f in benign {
+                let a = f.to_array();
+                for ((v, ai), mi) in var.iter_mut().zip(a).zip(mean) {
+                    *v += (ai - mi).powi(2);
+                }
+            }
+            for (s, v) in std.iter_mut().zip(var) {
+                // Floor the std so a constant feature does not blow up z-scores.
+                *s = (v / n).sqrt().max(1e-6);
+            }
+        }
+        Self {
+            mean,
+            std,
+            threshold,
+        }
+    }
+
+    /// Root-mean-square z-score of `features` against the benign envelope.
+    pub fn anomaly_score(&self, features: &CicflowFeatures) -> f64 {
+        let a = features.to_array();
+        let mut acc = 0.0;
+        for ((ai, mi), si) in a.into_iter().zip(self.mean).zip(self.std) {
+            let z = (ai - mi) / si;
+            acc += z * z;
+        }
+        (acc / 10.0).sqrt()
+    }
+
+    /// Score a raw flow, applying the CICFlowMeter pre-filter first.
+    pub fn evaluate(&self, records: &[LengthObservation], proto: u8) -> OneClassVerdict {
+        match extract_cicflow_features(records, proto) {
+            None => OneClassVerdict::Skipped,
+            Some(features) => {
+                let score = self.anomaly_score(&features);
+                if score > self.threshold {
+                    OneClassVerdict::Anomalous { score }
+                } else {
+                    OneClassVerdict::Normal { score }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +623,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Build a flow from (length, c2s) pairs spaced `step_ms` apart, all sharing
+    // one time base so inter-arrival times are deterministic.
+    fn flow(pairs: &[(usize, bool)], step_ms: u64) -> Vec<LengthObservation> {
+        let base = Instant::now();
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (len, c2s))| LengthObservation {
+                length: *len,
+                at: base + Duration::from_millis(i as u64 * step_ms),
+                client_to_server: *c2s,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cicflow_prefilter_skips_short_and_non_tcp_flows() {
+        let short = flow(&[(100, true), (200, false), (300, true)], 5);
+        assert!(extract_cicflow_features(&short, PROTO_TCP).is_none());
+        let long = flow(
+            &[
+                (100, true),
+                (200, false),
+                (300, true),
+                (400, false),
+                (500, true),
+            ],
+            5,
+        );
+        // Long enough for TCP, but UDP (proto 17) is skipped.
+        assert!(extract_cicflow_features(&long, 17).is_none());
+        assert!(extract_cicflow_features(&long, PROTO_TCP).is_some());
+    }
+
+    #[test]
+    fn one_class_flags_flow_far_from_benign_envelope() {
+        // Benign training set: web-like flows, mostly server→client bulk with
+        // a few client→server requests, ~20 ms spacing.
+        let benign_flows: Vec<_> = (0..8)
+            .map(|k| {
+                flow(
+                    &[
+                        (300, true),
+                        (1400, false),
+                        (1400, false),
+                        (1400, false),
+                        (80, true),
+                        (1400, false),
+                    ],
+                    18 + k,
+                )
+            })
+            .collect();
+        let benign_features: Vec<_> = benign_flows
+            .iter()
+            .filter_map(|f| extract_cicflow_features(f, PROTO_TCP))
+            .collect();
+        let model = OneClassModel::fit(&benign_features, 3.0);
+
+        // A benign-shaped flow scores as normal.
+        let normal = flow(
+            &[
+                (300, true),
+                (1400, false),
+                (1400, false),
+                (1400, false),
+                (80, true),
+                (1400, false),
+            ],
+            20,
+        );
+        assert!(matches!(
+            model.evaluate(&normal, PROTO_TCP),
+            OneClassVerdict::Normal { .. }
+        ));
+
+        // An unfamiliar flow: constant-size, symmetric, tightly-paced - nothing
+        // like the benign envelope. The open-world scorer flags it even though
+        // no proxy centroid would match.
+        let novel = flow(
+            &[
+                (512, true),
+                (512, false),
+                (512, true),
+                (512, false),
+                (512, true),
+                (512, false),
+            ],
+            1,
+        );
+        match model.evaluate(&novel, PROTO_TCP) {
+            OneClassVerdict::Anomalous { score } => assert!(score > 3.0),
+            other => panic!("expected Anomalous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_class_evaluate_skips_below_minimum() {
+        let model = OneClassModel::fit(&[], 3.0);
+        let tiny = flow(&[(100, true), (200, false)], 5);
+        assert_eq!(model.evaluate(&tiny, PROTO_TCP), OneClassVerdict::Skipped);
     }
 }
