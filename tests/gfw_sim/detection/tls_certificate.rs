@@ -190,10 +190,17 @@ fn name_covers(pattern: &str, sni: &str) -> bool {
         return false;
     }
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        // A wildcard covers exactly one extra label.
+        // A wildcard covers exactly one extra, non-empty label. `head` is the
+        // part of the SNI before the suffix; it must be a single label followed
+        // by a separating dot (e.g. "a." for "a.example.com"), never empty
+        // (".example.com") or multi-label ("a.b.example.com").
         return sni
             .strip_suffix(suffix)
-            .map(|head| head.ends_with('.') && head[..head.len() - 1].split('.').count() == 1)
+            .map(|head| {
+                head.strip_suffix('.')
+                    .map(|label| !label.is_empty() && !label.contains('.'))
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
     }
     pattern == sni
@@ -319,6 +326,20 @@ mod tests {
                 assert!(tells.contains(&CertTell::SniNotCovered))
             }
             other => panic!("expected Suspicious, got {other:?}"),
+        }
+        // An empty leading label must NOT match a wildcard.
+        match assess_certificate(".example.com", &meta) {
+            CertificateVerdict::Suspicious { tells } => {
+                assert!(tells.contains(&CertTell::SniNotCovered))
+            }
+            other => panic!("expected Suspicious for empty leading label, got {other:?}"),
+        }
+        // The bare apex (zero extra labels) is not covered by `*.` either.
+        match assess_certificate("example.com", &meta) {
+            CertificateVerdict::Suspicious { tells } => {
+                assert!(tells.contains(&CertTell::SniNotCovered))
+            }
+            other => panic!("expected Suspicious for apex, got {other:?}"),
         }
     }
 }
