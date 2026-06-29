@@ -14,9 +14,141 @@
 //! models the common A-record sinkhole, the three-injector race observed in
 //! Triplet Censors measurements, and a newer "drop" mode.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::super::data::sni_blocklist::DnsKeywordBlocklist;
+
+// ---------------------- DNS qtype constants ----------------------
+
+pub const QTYPE_A: u16 = 1;
+pub const QTYPE_AAAA: u16 = 28;
+pub const QTYPE_OPT: u16 = 41;
+pub const QTYPE_SVCB: u16 = 64;
+pub const QTYPE_HTTPS: u16 = 65;
+
+/// DNS RCODE for "name does not exist" (NXDOMAIN), returned by the response-
+/// rewriting path when a name matches the blocklist.
+pub const RCODE_NXDOMAIN: u16 = 3;
+
+// ---------------------- Domain matcher (exact + suffix) ----------------------
+
+/// How a domain entry was classified in the blocklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainMatchKind {
+    /// Matched a full-name exact rule (`DOMAIN`).
+    Exact,
+    /// Matched a parent-suffix rule (`DOMAIN-SUFFIX`).
+    Suffix,
+}
+
+/// A matched domain rule: the pattern that fired and how it matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainMatch {
+    pub pattern: String,
+    pub kind: DomainMatchKind,
+}
+
+/// Domain blocklist supporting exact (`DOMAIN`) and label-anchored suffix
+/// (`DOMAIN-SUFFIX`) matching. Suffix rules are indexed by reversed label list
+/// so a name only matches at a label boundary, never mid-label (which a plain
+/// substring matcher would wrongly accept).
+#[derive(Debug, Clone, Default)]
+pub struct DnsDomainBlocklist {
+    exact: HashMap<String, String>,
+    suffix: SuffixTrie,
+}
+
+impl DnsDomainBlocklist {
+    /// Build from rules. A `*.` prefix or a bare parent label is treated as a
+    /// `DOMAIN-SUFFIX`; anything else is an exact `DOMAIN`.
+    pub fn from_rules<I, S>(rules: I) -> Self
+    where
+        I: IntoIterator<Item = (S, DomainMatchKind)>,
+        S: AsRef<str>,
+    {
+        let mut exact = HashMap::new();
+        let mut suffix = SuffixTrie::default();
+        for (rule, kind) in rules {
+            let raw = rule
+                .as_ref()
+                .trim()
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if raw.is_empty() {
+                continue;
+            }
+            match kind {
+                DomainMatchKind::Exact => {
+                    exact.insert(raw.clone(), raw);
+                }
+                DomainMatchKind::Suffix => suffix.insert(&raw),
+            }
+        }
+        Self { exact, suffix }
+    }
+
+    /// Returns the matched rule (if any) for `name`.
+    pub fn matched(&self, name: &str) -> Option<DomainMatch> {
+        let needle = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+        if let Some(pattern) = self.exact.get(&needle) {
+            return Some(DomainMatch {
+                pattern: pattern.clone(),
+                kind: DomainMatchKind::Exact,
+            });
+        }
+        self.suffix.matched(&needle).map(|pattern| DomainMatch {
+            pattern: format!("*.{pattern}"),
+            kind: DomainMatchKind::Suffix,
+        })
+    }
+}
+
+/// Reversed-label trie for suffix matching. Each inserted suffix is stored as a
+/// reversed label chain terminating in a node flagged as a rule.
+#[derive(Debug, Clone, Default)]
+struct SuffixTrie {
+    root: TrieNode,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TrieNode {
+    children: HashMap<String, TrieNode>,
+    /// Full suffix pattern stored at a terminal node (for reporting).
+    terminal: Option<String>,
+}
+
+impl SuffixTrie {
+    fn insert(&mut self, suffix: &str) {
+        let mut node = &mut self.root;
+        for label in suffix.split('.').rev() {
+            node = node.children.entry(label.to_owned()).or_default();
+        }
+        node.terminal = Some(suffix.to_owned());
+    }
+
+    /// Return the matched suffix pattern if `name` ends at a rule boundary.
+    fn matched(&self, name: &str) -> Option<String> {
+        let mut node = &self.root;
+        let mut best: Option<String> = None;
+        for label in name.split('.').rev() {
+            match node.children.get(label) {
+                Some(child) => {
+                    node = child;
+                    if let Some(t) = &node.terminal {
+                        best = Some(t.clone());
+                    }
+                }
+                None => break,
+            }
+        }
+        best
+    }
+}
 
 /// Default sinkhole A-record that the GFW historically returned when injecting
 /// fake responses. These IPs have been documented many times in the academic
@@ -160,6 +292,13 @@ pub enum DnsAction {
     /// Newer drop-mode: silently swallow the query (the real resolver also
     /// answers, but the response is RST'd by the residual rule).
     Drop { matched_keyword: String },
+    /// Rewrite the answer to NXDOMAIN (RCODE 3). A resolver-side enforcement
+    /// path returns this for a blocklisted name instead of a sinkhole address,
+    /// which is an independently observable censorship fingerprint.
+    NxDomain {
+        forged_response: Vec<u8>,
+        matched_keyword: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,10 +307,13 @@ pub enum InjectionMode {
     FakeResponse,
     /// Drop the query (newer behavior on some sub-networks).
     Drop,
+    /// Rewrite the answer to NXDOMAIN (resolver-side enforcement).
+    NxDomain,
 }
 
 pub struct DnsInjector {
     blocklist: DnsKeywordBlocklist,
+    domain_blocklist: Option<DnsDomainBlocklist>,
     mode: InjectionMode,
     sinkhole_idx: std::cell::Cell<usize>,
     pub stats: std::cell::RefCell<DnsInjectorStats>,
@@ -182,6 +324,11 @@ pub struct DnsInjectorStats {
     pub queries_seen: u64,
     pub injections_issued: u64,
     pub drops_issued: u64,
+    pub nxdomains_issued: u64,
+    /// Number of queries whose qtype was SVCB (64) or HTTPS (65). Such queries
+    /// carry the ECH configuration in the answer, so the GFW records them as
+    /// reconnaissance of ECH-capable destinations.
+    pub ech_recon_observed: u64,
     pub last_injection: Option<Instant>,
 }
 
@@ -195,6 +342,7 @@ impl DnsInjector {
     pub fn with_mode(mode: InjectionMode) -> Self {
         Self {
             blocklist: DnsKeywordBlocklist::default_set(),
+            domain_blocklist: None,
             mode,
             sinkhole_idx: std::cell::Cell::new(0),
             stats: std::cell::RefCell::new(DnsInjectorStats::default()),
@@ -204,10 +352,20 @@ impl DnsInjector {
     pub fn with_blocklist(blocklist: DnsKeywordBlocklist, mode: InjectionMode) -> Self {
         Self {
             blocklist,
+            domain_blocklist: None,
             mode,
             sinkhole_idx: std::cell::Cell::new(0),
             stats: std::cell::RefCell::new(DnsInjectorStats::default()),
         }
+    }
+
+    /// Attach an exact + suffix domain blocklist. When present it is consulted
+    /// before the substring keyword list, modelling the resolver-side rule
+    /// table that matches `DOMAIN` / `DOMAIN-SUFFIX` entries at label
+    /// boundaries.
+    pub fn with_domain_blocklist(mut self, domains: DnsDomainBlocklist) -> Self {
+        self.domain_blocklist = Some(domains);
+        self
     }
 
     /// Inspect a UDP/53 payload. Returns the action the simulator should take.
@@ -218,8 +376,13 @@ impl DnsInjector {
             Err(_) => return DnsAction::Allow,
         };
         for question in &query.questions {
-            if let Some(keyword) = self.blocklist.matched(&question.name) {
-                let matched_keyword = keyword.to_owned();
+            // A SVCB/HTTPS query exposes that the client is resolving an
+            // ECH-capable destination; record it as reconnaissance regardless
+            // of the blocklist outcome.
+            if matches!(question.qtype, QTYPE_SVCB | QTYPE_HTTPS) {
+                self.stats.borrow_mut().ech_recon_observed += 1;
+            }
+            if let Some(matched_keyword) = self.matched_rule(&question.name) {
                 match self.mode {
                     InjectionMode::FakeResponse => {
                         let (resp, trace) = self.forge_a_response(&query, question);
@@ -236,10 +399,44 @@ impl DnsInjector {
                         self.stats.borrow_mut().drops_issued += 1;
                         return DnsAction::Drop { matched_keyword };
                     }
+                    InjectionMode::NxDomain => {
+                        let resp = self.forge_nxdomain(&query, question);
+                        self.stats.borrow_mut().nxdomains_issued += 1;
+                        return DnsAction::NxDomain {
+                            forged_response: resp,
+                            matched_keyword,
+                        };
+                    }
                 }
             }
         }
         DnsAction::Allow
+    }
+
+    /// Resolve a name against the domain blocklist (exact + suffix) first, then
+    /// the substring keyword list. Returns the rule string that fired.
+    fn matched_rule(&self, name: &str) -> Option<String> {
+        if let Some(domains) = &self.domain_blocklist {
+            if let Some(m) = domains.matched(name) {
+                return Some(m.pattern);
+            }
+        }
+        self.blocklist.matched(name).map(|k| k.to_owned())
+    }
+
+    fn forge_nxdomain(&self, query: &DnsQuery, question: &DnsQuestion) -> Vec<u8> {
+        let mut resp = Vec::with_capacity(32);
+        resp.extend_from_slice(&query.transaction_id.to_be_bytes());
+        // QR=1, opcode=0, AA=1, RD=1, RA=1, RCODE=3 (NXDOMAIN) -> 0x8583
+        resp.extend_from_slice(&(0x8580_u16 | RCODE_NXDOMAIN).to_be_bytes());
+        resp.extend_from_slice(&1_u16.to_be_bytes()); // QDCOUNT
+        resp.extend_from_slice(&0_u16.to_be_bytes()); // ANCOUNT
+        resp.extend_from_slice(&0_u16.to_be_bytes()); // NSCOUNT
+        resp.extend_from_slice(&0_u16.to_be_bytes()); // ARCOUNT
+        encode_name(&mut resp, &question.name);
+        resp.extend_from_slice(&question.qtype.to_be_bytes());
+        resp.extend_from_slice(&question.qclass.to_be_bytes());
+        resp
     }
 
     fn forge_a_response(
@@ -326,6 +523,10 @@ mod tests {
     use super::*;
 
     fn build_query(name: &str) -> Vec<u8> {
+        build_query_qtype(name, QTYPE_A)
+    }
+
+    fn build_query_qtype(name: &str, qtype: u16) -> Vec<u8> {
         let mut q = Vec::new();
         q.extend_from_slice(&0x1234_u16.to_be_bytes()); // txid
         q.extend_from_slice(&0x0100_u16.to_be_bytes()); // recursion desired
@@ -334,7 +535,7 @@ mod tests {
         q.extend_from_slice(&0_u16.to_be_bytes());
         q.extend_from_slice(&0_u16.to_be_bytes());
         encode_name(&mut q, name);
-        q.extend_from_slice(&1_u16.to_be_bytes()); // QTYPE=A
+        q.extend_from_slice(&qtype.to_be_bytes());
         q.extend_from_slice(&1_u16.to_be_bytes()); // QCLASS=IN
         q
     }
@@ -403,5 +604,76 @@ mod tests {
             other => panic!("expected drop, got {other:?}"),
         }
         assert_eq!(injector.stats_snapshot().drops_issued, 1);
+    }
+
+    #[test]
+    fn suffix_trie_matches_only_at_label_boundary() {
+        let bl = DnsDomainBlocklist::from_rules([
+            ("*.shadowsocks.io", DomainMatchKind::Suffix),
+            ("blocked.example", DomainMatchKind::Exact),
+        ]);
+        // Suffix matches the apex and any subdomain.
+        assert_eq!(
+            bl.matched("relay7.shadowsocks.io").map(|m| m.kind),
+            Some(DomainMatchKind::Suffix)
+        );
+        assert_eq!(
+            bl.matched("shadowsocks.io").map(|m| m.kind),
+            Some(DomainMatchKind::Suffix)
+        );
+        // Mid-label coincidence must NOT match (a substring matcher would).
+        assert!(bl.matched("notshadowsocks.io").is_none());
+        assert!(bl.matched("shadowsocks.io.evil.com").is_none());
+        // Exact rule matches only the full name.
+        assert_eq!(
+            bl.matched("blocked.example").map(|m| m.kind),
+            Some(DomainMatchKind::Exact)
+        );
+        assert!(bl.matched("sub.blocked.example").is_none());
+    }
+
+    #[test]
+    fn nxdomain_mode_rewrites_answer() {
+        let injector = DnsInjector::with_mode(InjectionMode::NxDomain);
+        let q = build_query("cdn.v2raycloud.io");
+        match injector.inspect(&q) {
+            DnsAction::NxDomain {
+                forged_response,
+                matched_keyword,
+            } => {
+                assert_eq!(matched_keyword, "v2ray");
+                let flags = u16::from_be_bytes([forged_response[2], forged_response[3]]);
+                assert_eq!(flags & 0x8000, 0x8000, "QR bit set");
+                assert_eq!(flags & 0x000f, RCODE_NXDOMAIN, "RCODE is NXDOMAIN");
+                // No answer records in an NXDOMAIN reply.
+                let ancount = u16::from_be_bytes([forged_response[6], forged_response[7]]);
+                assert_eq!(ancount, 0);
+            }
+            other => panic!("expected NxDomain, got {other:?}"),
+        }
+        assert_eq!(injector.stats_snapshot().nxdomains_issued, 1);
+    }
+
+    #[test]
+    fn domain_blocklist_takes_priority_over_keywords() {
+        let domains = DnsDomainBlocklist::from_rules([("*.example.net", DomainMatchKind::Suffix)]);
+        let injector = DnsInjector::with_mode(InjectionMode::Drop).with_domain_blocklist(domains);
+        // Name matches the domain suffix rule but no substring keyword.
+        match injector.inspect(&build_query("host.example.net")) {
+            DnsAction::Drop { matched_keyword } => assert_eq!(matched_keyword, "*.example.net"),
+            other => panic!("expected Drop via domain rule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn https_qtype_is_recorded_as_ech_recon() {
+        let injector = DnsInjector::default();
+        // A benign HTTPS-record lookup: not blocklisted, but recorded as recon.
+        let action = injector.inspect(&build_query_qtype("example.com", QTYPE_HTTPS));
+        assert_eq!(action, DnsAction::Allow);
+        assert_eq!(injector.stats_snapshot().ech_recon_observed, 1);
+        // An A lookup does not count as ECH recon.
+        injector.inspect(&build_query_qtype("example.com", QTYPE_A));
+        assert_eq!(injector.stats_snapshot().ech_recon_observed, 1);
     }
 }

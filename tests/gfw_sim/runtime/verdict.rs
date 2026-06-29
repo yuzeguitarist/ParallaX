@@ -266,6 +266,12 @@ impl From<DnsAction> for LayerVerdict {
                 "dns_inject",
                 format!("dropped query (keyword={matched_keyword})"),
             ),
+            DnsAction::NxDomain {
+                matched_keyword, ..
+            } => LayerVerdict::block(
+                "dns_inject",
+                format!("rewrote answer to NXDOMAIN (keyword={matched_keyword})"),
+            ),
         }
     }
 }

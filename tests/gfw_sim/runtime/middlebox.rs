@@ -154,7 +154,7 @@ impl GfwSimulator {
         if let Some(dns_query) = &scenario.dns_query {
             let action = self.dns_injector.inspect(dns_query);
             match &action {
-                DnsAction::InjectFakeResponse { .. } => {
+                DnsAction::InjectFakeResponse { .. } | DnsAction::NxDomain { .. } => {
                     egress_actions.push(EgressAction::DnsInjectionEmitted);
                 }
                 DnsAction::Drop { .. } => {
@@ -173,7 +173,7 @@ impl GfwSimulator {
                 ClientToServerEvent::DnsQuery { bytes } => {
                     let act = self.dns_injector.inspect(bytes);
                     match &act {
-                        DnsAction::InjectFakeResponse { .. } => {
+                        DnsAction::InjectFakeResponse { .. } | DnsAction::NxDomain { .. } => {
                             egress_actions.push(EgressAction::DnsInjectionEmitted);
                         }
                         DnsAction::Drop { .. } => {
