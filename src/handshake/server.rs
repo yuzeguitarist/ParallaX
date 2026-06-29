@@ -492,13 +492,15 @@ async fn build_quic_carrier(
         zeroize::Zeroizing::new(psk.to_vec()),
         zeroize::Zeroizing::new(*private_key),
     );
-    let (stek, guard) = match SERVER_ZERO_RTT.get() {
-        Some(zr) => (
-            Some(zr.stek.clone()),
-            Some(zr.guard.clone() as Arc<dyn crate::tls::quic::ZeroRttGuard>),
-        ),
-        None => (None, None),
-    };
+    // STEK and anti-replay guard travel as one inseparable pair, so the carrier can
+    // never accept 0-RTT without anti-replay.
+    let zero_rtt =
+        SERVER_ZERO_RTT
+            .get()
+            .map(|zr| crate::transport::udp::quic::endpoint::ZeroRttKeys {
+                stek: zr.stek.clone(),
+                guard: zr.guard.clone() as Arc<dyn crate::tls::quic::ZeroRttGuard>,
+            });
     // Persistent single-use anti-replay for accepted origin-splice markers (issue
     // #74): a sibling `.marker` of the auth-handshake replay cache, keyed by the same
     // PSK, with a window >= the marker freshness window so a captured marker stays
@@ -529,8 +531,7 @@ async fn build_quic_carrier(
     let config = crate::transport::udp::server_config_stable(
         cert,
         key,
-        stek,
-        guard,
+        zero_rtt,
         marker_key,
         marker_replay_guard,
         origin,

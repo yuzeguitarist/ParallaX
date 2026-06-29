@@ -106,6 +106,19 @@ fn looks_like_initial(data: &[u8]) -> bool {
         && u32::from_be_bytes([data[1], data[2], data[3], data[4]]) == QUIC_VERSION_V1
 }
 
+/// 0-RTT resumption material: the STEK that seals/opens NewSessionTickets and the
+/// cross-connection single-use anti-replay guard. Pairing them in one struct makes
+/// it impossible to enable 0-RTT acceptance (a STEK) without also wiring the
+/// anti-replay guard (RFC 8446 §8), closing the misconfiguration where a replayed
+/// ticket's early data would be accepted for the ticket lifetime.
+pub struct ZeroRttKeys {
+    /// STEK for issuing + accepting 0-RTT resumption tickets.
+    pub stek: Zeroizing<[u8; 32]>,
+    /// Cross-connection single-use 0-RTT anti-replay guard, installed on every
+    /// accepted connection.
+    pub guard: Arc<dyn ZeroRttGuard>,
+}
+
 /// Server identity for accepting connections. Transport parameters are NOT stored
 /// here: they are encoded per-connection from the chosen source connection id (so
 /// `initial_source_connection_id` matches the Initial header SCID, RFC 9000 §7.3),
@@ -117,12 +130,10 @@ pub struct ServerConfig {
     pub signing_key_pkcs8: Vec<u8>,
     /// Offered ALPN protocols (the relay offers exactly `h3`).
     pub alpn_protocols: Vec<Vec<u8>>,
-    /// STEK for issuing + accepting 0-RTT resumption tickets. `None` keeps the
-    /// server cold-start-only (no NewSessionTicket, no 0-RTT acceptance).
-    pub stek: Option<Zeroizing<[u8; 32]>>,
-    /// Cross-connection single-use 0-RTT anti-replay guard, installed on every
-    /// accepted connection. Should be `Some` whenever `stek` is `Some`.
-    pub replay_guard: Option<Arc<dyn ZeroRttGuard>>,
+    /// 0-RTT resumption keys (STEK + anti-replay guard), or `None` to keep the
+    /// server cold-start-only (no NewSessionTicket, no 0-RTT acceptance). Bundling
+    /// the two makes "accept 0-RTT without anti-replay" unrepresentable.
+    pub zero_rtt: Option<ZeroRttKeys>,
     /// Camouflage origin's UDP/443 address for the REALITY-style fallback splice.
     /// When `Some`, a datagram from an unknown peer that is NOT a well-formed v1
     /// Initial (a probe, garbage, non-v1, version-negotiation-eliciting) is relayed
@@ -761,13 +772,14 @@ impl Driver {
             // (RFC 9000 §7.3) instead of a stale config-time placeholder.
             super::transport_params::TransportParameters::server(&scid).encode_server(),
             ConnectionId::new(&scid),
-            cfg.stek.clone(),
+            cfg.zero_rtt.as_ref().map(|z| z.stek.clone()),
         ) {
             Ok(mut core) => {
                 // Install the shared single-use 0-RTT anti-replay guard so a replayed
-                // ticket on any connection is rejected (falls back to 1-RTT).
-                if let Some(guard) = cfg.replay_guard.clone() {
-                    core.set_zero_rtt_replay_guard(guard);
+                // ticket on any connection is rejected (falls back to 1-RTT). Paired
+                // with the STEK in `zero_rtt`, so enabling 0-RTT always wires the guard.
+                if let Some(z) = cfg.zero_rtt.as_ref() {
+                    core.set_zero_rtt_replay_guard(z.guard.clone());
                 }
                 // Install the auth-marker key BEFORE the ClientHello is processed: the
                 // marker is verified during handle_datagram and read back below. The
@@ -1439,8 +1451,7 @@ mod tests {
             cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
             signing_key_pkcs8: key,
             alpn_protocols: vec![b"h3".to_vec()],
-            stek: None,
-            replay_guard: None,
+            zero_rtt: None,
             origin_udp_addr,
             marker_key,
             marker_replay_guard: None,
