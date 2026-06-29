@@ -1290,10 +1290,20 @@ impl Driver {
                     super::offload::record_gso_call(slice.len() as u64);
                 } else {
                     // Kernel without GSO / oversized / transient error / not writable:
-                    // send the run one datagram at a time (awaiting writability) so no
-                    // bytes are dropped.
+                    // batch the run with one sendmmsg syscall instead of one send_to
+                    // per datagram, then await-resend whatever prefix the kernel did
+                    // not accept (short count / EAGAIN) so no bytes are dropped. The
+                    // wire output (independent datagrams) is identical either way.
                     super::offload::record_gso_fallback();
-                    for (dg, _) in slice {
+                    let sent = match socket.try_io(tokio::io::Interest::WRITABLE, || {
+                        super::offload::send_mmsg(socket.as_fd(), slice)
+                    }) {
+                        Ok(n) => n,
+                        // Not writable yet, or a hard error before message 0: nothing
+                        // batched, so resend the whole run below.
+                        Err(_) => 0,
+                    };
+                    for (dg, _) in &slice[sent..] {
                         let _ = socket.send_to(dg, run.peer).await;
                     }
                 }

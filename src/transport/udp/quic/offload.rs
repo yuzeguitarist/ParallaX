@@ -20,7 +20,7 @@
 //! offload (older kernels, non-Linux), so correctness never depends on it.
 
 #[cfg(target_os = "linux")]
-pub use linux::{enable_gro, recv_gro, send_gso};
+pub use linux::{enable_gro, recv_gro, send_gso, send_mmsg};
 
 // Public diagnostics surface: a stats endpoint reads `offload_stats()`. Not yet wired
 // to a caller in-crate, so allow the unused re-export rather than fabricate one.
@@ -279,6 +279,14 @@ mod linux {
             (*cmsg).cmsg_level = libc::SOL_UDP;
             (*cmsg).cmsg_type = libc::UDP_SEGMENT;
             (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+            // The UDP_SEGMENT cmsg is a u16; a segment larger than that cannot be
+            // expressed. The carrier's MAX_DATAGRAM (1252) is far below this, and DPLPMTUD
+            // is capped well under 65535, so this only guards a future invariant break —
+            // a debug_assert documents it without a release-path branch.
+            debug_assert!(
+                segment_size <= u16::MAX as usize,
+                "GSO segment_size {segment_size} exceeds the u16 UDP_SEGMENT field"
+            );
             let seg = segment_size as u16;
             std::ptr::copy_nonoverlapping(
                 (&seg as *const u16).cast::<u8>(),
@@ -295,6 +303,69 @@ mod linux {
                 Ok(sent as usize)
             }
         }
+    }
+
+    /// Send a batch of independent datagrams in one `sendmmsg(2)`, returning how many
+    /// the kernel accepted (a prefix of `batch`). This is the GSO-fallback fast path:
+    /// when a run cannot use `UDP_SEGMENT` (mixed sizes, an older kernel, an oversized
+    /// run, a transient error), the per-datagram path would otherwise spend one
+    /// `send_to` syscall — and one async wakeup — per packet. `sendmmsg` collapses
+    /// them into a single syscall while keeping each datagram an independent message
+    /// (its own destination, its own size), so the bytes/sizes/count on the wire are
+    /// identical to the per-datagram loop.
+    ///
+    /// Returns `Ok(n)` where `n` is the number of leading datagrams sent (the kernel
+    /// sends a prefix and reports a short count on `EAGAIN`/`EWOULDBLOCK` after the
+    /// first message, or a hard error on the very first). The caller resends the
+    /// `batch[n..]` remainder via the awaiting per-datagram fallback, so no bytes are
+    /// ever dropped. An empty batch returns `Ok(0)`.
+    pub fn send_mmsg(fd: BorrowedFd<'_>, batch: &[(Vec<u8>, SocketAddr)]) -> io::Result<usize> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        // Parallel backing storage that must outlive the syscall: one SockAddr, one
+        // iovec, and one mmsghdr per datagram. The mmsghdr's msg_hdr points into the
+        // addrs/iovs vectors, so all three must stay put for the sendmmsg call.
+        let addrs: Vec<SockAddr> = batch
+            .iter()
+            .map(|(_, peer)| SockAddr::from(*peer))
+            .collect();
+        let mut iovs: Vec<libc::iovec> = batch
+            .iter()
+            .map(|(dg, _)| libc::iovec {
+                iov_base: dg.as_ptr() as *mut libc::c_void,
+                iov_len: dg.len(),
+            })
+            .collect();
+        // SAFETY: mmsghdr is a C struct of plain integers/pointers; zeroed is a valid
+        // initial state before we fill msg_hdr below.
+        let mut msgs: Vec<libc::mmsghdr> = (0..batch.len())
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
+        for (i, msg) in msgs.iter_mut().enumerate() {
+            msg.msg_hdr.msg_name = addrs[i].as_ptr() as *mut libc::c_void;
+            msg.msg_hdr.msg_namelen = addrs[i].len();
+            msg.msg_hdr.msg_iov = &mut iovs[i];
+            msg.msg_hdr.msg_iovlen = 1;
+            // msg_len is an out field the kernel fills with bytes sent for this message.
+        }
+        // SAFETY: msgs/addrs/iovs are live for the call; each mmsghdr's msg_hdr points
+        // at the matching addr + iov, all with correct lengths. sendmmsg writes only
+        // each mmsghdr's msg_len out field.
+        let n = unsafe {
+            libc::sendmmsg(
+                fd.as_raw_fd(),
+                msgs.as_mut_ptr(),
+                msgs.len() as libc::c_uint,
+                0,
+            )
+        };
+        if n < 0 {
+            // A hard error before the first message was sent (e.g. EAGAIN with nothing
+            // sent). The caller resends the whole batch per-datagram.
+            return Err(io::Error::last_os_error());
+        }
+        Ok(n as usize)
     }
 
     /// A GRO read: the bytes the kernel coalesced and the segment size to re-split
@@ -489,5 +560,39 @@ mod tests {
             next = r.range.end;
         }
         assert_eq!(next, batch.len());
+    }
+
+    /// `send_mmsg` delivers a batch of independent datagrams to their destination in
+    /// one syscall, each as a distinct message (own size, own bytes), matching what a
+    /// per-datagram `send_to` loop would have put on the wire. Linux-only (the syscall
+    /// does not exist elsewhere); compiled everywhere via the Linux cfg, run on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn send_mmsg_delivers_each_datagram_verbatim() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsFd;
+
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        // Three differently-sized datagrams to the same peer (a mixed run GSO would
+        // reject, exactly the fallback case sendmmsg now batches).
+        let batch = vec![
+            (vec![1u8; 1252], rx_addr),
+            (vec![2u8; 40], rx_addr),
+            (vec![3u8; 700], rx_addr),
+        ];
+        let sent = super::linux::send_mmsg(tx.as_fd(), &batch).unwrap();
+        assert_eq!(sent, 3, "all three datagrams sent in one sendmmsg");
+
+        // Each arrives as its own datagram with its own length and payload, in order.
+        for (expected, _) in &batch {
+            let mut buf = vec![0u8; 2048];
+            let n = rx.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &expected[..], "datagram delivered verbatim");
+        }
     }
 }
