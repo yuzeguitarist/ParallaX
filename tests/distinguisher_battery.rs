@@ -25,6 +25,7 @@ use distinguisher::features::{self, window_features};
 use distinguisher::parallax_source;
 use distinguisher::perturb;
 use distinguisher::safari_h3_source;
+use distinguisher::safari_quic_source;
 use distinguisher::safari_source;
 use distinguisher::stats::{chi_square_gof, ljung_box, two_sample_ks};
 use distinguisher::trace::{Dir, Trace};
@@ -465,5 +466,89 @@ async fn parallax_vs_safari_h3_direction_and_size() {
     assert!(
         c2s >= 1 && s2c >= 1,
         "ParallaX capture not bidirectional: C2S={c2s} S2C={s2c}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 6: QUIC direction/size CALIBRATION against the large real-traffic
+// corpus (~6k datagrams), using an interactive request/response capture.
+//
+// Tier 5's bulk capture streams one big payload each way, producing a single
+// uplink burst then a single downlink burst — which inflates the direction-run
+// KS against a browser that interleaves many small turns. This tier (a) compares
+// against the high-volume QUIC corpus instead of the ~55-datagram H3 sample, and
+// (b) drives an interactive ping-pong so ParallaX's own direction interleave is
+// browser-shaped. It quantifies how much of the earlier divergence was a capture
+// artifact versus a genuine gap. Size + direction only; IAT is context-only.
+// ---------------------------------------------------------------------------
+
+/// A browser-like exchange schedule: many small request turns, each answered by
+/// a small-to-medium response. Deterministic (index-driven) so the capture is
+/// reproducible. ~20 turns is enough to build a direction-run distribution
+/// comparable to the real corpus without a multi-second test.
+fn browser_like_schedule() -> Vec<udp_capture::Exchange> {
+    // Response sizes cycle through a realistic spread (1–8 KB); requests stay
+    // small (~500 B), as a typical HTTP/3 GET would.
+    const RESPONSES: [usize; 5] = [1200, 3500, 8000, 600, 5000];
+    (0..20)
+        .map(|i| udp_capture::Exchange {
+            request_bytes: 500,
+            response_bytes: RESPONSES[i % RESPONSES.len()],
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "live QUIC loopback capture; run with --ignored --test-threads=1"]
+async fn quic_direction_size_calibration_vs_real_corpus() {
+    let safari = safari_quic_source::load_fixture().expect("load Safari QUIC corpus");
+
+    // Interactive (browser-shaped) capture — the calibrated comparison.
+    let interactive = udp_capture::capture_parallax_quic_interactive(&browser_like_schedule())
+        .await
+        .expect("interactive QUIC capture");
+
+    // Bulk single-shot capture — the old, uncalibrated shape, for contrast.
+    let bulk = udp_capture::capture_parallax_quic_trace(64 * 1024, 64 * 1024)
+        .await
+        .expect("bulk QUIC capture");
+
+    let ks_runs = |p: &Trace| {
+        two_sample_ks(
+            &features::direction_runs(&safari),
+            &features::direction_runs(p),
+        )
+    };
+    let ks_size = |p: &Trace| two_sample_ks(&safari.lengths(Dir::C2S), &p.lengths(Dir::C2S));
+
+    let bulk_runs = ks_runs(&bulk);
+    let int_runs = ks_runs(&interactive);
+    let bulk_size = ks_size(&bulk);
+    let int_size = ks_size(&interactive);
+
+    eprintln!(
+        "[tier6-cal] Safari QUIC corpus n={} (C2S {} / S2C {})",
+        safari.len(),
+        safari.dir(Dir::C2S).len(),
+        safari.dir(Dir::S2C).len()
+    );
+    eprintln!(
+        "[tier6-cal] direction-run KS:  bulk D={:.4} p={:.4}  ->  interactive D={:.4} p={:.4}",
+        bulk_runs.statistic, bulk_runs.p_value, int_runs.statistic, int_runs.p_value
+    );
+    eprintln!(
+        "[tier6-cal] C2S size KS:       bulk D={:.4} p={:.4}  ->  interactive D={:.4} p={:.4}",
+        bulk_size.statistic, bulk_size.p_value, int_size.statistic, int_size.p_value
+    );
+
+    // Sanity gate only (same posture as Tier 5): the interactive capture must be
+    // genuinely bidirectional. KS values stay informational — this tier exists
+    // to MEASURE the gap, not to gate on a threshold that loopback distributions
+    // have not yet been calibrated to support.
+    let c2s = interactive.dir(Dir::C2S).len();
+    let s2c = interactive.dir(Dir::S2C).len();
+    assert!(
+        c2s >= 1 && s2c >= 1,
+        "interactive capture not bidirectional: C2S={c2s} S2C={s2c}"
     );
 }
