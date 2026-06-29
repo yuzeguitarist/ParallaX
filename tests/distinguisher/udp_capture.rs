@@ -242,6 +242,13 @@ pub struct Exchange {
 /// would block until close), so the stream stays open across turns. Heavyweight;
 /// invoked only from `#[ignore]` tiers.
 pub async fn capture_parallax_quic_interactive(exchanges: &[Exchange]) -> Result<Trace, String> {
+    // Reject an empty schedule up front: without any exchanges the capture would
+    // contain only handshake/FIN datagrams, which looks bidirectional but carries
+    // no request/response traffic — a silently misleading calibration input.
+    if exchanges.is_empty() {
+        return Err("interactive capture requires a non-empty exchange schedule".into());
+    }
+
     let server = bind_server_endpoint("127.0.0.1:0".parse().unwrap(), "localhost")
         .await
         .map_err(|e| format!("bind server: {e}"))?;
