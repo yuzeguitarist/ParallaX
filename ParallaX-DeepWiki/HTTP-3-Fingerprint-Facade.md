@@ -17,7 +17,7 @@ probe, or relay (that is [QUIC Fast Plane](QUIC-Fast-Plane.md)).
 |---|---|
 | H3 frame encode/decode (RFC 9114). | QUIC connection / stream orchestration. |
 | Safari-26 SETTINGS, control + QPACK uni-stream shaping. | The QUIC transport (`src/transport/udp/quic/`). |
-| Static-only QPACK field sections (RFC 9204). | The QPACK **dynamic** table — ParallaX controls both ends, so it is unused. |
+| Static-only QPACK field sections (RFC 9204). | The QPACK **dynamic** table is advertised for Safari parity (`QPACK_MAX_TABLE_CAPACITY = 16383` in SETTINGS) but never populated — Required Insert Count stays 0. ParallaX controls both ends, so no dynamic entries are inserted. |
 
 ## QPACK subset
 

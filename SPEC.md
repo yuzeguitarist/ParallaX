@@ -159,11 +159,11 @@ encrypted records.
 | Magic (ASCII) | Hex | Message | Direction | §  |
 |---------------|-----|---------|-----------|----|
 | `PX1C` | `50 58 31 43` | CONNECT | C→S | 6.1 |
-| `PX1Q` | `50 58 31 51` | PQ_REKEY request | C→S | 5.6 |
-| `PX1K` | `50 58 31 4B` | SERVER_KEY_EXCHANGE | S→C | 5.6 |
-| `PX1S` | `50 58 31 53` | SERVER_IDENTITY (proof, whole) | S→C | 5.5 |
-| `PX1I` | `50 58 31 49` | SERVER_IDENTITY_CHUNK | S→C | 5.5 |
-| `PX1F` | `50 58 31 46` | FRAMED_CHUNK (generic chunk reassembly) | both | 5.7 |
+| `PX1Q` | `50 58 31 51` | PQ_REKEY request | C→S | 5.7 |
+| `PX1K` | `50 58 31 4B` | SERVER_KEY_EXCHANGE | S→C | 5.7 |
+| `PX1S` | `50 58 31 53` | SERVER_IDENTITY (proof, whole) | S→C | 5.6 |
+| `PX1I` | `50 58 31 49` | SERVER_IDENTITY_CHUNK | S→C | 5.6 |
+| `PX1F` | `50 58 31 46` | FRAMED_CHUNK (generic chunk reassembly) | both | 5.8 |
 | `PX1M` | `50 58 31 4D` | MUX_FRAME | both | 7 |
 | `PX1G` | `50 58 31 47` | UDP_REQUEST (negotiate QUIC plane) | C→S | 9.1 |
 | `PX1O` | `50 58 31 4F` | UDP_OFFER | S→C | 9.1 |
@@ -185,7 +185,7 @@ between the TCP and QUIC planes (used only when both planes are active):
 | Marker bytes (ASCII) | Meaning |
 |----------------------|---------|
 | `b"PX1Z-quic-relay-done"` (20 B) | the QUIC-plane relay finished; signals the TCP side to tear down |
-| `b"PX1Z-speed-quic-done"` (21 B) | the QUIC-plane speed test finished |
+| `b"PX1Z-speed-quic-done"` (20 B) | the QUIC-plane speed test finished |
 
 A TCP-only implementation never emits or sees these. Separately, when a QUIC
 relay drains cleanly the connection is closed with QUIC **application close code
@@ -488,10 +488,15 @@ exchanged and the client is authenticated (§7.2), both peers hold:
   (2) `mask_ecdh = X25519(tls_keyshare_ephemeral, server_static)` — unmasks the
   carrier (§7.2); (3) `x25519_shared = X25519(parallax_ephemeral, server_static)`
   — feeds `auth_key` and this chain secret.)
-- `transcript_hash` — `SHA-256(b"ParallaX v1 handshake transcript" || client_hello_record || server_hello_record)` (32 bytes), where
+- `transcript_hash` — `SHA-256(b"ParallaX v1 handshake transcript" || u32_be(len(client_hello_record)) || client_hello_record || u32_be(len(server_hello_record)) || server_hello_record)` (32 bytes), where
   `server_hello_record` is the **fallback origin's** ServerHello record (§7.1).
-  The label has **no** length prefix; the two records are concatenated raw, full
-  TLS record bytes (5-byte header included), client hello first.
+  Each record is preceded by its own 32-bit big-endian length prefix (the label
+  itself has no length prefix); the records are the full TLS record bytes (5-byte
+  header included), client hello first. The length prefixes bind the split point
+  between the two records into the hash. (Elsewhere this spec writes the inputs
+  as `client_hello_record || server_hello_record` for brevity; that shorthand
+  names the two participating records and omits the per-record length prefixes
+  made explicit here.)
 
 The **initial chain secret** is derived with a standard HKDF
 Extract-then-Expand:
@@ -1655,9 +1660,10 @@ a rejected source is simply spliced/closed like any other unauthenticated peer �
 so a client reimplementation needs nothing here; a server reimplementation
 SHOULD apply an equivalent policy:
 
-- A per-source concurrency cap (`max_concurrent_per_source`, default **256**),
-  keyed by IPv4 `/32` or IPv6 masked to `source_ipv6_prefix_len` (default
-  **/64**), with a coarser `/48` aggregate rollup ceiling so one routed prefix
+- A per-source concurrency cap (`max_concurrent_per_source_v4` /
+  `max_concurrent_per_source_v6`, both default **256**), keyed by IPv4 `/32` or
+  IPv6 masked to `source_ipv6_prefix_len` (default **/64**), with a coarser `/48`
+  aggregate rollup ceiling so one routed prefix
   cannot rotate `/64`s to evade the cap.
 - A global connection limit as the real backstop.
 
@@ -2052,24 +2058,31 @@ identity_secret_key = "<base64>"      # ParallaX server ML-DSA-87 secret — sig
                                       #   NOT a TLS cert key (pairs with client.server_identity_public_key)
 replay_cache_path = "/var/lib/parallax/parallax-replay.cache"   # default
 replay_cache_capacity = 49152         # default
-authorized_sni = ["..."]              # OPTIONAL allowlist of SNIs that may authenticate; empty = no SNI filter
+authorized_sni = ["..."]              # REQUIRED, non-empty allowlist of SNIs that may authenticate; an empty array fails config validation at startup
 strict_tls13 = true                   # default; require TLS 1.3 on the carrier
 first_record_wait_floor_ms = 8000     # default (see §13.1)
 first_record_wait_jitter_ms = 7000    # default
 fallback_idle_floor_ms = 600000       # default 10 min, resets per byte (see §13.1)
 fallback_idle_jitter_ms = 60000       # default 60 s
-max_concurrent_streams = 4            # default; mux streams per session
-max_concurrent_per_source = 256       # default; per-IP(/32 or /64) concurrency cap (§13.2)
+max_concurrent_per_source_v4 = 256    # default; per-source concurrency cap, IPv4 /32 (§13.2)
+max_concurrent_per_source_v6 = 256    # default; per-source concurrency cap, IPv6 masked to source_ipv6_prefix_len (§13.2)
 source_ipv6_prefix_len = 64           # default IPv6 source aggregation prefix
 tcp_congestion = "bbr"                # optional
 
 [traffic]   # all default toward speed (0 / off)
-min_padding / max_padding / min_delay_ms / max_delay_ms / cover_min_interval_ms
+min_padding / max_padding / min_delay_ms / max_delay_ms / cover_min_interval_ms / cover_max_interval_ms
+max_concurrent_streams = 4            # default; mux streams per session
 
 [transport]
-# SO_SNDBUF / SO_RCVBUF socket tuning
+tcp_send_buffer_bytes = <bytes>       # OPTIONAL. SO_SNDBUF for relay sockets; unset = kernel autotuning. Wire-invisible.
+tcp_recv_buffer_bytes = <bytes>       # OPTIONAL. SO_RCVBUF for relay sockets; unset = kernel autotuning. Affects advertised TCP window (server data-sink side only).
 
-[udp]       # optional QUIC plane (experimental knobs; several RESERVED)
+[udp]       # optional QUIC plane; LIVE: enabled, probe_timeout_ms, max_udp_payload_bytes,
+            # send_buffer_bytes, recv_buffer_bytes. RESERVED (parsed, not honored):
+            # cc, brutal_up_mbps, brutal_down_mbps, ignore_client_bandwidth, fec_profile,
+            # port_hop, masque_front, ech.
+send_buffer_bytes = <bytes>           # OPTIONAL. SO_SNDBUF for the UDP carrier socket; unset = autotuning. Wire-invisible.
+recv_buffer_bytes = <bytes>           # OPTIONAL. SO_RCVBUF for the UDP carrier socket; unset = autotuning. Wire-invisible.
 ```
 
 ### 22.2 CLI (reference)

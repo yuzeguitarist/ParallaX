@@ -118,15 +118,17 @@ prerequisite.
 The experimental UDP/QUIC fast plane. It is **off by default**; with
 `enabled = false` the runtime is byte-identical to TCP-only, so this whole table
 can be omitted (generated configs do not include it). Enabling requires matched
-binaries on both ends. Only three knobs are LIVE today; the rest are parsed and
+binaries on both ends. Only five knobs are LIVE today; the rest are parsed and
 validated for forward-compatibility but **not yet honored** (setting one logs a
 startup warning so an inert knob is not mistaken for an active one).
 
 | Field | Default | Status | Meaning |
 |---|---:|---|---|
 | `enabled` | `false` | LIVE | Turn the UDP/QUIC fast plane on (both ends). |
-| `probe_timeout_ms` | `300` | LIVE | Happy-Eyeballs UDP probe timeout before committing to TCP-only. Must be ≥ 1 when enabled. |
+| `probe_timeout_ms` | `1000` | LIVE | Happy-Eyeballs UDP probe timeout floor before committing to TCP-only. The effective budget is RTT-aware (`max(this, 6× observed control-plane RTT)`). Must be ≥ 1 when enabled. |
 | `max_udp_payload_bytes` | unset (`2048`) | LIVE | Largest UDP datagram the QUIC carrier reads in one recv (and the origin-splice relay buffer ceiling). Unset keeps the conservative `2048` default (~1.6× the largest datagram ParallaX emits). Oversized datagrams are truncated-and-dropped (truncation fails AEAD), so this caps per-datagram memory. Must be in `1200..=65527` — the floor is the RFC 9000 §14.1 Initial minimum so a legal Initial is always receivable. |
+| `send_buffer_bytes` | unset | LIVE | Explicit `SO_SNDBUF` for the UDP carrier socket. `None`/`0` keeps kernel autotuning (byte-identical to today). Clamped by the OS maximum (`net.core.wmem_max` / `kern.ipc.maxsockbuf`), so raise that first; a clamp below autotuning is logged. Sized to the path BDP, it lifts the upload window on high-RTT links. **Wire-invisible** — a UDP socket has no advertised window. |
+| `recv_buffer_bytes` | unset | LIVE | Explicit `SO_RCVBUF` for the UDP carrier socket. `None`/`0` keeps autotuning. Same OS-max clamp caveat (`net.core.rmem_max` / `kern.ipc.maxsockbuf`). A larger recv buffer lets the single-threaded driver absorb inbound bursts without socket-layer drops; independent of `max_udp_payload_bytes`. **Wire-invisible.** |
 | `cc` | `"bbr"` | RESERVED | Congestion controller: `"bbr"` (safe default) or `"brutal"` (Hysteria-style, opt-in, detectable). Phase 3. |
 | `brutal_up_mbps` | `0` | RESERVED | Declared uplink Mbps for Brutal; `0` means unset. Required with `brutal_down_mbps` when `cc = "brutal"` unless `ignore_client_bandwidth` is set. |
 | `brutal_down_mbps` | `0` | RESERVED | Declared downlink Mbps for Brutal; `0` means unset. |

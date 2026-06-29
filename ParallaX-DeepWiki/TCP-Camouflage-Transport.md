@@ -47,7 +47,7 @@ direction closing while the other direction still drains.
 
 ## Buffering
 
-The record/data layer targets 64 KiB relay buffers. Explicit kernel socket-buffer
+The record/data layer targets 256 KiB relay buffers (`RELAY_READ_BUFFER_TARGET`). Explicit kernel socket-buffer
 tuning is opt-in via the `[transport]` `tcp_send_buffer_bytes` /
 `tcp_recv_buffer_bytes` config knobs (off by default = kernel autotuning); see the
 [Configuration Reference](Configuration-Reference.md#transport). Throughput-

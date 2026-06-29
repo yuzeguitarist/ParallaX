@@ -104,7 +104,8 @@ data. The session ticket's PSK is zeroized after use.
 ## Configuration
 
 All knobs live in `[udp]` (see [Configuration Reference](Configuration-Reference.md)).
-LIVE today: `enabled`, `probe_timeout_ms`, `max_udp_payload_bytes`. The
+LIVE today: `enabled`, `probe_timeout_ms`, `max_udp_payload_bytes`,
+`send_buffer_bytes`, `recv_buffer_bytes`. The
 congestion-control (`cc`, `brutal_*`, `fec_profile`) and dropped Phase-2 camouflage
 knobs (`port_hop`, `masque_front`, `ech`) are RESERVED no-ops that log a startup
 warning if set.

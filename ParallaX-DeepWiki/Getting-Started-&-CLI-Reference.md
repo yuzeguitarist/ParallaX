@@ -96,7 +96,7 @@ either text or JSON. The JSON schema is `parallax.speed.evidence.v1`.
 ## Verification commands
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked --no-fail-fast
 cargo test --locked -- --ignored --test-threads=1
