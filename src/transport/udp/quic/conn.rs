@@ -21,6 +21,7 @@ use super::congestion::{AckInfo, Bbr, Controller};
 use super::frame::{Ack, Frame, Iter};
 use super::pacer::Pacer;
 use super::packet::{self, ConnectionId, Header, LongType, PacketSpace};
+use super::pmtud::Pmtud;
 use super::recovery::{RttEstimator, SentPacket, SentPackets};
 use super::spaces::{PacketNumberSpace, ReceivedPackets};
 use super::transport_params::TransportParameters;
@@ -468,6 +469,12 @@ pub struct Connection {
     /// cwnd already allows; bypassed before a model exists / below the min rate /
     /// while burst tokens remain.
     pacer: Pacer,
+    /// Path MTU discovery (DPLPMTUD, RFC 8899). Drives the datagram size bulk DATA is
+    /// built to: starts at the validated baseline and probes upward. `mtu_probe_pn`
+    /// is the packet number of the in-flight probe (if any), so its ACK/loss routes
+    /// to [`Pmtud`] — a probe loss validates a too-big size, NOT congestion (§14.4).
+    pmtud: Pmtud,
+    mtu_probe_pn: Option<u64>,
     /// Connection-wide cumulative delivered (acknowledged) bytes — the BBR /
     /// delivery-rate "delivered" counter (draft-cheng-iccrg-delivery-rate-est).
     delivered: u64,
@@ -604,6 +611,8 @@ impl Connection {
             rtt: RttEstimator::new(),
             cc: Box::new(Bbr::new()),
             pacer: Pacer::new(),
+            pmtud: Pmtud::new(),
+            mtu_probe_pn: None,
             delivered: 0,
             pto_count: 0,
             probe_pending: 0,
@@ -811,6 +820,21 @@ impl Connection {
     /// endpoint can drop this connection from its routing table.
     pub fn is_drained(&self) -> bool {
         self.drained
+    }
+
+    /// The current congestion window in bytes (test inspection only): lets a test
+    /// assert the in-flight burst is bounded by the live window rather than a fixed
+    /// constant, since MTU discovery + BBR can grow both the window and the per-packet
+    /// size during the handshake exchange.
+    #[cfg(test)]
+    pub(crate) fn cc_window(&self) -> u64 {
+        self.cc.window()
+    }
+
+    /// The validated path MTU (test inspection only).
+    #[cfg(test)]
+    pub(crate) fn current_mtu(&self) -> usize {
+        self.pmtud.current_mtu()
     }
 
     /// RFC 5705 exporter (byte-identical on both ends; backs the auth token).
@@ -1126,7 +1150,7 @@ impl Connection {
         // which is allowed to exceed it to guarantee forward progress.
         let probing = self.probe_pending > 0;
         let congestion_ok =
-            probing || self.bytes_in_flight() + MAX_DATAGRAM as u64 <= self.cc.window();
+            probing || self.bytes_in_flight() + self.pmtud.current_mtu() as u64 <= self.cc.window();
         // Packet pacing gate (PAR-23): spread bulk DATA-stream packets at the
         // controller's target rate. A PTO probe bypasses pacing (forward progress);
         // so do pure ACKs, handshake CRYPTO, HANDSHAKE_DONE, flow-control updates,
@@ -1183,6 +1207,23 @@ impl Connection {
             if pacing_ok && self.spaces[SPACE_DATA].keys.is_some() {
                 if let Some(id) = self.next_stream_to_send() {
                     let dg = self.build_stream_packet(id, now);
+                    self.probe_pending = self.probe_pending.saturating_sub(1);
+                    return Some(dg);
+                }
+            }
+            // A DPLPMTUD path-MTU probe (RFC 8899): after real data has drained, if the
+            // handshake is confirmed and no probe is in flight, emit one inflated
+            // PING+PADDING packet at the next candidate size. Low priority (real data
+            // first) and at most one outstanding, so it never displaces the transfer;
+            // its ACK/loss drives the MTU search. Gated on `handshake_confirmed` so a
+            // probe never races the handshake, and on no in-flight probe via
+            // `mtu_probe_pn`.
+            if self.spaces[SPACE_DATA].keys.is_some()
+                && self.handshake_confirmed
+                && self.mtu_probe_pn.is_none()
+            {
+                if let Some(size) = self.pmtud.next_probe_size() {
+                    let dg = self.build_mtu_probe_packet(size, now);
                     self.probe_pending = self.probe_pending.saturating_sub(1);
                     return Some(dg);
                 }
@@ -1262,7 +1303,7 @@ impl Connection {
         // idle connection is not woken.
         if let Some(t) = self.pacer.next_send_time() {
             let has_data = self.spaces[SPACE_DATA].keys.is_some()
-                && self.bytes_in_flight() + MAX_DATAGRAM as u64 <= self.cc.window()
+                && self.bytes_in_flight() + self.pmtud.current_mtu() as u64 <= self.cc.window()
                 && self.next_stream_to_send().is_some();
             if has_data {
                 earliest(t);
@@ -1314,12 +1355,9 @@ impl Connection {
             }
             let (lost, loss_time) = self.spaces[space].sent.detect_lost(loss_delay, now);
             self.spaces[space].loss_time = loss_time;
-            for (pn, _) in lost {
-                if let Some(content) = self.spaces[space].sent_content.remove(&pn) {
-                    self.requeue(space, content);
-                    any_loss = true;
-                }
-            }
+            // Route probe loss to the MTU search + exclude it from congestion, exactly
+            // as the ACK-driven path does (shared helper).
+            any_loss |= self.process_lost_packets(space, lost, now);
         }
         if any_loss {
             self.cc.on_congestion_event(now);
@@ -1643,6 +1681,54 @@ impl Connection {
         )
     }
 
+    /// Build a DPLPMTUD path-MTU probe (RFC 8899 §4.1 / RFC 9000 §14.4): an
+    /// ack-eliciting 1-RTT packet (PING + PADDING) inflated so the datagram is exactly
+    /// `probe_size` bytes. If it is acknowledged, the path carries `probe_size`; if it
+    /// is lost, the size is too big — and that loss is NOT a congestion signal. The
+    /// probe's packet number is recorded in `mtu_probe_pn` so [`Self::recv_ack`] / loss
+    /// detection route its outcome to [`Pmtud`] instead of the normal data path.
+    ///
+    /// The probe carries NO retransmittable content: a fresh probe is issued by the
+    /// state machine if this one is lost, so there is nothing to requeue.
+    fn build_mtu_probe_packet(&mut self, probe_size: usize, now: Instant) -> Vec<u8> {
+        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(SPACE_DATA, pn, pn_len);
+        let mut hdr_buf = Vec::new();
+        let pn_offset = header.encode(&mut hdr_buf);
+        let tag_len = self.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .unwrap()
+            .local
+            .packet
+            .tag_len();
+        // Target payload so the sealed datagram == probe_size:
+        //   probe_size = pn_offset + pn_len + payload_len + tag_len
+        // The payload is a 1-byte PING plus PADDING; clamp so the PADDING is >= the
+        // header-protection sample minimum even for a tiny (defensively small) probe.
+        let overhead = pn_offset + pn_len + tag_len;
+        let payload_len = probe_size.saturating_sub(overhead).max(4);
+        let pad = payload_len.saturating_sub(1); // minus the PING byte
+        let frames = [Frame::Ping, Frame::Padding(pad)];
+        let datagram = {
+            let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
+            seal_packet(&keys.local, header, &frames)
+        };
+        // Record the probe (ack-eliciting, no retransmittable content) and remember its
+        // PN so its ACK/loss drives the MTU search rather than the data path.
+        self.record_sent(
+            SPACE_DATA,
+            pn,
+            datagram.len(),
+            true,
+            SentContent::default(),
+            now,
+        );
+        self.mtu_probe_pn = Some(pn);
+        datagram
+    }
+
     /// Whether any receive window has grown enough to owe the peer a MAX_DATA or
     /// MAX_STREAM_DATA update.
     fn flow_update_pending(&self) -> bool {
@@ -1860,7 +1946,12 @@ impl Connection {
         } else {
             let offset = s.send_off;
             let frame_hdr = 1 + super::varint::size(id) + super::varint::size(offset) + 2;
-            let budget = MAX_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
+            // Packetize to the path MTU the connection has validated (DPLPMTUD): bulk
+            // DATA fills the discovered datagram size instead of the fixed 1252 ceiling.
+            let budget = self
+                .pmtud
+                .current_mtu()
+                .saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
             let remaining = s.send.len() - offset as usize;
             // Clamp the fresh chunk to both flow-control windows (RFC 9000 §4.1).
             let conn_window = self.send_max_data.saturating_sub(self.send_data_total);
@@ -1944,7 +2035,12 @@ impl Connection {
         } else {
             let offset = s.send_off;
             let frame_hdr = 1 + super::varint::size(id) + super::varint::size(offset) + 2;
-            let budget = MAX_DATAGRAM.saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
+            // 0-RTT data uses the same validated path MTU; before any probe completes
+            // (the usual case this early) current_mtu() is the BASE ceiling, unchanged.
+            let budget = self
+                .pmtud
+                .current_mtu()
+                .saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
             let remaining = s.send.len() - offset as usize;
             let conn_window = self.send_max_data.saturating_sub(self.send_data_total);
             let fc_window = s.send_max.saturating_sub(offset).min(conn_window) as usize;
@@ -2300,6 +2396,7 @@ impl Connection {
         let mut largest_delivered = None;
         let mut any_ack_eliciting = false;
         let mut acked_bytes = 0u64;
+        let mut probe_acked = false;
         for (pn, sp) in &newly {
             self.spaces[space].sent_content.remove(pn);
             if sp.ack_eliciting {
@@ -2310,6 +2407,19 @@ impl Connection {
                 largest_time = Some(sp.time_sent);
                 largest_delivered = Some(sp.delivered);
             }
+            // A DPLPMTUD probe was acknowledged: the path carries that size. Note it
+            // here and validate the size after the loop (the probe PN lives only in the
+            // DATA space). A full-size data ack also clears the black-hole streak.
+            if space == SPACE_DATA && self.mtu_probe_pn == Some(*pn) {
+                probe_acked = true;
+            }
+        }
+        if probe_acked {
+            self.mtu_probe_pn = None;
+            self.pmtud.on_probe_acked();
+        } else if space == SPACE_DATA && !newly.is_empty() {
+            // Any ordinary DATA ack at the current MTU proves the path still carries it.
+            self.pmtud.on_full_size_acked();
         }
         if let (Some(sent_at), true) = (largest_time, any_ack_eliciting) {
             // ACK delay applies only to the Application space (RFC 9002 §5.3); the
@@ -2358,17 +2468,48 @@ impl Connection {
         let loss_delay = self.rtt.loss_delay();
         let (lost, loss_time) = self.spaces[space].sent.detect_lost(loss_delay, now);
         self.spaces[space].loss_time = loss_time;
-        let mut any_lost = false;
-        for (pn, _) in lost {
-            if let Some(content) = self.spaces[space].sent_content.remove(&pn) {
-                self.requeue(space, content);
-                any_lost = true;
-            }
-        }
+        let any_lost = self.process_lost_packets(space, lost, now);
         if any_lost {
             self.cc.on_congestion_event(now);
         }
         Ok(())
+    }
+
+    /// Requeue the retransmittable content of declared-lost packets and report whether
+    /// any loss should signal congestion. A DPLPMTUD probe loss is routed to the MTU
+    /// state machine and EXCLUDED from the congestion signal (RFC 9000 §14.4: a lost
+    /// PMTU probe is not a congestion event); a full-size DATA loss also feeds the
+    /// black-hole detector. Shared by the ACK-driven and timeout-driven loss paths so
+    /// both treat a probe loss identically.
+    fn process_lost_packets(
+        &mut self,
+        space: usize,
+        lost: Vec<(u64, SentPacket)>,
+        _now: Instant,
+    ) -> bool {
+        let mut any_congestion_loss = false;
+        for (pn, _) in lost {
+            // A lost MTU probe: drive the search down, do NOT count it as congestion
+            // and do NOT requeue (the probe carries no retransmittable content; a fresh
+            // probe is issued by the state machine).
+            if space == SPACE_DATA && self.mtu_probe_pn == Some(pn) {
+                self.mtu_probe_pn = None;
+                self.pmtud.on_probe_lost();
+                self.spaces[space].sent_content.remove(&pn);
+                continue;
+            }
+            if let Some(content) = self.spaces[space].sent_content.remove(&pn) {
+                // A full-size DATA loss feeds the black-hole detector (sustained such
+                // losses at a grown MTU reset the path to BASE so the transfer
+                // self-heals). Ordinary loss below the threshold is ignored there.
+                if space == SPACE_DATA {
+                    self.pmtud.on_full_size_loss();
+                }
+                self.requeue(space, content);
+                any_congestion_loss = true;
+            }
+        }
+        any_congestion_loss
     }
 
     /// Reassemble an incoming CRYPTO fragment in order and feed the contiguous
@@ -3401,6 +3542,67 @@ mod tests {
     }
 
     #[test]
+    fn path_mtu_discovery_grows_the_datagram_over_a_clean_path() {
+        // DPLPMTUD must climb above the conservative BASE on a path that carries larger
+        // datagrams (the loss-free in-process loopback), and the bulk payload must stay
+        // byte-intact while the datagram size grows under it.
+        let now = Instant::now();
+        let dcid = ConnectionId::new(&[0x6d; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x6d, 0x6d, 0x6d, 0x6d]),
+        )
+        .unwrap();
+        // A fresh connection (before the handshake confirms + probes start) is at BASE.
+        assert_eq!(
+            client.current_mtu(),
+            super::super::pmtud::BASE_MTU,
+            "MTU starts at BASE before the handshake confirms"
+        );
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        let payload: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+        client.send_stream(RELAY_STREAM_ID, &payload);
+
+        let mut received = Vec::new();
+        for _ in 0..4000 {
+            let mut moved = false;
+            while let Some(dg) = client.poll_transmit(now) {
+                server.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            received.extend_from_slice(&server.read_stream(RELAY_STREAM_ID));
+            while let Some(dg) = server.poll_transmit(now) {
+                client.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            if !moved && received.len() == payload.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            received, payload,
+            "payload intact while the MTU grew under it"
+        );
+        assert!(
+            client.current_mtu() > super::super::pmtud::BASE_MTU,
+            "MTU discovery raised the datagram above BASE on a clean path (got {})",
+            client.current_mtu()
+        );
+        assert!(
+            client.current_mtu() <= super::super::pmtud::MAX_MTU,
+            "MTU never exceeds the search ceiling"
+        );
+    }
+
+    #[test]
     fn lost_stream_packet_is_retransmitted_and_reassembled() {
         let mut now = Instant::now();
         let dcid = ConnectionId::new(&[0x10; 8]);
@@ -3556,9 +3758,17 @@ mod tests {
         while let Some(dg) = client.poll_transmit(now) {
             burst += dg.len();
         }
+        // The burst is bounded by the live congestion window: the send gate stops once
+        // bytes-in-flight + one datagram would exceed it, so the burst can reach at most
+        // window + one MTU. Read the window (and MTU) live rather than hard-coding the
+        // initial 12000, because the handshake exchange — including DPLPMTUD probes that
+        // get acknowledged on the in-process loopback — can grow both the window and the
+        // per-packet size before this burst.
+        let window = client.cc_window() as usize;
+        let mtu = client.current_mtu();
         assert!(
-            (12_000..=14_000).contains(&burst),
-            "first burst is bounded by the initial congestion window, got {burst} bytes"
+            burst >= window.saturating_sub(mtu) && burst <= window + mtu,
+            "first burst ({burst}) is bounded by the congestion window ({window} ± one MTU {mtu})"
         );
     }
 
