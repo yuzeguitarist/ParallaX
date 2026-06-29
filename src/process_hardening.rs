@@ -1,7 +1,99 @@
 use std::{io, sync::OnceLock};
 
+use rand::{rngs::OsRng, RngCore};
+use zeroize::{Zeroize, Zeroizing};
+
 const HARDEN_TRANSIENT_ENV: &str = "PARALLAX_HARDEN_TRANSIENT_PLAINTEXT";
 const DISABLE_ANTI_DEBUG_ENV: &str = "PARALLAX_DISABLE_ANTI_DEBUG";
+
+/// A long-lived secret kept XOR-masked in memory while idle (#3, obfuscated
+/// residency).
+///
+/// The secret bytes are stored as `masked = plaintext XOR mask`, where `mask` is
+/// a process-random one-time pad generated at construction. The plaintext only
+/// materializes inside [`MaskedSecret::with_plaintext`], in a short-lived
+/// `Zeroizing` scratch that is wiped the instant the closure returns.
+///
+/// ## What this does and does NOT buy
+///
+/// A ring-0 / malicious-OS attacker can dump both `masked` and `mask` from this
+/// process and recombine them — this is NOT a defense against a kernel compromise,
+/// and nothing user-space can be. What it raises is the cost of an *opportunistic*
+/// memory scrape: the secret is not sitting in RAM as a contiguous high-entropy
+/// blob a `memmem` sweep can lift; an attacker must grab two regions and know to
+/// XOR them, and a snapshot taken outside the (rare, brief) sign window contains
+/// no recoverable plaintext at all. Use it only for LOW-FREQUENCY secrets (e.g.
+/// the once-per-connection identity signing key) — the unmask cost is paid on
+/// every access, so it is wrong for hot-path keys.
+///
+/// `mask` and `masked` are both `mlock`'d (locked once at construction, stable
+/// addresses) and zeroized on drop. The transient unmasked scratch in
+/// [`MaskedSecret::with_plaintext`] is `Zeroizing` (wiped on return) and is
+/// core-dump-excluded by the process-wide `RLIMIT_CORE=0`, but is deliberately NOT
+/// `mlock`'d per-use — see that method for why locking a per-call allocation would
+/// regress the long-lived keys' pinning. So the resident halves are swap-pinned;
+/// the brief plaintext-at-use is not, and could touch swap in its short window.
+pub struct MaskedSecret {
+    masked: Vec<u8>,
+    mask: Vec<u8>,
+}
+
+impl MaskedSecret {
+    /// Mask `secret` under a fresh process-random pad. The caller's plaintext copy
+    /// should be dropped/zeroized after handing it in (callers pass a `Zeroizing`).
+    pub fn new(secret: &[u8]) -> Self {
+        let mut mask = vec![0_u8; secret.len()];
+        OsRng.fill_bytes(&mut mask);
+        let mut masked = vec![0_u8; secret.len()];
+        for ((m, k), s) in masked.iter_mut().zip(mask.iter()).zip(secret.iter()) {
+            *m = s ^ k;
+        }
+        // Keep both halves out of swap and core dumps, like any other resident key.
+        protect_secret_bytes("masked_secret.masked", &masked);
+        protect_secret_bytes("masked_secret.mask", &mask);
+        Self { masked, mask }
+    }
+
+    /// Length of the underlying secret.
+    pub fn len(&self) -> usize {
+        self.masked.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.masked.is_empty()
+    }
+
+    /// Unmask into a transient `Zeroizing` scratch, run `f` against the plaintext,
+    /// and wipe the scratch on return. The plaintext never outlives the closure.
+    ///
+    /// The scratch is deliberately NOT `mlock`'d. `protect_secret_bytes` never
+    /// `munlock`s (it is built for lifetime-stable secrets on shared pages), so
+    /// locking a fresh per-call allocation would pin a new page on every connection
+    /// and never release it — growing the locked-page high-water mark until it
+    /// exhausts `RLIMIT_MEMLOCK` and starves the genuine long-lived keys (PSK,
+    /// X25519/ML-KEM static) of their pinning. That regression is worse than the
+    /// exposure it would close, so the brief unmask window relies instead on the
+    /// process-wide `RLIMIT_CORE=0` (no core dump) plus immediate `Zeroizing`
+    /// wipe. The masked/mask halves remain mlock'd (stable, locked once).
+    pub fn with_plaintext<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        let mut plaintext = Zeroizing::new(vec![0_u8; self.masked.len()]);
+        for ((p, m), k) in plaintext
+            .iter_mut()
+            .zip(self.masked.iter())
+            .zip(self.mask.iter())
+        {
+            *p = m ^ k;
+        }
+        f(&plaintext)
+    }
+}
+
+impl Drop for MaskedSecret {
+    fn drop(&mut self) {
+        self.masked.zeroize();
+        self.mask.zeroize();
+    }
+}
 
 /// Apply process-local hardening for long-running ParallaX runtimes.
 ///
@@ -29,7 +121,56 @@ pub fn harden_current_process() {
         if let Err(err) = disable_ptrace_dumpability() {
             tracing::warn!(error = %err, "failed to mark this process non-dumpable");
         }
+        warn_if_already_traced();
     }
+}
+
+/// One-shot startup check: if a debugger / tracer is already attached at launch,
+/// emit a single warning. Deliberately a WARN only — never auto-wipe or exit:
+///
+/// - On a server (out of GFW's reach, no on-host agent watching syscalls) this is
+///   the realistic "someone attached to my live process" signal, but an operator
+///   legitimately attaching gdb to debug a hang must not have the service killed
+///   under them, and on a multi-user proxy an auto-action on a false positive
+///   would take down every user's session at once.
+/// - Against a ring-0 / malicious-OS attacker the `TracerPid` field is whatever
+///   the kernel chooses to report, so escalating beyond a warning buys nothing.
+///
+/// Gated by the same [`anti_debug_enabled`] switch as the dumpable hardening.
+/// Linux-only (reads `/proc/self/status`); a no-op elsewhere.
+#[cfg(target_os = "linux")]
+fn warn_if_already_traced() {
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => {
+            if let Some(tracer_pid) = parse_tracer_pid(&status) {
+                if tracer_pid != 0 {
+                    tracing::warn!(
+                        tracer_pid,
+                        "this process is already being traced at startup (a debugger / \
+                         tracer is attached). Taking no action; if unexpected, \
+                         investigate the host."
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "could not read /proc/self/status for tracer check");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn warn_if_already_traced() {}
+
+/// Parse the `TracerPid:` field out of the Linux `/proc/<pid>/status` text.
+/// Returns the tracer's PID (0 = not traced), or `None` if the field is absent /
+/// unparseable. Pure so it is unit-testable without `/proc`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_tracer_pid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("TracerPid:"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
 /// Anti-debug hardening is on unless `PARALLAX_DISABLE_ANTI_DEBUG` is truthy.
@@ -327,6 +468,51 @@ mod tests {
     #[test]
     fn empty_range_needs_no_syscall() {
         assert_eq!(page_aligned_range_with_size(0x1000, 0, 4096), None);
+    }
+
+    #[test]
+    fn masked_secret_round_trips_and_hides_plaintext() {
+        let secret = b"ML-DSA-87 identity signing key bytes (stand-in)".to_vec();
+        let masked = super::MaskedSecret::new(&secret);
+
+        // Unmask reproduces the exact plaintext.
+        masked.with_plaintext(|pt| assert_eq!(pt, secret.as_slice()));
+        // ...and does so repeatedly (the mask is not consumed).
+        masked.with_plaintext(|pt| assert_eq!(pt, secret.as_slice()));
+
+        assert_eq!(masked.len(), secret.len());
+        assert!(!masked.is_empty());
+
+        // The stored masked bytes must NOT equal the plaintext (it is XORed under a
+        // random pad), or the masking bought nothing. A random all-zero pad is
+        // astronomically unlikely; assert they differ.
+        assert_ne!(
+            masked.masked, secret,
+            "masked residency must not store the raw plaintext"
+        );
+    }
+
+    #[test]
+    fn masked_secret_handles_empty() {
+        let masked = super::MaskedSecret::new(&[]);
+        assert!(masked.is_empty());
+        masked.with_plaintext(|pt| assert!(pt.is_empty()));
+    }
+
+    #[test]
+    fn parse_tracer_pid_reads_field() {
+        // Untraced: TracerPid is 0.
+        let untraced = "Name:\tplx\nState:\tS (sleeping)\nTracerPid:\t0\nUid:\t1000\n";
+        assert_eq!(super::parse_tracer_pid(untraced), Some(0));
+        // Traced: a real tracer PID.
+        let traced = "Name:\tplx\nTracerPid:\t4242\nUid:\t1000\n";
+        assert_eq!(super::parse_tracer_pid(traced), Some(4242));
+        // Absent field -> None (don't fabricate a "not traced" answer).
+        let absent = "Name:\tplx\nState:\tS (sleeping)\n";
+        assert_eq!(super::parse_tracer_pid(absent), None);
+        // Garbage value -> None rather than a wrong number.
+        let garbage = "TracerPid:\tnope\n";
+        assert_eq!(super::parse_tracer_pid(garbage), None);
     }
 
     #[test]
