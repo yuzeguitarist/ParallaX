@@ -267,6 +267,63 @@ fn space_index(space: PacketSpace) -> usize {
     }
 }
 
+/// The IP-layer ECN codepoint of a received datagram (RFC 3168 / RFC 9000 §13.4): the
+/// low two bits of the IP TOS / IPv6 traffic-class byte. The connection counts these
+/// per packet-number space and echoes the totals in ACK_ECN so the peer can validate
+/// ECN end to end (RFC 9000 §13.4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EcnCodepoint {
+    /// Not ECN-Capable Transport (0b00): the default when the path/kernel strips ECN.
+    #[default]
+    NotEct,
+    /// ECT(0) (0b10) — what ParallaX (and Safari) mark on egress.
+    Ect0,
+    /// ECT(1) (0b01).
+    Ect1,
+    /// Congestion Experienced (0b11): a router marked congestion on the path.
+    Ce,
+}
+
+impl EcnCodepoint {
+    /// Map the raw 2-bit ECN field to a codepoint (any out-of-range value ⇒ Not-ECT).
+    pub fn from_bits(bits: u8) -> Self {
+        match bits & 0b11 {
+            0b10 => EcnCodepoint::Ect0,
+            0b01 => EcnCodepoint::Ect1,
+            0b11 => EcnCodepoint::Ce,
+            _ => EcnCodepoint::NotEct,
+        }
+    }
+}
+
+/// Per-packet-number-space tally of received ECN codepoints, echoed in ACK_ECN
+/// (RFC 9000 §19.3.2). Only the Application space sees a meaningful CE stream in
+/// practice, but the counts are kept per space for RFC correctness.
+#[derive(Debug, Clone, Copy, Default)]
+struct EcnCounts {
+    ect0: u64,
+    ect1: u64,
+    ce: u64,
+}
+
+impl EcnCounts {
+    /// Fold one received datagram's ECN codepoint into the running totals.
+    fn record(&mut self, ecn: EcnCodepoint) {
+        match ecn {
+            EcnCodepoint::Ect0 => self.ect0 += 1,
+            EcnCodepoint::Ect1 => self.ect1 += 1,
+            EcnCodepoint::Ce => self.ce += 1,
+            EcnCodepoint::NotEct => {}
+        }
+    }
+
+    /// Whether any ECN codepoint has been seen (so a space that never received ECN
+    /// sends a plain ACK, not ACK_ECN — matching a path that strips ECN).
+    fn any(&self) -> bool {
+        self.ect0 != 0 || self.ect1 != 0 || self.ce != 0
+    }
+}
+
 /// What an ack-eliciting sent packet carried that must be RESENT (in a new packet,
 /// RFC 9002 §6.2.4) if the packet is declared lost. ACK/PADDING/PING carry nothing
 /// retransmittable, so a pure-ACK packet stores an empty record (and is not even
@@ -301,6 +358,10 @@ struct Space {
     /// removed when the packet is acked, drained into the retransmit queues when
     /// it is declared lost.
     sent_content: BTreeMap<u64, SentContent>,
+    /// Running tally of received ECN codepoints in this space, echoed in ACK_ECN
+    /// (RFC 9000 §13.4.2) so the peer can validate ECN. Incremented after a packet in
+    /// a received datagram AEAD-opens (an authenticated ECN mark).
+    recv_ecn: EcnCounts,
     /// An ack-eliciting packet has been received and not yet acknowledged.
     ack_pending: bool,
     /// When the LARGEST-numbered packet covered by the current (not-yet-sent) ACK was
@@ -475,6 +536,11 @@ pub struct Connection {
     /// to [`Pmtud`] — a probe loss validates a too-big size, NOT congestion (§14.4).
     pmtud: Pmtud,
     mtu_probe_pn: Option<u64>,
+    /// The largest CE count the peer has reported in an ACK_ECN for the Application
+    /// space (RFC 9000 §13.4.2). A reported increase means the path marked Congestion
+    /// Experienced on our egress; the delta drives one congestion event. Monotonic per
+    /// the RFC, so only growth is acted on.
+    peer_ecn_ce: u64,
     /// Connection-wide cumulative delivered (acknowledged) bytes — the BBR /
     /// delivery-rate "delivered" counter (draft-cheng-iccrg-delivery-rate-est).
     delivered: u64,
@@ -613,6 +679,7 @@ impl Connection {
             pacer: Pacer::new(),
             pmtud: Pmtud::new(),
             mtu_probe_pn: None,
+            peer_ecn_ce: 0,
             delivered: 0,
             pto_count: 0,
             probe_pending: 0,
@@ -835,6 +902,18 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn current_mtu(&self) -> usize {
         self.pmtud.current_mtu()
+    }
+
+    /// The largest CE count the peer has reported (test inspection only).
+    #[cfg(test)]
+    pub(crate) fn peer_ecn_ce(&self) -> u64 {
+        self.peer_ecn_ce
+    }
+
+    /// The received CE count tallied in the Application space (test inspection only).
+    #[cfg(test)]
+    pub(crate) fn data_recv_ce(&self) -> u64 {
+        self.spaces[SPACE_DATA].recv_ecn.ce
     }
 
     /// RFC 5705 exporter (byte-identical on both ends; backs the auth token).
@@ -1553,10 +1632,21 @@ impl Connection {
         } else {
             0
         };
-        let ack = self.spaces[space]
+        let mut ack = self.spaces[space]
             .recv
             .to_ack(ack_delay_raw)
             .expect("ack_pending is only set after receiving an ack-eliciting packet");
+        // Echo the received ECN counts as ACK_ECN (RFC 9000 §13.4.2) so the peer can
+        // validate its ECN marking. Only when this space has actually seen ECN — a
+        // space on an ECN-stripping path sends a plain ACK, matching the path.
+        let recv_ecn = self.spaces[space].recv_ecn;
+        if recv_ecn.any() {
+            ack.ecn = Some(super::frame::EcnCounts {
+                ect0: recv_ecn.ect0,
+                ect1: recv_ecn.ect1,
+                ce: recv_ecn.ce,
+            });
+        }
         let header = self.make_header(space, pn, pn_len);
         let datagram = {
             let keys = self.spaces[space].keys.as_ref().unwrap();
@@ -2089,7 +2179,21 @@ impl Connection {
     /// datagram. The TLS engine is pumped after each packet ([`Self::process_packet`])
     /// so that, e.g., the Handshake keys learned from a coalesced Initial are
     /// installed before the Handshake packet that follows it in the same datagram.
+    #[allow(dead_code)] // ECN-less entry point: used throughout the conn/netsim tests + a public API
     pub fn handle_datagram(&mut self, datagram: &[u8], now: Instant) -> Result<(), QuicTlsError> {
+        // Datagrams with no ECN information (tests, non-Linux recv path) are Not-ECT.
+        self.handle_datagram_ecn(datagram, EcnCodepoint::NotEct, now)
+    }
+
+    /// Like [`Self::handle_datagram`] but carries the datagram's IP-layer ECN codepoint
+    /// (RFC 9000 §13.4): after a packet in the datagram AEAD-opens, the codepoint is
+    /// folded into the receiving space's ECN tally so the next ACK echoes it as ACK_ECN.
+    pub fn handle_datagram_ecn(
+        &mut self,
+        datagram: &[u8],
+        ecn: EcnCodepoint,
+        now: Instant,
+    ) -> Result<(), QuicTlsError> {
         // NB: the idle timer (last_recv_time) is refreshed inside process_packet
         // only AFTER a packet AEAD-opens (RFC 9000 §10.1: "received and processed"),
         // so an off-path attacker cannot pin the connection open with garbage UDP.
@@ -2100,7 +2204,7 @@ impl Connection {
             // BEFORE `process_packet` decrypts in place. `None` ⇒ a short header
             // (or unparseable) which runs to the datagram end: process it, stop.
             let advance = packet::long_packet_len(&buf[pos..]);
-            self.process_packet(&mut buf[pos..], now)?;
+            self.process_packet(&mut buf[pos..], ecn, now)?;
             match advance {
                 Some(n) if n != 0 && pos.checked_add(n).is_some_and(|e| e <= buf.len()) => {
                     pos += n;
@@ -2117,7 +2221,12 @@ impl Connection {
     /// is dropped (RFC 9001 §5.4.2 — `Ok(())`): a coalesced trailer, a replay, or a
     /// packet for keys not yet held must NOT fail the connection. Only a protocol
     /// error decoding a frame on an AUTHENTICATED packet propagates.
-    fn process_packet(&mut self, pkt: &mut [u8], now: Instant) -> Result<(), QuicTlsError> {
+    fn process_packet(
+        &mut self,
+        pkt: &mut [u8],
+        ecn: EcnCodepoint,
+        now: Instant,
+    ) -> Result<(), QuicTlsError> {
         let pspace = match packet::first_packet_space(pkt) {
             Some(s) => s,
             None => return Ok(()), // unsupported type / clear fixed bit: drop
@@ -2211,6 +2320,12 @@ impl Connection {
         if !self.spaces[space].recv.insert(header.packet_number()) {
             return Ok(());
         }
+
+        // Fold this authenticated, non-duplicate packet's ECN codepoint into the
+        // space's tally (RFC 9000 §13.4): the next ACK echoes it as ACK_ECN so the peer
+        // can validate ECN. Recorded only after authentication + dedup so a forged or
+        // replayed datagram cannot inflate the counts.
+        self.spaces[space].recv_ecn.record(ecn);
 
         // Successfully processing a Handshake packet proves the peer holds Handshake
         // keys, hence received our Initial CRYPTO: discard Initial keys + state (RFC
@@ -2481,6 +2596,22 @@ impl Connection {
         let any_lost = self.process_lost_packets(space, lost, now);
         if any_lost {
             self.cc.on_congestion_event(now);
+        }
+
+        // ECN reaction (RFC 9002 §7): a reported increase in the peer's CE count means
+        // the path marked Congestion Experienced on our egress — a congestion signal
+        // equivalent to loss. Only the Application space carries a meaningful ECN
+        // stream, and the count is monotonic per the RFC, so act on growth only. (BBR's
+        // on_congestion_event is intentionally a no-op — it does not collapse on loss or
+        // CE — so this is RFC-correct signalling that today changes no behaviour; a
+        // future loss-reactive controller behind the same seam would honour it.)
+        if space == SPACE_DATA {
+            if let Some(ecn) = ack.ecn {
+                if ecn.ce > self.peer_ecn_ce {
+                    self.peer_ecn_ce = ecn.ce;
+                    self.cc.on_congestion_event(now);
+                }
+            }
         }
         Ok(())
     }
@@ -3609,6 +3740,57 @@ mod tests {
         assert!(
             client.current_mtu() <= super::super::pmtud::MAX_MTU,
             "MTU never exceeds the search ceiling"
+        );
+    }
+
+    #[test]
+    fn ecn_ce_is_tallied_echoed_in_ack_ecn_and_signals_congestion() {
+        // End-to-end ECN (RFC 9000 §13.4): a CE-marked datagram delivered to the server
+        // must be tallied, echoed in the server's ACK as ACK_ECN, and — when that ACK
+        // reaches the client — recorded as a peer CE increase (the congestion signal).
+        let now = Instant::now();
+        let dcid = ConnectionId::new(&[0xce; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xce, 0xce, 0xce, 0xce]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // The client sends some stream data; deliver each 1-RTT datagram to the server
+        // marked CE (as if a router on the path set Congestion Experienced).
+        client.send_stream(RELAY_STREAM_ID, b"ecn-marked relay bytes");
+        while let Some(dg) = client.poll_transmit(now) {
+            server
+                .handle_datagram_ecn(&dg, EcnCodepoint::Ce, now)
+                .unwrap();
+        }
+        assert!(
+            server.data_recv_ce() > 0,
+            "server tallied the CE-marked datagrams"
+        );
+
+        // The server's ACK must now carry ACK_ECN; deliver the server's packets to the
+        // client and assert the client recorded the peer's CE increase.
+        let mut saw_ack_ecn = false;
+        while let Some(dg) = server.poll_transmit(now) {
+            // Peek: at least one server datagram should decode to an ACK with ecn set.
+            // (We assert indirectly via the client's peer_ecn_ce below, but also sanity
+            // check the wire here by re-parsing is overkill — rely on the client state.)
+            client.handle_datagram(&dg, now).unwrap();
+            saw_ack_ecn = true;
+        }
+        assert!(saw_ack_ecn, "server emitted packets carrying its ACK");
+        assert!(
+            client.peer_ecn_ce() > 0,
+            "client recorded the peer's reported CE count (ACK_ECN echoed end to end)"
         );
     }
 

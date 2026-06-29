@@ -20,7 +20,7 @@
 //! offload (older kernels, non-Linux), so correctness never depends on it.
 
 #[cfg(target_os = "linux")]
-pub use linux::{enable_gro, recv_gro, send_gso, send_mmsg};
+pub use linux::{enable_gro, enable_recv_ecn, recv_gro, send_gso, send_mmsg};
 
 // Public diagnostics surface: a stats endpoint reads `offload_stats()`. Not yet wired
 // to a caller in-crate, so allow the unused re-export rather than fabricate one.
@@ -28,6 +28,50 @@ pub use linux::{enable_gro, recv_gro, send_gso, send_mmsg};
 pub use stats::{offload_stats, OffloadStats};
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub(super) use stats::{record_gro_read, record_gso_call, record_gso_fallback};
+
+/// The ECN codepoint ECT(0) (RFC 3168): the low two bits of the IP TOS / IPv6 traffic
+/// class byte set to `0b10`. A real Safari QUIC flow marks essentially every datagram
+/// ECT(0) from the first Initial (confirmed against a live capture), so a ParallaX
+/// flow that leaves datagrams Not-ECT is the actual passive distinguisher — marking
+/// ECT(0) is camouflage-positive, not just RFC-permitted (RFC 9000 §13.4).
+#[cfg(unix)]
+const ECN_ECT0: libc::c_int = 0b10;
+
+/// Mark all egress datagrams on `socket` as ECT(0) by setting the ECN bits of the IP
+/// TOS (IPv4) / traffic-class (IPv6) byte. Best-effort and wire-shaping only in the
+/// IP header's 2 ECN bits — the QUIC payload, sizes, and counts are untouched. A
+/// kernel that rejects the option just leaves datagrams Not-ECT (the prior behaviour).
+/// Returns whether the option took, for the recv-side ECN-validation default + tests.
+#[cfg(unix)]
+pub fn enable_ect0<S: std::os::fd::AsFd>(socket: &S, is_ipv6: bool) -> bool {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_fd().as_raw_fd();
+    let tos: libc::c_int = ECN_ECT0;
+    // IPv4 uses IP_TOS; IPv6 uses IPV6_TCLASS. A dual-stack v6 socket carries v4-mapped
+    // traffic in the v6 header, so for a v6 bind set the v6 traffic class.
+    let (level, optname) = if is_ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_TOS)
+    };
+    // SAFETY: setsockopt with a pointer to a stack-local c_int of matching length on a
+    // valid borrowed fd; it only mutates this socket's option state.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            (&tos as *const libc::c_int).cast(),
+            std::mem::size_of_val(&tos) as libc::socklen_t,
+        )
+    };
+    rc == 0
+}
+
+#[cfg(not(unix))]
+pub fn enable_ect0<S>(_socket: &S, _is_ipv6: bool) -> bool {
+    false
+}
 
 /// Process-wide GSO/GRO offload counters (PR #120 follow-up #1). PR #120 shipped the
 /// Linux GSO/GRO batching with no way to tell, on a running server, whether the
@@ -376,6 +420,37 @@ mod linux {
         pub peer: SocketAddr,
         pub total: usize,
         pub segment_size: usize,
+        /// The ECN codepoint from the IP TOS / IPv6 traffic-class byte's low 2 bits
+        /// (RFC 3168): 0 = Not-ECT, 0b10 = ECT(0), 0b01 = ECT(1), 0b11 = CE. GRO only
+        /// coalesces same-ECN datagrams (a kernel invariant), so one value covers every
+        /// segment of the read. 0 when the TOS cmsg is absent (IP_RECVTOS off / older
+        /// kernel), which reads as Not-ECT.
+        pub ecn: u8,
+    }
+
+    /// Enable receiving the inbound ECN codepoint (the IP TOS / IPv6 traffic-class
+    /// byte) as a control message, so [`recv_gro`] can read per-datagram ECN. Paired
+    /// with egress ECT(0): the server must count inbound CE marks to echo them in
+    /// ACK_ECN (RFC 9000 §13.4). Best-effort; without it `recv_gro` reports Not-ECT.
+    pub fn enable_recv_ecn<S: AsFd>(socket: &S, is_ipv6: bool) -> bool {
+        let fd = socket.as_fd().as_raw_fd();
+        let on: libc::c_int = 1;
+        let (level, optname) = if is_ipv6 {
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS)
+        } else {
+            (libc::IPPROTO_IP, libc::IP_RECVTOS)
+        };
+        // SAFETY: setsockopt with a stack c_int of matching length on a valid fd.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                optname,
+                (&on as *const libc::c_int).cast(),
+                std::mem::size_of_val(&on) as libc::socklen_t,
+            )
+        };
+        rc == 0
     }
 
     /// Receive one (possibly GRO-coalesced) read into `buf` via `recvmsg`, returning
@@ -391,8 +466,13 @@ mod linux {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        let mut cmsg_buf =
-            [0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize];
+        // Room for both control messages the kernel may attach: the UDP_GRO segment
+        // size (u16) and the ECN/TOS byte (delivered as an int). Sizing for just one
+        // would truncate the other.
+        let mut cmsg_buf = [0u8; unsafe {
+            libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32)
+                + libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32)
+        } as usize];
 
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         // SockAddrStorage is repr(transparent) over libc::sockaddr_storage, so its
@@ -428,14 +508,18 @@ mod linux {
             .as_socket()
             .ok_or_else(|| io::Error::other("recvmsg returned a non-IP peer"))?;
 
-        // Default: no GRO cmsg => one datagram of `total` bytes.
+        // Default: no GRO cmsg => one datagram of `total` bytes; no TOS cmsg => Not-ECT.
         let mut segment_size = total;
+        let mut ecn: u8 = 0;
         // SAFETY: msg is fully initialized by recvmsg; CMSG_* walk only within
-        // cmsg_buf as bounded by msg_controllen.
+        // cmsg_buf as bounded by msg_controllen. Scan ALL cmsgs (do not break early):
+        // the kernel may attach both the UDP_GRO segment size and the ECN/TOS byte.
         unsafe {
             let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
             while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_UDP && (*cmsg).cmsg_type == libc::UDP_GRO {
+                let level = (*cmsg).cmsg_level;
+                let kind = (*cmsg).cmsg_type;
+                if level == libc::SOL_UDP && kind == libc::UDP_GRO {
                     let mut seg: u16 = 0;
                     std::ptr::copy_nonoverlapping(
                         libc::CMSG_DATA(cmsg),
@@ -445,7 +529,19 @@ mod linux {
                     if seg != 0 {
                         segment_size = seg as usize;
                     }
-                    break;
+                } else if (level == libc::IPPROTO_IP && kind == libc::IP_TOS)
+                    || (level == libc::IPPROTO_IPV6 && kind == libc::IPV6_TCLASS)
+                {
+                    // The TOS/traffic-class byte is delivered as an int (IPv6) or a
+                    // single byte (IPv4); read the first byte either way and take the
+                    // low 2 bits (the ECN field, RFC 3168).
+                    let mut tos_byte: u8 = 0;
+                    std::ptr::copy_nonoverlapping(
+                        libc::CMSG_DATA(cmsg),
+                        &mut tos_byte as *mut u8,
+                        std::mem::size_of::<u8>(),
+                    );
+                    ecn = tos_byte & 0b11;
                 }
                 cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
             }
@@ -455,6 +551,7 @@ mod linux {
             peer,
             total,
             segment_size,
+            ecn,
         })
     }
 }
@@ -594,5 +691,35 @@ mod tests {
             let n = rx.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], &expected[..], "datagram delivered verbatim");
         }
+    }
+
+    /// `enable_ect0` sets the IP TOS byte's ECN bits to ECT(0) on the socket; read it
+    /// back via getsockopt to prove the option took (so egress datagrams are marked,
+    /// matching Safari). Unix-only (the sockopt is POSIX); runs on macOS + Linux.
+    #[cfg(unix)]
+    #[test]
+    fn enable_ect0_sets_the_ip_tos_ecn_bits() {
+        use std::net::UdpSocket;
+        use std::os::fd::{AsFd, AsRawFd};
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(enable_ect0(&sock.as_fd(), false), "IP_TOS ECT(0) set on v4");
+
+        // Read the TOS back: its low two bits must be ECT(0) = 0b10.
+        let fd = sock.as_raw_fd();
+        let mut tos: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt into a stack c_int with matching length on a valid fd.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                (&mut tos as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt IP_TOS");
+        assert_eq!(tos & 0b11, 0b10, "ECN field is ECT(0)");
     }
 }
