@@ -1326,14 +1326,13 @@ impl Driver {
                     // not accept (short count / EAGAIN) so no bytes are dropped. The
                     // wire output (independent datagrams) is identical either way.
                     super::offload::record_gso_fallback();
-                    let sent = match socket.try_io(tokio::io::Interest::WRITABLE, || {
-                        super::offload::send_mmsg(socket.as_fd(), slice)
-                    }) {
-                        Ok(n) => n,
-                        // Not writable yet, or a hard error before message 0: nothing
-                        // batched, so resend the whole run below.
-                        Err(_) => 0,
-                    };
+                    // `unwrap_or_default()` == 0 on a not-writable / hard error before
+                    // message 0: nothing batched, so the whole run is resent below.
+                    let sent = socket
+                        .try_io(tokio::io::Interest::WRITABLE, || {
+                            super::offload::send_mmsg(socket.as_fd(), slice)
+                        })
+                        .unwrap_or_default();
                     for (dg, _) in &slice[sent..] {
                         let _ = socket.send_to(dg, run.peer).await;
                     }
