@@ -544,6 +544,8 @@ impl Endpoint {
             accept_tx,
             connect_rx,
             close_rx,
+            #[cfg(target_os = "linux")]
+            gso_scratch: Vec::new(),
         };
         tokio::spawn(driver.run());
         Ok(Endpoint {
@@ -761,6 +763,12 @@ struct Driver {
     accept_tx: mpsc::UnboundedSender<Arc<ConnShared>>,
     connect_rx: mpsc::UnboundedReceiver<ConnectRequest>,
     close_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
+    /// Reusable GSO coalescing buffer (Linux only). The per-flush, per-run buffer that
+    /// concatenates a same-size run before the `UDP_SEGMENT` send was a fresh heap
+    /// allocation + copy on every bulk flush; reusing one buffer across flushes drops
+    /// the allocation. Cleared (length 0, capacity retained) before each run.
+    #[cfg(target_os = "linux")]
+    gso_scratch: Vec<u8>,
 }
 
 impl Driver {
@@ -1241,18 +1249,23 @@ impl Driver {
     /// singletons and any GSO failure fall back to per-datagram `send_to`. The bytes,
     /// sizes, and count on the wire are identical either way — GSO only collapses the
     /// syscalls. Off Linux this is exactly the old per-datagram loop.
-    async fn send_batch(&self, out: Vec<(Vec<u8>, SocketAddr)>) {
+    async fn send_batch(&mut self, out: Vec<(Vec<u8>, SocketAddr)>) {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsFd;
+            // Clone the socket Arc up front so the per-run loop borrows it without
+            // holding `&self`, leaving `self.gso_scratch` freely mutable below.
+            let socket = self.socket.clone();
             for run in super::offload::gso_runs(&out) {
                 let slice = &out[run.range.clone()];
                 if slice.len() == 1 {
-                    let _ = self.socket.send_to(&slice[0].0, run.peer).await;
+                    let _ = socket.send_to(&slice[0].0, run.peer).await;
                     continue;
                 }
-                // Coalesce the run into one buffer and hand it to the kernel to slice.
-                let mut segments = Vec::with_capacity(slice.len() * run.segment_size);
+                // Coalesce the run into the reusable scratch buffer (cleared, capacity
+                // retained across flushes) and hand it to the kernel to slice.
+                let segments = &mut self.gso_scratch;
+                segments.clear();
                 for (dg, _) in slice {
                     segments.extend_from_slice(dg);
                 }
@@ -1263,10 +1276,10 @@ impl Driver {
                 // silently dropping the unsent tail. WouldBlock (socket not writable
                 // yet) also falls through to the awaiting fallback.
                 let gso = matches!(
-                    self.socket.try_io(tokio::io::Interest::WRITABLE, || {
+                    socket.try_io(tokio::io::Interest::WRITABLE, || {
                         super::offload::send_gso(
-                            self.socket.as_fd(),
-                            &segments,
+                            socket.as_fd(),
+                            segments,
                             run.segment_size,
                             run.peer,
                         )
@@ -1281,7 +1294,7 @@ impl Driver {
                     // bytes are dropped.
                     super::offload::record_gso_fallback();
                     for (dg, _) in slice {
-                        let _ = self.socket.send_to(dg, run.peer).await;
+                        let _ = socket.send_to(dg, run.peer).await;
                     }
                 }
             }
