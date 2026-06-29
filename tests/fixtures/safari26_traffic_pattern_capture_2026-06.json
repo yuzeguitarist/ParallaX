@@ -1,0 +1,494 @@
+{
+  "capture": "Safari 26.4 / macOS 26.4.1, private windows, 5 CN sites + subresources, en0, 2026-06-29",
+  "safari_ja3": "ecdf4f49dd59effc439639da29186671",
+  "note": "DESENSITIZED: only TLS record lengths (bytes), public hostnames, relative timing, and the public JA3 string. No source IP, no URLs/paths, no cookies, no payload, no raw packets.",
+  "concurrency_note": "open_span_sec conflates sub-second parallel bursts (genuine concurrency, e.g. i.news.qq.com opened 6 connections in ~0.7s) with long-lived background reconnection (e.g. a ~120s span for long-poll/telemetry hosts). A small span with >1 connection = genuine parallel burst; a large span = spread-out reconnects, not simultaneity.",
+  "alpn_offered": {
+    "h2,http/1.1": 138,
+    "http/1.1": 48,
+    "h2": 17,
+    "h3": 2
+  },
+  "transport_split": {
+    "tcp_clienthellos": 163,
+    "quic_initials": 11,
+    "caveat": "CN sites skew TCP; not representative of Safari H3 preference globally"
+  },
+  "concurrency_per_host": {
+    "www.apple.com.cn": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "securemetrics.apple.com.cn": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "ptqgesmtzwdmeiknncqc.supabase.co": {
+      "connections": 6,
+      "open_span_sec": 120.699
+    },
+    "www.taobao.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "gm.mmstat.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "fourier.taobao.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "umdcv4.taobao.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "h5api.m.taobao.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "pc-growht-rta.taobao.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "s-gm.mmstat.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "push-v1.taobao.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "fourier.alibaba.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "log.mmstat.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "cm.mediav.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "ws.mmstat.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "g.aplus.taobao.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "ynuf.aliapp.org": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "4n9z22.tdum.alibaba.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "www.apple.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "www.bilibili.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "i0.hdslb.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "i1.hdslb.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "i2.hdslb.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "s1.hdslb.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "data.bilibili.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "api.live.bilibili.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "adtrack.qianwen.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "api.yuyueweb.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "impression.biligame.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "upos-sz-mirror14b.bilivideo.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "upos-sz-mirror08c.bilivideo.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "upos-sz-mirror08h.bilivideo.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "bvc.bilivideo.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "hw-v2-web-player-tracker.biliapi.net": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "activity.hdslb.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "unet.quark.cn": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "www.baidu.com": {
+      "connections": 3,
+      "open_span_sec": 0.696
+    },
+    "pss.bdstatic.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "psstatic.cdn.bcebos.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "hectorstatic.baidu.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "sp1.baidu.com": {
+      "connections": 2,
+      "open_span_sec": 0.186
+    },
+    "sp2.baidu.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "hector.baidu.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "mbd.baidu.com": {
+      "connections": 3,
+      "open_span_sec": 0.529
+    },
+    "gips2.baidu.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "sp3.baidu.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "passport.baidu.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "www.qq.com": {
+      "connections": 2,
+      "open_span_sec": 0.345
+    },
+    "mat1.gtimg.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "inews.gtimg.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "news.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "i.news.qq.com": {
+      "connections": 6,
+      "open_span_sec": 0.694
+    },
+    "yybadaccess.3g.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "vm.gtimg.cn": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "op.ssp.qq.com": {
+      "connections": 3,
+      "open_span_sec": 0.114
+    },
+    "sqt.gtimg.cn": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "news.ssp.qq.com": {
+      "connections": 2,
+      "open_span_sec": 8.005
+    },
+    "static.pc.yyb.qq.com": {
+      "connections": 2,
+      "open_span_sec": 0.253
+    },
+    "staticfile.qq.com": {
+      "connections": 2,
+      "open_span_sec": 0.258
+    },
+    "snowflake.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "video.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "v.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "h.trace.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "otheve.beacon.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "vd6.l.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "beacon.cdn.qq.com": {
+      "connections": 2,
+      "open_span_sec": 0.253
+    },
+    "puui.qpic.cn": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "p.qpic.cn": {
+      "connections": 2,
+      "open_span_sec": 0.169
+    },
+    "vfiles.gtimg.cn": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "wfiles.gtimg.cn": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "omexts.tc.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "sports3.gtimg.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "rumt-zh.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "sj.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "res.wx.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    },
+    "open.weixin.qq.com": {
+      "connections": 1,
+      "open_span_sec": 0.0
+    }
+  },
+  "opening_burst": {
+    "first_record_min": 1,
+    "first_record_median": 600,
+    "first_record_max": 2331,
+    "first_record_in_400_800": 22,
+    "n_streams_with_appdata": 38
+  },
+  "record_size_histogram": {
+    "200-600": 189,
+    "600-1500": 370,
+    "0-200": 1016,
+    "1500-4000": 51,
+    "16401_full": 344,
+    "4000-16400": 243
+  },
+  "record_size_stats": {
+    "total_records": 2213,
+    "min": 1,
+    "max": 16408,
+    "median": 433
+  },
+  "sample_opening_sequences": [
+    {
+      "host": "gm.mmstat.com",
+      "first6": [
+        405,
+        801,
+        294,
+        76,
+        33,
+        75
+      ]
+    },
+    {
+      "host": "s-gm.mmstat.com",
+      "first6": [
+        419,
+        75,
+        891,
+        808,
+        294,
+        76
+      ]
+    },
+    {
+      "host": "fourier.alibaba.com",
+      "first6": [
+        685,
+        73,
+        161,
+        33,
+        422,
+        100
+      ]
+    },
+    {
+      "host": "log.mmstat.com",
+      "first6": [
+        369,
+        64,
+        233,
+        124,
+        33,
+        618
+      ]
+    },
+    {
+      "host": "cm.mediav.com",
+      "first6": [
+        445,
+        64,
+        33,
+        336,
+        33,
+        41
+      ]
+    },
+    {
+      "host": "ws.mmstat.com",
+      "first6": [
+        766,
+        406,
+        791,
+        54,
+        32
+      ]
+    },
+    {
+      "host": "g.aplus.taobao.com",
+      "first6": [
+        1429,
+        64,
+        396,
+        76,
+        33
+      ]
+    },
+    {
+      "host": "i0.hdslb.com",
+      "first6": [
+        1,
+        53,
+        497,
+        126,
+        266,
+        266
+      ]
+    },
+    {
+      "host": "impression.biligame.com",
+      "first6": [
+        1436,
+        305
+      ]
+    },
+    {
+      "host": "upos-sz-mirror08c.bilivideo.com",
+      "first6": [
+        1,
+        69,
+        862,
+        266,
+        266,
+        57
+      ]
+    },
+    {
+      "host": "hw-v2-web-player-tracker.biliapi.net",
+      "first6": [
+        866,
+        203,
+        112,
+        51,
+        85,
+        256
+      ]
+    },
+    {
+      "host": "www.baidu.com",
+      "first6": [
+        742,
+        1203,
+        2382,
+        564,
+        4740,
+        5612
+      ]
+    },
+    {
+      "host": "www.baidu.com",
+      "first6": [
+        463,
+        256,
+        2911,
+        4120,
+        256,
+        4120
+      ]
+    },
+    {
+      "host": "www.baidu.com",
+      "first6": [
+        746,
+        1203,
+        2382,
+        564,
+        4740,
+        5612
+      ]
+    }
+  ]
+}
