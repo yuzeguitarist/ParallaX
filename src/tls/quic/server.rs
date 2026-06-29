@@ -561,8 +561,16 @@ pub struct ServerHandshake {
     /// marker MAC (issue #74). A marker minted for one DCID fails to verify when
     /// replayed onto a different DCID / routing identity. Empty until set.
     marker_dcid: Vec<u8>,
+    /// Operator's authorized-SNI allowlist, paired with `marker_key`. A ClientHello
+    /// carrying a valid + fresh marker is accepted only if its SNI is on this list;
+    /// otherwise `marker_result` is left `None` so the endpoint fronts the flow to
+    /// the camouflage origin, exactly as the TCP plane fronts an authenticated
+    /// ClientHello with an unauthorized SNI. Empty until set (cold-start: no marker
+    /// key, so the check never runs).
+    authorized_sni: Vec<String>,
     /// The marker recovered from this connection's ClientHello.random, if it carried
-    /// a valid + fresh one. Set during ClientHello processing when `marker_key` is set.
+    /// a valid + fresh one whose SNI is authorized. Set during ClientHello processing
+    /// when `marker_key` is set.
     marker_result: Option<crate::crypto::quic_marker::Marker>,
 }
 
@@ -606,6 +614,7 @@ impl ServerHandshake {
             replay_guard: None,
             marker_key: None,
             marker_dcid: Vec::new(),
+            authorized_sni: Vec::new(),
             marker_result: None,
         })
     }
@@ -617,17 +626,22 @@ impl ServerHandshake {
     }
 
     /// Install the origin-splice auth-marker key `(psk, server static X25519
-    /// private)`. Must be set before the ClientHello is processed; the server then
-    /// verifies `ClientHello.random` as a covert marker and exposes the result via
-    /// [`Self::marker_result`].
+    /// private)` plus the operator's authorized-SNI allowlist. Must be set before the
+    /// ClientHello is processed; the server then verifies `ClientHello.random` as a
+    /// covert marker AND that its SNI is authorized, exposing the result via
+    /// [`Self::marker_result`]. An empty `authorized_sni` authorizes nothing, so every
+    /// marker is fronted to the origin — the same posture the TCP plane takes when
+    /// `server.authorized_sni` is empty (config validation rejects an empty list).
     pub(crate) fn set_marker_key(
         &mut self,
         psk: Zeroizing<Vec<u8>>,
         static_priv: Zeroizing<[u8; 32]>,
         bound_dcid: Vec<u8>,
+        authorized_sni: Vec<String>,
     ) {
         self.marker_key = Some((psk, static_priv));
         self.marker_dcid = bound_dcid;
+        self.authorized_sni = authorized_sni;
     }
 
     /// The marker recovered from this connection's ClientHello.random, if valid +
@@ -804,6 +818,23 @@ impl ServerHandshake {
                 now,
                 MARKER_WINDOW_SECS,
             );
+            // Authorized-SNI gate (parity with the TCP plane's authenticated_decision):
+            // a valid marker only terminates locally if its SNI is on the operator's
+            // allowlist. The marker MAC already commits to this exact SNI, so an
+            // attacker cannot swap it; this enforces that even a legitimately-marked
+            // client may only front the operator-approved domains, fronting anything
+            // else to the camouflage origin. Dropping the marker to `None` routes the
+            // flow to the splice exactly as an unmarked Initial. The check runs only
+            // after `open` returned `Some` (a holder of both secrets), so it adds no
+            // timing signal distinguishing marked from unmarked flows.
+            if self.marker_result.is_some() {
+                let authorized = std::str::from_utf8(&summary.sni)
+                    .map(|sni| crate::handshake::is_authorized_sni(sni, &self.authorized_sni))
+                    .unwrap_or(false);
+                if !authorized {
+                    self.marker_result = None;
+                }
+            }
         }
 
         let (server_share, shared) = server_hybrid_kex(&summary.hybrid_key_share)?;
@@ -1613,6 +1644,9 @@ mod tests {
                 psk.clone(),
                 Zeroizing::new(server_kp.private),
                 bound_dcid.to_vec(),
+                // The client above uses SNI "example.com"; authorize it so the marker
+                // (when the DCID matches) is not nulled by the SNI gate.
+                vec!["example.com".to_owned()],
             );
             server.read_handshake(&ch).unwrap();
             server
@@ -1630,6 +1664,35 @@ mod tests {
         assert!(
             server_wrong.marker_result().is_none(),
             "marker bound to DCID_A is rejected when verified against DCID_B (issue #74)"
+        );
+
+        // DN-1: even with the matching DCID, a server whose allowlist does not contain
+        // the client's SNI ("example.com") drops the otherwise-valid marker, so the
+        // endpoint fronts the flow to the origin (authorized-SNI gate parity with TCP).
+        let mut server_unauth = {
+            let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+            let key =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                    .unwrap();
+            ServerHandshake::new(
+                cert_chain,
+                key.as_ref(),
+                vec![b"h3".to_vec()],
+                vec![0x05, 0x06, 0x07, 0x08],
+                None,
+            )
+            .unwrap()
+        };
+        server_unauth.set_marker_key(
+            psk.clone(),
+            Zeroizing::new(server_kp.private),
+            DCID_A.to_vec(),
+            vec!["allowed.example".to_owned()], // does NOT contain "example.com"
+        );
+        server_unauth.read_handshake(&ch).unwrap();
+        assert!(
+            server_unauth.marker_result().is_none(),
+            "a valid marker on an unauthorized SNI is dropped (DN-1: fronted to origin)"
         );
     }
 }

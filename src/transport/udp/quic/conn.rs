@@ -757,8 +757,10 @@ impl Connection {
         psk: zeroize::Zeroizing<Vec<u8>>,
         static_priv: zeroize::Zeroizing<[u8; 32]>,
         bound_dcid: Vec<u8>,
+        authorized_sni: Vec<String>,
     ) {
-        self.tls.set_marker_key(psk, static_priv, bound_dcid);
+        self.tls
+            .set_marker_key(psk, static_priv, bound_dcid, authorized_sni);
     }
 
     /// The origin-splice auth marker recovered from this connection's

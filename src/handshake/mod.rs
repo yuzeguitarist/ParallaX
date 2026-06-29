@@ -29,3 +29,16 @@ pub mod transcript;
 /// reproducing on localhost (where the response body does not pile up). Binding
 /// both ends to one constant keeps the window symmetric by construction.
 pub(crate) const MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS: usize = 64;
+
+/// Whether `sni` is on the operator's authorized list (case-insensitive exact
+/// match). The SINGLE source of truth for the authorized-SNI check across both
+/// transports: the TCP plane gates an authenticated ClientHello on it
+/// (`server::authenticated_decision`) and the QUIC plane gates a valid auth marker
+/// on it (`tls::quic::server::ServerHandshake::process_client_hello`). Keeping one
+/// implementation prevents the two transports from drifting into "one strict, one
+/// lax" — an unauthorized SNI is fronted to the camouflage origin on both.
+pub(crate) fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {
+    authorized_sni
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(sni))
+}

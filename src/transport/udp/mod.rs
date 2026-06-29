@@ -80,6 +80,8 @@ pub fn server_config(
         // Initial terminates locally (the prior behaviour).
         marker_key: None,
         marker_replay_guard: None,
+        // No marker key here, so the authorized-SNI gate never runs; empty.
+        authorized_sni: Vec::new(),
         // 0 => use the built-in default recv cap (issue #75).
         max_udp_payload: 0,
     }))
@@ -108,6 +110,8 @@ pub fn server_config_0rtt(
         // Marker fork dormant until the server runtime supplies the key.
         marker_key: None,
         marker_replay_guard: None,
+        // No marker key here, so the authorized-SNI gate never runs; empty.
+        authorized_sni: Vec::new(),
         // 0 => use the built-in default recv cap (issue #75).
         max_udp_payload: 0,
     }))
@@ -131,6 +135,7 @@ pub fn server_config_stable(
     marker_key: crate::crypto::quic_marker::MarkerKey,
     marker_replay_guard: Option<Arc<marker_replay::MarkerReplayGuard>>,
     origin_udp_addr: SocketAddr,
+    authorized_sni: Vec<String>,
     max_udp_payload: usize,
 ) -> Result<Arc<quic::endpoint::ServerConfig>, UdpTransportError> {
     Ok(Arc::new(quic::endpoint::ServerConfig {
@@ -141,6 +146,9 @@ pub fn server_config_stable(
         origin_udp_addr: Some(origin_udp_addr),
         marker_key: Some(marker_key),
         marker_replay_guard,
+        // The authorized-SNI allowlist a valid marker's SNI must be on to terminate
+        // locally (parity with the TCP plane); any other SNI is fronted to the origin.
+        authorized_sni,
         max_udp_payload,
     }))
 }

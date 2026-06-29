@@ -703,10 +703,23 @@ impl AeadCodec {
         *self.nonce_base
     }
 
-    /// Advances the sequence counter by `count` after a batch of records was
-    /// sealed/opened off-thread with explicit sequence numbers.
+    /// Advances the sequence counter by `count`. The single checked path for every
+    /// counter advance: the batch seal/open paths call it with the batch size, and
+    /// the serial `seal_in_place_detached` / `open_in_place_split` call it with `1`.
+    ///
+    /// The counter is a nonce input, so a silent wrap (the prior `saturating_add`,
+    /// which pins it at `u64::MAX`) would risk nonce reuse. Both classes of caller
+    /// pre-check the boundary before any record is processed (the batch path via
+    /// `sequence + count <= u64::MAX`, the serial path via the `*_with` functions'
+    /// `sequence == u64::MAX` rejection), so this never wraps in practice. Fail loud
+    /// regardless: a `checked_add` overflow poisons the codec, so every later
+    /// seal/open fails closed via `ensure_usable` rather than reusing a nonce. The
+    /// pre-checks remain the first gate; this is defence in depth on the primitive.
     pub(crate) fn advance_sequence(&mut self, count: u64) {
-        self.sequence = self.sequence.saturating_add(count);
+        match self.sequence.checked_add(count) {
+            Some(next) => self.sequence = next,
+            None => self.poison(),
+        }
     }
 
     /// Permanently marks the codec unusable. Called by the batch open paths
@@ -755,7 +768,12 @@ impl AeadCodec {
             plaintext,
             aad,
         )?;
-        self.sequence += 1;
+        // Advance via the checked path so the nonce counter fails loud (poisons the
+        // codec) rather than wrapping. `*_with` already rejected `sequence ==
+        // u64::MAX` above, so this never actually overflows today; routing the
+        // single-step increment through the same primitive keeps the fail-loud
+        // guarantee on the counter itself, not on a caller-side pre-check.
+        self.advance_sequence(1);
         Ok(tag)
     }
 
@@ -793,7 +811,9 @@ impl AeadCodec {
             ciphertext_with_tag,
             aad,
         )?;
-        self.sequence += 1;
+        // Checked advance (see `seal_in_place_detached`): fail loud on the counter
+        // itself instead of relying solely on the `*_with` pre-check.
+        self.advance_sequence(1);
         Ok(plaintext_len)
     }
 }
@@ -941,6 +961,35 @@ mod tests {
             dec.open(&ciphertext, b"tls-appdata"),
             Err(SessionError::Aead)
         ));
+    }
+
+    #[test]
+    fn advance_sequence_overflow_poisons_instead_of_wrapping() {
+        // DN-4: the sequence counter is a nonce input. A silent wrap (the prior
+        // saturating_add, which pins it at u64::MAX) would risk nonce reuse if a
+        // path ever reached advance_sequence without the callers' checked_add
+        // pre-check. A checked overflow must fail loud: poison the codec so every
+        // later seal/open fails closed, never reusing a nonce.
+        let key = [7_u8; KEY_LEN];
+        let nonce = [9_u8; NONCE_LEN];
+        let mut codec = AeadCodec::new(key, nonce);
+
+        // Drive the counter to the edge, then overflow it.
+        codec.advance_sequence(u64::MAX - 1);
+        assert!(codec.ensure_usable().is_ok(), "edge value is still usable");
+        codec.advance_sequence(2); // (u64::MAX - 1) + 2 overflows
+
+        assert!(
+            matches!(codec.ensure_usable(), Err(SessionError::Aead)),
+            "an overflowing advance must poison the codec, not silently saturate"
+        );
+        assert!(
+            matches!(
+                codec.seal(b"payload", b"tls-appdata"),
+                Err(SessionError::Aead)
+            ),
+            "a poisoned codec fails closed on seal"
+        );
     }
 
     #[test]

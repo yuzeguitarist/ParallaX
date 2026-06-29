@@ -264,6 +264,12 @@ pub struct ServerConfig {
     /// spliced to the origin, not re-terminated. `None` falls back to the in-memory
     /// first-sighting cache (cold-start / tests), which is lost on restart.
     pub marker_replay_guard: Option<Arc<crate::transport::udp::marker_replay::MarkerReplayGuard>>,
+    /// Operator's authorized-SNI allowlist, paired with `marker_key`. A v1 Initial
+    /// carrying a valid + fresh marker terminates locally only if its SNI is on this
+    /// list; any other SNI is fronted to the origin, matching the TCP plane's
+    /// authorized-SNI gate. Ignored when `marker_key` is `None`: with no marker key,
+    /// no marker is ever recovered, so the gate never runs whatever this contains.
+    pub authorized_sni: Vec<String>,
     /// Maximum UDP payload read per datagram on this endpoint — the inbound recv
     /// buffer size and the origin-splice relay buffer size (issue #75). Oversized
     /// datagrams are truncated, which fails AEAD and is dropped. `0` means use the
@@ -853,9 +859,22 @@ impl Driver {
         self.pending
             .retain(|_, p| now.duration_since(p.last) < PENDING_IDLE);
         // Bound state creation (review finding #1): held + active cores never exceed
-        // the hard cap. Floods past the cap are dropped before they can allocate a
-        // Box<ServerHandshake> + Bbr + spaces (unauthenticated DoS).
+        // the hard cap. Past the cap we must NOT allocate a Box<ServerHandshake> +
+        // Bbr + spaces (unauthenticated DoS). But a silent drop here is a present-tense
+        // distinguisher: the TCP plane sheds an overflow to the origin fallback
+        // (cap_shed_fallback_or_fin), so a QUIC plane that instead goes silent at its
+        // cap diverges observably from a real origin under load. Shed this v1 Initial
+        // to the origin splice too — a verbatim 1:1 relay, so the prober reaches the
+        // TRUE origin (which answers like the real server it is) and the two transports
+        // behave identically when saturated. The splice has its own independent
+        // MAX_SPLICE_FLOWS budget, so this adds no unbounded resource surface; once
+        // that budget is also exhausted the splice itself sheds, degrading exactly like
+        // an origin under a UDP flood. Dormant (drop, the prior behaviour) until the
+        // runtime supplies `origin_udp_addr`.
         if self.conns.len() + self.pending.len() >= MAX_SERVER_CONNS {
+            if let Some(origin) = cfg.origin_udp_addr {
+                self.open_splice(peer, origin, data, now);
+            }
             return;
         }
         // Random source connection id (RFC 9000 §5.1). A monotonic counter would make
@@ -903,6 +922,7 @@ impl Driver {
                         psk.clone(),
                         static_priv.clone(),
                         initial_dcid.as_slice().to_vec(),
+                        cfg.authorized_sni.clone(),
                     );
                 }
                 core
@@ -1550,9 +1570,22 @@ mod tests {
 
     /// Build a test `ServerConfig` with a fresh ECDSA key and the standard test
     /// cert/ALPN, varying only the two fields the individual builders care about.
+    /// The authorized-SNI allowlist is `["example.com"]` — the SNI every marker test
+    /// client connects with — so a valid marker on that SNI terminates locally.
     fn base_server_config(
         origin_udp_addr: Option<SocketAddr>,
         marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
+    ) -> Arc<ServerConfig> {
+        base_server_config_sni(origin_udp_addr, marker_key, vec!["example.com".to_owned()])
+    }
+
+    /// Like [`base_server_config`] but with an explicit authorized-SNI allowlist, so a
+    /// test can exercise the marker SNI gate (a marked client whose SNI is not on the
+    /// list must be fronted to the origin, not terminated).
+    fn base_server_config_sni(
+        origin_udp_addr: Option<SocketAddr>,
+        marker_key: Option<crate::crypto::quic_marker::MarkerKey>,
+        authorized_sni: Vec<String>,
     ) -> Arc<ServerConfig> {
         use aws_lc_rs::rand::SystemRandom;
         use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
@@ -1569,6 +1602,7 @@ mod tests {
             origin_udp_addr,
             marker_key,
             marker_replay_guard: None,
+            authorized_sni,
             max_udp_payload: 0,
         })
     }
@@ -1866,6 +1900,21 @@ mod tests {
         )
     }
 
+    /// Like [`server_config_marker`] but with an explicit authorized-SNI allowlist, so
+    /// the DN-1 marker SNI gate can be exercised.
+    fn server_config_marker_sni(
+        origin: SocketAddr,
+        psk: zeroize::Zeroizing<Vec<u8>>,
+        static_priv: [u8; 32],
+        authorized_sni: Vec<String>,
+    ) -> Arc<ServerConfig> {
+        base_server_config_sni(
+            Some(origin),
+            Some((psk, zeroize::Zeroizing::new(static_priv))),
+            authorized_sni,
+        )
+    }
+
     /// The marker fork: a client whose ClientHello.random carries a valid auth marker
     /// is TERMINATED locally (the handshake completes), while an unmarked client's
     /// Initial is spliced verbatim to the origin (which receives the >=1200B Initial).
@@ -1952,6 +2001,80 @@ mod tests {
         assert!(
             got >= MIN_INITIAL_DATAGRAM,
             "origin received a full v1 Initial ({got} bytes): the unmarked client was spliced"
+        );
+    }
+
+    /// DN-1: a client carrying a VALID marker but an UNAUTHORIZED SNI is fronted to the
+    /// origin, NOT terminated locally — parity with the TCP plane's authorized-SNI gate.
+    /// The marker MAC commits to the SNI, so the client cannot lie about it; the server
+    /// authorizes only `allowed.example` while the client connects with `example.com`,
+    /// so the otherwise-valid marker is dropped and the flight splices to the origin
+    /// (which receives the full >=1200B Initial). Sibling to
+    /// `marked_client_terminates_while_unmarked_initial_splices`, which authorizes the
+    /// client's SNI and so terminates it.
+    #[tokio::test]
+    async fn marked_client_with_unauthorized_sni_is_spliced() {
+        use crate::crypto::session::X25519KeyPair;
+        use crate::tls::quic::QuicMarkerConfig;
+        use crate::transport::udp::endpoint::bind_client_endpoint_accept_any;
+
+        let server_kp = X25519KeyPair::generate();
+        let psk = zeroize::Zeroizing::new(b"parallax-quic-unauth-sni-fork-psk".to_vec());
+
+        // Mock origin: report the size of any datagram it receives (the spliced flight).
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            while let Ok((n, _)) = origin.recv_from(&mut b).await {
+                if otx.send(n).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // The server authorizes ONLY `allowed.example`; the marked client below connects
+        // with `example.com`, so its valid marker must not rescue it from the splice.
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_marker_sni(
+                origin_addr,
+                psk.clone(),
+                server_kp.private,
+                vec!["allowed.example".to_owned()],
+            ),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let marked = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        marked.set_default_client_config(Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                QuicMarkerConfig {
+                    psk,
+                    server_static_public: server_kp.public,
+                },
+            ),
+        ));
+        // The connect never completes (the flight is spliced to the echo origin, not a
+        // real QUIC server), so bound it.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            marked.connect(server_addr, "example.com"),
+        )
+        .await;
+
+        let got = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("origin receives the spliced Initial (unauthorized SNI, not terminated)")
+            .expect("origin channel open");
+        assert!(
+            got >= MIN_INITIAL_DATAGRAM,
+            "origin received a full v1 Initial ({got} bytes): the unauthorized-SNI marked client was spliced"
         );
     }
 
