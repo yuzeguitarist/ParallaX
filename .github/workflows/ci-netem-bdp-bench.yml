@@ -97,4 +97,6 @@ jobs:
           path: |
             speed.json
             bench.out
+            /tmp/tmp.*/server.log
+            /tmp/tmp.*/speed.err
           if-no-files-found: warn

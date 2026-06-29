@@ -100,19 +100,29 @@ ip -n "$SNS_C" link set "$VETH_C" up
 ip -n "$SNS_S" link set lo up
 ip -n "$SNS_C" link set lo up
 
-# Egress shaping on BOTH ends: tbf (rate cap + bounded queue) with netem (delay)
-# as a child. tbf's `limit` is the bottleneck queue that backpressures the
-# sender; netem adds the one-way latency. Together: a finite-BDP, throttled,
-# latency link with a small queue — the regime netmatrix cannot model.
+# Egress shaping on BOTH ends with a SINGLE netem qdisc that does delay + rate +
+# a bounded packet queue. Using one netem (rather than tbf->netem stacked) avoids
+# the small-burst tbf token starvation that can drop the tiny TLS handshake
+# segments, while still giving a finite-BDP, throttled, small-queue link — the
+# regime netmatrix's userspace shaper cannot model. `limit` (in packets) is the
+# bottleneck queue; we size it from the byte budget assuming ~1500 B segments and
+# floor it at 32 packets so the handshake always fits.
+QUEUE_PKTS=$(( (QUEUE_KB * 1024 / 1500) > 32 ? (QUEUE_KB * 1024 / 1500) : 32 ))
 shape() {
   local ns="$1" dev="$2"
-  ip netns exec "$ns" tc qdisc add dev "$dev" root handle 1: tbf \
-    rate "${RATE_MBIT}mbit" burst 32kb limit "${QUEUE_KB}kb"
-  ip netns exec "$ns" tc qdisc add dev "$dev" parent 1: handle 10: netem \
-    delay "${HALF_RTT_MS}ms"
+  ip netns exec "$ns" tc qdisc add dev "$dev" root handle 1: netem \
+    delay "${HALF_RTT_MS}ms" rate "${RATE_MBIT}mbit" limit "${QUEUE_PKTS}"
 }
 shape "$SNS_S" "$VETH_S"
 shape "$SNS_C" "$VETH_C"
+log "shaped: delay=${HALF_RTT_MS}ms rate=${RATE_MBIT}mbit limit=${QUEUE_PKTS}pkts per direction"
+# Connectivity self-check across the shaped link before starting plx, so a
+# topology/routing failure surfaces here rather than as an opaque TLS EOF.
+if ! ip netns exec "$SNS_C" ping -c1 -W3 "$IP_S" >/dev/null 2>&1; then
+  log "client-ns cannot reach server-ns across the shaped link; tc/topology broken"
+  ip netns exec "$SNS_S" tc -s qdisc show dev "$VETH_S" >&2 || true
+  exit 1
+fi
 
 # --- generate paired configs ---------------------------------------------------------
 "$abs_plx" init cloudflare.com \
@@ -134,12 +144,28 @@ sleep 2
 if ! kill -0 "$SRV_PID" 2>/dev/null; then
   log "server failed to start"; cat "$WORKDIR/server.log" >&2; exit 1
 fi
+# Confirm the server is actually listening inside its ns before dialing.
+if ! ip netns exec "$SNS_S" ss -ltn 2>/dev/null | grep -q ":${PORT}"; then
+  log "server is not listening on :${PORT} in its ns"
+  ip netns exec "$SNS_S" ss -ltn >&2 || true
+  cat "$WORKDIR/server.log" >&2
+  exit 1
+fi
 
 log "running plx speed across shaped link..."
-ip netns exec "$SNS_C" "$abs_plx" speed -c "$WORKDIR/parallax.client.toml" --json \
-  >"$OUT_JSON" 2>"$WORKDIR/speed.err" || {
-    log "speed run failed"; cat "$WORKDIR/speed.err" >&2; exit 1;
-  }
+if ! ip netns exec "$SNS_C" "$abs_plx" speed -c "$WORKDIR/parallax.client.toml" --json \
+  >"$OUT_JSON" 2>"$WORKDIR/speed.err"; then
+  log "speed run failed; dumping diagnostics"
+  echo "----- speed.err -----" >&2; cat "$WORKDIR/speed.err" >&2
+  echo "----- server.log -----" >&2; cat "$WORKDIR/server.log" >&2
+  echo "----- tc stats (server veth) -----" >&2
+  ip netns exec "$SNS_S" tc -s qdisc show dev "$VETH_S" >&2 || true
+  echo "----- tc stats (client veth) -----" >&2
+  ip netns exec "$SNS_C" tc -s qdisc show dev "$VETH_C" >&2 || true
+  exit 1
+fi
 
 cat "$OUT_JSON"
 log "JSON written to $OUT_JSON"
+log "tc stats after run:"
+ip netns exec "$SNS_S" tc -s qdisc show dev "$VETH_S" >&2 || true
