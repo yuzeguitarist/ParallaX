@@ -911,21 +911,23 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
-# Endpoint hardening: deny ptrace/process_vm_readv against this service from any
-# other process on the host, and hide other PIDs from it. Raises the cost of a
-# same-host (non-root) attacker scraping keys/plaintext out of the server's
-# memory; a ring-0/root attacker can still override these, so this narrows the
-# half-compromised case, not a kernel compromise.
-RestrictPtrace=true
+# Endpoint hardening. Hide other PIDs in /proc from this service (limits it as a
+# pivot for enumerating other processes). NOTE: the service currently runs as root
+# (no User=), so ProtectProc does not stop a root-equivalent observer — it is a
+# mild defense-in-depth, not memory protection. The in-process PR_SET_DUMPABLE=0
+# (src/process_hardening.rs) is what actually resists a non-root debugger attach.
 ProtectProc=invisible
-# syscall allow-list: @system-service is systemd's curated service baseline and
-# already covers ParallaX's network + epoll path. mlock(2) lives in @memlock,
-# which is NOT in the baseline, so add it back explicitly — dropping it would make
-# the in-process mlock() of key pages fail (degrading swap-pinning) rather than
-# break startup. SystemCallErrorNumber turns a denied syscall into EPERM instead
-# of an immediate SIGSYS kill, so a kernel that lacks a listed call degrades
-# rather than crash-loops the service.
+# syscall filter: @system-service is systemd's curated service baseline and covers
+# ParallaX's network + epoll path. It does NOT include the ptrace family, so the
+# service cannot ptrace/process_vm_readv other processes; the trailing deny line
+# (~@debug) makes that explicit and also drops the debug syscalls. mlock(2) lives
+# in @memlock, NOT in the baseline, so add it back — dropping it would make the
+# in-process mlock() of key pages fail (degrading swap-pinning) rather than break
+# startup. SystemCallErrorNumber turns a denied syscall into EPERM instead of an
+# immediate SIGSYS kill, so a kernel missing a listed call degrades rather than
+# crash-loops the service.
 SystemCallFilter=@system-service @memlock
+SystemCallFilter=~@debug
 SystemCallErrorNumber=EPERM
 ReadWritePaths=/var/lib/parallax
 AmbientCapabilities=CAP_NET_BIND_SERVICE

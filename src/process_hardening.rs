@@ -26,10 +26,13 @@ const DISABLE_ANTI_DEBUG_ENV: &str = "PARALLAX_DISABLE_ANTI_DEBUG";
 /// the once-per-connection identity signing key) — the unmask cost is paid on
 /// every access, so it is wrong for hot-path keys.
 ///
-/// `mask` and `masked` are both zeroized on drop; the transient unmasked scratch
-/// is `Zeroizing` and is itself `mlock`'d + dump-excluded for the window it exists
-/// (see [`MaskedSecret::with_plaintext`]). So the resident halves, and the
-/// short-lived plaintext at use, are all kept out of swap and core dumps.
+/// `mask` and `masked` are both `mlock`'d (locked once at construction, stable
+/// addresses) and zeroized on drop. The transient unmasked scratch in
+/// [`MaskedSecret::with_plaintext`] is `Zeroizing` (wiped on return) and is
+/// core-dump-excluded by the process-wide `RLIMIT_CORE=0`, but is deliberately NOT
+/// `mlock`'d per-use — see that method for why locking a per-call allocation would
+/// regress the long-lived keys' pinning. So the resident halves are swap-pinned;
+/// the brief plaintext-at-use is not, and could touch swap in its short window.
 pub struct MaskedSecret {
     masked: Vec<u8>,
     mask: Vec<u8>,
@@ -63,16 +66,17 @@ impl MaskedSecret {
     /// Unmask into a transient `Zeroizing` scratch, run `f` against the plaintext,
     /// and wipe the scratch on return. The plaintext never outlives the closure.
     ///
-    /// The transient scratch is `mlock`'d and dump-excluded BEFORE it is filled, so
-    /// the plaintext is swap-pinned and core-dump-excluded for the brief window it
-    /// exists — matching the protection the previous always-resident plaintext key
-    /// had, without keeping the key materialized between uses. (The scratch is not
-    /// `munlock`'d on drop, by the same whole-page reasoning as `protect_secret_bytes`;
-    /// it is a fixed-size, low-frequency allocation, so the locked-page budget impact
-    /// is bounded.)
+    /// The scratch is deliberately NOT `mlock`'d. `protect_secret_bytes` never
+    /// `munlock`s (it is built for lifetime-stable secrets on shared pages), so
+    /// locking a fresh per-call allocation would pin a new page on every connection
+    /// and never release it — growing the locked-page high-water mark until it
+    /// exhausts `RLIMIT_MEMLOCK` and starves the genuine long-lived keys (PSK,
+    /// X25519/ML-KEM static) of their pinning. That regression is worse than the
+    /// exposure it would close, so the brief unmask window relies instead on the
+    /// process-wide `RLIMIT_CORE=0` (no core dump) plus immediate `Zeroizing`
+    /// wipe. The masked/mask halves remain mlock'd (stable, locked once).
     pub fn with_plaintext<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         let mut plaintext = Zeroizing::new(vec![0_u8; self.masked.len()]);
-        protect_secret_bytes("masked_secret.unmasked", &plaintext);
         for ((p, m), k) in plaintext
             .iter_mut()
             .zip(self.masked.iter())
