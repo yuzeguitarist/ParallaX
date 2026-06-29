@@ -58,17 +58,24 @@ fn parse_tsv(text: &str, server_port: &str) -> Result<Trace, String> {
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
+        // Fail closed on malformed rows (short row, bad time, bad length) rather
+        // than silently skipping — a corrupted fixture must surface, not quietly
+        // drop datagrams and shift the samples the Tier 5 tests depend on.
         if cols.len() < 4 {
-            continue;
+            return Err(format!(
+                "line {}: expected >=4 columns, got {}",
+                lineno + 1,
+                cols.len()
+            ));
         }
         let time: f64 = cols[1]
             .parse()
             .map_err(|_| format!("line {}: bad time {:?}", lineno + 1, cols[1]))?;
         let src_port = cols[2];
-        let len: u32 = match cols[3].trim().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let len: u32 = cols[3]
+            .trim()
+            .parse()
+            .map_err(|_| format!("line {}: bad udp_length {:?}", lineno + 1, cols[3]))?;
         let dir = if src_port == server_port {
             Dir::S2C
         } else {

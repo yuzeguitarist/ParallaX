@@ -148,19 +148,24 @@ pub async fn capture_parallax_quic_trace(
     let server_task = tokio::spawn(async move {
         let conn = match server.accept().await {
             Some(c) => c,
-            None => return,
+            None => return Err("server accept returned None".to_string()),
         };
         let (mut send, mut recv) = match conn.accept_bi().await {
             Some(s) => s,
-            None => return,
+            None => return Err("server accept_bi returned None".to_string()),
         };
         let mut sink = Vec::new();
-        let _ = recv.read_to_end(&mut sink).await;
+        recv.read_to_end(&mut sink)
+            .await
+            .map_err(|e| format!("server read: {e}"))?;
         let reply = vec![0xa5u8; downlink_bytes];
-        let _ = send.write_all(&reply).await;
+        send.write_all(&reply)
+            .await
+            .map_err(|e| format!("server write: {e}"))?;
         send.finish();
         // Hold the connection briefly so queued datagrams flush before drop.
         tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok::<usize, String>(sink.len())
     });
 
     let client = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
@@ -180,11 +185,32 @@ pub async fn capture_parallax_quic_trace(
         .map_err(|e| format!("client write: {e}"))?;
     send.finish();
     let mut got = Vec::new();
-    let _ = recv.read_to_end(&mut got).await;
+    recv.read_to_end(&mut got)
+        .await
+        .map_err(|e| format!("client read: {e}"))?;
 
     // Let the last datagrams (ACKs, stream FIN) cross the forwarder.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let _ = server_task.await;
+
+    // Propagate server-side stream errors and confirm the transfer completed in
+    // full: a truncated handshake/transfer would otherwise yield a misleading
+    // Tier 5 trace. We require the bytes actually transferred to match what was
+    // requested in both directions.
+    let server_recv = server_task
+        .await
+        .map_err(|e| format!("server task join: {e}"))?
+        .map_err(|e| format!("server task: {e}"))?;
+    if server_recv != uplink_bytes {
+        return Err(format!(
+            "uplink truncated: server received {server_recv} of {uplink_bytes} bytes"
+        ));
+    }
+    if got.len() != downlink_bytes {
+        return Err(format!(
+            "downlink truncated: client received {} of {downlink_bytes} bytes",
+            got.len()
+        ));
+    }
 
     let trace = forwarder.finish();
     if trace.is_empty() {

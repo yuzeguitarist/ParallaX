@@ -454,12 +454,16 @@ async fn parallax_vs_safari_h3_direction_and_size() {
         );
     }
 
-    // Sanity gate only: the capture must have produced a usable bidirectional
-    // trace. We do not gate on the KS verdicts themselves yet — loopback
+    // Sanity gate only: the capture must have produced a usable *bidirectional*
+    // trace — datagrams in BOTH directions, not just C2S (direction_runs() is
+    // non-empty for any non-empty trace, so it alone would accept a one-way
+    // capture). We do not gate on the KS verdicts themselves yet — loopback
     // datagram distributions need calibration before a hard threshold, exactly
     // as the length tier was left informational first.
+    let c2s = parallax.dir(Dir::C2S).len();
+    let s2c = parallax.dir(Dir::S2C).len();
     assert!(
-        !parallax_runs.is_empty() && parallax_up.len() >= 2,
-        "ParallaX capture lacked a usable bidirectional datagram trace"
+        c2s >= 1 && s2c >= 1,
+        "ParallaX capture not bidirectional: C2S={c2s} S2C={s2c}"
     );
 }
