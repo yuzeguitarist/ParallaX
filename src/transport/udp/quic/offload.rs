@@ -217,6 +217,15 @@ mod linux {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        // If `buf` was too small for the (GRO-coalesced) read, the kernel sets
+        // MSG_TRUNC and `n` is the *untruncated* size. Splitting a truncated buffer
+        // would feed a corrupt tail datagram to QUIC (and silently lose the rest), so
+        // reject the read; the caller drops it like any other bad datagram. With the
+        // 64 KiB GRO buffer the driver allocates this should never fire, but a buffer
+        // smaller than the kernel's coalesced maximum must fail loudly, not corrupt.
+        if msg.msg_flags & libc::MSG_TRUNC != 0 {
+            return Err(io::Error::other("GRO recvmsg truncated (buffer too small)"));
+        }
         let total = n as usize;
 
         // The kernel wrote msg_namelen bytes of source address into `storage`.

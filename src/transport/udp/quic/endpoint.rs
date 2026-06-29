@@ -38,6 +38,16 @@ use zeroize::Zeroizing;
 /// path MTU; oversized datagrams are truncated, which fails AEAD and is dropped).
 const MAX_UDP_PAYLOAD: usize = 2048;
 
+/// Receive-buffer size when Linux `UDP_GRO` is active. GRO coalesces multiple
+/// consecutive same-flow datagrams into ONE `recvmsg`, so the read buffer must hold
+/// the coalesced maximum (the kernel caps a GRO super-buffer at 64 KiB) — a buffer
+/// sized for a single datagram would truncate the read (`MSG_TRUNC`), dropping the
+/// tail datagrams and corrupting the last one. The per-datagram parse ceiling stays
+/// `recv_cap()`; this only sizes the gather buffer. 64 KiB is the largest a single
+/// GRO read can deliver.
+#[cfg(target_os = "linux")]
+const GRO_RECV_BUFFER: usize = 64 * 1024;
+
 /// Minimum size of a datagram carrying a client's first Initial (RFC 9000 §14.1):
 /// a server MUST discard smaller Initials. Used to gate server connection creation.
 const MIN_INITIAL_DATAGRAM: usize = 1200;
@@ -759,6 +769,12 @@ impl Driver {
     }
 
     async fn run(mut self) {
+        // On Linux UDP_GRO can coalesce many datagrams into one recvmsg, so the read
+        // buffer must hold the coalesced maximum (not just one datagram) or the read
+        // truncates. Off Linux (no GRO) one datagram per read, so recv_cap() suffices.
+        #[cfg(target_os = "linux")]
+        let mut buf = vec![0u8; self.recv_cap().max(GRO_RECV_BUFFER)];
+        #[cfg(not(target_os = "linux"))]
         let mut buf = vec![0u8; self.recv_cap()];
         loop {
             let socket = self.socket.clone();
