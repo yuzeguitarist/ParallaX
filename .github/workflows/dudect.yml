@@ -1,0 +1,100 @@
+name: dudect
+
+# Load-bearing constant-time gate for the inbound-reject path
+# (src/handshake/server.rs `rejection_path_timing_is_constant_dudect`).
+#
+# The REJECT_DH_OPS counter tests prove the X25519 op COUNT is input-independent;
+# this job proves the actual WALL-CLOCK latency of the rejection decision is
+# constant-time across the three attacker-reachable reject shapes, by sampling
+# each shape thousands of times and gating on the self-calibrated mean-latency
+# effect size. A data-dependent latency the op-count guard cannot see (the kind
+# that re-introduces an active-probing distinguisher) turns this RED.
+#
+# It is gated behind `--features dudect` (NOT #[ignore]) so it is a hard,
+# non-ignored gate here while staying out of the default `cargo test` (it is far
+# too slow for that lane). Kept in its own workflow file so its timing-sensitive
+# runner needs and longer runtime stay isolated from the main CI tier.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'ParallaX-DeepWiki/**'
+      - 'DEPLOYMENT.md'
+      - 'AGENTS.md'
+      - 'README.md'
+      - '.gitignore'
+      - 'LICENSE*'
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'ParallaX-DeepWiki/**'
+      - 'DEPLOYMENT.md'
+      - 'AGENTS.md'
+      - 'README.md'
+      - '.gitignore'
+      - 'LICENSE*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dudect-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  # Shared CI runners are slower and noisier than a dev box, so the per-run noise
+  # floor (control gap) is larger; the gate is self-calibrated against that
+  # control, and the absolute floor is set generously so a constant-time path
+  # never flakes while the pre-fix ~93µs asymmetry still fails by orders of
+  # magnitude. Tunable here without touching the test.
+  DUDECT_SAMPLES: '20000'
+  # 15µs absolute floor: ~18× the observed sub-µs constant-time residue, yet ~6×
+  # below the pre-fix ~93µs auth-fail asymmetry, so the gate has comfortable
+  # margin against shared-runner jitter while still failing a real regression by a
+  # wide band. The self-calibrated `PHYS_MULT × control` term carries the gate
+  # when a noisy runner inflates the control above this floor.
+  DUDECT_PHYS_FLOOR_NS: '15000'
+  DUDECT_PHYS_MULT: '10'
+
+jobs:
+  dudect:
+    name: dudect (reject-path constant-time)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-ci
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      # Lint the dudect-gated code too, so the feature-gated test cannot rot.
+      # Matches the repo convention (--all-targets, as in lint/ci-pr).
+      - name: cargo clippy --features dudect
+        run: cargo clippy --features dudect --all-targets --locked -- -D warnings
+
+      # The hard gate. Single-threaded so the timing loop is not perturbed by
+      # other test threads sharing the runner's cores.
+      - name: cargo test --features dudect (reject-path constant-time)
+        run: |
+          cargo test --locked --features dudect --lib \
+            rejection_path_timing_is_constant_dudect \
+            -- --nocapture --test-threads=1

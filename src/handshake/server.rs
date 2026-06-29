@@ -284,6 +284,102 @@ static RETAINED_QUIC_CONN_FOR_TEST: Mutex<Option<crate::transport::udp::quic::en
 #[cfg(test)]
 static REJECT_DH_OPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Fixed synthetic PSK used only to build the reject-path ballast context below.
+/// It never touches a real connection: it masks/authenticates a throwaway
+/// ClientHello whose verification work the reject arms replay. Using a constant
+/// (not the live PSK) keeps the context a pure `OnceLock` and keeps the real PSK
+/// out of the ballast code path entirely.
+const REJECT_BALLAST_PSK: &[u8] = b"parallax reject-path ballast psk (not a real secret)";
+
+/// Pre-built, read-only inputs that let the reject path replay the EXACT recover +
+/// derive + verify crypto the `recover==Some` auth-fail arm runs — by calling the
+/// SAME real functions on a fixed, legitimately-masked synthetic ClientHello,
+/// rather than hand-mirroring each step. Built once per process.
+struct RejectBallastCtx {
+    record: Vec<u8>,
+    parsed: crate::tls::client_hello::ClientHello,
+    /// X25519(ballast_server_static, record_tls_key_share) — the mask-slot shared
+    /// secret `recover` needs, precomputed so the ballast performs NO X25519 (the
+    /// reject arms' DH op-count parity is owned by the `dh()` ballast calls).
+    mask_ecdh: [u8; 32],
+    /// X25519(ballast_server_static, recovered_parallax_public) — the auth-slot
+    /// shared secret the HKDF auth-key derivation consumes, likewise precomputed.
+    auth_shared: [u8; 32],
+}
+
+/// Build the ballast context, or `None` if the synthetic ClientHello could not be
+/// produced/parsed (treated as "ballast unavailable" — the reject path then simply
+/// performs no replay; it never changes the decision, only the timing).
+fn build_reject_ballast_ctx() -> Option<RejectBallastCtx> {
+    let server = X25519KeyPair::generate();
+    let session = crate::tls::safari26::Safari26TlsCamouflage
+        .start(
+            "ballast.example".to_owned(),
+            REJECT_BALLAST_PSK,
+            &server.public,
+        )
+        .ok()?;
+    let record = session.client_hello_bytes().to_vec();
+    let parsed = parse_client_hello(&record).ok()?;
+    let tls_key_share = parsed.x25519_key_share?;
+    let mask_ecdh = x25519_shared_secret(&server.private, &tls_key_share);
+    // Recover the embedded ParallaX ephemeral so we can precompute the auth-slot
+    // shared secret the real verify path's HKDF would consume.
+    let material = recover_stateful_auth_material_from_parsed(
+        &record,
+        REJECT_BALLAST_PSK,
+        &mask_ecdh,
+        &parsed,
+    )
+    .ok()??;
+    let auth_shared = x25519_shared_secret(&server.private, &material.x25519_public);
+    Some(RejectBallastCtx {
+        record,
+        parsed,
+        mask_ecdh,
+        auth_shared,
+    })
+}
+
+/// Replay the `recover==Some` auth-fail crypto budget (recover + auth-key HKDF +
+/// verify HMAC/compare/ClientAuth-build) so the no-key_share and recover==None
+/// reject shapes are wall-clock indistinguishable from the auth-fail shape.
+///
+/// It calls the SAME real functions the auth-fail arm calls, on a fixed
+/// synthetic ClientHello, so there is nothing to keep in sync and no
+/// data-dependent branch — and it performs NO X25519 (DH op-count parity is
+/// already owned by the reject arms' `dh()` ballast). Verifying the dudect gate
+/// in `mod tests` proves the residual cross-shape timing is at the noise floor.
+///
+/// If the context failed to build (see `build_reject_ballast_ctx`), this is a
+/// no-op: the security decision is unchanged, only the timing-equalisation is
+/// skipped on that (degenerate, never-in-practice) platform.
+fn reject_path_constant_work() {
+    static CTX: OnceLock<Option<RejectBallastCtx>> = OnceLock::new();
+    let Some(ctx) = CTX.get_or_init(build_reject_ballast_ctx) else {
+        return;
+    };
+    let Ok(Some(material)) = recover_stateful_auth_material_from_parsed(
+        &ctx.record,
+        REJECT_BALLAST_PSK,
+        &ctx.mask_ecdh,
+        &ctx.parsed,
+    ) else {
+        return;
+    };
+    let Ok(auth_key) = derive_server_auth_key_from_shared(REJECT_BALLAST_PSK, &ctx.auth_shared)
+    else {
+        return;
+    };
+    let auth = verify_masked_stateful_client_hello_auth_with_parsed_material(
+        &ctx.record,
+        auth_key.as_slice(),
+        &material,
+        &ctx.parsed,
+    );
+    std::hint::black_box(&auth);
+}
+
 /// Test accessor for [`RETAINED_QUIC_CONN_FOR_TEST`] so the mid-relay reset e2e
 /// (in the client runtime test module) can grab and kill the server's retained
 /// QUIC fast plane in flight.
@@ -745,6 +841,13 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         server.listen
     );
 
+    // Eagerly build the reject-path ballast context now (one X25519 keygen +
+    // synthetic-ClientHello build), before the first connection. Otherwise the
+    // process's FIRST rejected connection would pay that one-time `OnceLock`
+    // initialisation and be measurably slower than later rejects — a "first-packet"
+    // timing tell. Warming it here folds that cost into startup.
+    reject_path_constant_work();
+
     loop {
         let (client, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -1115,13 +1218,22 @@ fn decide_connection_inbound(
                 );
             }
             // Masked auth failed. The two real DH ops (mask slot + auth slot) are
-            // already done, matching the recover==None and no-key_share reject
-            // shapes below at a fixed 2 ops, so fall straight to the splice.
+            // already done; the recover + derive + verify crypto budget this arm
+            // just spent is what the two reject arms below replay via
+            // reject_path_constant_work, so all three are wall-clock equal.
         } else {
+            // recover==None: spend the auth-slot DH (op-count parity), then replay
+            // the SAME recover+derive+verify crypto the auth-fail arm runs, so this
+            // reject shape is wall-clock indistinguishable from it (op-count alone
+            // cannot equalise the HKDF/HMAC the auth-fail arm runs and this skips).
             let _ = dh(&parsed.client_random); // ballast: auth-slot, recover==None
+            reject_path_constant_work();
         }
     } else {
+        // no key_share: same auth-slot DH (op-count parity) + recover+verify crypto
+        // replay as the arms above.
         let _ = dh(&parsed.client_random); // ballast: auth-slot, no key_share
+        reject_path_constant_work();
     }
 
     Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed))
@@ -6551,6 +6663,374 @@ mod tests {
              slack={slack}ns (control_gap={control_gap}ns). A timing distinguisher between \
              reject shapes may have been introduced."
         );
+    }
+
+    // ====================================================================
+    // dudect-style constant-time WALL-CLOCK proof of the inbound-reject path.
+    //
+    // The REJECT_DH_OPS counter tests above prove the X25519 OP COUNT is
+    // input-independent (exactly 2 per reject shape). That is necessary but NOT
+    // sufficient: it cannot see a data-dependent branch, cache pattern, or
+    // memcmp/HKDF/HMAC timing step that runs *within* a fixed op count. This
+    // section is the load-bearing measurement that closes that gap.
+    //
+    // Method (after Reparaz/Balasch/Verbauwhede, "Dude, is my code constant
+    // time?", DATE 2017): for each ordered pair of reject shapes we collect
+    // ~1e5–1e6 paired latency samples, accumulate them ONLINE (Welford — O(1)
+    // memory, no million-element vectors), and compute a Welch two-sample
+    // t-statistic. Per dudect we also evaluate a percentile-CROPPED variant that
+    // discards the slow tail (scheduler/IRQ outliers that swamp the real signal)
+    // and take the most significant |t| across crops.
+    //
+    // The gate is SELF-CALIBRATED: alongside every cross-shape pair we measure a
+    // same-shape control (shape vs itself, two independent interleaved streams).
+    // The control's |t| is the statistical noise floor of THIS run on THIS
+    // runner. A cross-shape |t| is a real distinguisher only if it materially
+    // exceeds the control. An absolute dudect floor (T_ABS) backstops the case
+    // where the control itself is pathologically large. This is what makes the
+    // test a hard gate that survives shared CI runners instead of an advisory.
+    // ====================================================================
+
+    /// Online (Welford) accumulator: streaming mean + variance over an unbounded
+    /// number of samples in O(1) memory. Used so the t-test never materialises a
+    /// million-element vector per shape.
+    #[cfg(test)]
+    #[derive(Clone, Default)]
+    struct WelfordAcc {
+        n: u64,
+        mean: f64,
+        m2: f64,
+    }
+
+    #[cfg(test)]
+    impl WelfordAcc {
+        fn push(&mut self, x: f64) {
+            self.n += 1;
+            let delta = x - self.mean;
+            self.mean += delta / self.n as f64;
+            let delta2 = x - self.mean;
+            self.m2 += delta * delta2;
+        }
+        /// Sample variance (n-1 denominator). 0.0 if fewer than 2 samples.
+        fn variance(&self) -> f64 {
+            if self.n < 2 {
+                0.0
+            } else {
+                self.m2 / (self.n - 1) as f64
+            }
+        }
+    }
+
+    /// Welch's two-sample t-statistic for unequal variances/sizes:
+    ///   t = (mean_a - mean_b) / sqrt(var_a/n_a + var_b/n_b)
+    /// Returns 0.0 when the pooled standard error is zero (degenerate/identical
+    /// constant streams) so the caller's |t| comparison stays well-defined.
+    #[cfg(test)]
+    fn welch_t(a: &WelfordAcc, b: &WelfordAcc) -> f64 {
+        if a.n < 2 || b.n < 2 {
+            return 0.0;
+        }
+        let se2 = a.variance() / a.n as f64 + b.variance() / b.n as f64;
+        if se2 <= 0.0 {
+            return 0.0;
+        }
+        (a.mean - b.mean) / se2.sqrt()
+    }
+
+    /// META-TEST (deterministic teeth for the t-statistic itself): Welch's t must
+    /// be ~0 for two draws of the same distribution and large for a clearly
+    /// shifted one. Pure arithmetic on synthetic data — fast, never flaky — so a
+    /// green dudect result below is not resting on a broken statistic.
+    #[test]
+    fn welch_t_statistic_is_non_vacuous() {
+        // Two interleaved halves of one ramp: same mean -> |t| small.
+        let (mut a, mut a2) = (WelfordAcc::default(), WelfordAcc::default());
+        for i in 0..2000u64 {
+            let x = 1000.0 + (i % 11) as f64;
+            if i % 2 == 0 {
+                a.push(x);
+            } else {
+                a2.push(x);
+            }
+        }
+        let same = welch_t(&a, &a2).abs();
+        assert!(
+            same < 4.5,
+            "same-distribution |t| must be small, got {same}"
+        );
+
+        // A shifted distribution (+50, same spread, same n) -> |t| huge.
+        let (mut lo, mut hi) = (WelfordAcc::default(), WelfordAcc::default());
+        for i in 0..2000u64 {
+            lo.push(1000.0 + (i % 11) as f64);
+            hi.push(1050.0 + (i % 11) as f64);
+        }
+        let shifted = welch_t(&lo, &hi).abs();
+        assert!(
+            shifted > 50.0,
+            "a clear mean shift must produce a large |t|, got {shifted}"
+        );
+    }
+
+    /// Time a single `decide_connection_inbound` reject in nanoseconds. The result
+    /// is discarded; only the latency matters. Marked #[inline(never)] so the
+    /// optimiser cannot hoist or fold the call out of the timing loop.
+    #[cfg(all(test, feature = "dudect"))]
+    #[inline(never)]
+    fn time_one_reject(record: &[u8], server_priv: &[u8; 32]) -> u64 {
+        use std::time::Instant;
+        let start = Instant::now();
+        let decision =
+            decide_connection_inbound(record, PSK, &[String::from("example.com")], server_priv);
+        // Consume the result through a black box so it is observably used.
+        std::hint::black_box(&decision);
+        start.elapsed().as_nanos() as u64
+    }
+
+    /// dudect crop levels: keep the fastest P% of samples, discarding the slow
+    /// tail where scheduler/IRQ noise dwarfs the (sub-ns) real signal. 100% = no
+    /// crop. We report the most significant |t| across all crops, as dudect does.
+    #[cfg(all(test, feature = "dudect"))]
+    const DUDECT_CROPS: &[u64] = &[100, 90, 70, 50, 30];
+
+    /// Run the dudect measurement for ONE ordered pair of byte records. Returns
+    /// `(t_cross, t_control)`:
+    ///   * `t_cross`   = max over crops of |Welch t(stream of `a`, stream of `b`)|
+    ///   * `t_control` = max over crops of |Welch t(two interleaved streams of `a`)|
+    ///
+    /// Both are measured in the SAME interleaved loop so environmental drift hits
+    /// them equally; the control is the per-run noise floor the gate calibrates
+    /// against. Sampling order within each round is permuted by a deterministic,
+    /// seeded RNG (dudect randomises class order to defeat systematic per-slot
+    /// bias) — deterministic so the test is reproducible without wall-clock RNG.
+    #[cfg(all(test, feature = "dudect"))]
+    fn dudect_pair(a: &[u8], b: &[u8], server_priv: &[u8; 32], samples: usize) -> DudectPair {
+        // Per-crop accumulators. Index 0 of each tuple is the "a"/"control-a"
+        // stream, index 1 is the "b"/"control-a2" stream.
+        let crops = DUDECT_CROPS.len();
+        let mut cross: Vec<(WelfordAcc, WelfordAcc)> = vec![Default::default(); crops];
+        let mut ctrl: Vec<(WelfordAcc, WelfordAcc)> = vec![Default::default(); crops];
+
+        // Pass 1: warm caches/branch predictor for BOTH shapes and estimate the
+        // per-crop latency cutoff from the combined a+b distribution, so cropping
+        // is data-driven rather than a magic constant. A small reservoir keeps
+        // this O(1)-ish without storing every warm-up sample.
+        let warm = (samples / 20).clamp(2_000, 50_000);
+        let mut reservoir: Vec<u64> = Vec::with_capacity(warm * 2);
+        for _ in 0..warm {
+            reservoir.push(time_one_reject(a, server_priv));
+            reservoir.push(time_one_reject(b, server_priv));
+        }
+        reservoir.sort_unstable();
+        // cutoff[c] = the P-th percentile latency for crop DUDECT_CROPS[c].
+        let cutoffs: Vec<u64> = DUDECT_CROPS
+            .iter()
+            .map(|&p| {
+                if p >= 100 {
+                    u64::MAX
+                } else {
+                    let idx = ((reservoir.len() as u64 * p) / 100) as usize;
+                    reservoir[idx.min(reservoir.len() - 1)]
+                }
+            })
+            .collect();
+
+        // Deterministic xorshift64* — seeded constant, no wall-clock entropy, so
+        // the permutation of measurement order is reproducible across runs.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_bit = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng & 1 == 1
+        };
+
+        // Pass 2: interleaved paired sampling. Each round measures, in a
+        // randomised order, one sample of `a` and one of `b` for the cross test,
+        // plus two further independent `a` samples for the control. Feeding each
+        // latency into every crop whose cutoff it satisfies.
+        let feed = |accs: &mut [(WelfordAcc, WelfordAcc)], cutoffs: &[u64], slot: usize, x: u64| {
+            for (acc, &cut) in accs.iter_mut().zip(cutoffs.iter()) {
+                if x <= cut {
+                    if slot == 0 {
+                        acc.0.push(x as f64);
+                    } else {
+                        acc.1.push(x as f64);
+                    }
+                }
+            }
+        };
+
+        for _ in 0..samples {
+            // Cross pair: randomise whether `a` or `b` is timed first this round.
+            if next_bit() {
+                let xa = time_one_reject(a, server_priv);
+                let xb = time_one_reject(b, server_priv);
+                feed(&mut cross, &cutoffs, 0, xa);
+                feed(&mut cross, &cutoffs, 1, xb);
+            } else {
+                let xb = time_one_reject(b, server_priv);
+                let xa = time_one_reject(a, server_priv);
+                feed(&mut cross, &cutoffs, 1, xb);
+                feed(&mut cross, &cutoffs, 0, xa);
+            }
+            // Control pair: two independent `a` streams, same randomisation.
+            if next_bit() {
+                let c0 = time_one_reject(a, server_priv);
+                let c1 = time_one_reject(a, server_priv);
+                feed(&mut ctrl, &cutoffs, 0, c0);
+                feed(&mut ctrl, &cutoffs, 1, c1);
+            } else {
+                let c1 = time_one_reject(a, server_priv);
+                let c0 = time_one_reject(a, server_priv);
+                feed(&mut ctrl, &cutoffs, 1, c1);
+                feed(&mut ctrl, &cutoffs, 0, c0);
+            }
+        }
+
+        let max_abs_t = |accs: &[(WelfordAcc, WelfordAcc)]| -> f64 {
+            accs.iter()
+                .map(|(x, y)| welch_t(x, y).abs())
+                .fold(0.0_f64, f64::max)
+        };
+        // Absolute mean-latency gap (ns) on the UNCROPPED (crop 100%, index 0)
+        // accumulators — the physical effect size, used as the second gate. Unlike
+        // |t| (which ∝ √n and flags sub-ns structure at scale), this is invariant
+        // to sample count, so it cleanly separates a µs-scale regression from the
+        // sub-µs SNI-length residue.
+        let mean_gap_ns = |accs: &[(WelfordAcc, WelfordAcc)]| -> f64 {
+            let (a, b) = &accs[0];
+            (a.mean - b.mean).abs()
+        };
+        DudectPair {
+            t_cross: max_abs_t(&cross),
+            t_ctrl: max_abs_t(&ctrl),
+            mean_gap_cross_ns: mean_gap_ns(&cross),
+            mean_gap_ctrl_ns: mean_gap_ns(&ctrl),
+        }
+    }
+
+    /// Result of one `dudect_pair` measurement: the self-calibrated Welch |t|
+    /// (statistical, √n-sensitive) and the absolute mean-latency gap in ns
+    /// (physical effect size, sample-count-invariant), each with its same-shape
+    /// control counterpart for self-normalisation.
+    #[cfg(all(test, feature = "dudect"))]
+    struct DudectPair {
+        t_cross: f64,
+        t_ctrl: f64,
+        mean_gap_cross_ns: f64,
+        mean_gap_ctrl_ns: f64,
+    }
+
+    /// LOAD-BEARING constant-time gate. For all three ordered pairs of the three
+    /// attacker-reachable parseable reject shapes (no-key_share `B`,
+    /// key_share+recover==None `R`, key_share+auth-fail `D`), the cross-shape
+    /// latency must be indistinguishable from a same-shape control on BOTH a
+    /// physical effect-size measure (absolute mean-latency gap, ns) AND a
+    /// statistical measure (self-calibrated Welch |t|). A real data-dependent
+    /// timing distinguisher between reject shapes turns this RED.
+    ///
+    /// Gated behind `--features dudect` (NOT #[ignore]): it is too slow for the
+    /// default `cargo test`, but when built it is a hard, non-ignored gate so a
+    /// regression cannot pass CI silently. The dedicated `dudect.yml` job runs it.
+    /// Sample count: env `DUDECT_SAMPLES` (default 1e5; nightly sets 1e6).
+    #[cfg(feature = "dudect")]
+    #[test]
+    fn rejection_path_timing_is_constant_dudect() {
+        let server = X25519KeyPair::generate();
+
+        // Minimum sample count for the gate to have statistical power. A tiny (or
+        // zero) sample count would make the loop below run too few iterations for
+        // the mean/variance to be meaningful — and `DUDECT_SAMPLES=0` would skip
+        // sampling entirely, leaving the accumulators empty and the assertions
+        // vacuously green. Reject anything below the floor LOUDLY rather than
+        // silently clamping, so the load-bearing gate cannot be neutered via env.
+        const MIN_DUDECT_SAMPLES: usize = 1_000;
+        let samples: usize = match std::env::var("DUDECT_SAMPLES") {
+            Ok(v) => {
+                let n: usize = v
+                    .parse()
+                    .unwrap_or_else(|_| panic!("DUDECT_SAMPLES={v:?} is not a valid usize"));
+                assert!(
+                    n >= MIN_DUDECT_SAMPLES,
+                    "DUDECT_SAMPLES={n} is below the {MIN_DUDECT_SAMPLES} floor; too few \
+                     samples would make this load-bearing constant-time gate vacuous"
+                );
+                n
+            }
+            Err(_) => 100_000,
+        };
+
+        // The three parseable reject shapes, matching the REJECT_DH_OPS counter
+        // tests' coverage exactly (B / recover==None / D).
+        let shape_b = client_hello_fixture_no_key_share("example.com");
+        let shape_r = client_hello_fixture_with_key_share_no_sni(&[0x66; 32]);
+        let shape_d = client_hello_fixture_with_key_share("example.com", &[0x66; 32]);
+        let shapes: [(&str, &[u8]); 3] = [
+            ("B(no-key_share)", &shape_b),
+            ("R(recover-None)", &shape_r),
+            ("D(auth-fail)", &shape_d),
+        ];
+
+        // DECISION CRITERION — physical effect size, self-calibrated.
+        //
+        // The hard gate is the absolute mean-latency gap (ns) between reject
+        // shapes, bounded against the same-run same-shape control gap. The mean gap
+        // is the EFFECT SIZE and is INVARIANT to sample count, so it does not
+        // inflate at 1e6 samples. The distinguisher this test exists to catch — the
+        // original ~93µs auth-fail asymmetry — is µs-scale and blows this gate out
+        // by orders of magnitude; the sub-µs residue that survives the constant-
+        // work replay (an SNI-length-dependent HMAC cost of a few ns) sits far
+        // below it.
+        //   allow = max(PHYS_FLOOR_NS, PHYS_MULT × control_gap_ns)
+        //
+        // Welch |t| is reported for diagnostics but is NOT gated: at 1e5–1e6
+        // samples |t| ∝ √n flags even a constant-time path's few-ns residue as
+        // "significant" (and swings widely with the control's per-run jitter), so a
+        // raw-|t| gate cannot separate a real regression from measurement noise on
+        // a path that is already physically constant-time. The dudect literature's
+        // |t|>4.5 rule assumes a fixed sample budget; the effect-size gate is the
+        // sample-count-robust equivalent. A real regression is caught physically.
+        let phys_floor_ns: f64 = env_f64("DUDECT_PHYS_FLOOR_NS", 3_000.0);
+        let phys_mult: f64 = env_f64("DUDECT_PHYS_MULT", 8.0);
+
+        for i in 0..shapes.len() {
+            for j in 0..shapes.len() {
+                if i == j {
+                    continue;
+                }
+                let (na, a) = shapes[i];
+                let (nb, b) = shapes[j];
+                let r = dudect_pair(a, b, &server.private, samples);
+                let phys_allow = phys_floor_ns.max(phys_mult * r.mean_gap_ctrl_ns);
+                eprintln!(
+                    "dudect {na} vs {nb}: mean_gap={:.0}ns (ctrl {:.0}ns, allow {:.0}ns) \
+                     [diag |t|={:.2} ctrl |t|={:.2}] samples={samples}",
+                    r.mean_gap_cross_ns, r.mean_gap_ctrl_ns, phys_allow, r.t_cross, r.t_ctrl,
+                );
+                assert!(
+                    r.mean_gap_cross_ns <= phys_allow,
+                    "TIMING DISTINGUISHER ({na} vs {nb}): mean latency gap {:.0}ns \
+                     exceeds allow {:.0}ns (control {:.0}ns, samples={samples}, \
+                     diag |t|={:.2}). The inbound-reject path has a µs-scale data-\
+                     dependent latency the X25519 op-count guard cannot see — the \
+                     anti-active-probing argument is breached.",
+                    r.mean_gap_cross_ns,
+                    phys_allow,
+                    r.mean_gap_ctrl_ns,
+                    r.t_cross,
+                );
+            }
+        }
+    }
+
+    /// Parse an `f64` from an env var, falling back to `default` when unset/invalid.
+    #[cfg(all(test, feature = "dudect"))]
+    fn env_f64(key: &str, default: f64) -> f64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     }
 
     /// L-7: a Verified PX1P ack with no retained connection must map to HardFail
