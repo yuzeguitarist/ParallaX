@@ -20,7 +20,7 @@
 //! offload (older kernels, non-Linux), so correctness never depends on it.
 
 #[cfg(target_os = "linux")]
-pub use linux::{enable_gro, recv_gro, send_gso, GroSegments};
+pub use linux::{enable_gro, recv_gro, send_gso};
 
 /// The kernel's hard ceiling on segments per `UDP_SEGMENT` send (`UDP_MAX_SEGMENTS`
 /// = `1 << 6` in `net/ipv4/udp.c`). A `sendmsg` whose GSO buffer holds more than
@@ -177,19 +177,12 @@ mod linux {
 
     /// A GRO read: the bytes the kernel coalesced and the segment size to re-split
     /// them by. `segment_size == total` (no GRO cmsg) means one ordinary datagram.
+    /// The caller re-splits with `buf[..total].chunks(segment_size)` — each chunk is
+    /// one of the original datagrams (the last may be shorter).
     pub struct GroSegments {
         pub peer: SocketAddr,
         pub total: usize,
         pub segment_size: usize,
-    }
-
-    impl GroSegments {
-        /// Iterate the individual datagrams within `buf[..self.total]`, each at most
-        /// `segment_size` (the last may be shorter).
-        pub fn iter<'a>(&self, buf: &'a [u8]) -> impl Iterator<Item = &'a [u8]> {
-            let seg = self.segment_size.max(1);
-            buf[..self.total].chunks(seg)
-        }
     }
 
     /// Receive one (possibly GRO-coalesced) read into `buf` via `recvmsg`, returning
@@ -231,9 +224,7 @@ mod linux {
         // bytes; SockAddrStorage carries that storage verbatim.
         let peer = unsafe { SockAddr::new(storage, msg.msg_namelen as socklen_t) }
             .as_socket()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "recvmsg returned a non-IP peer")
-            })?;
+            .ok_or_else(|| io::Error::other("recvmsg returned a non-IP peer"))?;
 
         // Default: no GRO cmsg => one datagram of `total` bytes.
         let mut segment_size = total;
