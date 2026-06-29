@@ -703,18 +703,18 @@ impl AeadCodec {
         *self.nonce_base
     }
 
-    /// Advances the sequence counter by `count` after a batch of records was
-    /// sealed/opened off-thread with explicit sequence numbers.
+    /// Advances the sequence counter by `count`. The single checked path for every
+    /// counter advance: the batch seal/open paths call it with the batch size, and
+    /// the serial `seal_in_place_detached` / `open_in_place_split` call it with `1`.
     ///
-    /// Callers (the parallel seal/open batch paths) pre-check `sequence +
-    /// count <= u64::MAX` before any record is processed, so this never wraps
-    /// in practice. The counter is a nonce input, so a silent wrap (the prior
-    /// `saturating_add`, which pins it at `u64::MAX`) would risk nonce reuse if
-    /// a future path ever reached here without that pre-check. Fail loud
-    /// instead: a `checked_add` overflow poisons the codec, so every later
-    /// seal/open fails closed via `ensure_usable` rather than reusing a nonce.
-    /// The pre-checks remain the first gate; this is defence in depth on the
-    /// primitive itself.
+    /// The counter is a nonce input, so a silent wrap (the prior `saturating_add`,
+    /// which pins it at `u64::MAX`) would risk nonce reuse. Both classes of caller
+    /// pre-check the boundary before any record is processed (the batch path via
+    /// `sequence + count <= u64::MAX`, the serial path via the `*_with` functions'
+    /// `sequence == u64::MAX` rejection), so this never wraps in practice. Fail loud
+    /// regardless: a `checked_add` overflow poisons the codec, so every later
+    /// seal/open fails closed via `ensure_usable` rather than reusing a nonce. The
+    /// pre-checks remain the first gate; this is defence in depth on the primitive.
     pub(crate) fn advance_sequence(&mut self, count: u64) {
         match self.sequence.checked_add(count) {
             Some(next) => self.sequence = next,
@@ -768,7 +768,12 @@ impl AeadCodec {
             plaintext,
             aad,
         )?;
-        self.sequence += 1;
+        // Advance via the checked path so the nonce counter fails loud (poisons the
+        // codec) rather than wrapping. `*_with` already rejected `sequence ==
+        // u64::MAX` above, so this never actually overflows today; routing the
+        // single-step increment through the same primitive keeps the fail-loud
+        // guarantee on the counter itself, not on a caller-side pre-check.
+        self.advance_sequence(1);
         Ok(tag)
     }
 
@@ -806,7 +811,9 @@ impl AeadCodec {
             ciphertext_with_tag,
             aad,
         )?;
-        self.sequence += 1;
+        // Checked advance (see `seal_in_place_detached`): fail loud on the counter
+        // itself instead of relying solely on the `*_with` pre-check.
+        self.advance_sequence(1);
         Ok(plaintext_len)
     }
 }

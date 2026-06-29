@@ -267,8 +267,8 @@ pub struct ServerConfig {
     /// Operator's authorized-SNI allowlist, paired with `marker_key`. A v1 Initial
     /// carrying a valid + fresh marker terminates locally only if its SNI is on this
     /// list; any other SNI is fronted to the origin, matching the TCP plane's
-    /// authorized-SNI gate. Empty when `marker_key` is `None` (cold-start: the gate
-    /// never runs because no marker is ever recovered).
+    /// authorized-SNI gate. Ignored when `marker_key` is `None`: with no marker key,
+    /// no marker is ever recovered, so the gate never runs whatever this contains.
     pub authorized_sni: Vec<String>,
     /// Maximum UDP payload read per datagram on this endpoint — the inbound recv
     /// buffer size and the origin-splice relay buffer size (issue #75). Oversized
