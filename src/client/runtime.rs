@@ -1795,7 +1795,10 @@ async fn run_client_udp_probe(
     // the verified (commit-late) 1-RTT path. The cached ticket is CONSUMED on use
     // (single-use). With no ticket, a normal cold 1-RTT handshake + probe runs,
     // byte-identical to before.
-    let stored_ticket = client_quic_ticket_slot().lock().unwrap().take();
+    let stored_ticket = client_quic_ticket_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
     let (conn, control_send, relay_send, relay_recv, outcome) = if let Some(ticket) = stored_ticket
     {
         let conn = match tokio::time::timeout(
@@ -1951,7 +1954,9 @@ async fn run_client_udp_probe(
             // issues its NewSessionTicket post-handshake; if it has not arrived yet
             // this is `None` and the next session simply starts cold.
             if let Some(fresh) = conn.take_session_ticket(current_unix_millis()) {
-                *client_quic_ticket_slot().lock().unwrap() = Some(fresh);
+                *client_quic_ticket_slot()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fresh);
             }
             ClientProbeResult {
                 outcome,

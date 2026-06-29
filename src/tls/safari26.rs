@@ -25,6 +25,7 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256, Sha384};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 use zeroize::Zeroizing;
@@ -1444,7 +1445,10 @@ fn process_server_handshake_messages(
                     ));
                 }
                 let expected = keys.server_finished_verify_data(transcript)?;
-                if body != expected {
+                // Constant-time compare: matches the QUIC TLS paths
+                // (handshake.rs / server.rs verify the Finished MAC via `ct_eq`)
+                // and avoids a per-byte timing distinguisher on the verify_data.
+                if !bool::from(body.ct_eq(&expected)) {
                     return Err(Safari26TlsError::Handshake(
                         "server Finished verify_data mismatch".to_owned(),
                     ));
