@@ -23,7 +23,7 @@ use tokio::{
     sync::{mpsc, Semaphore, TryAcquireError},
     time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::source_limit::SourceLimiter;
 use super::transcript::transcript_hash;
@@ -1084,7 +1084,12 @@ async fn handle_connection_inner(
 struct ServerRuntimeSecrets {
     private_key: Arc<zeroize::Zeroizing<[u8; 32]>>,
     server_public_key: [u8; 32],
-    identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
+    // #3 (obfuscated residency): the ML-DSA identity signing key is used at most
+    // once per connection, so it is kept XOR-masked while idle and unmasked only
+    // for the brief sign window. The X25519 static private key stays a plain mlocked
+    // `Zeroizing` because it is on every connection's key-derivation hot path, where
+    // a per-use unmask would be the wrong trade.
+    identity_secret_key: Arc<crate::process_hardening::MaskedSecret>,
 }
 
 impl ServerRuntimeSecrets {
@@ -1109,11 +1114,14 @@ impl ServerRuntimeSecrets {
             "runtime.server.private_key",
             &**private_key,
         );
-        let identity_secret_key = Arc::new(identity_secret_key);
-        crate::process_hardening::protect_secret_bytes(
-            "runtime.server.identity_secret_key",
-            identity_secret_key.as_slice(),
-        );
+        // #3: mask the identity key for idle residency. `decode_base64_secret`
+        // returned it in a `Zeroizing`, which wipes the plaintext copy on drop at
+        // the end of this scope once `MaskedSecret::new` has masked it. `MaskedSecret`
+        // registers its own masked/mask regions with the dump/lock hardening, so no
+        // separate `protect_secret_bytes` call is needed here.
+        let identity_secret_key = Arc::new(crate::process_hardening::MaskedSecret::new(
+            &identity_secret_key,
+        ));
         Ok(Self {
             private_key,
             server_public_key,
@@ -1129,7 +1137,7 @@ impl ServerRuntimeSecrets {
         self.server_public_key
     }
 
-    fn identity_secret_key(&self) -> Arc<zeroize::Zeroizing<Vec<u8>>> {
+    fn identity_secret_key(&self) -> Arc<crate::process_hardening::MaskedSecret> {
         Arc::clone(&self.identity_secret_key)
     }
 }
@@ -1817,7 +1825,7 @@ where
 async fn run_authenticated_data_mode(
     mut handshake: AuthenticatedHandshake,
     fixed_data_target: Option<&str>,
-    identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
+    identity_secret_key: Arc<crate::process_hardening::MaskedSecret>,
     sandwich_secret: &[u8],
     traffic: TrafficConfig,
     udp: &UdpConfig,
@@ -1851,7 +1859,14 @@ async fn run_authenticated_data_mode(
     let (fallback_read, mut fallback_write) = handshake.fallback.into_split();
     let mut client_records = TlsRecordReader::buffered(client_read);
     let mut fallback_records = TlsRecordReader::buffered(fallback_read);
-    let mut client_record = Vec::new();
+    // #1 (shrink the residency window): client->target plaintext is decrypted in
+    // place into this buffer, so wrap it in `Zeroizing` to scrub on drop at every
+    // exit of this relay. Best-effort: `Zeroizing` wipes the live `[0..len)` of the
+    // final buffer only — a record larger than capacity reallocs and frees the old
+    // (plaintext) buffer un-scrubbed, and a truncate leaves a stale capacity tail.
+    // It removes the dominant exposure (the last record sitting in a long-lived
+    // named buffer), not every fragment. See the realloc-scrub follow-up.
+    let mut client_record = Zeroizing::new(Vec::new());
     // Raw byte scratch for the origin->client camouflage forward (D5). The origin
     // direction is now a verbatim byte pump (preserving the origin's native TCP
     // segmentation) rather than a per-record re-frame, so it reads into a fixed
@@ -2947,20 +2962,24 @@ async fn encapsulate_mlkem_blocking(
 }
 
 async fn sign_server_identity_blocking(
-    identity_secret_key: Arc<zeroize::Zeroizing<Vec<u8>>>,
+    identity_secret_key: Arc<crate::process_hardening::MaskedSecret>,
     transcript_hash: [u8; 32],
     server_public_key: [u8; 32],
     pq_rekey_binding: [u8; 32],
     epoch: u64,
 ) -> Result<Vec<u8>, HandshakeServerError> {
+    // #3: the identity key is masked while idle; unmask it only inside this brief
+    // sign window (the `with_plaintext` scratch is wiped the moment signing returns).
     Ok(tokio::task::spawn_blocking(move || {
-        identity::sign_server_identity(
-            identity_secret_key.as_slice(),
-            &transcript_hash,
-            &server_public_key,
-            &pq_rekey_binding,
-            epoch,
-        )
+        identity_secret_key.with_plaintext(|sk| {
+            identity::sign_server_identity(
+                sk,
+                &transcript_hash,
+                &server_public_key,
+                &pq_rekey_binding,
+                epoch,
+            )
+        })
     })
     .await??)
 }
@@ -4232,10 +4251,19 @@ where
         .await?;
     }
 
-    let mut client_record = Vec::new();
-    let mut extra_record = Vec::new();
-    let mut batch_records = Vec::new();
-    let mut batch_plaintext = Vec::new();
+    // #1 (shrink the residency window): the relay plaintext buffers are wrapped in
+    // `Zeroizing` so every exit from this multi-`return` loop scrubs the relayed
+    // plaintext on drop, rather than leaving it in a freed page. `client_record`/
+    // `batch_plaintext` hold decrypted client->target plaintext; `batch_records`/
+    // `extra_record` stage the ciphertext records opened in place, so they too
+    // transit plaintext and are wiped. Drop-scrub keeps the hot loop body untouched
+    // (no per-record zeroize). Best-effort: only the final buffer's live `[0..len)`
+    // is wiped — reallocated-and-freed buffers and post-truncate capacity tails are
+    // not scrubbed (tracked follow-up).
+    let mut client_record = Zeroizing::new(Vec::new());
+    let mut extra_record = Zeroizing::new(Vec::new());
+    let mut batch_records = Zeroizing::new(Vec::new());
+    let mut batch_plaintext = Zeroizing::new(Vec::new());
     let mut deferred_read_error: Option<io::Error> = None;
     // Idle backstop for the whole mux session. Without it, a client that goes
     // silent (while its target readers also idle out) would leave this loop
@@ -5322,7 +5350,10 @@ where
     let mut uploaded = 0_u64;
     let mut consecutive_empty: u32 = 0;
     let mut total_empty: u64 = 0;
-    let mut client_record = Vec::new();
+    // #1: speed-test upload carries throwaway measurement bytes, but wrap the
+    // buffer in `Zeroizing` anyway so every relay-reader call site is uniformly
+    // scrub-on-drop (the reader's internal buffer is already `Zeroizing`).
+    let mut client_record = Zeroizing::new(Vec::new());
     let idle = fallback_idle_timeout();
     let phase_start = Instant::now();
     while uploaded < bytes {
@@ -5419,13 +5450,20 @@ async fn server_upload_loop<R>(
 where
     R: LegReader,
 {
-    let mut client_record = Vec::new();
+    // #1 (shrink the residency window): this is the production client->target TCP
+    // upload relay, so its plaintext buffers are `Zeroizing` to scrub on drop at
+    // every exit, matching the mux relay loop and the reader's internal buffer.
+    // `client_record`/`batch_plaintext` carry decrypted client->target plaintext;
+    // `batch_records`/`extra_record` stage the ciphertext records opened in place.
+    // Best-effort (same caveat as the mux loop): only the final buffer's live bytes
+    // are wiped; reallocated/truncated remnants are not (tracked follow-up).
+    let mut client_record = Zeroizing::new(Vec::new());
     // Scratch reused across iterations for the opportunistic batch-open path
     // (mirrors the mux reader): extra-record staging, concatenated records, and
     // concatenated plaintext.
-    let mut extra_record = Vec::new();
-    let mut batch_records = Vec::new();
-    let mut batch_plaintext = Vec::new();
+    let mut extra_record = Zeroizing::new(Vec::new());
+    let mut batch_records = Zeroizing::new(Vec::new());
+    let mut batch_plaintext = Zeroizing::new(Vec::new());
     let mut deferred_read_error: Option<io::Error> = None;
 
     loop {
@@ -5886,6 +5924,23 @@ impl RelaySealScratch {
             plaintext_buf: Vec::with_capacity(capacity),
             record_lens: Vec::new(),
         }
+    }
+}
+
+impl Drop for RelaySealScratch {
+    /// Wipe the relay plaintext on teardown (#1, shrink the residency window).
+    /// `plaintext_buf` accumulates frame-aligned relay plaintext before sealing
+    /// and `records_buf` holds the staged (plaintext-then-sealed) record bytes; a
+    /// bare `Vec` drop only frees, it does not scrub, leaving relay plaintext in a
+    /// freed page until the allocator reuses it. Zeroizing at scratch teardown (one
+    /// call per relay, NOT per record) keeps the hot seal path untouched while
+    /// denying a post-relay scrape the final buffers' plaintext. Best-effort: wipes
+    /// the live `[0..len)` only — buffers reallocated as the session grew were freed
+    /// un-scrubbed, so this is residency reduction, not a guarantee every byte is
+    /// gone. `records`/`record_lens` are offset/length bookkeeping, not secret.
+    fn drop(&mut self) {
+        self.plaintext_buf.zeroize();
+        self.records_buf.zeroize();
     }
 }
 

@@ -1,5 +1,6 @@
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use zeroize::Zeroizing;
 
 pub const TLS_HEADER_LEN: usize = 5;
 pub const TLS_LEGACY_VERSION: [u8; 2] = [0x03, 0x03];
@@ -84,7 +85,14 @@ pub struct TlsRecordReader<R> {
     reader: R,
     header: [u8; TLS_HEADER_LEN],
     header_pos: usize,
-    record: Vec<u8>,
+    // #1 (shrink the residency window): the internal record buffer is the other
+    // half of the `mem::swap` in `read_record_into` — a freshly decrypted record's
+    // plaintext lands back here on the NEXT read, so wrapping it in `Zeroizing`
+    // wipes it when the reader is dropped (or `into_inner`'d). Without this, the
+    // caller-side `Zeroizing` only ever scrubs whichever of the two ping-ponged
+    // buffers it currently holds, leaving the most recent plaintext resident in
+    // the reader. This is the root-cause fix that covers every relay reader at once.
+    record: Zeroizing<Vec<u8>>,
     payload_len: Option<usize>,
     payload_pos: usize,
 }
@@ -104,7 +112,7 @@ impl<R> TlsRecordReader<R> {
             reader,
             header: [0_u8; TLS_HEADER_LEN],
             header_pos: 0,
-            record: Vec::new(),
+            record: Zeroizing::new(Vec::new()),
             payload_len: None,
             payload_pos: 0,
         }
@@ -178,8 +186,8 @@ where
             })?;
             self.record.clear();
             self.record.extend_from_slice(&self.header);
-            self.record
-                .reserve(parsed.total_len.saturating_sub(self.record.len()));
+            let additional = parsed.total_len.saturating_sub(self.record.len());
+            self.record.reserve(additional);
             self.payload_len = Some(parsed.payload_len);
             self.payload_pos = 0;
         }
@@ -189,7 +197,7 @@ where
             let remaining = payload_len - self.payload_pos;
             let n = (&mut self.reader)
                 .take(remaining as u64)
-                .read_buf(&mut self.record)
+                .read_buf(&mut *self.record)
                 .await?;
             if n == 0 {
                 return Err(std::io::Error::new(
@@ -205,7 +213,7 @@ where
         self.payload_len = None;
         self.payload_pos = 0;
         out.clear();
-        std::mem::swap(out, &mut self.record);
+        std::mem::swap(out, &mut *self.record);
         Ok(())
     }
 
