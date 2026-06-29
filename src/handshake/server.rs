@@ -380,6 +380,13 @@ fn reject_path_constant_work() {
     std::hint::black_box(&auth);
 }
 
+/// Test-only counter of how many times `server_download_loop` took the saturated
+/// read-ahead (pipeline) branch, so a regression test can prove a short/non-bulk
+/// flow stays on the serial branch (counter unchanged) while a saturating bulk
+/// flow engages the pipeline (counter advances). Not compiled in release.
+#[cfg(test)]
+static DOWNLOAD_READ_AHEAD_ENGAGED: AtomicU64 = AtomicU64::new(0);
+
 /// Test accessor for [`RETAINED_QUIC_CONN_FOR_TEST`] so the mid-relay reset e2e
 /// (in the client runtime test module) can grab and kill the server's retained
 /// QUIC fast plane in flight.
@@ -5608,12 +5615,16 @@ where
             )?;
 
             if n == cap {
+                #[cfg(test)]
+                DOWNLOAD_READ_AHEAD_ENGAGED.fetch_add(1, Ordering::Relaxed);
                 // Saturated bulk: overlap the flush of this batch with reading the
                 // next burst into the spare buffer (lazily allocated). The borrows
                 // are disjoint (write: `client_write` + `seal_scratch.records_buf`;
-                // read: `target_read` + `spare`), so neither aliases the codec. A
-                // write error short-circuits immediately (the read is cancelled),
-                // matching the serial path's "write error before next read" order.
+                // read: `target_read` + `spare`), so neither aliases the codec. The
+                // helper finishes the write before surfacing any read result; only a
+                // write that completes FIRST with an error cancels the still-pending
+                // read, matching the serial path's "write error before next read"
+                // order (a read error never cancels the in-flight write).
                 let spare = spare_buf.get_or_insert_with(|| vec![0_u8; cap]);
                 let next_n = write_batch_with_read_ahead(
                     &mut client_write,
@@ -8837,7 +8848,15 @@ mod tests {
     /// pure-serial (no read-ahead, no spare allocation) branch and relay byte-exact.
     /// This pins the non-bulk path the gate routes short/interactive flows through,
     /// whose burst segmentation is identical to the pre-pipeline serial loop.
+    ///
+    /// Reads the process-global `DOWNLOAD_READ_AHEAD_ENGAGED` counter that other
+    /// parallel relay tests can perturb, so it is `#[ignore]`d and run serially
+    /// (CI runs `cargo test -- --ignored --test-threads=1`), matching the
+    /// `REJECT_DH_OPS` counter-test convention. The counter-unchanged assertion is
+    /// the part that distinguishes a correctly-gated serial relay from an
+    /// unconditional read-ahead (which would also relay byte-exact).
     #[tokio::test]
+    #[ignore = "reads the process-global DOWNLOAD_READ_AHEAD_ENGAGED counter; run serially"]
     async fn download_short_flow_takes_serial_branch_byte_exact() {
         use rand::{rngs::StdRng, RngCore, SeedableRng};
         use tokio::time::{timeout, Duration};
@@ -8857,6 +8876,12 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0x1234);
         let mut payload = vec![0_u8; 7777];
         rng.fill_bytes(&mut payload);
+
+        // Snapshot the saturated-read-ahead engagement counter; for a sub-buffer
+        // flow it must NOT advance (the whole point of the saturated gate). This is
+        // what distinguishes a correctly-gated serial relay from an unconditional
+        // read-ahead, which would also relay byte-exact and pass the byte check.
+        let read_ahead_before = DOWNLOAD_READ_AHEAD_ENGAGED.load(Ordering::Relaxed);
 
         let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = origin_listener.local_addr().unwrap();
@@ -8918,6 +8943,81 @@ mod tests {
         assert_eq!(
             collected, payload,
             "short flow must relay byte-exact via the serial branch"
+        );
+        assert_eq!(
+            DOWNLOAD_READ_AHEAD_ENGAGED.load(Ordering::Relaxed),
+            read_ahead_before,
+            "a sub-buffer flow must NOT engage the saturated read-ahead branch \
+             (the saturated gate must keep short/interactive flows on the serial path)",
+        );
+
+        // Conversely, a multi-MiB saturating transfer MUST engage the read-ahead
+        // branch — proving the gate is not vacuously always-serial. Run in the same
+        // serial test so the counter delta is race-free.
+        let bulk_before = DOWNLOAD_READ_AHEAD_ENGAGED.load(Ordering::Relaxed);
+        let mut bulk = vec![0_u8; 4 * 1024 * 1024 + 99];
+        rng.fill_bytes(&mut bulk);
+
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let bulk_for_origin = bulk.clone();
+        let origin = tokio::spawn(async move {
+            let mut target = tokio::net::TcpStream::connect(origin_addr).await.unwrap();
+            target.write_all(&bulk_for_origin).await.unwrap();
+        });
+        let (origin_for_loop, _) = origin_listener.accept().await.unwrap();
+        let (target_read, _t) = origin_for_loop.into_split();
+
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let collector = tokio::spawn(async move {
+            let (client_side, _) = client_listener.accept().await.unwrap();
+            let (client_read, _c) = client_side.into_split();
+            let mut reader = crate::transport::leg::TcpLegReader::buffered(client_read);
+            let mut open = codec();
+            let mut record = Vec::new();
+            let mut plaintext = Vec::new();
+            loop {
+                match reader.read_record_into(&mut record).await {
+                    Ok(()) => {
+                        let range = open.open_in_place_payload_range(&mut record).unwrap();
+                        plaintext.extend_from_slice(&record[range]);
+                    }
+                    Err(err) if reader.is_clean_close(&err) => break,
+                    Err(err) => panic!("unexpected reader error: {err}"),
+                }
+            }
+            plaintext
+        });
+        let client_for_loop = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+        let (_c, client_write) = client_for_loop.into_split();
+
+        let target_buf = vec![0_u8; relay_read_buffer_len(max_plaintext_len(0))];
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let traffic = TrafficConfig::default();
+        let download = server_download_loop(
+            target_read,
+            crate::transport::leg::TcpLegWriter(client_write),
+            codec(),
+            target_buf,
+            TimingProfile::from_config(traffic),
+            CoverTrafficProfile::from_config(traffic),
+            activity,
+            13,
+        );
+        let (loop_res, origin_res, collected) = timeout(Duration::from_secs(30), async {
+            tokio::join!(download, origin, collector)
+        })
+        .await
+        .expect("bulk relay must complete promptly");
+        loop_res.expect("download loop returns Ok on clean EOF");
+        origin_res.expect("origin task");
+        let collected = collected.expect("collector task");
+        assert_eq!(collected, bulk, "bulk flow must relay byte-exact");
+        assert!(
+            DOWNLOAD_READ_AHEAD_ENGAGED.load(Ordering::Relaxed) > bulk_before,
+            "a multi-MiB saturating transfer must engage the read-ahead pipeline branch \
+             (the saturated gate must not be vacuously always-serial)",
         );
     }
 }

@@ -2907,9 +2907,11 @@ where
                 // Saturated bulk: overlap the flush of this batch with reading the
                 // next burst into the spare buffer (lazily allocated). The borrows
                 // are disjoint (write: `server_write` + `seal_scratch.records_buf`;
-                // read: `local_read` + `spare`), so neither aliases the codec. A
-                // write error short-circuits immediately (the read is cancelled),
-                // matching the serial path's "write error before next read" order.
+                // read: `local_read` + `spare`), so neither aliases the codec. The
+                // helper finishes the write before surfacing any read result; only a
+                // write that completes FIRST with an error cancels the still-pending
+                // read, matching the serial path's "write error before next read"
+                // order (a read error never cancels the in-flight write).
                 let spare = spare_buf.get_or_insert_with(|| vec![0_u8; cap]);
                 let next_n = write_batch_with_read_ahead(
                     &mut server_write,
