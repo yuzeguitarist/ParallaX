@@ -797,6 +797,16 @@ impl Driver {
                             // (no GRO cmsg) yields a single chunk == the old
                             // `recv_from` behaviour.
                             let seg = segment_size.max(1);
+                            // Observe the GRO coalescing factor (PR #120 follow-up #1).
+                            // Only the Linux path is a real recvmsg/GRO read; the
+                            // non-Linux recv_from always reports segment_size == total
+                            // (one chunk), so recording it would falsely inflate the
+                            // GRO read count.
+                            #[cfg(target_os = "linux")]
+                            {
+                                let chunks = total.div_ceil(seg).max(1) as u64;
+                                super::offload::record_gro_read(chunks);
+                            }
                             for chunk in buf[..total].chunks(seg) {
                                 self.on_datagram(chunk, peer);
                             }
@@ -1263,10 +1273,13 @@ impl Driver {
                     }),
                     Ok(sent) if sent == segments.len()
                 );
-                if !gso {
+                if gso {
+                    super::offload::record_gso_call(slice.len() as u64);
+                } else {
                     // Kernel without GSO / oversized / transient error / not writable:
                     // send the run one datagram at a time (awaiting writability) so no
                     // bytes are dropped.
+                    super::offload::record_gso_fallback();
                     for (dg, _) in slice {
                         let _ = self.socket.send_to(dg, run.peer).await;
                     }

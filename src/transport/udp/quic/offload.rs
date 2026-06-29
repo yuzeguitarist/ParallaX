@@ -22,6 +22,128 @@
 #[cfg(target_os = "linux")]
 pub use linux::{enable_gro, recv_gro, send_gso};
 
+// Public diagnostics surface: a stats endpoint reads `offload_stats()`. Not yet wired
+// to a caller in-crate, so allow the unused re-export rather than fabricate one.
+#[allow(unused_imports)]
+pub use stats::{offload_stats, OffloadStats};
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub(super) use stats::{record_gro_read, record_gso_call, record_gso_fallback};
+
+/// Process-wide GSO/GRO offload counters (PR #120 follow-up #1). PR #120 shipped the
+/// Linux GSO/GRO batching with no way to tell, on a running server, whether the
+/// kernel offload is actually engaging or whether every flush silently takes the
+/// per-datagram fallback — so the throughput win could not be confirmed. These
+/// counters make the offload observable: the GSO hit/fallback split and the GRO
+/// coalescing factor. They are pure host-local bookkeeping (no wire effect) and the
+/// recording API is platform-agnostic so the test runs on every target, even where
+/// the syscalls do not exist.
+mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One process-wide counter set. Singleton in [`COUNTERS`].
+    struct Counters {
+        /// GSO `sendmsg` calls the kernel accepted (a multi-datagram run sent in one
+        /// syscall).
+        gso_calls: AtomicU64,
+        /// Datagrams emitted via accepted GSO calls (each would have cost one `send_to`
+        /// on the per-datagram path).
+        gso_datagrams: AtomicU64,
+        /// Runs that fell back to per-datagram `send_to` (no GSO, oversized, transient
+        /// error, short count, or not-writable).
+        gso_fallback_runs: AtomicU64,
+        /// `recvmsg` reads on the GRO path.
+        gro_reads: AtomicU64,
+        /// Datagrams recovered from GRO reads (the re-split chunk count). Equal to
+        /// `gro_reads` with no coalescing; above it when the kernel gathered several
+        /// datagrams per read.
+        gro_coalesced_datagrams: AtomicU64,
+    }
+
+    static COUNTERS: Counters = Counters {
+        gso_calls: AtomicU64::new(0),
+        gso_datagrams: AtomicU64::new(0),
+        gso_fallback_runs: AtomicU64::new(0),
+        gro_reads: AtomicU64::new(0),
+        gro_coalesced_datagrams: AtomicU64::new(0),
+    };
+
+    /// Record one accepted GSO call that emitted `datagrams` datagrams.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn record_gso_call(datagrams: u64) {
+        COUNTERS.gso_calls.fetch_add(1, Ordering::Relaxed);
+        COUNTERS
+            .gso_datagrams
+            .fetch_add(datagrams, Ordering::Relaxed);
+    }
+
+    /// Record one run that fell back to the per-datagram path.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn record_gso_fallback() {
+        COUNTERS.gso_fallback_runs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one GRO `recvmsg` that yielded `datagrams` datagrams after re-splitting.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn record_gro_read(datagrams: u64) {
+        COUNTERS.gro_reads.fetch_add(1, Ordering::Relaxed);
+        COUNTERS
+            .gro_coalesced_datagrams
+            .fetch_add(datagrams, Ordering::Relaxed);
+    }
+
+    /// A point-in-time snapshot of the offload counters, for diagnostics / a stats
+    /// endpoint. GSO hit ratio = `gso_calls / (gso_calls + gso_fallback_runs)`; GRO
+    /// coalescing factor = `gro_coalesced_datagrams / gro_reads`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[allow(dead_code)] // diagnostics snapshot; read by tests + a future stats endpoint
+    pub struct OffloadStats {
+        pub gso_calls: u64,
+        pub gso_datagrams: u64,
+        pub gso_fallback_runs: u64,
+        pub gro_reads: u64,
+        pub gro_coalesced_datagrams: u64,
+    }
+
+    /// Read the current process-wide offload counters.
+    #[allow(dead_code)] // diagnostics accessor; exercised by the offload stats test
+    pub fn offload_stats() -> OffloadStats {
+        OffloadStats {
+            gso_calls: COUNTERS.gso_calls.load(Ordering::Relaxed),
+            gso_datagrams: COUNTERS.gso_datagrams.load(Ordering::Relaxed),
+            gso_fallback_runs: COUNTERS.gso_fallback_runs.load(Ordering::Relaxed),
+            gro_reads: COUNTERS.gro_reads.load(Ordering::Relaxed),
+            gro_coalesced_datagrams: COUNTERS.gro_coalesced_datagrams.load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn recorders_increment_the_snapshot() {
+            // The counters are process-wide, so assert on the DELTA across recordings,
+            // not absolute values (another test in the same process may have touched
+            // them). The recorders are platform-agnostic, so this runs everywhere —
+            // covering the bookkeeping even on targets without the GSO/GRO syscalls.
+            let before = offload_stats();
+            record_gso_call(64);
+            record_gso_call(8);
+            record_gso_fallback();
+            record_gro_read(42);
+            let after = offload_stats();
+            assert_eq!(after.gso_calls - before.gso_calls, 2);
+            assert_eq!(after.gso_datagrams - before.gso_datagrams, 72);
+            assert_eq!(after.gso_fallback_runs - before.gso_fallback_runs, 1);
+            assert_eq!(after.gro_reads - before.gro_reads, 1);
+            assert_eq!(
+                after.gro_coalesced_datagrams - before.gro_coalesced_datagrams,
+                42
+            );
+        }
+    }
+}
+
 /// The kernel's hard ceiling on segments per `UDP_SEGMENT` send (`UDP_MAX_SEGMENTS`
 /// = `1 << 6` in `net/ipv4/udp.c`). A `sendmsg` whose GSO buffer holds more than
 /// this many segments fails with `EINVAL`; [`gso_runs`] therefore caps each emitted
