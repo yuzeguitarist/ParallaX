@@ -218,3 +218,102 @@ pub async fn capture_parallax_quic_trace(
     }
     Ok(trace)
 }
+
+/// One request/response exchange in an interactive capture: the client sends
+/// `request_bytes`, the server replies with `response_bytes`.
+#[derive(Debug, Clone, Copy)]
+pub struct Exchange {
+    pub request_bytes: usize,
+    pub response_bytes: usize,
+}
+
+/// Drive a real ParallaX QUIC session that performs a *sequence* of
+/// request/response exchanges over one bidirectional stream, and return the
+/// captured UDP-datagram [`Trace`].
+///
+/// WHY this exists: the bulk [`capture_parallax_quic_trace`] streams one large
+/// payload each way, which produces a single uplink burst followed by a single
+/// downlink burst — nothing like a browser. Real Safari QUIC interleaves many
+/// small request/response turns (`UUU DDD UUU DD …`). This driver reproduces
+/// that shape by ping-ponging `exchanges` over the stream, so the captured
+/// direction-run distribution can be compared to Safari's on equal terms.
+///
+/// Each turn uses `read_exact` for an exact byte count (not `read_to_end`, which
+/// would block until close), so the stream stays open across turns. Heavyweight;
+/// invoked only from `#[ignore]` tiers.
+pub async fn capture_parallax_quic_interactive(exchanges: &[Exchange]) -> Result<Trace, String> {
+    let server = bind_server_endpoint("127.0.0.1:0".parse().unwrap(), "localhost")
+        .await
+        .map_err(|e| format!("bind server: {e}"))?;
+    let server_addr = server
+        .local_addr()
+        .map_err(|e| format!("server addr: {e}"))?;
+
+    let forwarder = RecordingForwarder::spawn(server_addr)
+        .await
+        .map_err(|e| format!("spawn forwarder: {e}"))?;
+    let front_addr = forwarder.front_addr;
+
+    // The server mirrors each turn: read the agreed request size, write the
+    // agreed response size. It learns the per-turn sizes from the same schedule
+    // the client follows (passed by value into the task).
+    let schedule: Vec<Exchange> = exchanges.to_vec();
+    let server_task = tokio::spawn(async move {
+        let conn = match server.accept().await {
+            Some(c) => c,
+            None => return Err("server accept returned None".to_string()),
+        };
+        let (mut send, mut recv) = match conn.accept_bi().await {
+            Some(s) => s,
+            None => return Err("server accept_bi returned None".to_string()),
+        };
+        for (i, ex) in schedule.iter().enumerate() {
+            let mut req = vec![0u8; ex.request_bytes];
+            recv.read_exact(&mut req)
+                .await
+                .map_err(|e| format!("server read turn {i}: {e}"))?;
+            let resp = vec![0xa5u8; ex.response_bytes];
+            send.write_all(&resp)
+                .await
+                .map_err(|e| format!("server write turn {i}: {e}"))?;
+        }
+        send.finish();
+        // Hold briefly so the last datagrams flush before drop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok::<(), String>(())
+    });
+
+    let client = bind_client_endpoint_accept_any("127.0.0.1:0".parse().unwrap())
+        .await
+        .map_err(|e| format!("bind client: {e}"))?;
+    let conn = client
+        .connect(front_addr, "localhost")
+        .await
+        .map_err(|e| format!("client connect: {e}"))?;
+    let (mut send, mut recv) = conn.open_bi();
+
+    for (i, ex) in exchanges.iter().enumerate() {
+        let req = vec![0x5au8; ex.request_bytes];
+        send.write_all(&req)
+            .await
+            .map_err(|e| format!("client write turn {i}: {e}"))?;
+        let mut resp = vec![0u8; ex.response_bytes];
+        recv.read_exact(&mut resp)
+            .await
+            .map_err(|e| format!("client read turn {i}: {e}"))?;
+    }
+    send.finish();
+
+    // Let trailing datagrams (ACKs, FIN) cross the forwarder.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server_task
+        .await
+        .map_err(|e| format!("server task join: {e}"))?
+        .map_err(|e| format!("server task: {e}"))?;
+
+    let trace = forwarder.finish();
+    if trace.is_empty() {
+        return Err("forwarder captured no datagrams".into());
+    }
+    Ok(trace)
+}
