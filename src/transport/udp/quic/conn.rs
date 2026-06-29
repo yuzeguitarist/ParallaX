@@ -2451,6 +2451,16 @@ impl Connection {
                 }
                 _ => 0,
             };
+            // App-limited (draft-cheng-iccrg-delivery-rate-estimation): the sender ran
+            // out of data rather than bandwidth. A sample taken while app-limited must
+            // not raise BBR's bottleneck-bandwidth estimate, or an interactive/bursty
+            // flow that briefly drains its send buffer would lock in an under-estimate
+            // of the path and then under-send. Proxy it from current state: no stream
+            // has bytes (or a FIN) queued AND we are below the congestion window (so the
+            // gap is the app's, not the cwnd's). This was hard-coded `false`, which made
+            // every quiet gap look like a true bandwidth ceiling.
+            let app_limited =
+                self.next_stream_to_send().is_none() && self.bytes_in_flight() < self.cc.window();
             let info = AckInfo {
                 now,
                 bytes_acked: acked_bytes,
@@ -2458,7 +2468,7 @@ impl Connection {
                 delivery_rate,
                 in_flight: self.bytes_in_flight(),
                 delivered: self.delivered,
-                app_limited: false,
+                app_limited,
             };
             self.cc.on_ack(&info);
         }

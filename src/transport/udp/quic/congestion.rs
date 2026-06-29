@@ -70,11 +70,16 @@ const BBR_CWND_GAIN: f64 = 2.0;
 /// until the pipe fills (matches the high cwnd gain). Same value Cardwell et al. /
 /// quiche use for the startup pacer.
 const BBR_STARTUP_PACING_GAIN: f64 = BBR_HIGH_GAIN;
-/// Pacing gain in ProbeBW / ProbeRTT: pace AT the estimated bottleneck bandwidth
-/// (gain 1.0). BBRv1's ProbeBW gain cycle averages to ~1.0; pacing at the bottleneck
-/// rate is the steady-state behavior that smooths a full-window burst into a stream
-/// without reducing average throughput.
+/// Pacing gain in ProbeRTT: pace AT the estimated bottleneck bandwidth (gain 1.0) while
+/// the pipe drains for the RTprop re-measurement.
 const BBR_STEADY_PACING_GAIN: f64 = 1.0;
+/// BBRv1's ProbeBW pacing-gain cycle (Cardwell et al. §4.3.3): one phase per RTprop.
+/// `5/4` probes for more bandwidth (sends faster to see if the pipe grew), `3/4` then
+/// drains the queue that probe may have built, and the six `1.0` phases cruise at the
+/// estimated bottleneck. The cycle averages to ~1.0 so steady-state throughput is
+/// unchanged, but unlike a flat 1.0 it actively re-probes for additional bandwidth —
+/// the property a flat gain lacks, leaving a widened path undiscovered.
+const BBR_PROBE_BW_GAIN_CYCLE: [f64; 8] = [5.0 / 4.0, 3.0 / 4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 /// Minimum cwnd (4 packets), used as the floor and during ProbeRTT (RFC/draft).
 const BBR_MIN_PIPE_CWND: u64 = 4 * MAX_DATAGRAM_SIZE;
 /// RTprop min-filter window: re-take the minimum RTT at least this often.
@@ -125,6 +130,9 @@ pub struct Bbr {
     last_probe_rtt: Option<Instant>,
     probe_rtt_done: Option<Instant>,
     prior_cwnd: u64,
+    /// Index into [`BBR_PROBE_BW_GAIN_CYCLE`], advanced one phase per round while in
+    /// ProbeBW so the pacer cycles 5/4 → 3/4 → 1×6, re-probing for more bandwidth.
+    probe_bw_phase: usize,
 }
 
 impl Default for Bbr {
@@ -151,6 +159,7 @@ impl Bbr {
             last_probe_rtt: None,
             probe_rtt_done: None,
             prior_cwnd: INITIAL_WINDOW,
+            probe_bw_phase: 0,
         }
     }
 
@@ -176,6 +185,12 @@ impl Bbr {
         self.round_rate_max = 0;
         self.btlbw = self.rate_filter.iter().copied().max().unwrap_or(0);
 
+        // In ProbeBW, advance the pacing-gain cycle one phase per round so the pacer
+        // walks 5/4 → 3/4 → 1×6, periodically probing for more bandwidth.
+        if self.mode == BbrMode::ProbeBw {
+            self.probe_bw_phase = (self.probe_bw_phase + 1) % BBR_PROBE_BW_GAIN_CYCLE.len();
+        }
+
         if !self.filled_pipe {
             if self.btlbw as f64 >= self.full_bw as f64 * BBR_FULL_BW_THRESHOLD {
                 self.full_bw = self.btlbw;
@@ -185,6 +200,9 @@ impl Bbr {
                 if self.full_bw_count >= BBR_FULL_BW_COUNT {
                     self.filled_pipe = true;
                     self.mode = BbrMode::ProbeBw;
+                    // Start the gain cycle at a cruise phase (1.0), not the 5/4 probe
+                    // phase, so entering ProbeBW does not immediately overshoot.
+                    self.probe_bw_phase = 2;
                     // Seed the ProbeRTT clock when the pipe first fills, so the first
                     // dip is deferred ~BBR_PROBE_RTT_INTERVAL rather than firing on
                     // this very ack (which would stall cwnd to 4 packets the instant
@@ -223,6 +241,8 @@ impl Bbr {
                     self.probe_rtt_done = None;
                     self.cwnd = self.prior_cwnd;
                     self.mode = if self.filled_pipe {
+                        // Resume ProbeBW at a cruise phase, not the 5/4 probe.
+                        self.probe_bw_phase = 2;
                         BbrMode::ProbeBw
                     } else {
                         BbrMode::Startup
@@ -304,7 +324,10 @@ impl Controller for Bbr {
         }
         let gain = match self.mode {
             BbrMode::Startup => BBR_STARTUP_PACING_GAIN,
-            BbrMode::ProbeBw | BbrMode::ProbeRtt => BBR_STEADY_PACING_GAIN,
+            // ProbeBW walks the 8-phase gain cycle (5/4, 3/4, 1×6): re-probe for more
+            // bandwidth, then drain, then cruise. ProbeRTT paces at the bottleneck.
+            BbrMode::ProbeBw => BBR_PROBE_BW_GAIN_CYCLE[self.probe_bw_phase],
+            BbrMode::ProbeRtt => BBR_STEADY_PACING_GAIN,
         };
         // gain × BtlBw, saturating to the unpaced sentinel on overflow.
         let rate = gain * self.btlbw as f64;
@@ -445,10 +468,13 @@ mod tests {
         assert!(cc.btlbw > 0, "model built");
         let rate = cc.pacing_rate();
         assert_ne!(rate, u64::MAX, "paced once the model exists");
-        // Steady-state pace at ~BtlBw (gain 1.0); allow Startup's higher gain if the
-        // run did not fully reach ProbeBW.
+        // The rate tracks BtlBw × gain. The gain depends on the phase: Startup's high
+        // gain, or any phase of the ProbeBW cycle (5/4, 3/4, or 1.0), so the lower
+        // bound is the 3/4 drain phase and the upper bound is the Startup high gain.
+        let min_gain = 3.0 / 4.0;
         assert!(
-            rate >= cc.btlbw && rate as f64 <= cc.btlbw as f64 * BBR_HIGH_GAIN + 1.0,
+            rate as f64 >= cc.btlbw as f64 * min_gain - 1.0
+                && rate as f64 <= cc.btlbw as f64 * BBR_HIGH_GAIN + 1.0,
             "pacing_rate ({rate}) tracks BtlBw ({}) × gain",
             cc.btlbw
         );
@@ -467,5 +493,51 @@ mod tests {
             cc.btlbw, 0,
             "app-limited samples must not raise the bottleneck-bandwidth estimate"
         );
+    }
+
+    #[test]
+    fn probe_bw_pacing_cycles_above_and_below_the_bottleneck() {
+        // Once in ProbeBW, the pacing rate must walk the gain cycle: at least one round
+        // paces ABOVE BtlBw (the 5/4 probe-for-more phase) and at least one BELOW (the
+        // 3/4 drain phase), versus the old flat 1.0 that never re-probed. Average stays
+        // ~1.0 so steady-state throughput is unchanged.
+        let now = Instant::now();
+        let mut cc = Bbr::new();
+        let mut delivered = 0;
+        // Reach ProbeBW.
+        for i in 0..40 {
+            delivered += 500_000;
+            cc.on_ack(&bbr_ack(
+                10_000_000,
+                50,
+                delivered,
+                now + Duration::from_millis(i * 50),
+            ));
+        }
+        assert_eq!(cc.mode, BbrMode::ProbeBw, "reached ProbeBW");
+        let btlbw = cc.btlbw;
+
+        // Sample the pacing rate across a full 8-round cycle; advancing rounds advances
+        // the phase. Use a steady bandwidth so only the gain changes the rate.
+        let mut saw_above = false;
+        let mut saw_below = false;
+        for i in 40..56 {
+            delivered += 500_000;
+            cc.on_ack(&bbr_ack(
+                10_000_000,
+                50,
+                delivered,
+                now + Duration::from_millis(i * 50),
+            ));
+            let rate = cc.pacing_rate();
+            if rate as f64 > btlbw as f64 * 1.1 {
+                saw_above = true;
+            }
+            if (rate as f64) < btlbw as f64 * 0.9 {
+                saw_below = true;
+            }
+        }
+        assert!(saw_above, "the 5/4 phase paced above the bottleneck");
+        assert!(saw_below, "the 3/4 phase paced below the bottleneck");
     }
 }
