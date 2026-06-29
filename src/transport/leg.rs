@@ -63,6 +63,63 @@ pub(crate) trait LegWriter: Send {
     fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
+/// Flush a sealed record batch while reading the next source burst concurrently
+/// (read-ahead pipelining). The current batch's write ALWAYS runs to completion
+/// before this returns — preserving the serial loop's invariant that a sealed
+/// batch is fully flushed before the next read is acted on — while a write error
+/// is surfaced ahead of any read result. The race only ever cancels a read, never
+/// a write:
+///
+/// - Write completes first (Ok): await the read to completion and return its byte
+///   count. The read is not dropped, so no bytes are lost on the happy path.
+/// - Write completes first (Err): return the error WITHOUT awaiting the read.
+///   Dropping the pending `read` future is safe (tokio's `AsyncReadExt::read`
+///   consumes no bytes unless it returns `Ok(n)`), and the relay is being torn
+///   down anyway. This is what stops a blocked read from masking a write failure.
+/// - Read completes first (Ok or Err): AWAIT THE WRITE first, then surface its
+///   result if it errored, otherwise return the read's result. A read error must
+///   NOT cancel the in-flight write: the serial path always finishes the current
+///   batch's write before the next read, and cancelling a partially-flushed batch
+///   would drop already-sealed records and desync the record stream.
+///
+/// `read` is the caller's `source.read(&mut spare_buf)` future; on success this
+/// returns the number of bytes it read into that buffer.
+pub(crate) async fn write_batch_with_read_ahead<W, Fut>(
+    writer: &mut W,
+    sealed: &[u8],
+    read: Fut,
+) -> io::Result<usize>
+where
+    W: LegWriter,
+    Fut: Future<Output = io::Result<usize>>,
+{
+    let write = writer.write_records(sealed);
+    tokio::pin!(write);
+    tokio::pin!(read);
+
+    tokio::select! {
+        // Bias the write so an already-ready write result (including an error)
+        // wins over a simultaneously-ready read, matching the serial ordering.
+        biased;
+        write_res = &mut write => {
+            // Write finished first. Surface an error immediately, cancelling the
+            // still-pending read by dropping it as we return.
+            write_res?;
+            // Write succeeded: now await the read to completion (no bytes lost).
+            read.await
+        }
+        read_res = &mut read => {
+            // Read finished first. Finish the in-flight write BEFORE surfacing the
+            // read outcome — even when the read errored — so the current sealed
+            // batch is never cancelled mid-flush (the serial loop's write-before-
+            // next-read invariant). A write error takes priority over the read's
+            // result; otherwise the read's own result (Ok or Err) is returned.
+            write.await?;
+            read_res
+        }
+    }
+}
+
 /// TCP record-reader leg: delegates 1:1 to the existing buffered TLS record
 /// reader over the connection's owned read half.
 pub(crate) struct TcpLegReader<R>(pub BufferedTlsRecordReader<R>);
@@ -623,5 +680,144 @@ mod tests {
         );
 
         let _ = opener.await;
+    }
+
+    /// A `LegWriter` whose `write_records` resolves to a caller-chosen result
+    /// without touching any socket — lets the read-ahead helper tests drive the
+    /// write/read race deterministically. An optional `gate` makes the write stay
+    /// Pending until the gate is notified, so a test can force the READ arm to win
+    /// the biased `select!` (the write is biased first, so it must pend to lose).
+    struct MockWriter {
+        write_result: io::Result<()>,
+        written: Vec<u8>,
+        gate: Option<std::sync::Arc<tokio::sync::Notify>>,
+    }
+
+    impl MockWriter {
+        fn immediate(write_result: io::Result<()>) -> Self {
+            Self {
+                write_result,
+                written: Vec::new(),
+                gate: None,
+            }
+        }
+        fn gated(write_result: io::Result<()>, gate: std::sync::Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                write_result,
+                written: Vec::new(),
+                gate: Some(gate),
+            }
+        }
+    }
+
+    impl LegWriter for MockWriter {
+        async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if let Some(gate) = self.gate.clone() {
+                // Pend until released, so the read arm of the biased select wins.
+                gate.notified().await;
+            }
+            self.written.extend_from_slice(bytes);
+            // Clone the stored result (io::Error is not Clone, so map by kind).
+            match &self.write_result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+            }
+        }
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The read-ahead helper MUST surface a write error immediately, even when the
+    /// concurrent read never resolves — proving a failed peer write is not masked
+    /// behind a blocked source read (the read future is cancelled on the error).
+    #[tokio::test]
+    async fn write_batch_read_ahead_surfaces_write_error_despite_blocked_read() {
+        let mut writer =
+            MockWriter::immediate(Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer reset")));
+        // A read that never completes: if the helper waited on it, this test would
+        // hang and the timeout would fire.
+        let never_read = std::future::pending::<io::Result<usize>>();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_batch_with_read_ahead(&mut writer, b"sealed-records", never_read),
+        )
+        .await
+        .expect("write error must return promptly, not wait on the blocked read");
+
+        let err = result.expect_err("a write error must propagate");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// Happy path: the batch is written and the helper returns the read-ahead's
+    /// byte count.
+    #[tokio::test]
+    async fn write_batch_read_ahead_returns_read_count_on_success() {
+        let mut writer = MockWriter::immediate(Ok(()));
+        let read = async { Ok::<usize, io::Error>(4096) };
+        let n = write_batch_with_read_ahead(&mut writer, b"payload", read)
+            .await
+            .expect("happy path must succeed");
+        assert_eq!(n, 4096, "must return the read-ahead byte count");
+        assert_eq!(writer.written, b"payload", "the batch must be written");
+    }
+
+    /// Read-completes-first path (genuinely exercised): the write is GATED so it is
+    /// Pending when the biased select first polls it, forcing the READ arm to win.
+    /// The read fires the gate so the in-flight write can then complete with an
+    /// error — which must still propagate ahead of the read's success.
+    #[tokio::test]
+    async fn write_batch_read_ahead_read_first_then_write_error_propagates() {
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut writer = MockWriter::gated(
+            Err(io::Error::new(io::ErrorKind::ConnectionReset, "reset")),
+            gate.clone(),
+        );
+        // The read is ready, but it releases the write gate first, so the helper's
+        // `write.await` in the read arm completes with the write error.
+        let read = async move {
+            gate.notify_one();
+            Ok::<usize, io::Error>(10)
+        };
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_batch_with_read_ahead(&mut writer, b"x", read),
+        )
+        .await
+        .expect("must not hang")
+        .expect_err("a write error must propagate even when the read won the race");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    /// Read-ERROR-first path: a read error must NOT cancel the in-flight write. The
+    /// write is gated (so the read arm wins) and, once released, succeeds; the
+    /// helper must finish that write (the batch is fully flushed) and only then
+    /// surface the read error — preserving the serial loop's write-before-next-read
+    /// invariant so a partially-flushed batch is never dropped.
+    #[tokio::test]
+    async fn write_batch_read_ahead_read_error_does_not_cancel_inflight_write() {
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut writer = MockWriter::gated(Ok(()), gate.clone());
+        // The read errors, but first releases the write gate so the write can run
+        // to completion before the read error is surfaced.
+        let read = async move {
+            gate.notify_one();
+            Err::<usize, io::Error>(io::Error::new(io::ErrorKind::ConnectionReset, "read reset"))
+        };
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_batch_with_read_ahead(&mut writer, b"batch-bytes", read),
+        )
+        .await
+        .expect("must not hang")
+        .expect_err("the read error must surface after the write completes");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        // The crux: the batch was fully written before the read error returned —
+        // proving the in-flight write was NOT cancelled by the read error.
+        assert_eq!(
+            writer.written, b"batch-bytes",
+            "the in-flight write must complete (no dropped/partial batch) before a read error",
+        );
     }
 }
