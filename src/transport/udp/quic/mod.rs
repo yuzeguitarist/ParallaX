@@ -28,6 +28,9 @@ pub(crate) mod mux;
 /// issue #76). Drives two sans-IO `Connection`s over a virtual link.
 #[cfg(test)]
 mod netsim;
+/// Linux UDP segmentation/aggregation offload (GSO/GRO) for the carrier socket:
+/// batches the per-datagram send/recv syscalls without changing the wire shape.
+pub(crate) mod offload;
 pub(crate) mod pacer;
 pub(crate) mod packet;
 pub(crate) mod recovery;

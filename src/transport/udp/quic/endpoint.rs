@@ -206,6 +206,39 @@ fn apply_udp_socket_buffers(socket: &UdpSocket, bufs: UdpSocketBuffers) -> Appli
 #[cfg(not(unix))]
 fn set_udp_socket_buffers(_socket: &UdpSocket) {}
 
+/// Await one readable event and read it into `buf`, returning
+/// `(total_bytes, peer, segment_size)`. On Linux a `UDP_GRO`-coalesced read reports
+/// a `segment_size < total`, telling the caller to re-split `buf[..total]` into the
+/// original datagrams; without GRO (or off Linux) `segment_size == total`, i.e. one
+/// datagram, so the caller's chunk split is a no-op and behaviour matches
+/// `recv_from`.
+#[cfg(target_os = "linux")]
+async fn recv_datagrams(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, usize)> {
+    use std::os::fd::AsFd;
+    loop {
+        socket.readable().await?;
+        match socket.try_io(tokio::io::Interest::READABLE, || {
+            super::offload::recv_gro(socket.as_fd(), buf)
+        }) {
+            Ok(segs) => return Ok((segs.total, segs.peer, segs.segment_size)),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn recv_datagrams(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, usize)> {
+    let (len, peer) = socket.recv_from(buf).await?;
+    Ok((len, peer, len))
+}
+
 /// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
 /// packet in a datagram padded to the §14.1 minimum. A cheap pre-check so garbage,
 /// truncated, or non-Initial datagrams from unknown peers never allocate the
@@ -475,6 +508,11 @@ impl Endpoint {
         // tuning for high-BDP links). A no-op unless an operator opted in; see
         // [`configure_udp_socket_buffers`].
         set_udp_socket_buffers(&socket);
+        // Enable Linux UDP_GRO so the kernel coalesces consecutive same-flow inbound
+        // datagrams into one recvmsg (the driver re-splits them). Best-effort and
+        // wire-invisible: a kernel without GRO just keeps one-datagram-per-read.
+        #[cfg(target_os = "linux")]
+        let _ = super::offload::enable_gro(&*socket);
         let wake = Arc::new(Notify::new());
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = mpsc::unbounded_channel();
@@ -728,9 +766,19 @@ impl Driver {
             let deadline = self.next_deadline();
 
             tokio::select! {
-                r = socket.recv_from(&mut buf) => {
+                r = recv_datagrams(&socket, &mut buf) => {
                     match r {
-                        Ok((len, peer)) => self.on_datagram(&buf[..len], peer),
+                        Ok((total, peer, segment_size)) => {
+                            // GRO only ever coalesces datagrams from a SINGLE source
+                            // 4-tuple (a kernel invariant), so one `peer` is correct
+                            // for every chunk of this read. `segment_size == total`
+                            // (no GRO cmsg) yields a single chunk == the old
+                            // `recv_from` behaviour.
+                            let seg = segment_size.max(1);
+                            for chunk in buf[..total].chunks(seg) {
+                                self.on_datagram(chunk, peer);
+                            }
+                        }
                         Err(_) => continue,
                     }
                 }
@@ -1139,8 +1187,61 @@ impl Driver {
             }
             c.wake_handles();
         }
-        for (dg, peer) in out {
-            let _ = self.socket.send_to(&dg, peer).await;
+        self.send_batch(out).await;
+    }
+
+    /// Write a flush batch to the socket. On Linux, maximal runs of consecutive
+    /// same-peer, same-size datagrams go out in one `UDP_SEGMENT` (GSO) `sendmsg`;
+    /// singletons and any GSO failure fall back to per-datagram `send_to`. The bytes,
+    /// sizes, and count on the wire are identical either way — GSO only collapses the
+    /// syscalls. Off Linux this is exactly the old per-datagram loop.
+    async fn send_batch(&self, out: Vec<(Vec<u8>, SocketAddr)>) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd;
+            for run in super::offload::gso_runs(&out) {
+                let slice = &out[run.range.clone()];
+                if slice.len() == 1 {
+                    let _ = self.socket.send_to(&slice[0].0, run.peer).await;
+                    continue;
+                }
+                // Coalesce the run into one buffer and hand it to the kernel to slice.
+                let mut segments = Vec::with_capacity(slice.len() * run.segment_size);
+                for (dg, _) in slice {
+                    segments.extend_from_slice(dg);
+                }
+                // UDP_SEGMENT sendmsg is all-or-nothing (the kernel accepts the whole
+                // GSO super-buffer or returns an error — it never partial-accepts the
+                // way a stream socket would), but treat a short byte count as failure
+                // too so any future/edge kernel behaviour falls back rather than
+                // silently dropping the unsent tail. WouldBlock (socket not writable
+                // yet) also falls through to the awaiting fallback.
+                let gso = matches!(
+                    self.socket.try_io(tokio::io::Interest::WRITABLE, || {
+                        super::offload::send_gso(
+                            self.socket.as_fd(),
+                            &segments,
+                            run.segment_size,
+                            run.peer,
+                        )
+                    }),
+                    Ok(sent) if sent == segments.len()
+                );
+                if !gso {
+                    // Kernel without GSO / oversized / transient error / not writable:
+                    // send the run one datagram at a time (awaiting writability) so no
+                    // bytes are dropped.
+                    for (dg, _) in slice {
+                        let _ = self.socket.send_to(dg, run.peer).await;
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            for (dg, peer) in out {
+                let _ = self.socket.send_to(&dg, peer).await;
+            }
         }
     }
 
