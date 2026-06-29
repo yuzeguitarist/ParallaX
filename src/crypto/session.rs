@@ -705,8 +705,21 @@ impl AeadCodec {
 
     /// Advances the sequence counter by `count` after a batch of records was
     /// sealed/opened off-thread with explicit sequence numbers.
+    ///
+    /// Callers (the parallel seal/open batch paths) pre-check `sequence +
+    /// count <= u64::MAX` before any record is processed, so this never wraps
+    /// in practice. The counter is a nonce input, so a silent wrap (the prior
+    /// `saturating_add`, which pins it at `u64::MAX`) would risk nonce reuse if
+    /// a future path ever reached here without that pre-check. Fail loud
+    /// instead: a `checked_add` overflow poisons the codec, so every later
+    /// seal/open fails closed via `ensure_usable` rather than reusing a nonce.
+    /// The pre-checks remain the first gate; this is defence in depth on the
+    /// primitive itself.
     pub(crate) fn advance_sequence(&mut self, count: u64) {
-        self.sequence = self.sequence.saturating_add(count);
+        match self.sequence.checked_add(count) {
+            Some(next) => self.sequence = next,
+            None => self.poison(),
+        }
     }
 
     /// Permanently marks the codec unusable. Called by the batch open paths
@@ -941,6 +954,35 @@ mod tests {
             dec.open(&ciphertext, b"tls-appdata"),
             Err(SessionError::Aead)
         ));
+    }
+
+    #[test]
+    fn advance_sequence_overflow_poisons_instead_of_wrapping() {
+        // DN-4: the sequence counter is a nonce input. A silent wrap (the prior
+        // saturating_add, which pins it at u64::MAX) would risk nonce reuse if a
+        // path ever reached advance_sequence without the callers' checked_add
+        // pre-check. A checked overflow must fail loud: poison the codec so every
+        // later seal/open fails closed, never reusing a nonce.
+        let key = [7_u8; KEY_LEN];
+        let nonce = [9_u8; NONCE_LEN];
+        let mut codec = AeadCodec::new(key, nonce);
+
+        // Drive the counter to the edge, then overflow it.
+        codec.advance_sequence(u64::MAX - 1);
+        assert!(codec.ensure_usable().is_ok(), "edge value is still usable");
+        codec.advance_sequence(2); // (u64::MAX - 1) + 2 overflows
+
+        assert!(
+            matches!(codec.ensure_usable(), Err(SessionError::Aead)),
+            "an overflowing advance must poison the codec, not silently saturate"
+        );
+        assert!(
+            matches!(
+                codec.seal(b"payload", b"tls-appdata"),
+                Err(SessionError::Aead)
+            ),
+            "a poisoned codec fails closed on seal"
+        );
     }
 
     #[test]

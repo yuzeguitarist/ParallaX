@@ -146,6 +146,8 @@ mod tests {
             (psk.clone(), zeroize::Zeroizing::new(server_kp.private)),
             None,
             origin,
+            // The client below connects with "example.com", so authorize it.
+            vec!["example.com".to_owned()],
             0,
         )
         .unwrap();

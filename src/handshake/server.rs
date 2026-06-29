@@ -638,6 +638,9 @@ async fn build_quic_carrier(
         marker_key,
         marker_replay_guard,
         origin,
+        // The same allowlist the TCP plane authenticates against: a marked QUIC client
+        // may only front operator-approved domains; any other SNI splices to the origin.
+        server.authorized_sni.clone(),
         max_udp_payload,
     )?;
     Ok(crate::transport::udp::stable::QuicCarrier::bind(server.listen, config).await?)
@@ -1284,7 +1287,7 @@ fn authenticated_decision(
         None => return Ok(ConnectionDecision::Fallback(FallbackReason::MissingSni)),
     };
 
-    if !is_authorized_sni(&sni, authorized_sni) {
+    if !crate::handshake::is_authorized_sni(&sni, authorized_sni) {
         return Ok(ConnectionDecision::Fallback(
             FallbackReason::UnauthorizedSni(sni),
         ));
@@ -2608,11 +2611,10 @@ async fn run_authenticated_data_mode(
                             .await;
                         }
 
-                        let (target_addr, initial_payload) =
+                        let (target_addr, target_source, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
                         let mut target =
-                            connect_outbound_target(&target_addr, fixed_data_target.is_some())
-                                .await?;
+                            connect_outbound_target(&target_addr, target_source).await?;
                         tune_tcp_stream(&target)?;
                         if !initial_payload.is_empty() {
                             target.write_all(initial_payload).await?;
@@ -2798,10 +2800,28 @@ async fn run_authenticated_data_mode(
     }
 }
 
+/// Who chose the egress target, so the outbound path's private-address policy is
+/// keyed on an explicit fact rather than the implicit `fixed_data_target.is_some()`
+/// coupling. The two were equivalent today only because `resolve_connect_target`
+/// reads the same `Option` twice (once to pick the target, once to derive
+/// `allow_private`); separating them keeps the SSRF screen correct if a future
+/// feature ever lets the client influence the target while a fixed one is also set
+/// — only an operator-fixed target may reach a private address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetSource {
+    /// The operator's `data_target` config decided the destination; the client's
+    /// requested target was ignored. Trusted, so private/loopback egress is allowed
+    /// (e.g. a sidecar on localhost).
+    OperatorFixed,
+    /// The client's `ConnectRequest` decided the destination. Untrusted: it must
+    /// pass the public-address SSRF screen ([`validate_public_target_addrs`]).
+    ClientChosen,
+}
+
 fn resolve_connect_target<'a>(
     first_payload: &'a mut [u8],
     fixed_data_target: Option<&str>,
-) -> Result<(String, &'a mut [u8]), HandshakeServerError> {
+) -> Result<(String, TargetSource, &'a mut [u8]), HandshakeServerError> {
     crate::process_hardening::exclude_from_core_dump(
         "connect_request.first_payload",
         first_payload,
@@ -2810,24 +2830,33 @@ fn resolve_connect_target<'a>(
         Ok(request) => {
             request.protect_plaintext_memory();
             let payload_len = request.initial_payload.len();
-            let target = fixed_data_target
-                .map(str::to_owned)
-                .unwrap_or_else(|| request.target());
+            // A fixed target overrides the client's request (and is operator-chosen,
+            // so trusted); otherwise the destination is the client's own request.
+            let (target, source) = match fixed_data_target {
+                Some(fixed) => (fixed.to_owned(), TargetSource::OperatorFixed),
+                None => (request.target(), TargetSource::ClientChosen),
+            };
             let start = first_payload.len().saturating_sub(payload_len);
             let initial_payload = &mut first_payload[start..];
             crate::process_hardening::exclude_from_core_dump(
                 "connect_request.initial_payload",
                 initial_payload,
             );
-            Ok((target, initial_payload))
+            Ok((target, source, initial_payload))
         }
         Err(ConnectRequestError::BadMagic | ConnectRequestError::Truncated) => {
+            // Raw payload with no decodable request: only an operator-fixed target
+            // can name the destination (the client named none).
             let target = fixed_data_target.ok_or(HandshakeServerError::MissingConnectTarget)?;
             crate::process_hardening::exclude_from_core_dump(
                 "connect_request.fixed_target_payload",
                 first_payload,
             );
-            Ok((target.to_owned(), first_payload))
+            Ok((
+                target.to_owned(),
+                TargetSource::OperatorFixed,
+                first_payload,
+            ))
         }
         Err(err) => Err(HandshakeServerError::ConnectRequest(err)),
     }
@@ -2835,9 +2864,11 @@ fn resolve_connect_target<'a>(
 
 async fn connect_outbound_target(
     target_addr: &str,
-    allow_private: bool,
+    source: TargetSource,
 ) -> Result<TcpStream, HandshakeServerError> {
-    if allow_private {
+    // Only an operator-fixed destination may reach a private/loopback address; a
+    // client-chosen target is always screened against the public-address policy.
+    if matches!(source, TargetSource::OperatorFixed) {
         return connect_tcp_with_timeout(target_addr).await;
     }
 
@@ -4160,9 +4191,9 @@ async fn serve_mux_quic_substream_inner(
         }
     }
     let first_range = client_open.open_in_place_payload_range(&mut first_record)?;
-    let (target_addr, initial_payload) =
+    let (target_addr, target_source, initial_payload) =
         resolve_connect_target(&mut first_record[first_range], fixed_data_target)?;
-    let mut target = connect_outbound_target(&target_addr, fixed_data_target.is_some()).await?;
+    let mut target = connect_outbound_target(&target_addr, target_source).await?;
     tune_tcp_stream(&target)?;
     if !initial_payload.is_empty() {
         target.write_all(initial_payload).await?;
@@ -4418,9 +4449,11 @@ async fn process_server_mux_frame(
             // this stream id plus returning (dropping any half-built `target`, closing
             // its fds) is the complete teardown — exactly like the cap-reached,
             // duplicate-stream, and initial-payload-write arms.
-            let (target_addr, initial_payload) =
+            let (target_addr, target_source, initial_payload) =
                 match resolve_connect_target(payload.as_mut_slice(), context.fixed_data_target) {
-                    Ok((target_addr, initial_payload)) => (target_addr, initial_payload.to_vec()),
+                    Ok((target_addr, source, initial_payload)) => {
+                        (target_addr, source, initial_payload.to_vec())
+                    }
                     Err(_) => {
                         tracing::debug!(
                             cid = context.cid,
@@ -4431,21 +4464,18 @@ async fn process_server_mux_frame(
                         return Ok(());
                     }
                 };
-            let mut target =
-                match connect_outbound_target(&target_addr, context.fixed_data_target.is_some())
-                    .await
-                {
-                    Ok(target) => target,
-                    Err(_) => {
-                        tracing::debug!(
-                            cid = context.cid,
-                            stream_id = frame.stream_id,
-                            "mux outbound connect failed; resetting stream"
-                        );
-                        reset_unregistered_stream(frame_tx, frame.stream_id).await?;
-                        return Ok(());
-                    }
-                };
+            let mut target = match connect_outbound_target(&target_addr, target_source).await {
+                Ok(target) => target,
+                Err(_) => {
+                    tracing::debug!(
+                        cid = context.cid,
+                        stream_id = frame.stream_id,
+                        "mux outbound connect failed; resetting stream"
+                    );
+                    reset_unregistered_stream(frame_tx, frame.stream_id).await?;
+                    return Ok(());
+                }
+            };
             if tune_tcp_stream(&target).is_err() {
                 tracing::debug!(
                     cid = context.cid,
@@ -6016,12 +6046,6 @@ fn is_peer_idle_close(conn: &crate::transport::udp::quic::endpoint::Connection) 
     crate::protocol::data::is_relay_idle_close_reason(conn.close_reason().as_ref())
 }
 
-fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {
-    authorized_sni
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(sni))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -7389,9 +7413,10 @@ mod tests {
         };
 
         let mut encoded = request.encode().unwrap();
-        let (target, initial_payload) = resolve_connect_target(&mut encoded, None).unwrap();
+        let (target, source, initial_payload) = resolve_connect_target(&mut encoded, None).unwrap();
 
         assert_eq!(target, "[2001:db8::1]:443");
+        assert_eq!(source, TargetSource::ClientChosen);
         assert_eq!(initial_payload, b"hello");
     }
 
@@ -7404,20 +7429,23 @@ mod tests {
         };
 
         let mut encoded = request.encode().unwrap();
-        let (target, initial_payload) =
+        let (target, source, initial_payload) =
             resolve_connect_target(&mut encoded, Some("target.example:443")).unwrap();
 
         assert_eq!(target, "target.example:443");
+        // A fixed target overrides the client request and is operator-chosen.
+        assert_eq!(source, TargetSource::OperatorFixed);
         assert_eq!(initial_payload, b"hello");
     }
 
     #[test]
     fn resolve_connect_target_uses_fixed_target_for_raw_payload() {
         let mut raw = *b"GET / HTTP/1.1\r\n\r\n";
-        let (target, initial_payload) =
+        let (target, source, initial_payload) =
             resolve_connect_target(&mut raw, Some("target.example:443")).unwrap();
 
         assert_eq!(target, "target.example:443");
+        assert_eq!(source, TargetSource::OperatorFixed);
         assert_eq!(initial_payload, b"GET / HTTP/1.1\r\n\r\n");
     }
 
