@@ -96,6 +96,116 @@ const PENDING_IDLE: Duration = Duration::from_secs(2);
 /// fails closed on the origin cert and self-heals by redialing).
 const PENDING_DECIDE_DELAY: Duration = Duration::from_millis(50);
 
+/// Process-wide explicit SO_SNDBUF/SO_RCVBUF for the UDP carrier socket, installed
+/// once at startup (see [`configure_udp_socket_buffers`]). Either field `None` keeps
+/// kernel autotuning for that direction — the safe default, byte-identical to a build
+/// that never calls the configurator. Unlike TCP, a UDP socket has no advertised
+/// receive window or window scale, so both directions are entirely wire-invisible;
+/// the only effect is how many bytes the kernel will queue before user space reads
+/// (recv) or how much it will hold while the path drains (send). A larger recv buffer
+/// lets the single-threaded driver absorb inbound bursts without socket-layer drops;
+/// a larger send buffer lifts the upload window on high-BDP links where autotuning
+/// under-provisions it. An explicit value DISABLES autotuning for that direction and
+/// is clamped by the OS maximum.
+static UDP_SOCKET_BUFFER_OVERRIDE: std::sync::OnceLock<UdpSocketBuffers> =
+    std::sync::OnceLock::new();
+
+#[derive(Clone, Copy, Default)]
+struct UdpSocketBuffers {
+    send: Option<u32>,
+    recv: Option<u32>,
+}
+
+/// Set the explicit SO_SNDBUF/SO_RCVBUF requested on the UDP carrier socket, process
+/// wide. Call once at startup before any endpoint is bound. A `Some(0)` is treated as
+/// `None` (keep autotuning). First call wins; later calls are ignored. With both
+/// fields `None`/`0` the socket keeps kernel defaults (no behavioural change).
+pub fn configure_udp_socket_buffers(send_bytes: Option<u32>, recv_bytes: Option<u32>) {
+    let bufs = UdpSocketBuffers {
+        send: send_bytes.filter(|&b| b > 0),
+        recv: recv_bytes.filter(|&b| b > 0),
+    };
+    if UDP_SOCKET_BUFFER_OVERRIDE.set(bufs).is_err() {
+        tracing::debug!("udp socket buffer override already set; keeping the first value");
+    }
+}
+
+/// Apply the configured SO_SNDBUF/SO_RCVBUF to a freshly-bound UDP socket. Best-effort
+/// with a getsockopt read-back: the kernel silently clamps to the OS max, and a clamp
+/// BELOW the request means autotuning would likely have done better, so surface it
+/// (the same diagnostic shape as the TCP path). A no-op when no override is set.
+#[cfg(unix)]
+fn set_udp_socket_buffers(socket: &UdpSocket) {
+    let Some(bufs) = UDP_SOCKET_BUFFER_OVERRIDE.get() else {
+        return;
+    };
+    let _ = apply_udp_socket_buffers(socket, *bufs);
+}
+
+/// The buffer sizes the kernel actually applied, read back after the set. `None` for a
+/// direction means it was not requested, or the set / read-back failed — so a test can
+/// assert the plumbing took effect rather than tautologically passing on a silent
+/// failure.
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AppliedUdpBuffers {
+    send: Option<usize>,
+    recv: Option<usize>,
+}
+
+/// Apply explicit buffer sizes to a UDP socket (the pure core of
+/// [`set_udp_socket_buffers`], without the global lookup, so it is unit-testable).
+/// Returns the read-back applied sizes per direction. A no-op (all-`None`) when both
+/// directions are `None`.
+#[cfg(unix)]
+fn apply_udp_socket_buffers(socket: &UdpSocket, bufs: UdpSocketBuffers) -> AppliedUdpBuffers {
+    use socket2::SockRef;
+
+    let mut applied = AppliedUdpBuffers::default();
+    if bufs.send.is_none() && bufs.recv.is_none() {
+        return applied;
+    }
+    let sock = SockRef::from(socket);
+    if let Some(send) = bufs.send {
+        match sock.set_send_buffer_size(send as usize) {
+            Ok(()) => {
+                if let Ok(got) = sock.send_buffer_size() {
+                    applied.send = Some(got);
+                    if got < send as usize {
+                        tracing::warn!(
+                            requested = send,
+                            applied = got,
+                            "kernel clamped udp SO_SNDBUF (raise net.core.wmem_max / kern.ipc.maxsockbuf)"
+                        );
+                    }
+                }
+            }
+            Err(_) => tracing::trace!("udp SO_SNDBUF request failed; keeping kernel default"),
+        }
+    }
+    if let Some(recv) = bufs.recv {
+        match sock.set_recv_buffer_size(recv as usize) {
+            Ok(()) => {
+                if let Ok(got) = sock.recv_buffer_size() {
+                    applied.recv = Some(got);
+                    if got < recv as usize {
+                        tracing::warn!(
+                            requested = recv,
+                            applied = got,
+                            "kernel clamped udp SO_RCVBUF (raise net.core.rmem_max / kern.ipc.maxsockbuf)"
+                        );
+                    }
+                }
+            }
+            Err(_) => tracing::trace!("udp SO_RCVBUF request failed; keeping kernel default"),
+        }
+    }
+    applied
+}
+
+#[cfg(not(unix))]
+fn set_udp_socket_buffers(_socket: &UdpSocket) {}
+
 /// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
 /// packet in a datagram padded to the §14.1 minimum. A cheap pre-check so garbage,
 /// truncated, or non-Initial datagrams from unknown peers never allocate the
@@ -361,6 +471,10 @@ impl Endpoint {
 
     async fn bind(bind: SocketAddr, server: Option<Arc<ServerConfig>>) -> io::Result<Endpoint> {
         let socket = Arc::new(UdpSocket::bind(bind).await?);
+        // Apply any process-wide explicit SO_SNDBUF/SO_RCVBUF (wire-invisible kernel
+        // tuning for high-BDP links). A no-op unless an operator opted in; see
+        // [`configure_udp_socket_buffers`].
+        set_udp_socket_buffers(&socket);
         let wake = Arc::new(Notify::new());
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = mpsc::unbounded_channel();
@@ -1997,5 +2111,67 @@ mod tests {
             .await
             .expect("the late second Initial is also forwarded to the origin (not rescued)")
             .expect("origin channel open");
+    }
+
+    /// `Some(0)` is normalized to `None` (keep autotuning); a positive value is kept.
+    #[test]
+    fn configure_normalizes_zero_to_autotuning() {
+        let bufs = UdpSocketBuffers {
+            send: Some(0u32).filter(|&b| b > 0),
+            recv: Some(1_048_576u32).filter(|&b| b > 0),
+        };
+        assert!(bufs.send.is_none(), "0 means keep autotuning");
+        assert_eq!(bufs.recv, Some(1_048_576), "positive value is kept");
+    }
+
+    /// With no buffers requested, applying is a pure no-op (the default, zero-regression
+    /// path): it reports nothing applied and leaves the socket's kernel-chosen sizes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_none_leaves_socket_untouched() {
+        use socket2::SockRef;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let before = SockRef::from(&socket).recv_buffer_size().unwrap();
+        let applied = apply_udp_socket_buffers(&socket, UdpSocketBuffers::default());
+        assert_eq!(
+            applied,
+            AppliedUdpBuffers::default(),
+            "no-op reports nothing"
+        );
+        let after = SockRef::from(&socket).recv_buffer_size().unwrap();
+        assert_eq!(before, after, "no override must not touch the socket");
+    }
+
+    /// Applying an explicit recv buffer is accepted by the kernel and visible on the
+    /// returned read-back (the socket2 plumbing works on this platform). The kernel may
+    /// clamp to net.core.rmem_max / kern.ipc.maxsockbuf, so assert the set both reported
+    /// a value AND that value actually grew above the autotuned baseline — a silently
+    /// ignored or failed setsockopt would leave `applied.recv == None`, failing here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_explicit_recv_buffer_takes_effect() {
+        use socket2::SockRef;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let baseline = SockRef::from(&socket).recv_buffer_size().unwrap();
+        let applied = apply_udp_socket_buffers(
+            &socket,
+            UdpSocketBuffers {
+                send: None,
+                recv: Some(4_000_000),
+            },
+        );
+        // The meaningful plumbing assertion: the set + read-back both returned Ok, so
+        // `applied.recv` is Some (a silently-ignored or failed setsockopt would leave it
+        // None and fail here). The value must be at least the baseline — the kernel may
+        // clamp to net.core.rmem_max / kern.ipc.maxsockbuf, so it can equal but never
+        // shrink below where autotuning started.
+        let got = applied
+            .recv
+            .expect("the recv setsockopt + read-back must succeed");
+        assert!(
+            got >= baseline,
+            "explicit recv buffer ({got}) must be >= baseline ({baseline})"
+        );
+        assert!(applied.send.is_none(), "send was not requested");
     }
 }
