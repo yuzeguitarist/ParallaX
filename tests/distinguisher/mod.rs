@@ -27,6 +27,8 @@ pub mod classifier;
 pub mod features;
 pub mod parallax_source;
 pub mod perturb;
+pub mod safari_h3_source;
 pub mod safari_source;
 pub mod stats;
 pub mod trace;
+pub mod udp_capture;

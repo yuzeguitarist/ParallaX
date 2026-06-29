@@ -24,9 +24,11 @@ use distinguisher::classifier::{cross_validated_auc, roc_auc, separability, Samp
 use distinguisher::features::{self, window_features};
 use distinguisher::parallax_source;
 use distinguisher::perturb;
+use distinguisher::safari_h3_source;
 use distinguisher::safari_source;
 use distinguisher::stats::{chi_square_gof, ljung_box, two_sample_ks};
-use distinguisher::trace::{Dir, Record, Trace};
+use distinguisher::trace::{Dir, Trace};
+use distinguisher::udp_capture;
 
 /// Records-per-window for classifier feature rows. ~1528 Safari records / 30 ≈
 /// 50 rows, enough for a stable 5-fold CV-AUC.
@@ -364,24 +366,104 @@ fn parallax_vs_safari_uplink_length_distribution() {
     );
 }
 
-/// Tier 4 (socket): the full timing + direction comparison needs a live
-/// authenticated ParallaX session captured at the byte pump, which no existing
-/// loopback harness drives end-to-end. Left as an explicit, documented gap so
-/// the IAT/direction verdict is never silently faked from synthetic cadence.
+// ---------------------------------------------------------------------------
+// Tier 5: direction-interleave structure (UDP/H3 layer).
+//
+// Scope is deliberate (see udp_capture / safari_h3_source docs): we gate on
+// datagram DIRECTION structure and SIZE — both wire-faithful on loopback — and
+// never on inter-arrival time, whose absolute value is host-scheduling noise.
+// ---------------------------------------------------------------------------
+
+/// Fast tier: the direction-interleave distinguisher must fire on the 1:1-ACK
+/// pathology against the real Safari H3 datagram trace. This proves the
+/// direction-run dimension has discriminating power before we trust any
+/// "indistinguishable" verdict from the live capture.
 #[test]
-#[ignore = "needs end-to-end authenticated loopback capture; tracked as tier-4b"]
-fn parallax_vs_safari_timing_socket_capture() {
-    // Intentionally unimplemented. When a harness that drives an authenticated
-    // data-plane session over loopback exists, tap the byte pump for record
-    // boundaries + timestamps, build a Trace, and compare IAT (KS) + direction
-    // runs (chi-square) against Safari here. Synthetic cadence MUST NOT stand
-    // in for real timing in this tier.
-    let _ = (
-        Record {
-            len: 0,
-            dir: Dir::C2S,
-            t_micros: 0,
-        },
-        || -> Trace { Trace::default() },
+fn h3_direction_runs_detect_lockstep() {
+    let safari = safari_h3_source::load_fixture().expect("load Safari H3 fixture");
+    let lockstep = perturb::force_1to1_ack(&safari);
+
+    let real_runs = features::direction_runs(&safari);
+    let bad_runs = features::direction_runs(&lockstep);
+
+    // The pathology pins every run to length 1; the real browser bursts.
+    let real_max = real_runs.iter().cloned().fold(0.0, f64::max);
+    let bad_max = bad_runs.iter().cloned().fold(0.0, f64::max);
+    assert!(
+        bad_max <= 1.0,
+        "lockstep should pin runs to 1, got {bad_max}"
+    );
+    assert!(
+        real_max > 1.0,
+        "real Safari H3 runs unexpectedly all length 1"
+    );
+
+    let ks = two_sample_ks(&real_runs, &bad_runs);
+    assert!(
+        ks.p_value < 0.05,
+        "H3 direction-run KS failed to fire on lockstep: D={:.4} p={:.4}",
+        ks.statistic,
+        ks.p_value
+    );
+}
+
+/// Tier 5b (live): capture a real ParallaX QUIC session at the UDP-datagram
+/// layer through the recording forwarder, and compare its uplink direction-run
+/// and datagram-size distributions to Safari H3. Reports KS for both. IAT is
+/// printed for context only and never asserted on.
+#[tokio::test]
+#[ignore = "live QUIC loopback capture; run with --ignored --test-threads=1"]
+async fn parallax_vs_safari_h3_direction_and_size() {
+    let safari = safari_h3_source::load_fixture().expect("load Safari H3 fixture");
+
+    // Transfer volumes loosely matched to the Safari H3 capture so the datagram
+    // counts are comparable; content is irrelevant to size/direction.
+    let parallax = udp_capture::capture_parallax_quic_trace(64 * 1024, 64 * 1024)
+        .await
+        .expect("capture ParallaX QUIC trace");
+
+    // Direction-interleave structure (wire-faithful).
+    let safari_runs = features::direction_runs(&safari);
+    let parallax_runs = features::direction_runs(&parallax);
+    let runs_ks = two_sample_ks(&safari_runs, &parallax_runs);
+
+    // Datagram-size distribution, C2S (uplink) — the imitated direction.
+    let safari_up = safari.lengths(Dir::C2S);
+    let parallax_up = parallax.lengths(Dir::C2S);
+    let size_ks = two_sample_ks(&safari_up, &parallax_up);
+
+    eprintln!(
+        "[tier5-h3] Safari datagrams n={} (C2S {}), ParallaX n={} (C2S {})",
+        safari.len(),
+        safari_up.len(),
+        parallax.len(),
+        parallax_up.len()
+    );
+    eprintln!(
+        "[tier5-h3] direction-run KS D={:.4} p={:.4} | C2S size KS D={:.4} p={:.4}",
+        runs_ks.statistic, runs_ks.p_value, size_ks.statistic, size_ks.p_value
+    );
+    // IAT printed for context ONLY — not a gate (loopback wall-clock is noise).
+    let safari_iat = safari.iats(Dir::C2S);
+    let parallax_iat = parallax.iats(Dir::C2S);
+    if !safari_iat.is_empty() && !parallax_iat.is_empty() {
+        let iat_ks = two_sample_ks(&safari_iat, &parallax_iat);
+        eprintln!(
+            "[tier5-h3] (context only, NOT gated) C2S IAT KS D={:.4} p={:.4}",
+            iat_ks.statistic, iat_ks.p_value
+        );
+    }
+
+    // Sanity gate only: the capture must have produced a usable *bidirectional*
+    // trace — datagrams in BOTH directions, not just C2S (direction_runs() is
+    // non-empty for any non-empty trace, so it alone would accept a one-way
+    // capture). We do not gate on the KS verdicts themselves yet — loopback
+    // datagram distributions need calibration before a hard threshold, exactly
+    // as the length tier was left informational first.
+    let c2s = parallax.dir(Dir::C2S).len();
+    let s2c = parallax.dir(Dir::S2C).len();
+    assert!(
+        c2s >= 1 && s2c >= 1,
+        "ParallaX capture not bidirectional: C2S={c2s} S2C={s2c}"
     );
 }
