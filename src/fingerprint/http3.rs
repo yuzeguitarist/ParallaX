@@ -16,11 +16,14 @@
 //! (insert/eviction) and blocked-streams logic. ParallaX controls both ends and
 //! uses static-only encoding, which is fully RFC-compliant.
 //!
-//! TODO(qpack-dynamic): confirm whether the real Safari 26 QPACK encoder stream
-//! issues dynamic-table inserts on first request. If parity demands it we will
-//! need encoder-stream + dynamic-table support; until then ParallaX advertises a
-//! non-zero table capacity but only ever emits Required Insert Count = 0
-//! (static + literal) field sections.
+//! QPACK dynamic table (encoder-stream inserts): confirmed NOT needed for Safari
+//! parity. Real Safari 26.4 (2026-06-22 browser h3 wire capture, server-side
+//! keylog decrypt) encodes its request HEADERS entirely with literal / static
+//! representations: Required Insert Count = 0, no encoder-stream insert
+//! instructions. So ParallaX advertises a non-zero QPACK_MAX_TABLE_CAPACITY
+//! (matching Safari's 16383) but only ever emits Required Insert Count = 0
+//! (static + literal) field sections — which is exactly what Safari does. The
+//! decoder still must tolerate a server response that uses the dynamic table.
 
 use thiserror::Error;
 
