@@ -20,7 +20,173 @@
 //! offload (older kernels, non-Linux), so correctness never depends on it.
 
 #[cfg(target_os = "linux")]
-pub use linux::{enable_gro, recv_gro, send_gso};
+pub use linux::{enable_gro, enable_recv_ecn, recv_gro, send_gso, send_mmsg};
+
+// Public diagnostics surface: a stats endpoint reads `offload_stats()`. Not yet wired
+// to a caller in-crate, so allow the unused re-export rather than fabricate one.
+#[allow(unused_imports)]
+pub use stats::{offload_stats, OffloadStats};
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub(super) use stats::{record_gro_read, record_gso_call, record_gso_fallback};
+
+/// The ECN codepoint ECT(0) (RFC 3168): the low two bits of the IP TOS / IPv6 traffic
+/// class byte set to `0b10`. A real Safari QUIC flow marks essentially every datagram
+/// ECT(0) from the first Initial (confirmed against a live capture), so a ParallaX
+/// flow that leaves datagrams Not-ECT is the actual passive distinguisher — marking
+/// ECT(0) is camouflage-positive, not just RFC-permitted (RFC 9000 §13.4).
+#[cfg(unix)]
+const ECN_ECT0: libc::c_int = 0b10;
+
+/// Mark all egress datagrams on `socket` as ECT(0) by setting the ECN bits of the IP
+/// TOS (IPv4) / traffic-class (IPv6) byte. Best-effort and wire-shaping only in the
+/// IP header's 2 ECN bits — the QUIC payload, sizes, and counts are untouched. A
+/// kernel that rejects the option just leaves datagrams Not-ECT (the prior behaviour).
+/// Returns whether the option took, for the recv-side ECN-validation default + tests.
+#[cfg(unix)]
+pub fn enable_ect0<S: std::os::fd::AsFd>(socket: &S, is_ipv6: bool) -> bool {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_fd().as_raw_fd();
+    let tos: libc::c_int = ECN_ECT0;
+    // IPv4 uses IP_TOS; IPv6 uses IPV6_TCLASS. A dual-stack v6 socket carries v4-mapped
+    // traffic in the v6 header, so for a v6 bind set the v6 traffic class.
+    let (level, optname) = if is_ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_TOS)
+    };
+    // SAFETY: setsockopt with a pointer to a stack-local c_int of matching length on a
+    // valid borrowed fd; it only mutates this socket's option state.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            (&tos as *const libc::c_int).cast(),
+            std::mem::size_of_val(&tos) as libc::socklen_t,
+        )
+    };
+    rc == 0
+}
+
+#[cfg(not(unix))]
+pub fn enable_ect0<S>(_socket: &S, _is_ipv6: bool) -> bool {
+    false
+}
+
+/// Process-wide GSO/GRO offload counters (PR #120 follow-up #1). PR #120 shipped the
+/// Linux GSO/GRO batching with no way to tell, on a running server, whether the
+/// kernel offload is actually engaging or whether every flush silently takes the
+/// per-datagram fallback — so the throughput win could not be confirmed. These
+/// counters make the offload observable: the GSO hit/fallback split and the GRO
+/// coalescing factor. They are pure host-local bookkeeping (no wire effect) and the
+/// recording API is platform-agnostic so the test runs on every target, even where
+/// the syscalls do not exist.
+mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One process-wide counter set. Singleton in [`COUNTERS`].
+    struct Counters {
+        /// GSO `sendmsg` calls the kernel accepted (a multi-datagram run sent in one
+        /// syscall).
+        gso_calls: AtomicU64,
+        /// Datagrams emitted via accepted GSO calls (each would have cost one `send_to`
+        /// on the per-datagram path).
+        gso_datagrams: AtomicU64,
+        /// Runs that fell back to per-datagram `send_to` (no GSO, oversized, transient
+        /// error, short count, or not-writable).
+        gso_fallback_runs: AtomicU64,
+        /// `recvmsg` reads on the GRO path.
+        gro_reads: AtomicU64,
+        /// Datagrams recovered from GRO reads (the re-split chunk count). Equal to
+        /// `gro_reads` with no coalescing; above it when the kernel gathered several
+        /// datagrams per read.
+        gro_coalesced_datagrams: AtomicU64,
+    }
+
+    static COUNTERS: Counters = Counters {
+        gso_calls: AtomicU64::new(0),
+        gso_datagrams: AtomicU64::new(0),
+        gso_fallback_runs: AtomicU64::new(0),
+        gro_reads: AtomicU64::new(0),
+        gro_coalesced_datagrams: AtomicU64::new(0),
+    };
+
+    /// Record one accepted GSO call that emitted `datagrams` datagrams.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn record_gso_call(datagrams: u64) {
+        COUNTERS.gso_calls.fetch_add(1, Ordering::Relaxed);
+        COUNTERS
+            .gso_datagrams
+            .fetch_add(datagrams, Ordering::Relaxed);
+    }
+
+    /// Record one run that fell back to the per-datagram path.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn record_gso_fallback() {
+        COUNTERS.gso_fallback_runs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one GRO `recvmsg` that yielded `datagrams` datagrams after re-splitting.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn record_gro_read(datagrams: u64) {
+        COUNTERS.gro_reads.fetch_add(1, Ordering::Relaxed);
+        COUNTERS
+            .gro_coalesced_datagrams
+            .fetch_add(datagrams, Ordering::Relaxed);
+    }
+
+    /// A point-in-time snapshot of the offload counters, for diagnostics / a stats
+    /// endpoint. GSO hit ratio = `gso_calls / (gso_calls + gso_fallback_runs)`; GRO
+    /// coalescing factor = `gro_coalesced_datagrams / gro_reads`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[allow(dead_code)] // diagnostics snapshot; read by tests + a future stats endpoint
+    pub struct OffloadStats {
+        pub gso_calls: u64,
+        pub gso_datagrams: u64,
+        pub gso_fallback_runs: u64,
+        pub gro_reads: u64,
+        pub gro_coalesced_datagrams: u64,
+    }
+
+    /// Read the current process-wide offload counters.
+    #[allow(dead_code)] // diagnostics accessor; exercised by the offload stats test
+    pub fn offload_stats() -> OffloadStats {
+        OffloadStats {
+            gso_calls: COUNTERS.gso_calls.load(Ordering::Relaxed),
+            gso_datagrams: COUNTERS.gso_datagrams.load(Ordering::Relaxed),
+            gso_fallback_runs: COUNTERS.gso_fallback_runs.load(Ordering::Relaxed),
+            gro_reads: COUNTERS.gro_reads.load(Ordering::Relaxed),
+            gro_coalesced_datagrams: COUNTERS.gro_coalesced_datagrams.load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn recorders_increment_the_snapshot() {
+            // The counters are process-wide, so assert on the DELTA across recordings,
+            // not absolute values (another test in the same process may have touched
+            // them). The recorders are platform-agnostic, so this runs everywhere —
+            // covering the bookkeeping even on targets without the GSO/GRO syscalls.
+            let before = offload_stats();
+            record_gso_call(64);
+            record_gso_call(8);
+            record_gso_fallback();
+            record_gro_read(42);
+            let after = offload_stats();
+            assert_eq!(after.gso_calls - before.gso_calls, 2);
+            assert_eq!(after.gso_datagrams - before.gso_datagrams, 72);
+            assert_eq!(after.gso_fallback_runs - before.gso_fallback_runs, 1);
+            assert_eq!(after.gro_reads - before.gro_reads, 1);
+            assert_eq!(
+                after.gro_coalesced_datagrams - before.gro_coalesced_datagrams,
+                42
+            );
+        }
+    }
+}
 
 /// The kernel's hard ceiling on segments per `UDP_SEGMENT` send (`UDP_MAX_SEGMENTS`
 /// = `1 << 6` in `net/ipv4/udp.c`). A `sendmsg` whose GSO buffer holds more than
@@ -157,6 +323,14 @@ mod linux {
             (*cmsg).cmsg_level = libc::SOL_UDP;
             (*cmsg).cmsg_type = libc::UDP_SEGMENT;
             (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+            // The UDP_SEGMENT cmsg is a u16; a segment larger than that cannot be
+            // expressed. The carrier's MAX_DATAGRAM (1252) is far below this, and DPLPMTUD
+            // is capped well under 65535, so this only guards a future invariant break —
+            // a debug_assert documents it without a release-path branch.
+            debug_assert!(
+                segment_size <= u16::MAX as usize,
+                "GSO segment_size {segment_size} exceeds the u16 UDP_SEGMENT field"
+            );
             let seg = segment_size as u16;
             std::ptr::copy_nonoverlapping(
                 (&seg as *const u16).cast::<u8>(),
@@ -175,6 +349,69 @@ mod linux {
         }
     }
 
+    /// Send a batch of independent datagrams in one `sendmmsg(2)`, returning how many
+    /// the kernel accepted (a prefix of `batch`). This is the GSO-fallback fast path:
+    /// when a run cannot use `UDP_SEGMENT` (mixed sizes, an older kernel, an oversized
+    /// run, a transient error), the per-datagram path would otherwise spend one
+    /// `send_to` syscall — and one async wakeup — per packet. `sendmmsg` collapses
+    /// them into a single syscall while keeping each datagram an independent message
+    /// (its own destination, its own size), so the bytes/sizes/count on the wire are
+    /// identical to the per-datagram loop.
+    ///
+    /// Returns `Ok(n)` where `n` is the number of leading datagrams sent (the kernel
+    /// sends a prefix and reports a short count on `EAGAIN`/`EWOULDBLOCK` after the
+    /// first message, or a hard error on the very first). The caller resends the
+    /// `batch[n..]` remainder via the awaiting per-datagram fallback, so no bytes are
+    /// ever dropped. An empty batch returns `Ok(0)`.
+    pub fn send_mmsg(fd: BorrowedFd<'_>, batch: &[(Vec<u8>, SocketAddr)]) -> io::Result<usize> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        // Parallel backing storage that must outlive the syscall: one SockAddr, one
+        // iovec, and one mmsghdr per datagram. The mmsghdr's msg_hdr points into the
+        // addrs/iovs vectors, so all three must stay put for the sendmmsg call.
+        let addrs: Vec<SockAddr> = batch
+            .iter()
+            .map(|(_, peer)| SockAddr::from(*peer))
+            .collect();
+        let mut iovs: Vec<libc::iovec> = batch
+            .iter()
+            .map(|(dg, _)| libc::iovec {
+                iov_base: dg.as_ptr() as *mut libc::c_void,
+                iov_len: dg.len(),
+            })
+            .collect();
+        // SAFETY: mmsghdr is a C struct of plain integers/pointers; zeroed is a valid
+        // initial state before we fill msg_hdr below.
+        let mut msgs: Vec<libc::mmsghdr> = (0..batch.len())
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
+        for (i, msg) in msgs.iter_mut().enumerate() {
+            msg.msg_hdr.msg_name = addrs[i].as_ptr() as *mut libc::c_void;
+            msg.msg_hdr.msg_namelen = addrs[i].len();
+            msg.msg_hdr.msg_iov = &mut iovs[i];
+            msg.msg_hdr.msg_iovlen = 1;
+            // msg_len is an out field the kernel fills with bytes sent for this message.
+        }
+        // SAFETY: msgs/addrs/iovs are live for the call; each mmsghdr's msg_hdr points
+        // at the matching addr + iov, all with correct lengths. sendmmsg writes only
+        // each mmsghdr's msg_len out field.
+        let n = unsafe {
+            libc::sendmmsg(
+                fd.as_raw_fd(),
+                msgs.as_mut_ptr(),
+                msgs.len() as libc::c_uint,
+                0,
+            )
+        };
+        if n < 0 {
+            // A hard error before the first message was sent (e.g. EAGAIN with nothing
+            // sent). The caller resends the whole batch per-datagram.
+            return Err(io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
     /// A GRO read: the bytes the kernel coalesced and the segment size to re-split
     /// them by. `segment_size == total` (no GRO cmsg) means one ordinary datagram.
     /// The caller re-splits with `buf[..total].chunks(segment_size)` — each chunk is
@@ -183,6 +420,37 @@ mod linux {
         pub peer: SocketAddr,
         pub total: usize,
         pub segment_size: usize,
+        /// The ECN codepoint from the IP TOS / IPv6 traffic-class byte's low 2 bits
+        /// (RFC 3168): 0 = Not-ECT, 0b10 = ECT(0), 0b01 = ECT(1), 0b11 = CE. GRO only
+        /// coalesces same-ECN datagrams (a kernel invariant), so one value covers every
+        /// segment of the read. 0 when the TOS cmsg is absent (IP_RECVTOS off / older
+        /// kernel), which reads as Not-ECT.
+        pub ecn: u8,
+    }
+
+    /// Enable receiving the inbound ECN codepoint (the IP TOS / IPv6 traffic-class
+    /// byte) as a control message, so [`recv_gro`] can read per-datagram ECN. Paired
+    /// with egress ECT(0): the server must count inbound CE marks to echo them in
+    /// ACK_ECN (RFC 9000 §13.4). Best-effort; without it `recv_gro` reports Not-ECT.
+    pub fn enable_recv_ecn<S: AsFd>(socket: &S, is_ipv6: bool) -> bool {
+        let fd = socket.as_fd().as_raw_fd();
+        let on: libc::c_int = 1;
+        let (level, optname) = if is_ipv6 {
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS)
+        } else {
+            (libc::IPPROTO_IP, libc::IP_RECVTOS)
+        };
+        // SAFETY: setsockopt with a stack c_int of matching length on a valid fd.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                optname,
+                (&on as *const libc::c_int).cast(),
+                std::mem::size_of_val(&on) as libc::socklen_t,
+            )
+        };
+        rc == 0
     }
 
     /// Receive one (possibly GRO-coalesced) read into `buf` via `recvmsg`, returning
@@ -198,8 +466,13 @@ mod linux {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        let mut cmsg_buf =
-            [0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize];
+        // Room for both control messages the kernel may attach: the UDP_GRO segment
+        // size (u16) and the ECN/TOS byte (delivered as an int). Sizing for just one
+        // would truncate the other.
+        let mut cmsg_buf = [0u8; unsafe {
+            libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32)
+                + libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32)
+        } as usize];
 
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         // SockAddrStorage is repr(transparent) over libc::sockaddr_storage, so its
@@ -235,14 +508,18 @@ mod linux {
             .as_socket()
             .ok_or_else(|| io::Error::other("recvmsg returned a non-IP peer"))?;
 
-        // Default: no GRO cmsg => one datagram of `total` bytes.
+        // Default: no GRO cmsg => one datagram of `total` bytes; no TOS cmsg => Not-ECT.
         let mut segment_size = total;
+        let mut ecn: u8 = 0;
         // SAFETY: msg is fully initialized by recvmsg; CMSG_* walk only within
-        // cmsg_buf as bounded by msg_controllen.
+        // cmsg_buf as bounded by msg_controllen. Scan ALL cmsgs (do not break early):
+        // the kernel may attach both the UDP_GRO segment size and the ECN/TOS byte.
         unsafe {
             let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
             while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_UDP && (*cmsg).cmsg_type == libc::UDP_GRO {
+                let level = (*cmsg).cmsg_level;
+                let kind = (*cmsg).cmsg_type;
+                if level == libc::SOL_UDP && kind == libc::UDP_GRO {
                     let mut seg: u16 = 0;
                     std::ptr::copy_nonoverlapping(
                         libc::CMSG_DATA(cmsg),
@@ -252,7 +529,19 @@ mod linux {
                     if seg != 0 {
                         segment_size = seg as usize;
                     }
-                    break;
+                } else if (level == libc::IPPROTO_IP && kind == libc::IP_TOS)
+                    || (level == libc::IPPROTO_IPV6 && kind == libc::IPV6_TCLASS)
+                {
+                    // The TOS/traffic-class byte is delivered as an int (IPv6) or a
+                    // single byte (IPv4); read the first byte either way and take the
+                    // low 2 bits (the ECN field, RFC 3168).
+                    let mut tos_byte: u8 = 0;
+                    std::ptr::copy_nonoverlapping(
+                        libc::CMSG_DATA(cmsg),
+                        &mut tos_byte as *mut u8,
+                        std::mem::size_of::<u8>(),
+                    );
+                    ecn = tos_byte & 0b11;
                 }
                 cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
             }
@@ -262,6 +551,7 @@ mod linux {
             peer,
             total,
             segment_size,
+            ecn,
         })
     }
 }
@@ -367,5 +657,69 @@ mod tests {
             next = r.range.end;
         }
         assert_eq!(next, batch.len());
+    }
+
+    /// `send_mmsg` delivers a batch of independent datagrams to their destination in
+    /// one syscall, each as a distinct message (own size, own bytes), matching what a
+    /// per-datagram `send_to` loop would have put on the wire. Linux-only (the syscall
+    /// does not exist elsewhere); compiled everywhere via the Linux cfg, run on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn send_mmsg_delivers_each_datagram_verbatim() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsFd;
+
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        // Three differently-sized datagrams to the same peer (a mixed run GSO would
+        // reject, exactly the fallback case sendmmsg now batches).
+        let batch = vec![
+            (vec![1u8; 1252], rx_addr),
+            (vec![2u8; 40], rx_addr),
+            (vec![3u8; 700], rx_addr),
+        ];
+        let sent = super::linux::send_mmsg(tx.as_fd(), &batch).unwrap();
+        assert_eq!(sent, 3, "all three datagrams sent in one sendmmsg");
+
+        // Each arrives as its own datagram with its own length and payload, in order.
+        for (expected, _) in &batch {
+            let mut buf = vec![0u8; 2048];
+            let n = rx.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &expected[..], "datagram delivered verbatim");
+        }
+    }
+
+    /// `enable_ect0` sets the IP TOS byte's ECN bits to ECT(0) on the socket; read it
+    /// back via getsockopt to prove the option took (so egress datagrams are marked,
+    /// matching Safari). Unix-only (the sockopt is POSIX); runs on macOS + Linux.
+    #[cfg(unix)]
+    #[test]
+    fn enable_ect0_sets_the_ip_tos_ecn_bits() {
+        use std::net::UdpSocket;
+        use std::os::fd::{AsFd, AsRawFd};
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(enable_ect0(&sock.as_fd(), false), "IP_TOS ECT(0) set on v4");
+
+        // Read the TOS back: its low two bits must be ECT(0) = 0b10.
+        let fd = sock.as_raw_fd();
+        let mut tos: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt into a stack c_int with matching length on a valid fd.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                (&mut tos as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt IP_TOS");
+        assert_eq!(tos & 0b11, 0b10, "ECN field is ECT(0)");
     }
 }
