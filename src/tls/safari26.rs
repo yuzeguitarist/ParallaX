@@ -566,9 +566,14 @@ impl Safari26TlsSession {
                         let (level, description) = (decrypted.plaintext[0], decrypted.plaintext[1]);
                         // A warning close_notify is the origin's clean end-of-drain
                         // (same benign class as the bare FIN handled at :541); a real
-                        // client treats it as end-of-stream, not a failure.
+                        // client treats it as end-of-stream, not a failure. Report the
+                        // count WITHOUT this terminator record (`observed` was already
+                        // incremented above): a close_notify is an end-of-stream signal,
+                        // not a post-handshake data record, so it must match the bare-FIN
+                        // path's count exactly — otherwise a clean close would score as a
+                        // spurious post-handshake/ticket signal in `plx probe`.
                         if is_warning_close_notify(level, description) {
-                            return Ok(observed);
+                            return Ok(observed - 1);
                         }
                         return Err(Safari26TlsError::Alert { level, description });
                     }
@@ -2254,10 +2259,15 @@ mod tests {
         peer.write_all(&record).await.unwrap();
         drop(peer);
 
-        session
+        let observed = session
             .drain_post_handshake(&mut stream, &mut session_keys)
             .await
             .unwrap();
+        // The close_notify is an end-of-stream terminator, not a post-handshake
+        // data record: it must NOT be counted, matching the bare-FIN path (which
+        // returns without incrementing). A single close_notify => 0 observed
+        // records, so `plx probe` cannot score a clean close as a ticket signal.
+        assert_eq!(observed, 0);
     }
 
     #[tokio::test]
