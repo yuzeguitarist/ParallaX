@@ -804,6 +804,39 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_short_header_reserved_bits() {
+        // The existing reserved-bits test only covers the LONG header (mask 0x0c);
+        // the short-header path has its own guard (mask 0x18). Set a short reserved
+        // bit and confirm it is rejected before the packet number is decoded.
+        let hdr = Header::Short {
+            spin: false,
+            key_phase: false,
+            dcid: ConnectionId::new(&[0xaa, 0xbb, 0xcc, 0xdd]),
+            packet_number: 0,
+            pn_len: 1,
+        };
+        let mut out = Vec::new();
+        hdr.encode(&mut out);
+        out[0] |= 0x10; // a short-header reserved bit (mask 0x18)
+        assert_eq!(
+            Header::decode(&out, 4, 0),
+            Err(DecodeError::ReservedBitsSet)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_long_header_cid_over_max_len() {
+        // A long-header connection-id length byte above MAX_CID_LEN must be rejected
+        // (bounds check on a wire-controlled length on an unauthenticated Initial),
+        // not truncated silently or used to over-read.
+        let mut pkt = vec![LONG_HEADER_FORM | FIXED_BIT]; // Initial, pn_len bits 0
+        pkt.extend_from_slice(&1u32.to_be_bytes()); // version
+        pkt.push((MAX_CID_LEN + 1) as u8); // DCID length: one over the cap
+        pkt.extend_from_slice(&[0x00; MAX_CID_LEN + 1]); // the (too-long) DCID bytes
+        assert_eq!(Header::decode(&pkt, 0, 0), Err(DecodeError::CidTooLong));
+    }
+
+    #[test]
     fn decode_packet_number_exercises_window_wraparound_branches() {
         // The plain branch (no window adjustment).
         assert_eq!(decode_packet_number(300, 0x05, 1), 261);

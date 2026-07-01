@@ -184,6 +184,86 @@ pub mod tests {
         assert!(parsed.tls13_selected);
     }
 
+    #[test]
+    fn rejects_record_truncated_below_declared_length() {
+        // Declared record length exceeds the bytes actually present -> Truncated,
+        // before any body field is interpreted.
+        let mut record = server_hello_fixture();
+        record.pop();
+        assert_eq!(
+            parse_server_hello(&record),
+            Err(ServerHelloError::Truncated)
+        );
+    }
+
+    #[test]
+    fn rejects_non_handshake_content_type() {
+        let mut record = server_hello_fixture();
+        record[0] ^= 0xff; // corrupt the content type away from handshake
+        assert_eq!(
+            parse_server_hello(&record),
+            Err(ServerHelloError::NotHandshakeRecord)
+        );
+    }
+
+    #[test]
+    fn rejects_handshake_that_is_not_a_server_hello() {
+        let mut record = server_hello_fixture();
+        record[TLS_HEADER_LEN] = HANDSHAKE_SERVER_HELLO ^ 0x01; // e.g. a different handshake type
+        assert_eq!(
+            parse_server_hello(&record),
+            Err(ServerHelloError::NotServerHello)
+        );
+    }
+
+    #[test]
+    fn rejects_handshake_body_longer_than_record() {
+        // Inflate the 24-bit handshake body length past the record's own length so
+        // `body_end > header.total_len`.
+        let mut record = server_hello_fixture();
+        let body_len_hi = TLS_HEADER_LEN + 1; // first of the u24 body-length bytes
+        record[body_len_hi] = 0xff;
+        assert_eq!(
+            parse_server_hello(&record),
+            Err(ServerHelloError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn rejects_supported_versions_extension_of_wrong_length() {
+        // A supported_versions body must be exactly 2 bytes; a 3-byte body is
+        // rejected as InvalidLength (guards `parse_supported_versions`).
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0x44; 32]); // random
+        body.push(0); // empty session id
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite
+        body.push(0); // compression_method
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+        extensions.extend_from_slice(&3_u16.to_be_bytes()); // WRONG: 3-byte value
+        extensions.extend_from_slice(&[0x03, 0x04, 0x00]);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = Vec::new();
+        handshake.push(HANDSHAKE_SERVER_HELLO);
+        push_u24(&mut handshake, body.len() as u32);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(TLS_CONTENT_HANDSHAKE);
+        record.extend_from_slice(&[0x03, 0x03]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+
+        assert_eq!(
+            parse_server_hello(&record),
+            Err(ServerHelloError::InvalidLength)
+        );
+    }
+
     pub fn server_hello_fixture() -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // legacy_version
