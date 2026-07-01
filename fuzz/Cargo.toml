@@ -134,3 +134,10 @@ path = "fuzz_targets/h3_qpack_field_section.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "quic_transport_params"
+path = "fuzz_targets/quic_transport_params.rs"
+test = false
+doc = false
+bench = false
