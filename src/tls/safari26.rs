@@ -2594,6 +2594,121 @@ mod tests {
         drop(peer);
     }
 
+    #[tokio::test]
+    async fn await_http2_settings_ack_propagates_non_clean_read_error() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut keys = app_keys();
+
+        // A complete outer record HEADER whose declared payload length is far above
+        // the TLS record ceiling (0xffff): `read_record_into` reads the 5-byte header
+        // in full, then `parse_header` rejects it as PayloadTooLarge, which surfaces
+        // as an `io::ErrorKind::InvalidData`. That is NOT a clean-close kind, so the
+        // `is_clean_close(&err)` guard is false and the loop must propagate `Err`.
+        // (Kills the guard->true mutant, which would swallow it as `Ok(())`.)
+        peer.write_all(&[TLS_CONTENT_APPLICATION_DATA, 0x03, 0x03, 0xff, 0xff])
+            .await
+            .unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut keys)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Io(_)),
+            "a non-clean read error must propagate, got {err:?}"
+        );
+    }
+
+    /// An encrypted application-data record carrying `plaintext_len` bytes that begin
+    /// with an HTTP/2 frame header declaring the maximum 24-bit length (0xff_ffff).
+    /// `parse_complete` can never satisfy that length, so the frame stays unconsumed
+    /// and the bytes accumulate in the settings-ack buffer verbatim.
+    fn incomplete_giant_h2_frame_record(
+        peer_keys: &mut Tls13Keys,
+        plaintext_len: usize,
+    ) -> Vec<u8> {
+        let mut body = vec![0xff, 0xff, 0xff, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+        body.resize(plaintext_len, 0x0);
+        peer_keys
+            .server_application
+            .encrypt_record(TLS_RECORD_APPLICATION_DATA, &body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_below_buffer_limit_keeps_reading() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // One record of unconsumable frame bytes leaves the buffer well BELOW
+        // H2_FRAME_BUFFER_LIMIT, so the loop must NOT bail — it must keep reading and
+        // reach the following outer fatal alert, surfacing it as an error.
+        // (Kills the `>`->`<` mutant, which would bail early and return `Ok(())`.)
+        let record = incomplete_giant_h2_frame_record(
+            &mut peer_keys,
+            crate::tls::record::MAX_TLS_RECORD_PAYLOAD,
+        );
+        assert!(record.len() <= H2_FRAME_BUFFER_LIMIT);
+        peer.write_all(&record).await.unwrap();
+        peer.write_all(&tls_record(TLS_CONTENT_ALERT, &[0x02, 0x28]))
+            .await
+            .unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x02,
+                description: 0x28
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_at_buffer_limit_keeps_reading() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // Accumulate EXACTLY H2_FRAME_BUFFER_LIMIT (65536) bytes of unconsumable
+        // frame across four 16 KiB records. The bound is `len > LIMIT`, so at exactly
+        // the limit the loop must NOT bail and must go on to read the trailing outer
+        // fatal alert. (Kills both the `>`->`==` and `>`->`>=` mutants, each of which
+        // would bail at exactly 65536 and return `Ok(())` instead of erroring.)
+        let chunk = H2_FRAME_BUFFER_LIMIT / 4;
+        assert_eq!(chunk * 4, H2_FRAME_BUFFER_LIMIT);
+        assert!(chunk <= crate::tls::record::MAX_TLS_RECORD_PAYLOAD);
+        for _ in 0..4 {
+            let record = incomplete_giant_h2_frame_record(&mut peer_keys, chunk);
+            peer.write_all(&record).await.unwrap();
+        }
+        peer.write_all(&tls_record(TLS_CONTENT_ALERT, &[0x02, 0x28]))
+            .await
+            .unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x02,
+                description: 0x28
+            }
+        ));
+    }
+
     // ---- CompletedSafari26Handshake accessors ----
 
     #[test]
