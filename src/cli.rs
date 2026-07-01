@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use crate::{
     bench::{self, BenchmarkOptions},
     client::runtime,
-    config::{Config, DEFAULT_REPLAY_CACHE_PATH},
+    config::{Config, ReplayCacheWritability, DEFAULT_REPLAY_CACHE_PATH},
     crypto::{
         identity,
         session::{derive_client_keys, AeadCodec, X25519KeyPair},
@@ -225,6 +225,30 @@ fn check_config(config: PathBuf) -> anyhow::Result<()> {
             "warning: host key unavailable; validated structure and permissions only — \
              secret values not decrypted"
         );
+    }
+    match cfg.replay_cache_writability() {
+        ReplayCacheWritability::NotServer | ReplayCacheWritability::Writable => {}
+        ReplayCacheWritability::ParentMissingCreatable { missing } => {
+            println!(
+                "ok: replay-cache directory {} does not exist yet but is creatable on server start",
+                missing.display()
+            );
+        }
+        ReplayCacheWritability::NotWritable {
+            dir,
+            intended_parent,
+        } => {
+            println!(
+                "warning: replay-cache directory {} is not writable by this user; the server will \
+                 fail to open its replay cache on start.",
+                dir.display()
+            );
+            println!(
+                "         Create it with the right ownership (e.g. `sudo install -d -o $USER {}`) \
+                 or set server.replay_cache_path to a writable path.",
+                intended_parent.display()
+            );
+        }
     }
     let inline = cfg.inline_secret_fields();
     if inline.is_empty() {
@@ -1166,6 +1190,52 @@ mod tests {
             fs::set_permissions(&server_path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         check_config(server_path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn check_config_warns_but_succeeds_on_unwritable_replay_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses DAC write checks, so the unwritable-dir path can't be
+        // exercised as root.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("readonly");
+        fs::create_dir(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "example.com:443",
+            "example.com:443",
+            "example.com",
+        );
+        // Point the server's replay cache at a file under the read-only dir by
+        // rewriting the template's default path line (an absolute path is used
+        // verbatim, so no config-relative resolution applies).
+        let replacement = format!(
+            "replay_cache_path = {:?}",
+            ro.join("replay.cache").to_string_lossy()
+        );
+        let server_toml = generated.server.replace(
+            &format!("replay_cache_path = \"{DEFAULT_REPLAY_CACHE_PATH}\""),
+            &replacement,
+        );
+        assert!(
+            server_toml.contains(&replacement),
+            "template replay_cache_path line must be rewritten"
+        );
+        let server_path = dir.path().join("parallax.server.toml");
+        fs::write(&server_path, &server_toml).unwrap();
+        fs::set_permissions(&server_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // The unwritable replay dir is a warning, not a hard failure.
+        check_config(server_path).unwrap();
+
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
