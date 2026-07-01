@@ -506,19 +506,26 @@ impl<'a> Cursor<'a> {
     }
 
     fn skip(&mut self, n: usize) -> Result<(), DecodeError> {
-        if self.pos + n > self.buf.len() {
+        // `n` is an attacker-controlled varint (e.g. the Initial token length),
+        // so `self.pos + n` must use checked arithmetic: an unchecked add can
+        // wrap past `usize::MAX`, slip under the `> buf.len()` guard, and leave
+        // `self.pos` pointing past the buffer, panicking a later `varint()`
+        // slice on a raw pre-decryption datagram.
+        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
+        if end > self.buf.len() {
             return Err(DecodeError::Truncated);
         }
-        self.pos += n;
+        self.pos = end;
         Ok(())
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
-        let s = self
-            .buf
-            .get(self.pos..self.pos + n)
-            .ok_or(DecodeError::Truncated)?;
-        self.pos += n;
+        // See `skip`: `self.pos + n` on an attacker varint can overflow and make
+        // `get` observe a wrapped (valid-looking) range, so compute the end with
+        // checked arithmetic before slicing.
+        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
+        let s = self.buf.get(self.pos..end).ok_or(DecodeError::Truncated)?;
+        self.pos = end;
         Ok(s)
     }
 
@@ -528,7 +535,10 @@ impl<'a> Cursor<'a> {
     }
 
     fn varint(&mut self) -> Result<u64, DecodeError> {
-        let (v, n) = varint::decode(&self.buf[self.pos..]).ok_or(DecodeError::Truncated)?;
+        // Fail closed rather than index `&self.buf[self.pos..]`: if a prior read
+        // ever advanced `self.pos` past the buffer, the direct slice would panic.
+        let rest = self.buf.get(self.pos..).ok_or(DecodeError::Truncated)?;
+        let (v, n) = varint::decode(rest).ok_or(DecodeError::Truncated)?;
         self.pos += n;
         Ok(v)
     }
@@ -613,6 +623,23 @@ mod tests {
         let (decoded, aad_len) = Header::decode(&out, 0, 0).unwrap();
         assert_eq!(decoded, hdr);
         assert_eq!(aad_len, out.len());
+    }
+
+    #[test]
+    fn locate_pn_offset_rejects_overflowing_initial_token_length() {
+        // A raw, pre-decryption Initial whose token-length varint is the maximum
+        // 8-byte value (2^62-1). `Cursor::skip(tlen)` must fail closed with
+        // `Truncated` — an unchecked `self.pos + tlen` would wrap `usize`, slip
+        // under the length guard, and panic the following `varint()` slice.
+        let mut pkt = vec![LONG_HEADER_FORM | FIXED_BIT]; // Initial, type bits 0x00
+        pkt.extend_from_slice(&[0, 0, 0, 1]); // version
+        pkt.push(0); // dcid len = 0
+        pkt.push(0); // scid len = 0
+        pkt.extend_from_slice(&[0xff; 8]); // token length varint = 2^62-1
+
+        assert_eq!(locate_pn_offset(&pkt, 0), Err(DecodeError::Truncated));
+        // `long_packet_len` shares the same cursor; it must also stay bounded.
+        assert_eq!(long_packet_len(&pkt), None);
     }
 
     #[test]

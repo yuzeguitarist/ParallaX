@@ -228,17 +228,23 @@ impl TransportParameters {
         let mut seen: BTreeSet<u64> = BTreeSet::new();
         let mut i = 0usize;
         while i < blob.len() {
-            let (id, n) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
+            let (id, n) =
+                varint::decode(blob.get(i..).ok_or(Error::Truncated)?).ok_or(Error::Truncated)?;
             i += n;
             // RFC 9000 §7.4.1: a transport parameter MUST NOT appear more than once.
             if !seen.insert(id) {
                 return Err(Error::Duplicate);
             }
-            let (len, m) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
+            let (len, m) =
+                varint::decode(blob.get(i..).ok_or(Error::Truncated)?).ok_or(Error::Truncated)?;
             i += m;
             let len = len as usize;
-            let body = blob.get(i..i + len).ok_or(Error::Truncated)?;
-            i += len;
+            // `len` is an attacker-controlled varint parsed pre-authentication;
+            // `i + len` must be checked so a near-2^62 length cannot wrap `usize`
+            // and make `get` observe a wrapped, valid-looking range.
+            let end = i.checked_add(len).ok_or(Error::Truncated)?;
+            let body = blob.get(i..end).ok_or(Error::Truncated)?;
+            i = end;
             match id {
                 TP_INITIAL_MAX_DATA => tp.initial_max_data = read_varint_body(body)?,
                 TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => {
@@ -443,6 +449,19 @@ mod tests {
         let mut blob = Vec::new();
         varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
         varint::encode(4, &mut blob); // claims 4 value bytes
+        blob.extend_from_slice(&[0x00, 0x01]); // only 2 present
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn read_rejects_overflowing_parameter_length() {
+        // A parameter whose length varint is the maximum 8-byte value (2^62-1)
+        // must fail closed with Truncated. This parses pre-authentication, so an
+        // unchecked `i + len` would wrap `usize` and either mis-slice the body or
+        // panic the next `varint::decode(&blob[i..])`.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
+        varint::encode((1u64 << 62) - 1, &mut blob); // claims ~2^62 value bytes
         blob.extend_from_slice(&[0x00, 0x01]); // only 2 present
         assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
     }
