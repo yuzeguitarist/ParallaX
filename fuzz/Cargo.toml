@@ -73,6 +73,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "framed_reassembler"
+path = "fuzz_targets/framed_reassembler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "http2_frame_header"
 path = "fuzz_targets/http2_frame_header.rs"
 test = false
