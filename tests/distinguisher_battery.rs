@@ -368,6 +368,75 @@ fn parallax_vs_safari_uplink_length_distribution() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 4b: ParallaX vs Safari — downlink (S2C) length dimension.
+//
+// Tier 4 gates the uplink (client→server) record regime — the direction whose
+// sizing ParallaX imitates from the browser. But a censor observes the DOWNLINK
+// (server→client) too, and ParallaX's server relay seals it through a *separate*
+// codec construction (`SERVER_TO_CLIENT_AAD`). The Safari big-POST S2C stream
+// carries a real, dominant 16401-byte full-record bucket (the same regime as its
+// uplink), so the server relay must land on it as well. Nothing else in the
+// battery pins the downlink, so a server-side codec regression (wrong padding
+// profile / record limit / coalescing) would silently make ParallaX's downlink
+// distinguishable from Safari's and go uncaught. This tier closes that gap with
+// the same modal-pinning contract Tier 4 uses for the uplink.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallax_vs_safari_downlink_length_distribution() {
+    // Safari's server→client (port 8443) application-data records from the
+    // big-POST corpus — the downlink counterpart to Tier 4's uplink stream.
+    let safari = safari_source::load_bigpost().expect("load Safari big-POST fixture");
+    let safari_s2c = safari.lengths(Dir::S2C);
+    let total_bytes: u64 = safari_s2c.iter().map(|&l| l as u64).sum();
+
+    // Drive ParallaX's production *server* relay encoder over a payload of the
+    // same total downlink volume, so the record-count regimes are comparable.
+    let payload = vec![0x5a_u8; total_bytes as usize];
+    let parallax = parallax_source::downlink_trace(&payload);
+    let parallax_s2c = parallax.lengths(Dir::S2C);
+
+    let ks = two_sample_ks(&safari_s2c, &parallax_s2c);
+
+    let safari_full = safari_s2c.iter().filter(|&&l| l >= 16000.0).count();
+    let parallax_full = parallax_s2c.iter().filter(|&&l| l >= 16000.0).count();
+    eprintln!(
+        "[tier4b-downlink] Safari S2C n={} (full≥16000:{}), ParallaX S2C n={} (full≥16000:{}); \
+         KS D={:.4} p={:.4}",
+        safari_s2c.len(),
+        safari_full,
+        parallax_s2c.len(),
+        parallax_full,
+        ks.statistic,
+        ks.p_value
+    );
+
+    // Same contract as Tier 4: the KS verdict is informational (the two corpora
+    // legitimately differ in the small-control-record tail — Safari's H2 control
+    // frames vs ParallaX's pure-data downlink), while the modal (dominant) full
+    // record must be exactly 16401 on BOTH sides, byte-for-byte.
+    const FULL_RECORD_LEN: u32 = 16401;
+    let modal_len = |lens: &[f64]| -> (u32, usize) {
+        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for &l in lens {
+            *counts.entry(l as u32).or_default() += 1;
+        }
+        counts.into_iter().max_by_key(|&(_, c)| c).unwrap_or((0, 0))
+    };
+    let (safari_modal, safari_modal_n) = modal_len(&safari_s2c);
+    let (parallax_modal, parallax_modal_n) = modal_len(&parallax_s2c);
+
+    assert_eq!(
+        parallax_modal, FULL_RECORD_LEN,
+        "ParallaX downlink modal record length {parallax_modal} (×{parallax_modal_n}) != {FULL_RECORD_LEN}"
+    );
+    assert_eq!(
+        safari_modal, FULL_RECORD_LEN,
+        "Safari downlink modal record length {safari_modal} (×{safari_modal_n}) != {FULL_RECORD_LEN}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tier 5: direction-interleave structure (UDP/H3 layer).
 //
 // Scope is deliberate (see udp_capture / safari_h3_source docs): we gate on
