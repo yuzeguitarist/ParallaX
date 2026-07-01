@@ -4505,6 +4505,53 @@ mod tests {
         wait_for_task("fallback", fallback_task).await;
     }
 
+    /// Regression: the camouflage origin closes (a bare FIN, no close_notify)
+    /// before the authenticated client's PX1Q arrives. The server must treat the
+    /// origin's pre-PX1Q close as benign camouflage debris — pause the splice and
+    /// keep waiting for PX1Q so it can still send PX1K/PX1S — instead of aborting
+    /// the handshake (which left the client reading a FIN where it expected PX1K:
+    /// the "record_len=24 then TLS record header ended early" failure on high-RTT
+    /// links). The relay must still complete end to end.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn socks_relay_survives_origin_close_before_pq_rekey() {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback_eager_close().await;
+        let (target_addr, target_task) = spawn_eof_response_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
+        let (local_addr, client_task) =
+            spawn_local_client(parallax_addr, &server_keys, &server_identity_keys).await;
+
+        let mut app = connect_socks_target(local_addr, target_addr).await;
+        app.write_all(b"request-before-half-close").await.unwrap();
+        app.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), app.read_to_end(&mut response))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("relay failed when origin closed before PX1Q (the teardown-leak regression)")
+            })
+            .unwrap();
+        assert_eq!(response, b"response-after-half-close");
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_relay_succeeds_with_client_udp_negotiation_enabled() {
@@ -6182,6 +6229,58 @@ mod tests {
         flush_rustls_server(&mut server, &mut stream).await;
         let mut one = [0_u8; 1];
         let _ = timeout(Duration::from_millis(500), stream.read(&mut one)).await;
+    }
+
+    /// A camouflage origin that FINs the moment its TLS handshake completes — a
+    /// bare FIN, no close_notify (see below) — modelling a real origin that tears a
+    /// spliced connection down on its own schedule. Reproduction is deterministic
+    /// by TCP ordering, not timing: in-order delivery guarantees the ParallaX
+    /// server relays the origin's full handshake flight before it observes the
+    /// `Ok(0)` FIN on its fallback read arm, and the server (causally upstream of
+    /// the client's PX1Q) sees that FIN before the client can emit PX1Q — the exact
+    /// pre-PX1Q ordering that the fix must survive. A bare FIN is used deliberately:
+    /// a close_notify *alert* would abort the client's still-running `.complete()`
+    /// (`await_http2_settings_ack`), a separate client-side concern out of scope
+    /// here; this test pins the SERVER's pre-PX1Q origin-close handling. The client
+    /// tolerates a bare origin FIN during `.complete()` (its post-handshake/H2
+    /// waits exit via their record-boundary timeouts), so it still finishes its
+    /// camouflage and writes PX1Q. Origin-agnostic: nothing here is vendor-specific.
+    async fn run_camouflage_tls_server_eager_close(mut stream: TcpStream) {
+        let mut server =
+            rustls::ServerConnection::new(rustls_server_config()).expect("rustls server config");
+        let mut buf = [0_u8; 4096];
+
+        while server.is_handshaking() {
+            flush_rustls_server(&mut server, &mut stream).await;
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            let mut cursor = Cursor::new(&buf[..n]);
+            server.read_tls(&mut cursor).unwrap();
+            server.process_new_packets().unwrap();
+        }
+        flush_rustls_server(&mut server, &mut stream).await;
+        // The origin FINs the moment its TLS handshake completes — before the
+        // client's PX1Q can traverse the splice. The client's own
+        // `Safari26TlsSession::complete()` tolerates a bare origin FIN (its H2
+        // settings-ack wait treats a clean close as done), so the client still
+        // finishes its camouflage and writes PX1Q; the ParallaX SERVER is the side
+        // that must not treat this origin FIN as fatal. A bare FIN (no close_notify
+        // alert) is used deliberately: an alert would abort the client's
+        // still-running `.complete()` (a separate concern), whereas this test pins
+        // the server's pre-PX1Q origin-FIN handling. The server sees `Ok(0)` on its
+        // fallback read arm before any PX1Q arrives — the exact race this fixes.
+        drop(server);
+        let _ = stream.shutdown().await;
+    }
+
+    async fn spawn_camouflage_fallback_eager_close() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            run_camouflage_tls_server_eager_close(stream).await;
+        });
+        (addr, task)
     }
 
     async fn flush_rustls_server(server: &mut rustls::ServerConnection, stream: &mut TcpStream) {

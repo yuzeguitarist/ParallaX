@@ -1878,6 +1878,18 @@ async fn run_authenticated_data_mode(
     let mut client_camouflage_records_before_pq = 0usize;
     let mut client_camouflage_bytes_before_pq = 0usize;
     let mut fallback_bytes_before_pq = 0usize;
+    // The camouflage origin can finish its side (TLS `close_notify` + FIN) before
+    // the authenticated client's PX1Q reaches us — a real origin closes a
+    // completed HTTP/2 GET whenever it likes, and on a high-RTT link the client's
+    // PX1Q is still in flight when that close arrives. The origin closing is NOT a
+    // session-fatal event: the server is about to drop the origin the instant
+    // PX1Q arrives anyway (the splice exists only to cover the camouflage
+    // handshake). So when the origin half closes, stop pumping it and keep waiting
+    // for PX1Q on the client arm, rather than tearing the whole handshake down and
+    // leaving the client to read a FIN where it expects PX1K. `false` disables the
+    // fallback->client select arm (mirroring the byte-limit pause already there),
+    // so the loop proceeds on the client and deadline arms with no busy-spin.
+    let mut fallback_open = true;
     // Reassembles the client's PQ rekey (PX1Q), now split across several
     // variable-length FramedChunk records (PAR-21). On this direction no
     // camouflage interleaves after the handshake — the client writes all chunks
@@ -2675,6 +2687,16 @@ async fn run_authenticated_data_mode(
                                 "forwarding client camouflage record before ParallaX PQ rekey"
                             );
                         }
+                        // Only forward to the origin while its half is still open.
+                        // If it already closed before PX1Q (handled on the
+                        // fallback->client arm), drop the client's remaining
+                        // camouflage tail: those bytes were destined for an origin
+                        // that has left, and the client sends its camouflage flight
+                        // fire-and-forget before PX1Q, so discarding them is inert.
+                        // The record cap above still bounds this direction.
+                        if !fallback_open {
+                            continue;
+                        }
                         match timeout_at(
                             pre_pq_deadline,
                             fallback_write.write_all(&client_record),
@@ -2683,20 +2705,20 @@ async fn run_authenticated_data_mode(
                         {
                             Ok(Ok(())) => {}
                             Ok(Err(err)) if is_write_peer_close(&err) => {
-                                // The cover origin (fallback) closed; the client is
-                                // still live mid-camouflage and may have unread RX,
-                                // so drain->FIN both halves instead of a bare drop
-                                // (which would RST the client — the teardown tell we
-                                // avoid), matching the deadline arm below.
+                                // The cover origin closed mid-camouflage, observed on
+                                // the write side. Same benign case as an origin FIN on
+                                // the read arm: stop forwarding to it and keep waiting
+                                // for the client's PX1Q rather than tearing the
+                                // authenticated handshake down. The client is still
+                                // live; we simply stop pumping the (now-absent) origin.
                                 let _ = err;
-                                graceful_close_pre_pq(
-                                    client_records,
-                                    client_write,
-                                    fallback_records,
-                                    fallback_write,
-                                )
-                                .await;
-                                return Ok(());
+                                tracing::debug!(
+                                    cid,
+                                    "fallback origin closed on forward write before client PQ rekey; \
+                                     pausing fallback, still awaiting PX1Q"
+                                );
+                                fallback_open = false;
+                                continue;
                             }
                             Ok(Err(err)) => return Err(HandshakeServerError::Io(err)),
                             Err(_) => {
@@ -2730,11 +2752,37 @@ async fn run_authenticated_data_mode(
             // behind is lost (we never read records off this half again in pre-PQ).
             // The cap is byte-oriented to match (see PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT).
             read = fallback_records.get_mut().read(&mut fallback_relay_buf),
-                if fallback_bytes_before_pq < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT => {
+                if fallback_open && fallback_bytes_before_pq < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT => {
                 let n = match read {
-                    Ok(0) => return Ok(()),
+                    // Origin half-closed (FIN) or reset before PX1Q arrived. This is
+                    // expected camouflage debris, not a failure: a real origin closes
+                    // a finished session on its own schedule. Disable this arm and keep
+                    // waiting for the client's PX1Q on the client arm; the splice was
+                    // only ever covering the camouflage handshake, and the server drops
+                    // the origin on PX1Q regardless. Bounded by `pre_pq_deadline` if
+                    // PX1Q never comes (an authenticated client that never rekeys hits
+                    // the existing graceful teardown).
+                    Ok(0) => {
+                        tracing::debug!(
+                            cid,
+                            fallback_bytes_before_pq,
+                            "fallback origin closed before client PQ rekey; pausing fallback reads, \
+                             still awaiting PX1Q"
+                        );
+                        fallback_open = false;
+                        continue;
+                    }
                     Ok(n) => n,
-                    Err(ref err) if is_clean_close(err) => return Ok(()),
+                    Err(ref err) if is_clean_close(err) => {
+                        tracing::debug!(
+                            cid,
+                            fallback_bytes_before_pq,
+                            "fallback origin closed before client PQ rekey; pausing fallback reads, \
+                             still awaiting PX1Q"
+                        );
+                        fallback_open = false;
+                        continue;
+                    }
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
                 let before = fallback_bytes_before_pq;
