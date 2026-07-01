@@ -226,14 +226,14 @@ fn set_udp_socket_buffers(_socket: &UdpSocket) {}
 async fn recv_datagrams(
     socket: &UdpSocket,
     buf: &mut [u8],
-) -> io::Result<(usize, SocketAddr, usize)> {
+) -> io::Result<(usize, SocketAddr, usize, u8)> {
     use std::os::fd::AsFd;
     loop {
         socket.readable().await?;
         match socket.try_io(tokio::io::Interest::READABLE, || {
             super::offload::recv_gro(socket.as_fd(), buf)
         }) {
-            Ok(segs) => return Ok((segs.total, segs.peer, segs.segment_size)),
+            Ok(segs) => return Ok((segs.total, segs.peer, segs.segment_size, segs.ecn)),
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
         }
@@ -244,9 +244,12 @@ async fn recv_datagrams(
 async fn recv_datagrams(
     socket: &UdpSocket,
     buf: &mut [u8],
-) -> io::Result<(usize, SocketAddr, usize)> {
+) -> io::Result<(usize, SocketAddr, usize, u8)> {
+    // No recvmsg/cmsg path off Linux: report Not-ECT (0). Egress ECT(0) still applies
+    // (set via setsockopt), so this only means the server cannot read inbound CE marks
+    // on non-Linux — acceptable, the deploy target is Linux.
     let (len, peer) = socket.recv_from(buf).await?;
-    Ok((len, peer, len))
+    Ok((len, peer, len, 0))
 }
 
 /// Whether `data` is plausibly a client's first Initial: a v1 long-header Initial
@@ -529,6 +532,18 @@ impl Endpoint {
         // wire-invisible: a kernel without GRO just keeps one-datagram-per-read.
         #[cfg(target_os = "linux")]
         let _ = super::offload::enable_gro(&*socket);
+        // Mark egress datagrams ECT(0) (RFC 9000 §13.4): a real Safari QUIC flow does,
+        // so leaving them Not-ECT is a passive distinguisher. Best-effort; only the IP
+        // header's 2 ECN bits change, never the QUIC payload/sizes/counts.
+        #[cfg(unix)]
+        let is_ipv6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        #[cfg(unix)]
+        let _ = super::offload::enable_ect0(&*socket, is_ipv6);
+        // Receive the inbound ECN codepoint so the driver can count CE marks and echo
+        // them in ACK_ECN (RFC 9000 §13.4.2). Best-effort and Linux-only (the recv
+        // path reads it via recvmsg cmsg); off Linux datagrams read as Not-ECT.
+        #[cfg(target_os = "linux")]
+        let _ = super::offload::enable_recv_ecn(&*socket, is_ipv6);
         let wake = Arc::new(Notify::new());
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = mpsc::unbounded_channel();
@@ -544,6 +559,8 @@ impl Endpoint {
             accept_tx,
             connect_rx,
             close_rx,
+            #[cfg(target_os = "linux")]
+            gso_scratch: Vec::new(),
         };
         tokio::spawn(driver.run());
         Ok(Endpoint {
@@ -761,6 +778,12 @@ struct Driver {
     accept_tx: mpsc::UnboundedSender<Arc<ConnShared>>,
     connect_rx: mpsc::UnboundedReceiver<ConnectRequest>,
     close_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
+    /// Reusable GSO coalescing buffer (Linux only). The per-flush, per-run buffer that
+    /// concatenates a same-size run before the `UDP_SEGMENT` send was a fresh heap
+    /// allocation + copy on every bulk flush; reusing one buffer across flushes drops
+    /// the allocation. Cleared (length 0, capacity retained) before each run.
+    #[cfg(target_os = "linux")]
+    gso_scratch: Vec<u8>,
 }
 
 impl Driver {
@@ -790,15 +813,25 @@ impl Driver {
             tokio::select! {
                 r = recv_datagrams(&socket, &mut buf) => {
                     match r {
-                        Ok((total, peer, segment_size)) => {
+                        Ok((total, peer, segment_size, ecn)) => {
                             // GRO only ever coalesces datagrams from a SINGLE source
-                            // 4-tuple (a kernel invariant), so one `peer` is correct
-                            // for every chunk of this read. `segment_size == total`
-                            // (no GRO cmsg) yields a single chunk == the old
-                            // `recv_from` behaviour.
+                            // 4-tuple AND a single ECN codepoint (kernel invariants), so
+                            // one `peer` + one `ecn` is correct for every chunk of this
+                            // read. `segment_size == total` (no GRO cmsg) yields a single
+                            // chunk == the old `recv_from` behaviour.
                             let seg = segment_size.max(1);
+                            // Observe the GRO coalescing factor (PR #120 follow-up #1).
+                            // Only the Linux path is a real recvmsg/GRO read; the
+                            // non-Linux recv_from always reports segment_size == total
+                            // (one chunk), so recording it would falsely inflate the
+                            // GRO read count.
+                            #[cfg(target_os = "linux")]
+                            {
+                                let chunks = total.div_ceil(seg).max(1) as u64;
+                                super::offload::record_gro_read(chunks);
+                            }
                             for chunk in buf[..total].chunks(seg) {
-                                self.on_datagram(chunk, peer);
+                                self.on_datagram(chunk, peer, ecn);
                             }
                         }
                         Err(_) => continue,
@@ -882,10 +915,11 @@ impl Driver {
         }
     }
 
-    fn on_datagram(&mut self, data: &[u8], peer: SocketAddr) {
+    fn on_datagram(&mut self, data: &[u8], peer: SocketAddr, ecn: u8) {
         let now = Instant::now();
+        let ecn = super::conn::EcnCodepoint::from_bits(ecn);
         if let Some(c) = self.conns.get(&peer) {
-            let _ = c.core.lock().unwrap().handle_datagram(data, now);
+            let _ = c.core.lock().unwrap().handle_datagram_ecn(data, ecn, now);
             c.wake_handles();
             return;
         }
@@ -899,7 +933,7 @@ impl Driver {
         // and re-evaluate the terminate-vs-splice fork (the Safari ClientHello spans
         // two Initials, so the decision matures only once the whole CH is parsed).
         if self.pending.contains_key(&peer) {
-            self.feed_pending(peer, data, now);
+            self.feed_pending(peer, data, ecn, now);
             return;
         }
         // A datagram from an unknown peer: open a server connection if configured.
@@ -1002,7 +1036,11 @@ impl Driver {
             read_wakers: Mutex::new(Vec::new()),
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
-        let _ = shared.core.lock().unwrap().handle_datagram(data, now);
+        let _ = shared
+            .core
+            .lock()
+            .unwrap()
+            .handle_datagram_ecn(data, ecn, now);
 
         // Cold-start (no marker key): terminate locally immediately, exactly as the
         // pre-marker behaviour — no buffering, no added per-connection latency.
@@ -1034,9 +1072,20 @@ impl Driver {
 
     /// Feed a follow-up datagram into a peer's held first flight, then re-run the
     /// marker decision.
-    fn feed_pending(&mut self, peer: SocketAddr, data: &[u8], now: Instant) {
+    fn feed_pending(
+        &mut self,
+        peer: SocketAddr,
+        data: &[u8],
+        ecn: super::conn::EcnCodepoint,
+        now: Instant,
+    ) {
         if let Some(p) = self.pending.get_mut(&peer) {
-            let _ = p.shared.core.lock().unwrap().handle_datagram(data, now);
+            let _ = p
+                .shared
+                .core
+                .lock()
+                .unwrap()
+                .handle_datagram_ecn(data, ecn, now);
             p.datagrams.push(data.to_vec());
             p.last = now;
         }
@@ -1231,18 +1280,23 @@ impl Driver {
     /// singletons and any GSO failure fall back to per-datagram `send_to`. The bytes,
     /// sizes, and count on the wire are identical either way — GSO only collapses the
     /// syscalls. Off Linux this is exactly the old per-datagram loop.
-    async fn send_batch(&self, out: Vec<(Vec<u8>, SocketAddr)>) {
+    async fn send_batch(&mut self, out: Vec<(Vec<u8>, SocketAddr)>) {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsFd;
+            // Clone the socket Arc up front so the per-run loop borrows it without
+            // holding `&self`, leaving `self.gso_scratch` freely mutable below.
+            let socket = self.socket.clone();
             for run in super::offload::gso_runs(&out) {
                 let slice = &out[run.range.clone()];
                 if slice.len() == 1 {
-                    let _ = self.socket.send_to(&slice[0].0, run.peer).await;
+                    let _ = socket.send_to(&slice[0].0, run.peer).await;
                     continue;
                 }
-                // Coalesce the run into one buffer and hand it to the kernel to slice.
-                let mut segments = Vec::with_capacity(slice.len() * run.segment_size);
+                // Coalesce the run into the reusable scratch buffer (cleared, capacity
+                // retained across flushes) and hand it to the kernel to slice.
+                let segments = &mut self.gso_scratch;
+                segments.clear();
                 for (dg, _) in slice {
                     segments.extend_from_slice(dg);
                 }
@@ -1253,22 +1307,34 @@ impl Driver {
                 // silently dropping the unsent tail. WouldBlock (socket not writable
                 // yet) also falls through to the awaiting fallback.
                 let gso = matches!(
-                    self.socket.try_io(tokio::io::Interest::WRITABLE, || {
+                    socket.try_io(tokio::io::Interest::WRITABLE, || {
                         super::offload::send_gso(
-                            self.socket.as_fd(),
-                            &segments,
+                            socket.as_fd(),
+                            segments,
                             run.segment_size,
                             run.peer,
                         )
                     }),
                     Ok(sent) if sent == segments.len()
                 );
-                if !gso {
+                if gso {
+                    super::offload::record_gso_call(slice.len() as u64);
+                } else {
                     // Kernel without GSO / oversized / transient error / not writable:
-                    // send the run one datagram at a time (awaiting writability) so no
-                    // bytes are dropped.
-                    for (dg, _) in slice {
-                        let _ = self.socket.send_to(dg, run.peer).await;
+                    // batch the run with one sendmmsg syscall instead of one send_to
+                    // per datagram, then await-resend whatever prefix the kernel did
+                    // not accept (short count / EAGAIN) so no bytes are dropped. The
+                    // wire output (independent datagrams) is identical either way.
+                    super::offload::record_gso_fallback();
+                    // `unwrap_or_default()` == 0 on a not-writable / hard error before
+                    // message 0: nothing batched, so the whole run is resent below.
+                    let sent = socket
+                        .try_io(tokio::io::Interest::WRITABLE, || {
+                            super::offload::send_mmsg(socket.as_fd(), slice)
+                        })
+                        .unwrap_or_default();
+                    for (dg, _) in &slice[sent..] {
+                        let _ = socket.send_to(dg, run.peer).await;
                     }
                 }
             }

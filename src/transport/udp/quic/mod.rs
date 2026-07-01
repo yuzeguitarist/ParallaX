@@ -33,6 +33,10 @@ mod netsim;
 pub(crate) mod offload;
 pub(crate) mod pacer;
 pub(crate) mod packet;
+/// Path MTU discovery (DPLPMTUD, RFC 8899): probes the path upward from the 1200-byte
+/// baseline so bulk DATA packetizes to the real MTU instead of a fixed conservative
+/// ceiling. Pure state machine; the connection drives probe emission + ack/loss.
+pub(crate) mod pmtud;
 pub(crate) mod recovery;
 pub(crate) mod spaces;
 /// Verbatim UDP relay to the camouflage origin (the QUIC analogue of the TCP
