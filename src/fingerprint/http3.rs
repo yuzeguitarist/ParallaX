@@ -1094,6 +1094,64 @@ mod tests {
         );
     }
 
+    // --- QPACK prefix integer codec (RFC 7541 §5.1) -----------------------
+
+    #[test]
+    fn qpack_integer_put_read_roundtrip() {
+        // Round-trip a spread of values across every prefix width, including the
+        // exact `max_prefix` value (the first continuation case) and multi-byte
+        // continuations.
+        for prefix_bits in [3u8, 4, 5, 6, 7] {
+            let max_prefix = (1u64 << prefix_bits) - 1;
+            for value in [
+                0,
+                1,
+                max_prefix - 1,
+                max_prefix,
+                max_prefix + 1,
+                127,
+                128,
+                255,
+                16_383,
+                16_384,
+                1_000_000,
+                u64::MAX,
+            ] {
+                let mut buf = Vec::new();
+                put_qpack_integer(&mut buf, value, prefix_bits, 0);
+                let (decoded, consumed) =
+                    read_qpack_integer(&buf, prefix_bits).expect("well-formed integer decodes");
+                assert_eq!(decoded, value, "value {value} @ {prefix_bits} bits");
+                assert_eq!(consumed, buf.len(), "consumes exactly the encoded bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn qpack_integer_read_empty_is_none() {
+        assert!(read_qpack_integer(&[], 7).is_none());
+    }
+
+    #[test]
+    fn qpack_integer_read_truncated_continuation_is_none() {
+        // Prefix says "max, keep reading" (0x7f for a 7-bit prefix) but the
+        // continuation byte that must follow is missing -> fail closed.
+        assert!(read_qpack_integer(&[0x7f], 7).is_none());
+        // A continuation byte with its high bit set but no successor.
+        assert!(read_qpack_integer(&[0x7f, 0x80], 7).is_none());
+    }
+
+    #[test]
+    fn qpack_integer_read_overflow_is_none() {
+        // Ten 0x80 continuation bytes push `shift` past 63 (the guard), so the
+        // decoder must reject rather than wrap. Terminate with a final 0x01 that
+        // would only be reached if the guard were absent.
+        let mut evil = vec![0x7f];
+        evil.extend([0x80u8; 10]);
+        evil.push(0x01);
+        assert!(read_qpack_integer(&evil, 7).is_none());
+    }
+
     // --- SETTINGS: Safari-26 ground truth ---------------------------------
 
     #[test]

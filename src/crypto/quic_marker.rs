@@ -275,4 +275,48 @@ mod tests {
         let not_a_marker = [0x5a_u8; MARKER_LEN];
         assert!(open(PSK, &SS, SNI, DCID, &not_a_marker, now, WINDOW).is_none());
     }
+
+    #[test]
+    fn future_skew_boundary_is_exact() {
+        // A client clock ahead of the server by exactly FUTURE_SKEW_SECS is the
+        // last accepted case; one second more is rejected. Pins the
+        // `timestamp <= now + FUTURE_SKEW_SECS` edge (a `<`-vs-`<=` mutant dies).
+        let now = 1_900_000_000;
+        let cr = seal(PSK, &SS, SNI, DCID, now, &nonce());
+        // Server sees `now` earlier than the sealed timestamp by the full skew.
+        assert!(open(PSK, &SS, SNI, DCID, &cr, now - FUTURE_SKEW_SECS, WINDOW).is_some());
+        assert!(open(PSK, &SS, SNI, DCID, &cr, now - FUTURE_SKEW_SECS - 1, WINDOW).is_none());
+    }
+
+    #[test]
+    fn window_boundary_is_exact() {
+        // Freshness is `now <= timestamp + window`. Verifying at exactly the
+        // window edge is still fresh; one second past is stale. Pins the lower
+        // edge (verify at the instant of sealing) too.
+        let now = 1_900_000_000;
+        let cr = seal(PSK, &SS, SNI, DCID, now, &nonce());
+        assert!(open(PSK, &SS, SNI, DCID, &cr, now, WINDOW).is_some());
+        assert!(open(PSK, &SS, SNI, DCID, &cr, now + WINDOW, WINDOW).is_some());
+        assert!(open(PSK, &SS, SNI, DCID, &cr, now + WINDOW + 1, WINDOW).is_none());
+    }
+
+    #[test]
+    fn open_returns_the_sealed_nonce_and_timestamp() {
+        // The happy-path round-trip test seals under a constant nonce, so a
+        // mutant that returned the *input* bytes (or a fixed nonce) would
+        // survive. Use a distinctive nonce and a timestamp with all byte lanes
+        // set so the recovered freshness material is byte-for-byte the sealed one.
+        let now = 0x0102_0304_0506_0708;
+        // Build a per-byte-distinct nonce from its index (not a literal) so every
+        // lane differs — kills a mutant returning a fixed/input nonce — while the
+        // value isn't a hard-coded crypto constant.
+        let mut distinctive = [0u8; NONCE_LEN];
+        for (i, b) in distinctive.iter_mut().enumerate() {
+            *b = (i as u8) + 1;
+        }
+        let cr = seal(PSK, &SS, SNI, DCID, now, &distinctive);
+        let m = open(PSK, &SS, SNI, DCID, &cr, now, WINDOW).expect("valid marker opens");
+        assert_eq!(m.nonce, distinctive);
+        assert_eq!(m.timestamp, now);
+    }
 }
