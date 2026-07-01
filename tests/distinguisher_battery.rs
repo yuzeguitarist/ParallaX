@@ -552,3 +552,119 @@ async fn quic_direction_size_calibration_vs_real_corpus() {
         "interactive capture not bidirectional: C2S={c2s} S2C={s2c}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tier 3b: IAT / autocorrelation discriminability self-proof.
+//
+// Tier 3 proves the battery fires on the LENGTH axis (record-resize) and the
+// DIRECTION axis (1:1-ACK). The remaining defended dimension — inter-arrival
+// TIME and its serial structure — had no self-proof: the IAT KS and the
+// Ljung-Box autocorrelation detector were exercised only on synthetic data in
+// Tier 1, never against a perturbation of the real corpus. That is a blind spot
+// by the battery's own standard ("if it does not fire, any 'indistinguishable'
+// verdict it produces elsewhere is worthless"). These tests close it.
+//
+// Empirical anchors, measured on the real Safari uplink corpus (n=747 C2S IAT):
+//   * REAL uplink IAT is white-noise-like: Ljung-Box Q≈3.2, p≈0.98 — the
+//     browser's uplink cadence is NOT serially autocorrelated, so the null
+//     holds and the detector does not false-fire on the real browser.
+//   * jitter_iat(amount=1.0) shifts the IAT marginal: KS D≈0.17, p→0.
+//   * fixed_cadence: constant uplink period collapses the IAT marginal to a
+//     point mass: KS D≈0.93, p→0. (A PERFECTLY constant series has no
+//     autocorrelation to detect — the tell there is zero variance, caught by
+//     KS, not Ljung-Box. The AR-cadence test below covers the autocorrelation
+//     detector specifically.)
+//   * AR(1)-structured cadence injects genuine serial correlation:
+//     Ljung-Box Q≈1600, p→0.
+// ---------------------------------------------------------------------------
+
+/// Wires the previously-unused `jitter_iat` injector into a real self-proof: a
+/// browser-plausible retiming of the uplink must be caught on the IAT marginal.
+#[test]
+fn detects_iat_jitter() {
+    let safari = load_safari();
+    let jittered = perturb::jitter_iat(&safari, 1.0, 0xABCD);
+
+    let real_iat = safari.iats(Dir::C2S);
+    let bad_iat = jittered.iats(Dir::C2S);
+
+    // Sanity: the injector touches only timing, not lengths or directions, so
+    // the length/direction axes stay identical — this isolates the IAT tell.
+    assert_eq!(
+        safari.lengths(Dir::C2S),
+        jittered.lengths(Dir::C2S),
+        "jitter_iat must not alter record lengths"
+    );
+
+    let ks = two_sample_ks(&real_iat, &bad_iat);
+    assert!(
+        ks.p_value < 0.01,
+        "IAT-jitter KS failed to fire: D={:.4} p={:.4}",
+        ks.statistic,
+        ks.p_value
+    );
+}
+
+/// The "fixed-cadence beacon" pathology — a naive proxy flushing uplink on a
+/// constant timer — must be caught on the IAT marginal. This is the passive
+/// tell the production QUIC idle-PING jitter (`conn.rs`) exists to defeat.
+#[test]
+fn detects_fixed_cadence_beacon() {
+    let safari = load_safari();
+    let beacon = perturb::fixed_cadence(&safari, 5_000);
+
+    let real_iat = safari.iats(Dir::C2S);
+    let bad_iat = beacon.iats(Dir::C2S);
+
+    // A perfectly periodic uplink collapses the IAT marginal to (essentially) a
+    // single value; the real browser's IAT is broadly spread. KS must reject
+    // overwhelmingly.
+    let ks = two_sample_ks(&real_iat, &bad_iat);
+    assert!(
+        ks.statistic > 0.5 && ks.p_value < 0.01,
+        "fixed-cadence IAT KS failed to fire: D={:.4} p={:.4}",
+        ks.statistic,
+        ks.p_value
+    );
+}
+
+/// The autocorrelation detector (Ljung-Box) must (a) ACCEPT the real Safari
+/// uplink — whose IAT is serially uncorrelated — and (b) FIRE on an
+/// AR(1)-structured "adaptive beacon" cadence whose gaps carry genuine serial
+/// correlation. Proving both directions is what makes the detector trustworthy:
+/// a detector that fired on the real browser too would be a useless alarm.
+#[test]
+fn autocorrelation_detector_fires_on_structured_cadence_but_not_on_real() {
+    let safari = load_safari();
+    let real_iat = safari.iats(Dir::C2S);
+
+    // (a) Null: the real uplink IAT is not autocorrelated ⇒ high p.
+    let lb_real = ljung_box(&real_iat, 10);
+    assert!(
+        lb_real.p_value > 0.05,
+        "real Safari uplink IAT unexpectedly flagged autocorrelated: Q={:.2} p={:.4}",
+        lb_real.statistic,
+        lb_real.p_value
+    );
+
+    // (b) Alternative: an AR(1) cadence with phi=0.85 — a plausible "adaptive"
+    // beacon whose interval drifts from its own recent history. Deterministic.
+    let base = 10_000.0f64;
+    let mut prev = base;
+    let mut rng = Lcg::new(0x1234_5678);
+    let ar_iat: Vec<f64> = (0..real_iat.len())
+        .map(|_| {
+            let noise = (rng.unit() - 0.5) * 4_000.0;
+            let g = base + 0.85 * (prev - base) + noise;
+            prev = g;
+            g.max(1.0)
+        })
+        .collect();
+    let lb_ar = ljung_box(&ar_iat, 10);
+    assert!(
+        lb_ar.p_value < 0.01,
+        "AR(1) cadence not flagged autocorrelated: Q={:.2} p={:.4}",
+        lb_ar.statistic,
+        lb_ar.p_value
+    );
+}

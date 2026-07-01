@@ -98,3 +98,37 @@ pub fn jitter_iat(trace: &Trace, amount: f64, seed: u64) -> Trace {
     }
     Trace::new(out)
 }
+
+/// The "fixed-cadence beacon" pathology: rewrite the C2S (uplink) records so they
+/// are emitted at a strictly periodic interval `period_micros`, the way a naive
+/// proxy that flushes on a fixed timer looks. Lengths and directions are
+/// untouched; only the uplink timestamps become perfectly regular.
+///
+/// This is the passive "beacon" tell the production QUIC idle-PING jitter in
+/// `src/transport/udp/quic/conn.rs` exists to defeat: a fixed uplink period
+/// collapses the IAT marginal to a point mass, which a real browser's broadly
+/// spread cadence never does. Note it is a *variance/marginal* tell, caught by
+/// KS — a perfectly constant series has no serial autocorrelation for Ljung-Box
+/// to find (that detector's target is a periodic-but-noisy cadence instead).
+///
+/// S2C records keep their original timestamps (only the client-controlled
+/// uplink cadence is under ParallaX's control and thus the imitated surface),
+/// and the trace is re-sorted by time on construction.
+pub fn fixed_cadence(trace: &Trace, period_micros: u64) -> Trace {
+    let mut out = Vec::with_capacity(trace.records.len());
+    let mut next_c2s_t = 0u64;
+    for r in &trace.records {
+        match r.dir {
+            Dir::C2S => {
+                out.push(Record {
+                    len: r.len,
+                    dir: Dir::C2S,
+                    t_micros: next_c2s_t,
+                });
+                next_c2s_t += period_micros;
+            }
+            Dir::S2C => out.push(*r),
+        }
+    }
+    Trace::new(out)
+}
