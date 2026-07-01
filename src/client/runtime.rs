@@ -4552,6 +4552,55 @@ mod tests {
         wait_for_task("fallback", fallback_task).await;
     }
 
+    /// Regression (client-side sibling): the camouflage origin ends its side with a
+    /// real TLS 1.3 `close_notify` alert (encrypted, level 1 desc 0) before its FIN.
+    /// That alert can land while the client is still in `Safari26TlsSession::complete()`
+    /// (drain_post_handshake / await_http2_settings_ack). Those loops must treat a
+    /// warning close_notify as a clean end-of-stream — not abort with Err(Alert) —
+    /// so the client finishes its camouflage, writes PX1Q, and the relay completes.
+    /// End-to-end guard for the same integration path the server-side eager-close
+    /// test covers, but exercising the client's alert tolerance rather than the
+    /// server's origin-FIN handling.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn socks_relay_survives_origin_close_notify_before_pq_rekey() {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback_close_notify().await;
+        let (target_addr, target_task) = spawn_eof_response_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
+        let (local_addr, client_task) =
+            spawn_local_client(parallax_addr, &server_keys, &server_identity_keys).await;
+
+        let mut app = connect_socks_target(local_addr, target_addr).await;
+        app.write_all(b"request-before-half-close").await.unwrap();
+        app.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), app.read_to_end(&mut response))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("relay failed when origin sent close_notify before PX1Q (client-side alert-tolerance regression)")
+            })
+            .unwrap();
+        assert_eq!(response, b"response-after-half-close");
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn socks_relay_succeeds_with_client_udp_negotiation_enabled() {
@@ -6279,6 +6328,47 @@ mod tests {
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             run_camouflage_tls_server_eager_close(stream).await;
+        });
+        (addr, task)
+    }
+
+    /// Like `run_camouflage_tls_server_eager_close`, but the origin ends its side
+    /// with a real TLS 1.3 `close_notify` alert (AEAD-encrypted, level 1 desc 0)
+    /// before the FIN — what a real served origin actually sends. This exercises
+    /// the CLIENT-side tolerance: the close_notify can land while the client is
+    /// still in `Safari26TlsSession::complete()` (drain_post_handshake /
+    /// await_http2_settings_ack), which must treat a warning close_notify as a
+    /// clean end-of-stream rather than aborting the handshake, so the client still
+    /// finishes its camouflage and writes PX1Q and the relay completes.
+    async fn run_camouflage_tls_server_close_notify(mut stream: TcpStream) {
+        let mut server =
+            rustls::ServerConnection::new(rustls_server_config()).expect("rustls server config");
+        let mut buf = [0_u8; 4096];
+
+        while server.is_handshaking() {
+            flush_rustls_server(&mut server, &mut stream).await;
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            let mut cursor = Cursor::new(&buf[..n]);
+            server.read_tls(&mut cursor).unwrap();
+            server.process_new_packets().unwrap();
+        }
+        flush_rustls_server(&mut server, &mut stream).await;
+        // Send an encrypted warning close_notify (rustls emits it under the app
+        // keys once the handshake is complete), flush it, then FIN. This is the
+        // real-origin teardown the client-side fix must tolerate.
+        server.send_close_notify();
+        flush_rustls_server(&mut server, &mut stream).await;
+        drop(server);
+        let _ = stream.shutdown().await;
+    }
+
+    async fn spawn_camouflage_fallback_close_notify() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            run_camouflage_tls_server_close_notify(stream).await;
         });
         (addr, task)
     }

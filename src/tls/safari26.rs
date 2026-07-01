@@ -69,6 +69,12 @@ const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
 const TLS_RECORD_VERSION_CLIENT_HELLO: [u8; 2] = [0x03, 0x01];
 const TLS_RECORD_VERSION_TLS13: [u8; 2] = [0x03, 0x03];
 
+// RFC 8446 alert bytes. A warning-level close_notify (level 1, description 0) is
+// the graceful end-of-stream a served origin sends before/around its FIN; it is
+// the only alert value tolerated as a clean close (see is_warning_close_notify).
+const TLS_ALERT_LEVEL_WARNING: u8 = 0x01;
+const TLS_ALERT_DESC_CLOSE_NOTIFY: u8 = 0x00;
+
 /// Upper bound on a decompressed server certificate chain (TLS 1.3 cert
 /// compression). Real chains are a few KiB; 256 KiB is generous headroom while
 /// bounding the memory an attacker-supplied CompressedCertificate can force.
@@ -557,10 +563,19 @@ impl Safari26TlsSession {
                     let decrypted = keys.server_application.decrypt_record(&record)?;
                     if decrypted.content_type == TLS_CONTENT_ALERT && decrypted.plaintext.len() >= 2
                     {
-                        return Err(Safari26TlsError::Alert {
-                            level: decrypted.plaintext[0],
-                            description: decrypted.plaintext[1],
-                        });
+                        let (level, description) = (decrypted.plaintext[0], decrypted.plaintext[1]);
+                        // A warning close_notify is the origin's clean end-of-drain
+                        // (same benign class as the bare FIN handled at :541); a real
+                        // client treats it as end-of-stream, not a failure. Report the
+                        // count WITHOUT this terminator record (`observed` was already
+                        // incremented above): a close_notify is an end-of-stream signal,
+                        // not a post-handshake data record, so it must match the bare-FIN
+                        // path's count exactly — otherwise a clean close would score as a
+                        // spurious post-handshake/ticket signal in `plx probe`.
+                        if is_warning_close_notify(level, description) {
+                            return Ok(observed - 1);
+                        }
+                        return Err(Safari26TlsError::Alert { level, description });
                     }
                 }
                 _ => {}
@@ -656,10 +671,14 @@ impl Safari26TlsSession {
                     let chunk = keys.server_application.decrypt_record(&record)?;
                     if chunk.content_type != TLS_RECORD_APPLICATION_DATA {
                         if chunk.content_type == TLS_CONTENT_ALERT && chunk.plaintext.len() >= 2 {
-                            return Err(Safari26TlsError::Alert {
-                                level: chunk.plaintext[0],
-                                description: chunk.plaintext[1],
-                            });
+                            let (level, description) = (chunk.plaintext[0], chunk.plaintext[1]);
+                            // Origin closed before/around its SETTINGS: a warning
+                            // close_notify is a clean close, identical to the bare-FIN
+                            // path at :641 (no ACK, no responding write).
+                            if is_warning_close_notify(level, description) {
+                                return Ok(());
+                            }
+                            return Err(Safari26TlsError::Alert { level, description });
                         }
                         continue;
                     }
@@ -1703,6 +1722,15 @@ fn parse_alert<T>(record: &[u8]) -> Result<T, Safari26TlsError> {
     }
 }
 
+/// A warning-level close_notify (level 1, description 0) is the origin's graceful
+/// end-of-stream. It is tolerated as a clean close only on the AEAD-authenticated
+/// post-handshake alert branches; every fatal alert (level 2) and every other
+/// warning (e.g. user_canceled, desc 90) still aborts. Scoped precisely per
+/// RFC 8446 6.1 so real handshake failures are never masked.
+fn is_warning_close_notify(level: u8, description: u8) -> bool {
+    level == TLS_ALERT_LEVEL_WARNING && description == TLS_ALERT_DESC_CLOSE_NOTIFY
+}
+
 fn is_clean_close(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -2212,6 +2240,86 @@ mod tests {
         );
     }
 
+    // ---- drain_post_handshake ----
+
+    #[tokio::test]
+    async fn drain_post_handshake_tolerates_encrypted_close_notify() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // The real TLS 1.3 origin close_notify: an AEAD-wrapped warning alert
+        // [level 1, close_notify 0]. It must resolve to a clean end-of-drain (Ok),
+        // exactly as the bare-FIN path does.
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_CONTENT_ALERT, &[0x01, 0x00])
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        drop(peer);
+
+        let observed = session
+            .drain_post_handshake(&mut stream, &mut session_keys)
+            .await
+            .unwrap();
+        // The close_notify is an end-of-stream terminator, not a post-handshake
+        // data record: it must NOT be counted, matching the bare-FIN path (which
+        // returns without incrementing). A single close_notify => 0 observed
+        // records, so `plx probe` cannot score a clean close as a ticket signal.
+        assert_eq!(observed, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_errors_on_encrypted_fatal_alert() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // A fatal alert (level 2) must still abort even at drain time so real
+        // handshake failures are never swallowed.
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_CONTENT_ALERT, &[0x02, 0x28])
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        drop(peer);
+
+        let err = session
+            .drain_post_handshake(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x02,
+                description: 0x28
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_errors_on_plaintext_close_notify() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut keys = app_keys();
+
+        // Tolerance is scoped to the AEAD-authenticated branch only. A plaintext
+        // post-handshake close_notify is unauthenticated and not real-origin
+        // behavior, so it must still surface as an error.
+        peer.write_all(&tls_record(TLS_CONTENT_ALERT, &[0x01, 0x00]))
+            .await
+            .unwrap();
+        drop(peer);
+
+        let err = session
+            .drain_post_handshake(&mut stream, &mut keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Safari26TlsError::Alert { .. }));
+    }
+
     // ---- await_http2_settings_ack ----
 
     #[tokio::test]
@@ -2263,6 +2371,107 @@ mod tests {
                 description: 0x2a
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_tolerates_encrypted_close_notify() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // Origin closes before ACKing SETTINGS by sending an encrypted warning
+        // close_notify [1, 0]. The client must treat it as a clean close (Ok), the
+        // core fix for the pre-existing client-side race.
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_CONTENT_ALERT, &[0x01, 0x00])
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        drop(peer);
+
+        session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_rejects_encrypted_fatal_close_notify() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // A close_notify wrongly marked fatal (level 2, desc 0) must still abort:
+        // the predicate keys on level==1, so this is not a benign close.
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_CONTENT_ALERT, &[0x02, 0x00])
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x02,
+                description: 0x00
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_rejects_encrypted_warning_user_canceled() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // A warning alert that is NOT close_notify (user_canceled, desc 0x5a) must
+        // still abort: the predicate keys on desc==0, pinning the scope precisely.
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_CONTENT_ALERT, &[0x01, 0x5a])
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x01,
+                description: 0x5a
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_rejects_plaintext_close_notify() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut keys = app_keys();
+
+        // Tolerance is encrypted-only; an unauthenticated plaintext close_notify
+        // must still error (documents the intentional scope boundary).
+        peer.write_all(&tls_record(TLS_CONTENT_ALERT, &[0x01, 0x00]))
+            .await
+            .unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Safari26TlsError::Alert { .. }));
     }
 
     #[tokio::test]
