@@ -914,6 +914,32 @@ impl Config {
             .collect()
     }
 
+    /// Server-mode outbound targets (`fallback_addr`, and `data_target` when set)
+    /// whose host is an internal/special IP literal (loopback, private, link-local
+    /// incl. the cloud metadata endpoint, or unspecified). Reuses the same
+    /// classification as the load-time warning ([`outbound_literal_internal_ip`]),
+    /// but returns the findings so `plx check` can surface them on stdout — the
+    /// load-time `tracing::warn!` is swallowed unless `RUST_LOG` selects `warn`, so
+    /// an operator running `plx check` would otherwise never see this footgun.
+    ///
+    /// Empty for a client-mode config or when every literal target is public.
+    /// Hostnames are intentionally not resolved (an offline `plx check` must not
+    /// perform blocking DNS), matching the load-time warning.
+    pub fn internal_outbound_targets(&self) -> Vec<(&'static str, std::net::IpAddr)> {
+        let mut out = Vec::new();
+        if let Some(server) = &self.server {
+            if let Some(ip) = outbound_literal_internal_ip(&server.fallback_addr) {
+                out.push(("server.fallback_addr", ip));
+            }
+            if let Some(data_target) = &server.data_target {
+                if let Some(ip) = outbound_literal_internal_ip(data_target) {
+                    out.push(("server.data_target", ip));
+                }
+            }
+        }
+        out
+    }
+
     /// Path parts of plaintext sidecars referenced via `{ file = "..." }` (the
     /// `#fragment` stripped), deduplicated. `plx seal` removes these after sealing
     /// so the directory stops being a bearer credential. Only meaningful on a
@@ -2412,6 +2438,75 @@ authorized_sni = ["example.com"]
                 "{v} must NOT be flagged",
             );
         }
+    }
+
+    fn server_config_with_targets(fallback_addr: &str, data_target: Option<&str>) -> Config {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
+        let data_target_line = data_target
+            .map(|t| format!("data_target = \"{t}\"\n"))
+            .unwrap_or_default();
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{STRONG_PSK}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "{fallback_addr}"
+{data_target_line}private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        toml::from_str::<Config>(&raw).unwrap()
+    }
+
+    #[test]
+    fn internal_outbound_targets_flags_internal_fallback_and_data_target() {
+        let cfg = server_config_with_targets("127.0.0.1:443", Some("10.1.2.3:9000"));
+        let findings = cfg.internal_outbound_targets();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].0, "server.fallback_addr");
+        assert_eq!(findings[1].0, "server.data_target");
+    }
+
+    #[test]
+    fn internal_outbound_targets_empty_for_public_targets() {
+        let cfg = server_config_with_targets("cloudflare.com:443", Some("1.1.1.1:443"));
+        assert!(cfg.internal_outbound_targets().is_empty());
+    }
+
+    #[test]
+    fn internal_outbound_targets_flags_only_the_internal_one() {
+        // A public fallback but an internal data_target: only the latter is flagged.
+        let cfg = server_config_with_targets("example.com:443", Some("192.168.0.10:8080"));
+        let findings = cfg.internal_outbound_targets();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].0, "server.data_target");
+    }
+
+    #[test]
+    fn internal_outbound_targets_empty_for_client_config() {
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let cfg = toml::from_str::<Config>(&format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{STRONG_PSK}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{server_identity_public_key}"
+"#
+        ))
+        .unwrap();
+        assert!(cfg.internal_outbound_targets().is_empty());
     }
 
     #[test]
