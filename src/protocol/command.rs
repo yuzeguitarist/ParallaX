@@ -2758,6 +2758,44 @@ mod tests {
     }
 
     #[test]
+    fn control_frame_shaping_pad_falls_back_to_zero_when_no_band_fits() {
+        // The band-shaping primitive documents a returns-0 fallback ("no band fits
+        // within max_extra_pad") whose only effect is that the caller emits the record
+        // unshaped. The band-landing/round-trip path is covered end-to-end in
+        // data.rs (`band_shaped_control_frames_round_trip_and_land_on_a_band`), but the
+        // fallback branch itself is not. Pin both of its triggers:
+        use rand::{rngs::StdRng, SeedableRng};
+        let largest_band = *CONNECT_RECORD_SIZE_BANDS.iter().max().unwrap();
+
+        // Trigger 1: the raw wire size already exceeds the largest band, so no band is
+        // `>= raw_wire` — pad is 0 for any max_extra_pad, across seeds.
+        let over_largest = largest_band + 1 - DATA_RECORD_WIRE_OVERHEAD;
+        for seed in 0..16_u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let pad = control_frame_shaping_pad(over_largest, usize::MAX, &mut rng);
+            assert_eq!(pad, 0, "raw over largest band must not pad; seed={seed}");
+        }
+
+        // Trigger 2: a tiny frame that WOULD fit a band, but max_extra_pad is too small
+        // to reach even the smallest fitting band — again pad 0 (unshaped emit). Use
+        // max_extra_pad = 0 so the only way to pad to a band is unavailable.
+        for seed in 0..16_u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let pad = control_frame_shaping_pad(8, 0, &mut rng);
+            assert_eq!(pad, 0, "zero budget must not pad; seed={seed}");
+        }
+
+        // Sanity: with room, the same tiny frame DOES pad onto a band (so the two
+        // triggers above are the fallback, not a dead primitive).
+        let mut rng = StdRng::seed_from_u64(0);
+        let pad = control_frame_shaping_pad(8, usize::MAX, &mut rng);
+        assert!(
+            CONNECT_RECORD_SIZE_BANDS.contains(&(8 + DATA_RECORD_WIRE_OVERHEAD + pad)),
+            "with budget the frame must land on a band; pad={pad}"
+        );
+    }
+
+    #[test]
     fn shaping_extra_pad_lands_on_a_band() {
         // The padded wire size (raw plaintext + overhead + extra_pad) must equal
         // one of the configured bands, for many seeds and several request sizes.
