@@ -236,9 +236,13 @@ impl TransportParameters {
             }
             let (len, m) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
             i += m;
-            let len = len as usize;
-            let body = blob.get(i..i + len).ok_or(Error::Truncated)?;
-            i += len;
+            // try_from, not `as usize`: a >usize length varint must fail closed, not
+            // silently truncate on a 32-bit target — this parses attacker-controlled,
+            // pre-authentication input on the server (matches `packet.rs`).
+            let len = usize::try_from(len).map_err(|_| Error::Truncated)?;
+            let end = i.checked_add(len).ok_or(Error::Truncated)?;
+            let body = blob.get(i..end).ok_or(Error::Truncated)?;
+            i = end;
             match id {
                 TP_INITIAL_MAX_DATA => tp.initial_max_data = read_varint_body(body)?,
                 TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => {
@@ -498,5 +502,18 @@ mod tests {
         let mut blob = Vec::new();
         put_param_bytes(&mut blob, TP_INITIAL_MAX_DATA, &[0x01, 0x01]);
         assert_eq!(TransportParameters::read(&blob), Err(Error::Malformed));
+    }
+
+    #[test]
+    fn read_rejects_length_varint_past_blob_without_overflow() {
+        // A length varint that points past the end of the blob must fail closed as
+        // Truncated — never panic and never wrap `i + len` around. Uses the maximum
+        // 62-bit varint value (RFC 9000 §16) as the claimed length with no body, so
+        // the `checked_add`/`.get()` bounds are the only thing standing between a
+        // malformed pre-authentication blob and an out-of-bounds read.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
+        varint::encode((1u64 << 62) - 1, &mut blob); // claims ~4.6 exabytes of body
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
     }
 }
