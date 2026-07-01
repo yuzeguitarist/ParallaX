@@ -372,12 +372,22 @@ impl<'a> Iter<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], FrameError> {
-        let s = self
-            .buf
-            .get(self.pos..self.pos + n)
-            .ok_or(FrameError::Truncated)?;
-        self.pos += n;
+        let end = self.pos.checked_add(n).ok_or(FrameError::Truncated)?;
+        let s = self.buf.get(self.pos..end).ok_or(FrameError::Truncated)?;
+        self.pos = end;
         Ok(s)
+    }
+
+    /// Decode a varint that is a *length* prefix, as a `usize`.
+    ///
+    /// `usize::try_from`, not `as usize`: a length varint can be up to 2^62-1
+    /// (RFC 9000 §16), and this parses attacker-controlled frame payloads, so a
+    /// value that does not fit `usize` must fail closed (`Truncated`) rather than
+    /// silently truncate on a 32-bit target — matching the QUIC long-header parser
+    /// in `packet.rs`. On 64-bit this is behaviourally identical (`take`'s bounds
+    /// check already rejects the over-long slice).
+    fn varint_len(&mut self) -> Result<usize, FrameError> {
+        usize::try_from(self.varint()?).map_err(|_| FrameError::Truncated)
     }
 
     fn u64_be(&mut self) -> Result<u64, FrameError> {
@@ -410,14 +420,14 @@ impl<'a> Iter<'a> {
             }),
             FT_CRYPTO => {
                 let offset = self.varint()?;
-                let len = self.varint()? as usize;
+                let len = self.varint_len()?;
                 Ok(Frame::Crypto {
                     offset,
                     data: self.take(len)?,
                 })
             }
             FT_NEW_TOKEN => {
-                let len = self.varint()? as usize;
+                let len = self.varint_len()?;
                 Ok(Frame::NewToken {
                     token: self.take(len)?,
                 })
@@ -430,7 +440,7 @@ impl<'a> Iter<'a> {
                     0
                 };
                 let data = if ty & STREAM_LEN != 0 {
-                    let len = self.varint()? as usize;
+                    let len = self.varint_len()?;
                     self.take(len)?
                 } else {
                     // No length: the stream data runs to the end of the packet.
@@ -496,7 +506,7 @@ impl<'a> Iter<'a> {
                 let application = ty == FT_APPLICATION_CLOSE;
                 let error_code = self.varint()?;
                 let frame_type = if application { 0 } else { self.varint()? };
-                let len = self.varint()? as usize;
+                let len = self.varint_len()?;
                 Ok(Frame::Close(Close {
                     application,
                     error_code,
@@ -769,6 +779,46 @@ mod tests {
         }
         out.extend_from_slice(&[0xaa, 0xbb]);
         assert_eq!(Iter::new(&out).next(), Some(Err(FrameError::Truncated)));
+    }
+
+    #[test]
+    fn frame_length_far_past_buffer_fails_closed_without_overflow() {
+        // A length-prefixed frame whose declared length is the maximum 62-bit
+        // varint (RFC 9000 §16) but carries no body must fail closed as Truncated —
+        // never panic in `take` via a `pos + n` overflow, and never wrap. Covers the
+        // CRYPTO/NEW_TOKEN/STREAM/CONNECTION_CLOSE length reads, all of which flow
+        // through `varint_len` + `take`.
+        let max_varint = (1u64 << 62) - 1;
+
+        let mut crypto = Vec::new();
+        for v in [FT_CRYPTO, 0, max_varint] {
+            varint::encode(v, &mut crypto);
+        }
+        assert_eq!(Iter::new(&crypto).next(), Some(Err(FrameError::Truncated)));
+
+        let mut new_token = Vec::new();
+        for v in [FT_NEW_TOKEN, max_varint] {
+            varint::encode(v, &mut new_token);
+        }
+        assert_eq!(
+            Iter::new(&new_token).next(),
+            Some(Err(FrameError::Truncated))
+        );
+
+        // STREAM with OFF+LEN bits set, id 0, offset 0, huge len, no data.
+        let mut stream = Vec::new();
+        varint::encode(FT_STREAM_BASE | STREAM_OFF | STREAM_LEN, &mut stream);
+        for v in [0u64, 0, max_varint] {
+            varint::encode(v, &mut stream);
+        }
+        assert_eq!(Iter::new(&stream).next(), Some(Err(FrameError::Truncated)));
+
+        // CONNECTION_CLOSE: error_code, frame_type, huge reason len, no reason.
+        let mut close = Vec::new();
+        for v in [FT_CONNECTION_CLOSE, 0, 0, max_varint] {
+            varint::encode(v, &mut close);
+        }
+        assert_eq!(Iter::new(&close).next(), Some(Err(FrameError::Truncated)));
     }
 
     #[test]
