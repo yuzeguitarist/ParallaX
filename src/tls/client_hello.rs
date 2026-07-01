@@ -275,6 +275,172 @@ pub mod tests {
         assert!(parsed.x25519_key_share.is_some());
     }
 
+    // --- Negative-path coverage for the inbound-boundary sub-parsers. ---
+    //
+    // `parse_client_hello` is reached from the server's inbound decision on the
+    // attacker's first TLS record (`handshake/server.rs`), so every error branch
+    // below is a security boundary. The happy-path fixtures above proved parsing
+    // works; these pin the fail-closed behaviour so a future refactor cannot
+    // silently turn a reject into an accept (or a panic).
+
+    /// Assemble a ClientHello record around a caller-supplied extensions block,
+    /// reusing the same body/handshake/record framing as the happy-path fixtures so
+    /// a test can splice a crafted extension without re-deriving the offsets.
+    fn record_with_extensions(exts: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0x22; 32]); // random
+        body.push(32);
+        body.extend_from_slice(&[0_u8; 32]); // 32-byte SessionID
+        body.extend_from_slice(&2_u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]); // one cipher suite
+        body.push(1);
+        body.push(0); // compression: null
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(exts);
+
+        let mut handshake = Vec::new();
+        handshake.push(HANDSHAKE_CLIENT_HELLO);
+        push_u24(&mut handshake, body.len() as u32);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(TLS_CONTENT_HANDSHAKE);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn rejects_truncated_record() {
+        // A record whose declared length exceeds the bytes actually present must be
+        // Truncated, not read past the buffer.
+        let full = client_hello_fixture("example.com");
+        let cut = &full[..full.len() - 4];
+        assert_eq!(
+            parse_client_hello(cut),
+            Err(ClientHelloError::Truncated),
+            "a record shorter than its declared length must reject as Truncated"
+        );
+    }
+
+    #[test]
+    fn rejects_non_client_hello_handshake() {
+        // Same framing, but the handshake type byte is ServerHello (0x02), not
+        // ClientHello (0x01).
+        let mut record = client_hello_fixture("example.com");
+        record[TLS_HEADER_LEN] = 0x02;
+        assert_eq!(
+            parse_client_hello(&record),
+            Err(ClientHelloError::NotClientHello)
+        );
+    }
+
+    #[test]
+    fn rejects_odd_length_supported_versions() {
+        // supported_versions carries a 1-byte list length that MUST be even (each
+        // version is 2 bytes). An odd length is InvalidLength (RFC 8446 §4.2.1).
+        let mut exts = Vec::new();
+        // list length = 3 (odd), followed by one full version + one stray byte.
+        extension(&mut exts, EXT_SUPPORTED_VERSIONS, &[3, 0x03, 0x04, 0x00]);
+        let record = record_with_extensions(&exts);
+        assert_eq!(
+            parse_client_hello(&record),
+            Err(ClientHelloError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn rejects_supported_versions_length_past_extension() {
+        // The list length claims more bytes than the extension body holds.
+        let mut exts = Vec::new();
+        extension(&mut exts, EXT_SUPPORTED_VERSIONS, &[8, 0x03, 0x04]);
+        let record = record_with_extensions(&exts);
+        assert_eq!(
+            parse_client_hello(&record),
+            Err(ClientHelloError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn rejects_non_utf8_sni() {
+        // A host_name of type 0 whose bytes are not valid UTF-8 is InvalidSni.
+        let host = [0xff, 0xfe, 0xfd];
+        let mut sni_data = Vec::new();
+        sni_data.extend_from_slice(&((1 + 2 + host.len()) as u16).to_be_bytes());
+        sni_data.push(0); // name_type = host_name
+        sni_data.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        sni_data.extend_from_slice(&host);
+        let mut exts = Vec::new();
+        extension(&mut exts, EXT_SERVER_NAME, &sni_data);
+        let record = record_with_extensions(&exts);
+        assert_eq!(
+            parse_client_hello(&record),
+            Err(ClientHelloError::InvalidSni)
+        );
+    }
+
+    #[test]
+    fn rejects_sni_list_length_past_extension() {
+        // The server_name_list length overruns the extension body.
+        let mut sni_data = Vec::new();
+        sni_data.extend_from_slice(&64_u16.to_be_bytes()); // claims 64 bytes
+        sni_data.push(0);
+        sni_data.extend_from_slice(&3_u16.to_be_bytes());
+        sni_data.extend_from_slice(b"abc");
+        let mut exts = Vec::new();
+        extension(&mut exts, EXT_SERVER_NAME, &sni_data);
+        let record = record_with_extensions(&exts);
+        assert_eq!(
+            parse_client_hello(&record),
+            Err(ClientHelloError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn key_share_with_wrong_length_x25519_yields_no_share() {
+        // A key_share entry tagged x25519 but only 31 bytes long must be skipped
+        // (the `key.len() == 32` filter), leaving x25519_key_share == None rather
+        // than copying an under-length key.
+        let mut share = Vec::new();
+        share.extend_from_slice(&NAMED_GROUP_X25519.to_be_bytes());
+        share.extend_from_slice(&31_u16.to_be_bytes());
+        share.extend_from_slice(&[0xaa; 31]);
+        let mut key_share_data = Vec::new();
+        key_share_data.extend_from_slice(&(share.len() as u16).to_be_bytes());
+        key_share_data.extend_from_slice(&share);
+        let mut exts = Vec::new();
+        // supported_versions first so tls13 is still detected, then the bad share.
+        extension(&mut exts, EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]);
+        extension(&mut exts, EXT_KEY_SHARE, &key_share_data);
+        let record = record_with_extensions(&exts);
+        let parsed = parse_client_hello(&record).unwrap();
+        assert!(parsed.tls13_supported);
+        assert_eq!(
+            parsed.x25519_key_share, None,
+            "a 31-byte x25519 share must be skipped, not accepted"
+        );
+    }
+
+    #[test]
+    fn rejects_extensions_length_past_body() {
+        // The 2-byte extensions-length overruns the ClientHello body. Build a valid
+        // record then bump the extensions-length field past the body end so
+        // `ext_end > body_end`.
+        let mut exts = Vec::new();
+        extension(&mut exts, EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]);
+        let mut record = record_with_extensions(&exts);
+        // The extensions-length is the 2 bytes immediately preceding the extensions
+        // payload (which is the tail of the record).
+        let ext_len_pos = record.len() - exts.len() - 2;
+        record[ext_len_pos..ext_len_pos + 2].copy_from_slice(&0xffff_u16.to_be_bytes());
+        assert_eq!(
+            parse_client_hello(&record),
+            Err(ClientHelloError::InvalidLength)
+        );
+    }
+
     #[test]
     fn key_share_no_sni_fixture_has_key_share_and_no_sni() {
         // Ground truth for the M-2 recover==None reject shape: key_share present,
