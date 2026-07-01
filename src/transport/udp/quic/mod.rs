@@ -44,3 +44,9 @@ pub(crate) mod spaces;
 pub(crate) mod splice;
 pub(crate) mod transport_params;
 pub(crate) mod varint;
+
+/// Fuzz-only re-export of the frame-codec driver ([`frame::fuzz`]). Compiled ONLY
+/// under `--cfg fuzzing`; lets the `quic_frame_decode` fuzz target reach the
+/// otherwise `pub(crate)` decoder without widening the production API.
+#[cfg(fuzzing)]
+pub use frame::fuzz as frame_fuzz;
