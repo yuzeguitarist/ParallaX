@@ -796,7 +796,13 @@ impl UdpConfig {
 /// `invalid type: string "<the secret>", expected usize`. So we drop the message
 /// entirely and report only the position; the operator finds the typo by line.
 fn toml_error(raw: &str, err: toml::de::Error) -> ConfigError {
-    let off = err.span().map(|s| s.start).unwrap_or(0).min(raw.len());
+    let mut off = err.span().map(|s| s.start).unwrap_or(0).min(raw.len());
+    // `off` is a raw byte offset; if it lands inside a multi-byte UTF-8 sequence
+    // (a non-ASCII char near the syntax error) then `raw[..off]` would panic on a
+    // non-char-boundary index. Clamp down to the nearest boundary first.
+    while off > 0 && !raw.is_char_boundary(off) {
+        off -= 1;
+    }
     let line = raw[..off].bytes().filter(|&b| b == b'\n').count() + 1;
     let line_start = raw[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let column = off - line_start + 1;
@@ -2988,6 +2994,23 @@ psk = "{STRONG_PSK}"
                 !rendered.contains(secret) && !debugged.contains(secret),
                 "TOML parse error must not contain the secret (Display={rendered:?}, Debug={debugged:?})",
             );
+            assert!(matches!(err, ConfigError::Toml { .. }));
+        }
+    }
+
+    /// `toml_error` slices the raw config at the error's byte span; a multi-byte
+    /// UTF-8 char (e.g. a non-ASCII value near the syntax error) must not make the
+    /// `raw[..off]` index land on a non-char-boundary and panic. The result should
+    /// still be a sanitized `ConfigError::Toml { line, column }`.
+    #[test]
+    fn toml_error_tolerates_non_char_boundary_span() {
+        // The unterminated string leaves a multi-byte char (é / 中) inside the
+        // span that toml reports, exercising the boundary clamp.
+        for body in [
+            "mode = \"server\"\nsni = \"café\n",
+            "mode = \"server\"\nsni = \"中文\n",
+        ] {
+            let err = toml_error(body, toml::from_str::<Config>(body).unwrap_err());
             assert!(matches!(err, ConfigError::Toml { .. }));
         }
     }
