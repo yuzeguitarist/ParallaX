@@ -1387,3 +1387,81 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         "vendor/GREASE transport parameter value must be 0"
     );
 }
+
+/// JA4-QUIC fingerprint oracle for the UDP leg.
+///
+/// The TCP camouflage's ClientHello is pinned to the real Safari-26 JA4 by
+/// `ja4_census_oracle.rs`, and the QUIC ClientHello's *structure* is pinned by
+/// `udp_leg_clienthello_matches_safari26_h3_structure` above — but the QUIC
+/// *fingerprint* (JA4q) was never validated. `ja4_quic` existed only to be unit-
+/// tested on a synthetic hello; the real captured product QUIC ClientHello never
+/// flowed through it. This test closes that asymmetry so a JA4q drift on the QUIC
+/// leg turns the build red, exactly as a JA4 drift does on the TCP leg.
+///
+/// Two properties are asserted, mirroring the census oracle's contract:
+///   1. The deterministic JA4_a prefix is exactly `q13d0311h3` — protocol `q`
+///      (QUIC), TLS 1.3, SNI present (`d`), 3 non-GREASE cipher suites, 11
+///      non-GREASE extensions, ALPN `h3`. This is GREASE-independent by JA4
+///      construction, so it is a hard equality, not a band.
+///   2. The full GREASE-stripped JA4 (all three sections) is INVARIANT across
+///      several independent captures whose GREASE codepoints differ. JA4 must be
+///      immune to GREASE churn; if it were not, GREASE would leak into the
+///      fingerprint and the QUIC leg would be trivially trackable hello-to-hello.
+///      Mirrors `ja4_census_oracle.rs::live_full_ja4_is_census_member_across_grease_samples`,
+///      which loops several rounds so the invariance is not a two-sample fluke.
+#[tokio::test]
+async fn udp_leg_clienthello_ja4_quic_matches_safari26_h3_oracle() {
+    use crate::gfw_sim::detection::sni_filter::parse_client_hello;
+    use crate::gfw_sim::detection::tls_fingerprint::ja4_quic;
+
+    // The full JA4_a prefix is fixed by the Safari-26 H3 shape (see the structure
+    // test): q(uic) 13 d(sni) 03(ciphers) 11(exts) h3(alpn).
+    const EXPECTED_JA4_A: &str = "q13d0311h3";
+    // Rotate SNIs so successive captures draw independent GREASE codepoints (the
+    // real product path draws GREASE from OsRng). SNI is not part of JA4's hashed
+    // sections, so cross-SNI comparison is valid.
+    const SAMPLE_SNIS: [&str; 3] = ["cloudflare.com", "apple.com", "www.icloud.com"];
+
+    let capture_ja4 = |server: String| async move {
+        let (crypto, _scid) = capture_udp_leg_full_client_hello(&server).await;
+        let declared =
+            4 + (((crypto[1] as usize) << 16) | ((crypto[2] as usize) << 8) | (crypto[3] as usize));
+        let record = wrap_handshake_as_tls_record(&crypto[..declared]);
+        let parsed = parse_client_hello(&record).expect("reassembled ClientHello parses");
+        ja4_quic(&parsed)
+    };
+
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for round in 0..6 {
+        let sni = SAMPLE_SNIS[round % SAMPLE_SNIS.len()];
+        seen.push(capture_ja4(sni.to_owned()).await);
+    }
+
+    let (ja4_0, ja4_raw_0) = seen[0].clone();
+
+    // 1) Deterministic JA4_a prefix — hard equality.
+    let prefix = ja4_0.split('_').next().expect("JA4 has a prefix section");
+    assert_eq!(
+        prefix, EXPECTED_JA4_A,
+        "JA4-QUIC prefix drift: got {prefix:?} (full {ja4_0}), raw {ja4_raw_0}"
+    );
+    assert!(
+        ja4_0.starts_with("q13"),
+        "JA4-QUIC must carry the QUIC protocol prefix 'q'; got {ja4_0}"
+    );
+    assert_eq!(
+        ja4_0.split('_').count(),
+        3,
+        "JA4 must have three underscore-separated sections; got {ja4_0}"
+    );
+
+    // 2) GREASE invariance across all captures: every sampled JA4 must equal the
+    //    first. A single differing capture means GREASE leaked into the
+    //    fingerprint (or the shape is non-deterministic) — either is a defect.
+    for (i, (ja4, _)) in seen.iter().enumerate() {
+        assert_eq!(
+            *ja4, ja4_0,
+            "JA4-QUIC not GREASE-invariant: capture {i} = {ja4} != capture 0 = {ja4_0}"
+        );
+    }
+}
