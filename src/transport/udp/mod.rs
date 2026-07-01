@@ -22,7 +22,16 @@ pub mod probe;
 /// live production carrier for the UDP fast plane, built clean-room from RFC
 /// 9000/9001/9002. The `quinn` + vendored `quinn-proto` fork it replaced are gone
 /// from the dependency tree; each module carries its own RFC KAT / round-trip tests.
+///
+/// `pub(crate)` in every normal build; widened to `pub` ONLY under `--cfg fuzzing`
+/// (which cargo-fuzz sets) so the QUIC wire parsers — which run on
+/// attacker-controlled, pre-authentication datagram bytes on the server — are
+/// reachable from the external `parallax-fuzz` crate. This adds no production API
+/// surface, matching the `tls::safari26::fuzz` / `client::socks::fuzz` seams.
+#[cfg(not(fuzzing))]
 pub(crate) mod quic;
+#[cfg(fuzzing)]
+pub mod quic;
 /// Stable-:443 origin-splice QUIC carrier: a process-wide shared endpoint that
 /// marker-terminates authenticated ParallaX clients, splices every other Initial to
 /// the real origin, and routes accepted connections back to their session by DCID.

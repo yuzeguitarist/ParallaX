@@ -237,8 +237,15 @@ impl TransportParameters {
             let (len, m) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
             i += m;
             let len = len as usize;
-            let body = blob.get(i..i + len).ok_or(Error::Truncated)?;
-            i += len;
+            // `len` is an attacker-controlled varint (up to 2^62-1) parsed
+            // pre-authentication on the server. On a 32-bit `usize` target the
+            // `as usize` truncation plus `i + len` can wrap; a checked add makes
+            // an over-long length reject as `Truncated` on every target instead
+            // of relying on the 64-bit-only guarantee that `i + len` stays in
+            // range. No behavior change on the 64-bit relay path.
+            let end = i.checked_add(len).ok_or(Error::Truncated)?;
+            let body = blob.get(i..end).ok_or(Error::Truncated)?;
+            i = end;
             match id {
                 TP_INITIAL_MAX_DATA => tp.initial_max_data = read_varint_body(body)?,
                 TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => {
@@ -489,6 +496,20 @@ mod tests {
         varint::encode(20, &mut ok);
         ok.extend_from_slice(&[0xab; 20]);
         assert!(TransportParameters::read(&ok).is_ok());
+    }
+
+    #[test]
+    fn read_rejects_gigantic_length_claim() {
+        // A hostile blob whose parameter length field is the largest encodable
+        // varint (2^62 - 1) with no value bytes following. This is
+        // attacker-controlled, pre-authentication input; the checked add makes
+        // it reject as `Truncated` on every target (including 32-bit `usize`,
+        // where `i + len` could otherwise wrap) rather than indexing past the
+        // buffer.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
+        varint::encode(varint::MAX, &mut blob);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
     }
 
     #[test]
