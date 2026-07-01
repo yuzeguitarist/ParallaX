@@ -134,3 +134,10 @@ path = "fuzz_targets/h3_qpack_field_section.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "quic_frame_decode"
+path = "fuzz_targets/quic_frame_decode.rs"
+test = false
+doc = false
+bench = false

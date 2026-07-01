@@ -30,6 +30,13 @@ pub(crate) mod stable;
 /// Persistent single-use 0-RTT anti-replay guard (backs `tls::quic::ZeroRttGuard`).
 pub(crate) mod zero_rtt;
 
+/// Fuzz-only re-export of the QUIC frame-codec driver. Compiled ONLY under
+/// `--cfg fuzzing`; gives the `quic_frame_decode` fuzz target a crate-public path
+/// (`parallax::transport::udp::quic_frame_fuzz`) into the `pub(crate)` codec
+/// without adding any production API surface.
+#[cfg(fuzzing)]
+pub use quic::frame_fuzz as quic_frame_fuzz;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

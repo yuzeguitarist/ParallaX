@@ -821,6 +821,150 @@ mod tests {
         );
     }
 
+    /// One encoded representative of every `Frame` variant, for structural sweeps.
+    /// Kept in sync with the `Frame` enum: adding a variant without extending this
+    /// list leaves the new variant out of the truncation/roundtrip coverage below.
+    fn every_variant() -> Vec<Frame<'static>> {
+        vec![
+            Frame::Padding(3),
+            Frame::Ping,
+            Frame::Ack(Ack {
+                largest: 1000,
+                delay: 25,
+                ranges: vec![(1000, 1000), (990, 995)],
+                ecn: None,
+            }),
+            Frame::Ack(Ack {
+                largest: 42,
+                delay: 3,
+                ranges: vec![(40, 42)],
+                ecn: Some(EcnCounts {
+                    ect0: 10,
+                    ect1: 0,
+                    ce: 1,
+                }),
+            }),
+            Frame::ResetStream {
+                id: 4,
+                error_code: 7,
+                final_size: 1234,
+            },
+            Frame::StopSending {
+                id: 8,
+                error_code: 2,
+            },
+            Frame::Crypto {
+                offset: 16,
+                data: b"clienthello-bytes",
+            },
+            Frame::NewToken {
+                token: b"resumption-token",
+            },
+            Frame::Stream {
+                id: 0,
+                offset: 0,
+                fin: false,
+                data: b"relay-payload",
+            },
+            Frame::Stream {
+                id: 4,
+                offset: 4096,
+                fin: true,
+                data: b"tail",
+            },
+            Frame::MaxData(1 << 24),
+            Frame::MaxStreamData {
+                id: 4,
+                max: 1 << 21,
+            },
+            Frame::MaxStreams {
+                dir: Dir::Bidi,
+                max: 8,
+            },
+            Frame::MaxStreams {
+                dir: Dir::Uni,
+                max: 8,
+            },
+            Frame::DataBlocked(99),
+            Frame::StreamDataBlocked { id: 0, limit: 5 },
+            Frame::StreamsBlocked {
+                dir: Dir::Bidi,
+                limit: 1,
+            },
+            Frame::StreamsBlocked {
+                dir: Dir::Uni,
+                limit: 1,
+            },
+            Frame::NewConnectionId {
+                seq: 1,
+                retire_prior_to: 0,
+                cid: &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11],
+                reset_token: &[0x42; RESET_TOKEN_LEN],
+            },
+            Frame::RetireConnectionId(3),
+            Frame::PathChallenge(0x0123_4567_89ab_cdef),
+            Frame::PathResponse(0xfedc_ba98_7654_3210),
+            Frame::Close(Close {
+                application: false,
+                error_code: 0x0a,
+                frame_type: FT_STREAM_BASE,
+                reason: b"bad stream",
+            }),
+            Frame::Close(Close {
+                application: true,
+                error_code: 1,
+                frame_type: 0,
+                reason: b"relay idle",
+            }),
+            Frame::HandshakeDone,
+        ]
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        // A single-place guarantee that the whole enum, not just the hand-picked
+        // frames above, survives encode -> decode identically.
+        for frame in every_variant() {
+            round_trip(frame);
+        }
+    }
+
+    #[test]
+    fn every_variant_prefix_truncation_fails_closed() {
+        // For every variant, feed the decoder EVERY strict prefix of its encoding.
+        // A short read must fail cleanly (Truncated / Malformed) or decode a
+        // partial coalesced PADDING run — it must NEVER panic, read out of bounds,
+        // or over-allocate. This is the adversarial "cut the packet anywhere"
+        // property a network-facing parser must hold, and it exercises every
+        // `take`/`varint`/`u64_be` boundary in `parse_one`.
+        for frame in every_variant() {
+            let mut full = Vec::new();
+            frame.encode(&mut full);
+            for cut in 0..full.len() {
+                let prefix = &full[..cut];
+                // Drive the whole iterator; the property is total (no panic),
+                // regardless of Ok/Err. Collect forces every frame to parse.
+                let _: Vec<_> = Iter::new(prefix).collect();
+            }
+        }
+    }
+
+    #[test]
+    fn iterator_stops_after_first_error() {
+        // A valid PING, then an unknown frame type, then another valid PING.
+        // The iterator must yield Ping, then the error, then STOP (never reach the
+        // trailing PING) — matching `Iterator::next`'s fail-fast contract.
+        let mut buf = Vec::new();
+        Frame::Ping.encode(&mut buf);
+        varint::encode(0x30, &mut buf); // DATAGRAM: unknown to this pruned parser
+        Frame::Ping.encode(&mut buf);
+
+        let mut iter = Iter::new(&buf);
+        assert_eq!(iter.next(), Some(Ok(Frame::Ping)));
+        assert_eq!(iter.next(), Some(Err(FrameError::UnknownFrame(0x30))));
+        assert_eq!(iter.next(), None, "iteration must halt at the first error");
+    }
+
     #[test]
     fn parse_ack_rejects_underflowing_ranges() {
         // first_range > largest underflows the first range's low edge.
@@ -836,5 +980,59 @@ mod tests {
             varint::encode(v, &mut b);
         }
         assert_eq!(Iter::new(&b).next(), Some(Err(FrameError::Malformed)));
+    }
+}
+
+/// Fuzz-only driver for the QUIC frame decoder ([`Iter`]). Compiled ONLY under
+/// `--cfg fuzzing` (which cargo-fuzz sets); absent from normal `cargo build` /
+/// `cargo test` and CI, so it adds no production API surface. This is what lets
+/// the `quic_frame_decode` fuzz target reach the otherwise `pub(crate)` codec.
+///
+/// `frame.rs` decodes attacker-controlled QUIC packet payloads off the wire (the
+/// receive path in `super::conn::Connection::process_packet`), so it is exactly
+/// the kind of byte parser a fuzzer should hammer: every other frame parser in
+/// the tree (mux, HTTP/2, HTTP/3) already has one.
+#[cfg(fuzzing)]
+pub mod fuzz {
+    use super::{Frame, Iter};
+
+    /// Decode every frame in `data`, and for each frame that decodes, assert the
+    /// encode→decode→encode roundtrip is byte-stable (the invariant the
+    /// `mux_frame` / `h3_frame_decode` targets also assert). Returns the number of
+    /// frames successfully decoded before the first error (if any).
+    pub fn decode_all_roundtrip(data: &[u8]) -> usize {
+        let mut count = 0usize;
+        for result in Iter::new(data) {
+            match result {
+                Ok(frame) => {
+                    roundtrip_is_stable(&frame);
+                    count += 1;
+                }
+                // A decode error is expected on arbitrary input; the iterator
+                // stops after it. The point is that it must not panic.
+                Err(_) => break,
+            }
+        }
+        count
+    }
+
+    /// Encode a decoded frame, re-decode the bytes, and assert an identical frame
+    /// re-encodes to identical bytes. Our own encoder emits self-delimiting,
+    /// canonical framing, so this must be exact.
+    fn roundtrip_is_stable(frame: &Frame) {
+        let mut b1 = Vec::new();
+        frame.encode(&mut b1);
+
+        // Padding coalesces on decode, so a re-decode of a lone PADDING run yields
+        // one Padding(n) frame that re-encodes identically; every other variant is
+        // one frame per encoding. Decode exactly one frame back.
+        let decoded = match Iter::new(&b1).next() {
+            Some(Ok(f)) => f,
+            other => panic!("our own frame encoding must decode: {other:?}"),
+        };
+
+        let mut b2 = Vec::new();
+        decoded.encode(&mut b2);
+        assert_eq!(b1, b2, "QUIC frame encode/decode is not byte-stable");
     }
 }
