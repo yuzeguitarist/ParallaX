@@ -307,7 +307,13 @@ mod tests {
         // survive. Use a distinctive nonce and a timestamp with all byte lanes
         // set so the recovered freshness material is byte-for-byte the sealed one.
         let now = 0x0102_0304_0506_0708;
-        let distinctive: [u8; NONCE_LEN] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // Build a per-byte-distinct nonce from its index (not a literal) so every
+        // lane differs — kills a mutant returning a fixed/input nonce — while the
+        // value isn't a hard-coded crypto constant.
+        let mut distinctive = [0u8; NONCE_LEN];
+        for (i, b) in distinctive.iter_mut().enumerate() {
+            *b = (i as u8) + 1;
+        }
         let cr = seal(PSK, &SS, SNI, DCID, now, &distinctive);
         let m = open(PSK, &SS, SNI, DCID, &cr, now, WINDOW).expect("valid marker opens");
         assert_eq!(m.nonce, distinctive);
