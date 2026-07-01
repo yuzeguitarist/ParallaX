@@ -1,0 +1,102 @@
+name: ci-netem-bdp-bench
+
+# Single-connection TCP throughput over a real high-BDP, send-throttled kernel
+# link (network namespaces + veth + tc/netem/tbf), which `plx netmatrix` cannot
+# model: its userspace stream shaper buffers tens of MiB and so never exerts
+# real cwnd/sndbuf backpressure on the sender. This job builds an actual bounded
+# bottleneck queue so the sender IS backpressured — the only regime in which a
+# single-write-in-flight relay loop caps throughput at one batch per RTT, and
+# thus the only place a multi-batch in-flight pipeline change can be measured.
+#
+# It is informational/diagnostic (manual + on relevant paths), not a hard merge
+# gate: throughput on shared CI runners is noisy. It prints the speed JSON and a
+# computed efficiency (achieved / rate cap) so a before/after comparison is
+# possible from the run logs and artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rtt_ms:
+        description: 'Round-trip delay (ms)'
+        default: '150'
+      rate_mbit:
+        description: 'Per-direction rate cap (Mbit/s)'
+        default: '100'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'src/transport/**'
+      - 'src/client/**'
+      - 'src/handshake/**'
+      - 'src/protocol/**'
+      - 'scripts/netem-bdp-bench.sh'
+      - '.github/workflows/ci-netem-bdp-bench.yml'
+
+concurrency:
+  group: ci-netem-bdp-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  netem-bench:
+    name: netem-bdp-bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-ci
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: ensure tc/iproute2 present
+        run: sudo apt-get update && sudo apt-get install -y iproute2 jq
+
+      - name: build release binary
+        run: cargo build --release --locked --bin plx
+
+      - name: run netem BDP throughput bench
+        env:
+          RTT_MS: ${{ github.event.inputs.rtt_ms || '150' }}
+          RATE_MBIT: ${{ github.event.inputs.rate_mbit || '100' }}
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=RTT_MS,RATE_MBIT \
+            env PLX_BIN="$PWD/target/release/plx" OUT_JSON="$PWD/speed.json" \
+            bash scripts/netem-bdp-bench.sh | tee bench.out
+
+          echo "=== parsing throughput ==="
+          dn=$(jq -r '.runs[0].download.summary.median_mbps' speed.json)
+          up=$(jq -r '.runs[0].upload.summary.median_mbps' speed.json)
+          echo "download_median_mbps=$dn"
+          echo "upload_median_mbps=$up"
+          # Efficiency vs the configured rate cap. With a bounded queue < BDP,
+          # a single-in-flight loop should sit well below 1.0; a multi-batch
+          # pipeline should push it up. Printed for before/after comparison.
+          eff=$(awk -v d="$dn" -v r="$RATE_MBIT" 'BEGIN{printf "%.3f", d/r}')
+          echo "::notice::download efficiency (achieved/cap) = $eff  (rtt=${RTT_MS}ms cap=${RATE_MBIT}Mbit dn=${dn} up=${up})"
+
+      - name: upload speed JSON artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: netem-bench-speed-json
+          path: |
+            speed.json
+            bench.out
+            /tmp/tmp.*/server.log
+            /tmp/tmp.*/speed.err
+          if-no-files-found: warn
