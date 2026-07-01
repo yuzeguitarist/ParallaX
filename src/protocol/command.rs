@@ -2177,6 +2177,186 @@ mod tests {
     }
 
     #[test]
+    fn browser_shaped_sizes_holds_under_a_clamped_record_cap() {
+        // The existing browser-shaper tests all pass `max_record_size = usize::MAX`
+        // (the default / light-padding profile, where the cap sits far above the
+        // target distribution). A heavy-but-valid `max_padding` profile makes
+        // `pq_flight_max_chunk_size` clamp the per-record cap DOWN toward
+        // `PQ_FLIGHT_RECORD_MIN` (command.rs lines ~1173-1178). The tiling invariants
+        // must still hold on that clamp path: exact tiling (sizes sum to the payload),
+        // every record `>= PQ_FLIGHT_RECORD_MIN` (no tiny tell), every record within
+        // the effective cap (fits the sealed TLS record), and the count bounded (no
+        // shatter). This test sweeps the cap across the clamp range so a regression in
+        // the clamp interaction, not just the unclamped path, turns the build RED.
+        //
+        // The swept caps stay `>=` the smallest cap the RUNTIME can hand this shaper:
+        // config validation rejects any `max_padding` with `max_plaintext_len < 1024`
+        // (config.rs, `MIN_USABLE_PLAINTEXT_LEN`), so the smallest sealed budget is
+        // 1024 and `pq_flight_max_chunk_size(1024) == 1024 - 16 - 512 == 496`. Caps at
+        // or below the smallest target degenerate the `remaining - MIN` tail guard —
+        // that boundary is pinned separately in
+        // `browser_shaped_sizes_sub_min_cap_is_out_of_contract`; here we sweep the real
+        // in-contract range only.
+        use crate::protocol::data::{max_plaintext_len, MIN_USABLE_PLAINTEXT_LEN};
+        use rand::{rngs::StdRng, SeedableRng};
+        let max_target = *PQ_FLIGHT_RECORD_TARGETS.iter().max().unwrap();
+        // The exact cap the runtime derives at its worst (largest) accepted padding
+        // profile: the most padding the validator accepts gives the smallest sealed
+        // plaintext budget, hence the smallest per-record cap this shaper ever sees.
+        let runtime_floor_cap = {
+            let max_valid_padding = (0_u16..=u16::MAX)
+                .rev()
+                .find(|&p| max_plaintext_len(p) >= MIN_USABLE_PLAINTEXT_LEN)
+                .expect("some padding leaves room for the usable-plaintext floor");
+            pq_flight_max_chunk_size(max_plaintext_len(max_valid_padding))
+        };
+        assert!(
+            runtime_floor_cap >= 2 * PQ_FLIGHT_RECORD_MIN,
+            "runtime floor cap {runtime_floor_cap} unexpectedly tight (< 2*MIN)"
+        );
+        for payload_len in [1608_usize, 1609, 4635, 6243] {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+            // Caps spanning the clamp: at the runtime floor, between targets, and above
+            // the whole distribution (where the clamp is a no-op).
+            for &cap in &[
+                runtime_floor_cap,
+                runtime_floor_cap + 1,
+                512,
+                1000,
+                max_target,
+                max_target + 4096,
+            ] {
+                // The effective per-record ceiling the shaper uses (mirrors
+                // `browser_shaped_sizes`'s `max_target` clamp).
+                let effective = max_target.min(cap.max(PQ_FLIGHT_RECORD_MIN));
+                let bound = payload_len.div_ceil(PQ_FLIGHT_RECORD_MIN);
+                for seed in 0..24_u64 {
+                    let mut rng = StdRng::seed_from_u64(seed);
+                    let chunks =
+                        FramedChunk::encode_all_browser_shaped(&payload, cap, &mut rng).unwrap();
+                    assert!(
+                        chunks.len() <= bound,
+                        "shatter under cap={cap} len={payload_len} seed={seed}: {} > {bound}",
+                        chunks.len()
+                    );
+                    let mut reassembler = FramedReassembler::default();
+                    let mut assembled = None;
+                    let mut sum = 0_usize;
+                    for chunk in &chunks {
+                        let len = FramedChunk::decode_ref(chunk).unwrap().bytes.len();
+                        assert!(
+                            len >= PQ_FLIGHT_RECORD_MIN,
+                            "tiny tell record {len} under cap={cap} seed={seed}"
+                        );
+                        assert!(
+                            len <= effective,
+                            "record {len} exceeds effective cap {effective} (cap={cap})"
+                        );
+                        sum += len;
+                        if let Some(done) =
+                            reassembler.push(chunk, MAX_PQ_HANDSHAKE_FRAME * 2).unwrap()
+                        {
+                            assembled = Some(done);
+                        }
+                    }
+                    // Exact tiling: the shaped records cover the payload with no gap
+                    // and no overlap.
+                    assert_eq!(sum, payload_len, "tiling gap/overlap under cap={cap}");
+                    assert_eq!(
+                        assembled.as_deref(),
+                        Some(payload.as_slice()),
+                        "reassembly mismatch under cap={cap} seed={seed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn browser_shaped_sizes_sub_min_cap_is_out_of_contract() {
+        // Boundary documentation, not a live-path guarantee. `browser_shaped_sizes`
+        // keeps every record `>= PQ_FLIGHT_RECORD_MIN` only when its effective cap
+        // leaves room for the `remaining - PQ_FLIGHT_RECORD_MIN` tail draw — i.e. when
+        // the cap exceeds the smallest browser target. At a cap of exactly
+        // `PQ_FLIGHT_RECORD_MIN` the tail guard degenerates: `pick_target_size` clamps
+        // the draw back up to MIN, so a payload that is not a multiple of MIN leaves a
+        // sub-MIN final record. This is why `pq_flight_max_chunk_size` floors the
+        // runtime cap well above MIN (see the in-contract sweep above); production
+        // never passes a cap this tight. We pin the degeneration here so that if a
+        // future change tightens the runtime floor OR removes it, the intent is
+        // explicit: reassembly must ALWAYS still round-trip (the correctness invariant
+        // holds unconditionally); only the anti-tell size floor is cap-dependent.
+        use rand::{rngs::StdRng, SeedableRng};
+        // 1608 = 11*144 + 24, so the tail is a 24-byte record at cap == MIN.
+        let payload: Vec<u8> = (0..1608_u32).map(|i| (i % 251) as u8).collect();
+        let mut rng = StdRng::seed_from_u64(0);
+        let chunks =
+            FramedChunk::encode_all_browser_shaped(&payload, PQ_FLIGHT_RECORD_MIN, &mut rng)
+                .unwrap();
+        let last = FramedChunk::decode_ref(chunks.last().unwrap())
+            .unwrap()
+            .bytes
+            .len();
+        assert!(
+            last < PQ_FLIGHT_RECORD_MIN,
+            "sub-MIN cap is expected to under-run the size floor; got last={last}"
+        );
+        // Correctness is unconditional: even out of contract, the frame reassembles.
+        let mut reassembler = FramedReassembler::default();
+        let mut assembled = None;
+        for chunk in &chunks {
+            if let Some(done) = reassembler.push(chunk, MAX_PQ_HANDSHAKE_FRAME * 2).unwrap() {
+                assembled = Some(done);
+            }
+        }
+        assert_eq!(assembled.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn encode_all_shaped_pathological_bounds_still_tile_exactly() {
+        // The `encode_all_shaped` constrained draw has a fallback branch for
+        // pathological bounds where `max_chunk < 2 * min_chunk`, so no split can keep
+        // the tail `>= min_chunk` and it emits a lone `max_chunk` record (command.rs
+        // lines ~1070-1076). That branch is not otherwise exercised. It must still
+        // tile the payload exactly and round-trip: no over-max record, no lost bytes.
+        use rand::{rngs::StdRng, SeedableRng};
+        // min=256, max=300 => max < 2*min, forcing the fallback on every non-final
+        // step. A multi-record payload guarantees the fallback is taken.
+        let (min_chunk, max_chunk) = (256_usize, 300_usize);
+        for payload_len in [301_usize, 512, 900, 1608] {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 131) as u8).collect();
+            for seed in 0..32_u64 {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let chunks =
+                    FramedChunk::encode_all_shaped(&payload, &mut rng, min_chunk, max_chunk)
+                        .unwrap();
+                let mut reassembler = FramedReassembler::default();
+                let mut assembled = None;
+                let mut sum = 0_usize;
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    let len = FramedChunk::decode_ref(chunk).unwrap().bytes.len();
+                    // Non-final records are the fallback `max_chunk`; the final record
+                    // carries the remainder and may be shorter, but never over max.
+                    assert!(
+                        len <= max_chunk,
+                        "over-max record {len} > {max_chunk} at idx={idx} seed={seed}"
+                    );
+                    sum += len;
+                    if let Some(done) = reassembler.push(chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
+                        assembled = Some(done);
+                    }
+                }
+                assert_eq!(sum, payload_len, "tiling gap/overlap seed={seed}");
+                assert_eq!(
+                    assembled.as_deref(),
+                    Some(payload.as_slice()),
+                    "reassembly mismatch seed={seed}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn aggregate_pad_len_varies_within_bounds() {
         // PAR-28 Low-1 decorrelation: the per-session aggregate pad must vary across
         // sessions (kills the constant-aggregate correlation) and stay in [MIN, MAX]
