@@ -96,6 +96,20 @@ const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
 /// stream whose local app stops reading fills only its own 32-deep channel; the
 /// reader keeps servicing every other stream.
 const CLIENT_MUX_STREAM_CHANNEL: usize = 32;
+/// Grace window applied when a stream's download channel is full. A full channel
+/// alone does NOT mean the local app is stalled: a live app that merely drains
+/// slower than a bulk burst (the reader can dispatch a whole ~1 MiB open-batch of
+/// DATA frames — far more than the channel depth — before the download task next
+/// runs) transiently fills it too. So on a full channel the reader waits UP TO
+/// this long for a slot to free instead of resetting immediately: if the download
+/// task drains within the window the app was merely slow (deliver, no reset); if
+/// the window elapses with no drain the stream is genuinely stalled and is reset.
+/// The bound guarantees one stalled app can never wedge the shared reader for
+/// longer than this, while a live download draining at the link rate is never
+/// falsely reset. Sits far above the sub-second a live consumer needs to free one
+/// slot even under load, and well below the horizon at which a stalled peer would
+/// noticeably starve the other streams sharing the carrier.
+const CLIENT_MUX_STALL_RESET_GRACE: Duration = Duration::from_secs(2);
 const MUX_FRAME_BATCH_LIMIT: usize = 64;
 /// Cap on the ciphertext bytes batched per mux read before opening, bounding
 /// scratch memory while leaving enough records for the crypto pool to fan out.
@@ -777,12 +791,15 @@ enum DownloadOutcome {
 
 /// A decrypted download DATA frame handed from the single mux reader loop to a
 /// stream's own download task over a BOUNDED per-stream channel. The reader
-/// never writes a local app socket and only ever `try_send`s here (never
-/// `await`s), so a slow or stalled local app back-pressures ONLY its own channel
-/// — never the shared reader loop. A per-stream download task owns the socket
-/// write half and drains this channel to it. This is what keeps one slow
-/// download from head-of-line-blocking every other stream on the carrier (the
-/// failure mode a reader-inline `write_all` reintroduced).
+/// `try_send`s here on the common path (never touching the local app socket), so
+/// a slow or stalled local app back-pressures ONLY its own channel — never the
+/// shared reader loop. On a full channel the reader falls back to a BOUNDED
+/// blocking send (see [`dispatch_client_mux_frame`]), so a live-but-slow app is
+/// not falsely reset, yet a genuine stall can hold the reader only briefly before
+/// its stream is reset. A per-stream download task owns the socket write half and
+/// drains this channel to it. This is what keeps one slow download from head-of-
+/// line-blocking every other stream on the carrier (the failure mode a
+/// reader-inline `write_all` reintroduced).
 ///
 /// The stream's TERMINAL state (a server Fin/Reset, a full-channel stall reset,
 /// or a session teardown) is carried out-of-band on [`StreamTerminal`], not as a
@@ -3469,7 +3486,7 @@ where
             let mut frames = frames_payload;
             while !frames.is_empty() {
                 let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-                dispatch_client_mux_frame(&mut local_writes, frame, cid);
+                dispatch_client_mux_frame(&mut local_writes, frame, cid).await;
                 frames = &frames[used..];
             }
             Ok::<(), ClientRuntimeError>(())
@@ -3483,26 +3500,30 @@ where
 }
 
 /// Hands a decrypted download frame to its stream's own download task over the
-/// stream's bounded channel, using a NON-BLOCKING `try_send`. The reader never
-/// writes a local socket and never `await`s a per-stream channel, so it can NEVER
-/// be head-of-line-blocked by one slow (or stalled) local app — it keeps
-/// dispatching to every other stream regardless.
+/// stream's bounded channel. The common path is a NON-BLOCKING `try_send`, so the
+/// reader keeps dispatching to every other stream and is never head-of-line-
+/// blocked by one slow (or stalled) local app.
 ///
-/// Back-pressure resolution on a full channel: a stream whose local app has
-/// stopped reading long enough to fill its entire 32-deep queue is treated as a
-/// stalled stream and RESET — signalled `Reset`, dropped from the map, and (via
-/// the download task's Reset outcome) torn down upstream so the server releases
-/// its target socket. This bounds per-stream memory to the channel depth and
-/// sacrifices only the one stalled stream, never the shared carrier. The 32-frame
-/// buffer absorbs normal transient bursts (an app briefly slower than the link),
-/// so this reset fires only on a genuine stall, not routine slowness.
+/// Back-pressure resolution on a full channel: a full channel does NOT by itself
+/// mean the app has stalled — the reader can dispatch a whole open-batch of DATA
+/// frames (up to ~1 MiB, far more than the channel depth) before a stream's
+/// download task next gets to drain, so a live app that is merely slower than a
+/// bulk burst transiently fills it too. So on a full channel the reader falls back
+/// to a BOUNDED blocking send ([`CLIENT_MUX_STALL_RESET_GRACE`]): if a slot frees
+/// within the window the app was just slow (the frame is delivered, nothing is
+/// reset); if the window elapses with no drain the stream is genuinely stalled and
+/// is RESET — signalled `Reset`, dropped from the map, and (via the download
+/// task's Reset outcome) torn down upstream so the server releases its target
+/// socket. This bounds per-stream memory to the channel depth and caps how long
+/// one stalled app can hold the shared reader, while never falsely resetting a
+/// live download that drains at the link rate.
 ///
 /// The Data payload borrows the reused record buffer, so it is copied into the
 /// channel event; this is the (bounded, per-frame) cost of decoupling the reader
 /// from every local app's write speed — the alternative (reader-inline
-/// `write_all`, or a blocking `send().await`) head-of-line-blocks the whole
-/// carrier on the slowest local app.
-fn dispatch_client_mux_frame(
+/// `write_all`, or an UNBOUNDED blocking `send().await`) head-of-line-blocks the
+/// whole carrier on the slowest local app.
+async fn dispatch_client_mux_frame(
     local_writes: &mut HashMap<u32, ClientDownloadStream>,
     frame: MuxFrameRef<'_>,
     cid: u64,
@@ -3522,19 +3543,36 @@ fn dispatch_client_mux_frame(
                             // closed): stop trying to feed it.
                             local_writes.remove(&frame.stream_id);
                         }
-                        Err(TrySendError::Full(_)) => {
-                            // Local app stalled long enough to fill its whole
-                            // 32-deep queue: reset only this stream so the reader
-                            // never blocks and memory stays bounded. Stamp Reset,
-                            // then drop the sender — the task's Reset outcome
-                            // propagates upstream (server releases its target).
-                            tracing::debug!(
-                                cid,
-                                stream_id = frame.stream_id,
-                                "client mux download stalled; resetting the stream"
-                            );
-                            if let Some(stream) = local_writes.remove(&frame.stream_id) {
-                                stream.terminal.set(DownloadOutcome::Reset);
+                        Err(TrySendError::Full(event)) => {
+                            // Channel full: the app is draining slower than this
+                            // burst. Don't reset yet — wait UP TO the grace window
+                            // for a slot to free. Clone the sender so the map
+                            // borrow ends before the await (the reset arm re-takes
+                            // it). A live app frees a slot in well under the grace;
+                            // only a genuinely stalled one never drains.
+                            let sender = stream.events.clone();
+                            match timeout(CLIENT_MUX_STALL_RESET_GRACE, sender.send(event)).await {
+                                // Drained within the window: live-but-slow stream.
+                                Ok(Ok(())) => {}
+                                // Download task vanished while we waited.
+                                Ok(Err(_)) => {
+                                    local_writes.remove(&frame.stream_id);
+                                }
+                                // No drain for the whole window: a real stall.
+                                // Reset only this stream so the reader is freed and
+                                // memory stays bounded. Stamp Reset, then drop the
+                                // sender — the task's Reset outcome propagates
+                                // upstream (server releases its target).
+                                Err(_) => {
+                                    tracing::debug!(
+                                        cid,
+                                        stream_id = frame.stream_id,
+                                        "client mux download stalled; resetting the stream"
+                                    );
+                                    if let Some(stream) = local_writes.remove(&frame.stream_id) {
+                                        stream.terminal.set(DownloadOutcome::Reset);
+                                    }
+                                }
                             }
                         }
                     }
