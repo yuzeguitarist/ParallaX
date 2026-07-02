@@ -1878,6 +1878,35 @@ mod tests {
     }
 
     #[test]
+    fn compressed_certificate_rejects_unsupported_algorithm() {
+        // Only zlib (0x0001) is accepted. Any other CompressedCertificate
+        // algorithm must be refused on the still-unauthenticated server flight
+        // rather than fed to the zlib decoder. The existing tests only build zlib
+        // bodies, so this arm was never exercised. The algorithm check fires
+        // before the compressed body is read, so a bare 2-byte algorithm suffices.
+        let body = 0x0002_u16.to_be_bytes(); // brotli, not zlib
+        let err = parse_compressed_certificate_body(&body).unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Unsupported(m) if m.contains("algorithm")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn compressed_certificate_rejects_length_mismatch() {
+        // A well-formed zlib body whose declared uncompressed_length disagrees with
+        // the actual inflated length (both within the cap) must be rejected. This
+        // is distinct from the two cap guards above: here nothing is oversized, the
+        // header simply lies about the length. Declare 6, inflate to 5.
+        let body = build_compressed_cert_body(6, b"hello");
+        let err = parse_compressed_certificate_body(&body).unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("length mismatch")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn safari26_camouflage_emits_authenticated_client_hello() {
         let server = X25519KeyPair::generate();
         let psk = b"0123456789abcdef0123456789abcdef";
@@ -2983,6 +3012,32 @@ mod tests {
         assert!(matches!(
             parse_safari_server_hello(&record),
             Err(Safari26TlsError::MissingServerHello)
+        ));
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_tls13_without_key_share() {
+        // supported_versions selects TLS 1.3, but the ServerHello carries no
+        // key_share extension. A real TLS 1.3 ServerHello always echoes a
+        // key_share, so this must be rejected rather than proceeding with an
+        // absent group. Sibling reject branches (HRR, short session_id, non-zero
+        // compression, non-TLS1.3) are pinned above; this one had no test.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+        ext.extend_from_slice(&2_u16.to_be_bytes());
+        ext.extend_from_slice(&TLS13.to_be_bytes());
+        let record = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS12,
+            &[0x11; 32],
+            32,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &ext,
+        );
+        assert!(matches!(
+            parse_safari_server_hello(&record),
+            Err(Safari26TlsError::Handshake(ref m)) if m.contains("missing key_share")
         ));
     }
 
