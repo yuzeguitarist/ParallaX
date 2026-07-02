@@ -1,0 +1,36 @@
+{
+  "node": "box-b",
+  "commit": "d240e663",
+  "ts": "2026-07-02T14:38:51Z",
+  "owns": [
+    "tls_compressed_cert",
+    "mux_frame",
+    "client_hello_auth",
+    "command_codecs",
+    "socks_connect_request",
+    "udp_envelope",
+    "mldsa_verify",
+    "h3_frame_decode",
+    "h3_settings_parse"
+  ],
+  "execs_per_sec": {
+    "mux_frame": 396336,
+    "data_record_open": 17219,
+    "http2_frame_header": 330022,
+    "command_codecs": 283203,
+    "replay_journal": 2521,
+    "udp_envelope": 57233,
+    "udp_reorder": 44740,
+    "replay_dedup": 809,
+    "mldsa_verify": 8883
+  },
+  "total_execs_per_sec": 1140966,
+  "corpus_files": 14750,
+  "corpus_bytes": 31823335,
+  "crash_count": 0,
+  "oom_timeout_count": 0,
+  "max_rss_mb": 38,
+  "uptime_s": 1429404,
+  "disk_free_pct": 84,
+  "last_sync_ts": "2026-07-02T14:37:37Z"
+}
