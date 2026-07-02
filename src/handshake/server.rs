@@ -8791,6 +8791,25 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_6to4_range_is_classified_and_denied_outbound() {
+        // 2002::/16 (6to4) embeds an IPv4 address in its payload and would
+        // otherwise tunnel to an arbitrary v4 destination without passing the v4
+        // egress policy. It is in the deny chain but — unlike its sibling
+        // classifiers (documentation/teredo/nat64), pinned just above — had no test.
+        assert!(is_ipv6_6to4(Ipv6Addr::new(
+            0x2002, 0xc058, 0x6301, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_ipv6_6to4(Ipv6Addr::new(
+            0x2001, 0xc058, 0x6301, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_ipv6_6to4(Ipv6Addr::new(0x2003, 0, 0, 0, 0, 0, 0, 1)));
+        // The range must actually be denied at the egress gate, not just classified.
+        assert!(is_denied_outbound_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0xc058, 0x6301, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
     fn speed_test_dos_ceilings_match_their_documented_values() {
         // These are SECURITY ceilings that bound an authenticated client's speed-test
         // request (a malicious client could otherwise request terabytes of generated
@@ -8820,6 +8839,75 @@ mod tests {
             1_048_576, // 1 MiB
             "mux open batch must be exactly 1 MiB"
         );
+    }
+
+    #[test]
+    fn validate_speed_request_accepts_the_maximal_single_phase_request() {
+        // Each phase exactly at the per-phase cap with no samples: aggregate work
+        // is 2*1 GiB = 2 GiB, under the 4 GiB ceiling. The caps use `>`, so a
+        // request sitting exactly on the per-phase cap is still accepted — this
+        // guards against a `>` silently becoming `>=`.
+        let req = SpeedTestRequest {
+            warmup_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            download_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            upload_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            sample_count: 0,
+        };
+        assert!(validate_speed_request(&req, 0).is_ok());
+    }
+
+    #[test]
+    fn validate_speed_request_rejects_each_per_phase_overage() {
+        // One field over its cap at a time (others zero) must fail closed, so no
+        // single per-phase guard can be dropped without a test noticing.
+        let over = MAX_SPEED_TEST_BYTES_PER_PHASE + 1;
+        let cases = [
+            SpeedTestRequest {
+                warmup_bytes: over,
+                download_bytes: 0,
+                upload_bytes: 0,
+                sample_count: 0,
+            },
+            SpeedTestRequest {
+                warmup_bytes: 0,
+                download_bytes: over,
+                upload_bytes: 0,
+                sample_count: 0,
+            },
+            SpeedTestRequest {
+                warmup_bytes: 0,
+                download_bytes: 0,
+                upload_bytes: over,
+                sample_count: 0,
+            },
+            SpeedTestRequest {
+                warmup_bytes: 0,
+                download_bytes: 0,
+                upload_bytes: 0,
+                sample_count: MAX_SPEED_TEST_SAMPLES + 1,
+            },
+        ];
+        for req in &cases {
+            assert!(
+                validate_speed_request(req, 0).is_err(),
+                "a per-phase overage must be rejected: {req:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_speed_request_rejects_aggregate_over_ceiling_within_per_phase_caps() {
+        // Every field is within its own per-phase cap, but the aggregate
+        // 2*warmup + sample_count*(download+upload) = 2*1 GiB + 2*(1 GiB + 1 GiB)
+        // = 6 GiB exceeds the 4 GiB total ceiling. This is the branch the
+        // individual per-phase caps cannot catch.
+        let req = SpeedTestRequest {
+            warmup_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            download_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            upload_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            sample_count: 2,
+        };
+        assert!(validate_speed_request(&req, 0).is_err());
     }
 
     #[test]
