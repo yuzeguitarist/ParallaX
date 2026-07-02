@@ -1443,4 +1443,75 @@ mod tests {
         let err = parse_selected_alpn(&data).unwrap_err();
         assert_eq!(err.alert_description(), Some(ALERT_DECODE_ERROR));
     }
+
+    // --- compute_shared_secret: server key_share validation ----------------
+    // This is the QUIC client's key-exchange validator over an unauthenticated
+    // (pre-Finished) server key_share, yet none of its fail-closed arms had a
+    // test. Each case pins one arm; all are pure test calls, no wire change.
+
+    #[test]
+    fn x25519_key_share_wrong_length_rejected() {
+        let hs = handshake();
+        for bad in [
+            vec![0_u8; X25519_KEY_LEN - 1],
+            vec![0_u8; X25519_KEY_LEN + 1],
+            Vec::new(),
+        ] {
+            let err = hs.compute_shared_secret(GROUP_X25519, &bad).unwrap_err();
+            assert_eq!(err.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+        }
+    }
+
+    #[test]
+    fn x25519_key_share_valid_length_is_accepted() {
+        use crate::crypto::session::X25519KeyPair;
+        // A well-formed, non-degenerate peer share must compute a secret, so the
+        // length guard is not accidentally over-rejecting the happy path.
+        let hs = handshake();
+        let peer = X25519KeyPair::generate();
+        let shared = hs
+            .compute_shared_secret(GROUP_X25519, &peer.public)
+            .expect("valid X25519 share computes a shared secret");
+        assert_eq!(shared.len(), X25519_KEY_LEN);
+    }
+
+    #[test]
+    fn hybrid_key_share_wrong_length_rejected() {
+        let hs = handshake();
+        let good = MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN;
+        for bad in [vec![0_u8; good - 1], vec![0_u8; good + 1], Vec::new()] {
+            let err = hs
+                .compute_shared_secret(GROUP_X25519_MLKEM768, &bad)
+                .unwrap_err();
+            assert_eq!(err.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+        }
+    }
+
+    #[test]
+    fn unsupported_key_share_group_rejected() {
+        let hs = handshake();
+        // secp256r1 (0x0017) and a GREASE value are both groups the client never
+        // offers; a server selecting one must be rejected, not silently used.
+        for group in [0x0017_u16, 0x0a0a] {
+            let err = hs
+                .compute_shared_secret(group, &[0_u8; X25519_KEY_LEN])
+                .unwrap_err();
+            assert_eq!(err.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+        }
+    }
+
+    #[test]
+    fn degenerate_x25519_shared_secret_rejected() {
+        // The anti-small-order guard: an all-zero ECDH output is rejected, a
+        // non-zero one passes. Pins the contributory-behaviour check directly.
+        assert_eq!(
+            reject_degenerate_x25519(&[0_u8; X25519_KEY_LEN])
+                .unwrap_err()
+                .alert_description(),
+            Some(ALERT_ILLEGAL_PARAMETER),
+        );
+        let mut nonzero = [0_u8; X25519_KEY_LEN];
+        nonzero[0] = 1;
+        reject_degenerate_x25519(&nonzero).unwrap();
+    }
 }
