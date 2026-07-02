@@ -307,13 +307,13 @@ mod tests {
         // survive. Use a distinctive nonce and a timestamp with all byte lanes
         // set so the recovered freshness material is byte-for-byte the sealed one.
         let now = 0x0102_0304_0506_0708;
-        // Build a per-byte-distinct nonce from its index (not a literal) so every
-        // lane differs — kills a mutant returning a fixed/input nonce — while the
-        // value isn't a hard-coded crypto constant.
+        // A random per-run nonce (filled from the CSPRNG, not a hard-coded
+        // constant): the round-trip assertion below holds for ANY nonce, and a
+        // random one kills a mutant that returns a fixed or input-derived nonce
+        // even more strongly than a fixed distinctive literal would.
+        use rand::{rngs::OsRng, RngCore};
         let mut distinctive = [0u8; NONCE_LEN];
-        for (i, b) in distinctive.iter_mut().enumerate() {
-            *b = (i as u8) + 1;
-        }
+        OsRng.fill_bytes(&mut distinctive);
         let cr = seal(PSK, &SS, SNI, DCID, now, &distinctive);
         let m = open(PSK, &SS, SNI, DCID, &cr, now, WINDOW).expect("valid marker opens");
         assert_eq!(m.nonce, distinctive);
