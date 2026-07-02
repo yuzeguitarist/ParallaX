@@ -73,10 +73,29 @@ jobs:
           RTT_MS: ${{ github.event.inputs.rtt_ms || '150' }}
           RATE_MBIT: ${{ github.event.inputs.rate_mbit || '100' }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Runner-owned scratch dir (NOT a root-owned mktemp under /tmp, whose
+          # 0700 perms make the later artifact upload EACCES). plx runs as root
+          # via sudo and writes world-readable files here; the upload step (the
+          # runner user) can then read them.
+          mkdir -p netem-work
+          # This bench is diagnostic and NON-GATING (see the header): a full run
+          # needs the server namespace to reach the real camouflage origin
+          # (server.fallback_addr, e.g. cloudflare.com:443) to splice the TLS
+          # handshake, but an isolated CI netns has no outbound route — so on a
+          # shared runner it cannot complete (it surfaces as "TLS record header
+          # ended early"). Run it via workflow_dispatch on a real box for actual
+          # numbers. Here we run best-effort: never fail the check on a bench
+          # error — upload diagnostics and emit a warning instead.
+          status=0
           sudo --preserve-env=RTT_MS,RATE_MBIT \
-            env PLX_BIN="$PWD/target/release/plx" OUT_JSON="$PWD/speed.json" \
-            bash scripts/netem-bdp-bench.sh | tee bench.out
+            env PLX_BIN="$PWD/target/release/plx" OUT_JSON="$PWD/speed.json" WORKDIR="$PWD/netem-work" \
+            bash scripts/netem-bdp-bench.sh | tee bench.out || status="${PIPESTATUS[0]}"
+
+          if [ "$status" -ne 0 ] || [ ! -s speed.json ]; then
+            echo "::warning::netem-bdp-bench did not complete end-to-end (exit=$status); this diagnostic needs origin reachability from the server namespace, which an isolated CI runner lacks. Run via workflow_dispatch on a real box for throughput numbers. Diagnostics uploaded as artifacts."
+            exit 0
+          fi
 
           echo "=== parsing throughput ==="
           dn=$(jq -r '.runs[0].download.summary.median_mbps' speed.json)
@@ -97,6 +116,6 @@ jobs:
           path: |
             speed.json
             bench.out
-            /tmp/tmp.*/server.log
-            /tmp/tmp.*/speed.err
+            netem-work/server.log
+            netem-work/speed.err
           if-no-files-found: warn
