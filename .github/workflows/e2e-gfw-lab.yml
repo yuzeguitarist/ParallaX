@@ -1,0 +1,191 @@
+name: e2e-gfw-lab
+
+# End-to-end anti-censorship lab. Builds ParallaX on Linux/macOS/Windows,
+# then on Linux stands up a full client <-> [MITM "GFW box"] <-> server <->
+# origin topology and drives realistic traffic scenarios (download/upload/
+# bidirectional/serial/parallel/single-stream/video/call/web) under several
+# link-quality profiles, while the middle-box passively fingerprints every flow
+# and a separate active differential probe compares the server to the real
+# origin it camouflages as.
+#
+# Uses only GitHub-hosted (free for public repos) standard runners.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "ci/gfw-lab/**"
+      - ".github/workflows/e2e-gfw-lab.yml"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  # Weekly full run so regressions in detectability are caught even without a PR.
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-gfw-lab-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Cross-platform build + harness smoke test. Proves plx and the lab tools
+  # compile and run on all three OSes. The full networked E2E only runs on
+  # Linux (see the `linux-e2e` job), matching the project's deploy target.
+  # ---------------------------------------------------------------------------
+  build-matrix:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-e2e-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      # ParallaX itself.
+      - name: Build plx (release)
+        run: cargo build --release --locked --bin plx
+
+      # The lab harness (self-contained crate under ci/gfw-lab).
+      - name: Build gfw-lab tools (release)
+        working-directory: ci/gfw-lab
+        run: cargo build --release --locked
+
+      - name: Lab tools clippy + tests
+        working-directory: ci/gfw-lab
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      # Config-generation smoke test works identically on every OS (no network).
+      - name: Config generation smoke test (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(mktemp -d)"
+          ./target/release/plx init www.cloudflare.com \
+            --server-addr 127.0.0.1:8443 --server-listen 127.0.0.1:8443 \
+            --client-listen 127.0.0.1:1080 --inline-secrets -o "$out"
+          test -f "$out/parallax.server.toml"
+          test -f "$out/parallax.client.toml"
+          ./target/release/plx check -c "$out/parallax.client.toml"
+          echo "config generation OK on ${{ matrix.os }}"
+
+      - name: Config generation smoke test (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP ("cfg-" + [guid]::NewGuid()))
+          ./target/release/plx.exe init www.cloudflare.com `
+            --server-addr 127.0.0.1:8443 --server-listen 127.0.0.1:8443 `
+            --client-listen 127.0.0.1:1080 --inline-secrets -o $out
+          if (-not (Test-Path (Join-Path $out "parallax.server.toml"))) { throw "server config missing" }
+          if (-not (Test-Path (Join-Path $out "parallax.client.toml"))) { throw "client config missing" }
+          ./target/release/plx.exe check -c (Join-Path $out "parallax.client.toml")
+          Write-Host "config generation OK on windows"
+
+  # ---------------------------------------------------------------------------
+  # Full networked end-to-end lab on Linux.
+  # ---------------------------------------------------------------------------
+  linux-e2e:
+    name: linux e2e (${{ matrix.transport }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [tcp, quic]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parallax-e2e-ubuntu-latest
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Build plx (release)
+        run: cargo build --release --locked --bin plx
+
+      - name: Build gfw-lab tools (release)
+        working-directory: ci/gfw-lab
+        run: cargo build --release --locked
+
+      # The extra loopback address 127.0.0.2 is used in QUIC mode so the MITM box
+      # can own the advertised UDP port without colliding with the server.
+      - name: Enable loopback alias 127.0.0.2
+        run: sudo ip addr add 127.0.0.2/8 dev lo || true
+
+      - name: Run the GFW lab (${{ matrix.transport }})
+        env:
+          PLX: ${{ github.workspace }}/target/release/plx
+          LAB_BIN_DIR: ${{ github.workspace }}/ci/gfw-lab/target/release
+          TRANSPORT: ${{ matrix.transport }}
+          # TCP exercises the full profile ladder; QUIC uses a lighter ladder
+          # because each profile re-runs the whole handshake + rekey.
+          PROFILES: ${{ matrix.transport == 'quic' && 'perfect mobile_4g lossy' || 'perfect broadband mobile_4g mobile_3g transpacific' }}
+          FALLBACK_HOST: www.cloudflare.com
+          FALLBACK_PORT: "443"
+          WORKDIR: ${{ github.workspace }}/lab-artifacts
+        run: |
+          chmod +x ci/gfw-lab/run-lab.sh
+          ci/gfw-lab/run-lab.sh
+
+      - name: Summarize verdict
+        if: always()
+        run: |
+          report="${{ github.workspace }}/lab-artifacts/lab-report.json"
+          if [ -f "$report" ]; then
+            echo "### GFW lab (${{ matrix.transport }})" >> "$GITHUB_STEP_SUMMARY"
+            python3 - "$report" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          print(f"- **verdict:** {'PASS' if d['pass'] else 'FAIL'}")
+          print(f"- {d['summary']}")
+          print("")
+          print("| scenario | link | ok | download | upload | rtt(ms) |")
+          print("|---|---|---|---|---|---|")
+          for s in d["scenarios"]:
+              dl = f"{s['download_mbps']:.1f}" if s.get("download_mbps") else "-"
+              ul = f"{s['upload_mbps']:.1f}" if s.get("upload_mbps") else "-"
+              rtt = f"{s['rtt_ms']['median']:.1f}" if s.get("rtt_ms") else "-"
+              print(f"| {s['scenario']} | {s['link_profile']} | {'ok' if s['ok'] else 'FAIL'} | {dl} | {ul} | {rtt} |")
+          PY
+          else
+            echo "no lab-report.json produced" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload lab artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gfw-lab-${{ matrix.transport }}
+          path: lab-artifacts/*.json
+          if-no-files-found: warn
+          retention-days: 14
