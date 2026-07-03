@@ -22,9 +22,9 @@ struct Cli {
     /// Active differential-probe report JSON (optional).
     #[arg(long)]
     probe: Option<PathBuf>,
-    /// Passive GFW-box analysis report JSON (optional).
-    #[arg(long)]
-    box_report: Option<PathBuf>,
+    /// Passive GFW-box analysis report JSON(s), one per link profile (repeatable).
+    #[arg(long = "box-report")]
+    box_reports: Vec<PathBuf>,
     /// Output path for the assembled LabReport JSON.
     #[arg(long, default_value = "lab-report.json")]
     out: PathBuf,
@@ -46,14 +46,21 @@ fn main() -> Result<()> {
         Some(p) => Some(load(p)?),
         None => None,
     };
-    let passive: Option<GfwBoxReport> = match &cli.box_report {
-        Some(p) => Some(load(p)?),
-        None => None,
-    };
+    // Load every per-profile passive report and aggregate. The verdict must
+    // account for ALL profiles, not just one.
+    let mut passive_reports: Vec<GfwBoxReport> = Vec::new();
+    for p in &cli.box_reports {
+        passive_reports.push(load(p)?);
+    }
+    let passive_total_flows: usize = passive_reports.iter().map(|p| p.total_flows).sum();
+    let passive_flagged_flows: usize = passive_reports.iter().map(|p| p.flagged_flows).sum();
+    // Keep the last profile's report as the representative artifact in the JSON.
+    let passive: Option<GfwBoxReport> = passive_reports.last().cloned();
 
     // Pass policy:
     //   * every scenario completed (ok == true), AND
-    //   * the passive middle-box flagged ZERO flows as a proxy, AND
+    //   * the passive middle-box flagged ZERO flows as a proxy (across ALL
+    //     profiles), AND
     //   * the active differential prober found NO distinguisher vs the origin.
     let scenarios_ok = scenarios.iter().all(|s| s.ok);
     let failed_scenarios: Vec<&str> = scenarios
@@ -61,16 +68,13 @@ fn main() -> Result<()> {
         .filter(|s| !s.ok)
         .map(|s| s.scenario.as_str())
         .collect();
-    let passive_ok = passive
-        .as_ref()
-        .map(|p| p.flagged_flows == 0)
-        .unwrap_or(true);
+    let passive_ok = passive_flagged_flows == 0;
     let probe_ok = probe.as_ref().map(|p| !p.any_distinguisher).unwrap_or(true);
 
     let pass = scenarios_ok && passive_ok && probe_ok;
 
     let summary = format!(
-        "transport={} scenarios={}/{} passed{}{} | passive: {} flows, {} flagged | active probe: {} | verdict={}",
+        "transport={} scenarios={}/{} passed{} | passive: {} flows, {} flagged (across {} profile report(s)) | active probe: {} | verdict={}",
         cli.transport,
         scenarios.iter().filter(|s| s.ok).count(),
         scenarios.len(),
@@ -79,9 +83,9 @@ fn main() -> Result<()> {
         } else {
             format!(" (failed: {})", failed_scenarios.join(","))
         },
-        "",
-        passive.as_ref().map(|p| p.total_flows).unwrap_or(0),
-        passive.as_ref().map(|p| p.flagged_flows).unwrap_or(0),
+        passive_total_flows,
+        passive_flagged_flows,
+        passive_reports.len(),
         match &probe {
             Some(p) if p.any_distinguisher => "DISTINGUISHABLE",
             Some(_) => "resistant",

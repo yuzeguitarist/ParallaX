@@ -95,11 +95,20 @@ wait_for_log() { # <file> <pattern> <timeout>
 }
 
 # --------------------------------------------------------------------------
-# 1. Preflight: fallback origin reachable over IPv4?
+# 1. Preflight: fallback origin reachable over IPv4? (retry a few times so a
+#    transient egress blip does not turn CI red — exit 3 = environment error.)
 # --------------------------------------------------------------------------
-if ! curl -4 -sS -o /dev/null --max-time 15 "https://$FALLBACK_HOST:$FALLBACK_PORT/" 2>/dev/null; then
+reachable=0
+for attempt in 1 2 3 4; do
+  if curl -4 -sS -o /dev/null --max-time 15 "https://$FALLBACK_HOST:$FALLBACK_PORT/" 2>/dev/null; then
+    reachable=1; break
+  fi
+  echo "-- fallback preflight attempt $attempt failed; retrying"
+  sleep $((attempt * 3))
+done
+if [ "$reachable" -ne 1 ]; then
   echo "!! fallback origin https://$FALLBACK_HOST:$FALLBACK_PORT unreachable over IPv4."
-  echo "   The authenticated handshake requires it; aborting as an environment error."
+  echo "   The authenticated handshake requires it; aborting as an environment error (exit 3)."
   exit 3
 fi
 echo "-- fallback origin reachable"
@@ -122,22 +131,33 @@ CLIENT_CFG="$WORKDIR/parallax.client.toml"
 #   * data_target pinned to the local origin (operator-fixed target bypasses the
 #     SSRF screen so all proxied bytes land on our HTTP origin),
 #   * enable the UDP fast plane in QUIC mode.
-python3 - "$SERVER_CFG" "$WORKDIR/replay.cache" "$ORIGIN_ADDR" "$TRANSPORT" <<'PY'
+if ! python3 - "$SERVER_CFG" "$WORKDIR/replay.cache" "$ORIGIN_ADDR" "$TRANSPORT" <<'PY'
 import sys
 cfg, replay, origin, transport = sys.argv[1:5]
 lines = open(cfg).read().splitlines()
-out, in_server = [], False
+out = []
 for ln in lines:
     if ln.startswith("replay_cache_path"):
         ln = f'replay_cache_path = "{replay}"'
     out.append(ln)
 text = "\n".join(out)
-# inject data_target under [server]
-text = text.replace('[server]\n', f'[server]\ndata_target = "{origin}"\n', 1)
+# Pin the relay target to the local origin (operator-fixed target bypasses the
+# SSRF screen so all proxied bytes land on our controlled HTTP endpoint).
+if "[server]\n" not in text:
+    print("no [server] section to inject data_target into", file=sys.stderr)
+    sys.exit(1)
+text = text.replace("[server]\n", f'[server]\ndata_target = "{origin}"\n', 1)
 if transport == "quic":
     text += "\n\n[udp]\nenabled = true\n"
 open(cfg, "w").write(text + "\n")
 PY
+then
+  echo "!! server config rewrite failed"; exit 3
+fi
+
+# Assert the critical rewrite actually took effect (guards against a silent
+# no-op, since the script runs without `set -e`).
+grep -q '^data_target' "$SERVER_CFG" || { echo "!! data_target not injected into server config"; exit 3; }
 
 if [ "$TRANSPORT" = "quic" ]; then
   printf '\n[udp]\nenabled = true\n' >> "$CLIENT_CFG"
@@ -179,7 +199,12 @@ for PROFILE in $PROFILES; do
     "${UDP_ARGS[@]}" --profile "$PROFILE" --report "$BOX_REPORT" >"$BOX_LOG" 2>&1 &
   BOX_PID="$!"
   PIDS+=("$BOX_PID")
-  wait_for_log "$BOX_LOG" "gfw-box relay" 10 || { FAIL=1; }
+  # Wait for the post-bind readiness line (printed only once the ingress socket
+  # is actually listening).
+  wait_for_log "$BOX_LOG" "gfw-box relay listening" 10 || { FAIL=1; }
+  if [ "$TRANSPORT" = "quic" ]; then
+    wait_for_log "$BOX_LOG" "gfw-box udp relay listening" 10 || { FAIL=1; }
+  fi
 
   # Start the client (dials the box).
   CLIENT_LOG="$WORKDIR/client-$PROFILE.log"
@@ -221,9 +246,11 @@ for PROFILE in $PROFILES; do
     echo "   [warn] plx speed did not complete (see speed-$PROFILE.err)"
   fi
 
-  # Stop the box so it flushes its passive analysis report.
+  # Stop the box so it flushes its passive analysis report. Block on the
+  # process (it exits only after writing the report) instead of a fixed sleep,
+  # so a slow flush on a loaded runner cannot cause a false "no report" FAIL.
   kill -TERM "$BOX_PID" 2>/dev/null || true
-  sleep 2
+  wait "$BOX_PID" 2>/dev/null || true
   if [ -f "$BOX_REPORT" ]; then
     FLAGGED=$(python3 -c "import json;print(json.load(open('$BOX_REPORT'))['flagged_flows'])" 2>/dev/null || echo "?")
     TOTAL=$(python3 -c "import json;print(json.load(open('$BOX_REPORT'))['total_flows'])" 2>/dev/null || echo "?")
@@ -245,10 +272,11 @@ PROBE_REPORT="$WORKDIR/probe.json"
 # --------------------------------------------------------------------------
 # 6. Assemble the verdict
 # --------------------------------------------------------------------------
-# Use the last profile's box report as the representative passive artifact.
-LAST_BOX=$(ls -1 "$WORKDIR"/box-*.json 2>/dev/null | tail -n1)
+# Pass EVERY per-profile box report so the verdict aggregates all profiles.
 BOX_ARG=()
-[ -n "${LAST_BOX:-}" ] && BOX_ARG=(--box-report "$LAST_BOX")
+for BR in "$WORKDIR"/box-*.json; do
+  [ -f "$BR" ] && BOX_ARG+=(--box-report "$BR")
+done
 PROBE_ARG=()
 [ -f "$PROBE_REPORT" ] && PROBE_ARG=(--probe "$PROBE_REPORT")
 

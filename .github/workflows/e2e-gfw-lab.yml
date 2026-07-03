@@ -46,6 +46,11 @@ jobs:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # Windows is informational only: ParallaX targets Linux/macOS (see
+    # release.yml) and its aws-lc-rs / Unix-syscall surface has never been built
+    # for Windows. Keep the leg for signal, but never let it fail the job (which
+    # would cascade-skip the Linux E2E via `needs`).
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -155,7 +160,18 @@ jobs:
           WORKDIR: ${{ github.workspace }}/lab-artifacts
         run: |
           chmod +x ci/gfw-lab/run-lab.sh
+          set +e
           ci/gfw-lab/run-lab.sh
+          rc=$?
+          set -e
+          # Exit 3 = environment error (fallback origin unreachable after
+          # retries): surface as a warning rather than failing the PR. Any
+          # other non-zero exit is a real lab failure.
+          if [ "$rc" -eq 3 ]; then
+            echo "::warning::GFW lab skipped: fallback origin unreachable (environment)."
+            exit 0
+          fi
+          exit "$rc"
 
       - name: Summarize verdict
         if: always()
@@ -183,7 +199,7 @@ jobs:
 
       - name: Upload lab artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gfw-lab-${{ matrix.transport }}
           path: lab-artifacts/*.json

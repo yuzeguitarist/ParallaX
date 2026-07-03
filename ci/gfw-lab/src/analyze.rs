@@ -54,6 +54,14 @@ pub fn analyze_flow(obs: &FlowObservation) -> FlowFeatures {
 
     let mut flags = Vec::new();
 
+    // A censor can only classify a flow once it has seen the client's first
+    // application flight. A connection that was accepted but has not sent its
+    // ClientHello yet (a warm-pool/idle connection, one captured during the
+    // report's shutdown grace, or a control connection) carries no first-flight
+    // signal — treat it as INCONCLUSIVE, never as a proxy. Requiring a full TLS
+    // record header (5 bytes) before judging avoids that false positive.
+    let judged = obs.first_flight.len() >= 5;
+
     // H2: the exact "fully encrypted" classifier (Frolov & Wustrow, USENIX'23).
     // A packet is blocked as fully-encrypted iff NONE of the five exemptions
     // hold. Each exemption is a reason the payload looks like a *known* or
@@ -62,7 +70,10 @@ pub fn analyze_flow(obs: &FlowObservation) -> FlowFeatures {
     let ex2_first6_printable = first6_printable;
     let ex3_mostly_printable = printable > 0.5;
     let ex4_long_printable_run = longest_run > 20;
-    let ex5_known_protocol = ch.is_tls_record; // real ClientHello == known proto
+    // Ex5 "known protocol": require a real ClientHello, not merely a leading
+    // 0x16 byte, so a random stream that happens to start with 0x16 is not
+    // wrongly exempted.
+    let ex5_known_protocol = ch.is_client_hello;
     let exempt = ex1_popcount_outside
         || ex2_first6_printable
         || ex3_mostly_printable
@@ -74,9 +85,9 @@ pub fn analyze_flow(obs: &FlowObservation) -> FlowFeatures {
     }
 
     // H1: structural — is it even a TLS record / ClientHello?
-    if !ch.is_tls_record {
+    if judged && !ch.is_tls_record {
         flags.push("first_flight_not_tls_record".to_string());
-    } else if !ch.is_client_hello {
+    } else if ch.is_tls_record && !ch.is_client_hello {
         flags.push("tls_record_but_not_client_hello".to_string());
     }
 
@@ -90,12 +101,17 @@ pub fn analyze_flow(obs: &FlowObservation) -> FlowFeatures {
     }
 
     // A middle-box blocks when the flow looks like an obfuscated/fully-encrypted
-    // tunnel: either it is not TLS at all, or it passes the fully-encrypted
-    // test. Missing-SNI/ALPN alone are treated as informational (real clients
-    // occasionally omit them), so they do not set `flagged_as_proxy`.
-    let flagged_as_proxy = looks_fully_encrypted || !ch.is_tls_record;
+    // tunnel: either it is judged and is not TLS at all, or it passes the
+    // fully-encrypted test. Missing-SNI/ALPN alone are informational (real
+    // clients occasionally omit them), so they do not set `flagged_as_proxy`.
+    let flagged_as_proxy = looks_fully_encrypted || (judged && !ch.is_tls_record);
 
-    let rationale = if flagged_as_proxy {
+    let rationale = if !judged {
+        format!(
+            "inconclusive: only {} first-flight byte(s) observed",
+            obs.first_flight.len()
+        )
+    } else if flagged_as_proxy {
         format!(
             "middle-box would flag: tls_record={} fully_encrypted={} (popcount={:.2}, printable={:.2}, run={})",
             ch.is_tls_record, looks_fully_encrypted, popcount, printable, longest_run
@@ -171,6 +187,23 @@ mod tests {
             .verdict
             .flags
             .contains(&"fully_encrypted_first_packet".to_string()));
+    }
+
+    #[test]
+    fn empty_or_short_first_flight_is_inconclusive_not_flagged() {
+        // A connection that sent nothing (or only a couple of bytes) yet must
+        // not be classified as a proxy — this was a real CI false-positive.
+        for data in [vec![], vec![0x16u8], vec![0x16, 0x03, 0x01]] {
+            let f = analyze_flow(&obs_with(data));
+            assert!(
+                !f.verdict.flagged_as_proxy,
+                "short/empty first flight must be inconclusive"
+            );
+            assert!(!f
+                .verdict
+                .flags
+                .contains(&"first_flight_not_tls_record".to_string()));
+        }
     }
 
     #[test]

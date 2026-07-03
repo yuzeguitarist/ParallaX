@@ -129,28 +129,38 @@ async fn main() -> Result<()> {
 async fn run_relay(args: RelayArgs) -> Result<()> {
     let profile = LinkProfile::preset(&args.profile)
         .with_context(|| format!("unknown link profile: {}", args.profile))?;
-    eprintln!(
-        "gfw-box relay: listen={} upstream={} profile={} (latency={}ms jitter={}ms bw={}kbps loss={}%)",
-        args.listen, args.upstream, profile.name, profile.latency_ms, profile.jitter_ms,
-        profile.bandwidth_kbps, profile.loss_pct
-    );
 
     let flows: FlowRegistry = Arc::new(Mutex::new(Vec::new()));
     let udp = Arc::new(UdpCounters::default());
 
+    // Bind BEFORE announcing readiness so the orchestrator's log-grep cannot
+    // race ahead of an actually-listening socket.
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("bind TCP {}", args.listen))?;
 
     if let (Some(ul), Some(uu)) = (args.udp_listen, args.udp_upstream) {
+        // Bind the UDP ingress synchronously here so the "udp ready" line is
+        // only printed once it is actually listening.
+        let ingress = UdpSocket::bind(ul)
+            .await
+            .with_context(|| format!("bind UDP {ul}"))?;
+        eprintln!("gfw-box udp relay listening: listen={ul} upstream={uu}");
         let profile = profile.clone();
         let udp = Arc::clone(&udp);
         tokio::spawn(async move {
-            if let Err(e) = run_udp_relay(ul, uu, profile, udp).await {
+            if let Err(e) = run_udp_relay(ingress, uu, profile, udp).await {
                 eprintln!("gfw-box udp relay ended: {e:#}");
             }
         });
     }
+
+    // Readiness line (TCP ingress is bound at this point).
+    eprintln!(
+        "gfw-box relay listening: listen={} upstream={} profile={} (latency={}ms jitter={}ms bw={}kbps loss={}%)",
+        args.listen, args.upstream, profile.name, profile.latency_ms, profile.jitter_ms,
+        profile.bandwidth_kbps, profile.loss_pct
+    );
 
     let flow_id = Arc::new(AtomicU64::new(0));
     let accept_loop = {
@@ -385,13 +395,12 @@ where
 /// server replies are demultiplexed back to the right client (a single-client
 /// relay would cross-deliver once more than one QUIC flow exists).
 async fn run_udp_relay(
-    listen: SocketAddr,
+    ingress: UdpSocket,
     upstream: SocketAddr,
     profile: LinkProfile,
     counters: Arc<UdpCounters>,
 ) -> Result<()> {
-    let ingress = Arc::new(UdpSocket::bind(listen).await.context("bind udp")?);
-    eprintln!("gfw-box udp relay (multi-client): listen={listen} upstream={upstream}");
+    let ingress = Arc::new(ingress);
     // client_addr -> upstream socket dedicated to that client.
     let table: Arc<Mutex<std::collections::HashMap<SocketAddr, Arc<UdpSocket>>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -524,19 +533,15 @@ fn spawn_udp_return_pump(
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
-        loop {
-            match upstream_sock.recv(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    forward_datagram_impaired(
-                        UdpDest::Client(Arc::clone(&ingress), client),
-                        buf[..n].to_vec(),
-                        &profile,
-                        Arc::clone(&counters),
-                    );
-                }
-                Err(_) => break,
-            }
+        // Note: UDP has no EOF — `Ok(0)` is a legitimate zero-length datagram,
+        // so it is forwarded like any other; only a socket error ends the pump.
+        while let Ok(n) = upstream_sock.recv(&mut buf).await {
+            forward_datagram_impaired(
+                UdpDest::Client(Arc::clone(&ingress), client),
+                buf[..n].to_vec(),
+                &profile,
+                Arc::clone(&counters),
+            );
         }
     });
 }
@@ -548,7 +553,14 @@ fn write_report(
     udp: &Arc<UdpCounters>,
 ) -> Result<()> {
     let accs: Vec<Arc<Mutex<FlowAcc>>> = flows.lock().unwrap().clone();
-    let observations: Vec<FlowObservation> = accs.iter().map(snapshot).collect();
+    // Only analyse flows that actually delivered a client first flight. A
+    // connection accepted but still silent (warm-pool/idle, or caught in the
+    // shutdown grace) carries no signal a censor could classify.
+    let observations: Vec<FlowObservation> = accs
+        .iter()
+        .map(snapshot)
+        .filter(|o| !o.first_flight.is_empty())
+        .collect();
     let features: Vec<FlowFeatures> = observations.iter().map(analyze_flow).collect();
     let flagged = features
         .iter()
@@ -719,13 +731,13 @@ async fn differential_probe(
 ) -> ActiveProbeResult {
     // A REALITY-style server splices unauthenticated / non-TLS probes to the
     // real origin only after its first-record wait (default floor 8s + up to
-    // ~7s jitter). To observe the spliced response and compare its *class* to
-    // the reference, payload-bearing probes need a read window that outlasts
-    // that timeout; connect-and-wait legitimately expects silence from both.
+    // ~7s jitter ≈ 15s worst case). To observe the spliced response and compare
+    // its *class* to the reference, payload-bearing probes need a read window
+    // comfortably past that; connect-and-wait legitimately expects silence.
     let read_timeout = if payload.is_none() {
         Duration::from_secs(4)
     } else {
-        Duration::from_secs(20)
+        Duration::from_secs(30)
     };
     let px = capture_response(*server, payload.as_deref(), read_timeout).await;
     let rf = capture_response(reference, payload.as_deref(), read_timeout).await;
@@ -740,7 +752,15 @@ async fn differential_probe(
             // ends up in the same class as the reference (only slower, because
             // it waits out a first-record timeout before splicing). We flag a
             // distinguisher only on a class mismatch.
-            let distinguisher = pc != rc;
+            //
+            // Guard against a false positive: for a payload probe, if the
+            // ParallaX side produced NO bytes (empty) while the reference did,
+            // that is almost certainly the splice not completing within our read
+            // window (a timing artifact of the first-record wait on a loaded
+            // runner), not a behavioural tell — treat it as inconclusive.
+            let px_empty_timing =
+                payload.is_some() && pc == RespClass::Empty && rc != RespClass::Empty;
+            let distinguisher = pc != rc && !px_empty_timing;
             ActiveProbeResult {
                 probe: name.to_string(),
                 description: desc.to_string(),
@@ -754,14 +774,19 @@ async fn differential_probe(
                 server_latency_ms: pxl,
                 reference_latency_ms: rfl,
                 detail: format!(
-                    "parallax={}({}B,{:.0}ms) reference={}({}B,{:.0}ms) class_match={}",
+                    "parallax={}({}B,{:.0}ms) reference={}({}B,{:.0}ms) class_match={}{}",
                     pc.name(),
                     pxd.len(),
                     pxl,
                     rc.name(),
                     rfd.len(),
                     rfl,
-                    !distinguisher
+                    pc == rc,
+                    if px_empty_timing {
+                        " (inconclusive: no parallax response in window)"
+                    } else {
+                        ""
+                    }
                 ),
             }
         }
