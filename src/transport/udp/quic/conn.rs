@@ -399,6 +399,10 @@ struct Space {
 struct Stream {
     // Send half (bytes this endpoint transmits on the stream).
     send: Vec<u8>,
+    /// Absolute stream offset of `send[0]`: the fully-acked prefix is compacted
+    /// away (see [`Connection::compact_send_buffer`]), so an absolute offset `o`
+    /// indexes `send` at `o - send_base`.
+    send_base: u64,
     /// Next absolute offset to packetize from `send`.
     send_off: u64,
     /// Peer's MAX_STREAM_DATA limit: we MUST NOT send past this absolute offset.
@@ -452,6 +456,15 @@ const RELAY_STREAM_ID: u64 = 0;
 /// Initial per-stream receive window we advertise (MAX_STREAM_DATA); extended as
 /// the app reads. Matches the Safari `initial_max_stream_data` value.
 const STREAM_RECV_WINDOW: u64 = 2 * 1024 * 1024;
+
+/// Cap on bytes a stream's send half may hold buffered (unsent + in flight +
+/// awaiting compaction). The async write path stops accepting bytes once the
+/// backlog reaches this (see [`Connection::stream_send_capacity`]) and resumes as
+/// ACKs reclaim the buffer — without it an application writing faster than the
+/// peer acknowledges would grow `Stream::send` without bound (memory-DoS,
+/// finding #28). Sized to the per-stream receive window so a well-behaved peer
+/// can keep a full window in flight.
+pub(super) const STREAM_SEND_BUFFER: usize = 2 * 1024 * 1024;
 
 /// Initial connection-level receive window we advertise (MAX_DATA); extended as
 /// the app reads across all streams. Matches the Safari `initial_max_data` value.
@@ -983,6 +996,15 @@ impl Connection {
             .expect("just created")
             .send
             .extend_from_slice(data);
+    }
+
+    /// Remaining bytes stream `id` may buffer for sending before hitting the
+    /// per-stream backlog cap (see [`STREAM_SEND_BUFFER`]). The async write path
+    /// uses this for backpressure: at 0 it parks the writer until ACK progress
+    /// reclaims buffer space, instead of buffering without bound (finding #28).
+    pub fn stream_send_capacity(&self, id: u64) -> usize {
+        let buffered = self.streams.get(&id).map_or(0, |s| s.send.len());
+        STREAM_SEND_BUFFER.saturating_sub(buffered)
     }
 
     /// Mark stream `id` finished (a FIN is sent after all buffered bytes).
@@ -1964,11 +1986,12 @@ impl Connection {
                 if !s.retransmit.is_empty() {
                     return true;
                 }
-                let all_sent = (s.send_off as usize) == s.send.len();
+                let buffered_end = s.send_base + s.send.len() as u64;
+                let all_sent = s.send_off == buffered_end;
                 if s.fin && !s.fin_sent && all_sent {
                     return true; // an empty FIN consumes no flow-control credit
                 }
-                let fresh = (s.send_off as usize) < s.send.len();
+                let fresh = s.send_off < buffered_end;
                 let stream_window = s.send_max.saturating_sub(s.send_off);
                 fresh && stream_window > 0 && conn_window > 0
             })
@@ -2042,23 +2065,25 @@ impl Connection {
                 .pmtud
                 .current_mtu()
                 .saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
-            let remaining = s.send.len() - offset as usize;
+            let buffered_end = s.send_base + s.send.len() as u64;
+            let remaining = (buffered_end - offset) as usize;
             // Clamp the fresh chunk to both flow-control windows (RFC 9000 §4.1).
             let conn_window = self.send_max_data.saturating_sub(self.send_data_total);
             let fc_window = s.send_max.saturating_sub(offset).min(conn_window) as usize;
             let chunk = remaining.min(budget.max(1)).min(fc_window);
             let end = offset + chunk as u64;
             // Carry the FIN only once the final buffered byte is in this frame.
-            let fin = s.fin && !s.fin_sent && end as usize == s.send.len();
+            let fin = s.fin && !s.fin_sent && end == buffered_end;
             (offset, end, fin, false)
         };
 
         let datagram = {
+            let s = &self.streams[&id];
             let frame = Frame::Stream {
                 id,
                 offset,
                 fin,
-                data: &self.streams[&id].send[offset as usize..end as usize],
+                data: &s.send[(offset - s.send_base) as usize..(end - s.send_base) as usize],
             };
             let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
             seal_packet(&keys.local, header, &[frame])
@@ -2131,21 +2156,23 @@ impl Connection {
                 .pmtud
                 .current_mtu()
                 .saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
-            let remaining = s.send.len() - offset as usize;
+            let buffered_end = s.send_base + s.send.len() as u64;
+            let remaining = (buffered_end - offset) as usize;
             let conn_window = self.send_max_data.saturating_sub(self.send_data_total);
             let fc_window = s.send_max.saturating_sub(offset).min(conn_window) as usize;
             let chunk = remaining.min(budget.max(1)).min(fc_window);
             let end = offset + chunk as u64;
-            let fin = s.fin && !s.fin_sent && end as usize == s.send.len();
+            let fin = s.fin && !s.fin_sent && end == buffered_end;
             (offset, end, fin, false)
         };
 
         let datagram = {
+            let s = &self.streams[&id];
             let frame = Frame::Stream {
                 id,
                 offset,
                 fin,
-                data: &self.streams[&id].send[offset as usize..end as usize],
+                data: &s.send[(offset - s.send_base) as usize..(end - s.send_base) as usize],
             };
             let keys = self.zero_rtt_keys.as_ref().expect("0-RTT keys present");
             seal_packet(&keys.local, header, &[frame])
@@ -2397,7 +2424,7 @@ impl Connection {
                     // The peer will not read more of this stream: stop sending it.
                     // (A full RESET_STREAM emission lands with flow control.)
                     if let Some(s) = self.streams.get_mut(&id) {
-                        s.send_off = s.send.len() as u64;
+                        s.send_off = s.send_base + s.send.len() as u64;
                         s.retransmit.clear();
                     }
                 }
@@ -2512,8 +2539,17 @@ impl Connection {
         let mut any_ack_eliciting = false;
         let mut acked_bytes = 0u64;
         let mut probe_acked = false;
+        // Streams with newly-acked bytes: their fully-acked send-buffer prefixes are
+        // compacted below, once loss detection has requeued anything declared lost.
+        let mut acked_streams: Vec<u64> = Vec::new();
         for (pn, sp) in &newly {
-            self.spaces[space].sent_content.remove(pn);
+            if let Some(content) = self.spaces[space].sent_content.remove(pn) {
+                for &(id, _, _, _) in &content.stream {
+                    if !acked_streams.contains(&id) {
+                        acked_streams.push(id);
+                    }
+                }
+            }
             if sp.ack_eliciting {
                 any_ack_eliciting = true;
                 acked_bytes += sp.size;
@@ -2613,7 +2649,46 @@ impl Connection {
                 }
             }
         }
+
+        // Reclaim fully-acked send-buffer prefixes (finding #28). Runs AFTER loss
+        // detection so a lost range is already requeued in `retransmit` and still
+        // counts as needed.
+        for id in acked_streams {
+            self.compact_send_buffer(id);
+        }
         Ok(())
+    }
+
+    /// Drop the fully-acknowledged prefix of stream `id`'s send buffer so a
+    /// long-lived stream does not retain every byte ever sent (memory-DoS,
+    /// finding #28). Everything below the lowest offset still needed for
+    /// (re)transmission — fresh bytes from `send_off`, queued lost ranges, and
+    /// ranges in flight awaiting an ACK — has been acknowledged and can never be
+    /// resent, so it is dropped and `send_base` advanced to keep absolute-offset
+    /// indexing correct. Amortized O(1)/byte: compaction only runs once the dead
+    /// prefix is at least as large as the live tail it would memmove.
+    fn compact_send_buffer(&mut self, id: u64) {
+        let Some(s) = self.streams.get(&id) else {
+            return;
+        };
+        let mut low = s.send_off;
+        for &(off, _, _) in &s.retransmit {
+            low = low.min(off);
+        }
+        for content in self.spaces[SPACE_DATA].sent_content.values() {
+            for &(sid, off, _, _) in &content.stream {
+                if sid == id {
+                    low = low.min(off);
+                }
+            }
+        }
+        let s = self.streams.get_mut(&id).expect("checked above");
+        let reclaim = low.saturating_sub(s.send_base) as usize;
+        if reclaim == 0 || reclaim < s.send.len() - reclaim {
+            return;
+        }
+        s.send.drain(..reclaim);
+        s.send_base = low;
     }
 
     /// Requeue the retransmittable content of declared-lost packets and report whether
@@ -3679,6 +3754,70 @@ mod tests {
         assert_eq!(
             received, payload,
             "bytes intact and in order across the window"
+        );
+    }
+
+    #[test]
+    fn acked_send_buffer_prefix_is_reclaimed() {
+        // Finding #28: once a prefix of the send buffer is fully acknowledged it can
+        // never be resent, so it must be compacted away — a long-lived stream must
+        // not retain every byte ever sent.
+        let now = Instant::now();
+        let dcid = ConnectionId::new(&[0x28; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x28, 0x28, 0x28, 0x28]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        let payload: Vec<u8> = (0..256_000u32).map(|i| (i % 251) as u8).collect();
+        client.send_stream(RELAY_STREAM_ID, &payload);
+        assert_eq!(
+            client.stream_send_capacity(RELAY_STREAM_ID),
+            STREAM_SEND_BUFFER - payload.len(),
+            "buffered-but-unacked bytes consume send capacity"
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..2000 {
+            let mut moved = false;
+            while let Some(dg) = client.poll_transmit(now) {
+                server.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            received.extend_from_slice(&server.read_stream(RELAY_STREAM_ID));
+            while let Some(dg) = server.poll_transmit(now) {
+                client.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            if !moved && received.len() == payload.len() {
+                break;
+            }
+        }
+        assert_eq!(received, payload, "whole payload delivered in order");
+
+        let s = &client.streams[&RELAY_STREAM_ID];
+        assert!(
+            s.send.is_empty(),
+            "fully-acked send buffer compacted away (still holds {} bytes)",
+            s.send.len()
+        );
+        assert_eq!(
+            s.send_base, s.send_off,
+            "send_base advanced to the acked frontier"
+        );
+        assert_eq!(
+            client.stream_send_capacity(RELAY_STREAM_ID),
+            STREAM_SEND_BUFFER,
+            "acks restore the full send capacity"
         );
     }
 
