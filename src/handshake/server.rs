@@ -5178,7 +5178,8 @@ async fn run_authenticated_speed_test_mode(
 }
 
 /// Read the client's speed QUIC-run DONE marker off the TCP control connection,
-/// bounded so a vanished client cannot pin the server.
+/// bounded by an absolute deadline so neither a vanished client nor an
+/// empty-record trickle can pin the server.
 async fn read_speed_tcp_done<R>(
     reader: &mut R,
     client_open: &mut DataRecordCodec,
@@ -5189,13 +5190,17 @@ where
 {
     let mut record = Vec::new();
     let mut consecutive_empty: u32 = 0;
+    let mut total_empty: u64 = 0;
+    // Absolute phase deadline: a per-read timeout is reset by every record
+    // received, so a client trickling empty records just inside the backstop
+    // could hold the teardown for MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS *
+    // backstop (~34 h). Anchoring one deadline before the loop bounds the WHOLE
+    // wait regardless of how many records arrive (the upload phase's throughput
+    // floor plays this role there; the DONE read carries no data to rate-check,
+    // so a wall-clock bound is the equivalent backstop).
+    let deadline = Instant::now() + QUIC_RELAY_DONE_BACKSTOP;
     loop {
-        match tokio::time::timeout(
-            QUIC_RELAY_DONE_BACKSTOP,
-            reader.read_record_into(&mut record),
-        )
-        .await
-        {
+        match timeout_at(deadline, reader.read_record_into(&mut record)).await {
             Ok(res) => res.map_err(HandshakeServerError::Io)?,
             Err(_) => {
                 return Err(HandshakeServerError::Io(io::Error::new(
@@ -5207,14 +5212,22 @@ where
         let range = client_open.open_in_place_payload_range(&mut record)?;
         if range.is_empty() {
             // Padding-only record carries no progress. Bound how many may arrive
-            // back-to-back so a client streaming only empty records cannot reset the
-            // per-read timeout forever and pin the teardown (the same cap the upload
-            // phase applies).
+            // back-to-back so a client streaming only empty records cannot pin the
+            // teardown (the same cap the upload phase applies).
             consecutive_empty += 1;
             if consecutive_empty > MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS {
                 return Err(HandshakeServerError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "speed QUIC-run TCP DONE sent too many consecutive empty records",
+                )));
+            }
+            // Cumulative cap, mirroring the upload phase: counted across the whole
+            // read and never reset, so no record interleaving can extend it.
+            total_empty += 1;
+            if total_empty > MAX_TOTAL_EMPTY_UPLOAD_RECORDS {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed QUIC-run TCP DONE sent too many empty records",
                 )));
             }
             continue;
@@ -7980,6 +7993,38 @@ mod tests {
         read_speed_upload_phase(&mut io, total, SpeedTestAck::upload_done(total))
             .await
             .expect("a full record crossing the grace boundary must be credited, not rejected");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speed_tcp_done_bounds_an_empty_record_trickle_with_an_absolute_deadline() {
+        // #54: padding-only records arriving well inside the per-read backstop
+        // must not extend the DONE wait past the anchored phase deadline. Pre-fix,
+        // every record reset the 120 s per-read clock, so the trickle ran until
+        // the ~1024-record consecutive cap (~34 h of slot pin).
+        let (sealer, opener) = upload_floor_io_codecs();
+        let mut reader = TrickleLegReader {
+            sealer,
+            rng: StdRng::seed_from_u64(8),
+            payload: Vec::new(), // padding-only: opens to an empty payload range
+            advance_per_read: Duration::from_secs(30),
+            remaining: 10_000,
+        };
+        let mut client_open = opener;
+
+        let err = read_speed_tcp_done(&mut reader, &mut client_open, 1)
+            .await
+            .expect_err("an empty-record trickle must not satisfy the DONE read");
+        match err {
+            HandshakeServerError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        // The deadline must fire after ~QUIC_RELAY_DONE_BACKSTOP of trickle (a
+        // handful of 30 s records), NOT after the ~1024-record consecutive cap.
+        assert!(
+            reader.remaining > 9_900,
+            "deadline must fire within a few records (remaining {})",
+            reader.remaining
+        );
     }
 
     #[tokio::test]
