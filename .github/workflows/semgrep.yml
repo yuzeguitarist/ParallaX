@@ -48,7 +48,13 @@ jobs:
         run: |
           python3 -m venv /tmp/sg
           /tmp/sg/bin/pip install --quiet semgrep==1.167.0
+          # rust.lang.security.unsafe-usage is a blanket "you used `unsafe`" advisory
+          # (note severity) that matches every `unsafe` keyword with no dataflow
+          # analysis. This project's libc FFI (e.g. the QUIC GSO/GRO offload) is
+          # required, audited, and carries SAFETY comments, so the rule is pure noise
+          # here — exclude just that one rule, keeping the rest of p/rust active.
           /tmp/sg/bin/semgrep scan --config p/rust \
+            --exclude-rule=rust.lang.security.unsafe-usage.unsafe-usage \
             --sarif --output semgrep.sarif .
       - name: Upload SARIF
         if: always()

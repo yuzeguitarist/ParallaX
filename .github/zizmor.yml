@@ -1,0 +1,56 @@
+# zizmor configuration — https://docs.zizmor.sh/configuration/
+#
+# The `dtolnay/rust-toolchain` action is pinned by full commit SHA (supply-chain
+# hardening), but that action ships toolchains via rolling branches (`stable`,
+# `nightly`, …) rather than per-release version tags. dtolnay fast-forwards the
+# `stable` branch as new Rust releases land, so our pinned SHA is a *former* tip
+# that is:
+#
+#   * no longer reachable from any current branch/tag — which zizmor's
+#     reachability heuristic reports as `impostor-commit`, even though the commit
+#     is genuinely from dtolnay/rust-toolchain (verified: it is a real commit,
+#     message "toolchain: stable"); and
+#   * annotated `# stable` — a channel name, not a version tag — which trips
+#     `ref-version-mismatch`.
+#
+# Both are false positives intrinsic to how this action is versioned; pinning by
+# SHA is exactly the hardening zizmor otherwise recommends. Suppress only these
+# two rules, and only in the workflows that use the pin, so every other action
+# still gets full impostor-commit / ref-version-mismatch auditing.
+rules:
+  impostor-commit:
+    ignore:
+      - cargo-geiger.yml
+      - ci-fuzz-build.yml
+      - ci-pr.yml
+      - ci-quick.yml
+      - ci-relay-teardown.yml
+      - claude-dependency-audit.yml
+      - claude.yml
+      - dudect.yml
+      - fuzz-crash-triage.yml
+      - fuzz-nightly.yml
+      - fuzz-pr.yml
+      - kani.yml
+      - miri.yml
+      - mutants-autofix.yml
+      - nightly-mutants.yml
+      - release.yml
+  ref-version-mismatch:
+    ignore:
+      - cargo-geiger.yml
+      - ci-fuzz-build.yml
+      - ci-pr.yml
+      - ci-quick.yml
+      - ci-relay-teardown.yml
+      - claude-dependency-audit.yml
+      - claude.yml
+      - dudect.yml
+      - fuzz-crash-triage.yml
+      - fuzz-nightly.yml
+      - fuzz-pr.yml
+      - kani.yml
+      - miri.yml
+      - mutants-autofix.yml
+      - nightly-mutants.yml
+      - release.yml
