@@ -337,7 +337,7 @@ impl ReplayCache {
 
     fn persist_plain(&self, path: &Path) -> Result<(), ReplayCacheError> {
         let body = serialize_cached_entries(&self.encoded_entries);
-        let tmp = path.with_extension("tmp");
+        let tmp = cache_tmp_path(path);
         write_cache_file(&tmp, body.as_bytes())?;
         fs::rename(tmp, path)?;
         Ok(())
@@ -431,7 +431,7 @@ impl ReplayCache {
         mac_key: &CacheMacKey,
     ) -> Result<(), ReplayCacheError> {
         let (raw, journal) = serialize_authenticated_journal(&self.order, mac_key);
-        let tmp = path.with_extension("tmp");
+        let tmp = cache_tmp_path(path);
         write_cache_file(&tmp, raw.as_bytes())?;
         fs::rename(tmp, path)?;
         // Make the rename itself durable so a crash right after compaction/heal
@@ -440,6 +440,19 @@ impl ReplayCache {
         self.auth_journal = Some(journal);
         Ok(())
     }
+}
+
+/// Derives the temp path for the atomic tmp-file + rename writes by APPENDING
+/// `.tmp` to the FULL cache file name (`parallax-replay.cache.0rtt` ->
+/// `parallax-replay.cache.0rtt.tmp`). `Path::with_extension("tmp")` would
+/// REPLACE the final extension instead, mapping the sibling `.cache.0rtt` and
+/// `.cache.marker` caches onto the SAME `<dir>/parallax-replay.cache.tmp` —
+/// and since each sibling cache has its own lock, concurrent compaction could
+/// rename one cache's (same-PSK, MAC-valid) content into the other's file.
+fn cache_tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Read the replay-cache journal, refusing to follow a symlinked final path
@@ -1395,5 +1408,70 @@ mod tests {
             ReplayInsertOutcome::Replayed,
             "a 300s-old entry must be retained by the wide-window load prune, not replayable",
         );
+    }
+
+    #[test]
+    fn sibling_cache_tmp_paths_are_distinct() {
+        // #196: the temp name must be derived by APPENDING to the full cache file
+        // name; `with_extension("tmp")` replaced the final `.0rtt`/`.marker`
+        // component, collapsing both siblings onto one `parallax-replay.cache.tmp`.
+        let zero = cache_tmp_path(Path::new("/var/lib/parallax/parallax-replay.cache.0rtt"));
+        let marker = cache_tmp_path(Path::new("/var/lib/parallax/parallax-replay.cache.marker"));
+        assert_ne!(zero, marker, "sibling caches must not share one temp path");
+        assert_eq!(
+            zero,
+            Path::new("/var/lib/parallax/parallax-replay.cache.0rtt.tmp")
+        );
+        assert_eq!(
+            marker,
+            Path::new("/var/lib/parallax/parallax-replay.cache.marker.tmp")
+        );
+    }
+
+    #[test]
+    fn concurrent_sibling_compaction_does_not_clobber_either_cache() {
+        // #196 regression: the `.cache.0rtt` and `.cache.marker` siblings each have
+        // their own lock, so their compactions can run concurrently. With a shared
+        // temp path, one cache's (same-PSK, MAC-valid) content could be renamed into
+        // the other's file, or the tmp create/rename could fail EEXIST/ENOENT.
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let handles: Vec<_> = ["parallax-replay.cache.0rtt", "parallax-replay.cache.marker"]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                let path = dir.path().join(name);
+                std::thread::spawn(move || {
+                    let mut cache =
+                        ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+                    let entry = ReplayEntry {
+                        timestamp: now,
+                        nonce: [idx as u8 + 1; 8],
+                        transcript_fingerprint: [idx as u8 + 1; 32],
+                    };
+                    assert!(cache.insert_new(entry.clone(), now).unwrap());
+                    let mac_key = cache.mac_key.clone().expect("authenticated cache has key");
+                    for _ in 0..256 {
+                        cache
+                            .compact_authenticated_journal(&path, &mac_key)
+                            .expect("compaction must not race the sibling cache");
+                    }
+                    (path, entry)
+                })
+            })
+            .collect();
+        for handle in handles {
+            let (path, entry) = handle.join().unwrap();
+            // Each cache must reload cleanly and still hold ITS OWN entry — a
+            // sibling's journal renamed into place would load fine (same PSK) but
+            // record the WRONG entry, so the own-entry replay check catches it.
+            let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            assert!(
+                !loaded.insert_new(entry, now).unwrap(),
+                "cache at {} must still hold its own entry after concurrent compaction",
+                path.display()
+            );
+        }
     }
 }
