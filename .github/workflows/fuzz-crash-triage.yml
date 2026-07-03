@@ -75,6 +75,7 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          settings: .github/claude-hooks/settings.json
           # github_token intentionally omitted -> Claude GitHub App token, so the
           # PR it opens triggers ci-pr.yml.
           prompt: |
