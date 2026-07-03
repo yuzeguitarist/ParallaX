@@ -637,11 +637,11 @@ pub struct UdpConfig {
     #[serde(default = "default_udp_probe_timeout_ms")]
     pub probe_timeout_ms: u16,
     /// LIVE. Maximum UDP payload the QUIC carrier reads in one datagram (the inbound
-    /// receive-buffer ceiling and the origin-splice relay buffer). `None`/unset keeps
-    /// the conservative default (2048, ~1.6x the largest datagram ParallaX emits).
-    /// Oversized datagrams are truncated-and-dropped (truncation fails AEAD); this
-    /// caps per-datagram memory. Must be `>=` the RFC 9000 §14.1 Initial minimum
-    /// (1200) so a legal Initial is always receivable. See issue #75.
+    /// receive-buffer ceiling). `None`/unset keeps the conservative default (2048,
+    /// ~1.6x the largest datagram ParallaX emits). Oversized datagrams are
+    /// truncated-and-dropped (truncation fails AEAD); this caps per-datagram memory.
+    /// Must be `>=` the RFC 9000 §14.1 Initial minimum (1200) so a legal Initial is
+    /// always receivable. See issue #75.
     #[serde(default)]
     pub max_udp_payload_bytes: Option<u32>,
     /// LIVE. Explicit SO_SNDBUF for the UDP carrier socket, in bytes. `None`/`0`
