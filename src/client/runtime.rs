@@ -63,14 +63,16 @@ use crate::{
 };
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
-/// How many undecryptable (camouflage) records the client skips before the
-/// server's ParallaX key-exchange record. Bound to the shared
-/// [`crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] so it always
-/// covers the server's pre-PQ fallback forward cap; a smaller value (this was 16
-/// vs the server's 64) caused intermittent ~33-75% handshake failures on high-RTT
+/// How many BYTES of undecryptable (camouflage) records the client skips before
+/// the server's ParallaX key-exchange record. Bound to the shared
+/// [`crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES`] so it always
+/// covers the server's byte-oriented pre-PQ fallback forward cap — in the same
+/// unit. A smaller budget (this was 16 records vs the server's 64, then 64
+/// RECORDS vs the server's ~1 MiB BYTE cap, which real origins fill with many
+/// sub-16KiB records) caused intermittent ~33-75% handshake failures on high-RTT
 /// links where the camouflage origin's response body leaks into this skip window.
-const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize =
-    crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
+const MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE: usize =
+    crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
 /// Hard deadline for the whole post-connect authenticated establishment
 /// (camouflage TLS handshake + PQ rekey + identity verify). Mirrors the server's
 /// HANDSHAKE_TIMEOUT so a stalling/impersonating upstream cannot pin an
@@ -2252,7 +2254,12 @@ where
 {
     let mut server_records = TlsRecordReader::new(server);
     let mut record = Vec::new();
+    // The budget is measured in BYTES (the record count rides along for logs):
+    // the server's forward cap is a byte ceiling over a verbatim splice, so the
+    // client must meter the same unit or small origin records overrun it (see
+    // MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE).
     let mut skipped = 0;
+    let mut skipped_bytes = 0;
     // The server now splits PX1K across several FramedChunk records (PAR-21);
     // accumulate them here. Residual camouflage records (the fallback origin's
     // H2 response racing ahead) fail to open and are skipped up to the budget,
@@ -2273,7 +2280,8 @@ where
                 if skipped > 0 {
                     tracing::warn!(
                         skipped,
-                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        skipped_bytes,
+                        budget_bytes = MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE,
                         "accepted server key exchange after skipping residual camouflage records"
                     );
                 }
@@ -2284,8 +2292,9 @@ where
                 continue;
             }
             Err(ClientRuntimeError::Handshake(err)) if is_residual_camouflage_record(&err) => {
-                if skipped < MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE {
+                if skipped_bytes < MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE {
                     skipped += 1;
+                    skipped_bytes += record.len();
                     // Loud-on-purpose: hitting this path at all means the
                     // camouflage host is racing ahead of the ParallaX server's
                     // key-exchange record. We still tolerate it up to the
@@ -2293,22 +2302,24 @@ where
                     // global log level to trace.
                     tracing::warn!(
                         skipped,
-                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        skipped_bytes,
+                        budget_bytes = MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE,
                         record_len = record.len(),
                         "skipping residual camouflage TLS record before ParallaX key exchange"
                     );
                 } else {
                     // Fast-fail: do NOT silently keep reading. Surface this as
                     // a hard error with the exact diagnostic an operator needs
-                    // (skipped count, last record length, underlying cause) so
-                    // a future "灵异事件" never has to be reverse-engineered
-                    // from a blank log.
+                    // (skipped count/bytes, last record length, underlying
+                    // cause) so a future "灵异事件" never has to be
+                    // reverse-engineered from a blank log.
                     tracing::error!(
                         skipped,
-                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        skipped_bytes,
+                        budget_bytes = MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE,
                         record_len = record.len(),
                         error = %err,
-                        "exceeded residual camouflage record budget before ParallaX key exchange; \
+                        "exceeded residual camouflage byte budget before ParallaX key exchange; \
                          fallback host likely answered the H2 camouflage GET ahead of the \
                          ParallaX server's key-exchange record"
                     );
@@ -3969,7 +3980,13 @@ mod tests {
     /// what a forwarded camouflage-origin record looks like in the residual-skip
     /// loop before the ParallaX key exchange.
     fn camouflage_record(seed: u8) -> Vec<u8> {
-        let payload = vec![seed; 40];
+        camouflage_record_with_len(seed, 40)
+    }
+
+    /// [`camouflage_record`] with a chosen payload length (a real origin's record
+    /// sizes range from tiny H2 frames to full 16 KiB records).
+    fn camouflage_record_with_len(seed: u8, payload_len: usize) -> Vec<u8> {
+        let payload = vec![seed; payload_len];
         let len = payload.len() as u16;
         let mut rec = vec![0x17, 0x03, 0x03, (len >> 8) as u8, (len & 0xff) as u8];
         rec.extend_from_slice(&payload);
@@ -4012,14 +4029,11 @@ mod tests {
         out
     }
 
-    /// Regression for the high-RTT handshake-failure bug (client budget 16 vs
-    /// server forward limit 64): the client must skip as many camouflage records as
-    /// the server may forward before the key-exchange
-    /// (`MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`) and still accept the key
-    /// exchange. With the old budget this aborted with an AEAD/"residual budget"
-    /// error on the 17th camouflage record.
-    #[tokio::test]
-    async fn residual_skip_tolerates_full_server_forward_limit() {
+    // Test helper: a client session mid-PQ-rekey plus the matching sealed server
+    // key-exchange record, built the same way an authenticated server would
+    // (mirrors the `pq_rekey_changes_client_session_keys` roundtrip in
+    // handshake::client). Shared by the `residual_skip_*` tests.
+    fn session_with_server_key_exchange() -> (ClientDataSession, PendingPqRekey, Vec<u8>) {
         use rand::{rngs::StdRng, SeedableRng};
 
         use crate::{
@@ -4037,9 +4051,6 @@ mod tests {
         let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
         let mut rng = StdRng::seed_from_u64(42);
 
-        // Client builds its PQ rekey record; reconstruct the matching server
-        // key-exchange the same way an authenticated server would (mirrors the
-        // `pq_rekey_changes_client_session_keys` roundtrip in handshake::client).
         let (pq_record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
         let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
         let request =
@@ -4057,9 +4068,21 @@ mod tests {
             .unwrap(),
             &mut rng,
         );
+        (session, pending, kx_record)
+    }
 
-        // Prepend exactly the maximum number of camouflage records the server may
-        // forward, then the real key-exchange as the next record.
+    /// Regression for the original high-RTT handshake-failure bug (client budget
+    /// 16 records vs server forward limit 64): the client must skip
+    /// `MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS` camouflage records (well under
+    /// the byte budget) and still accept the key exchange. With the old budget
+    /// this aborted with an AEAD/"residual budget" error on the 17th camouflage
+    /// record.
+    #[tokio::test]
+    async fn residual_skip_tolerates_full_server_forward_limit() {
+        let (mut session, pending, kx_record) = session_with_server_key_exchange();
+
+        // Prepend one camouflage record per unit of the record-count window,
+        // then the real key-exchange as the next record.
         let mut stream = Vec::new();
         for i in 0..crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS {
             stream.extend_from_slice(&camouflage_record(i as u8));
@@ -4074,17 +4097,79 @@ mod tests {
             );
     }
 
+    /// Regression for the camouflage-window UNIT mismatch: the server's pre-PQ
+    /// forward cap is a BYTE ceiling (~1 MiB) over a verbatim splice, and real
+    /// origins segment H2 response bodies into many sub-16KiB records, so far
+    /// more than 64 records can legitimately precede the key exchange. The
+    /// client's residual-skip budget counts the same bytes; with the old
+    /// 64-RECORD budget this aborted on the 65th small record.
+    #[tokio::test]
+    async fn residual_skip_counts_bytes_not_records() {
+        let (mut session, pending, kx_record) = session_with_server_key_exchange();
+
+        // Far more records than the old record budget, still well under the
+        // shared byte budget, then the real key-exchange as the next record.
+        let mut stream = Vec::new();
+        let mut camouflage_bytes = 0;
+        for i in 0..512_usize {
+            let rec = camouflage_record(i as u8);
+            camouflage_bytes += rec.len();
+            stream.extend_from_slice(&rec);
+        }
+        assert!(camouflage_bytes <= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES);
+        stream.extend_from_slice(&kx_record);
+
+        let mut cursor: &[u8] = &stream;
+        apply_server_key_exchange_after_residuals(&mut cursor, &mut session, &pending, PSK)
+            .await
+            .expect(
+                "client must skip small residual camouflage records up to the byte budget, \
+                 not a record count",
+            );
+    }
+
+    /// The fast-fail must still fire on the byte budget: a peer that pushes more
+    /// camouflage bytes than the shared window (65 full-size records here) is not
+    /// a ParallaX server racing its key exchange, and the client aborts instead
+    /// of reading forever.
+    #[tokio::test]
+    async fn residual_skip_aborts_past_byte_budget() {
+        let (mut session, pending, kx_record) = session_with_server_key_exchange();
+
+        // 64 full-size records fill the byte budget exactly; the 65th arrives
+        // past it and must trip the fast-fail even with a valid key exchange
+        // behind it.
+        let full = record::MAX_TLS_RECORD_PAYLOAD;
+        let mut stream = Vec::new();
+        let mut camouflage_bytes = 0;
+        for i in 0..=crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS {
+            let rec = camouflage_record_with_len(i as u8, full);
+            camouflage_bytes += rec.len();
+            stream.extend_from_slice(&rec);
+        }
+        assert!(camouflage_bytes > crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES);
+        stream.extend_from_slice(&kx_record);
+
+        let mut cursor: &[u8] = &stream;
+        apply_server_key_exchange_after_residuals(&mut cursor, &mut session, &pending, PSK)
+            .await
+            .expect_err("residual camouflage bytes past the shared budget must abort");
+    }
+
     /// The client's residual-skip budget must always be at least the server's
-    /// pre-PQ fallback forward limit, or high-RTT handshakes intermittently abort
-    /// (the 16-vs-64 bug). Both are bound to the shared constant, so this holds by
-    /// construction; the test guards against a future divergence.
+    /// pre-PQ fallback forward limit — measured in the same unit, BYTES — or
+    /// high-RTT handshakes intermittently abort (the 16-vs-64 record bug, then
+    /// the 64-records-vs-~1MiB unit bug). Both are bound to the shared byte
+    /// constant, so this holds by construction; the test guards against a future
+    /// divergence.
     #[test]
     fn residual_budget_covers_server_forward_limit() {
         const {
             assert!(
-                MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE
-                    >= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS,
-                "client residual-skip budget must cover the server's pre-PQ fallback forward limit"
+                MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE
+                    >= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES,
+                "client residual-skip byte budget must cover the server's pre-PQ \
+                 fallback forward byte limit"
             );
         }
     }
