@@ -19,7 +19,7 @@
 //! never a false accept. The cache window MUST be at least the marker freshness
 //! window so a marker is retained for replay detection for as long as it is valid.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -31,13 +31,13 @@ use crate::crypto::replay::{ReplayCache, ReplayEntry, ReplayInsertOutcome};
 /// the marker freshness window so a replay stays detectable for as long as the
 /// marker is valid.
 pub struct MarkerReplayGuard {
-    cache: Mutex<ReplayCache>,
+    cache: Arc<Mutex<ReplayCache>>,
 }
 
 impl MarkerReplayGuard {
     pub(crate) fn new(cache: ReplayCache) -> Self {
         Self {
-            cache: Mutex::new(cache),
+            cache: Arc::new(Mutex::new(cache)),
         }
     }
 
@@ -45,6 +45,12 @@ impl MarkerReplayGuard {
     /// the connection may terminate locally (a real, non-replayed ParallaX client);
     /// `false` means a replay (or a poisoned lock / full or stale cache) and the flow
     /// must be spliced to the origin. `now_unix` is the current Unix time in seconds.
+    ///
+    /// The dedup decision is made synchronously in memory under the lock (so a
+    /// replayed marker is gated the instant its first sighting returns), but the
+    /// durable journal write — an fsync — is offloaded to a blocking thread
+    /// (issue #24): this method runs on the async QUIC endpoint driver task, and a
+    /// blocking fsync held under the mutex there stalls the whole executor.
     pub(crate) fn first_sighting(&self, m: &Marker, now_unix: u64) -> bool {
         let mut hasher = Sha256::new();
         hasher.update(m.nonce);
@@ -67,14 +73,48 @@ impl MarkerReplayGuard {
             nonce,
             transcript_fingerprint,
         };
-        match self.cache.lock() {
-            Ok(mut cache) => matches!(
-                cache.insert_new_outcome(entry, now_unix),
-                Ok(ReplayInsertOutcome::Inserted)
-            ),
+        let inserted = match self.cache.lock() {
+            Ok(mut cache) => {
+                cache.insert_new_outcome_deferred(entry, now_unix) == ReplayInsertOutcome::Inserted
+            }
             // A poisoned lock fails closed: treat as a replay (splice to origin)
             // rather than risk re-exposing the local termination path.
             Err(_) => false,
+        };
+        if inserted {
+            self.persist_in_background();
+        }
+        inserted
+    }
+
+    /// Runs the queued durable persist (journal append + fsync) off the async
+    /// executor via `spawn_blocking`, reacquiring the lock only inside the
+    /// blocking pool. Outside a tokio runtime (sync tests) it persists inline,
+    /// matching the pre-deferral behavior. A persist failure is logged and the
+    /// queued entry retried on the next sighting; the in-memory record keeps
+    /// gating replays either way — only its restart durability is delayed.
+    fn persist_in_background(&self) {
+        let cache = Arc::clone(&self.cache);
+        let persist = move || {
+            // Recover from a poisoned lock rather than dropping durability: the
+            // cache invariants are restored on each insert, so persisting the
+            // recovered state is safe (mirrors the auth handshake's replay insert).
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(err) = cache.persist_pending() {
+                tracing::warn!(
+                    error = %err,
+                    "marker replay cache persist failed; first sighting recorded \
+                     in memory only (retried on the next sighting)"
+                );
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(persist);
+            }
+            Err(_) => persist(),
         }
     }
 }
@@ -182,6 +222,64 @@ mod tests {
         assert!(
             !g2.first_sighting(&m, now),
             "replay spliced across a restart (persistent single-use)"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_first_sighting_gates_replays_inline_and_persists_in_background() {
+        // Issue #24: inside a runtime the fsync is offloaded to the blocking pool,
+        // but the in-memory dedup must still gate a replay SYNCHRONOUSLY — before
+        // the background persist has landed — and the persist must still land so
+        // single-use survives a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker-replay-async.cache");
+        let key = b"server-static-key-derived-mac-material";
+        let now = crate::crypto::replay::current_unix_timestamp().unwrap();
+        let m = marker(0x3c, now);
+
+        let cache = ReplayCache::load_or_create_authenticated_with_window(
+            &path,
+            64,
+            key,
+            MARKER_WINDOW_SECS,
+        )
+        .unwrap();
+        let g = MarkerReplayGuard::new(cache);
+        assert!(g.first_sighting(&m, now), "first sighting terminates");
+        assert!(
+            !g.first_sighting(&m, now),
+            "immediate replay is gated by the in-memory record, without waiting \
+             for the background persist"
+        );
+
+        // Wait for the background persist to land (header + one entry line).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let lines = std::fs::read_to_string(&path)
+                .map(|raw| raw.lines().count())
+                .unwrap_or(0);
+            if lines >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background persist never landed on disk"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Reload (simulating a restart): the marker is still single-use.
+        let reloaded = ReplayCache::load_or_create_authenticated_with_window(
+            &path,
+            64,
+            key,
+            MARKER_WINDOW_SECS,
+        )
+        .unwrap();
+        let g2 = MarkerReplayGuard::new(reloaded);
+        assert!(
+            !g2.first_sighting(&m, now),
+            "replay spliced across a restart (background persist was durable)"
         );
     }
 }

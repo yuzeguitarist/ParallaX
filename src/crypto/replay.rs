@@ -97,6 +97,13 @@ pub struct ReplayCache {
     encoded_entries: VecDeque<String>,
     nonces: HashSet<[u8; 8]>,
     transcripts: HashSet<[u8; 32]>,
+    /// Entries recorded in memory by [`Self::insert_new_outcome_deferred`] whose
+    /// durable journal write has not run yet; drained (oldest first) by
+    /// [`Self::persist_pending`] so the blocking fsync can run off the async
+    /// executor. Do not mix deferred and immediate inserts on one cache while
+    /// this queue is non-empty: the immediate path's append would journal its own
+    /// entry ahead of the still-queued ones.
+    pending_persist: VecDeque<ReplayEntry>,
 }
 
 impl ReplayCache {
@@ -111,6 +118,7 @@ impl ReplayCache {
             encoded_entries: VecDeque::with_capacity(capacity),
             nonces: HashSet::with_capacity(capacity),
             transcripts: HashSet::with_capacity(capacity),
+            pending_persist: VecDeque::new(),
         }
     }
 
@@ -243,27 +251,12 @@ impl ReplayCache {
             return Ok(ReplayInsertOutcome::Inserted);
         }
 
-        self.prune_expired(now);
-        if !self.is_fresh(entry.timestamp, now) {
-            return Ok(ReplayInsertOutcome::Stale);
-        }
-
-        if !self.nonces.insert(entry.nonce) {
-            return Ok(ReplayInsertOutcome::Replayed);
-        }
-        if !self.transcripts.insert(entry.transcript_fingerprint) {
-            self.nonces.remove(&entry.nonce);
-            return Ok(ReplayInsertOutcome::Replayed);
-        }
-        if self.order.len() >= self.capacity {
-            self.nonces.remove(&entry.nonce);
-            self.transcripts.remove(&entry.transcript_fingerprint);
-            return Ok(ReplayInsertOutcome::CacheFull);
-        }
-
         let nonce = entry.nonce;
         let transcript = entry.transcript_fingerprint;
-        self.push_loaded_entry(entry);
+        let outcome = self.stage_insert(entry, now);
+        if outcome != ReplayInsertOutcome::Inserted {
+            return Ok(outcome);
+        }
         if let Err(err) = self.persist() {
             // Roll back the in-memory mutation for THIS entry so memory tracks
             // durable state exactly: a legitimate retry can re-insert (no false
@@ -275,6 +268,97 @@ impl ReplayCache {
             return Err(err);
         }
         Ok(ReplayInsertOutcome::Inserted)
+    }
+
+    /// Like [`Self::insert_new_outcome`] but performs NO disk I/O: the entry is
+    /// recorded in memory (so it gates replays immediately, exactly like the
+    /// immediate variant) and queued for a later [`Self::persist_pending`], which
+    /// runs the blocking journal append + fsync. This lets async callers keep the
+    /// dedup decision synchronous under their lock while offloading the fsync to
+    /// a blocking thread (issue #24). Until `persist_pending` runs, the entry's
+    /// replay protection does not yet survive a restart.
+    pub fn insert_new_outcome_deferred(
+        &mut self,
+        entry: ReplayEntry,
+        now: u64,
+    ) -> ReplayInsertOutcome {
+        if self.capacity == 0 {
+            return ReplayInsertOutcome::Inserted;
+        }
+
+        let pending = entry.clone();
+        let outcome = self.stage_insert(entry, now);
+        if outcome == ReplayInsertOutcome::Inserted {
+            self.pending_persist.push_back(pending);
+        }
+        outcome
+    }
+
+    /// Durably persists every entry queued by [`Self::insert_new_outcome_deferred`],
+    /// oldest first. This is the blocking half of the deferred insert (journal
+    /// append + fsync, or a full compaction); run it off the async executor (e.g.
+    /// via `spawn_blocking`). On error the unpersisted remainder stays queued so a
+    /// later call retries; the in-memory record is NOT rolled back — the entry
+    /// keeps gating replays for this process's lifetime, only its restart
+    /// durability is pending.
+    pub fn persist_pending(&mut self) -> Result<(), ReplayCacheError> {
+        while let Some(entry) = self.pending_persist.front().cloned() {
+            // An entry pruned from memory while queued has already expired: a
+            // fresh load would prune its journal line immediately, and skipping
+            // it bounds the queue under a persistently failing disk.
+            if !self.nonces.contains(&entry.nonce) {
+                self.pending_persist.pop_front();
+                continue;
+            }
+            let Some(path) = self.path.clone() else {
+                // In-memory cache: nothing to persist.
+                self.pending_persist.clear();
+                return Ok(());
+            };
+            let compacted = match self.mac_key.clone() {
+                Some(mac_key) => self.persist_authenticated_entry(&path, &mac_key, Some(entry))?,
+                None => {
+                    // The plain journal is always rewritten whole from
+                    // `encoded_entries`, which already includes every queued entry.
+                    self.persist_plain(&path)?;
+                    true
+                }
+            };
+            if compacted {
+                // The write covered EVERY in-memory entry, including everything
+                // still queued; appending those again would duplicate journal
+                // lines.
+                self.pending_persist.clear();
+            } else {
+                self.pending_persist.pop_front();
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared in-memory stage of the insert paths: prune, freshness check, dedup
+    /// insert and push — everything except persistence.
+    fn stage_insert(&mut self, entry: ReplayEntry, now: u64) -> ReplayInsertOutcome {
+        self.prune_expired(now);
+        if !self.is_fresh(entry.timestamp, now) {
+            return ReplayInsertOutcome::Stale;
+        }
+
+        if !self.nonces.insert(entry.nonce) {
+            return ReplayInsertOutcome::Replayed;
+        }
+        if !self.transcripts.insert(entry.transcript_fingerprint) {
+            self.nonces.remove(&entry.nonce);
+            return ReplayInsertOutcome::Replayed;
+        }
+        if self.order.len() >= self.capacity {
+            self.nonces.remove(&entry.nonce);
+            self.transcripts.remove(&entry.transcript_fingerprint);
+            return ReplayInsertOutcome::CacheFull;
+        }
+
+        self.push_loaded_entry(entry);
+        ReplayInsertOutcome::Inserted
     }
 
     fn is_fresh(&self, timestamp: u64, now: u64) -> bool {
@@ -348,8 +432,26 @@ impl ReplayCache {
         path: &Path,
         mac_key: &CacheMacKey,
     ) -> Result<(), ReplayCacheError> {
+        let entry = self.order.back().cloned();
+        self.persist_authenticated_entry(path, mac_key, entry)
+            .map(|_compacted| ())
+    }
+
+    /// Appends `entry` to the committed journal, or compacts (rewriting the whole
+    /// journal from the in-memory `order`) when appending is impossible or
+    /// uneconomical. Returns `true` when the write was a compaction: a compaction
+    /// persists EVERY in-memory entry — including any still queued in
+    /// `pending_persist` — so a caller draining that queue must stop rather than
+    /// re-append already-durable entries (duplicating journal lines).
+    fn persist_authenticated_entry(
+        &mut self,
+        path: &Path,
+        mac_key: &CacheMacKey,
+        entry: Option<ReplayEntry>,
+    ) -> Result<bool, ReplayCacheError> {
         let Some(journal) = self.auth_journal else {
-            return self.compact_authenticated_journal(path, mac_key);
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         };
         // count==0 means no committed header exists yet (fresh file, or a 0-byte/
         // whitespace-only file left by a crash before the empty header was synced).
@@ -358,18 +460,21 @@ impl ReplayCache {
         // the in-place header rewrite below (the in-memory order already holds the
         // just-inserted entry, so this persists it as a clean count=1 journal).
         if journal.count == 0 {
-            return self.compact_authenticated_journal(path, mac_key);
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         }
         if self.should_compact_authenticated_journal(journal) {
-            return self.compact_authenticated_journal(path, mac_key);
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         }
-        let Some(entry) = self.order.back() else {
-            return self.compact_authenticated_journal(path, mac_key);
+        let Some(entry) = entry else {
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         };
 
         let next_count = journal.count.saturating_add(1);
         let (line, next_tail_mac) =
-            encode_authenticated_journal_entry(mac_key, next_count, entry, &journal.tail_mac);
+            encode_authenticated_journal_entry(mac_key, next_count, &entry, &journal.tail_mac);
         let next_header = authenticated_journal_header(mac_key, next_count, &next_tail_mac);
 
         let mut file = open_cache_file_for_append(path)?;
@@ -379,7 +484,8 @@ impl ReplayCache {
             // it cleanly via tmp-file + rename rather than appending onto a missing
             // header.
             drop(file);
-            return self.compact_authenticated_journal(path, mac_key);
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         }
         let committed_len = file.seek(SeekFrom::End(0))?;
         // Append the entry, then rewrite the header. On a failed APPEND (the common
@@ -415,7 +521,7 @@ impl ReplayCache {
             count: next_count,
             tail_mac: next_tail_mac,
         });
-        Ok(())
+        Ok(false)
     }
 
     fn should_compact_authenticated_journal(&self, journal: AuthJournalState) -> bool {
@@ -1394,6 +1500,152 @@ mod tests {
             reloaded.insert_new_outcome(entry, now).unwrap(),
             ReplayInsertOutcome::Replayed,
             "a 300s-old entry must be retained by the wide-window load prune, not replayable",
+        );
+    }
+
+    #[test]
+    fn deferred_insert_gates_replays_in_memory_and_persists_on_drain() {
+        // Issue #24: the deferred insert must dedup immediately (in memory,
+        // without touching the disk), and a later persist_pending must make every
+        // queued entry durable, in insertion order.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-deferred.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let first = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert_eq!(
+            cache.insert_new_outcome_deferred(first.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(
+            cache.insert_new_outcome_deferred(first.clone(), now),
+            ReplayInsertOutcome::Replayed,
+            "replay gated by the in-memory record before any persist"
+        );
+        assert_eq!(
+            cache.insert_new_outcome_deferred(second.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        assert!(!path.exists(), "deferred insert must not perform disk I/O");
+
+        cache.persist_pending().unwrap();
+        drop(cache);
+
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!loaded.insert_new(first, now).unwrap(), "first persisted");
+        assert!(!loaded.insert_new(second, now).unwrap(), "second persisted");
+    }
+
+    #[test]
+    fn deferred_entries_append_to_a_committed_journal() {
+        // Exercise persist_pending's APPEND path (a committed count >= 1 journal,
+        // no compaction): each queued entry lands as its own journal line and the
+        // already-committed entry is neither duplicated nor lost.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-deferred-append.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let committed = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let queued_a = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+        let queued_b = ReplayEntry {
+            timestamp: now,
+            nonce: [5; 8],
+            transcript_fingerprint: [6; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(committed.clone(), now).unwrap());
+        assert_eq!(
+            cache.insert_new_outcome_deferred(queued_a.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(
+            cache.insert_new_outcome_deferred(queued_b.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        cache.persist_pending().unwrap();
+        drop(cache);
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.lines().count(),
+            4,
+            "header + one line per entry (no duplicates): {raw:?}"
+        );
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!loaded.insert_new(committed, now).unwrap());
+        assert!(!loaded.insert_new(queued_a, now).unwrap());
+        assert!(!loaded.insert_new(queued_b, now).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_persist_failure_keeps_entry_queued_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-deferred-retry.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let committed = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let queued = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(committed, now).unwrap());
+
+        // Queue an entry, then make the journal unwritable so the drain fails.
+        assert_eq!(
+            cache.insert_new_outcome_deferred(queued.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(matches!(
+            cache.persist_pending(),
+            Err(ReplayCacheError::Io(_))
+        ));
+        // Unlike the immediate path there is no rollback: the in-memory record
+        // still gates a replay while durability is pending.
+        assert_eq!(
+            cache.insert_new_outcome_deferred(queued.clone(), now),
+            ReplayInsertOutcome::Replayed
+        );
+
+        // Restore writability: the retained queue drains on the next call and the
+        // entry becomes durable.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        cache.persist_pending().unwrap();
+        drop(cache);
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(
+            !loaded.insert_new(queued, now).unwrap(),
+            "queued entry persisted by the retry"
         );
     }
 }
