@@ -176,22 +176,19 @@ fn try_enter_cap_shed_fallback() -> Option<CapShedFallbackSlot> {
     }
 }
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
-// The client's residual-skip budget, mirrored here only for the operator-facing
-// warning logged when the forward cap is reached. Bound to the shared constant so
-// it can never drift from the client's actual budget again (the 16-vs-64 high-RTT
-// handshake-failure bug).
-const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize =
-    super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
-/// Cap on fallback-origin records forwarded to the client before the ParallaX PQ
-/// rekey arrives. This must comfortably cover a *full* fragmented TLS 1.3 server
-/// handshake flight (ServerHello + EncryptedExtensions + a possibly large,
-/// heavily fragmented Certificate chain + CertificateVerify + Finished): the
-/// client only sends its PQ record once that flight completes its Safari TLS
-/// camouflage, so a limit smaller than the origin's record count deadlocks the
-/// session (the server stops forwarding, the client keeps waiting). 64 records
-/// (~1 MiB) is far above any real handshake flight while still bounding forwarding.
-/// Bound to the shared [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] so the
-/// client's residual-skip budget always covers exactly what this may forward.
+// The client's residual-skip byte budget, mirrored here only for the
+// operator-facing warning logged when the forward cap is reached. Bound to the
+// shared constant so it can never drift from the client's actual budget again
+// (the 16-vs-64 record and 64-records-vs-~1MiB unit high-RTT handshake-failure
+// bugs).
+const CLIENT_RESIDUAL_CAMOUFLAGE_BYTE_BUDGET: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
+/// Cap on the CLIENT's camouflage records read before its ParallaX PQ rekey
+/// arrives (the client->fallback direction; the fallback->client direction is
+/// byte-capped, see [`PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT`]). A legitimate client
+/// emits only a handful of camouflage records before its PQ record, so 64 is far
+/// above any real client flight while still bounding an abusive unbounded
+/// client->fallback stream. Bound to the shared
+/// [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`].
 const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
 /// Byte ceiling on the origin->client camouflage forward in the authenticated
 /// pre-PQ phase (D5). That direction now forwards the origin's bytes VERBATIM —
@@ -199,14 +196,18 @@ const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_
 /// into its own write (a "one record, one segment" shape that no direct-to-origin
 /// connection and no `relay_fallback` byte pump produces, making the authenticated
 /// splice separable from both). Because the forward is byte-oriented now, the
-/// resource backstop is byte-oriented too: it is the record cap expressed in
-/// bytes (a full-size TLS record is header + max payload), so it bounds exactly
-/// the same "~1 MiB / 64 full records" envelope as before. The CLIENT still
-/// enforces its own [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] residual
-/// *record* budget on the reassembled stream, so the logical-record contract is
-/// unchanged; this cap is purely the server-side abuse/resource ceiling.
-const PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT: usize = PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT
-    * (crate::tls::record::MAX_TLS_RECORD_PAYLOAD + crate::tls::record::TLS_HEADER_LEN);
+/// cap is byte-oriented too: ~1 MiB (64 full-size records) comfortably covers a
+/// *full* fragmented TLS 1.3 server handshake flight (ServerHello,
+/// EncryptedExtensions, a possibly large, heavily fragmented Certificate chain,
+/// CertificateVerify, Finished); the client only sends its PQ record once
+/// that flight completes its Safari TLS camouflage, so a ceiling smaller than
+/// the origin's flight deadlocks the session (the server stops forwarding, the
+/// client keeps waiting). The CLIENT enforces the SAME byte budget on the
+/// reassembled record stream (both are bound to
+/// [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES`] — see its doc for why the
+/// two ends must share a unit), and the forward's final read is capped at the
+/// remaining budget so this end can never overshoot what the client tolerates.
+const PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
 const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
 /// Server-side ceilings on an authenticated speed-test request. The on-wire
 /// format permits arbitrary u64 byte counts and a u16 sample count; without a
@@ -2669,8 +2670,8 @@ async fn run_authenticated_data_mode(
                         client_camouflage_bytes_before_pq += client_record.len();
                         if client_camouflage_records_before_pq > PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT
                         {
-                            // Same 64-record ceiling as the fallback->client cap
-                            // below (that direction pauses; this one tears down). A
+                            // Same camouflage window as the fallback->client byte
+                            // cap below (that direction pauses; this one tears down). A
                             // legitimate client emits only a handful of camouflage
                             // records before its PQ rekey, so an unbounded
                             // client->fallback stream is abuse. Drain->FIN both
@@ -2765,8 +2766,15 @@ async fn run_authenticated_data_mode(
             // separable from both. Reading raw bytes off the buffered reader drains
             // any already-buffered bytes first, so nothing the record path left
             // behind is lost (we never read records off this half again in pre-PQ).
-            // The cap is byte-oriented to match (see PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT).
-            read = fallback_records.get_mut().read(&mut fallback_relay_buf),
+            // The cap is byte-oriented to match (see PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT),
+            // and each read is capped at the remaining budget so the forward can never
+            // overshoot the client's equal residual byte budget mid-read.
+            read = fallback_records.get_mut().read({
+                let remaining = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
+                    .saturating_sub(fallback_bytes_before_pq)
+                    .min(fallback_relay_buf.len());
+                &mut fallback_relay_buf[..remaining]
+            }),
                 if fallback_open && fallback_bytes_before_pq < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT => {
                 let n = match read {
                     // Origin half-closed (FIN) or reset before PX1Q arrived. This is
@@ -2818,7 +2826,7 @@ async fn run_authenticated_data_mode(
                         direction = "fallback->client",
                         task_name = "server-camouflage-writer",
                         fallback_bytes_before_pq,
-                        client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
+                        client_residual_byte_budget = CLIENT_RESIDUAL_CAMOUFLAGE_BYTE_BUDGET,
                         pre_pq_forward_byte_limit = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT,
                         "pre-PQ fallback camouflage forward byte limit reached; pausing fallback \
                          reads until ParallaX PQ rekey"
