@@ -273,8 +273,7 @@ mod tests {
         hs.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites: len=2, TLS_AES_128_GCM
         hs.extend_from_slice(&[0x01, 0x00]); // compression: len=1, null
         let body_len = (hs.len() - body_start - 3) as u32;
-        hs[body_start..body_start + 3]
-            .copy_from_slice(&body_len.to_be_bytes()[1..]); // u24
+        hs[body_start..body_start + 3].copy_from_slice(&body_len.to_be_bytes()[1..]); // u24
         let mut rec = vec![0x16, 0x03, 0x01];
         rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
         rec.extend_from_slice(&hs);
