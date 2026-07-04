@@ -228,13 +228,15 @@ impl TransportParameters {
         let mut seen: BTreeSet<u64> = BTreeSet::new();
         let mut i = 0usize;
         while i < blob.len() {
-            let (id, n) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
+            let (id, n) =
+                varint::decode(blob.get(i..).ok_or(Error::Truncated)?).ok_or(Error::Truncated)?;
             i += n;
             // RFC 9000 §7.4.1: a transport parameter MUST NOT appear more than once.
             if !seen.insert(id) {
                 return Err(Error::Duplicate);
             }
-            let (len, m) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
+            let (len, m) =
+                varint::decode(blob.get(i..).ok_or(Error::Truncated)?).ok_or(Error::Truncated)?;
             i += m;
             // Narrow the declared length before it indexes the blob. A QUIC varint
             // reaches 2^62-1: on a 32-bit target `len as usize` silently truncates
