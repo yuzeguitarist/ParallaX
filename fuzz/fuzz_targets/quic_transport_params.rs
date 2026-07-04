@@ -38,26 +38,18 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // Fixed-point property: encode the recognized values back out (server form,
-    // which serializes every field this parser reads) and re-read them. The second
-    // read must recover the same recognized values — the encoder emits each id at
-    // most once and in ascending order, so it round-trips through `read` cleanly.
+    // which serializes EVERY field this parser reads) and re-read them. The second
+    // read must recover the WHOLE struct byte-for-byte — the encoder emits each id
+    // at most once and in ascending order, so it round-trips through `read`
+    // cleanly. A full-struct equality (rather than a hand-picked subset of fields)
+    // keeps this invariant aligned with what `read`/`encode_server` actually
+    // handle, so an encode/decode regression on any field — including the
+    // per-stream-data and bidi-streams limits — cannot slip through.
     let reencoded = tp.encode_server();
     let tp2 = TransportParameters::read(&reencoded)
         .expect("our own encode_server output must re-read without error");
     assert_eq!(
-        tp2.initial_max_data, tp.initial_max_data,
-        "initial_max_data not stable across re-encode"
-    );
-    assert_eq!(
-        tp2.initial_max_streams_uni, tp.initial_max_streams_uni,
-        "max_streams_uni not stable across re-encode"
-    );
-    assert_eq!(
-        tp2.active_connection_id_limit, tp.active_connection_id_limit,
-        "active_connection_id_limit not stable across re-encode"
-    );
-    assert_eq!(
-        tp2.initial_src_cid, tp.initial_src_cid,
-        "initial_source_connection_id not stable across re-encode"
+        tp2, tp,
+        "transport parameters not stable across encode_server -> read"
     );
 });
