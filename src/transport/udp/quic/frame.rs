@@ -1040,9 +1040,21 @@ mod tests {
             frame.encode(&mut full);
             for cut in 0..full.len() {
                 let prefix = &full[..cut];
-                // Drive the whole iterator; the property is total (no panic),
-                // regardless of Ok/Err. Collect forces every frame to parse.
-                let _: Vec<_> = Iter::new(prefix).collect();
+                // Drive the whole iterator; the property is total (no panic).
+                // Collect forces every frame to parse. Beyond panic-safety, assert
+                // the stronger fail-closed guarantee: a strict prefix of ONE encoded
+                // frame must only ever yield a coalesced PADDING run or a clean
+                // Truncated/Malformed error — never a silently-accepted partial
+                // non-PADDING frame.
+                let parsed: Vec<_> = Iter::new(prefix).collect();
+                assert!(
+                    parsed.iter().all(|r| matches!(
+                        r,
+                        Ok(Frame::Padding(_)) | Err(FrameError::Truncated | FrameError::Malformed)
+                    )),
+                    "strict prefix of {frame:?} cut at {cut} must fail closed or \
+                     decode as coalesced PADDING, got {parsed:?}"
+                );
             }
         }
     }
