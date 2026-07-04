@@ -229,8 +229,30 @@ for PROFILE in $PROFILES; do
   # Run each traffic scenario through the SOCKS port.
   for S in $SCENARIOS; do
     OUT="$WORKDIR/scenario-$PROFILE-$S.json"
+    # On hostile links (high loss/latency, esp. over QUIC) the big bulk
+    # transfers are far too slow to finish in a CI time budget — a 32 MiB upload
+    # over 5% loss can exceed several minutes. Shrink the payloads there: the
+    # goal on these profiles is to prove loss/latency are SURVIVED (recovery
+    # works, stream still completes), not to measure raw throughput. Fast links
+    # keep the full sizes.
+    SIZE_ARGS=()
+    case "$PROFILE" in
+      lossy | satellite | mobile_3g)
+        case "$S" in
+          large-upload) SIZE_ARGS=(--bytes 2097152) ;;   # 32 MiB -> 2 MiB
+          single-stream) SIZE_ARGS=(--bytes 2097152) ;;  # 16 MiB -> 2 MiB
+          download) SIZE_ARGS=(--bytes 2097152) ;;       #  8 MiB -> 2 MiB
+          upload) SIZE_ARGS=(--bytes 2097152) ;;         #  4 MiB -> 2 MiB
+          bidirectional) SIZE_ARGS=(--bytes 1048576) ;;  #  4 MiB -> 1 MiB
+          video-hd) SIZE_ARGS=(--video-kbps 2000) ;;     # 15 Mbit -> 2 Mbit
+          video) SIZE_ARGS=(--video-kbps 2000) ;;        #  5 Mbit -> 2 Mbit
+          chat) SIZE_ARGS=(--iterations 15) ;;           # 40 -> 15 messages
+        esac
+        ;;
+    esac
     if "$TRAFFICGEN" --socks "$CLIENT_SOCKS" --connect-host origin.internal --connect-port 80 \
         --scenario "$S" --link-name "$PROFILE" --timeout-secs "$SCEN_TIMEOUT" \
+        "${SIZE_ARGS[@]}" \
         --report "$OUT" >>"$WORKDIR/trafficgen.log" 2>&1; then
       echo "   [ok]   $S"
     else
