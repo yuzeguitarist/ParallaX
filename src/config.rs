@@ -1180,6 +1180,16 @@ fn probe_dir_writable(dir: &Path) -> ReplayCacheWritability {
         if existing.is_dir() {
             break;
         }
+        if existing.exists() {
+            // A path component exists but is NOT a directory (e.g. a regular
+            // file). `create_dir_all` will fail on it at startup, so report it as
+            // not writable rather than as a creatable-parent — otherwise `plx
+            // check` says "ok, creatable" for a config the server cannot start.
+            return ReplayCacheWritability::NotWritable {
+                dir: existing.to_path_buf(),
+                intended_parent: dir.to_path_buf(),
+            };
+        }
         missing_parent = true;
         match existing.parent() {
             Some(p) if !p.as_os_str().is_empty() => existing = p,
@@ -1209,10 +1219,16 @@ fn probe_dir_writable(dir: &Path) -> ReplayCacheWritability {
 
 /// Attempt to create and immediately remove a uniquely-named probe file in `dir`.
 /// Returns `true` iff the create succeeded (the directory is writable). The probe
-/// file name is derived from the process id and never collides with a real cache
-/// file, so it never disturbs live state.
+/// file name combines the process id with a per-call sequence number, so it never
+/// collides with a real cache file and stays unique even when several checks run
+/// concurrently in one process (e.g. parallel test threads share a pid).
 fn dir_accepts_probe_file(dir: &Path) -> bool {
-    let probe = dir.join(format!(".parallax-check-probe.{}", std::process::id()));
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe = dir.join(format!(
+        ".parallax-check-probe.{}.{seq}",
+        std::process::id()
+    ));
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2723,6 +2739,29 @@ authorized_sni = ["example.com"]
 
         // Restore write perms so the tempdir cleans up.
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn probe_dir_writable_reports_not_writable_when_a_component_is_a_file() {
+        // A path component that already exists as a regular file (not a
+        // directory) makes `create_dir_all` fail at startup, so the preflight
+        // must report NotWritable rather than "creatable" — otherwise `plx check`
+        // greenlights a config the server cannot start on.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("iam-a-file");
+        fs::write(&file, b"not a directory").unwrap();
+        // Intended replay-cache parent sits *under* the file component.
+        let intended = file.join("state");
+        match probe_dir_writable(&intended) {
+            ReplayCacheWritability::NotWritable {
+                dir: d,
+                intended_parent,
+            } => {
+                assert_eq!(d, file);
+                assert_eq!(intended_parent, intended);
+            }
+            other => panic!("expected NotWritable for a non-directory component, got {other:?}"),
+        }
     }
 
     #[test]
