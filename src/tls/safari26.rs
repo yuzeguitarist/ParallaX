@@ -2738,6 +2738,72 @@ mod tests {
         ));
     }
 
+    async fn await_http2_settings_ack_keeps_reading_at_exactly_the_buffer_limit() {
+        let mut session = test_session();
+        let (mut stream, peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // Accumulate EXACTLY H2_FRAME_BUFFER_LIMIT (64 KiB) of inner application-data
+        // that never completes a single HTTP/2 frame: the first 9 bytes are a header
+        // announcing a ~16 MiB DATA frame (type 0x0, not SETTINGS) and the rest is
+        // filler, so `process_http2_frames` consumes nothing and `plaintext` grows to
+        // exactly the limit. At the limit the guard `plaintext.len() > LIMIT` is FALSE,
+        // so the real code keeps reading and surfaces the trailing alert as an error.
+        // This pins the STRICT `>`: a `<`, `==`, or `>=` there would instead return Ok
+        // early and never read the alert (verified against all three by manual mutation),
+        // so this one case kills every comparison mutant cargo-mutants flagged here.
+        const CHUNK: usize = 16_000;
+        let sizes = [
+            CHUNK,
+            CHUNK,
+            CHUNK,
+            CHUNK,
+            H2_FRAME_BUFFER_LIMIT - 4 * CHUNK,
+        ];
+        let mut records = Vec::new();
+        for (i, &size) in sizes.iter().enumerate() {
+            let mut inner = vec![0_u8; size];
+            if i == 0 {
+                // 3-byte length = 0x00FF_FFFF, then frame type 0x0 (DATA).
+                inner[0..4].copy_from_slice(&[0xff, 0xff, 0xff, 0x00]);
+            }
+            records.push(
+                peer_keys
+                    .server_application
+                    .encrypt_record(TLS_RECORD_APPLICATION_DATA, &inner)
+                    .unwrap(),
+            );
+        }
+        // The trailing outer alert is reached ONLY if the guard did not stop the loop.
+        let trailing_alert = tls_record(TLS_CONTENT_ALERT, &[0x02, 0x28]);
+
+        // Feed concurrently: 64 KB can exceed the loopback socket buffer, so a
+        // sequential write-then-read would deadlock; the reader drains as we fill.
+        let writer = tokio::spawn(async move {
+            let mut peer = peer;
+            for record in records {
+                if peer.write_all(&record).await.is_err() {
+                    return;
+                }
+            }
+            let _ = peer.write_all(&trailing_alert).await;
+        });
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x02,
+                description: 0x28
+            }
+        ));
+        let _ = writer.await;
+    }
+
     // ---- CompletedSafari26Handshake accessors ----
 
     #[test]
