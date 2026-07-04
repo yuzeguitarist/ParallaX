@@ -175,6 +175,15 @@ const MAX_STREAM_REASSEMBLY: usize = 2 * 1024 * 1024;
 /// byte cap): bounds buffered tuples against a tiny-fragment flood.
 const MAX_STREAM_PENDING_FRAGMENTS: usize = 4096;
 
+/// Cap on out-of-order STREAM bytes buffered across ALL streams, tied to the
+/// connection receive window. The per-stream cap composes badly on its own:
+/// duplicate/overlapping fragments below a stream's high watermark cost (almost)
+/// no connection flow-control credit, so [`MAX_PEER_STREAMS`] of each kind ×
+/// [`MAX_STREAM_REASSEMBLY`] (~256 MiB) could be buffered while
+/// [`CONN_RECV_WINDOW`] (16 MiB) is never engaged. This aggregate budget
+/// restores the connection-level bound the flow-control design assumes.
+const MAX_CONN_REASSEMBLY: usize = CONN_RECV_WINDOW as usize;
+
 /// RFC 9000 §18.2 default `ack_delay_exponent`. The peer scales its ACK `delay`
 /// field by `2^exponent` microseconds; we decode with the default (neither we nor
 /// the Safari client negotiate a different value).
@@ -493,13 +502,19 @@ fn is_uni(id: u64) -> bool {
 ///      counting against the reassembly budget (see the inline notes that this
 ///      replaced — a fragment an overlapping fill jumped entirely past matches
 ///      no removal path and would otherwise linger forever).
+///
+/// Returns the number of buffered bytes removed from `pending` (drained or
+/// evicted), so the STREAM caller can settle the connection-wide reassembly
+/// budget ([`MAX_CONN_REASSEMBLY`]); the CRYPTO caller has no aggregate budget
+/// and ignores it.
 fn drain_contiguous(
     pending: &mut Vec<(u64, Vec<u8>)>,
     recv_off: &mut u64,
     offset: u64,
     data: &[u8],
     sink: &mut Vec<u8>,
-) {
+) -> usize {
+    let mut freed = 0;
     let skip = (*recv_off - offset) as usize;
     if skip < data.len() {
         sink.extend_from_slice(&data[skip..]);
@@ -513,8 +528,16 @@ fn drain_contiguous(
         let s = (*recv_off - o) as usize;
         sink.extend_from_slice(&d[s..]);
         *recv_off += (d.len() - s) as u64;
+        freed += d.len();
     }
-    pending.retain(|(o, d)| *o + d.len() as u64 > *recv_off);
+    pending.retain(|(o, d)| {
+        let keep = *o + d.len() as u64 > *recv_off;
+        if !keep {
+            freed += d.len();
+        }
+        keep
+    });
+    freed
 }
 
 /// A hand-rolled QUIC v1 connection (client or server), carried to handshake
@@ -637,6 +660,10 @@ pub struct Connection {
     recv_max_data_sent: u64,
     recv_data_total: u64,
     recv_data_consumed: u64,
+    /// Out-of-order STREAM bytes currently buffered across all streams'
+    /// `recv_pending` (bounded by [`MAX_CONN_REASSEMBLY`]): incremented on push,
+    /// decremented as `drain_contiguous` drains/evicts fragments.
+    recv_pending_total: usize,
     /// A grown connection window owes the peer a MAX_DATA update.
     need_max_data: bool,
     /// Whether the peer's transport-parameter flow-control limits have been applied.
@@ -738,6 +765,7 @@ impl Connection {
             recv_max_data_sent: CONN_RECV_WINDOW,
             recv_data_total: 0,
             recv_data_consumed: 0,
+            recv_pending_total: 0,
             need_max_data: false,
             peer_flow_applied: false,
             peer_msd_bidi_local: 0,
@@ -2904,28 +2932,43 @@ impl Connection {
         // NOT this buffer: a zero-length fragment (e.g. a bare FIN, already recorded
         // above) carries nothing to reassemble, and duplicate/overlapping fragments
         // do not advance the watermark yet still buffer bytes. Drop empties and cap
-        // both buffered bytes and entry count (memory-exhaustion DoS otherwise).
+        // buffered bytes (per stream AND connection-wide) and entry count
+        // (memory-exhaustion DoS otherwise).
         if offset > s.recv_off {
             if !data.is_empty() {
+                // A fragment fully covered by an already-buffered one reassembles
+                // nothing new; drop it rather than buffer another copy. A retransmit
+                // duplicate leaves the high watermark unchanged (delta == 0), so it
+                // would otherwise consume reassembly budget at zero flow-control
+                // cost. Partial overlaps still buffer (they may fill gaps).
+                if s.recv_pending
+                    .iter()
+                    .any(|(o, d)| *o <= offset && *o + d.len() as u64 >= end)
+                {
+                    return Ok(());
+                }
                 let buffered: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
                 if buffered + data.len() > MAX_STREAM_REASSEMBLY
                     || s.recv_pending.len() >= MAX_STREAM_PENDING_FRAGMENTS
+                    || self.recv_pending_total + data.len() > MAX_CONN_REASSEMBLY
                 {
                     return Err(QuicTlsError::Crypto(
                         "stream reassembly buffer exceeded".into(),
                     ));
                 }
+                self.recv_pending_total += data.len();
                 s.recv_pending.push((offset, data.to_vec()));
             }
             return Ok(());
         }
-        drain_contiguous(
+        let freed = drain_contiguous(
             &mut s.recv_pending,
             &mut s.recv_off,
             offset,
             data,
             &mut s.recv,
         );
+        self.recv_pending_total -= freed;
         Ok(())
     }
 
@@ -4625,8 +4668,9 @@ mod tests {
     #[test]
     fn duplicate_out_of_order_stream_fragments_are_bounded() {
         // Each duplicate of a future-offset fragment leaves the flow-control high
-        // watermark unchanged (delta 0), so only the reassembly cap bounds the
-        // buffer. Without it, recv_pending would grow without bound.
+        // watermark unchanged (delta 0), so flow control never bounds it. It is
+        // fully covered by the already-buffered copy, so it must be dropped:
+        // buffering every copy would grow recv_pending at zero flow-control cost.
         let mut server = Connection::new_server(
             vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
             &server_key(),
@@ -4636,24 +4680,73 @@ mod tests {
         )
         .unwrap();
         let chunk = vec![0xAB; 1000];
-        let mut accepted = 0usize;
-        let mut rejected = false;
         for _ in 0..5000 {
-            match server.recv_stream(0, 10_000, false, &chunk) {
-                Ok(()) => accepted += 1,
-                Err(_) => {
+            server.recv_stream(0, 10_000, false, &chunk).unwrap();
+        }
+        assert_eq!(
+            server.streams[&0].recv_pending.len(),
+            1,
+            "duplicate out-of-order fragments are dropped, not buffered"
+        );
+        assert_eq!(server.recv_pending_total, chunk.len());
+        // The retained copy still reassembles once the gap is filled.
+        server
+            .recv_stream(0, 0, false, &vec![0xCC; 10_000])
+            .unwrap();
+        assert_eq!(server.streams[&0].recv_off, 11_000);
+        assert!(server.streams[&0].recv_pending.is_empty());
+        assert_eq!(
+            server.recv_pending_total, 0,
+            "drained fragments release the connection-wide budget"
+        );
+    }
+
+    #[test]
+    fn out_of_order_reassembly_is_bounded_connection_wide() {
+        // Overlapping future-offset fragments cost only their 1-byte watermark
+        // delta in connection flow-control credit yet buffer their full length,
+        // so the per-stream cap alone would let MAX_PEER_STREAMS × 2 MiB (≈128 MiB
+        // per kind) accumulate while CONN_RECV_WINDOW is never engaged. The
+        // aggregate budget must reject buffering past MAX_CONN_REASSEMBLY.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x6c, 0x6c, 0x6c, 0x6c]),
+        )
+        .unwrap();
+        let chunk = vec![0xCD; 256 * 1024];
+        let mut rejected = false;
+        'streams: for n in 0..MAX_PEER_STREAMS as u64 {
+            let id = n * 4; // client-initiated bidi (peer-initiated for the server)
+            for i in 0..8u64 {
+                // Each fragment extends the previous by one byte, so it is not a
+                // full duplicate (it is buffered) but costs only delta == 1 after
+                // the first (which charges its full length).
+                if server.recv_stream(id, i + 1, false, &chunk).is_err() {
                     rejected = true;
-                    break;
+                    break 'streams;
                 }
             }
         }
         assert!(
             rejected,
-            "duplicate out-of-order fragments are eventually rejected"
+            "aggregate out-of-order buffering is eventually rejected"
         );
         assert!(
-            accepted <= MAX_STREAM_REASSEMBLY / chunk.len() + 1,
-            "recv_pending is bounded by the byte cap (accepted {accepted})"
+            server.recv_pending_total <= MAX_CONN_REASSEMBLY,
+            "buffering never exceeds the connection-wide budget ({})",
+            server.recv_pending_total
+        );
+        let buffered: usize = server
+            .streams
+            .values()
+            .flat_map(|s| s.recv_pending.iter().map(|(_, d)| d.len()))
+            .sum();
+        assert_eq!(
+            buffered, server.recv_pending_total,
+            "the budget accounting matches the bytes actually buffered"
         );
     }
 
