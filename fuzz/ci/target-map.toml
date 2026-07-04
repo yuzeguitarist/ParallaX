@@ -141,6 +141,13 @@ max_len = 65536
 timeout = 20
 paths = ["src/protocol/command.rs", "src/crypto/pq.rs"]
 
+[targets.framed_reassembler]
+sanitizer = "none"
+rss = 1024
+max_len = 65536
+timeout = 20
+paths = ["src/protocol/command.rs"]
+
 [targets.replay_journal]
 sanitizer = "none"
 rss = 1024
