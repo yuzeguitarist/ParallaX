@@ -111,6 +111,13 @@ max_len = 8192
 timeout = 20
 paths = ["src/fingerprint/http3.rs"]
 
+[targets.quic_transport_params]
+sanitizer = "address"
+rss = 1024
+max_len = 4096
+timeout = 20
+paths = ["src/transport/udp/quic/transport_params.rs"]
+
 # --- box-b group: sanitizer = none + `-C overflow-checks=on` (codecs/arith) ----
 
 [targets.mux_frame]

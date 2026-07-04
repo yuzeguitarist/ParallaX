@@ -19,3 +19,12 @@ pub mod util;
 
 pub const PROTOCOL_NAME: &str = "ParallaX";
 pub const PROTOCOL_VERSION: u8 = 1;
+
+/// Fuzz-only re-exports for `pub(crate)` QUIC internals that fuzz targets must
+/// reach. The QUIC modules (`transport::udp::quic::*`) are deliberately
+/// crate-private; this aggregator surfaces a thin shim ONLY under `--cfg fuzzing`
+/// (which cargo-fuzz sets), so production API surface is unchanged.
+#[cfg(fuzzing)]
+pub mod quic_fuzz {
+    pub use crate::transport::udp::quic::transport_params::fuzz as transport_params;
+}
