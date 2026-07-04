@@ -438,6 +438,10 @@ struct ConnShared {
     /// Wakers of `RecvStream::poll_read` calls blocked for data, woken by the
     /// driver after each event. (Async handles use `event` instead.)
     read_wakers: Mutex<Vec<Waker>>,
+    /// Wakers of `SendStream::poll_write` calls blocked on send-buffer capacity
+    /// (backpressure), woken by the driver after each event (ACK progress
+    /// reclaims buffer space).
+    write_wakers: Mutex<Vec<Waker>>,
     /// Set once the connection has been pushed to the accept queue (server only).
     accept_taken: std::sync::atomic::AtomicBool,
 }
@@ -465,10 +469,23 @@ impl ConnShared {
         }
     }
 
-    /// Wake every blocked reader + async waiter (called by the driver after events).
+    /// Register a `poll_write` waker (deduplicated). Called while holding the core
+    /// lock so the driver cannot ack + wake between the capacity check and here.
+    fn register_write_waker(&self, w: &Waker) {
+        let mut wakers = self.write_wakers.lock().unwrap();
+        if !wakers.iter().any(|e| e.will_wake(w)) {
+            wakers.push(w.clone());
+        }
+    }
+
+    /// Wake every blocked reader, writer + async waiter (called by the driver
+    /// after events).
     fn wake_handles(&self) {
         self.event.notify_waiters();
         for w in std::mem::take(&mut *self.read_wakers.lock().unwrap()) {
+            w.wake();
+        }
+        for w in std::mem::take(&mut *self.write_wakers.lock().unwrap()) {
             w.wake();
         }
     }
@@ -1034,6 +1051,7 @@ impl Driver {
             event: Notify::new(),
             wake: self.wake.clone(),
             read_wakers: Mutex::new(Vec::new()),
+            write_wakers: Mutex::new(Vec::new()),
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
         let _ = shared
@@ -1253,6 +1271,7 @@ impl Driver {
             event: Notify::new(),
             wake: self.wake.clone(),
             read_wakers: Mutex::new(Vec::new()),
+            write_wakers: Mutex::new(Vec::new()),
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
         self.conns.insert(req.addr, shared.clone());
@@ -1625,7 +1644,7 @@ impl SendStream {
 impl AsyncWrite for SendStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut core = self.shared.core.lock().unwrap();
@@ -1637,10 +1656,23 @@ impl AsyncWrite for SendStream {
                 "connection closed",
             )));
         }
-        core.send_stream(self.id, data);
+        // Backpressure (memory-DoS guard, finding #28): the core caps each stream's
+        // buffered send backlog; without a cap an app writing faster than the peer
+        // acks would grow the buffer without bound. Accept at most the remaining
+        // capacity (a short write is a correct `AsyncWrite` outcome); at zero, park
+        // until the driver's ACK processing reclaims buffer space and wakes us.
+        // Register the waker while holding the core lock so the driver cannot ack +
+        // wake between the capacity check and registration (lost-wakeup avoidance).
+        let capacity = core.stream_send_capacity(self.id);
+        if capacity == 0 && !data.is_empty() {
+            self.shared.register_write_waker(cx.waker());
+            return Poll::Pending;
+        }
+        let n = data.len().min(capacity);
+        core.send_stream(self.id, &data[..n]);
         drop(core);
         self.shared.nudge();
-        Poll::Ready(Ok(data.len()))
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -2036,6 +2068,56 @@ mod tests {
         ctrl.finish();
         let got = srv.await.unwrap();
         assert_eq!(got, b"H3-SETTINGS", "uni stream delivered to accept_uni");
+    }
+
+    #[tokio::test]
+    async fn send_backpressure_short_writes_at_the_cap_and_still_delivers() {
+        // Finding #28: poll_write must not buffer without bound. A write larger than
+        // the per-stream send cap is accepted only up to the cap (a short write);
+        // the rest lands as ACKs reclaim buffer space, and every byte still arrives
+        // in order.
+        use super::super::conn::STREAM_SEND_BUFFER;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap();
+            let mut recv = conn.accept_uni().await.unwrap();
+            let mut got = Vec::new();
+            recv.read_to_end(&mut got).await.unwrap();
+            got
+        });
+
+        let conn = client.connect(server_addr, "example.com").await.unwrap();
+        let mut send = conn.open_uni();
+
+        // 1.5x the cap in one write: only the cap's worth may be accepted up front.
+        let payload: Vec<u8> = (0..(STREAM_SEND_BUFFER + STREAM_SEND_BUFFER / 2) as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let n = send.write(&payload).await.unwrap();
+        assert_eq!(
+            n, STREAM_SEND_BUFFER,
+            "a fresh stream accepts exactly the send-buffer cap, not the whole write"
+        );
+        // The remainder needs ACK progress to reclaim buffer space (poll_write parks
+        // on zero capacity until the driver wakes it).
+        tokio::time::timeout(Duration::from_secs(30), send.write_all(&payload[n..]))
+            .await
+            .expect("backpressured write completes once acks reclaim the buffer")
+            .unwrap();
+        send.finish();
+
+        let got = tokio::time::timeout(Duration::from_secs(30), srv)
+            .await
+            .expect("server reads the whole stream in time")
+            .unwrap();
+        assert_eq!(got, payload, "all bytes delivered in order past the cap");
     }
 
     #[tokio::test]
