@@ -172,4 +172,40 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn mldsa87_identity_signature_binds_epoch() {
+        // The epoch is authenticated (folded into the signed message), so a
+        // signature minted for one epoch must not verify against another — this
+        // is what prevents an identity proof from being lifted across a key
+        // rotation. Neither happy-path test varies the epoch, so pin it here.
+        let keys = keypair();
+        let transcript_hash = [7_u8; 32];
+        let x25519 = [9_u8; 32];
+        let binding = pq_rekey_binding(b"client pq", b"server kex");
+        let signature =
+            sign_server_identity(&keys.secret, &transcript_hash, &x25519, &binding, 41).unwrap();
+
+        // Same everything, one epoch later: must fail closed.
+        assert!(verify_server_identity(
+            &keys.public,
+            &signature,
+            &transcript_hash,
+            &x25519,
+            &binding,
+            42,
+        )
+        .is_err());
+
+        // Sanity: it does verify at the epoch it was signed under.
+        verify_server_identity(
+            &keys.public,
+            &signature,
+            &transcript_hash,
+            &x25519,
+            &binding,
+            41,
+        )
+        .unwrap();
+    }
 }
