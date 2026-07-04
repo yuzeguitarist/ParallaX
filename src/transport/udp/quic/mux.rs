@@ -91,3 +91,80 @@ pub(crate) enum SubstreamCodecError {
     #[error("invalid padding profile: {0}")]
     Padding(#[from] crate::traffic::TrafficError),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::session::{derive_client_keys, X25519KeyPair};
+    use rand::rngs::OsRng;
+
+    const TEST_PSK: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz!@#$";
+
+    // Both ends agree on the same `SessionKeys` after the handshake (client and
+    // server DH derive an identical struct), so a single value stands in for both
+    // in these codec-level tests — matching the treatment in `crypto::session`.
+    fn session_keys() -> SessionKeys {
+        let client = X25519KeyPair::generate();
+        let server = X25519KeyPair::generate();
+        derive_client_keys(TEST_PSK, &client.private, &server.public, &[7_u8; 32]).unwrap()
+    }
+
+    // The whole point of per-substream derivation is that the client's seal-to-server
+    // codec and the server's open-from-client codec — built independently from the
+    // SAME stream id — interoperate. This catches a direction/AAD/key swap in
+    // `client_substream_codecs` or `server_substream_codecs` that the key-derivation
+    // tests in `crypto::session` cannot (they never build a `DataRecordCodec`).
+    #[test]
+    fn client_seal_round_trips_through_server_open_on_the_same_stream() {
+        let keys = session_keys();
+        let traffic = TrafficConfig::default();
+        let stream_id = 4;
+
+        let (mut client_seal, _client_open) =
+            client_substream_codecs(&keys, traffic, stream_id).unwrap();
+        let (mut server_open, _server_seal) =
+            server_substream_codecs(&keys, traffic, stream_id).unwrap();
+
+        let payload = b"connect request on the mux substream";
+        let record = client_seal.seal(payload, &mut OsRng).unwrap();
+        assert_eq!(server_open.open(&record).unwrap(), payload);
+    }
+
+    // The reverse direction: the server's seal-to-client codec must open under the
+    // client's open-from-server codec for the same stream.
+    #[test]
+    fn server_seal_round_trips_through_client_open_on_the_same_stream() {
+        let keys = session_keys();
+        let traffic = TrafficConfig::default();
+        let stream_id = 8;
+
+        let (_client_seal, mut client_open) =
+            client_substream_codecs(&keys, traffic, stream_id).unwrap();
+        let (_server_open, mut server_seal) =
+            server_substream_codecs(&keys, traffic, stream_id).unwrap();
+
+        let payload = b"download bytes flowing back to the client";
+        let record = server_seal.seal(payload, &mut OsRng).unwrap();
+        assert_eq!(client_open.open(&record).unwrap(), payload);
+    }
+
+    // Cross-substream isolation: a record sealed on one stream must NOT open under a
+    // different stream's codec. This is the observable consequence of the
+    // per-stream `(key, nonce_base)` independence proven in `crypto::session`; if a
+    // future edit derived the codec from a constant instead of the stream id, two
+    // concurrent bidis would share keys (and reuse nonces) — this test would fail.
+    #[test]
+    fn record_sealed_on_one_stream_does_not_open_on_another() {
+        let keys = session_keys();
+        let traffic = TrafficConfig::default();
+
+        let (mut seal_on_1, _) = client_substream_codecs(&keys, traffic, 1).unwrap();
+        let (mut open_on_3, _) = server_substream_codecs(&keys, traffic, 3).unwrap();
+
+        let record = seal_on_1.seal(b"stream-1 payload", &mut OsRng).unwrap();
+        assert!(
+            open_on_3.open(&record).is_err(),
+            "a record sealed on stream 1 must not authenticate under stream 3's codec"
+        );
+    }
+}
