@@ -1424,8 +1424,22 @@ async fn udp_leg_clienthello_ja4_quic_matches_safari26_h3_oracle() {
 
     let capture_ja4 = |server: String| async move {
         let (crypto, _scid) = capture_udp_leg_full_client_hello(&server).await;
+        // Guard the reassembled CRYPTO stream before slicing: a capture that
+        // timed out or errored can return a short stream, and reading the 3-byte
+        // handshake length or the declared body out of bounds must surface as a
+        // clear test assertion, never an index panic.
+        assert!(
+            crypto.len() >= 4,
+            "captured CRYPTO stream too short for a handshake header: {} bytes",
+            crypto.len()
+        );
         let declared =
             4 + (((crypto[1] as usize) << 16) | ((crypto[2] as usize) << 8) | (crypto[3] as usize));
+        assert!(
+            crypto.len() >= declared,
+            "captured CRYPTO stream ({} bytes) shorter than the declared ClientHello ({declared} bytes)",
+            crypto.len()
+        );
         let record = wrap_handshake_as_tls_record(&crypto[..declared]);
         let parsed = parse_client_hello(&record).expect("reassembled ClientHello parses");
         ja4_quic(&parsed)
