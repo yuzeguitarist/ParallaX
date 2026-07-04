@@ -263,6 +263,16 @@ fn check_config(config: PathBuf) -> anyhow::Result<()> {
              `plx seal` to machine-bind the secrets, or move them into a 0600 sidecar file."
         );
     }
+    for (field, ip) in cfg.internal_outbound_targets() {
+        println!(
+            "warning: {field} = an internal/special IP ({ip}) (loopback, private, link-local \
+             incl. the cloud metadata endpoint, or unspecified)."
+        );
+        println!(
+            "         For the camouflage origin this should normally be a public address; \
+             ensure this is intentional."
+        );
+    }
     Ok(())
 }
 
