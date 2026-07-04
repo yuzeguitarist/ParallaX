@@ -317,10 +317,12 @@ pub struct ServerConfig {
     /// no marker is ever recovered, so the gate never runs whatever this contains.
     pub authorized_sni: Vec<String>,
     /// Maximum UDP payload read per datagram on this endpoint — the inbound recv
-    /// buffer size and the origin-splice relay buffer size (issue #75). Oversized
-    /// datagrams are truncated, which fails AEAD and is dropped. `0` means use the
-    /// built-in default ([`MAX_UDP_PAYLOAD`]); the server runtime resolves it from
-    /// `udp.max_udp_payload_bytes`.
+    /// buffer size (issue #75). Oversized datagrams are truncated, which fails
+    /// AEAD and is dropped. `0` means use the built-in default
+    /// ([`MAX_UDP_PAYLOAD`]); the server runtime resolves it from
+    /// `udp.max_udp_payload_bytes`. The origin-splice relay is deliberately NOT
+    /// sized by this cap: its origin→client pump buffer holds the largest possible
+    /// UDP datagram so origin replies are never silently truncated (finding #35).
     pub max_udp_payload: usize,
 }
 
@@ -1229,8 +1231,7 @@ impl Driver {
         if self.splices.len() >= MAX_SPLICE_FLOWS {
             return;
         }
-        let cap = self.recv_cap();
-        if let Ok(flow) = SpliceFlow::open(self.socket.clone(), peer, origin, first, cap) {
+        if let Ok(flow) = SpliceFlow::open(self.socket.clone(), peer, origin, first) {
             self.splices.insert(peer, (flow, now));
         }
     }
