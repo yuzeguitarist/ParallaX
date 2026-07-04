@@ -39,6 +39,10 @@ enum Command {
     Relay(RelayArgs),
     /// Actively probe the ParallaX server and compare to a reference origin.
     Probe(ProbeArgs),
+    /// Negative control: emit KNOWN-detectable flows (a naive obfuscated proxy
+    /// and a plaintext tunnel) at a target so the analyzer's teeth can be
+    /// verified. If these are NOT flagged, the detector is broken/rigged.
+    Adversary(AdversaryArgs),
 }
 
 #[derive(Parser)]
@@ -65,6 +69,17 @@ struct RelayArgs {
     /// Optional auto-stop after N seconds (0 = run until SIGINT/SIGTERM).
     #[arg(long, default_value_t = 0)]
     duration_secs: u64,
+}
+
+#[derive(Parser)]
+struct AdversaryArgs {
+    /// Target to connect to (the gfw-box relay's TCP ingress in the control
+    /// phase, so the box records + analyses these known-bad first flights).
+    #[arg(long, default_value = "127.0.0.1:9500")]
+    target: SocketAddr,
+    /// How many rounds of each adversary flavour to emit.
+    #[arg(long, default_value_t = 1)]
+    rounds: usize,
 }
 
 #[derive(Parser)]
@@ -123,6 +138,48 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Relay(args) => run_relay(args).await,
         Command::Probe(args) => run_probe(args).await,
+        Command::Adversary(args) => run_adversary(args).await,
+    }
+}
+
+/// Emit known-detectable first flights so the passive analyzer can be validated
+/// (a negative control). Each flavour opens its own connection, sends its first
+/// flight, briefly reads, and closes — exactly a naive proxy would.
+async fn run_adversary(args: AdversaryArgs) -> Result<()> {
+    eprintln!(
+        "gfw-box adversary: target={} rounds={} (emitting known-detectable flows)",
+        args.target, args.rounds
+    );
+    let mut rng = rand::thread_rng();
+    for _ in 0..args.rounds.max(1) {
+        // 1) "fully encrypted" obfuscated proxy: high-entropy random first flight.
+        let mut random_flow = vec![0u8; 512];
+        rng.fill(&mut random_flow[..]);
+        emit_flow(&args.target, &random_flow).await;
+
+        // 2) plaintext tunnel: a cleartext, non-TLS first flight.
+        let plaintext = b"OBFS-PROXY HELLO v1: this is not a TLS record\n".to_vec();
+        emit_flow(&args.target, &plaintext).await;
+    }
+    // Give the relay a moment to record the flows before it is asked to report.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(())
+}
+
+async fn emit_flow(target: &SocketAddr, first_flight: &[u8]) {
+    let attempt = async {
+        let mut s = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(target))
+            .await
+            .context("adversary connect timeout")??;
+        s.set_nodelay(true).ok();
+        s.write_all(first_flight).await?;
+        let mut buf = [0u8; 256];
+        let _ = tokio::time::timeout(Duration::from_millis(500), s.read(&mut buf)).await;
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(e) = attempt {
+        eprintln!("adversary flow error (non-fatal): {e:#}");
     }
 }
 

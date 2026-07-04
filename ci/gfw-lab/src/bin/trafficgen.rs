@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use rand::Rng;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -49,7 +50,8 @@ struct Cli {
     /// SOCKS5 CONNECT target port.
     #[arg(long, default_value_t = 80)]
     connect_port: u16,
-    /// Scenario name (download/upload/bidirectional/serial/parallel/single-stream/video/call/web).
+    /// Scenario name (download/upload/bidirectional/serial/parallel/single-stream/video/call/web/
+    /// large-upload/video-hd/web-heavy/chat/burst/api-poll/mixed/download-ramp).
     #[arg(long)]
     scenario: String,
     /// Label copied into the report's `link_profile`.
@@ -178,14 +180,21 @@ async fn run_scenario(cli: &Cli, s: &Scenario) -> Result<Measurement> {
         ScenarioKind::Download | ScenarioKind::SingleStream => {
             run_single_download(&target, s.bytes).await
         }
-        ScenarioKind::Upload => run_single_upload(&target, s.bytes).await,
+        ScenarioKind::Upload | ScenarioKind::LargeUpload => {
+            run_single_upload(&target, s.bytes).await
+        }
         ScenarioKind::Bidirectional => run_bidir(&target, s.bytes).await,
         ScenarioKind::Serial => run_serial(&target, s).await,
-        ScenarioKind::Parallel | ScenarioKind::Web => {
+        ScenarioKind::Parallel | ScenarioKind::Web | ScenarioKind::WebHeavy => {
             run_parallel(&target, s.bytes, s.concurrency).await
         }
-        ScenarioKind::Video => run_video(&target, s).await,
+        ScenarioKind::Video | ScenarioKind::VideoHd => run_video(&target, s).await,
         ScenarioKind::Call => run_call(&target, s).await,
+        ScenarioKind::Chat => run_chat(&target, s).await,
+        ScenarioKind::Burst => run_burst(&target, s).await,
+        ScenarioKind::ApiPoll => run_api_poll(&target, s).await,
+        ScenarioKind::Mixed => run_mixed(&target, s).await,
+        ScenarioKind::DownloadRamp => run_download_ramp(&target).await,
     }
 }
 
@@ -436,6 +445,257 @@ async fn run_call(t: &Target, s: &Scenario) -> Result<Measurement> {
             "call {} frames x {} B @ {}ms, median rtt {:.2}ms",
             s.iterations, s.frame_bytes, s.interval_ms, summary.median
         ),
+        ..Default::default()
+    })
+}
+
+/// Messaging shape: small echo frames on one keep-alive tunnel with a
+/// randomized idle gap between sends (uniform in [interval_ms/4 ..
+/// interval_ms*3]); per-message round-trip time is recorded.
+async fn run_chat(t: &Target, s: &Scenario) -> Result<Measurement> {
+    if s.frame_bytes == 0 {
+        bail!("chat: frame_bytes must be > 0");
+    }
+    let mut conn = HttpConn::connect(t).await?;
+    let frame = s.frame_bytes as u64;
+    let mut rtts = Vec::with_capacity(s.iterations);
+
+    for i in 0..s.iterations {
+        // Sporadic, human-like pause before every message after the first.
+        if i > 0 {
+            let gap_ms = rand::thread_rng().gen_range(s.interval_ms / 4..=s.interval_ms * 3);
+            tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+        }
+
+        let t0 = Instant::now();
+        conn.write_all(
+            format!(
+                "POST /echo HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n",
+                t.host, frame
+            )
+            .as_bytes(),
+        )
+        .await?;
+        conn.write_fill(frame, FILL).await?;
+        conn.flush().await?;
+
+        let head = conn.read_head().await?;
+        if head.code != 200 {
+            bail!("chat: unexpected status {}", head.code);
+        }
+        let cl = head
+            .content_length
+            .context("chat: missing Content-Length")?;
+        if cl != frame {
+            bail!("chat: echo Content-Length {cl} != frame {frame}");
+        }
+        let got = conn.drain_exact(cl).await?;
+        if got != cl {
+            bail!("chat: short echo {got} of {cl}");
+        }
+        rtts.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let bytes = s.iterations as u64 * frame * 2;
+    let summary = Summary::of(&rtts);
+    Ok(Measurement {
+        rtt_ms: Some(summary.clone()),
+        bytes_transferred: Some(bytes),
+        detail: format!(
+            "chat {} msgs x {} B, gaps [{}..{}]ms, median rtt {:.2}ms",
+            s.iterations,
+            s.frame_bytes,
+            s.interval_ms / 4,
+            s.interval_ms * 3,
+            summary.median
+        ),
+        ..Default::default()
+    })
+}
+
+/// On/off browsing shape: `iterations` cycles of one download then an idle
+/// gap, all on one keep-alive tunnel. Throughput is over the ACTIVE transfer
+/// time only (idle sleeps excluded).
+async fn run_burst(t: &Target, s: &Scenario) -> Result<Measurement> {
+    if s.bytes == 0 {
+        bail!("burst: bytes must be > 0");
+    }
+    let mut conn = HttpConn::connect(t).await?;
+    let mut active = Duration::ZERO;
+    let mut total = 0u64;
+
+    for i in 0..s.iterations {
+        let t0 = Instant::now();
+        conn.write_all(download_req(&t.host, s.bytes, 0).as_bytes())
+            .await?;
+        conn.flush().await?;
+        let head = conn.read_head().await?;
+        if head.code != 200 {
+            bail!("burst: unexpected status {}", head.code);
+        }
+        let cl = head
+            .content_length
+            .context("burst: missing Content-Length")?;
+        if cl != s.bytes {
+            bail!("burst: Content-Length {cl} != requested {}", s.bytes);
+        }
+        let got = conn.drain_exact(cl).await?;
+        if got != cl {
+            bail!("burst: short read {got} of {cl}");
+        }
+        active += t0.elapsed();
+        total += got;
+        // Idle gap between bursts (skipped after the last one).
+        if i + 1 < s.iterations {
+            tokio::time::sleep(Duration::from_millis(s.interval_ms)).await;
+        }
+    }
+
+    let expected = s.iterations as u64 * s.bytes;
+    if total != expected {
+        bail!("burst: transferred {total} of expected {expected}");
+    }
+    let secs = active.as_secs_f64();
+    Ok(Measurement {
+        download_mbps: Some(throughput_mbps(total, secs)),
+        bytes_transferred: Some(total),
+        detail: format!(
+            "burst {} cycles x {} B = {total} B, active {secs:.3}s, idle {}ms/cycle",
+            s.iterations, s.bytes, s.interval_ms
+        ),
+        ..Default::default()
+    })
+}
+
+/// API-polling shape: small `GET /ping` requests at a fixed cadence on one
+/// keep-alive tunnel; per-request round-trip time is recorded.
+async fn run_api_poll(t: &Target, s: &Scenario) -> Result<Measurement> {
+    let mut conn = HttpConn::connect(t).await?;
+    let interval = Duration::from_millis(s.interval_ms);
+    let mut rtts = Vec::with_capacity(s.iterations);
+    let mut total = 0u64;
+    let start = Instant::now();
+
+    for i in 0..s.iterations {
+        // Keep a fixed polling cadence relative to the first request.
+        let due = start + interval * i as u32;
+        let now = Instant::now();
+        if due > now {
+            tokio::time::sleep(due - now).await;
+        }
+
+        let t0 = Instant::now();
+        conn.write_all(ping_req(&t.host).as_bytes()).await?;
+        conn.flush().await?;
+        let head = conn.read_head().await?;
+        if head.code != 200 {
+            bail!("api-poll: unexpected status {}", head.code);
+        }
+        let cl = head
+            .content_length
+            .context("api-poll: missing Content-Length")?;
+        let got = conn.drain_exact(cl).await?;
+        if got != cl {
+            bail!("api-poll: short read {got} of {cl}");
+        }
+        total += got;
+        rtts.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // `/ping` replies with the 4-byte body "pong".
+    let expected = s.iterations as u64 * 4;
+    if total != expected {
+        bail!("api-poll: transferred {total} of expected {expected}");
+    }
+    let summary = Summary::of(&rtts);
+    Ok(Measurement {
+        rtt_ms: Some(summary.clone()),
+        bytes_transferred: Some(total),
+        detail: format!(
+            "api-poll {} reqs @ {}ms, median rtt {:.2}ms",
+            s.iterations, s.interval_ms, summary.median
+        ),
+        ..Default::default()
+    })
+}
+
+/// Multitask shape: a paced video downlink and a VoIP-style call run
+/// concurrently on separate tunnels. Throughput comes from the video leg and
+/// the RTT summary from the call leg; ok requires both legs to succeed.
+async fn run_mixed(t: &Target, s: &Scenario) -> Result<Measurement> {
+    let video = Scenario {
+        kind: ScenarioKind::Video,
+        bytes: s.bytes,
+        concurrency: 1,
+        iterations: 1,
+        frame_bytes: 0,
+        interval_ms: 0,
+        video_kbps: s.video_kbps,
+    };
+    let call = Scenario {
+        kind: ScenarioKind::Call,
+        bytes: 0,
+        concurrency: 1,
+        iterations: s.iterations,
+        frame_bytes: s.frame_bytes,
+        interval_ms: s.interval_ms,
+        video_kbps: 0,
+    };
+
+    let (v, c) = tokio::join!(run_video(t, &video), run_call(t, &call));
+    let v = v.context("mixed: video leg failed")?;
+    let c = c.context("mixed: call leg failed")?;
+
+    let bytes = v.bytes_transferred.unwrap_or(0) + c.bytes_transferred.unwrap_or(0);
+    Ok(Measurement {
+        download_mbps: v.download_mbps,
+        rtt_ms: c.rtt_ms,
+        bytes_transferred: Some(bytes),
+        detail: format!("mixed: video [{}] + call [{}]", v.detail, c.detail),
+        ..Default::default()
+    })
+}
+
+/// Object sizes for the download-ramp scenario: 64 KiB, 256 KiB, 1 MiB, 4 MiB.
+const RAMP_SIZES: [u64; 4] = [64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+
+/// Ramp shape: sequential downloads of increasing size on one keep-alive
+/// tunnel; aggregate throughput is over the total transfer time.
+async fn run_download_ramp(t: &Target) -> Result<Measurement> {
+    let mut conn = HttpConn::connect(t).await?;
+    let start = Instant::now();
+    let mut total = 0u64;
+
+    for bytes in RAMP_SIZES {
+        conn.write_all(download_req(&t.host, bytes, 0).as_bytes())
+            .await?;
+        conn.flush().await?;
+        let head = conn.read_head().await?;
+        if head.code != 200 {
+            bail!("download-ramp: unexpected status {}", head.code);
+        }
+        let cl = head
+            .content_length
+            .context("download-ramp: missing Content-Length")?;
+        if cl != bytes {
+            bail!("download-ramp: Content-Length {cl} != requested {bytes}");
+        }
+        let got = conn.drain_exact(cl).await?;
+        if got != cl {
+            bail!("download-ramp: short read {got} of {bytes}");
+        }
+        total += got;
+    }
+
+    let secs = start.elapsed().as_secs_f64();
+    let expected: u64 = RAMP_SIZES.iter().sum();
+    if total != expected {
+        bail!("download-ramp: transferred {total} of expected {expected}");
+    }
+    Ok(Measurement {
+        download_mbps: Some(throughput_mbps(total, secs)),
+        bytes_transferred: Some(total),
+        detail: format!("ramp {RAMP_SIZES:?} = {total} B in {secs:.3}s"),
         ..Default::default()
     })
 }

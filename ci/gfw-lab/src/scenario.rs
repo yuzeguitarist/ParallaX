@@ -27,6 +27,22 @@ pub enum ScenarioKind {
     Call,
     /// Web-page shape: one burst of parallel small/medium objects.
     Web,
+    /// Bulk single-stream upload of a large object (client -> server).
+    LargeUpload,
+    /// HD streaming-video shape: like `Video` but at a higher bitrate.
+    VideoHd,
+    /// Heavy web-page shape: a larger burst of parallel small objects.
+    WebHeavy,
+    /// Messaging shape: sporadic small echoes with randomized idle gaps.
+    Chat,
+    /// On/off browsing shape: medium downloads separated by idle gaps.
+    Burst,
+    /// API-polling shape: tiny requests at a fixed cadence.
+    ApiPoll,
+    /// Multitask shape: concurrent video downlink + VoIP call on two tunnels.
+    Mixed,
+    /// Ramp shape: sequential downloads of increasing size on one tunnel.
+    DownloadRamp,
 }
 
 impl ScenarioKind {
@@ -41,6 +57,14 @@ impl ScenarioKind {
             ScenarioKind::Video => "video",
             ScenarioKind::Call => "call",
             ScenarioKind::Web => "web",
+            ScenarioKind::LargeUpload => "large-upload",
+            ScenarioKind::VideoHd => "video-hd",
+            ScenarioKind::WebHeavy => "web-heavy",
+            ScenarioKind::Chat => "chat",
+            ScenarioKind::Burst => "burst",
+            ScenarioKind::ApiPoll => "api-poll",
+            ScenarioKind::Mixed => "mixed",
+            ScenarioKind::DownloadRamp => "download-ramp",
         }
     }
 
@@ -55,6 +79,14 @@ impl ScenarioKind {
             "video" => ScenarioKind::Video,
             "call" => ScenarioKind::Call,
             "web" => ScenarioKind::Web,
+            "large-upload" => ScenarioKind::LargeUpload,
+            "video-hd" => ScenarioKind::VideoHd,
+            "web-heavy" => ScenarioKind::WebHeavy,
+            "chat" => ScenarioKind::Chat,
+            "burst" => ScenarioKind::Burst,
+            "api-poll" => ScenarioKind::ApiPoll,
+            "mixed" => ScenarioKind::Mixed,
+            "download-ramp" => ScenarioKind::DownloadRamp,
             _ => return None,
         })
     }
@@ -70,6 +102,14 @@ impl ScenarioKind {
             ScenarioKind::Video,
             ScenarioKind::Call,
             ScenarioKind::Web,
+            ScenarioKind::LargeUpload,
+            ScenarioKind::VideoHd,
+            ScenarioKind::WebHeavy,
+            ScenarioKind::Chat,
+            ScenarioKind::Burst,
+            ScenarioKind::ApiPoll,
+            ScenarioKind::Mixed,
+            ScenarioKind::DownloadRamp,
         ]
     }
 }
@@ -174,6 +214,86 @@ impl Scenario {
                 kind,
                 bytes: 64 * 1024,
                 concurrency: 12,
+                iterations: 1,
+                frame_bytes: 0,
+                interval_ms: 0,
+                video_kbps: 0,
+            },
+            ScenarioKind::LargeUpload => Scenario {
+                kind,
+                bytes: 32 * 1024 * 1024,
+                concurrency: 1,
+                iterations: 1,
+                frame_bytes: 0,
+                interval_ms: 0,
+                video_kbps: 0,
+            },
+            ScenarioKind::VideoHd => Scenario {
+                kind,
+                bytes: 0,
+                concurrency: 1,
+                iterations: 1,
+                frame_bytes: 0,
+                interval_ms: 250,
+                // ~15 Mbit/s HD stream for ~6 seconds of play-out.
+                video_kbps: 15000,
+            },
+            ScenarioKind::WebHeavy => Scenario {
+                kind,
+                bytes: 48 * 1024,
+                concurrency: 24,
+                iterations: 1,
+                frame_bytes: 0,
+                interval_ms: 0,
+                video_kbps: 0,
+            },
+            ScenarioKind::Chat => Scenario {
+                kind,
+                bytes: 0,
+                // 40 messages of 96 B with randomized idle gaps drawn from
+                // [interval_ms/4 .. interval_ms*3] (sporadic, human-chat-like).
+                concurrency: 1,
+                iterations: 40,
+                frame_bytes: 96,
+                interval_ms: 800,
+                video_kbps: 0,
+            },
+            ScenarioKind::Burst => Scenario {
+                kind,
+                // 8 on/off cycles: 512 KiB download then 500ms idle.
+                bytes: 512 * 1024,
+                concurrency: 1,
+                iterations: 8,
+                frame_bytes: 0,
+                interval_ms: 500,
+                video_kbps: 0,
+            },
+            ScenarioKind::ApiPoll => Scenario {
+                kind,
+                bytes: 0,
+                concurrency: 1,
+                // 60 pings at a fixed 500ms period (~30s of polling).
+                iterations: 60,
+                frame_bytes: 0,
+                interval_ms: 500,
+                video_kbps: 0,
+            },
+            ScenarioKind::Mixed => Scenario {
+                kind,
+                bytes: 0,
+                concurrency: 1,
+                // Call leg: 150 frames x 160 B @ 20ms; video leg: ~4 Mbit/s
+                // for ~6 seconds of play-out, on separate tunnels.
+                iterations: 150,
+                frame_bytes: 160,
+                interval_ms: 20,
+                video_kbps: 4000,
+            },
+            ScenarioKind::DownloadRamp => Scenario {
+                kind,
+                // Sizes are fixed in trafficgen: 64 KiB, 256 KiB, 1 MiB, 4 MiB.
+                bytes: 0,
+                concurrency: 1,
                 iterations: 1,
                 frame_bytes: 0,
                 interval_ms: 0,

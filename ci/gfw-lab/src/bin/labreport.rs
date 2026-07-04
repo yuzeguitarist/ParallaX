@@ -25,6 +25,12 @@ struct Cli {
     /// Passive GFW-box analysis report JSON(s), one per link profile (repeatable).
     #[arg(long = "box-report")]
     box_reports: Vec<PathBuf>,
+    /// Negative-control box report: known-bad flows that the analyzer MUST flag.
+    #[arg(long)]
+    control_report: Option<PathBuf>,
+    /// Minimum flows the control must flag for the detector to be trusted.
+    #[arg(long, default_value_t = 2)]
+    min_control_flagged: usize,
     /// Output path for the assembled LabReport JSON.
     #[arg(long, default_value = "lab-report.json")]
     out: PathBuf,
@@ -57,11 +63,27 @@ fn main() -> Result<()> {
     // Keep the last profile's report as the representative artifact in the JSON.
     let passive: Option<GfwBoxReport> = passive_reports.last().cloned();
 
-    // Pass policy:
+    // Negative control: the SAME analyzer, run over deliberately-detectable
+    // flows (a random/obfuscated tunnel + a plaintext tunnel), MUST flag them.
+    // This proves the detector has teeth and is not rigged to always pass — if
+    // the control is not flagged, the whole verdict is meaningless, so FAIL.
+    let control: Option<GfwBoxReport> = match &cli.control_report {
+        Some(p) => Some(load(p)?),
+        None => None,
+    };
+    let control_flagged = control.as_ref().map(|c| c.flagged_flows).unwrap_or(0);
+    let control_ok = match &control {
+        Some(_) => control_flagged >= cli.min_control_flagged,
+        // No control provided: cannot vouch for the detector -> do not pass.
+        None => false,
+    };
+
+    // Pass policy — ALL must hold:
     //   * every scenario completed (ok == true), AND
-    //   * the passive middle-box flagged ZERO flows as a proxy (across ALL
-    //     profiles), AND
-    //   * the active differential prober found NO distinguisher vs the origin.
+    //   * the passive middle-box flagged ZERO ParallaX flows as a proxy (across
+    //     ALL profiles), AND
+    //   * the active differential prober found NO distinguisher vs the origin, AND
+    //   * the negative control WAS flagged (detector is proven to have teeth).
     let scenarios_ok = scenarios.iter().all(|s| s.ok);
     let failed_scenarios: Vec<&str> = scenarios
         .iter()
@@ -71,10 +93,10 @@ fn main() -> Result<()> {
     let passive_ok = passive_flagged_flows == 0;
     let probe_ok = probe.as_ref().map(|p| !p.any_distinguisher).unwrap_or(true);
 
-    let pass = scenarios_ok && passive_ok && probe_ok;
+    let pass = scenarios_ok && passive_ok && probe_ok && control_ok;
 
     let summary = format!(
-        "transport={} scenarios={}/{} passed{} | passive: {} flows, {} flagged (across {} profile report(s)) | active probe: {} | verdict={}",
+        "transport={} scenarios={}/{} passed{} | passive: {} ParallaX flows, {} flagged (across {} profile report(s)) | control: {} known-bad flows flagged (detector {}) | active probe: {} | verdict={}",
         cli.transport,
         scenarios.iter().filter(|s| s.ok).count(),
         scenarios.len(),
@@ -86,6 +108,8 @@ fn main() -> Result<()> {
         passive_total_flows,
         passive_flagged_flows,
         passive_reports.len(),
+        control_flagged,
+        if control_ok { "HAS TEETH" } else { "NOT VALIDATED" },
         match &probe {
             Some(p) if p.any_distinguisher => "DISTINGUISHABLE",
             Some(_) => "resistant",
@@ -104,6 +128,8 @@ fn main() -> Result<()> {
         scenarios,
         active_probe: probe,
         passive,
+        control,
+        detector_has_teeth: control_ok,
         pass,
         summary: summary.clone(),
     };

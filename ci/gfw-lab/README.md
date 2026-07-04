@@ -18,6 +18,49 @@ free GitHub-hosted runners.
 > `[workspace]` and `Cargo.lock`), so `cargo build` at the repo root never
 > pulls it in. Nothing here is a production component.
 
+## What this proves — and what it does NOT
+
+Read this first; it is deliberately honest about scope.
+
+**What it PROVES (high confidence):**
+
+- **Real-user usability.** The build compiles and a real user can actually
+  proxy traffic through it: a live-internet phase fetches real public HTTPS
+  sites through the tunnel, and 17 traffic scenarios move the expected bytes
+  across several link-quality profiles. This is the class of "passes review,
+  breaks for real users (can't connect / can't proxy)" bug that unit tests miss.
+- **Extreme-network robustness.** The proxy keeps working under added latency,
+  jitter, bandwidth caps, and (on the QUIC path) packet loss / reorder /
+  duplication.
+- **No regression against a battery of *known, public* distinguishers.** The
+  flows are not caught by the specific heuristics implemented here.
+- **The detector has teeth (not rigged).** A built-in negative control feeds the
+  *same* analyzer deliberately-detectable traffic (a random/obfuscated tunnel
+  and a plaintext tunnel); the run FAILS unless the analyzer flags them. So a
+  "0 ParallaX flows flagged" result is only accepted when the detector has
+  simultaneously proven it *does* flag known-bad traffic.
+
+**What it does NOT prove (important):**
+
+- **This is NOT the GFW, and NOT equivalent to any leaked censorship codebase.**
+  The analyzer is a **clean-room approximation** of a handful of *publicly
+  documented* detection techniques (TLS/JA3 fingerprinting, the Frolov–Wustrow
+  fully-encrypted first-packet test, coarse flow statistics, and differential
+  active probing). A real national firewall runs far more — ML classifiers on
+  rich flow features, long-horizon behavioural correlation, TLS-fingerprint
+  all/deny lists, cross-flow analysis, and continuously-updated rules.
+- **Passing here does NOT mean "undetectable by the real GFW."** It means "not
+  caught by *these* known heuristics." Treat a PASS as a **regression gate and a
+  lower bound**, not a certificate of unblockability. The asymmetry is real: a
+  clean-room detector will always be weaker than the fielded system, and weaker
+  still than a newer one.
+- The value is **differential over time**: if a ParallaX change suddenly trips
+  one of these well-understood distinguishers (or breaks real-user
+  connectivity), that is a genuine, actionable signal.
+
+To strengthen the detector, add more public heuristics in `src/analyze.rs` and
+extend the negative control so the new heuristic is proven to have teeth.
+
 ## Topology
 
 ```
@@ -49,7 +92,8 @@ a controlled endpoint.
 | `gfw-box`    | MITM relay. `relay` = transparent TCP (+optional UDP) forwarder with per-direction latency/jitter/bandwidth (and, on the UDP/QUIC path, loss/duplication/reorder) plus a passive per-flow analyzer. `probe` = active differential prober. |
 | `origin`     | Minimal HTTP/1.1 origin: `/download?bytes=N&rate_kbps=R`, `POST /upload`, `POST /echo`, `/ping`. |
 | `trafficgen` | Drives one traffic scenario through the client's SOCKS5 port and writes a `ScenarioOutcome` (throughput / RTT / bytes). |
-| `labreport`  | Assembles the per-component JSON into one `LabReport` and decides pass/fail. |
+| `gfw-box adversary` | Negative control: emits known-detectable flows (obfuscated/random + plaintext) so the analyzer's teeth can be verified. |
+| `labreport`  | Assembles the per-component JSON into one `LabReport` and decides pass/fail (including the detector self-test). |
 
 ## Passive analysis heuristics
 
@@ -80,15 +124,22 @@ tell).
 `satellite` — each sets one-way latency, jitter, bandwidth cap, and (UDP path
 only) loss / duplication / reorder. See `src/link.rs`.
 
-## Scenarios
+## Scenarios (17)
 
 `download`, `upload`, `bidirectional`, `serial`, `parallel`, `single-stream`,
-`video` (paced downlink bitrate), `call` (bidirectional frames at a fixed
-cadence, RTT/jitter), `web` (concurrent page objects). See `src/scenario.rs`.
+`video` (paced downlink), `call` (fixed-cadence bidirectional frames,
+RTT/jitter), `web` (concurrent page objects), `large-upload` (32 MiB bulk up),
+`video-hd` (~15 Mbit/s paced), `web-heavy` (24 concurrent objects), `chat`
+(sporadic long-lived messages with randomized idle gaps), `burst` (on/off
+browsing), `api-poll` (fixed-cadence small polls), `mixed` (simultaneous video
+download + VoIP call), `download-ramp` (sequential increasing sizes). Plus a
+`live-reachability` phase that fetches real public HTTPS sites through the
+tunnel. See `src/scenario.rs`.
 
-> The QUIC fast plane is a *single-Connect* relay, so the concurrency-based
-> scenarios (`parallel`, `web`) are **TCP-only**; the orchestrator selects the
-> transport-appropriate default set automatically.
+> The QUIC fast plane is a *single-Connect* relay — it carries one proxied
+> connection at a time, not several concurrent ones — so the concurrency-based
+> scenarios (`parallel`, `web`, `web-heavy`, `mixed`) are **TCP-only**. The
+> orchestrator selects the transport-appropriate default set automatically.
 
 ## Running locally
 
@@ -113,10 +164,14 @@ so the box can own the advertised UDP port without colliding with the server.
 
 `labreport` returns success (exit 0) only when **all** hold:
 
-- every scenario completed and transferred the expected bytes,
-- the passive middle-box flagged **zero** flows as a proxy, and
-- the active differential prober found **no** distinguisher vs the origin.
+- every scenario completed and transferred the expected bytes (including live
+  real-internet reachability),
+- the passive middle-box flagged **zero** ParallaX flows as a proxy (aggregated
+  across all link profiles),
+- the active differential prober found **no** distinguisher vs the origin, and
+- the **negative control was flagged** — i.e. the detector proved it has teeth
+  (otherwise a "0 flagged" result would be meaningless and the run FAILS).
 
 All per-component JSON artifacts (`scenario-*.json`, `speed-*.json`,
-`box-*.json`, `probe.json`, `lab-report.json`) are written to `WORKDIR` and
-uploaded by the CI job.
+`box-*.json`, `control.json`, `probe.json`, `lab-report.json`) are written to
+`WORKDIR` and uploaded by the CI job.

@@ -121,6 +121,13 @@ pub struct LabReport {
     pub scenarios: Vec<ScenarioOutcome>,
     pub active_probe: Option<ActiveProbeReport>,
     pub passive: Option<GfwBoxReport>,
+    /// Negative-control run: the same analyzer over deliberately-detectable
+    /// flows. `detector_has_teeth` is true only when the control was flagged,
+    /// proving the passive verdict is meaningful (not rigged to always pass).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<GfwBoxReport>,
+    #[serde(default)]
+    pub detector_has_teeth: bool,
     pub pass: bool,
     pub summary: String,
 }

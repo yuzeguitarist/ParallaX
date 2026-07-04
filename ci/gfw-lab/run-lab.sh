@@ -33,10 +33,16 @@ PROFILES="${PROFILES:-perfect broadband mobile_4g transpacific}"
 # "single-Connect relay" (see the client's startup log), so it does not carry
 # multiple *concurrent* proxied connections; the concurrency-based scenarios
 # (parallel, web) are therefore TCP-only. All other shapes run on both.
+# 17 scenarios total. Concurrency-based ones (parallel, web, web-heavy, mixed)
+# ride multiple simultaneous proxied connections, which the QUIC fast plane —
+# a single-Connect relay — does not carry, so they are TCP-only. The orchestrator
+# picks the transport-appropriate set automatically.
 if [ "${TRANSPORT}" = "quic" ]; then
-  SCENARIOS="${SCENARIOS:-download upload bidirectional serial single-stream video call}"
+  SCENARIOS="${SCENARIOS:-download upload bidirectional serial single-stream video call \
+large-upload video-hd chat burst api-poll download-ramp}"
 else
-  SCENARIOS="${SCENARIOS:-download upload bidirectional serial parallel single-stream video call web}"
+  SCENARIOS="${SCENARIOS:-download upload bidirectional serial parallel single-stream video call web \
+large-upload video-hd web-heavy chat burst api-poll mixed download-ramp}"
 fi
 FALLBACK_HOST="${FALLBACK_HOST:-www.cloudflare.com}"
 FALLBACK_PORT="${FALLBACK_PORT:-443}"
@@ -262,6 +268,96 @@ for PROFILE in $PROFILES; do
 done
 
 # --------------------------------------------------------------------------
+# 4b. Real-user live-internet reachability. The controlled scenarios above pin
+#     the relay target to the local origin (hermetic + deterministic). This
+#     phase instead lets the server relay to whatever the SOCKS client requests
+#     and fetches REAL public HTTPS sites through the tunnel — the closest thing
+#     to "can an actual user browse the internet through this build?". This is
+#     the test most likely to catch real-world "connects but can't proxy" bugs.
+# --------------------------------------------------------------------------
+echo "== live-internet reachability (real-user check) =="
+LIVE_SERVER_CFG="$WORKDIR/parallax.server.live.toml"
+LIVE_CLIENT_CFG="$WORKDIR/parallax.client.live.toml"
+cp "$SERVER_CFG" "$LIVE_SERVER_CFG"
+cp "$CLIENT_CFG" "$LIVE_CLIENT_CFG"
+# Drop data_target so the server relays to the client's SOCKS-requested target,
+# and move listen/replay off the main ports so both stacks can run together.
+python3 - "$LIVE_SERVER_CFG" "$WORKDIR/replay.live.cache" "$SERVER_HOST:18444" <<'PY'
+import sys
+cfg, replay, listen = sys.argv[1:4]
+out = []
+for ln in open(cfg).read().splitlines():
+    if ln.startswith("data_target"):
+        continue
+    if ln.startswith("replay_cache_path"):
+        ln = f'replay_cache_path = "{replay}"'
+    if ln.startswith("listen"):
+        ln = f'listen = "{listen}"'
+    out.append(ln)
+open(cfg, "w").write("\n".join(out) + "\n")
+PY
+# Point the live client straight at the live server (no box) on a fresh SOCKS port.
+sed -i "s#^server_addr = .*#server_addr = \"$SERVER_HOST:18444\"#" "$LIVE_CLIENT_CFG"
+sed -i "s#^listen = .*#listen = \"127.0.0.1:1099\"#" "$LIVE_CLIENT_CFG"
+chmod 600 "$LIVE_SERVER_CFG" "$LIVE_CLIENT_CFG"
+
+REACH_OK=1
+if "$PLX" check -c "$LIVE_SERVER_CFG" >/dev/null 2>&1 && "$PLX" check -c "$LIVE_CLIENT_CFG" >/dev/null 2>&1; then
+  RUST_LOG=parallax=info "$PLX" serve -c "$LIVE_SERVER_CFG" >"$WORKDIR/server.live.log" 2>&1 &
+  LIVE_SRV_PID="$!"; PIDS+=("$LIVE_SRV_PID")
+  wait_for_log "$WORKDIR/server.live.log" "server listening on" "$READY_TIMEOUT" || REACH_OK=0
+  RUST_LOG=parallax=info "$PLX" client -c "$LIVE_CLIENT_CFG" >"$WORKDIR/client.live.log" 2>&1 &
+  LIVE_CLI_PID="$!"; PIDS+=("$LIVE_CLI_PID")
+  wait_for_log "$WORKDIR/client.live.log" "client SOCKS5 listening on" "$READY_TIMEOUT" || REACH_OK=0
+
+  if [ "$REACH_OK" -eq 1 ]; then
+    for site in www.cloudflare.com www.wikipedia.org example.com www.apple.com; do
+      code=$(curl -4 --socks5-hostname 127.0.0.1:1099 -sS -o /dev/null \
+        -w '%{http_code}' --max-time 30 "https://$site/" 2>>"$WORKDIR/reachability.log" || echo 000)
+      if echo "$code" | grep -qE '^(2|3)'; then
+        echo "   [ok]   https://$site -> $code"
+      else
+        echo "   [FAIL] https://$site -> $code"
+        REACH_OK=0
+      fi
+    done
+  fi
+  kill -TERM "$LIVE_CLI_PID" 2>/dev/null || true
+  kill -TERM "$LIVE_SRV_PID" 2>/dev/null || true
+else
+  echo "   !! live config invalid"; REACH_OK=0
+fi
+LIVE_SCEN="$WORKDIR/scenario-live-reachability.json"
+if [ "$REACH_OK" -eq 1 ]; then
+  printf '{"scenario":"live-reachability","link_profile":"real-internet","ok":true,"detail":"fetched real public HTTPS sites through the tunnel"}\n' >"$LIVE_SCEN"
+else
+  printf '{"scenario":"live-reachability","link_profile":"real-internet","ok":false,"detail":"could not fetch real HTTPS sites through the tunnel"}\n' >"$LIVE_SCEN"
+  FAIL=1
+fi
+SCEN_ARGS+=(--scenario "$LIVE_SCEN")
+
+# --------------------------------------------------------------------------
+# 4c. Negative control (detector self-test). Run a dedicated box and emit
+#     KNOWN-detectable flows (obfuscated/random + plaintext). The SAME analyzer
+#     must flag them — proving it has teeth and the "0 flagged" verdict above is
+#     meaningful, not rigged. If the control is NOT flagged, the run FAILS.
+# --------------------------------------------------------------------------
+echo "== negative control (detector self-test) =="
+CONTROL_REPORT="$WORKDIR/control.json"
+CONTROL_LOG="$WORKDIR/control.log"
+"$GFW_BOX" relay --listen 127.0.0.1:9500 --upstream "$SERVER_HOST:$SERVER_PORT" \
+  --profile perfect --report "$CONTROL_REPORT" >"$CONTROL_LOG" 2>&1 &
+CONTROL_BOX_PID="$!"; PIDS+=("$CONTROL_BOX_PID")
+wait_for_log "$CONTROL_LOG" "gfw-box relay listening" 10 || FAIL=1
+"$GFW_BOX" adversary --target 127.0.0.1:9500 --rounds 2 >>"$CONTROL_LOG" 2>&1 || true
+kill -TERM "$CONTROL_BOX_PID" 2>/dev/null || true
+wait "$CONTROL_BOX_PID" 2>/dev/null || true
+if [ -f "$CONTROL_REPORT" ]; then
+  CFLAG=$(python3 -c "import json;print(json.load(open('$CONTROL_REPORT'))['flagged_flows'])" 2>/dev/null || echo 0)
+  echo "   control flagged $CFLAG known-bad flow(s) (detector self-test)"
+fi
+
+# --------------------------------------------------------------------------
 # 5. Active differential probe (direct to server, A/B vs reference origin)
 # --------------------------------------------------------------------------
 PROBE_REPORT="$WORKDIR/probe.json"
@@ -279,10 +375,12 @@ for BR in "$WORKDIR"/box-*.json; do
 done
 PROBE_ARG=()
 [ -f "$PROBE_REPORT" ] && PROBE_ARG=(--probe "$PROBE_REPORT")
+CONTROL_ARG=()
+[ -f "$CONTROL_REPORT" ] && CONTROL_ARG=(--control-report "$CONTROL_REPORT")
 
 echo "== verdict =="
 if "$LABREPORT" --transport "$TRANSPORT" "${SCEN_ARGS[@]}" \
-    "${PROBE_ARG[@]}" "${BOX_ARG[@]}" --out "$WORKDIR/lab-report.json"; then
+    "${PROBE_ARG[@]}" "${BOX_ARG[@]}" "${CONTROL_ARG[@]}" --out "$WORKDIR/lab-report.json"; then
   LAB_PASS=0
 else
   LAB_PASS=1
