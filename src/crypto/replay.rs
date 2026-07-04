@@ -251,6 +251,17 @@ impl ReplayCache {
             return Ok(ReplayInsertOutcome::Inserted);
         }
 
+        // A cache is driven by EITHER the immediate path (this method) OR the
+        // deferred path, never both — but flush any queued deferred entries first
+        // as defense-in-depth. `persist()` below appends only the newest entry,
+        // while a later `persist_pending()` may compact the whole journal; leaving
+        // queued entries here would let that compaction re-append lines already
+        // written, duplicating journal state after a restart. In practice
+        // `pending_persist` is always empty here, so this is a no-op.
+        if !self.pending_persist.is_empty() {
+            self.persist_pending()?;
+        }
+
         let nonce = entry.nonce;
         let transcript = entry.transcript_fingerprint;
         let outcome = self.stage_insert(entry, now);
