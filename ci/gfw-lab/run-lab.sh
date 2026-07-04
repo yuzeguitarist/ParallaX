@@ -17,8 +17,15 @@
 # The camouflage handshake splices to the real fallback origin, so the run needs
 # outbound internet to $FALLBACK_HOST (GitHub-hosted runners have it).
 #
-# Exit code 0 = PASS (all scenarios succeeded, zero flows flagged as a proxy,
-# no active-probe distinguisher). Non-zero = FAIL or setup error.
+# Exit codes:
+#   0 = PASS.
+#   1 = a genuine lab FAILURE (a scenario failed, a ParallaX flow was flagged,
+#       the active probe found a distinguisher, or the strong-pipeline replay
+#       blocked ParallaX / did not block the control).
+#   2 = a HARNESS/SETUP error (plx init/check, config rewrite, readiness wait) —
+#       a real bug that must fail CI.
+#   3 = an ENVIRONMENT error ONLY: the fallback origin is unreachable over IPv4.
+#       CI converts *only* this code into a non-fatal "skipped" warning.
 
 set -uo pipefail
 
@@ -127,7 +134,7 @@ rm -f "$WORKDIR"/parallax.*.toml
   --server-addr "$BOX_TCP" \
   --server-listen "$SERVER_LISTEN" \
   --client-listen "$CLIENT_SOCKS" \
-  --inline-secrets -o "$WORKDIR" >/dev/null || { echo "!! plx init failed"; exit 3; }
+  --inline-secrets -o "$WORKDIR" >/dev/null || { echo "!! plx init failed"; exit 2; }
 
 SERVER_CFG="$WORKDIR/parallax.server.toml"
 CLIENT_CFG="$WORKDIR/parallax.client.toml"
@@ -158,20 +165,20 @@ if transport == "quic":
 open(cfg, "w").write(text + "\n")
 PY
 then
-  echo "!! server config rewrite failed"; exit 3
+  echo "!! server config rewrite failed"; exit 2
 fi
 
 # Assert the critical rewrite actually took effect (guards against a silent
 # no-op, since the script runs without `set -e`).
-grep -q '^data_target' "$SERVER_CFG" || { echo "!! data_target not injected into server config"; exit 3; }
+grep -q '^data_target' "$SERVER_CFG" || { echo "!! data_target not injected into server config"; exit 2; }
 
 if [ "$TRANSPORT" = "quic" ]; then
   printf '\n[udp]\nenabled = true\n' >> "$CLIENT_CFG"
 fi
 chmod 600 "$SERVER_CFG" "$CLIENT_CFG"
 
-"$PLX" check -c "$SERVER_CFG" >/dev/null 2>&1 || { echo "!! server config invalid"; "$PLX" check -c "$SERVER_CFG"; exit 3; }
-"$PLX" check -c "$CLIENT_CFG" >/dev/null 2>&1 || { echo "!! client config invalid"; "$PLX" check -c "$CLIENT_CFG"; exit 3; }
+"$PLX" check -c "$SERVER_CFG" >/dev/null 2>&1 || { echo "!! server config invalid"; "$PLX" check -c "$SERVER_CFG"; exit 2; }
+"$PLX" check -c "$CLIENT_CFG" >/dev/null 2>&1 || { echo "!! client config invalid"; "$PLX" check -c "$CLIENT_CFG"; exit 2; }
 echo "-- configs generated and validated"
 
 # --------------------------------------------------------------------------
@@ -179,11 +186,11 @@ echo "-- configs generated and validated"
 # --------------------------------------------------------------------------
 "$ORIGIN" --listen "$ORIGIN_ADDR" >"$WORKDIR/origin.log" 2>&1 &
 PIDS+=("$!")
-wait_for_log "$WORKDIR/origin.log" "origin listening" 10 || exit 3
+wait_for_log "$WORKDIR/origin.log" "origin listening" 10 || exit 2
 
 RUST_LOG=parallax=info "$PLX" serve -c "$SERVER_CFG" >"$WORKDIR/server.log" 2>&1 &
 PIDS+=("$!")
-wait_for_log "$WORKDIR/server.log" "server listening on" "$READY_TIMEOUT" || exit 3
+wait_for_log "$WORKDIR/server.log" "server listening on" "$READY_TIMEOUT" || exit 2
 echo "-- origin + server up"
 
 FAIL=0
@@ -202,7 +209,8 @@ for PROFILE in $PROFILES; do
     UDP_ARGS=(--udp-listen "$BOX_UDP" --udp-upstream "$SERVER_HOST:$SERVER_PORT")
   fi
   "$GFW_BOX" relay --listen "$BOX_TCP" --upstream "$SERVER_HOST:$SERVER_PORT" \
-    "${UDP_ARGS[@]}" --profile "$PROFILE" --report "$BOX_REPORT" >"$BOX_LOG" 2>&1 &
+    "${UDP_ARGS[@]}" --profile "$PROFILE" --report "$BOX_REPORT" \
+    --role parallax --capture "$WORKDIR/box-$PROFILE.capture.json" >"$BOX_LOG" 2>&1 &
   BOX_PID="$!"
   PIDS+=("$BOX_PID")
   # Wait for the post-bind readiness line (printed only once the ingress socket
@@ -319,10 +327,10 @@ for ln in open(cfg).read().splitlines():
 open(cfg, "w").write("\n".join(out) + "\n")
 PY
 then
-  echo "!! live server config rewrite failed"; exit 3
+  echo "!! live server config rewrite failed"; exit 2
 fi
 # The whole point of this phase is a NON-fixed target, so data_target must be gone.
-grep -q '^data_target' "$LIVE_SERVER_CFG" && { echo "!! data_target not removed from live server config"; exit 3; }
+grep -q '^data_target' "$LIVE_SERVER_CFG" && { echo "!! data_target not removed from live server config"; exit 2; }
 # Point the live client straight at the live server (no box) on a fresh SOCKS port.
 sed -i "s#^server_addr = .*#server_addr = \"$SERVER_HOST:18444\"#" "$LIVE_CLIENT_CFG"
 sed -i "s#^listen = .*#listen = \"127.0.0.1:1099\"#" "$LIVE_CLIENT_CFG"
@@ -399,11 +407,14 @@ echo "== negative control (detector self-test) =="
 CONTROL_REPORT="$WORKDIR/control.json"
 CONTROL_LOG="$WORKDIR/control.log"
 "$GFW_BOX" relay --listen 127.0.0.1:9500 --upstream "$SERVER_HOST:$SERVER_PORT" \
-  --profile perfect --report "$CONTROL_REPORT" >"$CONTROL_LOG" 2>&1 &
+  --profile perfect --report "$CONTROL_REPORT" \
+  --role control --capture "$WORKDIR/control.capture.json" >"$CONTROL_LOG" 2>&1 &
 CONTROL_BOX_PID="$!"; PIDS+=("$CONTROL_BOX_PID")
 wait_for_log "$CONTROL_LOG" "gfw-box relay listening" 10 || FAIL=1
-# 2 rounds x 3 flavours = 6 known-bad flows (random-not-TLS, plaintext, and a
-# TLS-framed high-entropy body that ONLY the entropy classifier can catch).
+# 2 rounds x 4 flavours = 8 known-bad flows: random-not-TLS + plaintext + a
+# TLS-framed high-entropy body (ONLY the entropy classifier catches it) for the
+# simple analyzer's two teeth-paths, plus a well-formed blocklisted-SNI
+# ClientHello that the STRONG replay pipeline blocks deterministically.
 "$GFW_BOX" adversary --target 127.0.0.1:9500 --rounds 2 >>"$CONTROL_LOG" 2>&1 || true
 kill -TERM "$CONTROL_BOX_PID" 2>/dev/null || true
 wait "$CONTROL_BOX_PID" 2>/dev/null || true
@@ -428,8 +439,13 @@ fi
 # 6. Assemble the verdict
 # --------------------------------------------------------------------------
 # Pass EVERY per-profile box report so the verdict aggregates all profiles.
+# Exclude the *.capture.json files (different schema, consumed by the strong
+# replay test, not labreport).
 BOX_ARG=()
 for BR in "$WORKDIR"/box-*.json; do
+  case "$BR" in
+    *.capture.json) continue ;;
+  esac
   [ -f "$BR" ] && BOX_ARG+=(--box-report "$BR")
 done
 PROBE_ARG=()

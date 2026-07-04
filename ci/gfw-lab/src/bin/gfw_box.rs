@@ -66,6 +66,15 @@ struct RelayArgs {
     /// Where to write the JSON analysis report on shutdown.
     #[arg(long, default_value = "gfw-box-report.json")]
     report: String,
+    /// Optional path to also write a full replayable capture (ClientHello,
+    /// server first records, and the record length/timing series) for the
+    /// strong-pipeline replay test. Role label is `--role`.
+    #[arg(long)]
+    capture: Option<String>,
+    /// Role tag for the capture: "parallax" (a real proxied flow) or "control"
+    /// (a known-bad flow that the strong pipeline must BLOCK).
+    #[arg(long, default_value = "parallax")]
+    role: String,
     /// Optional auto-stop after N seconds (0 = run until SIGINT/SIGTERM).
     #[arg(long, default_value_t = 0)]
     duration_secs: u64,
@@ -117,7 +126,16 @@ struct FlowAcc {
     c2s_gaps_ms: Vec<f64>,
     last_c2s: Option<Instant>,
     first_flight: Vec<u8>,
+    /// Server->client first bytes (for the strong pipeline's ServerHello / MB-R).
+    first_flight_s2c: Vec<u8>,
+    /// Every relayed record as (len, c2s, t_ms) — the censor-visible length /
+    /// timing series that feeds burst statistics. Bounded to keep JSON small.
+    records: Vec<(usize, bool, f64)>,
 }
+
+/// Cap on recorded records per flow (keeps the capture JSON bounded while still
+/// giving the burst-statistics detector a rich length/timing series).
+const MAX_CAPTURE_RECORDS: usize = 8_000;
 
 /// Shared registry of all flow accumulators seen this window.
 type FlowRegistry = Arc<Mutex<Vec<Arc<Mutex<FlowAcc>>>>>;
@@ -177,6 +195,15 @@ async fn run_adversary(args: AdversaryArgs) -> Result<()> {
         rng.fill(&mut body[..]);
         framed.extend_from_slice(&body);
         emit_flow(&args.target, &framed).await;
+
+        // 4) A well-formed TLS 1.3 ClientHello carrying a BLOCKLISTED SNI
+        //    (a circumvention keyword). The simple box analyzer does NOT flag
+        //    this (it is a valid ClientHello), but the STRONG replay pipeline's
+        //    SNI filter blocks it deterministically — this is the control that
+        //    proves the strong pipeline (JA3/JA4 + SNI + dual-MB + burst) has
+        //    teeth on the exact live capture, not a synthetic stand-in.
+        let blocked = minimal_client_hello("relay7.shadowsocks.io");
+        emit_flow(&args.target, &blocked).await;
     }
     // Give the relay a moment to record the flows before it is asked to report.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -280,6 +307,47 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
     // Give in-flight flows a moment to finalize, then analyze + report.
     tokio::time::sleep(Duration::from_millis(400)).await;
     write_report(&args.report, &profile, &flows, &udp)?;
+    if let Some(path) = &args.capture {
+        write_capture(path, &args.role, &profile.name, &flows)?;
+    }
+    Ok(())
+}
+
+/// Write a full replayable capture (ClientHello, server first records, and the
+/// record length/timing series) so the strong-pipeline replay test can judge
+/// these exact live flows with the repo's GfwSimulator detectors.
+fn write_capture(path: &str, role: &str, profile_name: &str, flows: &FlowRegistry) -> Result<()> {
+    use gfw_lab::report::{to_hex, CaptureFile, CaptureRecord, CaptureTrace};
+    let accs: Vec<Arc<Mutex<FlowAcc>>> = flows.lock().unwrap().clone();
+    let mut traces = Vec::new();
+    for acc in &accs {
+        let g = acc.lock().unwrap();
+        if g.first_flight.is_empty() {
+            continue; // nothing sent -> nothing to replay
+        }
+        traces.push(CaptureTrace {
+            role: role.to_string(),
+            link_profile: profile_name.to_string(),
+            flow_id: g.flow_id,
+            first_flight_c2s_hex: to_hex(&g.first_flight),
+            first_flight_s2c_hex: to_hex(&g.first_flight_s2c),
+            records: g
+                .records
+                .iter()
+                .map(|&(len, c2s, t_ms)| CaptureRecord { len, c2s, t_ms })
+                .collect(),
+        });
+    }
+    let file = CaptureFile {
+        schema: CaptureFile::SCHEMA.to_string(),
+        traces,
+    };
+    std::fs::write(path, serde_json::to_string(&file)?)
+        .with_context(|| format!("write capture {path}"))?;
+    eprintln!(
+        "gfw-box capture: wrote {} trace(s) (role={role}) to {path}",
+        file.traces.len()
+    );
     Ok(())
 }
 
@@ -432,6 +500,13 @@ where
             {
                 let mut a = acc.lock().unwrap();
                 a.seg_sizes.push(n as f64);
+                let t_ms = a
+                    .start
+                    .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                if a.records.len() < MAX_CAPTURE_RECORDS {
+                    a.records.push((n, dir == Direction::C2S, t_ms));
+                }
                 match dir {
                     Direction::C2S => {
                         a.bytes_c2s += n as u64;
@@ -450,6 +525,10 @@ where
                     Direction::S2C => {
                         a.bytes_s2c += n as u64;
                         a.segments_s2c += 1;
+                        if a.first_flight_s2c.len() < FIRST_FLIGHT_CAP {
+                            let take = (FIRST_FLIGHT_CAP - a.first_flight_s2c.len()).min(n);
+                            a.first_flight_s2c.extend_from_slice(&chunk[..take]);
+                        }
                     }
                 }
             }

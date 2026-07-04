@@ -49,8 +49,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Shipping targets (release.yml ships Linux + macOS). Both are strict.
-        os: [ubuntu-latest, macos-latest]
+        # All three are STRICT: ParallaX supports Linux, macOS and Windows.
+        # (`plx` + the lab tools build and the config smoke test passes on all
+        # three — Windows was promoted from informational once it built green.)
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -78,7 +80,8 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --locked
 
-      - name: Config generation smoke test
+      - name: Config generation smoke test (unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -91,62 +94,8 @@ jobs:
           ./target/release/plx check -c "$out/parallax.client.toml"
           echo "config generation OK on ${{ matrix.os }}"
 
-  # ---------------------------------------------------------------------------
-  # Windows is NOT a shipping target (release.yml ships Linux + macOS only), and
-  # the crate's aws-lc-rs / Unix-syscall surface has never been built there.
-  # This leg is INFORMATIONAL: the portable lab tools must build/clippy/test on
-  # Windows (strict), but a `plx` build failure is surfaced as a warning rather
-  # than blocking the PR. It is a separate job (not in `linux-e2e`'s `needs`), so
-  # it can never skip or fail the real end-to-end run.
-  # ---------------------------------------------------------------------------
-  build-windows:
-    name: build (windows-latest, informational)
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: parallax-e2e-windows-latest
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
-
-      # The harness crate is pure tokio/serde/clap — it must be portable.
-      - name: Build gfw-lab tools (release)
-        working-directory: ci/gfw-lab
-        run: cargo build --release --locked
-
-      - name: Lab tools clippy + tests
-        working-directory: ci/gfw-lab
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --all-targets --locked -- -D warnings
-          cargo test --locked
-
-      # ParallaX itself — informational (see comment above).
-      - name: Build plx (release) [informational]
-        id: plx_win
-        continue-on-error: true
-        run: cargo build --release --locked --bin plx
-
-      - name: Report plx Windows build status
-        shell: bash
-        run: |
-          if [ "${{ steps.plx_win.outcome }}" = "success" ]; then
-            echo "plx builds on Windows"
-            echo "- \`plx\` **builds on Windows**" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::plx does not build on Windows (not a shipping target; informational)"
-            echo "- \`plx\` **does not build on Windows** (informational; ParallaX ships Linux + macOS)" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
       - name: Config generation smoke test (windows)
-        if: steps.plx_win.outcome == 'success'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $out = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP ("cfg-" + [guid]::NewGuid()))
@@ -212,14 +161,26 @@ jobs:
           ci/gfw-lab/run-lab.sh
           rc=$?
           set -e
-          # Exit 3 = environment error (fallback origin unreachable after
-          # retries): surface as a warning rather than failing the PR. Any
-          # other non-zero exit is a real lab failure.
+          # Exit-code contract (see run-lab.sh header):
+          #   3 = ENVIRONMENT ONLY (fallback origin unreachable) -> warn, do not
+          #       fail the PR. This is the ONLY code we soften.
+          #   2 = harness/setup bug, 1 = genuine lab failure -> fail the PR.
           if [ "$rc" -eq 3 ]; then
             echo "::warning::GFW lab skipped: fallback origin unreachable (environment)."
+            echo "LAB_SKIPPED=1" >> "$GITHUB_ENV"
             exit 0
           fi
           exit "$rc"
+
+      # Judge the LIVE captures with the repo's STRONG multi-layer GfwSimulator
+      # (SNI + JA3/JA4 + USENIX'23 + dual-middlebox + burst statistics), not just
+      # the lab's own lightweight analyzer. Parallax flows must not be blocked
+      # (and be recognized as Safari); the control flows must be blocked.
+      - name: Strong-pipeline replay of live captures
+        if: env.LAB_SKIPPED != '1'
+        env:
+          GFW_LAB_CAPTURE_DIR: ${{ github.workspace }}/lab-artifacts
+        run: cargo test --release --locked --test gfw_live_replay -- --ignored --nocapture
 
       - name: Summarize verdict
         if: always()

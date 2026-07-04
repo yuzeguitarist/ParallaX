@@ -135,3 +135,50 @@ pub struct LabReport {
 impl LabReport {
     pub const SCHEMA: &'static str = "parallax.gfwlab.report.v1";
 }
+
+/// One relayed record as the censor saw it on the wire (length + direction +
+/// arrival time). Feeds the strong-pipeline burst-statistics detector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureRecord {
+    pub len: usize,
+    /// true = client->server (uplink, the imitated side).
+    pub c2s: bool,
+    pub t_ms: f64,
+}
+
+/// A full live capture of one flow, in a form the repo's `GfwSimulator`
+/// (tests/gfw_sim) can replay: the client->server first flight (ClientHello),
+/// the server->client first records (ServerHello / CCS / AppData for the
+/// dual-middlebox), and the whole record length/timing series.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureTrace {
+    /// "parallax" for a real proxied flow; "control" for a known-bad flow.
+    pub role: String,
+    pub link_profile: String,
+    pub flow_id: u64,
+    pub first_flight_c2s_hex: String,
+    pub first_flight_s2c_hex: String,
+    pub records: Vec<CaptureRecord>,
+}
+
+/// The capture file a gfw-box writes for a whole measurement window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureFile {
+    pub schema: String,
+    pub traces: Vec<CaptureTrace>,
+}
+
+impl CaptureFile {
+    pub const SCHEMA: &'static str = "parallax.gfwlab.capture.v1";
+}
+
+/// Lower-case hex encoder (avoids adding a hex dependency).
+pub fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}

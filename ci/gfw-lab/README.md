@@ -33,12 +33,37 @@ Read this first; it is deliberately honest about scope.
   jitter, bandwidth caps, and (on the QUIC path) packet loss / reorder /
   duplication.
 - **No regression against a battery of *known, public* distinguishers.** The
-  flows are not caught by the specific heuristics implemented here.
+  flows are not caught by the fast inline analyzer here, **and** — the strong
+  check — the live captures are additionally replayed through the repo's own
+  multi-layer `GfwSimulator` (SNI + JA3/JA4 + USENIX'23 + dual-middlebox +
+  burst statistics) and are not blocked (see "Strong-pipeline replay" below).
 - **The detector has teeth (not rigged).** A built-in negative control feeds the
-  *same* analyzer deliberately-detectable traffic (a random/obfuscated tunnel
-  and a plaintext tunnel); the run FAILS unless the analyzer flags them. So a
-  "0 ParallaX flows flagged" result is only accepted when the detector has
-  simultaneously proven it *does* flag known-bad traffic.
+  *same* analyzers deliberately-detectable traffic; the run FAILS unless they
+  flag it — on both the inline analyzer's paths (structural + entropy) and the
+  strong pipeline (a blocklisted-SNI ClientHello it must `Block`). So a
+  "0 ParallaX flows flagged" result is only accepted when the detectors have
+  simultaneously proven they *do* catch known-bad traffic.
+
+### Strong-pipeline replay (closing the gap with a real GFW)
+
+The inline analyzer is intentionally lightweight. To get much closer to a real
+censor, `gfw-box relay --capture` records the **exact censor-visible wire bytes**
+of every flow (ClientHello, the server's first records, and the whole record
+length/timing series), and `tests/gfw_live_replay.rs` replays those **live
+captures** through the repo's **`GfwSimulator`** (`tests/gfw_sim`) — the strong,
+multi-layer clean-room pipeline modelled on the public GFW research and the 2025
+leaked-codebase analysis (SNI keyword filter, JA3 + JA4 fingerprinting, the
+USENIX'23 fully-encrypted test, the MB-RA/MB-R dual middlebox, and
+burst-statistics, all in one verdict).
+
+Gate: every `parallax` capture must **not** be `Block`ed and its ClientHello
+must be recognized as a **known browser (Safari)** by JA3/JA4; the `control`
+captures (incl. a well-formed blocklisted-SNI ClientHello) **must** be `Block`ed.
+This reuses the repo's real detection code instead of a weaker copy, and is
+honest about residual signal: a live ParallaX flow currently lands at
+`Suspicious` (never `Block`) — mildly anomalous to burst-statistics but
+fingerprinted as genuine Safari — so the gate is `!= Block`, matching how the
+repo's own `gfw_simulator` scenarios judge the burst path.
 
 **What it does NOT prove (important):**
 
@@ -96,7 +121,9 @@ a controlled endpoint.
 | `gfw-box`    | MITM relay. `relay` = transparent TCP (+optional UDP) forwarder with per-direction latency/jitter/bandwidth (and, on the UDP/QUIC path, loss/duplication/reorder) plus a passive per-flow analyzer. `probe` = active differential prober. |
 | `origin`     | Minimal HTTP/1.1 origin: `/download?bytes=N&rate_kbps=R`, `POST /upload`, `POST /echo`, `/ping`. |
 | `trafficgen` | Drives one traffic scenario through the client's SOCKS5 port and writes a `ScenarioOutcome` (throughput / RTT / bytes). |
-| `gfw-box adversary` | Negative control: emits known-detectable flows (obfuscated/random + plaintext) so the analyzer's teeth can be verified. |
+| `gfw-box adversary` | Negative control: emits known-detectable flows (obfuscated/random + plaintext + a blocklisted-SNI ClientHello) so both analyzers' teeth can be verified. |
+| `gfw-box relay --capture` | Records the live censor-visible wire bytes of every flow for the strong-pipeline replay. |
+| `tests/gfw_live_replay.rs` | Replays live captures through the repo's full `GfwSimulator` (strong multi-layer pipeline) and gates on its verdict. |
 | `labreport`  | Assembles the per-component JSON into one `LabReport` and decides pass/fail (including the detector self-test). |
 
 ## Passive analysis heuristics
