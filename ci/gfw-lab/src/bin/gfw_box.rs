@@ -140,7 +140,43 @@ const MAX_CAPTURE_RECORDS: usize = 8_000;
 /// Shared registry of all flow accumulators seen this window.
 type FlowRegistry = Arc<Mutex<Vec<Arc<Mutex<FlowAcc>>>>>;
 
-const FIRST_FLIGHT_CAP: usize = 2048;
+// A real Safari-26 TCP ClientHello with the X25519MLKEM768 key share is large;
+// 4096 leaves headroom so the captured first flight is never truncated (a
+// truncated ClientHello would fail to fingerprint and cause a confusing
+// hard-fail in the strong replay).
+const FIRST_FLIGHT_CAP: usize = 4096;
+
+/// Pull complete TLS records out of a per-direction reassembly buffer and
+/// return each record's on-wire payload length (the 2-byte length field, i.e.
+/// the bytes after the 5-byte record header). Leaves any partial trailing
+/// record in `buf`. This makes the captured length series RECORD-oriented (what
+/// the burst-statistics detector expects) rather than a function of arbitrary
+/// TCP read-chunk coalescing. Non-TLS streams (control flows) simply won't
+/// frame cleanly, which is fine — only ParallaX flows feed the burst detector.
+fn drain_tls_record_lens(buf: &mut Vec<u8>) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while buf.len() >= pos + 5 {
+        // record header: type(1) version(2) length(2, big-endian)
+        let ct = buf[pos];
+        let ver_hi = buf[pos + 1];
+        // A plausible TLS record: content type 20..=23, version 0x03xx.
+        if !(0x14..=0x17).contains(&ct) || ver_hi != 0x03 {
+            // Not TLS-framed — stop parsing and don't spin on garbage.
+            break;
+        }
+        let len = ((buf[pos + 3] as usize) << 8) | (buf[pos + 4] as usize);
+        if buf.len() < pos + 5 + len {
+            break; // partial record; wait for more bytes
+        }
+        out.push(len);
+        pos += 5 + len;
+    }
+    if pos > 0 {
+        buf.drain(0..pos);
+    }
+    out
+}
 
 #[derive(Default)]
 struct UdpCounters {
@@ -199,9 +235,12 @@ async fn run_adversary(args: AdversaryArgs) -> Result<()> {
         // 4) A well-formed TLS 1.3 ClientHello carrying a BLOCKLISTED SNI
         //    (a circumvention keyword). The simple box analyzer does NOT flag
         //    this (it is a valid ClientHello), but the STRONG replay pipeline's
-        //    SNI filter blocks it deterministically — this is the control that
-        //    proves the strong pipeline (JA3/JA4 + SNI + dual-MB + burst) has
-        //    teeth on the exact live capture, not a synthetic stand-in.
+        //    SNI keyword filter (MB-RA/MB-R dual middlebox) blocks it
+        //    deterministically — proving that path has teeth on the exact live
+        //    capture. (The strong pipeline's JA3/JA4 fingerprint teeth are
+        //    proven separately and positively by the replay test: every real
+        //    ParallaX ClientHello must be recognized as Safari, and no control
+        //    flow may be.)
         let blocked = minimal_client_hello("relay7.shadowsocks.io");
         emit_flow(&args.target, &blocked).await;
     }
@@ -490,6 +529,10 @@ where
     // Reader half: record features + enqueue.
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
+        // Per-direction TLS reassembly buffer, so the captured length series is
+        // RECORD-oriented (what burst-statistics expects), not a function of
+        // arbitrary TCP read-chunk coalescing.
+        let mut record_asm: Vec<u8> = Vec::new();
         loop {
             let n = match reader.read(&mut buf).await {
                 Ok(0) => break,
@@ -504,8 +547,18 @@ where
                     .start
                     .map(|s| s.elapsed().as_secs_f64() * 1000.0)
                     .unwrap_or(0.0);
-                if a.records.len() < MAX_CAPTURE_RECORDS {
-                    a.records.push((n, dir == Direction::C2S, t_ms));
+                // Frame out complete TLS records for the capture series.
+                record_asm.extend_from_slice(chunk);
+                let is_c2s = dir == Direction::C2S;
+                for rec_len in drain_tls_record_lens(&mut record_asm) {
+                    if a.records.len() < MAX_CAPTURE_RECORDS {
+                        a.records.push((rec_len, is_c2s, t_ms));
+                    }
+                }
+                // Bound the reassembly buffer if the stream is not TLS-framed
+                // (control flows) so it can't grow without bound.
+                if record_asm.len() > 128 * 1024 {
+                    record_asm.clear();
                 }
                 match dir {
                     Direction::C2S => {

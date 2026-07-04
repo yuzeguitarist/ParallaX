@@ -102,7 +102,9 @@ fn replay(trace: &CaptureTrace) -> ScenarioReport {
     let client_hello = from_hex(&trace.first_flight_c2s_hex);
     let s2c_first = from_hex(&trace.first_flight_s2c_hex);
 
-    let events_c2s = vec![ClientToServerEvent::TcpPayload { bytes: client_hello }];
+    let events_c2s = vec![ClientToServerEvent::TcpPayload {
+        bytes: client_hello,
+    }];
 
     // Feed the server's first flight as a ServerHello so the dual-middlebox
     // (MB-R) has a record to transition on. We only have the raw first bytes,
@@ -164,8 +166,8 @@ fn load_captures(dir: &std::path::Path) -> Vec<CaptureTrace> {
         }
         let data = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let file: CaptureFile = serde_json::from_str(&data)
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let file: CaptureFile =
+            serde_json::from_str(&data).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         traces.extend(file.traces);
     }
     traces
@@ -182,8 +184,13 @@ fn tls_fp_verdict(report: &ScenarioReport) -> Option<VerdictKind> {
 #[test]
 #[ignore = "requires live captures from the ci/gfw-lab run (GFW_LAB_CAPTURE_DIR)"]
 fn strong_pipeline_passes_parallax_and_blocks_control() {
-    let dir = std::env::var("GFW_LAB_CAPTURE_DIR")
-        .expect("set GFW_LAB_CAPTURE_DIR to the ci/gfw-lab workdir with *.capture.json files");
+    // This test needs live captures the ci/gfw-lab run produces; a plain
+    // `cargo test -- --ignored` (e.g. ci-pr.yml's blanket ignored pass) has no
+    // capture dir, so skip gracefully there. Only the e2e workflow sets this.
+    let Ok(dir) = std::env::var("GFW_LAB_CAPTURE_DIR") else {
+        eprintln!("GFW_LAB_CAPTURE_DIR unset; skipping (only runs under the e2e-gfw-lab workflow)");
+        return;
+    };
     let dir = std::path::PathBuf::from(dir);
     let traces = load_captures(&dir);
     assert!(
@@ -196,6 +203,7 @@ fn strong_pipeline_passes_parallax_and_blocks_control() {
     let mut parallax_known_browser = 0usize;
     let mut control_seen = 0usize;
     let mut control_blocked = 0usize;
+    let mut control_known_browser = 0usize;
 
     for trace in &traces {
         let report = replay(trace);
@@ -219,16 +227,33 @@ fn strong_pipeline_passes_parallax_and_blocks_control() {
                     trace.flow_id,
                     report.pretty()
                 );
-                // Positive indistinguishability: its ClientHello is recognized
-                // as a genuine known browser (Safari), not merely unclassified.
-                if fp == Some(VerdictKind::Allow) {
-                    parallax_known_browser += 1;
-                }
+                // Positive indistinguishability, per-flow (matches the repo's
+                // gfw_simulator scenario_1 standard): EVERY ParallaX ClientHello
+                // must be recognized as a genuine known browser (Safari) by
+                // JA3/JA4, not merely left unclassified.
+                assert_eq!(
+                    fp,
+                    Some(VerdictKind::Allow),
+                    "live ParallaX flow (profile={}, flow={}) was NOT fingerprinted as a known browser: tls_fingerprint={:?}\n{}",
+                    trace.link_profile,
+                    trace.flow_id,
+                    fp,
+                    report.pretty()
+                );
+                parallax_known_browser += 1;
             }
             "control" => {
                 control_seen += 1;
                 if verdict == VerdictKind::Block {
                     control_blocked += 1;
+                }
+                // A control flow must NEVER be mistaken for a real browser — if
+                // it were, the fingerprint "known browser" pass for ParallaX
+                // would be meaningless (the classifier would rubber-stamp
+                // anything). Known-bad control flows are non-browser by
+                // construction.
+                if fp == Some(VerdictKind::Allow) {
+                    control_known_browser += 1;
                 }
             }
             other => panic!("unknown capture role {other:?}"),
@@ -251,14 +276,30 @@ fn strong_pipeline_passes_parallax_and_blocks_control() {
         parallax_known_browser > 0,
         "no live ParallaX flow was recognized as a known browser (Safari) by JA3/JA4"
     );
-    // The control must exist and the strong pipeline must BLOCK it — otherwise
-    // "parallax not blocked" is meaningless (the pipeline could be toothless).
+    // Teeth of the strong pipeline are proven two ways, together covering the
+    // ParallaX-relevant layers:
+    //   * JA3/JA4 fingerprinting: proven POSITIVELY above — every ParallaX
+    //     ClientHello must be recognized as a known browser (Safari). If that
+    //     classifier silently broke, the per-flow assert above fails.
+    //   * SNI + MB-RA/MB-R dual middlebox: proven by the control — a well-formed
+    //     blocklisted-SNI ClientHello MUST be Blocked (deterministic). If that
+    //     path broke, control_blocked drops to 0 and this fails.
+    // (The inline-analyzer negative control separately proves the structural
+    // and Frolov-Wustrow entropy paths have teeth; burst-statistics is exercised
+    // on the live record-length series but is not itself a teeth-gated layer.)
     assert!(
         control_seen > 0,
         "no control captures present — cannot prove the strong pipeline has teeth"
     );
     assert!(
         control_blocked > 0,
-        "strong pipeline did NOT block ANY control flow — detector has no teeth on the live capture"
+        "strong pipeline did NOT block the blocklisted-SNI control — SNI/dual-MB path has no teeth on the live capture"
+    );
+    // Sanity on the fingerprint classifier itself: it must not rubber-stamp the
+    // known-bad control flows as a real browser (that would make the ParallaX
+    // "known browser" pass meaningless).
+    assert_eq!(
+        control_known_browser, 0,
+        "the fingerprint classifier wrongly recognized a known-bad control flow as a real browser"
     );
 }
