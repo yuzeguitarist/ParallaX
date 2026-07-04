@@ -3308,15 +3308,32 @@ async fn client_mux_download_loop(
     mut events: mpsc::Receiver<DownloadEvent>,
     terminal: StreamTerminal,
     outcome_tx: oneshot::Sender<DownloadOutcome>,
+    idle: Duration,
 ) {
     // Drain queued data to the local socket. The channel closes (recv -> None)
     // once the reader has dropped its sender, which it does AFTER stamping the
     // terminal flag — so every queued byte is flushed before we read the outcome.
+    //
+    // The write is bounded by `idle` (CLIENT_RELAY_IDLE_TIMEOUT in production): a
+    // local app that stops reading but holds its socket open wedges `write_all`
+    // once the kernel send buffer fills. Dropping the channel sender (the reader's
+    // stall reset, or the session idle backstop) only wakes `recv()`, never a task
+    // already parked in `write_all`, so without this bound such a task — and its
+    // socket fd + stream permit — would leak for the life of the process. The
+    // timeout reaps it, reporting a reset just like a dead local socket. A
+    // live-but-slow app keeps making progress well inside the window, so it is
+    // never falsely reset.
     let mut local_write_failed = false;
     while let Some(DownloadEvent(payload)) = events.recv().await {
-        if !payload.is_empty() && local_write.write_all(&payload).await.is_err() {
-            // Local app went away mid-download: stop draining. Report a reset so
-            // the per-connection task tears the server side down.
+        if !payload.is_empty()
+            && !matches!(
+                timeout(idle, local_write.write_all(&payload)).await,
+                Ok(Ok(()))
+            )
+        {
+            // Local app went away or wedged its socket for the whole idle window:
+            // stop draining. Report a reset so the per-connection task tears the
+            // server side down.
             local_write_failed = true;
             break;
         }
@@ -3338,6 +3355,7 @@ async fn client_mux_download_loop(
 fn apply_client_stream_control(
     local_writes: &mut HashMap<u32, ClientDownloadStream>,
     control: ClientStreamControl,
+    idle: Duration,
 ) {
     match control {
         ClientStreamControl::Register(reg) => {
@@ -3348,6 +3366,7 @@ fn apply_client_stream_control(
                 events_rx,
                 terminal.clone(),
                 reg.outcome_tx,
+                idle,
             ));
             local_writes.insert(
                 reg.stream_id,
@@ -3394,7 +3413,7 @@ where
                 registration = register_rx.recv(), if register_open => {
                     match registration {
                         Some(control) => {
-                            apply_client_stream_control(&mut local_writes, control);
+                            apply_client_stream_control(&mut local_writes, control, idle);
                         }
                         None => register_open = false,
                     }
@@ -3457,7 +3476,7 @@ where
         // stream's write half is always present before its first Data, and a
         // deregister from an exited per-connection task is applied promptly.
         while let Ok(control) = register_rx.try_recv() {
-            apply_client_stream_control(&mut local_writes, control);
+            apply_client_stream_control(&mut local_writes, control, idle);
         }
 
         // Open + dispatch the batch. Any AEAD-open, decode, or dispatch error
@@ -4597,6 +4616,61 @@ mod tests {
             client_mux_await_download(outcome_rx, 1).await,
             Ok(())
         ));
+    }
+
+    /// A local app that stops reading but holds its socket open wedges the
+    /// download task's `write_all` once the kernel send buffer fills. Dropping the
+    /// event sender (the reader's stall reset / session backstop) wakes only
+    /// `recv()`, never a task parked in `write_all`, so without the write's idle
+    /// bound the task — and its socket fd + stream permit — would leak forever.
+    /// This proves the bound reaps it with a `Reset`.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn client_mux_download_task_reaps_a_wedged_local_writer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        // The local app: accept it and NEVER read, so the ParallaX write half fills
+        // and stays full for the rest of the test.
+        let (app_side, _) = listener.accept().await.unwrap();
+        let (_parallax_read, parallax_write) = connect.await.unwrap().into_split();
+
+        let (events_tx, events_rx) = mpsc::channel::<DownloadEvent>(CLIENT_MUX_STREAM_CHANNEL);
+        let terminal = StreamTerminal::new();
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+
+        // A short injected idle so the write bound fires in real time.
+        let idle = Duration::from_millis(200);
+        let task = tokio::spawn(client_mux_download_loop(
+            parallax_write,
+            events_rx,
+            terminal,
+            outcome_tx,
+            idle,
+        ));
+
+        // Continuously feed download data. The app never reads, so `write_all`
+        // wedges once the socket buffer fills regardless of its (autotuned) size;
+        // the feeder stops when the task's receiver is dropped.
+        let feeder = tokio::spawn(async move {
+            let chunk = vec![0x5A_u8; 256 * 1024];
+            while events_tx.send(DownloadEvent(chunk.clone())).await.is_ok() {}
+        });
+
+        // The task MUST terminate (report Reset) within a wall budget thanks to the
+        // idle bound — even though the app never reads and data keeps arriving.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), outcome_rx)
+            .await
+            .expect("download task must reap itself within the wall budget once write wedges")
+            .expect("download task must report an outcome");
+        assert!(
+            matches!(outcome, DownloadOutcome::Reset),
+            "a wedged local writer must be reaped with a Reset",
+        );
+
+        feeder.abort();
+        drop(app_side);
+        let _ = task.await;
     }
 
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
