@@ -366,18 +366,35 @@ impl<'a> Iter<'a> {
     }
 
     fn varint(&mut self) -> Result<u64, FrameError> {
-        let (v, n) = varint::decode(&self.buf[self.pos..]).ok_or(FrameError::Truncated)?;
+        // Fail closed rather than index `&self.buf[self.pos..]` directly: a prior
+        // read that overran the buffer would otherwise panic here.
+        let rest = self.buf.get(self.pos..).ok_or(FrameError::Truncated)?;
+        let (v, n) = varint::decode(rest).ok_or(FrameError::Truncated)?;
         self.pos += n;
         Ok(v)
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], FrameError> {
-        let s = self
-            .buf
-            .get(self.pos..self.pos + n)
-            .ok_or(FrameError::Truncated)?;
-        self.pos += n;
+        // `n` is an attacker-controlled length varint (CRYPTO/STREAM/NEW_TOKEN/
+        // CONNECTION_CLOSE reason). `self.pos + n` must be checked: an unchecked
+        // add can wrap so `get` returns a wrapped range or `self.pos` advances
+        // past the buffer, panicking the next `varint()` slice.
+        let end = self.pos.checked_add(n).ok_or(FrameError::Truncated)?;
+        let s = self.buf.get(self.pos..end).ok_or(FrameError::Truncated)?;
+        self.pos = end;
         Ok(s)
+    }
+
+    /// Decode a varint that is a *length* prefix, as a `usize`.
+    ///
+    /// `usize::try_from`, not `as usize`: a length varint can be up to 2^62-1
+    /// (RFC 9000 §16), and this parses attacker-controlled frame payloads, so a
+    /// value that does not fit `usize` must fail closed (`Truncated`) rather than
+    /// silently truncate on a 32-bit target — matching the QUIC long-header parser
+    /// in `packet.rs`. On 64-bit this is behaviourally identical (`take`'s bounds
+    /// check already rejects the over-long slice).
+    fn varint_len(&mut self) -> Result<usize, FrameError> {
+        usize::try_from(self.varint()?).map_err(|_| FrameError::Truncated)
     }
 
     fn u64_be(&mut self) -> Result<u64, FrameError> {
@@ -410,14 +427,14 @@ impl<'a> Iter<'a> {
             }),
             FT_CRYPTO => {
                 let offset = self.varint()?;
-                let len = self.varint()? as usize;
+                let len = self.varint_len()?;
                 Ok(Frame::Crypto {
                     offset,
                     data: self.take(len)?,
                 })
             }
             FT_NEW_TOKEN => {
-                let len = self.varint()? as usize;
+                let len = self.varint_len()?;
                 Ok(Frame::NewToken {
                     token: self.take(len)?,
                 })
@@ -430,7 +447,7 @@ impl<'a> Iter<'a> {
                     0
                 };
                 let data = if ty & STREAM_LEN != 0 {
-                    let len = self.varint()? as usize;
+                    let len = self.varint_len()?;
                     self.take(len)?
                 } else {
                     // No length: the stream data runs to the end of the packet.
@@ -496,7 +513,7 @@ impl<'a> Iter<'a> {
                 let application = ty == FT_APPLICATION_CLOSE;
                 let error_code = self.varint()?;
                 let frame_type = if application { 0 } else { self.varint()? };
-                let len = self.varint()? as usize;
+                let len = self.varint_len()?;
                 Ok(Frame::Close(Close {
                     application,
                     error_code,
@@ -772,6 +789,46 @@ mod tests {
     }
 
     #[test]
+    fn frame_length_far_past_buffer_fails_closed_without_overflow() {
+        // A length-prefixed frame whose declared length is the maximum 62-bit
+        // varint (RFC 9000 §16) but carries no body must fail closed as Truncated —
+        // never panic in `take` via a `pos + n` overflow, and never wrap. Covers the
+        // CRYPTO/NEW_TOKEN/STREAM/CONNECTION_CLOSE length reads, all of which flow
+        // through `varint_len` + `take`.
+        let max_varint = (1u64 << 62) - 1;
+
+        let mut crypto = Vec::new();
+        for v in [FT_CRYPTO, 0, max_varint] {
+            varint::encode(v, &mut crypto);
+        }
+        assert_eq!(Iter::new(&crypto).next(), Some(Err(FrameError::Truncated)));
+
+        let mut new_token = Vec::new();
+        for v in [FT_NEW_TOKEN, max_varint] {
+            varint::encode(v, &mut new_token);
+        }
+        assert_eq!(
+            Iter::new(&new_token).next(),
+            Some(Err(FrameError::Truncated))
+        );
+
+        // STREAM with OFF+LEN bits set, id 0, offset 0, huge len, no data.
+        let mut stream = Vec::new();
+        varint::encode(FT_STREAM_BASE | STREAM_OFF | STREAM_LEN, &mut stream);
+        for v in [0u64, 0, max_varint] {
+            varint::encode(v, &mut stream);
+        }
+        assert_eq!(Iter::new(&stream).next(), Some(Err(FrameError::Truncated)));
+
+        // CONNECTION_CLOSE: error_code, frame_type, huge reason len, no reason.
+        let mut close = Vec::new();
+        for v in [FT_CONNECTION_CLOSE, 0, 0, max_varint] {
+            varint::encode(v, &mut close);
+        }
+        assert_eq!(Iter::new(&close).next(), Some(Err(FrameError::Truncated)));
+    }
+
+    #[test]
     fn ack_with_huge_range_count_does_not_over_allocate() {
         // A tiny ACK frame announcing an enormous range_count but carrying no
         // range bytes must fail with Truncated, NOT attempt a giant allocation.
@@ -780,6 +837,47 @@ mod tests {
             varint::encode(v, &mut out);
         }
         assert_eq!(Iter::new(&out).next(), Some(Err(FrameError::Truncated)));
+    }
+
+    #[test]
+    fn length_prefixed_frames_reject_overflowing_length() {
+        // Each of these frames carries an attacker-controlled length varint that
+        // feeds `Iter::take`. A near-`u64::MAX` length must fail closed with
+        // Truncated: an unchecked `self.pos + n` would wrap `usize`, either
+        // mis-slicing or leaving `self.pos` past the buffer to panic the next
+        // `varint()`. Use the maximum 8-byte varint value (2^62-1).
+        let huge = (1u64 << 62) - 1;
+
+        // CRYPTO: type, offset, length, (no data bytes present).
+        let mut crypto = Vec::new();
+        varint::encode(FT_CRYPTO, &mut crypto);
+        varint::encode(0, &mut crypto); // offset
+        varint::encode(huge, &mut crypto); // length
+        assert_eq!(Iter::new(&crypto).next(), Some(Err(FrameError::Truncated)));
+
+        // NEW_TOKEN: type, length, (no token bytes).
+        let mut new_token = Vec::new();
+        varint::encode(FT_NEW_TOKEN, &mut new_token);
+        varint::encode(huge, &mut new_token);
+        assert_eq!(
+            Iter::new(&new_token).next(),
+            Some(Err(FrameError::Truncated))
+        );
+
+        // STREAM with the LEN bit set: type, id, length, (no data).
+        let mut stream = Vec::new();
+        varint::encode(FT_STREAM_BASE | STREAM_LEN, &mut stream);
+        varint::encode(0, &mut stream); // id
+        varint::encode(huge, &mut stream); // length
+        assert_eq!(Iter::new(&stream).next(), Some(Err(FrameError::Truncated)));
+
+        // CONNECTION_CLOSE reason phrase length.
+        let mut close = Vec::new();
+        varint::encode(FT_CONNECTION_CLOSE, &mut close);
+        varint::encode(0, &mut close); // error_code
+        varint::encode(0, &mut close); // frame_type
+        varint::encode(huge, &mut close); // reason length
+        assert_eq!(Iter::new(&close).next(), Some(Err(FrameError::Truncated)));
     }
 
     #[test]
@@ -821,6 +919,162 @@ mod tests {
         );
     }
 
+    /// One encoded representative of every `Frame` variant, for structural sweeps.
+    /// Kept in sync with the `Frame` enum: adding a variant without extending this
+    /// list leaves the new variant out of the truncation/roundtrip coverage below.
+    fn every_variant() -> Vec<Frame<'static>> {
+        vec![
+            Frame::Padding(3),
+            Frame::Ping,
+            Frame::Ack(Ack {
+                largest: 1000,
+                delay: 25,
+                ranges: vec![(1000, 1000), (990, 995)],
+                ecn: None,
+            }),
+            Frame::Ack(Ack {
+                largest: 42,
+                delay: 3,
+                ranges: vec![(40, 42)],
+                ecn: Some(EcnCounts {
+                    ect0: 10,
+                    ect1: 0,
+                    ce: 1,
+                }),
+            }),
+            Frame::ResetStream {
+                id: 4,
+                error_code: 7,
+                final_size: 1234,
+            },
+            Frame::StopSending {
+                id: 8,
+                error_code: 2,
+            },
+            Frame::Crypto {
+                offset: 16,
+                data: b"clienthello-bytes",
+            },
+            Frame::NewToken {
+                token: b"resumption-token",
+            },
+            Frame::Stream {
+                id: 0,
+                offset: 0,
+                fin: false,
+                data: b"relay-payload",
+            },
+            Frame::Stream {
+                id: 4,
+                offset: 4096,
+                fin: true,
+                data: b"tail",
+            },
+            Frame::MaxData(1 << 24),
+            Frame::MaxStreamData {
+                id: 4,
+                max: 1 << 21,
+            },
+            Frame::MaxStreams {
+                dir: Dir::Bidi,
+                max: 8,
+            },
+            Frame::MaxStreams {
+                dir: Dir::Uni,
+                max: 8,
+            },
+            Frame::DataBlocked(99),
+            Frame::StreamDataBlocked { id: 0, limit: 5 },
+            Frame::StreamsBlocked {
+                dir: Dir::Bidi,
+                limit: 1,
+            },
+            Frame::StreamsBlocked {
+                dir: Dir::Uni,
+                limit: 1,
+            },
+            Frame::NewConnectionId {
+                seq: 1,
+                retire_prior_to: 0,
+                cid: &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11],
+                reset_token: &[0x42; RESET_TOKEN_LEN],
+            },
+            Frame::RetireConnectionId(3),
+            Frame::PathChallenge(0x0123_4567_89ab_cdef),
+            Frame::PathResponse(0xfedc_ba98_7654_3210),
+            Frame::Close(Close {
+                application: false,
+                error_code: 0x0a,
+                frame_type: FT_STREAM_BASE,
+                reason: b"bad stream",
+            }),
+            Frame::Close(Close {
+                application: true,
+                error_code: 1,
+                frame_type: 0,
+                reason: b"relay idle",
+            }),
+            Frame::HandshakeDone,
+        ]
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        // A single-place guarantee that the whole enum, not just the hand-picked
+        // frames above, survives encode -> decode identically.
+        for frame in every_variant() {
+            round_trip(frame);
+        }
+    }
+
+    #[test]
+    fn every_variant_prefix_truncation_fails_closed() {
+        // For every variant, feed the decoder EVERY strict prefix of its encoding.
+        // A short read must fail cleanly (Truncated / Malformed) or decode a
+        // partial coalesced PADDING run — it must NEVER panic, read out of bounds,
+        // or over-allocate. This is the adversarial "cut the packet anywhere"
+        // property a network-facing parser must hold, and it exercises every
+        // `take`/`varint`/`u64_be` boundary in `parse_one`.
+        for frame in every_variant() {
+            let mut full = Vec::new();
+            frame.encode(&mut full);
+            for cut in 0..full.len() {
+                let prefix = &full[..cut];
+                // Drive the whole iterator; the property is total (no panic).
+                // Collect forces every frame to parse. Beyond panic-safety, assert
+                // the stronger fail-closed guarantee: a strict prefix of ONE encoded
+                // frame must only ever yield a coalesced PADDING run or a clean
+                // Truncated/Malformed error — never a silently-accepted partial
+                // non-PADDING frame.
+                let parsed: Vec<_> = Iter::new(prefix).collect();
+                assert!(
+                    parsed.iter().all(|r| matches!(
+                        r,
+                        Ok(Frame::Padding(_)) | Err(FrameError::Truncated | FrameError::Malformed)
+                    )),
+                    "strict prefix of {frame:?} cut at {cut} must fail closed or \
+                     decode as coalesced PADDING, got {parsed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iterator_stops_after_first_error() {
+        // A valid PING, then an unknown frame type, then another valid PING.
+        // The iterator must yield Ping, then the error, then STOP (never reach the
+        // trailing PING) — matching `Iterator::next`'s fail-fast contract.
+        let mut buf = Vec::new();
+        Frame::Ping.encode(&mut buf);
+        varint::encode(0x30, &mut buf); // DATAGRAM: unknown to this pruned parser
+        Frame::Ping.encode(&mut buf);
+
+        let mut iter = Iter::new(&buf);
+        assert_eq!(iter.next(), Some(Ok(Frame::Ping)));
+        assert_eq!(iter.next(), Some(Err(FrameError::UnknownFrame(0x30))));
+        assert_eq!(iter.next(), None, "iteration must halt at the first error");
+    }
+
     #[test]
     fn parse_ack_rejects_underflowing_ranges() {
         // first_range > largest underflows the first range's low edge.
@@ -836,5 +1090,73 @@ mod tests {
             varint::encode(v, &mut b);
         }
         assert_eq!(Iter::new(&b).next(), Some(Err(FrameError::Malformed)));
+    }
+
+    #[test]
+    fn parse_ack_rejects_range_length_underflowing_low_edge() {
+        // The gap subtraction succeeds (high stays >= 0) but the range LENGTH then
+        // underflows the range's low edge: largest=100, first_range=0 -> smallest
+        // 100; gap=0 -> high = 100 - 2 = 98; len=200 -> low = 98 - 200 underflows.
+        // The `a`/`b` cases above both fail at the earlier gap subtraction, so this
+        // is the only case that exercises the `low = high - len` guard.
+        let mut f = Vec::new();
+        for v in [FT_ACK, 100, 0, 1, 0, 0, 200] {
+            varint::encode(v, &mut f);
+        }
+        assert_eq!(Iter::new(&f).next(), Some(Err(FrameError::Malformed)));
+    }
+}
+
+/// Fuzz-only driver for the QUIC frame decoder ([`Iter`]). Compiled ONLY under
+/// `--cfg fuzzing` (which cargo-fuzz sets); absent from normal `cargo build` /
+/// `cargo test` and CI, so it adds no production API surface. This is what lets
+/// the `quic_frame_decode` fuzz target reach the otherwise `pub(crate)` codec.
+///
+/// `frame.rs` decodes attacker-controlled QUIC packet payloads off the wire (the
+/// receive path in `super::conn::Connection::process_packet`), so it is exactly
+/// the kind of byte parser a fuzzer should hammer: every other frame parser in
+/// the tree (mux, HTTP/2, HTTP/3) already has one.
+#[cfg(fuzzing)]
+pub mod fuzz {
+    use super::{Frame, Iter};
+
+    /// Decode every frame in `data`, and for each frame that decodes, assert the
+    /// encode→decode→encode roundtrip is byte-stable (the invariant the
+    /// `mux_frame` / `h3_frame_decode` targets also assert). Returns the number of
+    /// frames successfully decoded before the first error (if any).
+    pub fn decode_all_roundtrip(data: &[u8]) -> usize {
+        let mut count = 0usize;
+        for result in Iter::new(data) {
+            match result {
+                Ok(frame) => {
+                    roundtrip_is_stable(&frame);
+                    count += 1;
+                }
+                // A decode error is expected on arbitrary input; the iterator
+                // stops after it. The point is that it must not panic.
+                Err(_) => break,
+            }
+        }
+        count
+    }
+
+    /// Encode a decoded frame, re-decode the bytes, and assert an identical frame
+    /// re-encodes to identical bytes. Our own encoder emits self-delimiting,
+    /// canonical framing, so this must be exact.
+    fn roundtrip_is_stable(frame: &Frame) {
+        let mut b1 = Vec::new();
+        frame.encode(&mut b1);
+
+        // Padding coalesces on decode, so a re-decode of a lone PADDING run yields
+        // one Padding(n) frame that re-encodes identically; every other variant is
+        // one frame per encoding. Decode exactly one frame back.
+        let decoded = match Iter::new(&b1).next() {
+            Some(Ok(f)) => f,
+            other => panic!("our own frame encoding must decode: {other:?}"),
+        };
+
+        let mut b2 = Vec::new();
+        decoded.encode(&mut b2);
+        assert_eq!(b1, b2, "QUIC frame encode/decode is not byte-stable");
     }
 }

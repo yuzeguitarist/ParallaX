@@ -85,3 +85,67 @@ impl ServerCertVerifier for AcceptAnyServerCert {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `AcceptAnyServerCert` deliberately trusts everything on the auth-token-bound
+    // UDP leg. These tests pin that documented FOOTGUN contract so an accidental
+    // future edit that starts *rejecting* inputs (which would silently break the
+    // QUIC leg's handshake) fails loudly here.
+
+    #[test]
+    fn accept_any_verifies_a_typical_cert_and_signature() {
+        let v = AcceptAnyServerCert;
+        assert!(v
+            .verify_cert(b"end-entity-der", &[b"intermediate-der"], "example.com", 1)
+            .is_ok());
+        assert!(v
+            .verify_signature(b"transcript", b"end-entity-der", 0x0807, b"sig")
+            .is_ok());
+    }
+
+    #[test]
+    fn accept_any_verifies_empty_and_garbage_inputs() {
+        // Empty cert, no intermediates, empty server name, epoch 0 and u64::MAX
+        // clocks, empty signature, arbitrary scheme — all still accepted, because
+        // this verifier makes NO decision based on its inputs.
+        let v = AcceptAnyServerCert;
+        assert!(v.verify_cert(b"", &[], "", 0).is_ok());
+        assert!(v
+            .verify_cert(&[0xFF; 8], &[b"", b"\x00\x01"], "\u{0}", u64::MAX)
+            .is_ok());
+        assert!(v.verify_signature(b"", b"", 0x0000, b"").is_ok());
+        assert!(v
+            .verify_signature(&[0xAA; 64], &[0xBB; 4], u16::MAX, &[0xCC; 3])
+            .is_ok());
+    }
+
+    #[test]
+    fn accept_any_is_object_safe_behind_a_trait_object() {
+        // Production injects the verifier as `dyn ServerCertVerifier` into the
+        // handshake, so the trait must stay object-safe and dispatch correctly.
+        let v: Box<dyn ServerCertVerifier> = Box::new(AcceptAnyServerCert);
+        assert!(v.verify_cert(b"c", &[], "h", 42).is_ok());
+        assert!(v.verify_signature(b"m", b"c", 0x0403, b"s").is_ok());
+    }
+
+    #[test]
+    fn cert_verify_error_display_is_stable() {
+        // The Display strings are the diagnostic surface a real (rejecting)
+        // verifier reports through; keep them stable and distinguishable.
+        assert_eq!(
+            CertVerifyError::Chain("expired".into()).to_string(),
+            "invalid certificate chain: expired"
+        );
+        assert_eq!(
+            CertVerifyError::Signature("bad".into()).to_string(),
+            "invalid handshake signature: bad"
+        );
+        assert_eq!(
+            CertVerifyError::UnsupportedScheme(0x0201).to_string(),
+            "unsupported signature scheme 0x0201"
+        );
+    }
+}

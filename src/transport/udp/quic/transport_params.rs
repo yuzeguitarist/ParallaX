@@ -228,17 +228,25 @@ impl TransportParameters {
         let mut seen: BTreeSet<u64> = BTreeSet::new();
         let mut i = 0usize;
         while i < blob.len() {
-            let (id, n) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
+            let (id, n) =
+                varint::decode(blob.get(i..).ok_or(Error::Truncated)?).ok_or(Error::Truncated)?;
             i += n;
             // RFC 9000 §7.4.1: a transport parameter MUST NOT appear more than once.
             if !seen.insert(id) {
                 return Err(Error::Duplicate);
             }
-            let (len, m) = varint::decode(&blob[i..]).ok_or(Error::Truncated)?;
+            let (len, m) =
+                varint::decode(blob.get(i..).ok_or(Error::Truncated)?).ok_or(Error::Truncated)?;
             i += m;
-            let len = len as usize;
-            let body = blob.get(i..i + len).ok_or(Error::Truncated)?;
-            i += len;
+            // Narrow the declared length before it indexes the blob. A QUIC varint
+            // reaches 2^62-1: on a 32-bit target `len as usize` silently truncates
+            // (mis-parsing the body) and `i + len` can wrap `usize`. This is the
+            // pre-authentication, attacker-controlled server parse path; fail closed
+            // as `Truncated` (matches `packet.rs`).
+            let len = usize::try_from(len).map_err(|_| Error::Truncated)?;
+            let end = i.checked_add(len).ok_or(Error::Truncated)?;
+            let body = blob.get(i..end).ok_or(Error::Truncated)?;
+            i = end;
             match id {
                 TP_INITIAL_MAX_DATA => tp.initial_max_data = read_varint_body(body)?,
                 TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => {
@@ -448,6 +456,20 @@ mod tests {
     }
 
     #[test]
+    fn read_rejects_oversized_declared_length() {
+        // A parameter whose declared length is the maximum QUIC varint (2^62-1)
+        // must fail closed as Truncated. On a 32-bit target the pre-fix `len as
+        // usize` truncated this and `i + len` could wrap; `usize::try_from` +
+        // `checked_add` reject it uniformly. This is the attacker-controlled,
+        // pre-authentication server parse path.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
+        varint::encode((1u64 << 62) - 1, &mut blob); // absurd declared body length
+        blob.extend_from_slice(&[0x00, 0x01]); // only a couple of bytes actually present
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
+    }
+
+    #[test]
     fn read_rejects_duplicate_parameter() {
         // RFC 9000 §7.4.1: the same id twice MUST be a TRANSPORT_PARAMETER_ERROR.
         let mut blob = Vec::new();
@@ -492,11 +514,53 @@ mod tests {
     }
 
     #[test]
+    fn read_rejects_gigantic_length_claim() {
+        // A hostile blob whose parameter length field is the largest encodable
+        // varint (2^62 - 1) with no value bytes following. This is
+        // attacker-controlled, pre-authentication input; the checked add makes
+        // it reject as `Truncated` on every target (including 32-bit `usize`,
+        // where `i + len` could otherwise wrap) rather than indexing past the
+        // buffer.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
+        varint::encode(varint::MAX, &mut blob);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
+    }
+
+    #[test]
     fn read_rejects_varint_param_with_non_varint_body() {
         // A varint-typed parameter whose body is two varints (not exactly one)
         // must be Malformed (read_varint_body requires the body to be one varint).
         let mut blob = Vec::new();
         put_param_bytes(&mut blob, TP_INITIAL_MAX_DATA, &[0x01, 0x01]);
         assert_eq!(TransportParameters::read(&blob), Err(Error::Malformed));
+    }
+
+    #[test]
+    fn read_rejects_length_varint_past_blob_without_overflow() {
+        // A length varint that points past the end of the blob must fail closed as
+        // Truncated — never panic and never wrap `i + len` around. Uses the maximum
+        // 62-bit varint value (RFC 9000 §16) as the claimed length with no body, so
+        // the `checked_add`/`.get()` bounds are the only thing standing between a
+        // malformed pre-authentication blob and an out-of-bounds read.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
+        varint::encode((1u64 << 62) - 1, &mut blob); // claims ~4.6 exabytes of body
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
+    }
+}
+
+/// Fuzz-only re-export of the transport-parameters decoder. `TransportParameters`
+/// is `pub(crate)`, so `read` is not reachable from the fuzz crate; this thin
+/// wrapper exposes it ONLY under `--cfg fuzzing` (which cargo-fuzz sets), so it
+/// adds no production API surface. The blob it parses is the peer's
+/// pre-authentication QUIC transport-parameters extension — attacker-controlled
+/// on the server.
+#[cfg(fuzzing)]
+pub mod fuzz {
+    use super::{Error, TransportParameters};
+
+    pub fn read(blob: &[u8]) -> Result<TransportParameters, Error> {
+        TransportParameters::read(blob)
     }
 }

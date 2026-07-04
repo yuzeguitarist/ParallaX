@@ -26,3 +26,7 @@ mutants.out.old/
 # Python bytecode cache (scripts/wiki_sync/ is stdlib-only Python); never commit.
 __pycache__/
 *.pyc
+
+# Default report output of the gfw-lab trafficgen bin when run by hand from the
+# crate dir (run-lab.sh writes to an explicit temp path). Local artifact only.
+ci/gfw-lab/trafficgen-report.json

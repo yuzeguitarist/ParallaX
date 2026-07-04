@@ -73,6 +73,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "framed_reassembler"
+path = "fuzz_targets/framed_reassembler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "http2_frame_header"
 path = "fuzz_targets/http2_frame_header.rs"
 test = false
@@ -134,3 +141,25 @@ path = "fuzz_targets/h3_qpack_field_section.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "quic_frame_decode"
+path = "fuzz_targets/quic_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_packet_header"
+path = "fuzz_targets/quic_packet_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_transport_params"
+path = "fuzz_targets/quic_transport_params.rs"
+test = false
+doc = false
+bench = false
+

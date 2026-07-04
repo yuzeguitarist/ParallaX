@@ -111,6 +111,13 @@ max_len = 8192
 timeout = 20
 paths = ["src/fingerprint/http3.rs"]
 
+[targets.quic_transport_params]
+sanitizer = "address"
+rss = 1024
+max_len = 4096
+timeout = 20
+paths = ["src/transport/udp/quic/transport_params.rs"]
+
 # --- box-b group: sanitizer = none + `-C overflow-checks=on` (codecs/arith) ----
 
 [targets.mux_frame]
@@ -134,12 +141,26 @@ max_len = 65536
 timeout = 20
 paths = ["src/fingerprint/http2.rs"]
 
+[targets.quic_frame_decode]
+sanitizer = "none"
+rss = 1536
+max_len = 65536
+timeout = 20
+paths = ["src/transport/udp/quic/frame.rs"]
+
 [targets.command_codecs]
 sanitizer = "none"
 rss = 1024
 max_len = 65536
 timeout = 20
 paths = ["src/protocol/command.rs", "src/crypto/pq.rs"]
+
+[targets.framed_reassembler]
+sanitizer = "none"
+rss = 1024
+max_len = 65536
+timeout = 20
+paths = ["src/protocol/command.rs"]
 
 [targets.replay_journal]
 sanitizer = "none"
@@ -161,3 +182,10 @@ rss = 2048
 max_len = 8192
 timeout = 25
 paths = ["src/crypto/mldsa/**"]
+
+[targets.quic_packet_header]
+sanitizer = "none"
+rss = 1536
+max_len = 65536
+timeout = 20
+paths = ["src/transport/udp/quic/packet.rs"]

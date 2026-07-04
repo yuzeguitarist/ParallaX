@@ -97,6 +97,13 @@ pub struct ReplayCache {
     encoded_entries: VecDeque<String>,
     nonces: HashSet<[u8; 8]>,
     transcripts: HashSet<[u8; 32]>,
+    /// Entries recorded in memory by [`Self::insert_new_outcome_deferred`] whose
+    /// durable journal write has not run yet; drained (oldest first) by
+    /// [`Self::persist_pending`] so the blocking fsync can run off the async
+    /// executor. Do not mix deferred and immediate inserts on one cache while
+    /// this queue is non-empty: the immediate path's append would journal its own
+    /// entry ahead of the still-queued ones.
+    pending_persist: VecDeque<ReplayEntry>,
 }
 
 impl ReplayCache {
@@ -111,6 +118,7 @@ impl ReplayCache {
             encoded_entries: VecDeque::with_capacity(capacity),
             nonces: HashSet::with_capacity(capacity),
             transcripts: HashSet::with_capacity(capacity),
+            pending_persist: VecDeque::new(),
         }
     }
 
@@ -243,27 +251,23 @@ impl ReplayCache {
             return Ok(ReplayInsertOutcome::Inserted);
         }
 
-        self.prune_expired(now);
-        if !self.is_fresh(entry.timestamp, now) {
-            return Ok(ReplayInsertOutcome::Stale);
-        }
-
-        if !self.nonces.insert(entry.nonce) {
-            return Ok(ReplayInsertOutcome::Replayed);
-        }
-        if !self.transcripts.insert(entry.transcript_fingerprint) {
-            self.nonces.remove(&entry.nonce);
-            return Ok(ReplayInsertOutcome::Replayed);
-        }
-        if self.order.len() >= self.capacity {
-            self.nonces.remove(&entry.nonce);
-            self.transcripts.remove(&entry.transcript_fingerprint);
-            return Ok(ReplayInsertOutcome::CacheFull);
+        // A cache is driven by EITHER the immediate path (this method) OR the
+        // deferred path, never both — but flush any queued deferred entries first
+        // as defense-in-depth. `persist()` below appends only the newest entry,
+        // while a later `persist_pending()` may compact the whole journal; leaving
+        // queued entries here would let that compaction re-append lines already
+        // written, duplicating journal state after a restart. In practice
+        // `pending_persist` is always empty here, so this is a no-op.
+        if !self.pending_persist.is_empty() {
+            self.persist_pending()?;
         }
 
         let nonce = entry.nonce;
         let transcript = entry.transcript_fingerprint;
-        self.push_loaded_entry(entry);
+        let outcome = self.stage_insert(entry, now);
+        if outcome != ReplayInsertOutcome::Inserted {
+            return Ok(outcome);
+        }
         if let Err(err) = self.persist() {
             // Roll back the in-memory mutation for THIS entry so memory tracks
             // durable state exactly: a legitimate retry can re-insert (no false
@@ -275,6 +279,97 @@ impl ReplayCache {
             return Err(err);
         }
         Ok(ReplayInsertOutcome::Inserted)
+    }
+
+    /// Like [`Self::insert_new_outcome`] but performs NO disk I/O: the entry is
+    /// recorded in memory (so it gates replays immediately, exactly like the
+    /// immediate variant) and queued for a later [`Self::persist_pending`], which
+    /// runs the blocking journal append + fsync. This lets async callers keep the
+    /// dedup decision synchronous under their lock while offloading the fsync to
+    /// a blocking thread (issue #24). Until `persist_pending` runs, the entry's
+    /// replay protection does not yet survive a restart.
+    pub fn insert_new_outcome_deferred(
+        &mut self,
+        entry: ReplayEntry,
+        now: u64,
+    ) -> ReplayInsertOutcome {
+        if self.capacity == 0 {
+            return ReplayInsertOutcome::Inserted;
+        }
+
+        let pending = entry.clone();
+        let outcome = self.stage_insert(entry, now);
+        if outcome == ReplayInsertOutcome::Inserted {
+            self.pending_persist.push_back(pending);
+        }
+        outcome
+    }
+
+    /// Durably persists every entry queued by [`Self::insert_new_outcome_deferred`],
+    /// oldest first. This is the blocking half of the deferred insert (journal
+    /// append + fsync, or a full compaction); run it off the async executor (e.g.
+    /// via `spawn_blocking`). On error the unpersisted remainder stays queued so a
+    /// later call retries; the in-memory record is NOT rolled back — the entry
+    /// keeps gating replays for this process's lifetime, only its restart
+    /// durability is pending.
+    pub fn persist_pending(&mut self) -> Result<(), ReplayCacheError> {
+        while let Some(entry) = self.pending_persist.front().cloned() {
+            // An entry pruned from memory while queued has already expired: a
+            // fresh load would prune its journal line immediately, and skipping
+            // it bounds the queue under a persistently failing disk.
+            if !self.nonces.contains(&entry.nonce) {
+                self.pending_persist.pop_front();
+                continue;
+            }
+            let Some(path) = self.path.clone() else {
+                // In-memory cache: nothing to persist.
+                self.pending_persist.clear();
+                return Ok(());
+            };
+            let compacted = match self.mac_key.clone() {
+                Some(mac_key) => self.persist_authenticated_entry(&path, &mac_key, Some(entry))?,
+                None => {
+                    // The plain journal is always rewritten whole from
+                    // `encoded_entries`, which already includes every queued entry.
+                    self.persist_plain(&path)?;
+                    true
+                }
+            };
+            if compacted {
+                // The write covered EVERY in-memory entry, including everything
+                // still queued; appending those again would duplicate journal
+                // lines.
+                self.pending_persist.clear();
+            } else {
+                self.pending_persist.pop_front();
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared in-memory stage of the insert paths: prune, freshness check, dedup
+    /// insert and push — everything except persistence.
+    fn stage_insert(&mut self, entry: ReplayEntry, now: u64) -> ReplayInsertOutcome {
+        self.prune_expired(now);
+        if !self.is_fresh(entry.timestamp, now) {
+            return ReplayInsertOutcome::Stale;
+        }
+
+        if !self.nonces.insert(entry.nonce) {
+            return ReplayInsertOutcome::Replayed;
+        }
+        if !self.transcripts.insert(entry.transcript_fingerprint) {
+            self.nonces.remove(&entry.nonce);
+            return ReplayInsertOutcome::Replayed;
+        }
+        if self.order.len() >= self.capacity {
+            self.nonces.remove(&entry.nonce);
+            self.transcripts.remove(&entry.transcript_fingerprint);
+            return ReplayInsertOutcome::CacheFull;
+        }
+
+        self.push_loaded_entry(entry);
+        ReplayInsertOutcome::Inserted
     }
 
     fn is_fresh(&self, timestamp: u64, now: u64) -> bool {
@@ -337,7 +432,7 @@ impl ReplayCache {
 
     fn persist_plain(&self, path: &Path) -> Result<(), ReplayCacheError> {
         let body = serialize_cached_entries(&self.encoded_entries);
-        let tmp = path.with_extension("tmp");
+        let tmp = cache_tmp_path(path);
         write_cache_file(&tmp, body.as_bytes())?;
         fs::rename(tmp, path)?;
         Ok(())
@@ -348,8 +443,26 @@ impl ReplayCache {
         path: &Path,
         mac_key: &CacheMacKey,
     ) -> Result<(), ReplayCacheError> {
+        let entry = self.order.back().cloned();
+        self.persist_authenticated_entry(path, mac_key, entry)
+            .map(|_compacted| ())
+    }
+
+    /// Appends `entry` to the committed journal, or compacts (rewriting the whole
+    /// journal from the in-memory `order`) when appending is impossible or
+    /// uneconomical. Returns `true` when the write was a compaction: a compaction
+    /// persists EVERY in-memory entry — including any still queued in
+    /// `pending_persist` — so a caller draining that queue must stop rather than
+    /// re-append already-durable entries (duplicating journal lines).
+    fn persist_authenticated_entry(
+        &mut self,
+        path: &Path,
+        mac_key: &CacheMacKey,
+        entry: Option<ReplayEntry>,
+    ) -> Result<bool, ReplayCacheError> {
         let Some(journal) = self.auth_journal else {
-            return self.compact_authenticated_journal(path, mac_key);
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         };
         // count==0 means no committed header exists yet (fresh file, or a 0-byte/
         // whitespace-only file left by a crash before the empty header was synced).
@@ -358,18 +471,21 @@ impl ReplayCache {
         // the in-place header rewrite below (the in-memory order already holds the
         // just-inserted entry, so this persists it as a clean count=1 journal).
         if journal.count == 0 {
-            return self.compact_authenticated_journal(path, mac_key);
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         }
         if self.should_compact_authenticated_journal(journal) {
-            return self.compact_authenticated_journal(path, mac_key);
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         }
-        let Some(entry) = self.order.back() else {
-            return self.compact_authenticated_journal(path, mac_key);
+        let Some(entry) = entry else {
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         };
 
         let next_count = journal.count.saturating_add(1);
         let (line, next_tail_mac) =
-            encode_authenticated_journal_entry(mac_key, next_count, entry, &journal.tail_mac);
+            encode_authenticated_journal_entry(mac_key, next_count, &entry, &journal.tail_mac);
         let next_header = authenticated_journal_header(mac_key, next_count, &next_tail_mac);
 
         let mut file = open_cache_file_for_append(path)?;
@@ -379,7 +495,8 @@ impl ReplayCache {
             // it cleanly via tmp-file + rename rather than appending onto a missing
             // header.
             drop(file);
-            return self.compact_authenticated_journal(path, mac_key);
+            self.compact_authenticated_journal(path, mac_key)?;
+            return Ok(true);
         }
         let committed_len = file.seek(SeekFrom::End(0))?;
         // Append the entry, then rewrite the header. On a failed APPEND (the common
@@ -415,7 +532,7 @@ impl ReplayCache {
             count: next_count,
             tail_mac: next_tail_mac,
         });
-        Ok(())
+        Ok(false)
     }
 
     fn should_compact_authenticated_journal(&self, journal: AuthJournalState) -> bool {
@@ -431,7 +548,7 @@ impl ReplayCache {
         mac_key: &CacheMacKey,
     ) -> Result<(), ReplayCacheError> {
         let (raw, journal) = serialize_authenticated_journal(&self.order, mac_key);
-        let tmp = path.with_extension("tmp");
+        let tmp = cache_tmp_path(path);
         write_cache_file(&tmp, raw.as_bytes())?;
         fs::rename(tmp, path)?;
         // Make the rename itself durable so a crash right after compaction/heal
@@ -440,6 +557,19 @@ impl ReplayCache {
         self.auth_journal = Some(journal);
         Ok(())
     }
+}
+
+/// Derives the temp path for the atomic tmp-file + rename writes by APPENDING
+/// `.tmp` to the FULL cache file name (`parallax-replay.cache.0rtt` ->
+/// `parallax-replay.cache.0rtt.tmp`). `Path::with_extension("tmp")` would
+/// REPLACE the final extension instead, mapping the sibling `.cache.0rtt` and
+/// `.cache.marker` caches onto the SAME `<dir>/parallax-replay.cache.tmp` —
+/// and since each sibling cache has its own lock, concurrent compaction could
+/// rename one cache's (same-PSK, MAC-valid) content into the other's file.
+fn cache_tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Read the replay-cache journal, refusing to follow a symlinked final path
@@ -1274,6 +1404,69 @@ mod tests {
     }
 
     #[test]
+    fn future_skew_boundary_is_exact() {
+        // The future bound is `timestamp <= now + MAX_FUTURE_SKEW_SECS`. An entry
+        // exactly at the edge is accepted; one second beyond is Stale. Existing
+        // tests only probe `now + 3` (inside) and `now + window` (far outside), so
+        // pin the exact edge here — a `<` vs `<=` mutant on the skew check dies.
+        let now = 3_000_000_u64;
+
+        let mut cache = ReplayCache::new(8);
+        let at_edge = ReplayEntry {
+            timestamp: now + MAX_FUTURE_SKEW_SECS,
+            nonce: [1_u8; 8],
+            transcript_fingerprint: [1_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(at_edge, now).unwrap(),
+            ReplayInsertOutcome::Inserted,
+            "exactly MAX_FUTURE_SKEW_SECS ahead is still fresh",
+        );
+
+        let past_edge = ReplayEntry {
+            timestamp: now + MAX_FUTURE_SKEW_SECS + 1,
+            nonce: [2_u8; 8],
+            transcript_fingerprint: [2_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(past_edge, now).unwrap(),
+            ReplayInsertOutcome::Stale,
+            "one second past the skew edge is rejected",
+        );
+    }
+
+    #[test]
+    fn past_window_boundary_is_exact() {
+        // The past bound is `timestamp + window_secs >= now`. An entry whose age is
+        // exactly the window is still fresh; one second older is Stale.
+        let window = DEFAULT_REPLAY_WINDOW_SECS;
+        let now = 5_000_000_u64;
+
+        let mut cache = ReplayCache::new(8);
+        let at_edge = ReplayEntry {
+            timestamp: now - window,
+            nonce: [3_u8; 8],
+            transcript_fingerprint: [3_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(at_edge, now).unwrap(),
+            ReplayInsertOutcome::Inserted,
+            "an entry exactly `window` seconds old is still fresh",
+        );
+
+        let past_edge = ReplayEntry {
+            timestamp: now - window - 1,
+            nonce: [4_u8; 8],
+            transcript_fingerprint: [4_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(past_edge, now).unwrap(),
+            ReplayInsertOutcome::Stale,
+            "one second older than the window is rejected",
+        );
+    }
+
+    #[test]
     fn authenticated_cache_heals_empty_file_left_by_first_append_crash() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay-empty.cache");
@@ -1395,5 +1588,353 @@ mod tests {
             ReplayInsertOutcome::Replayed,
             "a 300s-old entry must be retained by the wide-window load prune, not replayable",
         );
+    }
+
+    #[test]
+    fn sibling_cache_tmp_paths_are_distinct() {
+        // #196: the temp name must be derived by APPENDING to the full cache file
+        // name; `with_extension("tmp")` replaced the final `.0rtt`/`.marker`
+        // component, collapsing both siblings onto one `parallax-replay.cache.tmp`.
+        let zero = cache_tmp_path(Path::new("/var/lib/parallax/parallax-replay.cache.0rtt"));
+        let marker = cache_tmp_path(Path::new("/var/lib/parallax/parallax-replay.cache.marker"));
+        assert_ne!(zero, marker, "sibling caches must not share one temp path");
+        assert_eq!(
+            zero,
+            Path::new("/var/lib/parallax/parallax-replay.cache.0rtt.tmp")
+        );
+        assert_eq!(
+            marker,
+            Path::new("/var/lib/parallax/parallax-replay.cache.marker.tmp")
+        );
+    }
+
+    #[test]
+    fn concurrent_sibling_compaction_does_not_clobber_either_cache() {
+        // #196 regression: the `.cache.0rtt` and `.cache.marker` siblings each have
+        // their own lock, so their compactions can run concurrently. With a shared
+        // temp path, one cache's (same-PSK, MAC-valid) content could be renamed into
+        // the other's file, or the tmp create/rename could fail EEXIST/ENOENT.
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let handles: Vec<_> = ["parallax-replay.cache.0rtt", "parallax-replay.cache.marker"]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                let path = dir.path().join(name);
+                std::thread::spawn(move || {
+                    let mut cache =
+                        ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+                    let entry = ReplayEntry {
+                        timestamp: now,
+                        nonce: [idx as u8 + 1; 8],
+                        transcript_fingerprint: [idx as u8 + 1; 32],
+                    };
+                    assert!(cache.insert_new(entry.clone(), now).unwrap());
+                    let mac_key = cache.mac_key.clone().expect("authenticated cache has key");
+                    for _ in 0..256 {
+                        cache
+                            .compact_authenticated_journal(&path, &mac_key)
+                            .expect("compaction must not race the sibling cache");
+                    }
+                    (path, entry)
+                })
+            })
+            .collect();
+        for handle in handles {
+            let (path, entry) = handle.join().unwrap();
+            // Each cache must reload cleanly and still hold ITS OWN entry — a
+            // sibling's journal renamed into place would load fine (same PSK) but
+            // record the WRONG entry, so the own-entry replay check catches it.
+            let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            assert!(
+                !loaded.insert_new(entry, now).unwrap(),
+                "cache at {} must still hold its own entry after concurrent compaction",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_insert_gates_replays_in_memory_and_persists_on_drain() {
+        // Issue #24: the deferred insert must dedup immediately (in memory,
+        // without touching the disk), and a later persist_pending must make every
+        // queued entry durable, in insertion order.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-deferred.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let first = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert_eq!(
+            cache.insert_new_outcome_deferred(first.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(
+            cache.insert_new_outcome_deferred(first.clone(), now),
+            ReplayInsertOutcome::Replayed,
+            "replay gated by the in-memory record before any persist"
+        );
+        assert_eq!(
+            cache.insert_new_outcome_deferred(second.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        assert!(!path.exists(), "deferred insert must not perform disk I/O");
+
+        cache.persist_pending().unwrap();
+        drop(cache);
+
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!loaded.insert_new(first, now).unwrap(), "first persisted");
+        assert!(!loaded.insert_new(second, now).unwrap(), "second persisted");
+    }
+
+    #[test]
+    fn deferred_entries_append_to_a_committed_journal() {
+        // Exercise persist_pending's APPEND path (a committed count >= 1 journal,
+        // no compaction): each queued entry lands as its own journal line and the
+        // already-committed entry is neither duplicated nor lost.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-deferred-append.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let committed = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let queued_a = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+        let queued_b = ReplayEntry {
+            timestamp: now,
+            nonce: [5; 8],
+            transcript_fingerprint: [6; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(committed.clone(), now).unwrap());
+        assert_eq!(
+            cache.insert_new_outcome_deferred(queued_a.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(
+            cache.insert_new_outcome_deferred(queued_b.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        cache.persist_pending().unwrap();
+        drop(cache);
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.lines().count(),
+            4,
+            "header + one line per entry (no duplicates): {raw:?}"
+        );
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!loaded.insert_new(committed, now).unwrap());
+        assert!(!loaded.insert_new(queued_a, now).unwrap());
+        assert!(!loaded.insert_new(queued_b, now).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_persist_failure_keeps_entry_queued_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-deferred-retry.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let committed = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let queued = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(committed, now).unwrap());
+
+        // Queue an entry, then make the journal unwritable so the drain fails.
+        assert_eq!(
+            cache.insert_new_outcome_deferred(queued.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(matches!(
+            cache.persist_pending(),
+            Err(ReplayCacheError::Io(_))
+        ));
+        // Unlike the immediate path there is no rollback: the in-memory record
+        // still gates a replay while durability is pending.
+        assert_eq!(
+            cache.insert_new_outcome_deferred(queued.clone(), now),
+            ReplayInsertOutcome::Replayed
+        );
+
+        // Restore writability: the retained queue drains on the next call and the
+        // entry becomes durable.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        cache.persist_pending().unwrap();
+        drop(cache);
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(
+            !loaded.insert_new(queued, now).unwrap(),
+            "queued entry persisted by the retry"
+        );
+    }
+
+    // --- Journal-parse helper coverage (decode_hex_exact / hex_value / parse_entry) ---
+    //
+    // These pure helpers run on the replay-cache LOAD path: `decode_hex_exact` fires on
+    // every persisted entry (inside `parse_authenticated_journal_entry`, BEFORE its MAC
+    // check), so a corrupted or tampered journal line reaches them. The existing load
+    // tests only assert a coarse `MalformedLine | MacMismatch` OR and never call these
+    // helpers directly, so their malformed/boundary branches were unpinned. Tests-only —
+    // no production change. (`ReplayCacheError` derives no `PartialEq`, hence `matches!`.)
+
+    #[test]
+    fn hex_value_maps_every_valid_nibble_and_rejects_the_rest() {
+        assert_eq!(hex_value(b'0').unwrap(), 0);
+        assert_eq!(hex_value(b'9').unwrap(), 9);
+        // BOTH letter cases decode (the uppercase A-F arm has no other coverage).
+        assert_eq!(hex_value(b'a').unwrap(), 10);
+        assert_eq!(hex_value(b'f').unwrap(), 15);
+        assert_eq!(hex_value(b'A').unwrap(), 10);
+        assert_eq!(hex_value(b'F').unwrap(), 15);
+        // Everything else is rejected, including the bytes adjacent to the valid ASCII
+        // ranges ('/' = '0'-1, ':' = '9'+1, 'g'/'G' = 'f'/'F'+1) and the extremes.
+        for bad in [b' ', b'/', b':', b'g', b'G', b'x', b'\x00', b'\xff'] {
+            assert!(
+                matches!(hex_value(bad), Err(ReplayCacheError::MalformedHex)),
+                "0x{bad:02x} must be rejected as non-hex"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_hex_exact_round_trips_and_is_case_insensitive() {
+        let mut out = [0_u8; 4];
+        decode_hex_exact("0102FfaB", &mut out).unwrap();
+        assert_eq!(out, [0x01, 0x02, 0xff, 0xab]);
+    }
+
+    #[test]
+    fn decode_hex_exact_rejects_wrong_length() {
+        // The guard is `input.len() != out.len() * 2`: too short, too long, and empty
+        // all fail before any nibble is decoded.
+        let mut two = [0_u8; 2]; // expects exactly 4 hex chars
+        assert!(matches!(
+            decode_hex_exact("abc", &mut two),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        assert!(matches!(
+            decode_hex_exact("aabbcc", &mut two),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        let mut one = [0_u8; 1]; // expects exactly 2 hex chars
+        assert!(matches!(
+            decode_hex_exact("", &mut one),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+    }
+
+    #[test]
+    fn decode_hex_exact_rejects_non_hex_at_correct_length() {
+        // Correct length, but a non-hex byte in either nibble position.
+        let mut one = [0_u8; 1];
+        assert!(matches!(
+            decode_hex_exact("zz", &mut one),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        assert!(matches!(
+            decode_hex_exact("0g", &mut one),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        assert!(matches!(
+            decode_hex_exact("g0", &mut one),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+    }
+
+    #[test]
+    fn parse_entry_accepts_a_well_formed_line() {
+        let nonce_hex = "0102030405060708"; // 8 bytes
+        let transcript_hex = "ab".repeat(32); // 32 bytes
+        let line = format!("100 {nonce_hex} {transcript_hex}");
+        assert_eq!(
+            parse_entry(&line).unwrap(),
+            ReplayEntry {
+                timestamp: 100,
+                nonce: [1, 2, 3, 4, 5, 6, 7, 8],
+                transcript_fingerprint: [0xab; 32],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_entry_rejects_structurally_malformed_lines() {
+        let nonce_hex = "0102030405060708";
+        let transcript_hex = "ab".repeat(32);
+        // Non-numeric timestamp.
+        assert!(matches!(
+            parse_entry(&format!("nope {nonce_hex} {transcript_hex}")),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+        // Empty line (no fields at all).
+        assert!(matches!(
+            parse_entry(""),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+        // Missing both nonce and transcript.
+        assert!(matches!(
+            parse_entry("100"),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+        // Missing transcript.
+        assert!(matches!(
+            parse_entry(&format!("100 {nonce_hex}")),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+        // Trailing extra field.
+        assert!(matches!(
+            parse_entry(&format!("100 {nonce_hex} {transcript_hex} extra")),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+    }
+
+    #[test]
+    fn parse_entry_propagates_hex_errors_from_its_fields() {
+        let transcript_hex = "ab".repeat(32);
+        // Nonce field has the right structure but wrong hex length -> MalformedHex,
+        // proving parse_entry surfaces decode_hex_exact's error rather than swallowing
+        // it or mislabelling it as MalformedLine.
+        assert!(matches!(
+            parse_entry(&format!("100 abcd {transcript_hex}")),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        // Nonce field is the correct length (16 chars) but all non-hex.
+        let bad_nonce = "zz".repeat(8);
+        assert!(matches!(
+            parse_entry(&format!("100 {bad_nonce} {transcript_hex}")),
+            Err(ReplayCacheError::MalformedHex)
+        ));
     }
 }

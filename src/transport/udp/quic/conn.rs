@@ -175,6 +175,15 @@ const MAX_STREAM_REASSEMBLY: usize = 2 * 1024 * 1024;
 /// byte cap): bounds buffered tuples against a tiny-fragment flood.
 const MAX_STREAM_PENDING_FRAGMENTS: usize = 4096;
 
+/// Cap on out-of-order STREAM bytes buffered across ALL streams, tied to the
+/// connection receive window. The per-stream cap composes badly on its own:
+/// duplicate/overlapping fragments below a stream's high watermark cost (almost)
+/// no connection flow-control credit, so [`MAX_PEER_STREAMS`] of each kind ×
+/// [`MAX_STREAM_REASSEMBLY`] (~256 MiB) could be buffered while
+/// [`CONN_RECV_WINDOW`] (16 MiB) is never engaged. This aggregate budget
+/// restores the connection-level bound the flow-control design assumes.
+const MAX_CONN_REASSEMBLY: usize = CONN_RECV_WINDOW as usize;
+
 /// RFC 9000 §18.2 default `ack_delay_exponent`. The peer scales its ACK `delay`
 /// field by `2^exponent` microseconds; we decode with the default (neither we nor
 /// the Safari client negotiate a different value).
@@ -399,6 +408,10 @@ struct Space {
 struct Stream {
     // Send half (bytes this endpoint transmits on the stream).
     send: Vec<u8>,
+    /// Absolute stream offset of `send[0]`: the fully-acked prefix is compacted
+    /// away (see [`Connection::compact_send_buffer`]), so an absolute offset `o`
+    /// indexes `send` at `o - send_base`.
+    send_base: u64,
     /// Next absolute offset to packetize from `send`.
     send_off: u64,
     /// Peer's MAX_STREAM_DATA limit: we MUST NOT send past this absolute offset.
@@ -453,6 +466,15 @@ const RELAY_STREAM_ID: u64 = 0;
 /// the app reads. Matches the Safari `initial_max_stream_data` value.
 const STREAM_RECV_WINDOW: u64 = 2 * 1024 * 1024;
 
+/// Cap on bytes a stream's send half may hold buffered (unsent + in flight +
+/// awaiting compaction). The async write path stops accepting bytes once the
+/// backlog reaches this (see [`Connection::stream_send_capacity`]) and resumes as
+/// ACKs reclaim the buffer — without it an application writing faster than the
+/// peer acknowledges would grow `Stream::send` without bound (memory-DoS,
+/// finding #28). Sized to the per-stream receive window so a well-behaved peer
+/// can keep a full window in flight.
+pub(super) const STREAM_SEND_BUFFER: usize = 2 * 1024 * 1024;
+
 /// Initial connection-level receive window we advertise (MAX_DATA); extended as
 /// the app reads across all streams. Matches the Safari `initial_max_data` value.
 const CONN_RECV_WINDOW: u64 = 16 * 1024 * 1024;
@@ -480,13 +502,19 @@ fn is_uni(id: u64) -> bool {
 ///      counting against the reassembly budget (see the inline notes that this
 ///      replaced — a fragment an overlapping fill jumped entirely past matches
 ///      no removal path and would otherwise linger forever).
+///
+/// Returns the number of buffered bytes removed from `pending` (drained or
+/// evicted), so the STREAM caller can settle the connection-wide reassembly
+/// budget ([`MAX_CONN_REASSEMBLY`]); the CRYPTO caller has no aggregate budget
+/// and ignores it.
 fn drain_contiguous(
     pending: &mut Vec<(u64, Vec<u8>)>,
     recv_off: &mut u64,
     offset: u64,
     data: &[u8],
     sink: &mut Vec<u8>,
-) {
+) -> usize {
+    let mut freed = 0;
     let skip = (*recv_off - offset) as usize;
     if skip < data.len() {
         sink.extend_from_slice(&data[skip..]);
@@ -500,8 +528,16 @@ fn drain_contiguous(
         let s = (*recv_off - o) as usize;
         sink.extend_from_slice(&d[s..]);
         *recv_off += (d.len() - s) as u64;
+        freed += d.len();
     }
-    pending.retain(|(o, d)| *o + d.len() as u64 > *recv_off);
+    pending.retain(|(o, d)| {
+        let keep = *o + d.len() as u64 > *recv_off;
+        if !keep {
+            freed += d.len();
+        }
+        keep
+    });
+    freed
 }
 
 /// A hand-rolled QUIC v1 connection (client or server), carried to handshake
@@ -564,6 +600,19 @@ pub struct Connection {
     /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
     /// HANDSHAKE_DONE, the client when it receives it.
     handshake_confirmed: bool,
+    /// The peer's address is validated (RFC 9000 §8.1). A client trusts the server
+    /// address it dialed, so it starts `true`; a server starts `false` and flips
+    /// when a packet from the peer opens under Handshake keys — proof the peer
+    /// received our Initial flight at its claimed (unspoofable) address. While
+    /// `false`, egress is capped at 3x `anti_amp_recv` in `poll_transmit`.
+    peer_addr_validated: bool,
+    /// Bytes received in datagrams from the peer while its address was unvalidated.
+    /// Every datagram byte attributed to the connection counts, even bytes that
+    /// fail to decrypt (RFC 9000 §8.1) — garbage still "pays" 1:3 for what it can
+    /// reflect, which is exactly the amplification bound the limit accepts.
+    anti_amp_recv: u64,
+    /// Bytes sent to the peer while its address was unvalidated.
+    anti_amp_sent: u64,
     /// When any packet was last sent (drives the keep-alive timer).
     last_send_time: Option<Instant>,
     /// The current keep-alive cycle's interval, drawn fresh from
@@ -611,6 +660,10 @@ pub struct Connection {
     recv_max_data_sent: u64,
     recv_data_total: u64,
     recv_data_consumed: u64,
+    /// Out-of-order STREAM bytes currently buffered across all streams'
+    /// `recv_pending` (bounded by [`MAX_CONN_REASSEMBLY`]): incremented on push,
+    /// decremented as `drain_contiguous` drains/evicts fragments.
+    recv_pending_total: usize,
     /// A grown connection window owes the peer a MAX_DATA update.
     need_max_data: bool,
     /// Whether the peer's transport-parameter flow-control limits have been applied.
@@ -687,6 +740,9 @@ impl Connection {
             data_packets_open_failed: 0,
             handshake_done_pending: false,
             handshake_confirmed: false,
+            peer_addr_validated: side == Side::Client,
+            anti_amp_recv: 0,
+            anti_amp_sent: 0,
             last_send_time: None,
             keepalive_interval: random_keep_alive_interval(),
             ping_pending: false,
@@ -709,6 +765,7 @@ impl Connection {
             recv_max_data_sent: CONN_RECV_WINDOW,
             recv_data_total: 0,
             recv_data_consumed: 0,
+            recv_pending_total: 0,
             need_max_data: false,
             peer_flow_applied: false,
             peer_msd_bidi_local: 0,
@@ -985,6 +1042,15 @@ impl Connection {
             .extend_from_slice(data);
     }
 
+    /// Remaining bytes stream `id` may buffer for sending before hitting the
+    /// per-stream backlog cap (see [`STREAM_SEND_BUFFER`]). The async write path
+    /// uses this for backpressure: at 0 it parks the writer until ACK progress
+    /// reclaims buffer space, instead of buffering without bound (finding #28).
+    pub fn stream_send_capacity(&self, id: u64) -> usize {
+        let buffered = self.streams.get(&id).map_or(0, |s| s.send.len());
+        STREAM_SEND_BUFFER.saturating_sub(buffered)
+    }
+
     /// Mark stream `id` finished (a FIN is sent after all buffered bytes).
     pub fn finish_stream(&mut self, id: u64) {
         if let Some(s) = self.streams.get_mut(&id) {
@@ -1198,6 +1264,17 @@ impl Connection {
     /// congestion window unless a PTO probe is pending (RFC 9002 §6.2.4). One
     /// datagram per call; the driver loops until `None`.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let dg = self.poll_transmit_inner(now)?;
+        // Anti-amplification accounting (RFC 9000 §8.1): every byte sent before the
+        // peer's address is validated draws down the 3x budget enforced in
+        // `poll_transmit_inner`.
+        if !self.peer_addr_validated {
+            self.anti_amp_sent = self.anti_amp_sent.saturating_add(dg.len() as u64);
+        }
+        Some(dg)
+    }
+
+    fn poll_transmit_inner(&mut self, now: Instant) -> Option<Vec<u8>> {
         // Enforce the AEAD confidentiality limit (RFC 9001 §6.6): with no 1-RTT key
         // update, once we have sealed the cipher's safe number of 1-RTT packets we
         // MUST stop using the key — force-close rather than overrun the AEAD margin.
@@ -1216,6 +1293,23 @@ impl Connection {
                     return Some(dg);
                 }
             }
+            return None;
+        }
+        // Anti-amplification (RFC 9000 §8.1): until the peer's address is validated
+        // (a packet from it opens under Handshake keys), everything sent to it —
+        // ACKs and CRYPTO alike — is capped at 3x the bytes received from it, so a
+        // spoofed client Initial cannot reflect the multi-KB server handshake
+        // flight at a victim. Reserving a full MAX_DATAGRAM keeps the cap strict
+        // without building a packet that then could not be sent (building mutates
+        // send state); the single small close packet above stays within the same
+        // reserve. This cannot deadlock a genuine handshake: every client datagram
+        // grows the budget by 3x its size (client Initials alone are >=1200 bytes
+        // each, and PTO makes the client resend them), the driver re-polls on every
+        // receive, and the client's first Handshake-level packet lifts the cap.
+        if !self.peer_addr_validated
+            && self.anti_amp_sent.saturating_add(MAX_DATAGRAM as u64)
+                > self.anti_amp_recv.saturating_mul(3)
+        {
             return None;
         }
         // Pure ACKs first so acknowledgements are not held behind data, and are
@@ -1964,11 +2058,12 @@ impl Connection {
                 if !s.retransmit.is_empty() {
                     return true;
                 }
-                let all_sent = (s.send_off as usize) == s.send.len();
+                let buffered_end = s.send_base + s.send.len() as u64;
+                let all_sent = s.send_off == buffered_end;
                 if s.fin && !s.fin_sent && all_sent {
                     return true; // an empty FIN consumes no flow-control credit
                 }
-                let fresh = (s.send_off as usize) < s.send.len();
+                let fresh = s.send_off < buffered_end;
                 let stream_window = s.send_max.saturating_sub(s.send_off);
                 fresh && stream_window > 0 && conn_window > 0
             })
@@ -2042,23 +2137,25 @@ impl Connection {
                 .pmtud
                 .current_mtu()
                 .saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
-            let remaining = s.send.len() - offset as usize;
+            let buffered_end = s.send_base + s.send.len() as u64;
+            let remaining = (buffered_end - offset) as usize;
             // Clamp the fresh chunk to both flow-control windows (RFC 9000 §4.1).
             let conn_window = self.send_max_data.saturating_sub(self.send_data_total);
             let fc_window = s.send_max.saturating_sub(offset).min(conn_window) as usize;
             let chunk = remaining.min(budget.max(1)).min(fc_window);
             let end = offset + chunk as u64;
             // Carry the FIN only once the final buffered byte is in this frame.
-            let fin = s.fin && !s.fin_sent && end as usize == s.send.len();
+            let fin = s.fin && !s.fin_sent && end == buffered_end;
             (offset, end, fin, false)
         };
 
         let datagram = {
+            let s = &self.streams[&id];
             let frame = Frame::Stream {
                 id,
                 offset,
                 fin,
-                data: &self.streams[&id].send[offset as usize..end as usize],
+                data: &s.send[(offset - s.send_base) as usize..(end - s.send_base) as usize],
             };
             let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
             seal_packet(&keys.local, header, &[frame])
@@ -2131,21 +2228,23 @@ impl Connection {
                 .pmtud
                 .current_mtu()
                 .saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
-            let remaining = s.send.len() - offset as usize;
+            let buffered_end = s.send_base + s.send.len() as u64;
+            let remaining = (buffered_end - offset) as usize;
             let conn_window = self.send_max_data.saturating_sub(self.send_data_total);
             let fc_window = s.send_max.saturating_sub(offset).min(conn_window) as usize;
             let chunk = remaining.min(budget.max(1)).min(fc_window);
             let end = offset + chunk as u64;
-            let fin = s.fin && !s.fin_sent && end as usize == s.send.len();
+            let fin = s.fin && !s.fin_sent && end == buffered_end;
             (offset, end, fin, false)
         };
 
         let datagram = {
+            let s = &self.streams[&id];
             let frame = Frame::Stream {
                 id,
                 offset,
                 fin,
-                data: &self.streams[&id].send[offset as usize..end as usize],
+                data: &s.send[(offset - s.send_base) as usize..(end - s.send_base) as usize],
             };
             let keys = self.zero_rtt_keys.as_ref().expect("0-RTT keys present");
             seal_packet(&keys.local, header, &[frame])
@@ -2197,6 +2296,13 @@ impl Connection {
         // NB: the idle timer (last_recv_time) is refreshed inside process_packet
         // only AFTER a packet AEAD-opens (RFC 9000 §10.1: "received and processed"),
         // so an off-path attacker cannot pin the connection open with garbage UDP.
+        //
+        // Anti-amplification (RFC 9000 §8.1): while the peer's address is
+        // unvalidated, every byte of every datagram attributed to the connection —
+        // decryptable or not — grows the 3x send budget enforced in poll_transmit.
+        if !self.peer_addr_validated {
+            self.anti_amp_recv = self.anti_amp_recv.saturating_add(datagram.len() as u64);
+        }
         let mut buf = datagram.to_vec();
         let mut pos = 0;
         while pos < buf.len() {
@@ -2334,6 +2440,14 @@ impl Connection {
         if space == SPACE_HANDSHAKE && self.spaces[SPACE_INITIAL].keys.is_some() {
             self.discard_space(SPACE_INITIAL);
         }
+        // The same proof validates the peer's address (RFC 9000 §8.1: "receipt of
+        // a packet protected with Handshake keys"): only an on-path peer at its
+        // claimed address can hold Handshake keys, so the 3x anti-amplification
+        // cap is lifted. (0-RTT does NOT validate — it opens in SPACE_DATA under
+        // PSK-derived keys a replay could reuse from a spoofed address.)
+        if space == SPACE_HANDSHAKE {
+            self.peer_addr_validated = true;
+        }
 
         // Copy the decrypted frames out so the TLS engine can be mutated while we
         // iterate.
@@ -2397,7 +2511,7 @@ impl Connection {
                     // The peer will not read more of this stream: stop sending it.
                     // (A full RESET_STREAM emission lands with flow control.)
                     if let Some(s) = self.streams.get_mut(&id) {
-                        s.send_off = s.send.len() as u64;
+                        s.send_off = s.send_base + s.send.len() as u64;
                         s.retransmit.clear();
                     }
                 }
@@ -2512,8 +2626,17 @@ impl Connection {
         let mut any_ack_eliciting = false;
         let mut acked_bytes = 0u64;
         let mut probe_acked = false;
+        // Streams with newly-acked bytes: their fully-acked send-buffer prefixes are
+        // compacted below, once loss detection has requeued anything declared lost.
+        let mut acked_streams: Vec<u64> = Vec::new();
         for (pn, sp) in &newly {
-            self.spaces[space].sent_content.remove(pn);
+            if let Some(content) = self.spaces[space].sent_content.remove(pn) {
+                for &(id, _, _, _) in &content.stream {
+                    if !acked_streams.contains(&id) {
+                        acked_streams.push(id);
+                    }
+                }
+            }
             if sp.ack_eliciting {
                 any_ack_eliciting = true;
                 acked_bytes += sp.size;
@@ -2613,7 +2736,46 @@ impl Connection {
                 }
             }
         }
+
+        // Reclaim fully-acked send-buffer prefixes (finding #28). Runs AFTER loss
+        // detection so a lost range is already requeued in `retransmit` and still
+        // counts as needed.
+        for id in acked_streams {
+            self.compact_send_buffer(id);
+        }
         Ok(())
+    }
+
+    /// Drop the fully-acknowledged prefix of stream `id`'s send buffer so a
+    /// long-lived stream does not retain every byte ever sent (memory-DoS,
+    /// finding #28). Everything below the lowest offset still needed for
+    /// (re)transmission — fresh bytes from `send_off`, queued lost ranges, and
+    /// ranges in flight awaiting an ACK — has been acknowledged and can never be
+    /// resent, so it is dropped and `send_base` advanced to keep absolute-offset
+    /// indexing correct. Amortized O(1)/byte: compaction only runs once the dead
+    /// prefix is at least as large as the live tail it would memmove.
+    fn compact_send_buffer(&mut self, id: u64) {
+        let Some(s) = self.streams.get(&id) else {
+            return;
+        };
+        let mut low = s.send_off;
+        for &(off, _, _) in &s.retransmit {
+            low = low.min(off);
+        }
+        for content in self.spaces[SPACE_DATA].sent_content.values() {
+            for &(sid, off, _, _) in &content.stream {
+                if sid == id {
+                    low = low.min(off);
+                }
+            }
+        }
+        let s = self.streams.get_mut(&id).expect("checked above");
+        let reclaim = low.saturating_sub(s.send_base) as usize;
+        if reclaim == 0 || reclaim < s.send.len() - reclaim {
+            return;
+        }
+        s.send.drain(..reclaim);
+        s.send_base = low;
     }
 
     /// Requeue the retransmittable content of declared-lost packets and report whether
@@ -2770,28 +2932,43 @@ impl Connection {
         // NOT this buffer: a zero-length fragment (e.g. a bare FIN, already recorded
         // above) carries nothing to reassemble, and duplicate/overlapping fragments
         // do not advance the watermark yet still buffer bytes. Drop empties and cap
-        // both buffered bytes and entry count (memory-exhaustion DoS otherwise).
+        // buffered bytes (per stream AND connection-wide) and entry count
+        // (memory-exhaustion DoS otherwise).
         if offset > s.recv_off {
             if !data.is_empty() {
+                // A fragment fully covered by an already-buffered one reassembles
+                // nothing new; drop it rather than buffer another copy. A retransmit
+                // duplicate leaves the high watermark unchanged (delta == 0), so it
+                // would otherwise consume reassembly budget at zero flow-control
+                // cost. Partial overlaps still buffer (they may fill gaps).
+                if s.recv_pending
+                    .iter()
+                    .any(|(o, d)| *o <= offset && *o + d.len() as u64 >= end)
+                {
+                    return Ok(());
+                }
                 let buffered: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
                 if buffered + data.len() > MAX_STREAM_REASSEMBLY
                     || s.recv_pending.len() >= MAX_STREAM_PENDING_FRAGMENTS
+                    || self.recv_pending_total + data.len() > MAX_CONN_REASSEMBLY
                 {
                     return Err(QuicTlsError::Crypto(
                         "stream reassembly buffer exceeded".into(),
                     ));
                 }
+                self.recv_pending_total += data.len();
                 s.recv_pending.push((offset, data.to_vec()));
             }
             return Ok(());
         }
-        drain_contiguous(
+        let freed = drain_contiguous(
             &mut s.recv_pending,
             &mut s.recv_off,
             offset,
             data,
             &mut s.recv,
         );
+        self.recv_pending_total -= freed;
         Ok(())
     }
 
@@ -3452,6 +3629,64 @@ mod tests {
         );
     }
 
+    /// RFC 9000 §8.1 anti-amplification (findings #203/#216): before the client's
+    /// address is validated, the server's egress — here inflated by a multi-KB
+    /// certificate chain — is capped at 3x the bytes received, so a spoofed Initial
+    /// cannot reflect the full handshake flight at a victim. The clipped flight is
+    /// not a deadlock: the client's answering packets grow the budget and its first
+    /// Handshake-level packet validates the address, after which the rest of the
+    /// flight flows and the handshake completes.
+    #[test]
+    fn unvalidated_server_egress_is_capped_at_three_times_received() {
+        let dcid = ConnectionId::new(&[0xa3; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0xab; 16 * 1024]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x3a, 0x3a, 0x3a, 0x3a]),
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        // Deliver the full ClientHello flight, then drain the server WITHOUT letting
+        // the client answer yet: everything it emits must fit within 3x what it
+        // received. (The flight is still delivered so the exchange can resume below.)
+        let mut received = 0usize;
+        while let Some(dg) = client.poll_transmit(now) {
+            received += dg.len();
+            server.handle_datagram(&dg, now).unwrap();
+        }
+        let mut sent = 0usize;
+        while let Some(dg) = server.poll_transmit(now) {
+            sent += dg.len();
+            client.handle_datagram(&dg, now).unwrap();
+        }
+        assert!(
+            sent <= 3 * received,
+            "unvalidated server egress ({sent} bytes) exceeds 3x the {received} received"
+        );
+        // The cap actually bit: part of the oversized flight is still unsent.
+        let hs = &server.spaces[SPACE_HANDSHAKE];
+        assert!(
+            hs.crypto_send_off < hs.crypto_send.len(),
+            "the oversized flight should have been clipped by the amplification cap"
+        );
+        assert!(!server.peer_addr_validated);
+
+        // Let the exchange continue: the handshake still completes, and the cap is
+        // lifted once the client's Handshake-level packets prove its address.
+        drive(&mut client, &mut server);
+        assert!(
+            server.peer_addr_validated,
+            "a Handshake-level packet from the client validates its address"
+        );
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+    }
+
     /// Ping-pong datagrams between two connections until neither has anything more
     /// to send (handshake CRYPTO + ACKs, then 1-RTT data). Lossless, so a single
     /// `now` suffices (no timers fire).
@@ -3679,6 +3914,70 @@ mod tests {
         assert_eq!(
             received, payload,
             "bytes intact and in order across the window"
+        );
+    }
+
+    #[test]
+    fn acked_send_buffer_prefix_is_reclaimed() {
+        // Finding #28: once a prefix of the send buffer is fully acknowledged it can
+        // never be resent, so it must be compacted away — a long-lived stream must
+        // not retain every byte ever sent.
+        let now = Instant::now();
+        let dcid = ConnectionId::new(&[0x28; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x28, 0x28, 0x28, 0x28]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        let payload: Vec<u8> = (0..256_000u32).map(|i| (i % 251) as u8).collect();
+        client.send_stream(RELAY_STREAM_ID, &payload);
+        assert_eq!(
+            client.stream_send_capacity(RELAY_STREAM_ID),
+            STREAM_SEND_BUFFER - payload.len(),
+            "buffered-but-unacked bytes consume send capacity"
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..2000 {
+            let mut moved = false;
+            while let Some(dg) = client.poll_transmit(now) {
+                server.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            received.extend_from_slice(&server.read_stream(RELAY_STREAM_ID));
+            while let Some(dg) = server.poll_transmit(now) {
+                client.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            if !moved && received.len() == payload.len() {
+                break;
+            }
+        }
+        assert_eq!(received, payload, "whole payload delivered in order");
+
+        let s = &client.streams[&RELAY_STREAM_ID];
+        assert!(
+            s.send.is_empty(),
+            "fully-acked send buffer compacted away (still holds {} bytes)",
+            s.send.len()
+        );
+        assert_eq!(
+            s.send_base, s.send_off,
+            "send_base advanced to the acked frontier"
+        );
+        assert_eq!(
+            client.stream_send_capacity(RELAY_STREAM_ID),
+            STREAM_SEND_BUFFER,
+            "acks restore the full send capacity"
         );
     }
 
@@ -4369,8 +4668,9 @@ mod tests {
     #[test]
     fn duplicate_out_of_order_stream_fragments_are_bounded() {
         // Each duplicate of a future-offset fragment leaves the flow-control high
-        // watermark unchanged (delta 0), so only the reassembly cap bounds the
-        // buffer. Without it, recv_pending would grow without bound.
+        // watermark unchanged (delta 0), so flow control never bounds it. It is
+        // fully covered by the already-buffered copy, so it must be dropped:
+        // buffering every copy would grow recv_pending at zero flow-control cost.
         let mut server = Connection::new_server(
             vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
             &server_key(),
@@ -4380,24 +4680,73 @@ mod tests {
         )
         .unwrap();
         let chunk = vec![0xAB; 1000];
-        let mut accepted = 0usize;
-        let mut rejected = false;
         for _ in 0..5000 {
-            match server.recv_stream(0, 10_000, false, &chunk) {
-                Ok(()) => accepted += 1,
-                Err(_) => {
+            server.recv_stream(0, 10_000, false, &chunk).unwrap();
+        }
+        assert_eq!(
+            server.streams[&0].recv_pending.len(),
+            1,
+            "duplicate out-of-order fragments are dropped, not buffered"
+        );
+        assert_eq!(server.recv_pending_total, chunk.len());
+        // The retained copy still reassembles once the gap is filled.
+        server
+            .recv_stream(0, 0, false, &vec![0xCC; 10_000])
+            .unwrap();
+        assert_eq!(server.streams[&0].recv_off, 11_000);
+        assert!(server.streams[&0].recv_pending.is_empty());
+        assert_eq!(
+            server.recv_pending_total, 0,
+            "drained fragments release the connection-wide budget"
+        );
+    }
+
+    #[test]
+    fn out_of_order_reassembly_is_bounded_connection_wide() {
+        // Overlapping future-offset fragments cost only their 1-byte watermark
+        // delta in connection flow-control credit yet buffer their full length,
+        // so the per-stream cap alone would let MAX_PEER_STREAMS × 2 MiB (≈128 MiB
+        // per kind) accumulate while CONN_RECV_WINDOW is never engaged. The
+        // aggregate budget must reject buffering past MAX_CONN_REASSEMBLY.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x6c, 0x6c, 0x6c, 0x6c]),
+        )
+        .unwrap();
+        let chunk = vec![0xCD; 256 * 1024];
+        let mut rejected = false;
+        'streams: for n in 0..MAX_PEER_STREAMS as u64 {
+            let id = n * 4; // client-initiated bidi (peer-initiated for the server)
+            for i in 0..8u64 {
+                // Each fragment extends the previous by one byte, so it is not a
+                // full duplicate (it is buffered) but costs only delta == 1 after
+                // the first (which charges its full length).
+                if server.recv_stream(id, i + 1, false, &chunk).is_err() {
                     rejected = true;
-                    break;
+                    break 'streams;
                 }
             }
         }
         assert!(
             rejected,
-            "duplicate out-of-order fragments are eventually rejected"
+            "aggregate out-of-order buffering is eventually rejected"
         );
         assert!(
-            accepted <= MAX_STREAM_REASSEMBLY / chunk.len() + 1,
-            "recv_pending is bounded by the byte cap (accepted {accepted})"
+            server.recv_pending_total <= MAX_CONN_REASSEMBLY,
+            "buffering never exceeds the connection-wide budget ({})",
+            server.recv_pending_total
+        );
+        let buffered: usize = server
+            .streams
+            .values()
+            .flat_map(|s| s.recv_pending.iter().map(|(_, d)| d.len()))
+            .sum();
+        assert_eq!(
+            buffered, server.recv_pending_total,
+            "the budget accounting matches the bytes actually buffered"
         );
     }
 

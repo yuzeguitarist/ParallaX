@@ -1878,6 +1878,35 @@ mod tests {
     }
 
     #[test]
+    fn compressed_certificate_rejects_unsupported_algorithm() {
+        // Only zlib (0x0001) is accepted. Any other CompressedCertificate
+        // algorithm must be refused on the still-unauthenticated server flight
+        // rather than fed to the zlib decoder. The existing tests only build zlib
+        // bodies, so this arm was never exercised. The algorithm check fires
+        // before the compressed body is read, so a bare 2-byte algorithm suffices.
+        let body = 0x0002_u16.to_be_bytes(); // brotli, not zlib
+        let err = parse_compressed_certificate_body(&body).unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Unsupported(m) if m.contains("algorithm")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn compressed_certificate_rejects_length_mismatch() {
+        // A well-formed zlib body whose declared uncompressed_length disagrees with
+        // the actual inflated length (both within the cap) must be rejected. This
+        // is distinct from the two cap guards above: here nothing is oversized, the
+        // header simply lies about the length. Declare 6, inflate to 5.
+        let body = build_compressed_cert_body(6, b"hello");
+        let err = parse_compressed_certificate_body(&body).unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("length mismatch")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn safari26_camouflage_emits_authenticated_client_hello() {
         let server = X25519KeyPair::generate();
         let psk = b"0123456789abcdef0123456789abcdef";
@@ -2594,6 +2623,188 @@ mod tests {
         drop(peer);
     }
 
+    #[tokio::test]
+    async fn await_http2_settings_ack_propagates_non_clean_read_error() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut keys = app_keys();
+
+        // A complete outer record HEADER whose declared payload length is far above
+        // the TLS record ceiling (0xffff): `read_record_into` reads the 5-byte header
+        // in full, then `parse_header` rejects it as PayloadTooLarge, which surfaces
+        // as an `io::ErrorKind::InvalidData`. That is NOT a clean-close kind, so the
+        // `is_clean_close(&err)` guard is false and the loop must propagate `Err`.
+        // (Kills the guard->true mutant, which would swallow it as `Ok(())`.)
+        peer.write_all(&[TLS_CONTENT_APPLICATION_DATA, 0x03, 0x03, 0xff, 0xff])
+            .await
+            .unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut keys)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Safari26TlsError::Io(_)),
+            "a non-clean read error must propagate, got {err:?}"
+        );
+    }
+
+    /// An encrypted application-data record carrying `plaintext_len` bytes that begin
+    /// with an HTTP/2 frame header declaring the maximum 24-bit length (0xff_ffff).
+    /// `parse_complete` can never satisfy that length, so the frame stays unconsumed
+    /// and the bytes accumulate in the settings-ack buffer verbatim.
+    fn incomplete_giant_h2_frame_record(
+        peer_keys: &mut Tls13Keys,
+        plaintext_len: usize,
+    ) -> Vec<u8> {
+        let mut body = vec![0xff, 0xff, 0xff, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+        body.resize(plaintext_len, 0x0);
+        peer_keys
+            .server_application
+            .encrypt_record(TLS_RECORD_APPLICATION_DATA, &body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_below_buffer_limit_keeps_reading() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // One record of unconsumable frame bytes leaves the buffer well BELOW
+        // H2_FRAME_BUFFER_LIMIT, so the loop must NOT bail — it must keep reading and
+        // reach the following outer fatal alert, surfacing it as an error.
+        // (Kills the `>`->`<` mutant, which would bail early and return `Ok(())`.)
+        let record = incomplete_giant_h2_frame_record(
+            &mut peer_keys,
+            crate::tls::record::MAX_TLS_RECORD_PAYLOAD,
+        );
+        assert!(record.len() <= H2_FRAME_BUFFER_LIMIT);
+        peer.write_all(&record).await.unwrap();
+        peer.write_all(&tls_record(TLS_CONTENT_ALERT, &[0x02, 0x28]))
+            .await
+            .unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x02,
+                description: 0x28
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_at_buffer_limit_keeps_reading() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // Accumulate EXACTLY H2_FRAME_BUFFER_LIMIT (65536) bytes of unconsumable
+        // frame across four 16 KiB records. The bound is `len > LIMIT`, so at exactly
+        // the limit the loop must NOT bail and must go on to read the trailing outer
+        // fatal alert. (Kills both the `>`->`==` and `>`->`>=` mutants, each of which
+        // would bail at exactly 65536 and return `Ok(())` instead of erroring.)
+        let chunk = H2_FRAME_BUFFER_LIMIT / 4;
+        assert_eq!(chunk * 4, H2_FRAME_BUFFER_LIMIT);
+        assert!(chunk <= crate::tls::record::MAX_TLS_RECORD_PAYLOAD);
+        for _ in 0..4 {
+            let record = incomplete_giant_h2_frame_record(&mut peer_keys, chunk);
+            peer.write_all(&record).await.unwrap();
+        }
+        peer.write_all(&tls_record(TLS_CONTENT_ALERT, &[0x02, 0x28]))
+            .await
+            .unwrap();
+        drop(peer);
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x02,
+                description: 0x28
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_http2_settings_ack_keeps_reading_at_exactly_the_buffer_limit() {
+        let mut session = test_session();
+        let (mut stream, peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+
+        // Accumulate EXACTLY H2_FRAME_BUFFER_LIMIT (64 KiB) of inner application-data
+        // that never completes a single HTTP/2 frame: the first 9 bytes are a header
+        // announcing a ~16 MiB DATA frame (type 0x0, not SETTINGS) and the rest is
+        // filler, so `process_http2_frames` consumes nothing and `plaintext` grows to
+        // exactly the limit. At the limit the guard `plaintext.len() > LIMIT` is FALSE,
+        // so the real code keeps reading and surfaces the trailing alert as an error.
+        // This pins the STRICT `>`: a `<`, `==`, or `>=` there would instead return Ok
+        // early and never read the alert (verified against all three by manual mutation),
+        // so this one case kills every comparison mutant cargo-mutants flagged here.
+        const CHUNK: usize = 16_000;
+        let sizes = [
+            CHUNK,
+            CHUNK,
+            CHUNK,
+            CHUNK,
+            H2_FRAME_BUFFER_LIMIT - 4 * CHUNK,
+        ];
+        let mut records = Vec::new();
+        for (i, &size) in sizes.iter().enumerate() {
+            let mut inner = vec![0_u8; size];
+            if i == 0 {
+                // 3-byte length = 0x00FF_FFFF, then frame type 0x0 (DATA).
+                inner[0..4].copy_from_slice(&[0xff, 0xff, 0xff, 0x00]);
+            }
+            records.push(
+                peer_keys
+                    .server_application
+                    .encrypt_record(TLS_RECORD_APPLICATION_DATA, &inner)
+                    .unwrap(),
+            );
+        }
+        // The trailing outer alert is reached ONLY if the guard did not stop the loop.
+        let trailing_alert = tls_record(TLS_CONTENT_ALERT, &[0x02, 0x28]);
+
+        // Feed concurrently: 64 KB can exceed the loopback socket buffer, so a
+        // sequential write-then-read would deadlock; the reader drains as we fill.
+        let writer = tokio::spawn(async move {
+            let mut peer = peer;
+            for record in records {
+                if peer.write_all(&record).await.is_err() {
+                    return;
+                }
+            }
+            let _ = peer.write_all(&trailing_alert).await;
+        });
+
+        let err = session
+            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Safari26TlsError::Alert {
+                level: 0x02,
+                description: 0x28
+            }
+        ));
+        let _ = writer.await;
+    }
+
     // ---- CompletedSafari26Handshake accessors ----
 
     #[test]
@@ -2983,6 +3194,32 @@ mod tests {
         assert!(matches!(
             parse_safari_server_hello(&record),
             Err(Safari26TlsError::MissingServerHello)
+        ));
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_tls13_without_key_share() {
+        // supported_versions selects TLS 1.3, but the ServerHello carries no
+        // key_share extension. A real TLS 1.3 ServerHello always echoes a
+        // key_share, so this must be rejected rather than proceeding with an
+        // absent group. Sibling reject branches (HRR, short session_id, non-zero
+        // compression, non-TLS1.3) are pinned above; this one had no test.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+        ext.extend_from_slice(&2_u16.to_be_bytes());
+        ext.extend_from_slice(&TLS13.to_be_bytes());
+        let record = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS12,
+            &[0x11; 32],
+            32,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &ext,
+        );
+        assert!(matches!(
+            parse_safari_server_hello(&record),
+            Err(Safari26TlsError::Handshake(ref m)) if m.contains("missing key_share")
         ));
     }
 

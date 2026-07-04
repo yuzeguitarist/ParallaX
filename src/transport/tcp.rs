@@ -624,7 +624,6 @@ mod kernel_splice {
         io,
         net::{Shutdown, TcpStream as StdTcpStream},
         os::fd::{AsFd, BorrowedFd, OwnedFd},
-        sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant},
     };
@@ -644,25 +643,12 @@ mod kernel_splice {
         let left_to_right_write = right.try_clone()?;
         let right_to_left_read = right;
         let right_to_left_write = left;
-        let last_progress = Arc::new(Mutex::new(Instant::now()));
-        let left_progress = Arc::clone(&last_progress);
-        let right_progress = Arc::clone(&last_progress);
 
         let left_to_right = thread::spawn(move || {
-            splice_one_direction(
-                left_to_right_read,
-                left_to_right_write,
-                idle_timeout,
-                left_progress,
-            )
+            splice_one_direction(left_to_right_read, left_to_right_write, idle_timeout)
         });
         let right_to_left = thread::spawn(move || {
-            splice_one_direction(
-                right_to_left_read,
-                right_to_left_write,
-                idle_timeout,
-                right_progress,
-            )
+            splice_one_direction(right_to_left_read, right_to_left_write, idle_timeout)
         });
 
         // Always join BOTH threads before returning so neither relay thread (and
@@ -683,28 +669,46 @@ mod kernel_splice {
         read_stream: StdTcpStream,
         write_stream: StdTcpStream,
         idle_timeout: Duration,
-        last_progress: Arc<Mutex<Instant>>,
     ) -> io::Result<()> {
-        let result = splice_pump(&read_stream, &write_stream, idle_timeout, &last_progress);
-        // FIN on EVERY exit (idle timeout, EOF, or any error): drain bytes still
-        // queued on the read socket so its drop does not RST, then half-close the
-        // write socket so the downstream peer sees a graceful FIN. shutdown (not a
-        // bare drop) is required because the sibling direction still holds the
-        // other clone of this socket. Mirrors the userspace graceful_close path.
-        drain_std_recv(&read_stream);
-        let _ = write_stream.shutdown(Shutdown::Write);
-        result
+        match splice_pump(&read_stream, &write_stream, idle_timeout) {
+            Ok(()) => {
+                // FIN on clean exit (read-side idle timeout or EOF): drain bytes
+                // still queued on the read socket so its drop does not RST, then
+                // half-close the write socket so the downstream peer sees a
+                // graceful FIN. shutdown (not a bare drop) is required because the
+                // sibling direction still holds the other clone of this socket.
+                // Mirrors the userspace graceful_close path.
+                drain_std_recv(&read_stream);
+                let _ = write_stream.shutdown(Shutdown::Write);
+                Ok(())
+            }
+            Err(err) => {
+                // Abortive teardown on failure (e.g. a write-side idle timeout
+                // with bytes still buffered in the pipe): a graceful FIN here
+                // would masquerade a truncated stream as a clean close.
+                // SO_LINGER(0) turns the final close of the write socket into an
+                // RST so the peer observes the truncation, and shutting down its
+                // read side wakes the sibling direction (which reads the other
+                // clone of this socket) so the whole relay tears down promptly.
+                let _ = socket2::SockRef::from(&write_stream).set_linger(Some(Duration::ZERO));
+                let _ = write_stream.shutdown(Shutdown::Read);
+                Err(err)
+            }
+        }
     }
 
     /// Pumps one direction (read -> pipe -> write) until idle timeout, EOF, or
-    /// error. Never shuts the socket down itself; the caller FINs on every exit.
+    /// error. Never shuts the socket down itself; the caller tears down on exit.
     fn splice_pump(
         read_stream: &StdTcpStream,
         write_stream: &StdTcpStream,
         idle_timeout: Duration,
-        last_progress: &Arc<Mutex<Instant>>,
     ) -> io::Result<()> {
         let pipe = Pipe::new()?;
+        // The idle clock is PER DIRECTION: it is bumped only by this direction's
+        // own progress, so a busy sibling direction cannot keep a wedged direction
+        // (and its OS thread + fds) alive indefinitely.
+        let mut last_progress = Instant::now();
         loop {
             if !poll_fd_until_progress(
                 read_stream.as_fd(),
@@ -721,10 +725,7 @@ mod kernel_splice {
             if moved == 0 {
                 return Ok(()); // read EOF (peer half-closed)
             }
-            *last_progress
-                .lock()
-                .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))? =
-                Instant::now();
+            last_progress = Instant::now();
 
             let mut remaining = moved;
             while remaining > 0 {
@@ -734,7 +735,14 @@ mod kernel_splice {
                     idle_timeout,
                     last_progress,
                 )? {
-                    return Ok(()); // write-side idle timeout
+                    // Write-side idle timeout with bytes still in the pipe: those
+                    // bytes are dropped with the pipe, so reporting success would
+                    // let the caller FIN and masquerade the truncated stream as a
+                    // clean close. Fail so the teardown is abortive instead.
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "write-side idle timeout with buffered data",
+                    ));
                 }
                 let Some(written) =
                     splice_fd(pipe.read_fd.as_fd(), write_stream.as_fd(), remaining)?
@@ -745,10 +753,7 @@ mod kernel_splice {
                     return Ok(());
                 }
                 remaining -= written;
-                *last_progress
-                    .lock()
-                    .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))? =
-                    Instant::now();
+                last_progress = Instant::now();
             }
         }
     }
@@ -774,13 +779,16 @@ mod kernel_splice {
         fd: BorrowedFd<'_>,
         events: PollFlags,
         idle_timeout: Duration,
-        last_progress: &Mutex<Instant>,
+        last_progress: Instant,
     ) -> io::Result<bool> {
         use rustix::event::{poll, PollFd, Timespec};
         use rustix::io::Errno;
 
         loop {
-            let remaining = poll_timeout(idle_timeout, last_progress)?;
+            let remaining = idle_timeout.saturating_sub(last_progress.elapsed());
+            if remaining.is_zero() {
+                return Ok(false); // this direction's own idle deadline elapsed
+            }
             let timeout = Timespec {
                 tv_sec: remaining.as_secs() as i64,
                 tv_nsec: remaining.subsec_nanos() as _,
@@ -788,33 +796,14 @@ mod kernel_splice {
             let mut poll_fds = [PollFd::from_borrowed_fd(fd, events)];
             match poll(&mut poll_fds, Some(&timeout)) {
                 Ok(ready) if ready > 0 => return Ok(true),
-                Ok(_) => {
-                    // Poll timed out. The sibling direction shares last_progress and
-                    // may have bumped it while we waited, so only give up if the
-                    // shared idle deadline has truly elapsed; otherwise re-poll with
-                    // the refreshed remaining. This keeps the idle timer a single
-                    // shared deadline rather than letting a quiet direction tear down
-                    // a connection the other direction is actively pumping.
-                    if poll_timeout(idle_timeout, last_progress)?.is_zero() {
-                        return Ok(false);
-                    }
-                    continue;
-                }
+                // Poll ran the full remaining time and nothing can refresh this
+                // direction's deadline while it waits (progress is per direction),
+                // so the idle timeout has elapsed.
+                Ok(_) => return Ok(false),
                 Err(Errno::INTR) => continue,
                 Err(err) => return Err(err.into()),
             }
         }
-    }
-
-    fn poll_timeout(
-        idle_timeout: Duration,
-        last_progress: &Mutex<Instant>,
-    ) -> io::Result<Duration> {
-        let elapsed = last_progress
-            .lock()
-            .map_err(|_| io::Error::other("kernel splice progress lock poisoned"))?
-            .elapsed();
-        Ok(idle_timeout.saturating_sub(elapsed))
     }
 
     fn splice_fd(
@@ -969,5 +958,134 @@ mod tests {
 
         relay_task.await.unwrap();
         origin_task.abort();
+    }
+
+    // Finding #21: a write-side idle timeout with bytes still buffered in the
+    // splice pipe is a truncation, and must surface as an error (abortive
+    // teardown), not as a clean FIN masquerading as success.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn splice_relay_write_side_wedge_with_buffered_data_is_an_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Origin accepts but never reads, wedging the client->origin direction
+        // once every socket buffer on the path fills up.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (_origin, _) = origin_listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (client_side, _) = relay_listener.accept().await.unwrap();
+            let origin_side = TcpStream::connect(origin_addr).await.unwrap();
+            relay_kernel_splice_bidirectional_with_idle_timeout(
+                client_side,
+                origin_side,
+                Duration::from_millis(100),
+            )
+            .await
+        });
+
+        // Flood far past any plausible combined socket buffering so bytes are
+        // guaranteed to be sitting in the relay pipe when the write side wedges.
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        let flood = tokio::spawn(async move {
+            let chunk = vec![0x42_u8; 1024 * 1024];
+            for _ in 0..64 {
+                if client.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(10), relay_task)
+            .await
+            .expect("relay must tear down once the write side wedges")
+            .unwrap()
+            .expect_err("write-side idle timeout with pipe-buffered bytes must fail the relay");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        flood.abort();
+        origin_task.abort();
+    }
+
+    // Finding #22: the idle clock is per direction, so a direction with no
+    // traffic of its own must time out on its OWN inactivity even while the
+    // sibling direction is actively pumping bytes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn splice_relay_idle_direction_times_out_despite_busy_sibling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+
+        // Origin streams continuously (keeping origin->client busy) while
+        // watching its inbound side for the relay's idle-timeout FIN.
+        let origin_task = tokio::spawn(async move {
+            let (origin, _) = origin_listener.accept().await.unwrap();
+            let (mut origin_read, mut origin_write) = origin.into_split();
+            let writer = tokio::spawn(async move {
+                let chunk = [0x42_u8; 8 * 1024];
+                loop {
+                    if origin_write.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            // The client->origin direction is idle from the start, so the relay
+            // must FIN this inbound side after that direction's own idle
+            // timeout even though the other direction keeps making progress.
+            let mut buf = [0_u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(5), origin_read.read(&mut buf))
+                .await
+                .expect("idle direction must time out on its own inactivity")
+                .expect("idle-direction teardown must be a graceful FIN, not a RST");
+            assert_eq!(n, 0, "origin must see EOF while its stream is still busy");
+            writer.abort();
+        });
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (client_side, _) = relay_listener.accept().await.unwrap();
+            let origin_side = TcpStream::connect(origin_addr).await.unwrap();
+            relay_kernel_splice_bidirectional_with_idle_timeout(
+                client_side,
+                origin_side,
+                Duration::from_millis(100),
+            )
+            .await
+        });
+
+        // The client never writes; it only drains the origin's stream so the
+        // busy direction keeps bumping its own progress clock.
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        let drain = tokio::spawn(async move {
+            let mut sink = [0_u8; 16 * 1024];
+            loop {
+                match client.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        origin_task.await.unwrap();
+        // Once the origin's writer stops, the busy direction EOFs/idles out and
+        // the relay joins both threads and returns.
+        tokio::time::timeout(Duration::from_secs(10), relay_task)
+            .await
+            .expect("relay must return once both directions are done")
+            .unwrap()
+            .unwrap();
+        drain.await.unwrap();
     }
 }

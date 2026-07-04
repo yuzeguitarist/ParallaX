@@ -1319,4 +1319,79 @@ mod tests {
         );
         assert!(open2.open(&record, AAD).is_err());
     }
+
+    #[test]
+    fn cipher_suite_wire_codec_round_trips_and_rejects_unknown() {
+        // The one-byte suite tag rides the tail of a ServerKeyExchange and gates
+        // which AEAD family the whole session uses. Pin the wire mapping so a
+        // future variant reorder/rename cannot silently flip 0<->1 (a wire-compat
+        // and cross-version break), and confirm every non-{0,1} byte is rejected
+        // rather than defaulting to a suite.
+        for suite in [CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm] {
+            let wire = suite.to_wire();
+            assert_eq!(
+                CipherSuite::from_wire(wire),
+                Some(suite),
+                "suite must decode from its own wire tag: {suite:?}"
+            );
+        }
+        // Pin the concrete tag values (not just that they round-trip): these are
+        // on the wire and must never move.
+        assert_eq!(CipherSuite::ChaCha20Poly1305.to_wire(), 0);
+        assert_eq!(CipherSuite::Aes256Gcm.to_wire(), 1);
+        // Every other byte in the u8 space must be rejected.
+        for byte in 2_u8..=u8::MAX {
+            assert_eq!(
+                CipherSuite::from_wire(byte),
+                None,
+                "unknown suite tag {byte} must not decode to any suite"
+            );
+        }
+    }
+
+    #[test]
+    fn record_nonce_from_is_injective_in_sequence() {
+        // Fast-lane backstop for the counter-nonce scheme whose formal guarantee
+        // lives only under `#[cfg(kani)]` (absent from `cargo test`). Within one
+        // epoch (a fixed nonce_base) distinct sequence numbers MUST yield distinct
+        // nonces, or AEAD security collapses. This also catches a refactor that
+        // swaps the XOR for `&=`/`=` or narrows the touched byte range.
+        let base = [0xA5_u8; NONCE_LEN];
+
+        // Distinct sequences => distinct nonces across the full u64 range.
+        let seqs = [
+            0_u64,
+            1,
+            2,
+            255,
+            256,
+            u32::MAX as u64,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for &seq in &seqs {
+            let nonce = record_nonce_from(&base, seq);
+            assert!(
+                seen.insert(nonce),
+                "sequence {seq} collided with an earlier nonce"
+            );
+        }
+
+        // Sequence 0 is the identity: it must leave the base untouched.
+        assert_eq!(record_nonce_from(&base, 0), base);
+
+        // Only the low 8 bytes are sequence-dependent; the high bytes are the
+        // fixed epoch material and must never be perturbed by the counter.
+        let nonce_max = record_nonce_from(&base, u64::MAX);
+        assert_eq!(
+            nonce_max[..NONCE_LEN - 8],
+            base[..NONCE_LEN - 8],
+            "the counter must not touch the high (epoch) nonce bytes"
+        );
+        // The low 8 bytes are exactly base XOR the big-endian sequence.
+        for (i, b) in nonce_max[NONCE_LEN - 8..].iter().enumerate() {
+            assert_eq!(*b, base[NONCE_LEN - 8 + i] ^ 0xFF);
+        }
+    }
 }

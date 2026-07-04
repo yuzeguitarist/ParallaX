@@ -466,6 +466,48 @@ mod tests {
         );
     }
 
+    /// RFC 7541 §5.1 variable-length integer encoding — the canonical worked
+    /// example and the prefix/continuation boundaries. This encoder is exercised
+    /// only indirectly by the full-header tests; pin it directly so an off-by-one
+    /// in the `< max_prefix` boundary or the 7-bit continuation loop turns RED
+    /// here rather than surfacing as a subtle wire drift in a fingerprint frame.
+    #[test]
+    fn hpack_integer_matches_rfc7541_examples_and_boundaries() {
+        fn enc(value: usize, prefix_bits: u8) -> Vec<u8> {
+            let mut out = Vec::new();
+            push_hpack_integer(&mut out, value, prefix_bits, 0);
+            out
+        }
+
+        // RFC 7541 §5.1: encoding 1337 with a 5-bit prefix yields 0x1F 0x9A 0x0A.
+        assert_eq!(enc(1337, 5), vec![0x1F, 0x9A, 0x0A]);
+        // RFC 7541 §5.1: 10 in a 5-bit prefix fits in the prefix (single byte).
+        assert_eq!(enc(10, 5), vec![0x0A]);
+
+        // 7-bit prefix (the string-length encoding used throughout HPACK):
+        //   max_prefix_value = 127; values below it are a single prefix byte.
+        assert_eq!(enc(0, 7), vec![0x00]);
+        assert_eq!(enc(126, 7), vec![0x7E]);
+        // 127 hits the prefix ceiling: prefix byte 0x7F then a single 0x00.
+        assert_eq!(enc(127, 7), vec![0x7F, 0x00]);
+        // 128 = 127 + 1: prefix 0x7F, then remaining 1 in one continuation byte.
+        assert_eq!(enc(128, 7), vec![0x7F, 0x01]);
+        // 255 = 127 + 128: remaining 128 needs a continuation (0x80|0) then 0x01.
+        assert_eq!(enc(255, 7), vec![0x7F, 0x80, 0x01]);
+
+        // The first-byte mask is OR'd into the prefix byte only (not continuation
+        // bytes): a masked single-byte value keeps its mask, and the continuation
+        // bytes of a multi-byte value are unaffected by the mask.
+        let mut masked = Vec::new();
+        push_hpack_integer(&mut masked, 5, 6, 0x40);
+        assert_eq!(masked, vec![0x45]);
+        let mut masked_multi = Vec::new();
+        push_hpack_integer(&mut masked_multi, 1337, 5, 0xE0);
+        // Prefix byte carries the mask (0xE0 | 0x1F = 0xFF); the two continuation
+        // bytes stay 0x9A 0x0A exactly as in the unmasked RFC example.
+        assert_eq!(masked_multi, vec![0xFF, 0x9A, 0x0A]);
+    }
+
     /// Safari 26.4 emitted exactly these 11 bytes on the wire for the
     /// `:authority` literal of `localhost:8443`: `8a` (huffman | length=10)
     /// followed by `a0 e4 1d 13 9d 09 b8 f3 4d 33`. Capture: see

@@ -637,11 +637,11 @@ pub struct UdpConfig {
     #[serde(default = "default_udp_probe_timeout_ms")]
     pub probe_timeout_ms: u16,
     /// LIVE. Maximum UDP payload the QUIC carrier reads in one datagram (the inbound
-    /// receive-buffer ceiling and the origin-splice relay buffer). `None`/unset keeps
-    /// the conservative default (2048, ~1.6x the largest datagram ParallaX emits).
-    /// Oversized datagrams are truncated-and-dropped (truncation fails AEAD); this
-    /// caps per-datagram memory. Must be `>=` the RFC 9000 §14.1 Initial minimum
-    /// (1200) so a legal Initial is always receivable. See issue #75.
+    /// receive-buffer ceiling). `None`/unset keeps the conservative default (2048,
+    /// ~1.6x the largest datagram ParallaX emits). Oversized datagrams are
+    /// truncated-and-dropped (truncation fails AEAD); this caps per-datagram memory.
+    /// Must be `>=` the RFC 9000 §14.1 Initial minimum (1200) so a legal Initial is
+    /// always receivable. See issue #75.
     #[serde(default)]
     pub max_udp_payload_bytes: Option<u32>,
     /// LIVE. Explicit SO_SNDBUF for the UDP carrier socket, in bytes. `None`/`0`
@@ -796,7 +796,13 @@ impl UdpConfig {
 /// `invalid type: string "<the secret>", expected usize`. So we drop the message
 /// entirely and report only the position; the operator finds the typo by line.
 fn toml_error(raw: &str, err: toml::de::Error) -> ConfigError {
-    let off = err.span().map(|s| s.start).unwrap_or(0).min(raw.len());
+    let mut off = err.span().map(|s| s.start).unwrap_or(0).min(raw.len());
+    // `off` is a raw byte offset; if it lands inside a multi-byte UTF-8 sequence
+    // (a non-ASCII char near the syntax error) then `raw[..off]` would panic on a
+    // non-char-boundary index. Clamp down to the nearest boundary first.
+    while off > 0 && !raw.is_char_boundary(off) {
+        off -= 1;
+    }
     let line = raw[..off].bytes().filter(|&b| b == b'\n').count() + 1;
     let line_start = raw[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let column = off - line_start + 1;
@@ -912,6 +918,32 @@ impl Config {
             .filter(|field| field.source.is_inline_secret())
             .map(|field| field.dotted)
             .collect()
+    }
+
+    /// Server-mode outbound targets (`fallback_addr`, and `data_target` when set)
+    /// whose host is an internal/special IP literal (loopback, private, link-local
+    /// incl. the cloud metadata endpoint, or unspecified). Reuses the same
+    /// classification as the load-time warning ([`outbound_literal_internal_ip`]),
+    /// but returns the findings so `plx check` can surface them on stdout — the
+    /// load-time `tracing::warn!` is swallowed unless `RUST_LOG` selects `warn`, so
+    /// an operator running `plx check` would otherwise never see this footgun.
+    ///
+    /// Empty for a client-mode config or when every literal target is public.
+    /// Hostnames are intentionally not resolved (an offline `plx check` must not
+    /// perform blocking DNS), matching the load-time warning.
+    pub fn internal_outbound_targets(&self) -> Vec<(&'static str, std::net::IpAddr)> {
+        let mut out = Vec::new();
+        if let Some(server) = &self.server {
+            if let Some(ip) = outbound_literal_internal_ip(&server.fallback_addr) {
+                out.push(("server.fallback_addr", ip));
+            }
+            if let Some(data_target) = &server.data_target {
+                if let Some(ip) = outbound_literal_internal_ip(data_target) {
+                    out.push(("server.data_target", ip));
+                }
+            }
+        }
+        out
     }
 
     /// Path parts of plaintext sidecars referenced via `{ file = "..." }` (the
@@ -1083,6 +1115,130 @@ impl Config {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         server.replay_cache_path = config_dir.join(&server.replay_cache_path);
+    }
+
+    /// Preflight the writability of the server's replay-cache directory, for
+    /// `plx check`. The server writes three sibling cache files (the auth cache
+    /// and its `.0rtt` / `.marker` siblings) under `replay_cache_path`'s parent,
+    /// and `create_dir_all`s that parent at startup — so a config whose default
+    /// path (`/var/lib/parallax/...`) is not writable by the checking user fails
+    /// only when the server first runs. This surfaces that footgun at check time.
+    ///
+    /// Call AFTER path resolution (paths are resolved by [`Config::load_for_check`]
+    /// / [`Config::load`]). Returns [`ReplayCacheWritability::NotServer`] for a
+    /// client-mode config. The probe never touches the real cache files: it
+    /// creates and immediately removes a uniquely-named probe file in the nearest
+    /// existing ancestor directory.
+    pub fn replay_cache_writability(&self) -> ReplayCacheWritability {
+        let Some(server) = self.server.as_ref() else {
+            return ReplayCacheWritability::NotServer;
+        };
+        let parent = server
+            .replay_cache_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        probe_dir_writable(parent)
+    }
+}
+
+/// The result of [`Config::replay_cache_writability`]: whether the server's
+/// replay-cache directory can actually be written at check time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayCacheWritability {
+    /// The config is client-mode; the replay cache does not apply.
+    NotServer,
+    /// The replay-cache parent directory exists and is writable.
+    Writable,
+    /// The parent directory does not exist yet, but the nearest existing
+    /// ancestor IS writable — the server can `create_dir_all` it at startup.
+    ParentMissingCreatable {
+        /// The missing replay-cache parent directory.
+        missing: PathBuf,
+    },
+    /// The parent (or, if it is missing, the nearest existing ancestor) is not
+    /// writable by the current user — the server will fail to open the cache.
+    NotWritable {
+        /// The directory whose write access was actually denied (the nearest
+        /// existing ancestor of the intended parent).
+        dir: PathBuf,
+        /// The replay-cache parent directory the server actually needs (equal to
+        /// `dir` when that directory itself exists but is read-only).
+        intended_parent: PathBuf,
+    },
+}
+
+/// Probe whether `dir` (or, if it does not exist, the nearest existing ancestor)
+/// can be written by the current user, by creating and immediately removing a
+/// uniquely-named probe file. Side-effect-free on success or failure.
+fn probe_dir_writable(dir: &Path) -> ReplayCacheWritability {
+    // Walk up to the nearest existing directory. The server `create_dir_all`s the
+    // parent, so a missing parent whose closest existing ancestor is writable is
+    // fine — the create will succeed at startup.
+    let mut existing = dir;
+    let mut missing_parent = false;
+    loop {
+        if existing.is_dir() {
+            break;
+        }
+        if existing.exists() {
+            // A path component exists but is NOT a directory (e.g. a regular
+            // file). `create_dir_all` will fail on it at startup, so report it as
+            // not writable rather than as a creatable-parent — otherwise `plx
+            // check` says "ok, creatable" for a config the server cannot start.
+            return ReplayCacheWritability::NotWritable {
+                dir: existing.to_path_buf(),
+                intended_parent: dir.to_path_buf(),
+            };
+        }
+        missing_parent = true;
+        match existing.parent() {
+            Some(p) if !p.as_os_str().is_empty() => existing = p,
+            // Reached the root (or a relative path with no more components)
+            // without finding an existing directory: treat "." as the base.
+            _ => {
+                existing = Path::new(".");
+                break;
+            }
+        }
+    }
+
+    if !dir_accepts_probe_file(existing) {
+        return ReplayCacheWritability::NotWritable {
+            dir: existing.to_path_buf(),
+            intended_parent: dir.to_path_buf(),
+        };
+    }
+    if missing_parent {
+        ReplayCacheWritability::ParentMissingCreatable {
+            missing: dir.to_path_buf(),
+        }
+    } else {
+        ReplayCacheWritability::Writable
+    }
+}
+
+/// Attempt to create and immediately remove a uniquely-named probe file in `dir`.
+/// Returns `true` iff the create succeeded (the directory is writable). The probe
+/// file name combines the process id with a per-call sequence number, so it never
+/// collides with a real cache file and stays unique even when several checks run
+/// concurrently in one process (e.g. parallel test threads share a pid).
+fn dir_accepts_probe_file(dir: &Path) -> bool {
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe = dir.join(format!(
+        ".parallax-check-probe.{}.{seq}",
+        std::process::id()
+    ));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -2414,6 +2570,75 @@ authorized_sni = ["example.com"]
         }
     }
 
+    fn server_config_with_targets(fallback_addr: &str, data_target: Option<&str>) -> Config {
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
+        let data_target_line = data_target
+            .map(|t| format!("data_target = \"{t}\"\n"))
+            .unwrap_or_default();
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{STRONG_PSK}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "{fallback_addr}"
+{data_target_line}private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        toml::from_str::<Config>(&raw).unwrap()
+    }
+
+    #[test]
+    fn internal_outbound_targets_flags_internal_fallback_and_data_target() {
+        let cfg = server_config_with_targets("127.0.0.1:443", Some("10.1.2.3:9000"));
+        let findings = cfg.internal_outbound_targets();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].0, "server.fallback_addr");
+        assert_eq!(findings[1].0, "server.data_target");
+    }
+
+    #[test]
+    fn internal_outbound_targets_empty_for_public_targets() {
+        let cfg = server_config_with_targets("cloudflare.com:443", Some("1.1.1.1:443"));
+        assert!(cfg.internal_outbound_targets().is_empty());
+    }
+
+    #[test]
+    fn internal_outbound_targets_flags_only_the_internal_one() {
+        // A public fallback but an internal data_target: only the latter is flagged.
+        let cfg = server_config_with_targets("example.com:443", Some("192.168.0.10:8080"));
+        let findings = cfg.internal_outbound_targets();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].0, "server.data_target");
+    }
+
+    #[test]
+    fn internal_outbound_targets_empty_for_client_config() {
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let cfg = toml::from_str::<Config>(&format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{STRONG_PSK}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{server_identity_public_key}"
+"#
+        ))
+        .unwrap();
+        assert!(cfg.internal_outbound_targets().is_empty());
+    }
+
     #[test]
     fn rejects_bad_delay_range() {
         let traffic = TrafficConfig {
@@ -2460,6 +2685,178 @@ authorized_sni = ["example.com"]
         let cfg = Config::load(&path).unwrap();
         let server = cfg.server.unwrap();
         assert_eq!(server.replay_cache_path, nested.join("state/replay.cache"));
+    }
+
+    #[test]
+    fn probe_dir_writable_reports_writable_for_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_dir_writable(dir.path()),
+            ReplayCacheWritability::Writable
+        );
+        // The probe leaves no artifact behind.
+        let leftovers: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+        assert!(leftovers.is_empty(), "probe file must be removed");
+    }
+
+    #[test]
+    fn probe_dir_writable_reports_creatable_for_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does/not/exist/yet");
+        match probe_dir_writable(&missing) {
+            ReplayCacheWritability::ParentMissingCreatable { missing: m } => {
+                assert_eq!(m, missing);
+            }
+            other => panic!("expected ParentMissingCreatable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_dir_writable_reports_not_writable_for_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // A directory with no write permission for the owner cannot accept the
+        // probe file. Skip when running as root, which bypasses DAC checks.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("readonly");
+        fs::create_dir(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o500)).unwrap();
+
+        match probe_dir_writable(&ro) {
+            ReplayCacheWritability::NotWritable {
+                dir: d,
+                intended_parent,
+            } => {
+                assert_eq!(d, ro);
+                // The dir exists but is read-only, so the intended parent IS it.
+                assert_eq!(intended_parent, ro);
+            }
+            other => panic!("expected NotWritable, got {other:?}"),
+        }
+
+        // Restore write perms so the tempdir cleans up.
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn probe_dir_writable_reports_not_writable_when_a_component_is_a_file() {
+        // A path component that already exists as a regular file (not a
+        // directory) makes `create_dir_all` fail at startup, so the preflight
+        // must report NotWritable rather than "creatable" — otherwise `plx check`
+        // greenlights a config the server cannot start on.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("iam-a-file");
+        fs::write(&file, b"not a directory").unwrap();
+        // Intended replay-cache parent sits *under* the file component.
+        let intended = file.join("state");
+        match probe_dir_writable(&intended) {
+            ReplayCacheWritability::NotWritable {
+                dir: d,
+                intended_parent,
+            } => {
+                assert_eq!(d, file);
+                assert_eq!(intended_parent, intended);
+            }
+            other => panic!("expected NotWritable for a non-directory component, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_dir_writable_walks_to_nearest_existing_ancestor_for_readonly() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("readonly");
+        fs::create_dir(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o500)).unwrap();
+
+        // A missing subdirectory under a read-only ancestor: the nearest existing
+        // dir (`ro`) is not writable, so create_dir_all would fail at startup.
+        let under_ro = ro.join("state/replay.cache");
+        let intended = under_ro.parent().unwrap().to_path_buf();
+        match probe_dir_writable(&intended) {
+            ReplayCacheWritability::NotWritable {
+                dir: d,
+                intended_parent,
+            } => {
+                // Denied on the nearest existing ancestor (`ro`)...
+                assert_eq!(d, ro);
+                // ...but the remediation names the directory the server needs.
+                assert_eq!(intended_parent, intended);
+            }
+            other => panic!("expected NotWritable for nearest ancestor, got {other:?}"),
+        }
+
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn replay_cache_writability_is_not_server_for_client_config() {
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let cfg = toml::from_str::<Config>(&format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{STRONG_PSK}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{server_identity_public_key}"
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.replay_cache_writability(),
+            ReplayCacheWritability::NotServer
+        );
+    }
+
+    #[test]
+    fn replay_cache_writability_reports_writable_for_resolved_server_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("conf");
+        fs::create_dir(&nested).unwrap();
+        let path = nested.join("server.toml");
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
+        // A relative replay_cache_path resolves under the (writable) config dir.
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{STRONG_PSK}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+replay_cache_path = "replay.cache"
+authorized_sni = ["example.com"]
+"#
+        );
+        fs::write(&path, raw).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.replay_cache_writability(),
+            ReplayCacheWritability::Writable
+        );
     }
 
     #[test]
@@ -2988,6 +3385,23 @@ psk = "{STRONG_PSK}"
                 !rendered.contains(secret) && !debugged.contains(secret),
                 "TOML parse error must not contain the secret (Display={rendered:?}, Debug={debugged:?})",
             );
+            assert!(matches!(err, ConfigError::Toml { .. }));
+        }
+    }
+
+    /// `toml_error` slices the raw config at the error's byte span; a multi-byte
+    /// UTF-8 char (e.g. a non-ASCII value near the syntax error) must not make the
+    /// `raw[..off]` index land on a non-char-boundary and panic. The result should
+    /// still be a sanitized `ConfigError::Toml { line, column }`.
+    #[test]
+    fn toml_error_tolerates_non_char_boundary_span() {
+        // The unterminated string leaves a multi-byte char (é / 中) inside the
+        // span that toml reports, exercising the boundary clamp.
+        for body in [
+            "mode = \"server\"\nsni = \"café\n",
+            "mode = \"server\"\nsni = \"中文\n",
+        ] {
+            let err = toml_error(body, toml::from_str::<Config>(body).unwrap_err());
             assert!(matches!(err, ConfigError::Toml { .. }));
         }
     }

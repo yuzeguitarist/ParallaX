@@ -317,3 +317,71 @@ impl TlsSession for ServerHandshake {
         ServerHandshake::client_hello_processed(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Only `Alert` carries a peer-visible TLS alert description; the adapter maps
+    // `Some(code)` onto a QUIC CRYPTO_ERROR and every `None` onto
+    // PROTOCOL_VIOLATION. A stray `Some` on a non-alert variant would mislabel the
+    // connection close, so pin the discriminant precisely.
+    #[test]
+    fn alert_description_is_some_only_for_alert() {
+        assert_eq!(
+            QuicTlsError::alert(ALERT_DECODE_ERROR, "bad").alert_description(),
+            Some(ALERT_DECODE_ERROR)
+        );
+        for err in [
+            QuicTlsError::Crypto("x".into()),
+            QuicTlsError::Protocol("x".into()),
+            QuicTlsError::Certificate("x".into()),
+            QuicTlsError::UnsupportedVersion,
+            QuicTlsError::InvalidServerName("x".into()),
+        ] {
+            assert_eq!(
+                err.alert_description(),
+                None,
+                "{err:?} must not carry an alert"
+            );
+        }
+    }
+
+    // The `alert` constructor threads description + reason through unchanged.
+    #[test]
+    fn alert_constructor_preserves_description_and_reason() {
+        let err = QuicTlsError::alert(ALERT_BAD_RECORD_MAC, "mac mismatch");
+        match &err {
+            QuicTlsError::Alert {
+                description,
+                reason,
+            } => {
+                assert_eq!(*description, ALERT_BAD_RECORD_MAC);
+                assert_eq!(reason, "mac mismatch");
+            }
+            other => panic!("expected Alert, got {other:?}"),
+        }
+        assert_eq!(err.to_string(), "TLS alert 20: mac mismatch");
+    }
+
+    // `ClientConfig::new` MUST leave the marker off — a fresh config emits the
+    // pure-random ClientHello.random cold-start shape; `with_marker` opts into the
+    // covert auth marker. Getting this default wrong would silently change the
+    // client's visible handshake shape.
+    #[test]
+    fn client_config_marker_defaults_off_and_opts_in() {
+        let verifier: Arc<dyn ServerCertVerifier> = Arc::new(AcceptAnyServerCert);
+        let cfg = ClientConfig::new(verifier, vec![b"h3".to_vec()]);
+        assert!(cfg.marker.is_none(), "new() must not enable the marker");
+        assert_eq!(cfg.alpn_protocols, vec![b"h3".to_vec()]);
+
+        let with = cfg.with_marker(QuicMarkerConfig {
+            psk: zeroize::Zeroizing::new(b"deployment-psk".to_vec()),
+            server_static_public: [0x11; 32],
+        });
+        assert!(
+            with.marker.is_some(),
+            "with_marker() must enable the marker"
+        );
+    }
+}

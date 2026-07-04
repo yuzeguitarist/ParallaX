@@ -3,7 +3,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -63,14 +63,16 @@ use crate::{
 };
 
 const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
-/// How many undecryptable (camouflage) records the client skips before the
-/// server's ParallaX key-exchange record. Bound to the shared
-/// [`crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] so it always
-/// covers the server's pre-PQ fallback forward cap; a smaller value (this was 16
-/// vs the server's 64) caused intermittent ~33-75% handshake failures on high-RTT
+/// How many BYTES of undecryptable (camouflage) records the client skips before
+/// the server's ParallaX key-exchange record. Bound to the shared
+/// [`crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES`] so it always
+/// covers the server's byte-oriented pre-PQ fallback forward cap — in the same
+/// unit. A smaller budget (this was 16 records vs the server's 64, then 64
+/// RECORDS vs the server's ~1 MiB BYTE cap, which real origins fill with many
+/// sub-16KiB records) caused intermittent ~33-75% handshake failures on high-RTT
 /// links where the camouflage origin's response body leaks into this skip window.
-const MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE: usize =
-    crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
+const MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE: usize =
+    crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
 /// Hard deadline for the whole post-connect authenticated establishment
 /// (camouflage TLS handshake + PQ rekey + identity verify). Mirrors the server's
 /// HANDSHAKE_TIMEOUT so a stalling/impersonating upstream cannot pin an
@@ -88,6 +90,28 @@ const CLIENT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const SOCKS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const WARM_SESSION_POOL_TARGET: usize = 4;
 const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
+/// Depth of a single stream's download channel: how many decrypted download
+/// frames the reader may queue ahead of a stream's own download task before it
+/// must wait for that task to drain to the local socket. Bounds per-stream
+/// memory while giving the download task enough slack to keep the reader moving
+/// on to OTHER streams' frames instead of stalling on one slow local app. A
+/// stream whose local app stops reading fills only its own 32-deep channel; the
+/// reader keeps servicing every other stream.
+const CLIENT_MUX_STREAM_CHANNEL: usize = 32;
+/// Grace window applied when a stream's download channel is full. A full channel
+/// alone does NOT mean the local app is stalled: a live app that merely drains
+/// slower than a bulk burst (the reader can dispatch a whole ~1 MiB open-batch of
+/// DATA frames — far more than the channel depth — before the download task next
+/// runs) transiently fills it too. So on a full channel the reader waits UP TO
+/// this long for a slot to free instead of resetting immediately: if the download
+/// task drains within the window the app was merely slow (deliver, no reset); if
+/// the window elapses with no drain the stream is genuinely stalled and is reset.
+/// The bound guarantees one stalled app can never wedge the shared reader for
+/// longer than this, while a live download draining at the link rate is never
+/// falsely reset. Sits far above the sub-second a live consumer needs to free one
+/// slot even under load, and well below the horizon at which a stalled peer would
+/// noticeably starve the other streams sharing the carrier.
+const CLIENT_MUX_STALL_RESET_GRACE: Duration = Duration::from_secs(2);
 const MUX_FRAME_BATCH_LIMIT: usize = 64;
 /// Cap on the ciphertext bytes batched per mux read before opening, bounding
 /// scratch memory while leaving enough records for the crypto pool to fan out.
@@ -738,11 +762,11 @@ impl ClientMuxHandle {
     }
 }
 
-/// Hands a freshly opened stream's local write half to the single mux reader
-/// loop, which owns every download half and writes decrypted payloads inline
-/// (mirroring the server's upload path). `outcome_tx` lets the reader report
-/// stream completion back to the per-connection task that holds the slot
-/// permit, so the download direction no longer needs a per-stream task.
+/// Hands a freshly opened stream's local write half + completion one-shot to the
+/// single mux reader loop, which spawns the stream's own download task (owning the
+/// write half) and keeps only a bounded event channel to it. `outcome_tx` lets
+/// that download task report stream completion (Fin/Reset) back to the
+/// per-connection task that holds the slot permit.
 struct ClientStreamRegistration {
     stream_id: u32,
     local_write: OwnedWriteHalf,
@@ -765,6 +789,69 @@ enum ClientStreamControl {
 enum DownloadOutcome {
     Fin,
     Reset,
+}
+
+/// A decrypted download DATA frame handed from the single mux reader loop to a
+/// stream's own download task over a BOUNDED per-stream channel. The reader
+/// `try_send`s here on the common path (never touching the local app socket), so
+/// a slow or stalled local app back-pressures ONLY its own channel — never the
+/// shared reader loop. On a full channel the reader falls back to a BOUNDED
+/// blocking send (see [`dispatch_client_mux_frame`]), so a live-but-slow app is
+/// not falsely reset, yet a genuine stall can hold the reader only briefly before
+/// its stream is reset. A per-stream download task owns the socket write half and
+/// drains this channel to it. This is what keeps one slow download from head-of-
+/// line-blocking every other stream on the carrier (the failure mode a
+/// reader-inline `write_all` reintroduced).
+///
+/// The stream's TERMINAL state (a server Fin/Reset, a full-channel stall reset,
+/// or a session teardown) is carried out-of-band on [`StreamTerminal`], not as a
+/// channel message: a terminal signal must never be lost when the data channel
+/// is full, and the reader must never block to deliver it. The download task
+/// reads the terminal flag once the channel closes (all queued data drained).
+struct DownloadEvent(Vec<u8>);
+
+/// Per-stream terminal-state flag shared between the reader loop and the stream's
+/// download task. The reader stamps the outcome (then drops its channel sender);
+/// the download task reads it after the data channel closes, so queued data is
+/// always fully flushed before the terminal outcome is applied. Delivering the
+/// terminal state this way (not as a channel message) means it is never lost to a
+/// full data channel and never forces the reader to block.
+///
+/// Encoding: 0 = not yet terminal (session died without a clean signal → the task
+/// defaults to Reset so a truncated download surfaces as an error, never a
+/// clean-looking EOF), 1 = Fin, 2 = Reset.
+#[derive(Clone)]
+struct StreamTerminal(Arc<AtomicU8>);
+
+impl StreamTerminal {
+    const NONE: u8 = 0;
+    const FIN: u8 = 1;
+    const RESET: u8 = 2;
+
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(Self::NONE)))
+    }
+
+    /// Stamp the terminal outcome. First writer wins: a later signal never
+    /// downgrades a Fin to Reset or vice versa.
+    fn set(&self, outcome: DownloadOutcome) {
+        let value = match outcome {
+            DownloadOutcome::Fin => Self::FIN,
+            DownloadOutcome::Reset => Self::RESET,
+        };
+        let _ = self
+            .0
+            .compare_exchange(Self::NONE, value, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// Read the outcome after the data channel has closed. An unset flag means the
+    /// session ended without a clean signal → Reset (never silently clean).
+    fn outcome(&self) -> DownloadOutcome {
+        match self.0.load(Ordering::Acquire) {
+            Self::FIN => DownloadOutcome::Fin,
+            _ => DownloadOutcome::Reset,
+        }
+    }
 }
 
 impl ClientMuxPool {
@@ -2252,7 +2339,12 @@ where
 {
     let mut server_records = TlsRecordReader::new(server);
     let mut record = Vec::new();
+    // The budget is measured in BYTES (the record count rides along for logs):
+    // the server's forward cap is a byte ceiling over a verbatim splice, so the
+    // client must meter the same unit or small origin records overrun it (see
+    // MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE).
     let mut skipped = 0;
+    let mut skipped_bytes = 0;
     // The server now splits PX1K across several FramedChunk records (PAR-21);
     // accumulate them here. Residual camouflage records (the fallback origin's
     // H2 response racing ahead) fail to open and are skipped up to the budget,
@@ -2273,7 +2365,8 @@ where
                 if skipped > 0 {
                     tracing::warn!(
                         skipped,
-                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        skipped_bytes,
+                        budget_bytes = MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE,
                         "accepted server key exchange after skipping residual camouflage records"
                     );
                 }
@@ -2284,8 +2377,9 @@ where
                 continue;
             }
             Err(ClientRuntimeError::Handshake(err)) if is_residual_camouflage_record(&err) => {
-                if skipped < MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE {
+                if skipped_bytes < MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE {
                     skipped += 1;
+                    skipped_bytes += record.len();
                     // Loud-on-purpose: hitting this path at all means the
                     // camouflage host is racing ahead of the ParallaX server's
                     // key-exchange record. We still tolerate it up to the
@@ -2293,22 +2387,24 @@ where
                     // global log level to trace.
                     tracing::warn!(
                         skipped,
-                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        skipped_bytes,
+                        budget_bytes = MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE,
                         record_len = record.len(),
                         "skipping residual camouflage TLS record before ParallaX key exchange"
                     );
                 } else {
                     // Fast-fail: do NOT silently keep reading. Surface this as
                     // a hard error with the exact diagnostic an operator needs
-                    // (skipped count, last record length, underlying cause) so
-                    // a future "灵异事件" never has to be reverse-engineered
-                    // from a blank log.
+                    // (skipped count/bytes, last record length, underlying
+                    // cause) so a future "灵异事件" never has to be
+                    // reverse-engineered from a blank log.
                     tracing::error!(
                         skipped,
-                        budget = MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE,
+                        skipped_bytes,
+                        budget_bytes = MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE,
                         record_len = record.len(),
                         error = %err,
-                        "exceeded residual camouflage record budget before ParallaX key exchange; \
+                        "exceeded residual camouflage byte budget before ParallaX key exchange; \
                          fallback host likely answered the H2 camouflage GET ahead of the \
                          ParallaX server's key-exchange record"
                     );
@@ -3169,12 +3265,15 @@ async fn client_mux_upload_loop(
     }
 }
 
-/// A mux stream's local socket write half, owned by the reader loop, plus a
-/// one-shot used to report the download direction's completion back to the
-/// per-connection task that holds the stream's slot permit.
+/// The reader loop's handle to a stream's download direction: a bounded data
+/// channel to that stream's own download task, plus the shared terminal flag. The
+/// reader `try_send`s decrypted data here (never touching the local socket, never
+/// blocking), and stamps `terminal` for the end-of-stream outcome. The download
+/// task (spawned at registration) owns the socket write half and the completion
+/// one-shot.
 struct ClientDownloadStream {
-    write: OwnedWriteHalf,
-    outcome_tx: oneshot::Sender<DownloadOutcome>,
+    events: mpsc::Sender<DownloadEvent>,
+    terminal: StreamTerminal,
 }
 
 /// Resolves once the reader loop reports the download direction is done: a
@@ -3194,28 +3293,95 @@ async fn client_mux_await_download(
     }
 }
 
+/// A stream's own download task: owns the local socket write half and drains its
+/// bounded event channel to it. Because each stream has its OWN task and channel,
+/// a slow (or non-reading) local app blocks only this task on `write_all`; the
+/// shared reader loop keeps servicing every other stream. Reports the terminal
+/// outcome (Fin/Reset) back to the per-connection task via `outcome_tx`.
+///
+/// An explicit `Fin`/`Reset` event sets the reported outcome. If the channel
+/// closes without one (the reader/session dropped the sender on a hard error),
+/// the outcome defaults to `Reset` so a truncated download surfaces as a
+/// connection error rather than a clean, complete-looking EOF.
+async fn client_mux_download_loop(
+    mut local_write: OwnedWriteHalf,
+    mut events: mpsc::Receiver<DownloadEvent>,
+    terminal: StreamTerminal,
+    outcome_tx: oneshot::Sender<DownloadOutcome>,
+    idle: Duration,
+) {
+    // Drain queued data to the local socket. The channel closes (recv -> None)
+    // once the reader has dropped its sender, which it does AFTER stamping the
+    // terminal flag — so every queued byte is flushed before we read the outcome.
+    //
+    // The write is bounded by `idle` (CLIENT_RELAY_IDLE_TIMEOUT in production): a
+    // local app that stops reading but holds its socket open wedges `write_all`
+    // once the kernel send buffer fills. Dropping the channel sender (the reader's
+    // stall reset, or the session idle backstop) only wakes `recv()`, never a task
+    // already parked in `write_all`, so without this bound such a task — and its
+    // socket fd + stream permit — would leak for the life of the process. The
+    // timeout reaps it, reporting a reset just like a dead local socket. A
+    // live-but-slow app keeps making progress well inside the window, so it is
+    // never falsely reset.
+    let mut local_write_failed = false;
+    while let Some(DownloadEvent(payload)) = events.recv().await {
+        if !payload.is_empty()
+            && !matches!(
+                timeout(idle, local_write.write_all(&payload)).await,
+                Ok(Ok(()))
+            )
+        {
+            // Local app went away or wedged its socket for the whole idle window:
+            // stop draining. Report a reset so the per-connection task tears the
+            // server side down.
+            local_write_failed = true;
+            break;
+        }
+    }
+    let _ = local_write.shutdown().await;
+    let outcome = if local_write_failed {
+        DownloadOutcome::Reset
+    } else {
+        terminal.outcome()
+    };
+    let _ = outcome_tx.send(outcome);
+}
+
 /// Applies a control message to the reader-owned download-stream map. Register
-/// inserts the stream's write half; Deregister removes and FIN-closes it. Keeping
-/// this in one place ensures both the select arm and the opportunistic drain
-/// handle deregistration identically.
-async fn apply_client_stream_control(
+/// spawns the stream's download task and records its data sender + terminal flag;
+/// Deregister drops the sender (the task drains any queued data, then exits with
+/// whatever terminal outcome was stamped). Keeping this in one place ensures both
+/// the select arm and the opportunistic drain handle deregistration identically.
+fn apply_client_stream_control(
     local_writes: &mut HashMap<u32, ClientDownloadStream>,
     control: ClientStreamControl,
+    idle: Duration,
 ) {
     match control {
         ClientStreamControl::Register(reg) => {
+            let (events_tx, events_rx) = mpsc::channel(CLIENT_MUX_STREAM_CHANNEL);
+            let terminal = StreamTerminal::new();
+            tokio::spawn(client_mux_download_loop(
+                reg.local_write,
+                events_rx,
+                terminal.clone(),
+                reg.outcome_tx,
+                idle,
+            ));
             local_writes.insert(
                 reg.stream_id,
                 ClientDownloadStream {
-                    write: reg.local_write,
-                    outcome_tx: reg.outcome_tx,
+                    events: events_tx,
+                    terminal,
                 },
             );
         }
         ClientStreamControl::Deregister(stream_id) => {
-            if let Some(mut stream) = local_writes.remove(&stream_id) {
-                let _ = stream.write.shutdown().await;
-            }
+            // Dropping the sender closes the channel; the download task drains any
+            // queued frames, shuts the socket, and exits. No terminal stamp here:
+            // deregister is the per-connection task's own exit, not a server
+            // Fin/Reset, so the default (Reset) applies only if nothing else set it.
+            local_writes.remove(&stream_id);
         }
     }
 }
@@ -3247,7 +3413,7 @@ where
                 registration = register_rx.recv(), if register_open => {
                     match registration {
                         Some(control) => {
-                            apply_client_stream_control(&mut local_writes, control).await;
+                            apply_client_stream_control(&mut local_writes, control, idle);
                         }
                         None => register_open = false,
                     }
@@ -3268,8 +3434,7 @@ where
                     Ok(inner) => inner,
                     Err(_) => {
                         tracing::debug!(cid, "client mux idle backstop reached; tearing down session");
-                        shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin)
-                            .await;
+                        shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin);
                         return Ok(());
                     }
                 },
@@ -3278,11 +3443,11 @@ where
         match read_result {
             Ok(()) => {}
             Err(err) if server_records.is_clean_close(&err) => {
-                shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin).await;
+                shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin);
                 return Ok(());
             }
             Err(err) => {
-                shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset).await;
+                shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset);
                 return Err(ClientRuntimeError::Io(err));
             }
         }
@@ -3311,7 +3476,7 @@ where
         // stream's write half is always present before its first Data, and a
         // deregister from an exited per-connection task is applied promptly.
         while let Ok(control) = register_rx.try_recv() {
-            apply_client_stream_control(&mut local_writes, control).await;
+            apply_client_stream_control(&mut local_writes, control, idle);
         }
 
         // Open + dispatch the batch. Any AEAD-open, decode, or dispatch error
@@ -3351,57 +3516,109 @@ where
             let mut frames = frames_payload;
             while !frames.is_empty() {
                 let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-                dispatch_client_mux_frame(&mut local_writes, frame, cid).await?;
+                dispatch_client_mux_frame(&mut local_writes, frame, cid).await;
                 frames = &frames[used..];
             }
             Ok::<(), ClientRuntimeError>(())
         }
         .await;
         if let Err(err) = processed {
-            shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset).await;
+            shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset);
             return Err(err);
         }
     }
 }
 
-/// Writes a decrypted download frame straight to its local socket. The payload
-/// borrows the already-decrypted record buffer, so the relay hot path no longer
-/// allocates or hops through a per-stream channel. A failing local write tears
-/// down only that stream and keeps relaying the others.
+/// Hands a decrypted download frame to its stream's own download task over the
+/// stream's bounded channel. The common path is a NON-BLOCKING `try_send`, so the
+/// reader keeps dispatching to every other stream and is never head-of-line-
+/// blocked by one slow (or stalled) local app.
+///
+/// Back-pressure resolution on a full channel: a full channel does NOT by itself
+/// mean the app has stalled — the reader can dispatch a whole open-batch of DATA
+/// frames (up to ~1 MiB, far more than the channel depth) before a stream's
+/// download task next gets to drain, so a live app that is merely slower than a
+/// bulk burst transiently fills it too. So on a full channel the reader falls back
+/// to a BOUNDED blocking send ([`CLIENT_MUX_STALL_RESET_GRACE`]): if a slot frees
+/// within the window the app was just slow (the frame is delivered, nothing is
+/// reset); if the window elapses with no drain the stream is genuinely stalled and
+/// is RESET — signalled `Reset`, dropped from the map, and (via the download
+/// task's Reset outcome) torn down upstream so the server releases its target
+/// socket. This bounds per-stream memory to the channel depth and caps how long
+/// one stalled app can hold the shared reader, while never falsely resetting a
+/// live download that drains at the link rate.
+///
+/// The Data payload borrows the reused record buffer, so it is copied into the
+/// channel event; this is the (bounded, per-frame) cost of decoupling the reader
+/// from every local app's write speed — the alternative (reader-inline
+/// `write_all`, or an UNBOUNDED blocking `send().await`) head-of-line-blocks the
+/// whole carrier on the slowest local app.
 async fn dispatch_client_mux_frame(
     local_writes: &mut HashMap<u32, ClientDownloadStream>,
     frame: MuxFrameRef<'_>,
     cid: u64,
-) -> Result<(), ClientRuntimeError> {
+) {
+    use tokio::sync::mpsc::error::TrySendError;
     match frame.kind {
         MuxFrameKind::Data => {
-            let write_failed = match local_writes.get_mut(&frame.stream_id) {
-                Some(stream) if !frame.payload.is_empty() => {
-                    stream.write.write_all(frame.payload).await.is_err()
-                }
-                _ => false,
-            };
-            if write_failed {
-                if let Some(stream) = local_writes.remove(&frame.stream_id) {
-                    tracing::debug!(
-                        cid,
-                        stream_id = frame.stream_id,
-                        "client mux local write failed; dropping stream"
-                    );
-                    let _ = stream.outcome_tx.send(DownloadOutcome::Reset);
+            if !frame.payload.is_empty() {
+                if let Some(stream) = local_writes.get(&frame.stream_id) {
+                    match stream
+                        .events
+                        .try_send(DownloadEvent(frame.payload.to_vec()))
+                    {
+                        Ok(()) => {}
+                        Err(TrySendError::Closed(_)) => {
+                            // The stream's download task is gone (local app
+                            // closed): stop trying to feed it.
+                            local_writes.remove(&frame.stream_id);
+                        }
+                        Err(TrySendError::Full(event)) => {
+                            // Channel full: the app is draining slower than this
+                            // burst. Don't reset yet — wait UP TO the grace window
+                            // for a slot to free. Clone the sender so the map
+                            // borrow ends before the await (the reset arm re-takes
+                            // it). A live app frees a slot in well under the grace;
+                            // only a genuinely stalled one never drains.
+                            let sender = stream.events.clone();
+                            match timeout(CLIENT_MUX_STALL_RESET_GRACE, sender.send(event)).await {
+                                // Drained within the window: live-but-slow stream.
+                                Ok(Ok(())) => {}
+                                // Download task vanished while we waited.
+                                Ok(Err(_)) => {
+                                    local_writes.remove(&frame.stream_id);
+                                }
+                                // No drain for the whole window: a real stall.
+                                // Reset only this stream so the reader is freed and
+                                // memory stays bounded. Stamp Reset, then drop the
+                                // sender — the task's Reset outcome propagates
+                                // upstream (server releases its target).
+                                Err(_) => {
+                                    tracing::debug!(
+                                        cid,
+                                        stream_id = frame.stream_id,
+                                        "client mux download stalled; resetting the stream"
+                                    );
+                                    if let Some(stream) = local_writes.remove(&frame.stream_id) {
+                                        stream.terminal.set(DownloadOutcome::Reset);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
         MuxFrameKind::Fin => {
-            if let Some(mut stream) = local_writes.remove(&frame.stream_id) {
-                let _ = stream.write.shutdown().await;
-                let _ = stream.outcome_tx.send(DownloadOutcome::Fin);
+            if let Some(stream) = local_writes.remove(&frame.stream_id) {
+                // Stamp Fin, then drop the sender: the task flushes queued data,
+                // then reads the flag and reports a clean EOF.
+                stream.terminal.set(DownloadOutcome::Fin);
             }
         }
         MuxFrameKind::Reset => {
-            if let Some(mut stream) = local_writes.remove(&frame.stream_id) {
-                let _ = stream.write.shutdown().await;
-                let _ = stream.outcome_tx.send(DownloadOutcome::Reset);
+            if let Some(stream) = local_writes.remove(&frame.stream_id) {
+                stream.terminal.set(DownloadOutcome::Reset);
             }
         }
         MuxFrameKind::Cover => {}
@@ -3418,27 +3635,27 @@ async fn dispatch_client_mux_frame(
                 stream_id = frame.stream_id,
                 "ignoring unexpected server-originated mux Open frame"
             );
-            if let Some(mut stream) = local_writes.remove(&frame.stream_id) {
-                let _ = stream.write.shutdown().await;
-                let _ = stream.outcome_tx.send(DownloadOutcome::Reset);
+            if let Some(stream) = local_writes.remove(&frame.stream_id) {
+                stream.terminal.set(DownloadOutcome::Reset);
             }
         }
     }
-    Ok(())
 }
 
-/// Closes every download half when the session ends, signaling each waiting
-/// per-connection task the REASON explicitly: a clean close sends Fin (graceful
-/// EOF) while a hard session error sends Reset, so the local app sees a
-/// connection error instead of a truncated response delivered as success. (The
-/// old behavior relied on dropping the sender, which always mapped to a clean Fin.)
-async fn shutdown_client_download_streams(
+/// Ends every download stream when the session ends, signaling each stream's
+/// download task the REASON explicitly: a clean close sends Fin (graceful EOF)
+/// while a hard session error sends Reset, so the local app sees a connection
+/// error instead of a truncated response delivered as success. Draining the map
+/// also drops each event sender, so any task still busy writing exits once its
+/// queued frames flush.
+fn shutdown_client_download_streams(
     local_writes: &mut HashMap<u32, ClientDownloadStream>,
     outcome: DownloadOutcome,
 ) {
-    for (_, mut stream) in local_writes.drain() {
-        let _ = stream.write.shutdown().await;
-        let _ = stream.outcome_tx.send(outcome);
+    for (_, stream) in local_writes.drain() {
+        // Stamp the reason, then drop the sender (end of this scope): each task
+        // flushes its queued data, reads the flag, and reports Fin or Reset.
+        stream.terminal.set(outcome);
     }
 }
 
@@ -3969,7 +4186,13 @@ mod tests {
     /// what a forwarded camouflage-origin record looks like in the residual-skip
     /// loop before the ParallaX key exchange.
     fn camouflage_record(seed: u8) -> Vec<u8> {
-        let payload = vec![seed; 40];
+        camouflage_record_with_len(seed, 40)
+    }
+
+    /// [`camouflage_record`] with a chosen payload length (a real origin's record
+    /// sizes range from tiny H2 frames to full 16 KiB records).
+    fn camouflage_record_with_len(seed: u8, payload_len: usize) -> Vec<u8> {
+        let payload = vec![seed; payload_len];
         let len = payload.len() as u16;
         let mut rec = vec![0x17, 0x03, 0x03, (len >> 8) as u8, (len & 0xff) as u8];
         rec.extend_from_slice(&payload);
@@ -4012,14 +4235,11 @@ mod tests {
         out
     }
 
-    /// Regression for the high-RTT handshake-failure bug (client budget 16 vs
-    /// server forward limit 64): the client must skip as many camouflage records as
-    /// the server may forward before the key-exchange
-    /// (`MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`) and still accept the key
-    /// exchange. With the old budget this aborted with an AEAD/"residual budget"
-    /// error on the 17th camouflage record.
-    #[tokio::test]
-    async fn residual_skip_tolerates_full_server_forward_limit() {
+    // Test helper: a client session mid-PQ-rekey plus the matching sealed server
+    // key-exchange record, built the same way an authenticated server would
+    // (mirrors the `pq_rekey_changes_client_session_keys` roundtrip in
+    // handshake::client). Shared by the `residual_skip_*` tests.
+    fn session_with_server_key_exchange() -> (ClientDataSession, PendingPqRekey, Vec<u8>) {
         use rand::{rngs::StdRng, SeedableRng};
 
         use crate::{
@@ -4037,9 +4257,6 @@ mod tests {
         let mut session = ClientDataSession::new(keys.clone(), traffic).unwrap();
         let mut rng = StdRng::seed_from_u64(42);
 
-        // Client builds its PQ rekey record; reconstruct the matching server
-        // key-exchange the same way an authenticated server would (mirrors the
-        // `pq_rekey_changes_client_session_keys` roundtrip in handshake::client).
         let (pq_record, pending) = session.build_pq_rekey_record(&mut rng).unwrap();
         let (mut server_open, _) = data_codecs(&keys, traffic).unwrap();
         let request =
@@ -4057,9 +4274,21 @@ mod tests {
             .unwrap(),
             &mut rng,
         );
+        (session, pending, kx_record)
+    }
 
-        // Prepend exactly the maximum number of camouflage records the server may
-        // forward, then the real key-exchange as the next record.
+    /// Regression for the original high-RTT handshake-failure bug (client budget
+    /// 16 records vs server forward limit 64): the client must skip
+    /// `MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS` camouflage records (well under
+    /// the byte budget) and still accept the key exchange. With the old budget
+    /// this aborted with an AEAD/"residual budget" error on the 17th camouflage
+    /// record.
+    #[tokio::test]
+    async fn residual_skip_tolerates_full_server_forward_limit() {
+        let (mut session, pending, kx_record) = session_with_server_key_exchange();
+
+        // Prepend one camouflage record per unit of the record-count window,
+        // then the real key-exchange as the next record.
         let mut stream = Vec::new();
         for i in 0..crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS {
             stream.extend_from_slice(&camouflage_record(i as u8));
@@ -4074,17 +4303,79 @@ mod tests {
             );
     }
 
+    /// Regression for the camouflage-window UNIT mismatch: the server's pre-PQ
+    /// forward cap is a BYTE ceiling (~1 MiB) over a verbatim splice, and real
+    /// origins segment H2 response bodies into many sub-16KiB records, so far
+    /// more than 64 records can legitimately precede the key exchange. The
+    /// client's residual-skip budget counts the same bytes; with the old
+    /// 64-RECORD budget this aborted on the 65th small record.
+    #[tokio::test]
+    async fn residual_skip_counts_bytes_not_records() {
+        let (mut session, pending, kx_record) = session_with_server_key_exchange();
+
+        // Far more records than the old record budget, still well under the
+        // shared byte budget, then the real key-exchange as the next record.
+        let mut stream = Vec::new();
+        let mut camouflage_bytes = 0;
+        for i in 0..512_usize {
+            let rec = camouflage_record(i as u8);
+            camouflage_bytes += rec.len();
+            stream.extend_from_slice(&rec);
+        }
+        assert!(camouflage_bytes <= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES);
+        stream.extend_from_slice(&kx_record);
+
+        let mut cursor: &[u8] = &stream;
+        apply_server_key_exchange_after_residuals(&mut cursor, &mut session, &pending, PSK)
+            .await
+            .expect(
+                "client must skip small residual camouflage records up to the byte budget, \
+                 not a record count",
+            );
+    }
+
+    /// The fast-fail must still fire on the byte budget: a peer that pushes more
+    /// camouflage bytes than the shared window (65 full-size records here) is not
+    /// a ParallaX server racing its key exchange, and the client aborts instead
+    /// of reading forever.
+    #[tokio::test]
+    async fn residual_skip_aborts_past_byte_budget() {
+        let (mut session, pending, kx_record) = session_with_server_key_exchange();
+
+        // 64 full-size records fill the byte budget exactly; the 65th arrives
+        // past it and must trip the fast-fail even with a valid key exchange
+        // behind it.
+        let full = record::MAX_TLS_RECORD_PAYLOAD;
+        let mut stream = Vec::new();
+        let mut camouflage_bytes = 0;
+        for i in 0..=crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS {
+            let rec = camouflage_record_with_len(i as u8, full);
+            camouflage_bytes += rec.len();
+            stream.extend_from_slice(&rec);
+        }
+        assert!(camouflage_bytes > crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES);
+        stream.extend_from_slice(&kx_record);
+
+        let mut cursor: &[u8] = &stream;
+        apply_server_key_exchange_after_residuals(&mut cursor, &mut session, &pending, PSK)
+            .await
+            .expect_err("residual camouflage bytes past the shared budget must abort");
+    }
+
     /// The client's residual-skip budget must always be at least the server's
-    /// pre-PQ fallback forward limit, or high-RTT handshakes intermittently abort
-    /// (the 16-vs-64 bug). Both are bound to the shared constant, so this holds by
-    /// construction; the test guards against a future divergence.
+    /// pre-PQ fallback forward limit — measured in the same unit, BYTES — or
+    /// high-RTT handshakes intermittently abort (the 16-vs-64 record bug, then
+    /// the 64-records-vs-~1MiB unit bug). Both are bound to the shared byte
+    /// constant, so this holds by construction; the test guards against a future
+    /// divergence.
     #[test]
     fn residual_budget_covers_server_forward_limit() {
         const {
             assert!(
-                MAX_RESIDUAL_CAMOUFLAGE_RECORDS_BEFORE_KEY_EXCHANGE
-                    >= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS,
-                "client residual-skip budget must cover the server's pre-PQ fallback forward limit"
+                MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE
+                    >= crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES,
+                "client residual-skip byte budget must cover the server's pre-PQ \
+                 fallback forward byte limit"
             );
         }
     }
@@ -4325,6 +4616,61 @@ mod tests {
             client_mux_await_download(outcome_rx, 1).await,
             Ok(())
         ));
+    }
+
+    /// A local app that stops reading but holds its socket open wedges the
+    /// download task's `write_all` once the kernel send buffer fills. Dropping the
+    /// event sender (the reader's stall reset / session backstop) wakes only
+    /// `recv()`, never a task parked in `write_all`, so without the write's idle
+    /// bound the task — and its socket fd + stream permit — would leak forever.
+    /// This proves the bound reaps it with a `Reset`.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn client_mux_download_task_reaps_a_wedged_local_writer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        // The local app: accept it and NEVER read, so the ParallaX write half fills
+        // and stays full for the rest of the test.
+        let (app_side, _) = listener.accept().await.unwrap();
+        let (_parallax_read, parallax_write) = connect.await.unwrap().into_split();
+
+        let (events_tx, events_rx) = mpsc::channel::<DownloadEvent>(CLIENT_MUX_STREAM_CHANNEL);
+        let terminal = StreamTerminal::new();
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+
+        // A short injected idle so the write bound fires in real time.
+        let idle = Duration::from_millis(200);
+        let task = tokio::spawn(client_mux_download_loop(
+            parallax_write,
+            events_rx,
+            terminal,
+            outcome_tx,
+            idle,
+        ));
+
+        // Continuously feed download data. The app never reads, so `write_all`
+        // wedges once the socket buffer fills regardless of its (autotuned) size;
+        // the feeder stops when the task's receiver is dropped.
+        let feeder = tokio::spawn(async move {
+            let chunk = vec![0x5A_u8; 256 * 1024];
+            while events_tx.send(DownloadEvent(chunk.clone())).await.is_ok() {}
+        });
+
+        // The task MUST terminate (report Reset) within a wall budget thanks to the
+        // idle bound — even though the app never reads and data keeps arriving.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), outcome_rx)
+            .await
+            .expect("download task must reap itself within the wall budget once write wedges")
+            .expect("download task must report an outcome");
+        assert!(
+            matches!(outcome, DownloadOutcome::Reset),
+            "a wedged local writer must be reaped with a Reset",
+        );
+
+        feeder.abort();
+        drop(app_side);
+        let _ = task.await;
     }
 
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
@@ -5561,6 +5907,112 @@ mod tests {
         wait_for_task("server", server_task).await;
         wait_for_task("target", target_task).await;
         wait_for_task("fallback", fallback_task).await;
+    }
+
+    /// Regression cover for head-of-line blocking on the shared TCP mux carrier.
+    ///
+    /// All SOCKS connections share ONE carrier with a single reader loop. When
+    /// the reader wrote each stream's decrypted download frames inline to its
+    /// local socket, a single local app that stopped reading blocked the reader
+    /// on `write_all` — freezing the download direction of EVERY other stream on
+    /// the carrier until that one app resumed (or the session timed out). This is
+    /// the "connections pile up, then everything wedges" failure.
+    ///
+    /// The fix gives each stream its own bounded download channel + task, so a
+    /// stalled app back-pressures only its own channel. This test proves it:
+    /// stream A uploads a multi-MiB payload (echoed back as a large download) but
+    /// NEVER reads its response, stalling A's download well past its channel
+    /// depth. Stream B must still round-trip a small payload promptly. Pre-fix, B
+    /// times out (the reader is wedged on A's socket); post-fix, B completes and
+    /// only the stalled stream A is sacrificed (reset once its channel fills).
+    ///
+    /// The property under test is purely "B is not blocked by A". Stream A is
+    /// deliberately reset, so its own target write / relay tasks legitimately end
+    /// with errors — this test uses an error-tolerant target and does not require a
+    /// clean session join (that is covered by the other mux e2e tests). It aborts
+    /// the harness tasks once B has proven the carrier is not wedged.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_stalled_stream_does_not_block_other_streams() {
+        const STREAMS: usize = 2;
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback().await;
+
+        // Error-tolerant echo target: a reset stream (stalled A) makes its target
+        // socket error, which must NOT panic the target task (unlike the strict
+        // shared `spawn_multi_echo_target`). Best-effort echo, swallow errors.
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            for _ in 0..STREAMS {
+                let (mut stream, _) = match target_listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 64 * 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let mux_traffic = TrafficConfig {
+            max_concurrent_streams: STREAMS as u8,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_with_traffic(server_config, mux_traffic).await;
+        let (local_addr, client_task) =
+            spawn_mux_local_client(parallax_addr, &server_keys, &server_identity_keys, STREAMS)
+                .await;
+
+        // Stream A: upload several MiB (echoed back as an equally large download),
+        // then NEVER read the response. Its download backs up far past the 32-deep
+        // per-stream channel + kernel socket buffer, so a reader that wrote A's
+        // socket inline would wedge here — freezing every other stream.
+        let mut stalled = connect_socks_target(local_addr, target_addr).await;
+        let big = vec![0xA5_u8; 4 * 1024 * 1024];
+        stalled.write_all(&big).await.unwrap();
+        // Deliberately never read `stalled`'s response; keep the socket open so its
+        // download direction stays stalled for the rest of the test.
+
+        // Stream B must still complete quickly on the same carrier. This is the
+        // assertion: pre-fix it times out (reader wedged on A); post-fix it passes.
+        let healthy = connect_socks_target(local_addr, target_addr).await;
+        let small: Vec<u8> = (0..4096).map(|b| (b % 251) as u8).collect();
+        timeout(
+            Duration::from_secs(10),
+            assert_payload_round_trip(healthy, small),
+        )
+        .await
+        .expect("healthy stream wedged behind a stalled peer (head-of-line blocking)");
+
+        // Property proven. Tear down without requiring a clean join of the
+        // intentionally-reset stalled stream.
+        drop(stalled);
+        client_task.abort();
+        server_task.abort();
+        target_task.abort();
+        fallback_task.abort();
     }
 
     /// Tunables for one loopback mux benchmark run.

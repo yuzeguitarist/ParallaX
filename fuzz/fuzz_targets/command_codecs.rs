@@ -1,8 +1,9 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use parallax::protocol::command::{
-    ConnectRequest, PqRekeyRequest, ServerIdentityChunk, ServerIdentityProof, ServerKeyExchange,
-    SpeedTestAck, SpeedTestRequest, UdpDecline, UdpOffer, UdpProbeAck, UdpRequest,
+    ConnectRequest, FramedChunk, FramedReassembler, PqRekeyRequest, ServerIdentityChunk,
+    ServerIdentityProof, ServerKeyExchange, SpeedTestAck, SpeedTestRequest, UdpDecline, UdpOffer,
+    UdpProbeAck, UdpRequest,
 };
 
 // All protocol/command.rs wire codecs. Every decoder enforces canonical strict
@@ -70,12 +71,48 @@ fn rt_ske(b: &[u8]) {
     }
 }
 
+// FramedChunk carries the SAME `magic | total_len | offset | len | bytes`
+// offset codec as ServerIdentityChunk, but only ever exposes a borrowed
+// `decode_ref` + a payload-tiling `encode_all` (no owned decode()/encode()
+// pair), so it does not fit rt_eq!. It was therefore absent from this selector
+// even though it decodes untrusted bytes on the PQ-handshake path. Cover it: a
+// decoded chunk's payload, re-tiled into a fresh single-record frame, must
+// reassemble byte-for-byte through the reassembler that consumes it on the wire.
+fn rt_framed(b: &[u8]) {
+    let Ok(chunk) = FramedChunk::decode_ref(b) else {
+        return;
+    };
+    let payload = chunk.bytes.to_vec();
+    // A decoded chunk always carries a non-empty payload (the codec rejects
+    // len==0), so encode_all yields at least one record.
+    let reencoded = FramedChunk::encode_all(&payload, payload.len())
+        .expect("a decoded chunk payload must re-tile");
+    let mut reassembler = FramedReassembler::default();
+    let mut assembled = None;
+    for record in &reencoded {
+        // decode_ref -> encode_all -> decode_ref must be value-stable.
+        let d = FramedChunk::decode_ref(record).expect("our own FramedChunk record must decode");
+        assert_eq!(d.total_len as usize, payload.len(), "re-tiled total mismatch");
+        if let Some(done) = reassembler
+            .push(record, payload.len())
+            .expect("our own FramedChunk record must reassemble")
+        {
+            assembled = Some(done);
+        }
+    }
+    assert_eq!(
+        assembled.expect("re-tiled frame must fully reassemble"),
+        payload,
+        "FramedChunk decode -> re-tile -> reassemble is not lossless"
+    );
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
     let (sel, body) = (data[0], &data[1..]);
-    match sel % 11 {
+    match sel % 12 {
         0 => rt_eq!(ConnectRequest, body),
         1 => rt_eq!(PqRekeyRequest, body),
         2 => rt_ske(body),
@@ -86,6 +123,7 @@ fuzz_target!(|data: &[u8]| {
         7 => rt_eq_vec!(SpeedTestAck, body),
         8 => rt_eq_vec!(UdpProbeAck, body),
         9 => rt_eq_vec!(UdpRequest, body),
+        10 => rt_framed(body),
         _ => rt_eq_vec!(UdpDecline, body),
     }
 });

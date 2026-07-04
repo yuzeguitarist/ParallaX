@@ -70,11 +70,12 @@ jobs:
           shared-key: parallax-ci
           save-if: false
 
-      - uses: anthropics/claude-code-action@428971d2ecd6e3a7cb0ee0da2a3a8b33fdb3678d # v1.0.157
+      - uses: anthropics/claude-code-action@6c0083bb7289c31716797a039b6367b3079cc46e # v1.0.162
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          settings: .github/claude-hooks/settings.json
           # github_token intentionally omitted -> Claude GitHub App token, so the
           # PR it opens triggers ci-pr.yml.
           prompt: |

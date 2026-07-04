@@ -176,22 +176,19 @@ fn try_enter_cap_shed_fallback() -> Option<CapShedFallbackSlot> {
     }
 }
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
-// The client's residual-skip budget, mirrored here only for the operator-facing
-// warning logged when the forward cap is reached. Bound to the shared constant so
-// it can never drift from the client's actual budget again (the 16-vs-64 high-RTT
-// handshake-failure bug).
-const CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET: usize =
-    super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
-/// Cap on fallback-origin records forwarded to the client before the ParallaX PQ
-/// rekey arrives. This must comfortably cover a *full* fragmented TLS 1.3 server
-/// handshake flight (ServerHello + EncryptedExtensions + a possibly large,
-/// heavily fragmented Certificate chain + CertificateVerify + Finished): the
-/// client only sends its PQ record once that flight completes its Safari TLS
-/// camouflage, so a limit smaller than the origin's record count deadlocks the
-/// session (the server stops forwarding, the client keeps waiting). 64 records
-/// (~1 MiB) is far above any real handshake flight while still bounding forwarding.
-/// Bound to the shared [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] so the
-/// client's residual-skip budget always covers exactly what this may forward.
+// The client's residual-skip byte budget, mirrored here only for the
+// operator-facing warning logged when the forward cap is reached. Bound to the
+// shared constant so it can never drift from the client's actual budget again
+// (the 16-vs-64 record and 64-records-vs-~1MiB unit high-RTT handshake-failure
+// bugs).
+const CLIENT_RESIDUAL_CAMOUFLAGE_BYTE_BUDGET: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
+/// Cap on the CLIENT's camouflage records read before its ParallaX PQ rekey
+/// arrives (the client->fallback direction; the fallback->client direction is
+/// byte-capped, see [`PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT`]). A legitimate client
+/// emits only a handful of camouflage records before its PQ record, so 64 is far
+/// above any real client flight while still bounding an abusive unbounded
+/// client->fallback stream. Bound to the shared
+/// [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`].
 const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS;
 /// Byte ceiling on the origin->client camouflage forward in the authenticated
 /// pre-PQ phase (D5). That direction now forwards the origin's bytes VERBATIM —
@@ -199,14 +196,18 @@ const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_
 /// into its own write (a "one record, one segment" shape that no direct-to-origin
 /// connection and no `relay_fallback` byte pump produces, making the authenticated
 /// splice separable from both). Because the forward is byte-oriented now, the
-/// resource backstop is byte-oriented too: it is the record cap expressed in
-/// bytes (a full-size TLS record is header + max payload), so it bounds exactly
-/// the same "~1 MiB / 64 full records" envelope as before. The CLIENT still
-/// enforces its own [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS`] residual
-/// *record* budget on the reassembled stream, so the logical-record contract is
-/// unchanged; this cap is purely the server-side abuse/resource ceiling.
-const PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT: usize = PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT
-    * (crate::tls::record::MAX_TLS_RECORD_PAYLOAD + crate::tls::record::TLS_HEADER_LEN);
+/// cap is byte-oriented too: ~1 MiB (64 full-size records) comfortably covers a
+/// *full* fragmented TLS 1.3 server handshake flight (ServerHello,
+/// EncryptedExtensions, a possibly large, heavily fragmented Certificate chain,
+/// CertificateVerify, Finished); the client only sends its PQ record once
+/// that flight completes its Safari TLS camouflage, so a ceiling smaller than
+/// the origin's flight deadlocks the session (the server stops forwarding, the
+/// client keeps waiting). The CLIENT enforces the SAME byte budget on the
+/// reassembled record stream (both are bound to
+/// [`super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES`] — see its doc for why the
+/// two ends must share a unit), and the forward's final read is capped at the
+/// remaining budget so this end can never overshoot what the client tolerates.
+const PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
 const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
 /// Server-side ceilings on an authenticated speed-test request. The on-wire
 /// format permits arbitrary u64 byte counts and a u16 sample count; without a
@@ -1541,7 +1542,17 @@ async fn relay_fallback_userspace_loop(
                     // shutdown error never skips the final graceful teardown.
                     let _ = fallback_write.shutdown().await;
                 } else {
-                    fallback_write.write_all(&client_buf[..n]).await?;
+                    // Bound the forward write with the SAME idle timeout (#262):
+                    // this write is awaited INSIDE the selected arm, where the
+                    // pinned `idle_sleep` is not polled, so a zero-window peer
+                    // that never drains its receive buffer would otherwise stall
+                    // `write_all` forever and pin the connection permit. The
+                    // kernel splice path already polls the write fd against this
+                    // idle bound; on elapse, break so the relay tears down.
+                    match timeout(idle_timeout, fallback_write.write_all(&client_buf[..n])).await {
+                        Ok(result) => result?,
+                        Err(_) => break,
+                    }
                     idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                 }
             }
@@ -1551,7 +1562,11 @@ async fn relay_fallback_userspace_loop(
                     fallback_closed = true;
                     let _ = client_write.shutdown().await;
                 } else {
-                    client_write.write_all(&fallback_buf[..n]).await?;
+                    // Same write-side idle bound as the client->fallback arm.
+                    match timeout(idle_timeout, client_write.write_all(&fallback_buf[..n])).await {
+                        Ok(result) => result?,
+                        Err(_) => break,
+                    }
                     idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                 }
             }
@@ -2588,6 +2603,7 @@ async fn run_authenticated_data_mode(
                                             fixed_data_target,
                                             cid,
                                         },
+                                        fallback_idle_timeout(),
                                     )
                                     .await;
                                 }
@@ -2654,8 +2670,8 @@ async fn run_authenticated_data_mode(
                         client_camouflage_bytes_before_pq += client_record.len();
                         if client_camouflage_records_before_pq > PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT
                         {
-                            // Same 64-record ceiling as the fallback->client cap
-                            // below (that direction pauses; this one tears down). A
+                            // Same camouflage window as the fallback->client byte
+                            // cap below (that direction pauses; this one tears down). A
                             // legitimate client emits only a handful of camouflage
                             // records before its PQ rekey, so an unbounded
                             // client->fallback stream is abuse. Drain->FIN both
@@ -2750,8 +2766,15 @@ async fn run_authenticated_data_mode(
             // separable from both. Reading raw bytes off the buffered reader drains
             // any already-buffered bytes first, so nothing the record path left
             // behind is lost (we never read records off this half again in pre-PQ).
-            // The cap is byte-oriented to match (see PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT).
-            read = fallback_records.get_mut().read(&mut fallback_relay_buf),
+            // The cap is byte-oriented to match (see PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT),
+            // and each read is capped at the remaining budget so the forward can never
+            // overshoot the client's equal residual byte budget mid-read.
+            read = fallback_records.get_mut().read({
+                let remaining = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
+                    .saturating_sub(fallback_bytes_before_pq)
+                    .min(fallback_relay_buf.len());
+                &mut fallback_relay_buf[..remaining]
+            }),
                 if fallback_open && fallback_bytes_before_pq < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT => {
                 let n = match read {
                     // Origin half-closed (FIN) or reset before PX1Q arrived. This is
@@ -2803,7 +2826,7 @@ async fn run_authenticated_data_mode(
                         direction = "fallback->client",
                         task_name = "server-camouflage-writer",
                         fallback_bytes_before_pq,
-                        client_residual_budget = CLIENT_RESIDUAL_CAMOUFLAGE_RECORD_BUDGET,
+                        client_residual_byte_budget = CLIENT_RESIDUAL_CAMOUFLAGE_BYTE_BUDGET,
                         pre_pq_forward_byte_limit = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT,
                         "pre-PQ fallback camouflage forward byte limit reached; pausing fallback \
                          reads until ParallaX PQ rekey"
@@ -4031,12 +4054,17 @@ struct ServerMuxQuicContext<'a> {
 /// connects the target, and relays over the H3 DATA-frame legs.
 ///
 /// A per-connection ceiling (`max_streams`) bounds concurrent substreams; excess
-/// bidis are reset. The accept loop ends when the client closes the connection.
+/// bidis are reset. The accept loop ends when the client closes the connection,
+/// or when the whole-session idle backstop fires: `idle_timeout` (drawn from
+/// [`fallback_idle_timeout`] by the production call site; injected so tests can
+/// run the backstop on a short clock) bounds how long the session may sit with
+/// zero admitted and zero live substreams before it is reclaimed.
 async fn run_authenticated_mux_quic_data_mode(
     client_records: BufferedTlsRecordReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     probed: ServerProbedQuic,
     context: ServerMuxQuicContext<'_>,
+    idle_timeout: Duration,
 ) -> Result<(), HandshakeServerError> {
     let ServerProbedQuic {
         conn,
@@ -4076,8 +4104,39 @@ async fn run_authenticated_mux_quic_data_mode(
         "ParallaX mux-over-QUIC data mode started"
     );
 
+    // Application-level idle backstop for the whole session, mirroring the
+    // sibling relay modes (which all bound whole-relay silence with
+    // `fallback_idle_timeout`). The QUIC connection's own idle timeout is NOT a
+    // bound here: it is refreshed by ANY received packet, and keep-alive PINGs
+    // keep both ends exchanging packets, so a client that ACKs keep-alives while
+    // opening zero substreams (and sending zero TCP bytes to trip the watcher
+    // above) would otherwise pin the connection, both fds, and the admission
+    // permit forever. The clock resets ONLY when a substream is admitted; live
+    // substreams defer expiry (each is bounded by its own idle watchdog, which
+    // releases its permit on teardown, so a later expiry still reclaims the
+    // session).
+    let idle_sleep = sleep(idle_timeout);
+    tokio::pin!(idle_sleep);
+
     loop {
-        let Some((send, recv)) = conn.accept_bi().await else {
+        let accepted = tokio::select! {
+            accepted = conn.accept_bi() => accepted,
+            _ = &mut idle_sleep => {
+                if live.available_permits() < max_streams {
+                    // Substreams are still relaying: the session is not idle.
+                    idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
+                    continue;
+                }
+                tracing::debug!(
+                    cid = context.cid,
+                    "mux-over-QUIC session idle backstop reached; tearing down"
+                );
+                conn.close(RELAY_IDLE_CLOSE_CODE.into(), b"mux-idle");
+                tcp_watch.abort();
+                return Ok(());
+            }
+        };
+        let Some((send, recv)) = accepted else {
             // The QUIC connection closed (client dropped the session, surfaced via
             // the TCP watcher, or a transport close): no further substreams.
             tcp_watch.abort();
@@ -4096,6 +4155,9 @@ async fn run_authenticated_mux_quic_data_mode(
             );
             continue;
         };
+        // An admitted substream is real client activity: reset the session idle
+        // clock. (Rejected bidis deliberately do not.)
+        idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
         let (client_open, server_seal) =
             match crate::transport::udp::quic::mux::server_substream_codecs(
                 context.session_keys,
@@ -5178,7 +5240,8 @@ async fn run_authenticated_speed_test_mode(
 }
 
 /// Read the client's speed QUIC-run DONE marker off the TCP control connection,
-/// bounded so a vanished client cannot pin the server.
+/// bounded by an absolute deadline so neither a vanished client nor an
+/// empty-record trickle can pin the server.
 async fn read_speed_tcp_done<R>(
     reader: &mut R,
     client_open: &mut DataRecordCodec,
@@ -5189,13 +5252,17 @@ where
 {
     let mut record = Vec::new();
     let mut consecutive_empty: u32 = 0;
+    let mut total_empty: u64 = 0;
+    // Absolute phase deadline: a per-read timeout is reset by every record
+    // received, so a client trickling empty records just inside the backstop
+    // could hold the teardown for MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS *
+    // backstop (~34 h). Anchoring one deadline before the loop bounds the WHOLE
+    // wait regardless of how many records arrive (the upload phase's throughput
+    // floor plays this role there; the DONE read carries no data to rate-check,
+    // so a wall-clock bound is the equivalent backstop).
+    let deadline = Instant::now() + QUIC_RELAY_DONE_BACKSTOP;
     loop {
-        match tokio::time::timeout(
-            QUIC_RELAY_DONE_BACKSTOP,
-            reader.read_record_into(&mut record),
-        )
-        .await
-        {
+        match timeout_at(deadline, reader.read_record_into(&mut record)).await {
             Ok(res) => res.map_err(HandshakeServerError::Io)?,
             Err(_) => {
                 return Err(HandshakeServerError::Io(io::Error::new(
@@ -5207,14 +5274,22 @@ where
         let range = client_open.open_in_place_payload_range(&mut record)?;
         if range.is_empty() {
             // Padding-only record carries no progress. Bound how many may arrive
-            // back-to-back so a client streaming only empty records cannot reset the
-            // per-read timeout forever and pin the teardown (the same cap the upload
-            // phase applies).
+            // back-to-back so a client streaming only empty records cannot pin the
+            // teardown (the same cap the upload phase applies).
             consecutive_empty += 1;
             if consecutive_empty > MAX_CONSECUTIVE_EMPTY_UPLOAD_RECORDS {
                 return Err(HandshakeServerError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "speed QUIC-run TCP DONE sent too many consecutive empty records",
+                )));
+            }
+            // Cumulative cap, mirroring the upload phase: counted across the whole
+            // read and never reset, so no record interleaving can extend it.
+            total_empty += 1;
+            if total_empty > MAX_TOTAL_EMPTY_UPLOAD_RECORDS {
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "speed QUIC-run TCP DONE sent too many empty records",
                 )));
             }
             continue;
@@ -7723,6 +7798,128 @@ mod tests {
         acceptor.abort();
     }
 
+    /// #56: a client that keeps the mux-over-QUIC session transport-alive (the
+    /// QUIC connection's idle timeout is refreshed by ANY packet, keep-alives
+    /// included) while opening ZERO substreams and sending ZERO TCP bytes must
+    /// not pin the session — connection, both TCP fds, and admission permit —
+    /// forever. The accept loop's application-level idle backstop must return
+    /// within the injected idle timeout and close the connection with the agreed
+    /// idle code so the client reads the teardown as benign.
+    #[tokio::test]
+    #[ignore = "requires loopback UDP + TCP sockets"]
+    async fn mux_quic_idle_backstop_reclaims_silent_session() {
+        use crate::crypto::session::derive_server_keys;
+        use crate::protocol::data::is_relay_idle_close_reason;
+        use crate::tls::quic::{AcceptAnyServerCert, ClientConfig as QuicClientConfig};
+        use crate::transport::udp::h3::H3ControlStreams;
+        use crate::transport::udp::quic::endpoint::{Endpoint, ServerConfig as QuicServerConfig};
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        // In-process QUIC pair over loopback UDP (mirrors the endpoint unit tests).
+        let signing_key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap()
+                .as_ref()
+                .to_vec();
+        let quic_server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(QuicServerConfig {
+                cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+                signing_key_pkcs8: signing_key,
+                alpn_protocols: vec![b"h3".to_vec()],
+                zero_rtt: None,
+                origin_udp_addr: None,
+                marker_key: None,
+                marker_replay_guard: None,
+                authorized_sni: vec!["example.com".to_owned()],
+                max_udp_payload: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let quic_addr = quic_server.local_addr().unwrap();
+        let quic_client = Endpoint::client("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        quic_client.set_default_client_config(Arc::new(QuicClientConfig::new(
+            Arc::new(AcceptAnyServerCert),
+            vec![b"h3".to_vec()],
+        )));
+        let (client_conn, server_conn) = tokio::join!(
+            quic_client.connect(quic_addr, "example.com"),
+            quic_server.accept(),
+        );
+        let client_conn = client_conn.unwrap();
+        let server_conn = server_conn.unwrap();
+
+        // The probe bidi the production path quiesces on entry: the client opens
+        // it and writes a byte so it materializes on the server.
+        let (mut probe_send, probe_recv) = client_conn.open_bi();
+        probe_send.write_all(b"p").await.unwrap();
+        let (relay_send, relay_recv) = server_conn.accept_bi().await.unwrap();
+        // The server-opened H3 control/QPACK-encoder unis the session parks.
+        let h3_control = H3ControlStreams::new(server_conn.open_uni(), server_conn.open_uni());
+
+        // The parked TCP control connection: the client half stays open and
+        // SILENT for the whole test (no EOF, no stray byte), so `tcp_watch`
+        // never fires — exactly the DoS shape.
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let (client_tcp, accepted) =
+            tokio::join!(TcpStream::connect(tcp_addr), tcp_listener.accept());
+        let client_tcp = client_tcp.unwrap();
+        let (server_tcp, _) = accepted.unwrap();
+        let (server_tcp_read, server_tcp_write) = server_tcp.into_split();
+
+        let client_x = X25519KeyPair::generate();
+        let server_x = X25519KeyPair::generate();
+        let session_keys =
+            derive_server_keys(PSK, &server_x.private, &client_x.public, &[7_u8; 32]).unwrap();
+
+        // The client opens ZERO substreams: the session must be reclaimed by the
+        // idle backstop (the call RETURNS within the wall budget) rather than
+        // pinned on `accept_bi` indefinitely.
+        let session = run_authenticated_mux_quic_data_mode(
+            BufferedTlsRecordReader::buffered(server_tcp_read),
+            server_tcp_write,
+            ServerProbedQuic {
+                conn: server_conn,
+                h3_control,
+                relay_send,
+                relay_recv,
+            },
+            ServerMuxQuicContext {
+                session_keys: &session_keys,
+                traffic: TrafficConfig::default(),
+                fixed_data_target: None,
+                cid: 1,
+            },
+            Duration::from_millis(100),
+        );
+        tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("a zero-substream silent session must be reclaimed by the idle backstop")
+            .expect("idle teardown is a clean session end, not an error");
+
+        // The client observes the agreed idle close code (benign teardown), not a
+        // generic error close.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::transport::udp::endpoint::conn_closed(&client_conn),
+        )
+        .await
+        .expect("the idle close must reach the client");
+        assert!(
+            is_relay_idle_close_reason(client_conn.close_reason().as_ref()),
+            "the backstop must close with RELAY_IDLE_CLOSE_CODE, got {:?}",
+            client_conn.close_reason()
+        );
+
+        drop(client_tcp);
+        drop((probe_send, probe_recv));
+    }
+
     /// M-8: the speed-test DOWNLOAD phase must reclaim a zero-window stall as a
     /// Timeout (the upload phase already did). A client that connects and never
     /// reads drives the server's receive window to zero; once the send buffer
@@ -7982,6 +8179,38 @@ mod tests {
             .expect("a full record crossing the grace boundary must be credited, not rejected");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn speed_tcp_done_bounds_an_empty_record_trickle_with_an_absolute_deadline() {
+        // #54: padding-only records arriving well inside the per-read backstop
+        // must not extend the DONE wait past the anchored phase deadline. Pre-fix,
+        // every record reset the 120 s per-read clock, so the trickle ran until
+        // the ~1024-record consecutive cap (~34 h of slot pin).
+        let (sealer, opener) = upload_floor_io_codecs();
+        let mut reader = TrickleLegReader {
+            sealer,
+            rng: StdRng::seed_from_u64(8),
+            payload: Vec::new(), // padding-only: opens to an empty payload range
+            advance_per_read: Duration::from_secs(30),
+            remaining: 10_000,
+        };
+        let mut client_open = opener;
+
+        let err = read_speed_tcp_done(&mut reader, &mut client_open, 1)
+            .await
+            .expect_err("an empty-record trickle must not satisfy the DONE read");
+        match err {
+            HandshakeServerError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        // The deadline must fire after ~QUIC_RELAY_DONE_BACKSTOP of trickle (a
+        // handful of 30 s records), NOT after the ~1024-record consecutive cap.
+        assert!(
+            reader.remaining > 9_900,
+            "deadline must fire within a few records (remaining {})",
+            reader.remaining
+        );
+    }
+
     #[tokio::test]
     async fn fallback_relay_forwards_client_records_after_origin_flight() {
         let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
@@ -8176,6 +8405,63 @@ mod tests {
         assert_eq!(client_read, 0);
         assert_eq!(origin_task.await.unwrap(), 0);
         relay_task.await.unwrap();
+    }
+
+    /// #262: the userspace fallback relay's forward writes must be bounded by the
+    /// SAME idle timeout as its reads. `write_all` is awaited inside the selected
+    /// `select!` arm, where the pinned idle sleep is not polled, so a zero-window
+    /// peer (accepts but never reads) would stall the write forever, pinning the
+    /// connection permit — an unauthenticated DoS. The kernel splice path already
+    /// polls the write fd against the idle bound; this pins the userspace loop's
+    /// parity. Drives `relay_fallback_userspace_loop` directly because the
+    /// production entry may route to the kernel splice path on Linux.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn fallback_userspace_relay_write_stall_hits_idle_timeout() {
+        // client -> parallax pair: the probe writes an oversized payload.
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(parallax_addr).await.unwrap();
+            // Far exceeds the socket buffers; the task blocks mid-write and keeps
+            // the socket open for the duration of the test.
+            let big = vec![0_u8; 64 * 1024 * 1024];
+            let _ = stream.write_all(&big).await;
+            sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+        let (client_side, _) = parallax_listener.accept().await.unwrap();
+
+        // parallax -> origin pair: the origin accepts and NEVER reads, so its
+        // receive window goes to zero once the buffers fill.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (s, _) = origin_listener.accept().await.unwrap();
+            sleep(Duration::from_secs(30)).await;
+            drop(s);
+        });
+        let fallback = TcpStream::connect(origin_addr).await.unwrap();
+
+        let (mut client_read, mut client_write) = client_side.into_split();
+        let (mut fallback_read, mut fallback_write) = fallback.into_split();
+
+        let result = timeout(
+            Duration::from_secs(5),
+            relay_fallback_userspace_loop(
+                &mut client_read,
+                &mut client_write,
+                &mut fallback_read,
+                &mut fallback_write,
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("a zero-window stall on the forward write must hit the idle timeout, not hang");
+        result.expect("write-side idle timeout is a clean relay exit");
+
+        client.abort();
+        origin.abort();
     }
 
     #[test]
@@ -8791,6 +9077,25 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_6to4_range_is_classified_and_denied_outbound() {
+        // 2002::/16 (6to4) embeds an IPv4 address in its payload and would
+        // otherwise tunnel to an arbitrary v4 destination without passing the v4
+        // egress policy. It is in the deny chain but — unlike its sibling
+        // classifiers (documentation/teredo/nat64), pinned just above — had no test.
+        assert!(is_ipv6_6to4(Ipv6Addr::new(
+            0x2002, 0xc058, 0x6301, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_ipv6_6to4(Ipv6Addr::new(
+            0x2001, 0xc058, 0x6301, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_ipv6_6to4(Ipv6Addr::new(0x2003, 0, 0, 0, 0, 0, 0, 1)));
+        // The range must actually be denied at the egress gate, not just classified.
+        assert!(is_denied_outbound_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0xc058, 0x6301, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
     fn speed_test_dos_ceilings_match_their_documented_values() {
         // These are SECURITY ceilings that bound an authenticated client's speed-test
         // request (a malicious client could otherwise request terabytes of generated
@@ -8820,6 +9125,75 @@ mod tests {
             1_048_576, // 1 MiB
             "mux open batch must be exactly 1 MiB"
         );
+    }
+
+    #[test]
+    fn validate_speed_request_accepts_the_maximal_single_phase_request() {
+        // Each phase exactly at the per-phase cap with no samples: aggregate work
+        // is 2*1 GiB = 2 GiB, under the 4 GiB ceiling. The caps use `>`, so a
+        // request sitting exactly on the per-phase cap is still accepted — this
+        // guards against a `>` silently becoming `>=`.
+        let req = SpeedTestRequest {
+            warmup_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            download_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            upload_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            sample_count: 0,
+        };
+        assert!(validate_speed_request(&req, 0).is_ok());
+    }
+
+    #[test]
+    fn validate_speed_request_rejects_each_per_phase_overage() {
+        // One field over its cap at a time (others zero) must fail closed, so no
+        // single per-phase guard can be dropped without a test noticing.
+        let over = MAX_SPEED_TEST_BYTES_PER_PHASE + 1;
+        let cases = [
+            SpeedTestRequest {
+                warmup_bytes: over,
+                download_bytes: 0,
+                upload_bytes: 0,
+                sample_count: 0,
+            },
+            SpeedTestRequest {
+                warmup_bytes: 0,
+                download_bytes: over,
+                upload_bytes: 0,
+                sample_count: 0,
+            },
+            SpeedTestRequest {
+                warmup_bytes: 0,
+                download_bytes: 0,
+                upload_bytes: over,
+                sample_count: 0,
+            },
+            SpeedTestRequest {
+                warmup_bytes: 0,
+                download_bytes: 0,
+                upload_bytes: 0,
+                sample_count: MAX_SPEED_TEST_SAMPLES + 1,
+            },
+        ];
+        for req in &cases {
+            assert!(
+                validate_speed_request(req, 0).is_err(),
+                "a per-phase overage must be rejected: {req:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_speed_request_rejects_aggregate_over_ceiling_within_per_phase_caps() {
+        // Every field is within its own per-phase cap, but the aggregate
+        // 2*warmup + sample_count*(download+upload) = 2*1 GiB + 2*(1 GiB + 1 GiB)
+        // = 6 GiB exceeds the 4 GiB total ceiling. This is the branch the
+        // individual per-phase caps cannot catch.
+        let req = SpeedTestRequest {
+            warmup_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            download_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            upload_bytes: MAX_SPEED_TEST_BYTES_PER_PHASE,
+            sample_count: 2,
+        };
+        assert!(validate_speed_request(&req, 0).is_err());
     }
 
     #[test]

@@ -104,6 +104,8 @@ jobs:
             --lib \
             --bins \
             --test chaos_liveness \
+            --test distinguisher_battery \
+            --test gfw_live_replay \
             --test gfw_sim_provenance \
             --test ja4_census_oracle \
             --test mldsa_acvp \
@@ -111,6 +113,8 @@ jobs:
             --test no_timeout_ratchet \
             --test prober_loop \
             --test safari_h2_parity_baseline \
+            --test safari_h3_clienthello_0rtt_baseline \
+            --test safari_h3_clienthello_baseline \
             --test safari_parity_baseline \
             --test splice_equivalence
 

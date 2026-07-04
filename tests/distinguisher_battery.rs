@@ -368,6 +368,75 @@ fn parallax_vs_safari_uplink_length_distribution() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 4b: ParallaX vs Safari — downlink (S2C) length dimension.
+//
+// Tier 4 gates the uplink (client→server) record regime — the direction whose
+// sizing ParallaX imitates from the browser. But a censor observes the DOWNLINK
+// (server→client) too, and ParallaX's server relay seals it through a *separate*
+// codec construction (`SERVER_TO_CLIENT_AAD`). The Safari big-POST S2C stream
+// carries a real, dominant 16401-byte full-record bucket (the same regime as its
+// uplink), so the server relay must land on it as well. Nothing else in the
+// battery pins the downlink, so a server-side codec regression (wrong padding
+// profile / record limit / coalescing) would silently make ParallaX's downlink
+// distinguishable from Safari's and go uncaught. This tier closes that gap with
+// the same modal-pinning contract Tier 4 uses for the uplink.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallax_vs_safari_downlink_length_distribution() {
+    // Safari's server→client (port 8443) application-data records from the
+    // big-POST corpus — the downlink counterpart to Tier 4's uplink stream.
+    let safari = safari_source::load_bigpost().expect("load Safari big-POST fixture");
+    let safari_s2c = safari.lengths(Dir::S2C);
+    let total_bytes: u64 = safari_s2c.iter().map(|&l| l as u64).sum();
+
+    // Drive ParallaX's production *server* relay encoder over a payload of the
+    // same total downlink volume, so the record-count regimes are comparable.
+    let payload = vec![0x5a_u8; total_bytes as usize];
+    let parallax = parallax_source::downlink_trace(&payload);
+    let parallax_s2c = parallax.lengths(Dir::S2C);
+
+    let ks = two_sample_ks(&safari_s2c, &parallax_s2c);
+
+    let safari_full = safari_s2c.iter().filter(|&&l| l >= 16000.0).count();
+    let parallax_full = parallax_s2c.iter().filter(|&&l| l >= 16000.0).count();
+    eprintln!(
+        "[tier4b-downlink] Safari S2C n={} (full≥16000:{}), ParallaX S2C n={} (full≥16000:{}); \
+         KS D={:.4} p={:.4}",
+        safari_s2c.len(),
+        safari_full,
+        parallax_s2c.len(),
+        parallax_full,
+        ks.statistic,
+        ks.p_value
+    );
+
+    // Same contract as Tier 4: the KS verdict is informational (the two corpora
+    // legitimately differ in the small-control-record tail — Safari's H2 control
+    // frames vs ParallaX's pure-data downlink), while the modal (dominant) full
+    // record must be exactly 16401 on BOTH sides, byte-for-byte.
+    const FULL_RECORD_LEN: u32 = 16401;
+    let modal_len = |lens: &[f64]| -> (u32, usize) {
+        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for &l in lens {
+            *counts.entry(l as u32).or_default() += 1;
+        }
+        counts.into_iter().max_by_key(|&(_, c)| c).unwrap_or((0, 0))
+    };
+    let (safari_modal, safari_modal_n) = modal_len(&safari_s2c);
+    let (parallax_modal, parallax_modal_n) = modal_len(&parallax_s2c);
+
+    assert_eq!(
+        parallax_modal, FULL_RECORD_LEN,
+        "ParallaX downlink modal record length {parallax_modal} (×{parallax_modal_n}) != {FULL_RECORD_LEN}"
+    );
+    assert_eq!(
+        safari_modal, FULL_RECORD_LEN,
+        "Safari downlink modal record length {safari_modal} (×{safari_modal_n}) != {FULL_RECORD_LEN}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tier 5: direction-interleave structure (UDP/H3 layer).
 //
 // Scope is deliberate (see udp_capture / safari_h3_source docs): we gate on
@@ -550,5 +619,121 @@ async fn quic_direction_size_calibration_vs_real_corpus() {
     assert!(
         c2s >= 1 && s2c >= 1,
         "interactive capture not bidirectional: C2S={c2s} S2C={s2c}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3b: IAT / autocorrelation discriminability self-proof.
+//
+// Tier 3 proves the battery fires on the LENGTH axis (record-resize) and the
+// DIRECTION axis (1:1-ACK). The remaining defended dimension — inter-arrival
+// TIME and its serial structure — had no self-proof: the IAT KS and the
+// Ljung-Box autocorrelation detector were exercised only on synthetic data in
+// Tier 1, never against a perturbation of the real corpus. That is a blind spot
+// by the battery's own standard ("if it does not fire, any 'indistinguishable'
+// verdict it produces elsewhere is worthless"). These tests close it.
+//
+// Empirical anchors, measured on the real Safari uplink corpus (n=747 C2S IAT):
+//   * REAL uplink IAT is white-noise-like: Ljung-Box Q≈3.2, p≈0.98 — the
+//     browser's uplink cadence is NOT serially autocorrelated, so the null
+//     holds and the detector does not false-fire on the real browser.
+//   * jitter_iat(amount=1.0) shifts the IAT marginal: KS D≈0.17, p→0.
+//   * fixed_cadence: constant uplink period collapses the IAT marginal to a
+//     point mass: KS D≈0.93, p→0. (A PERFECTLY constant series has no
+//     autocorrelation to detect — the tell there is zero variance, caught by
+//     KS, not Ljung-Box. The AR-cadence test below covers the autocorrelation
+//     detector specifically.)
+//   * AR(1)-structured cadence injects genuine serial correlation:
+//     Ljung-Box Q≈1600, p→0.
+// ---------------------------------------------------------------------------
+
+/// Wires the previously-unused `jitter_iat` injector into a real self-proof: a
+/// browser-plausible retiming of the uplink must be caught on the IAT marginal.
+#[test]
+fn detects_iat_jitter() {
+    let safari = load_safari();
+    let jittered = perturb::jitter_iat(&safari, 1.0, 0xABCD);
+
+    let real_iat = safari.iats(Dir::C2S);
+    let bad_iat = jittered.iats(Dir::C2S);
+
+    // Sanity: the injector touches only timing, not lengths or directions, so
+    // the length/direction axes stay identical — this isolates the IAT tell.
+    assert_eq!(
+        safari.lengths(Dir::C2S),
+        jittered.lengths(Dir::C2S),
+        "jitter_iat must not alter record lengths"
+    );
+
+    let ks = two_sample_ks(&real_iat, &bad_iat);
+    assert!(
+        ks.p_value < 0.01,
+        "IAT-jitter KS failed to fire: D={:.4} p={:.4}",
+        ks.statistic,
+        ks.p_value
+    );
+}
+
+/// The "fixed-cadence beacon" pathology — a naive proxy flushing uplink on a
+/// constant timer — must be caught on the IAT marginal. This is the passive
+/// tell the production QUIC idle-PING jitter (`conn.rs`) exists to defeat.
+#[test]
+fn detects_fixed_cadence_beacon() {
+    let safari = load_safari();
+    let beacon = perturb::fixed_cadence(&safari, 5_000);
+
+    let real_iat = safari.iats(Dir::C2S);
+    let bad_iat = beacon.iats(Dir::C2S);
+
+    // A perfectly periodic uplink collapses the IAT marginal to (essentially) a
+    // single value; the real browser's IAT is broadly spread. KS must reject
+    // overwhelmingly.
+    let ks = two_sample_ks(&real_iat, &bad_iat);
+    assert!(
+        ks.statistic > 0.5 && ks.p_value < 0.01,
+        "fixed-cadence IAT KS failed to fire: D={:.4} p={:.4}",
+        ks.statistic,
+        ks.p_value
+    );
+}
+
+/// The autocorrelation detector (Ljung-Box) must (a) ACCEPT the real Safari
+/// uplink — whose IAT is serially uncorrelated — and (b) FIRE on an
+/// AR(1)-structured "adaptive beacon" cadence whose gaps carry genuine serial
+/// correlation. Proving both directions is what makes the detector trustworthy:
+/// a detector that fired on the real browser too would be a useless alarm.
+#[test]
+fn autocorrelation_detector_fires_on_structured_cadence_but_not_on_real() {
+    let safari = load_safari();
+    let real_iat = safari.iats(Dir::C2S);
+
+    // (a) Null: the real uplink IAT is not autocorrelated ⇒ high p.
+    let lb_real = ljung_box(&real_iat, 10);
+    assert!(
+        lb_real.p_value > 0.05,
+        "real Safari uplink IAT unexpectedly flagged autocorrelated: Q={:.2} p={:.4}",
+        lb_real.statistic,
+        lb_real.p_value
+    );
+
+    // (b) Alternative: an AR(1) cadence with phi=0.85 — a plausible "adaptive"
+    // beacon whose interval drifts from its own recent history. Deterministic.
+    let base = 10_000.0f64;
+    let mut prev = base;
+    let mut rng = Lcg::new(0x1234_5678);
+    let ar_iat: Vec<f64> = (0..real_iat.len())
+        .map(|_| {
+            let noise = (rng.unit() - 0.5) * 4_000.0;
+            let g = base + 0.85 * (prev - base) + noise;
+            prev = g;
+            g.max(1.0)
+        })
+        .collect();
+    let lb_ar = ljung_box(&ar_iat, 10);
+    assert!(
+        lb_ar.p_value < 0.01,
+        "AR(1) cadence not flagged autocorrelated: Q={:.2} p={:.4}",
+        lb_ar.statistic,
+        lb_ar.p_value
     );
 }

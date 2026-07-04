@@ -167,9 +167,17 @@ pub fn decode_packet_number(largest_pn: u64, truncated: u64, pn_len: usize) -> u
     let pn_hwin = pn_win / 2;
     let pn_mask = pn_win - 1;
     let candidate = (expected & !pn_mask) | truncated;
-    if candidate + pn_hwin <= expected && candidate < (1u64 << 62) - pn_win {
+    // `candidate + pn_hwin` / `expected + pn_hwin` can overflow `u64` for a
+    // near-`u64::MAX` operand (a debug-build panic; production packet numbers stay
+    // < 2^62 so it is not reached on the live path, but this `pub` fn is called on
+    // every received header before decryption and is exercised directly by fuzzing).
+    // `saturating_add` is exact here: `pn_hwin <= 2^31`, so a saturated result is
+    // strictly greater than any real `expected`/`candidate`, which preserves both
+    // inequalities — and the branch that then adds/subtracts `pn_win` is already
+    // gated by the `< 2^62 - pn_win` / `>= pn_win` bounds, so no result overflows.
+    if candidate.saturating_add(pn_hwin) <= expected && candidate < (1u64 << 62) - pn_win {
         candidate + pn_win
-    } else if candidate > expected + pn_hwin && candidate >= pn_win {
+    } else if candidate > expected.saturating_add(pn_hwin) && candidate >= pn_win {
         candidate - pn_win
     } else {
         candidate
@@ -506,19 +514,26 @@ impl<'a> Cursor<'a> {
     }
 
     fn skip(&mut self, n: usize) -> Result<(), DecodeError> {
-        if self.pos + n > self.buf.len() {
+        // `n` is an attacker-controlled varint (e.g. the Initial token length),
+        // so `self.pos + n` must use checked arithmetic: an unchecked add can
+        // wrap past `usize::MAX`, slip under the `> buf.len()` guard, and leave
+        // `self.pos` pointing past the buffer, panicking a later `varint()`
+        // slice on a raw pre-decryption datagram.
+        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
+        if end > self.buf.len() {
             return Err(DecodeError::Truncated);
         }
-        self.pos += n;
+        self.pos = end;
         Ok(())
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
-        let s = self
-            .buf
-            .get(self.pos..self.pos + n)
-            .ok_or(DecodeError::Truncated)?;
-        self.pos += n;
+        // See `skip`: `self.pos + n` on an attacker varint can overflow and make
+        // `get` observe a wrapped (valid-looking) range, so compute the end with
+        // checked arithmetic before slicing.
+        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
+        let s = self.buf.get(self.pos..end).ok_or(DecodeError::Truncated)?;
+        self.pos = end;
         Ok(s)
     }
 
@@ -528,7 +543,10 @@ impl<'a> Cursor<'a> {
     }
 
     fn varint(&mut self) -> Result<u64, DecodeError> {
-        let (v, n) = varint::decode(&self.buf[self.pos..]).ok_or(DecodeError::Truncated)?;
+        // Fail closed rather than index `&self.buf[self.pos..]`: if a prior read
+        // ever advanced `self.pos` past the buffer, the direct slice would panic.
+        let rest = self.buf.get(self.pos..).ok_or(DecodeError::Truncated)?;
+        let (v, n) = varint::decode(rest).ok_or(DecodeError::Truncated)?;
         self.pos += n;
         Ok(v)
     }
@@ -613,6 +631,23 @@ mod tests {
         let (decoded, aad_len) = Header::decode(&out, 0, 0).unwrap();
         assert_eq!(decoded, hdr);
         assert_eq!(aad_len, out.len());
+    }
+
+    #[test]
+    fn locate_pn_offset_rejects_overflowing_initial_token_length() {
+        // A raw, pre-decryption Initial whose token-length varint is the maximum
+        // 8-byte value (2^62-1). `Cursor::skip(tlen)` must fail closed with
+        // `Truncated` — an unchecked `self.pos + tlen` would wrap `usize`, slip
+        // under the length guard, and panic the following `varint()` slice.
+        let mut pkt = vec![LONG_HEADER_FORM | FIXED_BIT]; // Initial, type bits 0x00
+        pkt.extend_from_slice(&[0, 0, 0, 1]); // version
+        pkt.push(0); // dcid len = 0
+        pkt.push(0); // scid len = 0
+        pkt.extend_from_slice(&[0xff; 8]); // token length varint = 2^62-1
+
+        assert_eq!(locate_pn_offset(&pkt, 0), Err(DecodeError::Truncated));
+        // `long_packet_len` shares the same cursor; it must also stay bounded.
+        assert_eq!(long_packet_len(&pkt), None);
     }
 
     #[test]
@@ -804,6 +839,39 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_short_header_reserved_bits() {
+        // The existing reserved-bits test only covers the LONG header (mask 0x0c);
+        // the short-header path has its own guard (mask 0x18). Set a short reserved
+        // bit and confirm it is rejected before the packet number is decoded.
+        let hdr = Header::Short {
+            spin: false,
+            key_phase: false,
+            dcid: ConnectionId::new(&[0xaa, 0xbb, 0xcc, 0xdd]),
+            packet_number: 0,
+            pn_len: 1,
+        };
+        let mut out = Vec::new();
+        hdr.encode(&mut out);
+        out[0] |= 0x10; // a short-header reserved bit (mask 0x18)
+        assert_eq!(
+            Header::decode(&out, 4, 0),
+            Err(DecodeError::ReservedBitsSet)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_long_header_cid_over_max_len() {
+        // A long-header connection-id length byte above MAX_CID_LEN must be rejected
+        // (bounds check on a wire-controlled length on an unauthenticated Initial),
+        // not truncated silently or used to over-read.
+        let mut pkt = vec![LONG_HEADER_FORM | FIXED_BIT]; // Initial, pn_len bits 0
+        pkt.extend_from_slice(&1u32.to_be_bytes()); // version
+        pkt.push((MAX_CID_LEN + 1) as u8); // DCID length: one over the cap
+        pkt.extend_from_slice(&[0x00; MAX_CID_LEN + 1]); // the (too-long) DCID bytes
+        assert_eq!(Header::decode(&pkt, 0, 0), Err(DecodeError::CidTooLong));
+    }
+
+    #[test]
     fn decode_packet_number_exercises_window_wraparound_branches() {
         // The plain branch (no window adjustment).
         assert_eq!(decode_packet_number(300, 0x05, 1), 261);
@@ -815,6 +883,37 @@ mod tests {
         // largest 0x105 -> expected 0x106; truncated 0xfe -> candidate 0x1fe is
         // >half a window above expected, so a window is subtracted -> 0xfe.
         assert_eq!(decode_packet_number(0x105, 0xfe, 1), 0xfe);
+    }
+
+    #[test]
+    fn decode_packet_number_does_not_overflow_near_u64_max() {
+        // `decode_packet_number` runs on every received header BEFORE decryption,
+        // so it must be total over its input domain. A `largest_pn` a hair below
+        // `u64::MAX` (so `expected = largest_pn + 1` does NOT wrap to 0) drives
+        // `expected`/`candidate` near `u64::MAX`, where the pre-fix
+        // `candidate + pn_hwin` / `expected + pn_hwin` panicked in debug builds
+        // ("attempt to add with overflow"). The saturating adds keep it total.
+        // Sweep several such values and all four pn lengths.
+        for pn_len in 1..=4usize {
+            let pn_mask = (1u64 << (pn_len * 8)) - 1;
+            for delta in 0..4u64 {
+                let largest_pn = u64::MAX - delta;
+                for truncated in [0u64, 1, pn_mask, pn_mask / 2] {
+                    let got = decode_packet_number(largest_pn, truncated, pn_len);
+                    // Near u64::MAX no window can be added (would overflow past the
+                    // 2^62 bound) and the subtract branch's `candidate >= pn_win`
+                    // with `candidate` a half-window above `expected` cannot hold, so
+                    // the result is always the plain candidate.
+                    let expected = largest_pn.wrapping_add(1);
+                    let candidate = (expected & !pn_mask) | truncated;
+                    assert_eq!(
+                        got, candidate,
+                        "pn_len {pn_len} delta {delta} truncated {truncated:#x}: \
+                         near-u64::MAX decode must return the plain candidate"
+                    );
+                }
+            }
+        }
     }
 
     // The compose test proves the layer ROUND-TRIPS against itself; the three
