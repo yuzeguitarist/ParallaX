@@ -2738,6 +2738,7 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
     async fn await_http2_settings_ack_keeps_reading_at_exactly_the_buffer_limit() {
         let mut session = test_session();
         let (mut stream, peer) = loopback().await;
