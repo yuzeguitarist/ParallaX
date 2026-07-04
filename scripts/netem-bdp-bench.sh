@@ -59,8 +59,12 @@ BDP_BYTES=$(( RATE_MBIT * 125000 * RTT_MS / 1000 ))
 # 64 KiB so tiny configs still pass a couple of segments.
 QUEUE_KB="${QUEUE_KB:-$(( (BDP_BYTES / 2 / 1024) > 64 ? (BDP_BYTES / 2 / 1024) : 64 ))}"
 
-SNS_S="plxbenchS"
-SNS_C="plxbenchC"
+# Per-run-unique namespace names ($$ = this script's pid) so cleanup only ever
+# deletes namespaces THIS run created, and concurrent/leftover runs never collide
+# or destroy each other's namespaces. veth names are scoped inside the namespaces,
+# so they need no suffix.
+SNS_S="plxbenchS$$"
+SNS_C="plxbenchC$$"
 VETH_S="vethS"
 VETH_C="vethC"
 IP_S="10.123.0.1"
