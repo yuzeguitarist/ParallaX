@@ -29,7 +29,8 @@ const DISABLE_ANTI_DEBUG_ENV: &str = "PARALLAX_DISABLE_ANTI_DEBUG";
 /// `mask` and `masked` are both `mlock`'d (locked once at construction, stable
 /// addresses) and zeroized on drop. The transient unmasked scratch in
 /// [`MaskedSecret::with_plaintext`] is `Zeroizing` (wiped on return) and is
-/// core-dump-excluded by the process-wide `RLIMIT_CORE=0`, but is deliberately NOT
+/// core-dump-excluded (`MADV_DONTDUMP` per call, plus the process-wide
+/// `RLIMIT_CORE=0` and non-dumpable flag), but is deliberately NOT
 /// `mlock`'d per-use — see that method for why locking a per-call allocation would
 /// regress the long-lived keys' pinning. So the resident halves are swap-pinned;
 /// the brief plaintext-at-use is not, and could touch swap in its short window.
@@ -72,11 +73,15 @@ impl MaskedSecret {
     /// and never release it — growing the locked-page high-water mark until it
     /// exhausts `RLIMIT_MEMLOCK` and starves the genuine long-lived keys (PSK,
     /// X25519/ML-KEM static) of their pinning. That regression is worse than the
-    /// exposure it would close, so the brief unmask window relies instead on the
-    /// process-wide `RLIMIT_CORE=0` (no core dump) plus immediate `Zeroizing`
-    /// wipe. The masked/mask halves remain mlock'd (stable, locked once).
+    /// exposure it would close, so the brief unmask window relies instead on
+    /// core-dump exclusion (per-page `MADV_DONTDUMP` applied before unmasking,
+    /// on top of the process-wide `RLIMIT_CORE=0` + non-dumpable flag) plus
+    /// immediate `Zeroizing` wipe. The masked/mask halves remain mlock'd
+    /// (stable, locked once). This is a low-frequency path (once-per-connection
+    /// signing), so the per-call `madvise` cost is irrelevant.
     pub fn with_plaintext<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         let mut plaintext = Zeroizing::new(vec![0_u8; self.masked.len()]);
+        exclude_from_core_dump("masked_secret.plaintext", &plaintext);
         for ((p, m), k) in plaintext
             .iter_mut()
             .zip(self.masked.iter())
@@ -102,9 +107,12 @@ impl Drop for MaskedSecret {
 /// should keep serving traffic rather than break the protocol path.
 ///
 /// Platform coverage: core dumps are disabled on every unix
-/// (`setrlimit(RLIMIT_CORE, 0)`); debugger-attach resistance uses
+/// (`setrlimit(RLIMIT_CORE, 0)`); dumpability / debugger-attach resistance uses
 /// `PR_SET_DUMPABLE` on Linux, `ptrace(PT_DENY_ATTACH)` on macOS, and
-/// `procctl(PROC_TRACE_CTL)` on FreeBSD.
+/// `procctl(PROC_TRACE_CTL)` on FreeBSD. On Linux and FreeBSD the dumpability
+/// disable runs unconditionally (#247): `RLIMIT_CORE = 0` alone does not stop a
+/// piped `core_pattern` handler from capturing memory, so the dumpable flag is
+/// the exclusion that actually holds there.
 ///
 /// Anti-debug is on by default but honors `PARALLAX_DISABLE_ANTI_DEBUG`: on
 /// macOS `ptrace(PT_DENY_ATTACH)` *terminates the process if it is already being
@@ -114,15 +122,30 @@ pub fn harden_current_process() {
     if let Err(err) = disable_core_dumps() {
         tracing::warn!(error = %err, "failed to disable core dumps for this process");
     }
-    // Gated so a deployment that needs a debugger / crash reporter can opt out
-    // rather than have macOS PT_DENY_ATTACH abort startup under a pre-existing
-    // tracer (the syscall exits the process when it is already traced).
-    if anti_debug_enabled() {
+    // #247: `RLIMIT_CORE = 0` does not stop a piped `core_pattern` handler
+    // (e.g. systemd-coredump) from capturing process memory; clearing the
+    // dumpable flag is the reliable core-dump exclusion, so it must apply even
+    // when anti-debug is opted out. Only macOS keeps it behind the gate:
+    // `ptrace(PT_DENY_ATTACH)` *terminates the process if it is already being
+    // traced*, which is exactly what the opt-out exists to avoid.
+    if should_disable_dumpability(anti_debug_enabled()) {
         if let Err(err) = disable_ptrace_dumpability() {
             tracing::warn!(error = %err, "failed to mark this process non-dumpable");
         }
+    }
+    if anti_debug_enabled() {
         warn_if_already_traced();
     }
+}
+
+/// Whether [`disable_ptrace_dumpability`] runs for a given anti-debug setting.
+/// Unconditional everywhere the syscall cannot abort startup, because it is the
+/// core-dump exclusion that actually holds against a piped `core_pattern` — not
+/// merely an anti-debug measure. macOS is the exception: there the syscall is
+/// `PT_DENY_ATTACH`, which kills an already-traced process, so it stays behind
+/// the anti-debug opt-out. Pure so the gating is unit-testable.
+const fn should_disable_dumpability(anti_debug: bool) -> bool {
+    !cfg!(target_os = "macos") || anti_debug
 }
 
 /// One-shot startup check: if a debugger / tracer is already attached at launch,
@@ -136,8 +159,8 @@ pub fn harden_current_process() {
 /// - Against a ring-0 / malicious-OS attacker the `TracerPid` field is whatever
 ///   the kernel chooses to report, so escalating beyond a warning buys nothing.
 ///
-/// Gated by the same [`anti_debug_enabled`] switch as the dumpable hardening.
-/// Linux-only (reads `/proc/self/status`); a no-op elsewhere.
+/// Gated by [`anti_debug_enabled`]. Linux-only (reads `/proc/self/status`); a
+/// no-op elsewhere.
 #[cfg(target_os = "linux")]
 fn warn_if_already_traced() {
     match std::fs::read_to_string("/proc/self/status") {
@@ -497,6 +520,21 @@ mod tests {
         let masked = super::MaskedSecret::new(&[]);
         assert!(masked.is_empty());
         masked.with_plaintext(|pt| assert!(pt.is_empty()));
+    }
+
+    // #247: the dumpable-flag disable is the core-dump exclusion that actually
+    // holds against a piped `core_pattern` handler (RLIMIT_CORE=0 does not), so
+    // the harden path must invoke it even when anti-debug is opted out. Only
+    // macOS may gate it (PT_DENY_ATTACH kills an already-traced process there).
+    #[test]
+    fn dumpability_disable_ignores_anti_debug_opt_out() {
+        if cfg!(target_os = "macos") {
+            assert!(super::should_disable_dumpability(true));
+            assert!(!super::should_disable_dumpability(false));
+        } else {
+            assert!(super::should_disable_dumpability(true));
+            assert!(super::should_disable_dumpability(false));
+        }
     }
 
     #[test]
