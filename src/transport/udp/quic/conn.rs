@@ -564,6 +564,19 @@ pub struct Connection {
     /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
     /// HANDSHAKE_DONE, the client when it receives it.
     handshake_confirmed: bool,
+    /// The peer's address is validated (RFC 9000 §8.1). A client trusts the server
+    /// address it dialed, so it starts `true`; a server starts `false` and flips
+    /// when a packet from the peer opens under Handshake keys — proof the peer
+    /// received our Initial flight at its claimed (unspoofable) address. While
+    /// `false`, egress is capped at 3x `anti_amp_recv` in `poll_transmit`.
+    peer_addr_validated: bool,
+    /// Bytes received in datagrams from the peer while its address was unvalidated.
+    /// Every datagram byte attributed to the connection counts, even bytes that
+    /// fail to decrypt (RFC 9000 §8.1) — garbage still "pays" 1:3 for what it can
+    /// reflect, which is exactly the amplification bound the limit accepts.
+    anti_amp_recv: u64,
+    /// Bytes sent to the peer while its address was unvalidated.
+    anti_amp_sent: u64,
     /// When any packet was last sent (drives the keep-alive timer).
     last_send_time: Option<Instant>,
     /// The current keep-alive cycle's interval, drawn fresh from
@@ -687,6 +700,9 @@ impl Connection {
             data_packets_open_failed: 0,
             handshake_done_pending: false,
             handshake_confirmed: false,
+            peer_addr_validated: side == Side::Client,
+            anti_amp_recv: 0,
+            anti_amp_sent: 0,
             last_send_time: None,
             keepalive_interval: random_keep_alive_interval(),
             ping_pending: false,
@@ -1198,6 +1214,17 @@ impl Connection {
     /// congestion window unless a PTO probe is pending (RFC 9002 §6.2.4). One
     /// datagram per call; the driver loops until `None`.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let dg = self.poll_transmit_inner(now)?;
+        // Anti-amplification accounting (RFC 9000 §8.1): every byte sent before the
+        // peer's address is validated draws down the 3x budget enforced in
+        // `poll_transmit_inner`.
+        if !self.peer_addr_validated {
+            self.anti_amp_sent = self.anti_amp_sent.saturating_add(dg.len() as u64);
+        }
+        Some(dg)
+    }
+
+    fn poll_transmit_inner(&mut self, now: Instant) -> Option<Vec<u8>> {
         // Enforce the AEAD confidentiality limit (RFC 9001 §6.6): with no 1-RTT key
         // update, once we have sealed the cipher's safe number of 1-RTT packets we
         // MUST stop using the key — force-close rather than overrun the AEAD margin.
@@ -1216,6 +1243,23 @@ impl Connection {
                     return Some(dg);
                 }
             }
+            return None;
+        }
+        // Anti-amplification (RFC 9000 §8.1): until the peer's address is validated
+        // (a packet from it opens under Handshake keys), everything sent to it —
+        // ACKs and CRYPTO alike — is capped at 3x the bytes received from it, so a
+        // spoofed client Initial cannot reflect the multi-KB server handshake
+        // flight at a victim. Reserving a full MAX_DATAGRAM keeps the cap strict
+        // without building a packet that then could not be sent (building mutates
+        // send state); the single small close packet above stays within the same
+        // reserve. This cannot deadlock a genuine handshake: every client datagram
+        // grows the budget by 3x its size (client Initials alone are >=1200 bytes
+        // each, and PTO makes the client resend them), the driver re-polls on every
+        // receive, and the client's first Handshake-level packet lifts the cap.
+        if !self.peer_addr_validated
+            && self.anti_amp_sent.saturating_add(MAX_DATAGRAM as u64)
+                > self.anti_amp_recv.saturating_mul(3)
+        {
             return None;
         }
         // Pure ACKs first so acknowledgements are not held behind data, and are
@@ -2197,6 +2241,13 @@ impl Connection {
         // NB: the idle timer (last_recv_time) is refreshed inside process_packet
         // only AFTER a packet AEAD-opens (RFC 9000 §10.1: "received and processed"),
         // so an off-path attacker cannot pin the connection open with garbage UDP.
+        //
+        // Anti-amplification (RFC 9000 §8.1): while the peer's address is
+        // unvalidated, every byte of every datagram attributed to the connection —
+        // decryptable or not — grows the 3x send budget enforced in poll_transmit.
+        if !self.peer_addr_validated {
+            self.anti_amp_recv = self.anti_amp_recv.saturating_add(datagram.len() as u64);
+        }
         let mut buf = datagram.to_vec();
         let mut pos = 0;
         while pos < buf.len() {
@@ -2333,6 +2384,14 @@ impl Connection {
         // and for the client it implies the server acked our ClientHello.
         if space == SPACE_HANDSHAKE && self.spaces[SPACE_INITIAL].keys.is_some() {
             self.discard_space(SPACE_INITIAL);
+        }
+        // The same proof validates the peer's address (RFC 9000 §8.1: "receipt of
+        // a packet protected with Handshake keys"): only an on-path peer at its
+        // claimed address can hold Handshake keys, so the 3x anti-amplification
+        // cap is lifted. (0-RTT does NOT validate — it opens in SPACE_DATA under
+        // PSK-derived keys a replay could reuse from a spoofed address.)
+        if space == SPACE_HANDSHAKE {
+            self.peer_addr_validated = true;
         }
 
         // Copy the decrypted frames out so the TLS engine can be mutated while we
@@ -3450,6 +3509,64 @@ mod tests {
             client.handshake_confirmed,
             "client confirms on receiving HANDSHAKE_DONE"
         );
+    }
+
+    /// RFC 9000 §8.1 anti-amplification (findings #203/#216): before the client's
+    /// address is validated, the server's egress — here inflated by a multi-KB
+    /// certificate chain — is capped at 3x the bytes received, so a spoofed Initial
+    /// cannot reflect the full handshake flight at a victim. The clipped flight is
+    /// not a deadlock: the client's answering packets grow the budget and its first
+    /// Handshake-level packet validates the address, after which the rest of the
+    /// flight flows and the handshake completes.
+    #[test]
+    fn unvalidated_server_egress_is_capped_at_three_times_received() {
+        let dcid = ConnectionId::new(&[0xa3; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0xab; 16 * 1024]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x3a, 0x3a, 0x3a, 0x3a]),
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        // Deliver the full ClientHello flight, then drain the server WITHOUT letting
+        // the client answer yet: everything it emits must fit within 3x what it
+        // received. (The flight is still delivered so the exchange can resume below.)
+        let mut received = 0usize;
+        while let Some(dg) = client.poll_transmit(now) {
+            received += dg.len();
+            server.handle_datagram(&dg, now).unwrap();
+        }
+        let mut sent = 0usize;
+        while let Some(dg) = server.poll_transmit(now) {
+            sent += dg.len();
+            client.handle_datagram(&dg, now).unwrap();
+        }
+        assert!(
+            sent <= 3 * received,
+            "unvalidated server egress ({sent} bytes) exceeds 3x the {received} received"
+        );
+        // The cap actually bit: part of the oversized flight is still unsent.
+        let hs = &server.spaces[SPACE_HANDSHAKE];
+        assert!(
+            hs.crypto_send_off < hs.crypto_send.len(),
+            "the oversized flight should have been clipped by the amplification cap"
+        );
+        assert!(!server.peer_addr_validated);
+
+        // Let the exchange continue: the handshake still completes, and the cap is
+        // lifted once the client's Handshake-level packets prove its address.
+        drive(&mut client, &mut server);
+        assert!(
+            server.peer_addr_validated,
+            "a Handshake-level packet from the client validates its address"
+        );
+        assert!(!client.is_handshaking() && !server.is_handshaking());
     }
 
     /// Ping-pong datagrams between two connections until neither has anything more
