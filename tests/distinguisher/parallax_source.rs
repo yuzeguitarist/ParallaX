@@ -10,6 +10,13 @@
 //! data-plane length sequence. This mirrors how `tests/gfw_simulator.rs` derives
 //! its length series from the same production codec.
 //!
+//! Both relay directions are exposed: [`uplink_trace`] (client→server, the
+//! direction Safari's own record sizing is imitated on) and [`downlink_trace`]
+//! (server→client, sealed through the production *server* relay codec). Both run
+//! the identical `seal_chunks` sizing path, so the downlink is expected to land
+//! on the same 16401 full-record regime — comparing it to Safari's downlink
+//! guards the server relay's codec construction against a silent divergence.
+//!
 //! SCOPE / HONESTY: this captures the **length** dimension end-to-end through
 //! production code — the dimension where ParallaX deliberately matches Safari's
 //! 16401-byte record regime, so it is exactly where we want a quantitative
@@ -23,7 +30,7 @@
 use rand::SeedableRng;
 
 use parallax::crypto::session::AeadCodec;
-use parallax::protocol::data::{DataRecordCodec, CLIENT_TO_SERVER_AAD};
+use parallax::protocol::data::{DataRecordCodec, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD};
 use parallax::tls::record::{self, TLS_HEADER_LEN};
 // `seal_chunks` returns one `Vec<u8>` per sealed record, so each element is
 // already a single on-wire record — we parse its 5-byte header for the length.
@@ -34,19 +41,28 @@ use super::trace::{Dir, Record, Trace};
 /// Build a production `DataRecordCodec` with the default zero-padding profile —
 /// the same construction `gfw_simulator.rs` uses. Keys are fixed test vectors;
 /// they affect only the AEAD output bytes, never the record *lengths*.
-fn client_codec() -> DataRecordCodec {
+///
+/// `aad` selects the relay *direction*: the client relay seals with
+/// [`CLIENT_TO_SERVER_AAD`] and the server relay with [`SERVER_TO_CLIENT_AAD`].
+/// The AAD is authenticated-but-not-transmitted (a detached tag over the record
+/// ciphertext), so it never changes the on-wire record *length* — both
+/// directions run the identical `seal_chunks` sizing path. That is precisely why
+/// the downlink is expected to land on the same 16401 full-record regime as the
+/// uplink, and why comparing it to Safari's downlink is a real regression guard
+/// on the server relay's codec construction (padding profile + record limit).
+fn codec(aad: &'static [u8]) -> DataRecordCodec {
     DataRecordCodec::new(
         AeadCodec::new([5_u8; 32], [3_u8; 12]),
         PaddingProfile::new(0, 0).expect("zero padding profile"),
-        CLIENT_TO_SERVER_AAD,
+        aad,
     )
 }
 
-/// Seal `payload` through the production `seal_chunks` relay path and return the
-/// on-wire length of each emitted TLS record, parsed with the production header
-/// parser. These are the lengths a censor observes for ParallaX's uplink.
-pub fn record_lengths(payload: &[u8]) -> Vec<u32> {
-    let mut codec = client_codec();
+/// Seal `payload` through the production `seal_chunks` relay path for the given
+/// relay `aad` direction, and return the on-wire length of each emitted TLS
+/// record, parsed with the production header parser.
+fn record_lengths_with(aad: &'static [u8], payload: &[u8]) -> Vec<u32> {
+    let mut codec = codec(aad);
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x9a1c_2026);
     let sealed = codec.seal_chunks(payload, &mut rng).expect("seal_chunks");
 
@@ -64,18 +80,31 @@ pub fn record_lengths(payload: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// Build a ParallaX C2S [`Trace`] for an uplink `payload`, using the production
-/// record sizing and a uniform synthetic cadence. The cadence is a placeholder
-/// (see module docs); only the length dimension of this trace is meaningful.
-pub fn uplink_trace(payload: &[u8]) -> Trace {
-    let lens = record_lengths(payload);
+/// Uplink (client→server) record lengths a censor observes for ParallaX. Sealed
+/// through the production client relay codec (`CLIENT_TO_SERVER_AAD`).
+pub fn record_lengths(payload: &[u8]) -> Vec<u32> {
+    record_lengths_with(CLIENT_TO_SERVER_AAD, payload)
+}
+
+/// Downlink (server→client) record lengths a censor observes for ParallaX.
+/// Sealed through the production *server* relay codec (`SERVER_TO_CLIENT_AAD`) —
+/// the same `seal_chunks` sizing path as the uplink, so any divergence from the
+/// uplink regime would signal a server-side codec-construction regression.
+pub fn downlink_record_lengths(payload: &[u8]) -> Vec<u32> {
+    record_lengths_with(SERVER_TO_CLIENT_AAD, payload)
+}
+
+/// Build a ParallaX [`Trace`] in direction `dir` from `lens`, stamping a uniform
+/// synthetic 1 ms cadence. The cadence is a placeholder (see module docs); only
+/// the length dimension of this trace is meaningful.
+fn trace_from_lengths(lens: Vec<u32>, dir: Dir) -> Trace {
     let mut t = 0u64;
     let records = lens
         .into_iter()
         .map(|len| {
             let r = Record {
                 len,
-                dir: Dir::C2S,
+                dir,
                 t_micros: t,
             };
             t += 1_000; // 1 ms synthetic spacing
@@ -83,6 +112,20 @@ pub fn uplink_trace(payload: &[u8]) -> Trace {
         })
         .collect();
     Trace::new(records)
+}
+
+/// Build a ParallaX C2S [`Trace`] for an uplink `payload`, using the production
+/// record sizing and a uniform synthetic cadence. The cadence is a placeholder
+/// (see module docs); only the length dimension of this trace is meaningful.
+pub fn uplink_trace(payload: &[u8]) -> Trace {
+    trace_from_lengths(record_lengths(payload), Dir::C2S)
+}
+
+/// Build a ParallaX S2C [`Trace`] for a downlink `payload`, using the production
+/// *server* relay record sizing and a uniform synthetic cadence. Same honesty
+/// scope as [`uplink_trace`]: only the length dimension is meaningful.
+pub fn downlink_trace(payload: &[u8]) -> Trace {
+    trace_from_lengths(downlink_record_lengths(payload), Dir::S2C)
 }
 
 #[cfg(test)]
@@ -116,5 +159,30 @@ mod tests {
         // as a literal — not the production constant — so a regression that
         // shifts the regime (e.g. to 16400) is caught instead of tracked.
         assert_eq!(full, 16401, "ParallaX full-record length is not 16401");
+    }
+
+    #[test]
+    fn downlink_matches_uplink_record_regime() {
+        // The server relay seals through the same `seal_chunks` sizing path, so
+        // for an identical payload the downlink record lengths must be byte-for-
+        // byte identical to the uplink — the AAD direction is authenticated but
+        // never on the wire, so it cannot move the record `length`. If these ever
+        // diverge, the server codec was constructed with a different padding
+        // profile or record limit, which would make ParallaX's server→client
+        // traffic distinguishable from its own client→server traffic (and from
+        // Safari, whose downlink shares the same 16401 full-record regime).
+        let payload = vec![0x5a_u8; 16384 * 4 + 500];
+        let up = record_lengths(&payload);
+        let down = downlink_record_lengths(&payload);
+        assert_eq!(
+            up, down,
+            "downlink record lengths diverge from uplink for identical payload"
+        );
+        // And the downlink modal full record is the documented 16401 (literal,
+        // not the production constant — see `full_records_are_16401`).
+        assert_eq!(
+            down[0], 16401,
+            "ParallaX downlink full-record length is not 16401"
+        );
     }
 }
