@@ -44,9 +44,13 @@ Read this first; it is deliberately honest about scope.
 
 - **This is NOT the GFW, and NOT equivalent to any leaked censorship codebase.**
   The analyzer is a **clean-room approximation** of a handful of *publicly
-  documented* detection techniques (TLS/JA3 fingerprinting, the Frolov–Wustrow
-  fully-encrypted first-packet test, coarse flow statistics, and differential
-  active probing). A real national firewall runs far more — ML classifiers on
+  documented* detection techniques. Two of them gate the verdict — the
+  structural "is this a TLS record / ClientHello?" check and the Frolov–Wustrow
+  fully-encrypted first-packet test — and both are proven to have teeth by the
+  negative control. Others are **computed and recorded for inspection but do not
+  yet gate** (a JA3-style fingerprint, up/down ratio, segment-size and timing
+  stats), plus the differential active prober. A real national firewall runs far
+  more — ML classifiers on
   rich flow features, long-horizon behavioural correlation, TLS-fingerprint
   all/deny lists, cross-flow analysis, and continuously-updated rules.
 - **Passing here does NOT mean "undetectable by the real GFW."** It means "not

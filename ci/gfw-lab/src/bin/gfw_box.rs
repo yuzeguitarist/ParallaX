@@ -152,14 +152,31 @@ async fn run_adversary(args: AdversaryArgs) -> Result<()> {
     );
     let mut rng = rand::thread_rng();
     for _ in 0..args.rounds.max(1) {
-        // 1) "fully encrypted" obfuscated proxy: high-entropy random first flight.
+        // 1) "fully encrypted" obfuscated proxy: high-entropy random first flight
+        //    (first byte forced != 0x16 so it is NOT a TLS record — exercises the
+        //    structural "not TLS" detection path).
         let mut random_flow = vec![0u8; 512];
         rng.fill(&mut random_flow[..]);
+        if random_flow[0] == 0x16 {
+            random_flow[0] = 0x00;
+        }
         emit_flow(&args.target, &random_flow).await;
 
-        // 2) plaintext tunnel: a cleartext, non-TLS first flight.
+        // 2) plaintext tunnel: a cleartext, non-TLS first flight (structural path).
         let plaintext = b"OBFS-PROXY HELLO v1: this is not a TLS record\n".to_vec();
         emit_flow(&args.target, &plaintext).await;
+
+        // 3) TLS-FRAMED high-entropy payload: a well-formed TLS record header
+        //    (0x16 0x03 0x03 <len>) whose handshake body is NOT a ClientHello and
+        //    is high-entropy. This is `is_tls_record=true, is_client_hello=false`,
+        //    so the structural path does NOT flag it — it can ONLY be caught by
+        //    the Frolov-Wustrow "fully encrypted" entropy classifier. Without this
+        //    the control would only prove the trivial not-TLS check has teeth.
+        let mut framed = vec![0x16u8, 0x03, 0x03, 0x02, 0x00];
+        let mut body = vec![0u8; 512];
+        rng.fill(&mut body[..]);
+        framed.extend_from_slice(&body);
+        emit_flow(&args.target, &framed).await;
     }
     // Give the relay a moment to record the flows before it is asked to report.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -796,6 +813,7 @@ async fn differential_probe(
     } else {
         Duration::from_secs(30)
     };
+    let read_timeout_ms = read_timeout.as_secs_f64() * 1000.0;
     let px = capture_response(*server, payload.as_deref(), read_timeout).await;
     let rf = capture_response(reference, payload.as_deref(), read_timeout).await;
 
@@ -810,13 +828,19 @@ async fn differential_probe(
             // it waits out a first-record timeout before splicing). We flag a
             // distinguisher only on a class mismatch.
             //
-            // Guard against a false positive: for a payload probe, if the
-            // ParallaX side produced NO bytes (empty) while the reference did,
-            // that is almost certainly the splice not completing within our read
-            // window (a timing artifact of the first-record wait on a loaded
-            // runner), not a behavioural tell — treat it as inconclusive.
-            let px_empty_timing =
-                payload.is_some() && pc == RespClass::Empty && rc != RespClass::Empty;
+            // Narrow inconclusive carve-out (CRITICAL not to over-broaden): a
+            // payload probe where ParallaX produced NO bytes while the reference
+            // did is only excused if ParallaX genuinely *waited out the whole
+            // read window* (splice still pending). If ParallaX instead closed or
+            // reset EARLY (empty response well before the timeout) while the
+            // origin served, that is a real active-probing distinguisher — the
+            // canonical "reset unauthenticated probes" tell — and MUST be
+            // flagged. The measured server latency tells the two apart.
+            let waited_out_window = pxl >= read_timeout_ms - 2000.0;
+            let px_empty_timing = payload.is_some()
+                && pc == RespClass::Empty
+                && rc != RespClass::Empty
+                && waited_out_window;
             let distinguisher = pc != rc && !px_empty_timing;
             ActiveProbeResult {
                 probe: name.to_string(),

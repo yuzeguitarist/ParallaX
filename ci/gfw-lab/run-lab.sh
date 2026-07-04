@@ -282,7 +282,7 @@ cp "$SERVER_CFG" "$LIVE_SERVER_CFG"
 cp "$CLIENT_CFG" "$LIVE_CLIENT_CFG"
 # Drop data_target so the server relays to the client's SOCKS-requested target,
 # and move listen/replay off the main ports so both stacks can run together.
-python3 - "$LIVE_SERVER_CFG" "$WORKDIR/replay.live.cache" "$SERVER_HOST:18444" <<'PY'
+if ! python3 - "$LIVE_SERVER_CFG" "$WORKDIR/replay.live.cache" "$SERVER_HOST:18444" <<'PY'
 import sys
 cfg, replay, listen = sys.argv[1:4]
 out = []
@@ -291,11 +291,16 @@ for ln in open(cfg).read().splitlines():
         continue
     if ln.startswith("replay_cache_path"):
         ln = f'replay_cache_path = "{replay}"'
-    if ln.startswith("listen"):
+    if ln.startswith("listen "):
         ln = f'listen = "{listen}"'
     out.append(ln)
 open(cfg, "w").write("\n".join(out) + "\n")
 PY
+then
+  echo "!! live server config rewrite failed"; exit 3
+fi
+# The whole point of this phase is a NON-fixed target, so data_target must be gone.
+grep -q '^data_target' "$LIVE_SERVER_CFG" && { echo "!! data_target not removed from live server config"; exit 3; }
 # Point the live client straight at the live server (no box) on a fresh SOCKS port.
 sed -i "s#^server_addr = .*#server_addr = \"$SERVER_HOST:18444\"#" "$LIVE_CLIENT_CFG"
 sed -i "s#^listen = .*#listen = \"127.0.0.1:1099\"#" "$LIVE_CLIENT_CFG"
@@ -311,16 +316,37 @@ if "$PLX" check -c "$LIVE_SERVER_CFG" >/dev/null 2>&1 && "$PLX" check -c "$LIVE_
   wait_for_log "$WORKDIR/client.live.log" "client SOCKS5 listening on" "$READY_TIMEOUT" || REACH_OK=0
 
   if [ "$REACH_OK" -eq 1 ]; then
+    # Direct-fetch gating so we never blame the proxy for a site/network outage:
+    # only sites that are reachable DIRECTLY (no proxy) count; each such site
+    # must then also work THROUGH the tunnel. We require at least 2 healthy
+    # sites to have succeeded through the proxy (a single success can't rule out
+    # e.g. an MTU bug that only breaks larger responses).
+    reach_pass=0
+    reach_eligible=0
     for site in www.cloudflare.com www.wikipedia.org example.com www.apple.com; do
+      direct=$(curl -4 -sS -o /dev/null -w '%{http_code}' --max-time 20 "https://$site/" 2>>"$WORKDIR/reachability.log" || echo 000)
+      if ! echo "$direct" | grep -qE '^(2|3)'; then
+        echo "   [skip] https://$site (direct fetch $direct — site/network, not proxy)"
+        continue
+      fi
+      reach_eligible=$((reach_eligible + 1))
       code=$(curl -4 --socks5-hostname 127.0.0.1:1099 -sS -o /dev/null \
         -w '%{http_code}' --max-time 30 "https://$site/" 2>>"$WORKDIR/reachability.log" || echo 000)
       if echo "$code" | grep -qE '^(2|3)'; then
-        echo "   [ok]   https://$site -> $code"
+        echo "   [ok]   https://$site -> $code (direct $direct)"
+        reach_pass=$((reach_pass + 1))
       else
-        echo "   [FAIL] https://$site -> $code"
+        echo "   [FAIL] https://$site -> $code (direct $direct — proxy could not reach a healthy site)"
         REACH_OK=0
       fi
     done
+    if [ "$reach_eligible" -eq 0 ]; then
+      echo "   !! no site was reachable even directly — environment issue"
+      REACH_ENV_ERROR=1
+    elif [ "$reach_pass" -lt 2 ]; then
+      echo "   !! fewer than 2 sites reached through the tunnel"
+      REACH_OK=0
+    fi
   fi
   kill -TERM "$LIVE_CLI_PID" 2>/dev/null || true
   kill -TERM "$LIVE_SRV_PID" 2>/dev/null || true
@@ -328,7 +354,12 @@ else
   echo "   !! live config invalid"; REACH_OK=0
 fi
 LIVE_SCEN="$WORKDIR/scenario-live-reachability.json"
-if [ "$REACH_OK" -eq 1 ]; then
+if [ "${REACH_ENV_ERROR:-0}" -eq 1 ]; then
+  # No site reachable even directly: environment/egress issue, not a product
+  # regression. Record it as ok with a note (do not fail the product verdict).
+  printf '{"scenario":"live-reachability","link_profile":"real-internet","ok":true,"detail":"skipped: no public site reachable even directly (environment)"}\n' >"$LIVE_SCEN"
+  echo "::warning::live-reachability skipped (no direct internet)" 2>/dev/null || true
+elif [ "$REACH_OK" -eq 1 ]; then
   printf '{"scenario":"live-reachability","link_profile":"real-internet","ok":true,"detail":"fetched real public HTTPS sites through the tunnel"}\n' >"$LIVE_SCEN"
 else
   printf '{"scenario":"live-reachability","link_profile":"real-internet","ok":false,"detail":"could not fetch real HTTPS sites through the tunnel"}\n' >"$LIVE_SCEN"
@@ -349,6 +380,8 @@ CONTROL_LOG="$WORKDIR/control.log"
   --profile perfect --report "$CONTROL_REPORT" >"$CONTROL_LOG" 2>&1 &
 CONTROL_BOX_PID="$!"; PIDS+=("$CONTROL_BOX_PID")
 wait_for_log "$CONTROL_LOG" "gfw-box relay listening" 10 || FAIL=1
+# 2 rounds x 3 flavours = 6 known-bad flows (random-not-TLS, plaintext, and a
+# TLS-framed high-entropy body that ONLY the entropy classifier can catch).
 "$GFW_BOX" adversary --target 127.0.0.1:9500 --rounds 2 >>"$CONTROL_LOG" 2>&1 || true
 kill -TERM "$CONTROL_BOX_PID" 2>/dev/null || true
 wait "$CONTROL_BOX_PID" 2>/dev/null || true
@@ -358,12 +391,16 @@ if [ -f "$CONTROL_REPORT" ]; then
 fi
 
 # --------------------------------------------------------------------------
-# 5. Active differential probe (direct to server, A/B vs reference origin)
+# 5. Active differential probe (direct to server, A/B vs reference origin).
+#    A missing probe report is a real gap, not a free pass: mark FAIL.
 # --------------------------------------------------------------------------
 PROBE_REPORT="$WORKDIR/probe.json"
 "$GFW_BOX" probe --server "$SERVER_HOST:$SERVER_PORT" \
   --reference "$FALLBACK_HOST:$FALLBACK_PORT" --sni "$FALLBACK_HOST" \
   --report "$PROBE_REPORT" >"$WORKDIR/probe.log" 2>&1 || true
+if [ ! -f "$PROBE_REPORT" ]; then
+  echo "   !! active probe produced no report"; FAIL=1
+fi
 
 # --------------------------------------------------------------------------
 # 6. Assemble the verdict

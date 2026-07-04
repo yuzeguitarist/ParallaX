@@ -72,26 +72,54 @@ fn main() -> Result<()> {
         None => None,
     };
     let control_flagged = control.as_ref().map(|c| c.flagged_flows).unwrap_or(0);
+    // The control must exercise BOTH detection paths, so that neutering EITHER
+    // one is caught: the structural "not a TLS record" check AND the
+    // Frolov-Wustrow "fully encrypted" entropy classifier. Requiring the
+    // specific flags (not just a total count) means a regression that disables
+    // only the entropy test — while the trivial not-TLS check still fires — is
+    // still detected as "detector lost teeth" and FAILS the run.
+    let control_flag_present = |flag: &str| -> bool {
+        control
+            .as_ref()
+            .map(|c| {
+                c.flows
+                    .iter()
+                    .any(|f| f.verdict.flags.iter().any(|x| x == flag))
+            })
+            .unwrap_or(false)
+    };
+    let control_catches_structural = control_flag_present("first_flight_not_tls_record");
+    let control_catches_entropy = control_flag_present("fully_encrypted_first_packet");
     let control_ok = match &control {
-        Some(_) => control_flagged >= cli.min_control_flagged,
+        Some(_) => {
+            control_flagged >= cli.min_control_flagged
+                && control_catches_structural
+                && control_catches_entropy
+        }
         // No control provided: cannot vouch for the detector -> do not pass.
         None => false,
     };
 
-    // Pass policy — ALL must hold:
-    //   * every scenario completed (ok == true), AND
-    //   * the passive middle-box flagged ZERO ParallaX flows as a proxy (across
-    //     ALL profiles), AND
-    //   * the active differential prober found NO distinguisher vs the origin, AND
-    //   * the negative control WAS flagged (detector is proven to have teeth).
-    let scenarios_ok = scenarios.iter().all(|s| s.ok);
+    // Pass policy — ALL must hold (each is a hard, non-vacuous requirement):
+    //   * at least one scenario ran and every scenario completed (ok == true),
+    //   * the passive middle-box actually analysed ParallaX flows AND flagged
+    //     ZERO of them as a proxy (across ALL profiles),
+    //   * the active differential prober ran and found NO distinguisher, AND
+    //   * the negative control proved the detector has teeth on BOTH paths.
+    let scenarios_ran = !scenarios.is_empty();
+    let scenarios_ok = scenarios_ran && scenarios.iter().all(|s| s.ok);
     let failed_scenarios: Vec<&str> = scenarios
         .iter()
         .filter(|s| !s.ok)
         .map(|s| s.scenario.as_str())
         .collect();
-    let passive_ok = passive_flagged_flows == 0;
-    let probe_ok = probe.as_ref().map(|p| !p.any_distinguisher).unwrap_or(true);
+    // Non-vacuous: require that flows were actually analysed, not just "0 of 0".
+    let passive_ok = passive_total_flows > 0 && passive_flagged_flows == 0;
+    // Non-vacuous: the probe must have run (absent probe is NOT a free pass).
+    let probe_ok = probe
+        .as_ref()
+        .map(|p| !p.any_distinguisher)
+        .unwrap_or(false);
 
     let pass = scenarios_ok && passive_ok && probe_ok && control_ok;
 
