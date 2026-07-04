@@ -1789,4 +1789,141 @@ mod tests {
             "queued entry persisted by the retry"
         );
     }
+
+    // --- Journal-parse helper coverage (decode_hex_exact / hex_value / parse_entry) ---
+    //
+    // These pure helpers run on the replay-cache LOAD path: `decode_hex_exact` fires on
+    // every persisted entry (inside `parse_authenticated_journal_entry`, BEFORE its MAC
+    // check), so a corrupted or tampered journal line reaches them. The existing load
+    // tests only assert a coarse `MalformedLine | MacMismatch` OR and never call these
+    // helpers directly, so their malformed/boundary branches were unpinned. Tests-only —
+    // no production change. (`ReplayCacheError` derives no `PartialEq`, hence `matches!`.)
+
+    #[test]
+    fn hex_value_maps_every_valid_nibble_and_rejects_the_rest() {
+        assert_eq!(hex_value(b'0').unwrap(), 0);
+        assert_eq!(hex_value(b'9').unwrap(), 9);
+        // BOTH letter cases decode (the uppercase A-F arm has no other coverage).
+        assert_eq!(hex_value(b'a').unwrap(), 10);
+        assert_eq!(hex_value(b'f').unwrap(), 15);
+        assert_eq!(hex_value(b'A').unwrap(), 10);
+        assert_eq!(hex_value(b'F').unwrap(), 15);
+        // Everything else is rejected, including the bytes adjacent to the valid ASCII
+        // ranges ('/' = '0'-1, ':' = '9'+1, 'g'/'G' = 'f'/'F'+1) and the extremes.
+        for bad in [b' ', b'/', b':', b'g', b'G', b'x', b'\x00', b'\xff'] {
+            assert!(
+                matches!(hex_value(bad), Err(ReplayCacheError::MalformedHex)),
+                "0x{bad:02x} must be rejected as non-hex"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_hex_exact_round_trips_and_is_case_insensitive() {
+        let mut out = [0_u8; 4];
+        decode_hex_exact("0102FfaB", &mut out).unwrap();
+        assert_eq!(out, [0x01, 0x02, 0xff, 0xab]);
+    }
+
+    #[test]
+    fn decode_hex_exact_rejects_wrong_length() {
+        // The guard is `input.len() != out.len() * 2`: too short, too long, and empty
+        // all fail before any nibble is decoded.
+        let mut two = [0_u8; 2]; // expects exactly 4 hex chars
+        assert!(matches!(
+            decode_hex_exact("abc", &mut two),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        assert!(matches!(
+            decode_hex_exact("aabbcc", &mut two),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        let mut one = [0_u8; 1]; // expects exactly 2 hex chars
+        assert!(matches!(
+            decode_hex_exact("", &mut one),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+    }
+
+    #[test]
+    fn decode_hex_exact_rejects_non_hex_at_correct_length() {
+        // Correct length, but a non-hex byte in either nibble position.
+        let mut one = [0_u8; 1];
+        assert!(matches!(
+            decode_hex_exact("zz", &mut one),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        assert!(matches!(
+            decode_hex_exact("0g", &mut one),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        assert!(matches!(
+            decode_hex_exact("g0", &mut one),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+    }
+
+    #[test]
+    fn parse_entry_accepts_a_well_formed_line() {
+        let nonce_hex = "0102030405060708"; // 8 bytes
+        let transcript_hex = "ab".repeat(32); // 32 bytes
+        let line = format!("100 {nonce_hex} {transcript_hex}");
+        assert_eq!(
+            parse_entry(&line).unwrap(),
+            ReplayEntry {
+                timestamp: 100,
+                nonce: [1, 2, 3, 4, 5, 6, 7, 8],
+                transcript_fingerprint: [0xab; 32],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_entry_rejects_structurally_malformed_lines() {
+        let nonce_hex = "0102030405060708";
+        let transcript_hex = "ab".repeat(32);
+        // Non-numeric timestamp.
+        assert!(matches!(
+            parse_entry(&format!("nope {nonce_hex} {transcript_hex}")),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+        // Empty line (no fields at all).
+        assert!(matches!(
+            parse_entry(""),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+        // Missing both nonce and transcript.
+        assert!(matches!(
+            parse_entry("100"),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+        // Missing transcript.
+        assert!(matches!(
+            parse_entry(&format!("100 {nonce_hex}")),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+        // Trailing extra field.
+        assert!(matches!(
+            parse_entry(&format!("100 {nonce_hex} {transcript_hex} extra")),
+            Err(ReplayCacheError::MalformedLine(_))
+        ));
+    }
+
+    #[test]
+    fn parse_entry_propagates_hex_errors_from_its_fields() {
+        let transcript_hex = "ab".repeat(32);
+        // Nonce field has the right structure but wrong hex length -> MalformedHex,
+        // proving parse_entry surfaces decode_hex_exact's error rather than swallowing
+        // it or mislabelling it as MalformedLine.
+        assert!(matches!(
+            parse_entry(&format!("100 abcd {transcript_hex}")),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+        // Nonce field is the correct length (16 chars) but all non-hex.
+        let bad_nonce = "zz".repeat(8);
+        assert!(matches!(
+            parse_entry(&format!("100 {bad_nonce} {transcript_hex}")),
+            Err(ReplayCacheError::MalformedHex)
+        ));
+    }
 }
