@@ -2602,6 +2602,7 @@ async fn run_authenticated_data_mode(
                                             fixed_data_target,
                                             cid,
                                         },
+                                        fallback_idle_timeout(),
                                     )
                                     .await;
                                 }
@@ -4045,12 +4046,17 @@ struct ServerMuxQuicContext<'a> {
 /// connects the target, and relays over the H3 DATA-frame legs.
 ///
 /// A per-connection ceiling (`max_streams`) bounds concurrent substreams; excess
-/// bidis are reset. The accept loop ends when the client closes the connection.
+/// bidis are reset. The accept loop ends when the client closes the connection,
+/// or when the whole-session idle backstop fires: `idle_timeout` (drawn from
+/// [`fallback_idle_timeout`] by the production call site; injected so tests can
+/// run the backstop on a short clock) bounds how long the session may sit with
+/// zero admitted and zero live substreams before it is reclaimed.
 async fn run_authenticated_mux_quic_data_mode(
     client_records: BufferedTlsRecordReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     probed: ServerProbedQuic,
     context: ServerMuxQuicContext<'_>,
+    idle_timeout: Duration,
 ) -> Result<(), HandshakeServerError> {
     let ServerProbedQuic {
         conn,
@@ -4090,8 +4096,39 @@ async fn run_authenticated_mux_quic_data_mode(
         "ParallaX mux-over-QUIC data mode started"
     );
 
+    // Application-level idle backstop for the whole session, mirroring the
+    // sibling relay modes (which all bound whole-relay silence with
+    // `fallback_idle_timeout`). The QUIC connection's own idle timeout is NOT a
+    // bound here: it is refreshed by ANY received packet, and keep-alive PINGs
+    // keep both ends exchanging packets, so a client that ACKs keep-alives while
+    // opening zero substreams (and sending zero TCP bytes to trip the watcher
+    // above) would otherwise pin the connection, both fds, and the admission
+    // permit forever. The clock resets ONLY when a substream is admitted; live
+    // substreams defer expiry (each is bounded by its own idle watchdog, which
+    // releases its permit on teardown, so a later expiry still reclaims the
+    // session).
+    let idle_sleep = sleep(idle_timeout);
+    tokio::pin!(idle_sleep);
+
     loop {
-        let Some((send, recv)) = conn.accept_bi().await else {
+        let accepted = tokio::select! {
+            accepted = conn.accept_bi() => accepted,
+            _ = &mut idle_sleep => {
+                if live.available_permits() < max_streams {
+                    // Substreams are still relaying: the session is not idle.
+                    idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
+                    continue;
+                }
+                tracing::debug!(
+                    cid = context.cid,
+                    "mux-over-QUIC session idle backstop reached; tearing down"
+                );
+                conn.close(RELAY_IDLE_CLOSE_CODE.into(), b"mux-idle");
+                tcp_watch.abort();
+                return Ok(());
+            }
+        };
+        let Some((send, recv)) = accepted else {
             // The QUIC connection closed (client dropped the session, surfaced via
             // the TCP watcher, or a transport close): no further substreams.
             tcp_watch.abort();
@@ -4110,6 +4147,9 @@ async fn run_authenticated_mux_quic_data_mode(
             );
             continue;
         };
+        // An admitted substream is real client activity: reset the session idle
+        // clock. (Rejected bidis deliberately do not.)
+        idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
         let (client_open, server_seal) =
             match crate::transport::udp::quic::mux::server_substream_codecs(
                 context.session_keys,
@@ -7748,6 +7788,128 @@ mod tests {
         assert_eq!(reset.kind, MuxFrameKind::Reset);
 
         acceptor.abort();
+    }
+
+    /// #56: a client that keeps the mux-over-QUIC session transport-alive (the
+    /// QUIC connection's idle timeout is refreshed by ANY packet, keep-alives
+    /// included) while opening ZERO substreams and sending ZERO TCP bytes must
+    /// not pin the session — connection, both TCP fds, and admission permit —
+    /// forever. The accept loop's application-level idle backstop must return
+    /// within the injected idle timeout and close the connection with the agreed
+    /// idle code so the client reads the teardown as benign.
+    #[tokio::test]
+    #[ignore = "requires loopback UDP + TCP sockets"]
+    async fn mux_quic_idle_backstop_reclaims_silent_session() {
+        use crate::crypto::session::derive_server_keys;
+        use crate::protocol::data::is_relay_idle_close_reason;
+        use crate::tls::quic::{AcceptAnyServerCert, ClientConfig as QuicClientConfig};
+        use crate::transport::udp::h3::H3ControlStreams;
+        use crate::transport::udp::quic::endpoint::{Endpoint, ServerConfig as QuicServerConfig};
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        // In-process QUIC pair over loopback UDP (mirrors the endpoint unit tests).
+        let signing_key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap()
+                .as_ref()
+                .to_vec();
+        let quic_server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(QuicServerConfig {
+                cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+                signing_key_pkcs8: signing_key,
+                alpn_protocols: vec![b"h3".to_vec()],
+                zero_rtt: None,
+                origin_udp_addr: None,
+                marker_key: None,
+                marker_replay_guard: None,
+                authorized_sni: vec!["example.com".to_owned()],
+                max_udp_payload: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let quic_addr = quic_server.local_addr().unwrap();
+        let quic_client = Endpoint::client("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        quic_client.set_default_client_config(Arc::new(QuicClientConfig::new(
+            Arc::new(AcceptAnyServerCert),
+            vec![b"h3".to_vec()],
+        )));
+        let (client_conn, server_conn) = tokio::join!(
+            quic_client.connect(quic_addr, "example.com"),
+            quic_server.accept(),
+        );
+        let client_conn = client_conn.unwrap();
+        let server_conn = server_conn.unwrap();
+
+        // The probe bidi the production path quiesces on entry: the client opens
+        // it and writes a byte so it materializes on the server.
+        let (mut probe_send, probe_recv) = client_conn.open_bi();
+        probe_send.write_all(b"p").await.unwrap();
+        let (relay_send, relay_recv) = server_conn.accept_bi().await.unwrap();
+        // The server-opened H3 control/QPACK-encoder unis the session parks.
+        let h3_control = H3ControlStreams::new(server_conn.open_uni(), server_conn.open_uni());
+
+        // The parked TCP control connection: the client half stays open and
+        // SILENT for the whole test (no EOF, no stray byte), so `tcp_watch`
+        // never fires — exactly the DoS shape.
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let (client_tcp, accepted) =
+            tokio::join!(TcpStream::connect(tcp_addr), tcp_listener.accept());
+        let client_tcp = client_tcp.unwrap();
+        let (server_tcp, _) = accepted.unwrap();
+        let (server_tcp_read, server_tcp_write) = server_tcp.into_split();
+
+        let client_x = X25519KeyPair::generate();
+        let server_x = X25519KeyPair::generate();
+        let session_keys =
+            derive_server_keys(PSK, &server_x.private, &client_x.public, &[7_u8; 32]).unwrap();
+
+        // The client opens ZERO substreams: the session must be reclaimed by the
+        // idle backstop (the call RETURNS within the wall budget) rather than
+        // pinned on `accept_bi` indefinitely.
+        let session = run_authenticated_mux_quic_data_mode(
+            BufferedTlsRecordReader::buffered(server_tcp_read),
+            server_tcp_write,
+            ServerProbedQuic {
+                conn: server_conn,
+                h3_control,
+                relay_send,
+                relay_recv,
+            },
+            ServerMuxQuicContext {
+                session_keys: &session_keys,
+                traffic: TrafficConfig::default(),
+                fixed_data_target: None,
+                cid: 1,
+            },
+            Duration::from_millis(100),
+        );
+        tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("a zero-substream silent session must be reclaimed by the idle backstop")
+            .expect("idle teardown is a clean session end, not an error");
+
+        // The client observes the agreed idle close code (benign teardown), not a
+        // generic error close.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::transport::udp::endpoint::conn_closed(&client_conn),
+        )
+        .await
+        .expect("the idle close must reach the client");
+        assert!(
+            is_relay_idle_close_reason(client_conn.close_reason().as_ref()),
+            "the backstop must close with RELAY_IDLE_CLOSE_CODE, got {:?}",
+            client_conn.close_reason()
+        );
+
+        drop(client_tcp);
+        drop((probe_send, probe_recv));
     }
 
     /// M-8: the speed-test DOWNLOAD phase must reclaim a zero-window stall as a
