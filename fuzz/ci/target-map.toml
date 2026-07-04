@@ -141,6 +141,13 @@ max_len = 65536
 timeout = 20
 paths = ["src/fingerprint/http2.rs"]
 
+[targets.quic_frame_decode]
+sanitizer = "none"
+rss = 1536
+max_len = 65536
+timeout = 20
+paths = ["src/transport/udp/quic/frame.rs"]
+
 [targets.command_codecs]
 sanitizer = "none"
 rss = 1024
