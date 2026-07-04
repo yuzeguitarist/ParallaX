@@ -28,6 +28,7 @@ rules:
       - claude-dependency-audit.yml
       - claude.yml
       - dudect.yml
+      - e2e-gfw-lab.yml
       - fuzz-crash-triage.yml
       - fuzz-nightly.yml
       - fuzz-pr.yml
@@ -46,6 +47,7 @@ rules:
       - claude-dependency-audit.yml
       - claude.yml
       - dudect.yml
+      - e2e-gfw-lab.yml
       - fuzz-crash-triage.yml
       - fuzz-nightly.yml
       - fuzz-pr.yml
