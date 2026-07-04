@@ -57,3 +57,47 @@ pub(crate) fn is_authorized_sni(sni: &str, authorized_sni: &[String]) -> bool {
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(sni))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_authorized_sni;
+
+    fn list(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_authorized_list_denies_everything() {
+        // Fail-closed: with no authorized SNI configured, nothing is authorized
+        // (an empty `any(..)` is false). Both transports then front to camouflage.
+        assert!(!is_authorized_sni("example.com", &[]));
+    }
+
+    #[test]
+    fn exact_match_is_authorized_case_insensitively() {
+        let allow = list(&["example.com"]);
+        assert!(is_authorized_sni("example.com", &allow));
+        // TLS SNI is compared case-insensitively (ASCII), matching the DNS/TLS norm.
+        assert!(is_authorized_sni("EXAMPLE.COM", &allow));
+        assert!(is_authorized_sni("Example.Com", &allow));
+    }
+
+    #[test]
+    fn substring_or_superstring_is_not_a_match() {
+        // The check is EXACT, not substring: a hostname that merely contains or
+        // extends an authorized name must not be authorized (otherwise
+        // `example.com.attacker.com` or `notexample.com` would slip through).
+        let allow = list(&["example.com"]);
+        assert!(!is_authorized_sni("example.com.attacker.com", &allow));
+        assert!(!is_authorized_sni("notexample.com", &allow));
+        assert!(!is_authorized_sni("example.co", &allow));
+        assert!(!is_authorized_sni("", &allow));
+    }
+
+    #[test]
+    fn matches_any_entry_in_a_multi_host_list() {
+        let allow = list(&["a.example.com", "b.example.com"]);
+        assert!(is_authorized_sni("b.example.com", &allow));
+        assert!(!is_authorized_sni("c.example.com", &allow));
+    }
+}
