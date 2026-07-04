@@ -99,7 +99,11 @@ pub fn inspect_client_hello(buf: &[u8]) -> ClientHelloInfo {
     if hs_type != 0x01 {
         return info;
     }
-    info.is_client_hello = true;
+    // NOTE: `is_client_hello` is set only after the mandatory ClientHello body
+    // (version, random, session_id, cipher_suites, compression) parses in full,
+    // at the end of this function. Setting it here — before the body parse — would
+    // misclassify a truncated/malformed TLS handshake as a valid ClientHello,
+    // suppressing the `tls_record_but_not_client_hello` structural proxy flag.
 
     let Some(legacy_version) = c.u16() else {
         return info;
@@ -139,6 +143,11 @@ pub fn inspect_client_hello(buf: &[u8]) -> ClientHelloInfo {
     if c.take(comp_len as usize).is_none() {
         return info;
     }
+
+    // Every mandatory ClientHello field (version, random, session_id,
+    // cipher_suites, compression) parsed in full: this is a structurally valid
+    // ClientHello. Extensions below are optional and parsed best-effort.
+    info.is_client_hello = true;
 
     // extensions
     let mut ja3_exts = Vec::new();
@@ -227,4 +236,55 @@ fn parse_alpn(ext: &[u8]) -> Vec<String> {
         out.push(String::from_utf8_lossy(p).into_owned());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A TLS handshake record whose msg_type is ClientHello (0x01) but whose body
+    /// is truncated before the mandatory fields end must NOT be classified as a
+    /// valid ClientHello — otherwise the passive analyzer suppresses the
+    /// `tls_record_but_not_client_hello` structural proxy flag on malformed input.
+    #[test]
+    fn truncated_client_hello_body_is_not_classified_as_client_hello() {
+        // record header (0x16, 0x0301, len=4) + handshake header (0x01, u24 len)
+        // and then nothing: the mandatory version/random/... never parse.
+        let truncated = [0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x01, 0x00];
+        let info = inspect_client_hello(&truncated);
+        assert!(info.is_tls_record, "0x16 record type is a TLS record");
+        assert!(
+            !info.is_client_hello,
+            "a ClientHello truncated inside its mandatory fields must not count as one"
+        );
+    }
+
+    /// A well-formed minimal ClientHello (all mandatory fields present, no
+    /// extensions) is still a valid ClientHello.
+    #[test]
+    fn minimal_well_formed_client_hello_is_classified() {
+        let mut hs = Vec::new();
+        hs.push(0x01); // msg_type = ClientHello
+        let body_start = hs.len();
+        hs.extend_from_slice(&[0, 0, 0]); // u24 length placeholder
+        hs.extend_from_slice(&[0x03, 0x03]); // legacy_version TLS1.2
+        hs.extend_from_slice(&[0u8; 32]); // random
+        hs.push(0x00); // session_id len = 0
+        hs.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites: len=2, TLS_AES_128_GCM
+        hs.extend_from_slice(&[0x01, 0x00]); // compression: len=1, null
+        let body_len = (hs.len() - body_start - 3) as u32;
+        hs[body_start..body_start + 3]
+            .copy_from_slice(&body_len.to_be_bytes()[1..]); // u24
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+
+        let info = inspect_client_hello(&rec);
+        assert!(info.is_tls_record);
+        assert!(
+            info.is_client_hello,
+            "a structurally complete ClientHello must be classified as one"
+        );
+        assert_eq!(info.cipher_suite_count, 1);
+    }
 }
