@@ -887,4 +887,18 @@ mod tests {
         }
         assert_eq!(Iter::new(&b).next(), Some(Err(FrameError::Malformed)));
     }
+
+    #[test]
+    fn parse_ack_rejects_range_length_underflowing_low_edge() {
+        // The gap subtraction succeeds (high stays >= 0) but the range LENGTH then
+        // underflows the range's low edge: largest=100, first_range=0 -> smallest
+        // 100; gap=0 -> high = 100 - 2 = 98; len=200 -> low = 98 - 200 underflows.
+        // The `a`/`b` cases above both fail at the earlier gap subtraction, so this
+        // is the only case that exercises the `low = high - len` guard.
+        let mut f = Vec::new();
+        for v in [FT_ACK, 100, 0, 1, 0, 0, 200] {
+            varint::encode(v, &mut f);
+        }
+        assert_eq!(Iter::new(&f).next(), Some(Err(FrameError::Malformed)));
+    }
 }

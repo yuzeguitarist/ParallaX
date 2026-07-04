@@ -1287,6 +1287,69 @@ mod tests {
     }
 
     #[test]
+    fn future_skew_boundary_is_exact() {
+        // The future bound is `timestamp <= now + MAX_FUTURE_SKEW_SECS`. An entry
+        // exactly at the edge is accepted; one second beyond is Stale. Existing
+        // tests only probe `now + 3` (inside) and `now + window` (far outside), so
+        // pin the exact edge here — a `<` vs `<=` mutant on the skew check dies.
+        let now = 3_000_000_u64;
+
+        let mut cache = ReplayCache::new(8);
+        let at_edge = ReplayEntry {
+            timestamp: now + MAX_FUTURE_SKEW_SECS,
+            nonce: [1_u8; 8],
+            transcript_fingerprint: [1_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(at_edge, now).unwrap(),
+            ReplayInsertOutcome::Inserted,
+            "exactly MAX_FUTURE_SKEW_SECS ahead is still fresh",
+        );
+
+        let past_edge = ReplayEntry {
+            timestamp: now + MAX_FUTURE_SKEW_SECS + 1,
+            nonce: [2_u8; 8],
+            transcript_fingerprint: [2_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(past_edge, now).unwrap(),
+            ReplayInsertOutcome::Stale,
+            "one second past the skew edge is rejected",
+        );
+    }
+
+    #[test]
+    fn past_window_boundary_is_exact() {
+        // The past bound is `timestamp + window_secs >= now`. An entry whose age is
+        // exactly the window is still fresh; one second older is Stale.
+        let window = DEFAULT_REPLAY_WINDOW_SECS;
+        let now = 5_000_000_u64;
+
+        let mut cache = ReplayCache::new(8);
+        let at_edge = ReplayEntry {
+            timestamp: now - window,
+            nonce: [3_u8; 8],
+            transcript_fingerprint: [3_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(at_edge, now).unwrap(),
+            ReplayInsertOutcome::Inserted,
+            "an entry exactly `window` seconds old is still fresh",
+        );
+
+        let past_edge = ReplayEntry {
+            timestamp: now - window - 1,
+            nonce: [4_u8; 8],
+            transcript_fingerprint: [4_u8; 32],
+        };
+        assert_eq!(
+            cache.insert_new_outcome(past_edge, now).unwrap(),
+            ReplayInsertOutcome::Stale,
+            "one second older than the window is rejected",
+        );
+    }
+
+    #[test]
     fn authenticated_cache_heals_empty_file_left_by_first_append_crash() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay-empty.cache");
