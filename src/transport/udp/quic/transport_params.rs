@@ -496,6 +496,20 @@ mod tests {
     }
 
     #[test]
+    fn read_rejects_gigantic_length_claim() {
+        // A hostile blob whose parameter length field is the largest encodable
+        // varint (2^62 - 1) with no value bytes following. This is
+        // attacker-controlled, pre-authentication input; the checked add makes
+        // it reject as `Truncated` on every target (including 32-bit `usize`,
+        // where `i + len` could otherwise wrap) rather than indexing past the
+        // buffer.
+        let mut blob = Vec::new();
+        varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
+        varint::encode(varint::MAX, &mut blob);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
+    }
+
+    #[test]
     fn read_rejects_varint_param_with_non_varint_body() {
         // A varint-typed parameter whose body is two varints (not exactly one)
         // must be Malformed (read_varint_body requires the body to be one varint).

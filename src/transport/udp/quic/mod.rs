@@ -20,7 +20,13 @@
 pub(crate) mod congestion;
 pub(crate) mod conn;
 pub(crate) mod endpoint;
+// `frame` / `packet` / `transport_params` parse attacker-controlled,
+// pre-authentication datagram bytes; widened to `pub` ONLY under `--cfg fuzzing`
+// so the external fuzz crate can reach them, `pub(crate)` in every normal build.
+#[cfg(not(fuzzing))]
 pub(crate) mod frame;
+#[cfg(fuzzing)]
+pub mod frame;
 /// Per-substream codec derivation for mux-over-QUIC (native QUIC multiplexing of
 /// the multi-stream relay path).
 pub(crate) mod mux;
@@ -32,7 +38,10 @@ mod netsim;
 /// batches the per-datagram send/recv syscalls without changing the wire shape.
 pub(crate) mod offload;
 pub(crate) mod pacer;
+#[cfg(not(fuzzing))]
 pub(crate) mod packet;
+#[cfg(fuzzing)]
+pub mod packet;
 /// Path MTU discovery (DPLPMTUD, RFC 8899): probes the path upward from the 1200-byte
 /// baseline so bulk DATA packetizes to the real MTU instead of a fixed conservative
 /// ceiling. Pure state machine; the connection drives probe emission + ack/loss.
@@ -42,5 +51,8 @@ pub(crate) mod spaces;
 /// Verbatim UDP relay to the camouflage origin (the QUIC analogue of the TCP
 /// REALITY fallback splice). Probe / non-authenticated flows reach the true origin.
 pub(crate) mod splice;
+#[cfg(not(fuzzing))]
 pub(crate) mod transport_params;
+#[cfg(fuzzing)]
+pub mod transport_params;
 pub(crate) mod varint;

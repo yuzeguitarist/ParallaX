@@ -167,9 +167,17 @@ pub fn decode_packet_number(largest_pn: u64, truncated: u64, pn_len: usize) -> u
     let pn_hwin = pn_win / 2;
     let pn_mask = pn_win - 1;
     let candidate = (expected & !pn_mask) | truncated;
-    if candidate + pn_hwin <= expected && candidate < (1u64 << 62) - pn_win {
+    // `candidate + pn_hwin` / `expected + pn_hwin` can overflow `u64` for a
+    // near-`u64::MAX` operand (a debug-build panic; production packet numbers stay
+    // < 2^62 so it is not reached on the live path, but this `pub` fn is called on
+    // every received header before decryption and is exercised directly by fuzzing).
+    // `saturating_add` is exact here: `pn_hwin <= 2^31`, so a saturated result is
+    // strictly greater than any real `expected`/`candidate`, which preserves both
+    // inequalities — and the branch that then adds/subtracts `pn_win` is already
+    // gated by the `< 2^62 - pn_win` / `>= pn_win` bounds, so no result overflows.
+    if candidate.saturating_add(pn_hwin) <= expected && candidate < (1u64 << 62) - pn_win {
         candidate + pn_win
-    } else if candidate > expected + pn_hwin && candidate >= pn_win {
+    } else if candidate > expected.saturating_add(pn_hwin) && candidate >= pn_win {
         candidate - pn_win
     } else {
         candidate
@@ -848,6 +856,37 @@ mod tests {
         // largest 0x105 -> expected 0x106; truncated 0xfe -> candidate 0x1fe is
         // >half a window above expected, so a window is subtracted -> 0xfe.
         assert_eq!(decode_packet_number(0x105, 0xfe, 1), 0xfe);
+    }
+
+    #[test]
+    fn decode_packet_number_does_not_overflow_near_u64_max() {
+        // `decode_packet_number` runs on every received header BEFORE decryption,
+        // so it must be total over its input domain. A `largest_pn` a hair below
+        // `u64::MAX` (so `expected = largest_pn + 1` does NOT wrap to 0) drives
+        // `expected`/`candidate` near `u64::MAX`, where the pre-fix
+        // `candidate + pn_hwin` / `expected + pn_hwin` panicked in debug builds
+        // ("attempt to add with overflow"). The saturating adds keep it total.
+        // Sweep several such values and all four pn lengths.
+        for pn_len in 1..=4usize {
+            let pn_mask = (1u64 << (pn_len * 8)) - 1;
+            for delta in 0..4u64 {
+                let largest_pn = u64::MAX - delta;
+                for truncated in [0u64, 1, pn_mask, pn_mask / 2] {
+                    let got = decode_packet_number(largest_pn, truncated, pn_len);
+                    // Near u64::MAX no window can be added (would overflow past the
+                    // 2^62 bound) and the subtract branch's `candidate >= pn_win`
+                    // with `candidate` a half-window above `expected` cannot hold, so
+                    // the result is always the plain candidate.
+                    let expected = largest_pn.wrapping_add(1);
+                    let candidate = (expected & !pn_mask) | truncated;
+                    assert_eq!(
+                        got, candidate,
+                        "pn_len {pn_len} delta {delta} truncated {truncated:#x}: \
+                         near-u64::MAX decode must return the plain candidate"
+                    );
+                }
+            }
+        }
     }
 
     // The compose test proves the layer ROUND-TRIPS against itself; the three
