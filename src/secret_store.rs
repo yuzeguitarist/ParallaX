@@ -142,6 +142,10 @@ pub fn load_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealErr
         crate::config::ConfigError::Read(io) if io.kind() == std::io::ErrorKind::NotFound => {
             SealError::HostKeyMissing { path: path.clone() }
         }
+        // `InsecureConfigPermissions` only exists on Unix (the 0600/owner check
+        // is Unix-only), so this arm must be cfg-gated too — otherwise the crate
+        // fails to compile on non-Unix targets (E0599: variant not found).
+        #[cfg(unix)]
         crate::config::ConfigError::InsecureConfigPermissions { .. } => {
             SealError::HostKeyPermissions { path: path.clone() }
         }
