@@ -1269,4 +1269,32 @@ mod tests {
         assert!(batch_len > chunk_len);
         assert_eq!(batch_len, crate::protocol::data::RELAY_READ_BUFFER_TARGET);
     }
+
+    // The summary stat helpers are pure; only the odd-length / non-empty path is
+    // exercised by `direction_summary_uses_all_samples` (3 samples). Pin the
+    // even-length median branch and every empty-slice guard directly.
+
+    #[test]
+    fn median_handles_even_odd_and_empty() {
+        // Callers pass pre-sorted slices, so these inputs are sorted.
+        assert!((median(&[]) - 0.0).abs() < f64::EPSILON); // empty guard
+        assert!((median(&[42.0]) - 42.0).abs() < f64::EPSILON); // single
+        assert!((median(&[10.0, 20.0, 30.0]) - 20.0).abs() < f64::EPSILON); // odd
+        assert!((median(&[1.0, 2.0]) - 1.5).abs() < f64::EPSILON); // even branch
+        assert!((median(&[1.0, 2.0, 3.0, 4.0]) - 2.5).abs() < f64::EPSILON); // even branch
+    }
+
+    #[test]
+    fn mean_and_stddev_handle_empty_and_known_values() {
+        // Empty-slice guards return 0.0 (previously uncovered).
+        assert!((mean(&[]) - 0.0).abs() < f64::EPSILON);
+        assert!((stddev(&[], 0.0) - 0.0).abs() < f64::EPSILON);
+        // Known population stats: mean([2,4,6]) = 4; population stddev = sqrt(8/3).
+        let values = [2.0, 4.0, 6.0];
+        let m = mean(&values);
+        assert!((m - 4.0).abs() < f64::EPSILON);
+        assert!((stddev(&values, m) - (8.0_f64 / 3.0).sqrt()).abs() < 1e-12);
+        // A single sample has zero spread.
+        assert!((stddev(&[7.0], mean(&[7.0])) - 0.0).abs() < f64::EPSILON);
+    }
 }

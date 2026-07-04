@@ -666,4 +666,19 @@ mod tests {
         );
         shaper.abort();
     }
+
+    #[test]
+    fn json_escape_encodes_other_control_chars_as_u00xx() {
+        // The `" \ \n \r \t` specials are covered by `json_escape_covers_all_specials`;
+        // every OTHER U+0000..=U+001F control char must fall through to the `\u00XX`
+        // arm (previously uncovered), keeping the emitted diagnostics valid JSON.
+        // Note `\b`/`\f` are NOT special-cased here, so they take the general arm too.
+        assert_eq!(json_escape("\u{0}"), "\\u0000"); // NUL
+        assert_eq!(json_escape("\u{8}"), "\\u0008"); // backspace
+        assert_eq!(json_escape("\u{b}"), "\\u000b"); // vertical tab
+        assert_eq!(json_escape("\u{c}"), "\\u000c"); // form feed
+        assert_eq!(json_escape("\u{1f}"), "\\u001f"); // unit separator
+                                                      // Mixed: plain, a general control char, a special, plain — emitted in order.
+        assert_eq!(json_escape("a\u{1}\tb"), "a\\u0001\\tb");
+    }
 }
