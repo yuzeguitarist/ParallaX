@@ -1217,6 +1217,101 @@ mod tests {
         assert_eq!(err.alert_description(), Some(ALERT_DECODE_ERROR));
     }
 
+    /// Rebuild a real ClientHello body with the extension of type `drop_type`
+    /// removed (fixing up the extensions-vector length), so a specific
+    /// "missing extension" reject branch can be exercised from an otherwise-valid
+    /// ClientHello. The extensions vector is the last body field, so re-splicing
+    /// the prefix + new length + kept extensions reproduces the whole body.
+    fn without_extension(body: &[u8], drop_type: u16) -> Vec<u8> {
+        let sid_len = body[34] as usize;
+        let cs_len_off = 2 + 32 + 1 + sid_len;
+        let cs_len = u16::from_be_bytes([body[cs_len_off], body[cs_len_off + 1]]) as usize;
+        let comp_off = cs_len_off + 2 + cs_len;
+        let comp_len = body[comp_off] as usize;
+        let ext_vec_len_off = comp_off + 1 + comp_len;
+        let ext_total =
+            u16::from_be_bytes([body[ext_vec_len_off], body[ext_vec_len_off + 1]]) as usize;
+        let ext_data_off = ext_vec_len_off + 2;
+        let ext_data = &body[ext_data_off..ext_data_off + ext_total];
+
+        let mut kept = Vec::new();
+        let mut p = 0usize;
+        while p + 4 <= ext_data.len() {
+            let et = u16::from_be_bytes([ext_data[p], ext_data[p + 1]]);
+            let el = u16::from_be_bytes([ext_data[p + 2], ext_data[p + 3]]) as usize;
+            if et != drop_type {
+                kept.extend_from_slice(&ext_data[p..p + 4 + el]);
+            }
+            p += 4 + el;
+        }
+
+        let mut out = Vec::with_capacity(ext_vec_len_off + 2 + kept.len());
+        out.extend_from_slice(&body[..ext_vec_len_off]);
+        out.extend_from_slice(&(kept.len() as u16).to_be_bytes());
+        out.extend_from_slice(&kept);
+        out
+    }
+
+    #[test]
+    fn parser_sanity_without_extension_helper_drops_only_the_target() {
+        // Guard the helper itself: dropping an extension the CH does not carry is a
+        // no-op that still parses, so a later "missing X" assertion can trust that
+        // only the named extension was removed.
+        let body = real_client_hello_body();
+        let unchanged = without_extension(&body, 0xdead);
+        assert!(parse_client_hello(&unchanged).is_ok());
+    }
+
+    #[test]
+    fn parser_rejects_client_hello_without_aes128gcm() {
+        // The server requires TLS_AES_128_GCM_SHA256; a ClientHello whose
+        // cipher_suites list omits it is a handshake failure (RFC 8446 §4.1.2).
+        // Overwrite the (even-length) cipher_suites region with 0x0000 pairs so no
+        // offered suite matches, leaving framing intact.
+        let mut body = real_client_hello_body();
+        let sid_len = body[34] as usize;
+        let cs_len_off = 2 + 32 + 1 + sid_len;
+        let cs_len = u16::from_be_bytes([body[cs_len_off], body[cs_len_off + 1]]) as usize;
+        for b in &mut body[cs_len_off + 2..cs_len_off + 2 + cs_len] {
+            *b = 0;
+        }
+        let Err(err) = parse_client_hello(&body) else {
+            panic!("a ClientHello without TLS_AES_128_GCM_SHA256 must be rejected");
+        };
+        assert_eq!(err.alert_description(), Some(ALERT_HANDSHAKE_FAILURE));
+    }
+
+    #[test]
+    fn parser_rejects_client_hello_without_supported_versions() {
+        // No supported_versions extension => the client never signals TLS 1.3.
+        let body = without_extension(&real_client_hello_body(), EXT_SUPPORTED_VERSIONS);
+        let Err(err) = parse_client_hello(&body) else {
+            panic!("a ClientHello without supported_versions must be rejected");
+        };
+        assert_eq!(err.alert_description(), Some(ALERT_MISSING_EXTENSION));
+    }
+
+    #[test]
+    fn parser_rejects_client_hello_without_key_share() {
+        // supported_versions is kept (TLS 1.3 is offered) but the key_share
+        // extension is dropped, so no X25519MLKEM768 share is present.
+        let body = without_extension(&real_client_hello_body(), EXT_KEY_SHARE);
+        let Err(err) = parse_client_hello(&body) else {
+            panic!("a ClientHello without a key_share must be rejected");
+        };
+        assert_eq!(err.alert_description(), Some(ALERT_MISSING_EXTENSION));
+    }
+
+    #[test]
+    fn parser_rejects_client_hello_without_transport_params() {
+        // TLS 1.3 + key_share are kept; only quic_transport_parameters is dropped.
+        let body = without_extension(&real_client_hello_body(), EXT_QUIC_TRANSPORT_PARAMETERS);
+        let Err(err) = parse_client_hello(&body) else {
+            panic!("a ClientHello without quic_transport_parameters must be rejected");
+        };
+        assert_eq!(err.alert_description(), Some(ALERT_MISSING_EXTENSION));
+    }
+
     #[test]
     fn client_and_server_complete_a_tls_handshake_with_matching_exporter() {
         use crate::tls::quic::{
