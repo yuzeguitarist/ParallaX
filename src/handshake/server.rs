@@ -1541,7 +1541,17 @@ async fn relay_fallback_userspace_loop(
                     // shutdown error never skips the final graceful teardown.
                     let _ = fallback_write.shutdown().await;
                 } else {
-                    fallback_write.write_all(&client_buf[..n]).await?;
+                    // Bound the forward write with the SAME idle timeout (#262):
+                    // this write is awaited INSIDE the selected arm, where the
+                    // pinned `idle_sleep` is not polled, so a zero-window peer
+                    // that never drains its receive buffer would otherwise stall
+                    // `write_all` forever and pin the connection permit. The
+                    // kernel splice path already polls the write fd against this
+                    // idle bound; on elapse, break so the relay tears down.
+                    match timeout(idle_timeout, fallback_write.write_all(&client_buf[..n])).await {
+                        Ok(result) => result?,
+                        Err(_) => break,
+                    }
                     idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                 }
             }
@@ -1551,7 +1561,11 @@ async fn relay_fallback_userspace_loop(
                     fallback_closed = true;
                     let _ = client_write.shutdown().await;
                 } else {
-                    client_write.write_all(&fallback_buf[..n]).await?;
+                    // Same write-side idle bound as the client->fallback arm.
+                    match timeout(idle_timeout, client_write.write_all(&fallback_buf[..n])).await {
+                        Ok(result) => result?,
+                        Err(_) => break,
+                    }
                     idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                 }
             }
@@ -8176,6 +8190,63 @@ mod tests {
         assert_eq!(client_read, 0);
         assert_eq!(origin_task.await.unwrap(), 0);
         relay_task.await.unwrap();
+    }
+
+    /// #262: the userspace fallback relay's forward writes must be bounded by the
+    /// SAME idle timeout as its reads. `write_all` is awaited inside the selected
+    /// `select!` arm, where the pinned idle sleep is not polled, so a zero-window
+    /// peer (accepts but never reads) would stall the write forever, pinning the
+    /// connection permit — an unauthenticated DoS. The kernel splice path already
+    /// polls the write fd against the idle bound; this pins the userspace loop's
+    /// parity. Drives `relay_fallback_userspace_loop` directly because the
+    /// production entry may route to the kernel splice path on Linux.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn fallback_userspace_relay_write_stall_hits_idle_timeout() {
+        // client -> parallax pair: the probe writes an oversized payload.
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(parallax_addr).await.unwrap();
+            // Far exceeds the socket buffers; the task blocks mid-write and keeps
+            // the socket open for the duration of the test.
+            let big = vec![0_u8; 64 * 1024 * 1024];
+            let _ = stream.write_all(&big).await;
+            sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+        let (client_side, _) = parallax_listener.accept().await.unwrap();
+
+        // parallax -> origin pair: the origin accepts and NEVER reads, so its
+        // receive window goes to zero once the buffers fill.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (s, _) = origin_listener.accept().await.unwrap();
+            sleep(Duration::from_secs(30)).await;
+            drop(s);
+        });
+        let fallback = TcpStream::connect(origin_addr).await.unwrap();
+
+        let (mut client_read, mut client_write) = client_side.into_split();
+        let (mut fallback_read, mut fallback_write) = fallback.into_split();
+
+        let result = timeout(
+            Duration::from_secs(5),
+            relay_fallback_userspace_loop(
+                &mut client_read,
+                &mut client_write,
+                &mut fallback_read,
+                &mut fallback_write,
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("a zero-window stall on the forward write must hit the idle timeout, not hang");
+        result.expect("write-side idle timeout is a clean relay exit");
+
+        client.abort();
+        origin.abort();
     }
 
     #[test]
