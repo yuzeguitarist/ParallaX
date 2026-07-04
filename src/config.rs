@@ -1090,6 +1090,114 @@ impl Config {
             .unwrap_or_else(|| Path::new("."));
         server.replay_cache_path = config_dir.join(&server.replay_cache_path);
     }
+
+    /// Preflight the writability of the server's replay-cache directory, for
+    /// `plx check`. The server writes three sibling cache files (the auth cache
+    /// and its `.0rtt` / `.marker` siblings) under `replay_cache_path`'s parent,
+    /// and `create_dir_all`s that parent at startup — so a config whose default
+    /// path (`/var/lib/parallax/...`) is not writable by the checking user fails
+    /// only when the server first runs. This surfaces that footgun at check time.
+    ///
+    /// Call AFTER path resolution (paths are resolved by [`Config::load_for_check`]
+    /// / [`Config::load`]). Returns [`ReplayCacheWritability::NotServer`] for a
+    /// client-mode config. The probe never touches the real cache files: it
+    /// creates and immediately removes a uniquely-named probe file in the nearest
+    /// existing ancestor directory.
+    pub fn replay_cache_writability(&self) -> ReplayCacheWritability {
+        let Some(server) = self.server.as_ref() else {
+            return ReplayCacheWritability::NotServer;
+        };
+        let parent = server
+            .replay_cache_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        probe_dir_writable(parent)
+    }
+}
+
+/// The result of [`Config::replay_cache_writability`]: whether the server's
+/// replay-cache directory can actually be written at check time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayCacheWritability {
+    /// The config is client-mode; the replay cache does not apply.
+    NotServer,
+    /// The replay-cache parent directory exists and is writable.
+    Writable,
+    /// The parent directory does not exist yet, but the nearest existing
+    /// ancestor IS writable — the server can `create_dir_all` it at startup.
+    ParentMissingCreatable {
+        /// The missing replay-cache parent directory.
+        missing: PathBuf,
+    },
+    /// The parent (or, if it is missing, the nearest existing ancestor) is not
+    /// writable by the current user — the server will fail to open the cache.
+    NotWritable {
+        /// The directory whose write access was actually denied (the nearest
+        /// existing ancestor of the intended parent).
+        dir: PathBuf,
+        /// The replay-cache parent directory the server actually needs (equal to
+        /// `dir` when that directory itself exists but is read-only).
+        intended_parent: PathBuf,
+    },
+}
+
+/// Probe whether `dir` (or, if it does not exist, the nearest existing ancestor)
+/// can be written by the current user, by creating and immediately removing a
+/// uniquely-named probe file. Side-effect-free on success or failure.
+fn probe_dir_writable(dir: &Path) -> ReplayCacheWritability {
+    // Walk up to the nearest existing directory. The server `create_dir_all`s the
+    // parent, so a missing parent whose closest existing ancestor is writable is
+    // fine — the create will succeed at startup.
+    let mut existing = dir;
+    let mut missing_parent = false;
+    loop {
+        if existing.is_dir() {
+            break;
+        }
+        missing_parent = true;
+        match existing.parent() {
+            Some(p) if !p.as_os_str().is_empty() => existing = p,
+            // Reached the root (or a relative path with no more components)
+            // without finding an existing directory: treat "." as the base.
+            _ => {
+                existing = Path::new(".");
+                break;
+            }
+        }
+    }
+
+    if !dir_accepts_probe_file(existing) {
+        return ReplayCacheWritability::NotWritable {
+            dir: existing.to_path_buf(),
+            intended_parent: dir.to_path_buf(),
+        };
+    }
+    if missing_parent {
+        ReplayCacheWritability::ParentMissingCreatable {
+            missing: dir.to_path_buf(),
+        }
+    } else {
+        ReplayCacheWritability::Writable
+    }
+}
+
+/// Attempt to create and immediately remove a uniquely-named probe file in `dir`.
+/// Returns `true` iff the create succeeded (the directory is writable). The probe
+/// file name is derived from the process id and never collides with a real cache
+/// file, so it never disturbs live state.
+fn dir_accepts_probe_file(dir: &Path) -> bool {
+    let probe = dir.join(format!(".parallax-check-probe.{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(unix)]
@@ -2466,6 +2574,155 @@ authorized_sni = ["example.com"]
         let cfg = Config::load(&path).unwrap();
         let server = cfg.server.unwrap();
         assert_eq!(server.replay_cache_path, nested.join("state/replay.cache"));
+    }
+
+    #[test]
+    fn probe_dir_writable_reports_writable_for_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_dir_writable(dir.path()),
+            ReplayCacheWritability::Writable
+        );
+        // The probe leaves no artifact behind.
+        let leftovers: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+        assert!(leftovers.is_empty(), "probe file must be removed");
+    }
+
+    #[test]
+    fn probe_dir_writable_reports_creatable_for_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does/not/exist/yet");
+        match probe_dir_writable(&missing) {
+            ReplayCacheWritability::ParentMissingCreatable { missing: m } => {
+                assert_eq!(m, missing);
+            }
+            other => panic!("expected ParentMissingCreatable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_dir_writable_reports_not_writable_for_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // A directory with no write permission for the owner cannot accept the
+        // probe file. Skip when running as root, which bypasses DAC checks.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("readonly");
+        fs::create_dir(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o500)).unwrap();
+
+        match probe_dir_writable(&ro) {
+            ReplayCacheWritability::NotWritable {
+                dir: d,
+                intended_parent,
+            } => {
+                assert_eq!(d, ro);
+                // The dir exists but is read-only, so the intended parent IS it.
+                assert_eq!(intended_parent, ro);
+            }
+            other => panic!("expected NotWritable, got {other:?}"),
+        }
+
+        // Restore write perms so the tempdir cleans up.
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_dir_writable_walks_to_nearest_existing_ancestor_for_readonly() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("readonly");
+        fs::create_dir(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o500)).unwrap();
+
+        // A missing subdirectory under a read-only ancestor: the nearest existing
+        // dir (`ro`) is not writable, so create_dir_all would fail at startup.
+        let under_ro = ro.join("state/replay.cache");
+        let intended = under_ro.parent().unwrap().to_path_buf();
+        match probe_dir_writable(&intended) {
+            ReplayCacheWritability::NotWritable {
+                dir: d,
+                intended_parent,
+            } => {
+                // Denied on the nearest existing ancestor (`ro`)...
+                assert_eq!(d, ro);
+                // ...but the remediation names the directory the server needs.
+                assert_eq!(intended_parent, intended);
+            }
+            other => panic!("expected NotWritable for nearest ancestor, got {other:?}"),
+        }
+
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn replay_cache_writability_is_not_server_for_client_config() {
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let cfg = toml::from_str::<Config>(&format!(
+            r#"
+mode = "client"
+
+[crypto]
+psk = "{STRONG_PSK}"
+
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "{KEY}"
+server_identity_public_key = "{server_identity_public_key}"
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.replay_cache_writability(),
+            ReplayCacheWritability::NotServer
+        );
+    }
+
+    #[test]
+    fn replay_cache_writability_reports_writable_for_resolved_server_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("conf");
+        fs::create_dir(&nested).unwrap();
+        let path = nested.join("server.toml");
+        let identity_secret_key = STANDARD.encode(vec![0_u8; mldsa::secret_key_bytes()]);
+        // A relative replay_cache_path resolves under the (writable) config dir.
+        let raw = format!(
+            r#"
+mode = "server"
+
+[crypto]
+psk = "{STRONG_PSK}"
+
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+replay_cache_path = "replay.cache"
+authorized_sni = ["example.com"]
+"#
+        );
+        fs::write(&path, raw).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.replay_cache_writability(),
+            ReplayCacheWritability::Writable
+        );
     }
 
     #[test]
