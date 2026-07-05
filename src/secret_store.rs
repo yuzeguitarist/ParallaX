@@ -298,9 +298,28 @@ fn open_entry(
 }
 
 /// Read a sealed bundle from disk (the bundle itself is ciphertext, so it does
-/// not require restrictive permissions).
+/// not require restrictive permissions). The final path component is opened with
+/// `O_NOFOLLOW` on Unix — matching the project's secret-file discipline
+/// (`config::read_secret_config_file`, `replay::read_cache_file`) so a planted
+/// symlink cannot redirect the read; a swapped bundle already fails AEAD/parse,
+/// but the read path should not be the one place that follows symlinks.
 pub fn read_bundle(path: &Path) -> Result<SealedBundle, SealError> {
+    #[cfg(unix)]
+    let text = {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(SealError::Io)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(SealError::Io)?;
+        text
+    };
+    #[cfg(not(unix))]
     let text = fs::read_to_string(path).map_err(SealError::Io)?;
+
     let bundle: SealedBundle = toml::from_str(&text).map_err(|_| SealError::BundleMalformed)?;
     if bundle.version != BUNDLE_VERSION {
         return Err(SealError::BundleMalformed);

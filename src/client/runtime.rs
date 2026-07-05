@@ -78,10 +78,28 @@ const MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE: usize =
 /// HANDSHAKE_TIMEOUT so a stalling/impersonating upstream cannot pin an
 /// establishing task (and its permit/fds) indefinitely.
 const CLIENT_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(15);
-/// Idle backstop for an established client relay/mux session: if neither
-/// direction moves real bytes for this long, tear the session down so a silent
-/// (e.g. MITM-held) upstream cannot pin a global connection slot and both fds.
+/// Idle backstop FLOOR for an established client relay/mux session: if neither
+/// direction moves real bytes for this long (plus jitter), tear the session down
+/// so a silent (e.g. MITM-held) upstream cannot pin a global connection slot and
+/// both fds. Use [`client_relay_idle_timeout`] (floor + jitter) at close-timing
+/// sites, never the bare floor — see below.
 const CLIENT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Upward jitter over the idle floor. The client, like the server's fallback
+/// idle band, must not originate its idle close at a fixed round ~600.000s: that
+/// deterministic instant is a synthetic signature no real browser keep-alive
+/// produces, observable by a single long-lived silent probe. Drawing the actual
+/// timeout uniformly in `[600s, 660s]` per session (real thread RNG, independent
+/// across sessions) removes that fixed-close tell. Mirrors the server's
+/// `FALLBACK_IDLE_TIMEOUT_JITTER`.
+const CLIENT_RELAY_IDLE_JITTER: Duration = Duration::from_secs(60);
+
+/// Per-session idle backstop drawn uniformly in `[floor, floor + jitter]`, so the
+/// client-originated idle close carries no fixed-timing tell.
+fn client_relay_idle_timeout() -> Duration {
+    use rand::Rng;
+    let jitter_ms = rand::thread_rng().gen_range(0..=CLIENT_RELAY_IDLE_JITTER.as_millis() as u64);
+    CLIENT_RELAY_IDLE_TIMEOUT + Duration::from_millis(jitter_ms)
+}
 /// Bound on the local SOCKS5 negotiation. A loopback client that opens the
 /// socket then stalls (or trickles bytes one at a time) would otherwise park the
 /// connection task forever, holding a connection slot — and on the non-mux path
@@ -1166,7 +1184,7 @@ impl ClientMuxPool {
                 open_from_server,
                 register_rx,
                 session_cid,
-                CLIENT_RELAY_IDLE_TIMEOUT,
+                client_relay_idle_timeout(),
             )
             .await
             {
@@ -1459,7 +1477,7 @@ async fn client_mux_quic_substream(
     let relay = async { tokio::try_join!(upload, download) };
     let outcome = tokio::select! {
         joined = relay => Some(joined),
-        _ = client_relay_idle_watchdog(activity, CLIENT_RELAY_IDLE_TIMEOUT) => {
+        _ = client_relay_idle_watchdog(activity, client_relay_idle_timeout()) => {
             tracing::debug!(cid, stream_id, "client mux-over-QUIC substream idle backstop reached");
             None
         }
@@ -2716,7 +2734,7 @@ impl ClientRelay {
             let relay = async { tokio::try_join!(upload, download) };
             let relay_outcome = tokio::select! {
                 joined = relay => Some(joined),
-                _ = client_relay_idle_watchdog(activity, CLIENT_RELAY_IDLE_TIMEOUT) => {
+                _ = client_relay_idle_watchdog(activity, client_relay_idle_timeout()) => {
                     tracing::debug!(
                         cid,
                         "client QUIC fast-plane relay idle backstop reached; tearing down"
@@ -2786,7 +2804,7 @@ impl ClientRelay {
                     tokio::try_join!(upload, download)
                         .map(|(_seal_to_server, _open_from_server)| ())
                 } => result,
-                _ = client_relay_idle_watchdog(activity, CLIENT_RELAY_IDLE_TIMEOUT) => {
+                _ = client_relay_idle_watchdog(activity, client_relay_idle_timeout()) => {
                     tracing::debug!(cid, "client relay idle backstop reached; tearing down");
                     Ok(())
                 }

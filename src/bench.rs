@@ -494,7 +494,7 @@ fn bench_mlkem_decapsulate(options: BenchmarkOptions) -> Result<BenchmarkCase> {
         options,
         || {
             let shared = pq::decapsulate(&enc.ciphertext, &keys.secret)?;
-            if shared != enc.shared_secret {
+            if shared != *enc.shared_secret {
                 bail!("ML-KEM decapsulation produced an unexpected shared secret");
             }
             Ok(black_box(shared.len() as u64))

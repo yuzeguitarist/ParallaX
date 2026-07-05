@@ -450,8 +450,11 @@ pub struct ClientConfig {
     /// [`crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE`]. Operators in a
     /// region whose real Safari population is dominated by another locale can set
     /// their plausible value here so the fleet is not a single fixed `en-US`
-    /// cross-connection invariant. Both the H2 and H3 planes use the same value,
-    /// so they never diverge.
+    /// cross-connection invariant. The H2 business request (always-on TCP plane)
+    /// and the H3 business substreams both use this value, so they never diverge.
+    /// (The QUIC *establishment probe* request keeps the default en-US — it is
+    /// shared with the standalone `plx probe` origin check, which mimics a generic
+    /// fresh Safari; the QUIC fast plane is experimental / off by default.)
     #[serde(default)]
     pub accept_language: Option<String>,
 }
@@ -1422,9 +1425,12 @@ pub fn decode_key32_secret(
     if decoded.len() != 32 {
         return Err(ConfigError::InvalidKeyLen { field });
     }
-    let mut out = [0_u8; 32];
+    // Build directly into the `Zeroizing` so there is no separate un-scrubbed
+    // `[u8; 32]` stack copy of the (X25519 static private) key left behind by a
+    // `Zeroizing::new(out)` move of a `Copy` array.
+    let mut out = Zeroizing::new([0_u8; 32]);
     out.copy_from_slice(&decoded);
-    Ok(Zeroizing::new(out))
+    Ok(out)
 }
 
 pub fn decode_base64_bytes(field: &'static str, value: &str) -> Result<Vec<u8>, ConfigError> {
