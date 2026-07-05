@@ -32,19 +32,36 @@ const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
 /// target wire size into an `extra_pad` plaintext-suffix length.
 const DATA_RECORD_WIRE_OVERHEAD: usize = 2 + 16;
 
-/// Quantized wire-size bands the CONNECT record is padded up to (C3). The raw
+/// Wire-size band CENTERS the CONNECT record is padded toward (C3). The raw
 /// CONNECT record length is `CONNECT_FIXED_LEN + host_len + initial_payload_len`
 /// plus overhead, which directly leaks the target host length and the captured
 /// 0-RTT payload size — a small, variable, self-custom control record unlike any
-/// browser request. We snap the record to ONE randomly chosen band so the
-/// observable size carries no host_len signal, is never a tiny control packet,
-/// and is never a single fixed peak. Every band is a measured Safari-26 H2 record
-/// size — a subset of `traffic::OBSERVED_PACKET_TARGETS`, the same provenance as
-/// `PQ_FLIGHT_RECORD_TARGETS` — spread across the realistic CONNECT range so the
-/// random choice dominates the size. The largest band stays under the measured max
-/// (1500) / a typical MSS, so a shaped CONNECT never exceeds a browser-plausible
-/// record size.
+/// browser request. We snap the record onto one of these centers — chosen with a
+/// right-skewed weight, NOT uniformly — and add a small upward jitter of up to
+/// [`SHAPED_RECORD_SIZE_JITTER`] bytes (`band_shaping_pad`). So the observable size
+/// carries no host_len signal, is never a tiny control packet, and — the point of
+/// the jitter/weighting — is NOT confined to a handful of exact byte-lengths with
+/// uniform mass. A uniform comb of exact sizes is itself a cross-connection
+/// classifier signal; a real browser's request-size histogram is continuous and
+/// right-skewed, which the weighted center + jitter approximates. Every center is a
+/// measured Safari-26 H2 record size — a subset of `traffic::OBSERVED_PACKET_TARGETS`,
+/// the same provenance as `PQ_FLIGHT_RECORD_TARGETS` — spread across the realistic
+/// CONNECT range so the choice dominates the size. The largest center plus the
+/// jitter ceiling stays under the measured max (1500) / a typical MSS, so a shaped
+/// CONNECT never exceeds a browser-plausible record size.
 const CONNECT_RECORD_SIZE_BANDS: [usize; 8] = [286, 339, 469, 519, 569, 713, 735, 1353];
+
+/// Max jitter (bytes) the record-size shapers spread around a chosen band/target
+/// center: `band_shaping_pad` adds it UPWARD from a CONNECT band center,
+/// `pick_target_size` subtracts it DOWNWARD from a PQ-flight target center. This
+/// is what de-quantizes the shaper — without it the observable sizes collapse onto
+/// the handful of exact band/target byte-lengths with (near-)uniform mass, which
+/// is itself a cross-connection classifier signal. Kept small so adjacent sizes
+/// stay browser-plausible and so the largest CONNECT center (1353) + this jitter
+/// stays under the measured max (1500) / a typical MSS. Mirrors the data plane:
+/// `traffic::sample_padding_len` likewise perturbs its observed targets with a
+/// bucketed random span rather than emitting exact target sizes.
+const SHAPED_RECORD_SIZE_JITTER: usize = 96;
 
 /// Per-chunk plaintext size bounds for [`FramedChunk::encode_all_shaped`]
 /// splitting of the PQ handshake records. A fresh size in this range is drawn
@@ -66,7 +83,10 @@ pub const PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT: usize = 1024;
 /// PQ key exchange. The values are the measured Safari small/medium H2 record sizes
 /// (every one is a member of `traffic::OBSERVED_PACKET_TARGETS`, the same
 /// provenance), duplicated here only so the protocol layer carries no dependency on
-/// the traffic module.
+/// the traffic module. They are record-size CENTERS: `pick_target_size` draws one
+/// with a right-skewed weight and subtracts a small downward jitter, so the
+/// flight's records spread around these centers instead of landing on this dozen of
+/// exact byte-lengths with uniform mass (a uniform-comb tell across connections).
 const PQ_FLIGHT_RECORD_TARGETS: [usize; 12] = [
     144, 191, 286, 339, 469, 519, 569, 713, 735, 1353, 1440, 1459,
 ];
@@ -477,19 +497,20 @@ impl ConnectRequest {
     }
 
     /// Extra plaintext-suffix padding (C3) to snap this CONNECT record's on-wire
-    /// size onto one randomly chosen [`CONNECT_RECORD_SIZE_BANDS`] band, so the
-    /// observable record length leaks neither the target host length nor the
+    /// size toward one of the [`CONNECT_RECORD_SIZE_BANDS`] centers (plus jitter),
+    /// so the observable record length leaks neither the target host length nor the
     /// captured 0-RTT payload size.
     ///
-    /// A band is chosen UNIFORMLY AT RANDOM among those large enough to hold this
-    /// record, then the pad fills the gap. Choosing among all fitting bands (not
-    /// "the next band up") is what severs the size→payload correlation: for the
-    /// common case (raw size below the smallest band) the result is one of the
-    /// full band set regardless of host_len, so two different targets produce the
-    /// same size distribution. `max_extra_pad` caps the pad so the padded record
-    /// still fits one outer TLS record; if even the natural size already exceeds
-    /// the largest band (only reachable with a near-maximal captured 0-RTT
-    /// payload) no band fits and we add no extra pad — a rare tail, and that
+    /// A center is chosen with a right-skewed weight among those large enough to
+    /// hold this record, then the pad fills the gap plus a small upward jitter (see
+    /// [`band_shaping_pad`]). Choosing among all fitting centers (not "the next band
+    /// up") is what severs the size→payload correlation: for the common case (raw
+    /// size below the smallest center) the result is drawn from the full center set
+    /// regardless of host_len, so two different targets produce the same size
+    /// distribution. `max_extra_pad` caps the pad (jitter included) so the padded
+    /// record still fits one outer TLS record; if even the natural size already
+    /// exceeds the largest center (only reachable with a near-maximal captured 0-RTT
+    /// payload) no center fits and we add no extra pad — a rare tail, and that
     /// record's size is dominated by the large payload, not by host_len.
     pub fn shaping_extra_pad<R>(&self, max_extra_pad: usize, rng: &mut R) -> usize
     where
@@ -602,31 +623,51 @@ impl ConnectRequestRef<'_> {
     }
 }
 
-/// Whether a record's on-wire TLS payload length is one of the C3/C4/C6 shaping
-/// bands. Diagnostic/test helper so the shaping invariant can be checked from
-/// other modules without exposing the band table. Named for its CONNECT origin
-/// (C3); the in-band control frames (C4/C6) snap onto the SAME band set.
+/// Whether a record's on-wire TLS payload length is a plausible C3/C4/C6 shaped
+/// size: within the `[center, center + SHAPED_RECORD_SIZE_JITTER]` window of one of
+/// the shaping band centers. Diagnostic/test helper so the shaping invariant can be
+/// checked from other modules without exposing the band table. Named for its
+/// CONNECT origin (C3); the in-band control frames (C4/C6) snap onto the SAME band
+/// set. The window (not exact-membership) accepts the upward jitter
+/// `band_shaping_pad` adds, so it recognizes every size the shaper can emit while
+/// still rejecting sizes below the smallest center or in the gaps between windows.
 pub fn connect_record_size_is_shaped(wire_payload_len: usize) -> bool {
-    CONNECT_RECORD_SIZE_BANDS.contains(&wire_payload_len)
+    CONNECT_RECORD_SIZE_BANDS
+        .iter()
+        .any(|&center| (center..=center + SHAPED_RECORD_SIZE_JITTER).contains(&wire_payload_len))
 }
 
 /// Core of the C3/C4/C6 record-size shaping: given a record's raw plaintext
-/// `encoded_len`, return the EXACT extra padding-suffix length that snaps its
-/// on-wire TLS payload length onto one randomly chosen [`CONNECT_RECORD_SIZE_BANDS`]
-/// band. The raw on-wire size is `encoded_len + DATA_RECORD_WIRE_OVERHEAD` (the
-/// 2-byte self-pad trailer + AEAD tag a sealed record adds); a band is chosen
-/// UNIFORMLY AT RANDOM among those large enough to hold the record and reachable
-/// within `max_extra_pad`, then the pad fills the gap. Choosing among ALL fitting
-/// bands (not "the next band up") is what removes any size→content correlation.
-/// Returns 0 when no band fits within `max_extra_pad` (only reachable when the raw
-/// size already exceeds the largest band) — the caller then emits the record
-/// unshaped. The pad rides the seal layer's self-describing 2-byte trailer, so it
-/// is fully decode-transparent.
+/// `encoded_len`, return the extra padding-suffix length that pads its on-wire TLS
+/// payload length toward one of the [`CONNECT_RECORD_SIZE_BANDS`] centers, plus a
+/// small upward jitter. The raw on-wire size is `encoded_len +
+/// DATA_RECORD_WIRE_OVERHEAD` (the 2-byte self-pad trailer + AEAD tag a sealed
+/// record adds).
+///
+/// A center is chosen among those large enough to hold the record and reachable
+/// within `max_extra_pad` with a RIGHT-SKEWED weight ([`skewed_pick`], more mass on
+/// the smaller centers) rather than uniformly, and then a [`bucketed_jitter`]
+/// offset is added on top. This de-quantizes the shaper: the observable size is
+/// spread over `[center, center + jitter]` with skewed mass, approximating a real
+/// browser's continuous request-size histogram, instead of collapsing onto a
+/// handful of exact band byte-lengths with uniform mass (a uniform comb is itself a
+/// cross-connection classifier signal). Choosing among ALL fitting centers (not
+/// "the next band up") still severs any size→content correlation.
+///
+/// The jitter is bounded by the record's remaining pad budget so the padded wire
+/// never exceeds `raw_wire + max_extra_pad` (hence never the caller's record
+/// limit), and by [`SHAPED_RECORD_SIZE_JITTER`] so the top center stays under a
+/// browser-plausible record size. Returns 0 when no center fits within
+/// `max_extra_pad` (only reachable when the raw size already exceeds the largest
+/// center) — the caller then emits the record unshaped. The pad rides the seal
+/// layer's self-describing 2-byte trailer, so it is fully decode-transparent.
 fn band_shaping_pad<R>(encoded_len: usize, max_extra_pad: usize, rng: &mut R) -> usize
 where
     R: rand::Rng + ?Sized,
 {
     let raw_wire = encoded_len + DATA_RECORD_WIRE_OVERHEAD;
+    // Fitting centers, kept ascending (the table is ascending) so `skewed_pick`
+    // biases toward the smaller ones.
     let candidates: Vec<usize> = CONNECT_RECORD_SIZE_BANDS
         .iter()
         .copied()
@@ -635,8 +676,48 @@ where
     if candidates.is_empty() {
         return 0;
     }
-    let band = candidates[rng.gen_range(0..candidates.len())];
-    band - raw_wire
+    let center = skewed_pick(&candidates, rng);
+    // The base pad snaps the record onto the center; `base <= max_extra_pad` holds
+    // by the filter above.
+    let base = center - raw_wire;
+    // Jitter UP from the center, bounded by the remaining budget to this record's
+    // cap (so `base + jitter <= max_extra_pad`) and by the jitter ceiling. Computed
+    // as `max_extra_pad - base` to avoid overflow when `max_extra_pad == usize::MAX`.
+    let budget = max_extra_pad - base;
+    let jitter = bucketed_jitter(rng, budget.min(SHAPED_RECORD_SIZE_JITTER));
+    base + jitter
+}
+
+/// Pick a value from `sorted_ascending` (non-empty) with a right-skewed weight —
+/// more probability mass on the smaller entries — matching the shape of a real
+/// record-size histogram rather than the flat mass of `slice[gen_range(..)]`.
+/// Taking the minimum of two independent uniform indices yields a simple
+/// triangular bias toward index 0 without float weights.
+fn skewed_pick<R: rand::Rng + ?Sized>(sorted_ascending: &[usize], rng: &mut R) -> usize {
+    let n = sorted_ascending.len();
+    let i = rng.gen_range(0..n).min(rng.gen_range(0..n));
+    sorted_ascending[i]
+}
+
+/// A small non-negative jitter in `[0, cap]`, concentrated near zero via the same
+/// 70/22/8 bucketed-span structure the data-plane sampler
+/// (`traffic::sample_padding_len`) uses, so the shaped-size distribution around
+/// each center has the continuous, skewed shape of the measured data plane instead
+/// of a flat spread. `cap` is already bounded by [`SHAPED_RECORD_SIZE_JITTER`] at
+/// the call sites.
+fn bucketed_jitter<R: rand::Rng + ?Sized>(rng: &mut R, cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let bucket = rng.gen_range(0..100);
+    let span = if bucket < 70 {
+        cap.min(32)
+    } else if bucket < 92 {
+        cap.min(64)
+    } else {
+        cap
+    };
+    rng.gen_range(0..=span)
 }
 
 /// Extra padding-suffix length that snaps a fixed-length in-band control frame
@@ -1195,10 +1276,19 @@ fn browser_shaped_sizes<R: rand::Rng + ?Sized>(
     sizes
 }
 
-/// Draw a record size from [`PQ_FLIGHT_RECORD_TARGETS`] that is `<= hi` (so the
-/// constrained tail invariant holds). Falls back to `hi` clamped up to
-/// `PQ_FLIGHT_RECORD_MIN` when no target fits — only reachable when `hi` is below the
-/// smallest target, i.e. the penultimate record of a short tail.
+/// Draw a record size around a [`PQ_FLIGHT_RECORD_TARGETS`] center that is `<= hi`
+/// (so the constrained tail invariant holds). A center is chosen among the targets
+/// `<= hi` with a right-skewed weight ([`skewed_pick`]), then a [`bucketed_jitter`]
+/// offset is subtracted DOWNWARD. Downward jitter keeps the draw `<= center <= hi`
+/// (preserving the `>= PQ_FLIGHT_RECORD_MIN` tail guard in `browser_shaped_sizes`)
+/// and, clamped so the offset never drops below `PQ_FLIGHT_RECORD_MIN`, keeps every
+/// record `>= MIN` (no tiny tell record). The jitter de-quantizes the flight: its
+/// records spread around the target centers instead of landing on the dozen exact
+/// target byte-lengths with uniform mass (a uniform comb across connections).
+///
+/// Falls back to `hi` clamped up to `PQ_FLIGHT_RECORD_MIN` when no target fits —
+/// only reachable when `hi` is below the smallest target, i.e. the penultimate
+/// record of a short tail.
 fn pick_target_size<R: rand::Rng + ?Sized>(rng: &mut R, hi: usize) -> usize {
     let choices: Vec<usize> = PQ_FLIGHT_RECORD_TARGETS
         .iter()
@@ -1208,7 +1298,12 @@ fn pick_target_size<R: rand::Rng + ?Sized>(rng: &mut R, hi: usize) -> usize {
     if choices.is_empty() {
         return hi.max(PQ_FLIGHT_RECORD_MIN);
     }
-    choices[rng.gen_range(0..choices.len())]
+    let center = skewed_pick(&choices, rng);
+    let jitter = bucketed_jitter(
+        rng,
+        (center - PQ_FLIGHT_RECORD_MIN).min(SHAPED_RECORD_SIZE_JITTER),
+    );
+    center - jitter
 }
 
 /// Stateful reassembler for a [`FramedChunk`] sequence. Mirrors the in-order,
@@ -2134,11 +2229,16 @@ mod tests {
                     let len = decoded.bytes.len();
                     assert!(len >= PQ_FLIGHT_RECORD_MIN, "tiny tell record: {len}");
                     assert!(len <= max_target, "record over max target: {len}");
-                    // Every non-final record is exactly one of the browser targets.
+                    // Every non-final record sits within a downward jitter window of
+                    // one of the browser target centers (de-quantized: no longer
+                    // pinned to the exact target byte-lengths, but still anchored to
+                    // the measured distribution rather than an arbitrary size).
                     if idx + 1 < chunks.len() {
                         assert!(
-                            PQ_FLIGHT_RECORD_TARGETS.contains(&len),
-                            "non-final record {len} not a browser target"
+                            PQ_FLIGHT_RECORD_TARGETS
+                                .iter()
+                                .any(|&t| len <= t && t - len <= SHAPED_RECORD_SIZE_JITTER),
+                            "non-final record {len} not within jitter of any browser target"
                         );
                     }
                     sizes_seen.insert(len);
@@ -2155,6 +2255,113 @@ mod tests {
                 sizes_seen.len()
             );
         }
+    }
+
+    #[test]
+    fn shaped_sizes_are_dequantized_not_a_uniform_comb() {
+        // The core anti-detection property of this change: neither the CONNECT band
+        // shaper nor the PQ-flight shaper may confine observable sizes to the handful
+        // of exact center byte-lengths with (near-)uniform mass. Each must (a) spread
+        // sizes across many distinct values via jitter, (b) put MOST mass off the
+        // exact centers (a comb would put ALL mass on them), and (c) weight the
+        // center choice with a right skew (smaller centers strictly more likely than
+        // the largest) — while staying in-bounds. A regression that drops the jitter
+        // (uniform comb) or the weighting (flat mass) turns this RED.
+        use rand::{rngs::StdRng, SeedableRng};
+        use std::collections::BTreeSet;
+
+        // --- CONNECT band shaper -------------------------------------------------
+        // Tiny request below every center, generous cap: the full center set and the
+        // full jitter range are reachable.
+        let request = ConnectRequest {
+            host: "a.io".to_owned(),
+            port: 443,
+            initial_payload: Vec::new(),
+        };
+        let raw_wire = request.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
+        let mut wires = BTreeSet::new();
+        let mut off_center = 0usize;
+        let mut smallest_center_hits = 0usize;
+        let mut largest_center_hits = 0usize;
+        let smallest_center = *CONNECT_RECORD_SIZE_BANDS.iter().min().unwrap();
+        let largest_center = *CONNECT_RECORD_SIZE_BANDS.iter().max().unwrap();
+        let n = 4000u64;
+        for seed in 0..n {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let pad = request.shaping_extra_pad(16_000, &mut rng);
+            let wire = raw_wire + pad;
+            assert!(
+                connect_record_size_is_shaped(wire),
+                "CONNECT wire {wire} out of shaped bounds"
+            );
+            wires.insert(wire);
+            if !CONNECT_RECORD_SIZE_BANDS.contains(&wire) {
+                off_center += 1;
+            }
+            let center = CONNECT_RECORD_SIZE_BANDS
+                .iter()
+                .copied()
+                .filter(|&c| c <= wire)
+                .max()
+                .unwrap();
+            if center == smallest_center {
+                smallest_center_hits += 1;
+            }
+            if center == largest_center {
+                largest_center_hits += 1;
+            }
+        }
+        assert!(
+            wires.len() > 4 * CONNECT_RECORD_SIZE_BANDS.len(),
+            "CONNECT sizes not spread by jitter: {} distinct (>{} centers)",
+            wires.len(),
+            CONNECT_RECORD_SIZE_BANDS.len()
+        );
+        assert!(
+            off_center as u64 > n / 2,
+            "CONNECT: most mass must sit OFF the exact centers (comb tell); off={off_center}/{n}"
+        );
+        assert!(
+            smallest_center_hits > largest_center_hits,
+            "CONNECT center choice must be right-skewed: smallest {smallest_center_hits} \
+             must beat largest {largest_center_hits}"
+        );
+
+        // --- PQ-flight shaper ----------------------------------------------------
+        // Collect the NON-FINAL record sizes (the ones drawn from the target centers)
+        // across seeds; the final record carries the remainder and is not a draw.
+        let payload = vec![0x5a_u8; 6243];
+        let max_target = *PQ_FLIGHT_RECORD_TARGETS.iter().max().unwrap();
+        let mut sizes = BTreeSet::new();
+        let mut off_target = 0usize;
+        let mut total = 0usize;
+        for seed in 0..600u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let chunks =
+                FramedChunk::encode_all_browser_shaped(&payload, usize::MAX, &mut rng).unwrap();
+            for chunk in &chunks[..chunks.len() - 1] {
+                let len = FramedChunk::decode_ref(chunk).unwrap().bytes.len();
+                assert!(
+                    (PQ_FLIGHT_RECORD_MIN..=max_target).contains(&len),
+                    "PQ non-final record {len} out of [{PQ_FLIGHT_RECORD_MIN}, {max_target}]"
+                );
+                sizes.insert(len);
+                if !PQ_FLIGHT_RECORD_TARGETS.contains(&len) {
+                    off_target += 1;
+                }
+                total += 1;
+            }
+        }
+        assert!(
+            sizes.len() > 2 * PQ_FLIGHT_RECORD_TARGETS.len(),
+            "PQ sizes not spread by jitter: {} distinct (>{} targets)",
+            sizes.len(),
+            PQ_FLIGHT_RECORD_TARGETS.len()
+        );
+        assert!(
+            off_target as f64 > total as f64 * 0.5,
+            "PQ: most mass must sit OFF the exact targets (comb tell); off={off_target}/{total}"
+        );
     }
 
     #[test]
@@ -2546,11 +2753,11 @@ mod tests {
     #[test]
     fn shaping_extra_pad_respects_a_tight_max_extra_pad() {
         // The fitting filter requires `band - raw_wire <= max_extra_pad`. With a
-        // small request and a TIGHT cap, only the bands within reach of that cap may
-        // be chosen, and the returned pad must never exceed it. This pins the
-        // subtraction: `-` -> `+` shrinks the reachable set to just the smallest
-        // band, and `-` -> `/` makes (almost) every band "fit" — both change the
-        // reachable band set away from the exact expected pair below.
+        // small request and a TIGHT cap, only the centers within reach of that cap
+        // may be chosen, the returned pad must NEVER exceed it (even with jitter),
+        // and every padded wire must still be a recognized shaped size. This pins
+        // the subtraction (`-` -> `+`/`/` would change the reachable center set) and
+        // the jitter budget clamp (an unclamped jitter would push pad past the cap).
         use rand::{rngs::StdRng, SeedableRng};
         use std::collections::BTreeSet;
 
@@ -2562,20 +2769,21 @@ mod tests {
         let raw_wire = request.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
         let max_extra_pad = 500usize;
 
-        // Correct fitting set: bands with band >= raw_wire and band - raw_wire <= 500.
+        // Fitting centers: bands with band >= raw_wire and band - raw_wire <= 500.
         // raw_wire = 41 -> {286, 339, 469, 519} (569-41=528 > 500 is excluded).
-        let expected: BTreeSet<usize> = CONNECT_RECORD_SIZE_BANDS
+        let expected_centers: BTreeSet<usize> = CONNECT_RECORD_SIZE_BANDS
             .iter()
             .copied()
             .filter(|&b| b >= raw_wire && b - raw_wire <= max_extra_pad)
             .collect();
         assert_eq!(
-            expected,
+            expected_centers,
             BTreeSet::from([286usize, 339usize, 469usize, 519usize]),
-            "fixture sanity: tight cap should admit exactly these four bands"
+            "fixture sanity: tight cap should admit exactly these four centers"
         );
 
-        let mut reached = BTreeSet::new();
+        let mut reached_centers = BTreeSet::new();
+        let mut wires = BTreeSet::new();
         for seed in 0..512u64 {
             let mut rng = StdRng::seed_from_u64(seed);
             let pad = request.shaping_extra_pad(max_extra_pad, &mut rng);
@@ -2585,14 +2793,30 @@ mod tests {
             );
             let wire = raw_wire + pad;
             assert!(
-                CONNECT_RECORD_SIZE_BANDS.contains(&wire),
-                "padded wire {wire} must still land on a band"
+                connect_record_size_is_shaped(wire),
+                "padded wire {wire} must still be a recognized shaped size"
             );
-            reached.insert(wire);
+            // Map the jittered wire back to the center it was padded toward: the
+            // largest fitting center that is <= wire.
+            let center = expected_centers
+                .iter()
+                .copied()
+                .rfind(|&c| c <= wire)
+                .expect("a jittered wire is always >= some fitting center");
+            reached_centers.insert(center);
+            wires.insert(wire);
         }
         assert_eq!(
-            reached, expected,
-            "with a tight cap the reachable band set must be exactly the fitting bands"
+            reached_centers, expected_centers,
+            "with a tight cap the reachable center set must be exactly the fitting centers"
+        );
+        // De-quantized: the jitter must spread the wire off the exact centers, so
+        // there are strictly more distinct wire sizes than centers.
+        assert!(
+            wires.len() > expected_centers.len(),
+            "jitter must spread wire sizes beyond the {} centers; saw {}",
+            expected_centers.len(),
+            wires.len()
         );
     }
 
@@ -2786,21 +3010,23 @@ mod tests {
             assert_eq!(pad, 0, "zero budget must not pad; seed={seed}");
         }
 
-        // Sanity: with room, the same tiny frame DOES pad onto a band (so the two
-        // triggers above are the fallback, not a dead primitive).
+        // Sanity: with room, the same tiny frame DOES pad onto a shaped size (so the
+        // two triggers above are the fallback, not a dead primitive).
         let mut rng = StdRng::seed_from_u64(0);
         let pad = control_frame_shaping_pad(8, usize::MAX, &mut rng);
         assert!(
-            CONNECT_RECORD_SIZE_BANDS.contains(&(8 + DATA_RECORD_WIRE_OVERHEAD + pad)),
-            "with budget the frame must land on a band; pad={pad}"
+            connect_record_size_is_shaped(8 + DATA_RECORD_WIRE_OVERHEAD + pad),
+            "with budget the frame must land on a shaped size; pad={pad}"
         );
     }
 
     #[test]
     fn shaping_extra_pad_lands_on_a_band() {
-        // The padded wire size (raw plaintext + overhead + extra_pad) must equal
-        // one of the configured bands, for many seeds and several request sizes.
+        // The padded wire size (raw plaintext + overhead + extra_pad) must be a
+        // recognized shaped size (within a jitter window of a band center), for many
+        // seeds and several request sizes, and must never exceed the caller's cap.
         use rand::{rngs::StdRng, SeedableRng};
+        let max_extra_pad = 16_000usize;
         for payload_len in [0_usize, 17, 300, 700] {
             let request = ConnectRequest {
                 host: "example.com".to_owned(),
@@ -2810,11 +3036,15 @@ mod tests {
             let raw_wire = request.encoded_len() + DATA_RECORD_WIRE_OVERHEAD;
             for seed in 0..64 {
                 let mut rng = StdRng::seed_from_u64(seed);
-                let pad = request.shaping_extra_pad(16_000, &mut rng);
+                let pad = request.shaping_extra_pad(max_extra_pad, &mut rng);
+                assert!(
+                    pad <= max_extra_pad,
+                    "pad {pad} exceeds cap {max_extra_pad}"
+                );
                 let wire = raw_wire + pad;
                 assert!(
-                    CONNECT_RECORD_SIZE_BANDS.contains(&wire),
-                    "wire {wire} (raw {raw_wire} + pad {pad}) not on a band"
+                    connect_record_size_is_shaped(wire),
+                    "wire {wire} (raw {raw_wire} + pad {pad}) not a shaped size"
                 );
             }
         }
@@ -2829,7 +3059,7 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng};
         use std::collections::BTreeSet;
 
-        let bands_for = |host: &str| -> BTreeSet<usize> {
+        let wires_for = |host: &str| -> BTreeSet<usize> {
             let request = ConnectRequest {
                 host: host.to_owned(),
                 port: 443,
@@ -2844,12 +3074,25 @@ mod tests {
                 .collect()
         };
 
-        let short = bands_for("a.io");
-        let long = bands_for(&"x".repeat(200));
-        // Both short and long hosts are below the smallest band, so every band is
-        // reachable for both — identical sets, zero host_len leak.
+        let short = wires_for("a.io");
+        let long = wires_for(&"x".repeat(200));
+        // Both short and long hosts are below the smallest band center, so for a
+        // given seed the chosen center and jitter (hence the on-wire size) are
+        // identical regardless of host_len — the reachable wire-size SETS are equal,
+        // zero host_len leak. (The pad differs to absorb the host_len difference,
+        // but the observable wire size does not.)
         assert_eq!(short, long);
-        assert_eq!(short, CONNECT_RECORD_SIZE_BANDS.iter().copied().collect());
+        // Every reachable size is a recognized shaped size...
+        assert!(short
+            .iter()
+            .all(|&wire| connect_record_size_is_shaped(wire)));
+        // ...and de-quantization means many more distinct sizes than the 8 centers.
+        assert!(
+            short.len() > CONNECT_RECORD_SIZE_BANDS.len(),
+            "jitter must spread wire sizes beyond the {} centers; saw {}",
+            CONNECT_RECORD_SIZE_BANDS.len(),
+            short.len()
+        );
     }
 
     #[test]
