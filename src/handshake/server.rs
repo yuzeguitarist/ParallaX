@@ -3169,26 +3169,33 @@ fn is_ipv6_6to4(ip: Ipv6Addr) -> bool {
     ip.segments()[0] == 0x2002
 }
 
-/// NAT64 embedding prefixes that carry an IPv4 destination in their low 32 bits
-/// and would otherwise tunnel to an arbitrary IPv4 host without passing through
-/// the IPv4 egress policy:
+/// NAT64 embedding prefixes that carry an IPv4 destination and would otherwise
+/// tunnel to an arbitrary IPv4 host without passing through the IPv4 egress
+/// policy:
 ///
 ///   * RFC 6052 well-known prefix `64:ff9b::/96`, and
 ///   * RFC 8215 local-use prefix `64:ff9b:1::/48`.
 ///
-/// For an address in EITHER prefix, the embedded low-32-bit IPv4 is extracted and
-/// re-screened through [`is_denied_outbound_ipv4`], so a NAT64-embedded
-/// private/metadata address (e.g. `64:ff9b::10.0.0.1`) is denied while a
-/// legitimate public NAT64 target (e.g. `64:ff9b::8.8.8.8`) is ALLOWED rather than
-/// the whole prefix being wholesale-denied. This screens the ultimate IPv4
-/// destination the NAT64 tunnel would reach — closing the SSRF gap for the RFC
-/// 8215 prefix, which was not embedding-screened before.
+/// For an address in EITHER prefix, the embedded IPv4 is extracted with the
+/// per-prefix-length layout of RFC 6052 §2.2 and re-screened through
+/// [`is_denied_outbound_ipv4`], so a NAT64-embedded private/metadata address
+/// (e.g. `64:ff9b::10.0.0.1`) is denied while a legitimate public NAT64 target
+/// (e.g. `64:ff9b::8.8.8.8`) is ALLOWED rather than the whole prefix being
+/// wholesale-denied. This screens the ultimate IPv4 destination the NAT64
+/// tunnel would reach — closing the SSRF gap for the RFC 8215 prefix, which
+/// was not embedding-screened before.
 ///
-/// The low-32-bit extraction is the deliberate, uniform rule for both prefixes
-/// (the RFC 6052 §2.2 per-prefix-length embedding with its reserved u-byte is not
-/// modelled): it is fail-safe here because the interesting private/metadata IPv4
-/// ranges that MUST stay denied all sit in the low 32 bits under these prefixes,
-/// and a `0.0.0.0` low word (octets[0]==0) is itself denied.
+/// Extraction layouts (RFC 6052 §2.2):
+///
+///   * `/96`: the IPv4 sits in bits 96..127 (the low 32 bits).
+///   * `/48`: the IPv4 sits in bits 48..63 (high two octets) and 72..87 (low
+///     two octets), skipping the reserved `u` octet at bits 64..71.
+///
+/// The per-prefix layout matters both ways: reading the low 32 bits for a /48
+/// address would screen suffix bits instead of the real destination (an
+/// attacker parks a public-looking decoy in the suffix while the translator
+/// connects to a private embedded target), and it would deny a legitimate /48
+/// public target whose zero suffix extracts as `0.0.0.0`.
 fn is_ipv6_nat64(ip: Ipv6Addr) -> bool {
     let segments = ip.segments();
     let in_well_known_96 = segments[0] == 0x0064
@@ -3198,15 +3205,23 @@ fn is_ipv6_nat64(ip: Ipv6Addr) -> bool {
         && segments[4] == 0
         && segments[5] == 0;
     let in_rfc8215_48 = segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001;
-    if !(in_well_known_96 || in_rfc8215_48) {
+    let embedded = if in_well_known_96 {
+        Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            (segments[6] & 0xff) as u8,
+            (segments[7] >> 8) as u8,
+            (segments[7] & 0xff) as u8,
+        )
+    } else if in_rfc8215_48 {
+        Ipv4Addr::new(
+            (segments[3] >> 8) as u8,
+            (segments[3] & 0xff) as u8,
+            (segments[4] & 0xff) as u8,
+            (segments[5] >> 8) as u8,
+        )
+    } else {
         return false;
-    }
-    let embedded = Ipv4Addr::new(
-        (segments[6] >> 8) as u8,
-        (segments[6] & 0xff) as u8,
-        (segments[7] >> 8) as u8,
-        (segments[7] & 0xff) as u8,
-    );
+    };
     is_denied_outbound_ipv4(embedded)
 }
 
@@ -9448,17 +9463,19 @@ mod tests {
     #[test]
     fn nat64_embedded_ipv4_is_rescreened_for_both_prefixes() {
         // NAT64 (RFC 6052 `64:ff9b::/96` and RFC 8215 `64:ff9b:1::/48`) embeds an
-        // IPv4 destination in its low 32 bits. The egress screen must extract that
-        // embedded v4 and re-apply the IPv4 policy, so a NAT64 tunnel cannot be used
-        // to reach a private/metadata host (SSRF) while a NAT64 tunnel to a genuine
-        // public v4 stays usable (not wholesale-denied).
+        // IPv4 destination at a prefix-length-dependent position (RFC 6052 §2.2).
+        // The egress screen must extract that embedded v4 with the correct layout
+        // and re-apply the IPv4 policy, so a NAT64 tunnel cannot be used to reach
+        // a private/metadata host (SSRF) while a NAT64 tunnel to a genuine public
+        // v4 stays usable (not wholesale-denied).
         //
-        // helper: build a NAT64 address for a given prefix and embedded v4 octets.
-        let nat64 = |prefix2: u16, o: [u8; 4]| {
+        // helpers: build a NAT64 address embedding v4 octets `o` per RFC 6052 §2.2.
+        // /96: v4 in bits 96..127 (the low 32 bits).
+        let nat64_96 = |o: [u8; 4]| {
             IpAddr::V6(Ipv6Addr::new(
                 0x0064,
                 0xff9b,
-                prefix2,
+                0,
                 0,
                 0,
                 0,
@@ -9466,20 +9483,39 @@ mod tests {
                 u16::from(o[2]) << 8 | u16::from(o[3]),
             ))
         };
+        // /48: v4 in bits 48..63 and 72..87, u octet (zero) at bits 64..71,
+        // arbitrary suffix from bit 88.
+        let nat64_48 = |o: [u8; 4], suffix: [u16; 3]| {
+            IpAddr::V6(Ipv6Addr::new(
+                0x0064,
+                0xff9b,
+                0x0001,
+                u16::from(o[0]) << 8 | u16::from(o[1]),
+                u16::from(o[2]),
+                u16::from(o[3]) << 8 | (suffix[0] & 0xff),
+                suffix[1],
+                suffix[2],
+            ))
+        };
 
-        // Embedded PRIVATE / special v4 must be DENIED under BOTH prefixes.
-        for prefix2 in [0x0000u16 /* /96 */, 0x0001u16 /* /48 */] {
-            for (o, why) in [
-                ([10, 0, 0, 1], "RFC1918 10/8"),
-                ([192, 168, 1, 1], "RFC1918 192.168/16"),
-                ([127, 0, 0, 1], "loopback"),
-                ([169, 254, 169, 254], "link-local cloud metadata"),
-                ([0, 0, 0, 0], "unspecified / octets[0]==0"),
-            ] {
-                let addr = nat64(prefix2, o);
+        let private_v4 = [
+            ([10, 0, 0, 1], "RFC1918 10/8"),
+            ([192, 168, 1, 1], "RFC1918 192.168/16"),
+            ([127, 0, 0, 1], "loopback"),
+            ([169, 254, 169, 254], "link-local cloud metadata"),
+            ([0, 0, 0, 0], "unspecified / octets[0]==0"),
+        ];
+        let public_v4 = [[8, 8, 8, 8], [1, 1, 1, 1], [93, 184, 216, 34]];
+
+        // Embedded PRIVATE / special v4 must be DENIED under BOTH prefixes. For
+        // /48 the suffix carries a public-looking decoy (`8.8.8.8` in the low 32
+        // bits): a low-32-bit extraction would read the decoy and let the
+        // translator reach the private embedded target.
+        for (o, why) in private_v4 {
+            for addr in [nat64_96(o), nat64_48(o, [0, 0x0808, 0x0808])] {
                 assert!(
                     is_denied_outbound_ip(addr),
-                    "NAT64 (prefix2={prefix2:#x}) embedding {o:?} ({why}) must be denied"
+                    "NAT64 {addr} embedding {o:?} ({why}) must be denied"
                 );
                 if let IpAddr::V6(v6) = addr {
                     assert!(
@@ -9492,13 +9528,14 @@ mod tests {
 
         // Embedded PUBLIC v4 must be ALLOWED under BOTH prefixes (not wholesale-
         // denied): this is the behaviour change from "deny the whole 64:ff9b:*
-        // space" to "screen the embedded destination".
-        for prefix2 in [0x0000u16, 0x0001u16] {
-            for o in [[8, 8, 8, 8], [1, 1, 1, 1], [93, 184, 216, 34]] {
-                let addr = nat64(prefix2, o);
+        // space" to "screen the embedded destination". The /48 case uses a ZERO
+        // suffix: a low-32-bit extraction would read `0.0.0.0` and wrongly deny a
+        // legitimate public NAT64 target (the RFC 8215 overblocking bug).
+        for o in public_v4 {
+            for addr in [nat64_96(o), nat64_48(o, [0, 0, 0])] {
                 assert!(
                     !is_denied_outbound_ip(addr),
-                    "NAT64 (prefix2={prefix2:#x}) embedding public {o:?} must be allowed"
+                    "NAT64 {addr} embedding public {o:?} must be allowed"
                 );
                 if let IpAddr::V6(v6) = addr {
                     assert!(
@@ -9508,6 +9545,13 @@ mod tests {
                 }
             }
         }
+
+        // Segment-boundary pin for the /48 layout: 192.168.1.1 embeds as
+        // 64:ff9b:1:c0a8:1:100:: (segments[3]=0xc0a8, u|o2=0x0001, o3|suffix=0x0100),
+        // straddling three hextets. Any off-by-one-octet extraction misreads it.
+        assert!(is_ipv6_nat64(Ipv6Addr::new(
+            0x0064, 0xff9b, 0x0001, 0xc0a8, 0x0001, 0x0100, 0, 0
+        )));
 
         // An address that merely shares the first hextet but is neither prefix
         // (e.g. `64:ff9c::` / `64:ff9b:2::`) must NOT be treated as NAT64.
