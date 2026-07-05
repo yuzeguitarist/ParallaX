@@ -39,6 +39,13 @@ pub enum ConfigError {
         field: &'static str,
         source: base64::DecodeError,
     },
+    #[error("invalid base64 in {field}: {detail} (value redacted)")]
+    InvalidBase64Secret {
+        field: &'static str,
+        /// Position-only description built by [`invalid_base64_secret`]; never
+        /// contains bytes of the malformed secret.
+        detail: String,
+    },
     #[error("{field} must decode to exactly 32 bytes")]
     InvalidKeyLen { field: &'static str },
     #[error("{field} must be valid base64")]
@@ -1354,13 +1361,29 @@ impl TrafficConfig {
     }
 }
 
+/// Build a VALUE-FREE base64 error for a SECRET field. `base64::DecodeError`'s
+/// `Display` (and `Debug`) echo the offending input byte (e.g. "Invalid symbol
+/// 45, offset 3."), which for a malformed secret puts a fragment of the secret
+/// on stderr/logs — the exact channel [`toml_error`] strictly redacts. Keep only
+/// the error kind and position; non-secret fields (public keys) may keep the
+/// full [`ConfigError::InvalidBase64`] detail.
+fn invalid_base64_secret(field: &'static str, source: &base64::DecodeError) -> ConfigError {
+    use base64::DecodeError;
+    let detail = match source {
+        DecodeError::InvalidByte(offset, _) => format!("invalid symbol at offset {offset}"),
+        DecodeError::InvalidLength(len) => format!("invalid length {len}"),
+        DecodeError::InvalidLastSymbol(offset, _) => {
+            format!("invalid last symbol at offset {offset}")
+        }
+        DecodeError::InvalidPadding => "invalid padding".to_owned(),
+    };
+    ConfigError::InvalidBase64Secret { field, detail }
+}
+
 pub fn decode_psk(value: &str) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
     let decoded = STANDARD
         .decode(value)
-        .map_err(|source| ConfigError::InvalidBase64 {
-            field: "crypto.psk",
-            source,
-        })?;
+        .map_err(|source| invalid_base64_secret("crypto.psk", &source))?;
     if decoded.len() < 32 {
         return Err(ConfigError::WeakPsk);
     }
@@ -1420,7 +1443,7 @@ pub fn decode_key32_secret(
     let decoded = Zeroizing::new(
         STANDARD
             .decode(value)
-            .map_err(|source| ConfigError::InvalidBase64 { field, source })?,
+            .map_err(|source| invalid_base64_secret(field, &source))?,
     );
     if decoded.len() != 32 {
         return Err(ConfigError::InvalidKeyLen { field });
@@ -2504,7 +2527,7 @@ authorized_sni = ["example.com"]
         let err = decode_key32_secret("server.private_key", "***not-base64***").unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::InvalidBase64 {
+            ConfigError::InvalidBase64Secret {
                 field: "server.private_key",
                 ..
             }
@@ -2519,6 +2542,34 @@ authorized_sni = ["example.com"]
 
         let key = decode_key32_secret("server.private_key", KEY).unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn secret_field_base64_errors_are_value_free() {
+        // `base64::DecodeError`'s Display/Debug echo the offending input byte
+        // ("Invalid symbol 33, offset 4."); for a SECRET field the error must be
+        // position-only so no fragment of the secret reaches stderr/logs.
+        let bad_secret = "AAAA!AAAAsecretsecretsecretsecret";
+        for err in [
+            decode_psk(bad_secret).unwrap_err(),
+            decode_key32_secret("server.private_key", bad_secret).unwrap_err(),
+        ] {
+            assert!(matches!(err, ConfigError::InvalidBase64Secret { .. }));
+            let rendered = err.to_string();
+            let debugged = format!("{err:?}");
+            for text in [&rendered, &debugged] {
+                assert!(
+                    !text.contains('!') && !text.contains("33"),
+                    "secret base64 error must not echo the offending byte: {text:?}"
+                );
+                assert!(
+                    !text.contains("secret") && !text.contains("AAAA"),
+                    "secret base64 error must not echo the input: {text:?}"
+                );
+            }
+            // Position info is retained so the operator can still find the typo.
+            assert!(rendered.contains("offset 4"), "{rendered:?}");
+        }
     }
 
     #[test]
