@@ -281,6 +281,17 @@ impl Polyveck {
         }
     }
 
+    /// In-place `self[i] = a * self[i]` pointwise in NTT domain (with the `2^-32`
+    /// factor), for each of the `K` elements. Mirrors the C
+    /// `polyveck_pointwise_poly_montgomery(&t1, &cp, &t1)` aliasing dest=src2, so
+    /// no whole-`Polyveck` Copy temporary is spilled just to satisfy the borrow
+    /// checker.
+    pub fn pointwise_poly_montgomery_assign(&mut self, a: &Poly) {
+        for i in 0..K {
+            self.vec[i].pointwise_montgomery_assign(a);
+        }
+    }
+
     /// `polyveck_chknorm`: returns `true` (C `1`) iff some polynomial has a
     /// centered coefficient with absolute value `>= bound`. Assumes the vector was
     /// `reduce`d first.

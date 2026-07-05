@@ -333,8 +333,11 @@ pub fn verify_ctx(
     cp.ntt();
     t1.shiftl();
     t1.ntt();
-    let cp_poly = cp;
-    t1.pointwise_poly_montgomery(&cp_poly, &{ t1 });
+    // `t1 = cp * t1` in place rather than `t1.pointwise_poly_montgomery(&cp, &{ t1 })`,
+    // whose `&{ t1 }` block copies the whole `Polyveck` only to satisfy the borrow
+    // checker. This mirrors the C `polyveck_pointwise_poly_montgomery(&t1, &cp, &t1)`
+    // dest=src2 aliasing exactly and is byte-for-byte equivalent.
+    t1.pointwise_poly_montgomery_assign(&cp);
 
     // `w1 -= t1` in place rather than `w1.sub(&{ w1 }, &t1)`, whose `&{ w1 }` block
     // copies the whole `Polyveck` only to satisfy the borrow checker. `sub_assign`
