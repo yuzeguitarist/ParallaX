@@ -1168,9 +1168,14 @@ impl Tls13Keys {
         transcript: &HandshakeTranscript,
     ) -> Result<Self, Safari26TlsError> {
         let zeros = vec![0_u8; suite.hash_len()];
+        // `early_secret`/first `derived` are the PSK-less public HKDF(0,0) constant
+        // and its derivative (not secret), but `handshake_secret` and the second
+        // `derived` (below) ARE secret intermediates the stored keys flow from, so
+        // scrub them on drop like the stored fields — the freed heap must not retain
+        // camouflage key material (core dump / swap / heap disclosure).
         let early_secret = suite.hkdf_extract(&zeros, &zeros);
         let derived = suite.derive_secret(&early_secret, "derived", &[])?;
-        let handshake_secret = suite.hkdf_extract(&derived, shared_secret);
+        let handshake_secret = Zeroizing::new(suite.hkdf_extract(&derived, shared_secret));
         let client_handshake_secret = Zeroizing::new(suite.derive_secret(
             &handshake_secret,
             "c hs traffic",
@@ -1181,7 +1186,7 @@ impl Tls13Keys {
             "s hs traffic",
             transcript.bytes(),
         )?);
-        let derived = suite.derive_secret(&handshake_secret, "derived", &[])?;
+        let derived = Zeroizing::new(suite.derive_secret(&handshake_secret, "derived", &[])?);
         let master_secret = Zeroizing::new(suite.hkdf_extract(&derived, &zeros));
         Ok(Self {
             suite,
@@ -1200,12 +1205,16 @@ impl Tls13Keys {
         &mut self,
         transcript: &HandshakeTranscript,
     ) -> Result<(), Safari26TlsError> {
-        let client_application_secret =
-            self.suite
-                .derive_secret(&self.master_secret, "c ap traffic", transcript.bytes())?;
-        let server_application_secret =
-            self.suite
-                .derive_secret(&self.master_secret, "s ap traffic", transcript.bytes())?;
+        let client_application_secret = Zeroizing::new(self.suite.derive_secret(
+            &self.master_secret,
+            "c ap traffic",
+            transcript.bytes(),
+        )?);
+        let server_application_secret = Zeroizing::new(self.suite.derive_secret(
+            &self.master_secret,
+            "s ap traffic",
+            transcript.bytes(),
+        )?);
         self.client_application = RecordCipher::new(self.suite, &client_application_secret)?;
         self.server_application = RecordCipher::new(self.suite, &server_application_secret)?;
         Ok(())

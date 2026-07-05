@@ -242,10 +242,10 @@ impl ClientHandshake {
         let mut random = [0_u8; 32];
         match &config.marker {
             Some(m) => {
-                let ss = crate::crypto::session::x25519_shared_secret(
+                let ss = zeroize::Zeroizing::new(crate::crypto::session::x25519_shared_secret(
                     &x25519.private,
                     &m.server_static_public,
-                );
+                ));
                 let mut nonce = [0_u8; 12];
                 OsRng.fill_bytes(&mut nonce);
                 let now = std::time::SystemTime::now()

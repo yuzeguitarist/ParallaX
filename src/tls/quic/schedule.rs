@@ -82,9 +82,13 @@ impl KeySchedule {
         // all-zero PSK; a resumed (0-RTT / PSK) handshake feeds the ticket-derived
         // PSK so both ends chain the handshake + master secrets from the same early
         // secret.
-        let early_secret = suite.hkdf_extract(&zeros, psk.unwrap_or(&zeros));
+        // Wrap the early/derived intermediates too (the module invariant is "all
+        // intermediate secrets are Zeroizing"): for a resumed handshake `early_secret`
+        // is PSK-derived and anchors the binder/0-RTT keys, and `derived` is the salt
+        // from which the whole schedule flows — neither may linger in freed heap.
+        let early_secret = Zeroizing::new(suite.hkdf_extract(&zeros, psk.unwrap_or(&zeros)));
         let empty_hash = suite.digest(&[]);
-        let derived = suite.derive_secret(&early_secret, "derived", &empty_hash)?;
+        let derived = Zeroizing::new(suite.derive_secret(&early_secret, "derived", &empty_hash)?);
         let handshake_secret = Zeroizing::new(suite.hkdf_extract(&derived, shared_secret));
         let client_hs_secret = Zeroizing::new(suite.derive_secret(
             &handshake_secret,
@@ -156,9 +160,14 @@ impl KeySchedule {
     ) -> Result<Keys, QuicTlsError> {
         let zeros = vec![0_u8; self.suite.hash_len()];
         let empty_hash = self.suite.digest(&[]);
-        let derived = self
-            .suite
-            .derive_secret(&self.handshake_secret, "derived", &empty_hash)?;
+        // `derived` is master-secret-equivalent (master = HKDF-Extract(derived, 0)),
+        // so scrub it like every other schedule secret rather than leaving the plain
+        // heap Vec resident after drop.
+        let derived = Zeroizing::new(self.suite.derive_secret(
+            &self.handshake_secret,
+            "derived",
+            &empty_hash,
+        )?);
         let master_secret = Zeroizing::new(self.suite.hkdf_extract(&derived, &zeros));
         let client_app = Zeroizing::new(self.suite.derive_secret(
             &master_secret,

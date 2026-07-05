@@ -804,7 +804,10 @@ impl ServerHandshake {
             if share.len() >= 32 {
                 client_x25519.copy_from_slice(&share[share.len() - 32..]);
             }
-            let ss = crate::crypto::session::x25519_shared_secret(static_priv, &client_x25519);
+            let ss = zeroize::Zeroizing::new(crate::crypto::session::x25519_shared_secret(
+                static_priv,
+                &client_x25519,
+            ));
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
