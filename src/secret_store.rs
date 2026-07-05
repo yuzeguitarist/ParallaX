@@ -166,6 +166,9 @@ pub fn load_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealErr
     // `[u8; 32]` is Copy, so the move into `Zeroizing` above left a plaintext copy
     // of the host key on the stack; wipe it explicitly.
     key.zeroize();
+    // The host key is the single value that unlocks every sealed secret; keep it
+    // out of swap and core dumps while resident, like the PSK/identity keys.
+    crate::process_hardening::protect_secret_bytes("secret_store.host_key", out.as_slice());
     Ok(out)
 }
 
@@ -184,6 +187,9 @@ pub fn create_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealE
 
     let mut key = Zeroizing::new([0_u8; 32]);
     OsRng.fill_bytes(key.as_mut_slice());
+    // Same rationale as in `load_host_key`: never let the freshly minted host
+    // key hit swap or a core dump.
+    crate::process_hardening::protect_secret_bytes("secret_store.host_key", key.as_slice());
     let encoded = Zeroizing::new(STANDARD.encode(key.as_slice()));
 
     write_owner_only(&path, encoded.as_bytes())?;
@@ -213,6 +219,9 @@ fn derive_kek(host_key: &[u8; 32], salt: &[u8], field: &str) -> Zeroizing<[u8; 3
     let mut okm = Zeroizing::new([0_u8; 32]);
     hkdf.expand(&info, okm.as_mut_slice())
         .expect("HKDF-SHA256 expand of 32 bytes never fails");
+    // The KEK decrypts a long-lived secret; exclude it from swap/core dumps for
+    // its short lifetime (best-effort, page-granular — see process_hardening).
+    crate::process_hardening::protect_secret_bytes("secret_store.kek", okm.as_slice());
     okm
 }
 
@@ -376,6 +385,10 @@ pub fn open_sealed_reference(
             field: field.to_owned(),
         })?;
     let host_key = load_host_key(over)?;
+    // `load_host_key` protected its own buffer, but returning the Copy array
+    // moved the key to this frame and page protection does not follow a move;
+    // protect the copy that stays resident while entries decrypt.
+    crate::process_hardening::protect_secret_bytes("secret_store.host_key", host_key.as_slice());
     let aad = entry_aad(bundle.version, &bundle.id, field);
     open_entry(&host_key, field, &aad, entry)
 }

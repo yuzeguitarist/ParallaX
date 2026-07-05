@@ -442,6 +442,9 @@ fn seal_config(
         }
         Err(err) => return Err(err.into()),
     };
+    // The load/create above protected their own buffers, but returning the Copy
+    // array moved the key here; protect the copy resident for the whole seal.
+    process_hardening::protect_secret_bytes("cli.seal.host_key", host_key_bytes.as_slice());
 
     let config_dir = config
         .parent()
