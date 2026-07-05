@@ -118,6 +118,46 @@ max_len = 4096
 timeout = 20
 paths = ["src/transport/udp/quic/transport_params.rs"]
 
+# Hand-written QUIC-TLS 1.3 client pre-auth parsers (src/tls/quic/handshake.rs):
+# the ServerHello / EncryptedExtensions / Certificate / CertificateVerify walk and
+# the RFC 8879 compressed-certificate zlib path, all reached BEFORE cert verify.
+# QUIC-plane twins of tls_server_hello / tls_compressed_cert.
+
+[targets.quic_server_hello]
+sanitizer = "address"
+rss = 1024
+max_len = 4096
+timeout = 20
+paths = ["src/tls/quic/**"]
+
+[targets.quic_encrypted_extensions]
+sanitizer = "address"
+rss = 1024
+max_len = 4096
+timeout = 20
+paths = ["src/tls/quic/**"]
+
+[targets.quic_certificate]
+sanitizer = "address"
+rss = 1024
+max_len = 65536
+timeout = 20
+paths = ["src/tls/quic/**"]
+
+[targets.quic_certificate_verify]
+sanitizer = "address"
+rss = 1024
+max_len = 4096
+timeout = 20
+paths = ["src/tls/quic/**"]
+
+[targets.quic_compressed_cert]
+sanitizer = "address"
+rss = 2048
+max_len = 4194304
+timeout = 25
+paths = ["src/tls/quic/**"]
+
 # --- box-b group: sanitizer = none + `-C overflow-checks=on` (codecs/arith) ----
 
 [targets.mux_frame]
