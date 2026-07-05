@@ -93,6 +93,23 @@ const MAX_CHANGE_CIPHER_SPEC_RECORDS: usize = 2;
 /// vector a malicious cover origin could otherwise force via one length field.
 const MAX_ENCRYPTED_HANDSHAKE_MESSAGE: usize = 512 * 1024;
 
+/// Upper bound on the number of records read while assembling the encrypted
+/// server flight. A keyed peer (the cover origin, or a MITM holding the handshake
+/// keys) could otherwise trickle AEAD-valid records that each decrypt to a
+/// 0/1-byte fragment, keeping `flight.finished == false` forever without ever
+/// growing the buffer. A real TLS 1.3 flight is a handful of records even when a
+/// ~256 KiB cert chain is fragmented into 16 KiB records, so this leaves ample
+/// headroom while bounding the per-flight loop. Defense-in-depth: the outer
+/// `CLIENT_ESTABLISH_TIMEOUT` already bounds wall-clock time.
+const MAX_SERVER_FLIGHT_RECORDS: usize = 256;
+
+/// Upper bound on total decrypted handshake bytes accumulated across the server
+/// flight. Bounds the "grow forever with small-but-nonzero fragments" variant of
+/// the same trickle: the whole legitimate flight (EncryptedExtensions,
+/// Certificate up to `MAX_ENCRYPTED_HANDSHAKE_MESSAGE`, CertificateVerify,
+/// Finished) fits within one max-size message plus framing for the small ones.
+const MAX_SERVER_FLIGHT_DECRYPTED_BYTES: usize = MAX_ENCRYPTED_HANDSHAKE_MESSAGE + 64 * 1024;
+
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
@@ -446,8 +463,20 @@ impl Safari26TlsSession {
         let mut flight = ServerFlight::default();
         let mut handshake_buf = Vec::new();
         let mut ccs_records = 0_usize;
+        let mut records_read = 0_usize;
+        let mut total_decrypted = 0_usize;
 
         while !flight.finished {
+            // Bound the loop before each read: a keyed peer trickling records that
+            // each decrypt to a tiny fragment could otherwise keep `finished`
+            // false indefinitely. Mirror the CCS/message-length caps and fail
+            // closed on exceed (defense-in-depth atop CLIENT_ESTABLISH_TIMEOUT).
+            if records_read >= MAX_SERVER_FLIGHT_RECORDS {
+                return Err(Safari26TlsError::Handshake(
+                    "server flight exceeded maximum record count".to_owned(),
+                ));
+            }
+            records_read += 1;
             let record = read_record(stream).await?;
             self.tap_records(RecordDirection::Inbound, &record);
             let header = parse_header(&record)
@@ -476,6 +505,12 @@ impl Safari26TlsSession {
                         }
                         return Err(Safari26TlsError::Handshake(
                             "expected encrypted handshake record".to_owned(),
+                        ));
+                    }
+                    total_decrypted = total_decrypted.saturating_add(decrypted.plaintext.len());
+                    if total_decrypted > MAX_SERVER_FLIGHT_DECRYPTED_BYTES {
+                        return Err(Safari26TlsError::Handshake(
+                            "server flight exceeded maximum decrypted size".to_owned(),
                         ));
                     }
                     handshake_buf.extend_from_slice(&decrypted.plaintext);
@@ -2111,6 +2146,49 @@ mod tests {
         assert_eq!(
             second[0], TLS_RECORD_APPLICATION_DATA,
             "the Finished must be an encrypted application-data record, after the CCS"
+        );
+    }
+
+    /// A keyed peer that trickles AEAD-valid records, each decrypting to a 0-byte
+    /// handshake fragment, must not stall `read_encrypted_server_flight` forever:
+    /// `flight.finished` never flips, so the per-flight record cap has to make the
+    /// loop fail closed. `peer_keys` and `session_keys` are the two
+    /// independently-seq'd sets derived from identical inputs (see `app_keys`), so
+    /// each side's server-handshake cipher stays in lockstep across the records.
+    #[tokio::test]
+    async fn read_encrypted_server_flight_bounds_zero_byte_record_trickle() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+        let mut transcript = HandshakeTranscript::new();
+
+        // Exactly MAX_SERVER_FLIGHT_RECORDS empty-plaintext handshake records: the
+        // loop consumes all of them (each is AEAD-valid and decrypts to 0 bytes, so
+        // `flight.finished` stays false and the buffer never grows) and then trips
+        // the record cap on the next iteration without reading further.
+        let mut wire = Vec::new();
+        for _ in 0..MAX_SERVER_FLIGHT_RECORDS {
+            let record = peer_keys
+                .server_handshake
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &[])
+                .unwrap();
+            wire.extend_from_slice(&record);
+        }
+        peer.write_all(&wire).await.unwrap();
+        drop(peer);
+
+        let result = timeout(
+            Duration::from_secs(5),
+            session.read_encrypted_server_flight(&mut stream, &mut session_keys, &mut transcript),
+        )
+        .await
+        .expect("the record cap must fire without blocking on a further read");
+        // Match on the borrowed Result so the (never-taken) Ok(ServerFlight) arm
+        // does not require ServerFlight: Debug.
+        assert!(
+            matches!(&result, Err(Safari26TlsError::Handshake(m)) if m.contains("maximum record count")),
+            "expected the per-flight record-count bound",
         );
     }
 
