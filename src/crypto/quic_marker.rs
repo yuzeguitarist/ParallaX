@@ -122,10 +122,13 @@ pub fn seal(
     nonce: &[u8; NONCE_LEN],
 ) -> [u8; MARKER_LEN] {
     let (keystream, auth_key) = derive(psk, ecdh_ss);
-    let tag = compute_tag(&auth_key, sni, dcid, nonce, now_unix);
+    // The tag and the pre-mask carrier are keystream-protected material: scrub the
+    // stack copies on return (drop-time-only; the masked `out` is the public wire
+    // bytes and is intentionally returned as-is).
+    let tag = Zeroizing::new(compute_tag(&auth_key, sni, dcid, nonce, now_unix));
 
-    let mut plain = [0_u8; MARKER_LEN];
-    plain[..TAG_LEN].copy_from_slice(&tag);
+    let mut plain = Zeroizing::new([0_u8; MARKER_LEN]);
+    plain[..TAG_LEN].copy_from_slice(tag.as_ref());
     plain[TAG_LEN..TAG_LEN + NONCE_LEN].copy_from_slice(nonce);
     plain[TAG_LEN + NONCE_LEN..].copy_from_slice(&now_unix.to_be_bytes());
 
@@ -155,14 +158,18 @@ pub fn open(
 ) -> Option<Marker> {
     let (keystream, auth_key) = derive(psk, ecdh_ss);
 
-    let mut plain = [0_u8; MARKER_LEN];
+    // The de-masked carrier and the (received/expected) tags are keystream/MAC
+    // material: scrub the stack copies on return (drop-time-only). The recovered
+    // `nonce`/`timestamp` are NOT scrubbed — they are the freshness material this
+    // function exists to return (in `Marker`) for the caller's replay cache.
+    let mut plain = Zeroizing::new([0_u8; MARKER_LEN]);
     for (pl, (c, k)) in plain
         .iter_mut()
         .zip(client_random.iter().zip(keystream.iter()))
     {
         *pl = c ^ k;
     }
-    let mut tag = [0_u8; TAG_LEN];
+    let mut tag = Zeroizing::new([0_u8; TAG_LEN]);
     tag.copy_from_slice(&plain[..TAG_LEN]);
     let mut nonce = [0_u8; NONCE_LEN];
     nonce.copy_from_slice(&plain[TAG_LEN..TAG_LEN + NONCE_LEN]);
@@ -170,8 +177,8 @@ pub fn open(
     ts_bytes.copy_from_slice(&plain[TAG_LEN + NONCE_LEN..]);
     let timestamp = u64::from_be_bytes(ts_bytes);
 
-    let expected = compute_tag(&auth_key, sni, dcid, &nonce, timestamp);
-    let tag_ok = bool::from(tag.ct_eq(&expected));
+    let expected = Zeroizing::new(compute_tag(&auth_key, sni, dcid, &nonce, timestamp));
+    let tag_ok = bool::from(tag.ct_eq(expected.as_ref()));
 
     // Freshness: not older than the window, not more than the skew into the future.
     let fresh = timestamp <= now_unix.saturating_add(FUTURE_SKEW_SECS)
