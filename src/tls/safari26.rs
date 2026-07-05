@@ -429,9 +429,13 @@ impl Safari26TlsSession {
                 }
                 let mut server_public = [0_u8; X25519_KEY_LEN];
                 server_public.copy_from_slice(&server_hello.key_share);
-                Ok(Zeroizing::new(
-                    x25519_shared_secret(&self.tls_x25519.private, &server_public).to_vec(),
-                ))
+                // Scrub the raw [u8; 32] x25519 secret: the returned Zeroizing<Vec>
+                // wipes its copy, but the transient stack array must be wiped too.
+                let shared = Zeroizing::new(x25519_shared_secret(
+                    &self.tls_x25519.private,
+                    &server_public,
+                ));
+                Ok(Zeroizing::new(shared.to_vec()))
             }
             GROUP_X25519_MLKEM768 => {
                 if server_hello.key_share.len() != MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN {
@@ -448,10 +452,16 @@ impl Safari26TlsSession {
                     .map_err(|_| Safari26TlsError::MlKem)?;
                 let mut server_public = [0_u8; X25519_KEY_LEN];
                 server_public.copy_from_slice(server_x25519);
-                let x25519_shared = x25519_shared_secret(&self.tls_x25519.private, &server_public);
+                // Scrub the raw [u8; 32] x25519 secret on drop (mlkem_shared is
+                // already zeroized by its own type); the combined output is returned
+                // wrapped in Zeroizing.
+                let x25519_shared = Zeroizing::new(x25519_shared_secret(
+                    &self.tls_x25519.private,
+                    &server_public,
+                ));
                 let mut combined = Vec::with_capacity(64);
                 combined.extend_from_slice(mlkem_shared.as_ref());
-                combined.extend_from_slice(&x25519_shared);
+                combined.extend_from_slice(&*x25519_shared);
                 Ok(Zeroizing::new(combined))
             }
             _ => Err(Safari26TlsError::Unsupported(
@@ -1303,8 +1313,14 @@ fn finished_verify_data(
     traffic_secret: &[u8],
     transcript: &[u8],
 ) -> Result<Vec<u8>, Safari26TlsError> {
-    let finished_key =
-        suite.hkdf_expand_label(traffic_secret, "finished", &[], suite.hash_len())?;
+    // The finished_key is a transient derivation of the (secret) traffic secret;
+    // scrub it on drop so it does not linger in freed heap.
+    let finished_key = Zeroizing::new(suite.hkdf_expand_label(
+        traffic_secret,
+        "finished",
+        &[],
+        suite.hash_len(),
+    )?);
     let transcript_hash = suite.digest(transcript);
     suite.hmac(&finished_key, &transcript_hash)
 }
@@ -1330,7 +1346,10 @@ impl RecordCipher {
     fn new(suite: TlsCipherSuite, traffic_secret: &[u8]) -> Result<Self, Safari26TlsError> {
         let key =
             Zeroizing::new(suite.hkdf_expand_label(traffic_secret, "key", &[], suite.key_len())?);
-        let iv_vec = suite.hkdf_expand_label(traffic_secret, "iv", &[], TLS13_IV_LEN)?;
+        // The expanded IV bytes are key material; scrub the transient Vec on drop
+        // (the [u8; 12] copy lives on in `self.iv`, which is wiped with the cipher).
+        let iv_vec =
+            Zeroizing::new(suite.hkdf_expand_label(traffic_secret, "iv", &[], TLS13_IV_LEN)?);
         let mut iv = [0_u8; TLS13_IV_LEN];
         iv.copy_from_slice(&iv_vec);
         Ok(Self {
