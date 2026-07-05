@@ -198,9 +198,24 @@ mod stats {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const UDP_MAX_GSO_SEGMENTS: usize = 64;
 
+/// The kernel's ceiling on the TOTAL byte size of one `UDP_SEGMENT` super-buffer.
+/// A GSO send is still one `sendmsg` on one UDP socket, so it is bounded by the
+/// single-UDP-datagram maximum: `udp_sendmsg` rejects `len > 0xFFFF` outright
+/// (`-EMSGSIZE`) and the IPv4 append path subtracts the 20-byte IP + 8-byte UDP
+/// headers from the 65535 `IP_MAX_MTU`, leaving 65507 payload bytes (IPv6 allows
+/// 65527; using the v4 bound is safe for both). Without a byte cap, a run of
+/// [`UDP_MAX_GSO_SEGMENTS`] segments overflows this whenever `segment_size >
+/// 65507 / 64 ≈ 1023` — i.e. at EVERY real QUIC datagram size, including the
+/// default 1252 (64 × 1252 = 80128) and PMTUD-raised sizes — so each full-size
+/// bulk run would fail `sendmsg` and take the fallback path, meaning GSO never
+/// engaged for exactly the bulk transfers it exists for.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const UDP_MAX_GSO_BYTES: usize = 65507;
+
 /// Splits a GSO send batch into runs of consecutive datagrams that share a peer and
 /// a length (the unit a single `UDP_SEGMENT` call can emit: equal-sized segments,
-/// optionally one shorter tail), each capped at [`UDP_MAX_GSO_SEGMENTS`].
+/// optionally one shorter tail), each capped at [`UDP_MAX_GSO_SEGMENTS`] segments
+/// AND [`UDP_MAX_GSO_BYTES`] total bytes.
 ///
 /// Returns, for each run, the half-open index range into `batch` and the segment
 /// size. A run of length 1 is a degenerate batch the caller may send with a plain
@@ -214,7 +229,7 @@ pub const UDP_MAX_GSO_SEGMENTS: usize = 64;
 /// starts the next — because the QUIC sender emits uniform full-size datagrams during
 /// bulk flights and only short control packets (ACKs, close) otherwise, so this
 /// captures the bulk runs without ever mis-segmenting a mixed batch. A run longer
-/// than the segment cap is split into back-to-back full-size sub-runs (the trailing
+/// than either cap is split into back-to-back full-size sub-runs (the trailing
 /// sub-run carries the remainder), so the wire output is unchanged — only the syscall
 /// boundary moves.
 ///
@@ -227,13 +242,18 @@ pub fn gso_runs(batch: &[(Vec<u8>, std::net::SocketAddr)]) -> Vec<GsoRun> {
     while i < batch.len() {
         let (ref first_buf, peer) = batch[i];
         let size = first_buf.len();
+        // Per-run segment budget: the kernel's segment-count cap AND its total-byte
+        // cap (one GSO super-buffer is still one UDP datagram, <= UDP_MAX_GSO_BYTES;
+        // exceeding it makes sendmsg fail EMSGSIZE and the whole run take the
+        // fallback). `size.max(1)` guards the (never-emitted) empty datagram from a
+        // division by zero; the outer `.max(1)` keeps a degenerate oversized
+        // datagram as a single-segment run instead of an empty one.
+        let max_segs = UDP_MAX_GSO_SEGMENTS
+            .min(UDP_MAX_GSO_BYTES / size.max(1))
+            .max(1);
         let mut j = i + 1;
-        // Extend while same peer + same size AND the run stays within the kernel's
-        // per-send segment cap.
-        while j < batch.len()
-            && j - i < UDP_MAX_GSO_SEGMENTS
-            && batch[j].1 == peer
-            && batch[j].0.len() == size
+        // Extend while same peer + same size AND the run stays within both caps.
+        while j < batch.len() && j - i < max_segs && batch[j].1 == peer && batch[j].0.len() == size
         {
             j += 1;
         }
@@ -684,9 +704,10 @@ mod tests {
 
     #[test]
     fn long_run_is_split_at_the_segment_cap() {
-        // A bulk flight far longer than the kernel's per-send segment cap must be
-        // split into <=UDP_MAX_GSO_SEGMENTS sub-runs, never one over-long run the
-        // kernel would reject with EINVAL.
+        // A bulk flight far longer than the kernel's per-send caps must be split
+        // into sub-runs within BOTH limits (<=UDP_MAX_GSO_SEGMENTS segments and
+        // <=UDP_MAX_GSO_BYTES total), never one over-long run the kernel would
+        // reject (EINVAL past the segment cap, EMSGSIZE past the byte cap).
         let p = addr("10.0.0.1:443");
         let n = UDP_MAX_GSO_SEGMENTS * 2 + 5;
         let batch: Vec<_> = (0..n).map(|_| dg(1252, p)).collect();
@@ -704,8 +725,77 @@ mod tests {
             next = r.range.end;
         }
         assert_eq!(next, n);
-        // The first cap-sized run is exactly full (not under-filled).
-        assert_eq!(runs[0].range.len(), UDP_MAX_GSO_SEGMENTS);
+        // At 1252 bytes/segment the byte cap binds first: the fullest legal run is
+        // UDP_MAX_GSO_BYTES / 1252 = 52 segments (< the 64-segment cap), and the
+        // first run must be exactly full (not under-filled).
+        let effective = UDP_MAX_GSO_SEGMENTS.min(UDP_MAX_GSO_BYTES / 1252);
+        assert_eq!(effective, 52, "byte cap binds at the default datagram size");
+        assert_eq!(runs[0].range.len(), effective);
+    }
+
+    /// No emitted run may concatenate to more bytes than one `UDP_SEGMENT`
+    /// super-buffer can carry (one UDP datagram): a run past UDP_MAX_GSO_BYTES
+    /// makes `sendmsg` fail EMSGSIZE, so EVERY full-size bulk run would fall back
+    /// to per-datagram sends — GSO would never engage at real QUIC datagram sizes
+    /// (64 x 1252 = 80128; 64 x 1452 PMTUD-raised = 92928; both > 65507). Checks
+    /// representative segment sizes and proves the wire output (which datagrams,
+    /// in which order, with which sizes) is untouched by where the run boundaries
+    /// fall.
+    #[test]
+    fn no_run_exceeds_the_single_gso_buffer_byte_limit() {
+        let p = addr("10.0.0.1:443");
+        // Default QUIC datagram, PMTUD-raised, small control, and the pathological
+        // single-datagram maximum.
+        for &seg in &[1252usize, 1452, 40, UDP_MAX_GSO_BYTES] {
+            let n = 200; // several caps' worth of segments
+            let batch: Vec<_> = (0..n).map(|_| dg(seg, p)).collect();
+            let runs = gso_runs(&batch);
+            for r in &runs {
+                assert!(
+                    r.range.len() <= UDP_MAX_GSO_SEGMENTS,
+                    "seg={seg}: run of {} segments exceeds the segment cap",
+                    r.range.len()
+                );
+                assert!(
+                    r.range.len() * r.segment_size <= UDP_MAX_GSO_BYTES,
+                    "seg={seg}: run of {} segments x {} bytes = {} exceeds the \
+                     single-buffer byte limit {}",
+                    r.range.len(),
+                    r.segment_size,
+                    r.range.len() * r.segment_size,
+                    UDP_MAX_GSO_BYTES
+                );
+                assert_eq!(r.segment_size, seg, "seg={seg}: segment size preserved");
+            }
+            // Wire output unchanged: the runs tile 0..n contiguously in order, so
+            // exactly the original datagrams go out, in the original order, with
+            // the original sizes — only the syscall boundaries move.
+            let mut next = 0;
+            for r in &runs {
+                assert_eq!(r.range.start, next, "seg={seg}: runs are contiguous");
+                next = r.range.end;
+            }
+            assert_eq!(next, n, "seg={seg}: every datagram covered exactly once");
+        }
+    }
+
+    /// Below the byte-cap crossover (segment_size <= UDP_MAX_GSO_BYTES / 64 = 1023)
+    /// the 64-segment cap still binds unchanged — the byte cap must not shrink
+    /// small-datagram runs.
+    #[test]
+    fn segment_cap_still_binds_for_small_segments() {
+        let p = addr("10.0.0.1:443");
+        let seg = 1000; // 64 x 1000 = 64000 <= 65507: the segment cap binds
+        let n = UDP_MAX_GSO_SEGMENTS + 10;
+        let batch: Vec<_> = (0..n).map(|_| dg(seg, p)).collect();
+        let runs = gso_runs(&batch);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs[0].range.len(),
+            UDP_MAX_GSO_SEGMENTS,
+            "first run is exactly the segment cap"
+        );
+        assert_eq!(runs[1].range.len(), 10);
     }
 
     #[test]
