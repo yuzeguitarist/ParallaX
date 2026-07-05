@@ -451,10 +451,10 @@ pub struct ClientConfig {
     /// region whose real Safari population is dominated by another locale can set
     /// their plausible value here so the fleet is not a single fixed `en-US`
     /// cross-connection invariant. The H2 business request (always-on TCP plane)
-    /// and the H3 business substreams both use this value. (The QUIC *establishment
-    /// probe* request keeps the default en-US — it is shared with the standalone
-    /// `plx probe` origin check, which mimics a generic fresh Safari; the QUIC
-    /// fast plane is experimental / off by default.)
+    /// and the H3 business substreams both use this value, so they never diverge.
+    /// (The QUIC *establishment probe* request keeps the default en-US — it is
+    /// shared with the standalone `plx probe` origin check, which mimics a generic
+    /// fresh Safari; the QUIC fast plane is experimental / off by default.)
     #[serde(default)]
     pub accept_language: Option<String>,
 }
