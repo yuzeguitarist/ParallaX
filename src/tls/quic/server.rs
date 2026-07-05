@@ -195,17 +195,18 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
     // rejects repeats (handshake.rs); reject them here too so the server is not the
     // lenient end of the pair (silent last-writer-wins is an active-probe tell vs a
     // real TLS stack).
-    let mut seen_extensions: Vec<u16> = Vec::new();
+    // A HashSet keeps the check linear: repeated Vec scans would be quadratic in
+    // the extension count — a pre-authentication DoS amplifier.
+    let mut seen_extensions: std::collections::HashSet<u16> = std::collections::HashSet::new();
     while er.remaining() > 0 {
         let ext_type = er.u16()?;
         let ext_data = er.vec_u16()?;
-        if seen_extensions.contains(&ext_type) {
+        if !seen_extensions.insert(ext_type) {
             return Err(QuicTlsError::alert(
                 ALERT_ILLEGAL_PARAMETER,
                 "duplicate extension in ClientHello",
             ));
         }
-        seen_extensions.push(ext_type);
         match ext_type {
             EXT_SERVER_NAME => {
                 // ServerNameList: u16 list_len, then [name_type(1) u16 name_len name].
