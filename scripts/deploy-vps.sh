@@ -1386,6 +1386,14 @@ if command -v runuser >/dev/null 2>&1; then
   $sudo_prefix rm -rf "\$seal_staging"
   $sudo_prefix install -d -m 0700 -o parallax -g parallax "\$seal_staging"
   $sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml "\$seal_staging/parallax.server.toml"
+  # Seed the staging dir with the CURRENT live bundle (if any) so 'plx seal'
+  # MERGES into it rather than replacing it — otherwise sealing in an empty dir
+  # would silently drop sealed entries this bundle holds for other configs that
+  # share it (cubic P2). Copied as parallax so the seal (run as parallax) can
+  # rewrite it in place.
+  if $sudo_prefix test -f $q_remote_config_dir/parallax.secrets.enc; then
+    $sudo_prefix install -m 0600 -o parallax -g parallax $q_remote_config_dir/parallax.secrets.enc "\$seal_staging/parallax.secrets.enc"
+  fi
   if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c "\$seal_staging/parallax.server.toml"; then
     $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.server.toml" $q_remote_config
     $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.secrets.enc" $q_remote_config_dir/parallax.secrets.enc
