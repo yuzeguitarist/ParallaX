@@ -91,44 +91,69 @@ impl ReplayCacheGuard {
     /// ([`crate::transport::udp::marker_replay`]).
     fn persist_in_background(&self) {
         let slot = Arc::clone(&self.cache);
-        let persist = move || {
-            // Check the cache OUT under a short lock and run the blocking journal
-            // fsync with the lock RELEASED: holding the mutex across the fsync
-            // would make the driver-side `try_lock` in `accept_ticket` fail for
-            // the whole disk write (see the module docs' locking discipline).
-            //
-            // Recover from a poisoned lock rather than dropping durability: the
-            // cache invariants are restored on each insert, so persisting the
-            // recovered state is safe (mirrors the marker guard's persist path).
-            let checked_out = slot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            let Some(mut cache) = checked_out else {
-                // Another persist has the cache checked out. Inserts are
-                // impossible while it is out (accept fails closed), so every
-                // queued entry — including the one that triggered this call — is
-                // already inside that persist's cache and will be drained by it.
-                return;
-            };
-            let result = cache.persist_pending();
-            // Put the cache back BEFORE acting on the outcome so 0-RTT accepts
-            // resume even when the persist failed.
-            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cache);
-            if let Err(err) = result {
-                tracing::warn!(
-                    error = %err,
-                    "0-RTT replay cache persist failed; ticket accept recorded \
-                     in memory only (retried on the next accepted ticket)"
-                );
-            }
-        };
+        let persist = move || Self::persist_checked_out(&slot);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn_blocking(persist);
             }
             Err(_) => persist(),
         }
+    }
+
+    /// Drain the queued durable persist (journal append + fsync) for `slot`.
+    /// Checks the cache OUT under a short lock and runs the blocking fsync with
+    /// the lock RELEASED — holding the mutex across the fsync would make the
+    /// driver-side `try_lock` in `accept_ticket` fail for the whole disk write
+    /// (see the module docs' locking discipline). Recovers from a poisoned lock
+    /// rather than dropping durability (cache invariants are restored on each
+    /// insert, so persisting the recovered state is safe).
+    fn persist_checked_out(slot: &Arc<Mutex<Option<ReplayCache>>>) {
+        let checked_out = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(mut cache) = checked_out else {
+            // Another persist has the cache checked out. Inserts are impossible
+            // while it is out (accept fails closed), so every queued entry —
+            // including the one that triggered this call — is already inside that
+            // persist's cache and will be drained by it.
+            return;
+        };
+        let result = cache.persist_pending();
+        // Put the cache back BEFORE acting on the outcome so 0-RTT accepts resume
+        // even when the persist failed.
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cache);
+        if let Err(err) = result {
+            tracing::warn!(
+                error = %err,
+                "0-RTT replay cache persist failed; ticket accept recorded \
+                 in memory only (retried on the next accepted ticket)"
+            );
+        }
+    }
+
+    /// Test-only: synchronously drain any queued durable persist so a test can
+    /// observe cross-restart durability deterministically without racing the
+    /// `spawn_blocking` fsync. Blocks on `try_lock`-free take/fsync/put-back and
+    /// retries briefly if a background persist is momentarily mid-flight.
+    #[cfg(test)]
+    pub(crate) fn flush_pending_for_test(&self) {
+        for _ in 0..200 {
+            // If a background persist has the cache checked out, wait for it to
+            // put the cache back, then flush whatever remains pending.
+            if self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+            {
+                Self::persist_checked_out(&self.cache);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Last attempt regardless (returns early if still checked out).
+        Self::persist_checked_out(&self.cache);
     }
 }
 
