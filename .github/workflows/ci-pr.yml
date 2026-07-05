@@ -105,6 +105,7 @@ jobs:
             --bins \
             --test chaos_liveness \
             --test distinguisher_battery \
+            --test e2e_tunnel_roundtrip \
             --test gfw_live_replay \
             --test gfw_sim_provenance \
             --test ja4_census_oracle \
