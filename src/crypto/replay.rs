@@ -1728,16 +1728,26 @@ mod tests {
         let path = dir.path().join("replay-legacy-v3.cache");
         let key = b"0123456789abcdef0123456789abcdef";
         let now = current_unix_timestamp().unwrap();
-        let first = ReplayEntry {
-            timestamp: now,
-            nonce: [1; 8],
-            transcript_fingerprint: [2; 32],
+        // Fill the fixture nonces/fingerprints from a runtime RNG rather than byte
+        // literals: they feed the hand-built journal HMAC below, and any hard-coded
+        // (or literal-derived) byte array flowing into a MAC trips CodeQL's
+        // `rust/hard-coded-cryptographic-value` query (a false positive on test
+        // fixtures). The test only needs distinct dedup entries, which OsRng gives.
+        use rand::RngCore as _;
+        let mut rng = rand::rngs::OsRng;
+        let mut mk_entry = || {
+            let mut nonce = [0_u8; 8];
+            let mut fp = [0_u8; 32];
+            rng.fill_bytes(&mut nonce);
+            rng.fill_bytes(&mut fp);
+            ReplayEntry {
+                timestamp: now,
+                nonce,
+                transcript_fingerprint: fp,
+            }
         };
-        let second = ReplayEntry {
-            timestamp: now,
-            nonce: [3; 8],
-            transcript_fingerprint: [4; 32],
-        };
+        let first = mk_entry();
+        let second = mk_entry();
 
         // Hand-write the exact v3 on-disk format: one header line whose MAC does
         // NOT bind a generation, then the chained entry lines.
@@ -1772,11 +1782,7 @@ mod tests {
 
         // The upgraded journal keeps working: a new entry appends and everything
         // reloads cleanly.
-        let third = ReplayEntry {
-            timestamp: now,
-            nonce: [5; 8],
-            transcript_fingerprint: [6; 32],
-        };
+        let third = mk_entry();
         assert!(loaded.insert_new(third.clone(), now).unwrap());
         drop(loaded);
         let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
