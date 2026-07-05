@@ -181,7 +181,7 @@ pub fn create_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealE
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(SealError::Io)?;
+            ensure_host_key_dir(parent)?;
         }
     }
 
@@ -194,6 +194,72 @@ pub fn create_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealE
 
     write_owner_only(&path, encoded.as_bytes())?;
     Ok(key)
+}
+
+/// Ensure the directory that will hold the host keyfile exists with
+/// least-privilege permissions. A missing directory (the common first-run
+/// `/var/lib/parallax` case, which also stores the sealed bundle and replay
+/// cache) is created 0700 — a plain `create_dir_all` under the default umask
+/// would yield a world-listable 0755 dir — and the final component is
+/// re-opened `O_NOFOLLOW` and fstat-verified to be a euid-owned directory,
+/// mirroring `runtime_guard::ensure_state_dir`, so losing the create race to a
+/// planted directory or symlink fails closed. A pre-existing directory is left
+/// untouched (its mode is the operator's decision — chmod'ing e.g. `.` for a
+/// relative `--host-key` would be hostile), with a best-effort warning when it
+/// is not owned by the current user.
+fn ensure_host_key_dir(dir: &Path) -> Result<(), SealError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let euid = rustix::process::geteuid().as_raw();
+        if dir.is_dir() {
+            if let Ok(metadata) = fs::metadata(dir) {
+                if metadata.uid() != euid {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        uid = metadata.uid(),
+                        euid,
+                        "host-key directory is not owned by the current user; its owner \
+                         can replace the host key or sealed bundle"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(SealError::Io)?;
+
+        let dir_file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)
+            .map_err(SealError::Io)?;
+        let metadata = dir_file.metadata().map_err(SealError::Io)?;
+        let uid = metadata.uid();
+        if !metadata.is_dir() || uid != euid {
+            return Err(SealError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "host-key directory {} is not a euid-owned directory (uid={uid}, euid={euid})",
+                    dir.display()
+                ),
+            )));
+        }
+        // fchmod through the validated handle: exactly 0700 regardless of umask.
+        dir_file
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(SealError::Io)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir).map_err(SealError::Io)
+    }
 }
 
 fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), SealError> {
@@ -453,6 +519,45 @@ mod tests {
             open_entry(&key, "crypto.psk", &aad_b, &entry),
             Err(SealError::Decrypt)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_host_key_creates_owner_only_state_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state").join("parallax");
+        create_host_key(Some(&state.join("host.key"))).unwrap();
+        // The final state-dir component is exactly owner-only...
+        let mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "state dir must be created 0700, got {mode:o}");
+        // ...and intermediate components we created grant no group/world access.
+        let inter = fs::metadata(dir.path().join("state"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            inter & 0o077,
+            0,
+            "intermediate dirs must not grant group/world access, got {inter:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_host_key_leaves_pre_existing_dir_mode_alone() {
+        // A directory the OPERATOR already created keeps its chosen mode: the
+        // 0700 tightening applies only to dirs plx creates itself (chmod'ing a
+        // pre-existing dir — e.g. `.` for a relative --host-key — is hostile).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        create_host_key(Some(&state.join("host.key"))).unwrap();
+        let mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "pre-existing dir mode belongs to the operator");
     }
 
     #[test]
