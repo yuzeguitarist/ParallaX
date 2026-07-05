@@ -1404,22 +1404,60 @@ async fn client_mux_quic_substream(
     // browser-plausible HTTP/3 request lifecycle (HEADERS then DATA) instead of
     // starting directly with a DATA frame — the encrypted records ride the DATA
     // frames that follow, exactly like the probe bidi.
-    if let Err(err) = write_business_request_headers(&mut send, authority, accept_language).await {
-        send.reset(VarInt::from_u32(0));
-        return Err(ClientRuntimeError::Io(err));
+    //
+    // BOUNDED by CLIENT_ESTABLISH_TIMEOUT, matching the response-HEADERS read
+    // below: this write and the ConnectRequest write below both precede the relay
+    // idle watchdog, so without a bound a peer that accepts the bidi but grants no
+    // stream flow-control credit would block here forever, pinning this SOCKS
+    // connection's stream permit and local fd for the process lifetime.
+    match tokio::time::timeout(
+        CLIENT_ESTABLISH_TIMEOUT,
+        write_business_request_headers(&mut send, authority, accept_language),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            send.reset(VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(err));
+        }
+        Err(_) => {
+            send.reset(VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mux-over-QUIC substream request HEADERS write timed out",
+            )));
+        }
     }
 
     let mut server_write = H3DataFrameLegWriter(send);
     // First record on the substream: the ConnectRequest, sealed under the
     // substream codec and DATA-framed (the server reads it as the substream's
-    // opening command, mirroring MuxFrame::Open on the TCP path).
+    // opening command, mirroring MuxFrame::Open on the TCP path). BOUNDED by
+    // CLIENT_ESTABLISH_TIMEOUT for the same flow-control-credit reason as the
+    // HEADERS write above.
     let connect_payload = connect_request.encode()?;
     let connect_record = seal_to_server
         .seal(&connect_payload, &mut OsRng)
         .map_err(|err| io::Error::other(err.to_string()))?;
-    if let Err(err) = server_write.write_records(&connect_record).await {
-        server_write.0.reset(VarInt::from_u32(0));
-        return Err(ClientRuntimeError::Io(err));
+    match tokio::time::timeout(
+        CLIENT_ESTABLISH_TIMEOUT,
+        server_write.write_records(&connect_record),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            server_write.0.reset(VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(err));
+        }
+        Err(_) => {
+            server_write.0.reset(VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mux-over-QUIC substream ConnectRequest write timed out",
+            )));
+        }
     }
 
     // Read the server's `:status 200` response HEADERS frame before the download
