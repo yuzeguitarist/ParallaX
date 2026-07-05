@@ -1360,6 +1360,7 @@ fn next_mux_stream_id(next: &AtomicU32) -> u32 {
 /// runs the upload/download loops over the H3 DATA-frame legs — identical record
 /// carrier to the single-Connect QUIC relay, just one per substream. Teardown is
 /// per-stream: a clean finish on the send half, a `RESET_STREAM` on error.
+#[allow(clippy::too_many_arguments)]
 async fn client_mux_quic_substream(
     local: TcpStream,
     conn: crate::transport::udp::quic::endpoint::Connection,

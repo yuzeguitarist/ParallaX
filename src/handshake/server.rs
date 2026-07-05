@@ -1315,11 +1315,33 @@ pub async fn accept_authenticated(
     first_client_record: Vec<u8>,
     client_hello: AuthenticatedHello,
 ) -> Result<AuthenticatedHandshake, HandshakeServerError> {
-    let mut fallback = connect_tcp_with_timeout(&config.fallback_addr).await?;
-    tune_tcp_stream(&fallback)?;
-    write_all_with_handshake_timeout(&mut fallback, &first_client_record).await?;
-
-    let forwarded = read_forwarded_server_hello(&mut fallback).await?;
+    // Dialing the fallback origin fails before we own it, so only `client` needs a
+    // graceful FIN here (a bare `?`-drop with client RX queued would RST).
+    let mut fallback = match connect_tcp_with_timeout(&config.fallback_addr).await {
+        Ok(fallback) => fallback,
+        Err(err) => {
+            graceful_close_tcp_stream(client).await;
+            return Err(err);
+        }
+    };
+    // From here both `client` and `fallback` are owned; every error must FIN BOTH
+    // (never a bare drop → RST), even though the peer is already PSK-authenticated.
+    // Run the fallible forward-and-derive body in a closure and close both on Err.
+    let forward = async {
+        tune_tcp_stream(&fallback)?;
+        write_all_with_handshake_timeout(&mut fallback, &first_client_record).await?;
+        let forwarded = read_forwarded_server_hello(&mut fallback).await?;
+        Ok::<_, HandshakeServerError>(forwarded)
+    }
+    .await;
+    let forwarded = match forward {
+        Ok(forwarded) => forwarded,
+        Err(err) => {
+            graceful_close_tcp_stream(client).await;
+            graceful_close_tcp_stream(fallback).await;
+            return Err(err);
+        }
+    };
     if config.strict_tls13 && !forwarded.parsed.tls13_selected {
         // Mirror the origin's ServerHello to the client, then close BOTH sockets the
         // same drain->FIN way every other exit does so a strict-TLS1.3 reject is a
@@ -1333,10 +1355,23 @@ pub async fn accept_authenticated(
         graceful_close_tcp_stream(fallback).await;
         return Err(HandshakeServerError::Tls13Required);
     }
-    write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await?;
-
-    let context = transcript_hash(&first_client_record, &forwarded.raw_record);
-    let session_keys = derive_server_keys_from_shared(psk, &x25519_shared_secret, &context)?;
+    // Mirror the origin ServerHello + derive the epoch-0 keys; on any error FIN
+    // both sockets rather than bare-dropping (post-auth, but still no RST tell).
+    let finish = async {
+        write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await?;
+        let context = transcript_hash(&first_client_record, &forwarded.raw_record);
+        let session_keys = derive_server_keys_from_shared(psk, &x25519_shared_secret, &context)?;
+        Ok::<_, HandshakeServerError>(session_keys)
+    }
+    .await;
+    let session_keys = match finish {
+        Ok(session_keys) => session_keys,
+        Err(err) => {
+            graceful_close_tcp_stream(client).await;
+            graceful_close_tcp_stream(fallback).await;
+            return Err(err);
+        }
+    };
     session_keys.protect_secret_memory();
 
     Ok(AuthenticatedHandshake {
@@ -1380,15 +1415,48 @@ async fn connect_and_forward_to_fallback(
     Ok(fallback)
 }
 
-/// Drains a read half to `WouldBlock` (bounded) so the eventual close is a FIN,
-/// not a RST, even when more than one bufferful is queued. A single small pass
-/// could leave a backlog that RSTs on drop; this mirrors the splice path's
-/// multi-pass drain (capped at 16 x 16 KiB = 256 KiB).
-fn drain_read_half_to_block(reader: &OwnedReadHalf) {
+/// Wall-clock budget for the FIN-first lingering drain. Bounded so a peer that
+/// keeps sending and never closes after our FIN cannot pin the teardown; for
+/// that adversarial case a residual RST at the bounded cutoff is unavoidable and
+/// is indistinguishable from a real origin under memory pressure. Cooperating
+/// peers (the overwhelming common case) close well within this window.
+const GRACEFUL_FIN_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// FIN-first graceful half-close of one direction. Sends our FIN (`shutdown`) on
+/// the write half FIRST, then reads-and-discards the peer's remaining bytes until
+/// it closes (`read` == 0) or the bounded budget elapses. Order matters: only by
+/// draining to the peer's EOF *after* we FIN does the receive queue reach empty at
+/// the final drop, making the close a clean FIN. A bare drop — or the old
+/// drain-then-close under a fast sender — leaves queued bytes at close and the
+/// kernel emits a RST, the exact censor-observable tell a real origin never
+/// produces. (`shutdown(Read)` would NOT help: it neither flushes the receive
+/// queue nor suppresses the RST.)
+async fn graceful_fin_then_drain(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWriteHalf) {
+    let _ = write_half.shutdown().await;
     let mut scratch = [0_u8; 16 * 1024];
-    for _ in 0..16 {
-        match drain_ready_tcp_read(reader, &mut scratch, 0) {
-            Ok(n) if n == scratch.len() => continue,
+    let deadline = tokio::time::Instant::now() + GRACEFUL_FIN_DRAIN_BUDGET;
+    loop {
+        match tokio::time::timeout_at(deadline, read_half.read(&mut scratch)).await {
+            Ok(Ok(0)) => break,    // peer FIN: recv queue drained, clean close
+            Ok(Ok(_)) => continue, // discard and keep draining
+            _ => break,            // read error or budget elapsed
+        }
+    }
+}
+
+/// FIN-first graceful close of a whole `TcpStream` (by mutable ref, so callers can
+/// close on an error path without giving up ownership on the success path).
+/// `AsyncWriteExt::shutdown` on a `TcpStream` half-closes the write side (FIN);
+/// we then drain the peer to EOF (bounded) so the final drop carries no queued
+/// bytes and cannot RST. See [`graceful_fin_then_drain`].
+async fn graceful_fin_then_drain_stream(stream: &mut TcpStream) {
+    let _ = stream.shutdown().await;
+    let mut scratch = [0_u8; 16 * 1024];
+    let deadline = tokio::time::Instant::now() + GRACEFUL_FIN_DRAIN_BUDGET;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut scratch)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => continue,
             _ => break,
         }
     }
@@ -1398,10 +1466,8 @@ fn drain_read_half_to_block(reader: &OwnedReadHalf) {
 /// peer sees a graceful FIN. Dropping a socket with unread bytes still queued
 /// makes the kernel emit a RST, an observable tell a real origin would not
 /// produce; this keeps the close indistinguishable from an ordinary teardown.
-async fn graceful_close_tcp_stream(stream: TcpStream) {
-    let (read_half, mut write_half) = stream.into_split();
-    drain_read_half_to_block(&read_half);
-    let _ = write_half.shutdown().await;
+async fn graceful_close_tcp_stream(mut stream: TcpStream) {
+    graceful_fin_then_drain_stream(&mut stream).await;
 }
 
 /// Cap-rejection close that stays indistinguishable from the origin (H-1): relay
@@ -1500,9 +1566,9 @@ async fn relay_fallback_with_idle_timeout(
     // origin would not produce. Drain any ready bytes first so the close stays a
     // FIN even if a stray record arrived right before teardown.
     graceful_close_fallback_halves(
-        &client_read,
+        &mut client_read,
         &mut client_write,
-        &fallback_read,
+        &mut fallback_read,
         &mut fallback_write,
     )
     .await;
@@ -1577,15 +1643,18 @@ async fn relay_fallback_userspace_loop(
 }
 
 async fn graceful_close_fallback_halves(
-    client_read: &OwnedReadHalf,
+    client_read: &mut OwnedReadHalf,
     client_write: &mut OwnedWriteHalf,
-    fallback_read: &OwnedReadHalf,
+    fallback_read: &mut OwnedReadHalf,
     fallback_write: &mut OwnedWriteHalf,
 ) {
-    drain_read_half_to_block(client_read);
-    drain_read_half_to_block(fallback_read);
-    let _ = client_write.shutdown().await;
-    let _ = fallback_write.shutdown().await;
+    // FIN both directions first, then drain each to the peer's EOF (bounded), so
+    // neither socket drops with queued bytes (which would RST). Concurrent so the
+    // total teardown is bounded by one budget, not two.
+    tokio::join!(
+        graceful_fin_then_drain(client_read, client_write),
+        graceful_fin_then_drain(fallback_read, fallback_write),
+    );
 }
 
 /// Pre-PQ teardown: consume the buffered readers to recover the raw read halves,
@@ -1598,12 +1667,12 @@ async fn graceful_close_pre_pq(
     fallback_records: BufferedTlsRecordReader<OwnedReadHalf>,
     mut fallback_write: OwnedWriteHalf,
 ) {
-    let client_read = client_records.into_inner().into_inner();
-    let fallback_read = fallback_records.into_inner().into_inner();
+    let mut client_read = client_records.into_inner().into_inner();
+    let mut fallback_read = fallback_records.into_inner().into_inner();
     graceful_close_fallback_halves(
-        &client_read,
+        &mut client_read,
         &mut client_write,
-        &fallback_read,
+        &mut fallback_read,
         &mut fallback_write,
     )
     .await;
@@ -2028,12 +2097,12 @@ async fn run_authenticated_data_mode(
                             // close() emit a RST -- the FIN/RST tell every other
                             // teardown here avoids. Mirrors the pre-PQ-deadline
                             // teardown above; covers Replayed/Stale/CacheFull.
-                            let client_read = client_records.into_inner().into_inner();
-                            let fallback_read = fallback_records.into_inner().into_inner();
+                            let mut client_read = client_records.into_inner().into_inner();
+                            let mut fallback_read = fallback_records.into_inner().into_inner();
                             graceful_close_fallback_halves(
-                                &client_read,
+                                &mut client_read,
                                 &mut client_write,
-                                &fallback_read,
+                                &mut fallback_read,
                                 &mut fallback_write,
                             )
                             .await;
@@ -2202,9 +2271,8 @@ async fn run_authenticated_data_mode(
                                 // Graceful drain->FIN on the client (the fallback
                                 // halves were already dropped above): avoid a RST
                                 // if the client left unread bytes buffered.
-                                let client_read = client_records.into_inner().into_inner();
-                                drain_read_half_to_block(&client_read);
-                                let _ = client_write.shutdown().await;
+                                let mut client_read = client_records.into_inner().into_inner();
+                                graceful_fin_then_drain(&mut client_read, &mut client_write).await;
                                 return Ok(());
                             }
                         }
