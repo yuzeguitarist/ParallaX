@@ -205,32 +205,58 @@ pub fn create_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealE
 /// least-privilege permissions. A missing directory (the common first-run
 /// `/var/lib/parallax` case, which also stores the sealed bundle and replay
 /// cache) is created 0700 — a plain `create_dir_all` under the default umask
-/// would yield a world-listable 0755 dir — and the final component is
-/// re-opened `O_NOFOLLOW` and fstat-verified to be a euid-owned directory,
-/// mirroring `runtime_guard::ensure_state_dir`, so losing the create race to a
-/// planted directory or symlink fails closed. A pre-existing directory is left
-/// untouched (its mode is the operator's decision — chmod'ing e.g. `.` for a
-/// relative `--host-key` would be hostile), with a best-effort warning when it
-/// is not owned by the current user.
+/// would yield a world-listable 0755 dir. Whether pre-existing or freshly
+/// created, the final component is opened `O_NOFOLLOW | O_DIRECTORY` and
+/// fstat-verified through the fd, mirroring `runtime_guard::ensure_state_dir`:
+/// `Path::is_dir()` follows symlinks, so a metadata-based fast path would let
+/// a planted symlink pass and `host.key` would land inside the attacker-chosen
+/// target. A pre-existing directory's mode is left untouched (its mode is the
+/// operator's decision — chmod'ing e.g. `.` for a relative `--host-key` would
+/// be hostile), with a best-effort warning when it is not owned by the current
+/// user or grants group/world write.
 fn ensure_host_key_dir(dir: &Path) -> Result<(), SealError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
         let euid = rustix::process::geteuid().as_raw();
-        if dir.is_dir() {
-            if let Ok(metadata) = fs::metadata(dir) {
-                if metadata.uid() != euid {
+        // Probe the final component with O_NOFOLLOW | O_DIRECTORY — never
+        // `is_dir()`, which follows symlinks. An existing real directory
+        // opens; a planted symlink fails closed with ELOOP (ENOTDIR on
+        // macOS) and a non-directory with ENOTDIR; only a genuinely missing
+        // directory falls through to creation below.
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)
+        {
+            Ok(dir_file) => {
+                let metadata = dir_file.metadata().map_err(SealError::Io)?;
+                let uid = metadata.uid();
+                let mode = metadata.permissions().mode() & 0o777;
+                if uid != euid || mode & 0o022 != 0 {
                     tracing::warn!(
                         dir = %dir.display(),
-                        uid = metadata.uid(),
+                        uid,
                         euid,
-                        "host-key directory is not owned by the current user; its owner \
-                         can replace the host key or sealed bundle"
+                        mode = %format_args!("{mode:o}"),
+                        "host-key directory is not an owner-only directory of the current \
+                         user; whoever can write it can replace the host key or sealed bundle"
                     );
                 }
+                return Ok(());
             }
-            return Ok(());
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(SealError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "host-key directory {} could not be opened without following \
+                         symlinks: {err}",
+                        dir.display()
+                    ),
+                )));
+            }
         }
 
         fs::DirBuilder::new()
@@ -274,7 +300,11 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), SealError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // `create_new` is O_CREAT | O_EXCL, which POSIX already defines to
+        // fail on a symlinked final component (even a dangling one); add
+        // O_NOFOLLOW so the no-symlink guarantee is explicit rather than a
+        // side effect of the exclusivity flag.
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path).map_err(SealError::Io)?;
     file.write_all(contents).map_err(SealError::Io)?;
@@ -595,6 +625,39 @@ mod tests {
         create_host_key(Some(&state.join("host.key"))).unwrap();
         let mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "pre-existing dir mode belongs to the operator");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_host_key_rejects_symlinked_parent_dir() {
+        // `Path::is_dir()` follows symlinks, so a planted parent symlink used
+        // to pass the pre-existing-directory fast path and `host.key` would be
+        // created inside the attacker-chosen target. The O_NOFOLLOW |
+        // O_DIRECTORY probe must fail closed instead.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("state");
+        symlink(&target, &link).unwrap();
+        let err = create_host_key(Some(&link.join("host.key"))).unwrap_err();
+        assert!(matches!(err, SealError::Io(_)));
+        // Fails closed: nothing was written through the symlink.
+        assert!(!target.join("host.key").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_host_key_rejects_dangling_symlink_parent_dir() {
+        // A dangling symlink where the state dir should be must not be
+        // followed into creating the target path either: O_NOFOLLOW yields
+        // ELOOP (not NotFound), so creation never runs.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("state");
+        symlink(dir.path().join("nonexistent"), &link).unwrap();
+        let err = create_host_key(Some(&link.join("host.key"))).unwrap_err();
+        assert!(matches!(err, SealError::Io(_)));
     }
 
     #[test]
