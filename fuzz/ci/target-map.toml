@@ -128,35 +128,35 @@ sanitizer = "address"
 rss = 1024
 max_len = 4096
 timeout = 20
-paths = ["src/tls/quic/**"]
+paths = ["src/tls/quic/handshake.rs", "src/tls/quic/suite.rs"]
 
 [targets.quic_encrypted_extensions]
 sanitizer = "address"
 rss = 1024
 max_len = 4096
 timeout = 20
-paths = ["src/tls/quic/**"]
+paths = ["src/tls/quic/handshake.rs"]
 
 [targets.quic_certificate]
 sanitizer = "address"
 rss = 1024
 max_len = 65536
 timeout = 20
-paths = ["src/tls/quic/**"]
+paths = ["src/tls/quic/handshake.rs"]
 
 [targets.quic_certificate_verify]
 sanitizer = "address"
 rss = 1024
 max_len = 4096
 timeout = 20
-paths = ["src/tls/quic/**"]
+paths = ["src/tls/quic/handshake.rs"]
 
 [targets.quic_compressed_cert]
 sanitizer = "address"
 rss = 2048
 max_len = 4194304
 timeout = 25
-paths = ["src/tls/quic/**"]
+paths = ["src/tls/quic/handshake.rs"]
 
 # --- box-b group: sanitizer = none + `-C overflow-checks=on` (codecs/arith) ----
 
