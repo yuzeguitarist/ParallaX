@@ -3996,6 +3996,75 @@ mod tests {
         );
     }
 
+    /// Timing harness for [`Connection::compact_send_buffer`] under a large
+    /// in-flight set (big cwnd, many streams). NOT a pass/fail perf gate — it
+    /// only prints per-call cost, so it cannot flake in CI. Run it manually in
+    /// release mode:
+    ///
+    /// ```text
+    /// cargo test --locked --lib --release bench_compact_send_buffer -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing harness; run manually in --release with --nocapture"]
+    fn bench_compact_send_buffer() {
+        const STREAMS: u64 = 128;
+        const PACKETS: u64 = 4096; // in-flight DATA packets: a few-MB cwnd of 1200B packets
+        const RANGE_LEN: u64 = 1200;
+        const ITERS: u32 = 100; // repeats of "compact every stream once" (one ACK batch)
+
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0xbe; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let now = Instant::now();
+        let ids: Vec<u64> = (0..STREAMS).map(|_| client.open_bi()).collect();
+        // Record the in-flight set through the REAL send-path bookkeeping
+        // (`record_sent`), one STREAM range per packet round-robin across the
+        // streams — the shape a bulk transfer produces.
+        for k in 0..PACKETS {
+            let id = ids[(k % STREAMS) as usize];
+            let off = (k / STREAMS) * RANGE_LEN;
+            let content = SentContent {
+                stream: vec![(id, off, RANGE_LEN, false)],
+                ..SentContent::default()
+            };
+            let pn = client.spaces[SPACE_DATA].send.allocate();
+            client.record_sent(SPACE_DATA, pn, RANGE_LEN as usize, true, content, now);
+        }
+        // Give each stream a send buffer + packetize frontier consistent with the
+        // recorded ranges. Offset 0 is still in flight on every stream, so there
+        // is nothing to reclaim: each call does its full "lowest live offset"
+        // lookup and early-outs — the steady-state hot path (and the worst case
+        // for the old full rescan of sent_content).
+        let per_stream = PACKETS / STREAMS;
+        for &id in &ids {
+            let s = client.streams.get_mut(&id).unwrap();
+            s.send = vec![0xa5; (per_stream * RANGE_LEN) as usize];
+            s.send_off = per_stream * RANGE_LEN;
+        }
+
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            for &id in &ids {
+                client.compact_send_buffer(id);
+            }
+        }
+        let elapsed = t.elapsed();
+        let calls = ITERS * STREAMS as u32;
+        eprintln!(
+            "compact_send_buffer: {STREAMS} streams, {PACKETS} in-flight packets: \
+             {calls} calls in {elapsed:?} ({:?}/call)",
+            elapsed / calls
+        );
+        // Sanity: nothing was reclaimed (offset 0 is still live everywhere).
+        for &id in &ids {
+            assert_eq!(client.streams[&id].send_base, 0, "nothing to reclaim yet");
+        }
+    }
+
     #[test]
     fn path_mtu_discovery_grows_the_datagram_over_a_clean_path() {
         // DPLPMTUD must climb above the conservative BASE on a path that carries larger
