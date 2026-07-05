@@ -301,6 +301,39 @@ fn detects_record_resize() {
 // Tier 4: ParallaX vs Safari — length dimension via the production encoder.
 // ---------------------------------------------------------------------------
 
+/// Shared tail-shape contract for the Tier 4 / Tier 4b length tiers.
+///
+/// Production `seal_chunks` chunks a payload into full `FULL_RECORD_LEN`-byte
+/// records followed by AT MOST ONE short remainder. Both the uplink (Tier 4)
+/// and the server relay's downlink (Tier 4b) seal through that same sizing path,
+/// so ParallaX's own length tail must be equally degenerate. This gate filters
+/// out the full records, requires at most one remainder, and checks that the
+/// remainder falls in the open interval `(0, FULL_RECORD_LEN)`. A fragmentation
+/// regression (a coalescing bug, a padding-profile regression, an MTU split)
+/// would emit MANY sub-full records — itself a distinctive length tell — and
+/// trip this bound. `dir` labels the stream direction in assertion messages.
+fn assert_parallax_length_tail_degenerate(parallax_lengths: &[f64], dir: &str) {
+    const FULL_RECORD_LEN: u32 = 16401;
+    let parallax_tail: Vec<f64> = parallax_lengths
+        .iter()
+        .copied()
+        .filter(|&l| l != FULL_RECORD_LEN as f64)
+        .collect();
+    assert!(
+        parallax_tail.len() <= 1,
+        "ParallaX {dir} tail is not degenerate: expected <=1 non-full record \
+         (the trailing remainder), got {} non-16401 records: {:?}",
+        parallax_tail.len(),
+        parallax_tail
+    );
+    if let Some(&remainder) = parallax_tail.first() {
+        assert!(
+            (1.0..(FULL_RECORD_LEN as f64)).contains(&remainder),
+            "ParallaX {dir} remainder record {remainder} outside (0, {FULL_RECORD_LEN})"
+        );
+    }
+}
+
 #[test]
 fn parallax_vs_safari_uplink_length_distribution() {
     // Use the BIG-POST corpus: it has the real ~900 full 16401-byte uplink
@@ -379,24 +412,7 @@ fn parallax_vs_safari_uplink_length_distribution() {
     // AT MOST ONE short remainder. A regression that fragmented the uplink (a
     // coalescing bug, a padding-profile regression, an MTU split) would emit MANY
     // sub-full records — itself a distinctive length tell — and trip this bound.
-    let parallax_tail: Vec<f64> = parallax_c2s
-        .iter()
-        .copied()
-        .filter(|&l| l != FULL_RECORD_LEN as f64)
-        .collect();
-    assert!(
-        parallax_tail.len() <= 1,
-        "ParallaX uplink tail is not degenerate: expected <=1 non-full record \
-         (the trailing remainder), got {} non-16401 records: {:?}",
-        parallax_tail.len(),
-        parallax_tail
-    );
-    if let Some(&remainder) = parallax_tail.first() {
-        assert!(
-            (1.0..(FULL_RECORD_LEN as f64)).contains(&remainder),
-            "ParallaX uplink remainder record {remainder} outside (0, {FULL_RECORD_LEN})"
-        );
-    }
+    assert_parallax_length_tail_degenerate(&parallax_c2s, "uplink");
 }
 
 // ---------------------------------------------------------------------------
@@ -474,24 +490,7 @@ fn parallax_vs_safari_downlink_length_distribution() {
     // single 12080 B remainder). Safari's downlink legitimately carries a large
     // small-record tail (H2 control/DATA framing) that ParallaX does not, so —
     // as in Tier 4 — we gate ParallaX's own tail, not the cross-corpus KS.
-    let parallax_tail: Vec<f64> = parallax_s2c
-        .iter()
-        .copied()
-        .filter(|&l| l != FULL_RECORD_LEN as f64)
-        .collect();
-    assert!(
-        parallax_tail.len() <= 1,
-        "ParallaX downlink tail is not degenerate: expected <=1 non-full record \
-         (the trailing remainder), got {} non-16401 records: {:?}",
-        parallax_tail.len(),
-        parallax_tail
-    );
-    if let Some(&remainder) = parallax_tail.first() {
-        assert!(
-            (1.0..(FULL_RECORD_LEN as f64)).contains(&remainder),
-            "ParallaX downlink remainder record {remainder} outside (0, {FULL_RECORD_LEN})"
-        );
-    }
+    assert_parallax_length_tail_degenerate(&parallax_s2c, "downlink");
 }
 
 // ---------------------------------------------------------------------------
