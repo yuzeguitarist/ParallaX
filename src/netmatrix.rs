@@ -107,8 +107,13 @@ struct TokenBucket {
 impl TokenBucket {
     fn new(bandwidth_mbit: Option<u64>) -> Self {
         Self {
-            // 1 Mbit/s = 1_000_000 bits/s = 125_000 bytes/s.
-            bytes_per_sec: bandwidth_mbit.map(|m| m as f64 * 125_000.0),
+            // 1 Mbit/s = 1_000_000 bits/s = 125_000 bytes/s. A `Some(0)` cap is
+            // treated as unbounded: a 0.0 rate would make `consume` compute
+            // `n / 0.0 = inf` and panic in `Duration::from_secs_f64`. The const
+            // MATRIX never carries `Some(0)` today; this is a defensive guard.
+            bytes_per_sec: bandwidth_mbit
+                .filter(|&m| m > 0)
+                .map(|m| m as f64 * 125_000.0),
             next: Instant::now(),
         }
     }
@@ -451,6 +456,20 @@ mod tests {
             "expected ~200ms added RTT, saw {elapsed:?}"
         );
         shaper.abort();
+    }
+
+    #[tokio::test]
+    async fn token_bucket_treats_zero_bandwidth_as_unbounded() {
+        // `Some(0)` must not panic (`n / 0.0 = inf` would abort in
+        // `Duration::from_secs_f64`); it degrades to unbounded, like `None`.
+        let mut bucket = TokenBucket::new(Some(0));
+        assert!(bucket.bytes_per_sec.is_none());
+        let start = std::time::Instant::now();
+        bucket.consume(1_000_000).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "zero-bandwidth bucket must not pace"
+        );
     }
 
     #[tokio::test]
