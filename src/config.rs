@@ -1422,9 +1422,12 @@ pub fn decode_key32_secret(
     if decoded.len() != 32 {
         return Err(ConfigError::InvalidKeyLen { field });
     }
-    let mut out = [0_u8; 32];
+    // Build directly into the `Zeroizing` so there is no separate un-scrubbed
+    // `[u8; 32]` stack copy of the (X25519 static private) key left behind by a
+    // `Zeroizing::new(out)` move of a `Copy` array.
+    let mut out = Zeroizing::new([0_u8; 32]);
     out.copy_from_slice(&decoded);
-    Ok(Zeroizing::new(out))
+    Ok(out)
 }
 
 pub fn decode_base64_bytes(field: &'static str, value: &str) -> Result<Vec<u8>, ConfigError> {

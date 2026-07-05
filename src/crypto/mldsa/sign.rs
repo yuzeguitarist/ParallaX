@@ -70,8 +70,14 @@ pub fn keygen_internal(xi: &[u8; SEEDBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; SECR
     fips202::shake256(&mut seedbuf, &[&absorbed[..]]);
 
     let rho: [u8; SEEDBYTES] = core::array::from_fn(|i| seedbuf[i]);
-    let rhoprime: [u8; CRHBYTES] = core::array::from_fn(|i| seedbuf[SEEDBYTES + i]);
-    let key: [u8; SEEDBYTES] = core::array::from_fn(|i| seedbuf[SEEDBYTES + CRHBYTES + i]);
+    // `rhoprime` (feeds ExpandS) and `key` (the long-term signing secret) are
+    // secret: hold them in `Zeroizing` from creation so drop scrubs the actual
+    // binding. The prior `let mut x = x; x.zeroize()` scrubbed only a fresh Copy of
+    // these `[u8; N]` arrays, leaving the original resident.
+    let rhoprime: zeroize::Zeroizing<[u8; CRHBYTES]> =
+        zeroize::Zeroizing::new(core::array::from_fn(|i| seedbuf[SEEDBYTES + i]));
+    let key: zeroize::Zeroizing<[u8; SEEDBYTES]> =
+        zeroize::Zeroizing::new(core::array::from_fn(|i| seedbuf[SEEDBYTES + CRHBYTES + i]));
 
     // Expand matrix A from rho.
     let mut mat = [Polyvecl::zero(); K];
@@ -111,12 +117,9 @@ pub fn keygen_internal(xi: &[u8; SEEDBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; SECR
     pack_sk(&mut sk, &rho, &tr, &key, &t0, &s1, &s2);
 
     // Zeroize secret seed material and secret-bearing temporaries (plan §5).
-    // pk/sk/tr/rho are (or become) public; rhoprime/key and s1/s2/t0 are secret.
+    // pk/sk/tr/rho are (or become) public; rhoprime/key are `Zeroizing` (scrubbed
+    // on drop, no Copy leftover); s1/s2/t0 are secret and scrubbed here.
     seedbuf.zeroize();
-    let mut rhoprime = rhoprime;
-    rhoprime.zeroize();
-    let mut key = key;
-    key.zeroize();
     s1.zeroize();
     s1hat.zeroize();
     s2.zeroize();
