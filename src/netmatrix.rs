@@ -341,7 +341,14 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
         match outcome {
             Ok((report, run)) => {
                 let _ = writeln!(out, "    {{");
-                let _ = writeln!(out, "      \"profile\": \"{}\",", cell.imp.label);
+                // The MATRIX labels are static and escape-free today; routing
+                // them through json_escape keeps the emitter consistent with
+                // `upstream`/`error` and future-proofs new profile names.
+                let _ = writeln!(
+                    out,
+                    "      \"profile\": \"{}\",",
+                    json_escape(cell.imp.label)
+                );
                 let _ = writeln!(out, "      \"rtt_ms\": {},", cell.imp.rtt_ms);
                 let _ = writeln!(out, "      \"bandwidth_mbit\": {bw},");
                 let _ = writeln!(
@@ -363,7 +370,11 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
             }
             Err(err) => {
                 let _ = writeln!(out, "    {{");
-                let _ = writeln!(out, "      \"profile\": \"{}\",", cell.imp.label);
+                let _ = writeln!(
+                    out,
+                    "      \"profile\": \"{}\",",
+                    json_escape(cell.imp.label)
+                );
                 let _ = writeln!(out, "      \"rtt_ms\": {},", cell.imp.rtt_ms);
                 let _ = writeln!(out, "      \"bandwidth_mbit\": {bw},");
                 let _ = writeln!(out, "      \"error\": \"{}\"", json_escape(err));
@@ -657,6 +668,35 @@ mod tests {
             "last cell must not be comma-terminated"
         );
         assert!(json.trim_end().ends_with('}')); // document closes cleanly
+    }
+
+    #[test]
+    fn render_json_escapes_profile_label() {
+        // MATRIX labels are static and escape-free today, but the emitter must
+        // escape them like `upstream`/`error` so a future label with specials
+        // cannot break the JSON document.
+        let imp = Impairment {
+            label: "weird\"label",
+            rtt_ms: 0,
+            bandwidth_mbit: None,
+        };
+        let cells = vec![
+            NetCell {
+                imp,
+                outcome: Ok(sample_report()),
+            },
+            NetCell {
+                imp,
+                outcome: Err("boom".to_string()),
+            },
+        ];
+        let json = render_json("vps.example:443", &cells);
+        assert!(!json.contains("\"profile\": \"weird\"label\""));
+        assert_eq!(json.matches(r#""profile": "weird\"label","#).count(), 2);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("escaped label must keep the JSON valid");
+        assert_eq!(parsed["cells"][0]["profile"], "weird\"label");
+        assert_eq!(parsed["cells"][1]["profile"], "weird\"label");
     }
 
     #[test]
