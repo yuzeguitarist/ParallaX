@@ -2788,7 +2788,13 @@ server_identity_public_key = "{server_identity_public_key}"
         );
         // Set the field directly (a control char / non-ASCII value cannot be
         // written as a TOML basic-string escape) and assert validate() rejects it.
-        for bad in ["", "   ", "en-US\r\nX-Injected: 1", "en\u{0000}US", "日本語"] {
+        for bad in [
+            "",
+            "   ",
+            "en-US\r\nX-Injected: 1",
+            "en\u{0000}US",
+            "日本語",
+        ] {
             let mut cfg = toml::from_str::<Config>(&base).unwrap();
             cfg.client.as_mut().unwrap().accept_language = Some(bad.to_string());
             assert!(
