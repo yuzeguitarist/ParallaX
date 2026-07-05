@@ -957,6 +957,10 @@ ReadWritePaths=/var/lib/parallax
 # replay cache and the 'plx seal' host key live here and must be owned by the
 # service user to pass the loader's uid == euid check.
 StateDirectory=parallax
+# Without an explicit mode systemd re-applies its 0755 default to the state
+# dir on every start, silently undoing the deploy's 0700 and leaving the host
+# key + replay cache directory world-listable.
+StateDirectoryMode=0700
 # Bind :443 without root: keep ONLY the bind capability, ambient so the
 # non-root service actually receives it, and bound so nothing else can be
 # gained even through an exec.
