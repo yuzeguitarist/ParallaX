@@ -50,12 +50,31 @@ fn integration_test_names(repo_root: &Path) -> BTreeSet<String> {
 /// Robust to the YAML shape: the file is treated as whitespace-separated
 /// tokens, so shell line continuations (`\`) and flag ordering don't matter.
 /// `--test-threads=1` and similar are not `--test` and are ignored.
+///
+/// A shell/YAML line continuation can land a lone `\` token between `--test`
+/// and its value (when `--test` is the last token on a continued line, with
+/// the name on the following line). The old `windows(2)` scan assumed the two
+/// were always adjacent and would otherwise grab the `\` itself; here we skip
+/// any lone continuation tokens and take the next real token as the name. A
+/// backslash glued directly onto the name (`--test foo\`) is stripped too.
 fn workflow_invoked_tests(workflow_text: &str) -> BTreeSet<String> {
     let words: Vec<&str> = workflow_text.split_whitespace().collect();
     let mut invoked = BTreeSet::new();
-    for pair in words.windows(2) {
-        if pair[0] == "--test" {
-            invoked.insert(pair[1].trim_end_matches('\\').to_string());
+    for (i, &word) in words.iter().enumerate() {
+        if word != "--test" {
+            continue;
+        }
+        // Skip lone `\` continuation tokens to reach the actual name, which may
+        // sit on the next continued line.
+        let mut j = i + 1;
+        while words.get(j) == Some(&"\\") {
+            j += 1;
+        }
+        if let Some(name) = words.get(j) {
+            let name = name.trim_end_matches('\\');
+            if !name.is_empty() {
+                invoked.insert(name.to_string());
+            }
         }
     }
     invoked
@@ -134,6 +153,16 @@ fn guard_detects_a_missing_entry() {
         .map(|s| s.to_string())
         .collect();
     assert_eq!(invoked, expected, "parser extracted wrong `--test` tokens");
+
+    // Continuation robustness: when `--test` is the last token on a continued
+    // line and its name sits on the next line, the parser must follow across
+    // the lone `\` continuation token and still extract the name — not the `\`
+    // or an empty string (the failure mode of the old `windows(2)` scan).
+    let continued = workflow_invoked_tests("--test \\\n  foo");
+    assert!(
+        continued.contains("foo"),
+        "parser must follow a line continuation from `--test` to its name; got {continued:?}"
+    );
 
     let mut test_files = expected.clone();
     test_files.insert("deliberately_fake_missing_test".to_string());
