@@ -6,9 +6,10 @@ name: semgrep
 # Findings upload to the Security tab as SARIF and are NON-blocking — Semgrep's
 # Rust ruleset is small, so this is a supplementary lens, not a gate.
 #
-# Semgrep is installed into a throwaway venv at a pinned version. NOTE: this pin is
-# maintained BY HAND — Dependabot's github-actions ecosystem does not track a pip
-# package (it is not a `uses:` action), so bump the version below when desired.
+# Semgrep is installed into a throwaway venv from hash-pinned requirements
+# (.github/semgrep-requirements.txt, generated from semgrep-requirements.in via
+# pip-compile --generate-hashes). Dependabot does not track pip packages in
+# workflows, so bump the .in pin and regenerate the lockfile when desired.
 
 on:
   pull_request:
@@ -47,7 +48,8 @@ jobs:
       - name: Run Semgrep (p/rust) -> SARIF
         run: |
           python3 -m venv /tmp/sg
-          /tmp/sg/bin/pip install --quiet semgrep==1.167.0
+          /tmp/sg/bin/pip install --quiet --require-hashes \
+            -r .github/semgrep-requirements.txt
           # rust.lang.security.unsafe-usage is a blanket "you used `unsafe`" advisory
           # (note severity) that matches every `unsafe` keyword with no dataflow
           # analysis. This project's libc FFI (e.g. the QUIC GSO/GRO offload) is
