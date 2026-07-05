@@ -264,6 +264,37 @@ mod linux {
 
     use socket2::{socklen_t, SockAddr};
 
+    /// A cmsg control buffer that is `cmsghdr`-aligned. A bare `[u8; N]` has
+    /// alignment 1, but the kernel/`CMSG_*` macros reinterpret `msg_control` as a
+    /// `libc::cmsghdr` whose first field (`cmsg_len`) needs 8-byte alignment on
+    /// 64-bit Linux; writing/reading it through an under-aligned pointer is UB.
+    /// Backing the bytes with an `align(8)` newtype makes `as_mut_ptr()` return a
+    /// correctly aligned pointer (offset-0 field of an 8-aligned struct).
+    #[repr(C, align(8))]
+    struct CmsgBuf<const N: usize>([u8; N]);
+
+    impl<const N: usize> CmsgBuf<N> {
+        fn zeroed() -> Self {
+            Self([0u8; N])
+        }
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.0.as_mut_ptr()
+        }
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    /// Control-buffer size for one u16 `UDP_SEGMENT` cmsg (GSO send).
+    const GSO_CMSG_LEN: usize =
+        (unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) }) as usize;
+    /// Control-buffer size for the two cmsgs a GRO read may attach: the u16
+    /// segment size and the int ECN/TOS byte. Sizing for one would truncate the other.
+    const GRO_CMSG_LEN: usize = (unsafe {
+        libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32)
+            + libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32)
+    }) as usize;
+
     /// `setsockopt(UDP_GRO)` — enable generic receive offload on the carrier socket.
     /// Best-effort: a kernel without `UDP_GRO` (pre-5.0) just leaves it off and the
     /// caller keeps reading one datagram per `recvmsg`. Returns whether it took.
@@ -303,9 +334,8 @@ mod linux {
             iov_len: segments.len(),
         };
 
-        // Control buffer for one u16 UDP_SEGMENT cmsg, CMSG_SPACE-aligned.
-        let mut cmsg_buf =
-            [0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize];
+        // Control buffer for one u16 UDP_SEGMENT cmsg, cmsghdr-aligned.
+        let mut cmsg_buf = CmsgBuf::<GSO_CMSG_LEN>::zeroed();
 
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = addr.as_ptr() as *mut libc::c_void;
@@ -466,13 +496,9 @@ mod linux {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        // Room for both control messages the kernel may attach: the UDP_GRO segment
-        // size (u16) and the ECN/TOS byte (delivered as an int). Sizing for just one
-        // would truncate the other.
-        let mut cmsg_buf = [0u8; unsafe {
-            libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32)
-                + libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32)
-        } as usize];
+        // Room for both control messages the kernel may attach (see GRO_CMSG_LEN),
+        // cmsghdr-aligned.
+        let mut cmsg_buf = CmsgBuf::<GRO_CMSG_LEN>::zeroed();
 
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         // SockAddrStorage is repr(transparent) over libc::sockaddr_storage, so its

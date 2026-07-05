@@ -1138,9 +1138,12 @@ struct Tls13Keys {
     server_handshake: RecordCipher,
     client_application: RecordCipher,
     server_application: RecordCipher,
-    client_handshake_secret: Vec<u8>,
-    server_handshake_secret: Vec<u8>,
-    master_secret: Vec<u8>,
+    // Camouflage TLS 1.3 traffic secrets: scrubbed on drop so the cover-handshake
+    // key material does not linger in freed heap (core dump / swap / heap
+    // disclosure). The ParallaX tunnel keys are protected separately.
+    client_handshake_secret: Zeroizing<Vec<u8>>,
+    server_handshake_secret: Zeroizing<Vec<u8>>,
+    master_secret: Zeroizing<Vec<u8>>,
     negotiated_alpn: Option<Vec<u8>>,
 }
 
@@ -1154,12 +1157,18 @@ impl Tls13Keys {
         let early_secret = suite.hkdf_extract(&zeros, &zeros);
         let derived = suite.derive_secret(&early_secret, "derived", &[])?;
         let handshake_secret = suite.hkdf_extract(&derived, shared_secret);
-        let client_handshake_secret =
-            suite.derive_secret(&handshake_secret, "c hs traffic", transcript.bytes())?;
-        let server_handshake_secret =
-            suite.derive_secret(&handshake_secret, "s hs traffic", transcript.bytes())?;
+        let client_handshake_secret = Zeroizing::new(suite.derive_secret(
+            &handshake_secret,
+            "c hs traffic",
+            transcript.bytes(),
+        )?);
+        let server_handshake_secret = Zeroizing::new(suite.derive_secret(
+            &handshake_secret,
+            "s hs traffic",
+            transcript.bytes(),
+        )?);
         let derived = suite.derive_secret(&handshake_secret, "derived", &[])?;
-        let master_secret = suite.hkdf_extract(&derived, &zeros);
+        let master_secret = Zeroizing::new(suite.hkdf_extract(&derived, &zeros));
         Ok(Self {
             suite,
             client_handshake: RecordCipher::new(suite, &client_handshake_secret)?,
@@ -1228,7 +1237,8 @@ fn finished_verify_data(
 
 struct RecordCipher {
     suite: TlsCipherSuite,
-    key: Vec<u8>,
+    // Camouflage AEAD key, scrubbed on drop (see `Tls13Keys`).
+    key: Zeroizing<Vec<u8>>,
     iv: [u8; TLS13_IV_LEN],
     seq: u64,
 }
@@ -1237,14 +1247,15 @@ impl RecordCipher {
     fn zero(suite: TlsCipherSuite) -> Self {
         Self {
             suite,
-            key: vec![0_u8; suite.key_len()],
+            key: Zeroizing::new(vec![0_u8; suite.key_len()]),
             iv: [0_u8; TLS13_IV_LEN],
             seq: 0,
         }
     }
 
     fn new(suite: TlsCipherSuite, traffic_secret: &[u8]) -> Result<Self, Safari26TlsError> {
-        let key = suite.hkdf_expand_label(traffic_secret, "key", &[], suite.key_len())?;
+        let key =
+            Zeroizing::new(suite.hkdf_expand_label(traffic_secret, "key", &[], suite.key_len())?);
         let iv_vec = suite.hkdf_expand_label(traffic_secret, "iv", &[], TLS13_IV_LEN)?;
         let mut iv = [0_u8; TLS13_IV_LEN];
         iv.copy_from_slice(&iv_vec);

@@ -8,10 +8,11 @@
 //! (STEK). The server validates a resumed (0-RTT) ClientHello with no session
 //! database. The STEK is derived per-server from the host key, so a ticket sealed
 //! by one server never opens on another — cross-server 0-RTT replay fails closed
-//! at unseal (RFC 8446 §8.1, the user's "GFW replays elsewhere" concern). The
-//! sealed ticket is padded to a fixed length inside Safari 26.4's observed
-//! resumption-ticket range (157–160 B) so the wire `pre_shared_key` identity
-//! length is browser-plausible, not a ParallaX constant.
+//! at unseal (RFC 8446 §8.1, the user's "GFW replays elsewhere" concern). Each
+//! sealed ticket is padded to a per-ticket-random length inside Safari 26.4's
+//! observed resumption-ticket range (157–160 B) so the wire `pre_shared_key`
+//! identity length varies the way a real browser's does, rather than pinning a
+//! single ParallaX-constant length.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -30,12 +31,20 @@ use super::QuicTlsError;
 const STEK_NONCE_LEN: usize = 24;
 /// AEAD tag length.
 const TAG_LEN: usize = 16;
-/// Fixed sealed-ticket length on the wire, inside Safari 26.4's observed
-/// resumption-ticket range (157–160 B), so the `pre_shared_key` identity length is
-/// browser-plausible rather than a ParallaX tell.
-pub(crate) const SEALED_TICKET_LEN: usize = 160;
-/// Sealed plaintext length: total minus the nonce and AEAD tag (= 120).
-const PLAINTEXT_LEN: usize = SEALED_TICKET_LEN - STEK_NONCE_LEN - TAG_LEN;
+/// Sealed-ticket length window on the wire. Safari 26.4's observed resumption
+/// tickets span 157–160 B; every seal picks a length uniformly in this range so
+/// the wire `pre_shared_key` identity length VARIES across connections the way a
+/// real browser's does — a single fixed length would be a zero-variance
+/// cross-connection ParallaX invariant a censor could cluster on.
+pub(crate) const MIN_SEALED_TICKET_LEN: usize = 157;
+pub(crate) const MAX_SEALED_TICKET_LEN: usize = 160;
+/// Largest sealed plaintext length: max total minus the nonce and AEAD tag (= 120).
+/// The seal pads to a per-ticket-random target within the window; the ticket
+/// `content` must always fit under the SMALLEST plaintext (`MIN_PLAINTEXT_LEN`).
+const PLAINTEXT_LEN: usize = MAX_SEALED_TICKET_LEN - STEK_NONCE_LEN - TAG_LEN;
+/// Smallest sealed plaintext length (= 117): the content (+ its 2-byte length
+/// prefix) must fit here, because a ticket may be sealed at the low end.
+const MIN_PLAINTEXT_LEN: usize = MIN_SEALED_TICKET_LEN - STEK_NONCE_LEN - TAG_LEN;
 /// AAD binding the sealed blob to its purpose so a ticket cannot be confused with
 /// any other STEK-sealed object.
 const TICKET_AAD: &[u8] = b"ParallaX v1 QUIC 0-RTT ticket";
@@ -114,7 +123,9 @@ impl TicketState {
     }
 }
 
-/// Seal a [`TicketState`] into the fixed-length opaque ticket carried on the wire.
+/// Seal a [`TicketState`] into the opaque ticket carried on the wire. The wire
+/// length is randomized per ticket within Safari's observed window (see
+/// [`MIN_SEALED_TICKET_LEN`]/[`MAX_SEALED_TICKET_LEN`]).
 pub(crate) fn seal_ticket(stek: &[u8; 32], state: &TicketState) -> Result<Vec<u8>, QuicTlsError> {
     let mut content = Zeroizing::new(Vec::with_capacity(PLAINTEXT_LEN));
     content.push(TICKET_VERSION);
@@ -124,16 +135,22 @@ pub(crate) fn seal_ticket(stek: &[u8; 32], state: &TicketState) -> Result<Vec<u8
     content.extend_from_slice(&state.issued_at.to_be_bytes());
     content.extend_from_slice(&state.lifetime_secs.to_be_bytes());
 
-    // plaintext = content_len(u16) || content || zero padding to PLAINTEXT_LEN.
-    if content.len() + 2 > PLAINTEXT_LEN {
+    // plaintext = content_len(u16) || content || zero padding to a per-ticket
+    // random length in [MIN_PLAINTEXT_LEN, PLAINTEXT_LEN], so the sealed wire
+    // length varies uniformly across the observed Safari window [157, 160] B.
+    // The content must fit under the SMALLEST target since any length may be drawn.
+    if content.len() + 2 > MIN_PLAINTEXT_LEN {
         return Err(QuicTlsError::Crypto(
-            "0-RTT ticket state exceeds fixed length".into(),
+            "0-RTT ticket state exceeds the minimum sealed-ticket budget".into(),
         ));
     }
-    let mut plaintext = Zeroizing::new(Vec::with_capacity(PLAINTEXT_LEN));
+    // Uniform over the (MAX - MIN + 1) plaintext lengths → uniform sealed length.
+    let span = (PLAINTEXT_LEN - MIN_PLAINTEXT_LEN + 1) as u32;
+    let target_plaintext_len = MIN_PLAINTEXT_LEN + (OsRng.next_u32() % span) as usize;
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(target_plaintext_len));
     plaintext.extend_from_slice(&(content.len() as u16).to_be_bytes());
     plaintext.extend_from_slice(&content);
-    plaintext.resize(PLAINTEXT_LEN, 0);
+    plaintext.resize(target_plaintext_len, 0);
 
     let mut nonce = [0_u8; STEK_NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
@@ -148,10 +165,14 @@ pub(crate) fn seal_ticket(stek: &[u8; 32], state: &TicketState) -> Result<Vec<u8
         )
         .map_err(|_| QuicTlsError::Crypto("0-RTT ticket seal failed".into()))?;
 
-    let mut sealed = Vec::with_capacity(SEALED_TICKET_LEN);
+    let mut sealed = Vec::with_capacity(MAX_SEALED_TICKET_LEN);
     sealed.extend_from_slice(&nonce);
     sealed.extend_from_slice(&ciphertext);
-    debug_assert_eq!(sealed.len(), SEALED_TICKET_LEN);
+    debug_assert!(
+        (MIN_SEALED_TICKET_LEN..=MAX_SEALED_TICKET_LEN).contains(&sealed.len()),
+        "sealed ticket length {} outside the Safari window",
+        sealed.len()
+    );
     Ok(sealed)
 }
 
@@ -159,7 +180,10 @@ pub(crate) fn seal_ticket(stek: &[u8; 32], state: &TicketState) -> Result<Vec<u8
 /// failure (wrong STEK, tamper, wrong length, malformed) so the caller can fall
 /// back to a full handshake instead of failing the connection.
 pub(crate) fn open_ticket(stek: &[u8; 32], sealed: &[u8]) -> Option<TicketState> {
-    if sealed.len() != SEALED_TICKET_LEN {
+    // Accept any length in the Safari window (the seal randomizes it); the AEAD
+    // tag — not the length — is the integrity boundary, and `parse_ticket_state`
+    // ignores the trailing pad, so a variable target round-trips cleanly.
+    if !(MIN_SEALED_TICKET_LEN..=MAX_SEALED_TICKET_LEN).contains(&sealed.len()) {
         return None;
     }
     let (nonce, ciphertext) = sealed.split_at(STEK_NONCE_LEN);
@@ -437,17 +461,39 @@ mod tests {
     }
 
     #[test]
-    fn seal_open_round_trips_and_is_fixed_length() {
+    fn seal_open_round_trips_within_the_safari_length_window() {
         let stek = [0x11_u8; 32];
         let state = sample_state();
         let sealed = seal_ticket(&stek, &state).unwrap();
-        assert_eq!(
-            sealed.len(),
-            SEALED_TICKET_LEN,
-            "ticket is fixed wire length"
+        assert!(
+            (MIN_SEALED_TICKET_LEN..=MAX_SEALED_TICKET_LEN).contains(&sealed.len()),
+            "ticket wire length {} must sit in the Safari window [{MIN_SEALED_TICKET_LEN}, {MAX_SEALED_TICKET_LEN}]",
+            sealed.len()
         );
         let opened = open_ticket(&stek, &sealed).unwrap();
         assert_eq!(opened, state);
+    }
+
+    #[test]
+    fn seal_length_varies_across_the_window_and_all_round_trip() {
+        // Over many seals the wire length must actually SPREAD across 157..=160
+        // (not pin one value), which is the whole point of L6: a zero-variance
+        // identity length is a cross-connection ParallaX tell. Every draw must
+        // still open back to the same state.
+        let stek = [0x44_u8; 32];
+        let state = sample_state();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..256 {
+            let sealed = seal_ticket(&stek, &state).unwrap();
+            assert!((MIN_SEALED_TICKET_LEN..=MAX_SEALED_TICKET_LEN).contains(&sealed.len()));
+            assert_eq!(open_ticket(&stek, &sealed).unwrap(), state);
+            seen.insert(sealed.len());
+        }
+        assert_eq!(
+            seen,
+            (MIN_SEALED_TICKET_LEN..=MAX_SEALED_TICKET_LEN).collect(),
+            "sealed length must cover the whole Safari window across many draws, saw {seen:?}"
+        );
     }
 
     #[test]
@@ -461,7 +507,7 @@ mod tests {
             lifetime_secs: 7200,
         };
         let sealed = seal_ticket(&stek, &state).unwrap();
-        assert_eq!(sealed.len(), SEALED_TICKET_LEN);
+        assert!((MIN_SEALED_TICKET_LEN..=MAX_SEALED_TICKET_LEN).contains(&sealed.len()));
         assert_eq!(open_ticket(&stek, &sealed).unwrap(), state);
     }
 
@@ -478,8 +524,12 @@ mod tests {
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
         assert!(open_ticket(&stek, &sealed).is_none());
-        // Wrong length is rejected too.
+        // A truncated ticket fails closed too: either the length falls outside the
+        // accepted window, or (if still in-window) the shortened ciphertext fails
+        // the AEAD tag. Both yield None.
         assert!(open_ticket(&stek, &sealed[..sealed.len() - 1]).is_none());
+        // A length below the window is rejected outright.
+        assert!(open_ticket(&stek, &sealed[..MIN_SEALED_TICKET_LEN - 1]).is_none());
     }
 
     #[test]
@@ -500,7 +550,7 @@ mod tests {
             lifetime_secs: 604_800,
             age_add: 0xEF1C_2D44,
             nonce: Vec::new(),
-            ticket: vec![0xab_u8; SEALED_TICKET_LEN],
+            ticket: vec![0xab_u8; MAX_SEALED_TICKET_LEN],
             max_early_data: Some(QUIC_MAX_EARLY_DATA),
         };
         let msg = encode_new_session_ticket(&nst).unwrap();
@@ -528,7 +578,7 @@ mod tests {
     #[test]
     fn ticket_expiry_and_obfuscated_age() {
         let t = ClientTicket {
-            ticket: vec![0; SEALED_TICKET_LEN],
+            ticket: vec![0; MAX_SEALED_TICKET_LEN],
             psk: Zeroizing::new(vec![0x5a; 32]),
             suite: 0x1301,
             alpn: b"h3".to_vec(),
