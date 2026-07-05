@@ -138,6 +138,185 @@ pub fn harden_current_process() {
     }
 }
 
+/// Install a **best-effort seccomp-BPF denylist** that returns `EPERM` for the
+/// cheapest live-memory-scrape / anti-forensics syscalls, after first setting
+/// `PR_SET_NO_NEW_PRIVS`. Linux-only; a no-op on every other target.
+///
+/// # What it denies (everything else is ALLOWED)
+///
+/// This is a **denylist**, not an allowlist: the default action is
+/// `SeccompAction::Allow`, and only these syscalls are trapped to `EPERM`:
+///
+/// - `ptrace` — attach / peek / poke another task's memory & registers.
+/// - `process_vm_readv` / `process_vm_writev` — direct cross-process RAM copy.
+/// - `process_madvise` — remote `madvise` (can force pages out / probe layout).
+/// - `kcmp` — compares two processes' kernel objects (ASLR / handle oracles).
+/// - `pidfd_open` + `pidfd_getfd` — obtain a pidfd and steal another process's
+///   file descriptors (a modern, ptrace-free scrape / pivot primitive).
+///
+/// A denylist is used **deliberately** so the filter cannot break normal proxy
+/// operation: the tokio multi-thread runtime, `epoll`/`io_uring`, `futex`,
+/// `mmap`, socket and timer syscalls all fall through to `Allow`. A strict
+/// allowlist that forgot one of those would kill the runtime, which is exactly
+/// what the CRITICAL-SAFETY constraint forbids here. `EPERM` (not kill) is used
+/// for the denied set so that even if some future in-tree code path legitimately
+/// issued one of them, the daemon degrades with an error return rather than dying.
+///
+/// # Threat model — what this does and does NOT buy
+///
+/// seccomp constrains the syscalls issued **by this process and its threads**,
+/// not what other processes may do *to* it. So this does **NOT** stop a full
+/// ring-0 / root / malicious-kernel attacker — they can read `/proc/<pid>/mem`,
+/// attach from an unconstrained process, or disable the filter outright, and
+/// nothing in user space can prevent that. What it raises is the bar against an
+/// **unprivileged same-host foothold that ends up executing inside this address
+/// space** (an exploited worker thread, an injected `.so`, a malicious in-proc
+/// plugin): such code can no longer reach for `process_vm_readv`/`pidfd_getfd`/
+/// `ptrace` to scrape *other* processes' secrets or use `kcmp`/`process_madvise`
+/// for anti-forensics — those return `EPERM` instead. It is defense-in-depth,
+/// not a guarantee.
+///
+/// # Best-effort / fail-open
+///
+/// Every failure path (old kernel without `seccomp(2)`, a container that blocks
+/// the syscall, `PR_SET_NO_NEW_PRIVS` denied, an unsupported target arch) logs a
+/// **warning and returns** — it never panics and never fails the process. It also
+/// never falsely claims success: the confirming `INFO` log is emitted only after
+/// the kernel actually accepts the filter.
+///
+/// # Why "late"
+///
+/// It must be installed **after** startup work that legitimately touches the
+/// filesystem/keys and after listeners are bound, so none of those startup
+/// syscalls are affected — the filter only governs the steady-state serving loop.
+/// The denied set is never used on the normal serving path, so installing it late
+/// is transparent to traffic.
+///
+/// The BPF is compiled for `std::env::consts::ARCH` (the running binary's arch)
+/// by the vetted, pure-Rust `seccompiler` crate (from the Firecracker project),
+/// whose generated program kills the process on a *foreign-arch* syscall — an
+/// inherent, standard property of seccomp arch validation that native same-arch
+/// operation never triggers.
+///
+/// # Recommended call site (not wired here)
+///
+/// This module intentionally does **not** call this function; `src/cli.rs` /
+/// `src/main.rs` are owned elsewhere. The recommended placement is inside the
+/// long-running server path in `src/handshake/server.rs::run`, immediately after
+/// `let listener = TcpListener::bind(server.listen).await?;` (and after the
+/// optional UDP carrier bind), i.e. once keys are loaded and every listener is
+/// bound but before the `accept()` loop. It could also be gated behind a
+/// `PARALLAX_DISABLE_SECCOMP` env toggle by the owner of that call site, mirroring
+/// the existing `PARALLAX_DISABLE_ANTI_DEBUG` pattern, for operators who must run
+/// under unusual tracing tools.
+pub fn install_late_seccomp_filter() {
+    #[cfg(target_os = "linux")]
+    install_late_seccomp_filter_linux();
+
+    #[cfg(not(target_os = "linux"))]
+    tracing::debug!(
+        "late seccomp filter is Linux-only; skipping the memory-scrape denylist on this target"
+    );
+}
+
+/// The memory-scrape / anti-forensics syscalls the late filter traps to `EPERM`.
+/// Names are carried alongside the numbers purely for the confirmation log.
+#[cfg(target_os = "linux")]
+const SCRAPE_DENYLIST: &[(&str, libc::c_long)] = &[
+    ("ptrace", libc::SYS_ptrace),
+    ("process_vm_readv", libc::SYS_process_vm_readv),
+    ("process_vm_writev", libc::SYS_process_vm_writev),
+    ("process_madvise", libc::SYS_process_madvise),
+    ("kcmp", libc::SYS_kcmp),
+    ("pidfd_getfd", libc::SYS_pidfd_getfd),
+    ("pidfd_open", libc::SYS_pidfd_open),
+];
+
+#[cfg(target_os = "linux")]
+fn install_late_seccomp_filter_linux() {
+    // Required for an unprivileged process to load a seccomp filter; harmless if
+    // already privileged and idempotent if a prior call set it. seccompiler also
+    // sets this internally during apply, but doing it explicitly first both
+    // matches the documented ordering and lets us fail open with a clear reason.
+    if let Err(err) = rustix::thread::set_no_new_privs(true) {
+        tracing::warn!(
+            error = %err,
+            "PR_SET_NO_NEW_PRIVS failed; skipping best-effort seccomp filter (continuing)"
+        );
+        return;
+    }
+
+    let program = match build_scrape_denylist_filter() {
+        Ok(program) => program,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not compile seccomp memory-scrape denylist (unsupported arch?); \
+                 continuing without it (best-effort)"
+            );
+            return;
+        }
+    };
+
+    // TSYNC applies the filter to EVERY thread in the process, not just the
+    // caller — essential under the tokio multi-thread runtime, whose worker
+    // threads already exist by the late install point.
+    match seccompiler::apply_filter_all_threads(&program) {
+        Ok(()) => {
+            let denied: Vec<&str> = SCRAPE_DENYLIST.iter().map(|(name, _)| *name).collect();
+            tracing::info!(
+                ?denied,
+                "installed best-effort seccomp denylist \
+                 (memory-scrape/anti-forensics syscalls -> EPERM; all others allowed). \
+                 Note: does not stop a root/ring-0 attacker; raises the bar against an \
+                 unprivileged in-process foothold only."
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to install seccomp filter (old kernel or blocked syscall?); \
+                 continuing without it (best-effort)"
+            );
+        }
+    }
+}
+
+/// Compile the denylist into a BPF program for the running architecture.
+///
+/// Default action = `Allow` (fall-through for all unlisted syscalls); matched
+/// (denied) syscalls => `EPERM`. Empty rule vecs mean "match this syscall number
+/// unconditionally", so the deny is not argument-dependent. Kept separate from
+/// installation so it is unit-testable without touching process state.
+#[cfg(target_os = "linux")]
+fn build_scrape_denylist_filter() -> Result<seccompiler::BpfProgram, seccompiler::BackendError> {
+    use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+    use std::collections::BTreeMap;
+    use std::convert::TryInto;
+
+    let target_arch: TargetArch = std::env::consts::ARCH.try_into()?;
+
+    // `c_long` is `i64` on the 64-bit targets seccompiler supports but `i32` on
+    // 32-bit Linux, so the widening cast to the filter's `i64` key is required for
+    // portability even though it is a no-op on x86_64/aarch64/riscv64.
+    #[allow(clippy::unnecessary_cast)]
+    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = SCRAPE_DENYLIST
+        .iter()
+        .map(|(_, nr)| (*nr as i64, Vec::new()))
+        .collect();
+
+    let filter = SeccompFilter::new(
+        rules,
+        // Default (mismatch) action for everything NOT in the denylist: allow.
+        SeccompAction::Allow,
+        // Action for the denied syscalls: return EPERM without executing them.
+        SeccompAction::Errno(libc::EPERM as u32),
+        target_arch,
+    )?;
+
+    filter.try_into()
+}
+
 /// Whether [`disable_ptrace_dumpability`] runs for a given anti-debug setting.
 /// Unconditional everywhere the syscall cannot abort startup, because it is the
 /// core-dump exclusion that actually holds against a piped `core_pattern` — not
@@ -582,5 +761,123 @@ mod tests {
     fn protect_secret_bytes_does_not_panic() {
         let secret = vec![0x5a_u8; 64];
         super::protect_secret_bytes("test.secret", &secret);
+    }
+
+    // The public entry point is a no-op-safe, fail-open function on every target;
+    // calling it twice must never panic (idempotent, best-effort). On Linux this
+    // actually installs the process-wide filter, so it runs last-ish; the deny
+    // set is EPERM-only (never kill), so it cannot take the test process down.
+    #[test]
+    fn install_late_seccomp_filter_is_safe_to_call() {
+        super::install_late_seccomp_filter();
+        super::install_late_seccomp_filter();
+    }
+
+    // The denylist must compile to a non-empty BPF program on the supported
+    // architectures (x86_64/aarch64/riscv64 — what CI runs). On an unsupported
+    // arch `build` returns Err and the installer fails open, which is the
+    // documented behavior, so we only assert the shape when compilation succeeds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scrape_denylist_compiles_to_bpf() {
+        match super::build_scrape_denylist_filter() {
+            Ok(program) => {
+                // Arch-validation preamble + one chain per denied syscall + the
+                // trailing default action => comfortably more than the raw count.
+                assert!(
+                    program.len() > super::SCRAPE_DENYLIST.len(),
+                    "BPF program should include the arch preamble and per-syscall chains"
+                );
+            }
+            Err(err) => {
+                // Only tolerated on an arch seccompiler cannot target.
+                eprintln!("seccomp denylist not compiled on this arch (tolerated): {err}");
+            }
+        }
+    }
+
+    // CRITICAL-SAFETY test: prove the *shipped* BPF program does not kill the
+    // process for normal work and that a denied syscall returns EPERM.
+    //
+    // Isolation: we install the program with the thread-local `apply_filter`
+    // (NOT the process-wide TSYNC variant used in production) inside a dedicated
+    // worker thread. A non-TSYNC seccomp filter binds to the calling thread only,
+    // so sibling test threads and the rest of the harness are unaffected, and the
+    // thread simply exits when done (seccomp filters are irremovable, but this one
+    // dies with its thread). This exercises the exact BpfProgram we ship; only the
+    // apply flag differs. Denied syscalls use EPERM (never kill), and the program
+    // is compiled for the running arch, so the only seccomp kill path — a
+    // foreign-arch syscall — is never hit by this thread's native syscalls.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filter_allows_normal_ops_and_eperms_scrape() {
+        use std::convert::TryInto;
+
+        // If seccompiler cannot target this arch, the installer fails open; there
+        // is nothing to assert about the kernel behavior, so skip.
+        let arch: Result<seccompiler::TargetArch, _> = std::env::consts::ARCH.try_into();
+        if arch.is_err() {
+            eprintln!("skipping: seccomp unsupported on this arch");
+            return;
+        }
+        let program = super::build_scrape_denylist_filter().expect("denylist compiles");
+
+        let handle = std::thread::spawn(move || {
+            // Bind the filter to THIS thread only (no TSYNC).
+            rustix::thread::set_no_new_privs(true).expect("PR_SET_NO_NEW_PRIVS");
+            // If the kernel lacks seccomp entirely, fail open like production.
+            if seccompiler::apply_filter(&program).is_err() {
+                eprintln!("skipping kernel assertions: seccomp(2) unavailable");
+                return;
+            }
+
+            // --- Normal syscalls: must all be ALLOWED (thread stays alive). ---
+            // Heap allocation (brk/mmap).
+            let mut scratch = vec![0_u8; 64 * 1024];
+            scratch[0] = 1;
+            assert_eq!(scratch[0], 1);
+            // File open + read (openat/read).
+            let devnull = std::fs::File::open("/dev/null").expect("open /dev/null allowed");
+            drop(devnull);
+            // Socket create + bind (socket/bind).
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("socket/bind allowed");
+            assert!(sock.local_addr().is_ok());
+            // Timer sleep (clock_nanosleep/nanosleep).
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            // Thread create + join (clone/clone3 + futex), all fall through to Allow.
+            let inner = std::thread::spawn(|| 40 + 2);
+            assert_eq!(inner.join().expect("inner thread joins under filter"), 42);
+
+            // --- Denied syscalls: must return EPERM (intercepted, not executed). ---
+            // process_vm_readv with count=0 would normally succeed (return 0); under
+            // the filter it is trapped to EPERM before the kernel runs it, so a
+            // non-zero errno here proves the denial path fired.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_process_vm_readv,
+                    libc::getpid(),
+                    std::ptr::null::<libc::iovec>(),
+                    0_u64,
+                    std::ptr::null::<libc::iovec>(),
+                    0_u64,
+                    0_u64,
+                )
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert_eq!(rc, -1, "process_vm_readv must be blocked, not executed");
+            assert_eq!(errno, Some(libc::EPERM), "process_vm_readv must EPERM");
+
+            // ptrace(PTRACE_TRACEME) would normally succeed; must also EPERM.
+            let rc = unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_TRACEME, 0, 0, 0) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert_eq!(rc, -1, "ptrace must be blocked, not executed");
+            assert_eq!(errno, Some(libc::EPERM), "ptrace must EPERM");
+        });
+
+        // If the thread had been killed by seccomp, the whole process would have
+        // died; reaching here with a clean join proves normal ops survived.
+        handle
+            .join()
+            .expect("filtered worker thread completed without being killed");
     }
 }
