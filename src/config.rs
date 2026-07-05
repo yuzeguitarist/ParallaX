@@ -1013,10 +1013,14 @@ impl Config {
                 require_host_port("client.server_addr", &client.server_addr)?;
                 require_non_empty("client.sni", &client.sni)?;
                 if let Some(al) = &client.accept_language {
-                    // A header value: reject empty and any control char (incl. CR/LF)
-                    // and non-ASCII so a misconfigured value cannot become its own
-                    // distinguishing tell or a framing oddity.
-                    if al.is_empty() || !al.is_ascii() || al.bytes().any(|b| b.is_ascii_control()) {
+                    // A header value: reject empty/whitespace-only (matching the
+                    // require_non_empty discipline used for other fields), any control
+                    // char (incl. CR/LF), and non-ASCII, so a misconfigured value
+                    // cannot become its own distinguishing tell or a framing oddity.
+                    if al.trim().is_empty()
+                        || !al.is_ascii()
+                        || al.bytes().any(|b| b.is_ascii_control())
+                    {
                         return Err(ConfigError::InvalidAcceptLanguage);
                     }
                 }
@@ -2784,7 +2788,7 @@ server_identity_public_key = "{server_identity_public_key}"
         );
         // Set the field directly (a control char / non-ASCII value cannot be
         // written as a TOML basic-string escape) and assert validate() rejects it.
-        for bad in ["", "en-US\r\nX-Injected: 1", "en\u{0000}US", "日本語"] {
+        for bad in ["", "   ", "en-US\r\nX-Injected: 1", "en\u{0000}US", "日本語"] {
             let mut cfg = toml::from_str::<Config>(&base).unwrap();
             cfg.client.as_mut().unwrap().accept_language = Some(bad.to_string());
             assert!(

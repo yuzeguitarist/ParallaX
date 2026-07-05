@@ -31,6 +31,8 @@ const SAFARI26_SEC_FETCH_MODE: &str = "navigate";
 pub enum Http2FingerprintError {
     #[error("HTTP/2 frame payload is too large")]
     FrameTooLarge,
+    #[error("invalid header value (empty, non-ASCII, or contains control characters)")]
+    InvalidHeaderValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,15 @@ impl Http2Fingerprint {
         authority: &str,
         accept_language: &str,
     ) -> Result<Vec<u8>, Http2FingerprintError> {
+        // Defense-in-depth: `ClientConfig` already validates this, but as a public
+        // API reject any non-ASCII / control-char value so a future caller cannot
+        // corrupt the H2 fingerprint (or splice CRLF-like bytes) through us.
+        if accept_language.trim().is_empty()
+            || !accept_language.is_ascii()
+            || accept_language.bytes().any(|b| b.is_ascii_control())
+        {
+            return Err(Http2FingerprintError::InvalidHeaderValue);
+        }
         // Safari 26.4 main-document request, field order as captured:
         // :method :scheme :authority :path, then sec-fetch-dest, user-agent,
         // accept, sec-fetch-site, sec-fetch-mode, accept-language, priority,

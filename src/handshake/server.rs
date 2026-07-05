@@ -1337,8 +1337,10 @@ pub async fn accept_authenticated(
     let forwarded = match forward {
         Ok(forwarded) => forwarded,
         Err(err) => {
-            graceful_close_tcp_stream(client).await;
-            graceful_close_tcp_stream(fallback).await;
+            tokio::join!(
+                graceful_close_tcp_stream(client),
+                graceful_close_tcp_stream(fallback),
+            );
             return Err(err);
         }
     };
@@ -1351,8 +1353,10 @@ pub async fn accept_authenticated(
         // it like the client. Swallow a write error here: we tear the connection down
         // regardless and must still FIN.
         let _ = write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await;
-        graceful_close_tcp_stream(client).await;
-        graceful_close_tcp_stream(fallback).await;
+        tokio::join!(
+            graceful_close_tcp_stream(client),
+            graceful_close_tcp_stream(fallback),
+        );
         return Err(HandshakeServerError::Tls13Required);
     }
     // Mirror the origin ServerHello + derive the epoch-0 keys; on any error FIN
@@ -1367,8 +1371,10 @@ pub async fn accept_authenticated(
     let session_keys = match finish {
         Ok(session_keys) => session_keys,
         Err(err) => {
-            graceful_close_tcp_stream(client).await;
-            graceful_close_tcp_stream(fallback).await;
+            tokio::join!(
+                graceful_close_tcp_stream(client),
+                graceful_close_tcp_stream(fallback),
+            );
             return Err(err);
         }
     };
