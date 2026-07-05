@@ -125,15 +125,26 @@ impl CipherSuite {
     ) -> Result<Vec<u8>, QuicTlsError> {
         // The wire encoding packs `full_label_len`, `context.len()`, and `len`
         // into u8/u16 fields. Every internal caller uses short constant labels and
-        // bounded contexts (hashes ≤48 B), so these never overflow; assert it in
-        // debug builds to catch any future misuse before the silent truncation.
-        debug_assert!(label.len() <= 249, "TLS 1.3 label + \"tls13 \" must fit u8");
-        debug_assert!(context.len() <= 255, "TLS 1.3 HKDF context must fit u8");
-        debug_assert!(
-            len <= u16::MAX as usize,
-            "HKDF-Expand-Label output must fit u16"
-        );
+        // bounded contexts (hashes ≤48 B), so these never overflow in practice —
+        // but a raw `as u8`/`as u16` would SILENTLY TRUNCATE an over-long input and
+        // derive a subtly wrong key. Fail closed instead: reject anything that does
+        // not fit the RFC 8446 §7.1 wire fields rather than truncating in release.
         let full_label_len = 6 + label.len();
+        if full_label_len > u8::MAX as usize {
+            return Err(QuicTlsError::Crypto(
+                "HKDF-Expand-Label label exceeds the u8 wire length".into(),
+            ));
+        }
+        if context.len() > u8::MAX as usize {
+            return Err(QuicTlsError::Crypto(
+                "HKDF-Expand-Label context exceeds the u8 wire length".into(),
+            ));
+        }
+        if len > u16::MAX as usize {
+            return Err(QuicTlsError::Crypto(
+                "HKDF-Expand-Label output exceeds the u16 wire length".into(),
+            ));
+        }
         let mut info = Vec::with_capacity(2 + 1 + full_label_len + 1 + context.len());
         info.extend_from_slice(&(len as u16).to_be_bytes());
         info.push(full_label_len as u8);
@@ -230,6 +241,36 @@ mod tests {
             "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c\
              faea9ea9076ede7f4af152e8b2fa9cb6"
         );
+    }
+
+    #[test]
+    fn hkdf_expand_label_rejects_over_long_inputs_instead_of_truncating() {
+        // The wire fields are u8 (full label), u8 (context), u16 (output). Inputs
+        // that would overflow those must fail closed rather than silently truncate
+        // via `as u8`/`as u16` and derive a wrong key. `full_label_len = 6 + label`,
+        // so a 250-byte label overflows the u8 (6 + 250 = 256).
+        let suite = CipherSuite::Aes128GcmSha256;
+        let prk = suite.hkdf_extract(&[0_u8; 32], &[0_u8; 32]);
+
+        assert!(matches!(
+            suite.hkdf_expand_label(&prk, &"x".repeat(250), &[], 16),
+            Err(QuicTlsError::Crypto(_))
+        ));
+        assert!(matches!(
+            suite.hkdf_expand_label(&prk, "key", &[0_u8; 256], 16),
+            Err(QuicTlsError::Crypto(_))
+        ));
+        assert!(matches!(
+            suite.hkdf_expand_label(&prk, "key", &[], u16::MAX as usize + 1),
+            Err(QuicTlsError::Crypto(_))
+        ));
+
+        // The boundary values that DO fit the wire fields still succeed (the guard
+        // rejects only genuine overflow, not the largest legal input): a 249-byte
+        // label (6 + 249 = 255) and a 255-byte context.
+        assert!(suite
+            .hkdf_expand_label(&prk, &"x".repeat(249), &[0_u8; 255], 16)
+            .is_ok());
     }
 
     #[test]
