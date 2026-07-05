@@ -336,7 +336,11 @@ pub fn verify_ctx(
     let cp_poly = cp;
     t1.pointwise_poly_montgomery(&cp_poly, &{ t1 });
 
-    w1.sub(&{ w1 }, &t1);
+    // `w1 -= t1` in place rather than `w1.sub(&{ w1 }, &t1)`, whose `&{ w1 }` block
+    // copies the whole `Polyveck` only to satisfy the borrow checker. `sub_assign`
+    // is the established in-place idiom in this module (cf. `z.add_assign(&y)`,
+    // `w0.add_assign(&h)`) and is byte-for-byte equivalent here.
+    w1.sub_assign(&t1);
     w1.reduce();
     w1.invntt_tomont();
 
