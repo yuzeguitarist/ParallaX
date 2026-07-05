@@ -475,7 +475,16 @@ fn seal_config(
         secrets
             .iter()
             .map(|(field, value)| (*field, value.as_str())),
-    );
+    )
+    .with_context(|| {
+        format!(
+            "cannot re-seal {}: an entry retained from the existing bundle does not open \
+             under this host key, so its rollback protection cannot be preserved across \
+             the bundle-id rotation. Re-seal the config that owns it (with its host key) \
+             or use --output to write a separate bundle.",
+            bundle_path.display()
+        )
+    })?;
     // The bundle is ciphertext, but write it 0600 + O_NOFOLLOW + atomically: the
     // default 0644 would expose salts/nonces/field names and a pre-planted symlink
     // could redirect the write.
@@ -1480,6 +1489,54 @@ mod tests {
             private_b64
         );
         assert!(after.inline_secret_fields().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reseal_rotates_bundle_id_and_config_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let generated = generate_config_template(
+            "127.0.0.1:0",
+            "127.0.0.1:1080",
+            "example.com:443",
+            "example.com:443",
+            "example.com",
+        );
+        let server_path = dir.path().join("parallax.server.toml");
+        fs::write(&server_path, &generated.server).unwrap();
+        fs::set_permissions(&server_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let before = Config::load(&server_path).unwrap();
+        let psk_b64 = before.crypto.psk.as_b64().to_owned();
+
+        let host_key = dir.path().join("host.key");
+        std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+
+        seal_config(&server_path, None, None).unwrap();
+        let bundle_path = dir.path().join("parallax.secrets.enc");
+        let bundle_id = |path: &Path| -> String {
+            let value: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            value["id"].as_str().unwrap().to_owned()
+        };
+        let first_id = bundle_id(&bundle_path);
+
+        // Re-seal into the SAME bundle: the documented rollback guarantee
+        // ("each bundle has a fresh id") requires the id to rotate here, so a
+        // superseded entry from the first bundle cannot be spliced back in.
+        seal_config(&server_path, None, None).unwrap();
+        assert_ne!(
+            bundle_id(&bundle_path),
+            first_id,
+            "re-seal must rotate bundle.id"
+        );
+
+        // And the re-sealed config still resolves to the original secrets.
+        let after = Config::load(&server_path).unwrap();
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        assert_eq!(after.crypto.psk.as_b64(), psk_b64);
     }
 
     #[cfg(unix)]
