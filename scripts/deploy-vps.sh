@@ -903,6 +903,14 @@ Group=parallax
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+# The process mlock()s secret key pages to keep them out of swap
+# (src/process_hardening.rs). Without an explicit LimitMEMLOCK the distro
+# default (often 8 MiB or even 64 KiB) can silently cap those locks, degrading
+# swap-pinning with only a one-shot warning. LimitCORE=0 mirrors the
+# in-process setrlimit(RLIMIT_CORE, 0) so core dumps stay off even before
+# main() runs.
+LimitMEMLOCK=infinity
+LimitCORE=0
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
