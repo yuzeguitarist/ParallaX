@@ -31,8 +31,20 @@ type OfferRegistry = Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Connection>>>>;
 /// The process-wide stable-:443 carrier (see the module docs).
 pub(crate) struct QuicCarrier {
     registry: OfferRegistry,
-    /// Held for the carrier's lifetime: dropping it stops the endpoint + accept loop.
+    /// The endpoint handle whose driver task owns the bound `:443/UDP` socket. Held
+    /// for the carrier's lifetime; on drop the accept task is aborted (see
+    /// [`Self::accept_task`]) and this handle is released, which lets the driver exit
+    /// and frees the socket.
     endpoint: Endpoint,
+    /// Handle to the spawned accept loop, ABORTED by [`Drop`] to break a reference
+    /// cycle: the accept task owns an [`Endpoint`] clone (a live `connect_tx`), so
+    /// while it runs the driver's `connect_rx` never closes, the driver never
+    /// returns, [`Endpoint::accept`] never yields `None`, and neither the driver
+    /// task nor the bound `:443/UDP` socket are ever freed — dropping the carrier's
+    /// `endpoint` alone cannot break it. Aborting this task drops that clone so,
+    /// once the `endpoint` field drops right after, the driver exits and the socket
+    /// is released.
+    accept_task: tokio::task::JoinHandle<()>,
 }
 
 impl QuicCarrier {
@@ -48,7 +60,7 @@ impl QuicCarrier {
 
         let accept_ep = endpoint.clone();
         let accept_reg = registry.clone();
-        tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
             // `accept()` only yields marker-terminated connections — probers are
             // spliced to the origin inside the endpoint and never surface here.
             while let Some(conn) = accept_ep.accept().await {
@@ -76,7 +88,11 @@ impl QuicCarrier {
             }
         });
 
-        Ok(Arc::new(Self { registry, endpoint }))
+        Ok(Arc::new(Self {
+            registry,
+            endpoint,
+            accept_task,
+        }))
     }
 
     /// The carrier's bound local address (the real `:443/UDP`).
@@ -112,6 +128,18 @@ impl QuicCarrier {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(offer_id);
+    }
+}
+
+impl Drop for QuicCarrier {
+    fn drop(&mut self) {
+        // Break the reference cycle documented on `accept_task`: the accept loop
+        // owns an `Endpoint` clone (a live `connect_tx`). Aborting it drops that
+        // clone, so once the `endpoint` field drops immediately after this returns,
+        // the driver's `connect_rx` closes, the driver task returns, and the bound
+        // `:443/UDP` socket is released. Without this the driver — and the socket —
+        // would live forever.
+        self.accept_task.abort();
     }
 }
 
@@ -193,5 +221,60 @@ mod tests {
             &offer_id,
             "the routed connection carries the session offer_id as its DCID"
         );
+    }
+
+    /// Dropping the carrier must stop its accept loop and free the bound
+    /// `:443/UDP` socket. Regression: the accept task owns an `Endpoint` clone, so
+    /// without a `Drop` that aborts it the driver never exits and the port stays
+    /// bound forever — the "dropping it stops the endpoint + accept loop" contract
+    /// was false. Proven by rebinding the exact port after the drop.
+    #[tokio::test]
+    async fn dropping_the_carrier_frees_the_socket() {
+        let server_kp = X25519KeyPair::generate();
+        let psk = zeroize::Zeroizing::new(b"parallax-quic-stable-carrier-psk".to_vec());
+        let origin: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (cert, key) = self_signed_cert();
+        let config = server_config_stable(
+            cert,
+            key,
+            None,
+            (psk.clone(), zeroize::Zeroizing::new(server_kp.private)),
+            None,
+            origin,
+            vec!["example.com".to_owned()],
+            0,
+        )
+        .unwrap();
+
+        let carrier = QuicCarrier::bind("127.0.0.1:0".parse().unwrap(), config)
+            .await
+            .unwrap();
+        let carrier_addr = carrier.local_addr().unwrap();
+
+        // While the carrier is alive its socket owns the port: a fresh UDP bind to
+        // the same address must fail (the endpoint binds without SO_REUSEADDR).
+        assert!(
+            tokio::net::UdpSocket::bind(carrier_addr).await.is_err(),
+            "the carrier's port {carrier_addr} must be in use while it is alive"
+        );
+
+        drop(carrier);
+
+        // The abort + driver exit are asynchronous, so poll-rebind under a bounded
+        // timeout: a successful bind proves the driver task released the socket
+        // (i.e. the accept loop stopped and the cycle was broken). Pre-fix this
+        // never succeeds and the test times out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tokio::net::UdpSocket::bind(carrier_addr).await.is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropping the carrier did not free {carrier_addr}: the driver task \
+                 (and its accept loop) is still running"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
