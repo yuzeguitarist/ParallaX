@@ -5863,10 +5863,58 @@ where
 /// Returns the owned `server_seal` codec on a clean finish so the QUIC
 /// fast-plane teardown can seal the local DONE marker on the SAME send-direction
 /// codec (sequence continues uninterrupted). TCP-path callers discard it.
+///
+/// No-RST teardown (item #1): this thin wrapper owns the client-facing (censor-
+/// facing) write half and FINs it on ANY mid-relay error. The inner relay's
+/// clean-EOF paths already `shutdown()` their write half; before this, a mid-relay
+/// `?` bare-dropped `client_write`, which for the QUIC fast-plane leg
+/// (`H3DataFrameLegWriter` over a quinn `SendStream`) emits a `RESET_STREAM`
+/// (the QUIC analog of an RST / a visible truncation) instead of a clean stream
+/// finish. FIN-ing on error (mirroring `client_mux_download_loop` and
+/// `graceful_fin_then_drain`) turns that abrupt reset into a clean half-close on
+/// the error path too. (On the concrete TCP leg tokio's `OwnedWriteHalf` already
+/// FINs on drop, so there the explicit FIN just makes the send prompt/explicit.)
 #[allow(clippy::too_many_arguments)]
 async fn server_download_loop<W>(
-    mut target_read: OwnedReadHalf,
+    target_read: OwnedReadHalf,
     mut client_write: W,
+    server_seal: DataRecordCodec,
+    target_buf: Vec<u8>,
+    timing: TimingProfile,
+    cover: CoverTrafficProfile,
+    activity: RelayActivity,
+    cid: u64,
+) -> Result<DataRecordCodec, HandshakeServerError>
+where
+    W: LegWriter,
+{
+    let result = server_download_relay(
+        target_read,
+        &mut client_write,
+        server_seal,
+        target_buf,
+        timing,
+        cover,
+        activity,
+        cid,
+    )
+    .await;
+    if result.is_err() {
+        // FIN the censor-facing write half before propagating so teardown is a
+        // clean half-close, not an abrupt reset (see the fn doc). Best-effort:
+        // the relay is already failing, so a shutdown error is not actionable.
+        let _ = client_write.shutdown().await;
+    }
+    result
+}
+
+/// The actual server->client relay body. Borrows the client-facing write half so
+/// [`server_download_loop`] retains ownership to FIN it on error; every clean-EOF
+/// path here still `shutdown()`s it directly (so the wrapper never double-FINs).
+#[allow(clippy::too_many_arguments)]
+async fn server_download_relay<W>(
+    mut target_read: OwnedReadHalf,
+    client_write: &mut W,
     mut server_seal: DataRecordCodec,
     mut target_buf: Vec<u8>,
     timing: TimingProfile,
@@ -5940,7 +5988,7 @@ where
                 // order (a read error never cancels the in-flight write).
                 let spare = spare_buf.get_or_insert_with(|| vec![0_u8; cap]);
                 let next_n = write_batch_with_read_ahead(
-                    &mut client_write,
+                    &mut *client_write,
                     seal_scratch.records_buf.as_slice(),
                     target_read.read(spare),
                 )
@@ -5993,7 +6041,7 @@ where
             }
 
             write_server_data_records_chunked(
-                &mut client_write,
+                &mut *client_write,
                 &mut server_seal,
                 &target_buf[..n],
                 &mut rng,
@@ -6010,7 +6058,7 @@ where
         tokio::select! {
             _ = &mut cover_sleep, if cover.is_enabled() => {
                 write_server_data_records_chunked(
-                    &mut client_write,
+                    &mut *client_write,
                     &mut server_seal,
                     &[],
                     &mut rng,
@@ -6037,7 +6085,7 @@ where
                 }
 
                 write_server_data_records_chunked(
-                    &mut client_write,
+                    &mut *client_write,
                     &mut server_seal,
                     &target_buf[..n],
                     &mut rng,
@@ -9842,6 +9890,179 @@ mod tests {
             DOWNLOAD_READ_AHEAD_ENGAGED.load(Ordering::Relaxed) > bulk_before,
             "a multi-MiB saturating transfer must engage the read-ahead pipeline branch \
              (the saturated gate must not be vacuously always-serial)",
+        );
+    }
+
+    /// Item #1 (deterministic teeth): on a mid-relay ERROR the download loop must
+    /// FIN (call `shutdown` on) its client-facing write half — not bare-drop it.
+    /// A mock `LegWriter` whose write always fails drives the loop into its error
+    /// path and records whether `shutdown` was invoked. Transport-agnostic, so it
+    /// distinguishes the fix from the pre-fix bare-drop (which never called
+    /// `shutdown`), independent of tokio's TCP shutdown-on-drop.
+    #[tokio::test]
+    async fn download_loop_fins_client_write_on_relay_error() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::time::{timeout, Duration};
+
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordCodec};
+
+        struct FinRecordingWriter {
+            shutdown_called: Arc<AtomicBool>,
+        }
+        impl LegWriter for FinRecordingWriter {
+            async fn write_records(&mut self, _bytes: &[u8]) -> io::Result<()> {
+                // Force the relay's error path on the very first client write.
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client stopped reading",
+                ))
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                self.shutdown_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let key = [0x33_u8; KEY_LEN];
+        let nonce = [0x44_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let codec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+
+        // Target -> loop: a real TCP pair; the peer sends a few bytes (a sub-buffer
+        // burst, so the loop takes the serial branch and reaches the client write)
+        // and stays open, so the loop's error is the failing WRITE, not an EOF.
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let mut target = tokio::net::TcpStream::connect(origin_addr).await.unwrap();
+            target.write_all(b"some-origin-bytes").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let (origin_for_loop, _) = origin_listener.accept().await.unwrap();
+        let (target_read, _target_write) = origin_for_loop.into_split();
+
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let writer = FinRecordingWriter {
+            shutdown_called: shutdown_called.clone(),
+        };
+
+        let target_buf = vec![0_u8; relay_read_buffer_len(max_plaintext_len(0))];
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let traffic = TrafficConfig::default();
+        let result = timeout(
+            Duration::from_secs(10),
+            server_download_loop(
+                target_read,
+                writer,
+                codec,
+                target_buf,
+                TimingProfile::from_config(traffic),
+                CoverTrafficProfile::from_config(traffic),
+                activity,
+                21,
+            ),
+        )
+        .await
+        .expect("download loop must return promptly on a client write error");
+
+        assert!(
+            result.is_err(),
+            "a failing client write must surface as a relay error"
+        );
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "on a mid-relay error the download loop must FIN (shutdown) the client-facing \
+             write half, not bare-drop it",
+        );
+        origin.abort();
+    }
+
+    /// Item #1 (observable, over real TCP): a mid-relay error (here: the TARGET
+    /// resets) must leave the client-facing socket a clean FIN — the client peer's
+    /// drain ends in `read == 0`, never `ECONNRESET`. This is the no-RST-on-teardown
+    /// invariant the loop must uphold on the error path, not just the clean-EOF path.
+    #[tokio::test]
+    async fn download_loop_relay_error_fins_client_not_rst() {
+        use tokio::io::AsyncReadExt;
+        use tokio::time::{timeout, Duration};
+
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordCodec};
+
+        let key = [0x35_u8; KEY_LEN];
+        let nonce = [0x46_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let codec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+
+        // Target side: the peer sets SO_LINGER(0) and drops after a short delay, so
+        // the server's target read errors with a RST (ECONNRESET), driving the loop
+        // into its error path (NOT a clean EOF).
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_peer = tokio::spawn(async move {
+            let peer = tokio::net::TcpStream::connect(target_addr).await.unwrap();
+            // Force an RST (not a FIN) on drop by setting SO_LINGER(0). Use socket2's
+            // SockRef (as the rest of the tree does) since tokio's `set_linger` is
+            // deprecated (it can block the thread on drop; here the socket is dropped
+            // explicitly with no queued send data, so the linger-close is immediate).
+            socket2::SockRef::from(&peer)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(peer); // linger 0 -> RST to the server's target read half
+        });
+        let (target_for_loop, _) = target_listener.accept().await.unwrap();
+        let (target_read, _target_write) = target_for_loop.into_split();
+
+        // Client side: the download loop's client-facing write half; the peer drains
+        // and must observe a FIN, never a reset.
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let client_peer = tokio::spawn(async move {
+            let (mut client_side, _) = client_listener.accept().await.unwrap();
+            let mut scratch = [0_u8; 4096];
+            loop {
+                match client_side.read(&mut scratch).await {
+                    Ok(0) => return Ok(()), // clean FIN
+                    Ok(_) => continue,      // relayed record bytes, keep draining
+                    Err(err) => return Err(err),
+                }
+            }
+        });
+        let client_for_loop = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+        let (_client_read, client_write) = client_for_loop.into_split();
+
+        let target_buf = vec![0_u8; relay_read_buffer_len(max_plaintext_len(0))];
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let traffic = TrafficConfig::default();
+        let download = server_download_loop(
+            target_read,
+            crate::transport::leg::TcpLegWriter(client_write),
+            codec,
+            target_buf,
+            TimingProfile::from_config(traffic),
+            CoverTrafficProfile::from_config(traffic),
+            activity,
+            23,
+        );
+
+        let (loop_res, peer_res, _target_res) = timeout(Duration::from_secs(10), async {
+            tokio::join!(download, client_peer, target_peer)
+        })
+        .await
+        .expect("relay-error teardown must complete promptly");
+
+        assert!(
+            loop_res.is_err(),
+            "the target RST must surface as a relay error"
+        );
+        let peer_drain = peer_res.expect("client peer task");
+        assert!(
+            peer_drain.is_ok(),
+            "client must see a clean FIN on relay error, got {:?} (an RST/ECONNRESET is the \
+             censor-observable teardown tell the loop must never produce)",
+            peer_drain.err().map(|e| e.kind()),
         );
     }
 }
