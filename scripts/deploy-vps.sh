@@ -1350,37 +1350,59 @@ REMOTE_PROFILE
   # Seal the uploaded config's inline secrets on the server (plx seal encrypts
   # them under a host-local key so nothing plaintext stays at rest). It must run
   # AS the parallax user: the hardened config reader requires uid == euid on the
-  # 0600 config, and the rewrite creates a temp file inside the config dir — so
-  # the config dir is handed to the service user first. Skipped (with a loud
-  # warning) when the config dir is a shared system directory we must not chown,
-  # or when the operator passed --no-seal. Seal failure is non-fatal: the
-  # plaintext config is still valid, so the service still starts.
+  # 0600 config, and the rewrite + bundle write go through a temp file + atomic
+  # rename, which needs WRITE access on the containing directory. Handing the
+  # real config dir to the service user would also hand it every sibling file
+  # (e.g. the Polar Signals token/env installed there), so the seal instead runs
+  # in a parallax-owned staging dir under /var/lib/parallax (the service's own
+  # state dir) and root installs the sealed config + bundle back into the
+  # root-owned config dir. The parallax user ends up owning exactly its config
+  # file, the bundle, and the state dir — nothing else. Skipped (with a loud
+  # warning) when the config dir is a shared system directory whose ownership
+  # and mode we must not manage, or when the operator passed --no-seal. Seal
+  # failure is non-fatal: the plaintext config is still valid, so the service
+  # still starts.
   local seal_secrets_script=""
   if [[ "$SEAL_SECRETS" == "1" ]]; then
     case "$(dirname "$REMOTE_CONFIG")" in
       /|/etc|/usr|/usr/local|/usr/local/etc|/var|/var/lib|/srv|/opt|/root|/home|/tmp)
-        warn "config dir $(dirname "$REMOTE_CONFIG") is a shared system directory; refusing to hand it to the parallax user, so plx seal is SKIPPED and the server config keeps INLINE PLAINTEXT secrets (0600). Use a dedicated --remote-config directory (default /etc/parallax) to enable sealing."
+        warn "config dir $(dirname "$REMOTE_CONFIG") is a shared system directory; refusing to manage its ownership or write a sealed bundle into it, so plx seal is SKIPPED and the server config keeps INLINE PLAINTEXT secrets (0600). Use a dedicated --remote-config directory (default /etc/parallax) to enable sealing."
         ;;
       *)
         seal_secrets_script=$(cat <<REMOTE_SEAL
 echo "Sealing server secrets at rest (plx seal)..."
-$sudo_prefix chown parallax:parallax $q_remote_config_dir
-$sudo_prefix chmod 0700 $q_remote_config_dir
+# The config dir stays root-owned: only the config file itself (and the state
+# dir) belong to the service user. The chown also reverts dirs handed to
+# parallax by earlier revisions of this script.
+$sudo_prefix chown root:root $q_remote_config_dir
+$sudo_prefix chmod 0755 $q_remote_config_dir
 if command -v runuser >/dev/null 2>&1; then
-  if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c $q_remote_config; then
+  # Stage in the service's own state dir, seal there, then install the sealed
+  # results (still 0600, owner parallax) into the root-owned config dir. The
+  # host key is created at /var/lib/parallax/host.key either way, and the
+  # rewritten config references the bundle by bare file name, which resolves
+  # against whatever directory the config is loaded from.
+  seal_staging=/var/lib/parallax/.seal-staging
+  $sudo_prefix rm -rf "\$seal_staging"
+  $sudo_prefix install -d -m 0700 -o parallax -g parallax "\$seal_staging"
+  $sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml "\$seal_staging/parallax.server.toml"
+  if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c "\$seal_staging/parallax.server.toml"; then
+    $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.server.toml" $q_remote_config
+    $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.secrets.enc" $q_remote_config_dir/parallax.secrets.enc
     echo "Server secrets are machine-bound (sealed); the config on this VPS is no longer a plaintext bearer credential."
   else
-    echo "warning: plx seal failed; the server config still holds INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owner parallax). Fix and re-run on the VPS: runuser -u parallax -- $REMOTE_BIN seal -c $REMOTE_CONFIG" >&2
+    echo "warning: plx seal failed; the server config still holds INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owner parallax). Fix the reported error and re-run the deploy to retry sealing." >&2
   fi
+  $sudo_prefix rm -rf "\$seal_staging"
 else
-  echo "warning: runuser not found on the VPS; skipped plx seal — the server config holds INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owner parallax)." >&2
+  echo "warning: runuser not found on the VPS; skipped plx seal — the server config holds INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owner parallax). Install runuser (util-linux) and re-run the deploy to seal." >&2
 fi
 REMOTE_SEAL
 )
         ;;
     esac
   else
-    warn "sealing disabled (--no-seal): the server config keeps INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owned by the parallax user). To seal later, run on the VPS: runuser -u parallax -- $REMOTE_BIN seal -c $REMOTE_CONFIG"
+    warn "sealing disabled (--no-seal): the server config keeps INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owned by the parallax user). To seal, re-run the deploy without --no-seal."
   fi
 
   local remote_script
