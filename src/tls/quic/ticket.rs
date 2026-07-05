@@ -8,10 +8,11 @@
 //! (STEK). The server validates a resumed (0-RTT) ClientHello with no session
 //! database. The STEK is derived per-server from the host key, so a ticket sealed
 //! by one server never opens on another — cross-server 0-RTT replay fails closed
-//! at unseal (RFC 8446 §8.1, the user's "GFW replays elsewhere" concern). The
-//! sealed ticket is padded to a fixed length inside Safari 26.4's observed
-//! resumption-ticket range (157–160 B) so the wire `pre_shared_key` identity
-//! length is browser-plausible, not a ParallaX constant.
+//! at unseal (RFC 8446 §8.1, the user's "GFW replays elsewhere" concern). Each
+//! sealed ticket is padded to a per-ticket-random length inside Safari 26.4's
+//! observed resumption-ticket range (157–160 B) so the wire `pre_shared_key`
+//! identity length varies the way a real browser's does, rather than pinning a
+//! single ParallaX-constant length.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -122,7 +123,9 @@ impl TicketState {
     }
 }
 
-/// Seal a [`TicketState`] into the fixed-length opaque ticket carried on the wire.
+/// Seal a [`TicketState`] into the opaque ticket carried on the wire. The wire
+/// length is randomized per ticket within Safari's observed window (see
+/// [`MIN_SEALED_TICKET_LEN`]/[`MAX_SEALED_TICKET_LEN`]).
 pub(crate) fn seal_ticket(stek: &[u8; 32], state: &TicketState) -> Result<Vec<u8>, QuicTlsError> {
     let mut content = Zeroizing::new(Vec::with_capacity(PLAINTEXT_LEN));
     content.push(TICKET_VERSION);
@@ -138,7 +141,7 @@ pub(crate) fn seal_ticket(stek: &[u8; 32], state: &TicketState) -> Result<Vec<u8
     // The content must fit under the SMALLEST target since any length may be drawn.
     if content.len() + 2 > MIN_PLAINTEXT_LEN {
         return Err(QuicTlsError::Crypto(
-            "0-RTT ticket state exceeds fixed length".into(),
+            "0-RTT ticket state exceeds the minimum sealed-ticket budget".into(),
         ));
     }
     // Uniform over the (MAX - MIN + 1) plaintext lengths → uniform sealed length.
