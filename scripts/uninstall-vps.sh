@@ -29,8 +29,9 @@ Options:
   --keep-parca-agent               Keep the parca-agent snap package. Default.
   --remove-ufw-rule                Remove UFW rules that have the ParallaX comment. Default.
   --keep-ufw-rule                  Keep UFW rules.
-  --remove-user                    Remove the parallax system user created by deploy-vps.sh. Default.
-  --keep-user                      Keep the parallax system user.
+  --remove-user                    Remove the parallax system user. Off by default because
+                                   other ParallaX instances on the VPS share the account.
+  --keep-user                      Keep the parallax system user. Default.
   --sudo                           Always use sudo on the VPS.
   --no-sudo                        Never use sudo on the VPS.
   --dry-run                        Print the cleanup plan without changing anything.
@@ -341,7 +342,7 @@ export PATH="$PATH:/usr/sbin:/sbin"
 : "${REMOVE_BBR:=1}"
 : "${REMOVE_PARCA_AGENT:=0}"
 : "${REMOVE_UFW_RULE:=1}"
-: "${REMOVE_USER:=1}"
+: "${REMOVE_USER:=0}"
 
 if [[ -n "$SUDO" ]] && ! command -v "$SUDO" >/dev/null 2>&1; then
   echo "$SUDO was requested but is not installed on the VPS" >&2
@@ -488,8 +489,19 @@ remove_remote_files() {
 }
 
 remove_service_user() {
+  # Opt-in (--remove-user): every ParallaX instance on this VPS shares the
+  # parallax account, so deleting it while another instance's unit still
+  # references it would orphan that service's files and break its restart.
   [[ "$REMOVE_USER" == "1" ]] || return 0
   if id -u parallax >/dev/null 2>&1; then
+    # Even when opted in, keep the user if any remaining unit still runs as
+    # parallax (our own unit file was already removed above).
+    local other_units
+    other_units="$(grep -rlE '^User=parallax$' /etc/systemd/system 2>/dev/null || true)"
+    if [[ -n "$other_units" ]]; then
+      echo "kept the parallax system user: still referenced by $(printf '%s' "$other_units" | tr '\n' ' ')"
+      return 0
+    fi
     # Best-effort: userdel refuses while processes still run as parallax (for
     # example another ParallaX service instance sharing the user).
     if run_root userdel parallax 2>/dev/null; then
@@ -555,7 +567,8 @@ REMOVE_LOCAL="1"
 REMOVE_BBR="1"
 REMOVE_PARCA_AGENT="0"
 REMOVE_UFW_RULE="1"
-REMOVE_USER="1"
+# Keep the shared parallax account by default; see remove_service_user.
+REMOVE_USER="0"
 REMOTE_SUDO="auto"
 DRY_RUN="0"
 YES="0"
