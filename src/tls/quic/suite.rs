@@ -250,7 +250,14 @@ mod tests {
         // via `as u8`/`as u16` and derive a wrong key. `full_label_len = 6 + label`,
         // so a 250-byte label overflows the u8 (6 + 250 = 256).
         let suite = CipherSuite::Aes128GcmSha256;
-        let prk = suite.hkdf_extract(&[0_u8; 32], &[0_u8; 32]);
+        // Throwaway PRK from a runtime RNG (the length guard is independent of its
+        // value). A fixed test salt would trip CodeQL's
+        // `rust/hard-coded-cryptographic-value` query (a false positive on a test
+        // fixture); an OsRng-filled salt is not a hard-coded value.
+        use rand::RngCore as _;
+        let mut salt = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let prk = suite.hkdf_extract(&salt, &salt);
 
         assert!(matches!(
             suite.hkdf_expand_label(&prk, &"x".repeat(250), &[], 16),
