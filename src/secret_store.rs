@@ -349,6 +349,11 @@ fn seal_secret(host_key: &[u8; 32], field: &str, aad: &[u8], plaintext_b64: &str
     OsRng.fill_bytes(&mut nonce);
 
     let kek = derive_kek(host_key, &salt, field);
+    // `derive_kek` protected its own buffer, but returning the Copy array moved
+    // the KEK to this frame and page protection does not follow a move (same
+    // pattern as the host key in `open_sealed_reference`); protect the copy
+    // that is actually used to encrypt.
+    crate::process_hardening::protect_secret_bytes("secret_store.kek", kek.as_slice());
     let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.as_slice()));
     let ciphertext = cipher
         .encrypt(
@@ -389,6 +394,9 @@ fn open_entry(
         .map_err(|_| SealError::BundleMalformed)?;
 
     let kek = derive_kek(host_key, &salt, field);
+    // Same as in `seal_secret`: the move out of `derive_kek` left this frame's
+    // copy of the KEK unprotected; re-protect it for the decrypt's lifetime.
+    crate::process_hardening::protect_secret_bytes("secret_store.kek", kek.as_slice());
     let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.as_slice()));
     // Hold the decrypted plaintext in Zeroizing so the buffer is wiped on every
     // path, including the non-UTF-8 error branch below.
