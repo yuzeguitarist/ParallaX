@@ -897,6 +897,15 @@ fn write_init_files(output: &Path, generated: &GeneratedConfig) -> anyhow::Resul
     println!("  server: {}", server_path.display());
     println!("  client: {}", client_path.display());
     println!("Next: upload the server file to the VPS and keep the client file on this machine.");
+    // Inline secrets make each config file a bearer credential that a rooted
+    // host, backup, or snapshot reads without ever touching /proc — say so
+    // loudly on stderr.
+    eprintln!(
+        "WARNING: --inline-secrets stores plaintext secrets inside the config files. \
+         Anyone who can read them at rest (root, backups, disk snapshots) holds a \
+         bearer credential for this deployment. After deploying, run \
+         `plx seal -c parallax.server.toml` on the VPS to machine-bind the secrets."
+    );
     Ok(())
 }
 
