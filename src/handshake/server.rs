@@ -2138,20 +2138,16 @@ async fn run_authenticated_data_mode(
                             &server_ephemeral.private,
                             &client_x25519_public,
                         ));
-                        let mut pq_encapsulation =
+                        let pq_encapsulation =
                             encapsulate_mlkem_blocking(client_mlkem_public_key).await?;
-                        // Move the ML-KEM shared secret into a wipe-on-drop local and
-                        // clear the struct's own [u8;32] copy immediately. A struct-level
-                        // ZeroizeOnDrop can't help (`.ciphertext` is moved into the
-                        // key-exchange payload below, partially moving the struct so its
-                        // Drop glue can never run), and every `?` between here and the
-                        // rekey (encode / seal / write / rekey) would otherwise drop the
-                        // secret un-wiped — a path the new degenerate-X25519 rekey
-                        // rejection makes reachable. The Zeroizing local clears on ANY
-                        // return.
-                        let pq_shared_secret =
-                            zeroize::Zeroizing::new(pq_encapsulation.shared_secret);
-                        pq_encapsulation.shared_secret.zeroize();
+                        // The ML-KEM shared secret is a `Zeroizing<[u8; 32]>` field, so
+                        // moving it out here into a wipe-on-drop local scrubs it on ANY
+                        // return (every `?` between here and the rekey — encode / seal /
+                        // write / rekey). `.ciphertext` is moved into the key-exchange
+                        // payload below (partially moving the struct), which is why the
+                        // secret is a self-wiping FIELD rather than relying on struct
+                        // Drop glue that a partial move would forbid.
+                        let pq_shared_secret = pq_encapsulation.shared_secret;
                         let cipher_suite = server_data_cipher_suite();
                         let key_exchange_payload = ServerKeyExchange {
                             server_x25519_public: server_ephemeral.public,
