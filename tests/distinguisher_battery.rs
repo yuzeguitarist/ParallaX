@@ -365,6 +365,38 @@ fn parallax_vs_safari_uplink_length_distribution() {
         safari_modal, FULL_RECORD_LEN,
         "Safari modal record length {safari_modal} (×{safari_modal_n}) != {FULL_RECORD_LEN}"
     );
+
+    // Bounded small-record TAIL shape (the gap the modal check alone left open).
+    //
+    // The modal assertion pins the dominant bucket but says nothing about the
+    // *tail*: an encoder that emitted the right full records plus a spray of
+    // small ones would still pass it. Safari's uplink legitimately carries a tail
+    // of small H2 control frames (measured: 162 records in 26..=366 B) that
+    // ParallaX's pure-data uplink does not share — that mismatch is the accepted
+    // artifact behind the informational KS verdict above, so we do NOT gate the
+    // tail against Safari's. What we CAN gate is ParallaX's OWN tail: production
+    // `seal_chunks` chunks the payload into full 16401-byte records followed by
+    // AT MOST ONE short remainder. A regression that fragmented the uplink (a
+    // coalescing bug, a padding-profile regression, an MTU split) would emit MANY
+    // sub-full records — itself a distinctive length tell — and trip this bound.
+    let parallax_tail: Vec<f64> = parallax_c2s
+        .iter()
+        .copied()
+        .filter(|&l| l != FULL_RECORD_LEN as f64)
+        .collect();
+    assert!(
+        parallax_tail.len() <= 1,
+        "ParallaX uplink tail is not degenerate: expected <=1 non-full record \
+         (the trailing remainder), got {} non-16401 records: {:?}",
+        parallax_tail.len(),
+        parallax_tail
+    );
+    if let Some(&remainder) = parallax_tail.first() {
+        assert!(
+            (1.0..(FULL_RECORD_LEN as f64)).contains(&remainder),
+            "ParallaX uplink remainder record {remainder} outside (0, {FULL_RECORD_LEN})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +466,32 @@ fn parallax_vs_safari_downlink_length_distribution() {
         safari_modal, FULL_RECORD_LEN,
         "Safari downlink modal record length {safari_modal} (×{safari_modal_n}) != {FULL_RECORD_LEN}"
     );
+
+    // Bounded small-record TAIL shape — same contract as Tier 4, applied to the
+    // server relay's downlink. The server seals through the identical
+    // `seal_chunks` sizing path, so its tail must be equally degenerate: full
+    // 16401-byte records plus AT MOST ONE short remainder (measured here: a
+    // single 12080 B remainder). Safari's downlink legitimately carries a large
+    // small-record tail (H2 control/DATA framing) that ParallaX does not, so —
+    // as in Tier 4 — we gate ParallaX's own tail, not the cross-corpus KS.
+    let parallax_tail: Vec<f64> = parallax_s2c
+        .iter()
+        .copied()
+        .filter(|&l| l != FULL_RECORD_LEN as f64)
+        .collect();
+    assert!(
+        parallax_tail.len() <= 1,
+        "ParallaX downlink tail is not degenerate: expected <=1 non-full record \
+         (the trailing remainder), got {} non-16401 records: {:?}",
+        parallax_tail.len(),
+        parallax_tail
+    );
+    if let Some(&remainder) = parallax_tail.first() {
+        assert!(
+            (1.0..(FULL_RECORD_LEN as f64)).contains(&remainder),
+            "ParallaX downlink remainder record {remainder} outside (0, {FULL_RECORD_LEN})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -477,13 +535,31 @@ fn h3_direction_runs_detect_lockstep() {
     );
 }
 
-/// Tier 5b (live): capture a real ParallaX QUIC session at the UDP-datagram
-/// layer through the recording forwarder, and compare its uplink direction-run
-/// and datagram-size distributions to Safari H3. Reports KS for both. IAT is
-/// printed for context only and never asserted on.
+/// Tier 5b (live, MEASUREMENT-ONLY for the KS verdicts + a hard wire-bounds
+/// gate): capture a real ParallaX QUIC session at the UDP-datagram layer through
+/// the recording forwarder and report its uplink direction-run and datagram-size
+/// KS against Safari H3.
+///
+/// Why the KS verdicts are measurement-only here (NOT a gate): this tier drives
+/// a single BULK transfer (one big uplink burst, then one big downlink burst),
+/// which is nothing like a browser's many-small-turns interleave, so the
+/// direction-run KS is dominated by that capture artifact (measured D swings
+/// 0.53..0.90 run-to-run — uncalibrated and not remotely a stable threshold),
+/// and the size KS reflects bulk full-MTU datagrams vs Safari's browse mix
+/// rather than a genuine imitation gap. Gating either would be flaky or
+/// meaningless. **Tier 6 is the calibrated (interactive) comparison and carries
+/// the hard KS gate.** This tier is kept for the contrast Tier 6 reports.
+///
+/// What it DOES hard-gate (the strongest safe invariant for a bulk capture):
+/// wire-faithfulness of the datagrams themselves. Every datagram a censor sees
+/// must be MTU-bounded like real internet QUIC — a regression that emitted jumbo
+/// datagrams (a UDP GSO/coalescing bug, an MTU-discovery blowup, a framing
+/// regression) would be trivially distinguishable and trips the ceiling. Plus
+/// the capture must be genuinely bidirectional with a meaningful datagram count.
+/// IAT is printed for context only and never asserted on.
 #[tokio::test]
 #[ignore = "live QUIC loopback capture; run with --ignored --test-threads=1"]
-async fn parallax_vs_safari_h3_direction_and_size() {
+async fn parallax_vs_safari_h3_direction_size_measurement_only() {
     let safari = safari_h3_source::load_fixture().expect("load Safari H3 fixture");
 
     // Transfer volumes loosely matched to the Safari H3 capture so the datagram
@@ -510,7 +586,8 @@ async fn parallax_vs_safari_h3_direction_and_size() {
         parallax_up.len()
     );
     eprintln!(
-        "[tier5-h3] direction-run KS D={:.4} p={:.4} | C2S size KS D={:.4} p={:.4}",
+        "[tier5-h3] (MEASUREMENT-ONLY, not gated) direction-run KS D={:.4} p={:.4} | \
+         C2S size KS D={:.4} p={:.4}",
         runs_ks.statistic, runs_ks.p_value, size_ks.statistic, size_ks.p_value
     );
     // IAT printed for context ONLY — not a gate (loopback wall-clock is noise).
@@ -524,17 +601,32 @@ async fn parallax_vs_safari_h3_direction_and_size() {
         );
     }
 
-    // Sanity gate only: the capture must have produced a usable *bidirectional*
-    // trace — datagrams in BOTH directions, not just C2S (direction_runs() is
-    // non-empty for any non-empty trace, so it alone would accept a one-way
-    // capture). We do not gate on the KS verdicts themselves yet — loopback
-    // datagram distributions need calibration before a hard threshold, exactly
-    // as the length tier was left informational first.
+    // Hard gate (1): the capture must be genuinely bidirectional with a
+    // meaningful datagram count. `c2s>=1 && s2c>=1` (the old gate) would accept a
+    // near-empty capture; a 64 KiB bulk transfer each way yields dozens of
+    // datagrams per direction (measured C2S≈112, S2C≈111), so require >=10 each.
     let c2s = parallax.dir(Dir::C2S).len();
     let s2c = parallax.dir(Dir::S2C).len();
     assert!(
-        c2s >= 1 && s2c >= 1,
-        "ParallaX capture not bidirectional: C2S={c2s} S2C={s2c}"
+        c2s >= 10 && s2c >= 10,
+        "ParallaX capture not usefully bidirectional: C2S={c2s} S2C={s2c} (need >=10 each)"
+    );
+
+    // Hard gate (2): wire-faithfulness — every censor-visible datagram must be
+    // MTU-bounded like real internet QUIC. Measured max is 1440 B (both
+    // directions), matching Safari H3's 1430 B max; 1500 is the classic Ethernet
+    // MTU ceiling and leaves comfortable margin while still catching a gross
+    // datagram-size regression. This is a change-detector, not a tight bound.
+    const MTU_CEILING: f64 = 1500.0;
+    let max_datagram = parallax
+        .records
+        .iter()
+        .map(|r| r.len as f64)
+        .fold(0.0, f64::max);
+    assert!(
+        max_datagram <= MTU_CEILING,
+        "ParallaX QUIC emitted a {max_datagram} B datagram, exceeding the {MTU_CEILING} B \
+         MTU ceiling — jumbo datagrams are trivially distinguishable from real QUIC"
     );
 }
 
@@ -602,23 +694,68 @@ async fn quic_direction_size_calibration_vs_real_corpus() {
         safari.dir(Dir::S2C).len()
     );
     eprintln!(
-        "[tier6-cal] direction-run KS:  bulk D={:.4} p={:.4}  ->  interactive D={:.4} p={:.4}",
+        "[tier6-cal] direction-run KS:  bulk D={:.4} p={:.4} (measurement-only)  ->  \
+         interactive D={:.4} p={:.4} (GATED)",
         bulk_runs.statistic, bulk_runs.p_value, int_runs.statistic, int_runs.p_value
     );
     eprintln!(
-        "[tier6-cal] C2S size KS:       bulk D={:.4} p={:.4}  ->  interactive D={:.4} p={:.4}",
+        "[tier6-cal] C2S size KS:       bulk D={:.4} p={:.4} (measurement-only)  ->  \
+         interactive D={:.4} p={:.4} (GATED)",
         bulk_size.statistic, bulk_size.p_value, int_size.statistic, int_size.p_value
     );
 
-    // Sanity gate only (same posture as Tier 5): the interactive capture must be
-    // genuinely bidirectional. KS values stay informational — this tier exists
-    // to MEASURE the gap, not to gate on a threshold that loopback distributions
-    // have not yet been calibrated to support.
+    // The BULK KS stays measurement-only: the single-shot capture is the
+    // uncalibrated shape (its direction-run D swings ~0.09..0.64 run-to-run), and
+    // it is printed here purely for the contrast against the interactive run.
+    //
+    // The INTERACTIVE capture is the calibrated comparison this tier exists for:
+    // a browser-shaped ping-pong whose datagram sizing and interleave are
+    // deterministic, so its KS against the ~6k-datagram real corpus is stable
+    // (measured across many runs: direction-run D=0.4607, C2S size D=0.4143 —
+    // byte-identical every run). That stability is what lets this be a real gate.
+    //
+    // We gate the UPPER bound: ParallaX's interactive QUIC must not become MORE
+    // distinguishable from the real corpus than a calibrated ceiling. A QUIC-plane
+    // distinguishability regression (padding/coalescing/pacing that reshapes the
+    // datagram size or direction structure) pushes these D values UP and trips
+    // the gate; the ~0.15–0.16 headroom below keeps a healthy CI margin so normal
+    // run-to-run noise never does. These are the hard KS gates the reviewer asked
+    // for, sited where the machinery is calibrated (the fast tiers prove it fires).
+    const INT_RUNS_KS_CEILING: f64 = 0.62; // measured 0.4607, margin 0.16
+    const INT_SIZE_KS_CEILING: f64 = 0.56; // measured 0.4143, margin 0.15
+    assert!(
+        int_runs.statistic < INT_RUNS_KS_CEILING,
+        "interactive direction-run KS D={:.4} exceeded the {INT_RUNS_KS_CEILING} ceiling \
+         — ParallaX's QUIC direction structure regressed toward more distinguishable",
+        int_runs.statistic
+    );
+    assert!(
+        int_size.statistic < INT_SIZE_KS_CEILING,
+        "interactive C2S size KS D={:.4} exceeded the {INT_SIZE_KS_CEILING} ceiling \
+         — ParallaX's QUIC datagram sizing regressed toward more distinguishable",
+        int_size.statistic
+    );
+
+    // Structural hard gates (same wire-faithfulness posture as Tier 5b): the
+    // interactive capture must be genuinely bidirectional with a meaningful
+    // datagram count (measured C2S≈96, S2C≈95), and every datagram must be
+    // MTU-bounded like real internet QUIC (measured max 1440 B).
     let c2s = interactive.dir(Dir::C2S).len();
     let s2c = interactive.dir(Dir::S2C).len();
     assert!(
-        c2s >= 1 && s2c >= 1,
-        "interactive capture not bidirectional: C2S={c2s} S2C={s2c}"
+        c2s >= 20 && s2c >= 20,
+        "interactive capture not usefully bidirectional: C2S={c2s} S2C={s2c} (need >=20 each)"
+    );
+    const MTU_CEILING: f64 = 1500.0;
+    let max_datagram = interactive
+        .records
+        .iter()
+        .map(|r| r.len as f64)
+        .fold(0.0, f64::max);
+    assert!(
+        max_datagram <= MTU_CEILING,
+        "interactive ParallaX QUIC emitted a {max_datagram} B datagram, exceeding the \
+         {MTU_CEILING} B MTU ceiling — jumbo datagrams are trivially distinguishable"
     );
 }
 
