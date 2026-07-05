@@ -34,10 +34,11 @@ pub struct MlKemEncapsulation {
     pub ciphertext: Vec<u8>,
     /// The KEM shared secret, self-wiping on drop. A struct-level `ZeroizeOnDrop`
     /// cannot cover it because `.ciphertext` is partially moved out at the call
-    /// sites (which forbids `Drop` glue); wrapping the field in `Zeroizing` scrubs
-    /// it independently of that move, so the moved-from copies left in
-    /// `encapsulate`/`encapsulate_mlkem_blocking` frames no longer linger in freed
-    /// memory. (`Zeroizing<[u8; 32]>` is still `Clone`/`PartialEq`/`Eq`.)
+    /// sites (which forbids `Drop` glue); wrapping the FIELD in `Zeroizing` scrubs
+    /// it independently of that move. So a whole-struct drop on any error path now
+    /// scrubs the secret (previously a bare `[u8; 32]` was never scrubbed), and the
+    /// final owner that moves it out (`server.rs`) scrubs on every `?` exit.
+    /// (`Zeroizing<[u8; 32]>` is still `Clone`/`PartialEq`/`Eq`.)
     pub shared_secret: zeroize::Zeroizing<[u8; 32]>,
 }
 
