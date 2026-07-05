@@ -557,6 +557,26 @@ pub(crate) fn set_quic_carrier_for_test(
         .expect("quic carrier mutex poisoned") = carrier;
 }
 
+/// Drop guard that unregisters a pending UDP `offer_id` from the stable carrier on
+/// EVERY scope exit after [`crate::transport::udp::stable::QuicCarrier::register`]
+/// (item #3a). Before this, only the probe-timeout arm unregistered, so an early
+/// `?` on the offer seal / offer-record write returned first and leaked the
+/// oneshot sender in the carrier registry (an unbounded per-failed-negotiation
+/// leak). The guard unregisters unconditionally; after a successful handoff the
+/// carrier's accept loop has already `remove`d the entry, so this is then a
+/// harmless no-op. `unregister` is a synchronous lock+remove, so a `Drop` guard is
+/// sufficient (no async-drop needed).
+struct OfferRegistrationGuard {
+    carrier: Arc<crate::transport::udp::stable::QuicCarrier>,
+    offer_id: [u8; 16],
+}
+
+impl Drop for OfferRegistrationGuard {
+    fn drop(&mut self) {
+        self.carrier.unregister(&self.offer_id);
+    }
+}
+
 /// Bind the stable origin-splice carrier: marker key = the shared PSK + the server's
 /// static X25519 private key (the same REALITY static key the TCP plane authenticates
 /// with), splice origin = the camouflage origin's UDP `:443` (resolved from
@@ -2362,6 +2382,17 @@ async fn run_authenticated_data_mode(
                             };
 
                             if let Some((carrier, offer_id, port, rx)) = offered {
+                                // Item #3a: from the moment `carrier.register` ran
+                                // (producing `rx`), guarantee the offer_id is
+                                // unregistered on EVERY exit — including the offer
+                                // seal / offer-record write `?` below, which return
+                                // before the probe-timeout arm that used to be the
+                                // sole unregister and would otherwise leak the
+                                // registry entry.
+                                let _offer_registration = OfferRegistrationGuard {
+                                    carrier: carrier.clone(),
+                                    offer_id,
+                                };
                                 let offer = UdpOffer {
                                     offer_id,
                                     udp_port: port,
@@ -4134,6 +4165,7 @@ async fn run_authenticated_mux_data_mode(
         context.cover,
         context.cid,
         payload_pool,
+        fallback_idle_timeout(),
     );
     let ((), ()) = tokio::try_join!(reader, writer)?;
     Ok(())
@@ -4942,6 +4974,17 @@ async fn server_mux_target_reader_loop(
     }
 }
 
+/// Item #3b: bound every client-facing write. The batched writer does one
+/// `write_records` await per drained batch; with no bound, an authenticated
+/// client that stops reading wedges that write once its kernel receive buffer
+/// fills, pinning this session, the 1024-deep frame channel, and every relayed
+/// target fd for the life of the process (dropping the frame senders only wakes
+/// `recv()`, never a task already parked in `write_records`). Mirror the client's
+/// `client_mux_download_loop`: bound each write by the `idle` backstop (the
+/// production caller passes [`fallback_idle_timeout`]) and SHED (tear the session
+/// down) on expiry. A live-but-slow client keeps making progress well inside the
+/// (600s-scale) window and is never falsely shed; `idle` is a parameter so the
+/// wedge-shed path is testable without a 600s wait.
 async fn server_mux_writer_loop<W>(
     mut client_write: W,
     mut server_seal: DataRecordCodec,
@@ -4949,6 +4992,7 @@ async fn server_mux_writer_loop<W>(
     cover: CoverTrafficProfile,
     cid: u64,
     payload_pool: MuxPayloadPool,
+    idle: Duration,
 ) -> Result<(), HandshakeServerError>
 where
     W: LegWriter,
@@ -4961,44 +5005,8 @@ where
                 let _ = client_write.shutdown().await;
                 return Ok(());
             };
-            write_server_mux_frames_batched(
-                &mut client_write,
-                &mut server_seal,
-                frame,
-                ServerMuxBatchState {
-                    frame_rx: &mut frame_rx,
-                },
-                &mut rng,
-                &mut seal_scratch,
-                RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
-                &payload_pool,
-            )
-            .await?;
-        }
-    }
-
-    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
-
-    loop {
-        tokio::select! {
-            _ = &mut cover_sleep, if cover.is_enabled() => {
-                write_server_mux_frame(
-                    &mut client_write,
-                    &mut server_seal,
-                    MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
-                    &mut rng,
-                    &mut seal_scratch,
-                    cid,
-                    "server-mux-cover-writer",
-                )
-                .await?;
-                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
-            }
-            frame = frame_rx.recv() => {
-                let Some(frame) = frame else {
-                    let _ = client_write.shutdown().await;
-                    return Ok(());
-                };
+            match timeout(
+                idle,
                 write_server_mux_frames_batched(
                     &mut client_write,
                     &mut server_seal,
@@ -5010,11 +5018,80 @@ where
                     &mut seal_scratch,
                     RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
                     &payload_pool,
-                )
-                .await?;
+                ),
+            )
+            .await
+            {
+                Ok(res) => res?,
+                Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
             }
         }
     }
+
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+
+    loop {
+        tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                match timeout(
+                    idle,
+                    write_server_mux_frame(
+                        &mut client_write,
+                        &mut server_seal,
+                        MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
+                        &mut rng,
+                        &mut seal_scratch,
+                        cid,
+                        "server-mux-cover-writer",
+                    ),
+                )
+                .await
+                {
+                    Ok(res) => res?,
+                    Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
+                }
+                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
+            }
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else {
+                    let _ = client_write.shutdown().await;
+                    return Ok(());
+                };
+                match timeout(
+                    idle,
+                    write_server_mux_frames_batched(
+                        &mut client_write,
+                        &mut server_seal,
+                        frame,
+                        ServerMuxBatchState {
+                            frame_rx: &mut frame_rx,
+                        },
+                        &mut rng,
+                        &mut seal_scratch,
+                        RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
+                        &payload_pool,
+                    ),
+                )
+                .await
+                {
+                    Ok(res) => res?,
+                    Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
+                }
+            }
+        }
+    }
+}
+
+/// Item #3b: the shed outcome when the mux writer's client-facing write exceeds
+/// the idle backstop (a non-reading authenticated client). Logs once and maps to
+/// a `Timeout` error so the writer loop returns and `try_join!` tears the whole
+/// session down, releasing the frame channel and every relayed target fd.
+fn shed_mux_writer_on_stalled_client(cid: u64) -> HandshakeServerError {
+    tracing::warn!(
+        cid,
+        "server mux client-write idle backstop elapsed; shedding session"
+    );
+    HandshakeServerError::Timeout
 }
 
 async fn write_server_mux_frame<W, R>(
@@ -10064,5 +10141,126 @@ mod tests {
              censor-observable teardown tell the loop must never produce)",
             peer_drain.err().map(|e| e.kind()),
         );
+    }
+
+    /// Item #3a: the `OfferRegistrationGuard` must unregister its `offer_id` on
+    /// EVERY scope exit. Before this guard the only unregister lived on the
+    /// probe-timeout arm, so an early `?` on the offer seal / offer-record write
+    /// returned first and leaked the carrier's oneshot sender (an unbounded
+    /// per-failed-negotiation registry leak). Here: register an offer, confirm the
+    /// receiver is live (pending, not closed), drop the guard, then confirm the
+    /// sender was removed — the receiver observes a CLOSED channel. A leak would
+    /// keep the sender parked in the registry and the receiver open, so the
+    /// closed-channel observation is exactly the tell the fix restores.
+    #[tokio::test]
+    async fn offer_registration_guard_unregisters_on_drop() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        // A production carrier bound on loopback: no external network is needed —
+        // the numeric fallback_addr resolves without DNS, the camouflage cert is
+        // self-signed in-process, the replay cache is a temp file, and the endpoint
+        // binds 127.0.0.1:0. This is the same build path production uses.
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let config = authenticated_server_config(
+            "127.0.0.1:443".parse().unwrap(),
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_dir.path().join("parallax-replay.cache"),
+        );
+        let carrier = build_quic_carrier_for_test(&config, PSK)
+            .await
+            .expect("bind loopback stable carrier");
+
+        let offer_id = [0x5c_u8; 16];
+        let mut rx = carrier.register(offer_id);
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "a freshly registered offer_id must have a live (pending) sender"
+        );
+
+        {
+            // The guard is the ONLY thing that unregisters here; dropping it at the
+            // end of this scope must remove the registry entry unconditionally.
+            let _guard = OfferRegistrationGuard {
+                carrier: carrier.clone(),
+                offer_id,
+            };
+        }
+
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Closed)),
+            "dropping the guard must unregister the offer_id (drop its sender) so the \
+             receiver observes a closed channel — not a leaked, still-open entry",
+        );
+    }
+
+    /// Item #3b: a non-reading authenticated client must not wedge the mux writer
+    /// forever. Once a client-facing write exceeds the idle backstop, the writer
+    /// SHEDS (returns `Timeout`) so `try_join!` tears the session down and releases
+    /// the frame channel + relayed target fds. A `LegWriter` whose `write_records`
+    /// never completes models the wedged client; with a short injected idle the
+    /// loop must return `Err(Timeout)` promptly instead of parking indefinitely.
+    #[tokio::test]
+    async fn mux_writer_sheds_when_client_write_stalls() {
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{max_plaintext_len, DataRecordCodec};
+
+        struct StalledWriter;
+        impl LegWriter for StalledWriter {
+            async fn write_records(&mut self, _bytes: &[u8]) -> io::Result<()> {
+                // A wedged client: the client-facing write never drains.
+                std::future::pending().await
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let key = [0x51_u8; KEY_LEN];
+        let nonce = [0x62_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let codec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+
+        let chunk_size = max_plaintext_len(0);
+        let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
+        let (frame_tx, frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+
+        // One real frame so the loop takes the write path (where the mock parks).
+        // Keep the sender alive so `recv()` never returns None — otherwise the loop
+        // would exit cleanly instead of exercising the wedge-shed.
+        frame_tx
+            .send(MuxFrame {
+                stream_id: 1,
+                kind: MuxFrameKind::Data,
+                payload: b"payload".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        // Cover is disabled by default (cover_max_interval_ms == 0), so the simpler
+        // non-cover write branch runs. Inject a short idle so the shed is observable
+        // without the production 600s wait.
+        let cover = CoverTrafficProfile::from_config(TrafficConfig::default());
+        assert!(
+            !cover.is_enabled(),
+            "test relies on the non-cover write branch"
+        );
+        let idle = Duration::from_millis(50);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_mux_writer_loop(StalledWriter, codec, frame_rx, cover, 7, payload_pool, idle),
+        )
+        .await
+        .expect("the mux writer must shed (return) well before the outer 5s budget");
+
+        assert!(
+            matches!(result, Err(HandshakeServerError::Timeout)),
+            "a wedged client-facing write past the idle backstop must shed as Timeout, \
+             got {result:?}",
+        );
+        drop(frame_tx);
     }
 }
