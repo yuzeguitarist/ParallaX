@@ -656,9 +656,15 @@ impl AeadCodec {
         key: [u8; KEY_LEN],
         nonce_base: [u8; NONCE_LEN],
     ) -> Self {
+        // The by-value `Copy` params are transient secret copies: wrap them so the
+        // local copies are scrubbed on return (best-effort, drop-time-only — same
+        // discipline as `expand_epoch_keys`). The live secrets are the boxed
+        // fields below, zeroized by the codec's own `Drop`.
+        let key = Zeroizing::new(key);
+        let nonce_base = Zeroizing::new(nonce_base);
         let codec = Self {
-            key: Box::new(key),
-            nonce_base: Box::new(nonce_base),
+            key: Box::new(*key),
+            nonce_base: Box::new(*nonce_base),
             sequence: 0,
             suite,
             cipher: make_cipher(suite, &key),
@@ -683,12 +689,16 @@ impl AeadCodec {
         key: [u8; KEY_LEN],
         nonce_base: [u8; NONCE_LEN],
     ) {
+        // Scrub the transient by-value param copies on return (best-effort, as in
+        // `new_with_suite`); the live secrets are the boxed fields overwritten below.
+        let key = Zeroizing::new(key);
+        let nonce_base = Zeroizing::new(nonce_base);
         self.key.zeroize();
         self.nonce_base.zeroize();
         // Overwrite the existing heap allocations in place so the locked pages
         // stay valid across the rekey (re-`protect` below is then idempotent).
-        *self.key = key;
-        *self.nonce_base = nonce_base;
+        *self.key = *key;
+        *self.nonce_base = *nonce_base;
         self.sequence = 0;
         self.suite = suite;
         self.cipher = make_cipher(suite, &key);
