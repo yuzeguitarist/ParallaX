@@ -1391,11 +1391,11 @@ if command -v runuser >/dev/null 2>&1; then
     $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.secrets.enc" $q_remote_config_dir/parallax.secrets.enc
     echo "Server secrets are machine-bound (sealed); the config on this VPS is no longer a plaintext bearer credential."
   else
-    echo "warning: plx seal failed; the server config still holds INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owner parallax). Fix the reported error and re-run the deploy to retry sealing." >&2
+    echo 'warning: plx seal failed; the server config still holds INLINE PLAINTEXT secrets at '$q_remote_config' (kept 0600, owner parallax). Fix the reported error and re-run the deploy to retry sealing.' >&2
   fi
   $sudo_prefix rm -rf "\$seal_staging"
 else
-  echo "warning: runuser not found on the VPS; skipped plx seal — the server config holds INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owner parallax). Install runuser (util-linux) and re-run the deploy to seal." >&2
+  echo 'warning: runuser not found on the VPS; skipped plx seal — the server config holds INLINE PLAINTEXT secrets at '$q_remote_config' (kept 0600, owner parallax). Install runuser (util-linux) and re-run the deploy to seal.' >&2
 fi
 REMOTE_SEAL
 )
