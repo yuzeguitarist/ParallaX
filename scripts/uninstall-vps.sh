@@ -478,6 +478,9 @@ remove_remote_files() {
 
   remove_file "$REMOTE_BIN"
   remove_file "$REMOTE_CONFIG"
+  # Sealed-secrets bundle written by the deploy's `plx seal` step (the matching
+  # host.key lives under /var/lib/parallax and goes with that tree below).
+  remove_file "$config_dir/parallax.secrets.enc"
   remove_file "$replay_cache"
   remove_dir_tree /var/lib/parallax
   remove_dir_if_empty "$config_dir"

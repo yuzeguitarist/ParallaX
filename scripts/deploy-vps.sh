@@ -44,6 +44,10 @@ Options:
   --no-install-build-tools     Do not install missing local build helpers; fail with instructions instead.
   --enable-bbr                 Configure VPS tcp_bbr + fq during deploy. Default.
   --no-enable-bbr              Skip remote BBR/fq sysctl configuration.
+  --seal                       Run plx seal on the VPS after install so no plaintext
+                               secret stays at rest in the server config. Default.
+  --no-seal                    Skip sealing; the server config keeps inline plaintext
+                               secrets (0600, owned by the parallax service user).
   --profile-mode <mode>        Profiling integration: none or polar-cloud. Defaults to none.
   --polar-token-file <path>    Read Polar Signals token from this local file instead of prompting.
                                Useful for CI. (An inline token argument is intentionally NOT
@@ -728,9 +732,10 @@ build_host_tools_and_configs() {
     rm -f "$server_cfg" "$client_cfg"
     deploy_info_log "generating local-only server/client configs"
     # Inline secrets here on purpose: the deploy flow uploads a single
-    # self-contained server config to the VPS (kept 0600, never committed). To
-    # machine-bind it afterwards, run `plx seal -c parallax.server.toml` on the
-    # server. Interactive `plx init` defaults to split/referenced secret files.
+    # self-contained server config to the VPS (kept 0600, never committed).
+    # After install, the deploy runs `plx seal` on the server (unless --no-seal)
+    # so the config at rest on the VPS stops carrying plaintext secrets.
+    # Interactive `plx init` defaults to split/referenced secret files.
     run cargo run --locked --quiet --bin plx -- init "$DEST" \
       --server-addr "$SERVER_ADDR" \
       --server-listen "$SERVER_LISTEN" \
@@ -1338,6 +1343,42 @@ fi
 REMOTE_PROFILE
 )
   fi
+  # Seal the uploaded config's inline secrets on the server (plx seal encrypts
+  # them under a host-local key so nothing plaintext stays at rest). It must run
+  # AS the parallax user: the hardened config reader requires uid == euid on the
+  # 0600 config, and the rewrite creates a temp file inside the config dir — so
+  # the config dir is handed to the service user first. Skipped (with a loud
+  # warning) when the config dir is a shared system directory we must not chown,
+  # or when the operator passed --no-seal. Seal failure is non-fatal: the
+  # plaintext config is still valid, so the service still starts.
+  local seal_secrets_script=""
+  if [[ "$SEAL_SECRETS" == "1" ]]; then
+    case "$(dirname "$REMOTE_CONFIG")" in
+      /|/etc|/usr|/usr/local|/usr/local/etc|/var|/var/lib|/srv|/opt|/root|/home|/tmp)
+        warn "config dir $(dirname "$REMOTE_CONFIG") is a shared system directory; refusing to hand it to the parallax user, so plx seal is SKIPPED and the server config keeps INLINE PLAINTEXT secrets (0600). Use a dedicated --remote-config directory (default /etc/parallax) to enable sealing."
+        ;;
+      *)
+        seal_secrets_script=$(cat <<REMOTE_SEAL
+echo "Sealing server secrets at rest (plx seal)..."
+$sudo_prefix chown parallax:parallax $q_remote_config_dir
+$sudo_prefix chmod 0700 $q_remote_config_dir
+if command -v runuser >/dev/null 2>&1; then
+  if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c $q_remote_config; then
+    echo "Server secrets are machine-bound (sealed); the config on this VPS is no longer a plaintext bearer credential."
+  else
+    echo "warning: plx seal failed; the server config still holds INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owner parallax). Fix and re-run on the VPS: runuser -u parallax -- $REMOTE_BIN seal -c $REMOTE_CONFIG" >&2
+  fi
+else
+  echo "warning: runuser not found on the VPS; skipped plx seal — the server config holds INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owner parallax)." >&2
+fi
+REMOTE_SEAL
+)
+        ;;
+    esac
+  else
+    warn "sealing disabled (--no-seal): the server config keeps INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owned by the parallax user). To seal later, run on the VPS: runuser -u parallax -- $REMOTE_BIN seal -c $REMOTE_CONFIG"
+  fi
+
   local remote_script
   remote_script=$(cat <<REMOTE
 set -Eeuo pipefail
@@ -1368,6 +1409,7 @@ $sudo_prefix install -d -m 0700 -o parallax -g parallax /var/lib/parallax
 $sudo_prefix chown -R parallax:parallax /var/lib/parallax
 $sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml $q_remote_config
 $replay_cache_reset_script
+$seal_secrets_script
 $sudo_prefix install -m 0644 $q_tmp/parallax.service $q_service_path
 if command -v systemctl >/dev/null 2>&1; then
   $sudo_prefix systemctl daemon-reload
@@ -1426,6 +1468,7 @@ CARGO_PROFILE_SET="0"
 DOCKER_IMAGE="${PARALLAX_DOCKER_IMAGE:-rust:1-bookworm}"
 INSTALL_BUILD_TOOLS="yes"
 ENABLE_BBR="1"
+SEAL_SECRETS="1"
 PROFILE_MODE="none"
 POLAR_TOKEN_FILE=""
 POLAR_PROJECT_ID=""
@@ -1466,6 +1509,8 @@ while [[ $# -gt 0 ]]; do
     --no-install-build-tools) INSTALL_BUILD_TOOLS="no"; shift ;;
     --enable-bbr) ENABLE_BBR="1"; shift ;;
     --no-enable-bbr) ENABLE_BBR="0"; shift ;;
+    --seal) SEAL_SECRETS="1"; shift ;;
+    --no-seal) SEAL_SECRETS="0"; shift ;;
     --profile-mode) PROFILE_MODE=${2:-}; shift 2 ;;
     --polar-bearer-token)
       die "--polar-bearer-token is no longer supported: an argv token leaks via /proc/<pid>/cmdline, ps, and CI logs. Use --polar-token-file or the interactive hidden prompt."
