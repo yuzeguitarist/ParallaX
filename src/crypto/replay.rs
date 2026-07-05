@@ -1802,13 +1802,13 @@ mod tests {
         // (or literal-derived) byte array flowing into a MAC trips CodeQL's
         // `rust/hard-coded-cryptographic-value` query (a false positive on test
         // fixtures). The test only needs distinct dedup entries, which OsRng gives.
-        use rand::RngCore as _;
-        let mut rng = rand::rngs::OsRng;
-        let mut mk_entry = || {
-            let mut nonce = [0_u8; 8];
-            let mut fp = [0_u8; 32];
-            rng.fill_bytes(&mut nonce);
-            rng.fill_bytes(&mut fp);
+        let mk_entry = || {
+            // `rand::random()` with no zero-array initializer: a `fill_bytes` into a
+            // `[0u8; N]` still leaves the zero literal for CodeQL's
+            // `rust/hard-coded-cryptographic-value` query to flag (a false positive
+            // on this test fixture, whose bytes only need to be distinct dedup keys).
+            let nonce: [u8; 8] = rand::random();
+            let fp: [u8; 32] = rand::random();
             ReplayEntry {
                 timestamp: now,
                 nonce,
