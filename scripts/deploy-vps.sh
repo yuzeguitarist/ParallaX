@@ -890,6 +890,16 @@ After=network-online.target
 Type=simple
 ExecStart=$REMOTE_BIN serve -c $REMOTE_CONFIG
 WorkingDirectory=/var/lib/parallax
+# Run as a dedicated non-root system user (created by deploy-vps.sh). Without
+# User=, a service RCE is instantly root, which defeats both this sandbox and
+# the in-process secret hardening. Deliberately NOT DynamicUser=yes: the config
+# loader fstat-checks that the 0600 config and the seal host key are owned by
+# the process euid (src/config.rs read_secret_config_file), and 'plx seal' must
+# run as the same uid at deploy time - a per-start dynamic uid can satisfy
+# neither, so the files under /etc/parallax and /var/lib/parallax are owned by
+# the fixed parallax user instead.
+User=parallax
+Group=parallax
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -912,10 +922,10 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
 # Endpoint hardening. Hide other PIDs in /proc from this service (limits it as a
-# pivot for enumerating other processes). NOTE: the service currently runs as root
-# (no User=), so ProtectProc does not stop a root-equivalent observer — it is a
-# mild defense-in-depth, not memory protection. The in-process PR_SET_DUMPABLE=0
-# (src/process_hardening.rs) is what actually resists a non-root debugger attach.
+# pivot for enumerating other processes). With User=parallax this is real
+# containment: the unprivileged service cannot observe other users' processes.
+# The in-process PR_SET_DUMPABLE=0 (src/process_hardening.rs) additionally
+# resists a same-uid debugger attach.
 ProtectProc=invisible
 # syscall filter: @system-service is systemd's curated service baseline and covers
 # ParallaX's network + epoll path. It does NOT include the ptrace family, so the
@@ -930,6 +940,13 @@ SystemCallFilter=@system-service @memlock
 SystemCallFilter=~@debug
 SystemCallErrorNumber=EPERM
 ReadWritePaths=/var/lib/parallax
+# systemd keeps /var/lib/parallax present and owned by User=parallax; the
+# replay cache and the 'plx seal' host key live here and must be owned by the
+# service user to pass the loader's uid == euid check.
+StateDirectory=parallax
+# Bind :443 without root: keep ONLY the bind capability, ambient so the
+# non-root service actually receives it, and bound so nothing else can be
+# gained even through an exec.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
@@ -1316,6 +1333,7 @@ REMOTE_PROFILE
   local remote_script
   remote_script=$(cat <<REMOTE
 set -Eeuo pipefail
+export PATH="\$PATH:/usr/sbin:/sbin"
 PARCA_AGENT_CHANNEL=$q_parca_agent_channel
 cleanup_remote_tmp() {
   rm -rf $q_tmp
@@ -1323,9 +1341,24 @@ cleanup_remote_tmp() {
 trap cleanup_remote_tmp EXIT
 $net_buffer_sysctl_script
 $bbr_install_script
-$sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir /var/lib/parallax
+if ! id -u parallax >/dev/null 2>&1; then
+  echo "Creating dedicated parallax system user for the service..."
+  nologin_shell="\$(command -v nologin || echo /usr/sbin/nologin)"
+  if getent group parallax >/dev/null 2>&1; then
+    $sudo_prefix useradd --system --gid parallax --home-dir /var/lib/parallax --no-create-home --shell "\$nologin_shell" parallax
+  else
+    $sudo_prefix useradd --system --user-group --home-dir /var/lib/parallax --no-create-home --shell "\$nologin_shell" parallax
+  fi
+fi
+$sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir
 $sudo_prefix install -m 0755 $q_tmp/plx $q_remote_bin
-$sudo_prefix install -m 0600 $q_tmp/parallax.server.toml $q_remote_config
+# The service runs as User=parallax and the config loader fstat-checks that the
+# 0600 config, the seal host key, and the replay cache are owned by that exact
+# uid — root-owned files would fail startup. chown -R also adopts files left
+# root-owned by older root-running deployments.
+$sudo_prefix install -d -m 0700 -o parallax -g parallax /var/lib/parallax
+$sudo_prefix chown -R parallax:parallax /var/lib/parallax
+$sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml $q_remote_config
 $replay_cache_reset_script
 $sudo_prefix install -m 0644 $q_tmp/parallax.service $q_service_path
 if command -v systemctl >/dev/null 2>&1; then

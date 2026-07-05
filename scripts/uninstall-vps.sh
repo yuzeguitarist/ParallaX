@@ -29,6 +29,8 @@ Options:
   --keep-parca-agent               Keep the parca-agent snap package. Default.
   --remove-ufw-rule                Remove UFW rules that have the ParallaX comment. Default.
   --keep-ufw-rule                  Keep UFW rules.
+  --remove-user                    Remove the parallax system user created by deploy-vps.sh. Default.
+  --keep-user                      Keep the parallax system user.
   --sudo                           Always use sudo on the VPS.
   --no-sudo                        Never use sudo on the VPS.
   --dry-run                        Print the cleanup plan without changing anything.
@@ -299,6 +301,7 @@ Uninstall plan:
   Remove sysctl files:    $REMOVE_BBR
   Remove Parca Agent:     $REMOVE_PARCA_AGENT
   Remove UFW rules:       $REMOVE_UFW_RULE
+  Remove parallax user:   $REMOVE_USER
   Remove local configs:   $REMOVE_LOCAL
   Local config directory: $LOCAL_DIR
 PLAN
@@ -316,7 +319,7 @@ confirm_or_exit() {
 }
 
 remote_uninstall() {
-  local q_sudo q_remote_bin q_remote_config q_service_name q_remove_bbr q_remove_parca q_remove_ufw
+  local q_sudo q_remote_bin q_remote_config q_service_name q_remove_bbr q_remove_parca q_remove_ufw q_remove_user
   q_sudo="$(shell_quote "$REMOTE_SUDO")"
   q_remote_bin="$(shell_quote "$REMOTE_BIN")"
   q_remote_config="$(shell_quote "$REMOTE_CONFIG")"
@@ -324,10 +327,12 @@ remote_uninstall() {
   q_remove_bbr="$(shell_quote "$REMOVE_BBR")"
   q_remove_parca="$(shell_quote "$REMOVE_PARCA_AGENT")"
   q_remove_ufw="$(shell_quote "$REMOVE_UFW_RULE")"
+  q_remove_user="$(shell_quote "$REMOVE_USER")"
 
   local remote_script
   remote_script=$(cat <<'REMOTE'
 set -Eeuo pipefail
+export PATH="$PATH:/usr/sbin:/sbin"
 
 : "${SUDO:=}"
 : "${REMOTE_BIN:?missing REMOTE_BIN}"
@@ -336,6 +341,7 @@ set -Eeuo pipefail
 : "${REMOVE_BBR:=1}"
 : "${REMOVE_PARCA_AGENT:=0}"
 : "${REMOVE_UFW_RULE:=1}"
+: "${REMOVE_USER:=1}"
 
 if [[ -n "$SUDO" ]] && ! command -v "$SUDO" >/dev/null 2>&1; then
   echo "$SUDO was requested but is not installed on the VPS" >&2
@@ -478,11 +484,27 @@ remove_remote_files() {
   remove_dir_if_empty /etc/parallax
 }
 
+remove_service_user() {
+  [[ "$REMOVE_USER" == "1" ]] || return 0
+  if id -u parallax >/dev/null 2>&1; then
+    # Best-effort: userdel refuses while processes still run as parallax (for
+    # example another ParallaX service instance sharing the user).
+    if run_root userdel parallax 2>/dev/null; then
+      echo "removed parallax system user"
+    else
+      echo "warning: could not remove the parallax system user (still in use by another service?)" >&2
+    fi
+  else
+    echo "parallax system user not present"
+  fi
+}
+
 remove_parallax_service
 remove_parca_service
 remove_remote_files
 remove_bbr_files
 remove_ufw_rules
+remove_service_user
 
 if command -v systemctl >/dev/null 2>&1; then
   run_root systemctl daemon-reload || true
@@ -499,7 +521,7 @@ REMOTE
   fi
 
   log "Connecting to VPS and removing ParallaX artifacts"
-  ssh -p "$SSH_PORT" "$SSH_TARGET" "SUDO=$q_sudo REMOTE_BIN=$q_remote_bin REMOTE_CONFIG=$q_remote_config SERVICE_NAME=$q_service_name REMOVE_BBR=$q_remove_bbr REMOVE_PARCA_AGENT=$q_remove_parca REMOVE_UFW_RULE=$q_remove_ufw bash -s" <<<"$remote_script"
+  ssh -p "$SSH_PORT" "$SSH_TARGET" "SUDO=$q_sudo REMOTE_BIN=$q_remote_bin REMOTE_CONFIG=$q_remote_config SERVICE_NAME=$q_service_name REMOVE_BBR=$q_remove_bbr REMOVE_PARCA_AGENT=$q_remove_parca REMOVE_UFW_RULE=$q_remove_ufw REMOVE_USER=$q_remove_user bash -s" <<<"$remote_script"
 }
 
 local_uninstall() {
@@ -530,6 +552,7 @@ REMOVE_LOCAL="1"
 REMOVE_BBR="1"
 REMOVE_PARCA_AGENT="0"
 REMOVE_UFW_RULE="1"
+REMOVE_USER="1"
 REMOTE_SUDO="auto"
 DRY_RUN="0"
 YES="0"
@@ -553,6 +576,8 @@ while [[ $# -gt 0 ]]; do
     --keep-parca-agent) REMOVE_PARCA_AGENT="0"; shift ;;
     --remove-ufw-rule) REMOVE_UFW_RULE="1"; shift ;;
     --keep-ufw-rule) REMOVE_UFW_RULE="0"; shift ;;
+    --remove-user) REMOVE_USER="1"; shift ;;
+    --keep-user) REMOVE_USER="0"; shift ;;
     --sudo) REMOTE_SUDO="sudo"; shift ;;
     --no-sudo) REMOTE_SUDO="none"; shift ;;
     --dry-run) DRY_RUN="1"; shift ;;
