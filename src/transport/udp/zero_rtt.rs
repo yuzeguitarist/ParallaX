@@ -138,22 +138,33 @@ impl ReplayCacheGuard {
     /// retries briefly if a background persist is momentarily mid-flight.
     #[cfg(test)]
     pub(crate) fn flush_pending_for_test(&self) {
-        for _ in 0..200 {
-            // If a background persist has the cache checked out, wait for it to
-            // put the cache back, then flush whatever remains pending.
-            if self
+        // Retry until we ourselves successfully TAKE the cache and drain it — do
+        // not just check `is_some()` (which races a concurrent take) or fall back
+        // to `persist_checked_out` (which early-returns on a checked-out `None`,
+        // leaving the pending write unflushed). Taking the cache atomically and
+        // persisting guarantees that on return every entry that existed is durable:
+        // either an in-flight background persist already wrote it (and we then drain
+        // an empty queue), or we write it ourselves.
+        for _ in 0..1000 {
+            let taken = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some()
-            {
-                Self::persist_checked_out(&self.cache);
-                return;
+                .take();
+            match taken {
+                Some(mut cache) => {
+                    let result = cache.persist_pending();
+                    *self
+                        .cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cache);
+                    result.expect("flush_pending_for_test: persist failed");
+                    return;
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        // Last attempt regardless (returns early if still checked out).
-        Self::persist_checked_out(&self.cache);
+        panic!("flush_pending_for_test: background persist never released the cache");
     }
 }
 
