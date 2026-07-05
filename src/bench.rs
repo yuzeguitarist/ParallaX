@@ -922,8 +922,21 @@ fn bench_client_speed_download_open_1mb(options: BenchmarkOptions) -> Result<Ben
         TIER_BULK,
         options,
         || {
+            // The fixture pre-seals exactly `iterations + warmup` batches with
+            // the SAME tier the runner uses, so `batch_idx` stays in bounds. If
+            // the tier passed to run_case ever diverges from the one used to
+            // size the fixture, fail with a clear message instead of an
+            // out-of-bounds panic.
+            let Some(batch) = batch_ranges.get(batch_idx) else {
+                bail!(
+                    "client.speed_download_open_1mb ran more batches ({}) than were pre-sealed \
+                     ({}); the fixture tier diverged from the run tier",
+                    batch_idx + 1,
+                    batch_ranges.len()
+                );
+            };
             let mut recovered = 0_usize;
-            for range in &batch_ranges[batch_idx] {
+            for range in batch {
                 scratch.clear();
                 scratch.extend_from_slice(&encoded[range.clone()]);
                 let payload = session.open_server_record_in_place_payload_range(&mut scratch)?;
