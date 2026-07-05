@@ -38,14 +38,13 @@ const DATA_RECORD_WIRE_OVERHEAD: usize = 2 + 16;
 /// 0-RTT payload size — a small, variable, self-custom control record unlike any
 /// browser request. We snap the record to ONE randomly chosen band so the
 /// observable size carries no host_len signal, is never a tiny control packet,
-/// and is never a single fixed peak. The bands sit in the same sub-2 KiB
-/// browser-request magnitude as the measured Safari first-request burst
-/// (SETTINGS+WINDOW_UPDATE+HEADERS ~368 B and follow-on requests), WITHOUT
-/// pinning to Safari's exact 368 — a fixed Safari value would itself become a
-/// cluster signature once ParallaX is being hunted. Reusing the measured-Safari
-/// provenance of `PQ_FLIGHT_RECORD_TARGETS`, spread across the realistic CONNECT
-/// range so the random choice dominates the size.
-const CONNECT_RECORD_SIZE_BANDS: [usize; 8] = [286, 469, 569, 735, 911, 1180, 1353, 1600];
+/// and is never a single fixed peak. Every band is a measured Safari-26 H2 record
+/// size — a subset of `traffic::OBSERVED_PACKET_TARGETS`, the same provenance as
+/// `PQ_FLIGHT_RECORD_TARGETS` — spread across the realistic CONNECT range so the
+/// random choice dominates the size. The largest band stays under the measured max
+/// (1500) / a typical MSS, so a shaped CONNECT never exceeds a browser-plausible
+/// record size.
+const CONNECT_RECORD_SIZE_BANDS: [usize; 8] = [286, 339, 469, 519, 569, 713, 735, 1353];
 
 /// Per-chunk plaintext size bounds for [`FramedChunk::encode_all_shaped`]
 /// splitting of the PQ handshake records. A fresh size in this range is drawn
@@ -65,10 +64,12 @@ pub const PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT: usize = 1024;
 /// sides — makes the post-handshake burst fall inside the page-load distribution the
 /// outer camouflage GET already justifies, instead of reading as a second, heavier
 /// PQ key exchange. The values are the measured Safari small/medium H2 record sizes
-/// (a subset of `traffic::OBSERVED_PACKET_TARGETS`, the same provenance), kept here
-/// so the protocol layer carries no dependency on the traffic module.
-const PQ_FLIGHT_RECORD_TARGETS: [usize; 12] =
-    [144, 191, 286, 339, 469, 519, 569, 713, 735, 911, 1180, 1353];
+/// (every one is a member of `traffic::OBSERVED_PACKET_TARGETS`, the same
+/// provenance), duplicated here only so the protocol layer carries no dependency on
+/// the traffic module.
+const PQ_FLIGHT_RECORD_TARGETS: [usize; 12] = [
+    144, 191, 286, 339, 469, 519, 569, 713, 735, 1353, 1440, 1459,
+];
 
 /// Lower bound on a shaped PQ record so the flight never emits a tiny tell record,
 /// and so the record COUNT stays bounded (a ~4.6 KiB identity proof must not shatter
@@ -2562,7 +2563,7 @@ mod tests {
         let max_extra_pad = 500usize;
 
         // Correct fitting set: bands with band >= raw_wire and band - raw_wire <= 500.
-        // raw_wire = 41 -> {286, 469} (569-41=528 > 500 is excluded).
+        // raw_wire = 41 -> {286, 339, 469, 519} (569-41=528 > 500 is excluded).
         let expected: BTreeSet<usize> = CONNECT_RECORD_SIZE_BANDS
             .iter()
             .copied()
@@ -2570,8 +2571,8 @@ mod tests {
             .collect();
         assert_eq!(
             expected,
-            BTreeSet::from([286usize, 469usize]),
-            "fixture sanity: tight cap should admit exactly these two bands"
+            BTreeSet::from([286usize, 339usize, 469usize, 519usize]),
+            "fixture sanity: tight cap should admit exactly these four bands"
         );
 
         let mut reached = BTreeSet::new();
