@@ -555,12 +555,31 @@ async fn real_server_resists_active_probes() {
     }
 
     let agg = ActiveProber::with_default_probes().score_observations(&observations);
-    assert_ne!(
+    // Behavioral gate, pointed at the MEASURED aggregate. The old assertion here
+    // was only `!= ConfirmedProxy`, which is nearly tautological once the
+    // per-probe checks above pass: they force every observation to
+    // (bytes+legit, !held, !reset), and such observations can never sum past the
+    // `Suspicious` floor, so `!= ConfirmedProxy` was guaranteed rather than
+    // tested. Assert the stronger, still-non-flaky fact the measurement actually
+    // supports: the real server is affirmatively benign — verdict `Inconclusive`
+    // (not merely "not Confirmed"), and its aggregate suspicion sits below the
+    // `Suspicious` floor (0.45). Measured top-two-avg is 0.15 (a lone +0.15 from
+    // the empty-payload probes that legitimately wait out the multi-second
+    // first-record window), leaving ~0.30 of margin. A regression that made ANY
+    // probe held/reset/junk would push a score >= 0.45 and trip this.
+    const SUSPICIOUS_FLOOR: f64 = 0.45;
+    assert_eq!(
         agg.verdict,
-        ProbeAggregateVerdict::ConfirmedProxy,
-        "the REAL server's MEASURED probe responses were scored ConfirmedProxy \
-         — the fallback camouflage is not resisting active probing. \
-         observations: {observations:#?}; aggregate: {agg:#?}"
+        ProbeAggregateVerdict::Inconclusive,
+        "the REAL server's MEASURED probe responses did not score affirmatively \
+         benign (Inconclusive) — the fallback camouflage is not cleanly resisting \
+         active probing. observations: {observations:#?}; aggregate: {agg:#?}"
+    );
+    assert!(
+        agg.top_two_avg < SUSPICIOUS_FLOOR,
+        "the REAL server's aggregate suspicion {:.2} reached the {SUSPICIOUS_FLOOR} \
+         Suspicious floor — a probe surfaced a proxy tell. aggregate: {agg:#?}",
+        agg.top_two_avg
     );
 
     parallax_task.abort();
