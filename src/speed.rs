@@ -206,13 +206,14 @@ pub struct SpeedReport {
 }
 
 impl SpeedReport {
-    /// The primary (TCP) transport run — always present, always first. Callers that
-    /// want a single headline figure (e.g. the netmatrix benchmark) use this; the
-    /// QUIC run, when measured, is the second entry in [`Self::runs`].
-    pub fn primary_run(&self) -> &TransportRun {
-        self.runs
-            .first()
-            .expect("a SpeedReport always has at least the TCP run")
+    /// The primary (TCP) transport run. Reports built by [`run`] always measure
+    /// TCP first, so this is `Some` with the TCP run in that case; the QUIC run,
+    /// when measured, is the second entry in [`Self::runs`]. Returns `None` only
+    /// for an externally-built report with empty `runs` (the fields are public),
+    /// instead of panicking. Callers that want a single headline figure (e.g.
+    /// the netmatrix benchmark) use this.
+    pub fn primary_run(&self) -> Option<&TransportRun> {
+        self.runs.first()
     }
 
     /// The run for a specific transport, if it was measured.
@@ -1090,6 +1091,19 @@ mod tests {
                 upload: DirectionReport::new(samples),
             }],
         }
+    }
+
+    #[test]
+    fn primary_run_returns_first_run_or_none_when_empty() {
+        let full = report();
+        let run = full.primary_run().expect("fixture report has a TCP run");
+        assert_eq!(run.transport, Transport::Tcp);
+
+        // The fields are public, so an externally-built report can carry an
+        // empty `runs`; primary_run must return None instead of panicking.
+        let mut empty = report();
+        empty.runs.clear();
+        assert!(empty.primary_run().is_none());
     }
 
     #[test]

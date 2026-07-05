@@ -40,7 +40,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 
 use crate::config::{Config, Mode};
-use crate::speed::{self, SpeedReport};
+use crate::speed::{self, SpeedReport, TransportRun};
 
 /// One network-impairment profile applied symmetrically to both directions.
 #[derive(Debug, Clone, Copy)]
@@ -277,18 +277,31 @@ fn render_text(upstream: &str, cells: &[NetCell]) -> String {
             .bandwidth_mbit
             .map(|m| m.to_string())
             .unwrap_or_else(|| "inf".to_string());
+        // `speed::run` always measures TCP, so `primary_run()` is `Some` for any
+        // report it produced; the `None` arm only guards an externally-built
+        // report with empty `runs` (the fields are public) so the renderer
+        // degrades to an ERROR row instead of panicking.
         match &cell.outcome {
-            Ok(report) => {
-                let _ = writeln!(
-                    out,
-                    "{:<18} {:>9} {:>12} {:>14.2} {:>14.2}",
-                    cell.imp.label,
-                    cell.imp.rtt_ms,
-                    bw,
-                    report.primary_run().download.summary.median_mbps,
-                    report.primary_run().upload.summary.median_mbps,
-                );
-            }
+            Ok(report) => match report.primary_run() {
+                Some(run) => {
+                    let _ = writeln!(
+                        out,
+                        "{:<18} {:>9} {:>12} {:>14.2} {:>14.2}",
+                        cell.imp.label,
+                        cell.imp.rtt_ms,
+                        bw,
+                        run.download.summary.median_mbps,
+                        run.upload.summary.median_mbps,
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "{:<18} {:>9} {:>12}  ERROR: speed report has no transport runs",
+                        cell.imp.label, cell.imp.rtt_ms, bw
+                    );
+                }
+            },
             Err(err) => {
                 let _ = writeln!(
                     out,
@@ -314,8 +327,19 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
             .bandwidth_mbit
             .map(|m| m.to_string())
             .unwrap_or_else(|| "null".to_string());
-        match &cell.outcome {
-            Ok(report) => {
+        // Flatten "speed failed" and "report has no transport runs" into one
+        // error arm so the emitted cell shape stays consistent. `speed::run`
+        // always measures TCP, so the empty-runs case only guards an
+        // externally-built report (the fields are public).
+        let outcome: Result<(&SpeedReport, &TransportRun), &str> = match &cell.outcome {
+            Ok(report) => report
+                .primary_run()
+                .map(|run| (report, run))
+                .ok_or("speed report has no transport runs"),
+            Err(err) => Err(err.as_str()),
+        };
+        match outcome {
+            Ok((report, run)) => {
                 let _ = writeln!(out, "    {{");
                 let _ = writeln!(out, "      \"profile\": \"{}\",", cell.imp.label);
                 let _ = writeln!(out, "      \"rtt_ms\": {},", cell.imp.rtt_ms);
@@ -328,12 +352,12 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
                 let _ = writeln!(
                     out,
                     "      \"download_median_mbps\": {},",
-                    json_f64(report.primary_run().download.summary.median_mbps, 4)
+                    json_f64(run.download.summary.median_mbps, 4)
                 );
                 let _ = writeln!(
                     out,
                     "      \"upload_median_mbps\": {}",
-                    json_f64(report.primary_run().upload.summary.median_mbps, 4)
+                    json_f64(run.upload.summary.median_mbps, 4)
                 );
                 let _ = writeln!(out, "    }}{comma}");
             }
@@ -633,6 +657,25 @@ mod tests {
             "last cell must not be comma-terminated"
         );
         assert!(json.trim_end().ends_with('}')); // document closes cleanly
+    }
+
+    #[test]
+    fn renderers_degrade_to_error_for_empty_runs_report() {
+        // An externally-built SpeedReport with empty `runs` (public fields)
+        // must render as an error cell in both formats, not panic.
+        let mut report = sample_report();
+        report.runs.clear();
+        let cells = vec![NetCell {
+            imp: MATRIX[0],
+            outcome: Ok(report),
+        }];
+
+        let text = render_text("vps.example:443", &cells);
+        assert!(text.contains("ERROR: speed report has no transport runs"));
+
+        let json = render_json("vps.example:443", &cells);
+        assert!(json.contains("\"error\": \"speed report has no transport runs\""));
+        assert!(!json.contains("download_median_mbps"));
     }
 
     #[test]
