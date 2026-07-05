@@ -333,10 +333,7 @@ pub fn safari26_request_fields_with_language(
             "sec-fetch-mode".to_string(),
             SAFARI26_SEC_FETCH_MODE.to_string(),
         ),
-        (
-            "accept-language".to_string(),
-            accept_language.to_string(),
-        ),
+        ("accept-language".to_string(), accept_language.to_string()),
         ("priority".to_string(), SAFARI26_PRIORITY.to_string()),
         (
             "accept-encoding".to_string(),

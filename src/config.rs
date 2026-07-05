@@ -1016,10 +1016,7 @@ impl Config {
                     // A header value: reject empty and any control char (incl. CR/LF)
                     // and non-ASCII so a misconfigured value cannot become its own
                     // distinguishing tell or a framing oddity.
-                    if al.is_empty()
-                        || !al.is_ascii()
-                        || al.bytes().any(|b| b.is_ascii_control())
-                    {
+                    if al.is_empty() || !al.is_ascii() || al.bytes().any(|b| b.is_ascii_control()) {
                         return Err(ConfigError::InvalidAcceptLanguage);
                     }
                 }

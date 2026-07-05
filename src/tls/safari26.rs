@@ -291,7 +291,6 @@ impl Safari26TlsCamouflage {
             tap: VecRecordTap::default(),
         })
     }
-
 }
 
 pub struct Safari26TlsSession {

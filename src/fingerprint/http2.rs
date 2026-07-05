@@ -616,7 +616,10 @@ mod tests {
         let zh = fp
             .headers_frame_with_language("localhost:8443", "zh-CN,zh;q=0.9")
             .unwrap();
-        assert_ne!(default, zh, "a different accept-language must change the frame");
+        assert_ne!(
+            default, zh,
+            "a different accept-language must change the frame"
+        );
 
         let al = huffman_payload("zh-CN,zh;q=0.9".as_bytes());
         let mut expected_al = vec![0x51_u8, 0x80 | al.len() as u8];

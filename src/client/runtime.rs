@@ -1139,11 +1139,7 @@ impl ClientMuxPool {
                     session_keys,
                     traffic: self.traffic,
                     authority: Arc::from(self.config.sni.as_str()),
-                    accept_language: self
-                        .config
-                        .accept_language
-                        .as_deref()
-                        .map(Arc::from),
+                    accept_language: self.config.accept_language.as_deref().map(Arc::from),
                     _endpoint: Arc::new(endpoint),
                     _h3_control: Arc::new(h3_control),
                     // Keep the outer TCP connection alive for the session's duration

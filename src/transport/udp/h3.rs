@@ -36,8 +36,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::fingerprint::http3::{
     self, parse_settings_payload, response_status_200_headers_frame, safari26_headers_frame,
-    safari26_headers_frame_with_language, safari26_settings_frame, Http3Setting, FRAME_TYPE_HEADERS,
-    FRAME_TYPE_SETTINGS, STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER, STREAM_TYPE_QPACK_ENCODER,
+    safari26_headers_frame_with_language, safari26_settings_frame, Http3Setting,
+    FRAME_TYPE_HEADERS, FRAME_TYPE_SETTINGS, STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER,
+    STREAM_TYPE_QPACK_ENCODER,
 };
 use crate::transport::udp::quic::endpoint::{Connection, RecvStream, SendStream};
 
