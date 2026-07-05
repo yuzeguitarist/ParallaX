@@ -131,6 +131,24 @@ pub struct ReplayCache {
     /// this queue is non-empty: the immediate path's append would journal its own
     /// entry ahead of the still-queued ones.
     pending_persist: VecDeque<ReplayEntry>,
+    /// One-shot injected failure consumed by the next header commit in
+    /// [`Self::persist_authenticated_entry`] (tests only).
+    #[cfg(test)]
+    fail_header_commit: Option<HeaderCommitFailure>,
+}
+
+/// Test-only fault injection for the header-commit phase of
+/// [`ReplayCache::persist_authenticated_entry`]: deterministically reproduces
+/// the two on-disk outcomes a failed commit can leave behind (no header byte
+/// landed / the full slot landed with only the error report surviving) without
+/// needing a faulty disk.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum HeaderCommitFailure {
+    /// Report an error before any header byte is written.
+    BeforeWrite,
+    /// Perform the full durable header write, then report an error anyway.
+    AfterDurableWrite,
 }
 
 impl ReplayCache {
@@ -146,6 +164,8 @@ impl ReplayCache {
             nonces: HashSet::with_capacity(capacity),
             transcripts: HashSet::with_capacity(capacity),
             pending_persist: VecDeque::new(),
+            #[cfg(test)]
+            fail_header_commit: None,
         }
     }
 
@@ -540,30 +560,79 @@ impl ReplayCache {
             return Ok(true);
         }
         let committed_len = file.seek(SeekFrom::End(0))?;
-        // Append the entry, then commit the inactive header slot. On a failed
-        // APPEND (the common ENOSPC/EIO case) truncate the file back to its last
-        // committed length so a half-written orphan line cannot desync the journal.
-        // A failure (or crash) DURING the header write is harmless: it tears only
-        // the inactive slot, the active slot still commits exactly `count` entries,
-        // and the next load falls back to it, drops the uncommitted tail, and heals
-        // the torn slot via the compaction rewrite. committed_len is the prior
-        // committed length (a 0-length file already returned via compact above).
-        let append_and_commit = |file: &mut fs::File| -> io::Result<()> {
+        // The entry APPEND and the HEADER COMMIT are separate failure domains
+        // with opposite rollback rules; sharing one error path let a failed
+        // header commit truncate an entry that a fully-landed (MAC-valid,
+        // higher-generation) slot could already advertise — a valid header whose
+        // body was removed, which fails every later load as a "truncated
+        // journal" (fail-closed, by design of the truncation detector).
+        //
+        // Phase 1 — append the entry and make it durable BEFORE the header that
+        // will advertise it (without this ordering a reordered/partial writeback
+        // could persist a count=N+1 header while entry N+1 is absent — the same
+        // unloadable state). On failure, truncating back to `committed_len` is
+        // safe and correct: no header byte has been written yet, so the
+        // still-active old header remains authoritative and the file returns to
+        // exactly its last committed state (a 0-length file already returned via
+        // compact above).
+        let append_entry = |file: &mut fs::File| -> io::Result<()> {
             file.write_all(line.as_bytes())?;
-            // Make the appended entry durable BEFORE the header that will advertise
-            // it. Without this ordering a reordered/partial writeback could leave a
-            // header claiming count N+1 while entry N+1 is absent, which fails to
-            // load as a "truncated journal". The reverse (entry durable, header
-            // not) is healed on load by truncating the uncommitted tail.
-            file.sync_data()?;
+            file.sync_data()
+        };
+        if let Err(err) = append_entry(&mut file) {
+            if file.set_len(committed_len).is_ok() {
+                let _ = file.sync_data();
+            } else {
+                // The rollback itself failed, so the tail may keep a partial
+                // orphan line and appending after it would desync the entry
+                // chain. Drop the in-memory journal state: the next persist
+                // routes through the atomic tmp-file + rename compaction, which
+                // rewrites the whole file no matter what the tail holds.
+                self.auth_journal = None;
+            }
+            return Err(err.into());
+        }
+
+        #[cfg(test)]
+        let injected_failure = self.fail_header_commit.take();
+        // Phase 2 — commit the new header into the inactive slot. From here on
+        // the appended entry must NEVER be truncated: a failed write/sync may
+        // still have landed any prefix of the slot — or all of it, with only the
+        // error report surviving — so a MAC-valid generation-N+1 header
+        // advertising count N+1 can exist on disk, and removing the body it
+        // advertises would wedge every later load. Leaving the entry in place is
+        // consistent in both outcomes: if the new header landed, the entry is
+        // simply committed; if it tore or never landed, the old slot wins slot
+        // selection on load and the entry is dropped as an uncommitted tail and
+        // healed by the rewrite.
+        let commit_header = |file: &mut fs::File| -> io::Result<()> {
+            #[cfg(test)]
+            if matches!(injected_failure, Some(HeaderCommitFailure::BeforeWrite)) {
+                return Err(io::Error::other("injected header-commit failure"));
+            }
             file.seek(SeekFrom::Start(header_offset))?;
             file.write_all(next_header.as_bytes())?;
             file.sync_data()?;
+            #[cfg(test)]
+            if matches!(
+                injected_failure,
+                Some(HeaderCommitFailure::AfterDurableWrite)
+            ) {
+                return Err(io::Error::other(
+                    "injected header-commit failure (write landed)",
+                ));
+            }
             Ok(())
         };
-        if let Err(err) = append_and_commit(&mut file) {
-            let _ = file.set_len(committed_len);
-            let _ = file.sync_data();
+        if let Err(err) = commit_header(&mut file) {
+            // Whether the commit landed is unknown, so the in-memory
+            // generation/count/tail no longer reliably describe the file. Drop
+            // them: the next persist compacts (atomic tmp-file + rename rewrite
+            // from the in-memory entries), reconciling the file to memory
+            // regardless of which state the failed commit left behind —
+            // including re-dropping an entry the caller rolls back from memory
+            // but whose commit actually landed.
+            self.auth_journal = None;
             return Err(err.into());
         }
         self.auth_journal = Some(AuthJournalState {
@@ -1999,6 +2068,130 @@ mod tests {
         assert!(
             !loaded.insert_new(entry2, now).unwrap(),
             "entry2 recorded after retry"
+        );
+    }
+
+    #[test]
+    fn header_commit_failure_after_durable_append_never_truncates_the_entry() {
+        // Regression (cubic P2): the entry append and the header commit are
+        // separate failure domains. If the header commit reports an error AFTER
+        // the new (higher-generation) slot durably landed, the old shared error
+        // path truncated the appended entry — leaving a MAC-valid header
+        // advertising a removed body, which
+        // `authenticated_journal_detects_committed_truncation` pins as
+        // permanently unloadable. Inject exactly that failure and assert the
+        // entry is left in place and every subsequent load is consistent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-header-commit-fail.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let first = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(first.clone(), now).unwrap());
+        let committed_len = fs::metadata(&path).unwrap().len();
+
+        cache.fail_header_commit = Some(HeaderCommitFailure::AfterDurableWrite);
+        assert!(matches!(
+            cache.insert_new_outcome(second.clone(), now),
+            Err(ReplayCacheError::Io(_))
+        ));
+
+        // The durable append must NOT be rolled back: the landed gen-2 header
+        // advertises count=2, so truncating the body would wedge the next load.
+        assert!(
+            fs::metadata(&path).unwrap().len() > committed_len,
+            "a failed header commit must not truncate the appended entry"
+        );
+
+        // A restart sees the landed header: the journal loads (no wedge) and the
+        // entry it advertises is committed, still gating replays.
+        let mut restarted = ReplayCache::load_or_create_authenticated(&path, 8, key)
+            .expect("journal must stay loadable after a failed header commit");
+        assert!(!restarted.insert_new(first.clone(), now).unwrap());
+        assert!(
+            !restarted.insert_new(second.clone(), now).unwrap(),
+            "the entry advertised by the landed header is committed"
+        );
+        drop(restarted);
+
+        // The ORIGINAL process also recovers: the commit state is unknown, so
+        // the next persist routes through the atomic compaction rewrite, and the
+        // rolled-back entry is re-insertable (not falsely Replayed).
+        assert!(
+            cache.insert_new(second.clone(), now).unwrap(),
+            "rolled-back entry must be re-insertable after the failed commit"
+        );
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!reloaded.insert_new(first, now).unwrap());
+        assert!(!reloaded.insert_new(second, now).unwrap());
+    }
+
+    #[test]
+    fn header_commit_failure_with_no_header_bytes_leaves_a_healable_tail() {
+        // The complementary phase-2 outcome: the commit fails before ANY header
+        // byte lands, so both slots still hold the old committed state (a valid
+        // generation tie) and the durable entry beyond their count is an
+        // uncommitted tail. The load must fall back to the old count, drop and
+        // heal the tail, and keep the entry re-insertable — never wedge.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-header-commit-fail-early.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let first = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(first.clone(), now).unwrap());
+        let committed_raw = fs::read(&path).unwrap();
+
+        cache.fail_header_commit = Some(HeaderCommitFailure::BeforeWrite);
+        assert!(matches!(
+            cache.insert_new_outcome(second.clone(), now),
+            Err(ReplayCacheError::Io(_))
+        ));
+        drop(cache);
+
+        // The durable entry stays (only the append's OWN failure rolls it back)
+        // and the header region is byte-for-byte untouched.
+        let raw_after = fs::read(&path).unwrap();
+        assert!(
+            raw_after.len() > committed_raw.len(),
+            "the durable append must survive the failed header commit"
+        );
+        assert_eq!(
+            &raw_after[..AUTH_JOURNAL_HEADER_REGION_LEN],
+            &committed_raw[..AUTH_JOURNAL_HEADER_REGION_LEN],
+            "no header byte landed"
+        );
+
+        // A restart falls back to the old header: it loads cleanly, the
+        // committed entry still gates replays, and the uncommitted tail is
+        // dropped (and healed) so the failed entry is re-insertable rather than
+        // falsely Replayed.
+        let mut restarted = ReplayCache::load_or_create_authenticated(&path, 8, key)
+            .expect("journal must stay loadable after a failed header commit");
+        assert!(!restarted.insert_new(first, now).unwrap());
+        assert!(
+            restarted.insert_new(second, now).unwrap(),
+            "the uncommitted tail entry is re-insertable after the fallback"
         );
     }
 
