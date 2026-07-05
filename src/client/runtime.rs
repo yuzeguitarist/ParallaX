@@ -724,6 +724,9 @@ enum MuxCarrier {
         /// each business bidi's request HEADERS frame so every substream opens with
         /// a browser-plausible H3 request lifecycle. Shared, read-only.
         authority: Arc<str>,
+        /// Operator-configured `accept-language` for each business bidi's request
+        /// HEADERS (default en-US when `None`), kept in lockstep with the H2 plane.
+        accept_language: Option<Arc<str>>,
         /// Held alive for the session's duration: the QUIC endpoint + H3 control
         /// streams must outlive every substream (RFC 9114 §6.2.1).
         _endpoint: Arc<crate::transport::udp::quic::endpoint::Endpoint>,
@@ -1136,6 +1139,11 @@ impl ClientMuxPool {
                     session_keys,
                     traffic: self.traffic,
                     authority: Arc::from(self.config.sni.as_str()),
+                    accept_language: self
+                        .config
+                        .accept_language
+                        .as_deref()
+                        .map(Arc::from),
                     _endpoint: Arc::new(endpoint),
                     _h3_control: Arc::new(h3_control),
                     // Keep the outer TCP connection alive for the session's duration
@@ -1242,6 +1250,7 @@ async fn handle_local_mux_connection_with_cid(
         session_keys,
         traffic,
         authority,
+        accept_language,
         ..
     } = &mux.carrier
     {
@@ -1252,6 +1261,7 @@ async fn handle_local_mux_connection_with_cid(
             *traffic,
             connect_request,
             authority,
+            accept_language.as_deref(),
             cid,
         )
         .await;
@@ -1357,6 +1367,7 @@ async fn client_mux_quic_substream(
     traffic: TrafficConfig,
     connect_request: ConnectRequest,
     authority: &str,
+    accept_language: Option<&str>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
     use crate::transport::udp::h3::{
@@ -1378,7 +1389,7 @@ async fn client_mux_quic_substream(
     // browser-plausible HTTP/3 request lifecycle (HEADERS then DATA) instead of
     // starting directly with a DATA frame — the encrypted records ride the DATA
     // frames that follow, exactly like the probe bidi.
-    if let Err(err) = write_business_request_headers(&mut send, authority).await {
+    if let Err(err) = write_business_request_headers(&mut send, authority, accept_language).await {
         send.reset(VarInt::from_u32(0));
         return Err(ClientRuntimeError::Io(err));
     }
@@ -2542,10 +2553,11 @@ async fn establish_data_session(
     psk: &[u8],
     server_public: &[u8; 32],
 ) -> Result<ClientDataSession, ClientRuntimeError> {
-    let completed = Safari26TlsCamouflage
-        .start(config.sni.clone(), psk, server_public)?
-        .complete(server)
-        .await?;
+    let mut session = Safari26TlsCamouflage.start(config.sni.clone(), psk, server_public)?;
+    if let Some(al) = &config.accept_language {
+        session = session.with_accept_language(al.clone());
+    }
+    let completed = session.complete(server).await?;
     let session_keys = client::derive_session_keys_from_shared(
         psk,
         completed.x25519_shared_secret(),
@@ -4501,6 +4513,7 @@ mod tests {
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+            accept_language: None,
         });
         let server_addr = ServerAddrResolver::new(&client_config.server_addr)
             .await
@@ -5145,6 +5158,7 @@ mod tests {
                 sni: "example.com".to_owned(),
                 server_public_key: STANDARD.encode(server_keys.public),
                 server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+                accept_language: None,
             }),
             server: None,
         }
@@ -6514,6 +6528,7 @@ mod tests {
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+            accept_language: None,
         });
         let traffic = TrafficConfig {
             max_concurrent_streams: stream_count as u8,
@@ -6579,6 +6594,7 @@ mod tests {
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+            accept_language: None,
         };
         let server_public_key = server_keys.public;
         let server_identity_public_key = server_identity_keys.public.clone();
@@ -6615,6 +6631,7 @@ mod tests {
             sni: "example.com".to_owned(),
             server_public_key: STANDARD.encode(server_keys.public),
             server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+            accept_language: None,
         };
         let server_public_key = server_keys.public;
         let server_identity_public_key = server_identity_keys.public.clone();

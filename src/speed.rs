@@ -1230,6 +1230,7 @@ mod tests {
             sni: "example.com".to_owned(),
             server_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             server_identity_public_key: STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]),
+            accept_language: None,
         });
         let err = run(cfg).await.unwrap_err();
         assert!(matches!(err, SpeedError::Config(ConfigError::WeakPsk)));

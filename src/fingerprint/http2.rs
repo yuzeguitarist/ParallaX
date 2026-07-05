@@ -97,13 +97,27 @@ impl Http2Fingerprint {
         frame(0x4, 0x1, 0, &[])
     }
 
+    /// Build the opening HEADERS frame with the default Safari en-US
+    /// `accept-language`. See [`Self::headers_frame_with_language`].
     pub fn headers_frame(&self, authority: &str) -> Result<Vec<u8>, Http2FingerprintError> {
+        self.headers_frame_with_language(authority, SAFARI26_ACCEPT_LANGUAGE)
+    }
+
+    /// Build the opening HEADERS frame with an explicit `accept-language` value.
+    /// Every other field is byte-identical to the captured Safari 26.4 request;
+    /// only the accept-language value varies (operator-configurable, defaulting to
+    /// [`SAFARI26_ACCEPT_LANGUAGE`] via [`Self::headers_frame`]).
+    pub fn headers_frame_with_language(
+        &self,
+        authority: &str,
+        accept_language: &str,
+    ) -> Result<Vec<u8>, Http2FingerprintError> {
         // Safari 26.4 main-document request, field order as captured:
         // :method :scheme :authority :path, then sec-fetch-dest, user-agent,
         // accept, sec-fetch-site, sec-fetch-mode, accept-language, priority,
-        // accept-encoding. accept-language is the project's en-US default (the
-        // capture carries zh-CN); everything else matches the wire byte-for-byte.
-        let mut payload = Vec::with_capacity(260 + authority.len());
+        // accept-encoding. accept-language defaults to the project's en-US string
+        // (the capture carries zh-CN); everything else matches the wire byte-for-byte.
+        let mut payload = Vec::with_capacity(260 + authority.len() + accept_language.len());
         payload.push(0x82); // :method: GET
         payload.push(0x87); // :scheme: https
         push_hpack_literal_with_indexed_name(&mut payload, 1, authority.as_bytes(), true);
@@ -136,12 +150,7 @@ impl Http2Fingerprint {
             SAFARI26_SEC_FETCH_MODE.as_bytes(),
             true,
         );
-        push_hpack_literal_with_indexed_name(
-            &mut payload,
-            17,
-            SAFARI26_ACCEPT_LANGUAGE.as_bytes(),
-            true,
-        );
+        push_hpack_literal_with_indexed_name(&mut payload, 17, accept_language.as_bytes(), true);
         push_hpack_literal_with_new_name(
             &mut payload,
             b"priority",
@@ -583,5 +592,43 @@ mod tests {
         s.chunks(2)
             .map(|c| (nibble(c[0]) << 4) | nibble(c[1]))
             .collect()
+    }
+
+    #[test]
+    fn headers_frame_defaults_to_the_en_us_accept_language_byte_for_byte() {
+        // The default path must remain byte-identical to explicitly passing the
+        // en-US constant, so the configurable knob never perturbs the default
+        // fleet fingerprint.
+        let fp = Http2Fingerprint::safari26();
+        let default = fp.headers_frame("localhost:8443").unwrap();
+        let explicit = fp
+            .headers_frame_with_language("localhost:8443", SAFARI26_ACCEPT_LANGUAGE)
+            .unwrap();
+        assert_eq!(default, explicit);
+    }
+
+    #[test]
+    fn configured_accept_language_changes_only_the_language_segment() {
+        // A configured value must appear (Huffman-encoded) in the frame and differ
+        // from the default, while every other field stays put.
+        let fp = Http2Fingerprint::safari26();
+        let default = fp.headers_frame("localhost:8443").unwrap();
+        let zh = fp
+            .headers_frame_with_language("localhost:8443", "zh-CN,zh;q=0.9")
+            .unwrap();
+        assert_ne!(default, zh, "a different accept-language must change the frame");
+
+        let al = huffman_payload("zh-CN,zh;q=0.9".as_bytes());
+        let mut expected_al = vec![0x51_u8, 0x80 | al.len() as u8];
+        expected_al.extend_from_slice(&al);
+        let (header, total) = Http2FrameHeader::parse_complete(&zh).unwrap();
+        let payload = &zh[Http2FrameHeader::SIZE..total];
+        assert_eq!(header.len, total - Http2FrameHeader::SIZE);
+        assert!(
+            payload
+                .windows(expected_al.len())
+                .any(|window| window == expected_al),
+            "the configured accept-language must be HPACK/Huffman-encoded in place",
+        );
     }
 }

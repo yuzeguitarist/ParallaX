@@ -116,6 +116,8 @@ pub enum ConfigError {
     InvalidTimeoutJitter,
     #[error("server.tcp_congestion must be a short algorithm name (letters, digits, '_' or '-'), e.g. \"bbr\"")]
     InvalidCongestionControl,
+    #[error("client.accept_language must be a non-empty, single-line ASCII header value (no control characters), e.g. \"en-US,en;q=0.9\"")]
+    InvalidAcceptLanguage,
     #[cfg(unix)]
     #[error(
         "config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, \
@@ -443,6 +445,15 @@ pub struct ClientConfig {
     pub sni: String,
     pub server_public_key: String,
     pub server_identity_public_key: String,
+    /// Optional `accept-language` header value advertised in the camouflage H2/H3
+    /// request. Defaults (when unset) to the Safari en-US string
+    /// [`crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE`]. Operators in a
+    /// region whose real Safari population is dominated by another locale can set
+    /// their plausible value here so the fleet is not a single fixed `en-US`
+    /// cross-connection invariant. Both the H2 and H3 planes use the same value,
+    /// so they never diverge.
+    #[serde(default)]
+    pub accept_language: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1001,6 +1012,17 @@ impl Config {
                 }
                 require_host_port("client.server_addr", &client.server_addr)?;
                 require_non_empty("client.sni", &client.sni)?;
+                if let Some(al) = &client.accept_language {
+                    // A header value: reject empty and any control char (incl. CR/LF)
+                    // and non-ASCII so a misconfigured value cannot become its own
+                    // distinguishing tell or a framing oddity.
+                    if al.is_empty()
+                        || !al.is_ascii()
+                        || al.bytes().any(|b| b.is_ascii_control())
+                    {
+                        return Err(ConfigError::InvalidAcceptLanguage);
+                    }
+                }
                 decode_key32("client.server_public_key", &client.server_public_key)?;
                 decode_base64_bytes_exact(
                     "client.server_identity_public_key",
@@ -2708,6 +2730,70 @@ authorized_sni = ["example.com"]
                 assert_eq!(m, missing);
             }
             other => panic!("expected ParentMissingCreatable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_accept_language_defaults_to_none_and_accepts_a_plausible_value() {
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let base = format!(
+            r#"
+mode = "client"
+[crypto]
+psk = "{}"
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+server_identity_public_key = "{server_identity_public_key}"
+"#,
+            STANDARD.encode([0x5a_u8; 32])
+        );
+        // Unset -> None (defaults to the en-US constant at use sites).
+        let cfg = toml::from_str::<Config>(&base).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.client.unwrap().accept_language, None);
+
+        // A plausible regional value is accepted.
+        let with_lang = base.replace(
+            "sni = \"example.com\"",
+            "sni = \"example.com\"\naccept_language = \"zh-CN,zh;q=0.9\"",
+        );
+        let cfg = toml::from_str::<Config>(&with_lang).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.client.unwrap().accept_language.as_deref(),
+            Some("zh-CN,zh;q=0.9")
+        );
+    }
+
+    #[test]
+    fn client_accept_language_rejects_control_chars_and_empty() {
+        let server_identity_public_key = STANDARD.encode(vec![0_u8; mldsa::public_key_bytes()]);
+        let base = format!(
+            r#"
+mode = "client"
+[crypto]
+psk = "{}"
+[client]
+listen = "127.0.0.1:1080"
+server_addr = "example.com:443"
+sni = "example.com"
+server_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+server_identity_public_key = "{server_identity_public_key}"
+"#,
+            STANDARD.encode([0x5a_u8; 32])
+        );
+        // Set the field directly (a control char / non-ASCII value cannot be
+        // written as a TOML basic-string escape) and assert validate() rejects it.
+        for bad in ["", "en-US\r\nX-Injected: 1", "en\u{0000}US", "日本語"] {
+            let mut cfg = toml::from_str::<Config>(&base).unwrap();
+            cfg.client.as_mut().unwrap().accept_language = Some(bad.to_string());
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::InvalidAcceptLanguage)),
+                "accept_language {bad:?} must be rejected"
+            );
         }
     }
 

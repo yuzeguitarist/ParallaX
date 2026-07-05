@@ -36,8 +36,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::fingerprint::http3::{
     self, parse_settings_payload, response_status_200_headers_frame, safari26_headers_frame,
-    safari26_settings_frame, Http3Setting, FRAME_TYPE_HEADERS, FRAME_TYPE_SETTINGS,
-    STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER, STREAM_TYPE_QPACK_ENCODER,
+    safari26_headers_frame_with_language, safari26_settings_frame, Http3Setting, FRAME_TYPE_HEADERS,
+    FRAME_TYPE_SETTINGS, STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER, STREAM_TYPE_QPACK_ENCODER,
 };
 use crate::transport::udp::quic::endpoint::{Connection, RecvStream, SendStream};
 
@@ -276,9 +276,13 @@ const MAX_BUSINESS_HEADERS_FRAME_LEN: usize = 4096;
 pub(crate) async fn write_business_request_headers(
     send: &mut SendStream,
     authority: &str,
+    accept_language: Option<&str>,
 ) -> Result<(), io::Error> {
-    let headers = safari26_headers_frame(authority)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    let headers = match accept_language {
+        Some(al) => safari26_headers_frame_with_language(authority, al),
+        None => safari26_headers_frame(authority),
+    }
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
     send.write_all(&headers)
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
@@ -442,7 +446,7 @@ mod tests {
 
         let client = async move {
             let (mut send, mut recv) = client_conn.open_bi();
-            write_business_request_headers(&mut send, "example.com")
+            write_business_request_headers(&mut send, "example.com", None)
                 .await
                 .unwrap();
             // A DATA frame would normally follow; here we only assert the HEADERS
