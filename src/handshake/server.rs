@@ -7232,6 +7232,75 @@ mod tests {
         );
     }
 
+    /// Self-calibrated Welch |t| ceiling for the dudect gate (item #4): the largest
+    /// cross-shape |t| tolerated, given the SAME-run same-shape control |t| that is
+    /// the per-runner statistical noise floor. Structured exactly like the physical
+    /// mean-gap gate (`max(FLOOR, MULT × control)`):
+    ///
+    ///   allow = max(t_abs, t_mult × t_ctrl)
+    ///
+    /// This is what makes gating |t| robust despite |t| ∝ √n: cross and control are
+    /// measured together at the SAME sample count in the SAME interleaved loop, so
+    /// the √n inflation hits both equally and cancels in the ratio. A real
+    /// data-dependent distinguisher (the µs-scale asymmetry this test exists to
+    /// catch) blows the cross |t| into the thousands+ — orders of magnitude past the
+    /// control — while the already-bounded sub-µs SNI-length residue keeps the cross
+    /// |t| in the control's neighbourhood. The `t_abs` floor keeps the gate from
+    /// tripping on pure ratio noise when the control |t| happens to be tiny.
+    #[cfg(test)]
+    fn dudect_t_allow(t_ctrl: f64, t_abs: f64, t_mult: f64) -> f64 {
+        t_abs.max(t_mult * t_ctrl)
+    }
+
+    /// META-TEST (deterministic teeth for the |t| GATE itself, item #4): proves the
+    /// self-calibrated |t| ceiling is non-vacuous — it REJECTS a gross statistical
+    /// distinguisher (the kind a µs-scale timing regression produces) yet ACCEPTS a
+    /// residue whose |t| tracks the control, and widens with a noisy control so it
+    /// cannot false-positive on per-runner jitter. Pure arithmetic, never flaky, and
+    /// compiled in every test build (not behind `--features dudect`), so the gate
+    /// logic is guarded even when the slow measurement job does not run.
+    #[test]
+    fn dudect_t_gate_is_non_vacuous() {
+        // The production defaults used by the dudect test below.
+        let (t_abs, t_mult) = (1_000.0_f64, 10.0_f64);
+
+        // A real distinguisher: cross |t| in the thousands against a quiet control
+        // MUST be rejected (this is the µs-scale regression signature).
+        let regression_t_cross = 6_000.0;
+        let quiet_ctrl = 8.0;
+        assert!(
+            regression_t_cross > dudect_t_allow(quiet_ctrl, t_abs, t_mult),
+            "a µs-scale distinguisher (|t| in the thousands) must exceed the gate"
+        );
+
+        // A constant-time-but-not-perfect residue: cross |t| a few tens, tracking a
+        // similar control, MUST be accepted (no false positive on the SNI residue).
+        assert!(
+            45.0 <= dudect_t_allow(20.0, t_abs, t_mult),
+            "a sub-µs residue whose |t| tracks the control must be within the gate"
+        );
+
+        // Self-calibration: a pathologically noisy control widens the allowance so a
+        // proportionally-noisy cross does not trip purely on per-runner jitter.
+        assert!(
+            1_500.0 <= dudect_t_allow(200.0, t_abs, t_mult),
+            "the gate must scale with the control noise floor (t_mult × t_ctrl)"
+        );
+
+        // Non-vacuous floor: when the control |t| is ~0, the absolute floor (not an
+        // ill-defined ratio) is what bounds the cross |t| — and it is finite, so a
+        // huge cross |t| is still caught.
+        assert_eq!(
+            dudect_t_allow(0.0, t_abs, t_mult),
+            t_abs,
+            "with a ~0 control the absolute floor governs the gate"
+        );
+        assert!(
+            10_000.0 > dudect_t_allow(0.0, t_abs, t_mult),
+            "the absolute floor must still reject a gross |t| when the control is ~0"
+        );
+    }
+
     /// Time a single `decide_connection_inbound` reject in nanoseconds. The result
     /// is discarded; only the latency matters. Marked #[inline(never)] so the
     /// optimiser cannot hoist or fold the call out of the timing loop.
@@ -7432,27 +7501,40 @@ mod tests {
             ("D(auth-fail)", &shape_d),
         ];
 
-        // DECISION CRITERION — physical effect size, self-calibrated.
+        // DECISION CRITERIA — physical effect size AND a self-calibrated |t|, both
+        // self-calibrated against the same-run same-shape control (item #4). A pair
+        // must pass BOTH gates.
         //
-        // The hard gate is the absolute mean-latency gap (ns) between reject
-        // shapes, bounded against the same-run same-shape control gap. The mean gap
-        // is the EFFECT SIZE and is INVARIANT to sample count, so it does not
-        // inflate at 1e6 samples. The distinguisher this test exists to catch — the
-        // original ~93µs auth-fail asymmetry — is µs-scale and blows this gate out
-        // by orders of magnitude; the sub-µs residue that survives the constant-
-        // work replay (an SNI-length-dependent HMAC cost of a few ns) sits far
-        // below it.
-        //   allow = max(PHYS_FLOOR_NS, PHYS_MULT × control_gap_ns)
+        // GATE 1 (physical, sample-count-invariant): the absolute mean-latency gap
+        // (ns) between reject shapes, bounded against the same-run control gap. The
+        // mean gap is the EFFECT SIZE and does NOT inflate at 1e6 samples. The
+        // distinguisher this test exists to catch — the original ~93µs auth-fail
+        // asymmetry — is µs-scale and blows this gate out by orders of magnitude;
+        // the sub-µs residue that survives the constant-work replay (an
+        // SNI-length-dependent HMAC cost of a few ns) sits far below it.
+        //   phys_allow = max(PHYS_FLOOR_NS, PHYS_MULT × control_gap_ns)
         //
-        // Welch |t| is reported for diagnostics but is NOT gated: at 1e5–1e6
-        // samples |t| ∝ √n flags even a constant-time path's few-ns residue as
-        // "significant" (and swings widely with the control's per-run jitter), so a
-        // raw-|t| gate cannot separate a real regression from measurement noise on
-        // a path that is already physically constant-time. The dudect literature's
-        // |t|>4.5 rule assumes a fixed sample budget; the effect-size gate is the
-        // sample-count-robust equivalent. A real regression is caught physically.
+        // GATE 2 (statistical, self-calibrated): the Welch |t| is now GATED too, but
+        // NOT against a fixed absolute threshold — that would be flaky, because at
+        // 1e5–1e6 samples |t| ∝ √n flags even a constant-time path's few-ns residue
+        // as "significant" and swings with per-run jitter (the dudect literature's
+        // |t|>4.5 rule assumes a fixed, modest sample budget). Instead the cross |t|
+        // is bounded against the SAME-RUN control |t|, which is measured at the SAME
+        // sample count in the SAME interleaved loop — so the √n inflation and the
+        // per-runner jitter hit both and cancel in the ratio:
+        //   t_allow = max(T_ABS, T_MULT × control_t)
+        // A real µs-scale distinguisher pushes the cross |t| into the thousands+
+        // (orders of magnitude past control), so this gate has teeth; the bounded
+        // sub-µs residue keeps the cross |t| in the control's neighbourhood, so it is
+        // robust. The `T_ABS` floor keeps a tiny control |t| from turning pure ratio
+        // noise into a false positive. `dudect_t_gate_is_non_vacuous` unit-tests this
+        // decision directly. Tunable via env for the nightly job; defaults chosen so
+        // the residue (few-ns → |t| ≲ 100 even at 1e6) is far under T_ABS while the
+        // µs regression (|t| in the thousands) is far over it.
         let phys_floor_ns: f64 = env_f64("DUDECT_PHYS_FLOOR_NS", 3_000.0);
         let phys_mult: f64 = env_f64("DUDECT_PHYS_MULT", 8.0);
+        let t_abs: f64 = env_f64("DUDECT_T_ABS", 1_000.0);
+        let t_mult: f64 = env_f64("DUDECT_T_MULT", 10.0);
 
         for i in 0..shapes.len() {
             for j in 0..shapes.len() {
@@ -7463,10 +7545,16 @@ mod tests {
                 let (nb, b) = shapes[j];
                 let r = dudect_pair(a, b, &server.private, samples);
                 let phys_allow = phys_floor_ns.max(phys_mult * r.mean_gap_ctrl_ns);
+                let t_allow = dudect_t_allow(r.t_ctrl, t_abs, t_mult);
                 eprintln!(
                     "dudect {na} vs {nb}: mean_gap={:.0}ns (ctrl {:.0}ns, allow {:.0}ns) \
-                     [diag |t|={:.2} ctrl |t|={:.2}] samples={samples}",
-                    r.mean_gap_cross_ns, r.mean_gap_ctrl_ns, phys_allow, r.t_cross, r.t_ctrl,
+                     |t|={:.2} (ctrl {:.2}, allow {:.2}) samples={samples}",
+                    r.mean_gap_cross_ns,
+                    r.mean_gap_ctrl_ns,
+                    phys_allow,
+                    r.t_cross,
+                    r.t_ctrl,
+                    t_allow,
                 );
                 assert!(
                     r.mean_gap_cross_ns <= phys_allow,
@@ -7479,6 +7567,18 @@ mod tests {
                     phys_allow,
                     r.mean_gap_ctrl_ns,
                     r.t_cross,
+                );
+                assert!(
+                    r.t_cross <= t_allow,
+                    "TIMING DISTINGUISHER ({na} vs {nb}): Welch |t|={:.2} exceeds the \
+                     self-calibrated allow {:.2} (control |t|={:.2}, T_ABS={t_abs}, \
+                     T_MULT={t_mult}, mean_gap={:.0}ns, samples={samples}). The cross-\
+                     shape latency is statistically distinguishable from the same-shape \
+                     control by orders of magnitude past per-run noise.",
+                    r.t_cross,
+                    t_allow,
+                    r.t_ctrl,
+                    r.mean_gap_cross_ns,
                 );
             }
         }
