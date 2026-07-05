@@ -37,6 +37,25 @@
 //! window for keeping the shared driver responsive — the availability of every
 //! connection on the endpoint outweighs a single ticket's cross-restart durability
 //! in the rare crash-at-exactly-that-instant case.
+//!
+//! # Locking discipline: the driver never blocks on the cache mutex
+//!
+//! Deferring the fsync alone is not enough: if the background persist held the
+//! cache mutex ACROSS its fsync while `accept_ticket` took a blocking `lock()`,
+//! the driver would stall on the mutex for the whole disk write — the same
+//! head-of-line hazard, one lock removed. Two rules close it:
+//!
+//! 1. The background persist never holds the mutex across the fsync. It CHECKS
+//!    the cache OUT of the slot (`Option::take`) under a short lock, runs the
+//!    journal write + fsync with the lock RELEASED, and puts the cache back
+//!    under another short lock. The mutex only ever guards memory-fast
+//!    operations (gate insert, take, put-back).
+//! 2. `accept_ticket` takes the mutex with `try_lock` and FAILS CLOSED when it
+//!    cannot consult the in-memory gate immediately — lock contended, poisoned,
+//!    or the cache checked out by an in-flight persist. Rejecting 0-RTT is
+//!    always safe: the client completes a full 1-RTT handshake and the ticket's
+//!    early data is never processed, so replay safety is preserved (early data
+//!    is only ever accepted when the gate was actually consulted).
 
 use std::sync::{Arc, Mutex};
 
@@ -49,34 +68,54 @@ use crate::tls::quic::ZeroRttGuard;
 /// should be built with a freshness window `>=` the issued ticket lifetime so a
 /// replay is still detected for as long as the ticket is valid.
 pub(crate) struct ReplayCacheGuard {
-    cache: Arc<Mutex<ReplayCache>>,
+    /// The cache normally lives in this slot; a background persist checks it out
+    /// (slot -> `None`) for the duration of the journal fsync and puts it back
+    /// after, so the mutex is only ever held for memory-fast operations — never
+    /// across disk I/O (see the module docs' locking discipline).
+    cache: Arc<Mutex<Option<ReplayCache>>>,
 }
 
 impl ReplayCacheGuard {
     pub(crate) fn new(cache: ReplayCache) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(cache)),
+            cache: Arc::new(Mutex::new(Some(cache))),
         }
     }
 
     /// Runs the queued durable persist (journal append + fsync) off the async
-    /// executor via `spawn_blocking`, reacquiring the lock only inside the
-    /// blocking pool. Outside a tokio runtime (sync tests) it persists inline,
-    /// matching the pre-deferral behavior. A persist failure is logged and the
-    /// queued entry retried on the next accepted ticket; the in-memory record keeps
-    /// gating replays either way — only its restart durability is delayed. Mirrors
-    /// the marker guard's `persist_in_background`
+    /// executor via `spawn_blocking`. Outside a tokio runtime (sync tests) it
+    /// persists inline, matching the pre-deferral behavior. A persist failure is
+    /// logged and the queued entry retried on the next accepted ticket; the
+    /// in-memory record keeps gating replays either way — only its restart
+    /// durability is delayed. Mirrors the marker guard's `persist_in_background`
     /// ([`crate::transport::udp::marker_replay`]).
     fn persist_in_background(&self) {
-        let cache = Arc::clone(&self.cache);
+        let slot = Arc::clone(&self.cache);
         let persist = move || {
+            // Check the cache OUT under a short lock and run the blocking journal
+            // fsync with the lock RELEASED: holding the mutex across the fsync
+            // would make the driver-side `try_lock` in `accept_ticket` fail for
+            // the whole disk write (see the module docs' locking discipline).
+            //
             // Recover from a poisoned lock rather than dropping durability: the
             // cache invariants are restored on each insert, so persisting the
             // recovered state is safe (mirrors the marker guard's persist path).
-            let mut cache = cache
+            let checked_out = slot
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Err(err) = cache.persist_pending() {
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let Some(mut cache) = checked_out else {
+                // Another persist has the cache checked out. Inserts are
+                // impossible while it is out (accept fails closed), so every
+                // queued entry — including the one that triggered this call — is
+                // already inside that persist's cache and will be drained by it.
+                return;
+            };
+            let result = cache.persist_pending();
+            // Put the cache back BEFORE acting on the outcome so 0-RTT accepts
+            // resume even when the persist failed.
+            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cache);
+            if let Err(err) = result {
                 tracing::warn!(
                     error = %err,
                     "0-RTT replay cache persist failed; ticket accept recorded \
@@ -114,13 +153,22 @@ impl ZeroRttGuard for ReplayCacheGuard {
         // gated the instant this returns); only the durable journal fsync is
         // deferred to a blocking thread, so the shared driver task is never stalled
         // on disk (issue #24 — see the module docs for the accepted crash-window
-        // tradeoff). This mirrors the marker guard exactly.
-        let accepted = match self.cache.lock() {
-            Ok(mut cache) => {
-                cache.insert_new_outcome_deferred(entry, now_unix) == ReplayInsertOutcome::Inserted
-            }
-            // A poisoned lock fails closed: reject 0-RTT (the client falls back to
-            // a full 1-RTT handshake) rather than risk accepting a replay.
+        // tradeoff). This runs on the single QUIC driver task, so the lock is taken
+        // NON-BLOCKING: if it is contended, poisoned, or the cache is checked out
+        // by an in-flight background persist, the 0-RTT attempt FAILS CLOSED — the
+        // client falls back to a full 1-RTT handshake, which is always safe — rather
+        // than block the driver or risk accepting a replay (see the module docs'
+        // locking discipline). This mirrors the marker guard exactly.
+        let accepted = match self.cache.try_lock() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(cache) => {
+                    cache.insert_new_outcome_deferred(entry, now_unix)
+                        == ReplayInsertOutcome::Inserted
+                }
+                // A background persist has the cache checked out for its fsync:
+                // fail closed to 1-RTT instead of waiting on the disk.
+                None => false,
+            },
             Err(_) => false,
         };
         if accepted {
@@ -202,6 +250,89 @@ mod tests {
             !g2.accept_ticket(ticket, now),
             "replay rejected across a restart (persistent single-use)"
         );
+    }
+
+    #[test]
+    fn accept_during_in_flight_persist_fails_closed_without_blocking() {
+        // `accept_ticket` runs on the single QUIC driver task. While a background
+        // persist has the cache checked out for its fsync, the driver must NOT
+        // block on the lock: the 0-RTT attempt fails closed (the client falls back
+        // to a full 1-RTT handshake) immediately, and single-use is still enforced
+        // once the persist completes.
+        let g = guard();
+        let now = 4_000_000;
+        let ticket = b"ticket-during-persist";
+
+        // Simulate an in-flight background persist exactly as
+        // `persist_in_background` does: check the cache out of the slot.
+        let checked_out = g
+            .cache
+            .lock()
+            .unwrap()
+            .take()
+            .expect("cache starts in the slot");
+        let start = std::time::Instant::now();
+        let accepted = g.accept_ticket(ticket, now);
+        let elapsed = start.elapsed();
+        assert!(
+            !accepted,
+            "0-RTT fails closed to 1-RTT while a persist is in flight"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "accept must not block while the persist runs (took {elapsed:?})"
+        );
+
+        // Persist finishes: the cache returns to the slot. The failed-closed
+        // attempt was never recorded — its early data was never accepted — so the
+        // ticket's first ACCEPTED use happens now, and stays single-use.
+        *g.cache.lock().unwrap() = Some(checked_out);
+        assert!(
+            g.accept_ticket(ticket, now),
+            "accepted once the persist completed"
+        );
+        assert!(!g.accept_ticket(ticket, now), "replay is still gated");
+    }
+
+    #[test]
+    fn accept_never_blocks_on_a_contended_lock() {
+        // Complement to the checked-out case: raw mutex contention (another thread
+        // holding the slot lock) must not block the driver either — `try_lock`
+        // fails closed to 1-RTT immediately.
+        use std::sync::mpsc;
+
+        let g = Arc::new(guard());
+        let now = 5_000_000;
+        let ticket = b"ticket-under-contention";
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = {
+            let g = Arc::clone(&g);
+            std::thread::spawn(move || {
+                let slot = g.cache.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(slot);
+            })
+        };
+        locked_rx.recv().unwrap();
+
+        let start = std::time::Instant::now();
+        assert!(
+            !g.accept_ticket(ticket, now),
+            "contended lock fails closed to 1-RTT"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "accept must not wait for the lock holder"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        // Once contention clears, the same ticket is accepted once, then gated.
+        assert!(g.accept_ticket(ticket, now));
+        assert!(!g.accept_ticket(ticket, now));
     }
 
     #[tokio::test]
