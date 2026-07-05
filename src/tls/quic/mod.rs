@@ -168,6 +168,12 @@ impl ClientConfig {
 
 pub use handshake::{ClientHandshake, KeyChange};
 
+// Expose the pre-auth QUIC-TLS parser fuzz wrappers (the `handshake` module is
+// private, so re-export its fuzz submodule as `crate::tls::quic::fuzz`) — mirrors
+// how `crate::tls::safari26::fuzz` surfaces the TCP-plane twins.
+#[cfg(fuzzing)]
+pub use handshake::fuzz;
+
 mod handshake;
 
 pub(crate) use schedule::initial_keys;

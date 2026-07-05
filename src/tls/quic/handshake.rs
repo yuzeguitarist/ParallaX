@@ -583,145 +583,11 @@ impl ClientHandshake {
     }
 
     fn handle_server_hello(&mut self, body: &[u8]) -> Result<(), QuicTlsError> {
-        let mut c = Cursor::new(body);
-        let legacy_version = c.u16()?;
-        if legacy_version != TLS13_LEGACY_VERSION {
-            return Err(QuicTlsError::alert(
-                ALERT_ILLEGAL_PARAMETER,
-                "ServerHello legacy_version is not 0x0303",
-            ));
-        }
-        let random = c.bytes(32)?;
-        if random == HRR_RANDOM {
-            // Accepted limitation (tracked follow-up): HelloRetryRequest is not
-            // handled — the client aborts instead of sending a second ClientHello.
-            // The production QUIC peer is ParallaX's own server, which never sends
-            // HRR (it accepts the offered X25519MLKEM768), and the TCP camouflage
-            // path (safari26) takes the same posture. A future slice can add HRR
-            // for full browser parity under active Initial-space injection.
-            return Err(QuicTlsError::alert(
-                ALERT_HANDSHAKE_FAILURE,
-                "HelloRetryRequest is not supported",
-            ));
-        }
-        // legacy_session_id_echo: our QUIC ClientHello sends an EMPTY session id,
-        // so RFC 8446 §4.1.3 requires the echo to be empty too. A non-empty echo
-        // is a lenient behavioural tell vs rustls/Safari; reject it.
-        if !c.vec_u8()?.is_empty() {
-            return Err(QuicTlsError::alert(
-                ALERT_ILLEGAL_PARAMETER,
-                "ServerHello legacy_session_id_echo is not empty",
-            ));
-        }
-        let suite = CipherSuite::from_u16(c.u16()?)?;
-        if c.u8()? != 0 {
-            return Err(QuicTlsError::alert(
-                ALERT_ILLEGAL_PARAMETER,
-                "ServerHello compression_method is not null",
-            ));
-        }
-
-        let extensions = c.vec_u16()?;
-        let mut e = Cursor::new(extensions);
-        let mut tls13_selected = false;
-        let mut key_share_group = None;
-        let mut key_share = None;
-        let mut psk_selected = false;
-        while e.remaining() > 0 {
-            let ext_type = e.u16()?;
-            let data = e.vec_u16()?;
-            match ext_type {
-                EXT_SUPPORTED_VERSIONS => {
-                    if tls13_selected {
-                        return Err(QuicTlsError::alert(
-                            ALERT_ILLEGAL_PARAMETER,
-                            "duplicate supported_versions in ServerHello",
-                        ));
-                    }
-                    if data.len() == 2
-                        && u16::from_be_bytes([data[0], data[1]]) == TLS13_SELECTED_VERSION
-                    {
-                        tls13_selected = true;
-                    } else {
-                        return Err(QuicTlsError::alert(
-                            ALERT_ILLEGAL_PARAMETER,
-                            "ServerHello supported_versions did not select TLS 1.3",
-                        ));
-                    }
-                }
-                EXT_KEY_SHARE => {
-                    if key_share_group.is_some() {
-                        return Err(QuicTlsError::alert(
-                            ALERT_ILLEGAL_PARAMETER,
-                            "duplicate key_share in ServerHello",
-                        ));
-                    }
-                    let mut ks = Cursor::new(data);
-                    key_share_group = Some(ks.u16()?);
-                    key_share = Some(ks.vec_u16()?.to_vec());
-                    if ks.remaining() != 0 {
-                        return Err(QuicTlsError::alert(
-                            ALERT_DECODE_ERROR,
-                            "trailing bytes after ServerHello key_share",
-                        ));
-                    }
-                }
-                // RFC 8446 §4.2: a TLS 1.3 ServerHello carries only
-                // supported_versions + key_share (plus pre_shared_key when the
-                // client offered one — handled above). Reject anything else rather
-                // than silently tolerating it — silent leniency is an active-probe
-                // tell.
-                EXT_PRE_SHARED_KEY => {
-                    // The server selects one of the PSK identities we offered. We
-                    // offer exactly one (index 0), so this is illegal unless we
-                    // resumed, and the selected_identity must be 0.
-                    if self.resumption_psk.is_none() {
-                        return Err(QuicTlsError::alert(
-                            ALERT_ILLEGAL_PARAMETER,
-                            "ServerHello pre_shared_key we did not offer",
-                        ));
-                    }
-                    if data.len() != 2 || u16::from_be_bytes([data[0], data[1]]) != 0 {
-                        return Err(QuicTlsError::alert(
-                            ALERT_ILLEGAL_PARAMETER,
-                            "ServerHello selected_identity is not our offered PSK",
-                        ));
-                    }
-                    psk_selected = true;
-                }
-                other => {
-                    return Err(QuicTlsError::alert(
-                        ALERT_UNSUPPORTED_EXTENSION,
-                        format!("unexpected ServerHello extension {other:#06x}"),
-                    ));
-                }
-            }
-        }
-        self.psk_accepted = psk_selected;
-        if !tls13_selected {
-            return Err(QuicTlsError::alert(
-                ALERT_MISSING_EXTENSION,
-                "ServerHello did not select TLS 1.3 (no supported_versions)",
-            ));
-        }
-        // A real TLS stack rejects trailing bytes after the extensions block; silent
-        // tolerance is an active-probe distinguisher (same posture as the unknown-
-        // extension rejection above).
-        if c.remaining() != 0 {
-            return Err(QuicTlsError::alert(
-                ALERT_DECODE_ERROR,
-                "trailing bytes after ServerHello extensions",
-            ));
-        }
-        let group = key_share_group.ok_or_else(|| {
-            QuicTlsError::alert(ALERT_MISSING_EXTENSION, "ServerHello missing key_share")
-        })?;
-        let share = key_share.ok_or_else(|| {
-            QuicTlsError::alert(
-                ALERT_MISSING_EXTENSION,
-                "ServerHello missing key_share data",
-            )
-        })?;
+        let parsed = parse_server_hello_body(body, self.resumption_psk.is_some())?;
+        let suite = parsed.suite;
+        let group = parsed.key_share_group;
+        let share = parsed.key_share;
+        self.psk_accepted = parsed.psk_selected;
 
         self.suite = Some(suite);
         let shared_secret = self.compute_shared_secret(group, &share)?;
@@ -824,80 +690,10 @@ impl ClientHandshake {
     }
 
     fn handle_encrypted_extensions(&mut self, body: &[u8]) -> Result<(), QuicTlsError> {
-        let mut c = Cursor::new(body);
-        let extensions = c.vec_u16()?;
-        let mut e = Cursor::new(extensions);
-        while e.remaining() > 0 {
-            let ext_type = e.u16()?;
-            let data = e.vec_u16()?;
-            match ext_type {
-                EXT_ALPN => {
-                    if self.alpn.is_some() {
-                        return Err(QuicTlsError::alert(
-                            ALERT_ILLEGAL_PARAMETER,
-                            "duplicate ALPN extension in EncryptedExtensions",
-                        ));
-                    }
-                    let selected = parse_selected_alpn(data)?;
-                    // RFC 7301 §3.2: the server MUST select a protocol the client
-                    // offered. Reject an unoffered (or empty) selection rather than
-                    // completing the handshake on a protocol we never advertised.
-                    if !self
-                        .config
-                        .alpn_protocols
-                        .iter()
-                        .any(|offered| offered.as_slice() == selected)
-                    {
-                        return Err(QuicTlsError::alert(
-                            ALERT_ILLEGAL_PARAMETER,
-                            "server selected an ALPN protocol the client did not offer",
-                        ));
-                    }
-                    self.alpn = Some(selected.to_vec());
-                }
-                EXT_QUIC_TRANSPORT_PARAMETERS => {
-                    if self.peer_transport_params.is_some() {
-                        return Err(QuicTlsError::alert(
-                            ALERT_ILLEGAL_PARAMETER,
-                            "duplicate quic_transport_parameters in EncryptedExtensions",
-                        ));
-                    }
-                    self.peer_transport_params = Some(data.to_vec());
-                }
-                EXT_EARLY_DATA => {
-                    // The server echoing `early_data` accepts 0-RTT (RFC 8446
-                    // §4.2.10); its EncryptedExtensions body is empty.
-                    if !data.is_empty() {
-                        return Err(QuicTlsError::alert(
-                            ALERT_DECODE_ERROR,
-                            "EncryptedExtensions early_data must be empty",
-                        ));
-                    }
-                    self.early_data_accepted = true;
-                }
-                _ => {}
-            }
-        }
-        // Reject trailing bytes after the extensions block (active-probe distinguisher).
-        if c.remaining() != 0 {
-            return Err(QuicTlsError::alert(
-                ALERT_DECODE_ERROR,
-                "trailing bytes after EncryptedExtensions",
-            ));
-        }
-        // ALPN is mandatory for QUIC: if we offered ALPN the server must select one.
-        if !self.config.alpn_protocols.is_empty() && self.alpn.is_none() {
-            return Err(QuicTlsError::alert(
-                super::ALERT_NO_APPLICATION_PROTOCOL,
-                "server selected no ALPN protocol",
-            ));
-        }
-        if self.peer_transport_params.is_none() {
-            return Err(QuicTlsError::alert(
-                ALERT_MISSING_EXTENSION,
-                "EncryptedExtensions missing quic_transport_parameters",
-            ));
-        }
+        let parsed = parse_encrypted_extensions_body(body, &self.config.alpn_protocols)?;
+        self.alpn = parsed.alpn;
+        self.peer_transport_params = parsed.transport_params;
+        self.early_data_accepted = parsed.early_data;
         Ok(())
     }
 
@@ -934,9 +730,7 @@ impl ClientHandshake {
                 )
             })?
             .clone();
-        let mut c = Cursor::new(body);
-        let scheme = c.u16()?;
-        let signature = c.vec_u16()?;
+        let (scheme, signature) = parse_certificate_verify_body(body)?;
 
         // Signed content: 64 spaces || "TLS 1.3, server CertificateVerify" || 0x00
         // || Transcript-Hash(ClientHello..Certificate). The transcript hash is
@@ -1005,6 +799,282 @@ fn reject_degenerate_x25519(secret: &[u8; X25519_KEY_LEN]) -> Result<(), QuicTls
         ));
     }
     Ok(())
+}
+
+/// The fields a ServerHello body parses down to, before the (self-dependent) key
+/// exchange + schedule derivation in [`ClientHandshake::handle_server_hello`].
+struct ServerHelloParsed {
+    suite: CipherSuite,
+    key_share_group: u16,
+    key_share: Vec<u8>,
+    /// The server echoed our (single) offered `pre_shared_key` — a resumption.
+    psk_selected: bool,
+}
+
+/// Parse a TLS 1.3 ServerHello body (the handshake-message payload, WITHOUT the
+/// 4-byte type+length header) into [`ServerHelloParsed`]. This is the entire
+/// hand-written, pre-authentication byte walk over an impersonating/MITM
+/// upstream's ServerHello; the key exchange it feeds runs in the caller.
+///
+/// `offered_resumption_psk` is whether this handshake offered a `pre_shared_key`
+/// (i.e. `self.resumption_psk.is_some()`): the server may only echo one back if we
+/// offered it, so the check is threaded in rather than reaching into `self`.
+fn parse_server_hello_body(
+    body: &[u8],
+    offered_resumption_psk: bool,
+) -> Result<ServerHelloParsed, QuicTlsError> {
+    let mut c = Cursor::new(body);
+    let legacy_version = c.u16()?;
+    if legacy_version != TLS13_LEGACY_VERSION {
+        return Err(QuicTlsError::alert(
+            ALERT_ILLEGAL_PARAMETER,
+            "ServerHello legacy_version is not 0x0303",
+        ));
+    }
+    let random = c.bytes(32)?;
+    if random == HRR_RANDOM {
+        // Accepted limitation (tracked follow-up): HelloRetryRequest is not
+        // handled — the client aborts instead of sending a second ClientHello.
+        // The production QUIC peer is ParallaX's own server, which never sends
+        // HRR (it accepts the offered X25519MLKEM768), and the TCP camouflage
+        // path (safari26) takes the same posture. A future slice can add HRR
+        // for full browser parity under active Initial-space injection.
+        return Err(QuicTlsError::alert(
+            ALERT_HANDSHAKE_FAILURE,
+            "HelloRetryRequest is not supported",
+        ));
+    }
+    // legacy_session_id_echo: our QUIC ClientHello sends an EMPTY session id,
+    // so RFC 8446 §4.1.3 requires the echo to be empty too. A non-empty echo
+    // is a lenient behavioural tell vs rustls/Safari; reject it.
+    if !c.vec_u8()?.is_empty() {
+        return Err(QuicTlsError::alert(
+            ALERT_ILLEGAL_PARAMETER,
+            "ServerHello legacy_session_id_echo is not empty",
+        ));
+    }
+    let suite = CipherSuite::from_u16(c.u16()?)?;
+    if c.u8()? != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_ILLEGAL_PARAMETER,
+            "ServerHello compression_method is not null",
+        ));
+    }
+
+    let extensions = c.vec_u16()?;
+    let mut e = Cursor::new(extensions);
+    let mut tls13_selected = false;
+    let mut key_share_group = None;
+    let mut key_share = None;
+    let mut psk_selected = false;
+    while e.remaining() > 0 {
+        let ext_type = e.u16()?;
+        let data = e.vec_u16()?;
+        match ext_type {
+            EXT_SUPPORTED_VERSIONS => {
+                if tls13_selected {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "duplicate supported_versions in ServerHello",
+                    ));
+                }
+                if data.len() == 2
+                    && u16::from_be_bytes([data[0], data[1]]) == TLS13_SELECTED_VERSION
+                {
+                    tls13_selected = true;
+                } else {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "ServerHello supported_versions did not select TLS 1.3",
+                    ));
+                }
+            }
+            EXT_KEY_SHARE => {
+                if key_share_group.is_some() {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "duplicate key_share in ServerHello",
+                    ));
+                }
+                let mut ks = Cursor::new(data);
+                key_share_group = Some(ks.u16()?);
+                key_share = Some(ks.vec_u16()?.to_vec());
+                if ks.remaining() != 0 {
+                    return Err(QuicTlsError::alert(
+                        ALERT_DECODE_ERROR,
+                        "trailing bytes after ServerHello key_share",
+                    ));
+                }
+            }
+            // RFC 8446 §4.2: a TLS 1.3 ServerHello carries only
+            // supported_versions + key_share (plus pre_shared_key when the
+            // client offered one — handled above). Reject anything else rather
+            // than silently tolerating it — silent leniency is an active-probe
+            // tell.
+            EXT_PRE_SHARED_KEY => {
+                // The server selects one of the PSK identities we offered. We
+                // offer exactly one (index 0), so this is illegal unless we
+                // resumed, and the selected_identity must be 0.
+                if !offered_resumption_psk {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "ServerHello pre_shared_key we did not offer",
+                    ));
+                }
+                if data.len() != 2 || u16::from_be_bytes([data[0], data[1]]) != 0 {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "ServerHello selected_identity is not our offered PSK",
+                    ));
+                }
+                psk_selected = true;
+            }
+            other => {
+                return Err(QuicTlsError::alert(
+                    ALERT_UNSUPPORTED_EXTENSION,
+                    format!("unexpected ServerHello extension {other:#06x}"),
+                ));
+            }
+        }
+    }
+    if !tls13_selected {
+        return Err(QuicTlsError::alert(
+            ALERT_MISSING_EXTENSION,
+            "ServerHello did not select TLS 1.3 (no supported_versions)",
+        ));
+    }
+    // A real TLS stack rejects trailing bytes after the extensions block; silent
+    // tolerance is an active-probe distinguisher (same posture as the unknown-
+    // extension rejection above).
+    if c.remaining() != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "trailing bytes after ServerHello extensions",
+        ));
+    }
+    let group = key_share_group.ok_or_else(|| {
+        QuicTlsError::alert(ALERT_MISSING_EXTENSION, "ServerHello missing key_share")
+    })?;
+    let share = key_share.ok_or_else(|| {
+        QuicTlsError::alert(
+            ALERT_MISSING_EXTENSION,
+            "ServerHello missing key_share data",
+        )
+    })?;
+    Ok(ServerHelloParsed {
+        suite,
+        key_share_group: group,
+        key_share: share,
+        psk_selected,
+    })
+}
+
+/// The fields an EncryptedExtensions body parses down to.
+struct EncryptedExtensionsParsed {
+    alpn: Option<Vec<u8>>,
+    transport_params: Option<Vec<u8>>,
+    early_data: bool,
+}
+
+/// Parse a TLS 1.3 EncryptedExtensions body (WITHOUT the 4-byte handshake header).
+/// This is the pre-authentication byte walk over the server's EncryptedExtensions;
+/// `offered_alpn` is the client's offered ALPN list (`self.config.alpn_protocols`),
+/// used to reject an unoffered / missing selection exactly as the handshake does.
+fn parse_encrypted_extensions_body(
+    body: &[u8],
+    offered_alpn: &[Vec<u8>],
+) -> Result<EncryptedExtensionsParsed, QuicTlsError> {
+    let mut c = Cursor::new(body);
+    let extensions = c.vec_u16()?;
+    let mut e = Cursor::new(extensions);
+    let mut alpn = None;
+    let mut transport_params = None;
+    let mut early_data = false;
+    while e.remaining() > 0 {
+        let ext_type = e.u16()?;
+        let data = e.vec_u16()?;
+        match ext_type {
+            EXT_ALPN => {
+                if alpn.is_some() {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "duplicate ALPN extension in EncryptedExtensions",
+                    ));
+                }
+                let selected = parse_selected_alpn(data)?;
+                // RFC 7301 §3.2: the server MUST select a protocol the client
+                // offered. Reject an unoffered (or empty) selection rather than
+                // completing the handshake on a protocol we never advertised.
+                if !offered_alpn
+                    .iter()
+                    .any(|offered| offered.as_slice() == selected)
+                {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "server selected an ALPN protocol the client did not offer",
+                    ));
+                }
+                alpn = Some(selected.to_vec());
+            }
+            EXT_QUIC_TRANSPORT_PARAMETERS => {
+                if transport_params.is_some() {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "duplicate quic_transport_parameters in EncryptedExtensions",
+                    ));
+                }
+                transport_params = Some(data.to_vec());
+            }
+            EXT_EARLY_DATA => {
+                // The server echoing `early_data` accepts 0-RTT (RFC 8446
+                // §4.2.10); its EncryptedExtensions body is empty.
+                if !data.is_empty() {
+                    return Err(QuicTlsError::alert(
+                        ALERT_DECODE_ERROR,
+                        "EncryptedExtensions early_data must be empty",
+                    ));
+                }
+                early_data = true;
+            }
+            _ => {}
+        }
+    }
+    // Reject trailing bytes after the extensions block (active-probe distinguisher).
+    if c.remaining() != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "trailing bytes after EncryptedExtensions",
+        ));
+    }
+    // ALPN is mandatory for QUIC: if we offered ALPN the server must select one.
+    if !offered_alpn.is_empty() && alpn.is_none() {
+        return Err(QuicTlsError::alert(
+            super::ALERT_NO_APPLICATION_PROTOCOL,
+            "server selected no ALPN protocol",
+        ));
+    }
+    if transport_params.is_none() {
+        return Err(QuicTlsError::alert(
+            ALERT_MISSING_EXTENSION,
+            "EncryptedExtensions missing quic_transport_parameters",
+        ));
+    }
+    Ok(EncryptedExtensionsParsed {
+        alpn,
+        transport_params,
+        early_data,
+    })
+}
+
+/// Parse a TLS 1.3 CertificateVerify body (WITHOUT the 4-byte handshake header)
+/// into its `(signature_scheme, signature)` — the pre-authentication byte walk
+/// over an unauthenticated upstream's CertificateVerify. The signature itself is
+/// checked by the caller against the transcript + leaf certificate.
+fn parse_certificate_verify_body(body: &[u8]) -> Result<(u16, &[u8]), QuicTlsError> {
+    let mut c = Cursor::new(body);
+    let scheme = c.u16()?;
+    let signature = c.vec_u16()?;
+    Ok((scheme, signature))
 }
 
 /// Parse the selected ALPN protocol from an ALPN extension body.
@@ -1156,6 +1226,64 @@ impl<'a> Cursor<'a> {
     fn vec_u24(&mut self) -> Result<&'a [u8], QuicTlsError> {
         let len = self.u24()? as usize;
         self.take(len)
+    }
+}
+
+/// Fuzz-only, panic-safe wrappers over the hand-written, PRE-AUTHENTICATION QUIC
+/// TLS 1.3 parsers: the client parses an impersonating/MITM upstream's
+/// ServerHello / EncryptedExtensions / Certificate / CertificateVerify (and the
+/// RFC 8879 compressed-certificate zlib path) BEFORE any certificate check, so
+/// every one of these walks attacker-controlled bytes. These are thin wrappers
+/// (not `pub use`, which would hit E0364 on the private fns) that erase the
+/// crate-internal error type; they take the raw handshake-message BODY (no 4-byte
+/// type+length header). See `fuzz/fuzz_targets/quic_*.rs`.
+#[cfg(fuzzing)]
+#[allow(clippy::result_unit_err)] // fuzz-only wrappers intentionally erase the crate error type
+pub mod fuzz {
+    /// Parse a ServerHello body. Runs both the cold-start (no PSK offered) and the
+    /// resumption (PSK offered) arm so the `pre_shared_key` branch is reachable.
+    pub fn parse_server_hello(body: &[u8]) -> Result<(), ()> {
+        let cold = super::parse_server_hello_body(body, false);
+        let resumed = super::parse_server_hello_body(body, true);
+        // The offered-PSK flag only gates the pre_shared_key extension arm, so a
+        // body carrying no pre_shared_key must parse identically either way.
+        if let (Ok(c), Ok(r)) = (&cold, &resumed) {
+            assert_eq!(
+                c.suite, r.suite,
+                "offered-PSK flag changed the parsed suite of a PSK-free ServerHello"
+            );
+            assert_eq!(
+                c.key_share, r.key_share,
+                "offered-PSK flag changed the parsed key_share of a PSK-free ServerHello"
+            );
+        }
+        cold.map(|_| ()).map_err(|_| ())?;
+        resumed.map(|_| ()).map_err(|_| ())
+    }
+
+    /// Parse an EncryptedExtensions body against the production offered-ALPN list.
+    pub fn parse_encrypted_extensions(body: &[u8]) -> Result<(), ()> {
+        let offered_alpn = [b"h3".to_vec()];
+        super::parse_encrypted_extensions_body(body, &offered_alpn)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    /// Parse a Certificate body into the DER chain.
+    pub fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+        super::parse_certificate_body(body).map_err(|_| ())
+    }
+
+    /// Parse a CompressedCertificate body (the zlib decompression + cert parse).
+    pub fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+        super::parse_compressed_certificate_body(body).map_err(|_| ())
+    }
+
+    /// Parse a CertificateVerify body into `(scheme, signature_len)`.
+    pub fn parse_certificate_verify(body: &[u8]) -> Result<(u16, usize), ()> {
+        super::parse_certificate_verify_body(body)
+            .map(|(scheme, sig)| (scheme, sig.len()))
+            .map_err(|_| ())
     }
 }
 
