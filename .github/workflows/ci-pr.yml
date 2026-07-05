@@ -104,6 +104,7 @@ jobs:
             --lib \
             --bins \
             --test chaos_liveness \
+            --test ci_test_allowlist_complete \
             --test distinguisher_battery \
             --test gfw_live_replay \
             --test gfw_sim_provenance \
