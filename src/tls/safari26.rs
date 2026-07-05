@@ -303,6 +303,7 @@ impl Safari26TlsCamouflage {
             parallax_x25519_shared_secret: parallax_shared_secret,
             tls_x25519,
             tls_mlkem768_secret: mlkem_secret,
+            sent_session_id: session_id,
             sni,
             accept_language: crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE.to_owned(),
             tap: VecRecordTap::default(),
@@ -316,6 +317,11 @@ pub struct Safari26TlsSession {
     parallax_x25519_shared_secret: Zeroizing<[u8; 32]>,
     tls_x25519: X25519KeyPair,
     tls_mlkem768_secret: Zeroizing<Vec<u8>>,
+    /// The `legacy_session_id` this client placed in its ClientHello. RFC 8446
+    /// §4.1.3 requires the server to echo it back verbatim in the ServerHello, so
+    /// it is retained here to enforce that exact echo at parse time (matching the
+    /// BoringSSL/Safari client we imitate, which aborts on any mismatch).
+    sent_session_id: [u8; 32],
     sni: String,
     /// `accept-language` value advertised in the H2 camouflage request. Defaults
     /// to [`crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE`]; overridable via
@@ -353,7 +359,7 @@ impl Safari26TlsSession {
 
         let server_hello_record = self.read_server_hello_record(stream).await?;
         transcript.push_handshake_record(&server_hello_record)?;
-        let server_hello = parse_safari_server_hello(&server_hello_record)?;
+        let server_hello = parse_safari_server_hello(&server_hello_record, &self.sent_session_id)?;
         let shared_secret = self.tls_shared_secret(&server_hello)?;
         let mut keys = Tls13Keys::new(server_hello.cipher_suite, &shared_secret, &transcript)?;
 
@@ -989,7 +995,10 @@ struct ParsedServerHello {
     key_share: Vec<u8>,
 }
 
-fn parse_safari_server_hello(record: &[u8]) -> Result<ParsedServerHello, Safari26TlsError> {
+fn parse_safari_server_hello(
+    record: &[u8],
+    expected_session_id: &[u8],
+) -> Result<ParsedServerHello, Safari26TlsError> {
     let _ = parse_server_hello(record)?;
     let (_, payload) = super::record::parse_exact(record)
         .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
@@ -1014,9 +1023,16 @@ fn parse_safari_server_hello(record: &[u8]) -> Result<ParsedServerHello, Safari2
         return Err(Safari26TlsError::Unsupported("HelloRetryRequest"));
     }
     let session_id = b.vec_u8()?;
-    if session_id.len() != 32 {
+    // RFC 8446 §4.1.3: the server MUST echo the ClientHello's legacy_session_id
+    // verbatim. Checking equality (not just the 32-byte length) matches the
+    // BoringSSL/Safari client we imitate, which aborts on any mismatch. Not
+    // security-critical on its own — the ServerHello is transcript-bound into the
+    // Finished MAC — but a length-only check is a behavioral deviation from that
+    // client. The comparison subsumes the prior length guard because
+    // `expected_session_id` is always the 32-byte value this client sent.
+    if session_id != expected_session_id {
         return Err(Safari26TlsError::Handshake(
-            "ServerHello did not echo a 32-byte session_id".to_owned(),
+            "ServerHello did not echo the ClientHello legacy_session_id".to_owned(),
         ));
     }
     let cipher_suite = TlsCipherSuite::from_u16(b.u16()?)?;
@@ -3175,7 +3191,7 @@ mod tests {
         // supported_versions or key_share match arm, and the `>` mutations of the
         // `e.remaining() > 0` extension-loop guard (all of which would make this
         // valid record error out).
-        let parsed = parse_safari_server_hello(&valid_safari_server_hello()).unwrap();
+        let parsed = parse_safari_server_hello(&valid_safari_server_hello(), &[0x55; 32]).unwrap();
         assert!(matches!(
             parsed.cipher_suite,
             TlsCipherSuite::Aes128GcmSha256
@@ -3196,7 +3212,7 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::ServerHello(
                 ServerHelloError::NotServerHello
             ))
@@ -3215,7 +3231,7 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Handshake(_))
         ));
     }
@@ -3236,7 +3252,7 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Unsupported("HelloRetryRequest"))
         ));
     }
@@ -3253,9 +3269,27 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Handshake(_))
         ));
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_mismatched_session_id_echo() {
+        // A well-formed 32-byte session_id that differs from the one the client
+        // sent must be rejected: RFC 8446 §4.1.3 requires an exact echo, and the
+        // client we imitate aborts on mismatch. The record is otherwise valid —
+        // only the echoed value differs — so this isolates the equality check from
+        // the length/shape guards. `valid_safari_server_hello` fills the session_id
+        // with 0x55, so a `0x11` expectation is a clean mismatch.
+        let record = valid_safari_server_hello();
+        assert!(matches!(
+            parse_safari_server_hello(&record, &[0x11; 32]),
+            Err(Safari26TlsError::Handshake(ref m))
+                if m.contains("did not echo the ClientHello legacy_session_id")
+        ));
+        // The exact echo is accepted, pinning the `!=`->`==` mutant on the guard.
+        assert!(parse_safari_server_hello(&record, &[0x55; 32]).is_ok());
     }
 
     #[test]
@@ -3270,7 +3304,7 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Handshake(_))
         ));
     }
@@ -3304,7 +3338,7 @@ mod tests {
             &ext,
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::MissingServerHello)
         ));
     }
@@ -3330,7 +3364,7 @@ mod tests {
             &ext,
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Handshake(ref m)) if m.contains("missing key_share")
         ));
     }
