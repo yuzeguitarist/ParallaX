@@ -317,18 +317,18 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
                 let _ = writeln!(out, "      \"bandwidth_mbit\": {bw},");
                 let _ = writeln!(
                     out,
-                    "      \"handshake_ms\": {:.3},",
-                    report.handshake.elapsed.as_secs_f64() * 1000.0
+                    "      \"handshake_ms\": {},",
+                    json_f64(report.handshake.elapsed.as_secs_f64() * 1000.0, 3)
                 );
                 let _ = writeln!(
                     out,
-                    "      \"download_median_mbps\": {:.4},",
-                    report.primary_run().download.summary.median_mbps
+                    "      \"download_median_mbps\": {},",
+                    json_f64(report.primary_run().download.summary.median_mbps, 4)
                 );
                 let _ = writeln!(
                     out,
-                    "      \"upload_median_mbps\": {:.4}",
-                    report.primary_run().upload.summary.median_mbps
+                    "      \"upload_median_mbps\": {}",
+                    json_f64(report.primary_run().upload.summary.median_mbps, 4)
                 );
                 let _ = writeln!(out, "    }}{comma}");
             }
@@ -345,6 +345,18 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
     let _ = writeln!(out, "  ]");
     let _ = writeln!(out, "}}");
     out
+}
+
+/// Format an `f64` for JSON at the given precision. A non-finite value would
+/// render as `NaN`/`inf`, which is not valid JSON and is rejected by strict
+/// parsers; upstream guards keep values finite today, but emit `null`
+/// defensively so the document stays parseable regardless.
+fn json_f64(value: f64, precision: usize) -> String {
+    if value.is_finite() {
+        format!("{value:.precision$}")
+    } else {
+        "null".to_string()
+    }
 }
 
 fn json_escape(s: &str) -> String {
@@ -602,6 +614,38 @@ mod tests {
             "last cell must not be comma-terminated"
         );
         assert!(json.trim_end().ends_with('}')); // document closes cleanly
+    }
+
+    #[test]
+    fn json_f64_emits_null_for_non_finite() {
+        assert_eq!(json_f64(1.5, 4), "1.5000");
+        assert_eq!(json_f64(42.0, 3), "42.000");
+        assert_eq!(json_f64(f64::NAN, 4), "null");
+        assert_eq!(json_f64(f64::INFINITY, 4), "null");
+        assert_eq!(json_f64(f64::NEG_INFINITY, 3), "null");
+    }
+
+    #[test]
+    fn render_json_stays_parseable_with_non_finite_medians() {
+        // SpeedReport has public fields, so a non-finite median can reach the
+        // renderer. It must emit `null` instead of `NaN`/`inf` so the document
+        // stays valid JSON for strict parsers.
+        let mut report = sample_report();
+        report.runs[0].download.summary.median_mbps = f64::NAN;
+        report.runs[0].upload.summary.median_mbps = f64::INFINITY;
+        let cells = vec![NetCell {
+            imp: MATRIX[0],
+            outcome: Ok(report),
+        }];
+        let json = render_json("vps.example:443", &cells);
+        assert!(json.contains("\"download_median_mbps\": null,"));
+        assert!(json.contains("\"upload_median_mbps\": null"));
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("netmatrix JSON with non-finite medians must still parse");
+        assert_eq!(
+            parsed["cells"][0]["download_median_mbps"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
