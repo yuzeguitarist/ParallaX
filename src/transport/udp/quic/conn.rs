@@ -650,6 +650,16 @@ pub struct Connection {
     drained: bool,
     /// When a packet was last received (drives the idle timeout, RFC 9000 §10.1).
     last_recv_time: Option<Instant>,
+    /// When this connection was constructed: the cold-start backstop origin for the
+    /// idle deadline while `last_recv_time` is still `None` (no packet has ever
+    /// AEAD-opened). Without it such a connection arms NO idle timer at all — a
+    /// server-side connection created for a spoofed/undecryptable Initial would
+    /// return `next_timeout() == None` and sit in the endpoint's table forever
+    /// (table-exhaustion DoS), and a client whose peer never replies would
+    /// retransmit Initials indefinitely. `next_timeout` and `handle_timeout` both
+    /// read `last_recv_time.unwrap_or(created_at)`, so the armed deadline and the
+    /// fire condition never disagree.
+    created_at: Instant,
     /// Connection-level flow control (RFC 9000 §4.1). Send side: the peer's MAX_DATA
     /// limit and how much we have sent against it. Receive side: the limit we
     /// advertise, the last value sent, total received (enforcement), total consumed
@@ -759,6 +769,7 @@ impl Connection {
             close_time: None,
             drained: false,
             last_recv_time: None,
+            created_at: Instant::now(),
             send_max_data: 0,
             send_data_total: 0,
             recv_max_data: CONN_RECV_WINDOW,
@@ -1483,10 +1494,13 @@ impl Connection {
             }
         }
         // Idle timeout (RFC 9000 §10.1): tear down after no receipt for too long.
+        // Falls back to `created_at` while no packet has ever AEAD-opened, so a
+        // connection that never receives an openable packet (spoofed Initial on
+        // the server, silent peer on the client) still arms a teardown deadline
+        // instead of living forever with no timer.
         if self.closed.is_none() {
-            if let Some(last) = self.last_recv_time {
-                earliest(last + IDLE_TIMEOUT);
-            }
+            let last = self.last_recv_time.unwrap_or(self.created_at);
+            earliest(last + IDLE_TIMEOUT);
         }
         deadline
     }
@@ -1509,10 +1523,11 @@ impl Connection {
             return;
         }
         // Idle timeout (RFC 9000 §10.1): close the connection if silent too long.
+        // Reads the SAME `last_recv_time.unwrap_or(created_at)` origin as
+        // `next_timeout`, so the cold-start backstop deadline armed there also
+        // fires here even when no packet ever AEAD-opened.
         if self.closed.is_none()
-            && self
-                .last_recv_time
-                .is_some_and(|last| now >= last + IDLE_TIMEOUT)
+            && now >= self.last_recv_time.unwrap_or(self.created_at) + IDLE_TIMEOUT
         {
             self.closed = Some(CloseReason::IdleTimeout);
             self.close_time = Some(now);
@@ -4940,6 +4955,148 @@ mod tests {
         assert!(
             server.last_recv_time.is_none(),
             "a garbage datagram must not start/refresh the idle timer"
+        );
+    }
+
+    #[test]
+    fn never_opening_server_connection_hits_the_cold_start_backstop() {
+        // DoS backstop: a server connection created for a spoofed/undecryptable
+        // Initial never AEAD-opens a packet, so `last_recv_time` stays `None`.
+        // Without the `created_at` fallback it would arm NO timer at all
+        // (`next_timeout() == None`) and sit in the endpoint's table forever.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x0d, 0x05, 0x0d, 0x05]),
+        )
+        .unwrap();
+        let t0 = server.created_at;
+        assert_eq!(
+            server.next_timeout(),
+            Some(t0 + IDLE_TIMEOUT),
+            "a connection that never opened a packet still arms the idle backstop"
+        );
+        // Garbage that never AEAD-opens must not refresh the backstop either.
+        let _ = server.handle_datagram(&[0xff; 1200], t0 + Duration::from_secs(1));
+        assert_eq!(
+            server.next_timeout(),
+            Some(t0 + IDLE_TIMEOUT),
+            "an un-openable datagram must not push the backstop deadline out"
+        );
+        // Just before the deadline: still open.
+        server.handle_timeout(t0 + IDLE_TIMEOUT - Duration::from_millis(1));
+        assert!(!server.is_closed(), "backstop must not fire early");
+        // At the deadline: torn down as an idle timeout.
+        server.handle_timeout(t0 + IDLE_TIMEOUT);
+        assert!(
+            matches!(server.close_reason(), Some(CloseReason::IdleTimeout)),
+            "cold-start zombie closes as an idle timeout, got {:?}",
+            server.close_reason()
+        );
+        // And after the drain period it is reapable by the endpoint.
+        let drain = server
+            .next_timeout()
+            .expect("a closing connection arms its drain deadline");
+        server.handle_timeout(drain);
+        assert!(
+            server.is_drained(),
+            "the endpoint can reap the never-opening connection"
+        );
+    }
+
+    #[test]
+    fn client_with_silent_peer_times_out_instead_of_probing_forever() {
+        // A client whose peer NEVER replies keeps `last_recv_time == None`; before
+        // the backstop its only timers were PTOs, so it would retransmit Initials
+        // forever. Drive it exactly as the endpoint does (handle_timeout at each
+        // armed deadline, then poll_transmit) and prove it closes by the backstop.
+        let dcid = ConnectionId::new(&[0x51, 0x1e, 0x47, 0x0e, 0x51, 0x1e, 0x47, 0x0e]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let t0 = client.created_at;
+        let mut now = t0;
+        while client.poll_transmit(now).is_some() {}
+        let mut fired = 0u32;
+        while !client.is_closed() {
+            let deadline = client
+                .next_timeout()
+                .expect("an unanswered client always has a timer armed");
+            assert!(
+                deadline <= t0 + IDLE_TIMEOUT,
+                "no timer may be armed past the cold-start backstop"
+            );
+            now = deadline;
+            client.handle_timeout(now);
+            while client.poll_transmit(now).is_some() {}
+            fired += 1;
+            assert!(fired < 1000, "must converge to a close, not probe forever");
+        }
+        assert!(
+            matches!(client.close_reason(), Some(CloseReason::IdleTimeout)),
+            "silent-peer client closes as an idle timeout, got {:?}",
+            client.close_reason()
+        );
+        assert_eq!(
+            now,
+            t0 + IDLE_TIMEOUT,
+            "teardown happens exactly at the backstop deadline"
+        );
+    }
+
+    #[test]
+    fn established_connection_idle_deadline_tracks_receipt_not_creation() {
+        // The backstop must be inert once a packet has AEAD-opened: the idle
+        // deadline follows `last_recv_time`, not `created_at`. Handshake at
+        // t0+10s, so the receipt-based deadline (t0+40s) is 10s later than the
+        // creation-based one (t0+30s) — the connection must survive the latter.
+        let dcid = ConnectionId::new(&[0x1d, 0x1e, 0x0f, 0x0f, 0x1d, 0x1e, 0x0f, 0x0f]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x1d, 0x1e, 0x0f, 0x0f]),
+        )
+        .unwrap();
+        let t0 = client.created_at;
+        // Lossless in-process pump (like `drive`) but at t0+10s, so last_recv_time
+        // lands well after created_at.
+        let hs = t0 + Duration::from_secs(10);
+        for _ in 0..16 {
+            let mut moved = false;
+            while let Some(dg) = client.poll_transmit(hs) {
+                server.handle_datagram(&dg, hs).unwrap();
+                moved = true;
+            }
+            while let Some(dg) = server.poll_transmit(hs) {
+                client.handle_datagram(&dg, hs).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "handshake completed");
+        assert_eq!(client.last_recv_time, Some(hs));
+        // Past created_at + IDLE_TIMEOUT but before last_recv + IDLE_TIMEOUT:
+        // must stay open (the backstop yields to the real receipt time).
+        client.handle_timeout(t0 + IDLE_TIMEOUT + Duration::from_secs(1));
+        assert!(
+            !client.is_closed(),
+            "a connection that has received packets must not close on the creation-based backstop"
+        );
+        // The receipt-based deadline still fires as before.
+        client.handle_timeout(hs + IDLE_TIMEOUT);
+        assert!(
+            matches!(client.close_reason(), Some(CloseReason::IdleTimeout)),
+            "the ordinary idle timeout is unaffected, got {:?}",
+            client.close_reason()
         );
     }
 
