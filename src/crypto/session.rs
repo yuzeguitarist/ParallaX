@@ -53,7 +53,15 @@ impl fmt::Debug for X25519KeyPair {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+// `PartialEq`/`Eq` are derived ONLY under `cfg(test)`: the derived `==` compares
+// the live secret key bytes in variable time, which is fine for `assert_eq!` in
+// tests but would be a timing side-channel if a production path ever compared
+// two `SessionKeys`. Gating the impls makes such a comparison a compile error in
+// a non-test build (verified by `cargo build` / `cargo clippy`, which compile the
+// production crate without these impls). If a production path ever needs secret
+// equality, implement it explicitly via `subtle::ConstantTimeEq` instead.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct SessionKeys {
     pub client_key: [u8; KEY_LEN],
     pub server_key: [u8; KEY_LEN],
@@ -1246,6 +1254,19 @@ mod tests {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
         derive_client_keys(TEST_PSK, &client.private, &server.public, &[7_u8; 32]).unwrap()
+    }
+
+    #[test]
+    fn session_keys_equality_is_test_only() {
+        // `SessionKeys: PartialEq/Eq` exists ONLY under cfg(test) (the derived `==`
+        // is variable-time over live secret bytes). This test pins that the
+        // test-gated impls still exist so `assert_eq!` keeps working in tests; the
+        // complementary check — that equality is UNAVAILABLE in production — is the
+        // non-test compile itself (`cargo build` / `cargo clippy`), where any
+        // production `==` over `SessionKeys` is now a compile error.
+        let keys = session_keys_fixture();
+        let same = keys.clone();
+        assert_eq!(keys, same);
     }
 
     #[test]

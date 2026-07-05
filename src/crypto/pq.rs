@@ -29,7 +29,13 @@ pub struct MlKemKeyPair {
     pub secret: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+// `PartialEq`/`Eq` are derived ONLY under `cfg(test)`: the derived `==` compares
+// the live `shared_secret` bytes in variable time — fine for test `assert_eq!`,
+// a timing side-channel if production ever compared two encapsulations. Gating
+// the impls makes such a comparison a compile error in a non-test build; use
+// `subtle::ConstantTimeEq` explicitly if a production path ever needs equality.
+#[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct MlKemEncapsulation {
     pub ciphertext: Vec<u8>,
     /// The KEM shared secret, self-wiping on drop. A struct-level `ZeroizeOnDrop`
@@ -217,6 +223,20 @@ fn shared_secret_32(shared_secret: &[u8]) -> Result<[u8; 32], PqError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encapsulation_equality_is_test_only() {
+        // `MlKemEncapsulation: PartialEq/Eq` exists ONLY under cfg(test) (the
+        // derived `==` is variable-time over the live `shared_secret`). This pins
+        // that the test-gated impls still exist for `assert_eq!`; the complementary
+        // guarantee — equality UNAVAILABLE in production — is the non-test compile
+        // itself (`cargo build` / `cargo clippy`), where any production `==` over
+        // `MlKemEncapsulation` is now a compile error.
+        let keys = keypair();
+        let enc = encapsulate(&keys.public).unwrap();
+        let same = enc.clone();
+        assert_eq!(enc, same);
+    }
 
     #[test]
     fn mlkem_round_trip() {
