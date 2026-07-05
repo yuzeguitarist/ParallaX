@@ -317,8 +317,11 @@ pub struct ServerConfig {
     /// no marker is ever recovered, so the gate never runs whatever this contains.
     pub authorized_sni: Vec<String>,
     /// Maximum UDP payload read per datagram on this endpoint — the inbound recv
-    /// buffer size (issue #75). Oversized datagrams are truncated, which fails
-    /// AEAD and is dropped. `0` means use the built-in default
+    /// ceiling (issue #75). Oversized datagrams never reach the packet parser: off
+    /// Linux the recv buffer is exactly this size, so they are truncated by
+    /// `recv_from`, fail AEAD, and are dropped; on Linux (64 KiB GRO gather
+    /// buffer) they arrive intact and the driver drops any chunk larger than
+    /// this cap before parsing. `0` means use the built-in default
     /// ([`MAX_UDP_PAYLOAD`]); the server runtime resolves it from
     /// `udp.max_udp_payload_bytes`. The origin-splice relay is deliberately NOT
     /// sized by this cap: its origin→client pump buffer holds the largest possible
@@ -849,7 +852,21 @@ impl Driver {
                                 let chunks = total.div_ceil(seg).max(1) as u64;
                                 super::offload::record_gro_read(chunks);
                             }
+                            // Enforce the configured `max_udp_payload` recv ceiling per
+                            // datagram (issue #75). On Linux the read buffer is the 64 KiB
+                            // GRO gather buffer, so a single non-coalesced datagram larger
+                            // than recv_cap() arrives INTACT here (never truncated by the
+                            // kernel) and would otherwise be parsed in full — drop such
+                            // chunks so the cap holds on every platform. Off Linux the
+                            // buffer is exactly recv_cap() bytes (oversized datagrams are
+                            // truncated by recv_from), so this check never fires. A GRO
+                            // read's shorter tail chunk is a genuine original datagram
+                            // and passes untouched.
+                            let cap = self.recv_cap();
                             for chunk in buf[..total].chunks(seg) {
+                                if chunk.len() > cap {
+                                    continue;
+                                }
                                 self.on_datagram(chunk, peer, ecn);
                             }
                         }
@@ -1879,6 +1896,69 @@ mod tests {
             &rb[..rn],
             b"not-a-quic-initial-packet-origin",
             "datagram spliced verbatim to the origin and the reply relayed back"
+        );
+    }
+
+    /// The configured `max_udp_payload` recv ceiling holds on the Linux GRO path
+    /// (issue #75). The Linux read buffer is the 64 KiB GRO gather buffer, so a
+    /// single non-coalesced datagram between `recv_cap()` (default 2048) and
+    /// 64 KiB arrives INTACT — the driver must drop it before parsing/routing,
+    /// not hand it to `on_datagram` in full. Observable via the origin splice: an
+    /// oversized non-Initial datagram would be spliced verbatim to the origin if
+    /// parsed, so the origin must see only the within-cap follow-up datagram.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn oversized_datagram_is_dropped_against_recv_cap_on_the_gro_path() {
+        // Mock origin: report the size of every datagram that reaches it.
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (otx, mut orx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 65536];
+            loop {
+                let (n, _) = origin.recv_from(&mut b).await.unwrap();
+                if otx.send(n).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_splicing(origin_addr),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // 3000 bytes: over the default 2048-byte cap, under the 64 KiB GRO buffer,
+        // and NOT a v1 Initial (short-header first byte) — so if it were parsed it
+        // would open an origin splice and arrive at the origin verbatim. The recv
+        // cap must drop it first.
+        client
+            .send_to(&vec![0x5au8; 3000], server_addr)
+            .await
+            .unwrap();
+        // A within-cap garbage datagram from the same peer must still be processed
+        // (it opens the splice), proving the drop is per-datagram, not a stall.
+        client.send_to(b"small-probe", server_addr).await.unwrap();
+
+        let n = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("the within-cap datagram reaches the origin")
+            .unwrap();
+        assert_eq!(
+            n,
+            b"small-probe".len(),
+            "only the within-cap datagram is spliced; the oversized one is dropped"
+        );
+        // And nothing else arrives: the oversized datagram was dropped, not queued.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), orx.recv())
+                .await
+                .is_err(),
+            "the oversized datagram must never reach the origin"
         );
     }
 
