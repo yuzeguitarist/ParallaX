@@ -517,6 +517,7 @@ mod tests {
                 sni: "example.com".to_owned(),
                 server_public_key: "server-public".to_owned(),
                 server_identity_public_key: "server-identity-public".to_owned(),
+                accept_language: None,
             }),
             server: None,
         }

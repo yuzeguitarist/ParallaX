@@ -288,15 +288,32 @@ pub fn parse_settings_payload(mut payload: &[u8]) -> Result<Vec<Http3Setting>, H
 /// `sec-fetch-dest, user-agent, accept, sec-fetch-site, sec-fetch-mode,
 /// accept-language, priority, accept-encoding`.
 pub fn safari26_headers_frame(authority: &str) -> Result<Vec<u8>, Http3Error> {
-    let fields = safari26_request_fields(authority);
+    safari26_headers_frame_with_language(authority, SAFARI26_ACCEPT_LANGUAGE)
+}
+
+/// Build the opening H3 request HEADERS frame with an explicit `accept-language`
+/// value (kept in lockstep with the H2 path so the two planes never diverge).
+pub fn safari26_headers_frame_with_language(
+    authority: &str,
+    accept_language: &str,
+) -> Result<Vec<u8>, Http3Error> {
+    let fields = safari26_request_fields_with_language(authority, accept_language);
     let section = encode_field_section(&fields);
     encode_frame(FRAME_TYPE_HEADERS, &section)
 }
 
 /// The ordered `(name, value)` header list Safari 26 sends on its opening H3
-/// request. Exposed for tests and for callers that want the field list without
-/// the QPACK/frame wrapping.
+/// request, with the default en-US `accept-language`. Exposed for tests and for
+/// callers that want the field list without the QPACK/frame wrapping.
 pub fn safari26_request_fields(authority: &str) -> Vec<(String, String)> {
+    safari26_request_fields_with_language(authority, SAFARI26_ACCEPT_LANGUAGE)
+}
+
+/// Like [`safari26_request_fields`] but with an explicit `accept-language`.
+pub fn safari26_request_fields_with_language(
+    authority: &str,
+    accept_language: &str,
+) -> Vec<(String, String)> {
     vec![
         (":method".to_string(), "GET".to_string()),
         (":scheme".to_string(), "https".to_string()),
@@ -316,10 +333,7 @@ pub fn safari26_request_fields(authority: &str) -> Vec<(String, String)> {
             "sec-fetch-mode".to_string(),
             SAFARI26_SEC_FETCH_MODE.to_string(),
         ),
-        (
-            "accept-language".to_string(),
-            SAFARI26_ACCEPT_LANGUAGE.to_string(),
-        ),
+        ("accept-language".to_string(), accept_language.to_string()),
         ("priority".to_string(), SAFARI26_PRIORITY.to_string()),
         (
             "accept-encoding".to_string(),

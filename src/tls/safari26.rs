@@ -287,6 +287,7 @@ impl Safari26TlsCamouflage {
             tls_x25519,
             tls_mlkem768_secret: mlkem_secret,
             sni,
+            accept_language: crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE.to_owned(),
             tap: VecRecordTap::default(),
         })
     }
@@ -299,6 +300,11 @@ pub struct Safari26TlsSession {
     tls_x25519: X25519KeyPair,
     tls_mlkem768_secret: Zeroizing<Vec<u8>>,
     sni: String,
+    /// `accept-language` value advertised in the H2 camouflage request. Defaults
+    /// to [`crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE`]; overridable via
+    /// [`Self::with_accept_language`] so an operator's configured locale flows
+    /// into the emitted request instead of a fleet-wide constant.
+    accept_language: String,
     tap: VecRecordTap,
 }
 
@@ -307,6 +313,14 @@ impl Safari26TlsSession {
     /// 26 path.
     pub fn client_hello_bytes(&self) -> &[u8] {
         &self.client_hello
+    }
+
+    /// Override the `accept-language` advertised in the H2 camouflage request
+    /// (default: Safari en-US). The client threads its configured value here so
+    /// the fleet is not a single fixed `accept-language` cross-connection tell.
+    pub fn with_accept_language(mut self, accept_language: String) -> Self {
+        self.accept_language = accept_language;
+        self
     }
 
     pub async fn complete(
@@ -611,7 +625,7 @@ impl Safari26TlsSession {
         let fingerprint = Http2Fingerprint::safari26();
         let preface = fingerprint.connection_preface()?;
         self.write_application_data(stream, keys, &preface).await?;
-        let headers = fingerprint.headers_frame(&self.sni)?;
+        let headers = fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?;
         self.write_application_data(stream, keys, &headers).await?;
         self.await_http2_settings_ack(stream, keys).await?;
         Ok(())

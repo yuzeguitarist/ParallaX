@@ -677,6 +677,7 @@ mod tests {
                 sni: "camouflage.example:443".to_owned(),
                 server_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
                 server_identity_public_key,
+                accept_language: None,
             }),
             server: None,
         }

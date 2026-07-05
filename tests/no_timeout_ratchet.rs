@@ -317,11 +317,13 @@ fn combined_inbound_read_census_is_pinned() {
     // non-saturated serial read), and client_upload_loop adds a net 2 (its serial
     // no-cover read is replaced by prime + saturated read-ahead + non-saturated
     // serial read) — all UNTIMED, all in their existing relay loops.)
-    const EXPECTED_TOTAL_SITES: usize = 35;
-    // Timed sites: 12 (server) + 3 (runtime) = 15. (+2 server: the speed QUIC-run
-    // request read and the TCP DONE read, both bounded by `QUIC_RELAY_DONE_BACKSTOP`
-    // / `PX1_CONTROL_READ_TIMEOUT`.)
-    const EXPECTED_TIMED_SITES: usize = 15;
+    // (+2 server vs the prior baseline of 35: the FIN-first teardown drain adds two
+    // reads — `graceful_fin_then_drain` and `graceful_fin_then_drain_stream` — each
+    // a `read()` bounded by `timeout_at(GRACEFUL_FIN_DRAIN_BUDGET)`, so both TIMED.)
+    const EXPECTED_TOTAL_SITES: usize = 37;
+    // Timed sites: 14 (server) + 3 (runtime) = 17. (+2 server vs the prior 15: the
+    // two FIN-first drain reads above, both bounded by `GRACEFUL_FIN_DRAIN_BUDGET`.)
+    const EXPECTED_TIMED_SITES: usize = 17;
 
     assert_eq!(
         total, EXPECTED_TOTAL_SITES,
