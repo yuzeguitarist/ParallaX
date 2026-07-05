@@ -288,10 +288,12 @@ mod linux {
     /// Control-buffer size for one u16 `UDP_SEGMENT` cmsg (GSO send).
     const GSO_CMSG_LEN: usize =
         (unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) }) as usize;
-    /// Control-buffer size for the two cmsgs a GRO read may attach: the u16
-    /// segment size and the int ECN/TOS byte. Sizing for one would truncate the other.
+    /// Control-buffer size for the two cmsgs a GRO read may attach: the `int`
+    /// segment size (the kernel `put_cmsg`s UDP_GRO as `sizeof(int)`, see
+    /// `udp_cmsg_recv` in net/ipv4/udp.c) and the `int` ECN/TOS value. Sizing for
+    /// one would truncate the other.
     const GRO_CMSG_LEN: usize = (unsafe {
-        libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32)
+        libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32)
             + libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32)
     }) as usize;
 
@@ -537,39 +539,83 @@ mod linux {
         // Default: no GRO cmsg => one datagram of `total` bytes; no TOS cmsg => Not-ECT.
         let mut segment_size = total;
         let mut ecn: u8 = 0;
+        // MSG_CTRUNC: the control buffer was too small for every cmsg the kernel
+        // wanted to attach, so any cmsg that IS present may not be the full set (and
+        // a partially-copied trailing cmsg is possible in principle). Treat the
+        // control data as untrusted: keep the defaults — one segment of `total`
+        // bytes (mis-splitting on a bogus segment size would corrupt every chunk)
+        // and Not-ECT (never invent a CE/ECT mark from garbage). The payload itself
+        // is intact (that would be MSG_TRUNC, handled above), so the read still
+        // yields one valid datagram. GRO_CMSG_LEN sizes the buffer for both cmsgs
+        // we enable, so this only fires if the kernel ever attaches more.
+        let ctruncated = msg.msg_flags & libc::MSG_CTRUNC != 0;
         // SAFETY: msg is fully initialized by recvmsg; CMSG_* walk only within
         // cmsg_buf as bounded by msg_controllen. Scan ALL cmsgs (do not break early):
-        // the kernel may attach both the UDP_GRO segment size and the ECN/TOS byte.
-        unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg.is_null() {
-                let level = (*cmsg).cmsg_level;
-                let kind = (*cmsg).cmsg_type;
-                if level == libc::SOL_UDP && kind == libc::UDP_GRO {
-                    let mut seg: u16 = 0;
-                    std::ptr::copy_nonoverlapping(
-                        libc::CMSG_DATA(cmsg),
-                        (&mut seg as *mut u16).cast::<u8>(),
-                        std::mem::size_of::<u16>(),
-                    );
-                    if seg != 0 {
-                        segment_size = seg as usize;
+        // the kernel may attach both the UDP_GRO segment size and the ECN/TOS value.
+        // Every CMSG_DATA read below is length-guarded by the cmsg's own cmsg_len
+        // (never read more payload bytes than the kernel wrote), and copies into
+        // local integers via copy_nonoverlapping, so no alignment is assumed on the
+        // cmsg payload pointer.
+        if !ctruncated {
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    let level = (*cmsg).cmsg_level;
+                    let kind = (*cmsg).cmsg_type;
+                    // Payload bytes in this cmsg: cmsg_len minus the aligned header
+                    // (CMSG_LEN(0)). saturating_sub so a malformed header can never
+                    // wrap into a huge length.
+                    let data_len =
+                        ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+                    if level == libc::SOL_UDP && kind == libc::UDP_GRO {
+                        // The kernel delivers the GRO segment size as a full native
+                        // `int` (`put_cmsg(.., sizeof(int), &gso_size)` in
+                        // net/ipv4/udp.c). Read the whole int native-endian — reading
+                        // only the first two bytes would yield the (zero) high half on
+                        // big-endian. Guarded on cmsg_len so a short/foreign cmsg is
+                        // ignored rather than over-read.
+                        if data_len >= std::mem::size_of::<libc::c_int>() {
+                            let mut seg: libc::c_int = 0;
+                            std::ptr::copy_nonoverlapping(
+                                libc::CMSG_DATA(cmsg),
+                                (&mut seg as *mut libc::c_int).cast::<u8>(),
+                                std::mem::size_of::<libc::c_int>(),
+                            );
+                            if seg > 0 {
+                                segment_size = seg as usize;
+                            }
+                        }
+                    } else if (level == libc::IPPROTO_IP && kind == libc::IP_TOS)
+                        || (level == libc::IPPROTO_IPV6 && kind == libc::IPV6_TCLASS)
+                    {
+                        // The TOS/traffic-class value arrives in two shapes: IPv4
+                        // IP_TOS is a single byte (`ip_cmsg_recv_tos`), IPv6
+                        // IPV6_TCLASS is a full native `int` (`ip6_datagram_recv_ctl`).
+                        // Dispatch on the delivered length: an int must be read whole
+                        // and native-endian — taking its first byte reads the MSB on
+                        // big-endian, silently zeroing the ECN field (CE marks lost).
+                        // A one-byte payload IS the TOS byte (no endianness). Low 2
+                        // bits = the ECN field (RFC 3168).
+                        if data_len >= std::mem::size_of::<libc::c_int>() {
+                            let mut tos: libc::c_int = 0;
+                            std::ptr::copy_nonoverlapping(
+                                libc::CMSG_DATA(cmsg),
+                                (&mut tos as *mut libc::c_int).cast::<u8>(),
+                                std::mem::size_of::<libc::c_int>(),
+                            );
+                            ecn = (tos & 0b11) as u8;
+                        } else if data_len >= 1 {
+                            let mut tos_byte: u8 = 0;
+                            std::ptr::copy_nonoverlapping(
+                                libc::CMSG_DATA(cmsg),
+                                &mut tos_byte as *mut u8,
+                                1,
+                            );
+                            ecn = tos_byte & 0b11;
+                        }
                     }
-                } else if (level == libc::IPPROTO_IP && kind == libc::IP_TOS)
-                    || (level == libc::IPPROTO_IPV6 && kind == libc::IPV6_TCLASS)
-                {
-                    // The TOS/traffic-class byte is delivered as an int (IPv6) or a
-                    // single byte (IPv4); read the first byte either way and take the
-                    // low 2 bits (the ECN field, RFC 3168).
-                    let mut tos_byte: u8 = 0;
-                    std::ptr::copy_nonoverlapping(
-                        libc::CMSG_DATA(cmsg),
-                        &mut tos_byte as *mut u8,
-                        std::mem::size_of::<u8>(),
-                    );
-                    ecn = tos_byte & 0b11;
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                 }
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
             }
         }
 
@@ -717,6 +763,60 @@ mod tests {
             let n = rx.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], &expected[..], "datagram delivered verbatim");
         }
+    }
+
+    /// `recv_gro` recovers the inbound ECN codepoint from the IPv4 `IP_TOS` cmsg,
+    /// whose payload the kernel delivers as a SINGLE byte (`ip_cmsg_recv_tos`) —
+    /// exercising the one-byte branch of the length-dispatched TOS read. Loopback:
+    /// tx marks ECT(0), rx must read 0b10, not Not-ECT.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_gro_reads_ecn_from_ipv4_tos_cmsg() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsFd;
+
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        assert!(linux::enable_recv_ecn(&rx, false), "IP_RECVTOS set");
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(enable_ect0(&tx, false), "egress ECT(0) set");
+        tx.send_to(&[0xAB; 100], rx.local_addr().unwrap()).unwrap();
+
+        let mut buf = [0u8; 2048];
+        let segs = linux::recv_gro(rx.as_fd(), &mut buf).unwrap();
+        assert_eq!(segs.total, 100);
+        assert_eq!(segs.segment_size, 100, "no GRO cmsg => one datagram");
+        assert_eq!(segs.ecn, 0b10, "ECT(0) recovered from the IP_TOS cmsg");
+        assert_eq!(&buf[..100], &[0xAB; 100][..]);
+    }
+
+    /// `recv_gro` recovers the inbound ECN codepoint from the IPv6 `IPV6_TCLASS`
+    /// cmsg, whose payload the kernel delivers as a full native `int`
+    /// (`ip6_datagram_recv_ctl`) — exercising the whole-int branch whose old
+    /// first-byte read was the big-endian CE-loss bug. Skips (passes vacuously)
+    /// where the host has no IPv6 loopback.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_gro_reads_ecn_from_ipv6_tclass_cmsg() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsFd;
+
+        let Ok(rx) = UdpSocket::bind("[::1]:0") else {
+            eprintln!("no IPv6 loopback on this host; skipping");
+            return;
+        };
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        assert!(linux::enable_recv_ecn(&rx, true), "IPV6_RECVTCLASS set");
+        let tx = UdpSocket::bind("[::1]:0").unwrap();
+        assert!(enable_ect0(&tx, true), "egress ECT(0) set");
+        tx.send_to(&[0xCD; 64], rx.local_addr().unwrap()).unwrap();
+
+        let mut buf = [0u8; 2048];
+        let segs = linux::recv_gro(rx.as_fd(), &mut buf).unwrap();
+        assert_eq!(segs.total, 64);
+        assert_eq!(segs.ecn, 0b10, "ECT(0) recovered from the int TCLASS cmsg");
     }
 
     /// `enable_ect0` sets the IP TOS byte's ECN bits to ECT(0) on the socket; read it
