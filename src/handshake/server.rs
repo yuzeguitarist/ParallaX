@@ -1474,15 +1474,31 @@ async fn graceful_close_tcp_stream(mut stream: TcpStream) {
 /// to the camouflage origin so the client still gets a real ServerHello, bounded by
 /// the 64-relay concurrency ceiling with the idle drawn from the SAME band as a
 /// healthy splice; if the budget is full or the origin dial fails, fall back to a
-/// graceful FIN (the prior behavior). We never read the ClientHello at admission
-/// time, so the prefix is empty — the client's own ClientHello then splices straight
-/// through to the origin.
-async fn cap_shed_fallback_or_fin(client: TcpStream, fallback_addr: String) {
+/// graceful FIN (the prior behavior).
+///
+/// L8: read the client's first record BEFORE dialing the origin, then forward it —
+/// mirroring the healthy splice's dial-AFTER-read ordering. Dialing upfront with an
+/// empty prefix (the old behavior) made a cap-shed connection's handshake-start
+/// timing observably different from a healthy splice to a keyless prober that could
+/// drive the box to its cap; reading first removes that establishment-ordering tell.
+/// The read is bounded by `first_record_wait_timeout` and the whole path by the 64
+/// cap-shed slots, so it cannot be amplified into a resource exhaustion.
+async fn cap_shed_fallback_or_fin(mut client: TcpStream, fallback_addr: String) {
     let Some(_slot) = try_enter_cap_shed_fallback() else {
         graceful_close_tcp_stream(client).await;
         return;
     };
-    match connect_and_forward_to_fallback(&fallback_addr, &[]).await {
+    // Read the ClientHello (or the partial give-up prefix) first, exactly as the
+    // healthy path does, so the origin dial happens AFTER the read on both paths.
+    let prefix = match read_first_client_record(&mut client).await {
+        Ok(FirstClientRead::Record(record)) => record,
+        Ok(FirstClientRead::FallbackPrefix(prefix)) => prefix,
+        Err(_) => {
+            graceful_close_tcp_stream(client).await;
+            return;
+        }
+    };
+    match connect_and_forward_to_fallback(&fallback_addr, &prefix).await {
         Ok(fallback) => {
             // Draw the idle backstop from the SAME distribution as a healthy splice
             // ([`fallback_idle_timeout`], [600s, 660s]) rather than a separate tight
@@ -1491,11 +1507,10 @@ async fn cap_shed_fallback_or_fin(client: TcpStream, fallback_addr: String) {
             // separate the two populations in a handful of samples and read "this box
             // is at its cap" — a threshold-triggered, externally observable state tell
             // (a real origin's idle policy does not switch on THIS front box's permit
-            // accounting). Unifying the band removes that idle-close-time tell. (A
-            // silent prober can still observe the pre-existing handshake-start
-            // difference — cap-shed dials the origin BEFORE reading a ClientHello,
-            // healthy splice dials after — but that is unchanged by this fix and
-            // shared with the first-record-wait residual.)
+            // accounting). Unifying the band removes that idle-close-time tell. The
+            // former handshake-start difference (cap-shed dialed BEFORE reading a
+            // ClientHello, healthy splice dials after) is now also gone: cap-shed
+            // reads the first record first (L8), so both paths dial-after-read.
             //
             // The cap-as-DoS-amplifier concern is still defused by construction: the
             // hard [`MAX_CONCURRENT_CAP_SHED_FALLBACKS`] (64) ceiling bounds the
