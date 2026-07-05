@@ -1074,6 +1074,14 @@ fn parse_certificate_verify_body(body: &[u8]) -> Result<(u16, &[u8]), QuicTlsErr
     let mut c = Cursor::new(body);
     let scheme = c.u16()?;
     let signature = c.vec_u16()?;
+    // A real TLS stack rejects trailing bytes after the signature; tolerating
+    // them is an active-probe distinguisher (matches the sibling parsers).
+    if c.remaining() != 0 {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "trailing bytes after CertificateVerify signature",
+        ));
+    }
     Ok((scheme, signature))
 }
 
@@ -1569,6 +1577,20 @@ mod tests {
         let mut data = (list.len() as u16).to_be_bytes().to_vec();
         data.extend_from_slice(&list);
         let err = parse_selected_alpn(&data).unwrap_err();
+        assert_eq!(err.alert_description(), Some(ALERT_DECODE_ERROR));
+    }
+
+    #[test]
+    fn certificate_verify_trailing_bytes_rejected() {
+        // scheme (0x0403) + u16-length signature; exact body parses...
+        let mut body = vec![0x04, 0x03, 0x00, 0x03, 0xaa, 0xbb, 0xcc];
+        let (scheme, sig) = parse_certificate_verify_body(&body).unwrap();
+        assert_eq!(scheme, 0x0403);
+        assert_eq!(sig, &[0xaa, 0xbb, 0xcc]);
+        // ...but bytes after the signature are rejected, matching the sibling
+        // parsers' strictness (fail closed on trailing garbage).
+        body.push(0x00);
+        let err = parse_certificate_verify_body(&body).unwrap_err();
         assert_eq!(err.alert_description(), Some(ALERT_DECODE_ERROR));
     }
 
