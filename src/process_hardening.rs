@@ -763,10 +763,19 @@ mod tests {
         super::protect_secret_bytes("test.secret", &secret);
     }
 
-    // The public entry point is a no-op-safe, fail-open function on every target;
-    // calling it twice must never panic (idempotent, best-effort). On Linux this
-    // actually installs the process-wide filter, so it runs last-ish; the deny
-    // set is EPERM-only (never kill), so it cannot take the test process down.
+    // The public entry point is a no-op-safe, fail-open function; calling it
+    // twice must never panic (idempotent, best-effort). Gated OFF Linux on
+    // purpose: there `install_late_seccomp_filter` installs a process-wide
+    // (TSYNC) seccomp filter plus PR_SET_NO_NEW_PRIVS that would irreversibly
+    // constrain the whole shared `cargo test` process and every parallel test
+    // thread, making the suite non-deterministic. Its Linux behavior is covered
+    // piecewise without touching process-global state: BPF compilation by
+    // `scrape_denylist_compiles_to_bpf`, and kernel install + allow/EPERM
+    // semantics thread-locally by `filter_allows_normal_ops_and_eperms_scrape`.
+    // Exercising the all-threads install itself belongs in a dedicated-process
+    // integration test (its own tests/*.rs binary running exactly one test, so
+    // the filter dies with that process), not in the shared unit harness.
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn install_late_seccomp_filter_is_safe_to_call() {
         super::install_late_seccomp_filter();
