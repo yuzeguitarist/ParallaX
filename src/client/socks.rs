@@ -9,15 +9,6 @@ pub struct SocksRequest {
     pub port: u16,
 }
 
-impl SocksRequest {
-    pub fn target(&self) -> String {
-        match self.host.parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V6(_)) => format!("[{}]:{}", self.host, self.port),
-            _ => format!("{}:{}", self.host, self.port),
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum SocksError {
     #[error("I/O error: {0}")]
@@ -196,16 +187,6 @@ mod tests {
             matches!(result, Err(SocksError::InvalidDomain)),
             "non-UTF-8 domain must be rejected at the SOCKS boundary, got {result:?}"
         );
-    }
-
-    #[test]
-    fn target_brackets_ipv6_literals() {
-        let request = SocksRequest {
-            host: "::1".to_owned(),
-            port: 443,
-        };
-
-        assert_eq!(request.target(), "[::1]:443");
     }
 }
 
