@@ -15,7 +15,8 @@
 //! info = "parallax-seal-v1|<field>"). The base64 secret text is then sealed with
 //! XChaCha20-Poly1305 (random 24B nonce) using `version | bundle-id | field` as
 //! AAD, so an entry cannot be silently swapped between fields, transplanted into
-//! another bundle, or rolled back across a re-seal (each bundle has a fresh id).
+//! another bundle, or rolled back across a re-seal (every seal — including a
+//! re-seal into an existing bundle — rotates the bundle id; see [`seal_into`]).
 
 use std::{
     collections::BTreeMap,
@@ -92,14 +93,18 @@ pub struct SealedBundle {
 
 impl Default for SealedBundle {
     fn default() -> Self {
-        let mut id = [0_u8; 16];
-        OsRng.fill_bytes(&mut id);
         Self {
             version: BUNDLE_VERSION,
-            id: STANDARD.encode(id),
+            id: fresh_bundle_id(),
             entries: BTreeMap::new(),
         }
     }
+}
+
+fn fresh_bundle_id() -> String {
+    let mut id = [0_u8; 16];
+    OsRng.fill_bytes(&mut id);
+    STANDARD.encode(id)
 }
 
 /// Resolve the host keyfile path: the explicit override wins, then the
@@ -166,6 +171,9 @@ pub fn load_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealErr
     // `[u8; 32]` is Copy, so the move into `Zeroizing` above left a plaintext copy
     // of the host key on the stack; wipe it explicitly.
     key.zeroize();
+    // The host key is the single value that unlocks every sealed secret; keep it
+    // out of swap and core dumps while resident, like the PSK/identity keys.
+    crate::process_hardening::protect_secret_bytes("secret_store.host_key", out.as_slice());
     Ok(out)
 }
 
@@ -178,16 +186,111 @@ pub fn create_host_key(over: Option<&Path>) -> Result<Zeroizing<[u8; 32]>, SealE
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(SealError::Io)?;
+            ensure_host_key_dir(parent)?;
         }
     }
 
     let mut key = Zeroizing::new([0_u8; 32]);
     OsRng.fill_bytes(key.as_mut_slice());
+    // Same rationale as in `load_host_key`: never let the freshly minted host
+    // key hit swap or a core dump.
+    crate::process_hardening::protect_secret_bytes("secret_store.host_key", key.as_slice());
     let encoded = Zeroizing::new(STANDARD.encode(key.as_slice()));
 
     write_owner_only(&path, encoded.as_bytes())?;
     Ok(key)
+}
+
+/// Ensure the directory that will hold the host keyfile exists with
+/// least-privilege permissions. A missing directory (the common first-run
+/// `/var/lib/parallax` case, which also stores the sealed bundle and replay
+/// cache) is created 0700 — a plain `create_dir_all` under the default umask
+/// would yield a world-listable 0755 dir. Whether pre-existing or freshly
+/// created, the final component is opened `O_NOFOLLOW | O_DIRECTORY` and
+/// fstat-verified through the fd, mirroring `runtime_guard::ensure_state_dir`:
+/// `Path::is_dir()` follows symlinks, so a metadata-based fast path would let
+/// a planted symlink pass and `host.key` would land inside the attacker-chosen
+/// target. A pre-existing directory's mode is left untouched (its mode is the
+/// operator's decision — chmod'ing e.g. `.` for a relative `--host-key` would
+/// be hostile), with a best-effort warning when it is not owned by the current
+/// user or grants group/world write.
+fn ensure_host_key_dir(dir: &Path) -> Result<(), SealError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let euid = rustix::process::geteuid().as_raw();
+        // Probe the final component with O_NOFOLLOW | O_DIRECTORY — never
+        // `is_dir()`, which follows symlinks. An existing real directory
+        // opens; a planted symlink fails closed with ELOOP (ENOTDIR on
+        // macOS) and a non-directory with ENOTDIR; only a genuinely missing
+        // directory falls through to creation below.
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)
+        {
+            Ok(dir_file) => {
+                let metadata = dir_file.metadata().map_err(SealError::Io)?;
+                let uid = metadata.uid();
+                let mode = metadata.permissions().mode() & 0o777;
+                if uid != euid || mode & 0o022 != 0 {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        uid,
+                        euid,
+                        mode = %format_args!("{mode:o}"),
+                        "host-key directory is not an owner-only directory of the current \
+                         user; whoever can write it can replace the host key or sealed bundle"
+                    );
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(SealError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "host-key directory {} could not be opened without following \
+                         symlinks: {err}",
+                        dir.display()
+                    ),
+                )));
+            }
+        }
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(SealError::Io)?;
+
+        let dir_file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)
+            .map_err(SealError::Io)?;
+        let metadata = dir_file.metadata().map_err(SealError::Io)?;
+        let uid = metadata.uid();
+        if !metadata.is_dir() || uid != euid {
+            return Err(SealError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "host-key directory {} is not a euid-owned directory (uid={uid}, euid={euid})",
+                    dir.display()
+                ),
+            )));
+        }
+        // fchmod through the validated handle: exactly 0700 regardless of umask.
+        dir_file
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(SealError::Io)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir).map_err(SealError::Io)
+    }
 }
 
 fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), SealError> {
@@ -197,7 +300,11 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), SealError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // `create_new` is O_CREAT | O_EXCL, which POSIX already defines to
+        // fail on a symlinked final component (even a dangling one); add
+        // O_NOFOLLOW so the no-symlink guarantee is explicit rather than a
+        // side effect of the exclusivity flag.
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path).map_err(SealError::Io)?;
     file.write_all(contents).map_err(SealError::Io)?;
@@ -213,6 +320,9 @@ fn derive_kek(host_key: &[u8; 32], salt: &[u8], field: &str) -> Zeroizing<[u8; 3
     let mut okm = Zeroizing::new([0_u8; 32]);
     hkdf.expand(&info, okm.as_mut_slice())
         .expect("HKDF-SHA256 expand of 32 bytes never fails");
+    // The KEK decrypts a long-lived secret; exclude it from swap/core dumps for
+    // its short lifetime (best-effort, page-granular — see process_hardening).
+    crate::process_hardening::protect_secret_bytes("secret_store.kek", okm.as_slice());
     okm
 }
 
@@ -239,6 +349,11 @@ fn seal_secret(host_key: &[u8; 32], field: &str, aad: &[u8], plaintext_b64: &str
     OsRng.fill_bytes(&mut nonce);
 
     let kek = derive_kek(host_key, &salt, field);
+    // `derive_kek` protected its own buffer, but returning the Copy array moved
+    // the KEK to this frame and page protection does not follow a move (same
+    // pattern as the host key in `open_sealed_reference`); protect the copy
+    // that is actually used to encrypt.
+    crate::process_hardening::protect_secret_bytes("secret_store.kek", kek.as_slice());
     let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.as_slice()));
     let ciphertext = cipher
         .encrypt(
@@ -279,6 +394,9 @@ fn open_entry(
         .map_err(|_| SealError::BundleMalformed)?;
 
     let kek = derive_kek(host_key, &salt, field);
+    // Same as in `seal_secret`: the move out of `derive_kek` left this frame's
+    // copy of the KEK unprotected; re-protect it for the decrypt's lifetime.
+    crate::process_hardening::protect_secret_bytes("secret_store.kek", kek.as_slice());
     let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.as_slice()));
     // Hold the decrypted plaintext in Zeroizing so the buffer is wiped on every
     // path, including the non-UTF-8 error branch below.
@@ -333,20 +451,51 @@ pub fn bundle_to_toml(bundle: &SealedBundle) -> String {
 }
 
 /// Seal `(field, base64-secret)` pairs into an existing bundle, in place. New
-/// fields are added; an existing field is re-sealed (overwritten). Entries are
-/// bound to `bundle.id`, so merging keeps every entry openable.
+/// fields are added; an existing field is re-sealed (overwritten); entries not
+/// named in `secrets` are retained.
+///
+/// Every call rotates `bundle.id` to a fresh random value and re-seals the
+/// retained entries under it, keeping the documented guarantee that a
+/// superseded entry cannot be rolled back into (or transplanted across) a
+/// re-sealed bundle — without rotation, a re-seal would leave the old id in
+/// place and an attacker holding a previous bundle could splice a superseded
+/// entry back in. Retaining an entry requires decrypting it first, so this
+/// fails closed (bundle untouched) if any retained entry does not open under
+/// `host_key` — better than silently carrying an entry whose rollback
+/// protection can no longer be preserved.
 pub fn seal_into<'a>(
     bundle: &mut SealedBundle,
     host_key: &[u8; 32],
     secrets: impl IntoIterator<Item = (&'a str, &'a str)>,
-) {
-    for (field, plaintext_b64) in secrets {
+) -> Result<(), SealError> {
+    let replacements: Vec<(&str, &str)> = secrets.into_iter().collect();
+    let mut retained: Vec<(String, Zeroizing<String>)> = Vec::new();
+    for (field, entry) in &bundle.entries {
+        if replacements
+            .iter()
+            .any(|(replaced, _)| *replaced == field.as_str())
+        {
+            continue;
+        }
+        let aad = entry_aad(bundle.version, &bundle.id, field);
+        let plaintext = open_entry(host_key, field, &aad, entry)?;
+        retained.push((field.clone(), plaintext));
+    }
+
+    bundle.id = fresh_bundle_id();
+    bundle.entries.clear();
+    for (field, plaintext_b64) in retained
+        .iter()
+        .map(|(field, plaintext)| (field.as_str(), plaintext.as_str()))
+        .chain(replacements.iter().copied())
+    {
         let aad = entry_aad(bundle.version, &bundle.id, field);
         bundle.entries.insert(
             field.to_owned(),
             seal_secret(host_key, field, &aad, plaintext_b64),
         );
     }
+    Ok(())
 }
 
 /// Build a fresh sealed bundle from `(field, base64-secret)` pairs.
@@ -355,7 +504,8 @@ pub fn seal_all<'a>(
     secrets: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> SealedBundle {
     let mut bundle = SealedBundle::default();
-    seal_into(&mut bundle, host_key, secrets);
+    seal_into(&mut bundle, host_key, secrets)
+        .expect("a fresh bundle has no retained entries to decrypt");
     bundle
 }
 
@@ -376,6 +526,10 @@ pub fn open_sealed_reference(
             field: field.to_owned(),
         })?;
     let host_key = load_host_key(over)?;
+    // `load_host_key` protected its own buffer, but returning the Copy array
+    // moved the key to this frame and page protection does not follow a move;
+    // protect the copy that stays resident while entries decrypt.
+    crate::process_hardening::protect_secret_bytes("secret_store.host_key", host_key.as_slice());
     let aad = entry_aad(bundle.version, &bundle.id, field);
     open_entry(&host_key, field, &aad, entry)
 }
@@ -442,6 +596,78 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn create_host_key_creates_owner_only_state_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state").join("parallax");
+        create_host_key(Some(&state.join("host.key"))).unwrap();
+        // The final state-dir component is exactly owner-only...
+        let mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "state dir must be created 0700, got {mode:o}");
+        // ...and intermediate components we created grant no group/world access.
+        let inter = fs::metadata(dir.path().join("state"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            inter & 0o077,
+            0,
+            "intermediate dirs must not grant group/world access, got {inter:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_host_key_leaves_pre_existing_dir_mode_alone() {
+        // A directory the OPERATOR already created keeps its chosen mode: the
+        // 0700 tightening applies only to dirs plx creates itself (chmod'ing a
+        // pre-existing dir — e.g. `.` for a relative --host-key — is hostile).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        create_host_key(Some(&state.join("host.key"))).unwrap();
+        let mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "pre-existing dir mode belongs to the operator");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_host_key_rejects_symlinked_parent_dir() {
+        // `Path::is_dir()` follows symlinks, so a planted parent symlink used
+        // to pass the pre-existing-directory fast path and `host.key` would be
+        // created inside the attacker-chosen target. The O_NOFOLLOW |
+        // O_DIRECTORY probe must fail closed instead.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("state");
+        symlink(&target, &link).unwrap();
+        let err = create_host_key(Some(&link.join("host.key"))).unwrap_err();
+        assert!(matches!(err, SealError::Io(_)));
+        // Fails closed: nothing was written through the symlink.
+        assert!(!target.join("host.key").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_host_key_rejects_dangling_symlink_parent_dir() {
+        // A dangling symlink where the state dir should be must not be
+        // followed into creating the target path either: O_NOFOLLOW yields
+        // ELOOP (not NotFound), so creation never runs.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("state");
+        symlink(dir.path().join("nonexistent"), &link).unwrap();
+        let err = create_host_key(Some(&link.join("host.key"))).unwrap_err();
+        assert!(matches!(err, SealError::Io(_)));
+    }
+
     #[test]
     fn create_host_key_refuses_overwrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -483,13 +709,56 @@ mod tests {
     fn seal_into_merges_without_dropping_existing_entries() {
         let (_dir, key) = temp_host_key();
         let mut bundle = seal_all(&key, [("crypto.psk", "AAAA")]);
-        seal_into(&mut bundle, &key, [("server.private_key", "BBBB")]);
+        seal_into(&mut bundle, &key, [("server.private_key", "BBBB")]).unwrap();
         // Both the pre-existing and the merged-in entry remain openable.
         for (field, expected) in [("crypto.psk", "AAAA"), ("server.private_key", "BBBB")] {
             let aad = entry_aad(bundle.version, &bundle.id, field);
             let opened = open_entry(&key, field, &aad, &bundle.entries[field]).unwrap();
             assert_eq!(opened.as_str(), expected);
         }
+    }
+
+    #[test]
+    fn reseal_rotates_bundle_id_and_defeats_entry_rollback() {
+        let (_dir, key) = temp_host_key();
+        let mut bundle = seal_all(&key, [("crypto.psk", "AAAA")]);
+        let old_id = bundle.id.clone();
+        let superseded = bundle.entries["crypto.psk"].clone();
+
+        seal_into(&mut bundle, &key, [("crypto.psk", "BBBB")]).unwrap();
+        assert_ne!(bundle.id, old_id, "a re-seal must rotate the bundle id");
+
+        // Splicing the superseded entry into the re-sealed bundle must fail:
+        // its AAD carries the old id, and the id has rotated.
+        let aad = entry_aad(bundle.version, &bundle.id, "crypto.psk");
+        assert!(matches!(
+            open_entry(&key, "crypto.psk", &aad, &superseded),
+            Err(SealError::Decrypt)
+        ));
+        // The replacement value opens under the rotated id.
+        let opened = open_entry(&key, "crypto.psk", &aad, &bundle.entries["crypto.psk"]).unwrap();
+        assert_eq!(opened.as_str(), "BBBB");
+    }
+
+    #[test]
+    fn reseal_fails_closed_when_a_retained_entry_does_not_open() {
+        // Rotating the id requires re-encrypting retained entries; a retained
+        // entry sealed under a DIFFERENT host key cannot be re-encrypted, so the
+        // seal must fail without touching the bundle rather than silently break
+        // (or silently keep) that entry.
+        let (_dir_a, key_a) = temp_host_key();
+        let (_dir_b, key_b) = temp_host_key();
+        let mut bundle = seal_all(&key_a, [("crypto.psk", "AAAA")]);
+        let id_before = bundle.id.clone();
+
+        let err = seal_into(&mut bundle, &key_b, [("server.private_key", "BBBB")]).unwrap_err();
+        assert!(matches!(err, SealError::Decrypt));
+        assert_eq!(
+            bundle.id, id_before,
+            "failed seal must leave the bundle untouched"
+        );
+        assert!(bundle.entries.contains_key("crypto.psk"));
+        assert!(!bundle.entries.contains_key("server.private_key"));
     }
 
     #[test]
