@@ -44,6 +44,10 @@ Options:
   --no-install-build-tools     Do not install missing local build helpers; fail with instructions instead.
   --enable-bbr                 Configure VPS tcp_bbr + fq during deploy. Default.
   --no-enable-bbr              Skip remote BBR/fq sysctl configuration.
+  --seal                       Run plx seal on the VPS after install so no plaintext
+                               secret stays at rest in the server config. Default.
+  --no-seal                    Skip sealing; the server config keeps inline plaintext
+                               secrets (0600, owned by the parallax service user).
   --profile-mode <mode>        Profiling integration: none or polar-cloud. Defaults to none.
   --polar-token-file <path>    Read Polar Signals token from this local file instead of prompting.
                                Useful for CI. (An inline token argument is intentionally NOT
@@ -728,9 +732,10 @@ build_host_tools_and_configs() {
     rm -f "$server_cfg" "$client_cfg"
     deploy_info_log "generating local-only server/client configs"
     # Inline secrets here on purpose: the deploy flow uploads a single
-    # self-contained server config to the VPS (kept 0600, never committed). To
-    # machine-bind it afterwards, run `plx seal -c parallax.server.toml` on the
-    # server. Interactive `plx init` defaults to split/referenced secret files.
+    # self-contained server config to the VPS (kept 0600, never committed).
+    # After install, the deploy runs `plx seal` on the server (unless --no-seal)
+    # so the config at rest on the VPS stops carrying plaintext secrets.
+    # Interactive `plx init` defaults to split/referenced secret files.
     run cargo run --locked --quiet --bin plx -- init "$DEST" \
       --server-addr "$SERVER_ADDR" \
       --server-listen "$SERVER_LISTEN" \
@@ -890,9 +895,27 @@ After=network-online.target
 Type=simple
 ExecStart=$REMOTE_BIN serve -c $REMOTE_CONFIG
 WorkingDirectory=/var/lib/parallax
+# Run as a dedicated non-root system user (created by deploy-vps.sh). Without
+# User=, a service RCE is instantly root, which defeats both this sandbox and
+# the in-process secret hardening. Deliberately NOT DynamicUser=yes: the config
+# loader fstat-checks that the 0600 config and the seal host key are owned by
+# the process euid (src/config.rs read_secret_config_file), and 'plx seal' must
+# run as the same uid at deploy time - a per-start dynamic uid can satisfy
+# neither, so the files under /etc/parallax and /var/lib/parallax are owned by
+# the fixed parallax user instead.
+User=parallax
+Group=parallax
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+# The process mlock()s secret key pages to keep them out of swap
+# (src/process_hardening.rs). Without an explicit LimitMEMLOCK the distro
+# default (often 8 MiB or even 64 KiB) can silently cap those locks, degrading
+# swap-pinning with only a one-shot warning. LimitCORE=0 mirrors the
+# in-process setrlimit(RLIMIT_CORE, 0) so core dumps stay off even before
+# main() runs.
+LimitMEMLOCK=infinity
+LimitCORE=0
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -912,10 +935,10 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
 # Endpoint hardening. Hide other PIDs in /proc from this service (limits it as a
-# pivot for enumerating other processes). NOTE: the service currently runs as root
-# (no User=), so ProtectProc does not stop a root-equivalent observer — it is a
-# mild defense-in-depth, not memory protection. The in-process PR_SET_DUMPABLE=0
-# (src/process_hardening.rs) is what actually resists a non-root debugger attach.
+# pivot for enumerating other processes). With User=parallax this is real
+# containment: the unprivileged service cannot observe other users' processes.
+# The in-process PR_SET_DUMPABLE=0 (src/process_hardening.rs) additionally
+# resists a same-uid debugger attach.
 ProtectProc=invisible
 # syscall filter: @system-service is systemd's curated service baseline and covers
 # ParallaX's network + epoll path. It does NOT include the ptrace family, so the
@@ -930,6 +953,17 @@ SystemCallFilter=@system-service @memlock
 SystemCallFilter=~@debug
 SystemCallErrorNumber=EPERM
 ReadWritePaths=/var/lib/parallax
+# systemd keeps /var/lib/parallax present and owned by User=parallax; the
+# replay cache and the 'plx seal' host key live here and must be owned by the
+# service user to pass the loader's uid == euid check.
+StateDirectory=parallax
+# Without an explicit mode systemd re-applies its 0755 default to the state
+# dir on every start, silently undoing the deploy's 0700 and leaving the host
+# key + replay cache directory world-listable.
+StateDirectoryMode=0700
+# Bind :443 without root: keep ONLY the bind capability, ambient so the
+# non-root service actually receives it, and bound so nothing else can be
+# gained even through an exec.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
@@ -1313,9 +1347,76 @@ fi
 REMOTE_PROFILE
 )
   fi
+  # Seal the uploaded config's inline secrets on the server (plx seal encrypts
+  # them under a host-local key so nothing plaintext stays at rest). It must run
+  # AS the parallax user: the hardened config reader requires uid == euid on the
+  # 0600 config, and the rewrite + bundle write go through a temp file + atomic
+  # rename, which needs WRITE access on the containing directory. Handing the
+  # real config dir to the service user would also hand it every sibling file
+  # (e.g. the Polar Signals token/env installed there), so the seal instead runs
+  # in a parallax-owned staging dir under /var/lib/parallax (the service's own
+  # state dir) and root installs the sealed config + bundle back into the
+  # root-owned config dir. The parallax user ends up owning exactly its config
+  # file, the bundle, and the state dir — nothing else. Skipped (with a loud
+  # warning) when the config dir is a shared system directory whose ownership
+  # and mode we must not manage, or when the operator passed --no-seal. Seal
+  # failure is non-fatal: the plaintext config is still valid, so the service
+  # still starts.
+  local seal_secrets_script=""
+  if [[ "$SEAL_SECRETS" == "1" ]]; then
+    case "$(dirname "$REMOTE_CONFIG")" in
+      /|/etc|/usr|/usr/local|/usr/local/etc|/var|/var/lib|/srv|/opt|/root|/home|/tmp)
+        warn "config dir $(dirname "$REMOTE_CONFIG") is a shared system directory; refusing to manage its ownership or write a sealed bundle into it, so plx seal is SKIPPED and the server config keeps INLINE PLAINTEXT secrets (0600). Use a dedicated --remote-config directory (default /etc/parallax) to enable sealing."
+        ;;
+      *)
+        seal_secrets_script=$(cat <<REMOTE_SEAL
+echo "Sealing server secrets at rest (plx seal)..."
+# The config dir stays root-owned: only the config file itself (and the state
+# dir) belong to the service user. The chown also reverts dirs handed to
+# parallax by earlier revisions of this script.
+$sudo_prefix chown root:root $q_remote_config_dir
+$sudo_prefix chmod 0755 $q_remote_config_dir
+if command -v runuser >/dev/null 2>&1; then
+  # Stage in the service's own state dir, seal there, then install the sealed
+  # results (still 0600, owner parallax) into the root-owned config dir. The
+  # host key is created at /var/lib/parallax/host.key either way, and the
+  # rewritten config references the bundle by bare file name, which resolves
+  # against whatever directory the config is loaded from.
+  seal_staging=/var/lib/parallax/.seal-staging
+  $sudo_prefix rm -rf "\$seal_staging"
+  $sudo_prefix install -d -m 0700 -o parallax -g parallax "\$seal_staging"
+  $sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml "\$seal_staging/parallax.server.toml"
+  # Seed the staging dir with the CURRENT live bundle (if any) so 'plx seal'
+  # MERGES into it rather than replacing it — otherwise sealing in an empty dir
+  # would silently drop sealed entries this bundle holds for other configs that
+  # share it (cubic P2). Copied as parallax so the seal (run as parallax) can
+  # rewrite it in place.
+  if $sudo_prefix test -f $q_remote_config_dir/parallax.secrets.enc; then
+    $sudo_prefix install -m 0600 -o parallax -g parallax $q_remote_config_dir/parallax.secrets.enc "\$seal_staging/parallax.secrets.enc"
+  fi
+  if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c "\$seal_staging/parallax.server.toml"; then
+    $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.server.toml" $q_remote_config
+    $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.secrets.enc" $q_remote_config_dir/parallax.secrets.enc
+    echo "Server secrets are machine-bound (sealed); the config on this VPS is no longer a plaintext bearer credential."
+  else
+    echo 'warning: plx seal failed; the server config still holds INLINE PLAINTEXT secrets at '$q_remote_config' (kept 0600, owner parallax). Fix the reported error and re-run the deploy to retry sealing.' >&2
+  fi
+  $sudo_prefix rm -rf "\$seal_staging"
+else
+  echo 'warning: runuser not found on the VPS; skipped plx seal — the server config holds INLINE PLAINTEXT secrets at '$q_remote_config' (kept 0600, owner parallax). Install runuser (util-linux) and re-run the deploy to seal.' >&2
+fi
+REMOTE_SEAL
+)
+        ;;
+    esac
+  else
+    warn "sealing disabled (--no-seal): the server config keeps INLINE PLAINTEXT secrets at $REMOTE_CONFIG (kept 0600, owned by the parallax user). To seal, re-run the deploy without --no-seal."
+  fi
+
   local remote_script
   remote_script=$(cat <<REMOTE
 set -Eeuo pipefail
+export PATH="\$PATH:/usr/sbin:/sbin"
 PARCA_AGENT_CHANNEL=$q_parca_agent_channel
 cleanup_remote_tmp() {
   rm -rf $q_tmp
@@ -1323,10 +1424,26 @@ cleanup_remote_tmp() {
 trap cleanup_remote_tmp EXIT
 $net_buffer_sysctl_script
 $bbr_install_script
-$sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir /var/lib/parallax
+if ! id -u parallax >/dev/null 2>&1; then
+  echo "Creating dedicated parallax system user for the service..."
+  nologin_shell="\$(command -v nologin || echo /usr/sbin/nologin)"
+  if getent group parallax >/dev/null 2>&1; then
+    $sudo_prefix useradd --system --gid parallax --home-dir /var/lib/parallax --no-create-home --shell "\$nologin_shell" parallax
+  else
+    $sudo_prefix useradd --system --user-group --home-dir /var/lib/parallax --no-create-home --shell "\$nologin_shell" parallax
+  fi
+fi
+$sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir
 $sudo_prefix install -m 0755 $q_tmp/plx $q_remote_bin
-$sudo_prefix install -m 0600 $q_tmp/parallax.server.toml $q_remote_config
+# The service runs as User=parallax and the config loader fstat-checks that the
+# 0600 config, the seal host key, and the replay cache are owned by that exact
+# uid — root-owned files would fail startup. chown -R also adopts files left
+# root-owned by older root-running deployments.
+$sudo_prefix install -d -m 0700 -o parallax -g parallax /var/lib/parallax
+$sudo_prefix chown -R parallax:parallax /var/lib/parallax
+$sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml $q_remote_config
 $replay_cache_reset_script
+$seal_secrets_script
 $sudo_prefix install -m 0644 $q_tmp/parallax.service $q_service_path
 if command -v systemctl >/dev/null 2>&1; then
   $sudo_prefix systemctl daemon-reload
@@ -1385,6 +1502,7 @@ CARGO_PROFILE_SET="0"
 DOCKER_IMAGE="${PARALLAX_DOCKER_IMAGE:-rust:1-bookworm}"
 INSTALL_BUILD_TOOLS="yes"
 ENABLE_BBR="1"
+SEAL_SECRETS="1"
 PROFILE_MODE="none"
 POLAR_TOKEN_FILE=""
 POLAR_PROJECT_ID=""
@@ -1425,6 +1543,8 @@ while [[ $# -gt 0 ]]; do
     --no-install-build-tools) INSTALL_BUILD_TOOLS="no"; shift ;;
     --enable-bbr) ENABLE_BBR="1"; shift ;;
     --no-enable-bbr) ENABLE_BBR="0"; shift ;;
+    --seal) SEAL_SECRETS="1"; shift ;;
+    --no-seal) SEAL_SECRETS="0"; shift ;;
     --profile-mode) PROFILE_MODE=${2:-}; shift 2 ;;
     --polar-bearer-token)
       die "--polar-bearer-token is no longer supported: an argv token leaks via /proc/<pid>/cmdline, ps, and CI logs. Use --polar-token-file or the interactive hidden prompt."
