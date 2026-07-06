@@ -93,12 +93,12 @@ extend the negative control so the new heuristic is proven to have teeth.
 ## Topology
 
 ```
- trafficgen ──SOCKS5──▶ plx client ──TCP/UDP──▶ ┌─────────────┐ ──▶ plx server ──▶ origin (HTTP)
-                                                 │   gfw-box   │
-                                                 │  (censor)   │
-                                                 │ • link sim  │
-                                                 │ • analysis  │
-                                                 └─────────────┘
+                                              ┌─────────────┐ 
+                                              │   gfw-box   │
+trafficgen ──SOCKS5──▶ plx client ──TCP/UDP──▶│  (censor)   │──▶ plx server ──▶ origin (HTTP)
+                                              │ • link sim  │
+                                              │ • analysis  │
+                                              └─────────────┘
 ```
 
 The client's `server_addr` points at the **gfw-box**, which transparently
