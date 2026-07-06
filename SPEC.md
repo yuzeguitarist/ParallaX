@@ -935,22 +935,22 @@ CLIENT                          PARALLAX SERVER                      FALLBACK OR
   │◄═══ EncryptedExtensions, Certificate, CertificateVerify, Finished ════│ origin's real
   │       (client verifies ORIGIN cert vs sni)                            │  cert + flight
   │══ ChangeCipherSpec ═══════════════ (client's 2nd flight, before ═════►│
-  │══ Finished ════════════════════════ the encrypted Finished) ═════════►│
+  │══ Finished ═══════════════════════ the encrypted Finished) ══════════►│
   │                                   │                                   │
   │== both derive chain_secret + epoch-0 keys from the ParallaX auth ECDH │
   │   (§5.3/§5.4; independent of the TLS secrets; ServerHello is origin's)│
   │                                   │                                   │
   │  Phase B — PQ hybrid + identity (sealed, inside the established TLS)  │
   │─ PX1Q PqRekeyRequest(PX1F chunks)►│ first valid PX1Q ──► server STOPS │
-  │                                   │  relaying, drops origin ────────╳ │ (origin closed)
-  │                                   │  and answers as ParallaX itself:  │
+  │                                   │ relaying, drops origin ───────────╳ (origin closed)
+  │                                   │ and answers as ParallaX itself:   │
   │◄── PX1K ServerKeyExchange (+tag) ─│                                  ───
-  │◄── PX1S/PX1I ServerIdentityProof ─│ (ML-DSA-87 signature)             
-  │== rekey: epoch=1, seq=0, new keys │ (§5.7)                           
-  │(client verifies ML-DSA sig; FAIL ─► abort)                          
+  │◄── PX1S/PX1I ServerIdentityProof ─│  (ML-DSA-87 signature)             
+  │== rekey: epoch=1, seq=0, new keys │  (§5.7)                           
+  │ (client verifies ML-DSA sig; FAIL ─► abort)                          
   │                                   │                                    
   │ Phase C — command (sealed)        │                                    
-  │── PX1C CONNECT host:port(+0-RTT) ►│ server dials the real target      
+  │──PX1C CONNECT host:port(+0-RTT)──►│ server dials the real target      
   │                                   │                                    
   │ Phase D — data relay (sealed, optionally muxed)                       
   │◄───────── PX1M / record stream ──►│                                   
@@ -1683,12 +1683,12 @@ traffic in two ways:
 2. **Negotiation handshake (over TCP):**
 
 ```
-CLIENT                                  SERVER
-  │── PX1G  UDP_REQUEST (version=1) ───►│
-  │                                     │ (UDP enabled?)
-  │◄── PX1O UDP_OFFER (port, cc, fec) ──│   or  ◄── PX1N UDP_DECLINE (reason)
-  │── PX1P UDP_PROBE_ACK ──────────────►│   (path probe result)
-  │   ... bring up QUIC plane ...       │
+CLIENT                                 SERVER
+  │─── PX1G UDP_REQUEST (version=1) ────►│
+  │                                      │ (UDP enabled?)
+  │◄── PX1O UDP_OFFER (port, cc, fec) ───│ or ◄─── PX1N UDP_DECLINE (reason)
+  │─── PX1P UDP_PROBE_ACK ──────────────►│ (path probe result)
+  │    ... bring up QUIC plane ...       │
 ```
 
 The offer advertises a UDP `port`, a congestion-control choice (`cc`: BBR or
