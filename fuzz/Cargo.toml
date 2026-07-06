@@ -163,3 +163,38 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "quic_server_hello"
+path = "fuzz_targets/quic_server_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_encrypted_extensions"
+path = "fuzz_targets/quic_encrypted_extensions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_certificate"
+path = "fuzz_targets/quic_certificate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_certificate_verify"
+path = "fuzz_targets/quic_certificate_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_compressed_cert"
+path = "fuzz_targets/quic_compressed_cert.rs"
+test = false
+doc = false
+bench = false
+

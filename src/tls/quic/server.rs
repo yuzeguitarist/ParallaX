@@ -190,9 +190,23 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloSummary, QuicTlsError> {
     let mut psk_binder = None;
     let mut psk_binders_wire_len = None;
     let mut offers_early_data = false;
+    // RFC 8446 §4.2: "There MUST NOT be more than one extension of the same type
+    // in a given extension block." The client-side ServerHello parser already
+    // rejects repeats (handshake.rs); reject them here too so the server is not the
+    // lenient end of the pair (silent last-writer-wins is an active-probe tell vs a
+    // real TLS stack).
+    // A HashSet keeps the check linear: repeated Vec scans would be quadratic in
+    // the extension count — a pre-authentication DoS amplifier.
+    let mut seen_extensions: std::collections::HashSet<u16> = std::collections::HashSet::new();
     while er.remaining() > 0 {
         let ext_type = er.u16()?;
         let ext_data = er.vec_u16()?;
+        if !seen_extensions.insert(ext_type) {
+            return Err(QuicTlsError::alert(
+                ALERT_ILLEGAL_PARAMETER,
+                "duplicate extension in ClientHello",
+            ));
+        }
         match ext_type {
             EXT_SERVER_NAME => {
                 // ServerNameList: u16 list_len, then [name_type(1) u16 name_len name].
@@ -1191,6 +1205,41 @@ mod tests {
             panic!("trailing-byte ClientHello must be rejected");
         };
         assert_eq!(err.alert_description(), Some(ALERT_DECODE_ERROR));
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_extension() {
+        // RFC 8446 §4.2: an extension type MUST NOT appear more than once in a
+        // block. Duplicate the first extension of a real ClientHello (fixing the
+        // extensions-vector length) and assert the parser rejects it rather than
+        // silently applying last-writer-wins.
+        let body = real_client_hello_body();
+        let sid_len = body[34] as usize;
+        let cs_len_off = 2 + 32 + 1 + sid_len;
+        let cs_len = u16::from_be_bytes([body[cs_len_off], body[cs_len_off + 1]]) as usize;
+        let comp_off = cs_len_off + 2 + cs_len;
+        let comp_len = body[comp_off] as usize;
+        let ext_vec_len_off = comp_off + 1 + comp_len;
+        let ext_total =
+            u16::from_be_bytes([body[ext_vec_len_off], body[ext_vec_len_off + 1]]) as usize;
+        let ext_data_off = ext_vec_len_off + 2;
+        let ext_data = &body[ext_data_off..ext_data_off + ext_total];
+        // The first extension is type(2) ‖ len(2) ‖ body; append an exact copy so
+        // its type appears twice.
+        let first_len = u16::from_be_bytes([ext_data[2], ext_data[3]]) as usize;
+        let first = ext_data[..4 + first_len].to_vec();
+
+        let mut new_ext = ext_data.to_vec();
+        new_ext.extend_from_slice(&first);
+        let mut out = Vec::with_capacity(ext_vec_len_off + 2 + new_ext.len());
+        out.extend_from_slice(&body[..ext_vec_len_off]);
+        out.extend_from_slice(&(new_ext.len() as u16).to_be_bytes());
+        out.extend_from_slice(&new_ext);
+
+        let Err(err) = parse_client_hello(&out) else {
+            panic!("a ClientHello with a duplicate extension must be rejected");
+        };
+        assert_eq!(err.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
     }
 
     #[test]
