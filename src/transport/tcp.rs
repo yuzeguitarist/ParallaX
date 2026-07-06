@@ -670,31 +670,19 @@ mod kernel_splice {
         write_stream: StdTcpStream,
         idle_timeout: Duration,
     ) -> io::Result<()> {
-        match splice_pump(&read_stream, &write_stream, idle_timeout) {
-            Ok(()) => {
-                // FIN on clean exit (read-side idle timeout or EOF): drain bytes
-                // still queued on the read socket so its drop does not RST, then
-                // half-close the write socket so the downstream peer sees a
-                // graceful FIN. shutdown (not a bare drop) is required because the
-                // sibling direction still holds the other clone of this socket.
-                // Mirrors the userspace graceful_close path.
-                drain_std_recv(&read_stream);
-                let _ = write_stream.shutdown(Shutdown::Write);
-                Ok(())
-            }
-            Err(err) => {
-                // Abortive teardown on failure (e.g. a write-side idle timeout
-                // with bytes still buffered in the pipe): a graceful FIN here
-                // would masquerade a truncated stream as a clean close.
-                // SO_LINGER(0) turns the final close of the write socket into an
-                // RST so the peer observes the truncation, and shutting down its
-                // read side wakes the sibling direction (which reads the other
-                // clone of this socket) so the whole relay tears down promptly.
-                let _ = socket2::SockRef::from(&write_stream).set_linger(Some(Duration::ZERO));
-                let _ = write_stream.shutdown(Shutdown::Read);
-                Err(err)
-            }
-        }
+        let result = splice_pump(&read_stream, &write_stream, idle_timeout);
+        // Strict-FIN teardown on BOTH exits -- the clean path (read-side idle
+        // timeout or EOF) AND the error/truncation path (e.g. a write-side idle
+        // timeout with pipe-buffered bytes, or a splice/poll IO error). A wire RST
+        // is a censor-observable confirmation signal that a real origin never emits
+        // on close, so it is forbidden even on the error path: the fallback splice
+        // is the origin-facing, censor-observable plane. In every case we FIN the
+        // downstream and drain this direction's read socket toward EOF (bounded), so
+        // no socket drops with queued bytes and RSTs. The clean-vs-truncated
+        // distinction the relay relies on is surfaced to the caller through `result`
+        // -- a truncation returns `Err` -- NEVER by resetting the peer on the wire.
+        fin_write_then_drain_read(&read_stream, &write_stream);
+        result
     }
 
     /// Pumps one direction (read -> pipe -> write) until idle timeout, EOF, or
@@ -758,19 +746,77 @@ mod kernel_splice {
         }
     }
 
-    /// Best-effort, bounded, non-blocking drain of a socket's receive buffer so
-    /// that closing it emits a FIN rather than a RST. The stream is already
-    /// nonblocking (set in `splice_bidirectional_with_idle_timeout`).
-    fn drain_std_recv(stream: &StdTcpStream) {
+    /// Wall-clock budget for the FIN-first lingering drain of a splice direction's
+    /// read socket. Bounded so a peer that keeps sending (or never closes) after
+    /// our FIN cannot pin the blocking relay thread; matches the userspace relay's
+    /// `graceful_fin_then_drain` budget (`handshake::server`). Hitting this cutoff
+    /// with bytes still queued is the sole residual: an adversarial never-closing
+    /// sender then still risks a RST at the final drop, which is indistinguishable
+    /// from a real origin shedding a peer under memory pressure.
+    const FIN_DRAIN_TIME_BUDGET: Duration = Duration::from_secs(2);
+
+    /// Companion hard byte cap on the same drain: a fast, never-closing sender
+    /// keeps the read socket endlessly readable, so bound the total bytes discarded
+    /// per direction as well as the wall-clock time so it cannot pin the thread for
+    /// the full budget. Same residual as the time cutoff; generous enough to fully
+    /// drain a cooperating peer's in-flight backlog before it FINs.
+    const FIN_DRAIN_BYTE_BUDGET: usize = 16 * 1024 * 1024;
+
+    /// FIN-first graceful half-close of one splice direction -- the std/blocking
+    /// analogue of `handshake::server::graceful_fin_then_drain`. `shutdown(Write)`
+    /// the downstream FIRST (our FIN), THEN drain this direction's read socket
+    /// toward the peer's EOF -- bounded by both [`FIN_DRAIN_TIME_BUDGET`] and
+    /// [`FIN_DRAIN_BYTE_BUDGET`] -- so the read socket's final drop finds an empty
+    /// receive queue and the kernel emits a FIN, not a RST.
+    ///
+    /// Ordering matters: only draining to EOF *after* our FIN empties the receive
+    /// queue under a fast/late sender; the old drain-then-close (bounded at 256 KiB,
+    /// breaking on the first WouldBlock) left queued or just-arrived bytes at the
+    /// drop and the kernel RST'd -- the exact censor-observable tell a real origin
+    /// never produces. `shutdown(Read)` is deliberately NOT used here: it neither
+    /// flushes the receive queue nor suppresses the RST, and it cannot wake the
+    /// sibling direction without RST risk under continued data, so the sibling
+    /// instead tears down on its own per-direction idle timeout. `shutdown` (not a
+    /// bare drop) is required because the sibling still holds the other clone of
+    /// each socket. The stream is already nonblocking (set in
+    /// `splice_bidirectional_with_idle_timeout`).
+    fn fin_write_then_drain_read(read_stream: &StdTcpStream, write_stream: &StdTcpStream) {
         use std::io::Read;
-        let mut reader: &StdTcpStream = stream;
+
+        // FIN the downstream first, before draining, so the peer sees the graceful
+        // close promptly regardless of how long the read-side drain lingers.
+        let _ = write_stream.shutdown(Shutdown::Write);
+
+        // Then drain the read socket toward EOF so its final drop carries no queued
+        // bytes. Bounded by time AND bytes so a never-closing peer cannot pin us.
+        let start = Instant::now();
+        let mut drained = 0_usize;
         let mut scratch = [0_u8; 16 * 1024];
-        for _ in 0..16 {
+        let mut reader: &StdTcpStream = read_stream;
+        while drained < FIN_DRAIN_BYTE_BUDGET {
+            if start.elapsed() >= FIN_DRAIN_TIME_BUDGET {
+                break; // time budget elapsed (residual)
+            }
             match reader.read(&mut scratch) {
-                Ok(0) => break,
-                Ok(_) => continue,
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Ok(0) => break, // peer EOF: receive queue drained, clean FIN at drop
+                Ok(n) => drained = drained.saturating_add(n),
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    // Momentarily empty: wait (bounded) for late bytes or the
+                    // peer's FIN rather than stopping now, so a brief sender pause
+                    // cannot leave bytes to arrive between here and the final drop.
+                    match poll_fd_until_progress(
+                        read_stream.as_fd(),
+                        PollFlags::IN,
+                        FIN_DRAIN_TIME_BUDGET,
+                        start,
+                    ) {
+                        Ok(true) => {}      // readable (data or EOF): loop and read
+                        Ok(false) => break, // time budget elapsed (residual)
+                        Err(_) => break,    // poll error
+                    }
+                }
+                Err(_) => break, // read error (e.g. the peer RST'd): nothing to drain
             }
         }
     }
@@ -1012,6 +1058,93 @@ mod tests {
 
         flood.abort();
         origin_task.abort();
+    }
+
+    // Strict-FIN mandate: the ERROR/truncation teardown path (a write-side idle
+    // timeout with pipe-buffered bytes) must still close the write-side (origin-
+    // facing, censor-observable) peer with a graceful FIN -- the peer reads EOF --
+    // never a wire RST (which would surface as ConnectionReset). The truncation is
+    // surfaced to the CALLER via the relay's Err return, NOT by resetting the peer.
+    // This is the regression guard for the old SO_LINGER(0) abortive close.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn splice_relay_error_path_closes_write_peer_with_fin_not_rst() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // The origin stays idle past the idle timeout so the client->origin
+        // direction wedges and hits its write-side idle timeout with bytes still
+        // in the splice pipe -- the error/truncation teardown path. Only AFTER
+        // that does the origin read, so its reads observe the teardown the relay
+        // chose: a graceful FIN (Ok(0)) under the strict-FIN fix, or a RST
+        // (ConnectionReset) under the old SO_LINGER(0) abortive close.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            // Let the wedge form and the write-side idle timeout fire (idle
+            // timeout is 100ms below) before reading anything.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Drain whatever was buffered before the wedge; the TERMINAL read must
+            // be a graceful EOF (Ok(0)), never a ConnectionReset that a wire RST
+            // would produce.
+            let mut buf = [0_u8; 64 * 1024];
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), origin.read(&mut buf)).await {
+                    Ok(Ok(0)) => break,    // FIN observed: graceful, censor-safe close
+                    Ok(Ok(_)) => continue, // buffered pre-wedge bytes
+                    Ok(Err(err)) => panic!(
+                        "error-path teardown must FIN the write-side peer, got {:?}",
+                        err.kind()
+                    ),
+                    Err(_) => panic!("relay did not close the wedged write-side peer"),
+                }
+            }
+        });
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (client_side, _) = relay_listener.accept().await.unwrap();
+            let origin_side = TcpStream::connect(origin_addr).await.unwrap();
+            relay_kernel_splice_bidirectional_with_idle_timeout(
+                client_side,
+                origin_side,
+                Duration::from_millis(100),
+            )
+            .await
+        });
+
+        // Flood so bytes are sitting in the relay pipe when the write side wedges,
+        // and keep the client alive (write_all blocks once buffers fill) so its own
+        // teardown does not race the assertion on the origin side.
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        let flood = tokio::spawn(async move {
+            let chunk = vec![0x42_u8; 1024 * 1024];
+            for _ in 0..64 {
+                if client.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // The relay must fail (truncation surfaced to the caller as an error), which
+        // proves the truncation signal is threaded via the return value rather than
+        // via a wire RST.
+        let err = tokio::time::timeout(Duration::from_secs(10), relay_task)
+            .await
+            .expect("relay must tear down once the write side wedges")
+            .unwrap()
+            .expect_err("write-side idle timeout with pipe-buffered bytes must fail the relay");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        // The crux: the write-side peer saw a FIN, not a RST (asserted in the task).
+        tokio::time::timeout(Duration::from_secs(10), origin_task)
+            .await
+            .expect("origin must observe the teardown promptly")
+            .unwrap();
+
+        flood.abort();
     }
 
     // Finding #22: the idle clock is per direction, so a direction with no

@@ -413,9 +413,14 @@ mod tests {
         let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
 
         // The reader signals the opener once it has fully drained the stream, so
-        // the opener can keep `client_conn` alive until then: dropping the last
-        // Connection handle closes the QUIC connection (application close), which
-        // would tear the stream down before the reader sees the clean finish.
+        // the opener holds `client_conn` alive across the read. NOTE: this
+        // hand-rolled QUIC stack puts NO `Drop` on `Connection`/`SendStream`/
+        // `RecvStream`, so dropping the last app-side handle is SILENT -- it does
+        // NOT emit an application close or a RESET_STREAM. A dropped connection
+        // instead lingers until the endpoint driver reaps it at the idle timeout;
+        // explicit teardown is only via `Connection::close` or stream
+        // `finish`/`reset`. Keeping the handle live simply keeps the connection
+        // unambiguously present for the whole clean-finish read.
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         // quinn opens a bidi stream lazily: the acceptor only observes it once
