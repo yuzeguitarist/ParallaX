@@ -58,11 +58,10 @@ interpreted as in RFC 2119.
    Application (browser, curl, ...)
         │  SOCKS5  (CONNECT)
         ▼
-   ┌──────────────┐        Carrier: Safari-26 TLS1.3/H2  (TCP)
-   │ ParallaX     │  ════  or Safari-26 QUIC v1/H3       (UDP)  ════►  ┌──────────────┐
-   │ Client       │        camouflaged, authenticated                  │ ParallaX     │
-   └──────────────┘                                                    │ Server       │
-                                                                       └──────┬───────┘
+   ┌──────────────┐        Carrier: Safari-26 TLS1.3/H2  (TCP)         ┌──────────────┐
+   │ ParallaX     │  ════  or Safari-26 QUIC v1/H3       (UDP)  ════►  │ ParallaX     │
+   │ Client       │        camouflaged, authenticated                  │ Server       │
+   └──────────────┘                                                    └──────┬───────┘
                                                                               │ TCP/UDP
                                                                               ▼
                                                                     Destination (the CONNECT
