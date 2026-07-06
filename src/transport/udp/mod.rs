@@ -702,11 +702,17 @@ mod zero_rtt_resumption {
 
         // Server 1 (file-backed guard): cold session deposits a ticket, then a first
         // resumption is accepted (recording the ticket in the persistent cache).
+        // Hold the guard so we can deterministically flush its deferred persist
+        // before the "restart" (durability is offloaded to a background fsync —
+        // issue #24 — so a graceful restart must wait for that write to land;
+        // only a crash before it lands opens the documented cross-restart window).
+        let guard1 = load_guard();
+        let guard1_dyn: Arc<dyn crate::tls::quic::ZeroRttGuard> = guard1.clone();
         let server1 = bind_server_endpoint_0rtt(
             "127.0.0.1:0".parse().unwrap(),
             "localhost",
             derive_stek(&stek_seed),
-            load_guard(),
+            guard1_dyn,
         )
         .await
         .unwrap();
@@ -716,9 +722,12 @@ mod zero_rtt_resumption {
             resume_session(&client().await, &server1, addr1, ticket.clone()).await;
         assert!(accepted1, "before restart: fresh ticket's 0-RTT accepted");
 
-        // "Restart": drop server 1, rebuild on a fresh ephemeral endpoint with the
-        // SAME STEK and a guard RELOADED from the same persistent cache file.
+        // Graceful restart: flush the deferred persist so the accepted ticket is
+        // durably recorded, then drop server 1 and rebuild on a fresh ephemeral
+        // endpoint with the SAME STEK and a guard RELOADED from the same cache file.
+        guard1.flush_pending_for_test();
         drop(server1);
+        drop(guard1);
         let server2 = bind_server_endpoint_0rtt(
             "127.0.0.1:0".parse().unwrap(),
             "localhost",

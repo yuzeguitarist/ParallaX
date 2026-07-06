@@ -31,26 +31,35 @@ use crate::crypto::replay::{ReplayCache, ReplayEntry, ReplayInsertOutcome};
 /// the marker freshness window so a replay stays detectable for as long as the
 /// marker is valid.
 pub struct MarkerReplayGuard {
-    cache: Arc<Mutex<ReplayCache>>,
+    /// The cache normally lives in this slot; a background persist checks it out
+    /// (slot -> `None`) for the duration of the journal fsync and puts it back
+    /// after, so the mutex is only ever held for memory-fast operations — never
+    /// across disk I/O (same locking discipline as the 0-RTT guard, see
+    /// [`crate::transport::udp::zero_rtt`]).
+    cache: Arc<Mutex<Option<ReplayCache>>>,
 }
 
 impl MarkerReplayGuard {
     pub(crate) fn new(cache: ReplayCache) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(cache)),
+            cache: Arc::new(Mutex::new(Some(cache))),
         }
     }
 
     /// Record the marker and report whether this is its FIRST sighting. `true` means
     /// the connection may terminate locally (a real, non-replayed ParallaX client);
-    /// `false` means a replay (or a poisoned lock / full or stale cache) and the flow
-    /// must be spliced to the origin. `now_unix` is the current Unix time in seconds.
+    /// `false` means a replay (or a poisoned/contended lock, an in-flight background
+    /// persist, or a full or stale cache) and the flow must be spliced to the
+    /// origin. `now_unix` is the current Unix time in seconds.
     ///
     /// The dedup decision is made synchronously in memory under the lock (so a
     /// replayed marker is gated the instant its first sighting returns), but the
     /// durable journal write — an fsync — is offloaded to a blocking thread
     /// (issue #24): this method runs on the async QUIC endpoint driver task, and a
-    /// blocking fsync held under the mutex there stalls the whole executor.
+    /// blocking fsync held under the mutex there stalls the whole executor. For the
+    /// same reason the lock here is taken NON-BLOCKING (`try_lock`): if the gate
+    /// cannot be consulted immediately the marker FAILS CLOSED to a splice rather
+    /// than stall the driver waiting for a persist's fsync.
     pub(crate) fn first_sighting(&self, m: &Marker, now_unix: u64) -> bool {
         let mut hasher = Sha256::new();
         hasher.update(m.nonce);
@@ -73,12 +82,19 @@ impl MarkerReplayGuard {
             nonce,
             transcript_fingerprint,
         };
-        let inserted = match self.cache.lock() {
-            Ok(mut cache) => {
-                cache.insert_new_outcome_deferred(entry, now_unix) == ReplayInsertOutcome::Inserted
-            }
-            // A poisoned lock fails closed: treat as a replay (splice to origin)
-            // rather than risk re-exposing the local termination path.
+        let inserted = match self.cache.try_lock() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(cache) => {
+                    cache.insert_new_outcome_deferred(entry, now_unix)
+                        == ReplayInsertOutcome::Inserted
+                }
+                // A background persist has the cache checked out for its fsync:
+                // fail closed (splice to origin) instead of waiting on the disk.
+                None => false,
+            },
+            // A poisoned or contended lock fails closed: treat as a replay (splice
+            // to origin) rather than block the driver or risk re-exposing the
+            // local termination path.
             Err(_) => false,
         };
         if inserted {
@@ -88,21 +104,39 @@ impl MarkerReplayGuard {
     }
 
     /// Runs the queued durable persist (journal append + fsync) off the async
-    /// executor via `spawn_blocking`, reacquiring the lock only inside the
-    /// blocking pool. Outside a tokio runtime (sync tests) it persists inline,
-    /// matching the pre-deferral behavior. A persist failure is logged and the
-    /// queued entry retried on the next sighting; the in-memory record keeps
-    /// gating replays either way — only its restart durability is delayed.
+    /// executor via `spawn_blocking`. Outside a tokio runtime (sync tests) it
+    /// persists inline, matching the pre-deferral behavior. A persist failure is
+    /// logged and the queued entry retried on the next sighting; the in-memory
+    /// record keeps gating replays either way — only its restart durability is
+    /// delayed.
     fn persist_in_background(&self) {
-        let cache = Arc::clone(&self.cache);
+        let slot = Arc::clone(&self.cache);
         let persist = move || {
+            // Check the cache OUT under a short lock and run the blocking journal
+            // fsync with the lock RELEASED: holding the mutex across the fsync
+            // would make the driver-side `try_lock` in `first_sighting` fail for
+            // the whole disk write (same locking discipline as the 0-RTT guard).
+            //
             // Recover from a poisoned lock rather than dropping durability: the
             // cache invariants are restored on each insert, so persisting the
             // recovered state is safe (mirrors the auth handshake's replay insert).
-            let mut cache = cache
+            let checked_out = slot
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Err(err) = cache.persist_pending() {
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let Some(mut cache) = checked_out else {
+                // Another persist has the cache checked out. Inserts are
+                // impossible while it is out (first_sighting fails closed), so
+                // every queued entry — including the one that triggered this call
+                // — is already inside that persist's cache and will be drained by
+                // it.
+                return;
+            };
+            let result = cache.persist_pending();
+            // Put the cache back BEFORE acting on the outcome so first sightings
+            // resume even when the persist failed.
+            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cache);
+            if let Err(err) = result {
                 tracing::warn!(
                     error = %err,
                     "marker replay cache persist failed; first sighting recorded \
@@ -223,6 +257,48 @@ mod tests {
             !g2.first_sighting(&m, now),
             "replay spliced across a restart (persistent single-use)"
         );
+    }
+
+    #[test]
+    fn first_sighting_during_in_flight_persist_fails_closed_without_blocking() {
+        // Same driver-side invariant as the 0-RTT guard: `first_sighting` runs on
+        // the QUIC endpoint driver task. While a background persist has the cache
+        // checked out for its fsync the driver must NOT block on the lock — the
+        // marker fails closed (spliced to the origin) immediately, and single-use
+        // is still enforced once the persist completes.
+        let g = guard();
+        let now = 1_900_000_000;
+        let m = marker(0x44, now);
+
+        // Simulate an in-flight background persist exactly as
+        // `persist_in_background` does: check the cache out of the slot.
+        let checked_out = g
+            .cache
+            .lock()
+            .unwrap()
+            .take()
+            .expect("cache starts in the slot");
+        let start = std::time::Instant::now();
+        let sighted = g.first_sighting(&m, now);
+        let elapsed = start.elapsed();
+        assert!(
+            !sighted,
+            "fails closed (splice to origin) while a persist is in flight"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "first_sighting must not block while the persist runs (took {elapsed:?})"
+        );
+
+        // Persist finishes: the cache returns to the slot. The failed-closed
+        // sighting was never recorded (the flow was spliced, not terminated), so
+        // the first RECORDED sighting happens now — and stays single-use.
+        *g.cache.lock().unwrap() = Some(checked_out);
+        assert!(
+            g.first_sighting(&m, now),
+            "terminates once the persist completed"
+        );
+        assert!(!g.first_sighting(&m, now), "replay is still gated");
     }
 
     #[tokio::test]
