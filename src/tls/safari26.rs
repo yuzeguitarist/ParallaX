@@ -93,6 +93,23 @@ const MAX_CHANGE_CIPHER_SPEC_RECORDS: usize = 2;
 /// vector a malicious cover origin could otherwise force via one length field.
 const MAX_ENCRYPTED_HANDSHAKE_MESSAGE: usize = 512 * 1024;
 
+/// Upper bound on the number of records read while assembling the encrypted
+/// server flight. A keyed peer (the cover origin, or a MITM holding the handshake
+/// keys) could otherwise trickle AEAD-valid records that each decrypt to a
+/// 0/1-byte fragment, keeping `flight.finished == false` forever without ever
+/// growing the buffer. A real TLS 1.3 flight is a handful of records even when a
+/// ~256 KiB cert chain is fragmented into 16 KiB records, so this leaves ample
+/// headroom while bounding the per-flight loop. Defense-in-depth: the outer
+/// `CLIENT_ESTABLISH_TIMEOUT` already bounds wall-clock time.
+const MAX_SERVER_FLIGHT_RECORDS: usize = 256;
+
+/// Upper bound on total decrypted handshake bytes accumulated across the server
+/// flight. Bounds the "grow forever with small-but-nonzero fragments" variant of
+/// the same trickle: the whole legitimate flight (EncryptedExtensions,
+/// Certificate up to `MAX_ENCRYPTED_HANDSHAKE_MESSAGE`, CertificateVerify,
+/// Finished) fits within one max-size message plus framing for the small ones.
+const MAX_SERVER_FLIGHT_DECRYPTED_BYTES: usize = MAX_ENCRYPTED_HANDSHAKE_MESSAGE + 64 * 1024;
+
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
@@ -286,6 +303,7 @@ impl Safari26TlsCamouflage {
             parallax_x25519_shared_secret: parallax_shared_secret,
             tls_x25519,
             tls_mlkem768_secret: mlkem_secret,
+            sent_session_id: session_id,
             sni,
             accept_language: crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE.to_owned(),
             tap: VecRecordTap::default(),
@@ -299,6 +317,11 @@ pub struct Safari26TlsSession {
     parallax_x25519_shared_secret: Zeroizing<[u8; 32]>,
     tls_x25519: X25519KeyPair,
     tls_mlkem768_secret: Zeroizing<Vec<u8>>,
+    /// The `legacy_session_id` this client placed in its ClientHello. RFC 8446
+    /// §4.1.3 requires the server to echo it back verbatim in the ServerHello, so
+    /// it is retained here to enforce that exact echo at parse time (matching the
+    /// BoringSSL/Safari client we imitate, which aborts on any mismatch).
+    sent_session_id: [u8; 32],
     sni: String,
     /// `accept-language` value advertised in the H2 camouflage request. Defaults
     /// to [`crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE`]; overridable via
@@ -336,7 +359,7 @@ impl Safari26TlsSession {
 
         let server_hello_record = self.read_server_hello_record(stream).await?;
         transcript.push_handshake_record(&server_hello_record)?;
-        let server_hello = parse_safari_server_hello(&server_hello_record)?;
+        let server_hello = parse_safari_server_hello(&server_hello_record, &self.sent_session_id)?;
         let shared_secret = self.tls_shared_secret(&server_hello)?;
         let mut keys = Tls13Keys::new(server_hello.cipher_suite, &shared_secret, &transcript)?;
 
@@ -406,9 +429,13 @@ impl Safari26TlsSession {
                 }
                 let mut server_public = [0_u8; X25519_KEY_LEN];
                 server_public.copy_from_slice(&server_hello.key_share);
-                Ok(Zeroizing::new(
-                    x25519_shared_secret(&self.tls_x25519.private, &server_public).to_vec(),
-                ))
+                // Scrub the raw [u8; 32] x25519 secret: the returned Zeroizing<Vec>
+                // wipes its copy, but the transient stack array must be wiped too.
+                let shared = Zeroizing::new(x25519_shared_secret(
+                    &self.tls_x25519.private,
+                    &server_public,
+                ));
+                Ok(Zeroizing::new(shared.to_vec()))
             }
             GROUP_X25519_MLKEM768 => {
                 if server_hello.key_share.len() != MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN {
@@ -425,10 +452,16 @@ impl Safari26TlsSession {
                     .map_err(|_| Safari26TlsError::MlKem)?;
                 let mut server_public = [0_u8; X25519_KEY_LEN];
                 server_public.copy_from_slice(server_x25519);
-                let x25519_shared = x25519_shared_secret(&self.tls_x25519.private, &server_public);
+                // Scrub the raw [u8; 32] x25519 secret on drop (mlkem_shared is
+                // already zeroized by its own type); the combined output is returned
+                // wrapped in Zeroizing.
+                let x25519_shared = Zeroizing::new(x25519_shared_secret(
+                    &self.tls_x25519.private,
+                    &server_public,
+                ));
                 let mut combined = Vec::with_capacity(64);
                 combined.extend_from_slice(mlkem_shared.as_ref());
-                combined.extend_from_slice(&x25519_shared);
+                combined.extend_from_slice(&*x25519_shared);
                 Ok(Zeroizing::new(combined))
             }
             _ => Err(Safari26TlsError::Unsupported(
@@ -446,8 +479,20 @@ impl Safari26TlsSession {
         let mut flight = ServerFlight::default();
         let mut handshake_buf = Vec::new();
         let mut ccs_records = 0_usize;
+        let mut records_read = 0_usize;
+        let mut total_decrypted = 0_usize;
 
         while !flight.finished {
+            // Bound the loop before each read: a keyed peer trickling records that
+            // each decrypt to a tiny fragment could otherwise keep `finished`
+            // false indefinitely. Mirror the CCS/message-length caps and fail
+            // closed on exceed (defense-in-depth atop CLIENT_ESTABLISH_TIMEOUT).
+            if records_read >= MAX_SERVER_FLIGHT_RECORDS {
+                return Err(Safari26TlsError::Handshake(
+                    "server flight exceeded maximum record count".to_owned(),
+                ));
+            }
+            records_read += 1;
             let record = read_record(stream).await?;
             self.tap_records(RecordDirection::Inbound, &record);
             let header = parse_header(&record)
@@ -476,6 +521,12 @@ impl Safari26TlsSession {
                         }
                         return Err(Safari26TlsError::Handshake(
                             "expected encrypted handshake record".to_owned(),
+                        ));
+                    }
+                    total_decrypted = total_decrypted.saturating_add(decrypted.plaintext.len());
+                    if total_decrypted > MAX_SERVER_FLIGHT_DECRYPTED_BYTES {
+                        return Err(Safari26TlsError::Handshake(
+                            "server flight exceeded maximum decrypted size".to_owned(),
                         ));
                     }
                     handshake_buf.extend_from_slice(&decrypted.plaintext);
@@ -954,7 +1005,10 @@ struct ParsedServerHello {
     key_share: Vec<u8>,
 }
 
-fn parse_safari_server_hello(record: &[u8]) -> Result<ParsedServerHello, Safari26TlsError> {
+fn parse_safari_server_hello(
+    record: &[u8],
+    expected_session_id: &[u8],
+) -> Result<ParsedServerHello, Safari26TlsError> {
     let _ = parse_server_hello(record)?;
     let (_, payload) = super::record::parse_exact(record)
         .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
@@ -979,9 +1033,16 @@ fn parse_safari_server_hello(record: &[u8]) -> Result<ParsedServerHello, Safari2
         return Err(Safari26TlsError::Unsupported("HelloRetryRequest"));
     }
     let session_id = b.vec_u8()?;
-    if session_id.len() != 32 {
+    // RFC 8446 §4.1.3: the server MUST echo the ClientHello's legacy_session_id
+    // verbatim. Checking equality (not just the 32-byte length) matches the
+    // BoringSSL/Safari client we imitate, which aborts on any mismatch. Not
+    // security-critical on its own — the ServerHello is transcript-bound into the
+    // Finished MAC — but a length-only check is a behavioral deviation from that
+    // client. The comparison subsumes the prior length guard because
+    // `expected_session_id` is always the 32-byte value this client sent.
+    if session_id != expected_session_id {
         return Err(Safari26TlsError::Handshake(
-            "ServerHello did not echo a 32-byte session_id".to_owned(),
+            "ServerHello did not echo the ClientHello legacy_session_id".to_owned(),
         ));
     }
     let cipher_suite = TlsCipherSuite::from_u16(b.u16()?)?;
@@ -1252,8 +1313,14 @@ fn finished_verify_data(
     traffic_secret: &[u8],
     transcript: &[u8],
 ) -> Result<Vec<u8>, Safari26TlsError> {
-    let finished_key =
-        suite.hkdf_expand_label(traffic_secret, "finished", &[], suite.hash_len())?;
+    // The finished_key is a transient derivation of the (secret) traffic secret;
+    // scrub it on drop so it does not linger in freed heap.
+    let finished_key = Zeroizing::new(suite.hkdf_expand_label(
+        traffic_secret,
+        "finished",
+        &[],
+        suite.hash_len(),
+    )?);
     let transcript_hash = suite.digest(transcript);
     suite.hmac(&finished_key, &transcript_hash)
 }
@@ -1279,7 +1346,10 @@ impl RecordCipher {
     fn new(suite: TlsCipherSuite, traffic_secret: &[u8]) -> Result<Self, Safari26TlsError> {
         let key =
             Zeroizing::new(suite.hkdf_expand_label(traffic_secret, "key", &[], suite.key_len())?);
-        let iv_vec = suite.hkdf_expand_label(traffic_secret, "iv", &[], TLS13_IV_LEN)?;
+        // The expanded IV bytes are key material; scrub the transient Vec on drop
+        // (the [u8; 12] copy lives on in `self.iv`, which is wiped with the cipher).
+        let iv_vec =
+            Zeroizing::new(suite.hkdf_expand_label(traffic_secret, "iv", &[], TLS13_IV_LEN)?);
         let mut iv = [0_u8; TLS13_IV_LEN];
         iv.copy_from_slice(&iv_vec);
         Ok(Self {
@@ -2111,6 +2181,49 @@ mod tests {
         assert_eq!(
             second[0], TLS_RECORD_APPLICATION_DATA,
             "the Finished must be an encrypted application-data record, after the CCS"
+        );
+    }
+
+    /// A keyed peer that trickles AEAD-valid records, each decrypting to a 0-byte
+    /// handshake fragment, must not stall `read_encrypted_server_flight` forever:
+    /// `flight.finished` never flips, so the per-flight record cap has to make the
+    /// loop fail closed. `peer_keys` and `session_keys` are the two
+    /// independently-seq'd sets derived from identical inputs (see `app_keys`), so
+    /// each side's server-handshake cipher stays in lockstep across the records.
+    #[tokio::test]
+    async fn read_encrypted_server_flight_bounds_zero_byte_record_trickle() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+        let mut transcript = HandshakeTranscript::new();
+
+        // Exactly MAX_SERVER_FLIGHT_RECORDS empty-plaintext handshake records: the
+        // loop consumes all of them (each is AEAD-valid and decrypts to 0 bytes, so
+        // `flight.finished` stays false and the buffer never grows) and then trips
+        // the record cap on the next iteration without reading further.
+        let mut wire = Vec::new();
+        for _ in 0..MAX_SERVER_FLIGHT_RECORDS {
+            let record = peer_keys
+                .server_handshake
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &[])
+                .unwrap();
+            wire.extend_from_slice(&record);
+        }
+        peer.write_all(&wire).await.unwrap();
+        drop(peer);
+
+        let result = timeout(
+            Duration::from_secs(5),
+            session.read_encrypted_server_flight(&mut stream, &mut session_keys, &mut transcript),
+        )
+        .await
+        .expect("the record cap must fire without blocking on a further read");
+        // Match on the borrowed Result so the (never-taken) Ok(ServerFlight) arm
+        // does not require ServerFlight: Debug.
+        assert!(
+            matches!(&result, Err(Safari26TlsError::Handshake(m)) if m.contains("maximum record count")),
+            "expected the per-flight record-count bound",
         );
     }
 
@@ -3097,7 +3210,7 @@ mod tests {
         // supported_versions or key_share match arm, and the `>` mutations of the
         // `e.remaining() > 0` extension-loop guard (all of which would make this
         // valid record error out).
-        let parsed = parse_safari_server_hello(&valid_safari_server_hello()).unwrap();
+        let parsed = parse_safari_server_hello(&valid_safari_server_hello(), &[0x55; 32]).unwrap();
         assert!(matches!(
             parsed.cipher_suite,
             TlsCipherSuite::Aes128GcmSha256
@@ -3118,7 +3231,7 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::ServerHello(
                 ServerHelloError::NotServerHello
             ))
@@ -3137,7 +3250,7 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Handshake(_))
         ));
     }
@@ -3158,7 +3271,7 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Unsupported("HelloRetryRequest"))
         ));
     }
@@ -3175,9 +3288,27 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Handshake(_))
         ));
+    }
+
+    #[test]
+    fn parse_safari_server_hello_rejects_mismatched_session_id_echo() {
+        // A well-formed 32-byte session_id that differs from the one the client
+        // sent must be rejected: RFC 8446 §4.1.3 requires an exact echo, and the
+        // client we imitate aborts on mismatch. The record is otherwise valid —
+        // only the echoed value differs — so this isolates the equality check from
+        // the length/shape guards. `valid_safari_server_hello` fills the session_id
+        // with 0x55, so a `0x11` expectation is a clean mismatch.
+        let record = valid_safari_server_hello();
+        assert!(matches!(
+            parse_safari_server_hello(&record, &[0x11; 32]),
+            Err(Safari26TlsError::Handshake(ref m))
+                if m.contains("did not echo the ClientHello legacy_session_id")
+        ));
+        // The exact echo is accepted, pinning the `!=`->`==` mutant on the guard.
+        assert!(parse_safari_server_hello(&record, &[0x55; 32]).is_ok());
     }
 
     #[test]
@@ -3192,7 +3323,7 @@ mod tests {
             &valid_sh_extensions(),
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Handshake(_))
         ));
     }
@@ -3226,7 +3357,7 @@ mod tests {
             &ext,
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::MissingServerHello)
         ));
     }
@@ -3252,7 +3383,7 @@ mod tests {
             &ext,
         );
         assert!(matches!(
-            parse_safari_server_hello(&record),
+            parse_safari_server_hello(&record, &[0x55; 32]),
             Err(Safari26TlsError::Handshake(ref m)) if m.contains("missing key_share")
         ));
     }
