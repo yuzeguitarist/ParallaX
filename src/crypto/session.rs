@@ -53,7 +53,15 @@ impl fmt::Debug for X25519KeyPair {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+// `PartialEq`/`Eq` are derived ONLY under `cfg(test)`: the derived `==` compares
+// the live secret key bytes in variable time, which is fine for `assert_eq!` in
+// tests but would be a timing side-channel if a production path ever compared
+// two `SessionKeys`. Gating the impls makes such a comparison a compile error in
+// a non-test build (verified by `cargo build` / `cargo clippy`, which compile the
+// production crate without these impls). If a production path ever needs secret
+// equality, implement it explicitly via `subtle::ConstantTimeEq` instead.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct SessionKeys {
     pub client_key: [u8; KEY_LEN],
     pub server_key: [u8; KEY_LEN],
@@ -648,9 +656,15 @@ impl AeadCodec {
         key: [u8; KEY_LEN],
         nonce_base: [u8; NONCE_LEN],
     ) -> Self {
+        // The by-value `Copy` params are transient secret copies: wrap them so the
+        // local copies are scrubbed on return (best-effort, drop-time-only — same
+        // discipline as `expand_epoch_keys`). The live secrets are the boxed
+        // fields below, zeroized by the codec's own `Drop`.
+        let key = Zeroizing::new(key);
+        let nonce_base = Zeroizing::new(nonce_base);
         let codec = Self {
-            key: Box::new(key),
-            nonce_base: Box::new(nonce_base),
+            key: Box::new(*key),
+            nonce_base: Box::new(*nonce_base),
             sequence: 0,
             suite,
             cipher: make_cipher(suite, &key),
@@ -675,12 +689,16 @@ impl AeadCodec {
         key: [u8; KEY_LEN],
         nonce_base: [u8; NONCE_LEN],
     ) {
+        // Scrub the transient by-value param copies on return (best-effort, as in
+        // `new_with_suite`); the live secrets are the boxed fields overwritten below.
+        let key = Zeroizing::new(key);
+        let nonce_base = Zeroizing::new(nonce_base);
         self.key.zeroize();
         self.nonce_base.zeroize();
         // Overwrite the existing heap allocations in place so the locked pages
         // stay valid across the rekey (re-`protect` below is then idempotent).
-        *self.key = key;
-        *self.nonce_base = nonce_base;
+        *self.key = *key;
+        *self.nonce_base = *nonce_base;
         self.sequence = 0;
         self.suite = suite;
         self.cipher = make_cipher(suite, &key);
@@ -1246,6 +1264,19 @@ mod tests {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
         derive_client_keys(TEST_PSK, &client.private, &server.public, &[7_u8; 32]).unwrap()
+    }
+
+    #[test]
+    fn session_keys_equality_is_test_only() {
+        // `SessionKeys: PartialEq/Eq` exists ONLY under cfg(test) (the derived `==`
+        // is variable-time over live secret bytes). This test pins that the
+        // test-gated impls still exist so `assert_eq!` keeps working in tests; the
+        // complementary check — that equality is UNAVAILABLE in production — is the
+        // non-test compile itself (`cargo build` / `cargo clippy`), where any
+        // production `==` over `SessionKeys` is now a compile error.
+        let keys = session_keys_fixture();
+        let same = keys.clone();
+        assert_eq!(keys, same);
     }
 
     #[test]
