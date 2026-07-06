@@ -89,6 +89,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.7", features = ["derive"] }
 
+# Linux-only seccomp-BPF filter compiler (pure Rust, from the Firecracker
+# project; MSRV-friendly, no C toolchain). Backs
+# `process_hardening::install_late_seccomp_filter`: the post-startup
+# best-effort denylist of memory-scrape syscalls (ptrace,
+# process_vm_readv/_writev, process_madvise, kcmp, pidfd_open/_getfd).
+# Pinned exact: the BPF it emits is a security control, so upgrades should be
+# deliberate reviewed bumps rather than silent semver drift.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "=0.5.0"
+
 [dev-dependencies]
 tempfile = "3"
 # Test-only: enables tokio's paused-clock controls (`time::pause`/`advance`,
