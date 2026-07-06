@@ -206,13 +206,14 @@ pub struct SpeedReport {
 }
 
 impl SpeedReport {
-    /// The primary (TCP) transport run — always present, always first. Callers that
-    /// want a single headline figure (e.g. the netmatrix benchmark) use this; the
-    /// QUIC run, when measured, is the second entry in [`Self::runs`].
-    pub fn primary_run(&self) -> &TransportRun {
-        self.runs
-            .first()
-            .expect("a SpeedReport always has at least the TCP run")
+    /// The primary (TCP) transport run. Reports built by [`run`] always measure
+    /// TCP first, so this is `Some` with the TCP run in that case; the QUIC run,
+    /// when measured, is the second entry in [`Self::runs`]. Returns `None` only
+    /// for an externally-built report with empty `runs` (the fields are public),
+    /// instead of panicking. Callers that want a single headline figure (e.g.
+    /// the netmatrix benchmark) use this.
+    pub fn primary_run(&self) -> Option<&TransportRun> {
+        self.runs.first()
     }
 
     /// The run for a specific transport, if it was measured.
@@ -822,7 +823,14 @@ fn write_json_u128(out: &mut String, indent: usize, key: &str, value: u128, comm
 
 fn write_json_f64(out: &mut String, indent: usize, key: &str, value: f64, comma: bool) {
     write_json_key(out, indent, key);
-    let _ = write!(out, "{value:.6}");
+    // A non-finite f64 would render as `NaN`/`inf`, which is not valid JSON and
+    // is rejected by strict parsers. Upstream guards keep values finite today;
+    // emit `null` defensively so the document stays parseable regardless.
+    if value.is_finite() {
+        let _ = write!(out, "{value:.6}");
+    } else {
+        out.push_str("null");
+    }
     write_json_comma_newline(out, comma);
 }
 
@@ -1086,6 +1094,19 @@ mod tests {
     }
 
     #[test]
+    fn primary_run_returns_first_run_or_none_when_empty() {
+        let full = report();
+        let run = full.primary_run().expect("fixture report has a TCP run");
+        assert_eq!(run.transport, Transport::Tcp);
+
+        // The fields are public, so an externally-built report can carry an
+        // empty `runs`; primary_run must return None instead of panicking.
+        let mut empty = report();
+        empty.runs.clear();
+        assert!(empty.primary_run().is_none());
+    }
+
+    #[test]
     fn direction_summary_uses_all_samples() {
         let report = DirectionReport::new(vec![
             sample(1, 1_000_000, 100),
@@ -1129,6 +1150,37 @@ mod tests {
     #[test]
     fn json_escape_handles_control_characters() {
         assert_eq!(json_escape("a\"b\\c\n"), "a\\\"b\\\\c\\n");
+    }
+
+    #[test]
+    fn write_json_f64_emits_null_for_non_finite() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut out = String::new();
+            write_json_f64(&mut out, 0, "v", value, false);
+            assert_eq!(out, "\"v\": null\n");
+        }
+        let mut out = String::new();
+        write_json_f64(&mut out, 0, "v", 1.5, false);
+        assert_eq!(out, "\"v\": 1.500000\n");
+    }
+
+    #[test]
+    fn speed_report_json_stays_parseable_with_non_finite_floats() {
+        // SpeedReport has public fields, so an external builder can hand the
+        // emitter a non-finite summary value. The report must still be valid
+        // JSON (non-finite floats become `null`).
+        let mut report = report();
+        report.runs[0].download.summary.median_mbps = f64::NAN;
+        report.runs[0].upload.summary.max_mbps = f64::INFINITY;
+        let json = report.to_json();
+        assert!(json.contains("\"median_mbps\": null"));
+        assert!(json.contains("\"max_mbps\": null"));
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("report with non-finite floats must still emit valid JSON");
+        assert_eq!(
+            parsed["runs"][0]["download"]["summary"]["median_mbps"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

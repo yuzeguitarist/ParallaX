@@ -244,20 +244,20 @@ impl BenchmarkCase {
                 "\"iterations\":{},",
                 "\"warmup\":{},",
                 "\"elapsed_ns\":{},",
-                "\"ns_per_op\":{:.4},",
-                "\"ops_per_second\":{:.4},",
+                "\"ns_per_op\":{},",
+                "\"ops_per_second\":{},",
                 "\"processed_bytes\":{},",
-                "\"mib_per_second\":{:.4}}}"
+                "\"mib_per_second\":{}}}"
             ),
             self.group.label(),
             self.name,
             self.iterations,
             self.warmup,
             self.elapsed.as_nanos(),
-            self.ns_per_op(),
-            self.ops_per_second(),
+            json_f64(self.ns_per_op()),
+            json_f64(self.ops_per_second()),
             self.processed_bytes,
-            self.mib_per_second(),
+            json_f64(self.mib_per_second()),
         );
     }
 }
@@ -922,8 +922,21 @@ fn bench_client_speed_download_open_1mb(options: BenchmarkOptions) -> Result<Ben
         TIER_BULK,
         options,
         || {
+            // The fixture pre-seals exactly `iterations + warmup` batches with
+            // the SAME tier the runner uses, so `batch_idx` stays in bounds. If
+            // the tier passed to run_case ever diverges from the one used to
+            // size the fixture, fail with a clear message instead of an
+            // out-of-bounds panic.
+            let Some(batch) = batch_ranges.get(batch_idx) else {
+                bail!(
+                    "client.speed_download_open_1mb ran more batches ({}) than were pre-sealed \
+                     ({}); the fixture tier diverged from the run tier",
+                    batch_idx + 1,
+                    batch_ranges.len()
+                );
+            };
             let mut recovered = 0_usize;
-            for range in &batch_ranges[batch_idx] {
+            for range in batch {
                 scratch.clear();
                 scratch.extend_from_slice(&encoded[range.clone()]);
                 let payload = session.open_server_record_in_place_payload_range(&mut scratch)?;
@@ -2067,6 +2080,18 @@ fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64().max(f64::MIN_POSITIVE)
 }
 
+/// Format an `f64` for the JSON report. A non-finite value would render as
+/// `NaN`/`inf`, which is not valid JSON and is rejected by strict parsers;
+/// the derived metrics are finite today (`seconds` floors the divisor), but
+/// emit `null` defensively so the document stays parseable regardless.
+fn json_f64(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.4}")
+    } else {
+        "null".to_string()
+    }
+}
+
 fn format_duration(duration: Duration) -> String {
     let nanos = duration.as_nanos();
     if nanos < 1_000 {
@@ -2131,6 +2156,40 @@ mod tests {
         assert!(json.contains("\"cases\""));
         assert!(json.contains("\"ns_per_op\""));
         assert!(json.contains("\"mib_per_second\""));
+    }
+
+    #[test]
+    fn json_f64_emits_null_for_non_finite() {
+        assert_eq!(json_f64(1.5), "1.5000");
+        assert_eq!(json_f64(f64::NAN), "null");
+        assert_eq!(json_f64(f64::INFINITY), "null");
+        assert_eq!(json_f64(f64::NEG_INFINITY), "null");
+    }
+
+    #[test]
+    fn case_json_stays_parseable_with_non_finite_metrics() {
+        // BenchmarkCase fields are public, so an externally-built case can
+        // carry values whose derived metrics overflow to infinity (u64::MAX
+        // work over a zero elapsed floored to f64::MIN_POSITIVE). The JSON
+        // emitter must render `null` (not `NaN`/`inf`) so the document stays
+        // valid for strict parsers.
+        let case = BenchmarkCase {
+            group: BenchGroup::State,
+            name: "synthetic",
+            iterations: u64::MAX,
+            warmup: 0,
+            elapsed: Duration::ZERO,
+            processed_bytes: u64::MAX,
+        };
+        assert!(!case.ops_per_second().is_finite());
+        assert!(!case.mib_per_second().is_finite());
+        let mut out = String::new();
+        case.write_json(&mut out);
+        assert!(out.contains("\"ops_per_second\":null"));
+        assert!(out.contains("\"mib_per_second\":null"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("case JSON with non-finite metrics must still parse");
+        assert_eq!(parsed["ops_per_second"], serde_json::Value::Null);
     }
 
     #[test]

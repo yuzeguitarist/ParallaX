@@ -40,7 +40,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 
 use crate::config::{Config, Mode};
-use crate::speed::{self, SpeedReport};
+use crate::speed::{self, SpeedReport, TransportRun};
 
 /// One network-impairment profile applied symmetrically to both directions.
 #[derive(Debug, Clone, Copy)]
@@ -107,8 +107,13 @@ struct TokenBucket {
 impl TokenBucket {
     fn new(bandwidth_mbit: Option<u64>) -> Self {
         Self {
-            // 1 Mbit/s = 1_000_000 bits/s = 125_000 bytes/s.
-            bytes_per_sec: bandwidth_mbit.map(|m| m as f64 * 125_000.0),
+            // 1 Mbit/s = 1_000_000 bits/s = 125_000 bytes/s. A `Some(0)` cap is
+            // treated as unbounded: a 0.0 rate would make `consume` compute
+            // `n / 0.0 = inf` and panic in `Duration::from_secs_f64`. The const
+            // MATRIX never carries `Some(0)` today; this is a defensive guard.
+            bytes_per_sec: bandwidth_mbit
+                .filter(|&m| m > 0)
+                .map(|m| m as f64 * 125_000.0),
             next: Instant::now(),
         }
     }
@@ -272,18 +277,31 @@ fn render_text(upstream: &str, cells: &[NetCell]) -> String {
             .bandwidth_mbit
             .map(|m| m.to_string())
             .unwrap_or_else(|| "inf".to_string());
+        // `speed::run` always measures TCP, so `primary_run()` is `Some` for any
+        // report it produced; the `None` arm only guards an externally-built
+        // report with empty `runs` (the fields are public) so the renderer
+        // degrades to an ERROR row instead of panicking.
         match &cell.outcome {
-            Ok(report) => {
-                let _ = writeln!(
-                    out,
-                    "{:<18} {:>9} {:>12} {:>14.2} {:>14.2}",
-                    cell.imp.label,
-                    cell.imp.rtt_ms,
-                    bw,
-                    report.primary_run().download.summary.median_mbps,
-                    report.primary_run().upload.summary.median_mbps,
-                );
-            }
+            Ok(report) => match report.primary_run() {
+                Some(run) => {
+                    let _ = writeln!(
+                        out,
+                        "{:<18} {:>9} {:>12} {:>14.2} {:>14.2}",
+                        cell.imp.label,
+                        cell.imp.rtt_ms,
+                        bw,
+                        run.download.summary.median_mbps,
+                        run.upload.summary.median_mbps,
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "{:<18} {:>9} {:>12}  ERROR: speed report has no transport runs",
+                        cell.imp.label, cell.imp.rtt_ms, bw
+                    );
+                }
+            },
             Err(err) => {
                 let _ = writeln!(
                     out,
@@ -309,32 +327,54 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
             .bandwidth_mbit
             .map(|m| m.to_string())
             .unwrap_or_else(|| "null".to_string());
-        match &cell.outcome {
-            Ok(report) => {
+        // Flatten "speed failed" and "report has no transport runs" into one
+        // error arm so the emitted cell shape stays consistent. `speed::run`
+        // always measures TCP, so the empty-runs case only guards an
+        // externally-built report (the fields are public).
+        let outcome: Result<(&SpeedReport, &TransportRun), &str> = match &cell.outcome {
+            Ok(report) => report
+                .primary_run()
+                .map(|run| (report, run))
+                .ok_or("speed report has no transport runs"),
+            Err(err) => Err(err.as_str()),
+        };
+        match outcome {
+            Ok((report, run)) => {
                 let _ = writeln!(out, "    {{");
-                let _ = writeln!(out, "      \"profile\": \"{}\",", cell.imp.label);
+                // The MATRIX labels are static and escape-free today; routing
+                // them through json_escape keeps the emitter consistent with
+                // `upstream`/`error` and future-proofs new profile names.
+                let _ = writeln!(
+                    out,
+                    "      \"profile\": \"{}\",",
+                    json_escape(cell.imp.label)
+                );
                 let _ = writeln!(out, "      \"rtt_ms\": {},", cell.imp.rtt_ms);
                 let _ = writeln!(out, "      \"bandwidth_mbit\": {bw},");
                 let _ = writeln!(
                     out,
-                    "      \"handshake_ms\": {:.3},",
-                    report.handshake.elapsed.as_secs_f64() * 1000.0
+                    "      \"handshake_ms\": {},",
+                    json_f64(report.handshake.elapsed.as_secs_f64() * 1000.0, 3)
                 );
                 let _ = writeln!(
                     out,
-                    "      \"download_median_mbps\": {:.4},",
-                    report.primary_run().download.summary.median_mbps
+                    "      \"download_median_mbps\": {},",
+                    json_f64(run.download.summary.median_mbps, 4)
                 );
                 let _ = writeln!(
                     out,
-                    "      \"upload_median_mbps\": {:.4}",
-                    report.primary_run().upload.summary.median_mbps
+                    "      \"upload_median_mbps\": {}",
+                    json_f64(run.upload.summary.median_mbps, 4)
                 );
                 let _ = writeln!(out, "    }}{comma}");
             }
             Err(err) => {
                 let _ = writeln!(out, "    {{");
-                let _ = writeln!(out, "      \"profile\": \"{}\",", cell.imp.label);
+                let _ = writeln!(
+                    out,
+                    "      \"profile\": \"{}\",",
+                    json_escape(cell.imp.label)
+                );
                 let _ = writeln!(out, "      \"rtt_ms\": {},", cell.imp.rtt_ms);
                 let _ = writeln!(out, "      \"bandwidth_mbit\": {bw},");
                 let _ = writeln!(out, "      \"error\": \"{}\"", json_escape(err));
@@ -345,6 +385,18 @@ fn render_json(upstream: &str, cells: &[NetCell]) -> String {
     let _ = writeln!(out, "  ]");
     let _ = writeln!(out, "}}");
     out
+}
+
+/// Format an `f64` for JSON at the given precision. A non-finite value would
+/// render as `NaN`/`inf`, which is not valid JSON and is rejected by strict
+/// parsers; upstream guards keep values finite today, but emit `null`
+/// defensively so the document stays parseable regardless.
+fn json_f64(value: f64, precision: usize) -> String {
+    if value.is_finite() {
+        format!("{value:.precision$}")
+    } else {
+        "null".to_string()
+    }
 }
 
 fn json_escape(s: &str) -> String {
@@ -439,6 +491,20 @@ mod tests {
             "expected ~200ms added RTT, saw {elapsed:?}"
         );
         shaper.abort();
+    }
+
+    #[tokio::test]
+    async fn token_bucket_treats_zero_bandwidth_as_unbounded() {
+        // `Some(0)` must not panic (`n / 0.0 = inf` would abort in
+        // `Duration::from_secs_f64`); it degrades to unbounded, like `None`.
+        let mut bucket = TokenBucket::new(Some(0));
+        assert!(bucket.bytes_per_sec.is_none());
+        let start = std::time::Instant::now();
+        bucket.consume(1_000_000).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "zero-bandwidth bucket must not pace"
+        );
     }
 
     #[tokio::test]
@@ -602,6 +668,86 @@ mod tests {
             "last cell must not be comma-terminated"
         );
         assert!(json.trim_end().ends_with('}')); // document closes cleanly
+    }
+
+    #[test]
+    fn render_json_escapes_profile_label() {
+        // MATRIX labels are static and escape-free today, but the emitter must
+        // escape them like `upstream`/`error` so a future label with specials
+        // cannot break the JSON document.
+        let imp = Impairment {
+            label: "weird\"label",
+            rtt_ms: 0,
+            bandwidth_mbit: None,
+        };
+        let cells = vec![
+            NetCell {
+                imp,
+                outcome: Ok(sample_report()),
+            },
+            NetCell {
+                imp,
+                outcome: Err("boom".to_string()),
+            },
+        ];
+        let json = render_json("vps.example:443", &cells);
+        assert!(!json.contains("\"profile\": \"weird\"label\""));
+        assert_eq!(json.matches(r#""profile": "weird\"label","#).count(), 2);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("escaped label must keep the JSON valid");
+        assert_eq!(parsed["cells"][0]["profile"], "weird\"label");
+        assert_eq!(parsed["cells"][1]["profile"], "weird\"label");
+    }
+
+    #[test]
+    fn renderers_degrade_to_error_for_empty_runs_report() {
+        // An externally-built SpeedReport with empty `runs` (public fields)
+        // must render as an error cell in both formats, not panic.
+        let mut report = sample_report();
+        report.runs.clear();
+        let cells = vec![NetCell {
+            imp: MATRIX[0],
+            outcome: Ok(report),
+        }];
+
+        let text = render_text("vps.example:443", &cells);
+        assert!(text.contains("ERROR: speed report has no transport runs"));
+
+        let json = render_json("vps.example:443", &cells);
+        assert!(json.contains("\"error\": \"speed report has no transport runs\""));
+        assert!(!json.contains("download_median_mbps"));
+    }
+
+    #[test]
+    fn json_f64_emits_null_for_non_finite() {
+        assert_eq!(json_f64(1.5, 4), "1.5000");
+        assert_eq!(json_f64(42.0, 3), "42.000");
+        assert_eq!(json_f64(f64::NAN, 4), "null");
+        assert_eq!(json_f64(f64::INFINITY, 4), "null");
+        assert_eq!(json_f64(f64::NEG_INFINITY, 3), "null");
+    }
+
+    #[test]
+    fn render_json_stays_parseable_with_non_finite_medians() {
+        // SpeedReport has public fields, so a non-finite median can reach the
+        // renderer. It must emit `null` instead of `NaN`/`inf` so the document
+        // stays valid JSON for strict parsers.
+        let mut report = sample_report();
+        report.runs[0].download.summary.median_mbps = f64::NAN;
+        report.runs[0].upload.summary.median_mbps = f64::INFINITY;
+        let cells = vec![NetCell {
+            imp: MATRIX[0],
+            outcome: Ok(report),
+        }];
+        let json = render_json("vps.example:443", &cells);
+        assert!(json.contains("\"download_median_mbps\": null,"));
+        assert!(json.contains("\"upload_median_mbps\": null"));
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("netmatrix JSON with non-finite medians must still parse");
+        assert_eq!(
+            parsed["cells"][0]["download_median_mbps"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
