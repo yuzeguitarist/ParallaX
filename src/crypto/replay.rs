@@ -26,11 +26,29 @@ pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 2 * 60;
 /// stale entries behind it — accelerating CacheFull fail-close. 5s covers real
 /// clock skew without giving an attacker a future-dating lever.
 const MAX_FUTURE_SKEW_SECS: u64 = 5;
-const AUTH_JOURNAL_VERSION: &str = "parallax-replay-cache-v3";
+const AUTH_JOURNAL_VERSION: &str = "parallax-replay-cache-v4";
+/// Previous on-disk format: ONE header line rewritten in place at offset 0 on
+/// every insert. A crash during that rewrite could tear the only header and
+/// wedge startup with `MacMismatch` (fail-closed availability loss, issue #143
+/// L11). Still accepted on load — verified with the legacy header MAC that does
+/// not bind a generation — and upgraded to the v4 double-buffered layout by the
+/// atomic compaction rewrite on first load.
+const LEGACY_AUTH_JOURNAL_VERSION_V3: &str = "parallax-replay-cache-v3";
 const CACHE_KEY_LABEL: &[u8] = b"ParallaX v1 replay cache MAC key";
 const CACHE_JOURNAL_HEADER_MAC_LABEL: &[u8] = b"ParallaX v1 replay cache journal header MAC";
 const CACHE_JOURNAL_ENTRY_MAC_LABEL: &[u8] = b"ParallaX v1 replay cache journal entry MAC";
-const AUTH_JOURNAL_HEADER_LEN: usize = 187;
+/// Byte length of ONE fixed-size v4 header slot, including its trailing
+/// newline. The journal carries [`AUTH_JOURNAL_HEADER_SLOTS`] of these back to
+/// back at the top of the file (an A/B superblock pair). Each per-insert
+/// header commit overwrites only the currently-INACTIVE slot, so the last
+/// committed header is never being written and can never be torn by a crash:
+/// at least one slot always MAC-verifies, and the highest-generation valid
+/// slot is the last committed state.
+const AUTH_JOURNAL_HEADER_LEN: usize = 208;
+const AUTH_JOURNAL_HEADER_SLOTS: usize = 2;
+/// Total bytes occupied by the header region (both slots); entry lines start
+/// at this offset.
+const AUTH_JOURNAL_HEADER_REGION_LEN: usize = AUTH_JOURNAL_HEADER_LEN * AUTH_JOURNAL_HEADER_SLOTS;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -82,8 +100,17 @@ impl fmt::Debug for CacheMacKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AuthJournalState {
+    /// Monotonically-increasing header-commit number, bound into the header
+    /// MAC. The loader picks the highest-generation slot that verifies; the
+    /// writer commits `generation + 1` into the slot NOT holding the current
+    /// generation, so the committed slot is never overwritten in place.
+    generation: u64,
     count: u64,
     tail_mac: [u8; 32],
+    /// Index of the header slot holding the committed `generation`. The next
+    /// header commit targets the OTHER slot, so a crash mid-write can only
+    /// tear the not-yet-committed slot.
+    active_slot: usize,
 }
 
 #[derive(Debug)]
@@ -104,6 +131,24 @@ pub struct ReplayCache {
     /// this queue is non-empty: the immediate path's append would journal its own
     /// entry ahead of the still-queued ones.
     pending_persist: VecDeque<ReplayEntry>,
+    /// One-shot injected failure consumed by the next header commit in
+    /// [`Self::persist_authenticated_entry`] (tests only).
+    #[cfg(test)]
+    fail_header_commit: Option<HeaderCommitFailure>,
+}
+
+/// Test-only fault injection for the header-commit phase of
+/// [`ReplayCache::persist_authenticated_entry`]: deterministically reproduces
+/// the two on-disk outcomes a failed commit can leave behind (no header byte
+/// landed / the full slot landed with only the error report surviving) without
+/// needing a faulty disk.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum HeaderCommitFailure {
+    /// Report an error before any header byte is written.
+    BeforeWrite,
+    /// Perform the full durable header write, then report an error anyway.
+    AfterDurableWrite,
 }
 
 impl ReplayCache {
@@ -119,6 +164,8 @@ impl ReplayCache {
             nonces: HashSet::with_capacity(capacity),
             transcripts: HashSet::with_capacity(capacity),
             pending_persist: VecDeque::new(),
+            #[cfg(test)]
+            fail_header_commit: None,
         }
     }
 
@@ -190,8 +237,10 @@ impl ReplayCache {
             path: Some(path.clone()),
             mac_key: Some(mac_key),
             auth_journal: Some(AuthJournalState {
+                generation: 0,
                 count: 0,
                 tail_mac: [0_u8; 32],
+                active_slot: 0,
             }),
             ..Self::new(capacity)
         }
@@ -212,17 +261,20 @@ impl ReplayCache {
             return Ok(cache);
         }
         let mac_key_owned = cache.mac_key.clone().expect("authenticated cache has key");
-        let (entries, journal, has_uncommitted_tail) =
+        let (entries, journal, needs_rewrite) =
             parse_authenticated_journal_entries(&raw, &mac_key_owned)?;
         cache.auth_journal = Some(journal);
         for entry in entries {
             cache.insert_loaded(entry);
         }
         cache.prune_expired(current_unix_timestamp()?);
-        // Heal an uncommitted trailing entry left by a crash mid-persist by
-        // rewriting the file to its committed state, so a later append starts at
-        // the correct offset and the cache stays loadable.
-        if has_uncommitted_tail {
+        // Rewrite the journal to a clean committed state when the on-disk file
+        // is not one: an uncommitted trailing entry left by a crash mid-persist
+        // (so a later append starts at the correct offset), a torn header slot
+        // left by a crash mid-header-commit (so both slots are valid again), or
+        // a legacy v3 single-header journal (upgraded to the v4 double-buffered
+        // layout). The rewrite is the atomic tmp-file + rename compaction.
+        if needs_rewrite {
             cache.compact_authenticated_journal(&path, &mac_key_owned)?;
         }
         Ok(cache)
@@ -468,7 +520,7 @@ impl ReplayCache {
         // whitespace-only file left by a crash before the empty header was synced).
         // Route the first insert through the atomic tmp-file+rename clean write so
         // any stale prefix bytes are discarded instead of being half-overwritten by
-        // the in-place header rewrite below (the in-memory order already holds the
+        // the header-slot commit below (the in-memory order already holds the
         // just-inserted entry, so this persists it as a clean count=1 journal).
         if journal.count == 0 {
             self.compact_authenticated_journal(path, mac_key)?;
@@ -483,10 +535,19 @@ impl ReplayCache {
             return Ok(true);
         };
 
+        let next_generation = journal.generation.saturating_add(1);
         let next_count = journal.count.saturating_add(1);
         let (line, next_tail_mac) =
             encode_authenticated_journal_entry(mac_key, next_count, &entry, &journal.tail_mac);
-        let next_header = authenticated_journal_header(mac_key, next_count, &next_tail_mac);
+        let next_header =
+            authenticated_journal_header(mac_key, next_generation, next_count, &next_tail_mac);
+        // Commit the new header into the currently-INACTIVE slot: the slot holding
+        // the committed generation is never written, so a crash (or torn write)
+        // during this commit can only damage the slot that was already stale — the
+        // last committed header always survives intact (crash-atomic, issue #143
+        // L11) and the loader falls back to it via the generation ordering.
+        let target_slot = (journal.active_slot + 1) % AUTH_JOURNAL_HEADER_SLOTS;
+        let header_offset = (target_slot * AUTH_JOURNAL_HEADER_LEN) as u64;
 
         let mut file = open_cache_file_for_append(path)?;
         if file.metadata()?.len() == 0 {
@@ -499,38 +560,86 @@ impl ReplayCache {
             return Ok(true);
         }
         let committed_len = file.seek(SeekFrom::End(0))?;
-        // Append the entry, then rewrite the header. On a failed APPEND (the common
-        // ENOSPC/EIO case) truncate the file back to its last committed length so a
-        // half-written orphan line cannot desync the journal. NOTE: this is NOT
-        // fully crash-atomic for the in-place header rewrite — if the process dies
-        // (or the disk errors) DURING the header `write_all`/`sync_data` at offset
-        // 0, set_len(committed_len) removes only the trailing line, not a partially
-        // overwritten header, so a subsequent restart can still hit a MacMismatch.
-        // The append-failure rollback below is the guarantee; a torn header rewrite
-        // is a narrower residual (a robust fix would write via tmp-file + rename,
-        // like compact_authenticated_journal). committed_len is the prior committed
-        // length (a 0-length file already returned via compact above).
-        let append_and_commit = |file: &mut fs::File| -> io::Result<()> {
+        // The entry APPEND and the HEADER COMMIT are separate failure domains
+        // with opposite rollback rules; sharing one error path let a failed
+        // header commit truncate an entry that a fully-landed (MAC-valid,
+        // higher-generation) slot could already advertise — a valid header whose
+        // body was removed, which fails every later load as a "truncated
+        // journal" (fail-closed, by design of the truncation detector).
+        //
+        // Phase 1 — append the entry and make it durable BEFORE the header that
+        // will advertise it (without this ordering a reordered/partial writeback
+        // could persist a count=N+1 header while entry N+1 is absent — the same
+        // unloadable state). On failure, truncating back to `committed_len` is
+        // safe and correct: no header byte has been written yet, so the
+        // still-active old header remains authoritative and the file returns to
+        // exactly its last committed state (a 0-length file already returned via
+        // compact above).
+        let append_entry = |file: &mut fs::File| -> io::Result<()> {
             file.write_all(line.as_bytes())?;
-            // Make the appended entry durable BEFORE the header that will advertise
-            // it. Without this ordering a reordered/partial writeback could leave a
-            // header claiming count N+1 while entry N+1 is absent, which fails to
-            // load as a "truncated journal". The reverse (entry durable, header
-            // not) is healed on load by truncating the uncommitted tail.
-            file.sync_data()?;
-            file.seek(SeekFrom::Start(0))?;
+            file.sync_data()
+        };
+        if let Err(err) = append_entry(&mut file) {
+            if file.set_len(committed_len).is_ok() {
+                let _ = file.sync_data();
+            } else {
+                // The rollback itself failed, so the tail may keep a partial
+                // orphan line and appending after it would desync the entry
+                // chain. Drop the in-memory journal state: the next persist
+                // routes through the atomic tmp-file + rename compaction, which
+                // rewrites the whole file no matter what the tail holds.
+                self.auth_journal = None;
+            }
+            return Err(err.into());
+        }
+
+        #[cfg(test)]
+        let injected_failure = self.fail_header_commit.take();
+        // Phase 2 — commit the new header into the inactive slot. From here on
+        // the appended entry must NEVER be truncated: a failed write/sync may
+        // still have landed any prefix of the slot — or all of it, with only the
+        // error report surviving — so a MAC-valid generation-N+1 header
+        // advertising count N+1 can exist on disk, and removing the body it
+        // advertises would wedge every later load. Leaving the entry in place is
+        // consistent in both outcomes: if the new header landed, the entry is
+        // simply committed; if it tore or never landed, the old slot wins slot
+        // selection on load and the entry is dropped as an uncommitted tail and
+        // healed by the rewrite.
+        let commit_header = |file: &mut fs::File| -> io::Result<()> {
+            #[cfg(test)]
+            if matches!(injected_failure, Some(HeaderCommitFailure::BeforeWrite)) {
+                return Err(io::Error::other("injected header-commit failure"));
+            }
+            file.seek(SeekFrom::Start(header_offset))?;
             file.write_all(next_header.as_bytes())?;
             file.sync_data()?;
+            #[cfg(test)]
+            if matches!(
+                injected_failure,
+                Some(HeaderCommitFailure::AfterDurableWrite)
+            ) {
+                return Err(io::Error::other(
+                    "injected header-commit failure (write landed)",
+                ));
+            }
             Ok(())
         };
-        if let Err(err) = append_and_commit(&mut file) {
-            let _ = file.set_len(committed_len);
-            let _ = file.sync_data();
+        if let Err(err) = commit_header(&mut file) {
+            // Whether the commit landed is unknown, so the in-memory
+            // generation/count/tail no longer reliably describe the file. Drop
+            // them: the next persist compacts (atomic tmp-file + rename rewrite
+            // from the in-memory entries), reconciling the file to memory
+            // regardless of which state the failed commit left behind —
+            // including re-dropping an entry the caller rolls back from memory
+            // but whose commit actually landed.
+            self.auth_journal = None;
             return Err(err.into());
         }
         self.auth_journal = Some(AuthJournalState {
+            generation: next_generation,
             count: next_count,
             tail_mac: next_tail_mac,
+            active_slot: target_slot,
         });
         Ok(false)
     }
@@ -677,18 +786,109 @@ fn parse_entry(line: &str) -> Result<ReplayEntry, ReplayCacheError> {
     })
 }
 
+/// Parses a full authenticated journal (v4 double-buffered, or legacy v3
+/// single-header). Returns the entries, the committed journal state, and
+/// whether the caller must rewrite the file to a clean committed state (an
+/// uncommitted trailing entry, a torn header slot, or a legacy v3 layout that
+/// needs upgrading).
 fn parse_authenticated_journal_entries(
     raw: &str,
     mac_key: &CacheMacKey,
 ) -> Result<(Vec<ReplayEntry>, AuthJournalState, bool), ReplayCacheError> {
-    let (header, body) = raw
-        .split_once('\n')
-        .ok_or_else(|| ReplayCacheError::MalformedLine("missing replay cache header".to_owned()))?;
-    let journal = parse_authenticated_journal_header(header, mac_key)?;
-    let mut entries = Vec::with_capacity(journal.count.min(8192) as usize);
+    if raw.starts_with(LEGACY_AUTH_JOURNAL_VERSION_V3) {
+        let (header, body) = raw.split_once('\n').ok_or_else(|| {
+            ReplayCacheError::MalformedLine("missing replay cache header".to_owned())
+        })?;
+        let (count, tail_mac) = parse_legacy_v3_journal_header(header, mac_key)?;
+        let (entries, _has_uncommitted_tail) =
+            parse_authenticated_journal_body(body, mac_key, count, &tail_mac)?;
+        let journal = AuthJournalState {
+            generation: 0,
+            count,
+            tail_mac,
+            active_slot: 0,
+        };
+        // A v3 journal is ALWAYS rewritten on load: the upgrade to the v4
+        // double-buffered layout rides the same atomic compaction that heals an
+        // uncommitted tail, so the single-header format (and its torn-header
+        // startup wedge) disappears after the first load.
+        return Ok((entries, journal, true));
+    }
+
+    // v4 layout: AUTH_JOURNAL_HEADER_SLOTS fixed-length header slots back to
+    // back, then the entry lines. Pick the highest-generation slot whose MAC
+    // verifies: the per-insert header commit only ever overwrites the slot NOT
+    // holding the newest committed generation, so a crash mid-commit tears at
+    // most that one slot and the other still holds the last committed state.
+    // Both header and torn-slot bytes come from our own ASCII writes, so a torn
+    // slot never breaks the UTF-8 read; `str::get` guards the residual
+    // (externally corrupted) non-boundary case without panicking.
+    let mut best: Option<(usize, HeaderSlot)> = None;
+    let mut any_slot_invalid = false;
+    let mut saw_mac_mismatch = false;
+    for slot_index in 0..AUTH_JOURNAL_HEADER_SLOTS {
+        let start = slot_index * AUTH_JOURNAL_HEADER_LEN;
+        let raw_slot = raw.get(start..start + AUTH_JOURNAL_HEADER_LEN);
+        match raw_slot.map(|slot| parse_authenticated_journal_header_slot(slot, mac_key)) {
+            Some(Ok(slot)) => {
+                // Strictly-greater keeps the LOWEST index on a generation tie
+                // (identical twin slots written by a compaction).
+                let newer = match &best {
+                    Some((_, current)) => slot.generation > current.generation,
+                    None => true,
+                };
+                if newer {
+                    best = Some((slot_index, slot));
+                }
+            }
+            Some(Err(err)) => {
+                any_slot_invalid = true;
+                saw_mac_mismatch |= matches!(err, ReplayCacheError::MacMismatch);
+            }
+            None => any_slot_invalid = true,
+        }
+    }
+    let Some((active_slot, header)) = best else {
+        // NO slot verifies: fail closed exactly like the v3 single-header
+        // format did. Chain-walk recovery is deliberately NOT attempted — a
+        // trusted header count is what distinguishes a torn-header crash from
+        // malicious truncation of committed entries.
+        return Err(if saw_mac_mismatch {
+            ReplayCacheError::MacMismatch
+        } else {
+            ReplayCacheError::MalformedLine("no valid replay cache header slot".to_owned())
+        });
+    };
+    let body = raw.get(AUTH_JOURNAL_HEADER_REGION_LEN..).ok_or_else(|| {
+        ReplayCacheError::MalformedLine("truncated replay cache header region".to_owned())
+    })?;
+    let (entries, has_uncommitted_tail) =
+        parse_authenticated_journal_body(body, mac_key, header.count, &header.tail_mac)?;
+    let journal = AuthJournalState {
+        generation: header.generation,
+        count: header.count,
+        tail_mac: header.tail_mac,
+        active_slot,
+    };
+    // A torn (invalid) slot is healed by the same rewrite that drops an
+    // uncommitted tail; the two almost always co-occur (the entry append is
+    // synced BEFORE the header commit that a crash tears).
+    Ok((entries, journal, has_uncommitted_tail || any_slot_invalid))
+}
+
+/// Verifies the entry lines in `body` against a trusted (MAC-verified) header
+/// `count`/`tail_mac`. Returns the committed entries and whether uncommitted
+/// trailing lines follow them.
+fn parse_authenticated_journal_body(
+    body: &str,
+    mac_key: &CacheMacKey,
+    count: u64,
+    tail_mac: &[u8; 32],
+) -> Result<(Vec<ReplayEntry>, bool), ReplayCacheError> {
+    let mut entries = Vec::with_capacity(count.min(8192) as usize);
     let mut previous_mac = [0_u8; 32];
     let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-    for index in 1..=journal.count {
+    for index in 1..=count {
         let line = lines.next().ok_or_else(|| {
             ReplayCacheError::MalformedLine("truncated replay journal".to_owned())
         })?;
@@ -697,26 +897,87 @@ fn parse_authenticated_journal_entries(
         previous_mac = entry_mac;
         entries.push(entry);
     }
-    if !bool::from(previous_mac.ct_eq(&journal.tail_mac)) {
+    if !bool::from(previous_mac.ct_eq(tail_mac)) {
         return Err(ReplayCacheError::MacMismatch);
     }
-    // A crash between the durable entry append and the in-place header rewrite can
-    // leave one (or more) committed-looking lines beyond `count`. The header (and
-    // its validated tail MAC) is authoritative, so we accept the prefix but flag
-    // the uncommitted tail so the caller can rewrite the file to the committed
-    // length. Without this, the next append seeks past the stale line, and a later
-    // restart parses it as the committed next entry and fails with MacMismatch,
-    // blocking startup.
+    // A crash between the durable entry append and the header-slot commit can
+    // leave one (or more) committed-looking lines beyond `count`. The header
+    // (and its validated tail MAC) is authoritative, so we accept the prefix
+    // but flag the uncommitted tail so the caller can rewrite the file to the
+    // committed length. Without this, the next append seeks past the stale
+    // line, and a later restart parses it as the committed next entry and fails
+    // with MacMismatch, blocking startup.
     let has_uncommitted_tail = lines.next().is_some();
-    Ok((entries, journal, has_uncommitted_tail))
+    Ok((entries, has_uncommitted_tail))
 }
 
-fn parse_authenticated_journal_header(
-    header: &str,
+/// One MAC-verified v4 header slot, before slot selection.
+struct HeaderSlot {
+    generation: u64,
+    count: u64,
+    tail_mac: [u8; 32],
+}
+
+fn parse_authenticated_journal_header_slot(
+    raw_slot: &str,
     mac_key: &CacheMacKey,
-) -> Result<AuthJournalState, ReplayCacheError> {
+) -> Result<HeaderSlot, ReplayCacheError> {
+    let header = raw_slot
+        .strip_suffix('\n')
+        .ok_or_else(|| ReplayCacheError::MalformedLine("unterminated header slot".to_owned()))?;
     let mut parts = header.split_whitespace();
     if parts.next() != Some(AUTH_JOURNAL_VERSION) {
+        return Err(ReplayCacheError::MalformedLine(header.to_owned()));
+    }
+    let generation_hex = parts
+        .next()
+        .and_then(|part| part.strip_prefix("gen="))
+        .ok_or_else(|| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    let count_hex = parts
+        .next()
+        .and_then(|part| part.strip_prefix("count="))
+        .ok_or_else(|| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    let tail_hex = parts
+        .next()
+        .and_then(|part| part.strip_prefix("tail="))
+        .ok_or_else(|| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    let header_mac_hex = parts
+        .next()
+        .and_then(|part| part.strip_prefix("mac="))
+        .ok_or_else(|| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    if parts.next().is_some() {
+        return Err(ReplayCacheError::MalformedLine(header.to_owned()));
+    }
+
+    let generation = u64::from_str_radix(generation_hex, 16)
+        .map_err(|_| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    let count = u64::from_str_radix(count_hex, 16)
+        .map_err(|_| ReplayCacheError::MalformedLine(header.to_owned()))?;
+    let mut tail_mac = [0_u8; 32];
+    decode_hex_exact(tail_hex, &mut tail_mac)?;
+    let mut expected_header_mac = [0_u8; 32];
+    decode_hex_exact(header_mac_hex, &mut expected_header_mac)?;
+    let actual_header_mac = cache_journal_header_mac(mac_key, generation, count, &tail_mac);
+    if !bool::from(actual_header_mac.ct_eq(&expected_header_mac)) {
+        return Err(ReplayCacheError::MacMismatch);
+    }
+
+    Ok(HeaderSlot {
+        generation,
+        count,
+        tail_mac,
+    })
+}
+
+/// Parses and verifies a legacy v3 single-header line (no generation binding).
+/// Read-only compatibility for the upgrade-on-first-load path; v3 headers are
+/// never written.
+fn parse_legacy_v3_journal_header(
+    header: &str,
+    mac_key: &CacheMacKey,
+) -> Result<(u64, [u8; 32]), ReplayCacheError> {
+    let mut parts = header.split_whitespace();
+    if parts.next() != Some(LEGACY_AUTH_JOURNAL_VERSION_V3) {
         return Err(ReplayCacheError::MalformedLine(header.to_owned()));
     }
     let count_hex = parts
@@ -741,12 +1002,12 @@ fn parse_authenticated_journal_header(
     decode_hex_exact(tail_hex, &mut tail_mac)?;
     let mut expected_header_mac = [0_u8; 32];
     decode_hex_exact(header_mac_hex, &mut expected_header_mac)?;
-    let actual_header_mac = cache_journal_header_mac(mac_key, count, &tail_mac);
+    let actual_header_mac = legacy_cache_journal_header_mac_v3(mac_key, count, &tail_mac);
     if !bool::from(actual_header_mac.ct_eq(&expected_header_mac)) {
         return Err(ReplayCacheError::MacMismatch);
     }
 
-    Ok(AuthJournalState { count, tail_mac })
+    Ok((count, tail_mac))
 }
 
 fn parse_authenticated_journal_entry(
@@ -844,21 +1105,41 @@ fn serialize_authenticated_journal(
         previous_mac = entry_mac;
     }
 
+    // A compaction replaces the whole file atomically (tmp + rename), so the
+    // generation counter restarts: both slots are written identically at
+    // generation 1, the tie-break picks slot 0 as active, and the next insert
+    // commits generation 2 into slot 1. Generations only order slots WITHIN one
+    // file, so the restart is harmless.
     let journal = AuthJournalState {
+        generation: 1,
         count,
         tail_mac: previous_mac,
+        active_slot: 0,
     };
-    let header = authenticated_journal_header(mac_key, count, &journal.tail_mac);
-    let mut raw = String::with_capacity(header.len() + body.len());
-    raw.push_str(&header);
+    let header =
+        authenticated_journal_header(mac_key, journal.generation, count, &journal.tail_mac);
+    let mut raw = String::with_capacity(AUTH_JOURNAL_HEADER_REGION_LEN + body.len());
+    for _ in 0..AUTH_JOURNAL_HEADER_SLOTS {
+        raw.push_str(&header);
+    }
     raw.push_str(&body);
     (raw, journal)
 }
 
-fn authenticated_journal_header(mac_key: &CacheMacKey, count: u64, tail_mac: &[u8; 32]) -> String {
-    let header_mac = cache_journal_header_mac(mac_key, count, tail_mac);
+/// Encodes ONE fixed-length v4 header slot. The `generation` is bound into the
+/// header MAC so a stale slot can never masquerade as a newer commit; the
+/// loader picks the highest-generation slot that verifies.
+fn authenticated_journal_header(
+    mac_key: &CacheMacKey,
+    generation: u64,
+    count: u64,
+    tail_mac: &[u8; 32],
+) -> String {
+    let header_mac = cache_journal_header_mac(mac_key, generation, count, tail_mac);
     let mut raw = String::with_capacity(AUTH_JOURNAL_HEADER_LEN);
     raw.push_str(AUTH_JOURNAL_VERSION);
+    raw.push_str(" gen=");
+    raw.push_str(&format!("{generation:016x}"));
     raw.push_str(" count=");
     raw.push_str(&format!("{count:016x}"));
     raw.push_str(" tail=");
@@ -907,7 +1188,33 @@ fn cache_mac_key(key_material: &[u8]) -> CacheMacKey {
     CacheMacKey(out)
 }
 
-fn cache_journal_header_mac(mac_key: &CacheMacKey, count: u64, tail_mac: &[u8; 32]) -> [u8; 32] {
+/// v4 header-slot MAC: binds the GENERATION as well as the count/tail so a
+/// stale-but-intact slot can never be replayed as a newer commit — slot
+/// selection on load orders by generation, and only MAC-verified generations
+/// participate. The 8-byte generation prefix also makes the MAC input 8 bytes
+/// longer than the legacy v3 header MAC's, so the two can never collide under
+/// the shared label.
+fn cache_journal_header_mac(
+    mac_key: &CacheMacKey,
+    generation: u64,
+    count: u64,
+    tail_mac: &[u8; 32],
+) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(&mac_key.0).expect("HMAC accepts any key length");
+    mac.update(CACHE_JOURNAL_HEADER_MAC_LABEL);
+    mac.update(&generation.to_be_bytes());
+    mac.update(&count.to_be_bytes());
+    mac.update(tail_mac);
+    mac.finalize().into_bytes().into()
+}
+
+/// Legacy v3 header MAC (no generation). Verify-only: used to authenticate a
+/// pre-upgrade journal before it is rewritten in the v4 layout.
+fn legacy_cache_journal_header_mac_v3(
+    mac_key: &CacheMacKey,
+    count: u64,
+    tail_mac: &[u8; 32],
+) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(&mac_key.0).expect("HMAC accepts any key length");
     mac.update(CACHE_JOURNAL_HEADER_MAC_LABEL);
     mac.update(&count.to_be_bytes());
@@ -1342,10 +1649,13 @@ mod tests {
             .unwrap());
 
         let raw = fs::read_to_string(&path).unwrap();
+        // Keep the full header region (both slots — their committed count=2 is the
+        // truncation detector) plus only the FIRST entry line.
         let mut lines = raw.lines();
         let truncated = format!(
-            "{}\n{}\n",
-            lines.next().expect("journal header"),
+            "{}\n{}\n{}\n",
+            lines.next().expect("journal header slot A"),
+            lines.next().expect("journal header slot B"),
             lines.next().expect("first journal entry")
         );
         fs::write(&path, truncated).unwrap();
@@ -1353,6 +1663,213 @@ mod tests {
         assert!(matches!(
             ReplayCache::load_or_create_authenticated(&path, 8, key),
             Err(ReplayCacheError::MalformedLine(_)) | Err(ReplayCacheError::MacMismatch)
+        ));
+    }
+
+    /// Builds a journal whose two header slots differ: two inserts leave slot A
+    /// holding the first commit (generation 1, count 1, via the compaction that
+    /// writes a fresh file) and slot B holding the second insert's commit
+    /// (generation 2, count 2), with both entry lines appended after the header
+    /// region. Returns the two entries and `now`.
+    fn journal_with_divergent_slots(path: &Path, key: &[u8]) -> (ReplayEntry, ReplayEntry, u64) {
+        let now = current_unix_timestamp().unwrap();
+        let first = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+        let mut cache = ReplayCache::load_or_create_authenticated(path, 8, key).unwrap();
+        assert!(cache.insert_new(first.clone(), now).unwrap());
+        assert!(cache.insert_new(second.clone(), now).unwrap());
+        (first, second, now)
+    }
+
+    /// Overwrites part of one fixed-length header slot in place, as a crash
+    /// mid-`write_all` would.
+    fn tear_header_slot(path: &Path, slot: usize) {
+        let mut raw = fs::read(path).unwrap();
+        let start = slot * AUTH_JOURNAL_HEADER_LEN + 40;
+        for byte in &mut raw[start..start + 40] {
+            *byte = b'!';
+        }
+        fs::write(path, &raw).unwrap();
+    }
+
+    #[test]
+    fn torn_active_header_slot_falls_back_to_the_surviving_commit() {
+        // Issue #143 L11: a crash DURING the in-place header write must not wedge
+        // startup. Tear the ACTIVE (highest-generation) slot — exactly what an
+        // interrupted commit leaves — and the load must fall back to the other
+        // slot's last committed header instead of failing with MacMismatch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-torn-active.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let (first, second, now) = journal_with_divergent_slots(&path, key);
+        // Slot B (index 1) carries generation 2 = the active commit.
+        tear_header_slot(&path, 1);
+
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key)
+            .expect("torn active slot must fall back to the surviving slot, not fail closed");
+        // The surviving slot committed count=1: entry 1 is present and still
+        // gates replays (the trusted count + entry set are intact).
+        assert!(
+            !reloaded.insert_new(first.clone(), now).unwrap(),
+            "committed entry survives the torn header"
+        );
+        // Entry 2's commit never completed, so its appended line is an
+        // uncommitted tail: dropped on load (crash-consistent) and re-insertable.
+        assert!(
+            reloaded.insert_new(second.clone(), now).unwrap(),
+            "the uncommitted entry is re-insertable, not falsely Replayed"
+        );
+
+        // The load healed the torn slot (compaction rewrite): a further reload
+        // succeeds and sees both entries committed.
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains('!'), "torn slot bytes healed by the rewrite");
+        let mut again = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!again.insert_new(first, now).unwrap());
+        assert!(!again.insert_new(second, now).unwrap());
+    }
+
+    #[test]
+    fn torn_inactive_header_slot_keeps_the_newest_commit() {
+        // The complementary tear: the STALE slot is damaged (a crash during the
+        // NEXT commit, before the new header landed). The newest committed slot
+        // still verifies, so nothing is lost — count=2 and both entries stand.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-torn-inactive.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let (first, second, now) = journal_with_divergent_slots(&path, key);
+        // Slot A (index 0) carries generation 1 = the stale commit.
+        tear_header_slot(&path, 0);
+
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key)
+            .expect("torn inactive slot must not affect the newest commit");
+        assert!(!reloaded.insert_new(first, now).unwrap());
+        assert!(!reloaded.insert_new(second, now).unwrap());
+    }
+
+    #[test]
+    fn both_header_slots_torn_fails_closed() {
+        // With NO verifying slot there is no trusted count, and a chain walk
+        // cannot distinguish a torn-header crash from malicious truncation of
+        // committed entries — so the load must fail closed, exactly like v3.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-torn-both.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let _ = journal_with_divergent_slots(&path, key);
+        tear_header_slot(&path, 0);
+        tear_header_slot(&path, 1);
+
+        assert!(matches!(
+            ReplayCache::load_or_create_authenticated(&path, 8, key),
+            Err(ReplayCacheError::MalformedLine(_)) | Err(ReplayCacheError::MacMismatch)
+        ));
+    }
+
+    #[test]
+    fn header_mac_binds_the_generation() {
+        // The v4 header MAC must bind the generation, otherwise a stale slot's
+        // MAC could be replayed onto a forged higher generation and win slot
+        // selection with a rolled-back count.
+        let mac_key = cache_mac_key(b"0123456789abcdef0123456789abcdef");
+        let tail = [7_u8; 32];
+        assert_ne!(
+            cache_journal_header_mac(&mac_key, 1, 5, &tail),
+            cache_journal_header_mac(&mac_key, 2, 5, &tail),
+            "same count/tail under different generations must MAC differently"
+        );
+    }
+
+    #[test]
+    fn legacy_v3_journal_loads_and_upgrades_to_v4() {
+        // A journal written by the previous release (single in-place header, no
+        // generation) must still load — entries, count-based truncation
+        // detection and replay gating intact — and be rewritten in the v4
+        // double-buffered layout on first load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-legacy-v3.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        // Fill the fixture nonces/fingerprints from a runtime RNG rather than byte
+        // literals: they feed the hand-built journal HMAC below, and any hard-coded
+        // (or literal-derived) byte array flowing into a MAC trips CodeQL's
+        // `rust/hard-coded-cryptographic-value` query (a false positive on test
+        // fixtures). The test only needs distinct dedup entries, which OsRng gives.
+        let mk_entry = || {
+            // `rand::random()` with no zero-array initializer: a `fill_bytes` into a
+            // `[0u8; N]` still leaves the zero literal for CodeQL's
+            // `rust/hard-coded-cryptographic-value` query to flag (a false positive
+            // on this test fixture, whose bytes only need to be distinct dedup keys).
+            let nonce: [u8; 8] = rand::random();
+            let fp: [u8; 32] = rand::random();
+            ReplayEntry {
+                timestamp: now,
+                nonce,
+                transcript_fingerprint: fp,
+            }
+        };
+        let first = mk_entry();
+        let second = mk_entry();
+
+        // Hand-write the exact v3 on-disk format: one header line whose MAC does
+        // NOT bind a generation, then the chained entry lines.
+        let mac_key = cache_mac_key(key);
+        let (line1, mac1) = encode_authenticated_journal_entry(&mac_key, 1, &first, &[0_u8; 32]);
+        let (line2, mac2) = encode_authenticated_journal_entry(&mac_key, 2, &second, &mac1);
+        let header_mac = legacy_cache_journal_header_mac_v3(&mac_key, 2, &mac2);
+        let mut header = String::new();
+        header.push_str(LEGACY_AUTH_JOURNAL_VERSION_V3);
+        header.push_str(" count=");
+        header.push_str(&format!("{:016x}", 2));
+        header.push_str(" tail=");
+        push_hex(&mut header, &mac2);
+        header.push_str(" mac=");
+        push_hex(&mut header, &header_mac);
+        header.push('\n');
+        let v3_raw = format!("{header}{line1}{line2}");
+        fs::write(&path, &v3_raw).unwrap();
+
+        let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key)
+            .expect("a legacy v3 journal must load");
+        assert!(
+            !loaded.insert_new(first.clone(), now).unwrap(),
+            "v3 entries survive the upgrade"
+        );
+        assert!(!loaded.insert_new(second.clone(), now).unwrap());
+
+        // The first load upgraded the file to the v4 double-buffered layout.
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with(AUTH_JOURNAL_VERSION));
+        assert!(!raw.contains(LEGACY_AUTH_JOURNAL_VERSION_V3));
+
+        // The upgraded journal keeps working: a new entry appends and everything
+        // reloads cleanly.
+        let third = mk_entry();
+        assert!(loaded.insert_new(third.clone(), now).unwrap());
+        drop(loaded);
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!reloaded.insert_new(first, now).unwrap());
+        assert!(!reloaded.insert_new(second, now).unwrap());
+        assert!(!reloaded.insert_new(third, now).unwrap());
+
+        // A tampered v3 header (count bumped without a matching MAC) still fails
+        // closed: the legacy compatibility path stays authenticated.
+        let tampered_path = dir.path().join("replay-legacy-v3-tampered.cache");
+        fs::write(
+            &tampered_path,
+            v3_raw.replacen("count=0000000000000002", "count=0000000000000003", 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            ReplayCache::load_or_create_authenticated(&tampered_path, 8, key),
+            Err(ReplayCacheError::MacMismatch)
         ));
     }
 
@@ -1555,6 +2072,130 @@ mod tests {
     }
 
     #[test]
+    fn header_commit_failure_after_durable_append_never_truncates_the_entry() {
+        // Regression (cubic P2): the entry append and the header commit are
+        // separate failure domains. If the header commit reports an error AFTER
+        // the new (higher-generation) slot durably landed, the old shared error
+        // path truncated the appended entry — leaving a MAC-valid header
+        // advertising a removed body, which
+        // `authenticated_journal_detects_committed_truncation` pins as
+        // permanently unloadable. Inject exactly that failure and assert the
+        // entry is left in place and every subsequent load is consistent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-header-commit-fail.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let first = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(first.clone(), now).unwrap());
+        let committed_len = fs::metadata(&path).unwrap().len();
+
+        cache.fail_header_commit = Some(HeaderCommitFailure::AfterDurableWrite);
+        assert!(matches!(
+            cache.insert_new_outcome(second.clone(), now),
+            Err(ReplayCacheError::Io(_))
+        ));
+
+        // The durable append must NOT be rolled back: the landed gen-2 header
+        // advertises count=2, so truncating the body would wedge the next load.
+        assert!(
+            fs::metadata(&path).unwrap().len() > committed_len,
+            "a failed header commit must not truncate the appended entry"
+        );
+
+        // A restart sees the landed header: the journal loads (no wedge) and the
+        // entry it advertises is committed, still gating replays.
+        let mut restarted = ReplayCache::load_or_create_authenticated(&path, 8, key)
+            .expect("journal must stay loadable after a failed header commit");
+        assert!(!restarted.insert_new(first.clone(), now).unwrap());
+        assert!(
+            !restarted.insert_new(second.clone(), now).unwrap(),
+            "the entry advertised by the landed header is committed"
+        );
+        drop(restarted);
+
+        // The ORIGINAL process also recovers: the commit state is unknown, so
+        // the next persist routes through the atomic compaction rewrite, and the
+        // rolled-back entry is re-insertable (not falsely Replayed).
+        assert!(
+            cache.insert_new(second.clone(), now).unwrap(),
+            "rolled-back entry must be re-insertable after the failed commit"
+        );
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(!reloaded.insert_new(first, now).unwrap());
+        assert!(!reloaded.insert_new(second, now).unwrap());
+    }
+
+    #[test]
+    fn header_commit_failure_with_no_header_bytes_leaves_a_healable_tail() {
+        // The complementary phase-2 outcome: the commit fails before ANY header
+        // byte lands, so both slots still hold the old committed state (a valid
+        // generation tie) and the durable entry beyond their count is an
+        // uncommitted tail. The load must fall back to the old count, drop and
+        // heal the tail, and keep the entry re-insertable — never wedge.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-header-commit-fail-early.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let first = ReplayEntry {
+            timestamp: now,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        let second = ReplayEntry {
+            timestamp: now,
+            nonce: [3; 8],
+            transcript_fingerprint: [4; 32],
+        };
+
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(cache.insert_new(first.clone(), now).unwrap());
+        let committed_raw = fs::read(&path).unwrap();
+
+        cache.fail_header_commit = Some(HeaderCommitFailure::BeforeWrite);
+        assert!(matches!(
+            cache.insert_new_outcome(second.clone(), now),
+            Err(ReplayCacheError::Io(_))
+        ));
+        drop(cache);
+
+        // The durable entry stays (only the append's OWN failure rolls it back)
+        // and the header region is byte-for-byte untouched.
+        let raw_after = fs::read(&path).unwrap();
+        assert!(
+            raw_after.len() > committed_raw.len(),
+            "the durable append must survive the failed header commit"
+        );
+        assert_eq!(
+            &raw_after[..AUTH_JOURNAL_HEADER_REGION_LEN],
+            &committed_raw[..AUTH_JOURNAL_HEADER_REGION_LEN],
+            "no header byte landed"
+        );
+
+        // A restart falls back to the old header: it loads cleanly, the
+        // committed entry still gates replays, and the uncommitted tail is
+        // dropped (and healed) so the failed entry is re-insertable rather than
+        // falsely Replayed.
+        let mut restarted = ReplayCache::load_or_create_authenticated(&path, 8, key)
+            .expect("journal must stay loadable after a failed header commit");
+        assert!(!restarted.insert_new(first, now).unwrap());
+        assert!(
+            restarted.insert_new(second, now).unwrap(),
+            "the uncommitted tail entry is re-insertable after the fallback"
+        );
+    }
+
+    #[test]
     fn widened_window_retains_entries_across_reload_with_no_replay_gap() {
         // Regression for the post-restart replay gap: building the cache with the
         // default window and widening afterwards pruned entries at load that the
@@ -1740,8 +2381,8 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         assert_eq!(
             raw.lines().count(),
-            4,
-            "header + one line per entry (no duplicates): {raw:?}"
+            AUTH_JOURNAL_HEADER_SLOTS + 3,
+            "both header slots + one line per entry (no duplicates): {raw:?}"
         );
         let mut loaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
         assert!(!loaded.insert_new(committed, now).unwrap());
