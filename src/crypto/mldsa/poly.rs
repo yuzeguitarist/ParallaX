@@ -153,6 +153,17 @@ impl Poly {
         }
     }
 
+    /// In-place `self[i] = montgomery_reduce(a[i] * self[i])`. Mirrors the C
+    /// `poly_pointwise_montgomery` aliasing dest=src2 (e.g. `poly_pointwise_
+    /// montgomery(&t1->vec[i], &cp, &t1->vec[i])`): each coefficient is read and
+    /// written in the same step, so no `Poly` Copy temporary of `self` is spilled.
+    #[inline]
+    pub fn pointwise_montgomery_assign(&mut self, a: &Poly) {
+        for i in 0..N {
+            self.coeffs[i] = montgomery_reduce(a.coeffs[i] as i64 * self.coeffs[i] as i64);
+        }
+    }
+
     /// Per-coefficient `power2round` (`poly.c` `poly_power2round`): writes high
     /// bits into `a1` and low bits into `a0`, both reading from `self`.
     #[inline]

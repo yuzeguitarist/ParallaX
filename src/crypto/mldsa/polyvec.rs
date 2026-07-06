@@ -138,8 +138,13 @@ impl Polyvecl {
         let mut t = Poly::zero();
         for i in 1..L {
             t.pointwise_montgomery(&u.vec[i], &v.vec[i]);
-            let wcur = *w;
-            w.add(&wcur, &t);
+            // In-place accumulate (`w += t`) rather than `let wcur = *w; w.add(&wcur, &t)`:
+            // the accumulator holds secret-derived material on the sign/keygen path
+            // (`A·s1`, `A·y`), so this mirrors the plan §5 rationale already applied to
+            // `add_assign`/`sub_assign` — no full-polynomial Copy temporary is spilled.
+            // It also drops one accumulator Copy per step (L-1 per row, K·(L-1) per
+            // matrix-vector product).
+            w.add_assign(&t);
         }
     }
 
@@ -273,6 +278,17 @@ impl Polyveck {
         for i in 0..K {
             let vi = v.vec[i];
             self.vec[i].pointwise_montgomery(a, &vi);
+        }
+    }
+
+    /// In-place `self[i] = a * self[i]` pointwise in NTT domain (with the `2^-32`
+    /// factor), for each of the `K` elements. Mirrors the C
+    /// `polyveck_pointwise_poly_montgomery(&t1, &cp, &t1)` aliasing dest=src2, so
+    /// no whole-`Polyveck` Copy temporary is spilled just to satisfy the borrow
+    /// checker.
+    pub fn pointwise_poly_montgomery_assign(&mut self, a: &Poly) {
+        for i in 0..K {
+            self.vec[i].pointwise_montgomery_assign(a);
         }
     }
 
