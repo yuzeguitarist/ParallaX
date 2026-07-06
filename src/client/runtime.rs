@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, oneshot, Mutex, Notify, Semaphore, TryAcquireError},
+    sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
     time::{sleep, timeout, Instant},
 };
 
@@ -152,6 +152,10 @@ const MUX_WARM_KEEPER_ACTIVE_WINDOW: Duration = Duration::from_secs(90);
 const MUX_WARM_KEEPER_MAX_REBUILD_FAILURES: u32 = 4;
 /// Cap on the exponential backoff between failed proactive rebuild attempts.
 const MUX_WARM_KEEPER_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Number of fully-idle mux sessions the pool keeps warm for reuse. Sessions
+/// beyond this that have every substream slot free are dropped (closing their
+/// carrier) so a post-burst client does not hoard idle TLS/QUIC sessions.
+const MUX_POOL_MAX_IDLE_SESSIONS: usize = 2;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -680,23 +684,36 @@ fn warm_session_is_live(_stream: &TcpStream) -> bool {
     true
 }
 
-/// State of the shared mux session, used to single-flight establishment WITHOUT
-/// holding the pool mutex across the (up to 15s) network handshake. `Building`
-/// carries a `Notify` the in-flight builder fires on completion (success or
-/// failure) so every concurrently-waiting connection shares the one attempt
-/// instead of serializing a fresh 15s handshake each behind the lock.
-enum MuxState {
-    /// No session and nobody building one.
-    Idle,
-    /// A build is in flight; waiters park on this `Notify`.
-    Building(Arc<Notify>),
-    /// A live (or possibly now-stale) session; reusability is re-checked.
-    Ready(ClientMuxHandle),
+/// Live sessions in the mux pool plus the single-flight build coordinator.
+///
+/// Historically this was a single shared session, which turned
+/// `max_concurrent_streams` (a PER-SESSION substream cap) into a GLOBAL cap on
+/// simultaneous proxied connections: once that many keep-alive connections held
+/// every slot, each new local connection blocked forever on the slot semaphore
+/// (the "new tab never loads with max_concurrent_streams > 1" bug). The pool now
+/// keeps as many sessions as demand needs — a new one is opened when every
+/// existing session's substream slots are taken — so concurrency is bounded only
+/// by the fd-based connection limit, exactly like the `max_concurrent_streams=1`
+/// per-connection path.
+///
+/// `building` single-flights establishment WITHOUT holding the pool mutex across
+/// the (up to 15s) network handshake: it carries a `Notify` the in-flight builder
+/// fires on completion (success or failure) so concurrently-waiting connections
+/// share the one attempt (and then re-check the pool, which may now have a free
+/// slot) instead of each serializing a fresh handshake behind the lock.
+#[derive(Default)]
+struct MuxPoolState {
+    /// Established sessions. Dead sessions are pruned on access; fully-idle
+    /// sessions beyond [`MUX_POOL_MAX_IDLE_SESSIONS`] are dropped to bound the
+    /// idle footprint.
+    sessions: Vec<ClientMuxHandle>,
+    /// `Some` while a session build is in flight; waiters park on this `Notify`.
+    building: Option<Arc<Notify>>,
 }
 
 #[derive(Clone)]
 struct ClientMuxPool {
-    inner: Arc<Mutex<MuxState>>,
+    inner: Arc<Mutex<MuxPoolState>>,
     /// Monotonic ms of the last real connection served by `handle()`. The warm-
     /// keeper consults it to refill a dead tunnel only during active-use windows
     /// (so an idle client never re-handshakes on a 24/7 timer).
@@ -876,6 +893,18 @@ impl StreamTerminal {
     }
 }
 
+/// Reserves one substream slot on the first pooled session that still has a free
+/// slot, returning that session's handle plus the owning permit. `None` when every
+/// session is saturated (the caller then opens a new session).
+fn reserve_slot(sessions: &[ClientMuxHandle]) -> Option<(ClientMuxHandle, OwnedSemaphorePermit)> {
+    for handle in sessions {
+        if let Ok(permit) = Arc::clone(&handle.stream_slots).try_acquire_owned() {
+            return Some((handle.clone(), permit));
+        }
+    }
+    None
+}
+
 impl ClientMuxPool {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -889,7 +918,7 @@ impl ClientMuxPool {
         server_identity_public: Arc<[u8]>,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(MuxState::Idle)),
+            inner: Arc::new(Mutex::new(MuxPoolState::default())),
             last_activity: Arc::new(AtomicU64::new(0)),
             config,
             server_addr,
@@ -903,113 +932,180 @@ impl ClientMuxPool {
     }
 
     /// Records activity (so the warm-keeper keeps a tunnel ready during active
-    /// use), then returns a reusable mux session, building one if needed.
-    async fn handle(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
+    /// use), then reserves a substream slot on a reusable session — reusing a
+    /// session that still has a free slot, or opening a new one when every
+    /// existing session is saturated. The returned permit MUST be held for the
+    /// whole local connection: it is what bounds a session to
+    /// `max_concurrent_streams` substreams. Because the pool grows on demand, the
+    /// number of concurrent connections is NOT capped at `max_concurrent_streams`
+    /// (the single-session starvation bug); it is bounded only by the fd-based
+    /// connection limit, like the `max_concurrent_streams=1` path.
+    async fn acquire(&self) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
         self.last_activity
             .store(relay_now_millis(), Ordering::Relaxed);
-        self.get_or_build().await
-    }
-
-    async fn get_or_build(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
         loop {
-            let mut state = self.inner.lock().await;
-            // Decide an action without awaiting under the lock. The match yields an
-            // OWNED value so its borrow of `state` ends before we touch the guard.
-            let waiting_notify: Option<Arc<Notify>> = match &*state {
-                // A cached session is only reusable if BOTH of its tasks are alive
-                // (see ClientMuxHandle::is_reusable). The reader can exit
-                // independently of the writer — e.g. on a clean server->client
-                // half-close FIN the reader returns Ok while the cover-disabled
-                // writer blocks forever on frame_rx.recv(). Probing only the writer
-                // would keep handing out a half-dead handle whose register_tx is
-                // closed, and every new local connection would fail at
-                // register_tx.send. A stale Ready falls through to a rebuild.
-                MuxState::Ready(handle) if handle.is_reusable() => {
-                    return Ok(handle.clone());
+            // Decide an action without awaiting under the lock. Prune dead and
+            // surplus-idle sessions, then take a free slot on any live session.
+            let waiting_notify: Option<Arc<Notify>> = {
+                let mut state = self.inner.lock().await;
+                self.reap_sessions(&mut state);
+                if let Some(reserved) = reserve_slot(&state.sessions) {
+                    return Ok(reserved);
                 }
-                MuxState::Building(notify) => Some(notify.clone()),
-                // Idle, or a stale (non-reusable) Ready: we become the builder.
-                _ => None,
+                match &state.building {
+                    Some(notify) => Some(notify.clone()),
+                    None => {
+                        let notify = Arc::new(Notify::new());
+                        state.building = Some(Arc::clone(&notify));
+                        drop(state);
+                        // We are the sole builder. Establish OFF-LOCK, add the new
+                        // session, take its first slot, and wake waiters (which
+                        // re-check and may grab the new session's remaining slots).
+                        return self.build_and_reserve(notify).await;
+                    }
+                }
             };
 
-            match waiting_notify {
-                Some(notify) => {
-                    // Another connection is establishing the session. Register for
-                    // its completion wakeup BEFORE dropping the lock (lost-wakeup
-                    // safety: a notify_waiters() racing our unlock is not missed),
-                    // then wait off-lock and re-check.
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    drop(state);
-                    notified.await;
-                    continue;
-                }
-                None => {
-                    // Sole builder: publish Building, release the lock, and run the
-                    // (up to CLIENT_ESTABLISH_TIMEOUT) handshake OFF-LOCK so a slow
-                    // or stalling server cannot block every other local connection
-                    // behind this mutex — the M-7 fix. Concurrent callers share
-                    // this single attempt instead of serializing a fresh handshake.
-                    let notify = Arc::new(Notify::new());
-                    *state = MuxState::Building(Arc::clone(&notify));
-                    drop(state);
-
-                    // Run establishment in a detached task and await its handle, so a
-                    // PANIC inside start_session() surfaces as Err(JoinError) and is
-                    // handled on the normal path below (reset Building->Idle + notify)
-                    // instead of unwinding past the reset and stranding every waiter
-                    // on a Notify that never fires. This restores the panic self-heal
-                    // the pre-single-flight lock-holding code had, WITHOUT a
-                    // try_lock-in-Drop guard (which could miss the reset under lock
-                    // contention). handle() callers run it in detached spawns, so the
-                    // future itself is never cancelled mid-await.
-                    let pool = self.clone();
-                    let result = match tokio::spawn(async move { pool.start_session().await }).await
-                    {
-                        Ok(r) => r,
-                        Err(join_err) => {
-                            tracing::warn!(
-                                error = %join_err,
-                                "client mux establishment task failed (panic); resetting"
-                            );
-                            Err(ClientRuntimeError::Io(io::Error::other(
-                                "client mux establishment task panicked",
-                            )))
-                        }
-                    };
-                    let mut state = self.inner.lock().await;
-                    let outcome = match result {
-                        Ok(handle) => {
-                            *state = MuxState::Ready(handle.clone());
-                            Ok(handle)
-                        }
-                        Err(err) => {
-                            // Reset so a waiter re-loops and one becomes the next
-                            // builder (preserves the original retry-on-failure).
-                            *state = MuxState::Idle;
-                            Err(err)
-                        }
-                    };
-                    drop(state);
-                    notify.notify_waiters();
-                    return outcome;
-                }
+            // Another connection is establishing a session. Park on its completion
+            // (registering BEFORE dropping the lock is handled above by cloning the
+            // Notify), then re-loop: the new session may now have a free slot, or
+            // we become the next builder.
+            if let Some(notify) = waiting_notify {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                notified.await;
             }
         }
+    }
+
+    /// Builds a new session off-lock (single-flighted via `notify`), records it,
+    /// reserves its first substream slot, and wakes any parked waiters.
+    async fn build_and_reserve(
+        &self,
+        notify: Arc<Notify>,
+    ) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
+        let result = self.spawn_build().await;
+        let mut state = self.inner.lock().await;
+        state.building = None;
+        let outcome = match result {
+            Ok(handle) => {
+                // A fresh session always has free slots, so this cannot fail.
+                let permit = Arc::clone(&handle.stream_slots)
+                    .try_acquire_owned()
+                    .expect("a freshly built mux session has free substream slots");
+                state.sessions.push(handle.clone());
+                Ok((handle, permit))
+            }
+            // Leave the pool without this session so a waiter re-loops and one
+            // becomes the next builder (preserves retry-on-failure).
+            Err(err) => Err(err),
+        };
+        drop(state);
+        notify.notify_waiters();
+        outcome
+    }
+
+    /// Ensures at least one reusable session exists WITHOUT reserving a slot, for
+    /// the warm-keeper. Shares the same single-flight build coordinator as
+    /// [`Self::acquire`], so a warm rebuild never races a connection into building
+    /// two sessions at once.
+    async fn ensure_warm(&self) -> Result<(), ClientRuntimeError> {
+        loop {
+            let waiting_notify: Option<Arc<Notify>> = {
+                let mut state = self.inner.lock().await;
+                self.reap_sessions(&mut state);
+                if !state.sessions.is_empty() {
+                    return Ok(());
+                }
+                match &state.building {
+                    Some(notify) => Some(notify.clone()),
+                    None => {
+                        let notify = Arc::new(Notify::new());
+                        state.building = Some(Arc::clone(&notify));
+                        drop(state);
+                        let result = self.spawn_build().await;
+                        let mut state = self.inner.lock().await;
+                        state.building = None;
+                        let outcome = match result {
+                            Ok(handle) => {
+                                state.sessions.push(handle);
+                                Ok(())
+                            }
+                            Err(err) => Err(err),
+                        };
+                        drop(state);
+                        notify.notify_waiters();
+                        return outcome;
+                    }
+                }
+            };
+            if let Some(notify) = waiting_notify {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                notified.await;
+            }
+        }
+    }
+
+    /// Runs `start_session` in a detached task and awaits it, so a PANIC inside
+    /// establishment surfaces as `Err` (self-heal) instead of unwinding past the
+    /// `building` reset and stranding every waiter on a Notify that never fires.
+    /// The (up to CLIENT_ESTABLISH_TIMEOUT) handshake runs OFF-LOCK so a slow or
+    /// stalling server never blocks other local connections behind the pool mutex.
+    async fn spawn_build(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
+        let pool = self.clone();
+        match tokio::spawn(async move { pool.start_session().await }).await {
+            Ok(result) => result,
+            Err(join_err) => {
+                tracing::warn!(
+                    error = %join_err,
+                    "client mux establishment task failed (panic); resetting"
+                );
+                Err(ClientRuntimeError::Io(io::Error::other(
+                    "client mux establishment task panicked",
+                )))
+            }
+        }
+    }
+
+    /// Drops sessions that are no longer reusable (both carrier tasks/conn must be
+    /// live — see [`ClientMuxHandle::is_reusable`]) and fully-idle sessions beyond
+    /// [`MUX_POOL_MAX_IDLE_SESSIONS`], so the pool does not hoard idle carriers
+    /// after a burst. A session with any substream slot in use is always kept.
+    fn reap_sessions(&self, state: &mut MuxPoolState) {
+        let full_slots = self.traffic.max_concurrent_streams as usize;
+        let mut idle_kept = 0;
+        state.sessions.retain(|handle| {
+            if !handle.is_reusable() {
+                return false;
+            }
+            // Fully idle == every substream slot free (no active connection).
+            if handle.stream_slots.available_permits() >= full_slots {
+                if idle_kept < MUX_POOL_MAX_IDLE_SESSIONS {
+                    idle_kept += 1;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        });
     }
 
     fn ensure_started(&self) {
         let pool = self.clone();
         tokio::spawn(async move {
             // Initial warm at startup.
-            if let Err(err) = pool.get_or_build().await {
+            if let Err(err) = pool.ensure_warm().await {
                 tracing::debug!(error = %err, "client mux warm session startup failed");
             }
             // Warm-keeper: during active-use windows, proactively rebuild a dead
             // shared tunnel so the next local connection finds it warm (resilience
             // to a mid-session RST/blackhole). Outside the active window, let it
-            // idle out — no 24/7 re-handshake churn. Uses get_or_build (not handle)
+            // idle out — no 24/7 re-handshake churn. Uses ensure_warm (not acquire)
             // so the keeper never bumps last_activity and thus never perpetuates
             // itself past genuine idle.
             //
@@ -1025,8 +1121,9 @@ impl ClientMuxPool {
             loop {
                 sleep(MUX_WARM_KEEPER_INTERVAL).await;
                 let alive = {
-                    let state = pool.inner.lock().await;
-                    matches!(&*state, MuxState::Ready(handle) if handle.is_reusable())
+                    let mut state = pool.inner.lock().await;
+                    pool.reap_sessions(&mut state);
+                    !state.sessions.is_empty()
                 };
                 if alive {
                     failures = 0;
@@ -1058,7 +1155,7 @@ impl ClientMuxPool {
                 if now < next_rebuild_at {
                     continue;
                 }
-                match pool.get_or_build().await {
+                match pool.ensure_warm().await {
                     Ok(_) => {
                         failures = 0;
                         next_rebuild_at = 0;
@@ -1243,11 +1340,11 @@ async fn handle_local_mux_connection_with_cid(
                 );
             }
         };
-    let mux = mux_pool.handle().await?;
-    let _stream_permit = Arc::clone(&mux.stream_slots)
-        .acquire_owned()
-        .await
-        .map_err(|_| io::Error::other("client mux stream limiter was closed"))?;
+    // Reserve a substream slot on a session that has one free, opening a new
+    // session if every existing session is saturated. The permit is held for the
+    // whole connection: it bounds each session to `max_concurrent_streams`
+    // substreams WITHOUT capping the client's total concurrent connections.
+    let (mux, _stream_permit) = mux_pool.acquire().await?;
     let initial_payload_cap = MuxFrame::max_open_initial_payload_len(&request.host, mux.chunk_size);
     let initial_payload = initial_payload::read_initial_payload(&mut local, initial_payload_cap)
         .await
@@ -4589,21 +4686,21 @@ mod tests {
 
         // Kick off a builder; it parks in start_session() OFF-LOCK.
         let builder_pool = pool.clone();
-        let builder = tokio::spawn(async move { builder_pool.handle().await });
+        let builder = tokio::spawn(async move { builder_pool.acquire().await });
 
-        // Let it publish Building and enter the stalled handshake.
+        // Let it publish `building` and enter the stalled handshake.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        // The pool mutex MUST be free (not held across establishment) and the
-        // state MUST be the in-flight Building — the M-7 guarantee.
+        // The pool mutex MUST be free (not held across establishment) and a build
+        // MUST be in flight with no session yet published — the M-7 guarantee.
         {
             let state = pool
                 .inner
                 .try_lock()
                 .expect("pool mutex must not be held across establishment");
             assert!(
-                matches!(*state, MuxState::Building(_)),
-                "state must be Building while the single in-flight session establishes",
+                state.building.is_some() && state.sessions.is_empty(),
+                "a build must be in flight (no session yet) while establishing",
             );
         }
 
@@ -5751,6 +5848,105 @@ mod tests {
         wait_for_task("fallback", fallback_task).await;
     }
 
+    /// Regression cover for the mux concurrency-starvation bug.
+    ///
+    /// `max_concurrent_streams` is meant to bound SUBSTREAMS PER SESSION, but the
+    /// client kept only ONE shared mux session, so the value became a GLOBAL cap on
+    /// simultaneous proxied connections: once `max_concurrent_streams` keep-alive
+    /// connections held every slot, each new local connection blocked FOREVER on the
+    /// per-session slot semaphore. That is the reported "with max_concurrent_streams
+    /// > 1, a new tab / new site never loads (while an already-open tab still works,
+    /// slowly)" symptom; `=1` worked only because it takes the independent
+    /// per-connection `WarmSessionPool` path instead.
+    ///
+    /// The fix makes the pool open an ADDITIONAL session when the existing one is
+    /// saturated, so a new connection is served on a fresh session instead of being
+    /// starved. This test occupies both slots of a `max_concurrent_streams = 2`
+    /// session with two held-open connections, then requires a third connection to
+    /// still round-trip promptly.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_saturated_session_does_not_starve_new_connection() {
+        // Both sessions (the saturated first one and the new second one) relay a
+        // camouflage handshake to the fallback, so it must serve more than one.
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback_multi().await;
+        // Three substreams total (two held + one new) -> three target sockets.
+        let (target_addr, target_task) = spawn_multi_echo_target(3).await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let mux_traffic = TrafficConfig {
+            max_concurrent_streams: 2,
+            ..TrafficConfig::default()
+        };
+        // The server MUST accept more than one authenticated connection: after the
+        // fix the client opens a second session for the third local connection.
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_multi(server_config, mux_traffic).await;
+        let (local_addr, client_task) = spawn_mux_local_client_accept_loop(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys,
+            2,
+        )
+        .await;
+
+        // Two connections that each FULLY open a substream (the echo round-trip
+        // proves the slot permit was acquired and held) and are then left open,
+        // occupying both slots of the single session the buggy pool would share.
+        let mut hold_one = connect_socks_target(local_addr, target_addr).await;
+        hold_one.write_all(b"hold-one").await.unwrap();
+        let mut echoed = [0_u8; 8];
+        timeout(Duration::from_secs(8), hold_one.read_exact(&mut echoed))
+            .await
+            .expect("first holding connection did not open")
+            .unwrap();
+        assert_eq!(&echoed, b"hold-one");
+
+        let mut hold_two = connect_socks_target(local_addr, target_addr).await;
+        hold_two.write_all(b"hold-two").await.unwrap();
+        let mut echoed = [0_u8; 8];
+        timeout(Duration::from_secs(8), hold_two.read_exact(&mut echoed))
+            .await
+            .expect("second holding connection did not open")
+            .unwrap();
+        assert_eq!(&echoed, b"hold-two");
+
+        // Both slots of the first session are now held. A third connection must NOT
+        // be starved: on the buggy single-session pool it blocks forever on the slot
+        // semaphore; with the fix it is served on a fresh session and round-trips.
+        let third = async {
+            let mut app = connect_socks_target(local_addr, target_addr).await;
+            app.write_all(b"third").await.unwrap();
+            let mut got = [0_u8; 5];
+            app.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"third");
+            app
+        };
+        let _third_app = timeout(Duration::from_secs(8), third)
+            .await
+            .expect("third mux connection was starved by the per-session slot cap");
+
+        // Keep the two holding connections alive until here so they genuinely
+        // occupied both slots for the whole duration of the third connection.
+        drop(hold_one);
+        drop(hold_two);
+
+        client_task.abort();
+        server_task.abort();
+        target_task.abort();
+        fallback_task.abort();
+    }
+
     /// Mux-over-QUIC: with `udp.enabled` and `max_concurrent_streams > 1`, several
     /// concurrent SOCKS streams must each round-trip BYTE-EXACT over their OWN QUIC
     /// bidi (native multiplexing). The `QUIC_LEG_BYTES_WRITTEN` instrument confirms
@@ -6313,6 +6509,27 @@ mod tests {
         (addr, task)
     }
 
+    /// Camouflage-origin listener that serves EVERY inbound camouflage handshake
+    /// (each authenticated session relays its ClientHello to the fallback once), so
+    /// tests that open more than one session are not starved on a single accept.
+    /// Aborted by the caller at test end.
+    async fn spawn_camouflage_fallback_multi() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    run_camouflage_tls_server(stream).await;
+                });
+            }
+        });
+        (addr, task)
+    }
+
     async fn spawn_multi_echo_target(count: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6569,6 +6786,91 @@ mod tests {
             UdpConfig::default(),
         )
         .await
+    }
+
+    /// A Parallax server that keeps accepting authenticated connections (each
+    /// handled independently), used by the mux-starvation test where the fixed
+    /// client opens more than one session. Aborted by the caller at test end.
+    async fn spawn_parallax_server_multi(
+        server_config: ServerConfig,
+        traffic: TrafficConfig,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_config = Arc::new(server_config);
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let server_config = Arc::clone(&server_config);
+                tokio::spawn(async move {
+                    let _ = server::handle_connection(
+                        stream,
+                        &server_config,
+                        traffic,
+                        &UdpConfig::default(),
+                        PSK,
+                    )
+                    .await;
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    /// A mux client that shares one [`ClientMuxPool`] across an unbounded stream of
+    /// accepted local connections (each spawned as its own task), so a test can
+    /// hold several connections open at once. `stream_limit` sets
+    /// `max_concurrent_streams`. Aborted by the caller at test end.
+    async fn spawn_mux_local_client_accept_loop(
+        parallax_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+        stream_limit: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_config = Arc::new(ClientConfig {
+            listen: addr,
+            server_addr: parallax_addr.to_string(),
+            sni: "example.com".to_owned(),
+            server_public_key: STANDARD.encode(server_keys.public),
+            server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+            accept_language: None,
+        });
+        let traffic = TrafficConfig {
+            max_concurrent_streams: stream_limit as u8,
+            ..TrafficConfig::default()
+        };
+        let server_addr = ServerAddrResolver::new(&client_config.server_addr)
+            .await
+            .unwrap();
+        let mux_pool = ClientMuxPool::new(
+            Arc::clone(&client_config),
+            server_addr,
+            traffic,
+            Arc::new(UdpConfig::default()),
+            Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL)),
+            Arc::new(zeroize::Zeroizing::new(PSK.to_vec())),
+            server_keys.public,
+            Arc::from(server_identity_keys.public.clone().into_boxed_slice()),
+        );
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let mux_pool = mux_pool.clone();
+                let cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let _ = handle_local_mux_connection_with_cid(stream, mux_pool, cid).await;
+                });
+            }
+        });
+        (addr, task)
     }
 
     async fn spawn_mux_local_client_with_udp(
