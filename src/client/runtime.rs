@@ -74,9 +74,10 @@ const MAX_SERVER_IDENTITY_PAYLOAD: usize = 16 * 1024;
 const MAX_RESIDUAL_CAMOUFLAGE_BYTES_BEFORE_KEY_EXCHANGE: usize =
     crate::handshake::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
 /// Hard deadline for the whole post-connect authenticated establishment
-/// (camouflage TLS handshake + PQ rekey + identity verify). Mirrors the server's
-/// HANDSHAKE_TIMEOUT so a stalling/impersonating upstream cannot pin an
-/// establishing task (and its permit/fds) indefinitely.
+/// (camouflage TLS handshake + PQ rekey + identity verify). Sized to cover the
+/// full multi-phase client establishment (it is deliberately longer than the
+/// server's single-phase HANDSHAKE_TIMEOUT), so a stalling/impersonating upstream
+/// cannot pin an establishing task (and its permit/fds) indefinitely.
 const CLIENT_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Idle backstop FLOOR for an established client relay/mux session: if neither
 /// direction moves real bytes for this long (plus jitter), tear the session down
@@ -1364,6 +1365,9 @@ async fn handle_local_mux_connection_with_cid(
 }
 
 fn next_mux_stream_id(next: &AtomicU32) -> u32 {
+    // The counter starts odd and advances by 2, so values are already odd; the
+    // `| 1` is a belt-and-suspenders guard that pins the client-odd id parity
+    // even if the seed is ever changed to an even value.
     next.fetch_add(2, Ordering::Relaxed) | 1
 }
 
@@ -1404,22 +1408,60 @@ async fn client_mux_quic_substream(
     // browser-plausible HTTP/3 request lifecycle (HEADERS then DATA) instead of
     // starting directly with a DATA frame — the encrypted records ride the DATA
     // frames that follow, exactly like the probe bidi.
-    if let Err(err) = write_business_request_headers(&mut send, authority, accept_language).await {
-        send.reset(VarInt::from_u32(0));
-        return Err(ClientRuntimeError::Io(err));
+    //
+    // BOUNDED by CLIENT_ESTABLISH_TIMEOUT, matching the response-HEADERS read
+    // below: this write and the ConnectRequest write below both precede the relay
+    // idle watchdog, so without a bound a peer that accepts the bidi but grants no
+    // stream flow-control credit would block here forever, pinning this SOCKS
+    // connection's stream permit and local fd for the process lifetime.
+    match tokio::time::timeout(
+        CLIENT_ESTABLISH_TIMEOUT,
+        write_business_request_headers(&mut send, authority, accept_language),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            send.reset(VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(err));
+        }
+        Err(_) => {
+            send.reset(VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mux-over-QUIC substream request HEADERS write timed out",
+            )));
+        }
     }
 
     let mut server_write = H3DataFrameLegWriter(send);
     // First record on the substream: the ConnectRequest, sealed under the
     // substream codec and DATA-framed (the server reads it as the substream's
-    // opening command, mirroring MuxFrame::Open on the TCP path).
+    // opening command, mirroring MuxFrame::Open on the TCP path). BOUNDED by
+    // CLIENT_ESTABLISH_TIMEOUT for the same flow-control-credit reason as the
+    // HEADERS write above.
     let connect_payload = connect_request.encode()?;
     let connect_record = seal_to_server
         .seal(&connect_payload, &mut OsRng)
         .map_err(|err| io::Error::other(err.to_string()))?;
-    if let Err(err) = server_write.write_records(&connect_record).await {
-        server_write.0.reset(VarInt::from_u32(0));
-        return Err(ClientRuntimeError::Io(err));
+    match tokio::time::timeout(
+        CLIENT_ESTABLISH_TIMEOUT,
+        server_write.write_records(&connect_record),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            server_write.0.reset(VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(err));
+        }
+        Err(_) => {
+            server_write.0.reset(VarInt::from_u32(0));
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mux-over-QUIC substream ConnectRequest write timed out",
+            )));
+        }
     }
 
     // Read the server's `:status 200` response HEADERS frame before the download
@@ -1487,10 +1529,11 @@ async fn client_mux_quic_substream(
         // send half (shutdown on local EOF), and the download saw the server's
         // clean stream finish. The bidi quiesces; no reset needed.
         Some(Ok(_)) => Ok(()),
-        // Idle teardown or a relay error: RESET_STREAM both halves so the server's
-        // substream task recovers promptly instead of waiting on the connection
-        // idle-timeout. (The send half was moved into the relay writer, so reset by
-        // id via the connection.) `stop` the recv half too.
+        // Idle teardown or a relay error: RESET_STREAM the SEND half so the
+        // server's substream task recovers promptly instead of waiting on the
+        // connection idle-timeout. (The send half was moved into the relay writer,
+        // so reset by id via the connection.) This resets only the send half; there
+        // is no STOP_SENDING API here, so the recv half is left to be dropped.
         None => {
             conn.reset_stream(stream_id, VarInt::from_u32(0));
             Ok(())
