@@ -557,6 +557,26 @@ pub(crate) fn set_quic_carrier_for_test(
         .expect("quic carrier mutex poisoned") = carrier;
 }
 
+/// Drop guard that unregisters a pending UDP `offer_id` from the stable carrier on
+/// EVERY scope exit after [`crate::transport::udp::stable::QuicCarrier::register`]
+/// (item #3a). Before this, only the probe-timeout arm unregistered, so an early
+/// `?` on the offer seal / offer-record write returned first and leaked the
+/// oneshot sender in the carrier registry (an unbounded per-failed-negotiation
+/// leak). The guard unregisters unconditionally; after a successful handoff the
+/// carrier's accept loop has already `remove`d the entry, so this is then a
+/// harmless no-op. `unregister` is a synchronous lock+remove, so a `Drop` guard is
+/// sufficient (no async-drop needed).
+struct OfferRegistrationGuard {
+    carrier: Arc<crate::transport::udp::stable::QuicCarrier>,
+    offer_id: [u8; 16],
+}
+
+impl Drop for OfferRegistrationGuard {
+    fn drop(&mut self) {
+        self.carrier.unregister(&self.offer_id);
+    }
+}
+
 /// Bind the stable origin-splice carrier: marker key = the shared PSK + the server's
 /// static X25519 private key (the same REALITY static key the TCP plane authenticates
 /// with), splice origin = the camouflage origin's UDP `:443` (resolved from
@@ -2362,6 +2382,17 @@ async fn run_authenticated_data_mode(
                             };
 
                             if let Some((carrier, offer_id, port, rx)) = offered {
+                                // Item #3a: from the moment `carrier.register` ran
+                                // (producing `rx`), guarantee the offer_id is
+                                // unregistered on EVERY exit — including the offer
+                                // seal / offer-record write `?` below, which return
+                                // before the probe-timeout arm that used to be the
+                                // sole unregister and would otherwise leak the
+                                // registry entry.
+                                let _offer_registration = OfferRegistrationGuard {
+                                    carrier: carrier.clone(),
+                                    offer_id,
+                                };
                                 let offer = UdpOffer {
                                     offer_id,
                                     udp_port: port,
@@ -3107,6 +3138,10 @@ fn is_denied_outbound_ipv4(ip: Ipv4Addr) -> bool {
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
         || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
         || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        // 6to4 relay anycast 192.88.99.0/24 (RFC 7526): the deprecated 6to4 relay
+        // anycast prefix, which can be used to bounce traffic through relays; deny
+        // it outbound alongside the other special-use v4 ranges.
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
         || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
         || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
         || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
@@ -3134,12 +3169,60 @@ fn is_ipv6_6to4(ip: Ipv6Addr) -> bool {
     ip.segments()[0] == 0x2002
 }
 
-/// NAT64 well-known prefix `64:ff9b::/96` (RFC 6052), which embeds an IPv4
-/// address in its low 32 bits and would otherwise tunnel to an arbitrary IPv4
-/// destination without passing through the IPv4 egress policy.
+/// NAT64 embedding prefixes that carry an IPv4 destination and would otherwise
+/// tunnel to an arbitrary IPv4 host without passing through the IPv4 egress
+/// policy:
+///
+///   * RFC 6052 well-known prefix `64:ff9b::/96`, and
+///   * RFC 8215 local-use prefix `64:ff9b:1::/48`.
+///
+/// For an address in EITHER prefix, the embedded IPv4 is extracted with the
+/// per-prefix-length layout of RFC 6052 §2.2 and re-screened through
+/// [`is_denied_outbound_ipv4`], so a NAT64-embedded private/metadata address
+/// (e.g. `64:ff9b::10.0.0.1`) is denied while a legitimate public NAT64 target
+/// (e.g. `64:ff9b::8.8.8.8`) is ALLOWED rather than the whole prefix being
+/// wholesale-denied. This screens the ultimate IPv4 destination the NAT64
+/// tunnel would reach — closing the SSRF gap for the RFC 8215 prefix, which
+/// was not embedding-screened before.
+///
+/// Extraction layouts (RFC 6052 §2.2):
+///
+///   * `/96`: the IPv4 sits in bits 96..127 (the low 32 bits).
+///   * `/48`: the IPv4 sits in bits 48..63 (high two octets) and 72..87 (low
+///     two octets), skipping the reserved `u` octet at bits 64..71.
+///
+/// The per-prefix layout matters both ways: reading the low 32 bits for a /48
+/// address would screen suffix bits instead of the real destination (an
+/// attacker parks a public-looking decoy in the suffix while the translator
+/// connects to a private embedded target), and it would deny a legitimate /48
+/// public target whose zero suffix extracts as `0.0.0.0`.
 fn is_ipv6_nat64(ip: Ipv6Addr) -> bool {
     let segments = ip.segments();
-    segments[0] == 0x0064 && segments[1] == 0xff9b
+    let in_well_known_96 = segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0;
+    let in_rfc8215_48 = segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001;
+    let embedded = if in_well_known_96 {
+        Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            (segments[6] & 0xff) as u8,
+            (segments[7] >> 8) as u8,
+            (segments[7] & 0xff) as u8,
+        )
+    } else if in_rfc8215_48 {
+        Ipv4Addr::new(
+            (segments[3] >> 8) as u8,
+            (segments[3] & 0xff) as u8,
+            (segments[4] & 0xff) as u8,
+            (segments[5] >> 8) as u8,
+        )
+    } else {
+        return false;
+    };
+    is_denied_outbound_ipv4(embedded)
 }
 
 async fn encapsulate_mlkem_blocking(
@@ -4097,6 +4180,7 @@ async fn run_authenticated_mux_data_mode(
         context.cover,
         context.cid,
         payload_pool,
+        fallback_idle_timeout(),
     );
     let ((), ()) = tokio::try_join!(reader, writer)?;
     Ok(())
@@ -4905,6 +4989,17 @@ async fn server_mux_target_reader_loop(
     }
 }
 
+/// Item #3b: bound every client-facing write. The batched writer does one
+/// `write_records` await per drained batch; with no bound, an authenticated
+/// client that stops reading wedges that write once its kernel receive buffer
+/// fills, pinning this session, the 1024-deep frame channel, and every relayed
+/// target fd for the life of the process (dropping the frame senders only wakes
+/// `recv()`, never a task already parked in `write_records`). Mirror the client's
+/// `client_mux_download_loop`: bound each write by the `idle` backstop (the
+/// production caller passes [`fallback_idle_timeout`]) and SHED (tear the session
+/// down) on expiry. A live-but-slow client keeps making progress well inside the
+/// (600s-scale) window and is never falsely shed; `idle` is a parameter so the
+/// wedge-shed path is testable without a 600s wait.
 async fn server_mux_writer_loop<W>(
     mut client_write: W,
     mut server_seal: DataRecordCodec,
@@ -4912,6 +5007,7 @@ async fn server_mux_writer_loop<W>(
     cover: CoverTrafficProfile,
     cid: u64,
     payload_pool: MuxPayloadPool,
+    idle: Duration,
 ) -> Result<(), HandshakeServerError>
 where
     W: LegWriter,
@@ -4924,44 +5020,8 @@ where
                 let _ = client_write.shutdown().await;
                 return Ok(());
             };
-            write_server_mux_frames_batched(
-                &mut client_write,
-                &mut server_seal,
-                frame,
-                ServerMuxBatchState {
-                    frame_rx: &mut frame_rx,
-                },
-                &mut rng,
-                &mut seal_scratch,
-                RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
-                &payload_pool,
-            )
-            .await?;
-        }
-    }
-
-    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
-
-    loop {
-        tokio::select! {
-            _ = &mut cover_sleep, if cover.is_enabled() => {
-                write_server_mux_frame(
-                    &mut client_write,
-                    &mut server_seal,
-                    MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
-                    &mut rng,
-                    &mut seal_scratch,
-                    cid,
-                    "server-mux-cover-writer",
-                )
-                .await?;
-                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
-            }
-            frame = frame_rx.recv() => {
-                let Some(frame) = frame else {
-                    let _ = client_write.shutdown().await;
-                    return Ok(());
-                };
+            match timeout(
+                idle,
                 write_server_mux_frames_batched(
                     &mut client_write,
                     &mut server_seal,
@@ -4973,11 +5033,80 @@ where
                     &mut seal_scratch,
                     RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
                     &payload_pool,
-                )
-                .await?;
+                ),
+            )
+            .await
+            {
+                Ok(res) => res?,
+                Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
             }
         }
     }
+
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+
+    loop {
+        tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                match timeout(
+                    idle,
+                    write_server_mux_frame(
+                        &mut client_write,
+                        &mut server_seal,
+                        MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
+                        &mut rng,
+                        &mut seal_scratch,
+                        cid,
+                        "server-mux-cover-writer",
+                    ),
+                )
+                .await
+                {
+                    Ok(res) => res?,
+                    Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
+                }
+                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
+            }
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else {
+                    let _ = client_write.shutdown().await;
+                    return Ok(());
+                };
+                match timeout(
+                    idle,
+                    write_server_mux_frames_batched(
+                        &mut client_write,
+                        &mut server_seal,
+                        frame,
+                        ServerMuxBatchState {
+                            frame_rx: &mut frame_rx,
+                        },
+                        &mut rng,
+                        &mut seal_scratch,
+                        RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
+                        &payload_pool,
+                    ),
+                )
+                .await
+                {
+                    Ok(res) => res?,
+                    Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
+                }
+            }
+        }
+    }
+}
+
+/// Item #3b: the shed outcome when the mux writer's client-facing write exceeds
+/// the idle backstop (a non-reading authenticated client). Logs once and maps to
+/// a `Timeout` error so the writer loop returns and `try_join!` tears the whole
+/// session down, releasing the frame channel and every relayed target fd.
+fn shed_mux_writer_on_stalled_client(cid: u64) -> HandshakeServerError {
+    tracing::warn!(
+        cid,
+        "server mux client-write idle backstop elapsed; shedding session"
+    );
+    HandshakeServerError::Timeout
 }
 
 async fn write_server_mux_frame<W, R>(
@@ -5826,10 +5955,58 @@ where
 /// Returns the owned `server_seal` codec on a clean finish so the QUIC
 /// fast-plane teardown can seal the local DONE marker on the SAME send-direction
 /// codec (sequence continues uninterrupted). TCP-path callers discard it.
+///
+/// No-RST teardown (item #1): this thin wrapper owns the client-facing (censor-
+/// facing) write half and FINs it on ANY mid-relay error. The inner relay's
+/// clean-EOF paths already `shutdown()` their write half; before this, a mid-relay
+/// `?` bare-dropped `client_write`, which for the QUIC fast-plane leg
+/// (`H3DataFrameLegWriter` over a quinn `SendStream`) emits a `RESET_STREAM`
+/// (the QUIC analog of an RST / a visible truncation) instead of a clean stream
+/// finish. FIN-ing on error (mirroring `client_mux_download_loop` and
+/// `graceful_fin_then_drain`) turns that abrupt reset into a clean half-close on
+/// the error path too. (On the concrete TCP leg tokio's `OwnedWriteHalf` already
+/// FINs on drop, so there the explicit FIN just makes the send prompt/explicit.)
 #[allow(clippy::too_many_arguments)]
 async fn server_download_loop<W>(
-    mut target_read: OwnedReadHalf,
+    target_read: OwnedReadHalf,
     mut client_write: W,
+    server_seal: DataRecordCodec,
+    target_buf: Vec<u8>,
+    timing: TimingProfile,
+    cover: CoverTrafficProfile,
+    activity: RelayActivity,
+    cid: u64,
+) -> Result<DataRecordCodec, HandshakeServerError>
+where
+    W: LegWriter,
+{
+    let result = server_download_relay(
+        target_read,
+        &mut client_write,
+        server_seal,
+        target_buf,
+        timing,
+        cover,
+        activity,
+        cid,
+    )
+    .await;
+    if result.is_err() {
+        // FIN the censor-facing write half before propagating so teardown is a
+        // clean half-close, not an abrupt reset (see the fn doc). Best-effort:
+        // the relay is already failing, so a shutdown error is not actionable.
+        let _ = client_write.shutdown().await;
+    }
+    result
+}
+
+/// The actual server->client relay body. Borrows the client-facing write half so
+/// [`server_download_loop`] retains ownership to FIN it on error; every clean-EOF
+/// path here still `shutdown()`s it directly (so the wrapper never double-FINs).
+#[allow(clippy::too_many_arguments)]
+async fn server_download_relay<W>(
+    mut target_read: OwnedReadHalf,
+    client_write: &mut W,
     mut server_seal: DataRecordCodec,
     mut target_buf: Vec<u8>,
     timing: TimingProfile,
@@ -5903,7 +6080,7 @@ where
                 // order (a read error never cancels the in-flight write).
                 let spare = spare_buf.get_or_insert_with(|| vec![0_u8; cap]);
                 let next_n = write_batch_with_read_ahead(
-                    &mut client_write,
+                    &mut *client_write,
                     seal_scratch.records_buf.as_slice(),
                     target_read.read(spare),
                 )
@@ -5956,7 +6133,7 @@ where
             }
 
             write_server_data_records_chunked(
-                &mut client_write,
+                &mut *client_write,
                 &mut server_seal,
                 &target_buf[..n],
                 &mut rng,
@@ -5973,7 +6150,7 @@ where
         tokio::select! {
             _ = &mut cover_sleep, if cover.is_enabled() => {
                 write_server_data_records_chunked(
-                    &mut client_write,
+                    &mut *client_write,
                     &mut server_seal,
                     &[],
                     &mut rng,
@@ -6000,7 +6177,7 @@ where
                 }
 
                 write_server_data_records_chunked(
-                    &mut client_write,
+                    &mut *client_write,
                     &mut server_seal,
                     &target_buf[..n],
                     &mut rng,
@@ -7195,6 +7372,75 @@ mod tests {
         );
     }
 
+    /// Self-calibrated Welch |t| ceiling for the dudect gate (item #4): the largest
+    /// cross-shape |t| tolerated, given the SAME-run same-shape control |t| that is
+    /// the per-runner statistical noise floor. Structured exactly like the physical
+    /// mean-gap gate (`max(FLOOR, MULT × control)`):
+    ///
+    ///   allow = max(t_abs, t_mult × t_ctrl)
+    ///
+    /// This is what makes gating |t| robust despite |t| ∝ √n: cross and control are
+    /// measured together at the SAME sample count in the SAME interleaved loop, so
+    /// the √n inflation hits both equally and cancels in the ratio. A real
+    /// data-dependent distinguisher (the µs-scale asymmetry this test exists to
+    /// catch) blows the cross |t| into the thousands+ — orders of magnitude past the
+    /// control — while the already-bounded sub-µs SNI-length residue keeps the cross
+    /// |t| in the control's neighbourhood. The `t_abs` floor keeps the gate from
+    /// tripping on pure ratio noise when the control |t| happens to be tiny.
+    #[cfg(test)]
+    fn dudect_t_allow(t_ctrl: f64, t_abs: f64, t_mult: f64) -> f64 {
+        t_abs.max(t_mult * t_ctrl)
+    }
+
+    /// META-TEST (deterministic teeth for the |t| GATE itself, item #4): proves the
+    /// self-calibrated |t| ceiling is non-vacuous — it REJECTS a gross statistical
+    /// distinguisher (the kind a µs-scale timing regression produces) yet ACCEPTS a
+    /// residue whose |t| tracks the control, and widens with a noisy control so it
+    /// cannot false-positive on per-runner jitter. Pure arithmetic, never flaky, and
+    /// compiled in every test build (not behind `--features dudect`), so the gate
+    /// logic is guarded even when the slow measurement job does not run.
+    #[test]
+    fn dudect_t_gate_is_non_vacuous() {
+        // The production defaults used by the dudect test below.
+        let (t_abs, t_mult) = (1_000.0_f64, 10.0_f64);
+
+        // A real distinguisher: cross |t| in the thousands against a quiet control
+        // MUST be rejected (this is the µs-scale regression signature).
+        let regression_t_cross = 6_000.0;
+        let quiet_ctrl = 8.0;
+        assert!(
+            regression_t_cross > dudect_t_allow(quiet_ctrl, t_abs, t_mult),
+            "a µs-scale distinguisher (|t| in the thousands) must exceed the gate"
+        );
+
+        // A constant-time-but-not-perfect residue: cross |t| a few tens, tracking a
+        // similar control, MUST be accepted (no false positive on the SNI residue).
+        assert!(
+            45.0 <= dudect_t_allow(20.0, t_abs, t_mult),
+            "a sub-µs residue whose |t| tracks the control must be within the gate"
+        );
+
+        // Self-calibration: a pathologically noisy control widens the allowance so a
+        // proportionally-noisy cross does not trip purely on per-runner jitter.
+        assert!(
+            1_500.0 <= dudect_t_allow(200.0, t_abs, t_mult),
+            "the gate must scale with the control noise floor (t_mult × t_ctrl)"
+        );
+
+        // Non-vacuous floor: when the control |t| is ~0, the absolute floor (not an
+        // ill-defined ratio) is what bounds the cross |t| — and it is finite, so a
+        // huge cross |t| is still caught.
+        assert_eq!(
+            dudect_t_allow(0.0, t_abs, t_mult),
+            t_abs,
+            "with a ~0 control the absolute floor governs the gate"
+        );
+        assert!(
+            10_000.0 > dudect_t_allow(0.0, t_abs, t_mult),
+            "the absolute floor must still reject a gross |t| when the control is ~0"
+        );
+    }
+
     /// Time a single `decide_connection_inbound` reject in nanoseconds. The result
     /// is discarded; only the latency matters. Marked #[inline(never)] so the
     /// optimiser cannot hoist or fold the call out of the timing loop.
@@ -7395,27 +7641,40 @@ mod tests {
             ("D(auth-fail)", &shape_d),
         ];
 
-        // DECISION CRITERION — physical effect size, self-calibrated.
+        // DECISION CRITERIA — physical effect size AND a self-calibrated |t|, both
+        // self-calibrated against the same-run same-shape control (item #4). A pair
+        // must pass BOTH gates.
         //
-        // The hard gate is the absolute mean-latency gap (ns) between reject
-        // shapes, bounded against the same-run same-shape control gap. The mean gap
-        // is the EFFECT SIZE and is INVARIANT to sample count, so it does not
-        // inflate at 1e6 samples. The distinguisher this test exists to catch — the
-        // original ~93µs auth-fail asymmetry — is µs-scale and blows this gate out
-        // by orders of magnitude; the sub-µs residue that survives the constant-
-        // work replay (an SNI-length-dependent HMAC cost of a few ns) sits far
-        // below it.
-        //   allow = max(PHYS_FLOOR_NS, PHYS_MULT × control_gap_ns)
+        // GATE 1 (physical, sample-count-invariant): the absolute mean-latency gap
+        // (ns) between reject shapes, bounded against the same-run control gap. The
+        // mean gap is the EFFECT SIZE and does NOT inflate at 1e6 samples. The
+        // distinguisher this test exists to catch — the original ~93µs auth-fail
+        // asymmetry — is µs-scale and blows this gate out by orders of magnitude;
+        // the sub-µs residue that survives the constant-work replay (an
+        // SNI-length-dependent HMAC cost of a few ns) sits far below it.
+        //   phys_allow = max(PHYS_FLOOR_NS, PHYS_MULT × control_gap_ns)
         //
-        // Welch |t| is reported for diagnostics but is NOT gated: at 1e5–1e6
-        // samples |t| ∝ √n flags even a constant-time path's few-ns residue as
-        // "significant" (and swings widely with the control's per-run jitter), so a
-        // raw-|t| gate cannot separate a real regression from measurement noise on
-        // a path that is already physically constant-time. The dudect literature's
-        // |t|>4.5 rule assumes a fixed sample budget; the effect-size gate is the
-        // sample-count-robust equivalent. A real regression is caught physically.
+        // GATE 2 (statistical, self-calibrated): the Welch |t| is now GATED too, but
+        // NOT against a fixed absolute threshold — that would be flaky, because at
+        // 1e5–1e6 samples |t| ∝ √n flags even a constant-time path's few-ns residue
+        // as "significant" and swings with per-run jitter (the dudect literature's
+        // |t|>4.5 rule assumes a fixed, modest sample budget). Instead the cross |t|
+        // is bounded against the SAME-RUN control |t|, which is measured at the SAME
+        // sample count in the SAME interleaved loop — so the √n inflation and the
+        // per-runner jitter hit both and cancel in the ratio:
+        //   t_allow = max(T_ABS, T_MULT × control_t)
+        // A real µs-scale distinguisher pushes the cross |t| into the thousands+
+        // (orders of magnitude past control), so this gate has teeth; the bounded
+        // sub-µs residue keeps the cross |t| in the control's neighbourhood, so it is
+        // robust. The `T_ABS` floor keeps a tiny control |t| from turning pure ratio
+        // noise into a false positive. `dudect_t_gate_is_non_vacuous` unit-tests this
+        // decision directly. Tunable via env for the nightly job; defaults chosen so
+        // the residue (few-ns → |t| ≲ 100 even at 1e6) is far under T_ABS while the
+        // µs regression (|t| in the thousands) is far over it.
         let phys_floor_ns: f64 = env_f64("DUDECT_PHYS_FLOOR_NS", 3_000.0);
         let phys_mult: f64 = env_f64("DUDECT_PHYS_MULT", 8.0);
+        let t_abs: f64 = env_f64("DUDECT_T_ABS", 1_000.0);
+        let t_mult: f64 = env_f64("DUDECT_T_MULT", 10.0);
 
         for i in 0..shapes.len() {
             for j in 0..shapes.len() {
@@ -7426,10 +7685,16 @@ mod tests {
                 let (nb, b) = shapes[j];
                 let r = dudect_pair(a, b, &server.private, samples);
                 let phys_allow = phys_floor_ns.max(phys_mult * r.mean_gap_ctrl_ns);
+                let t_allow = dudect_t_allow(r.t_ctrl, t_abs, t_mult);
                 eprintln!(
                     "dudect {na} vs {nb}: mean_gap={:.0}ns (ctrl {:.0}ns, allow {:.0}ns) \
-                     [diag |t|={:.2} ctrl |t|={:.2}] samples={samples}",
-                    r.mean_gap_cross_ns, r.mean_gap_ctrl_ns, phys_allow, r.t_cross, r.t_ctrl,
+                     |t|={:.2} (ctrl {:.2}, allow {:.2}) samples={samples}",
+                    r.mean_gap_cross_ns,
+                    r.mean_gap_ctrl_ns,
+                    phys_allow,
+                    r.t_cross,
+                    r.t_ctrl,
+                    t_allow,
                 );
                 assert!(
                     r.mean_gap_cross_ns <= phys_allow,
@@ -7442,6 +7707,18 @@ mod tests {
                     phys_allow,
                     r.mean_gap_ctrl_ns,
                     r.t_cross,
+                );
+                assert!(
+                    r.t_cross <= t_allow,
+                    "TIMING DISTINGUISHER ({na} vs {nb}): Welch |t|={:.2} exceeds the \
+                     self-calibrated allow {:.2} (control |t|={:.2}, T_ABS={t_abs}, \
+                     T_MULT={t_mult}, mean_gap={:.0}ns, samples={samples}). The cross-\
+                     shape latency is statistically distinguishable from the same-shape \
+                     control by orders of magnitude past per-run noise.",
+                    r.t_cross,
+                    t_allow,
+                    r.t_ctrl,
+                    r.mean_gap_cross_ns,
                 );
             }
         }
@@ -7744,12 +8021,15 @@ mod tests {
         let v4_mapped_private = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001));
         // v4-compatible private (::10.0.0.1) — only caught by to_ipv4(), not to_ipv4_mapped()
         let v4_compatible_private = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001));
-        // NAT64 well-known prefix wrapping 8.8.8.8 (64:ff9b::808:808)
-        let nat64 = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808));
+        // NAT64 well-known prefix wrapping a PRIVATE v4 (64:ff9b::10.0.0.1): the
+        // embedded low-32-bit IPv4 is re-screened, so a NAT64-tunnelled private
+        // destination is denied (a public-v4 NAT64 target is allowed — covered by
+        // the dedicated NAT64 embedding test).
+        let nat64_private = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x0001));
         for denied in [
             v4_mapped_private,
             v4_compatible_private,
-            nat64,
+            nat64_private,
             IpAddr::V6(Ipv6Addr::LOCALHOST),
         ] {
             assert!(
@@ -9181,6 +9461,129 @@ mod tests {
     }
 
     #[test]
+    fn nat64_embedded_ipv4_is_rescreened_for_both_prefixes() {
+        // NAT64 (RFC 6052 `64:ff9b::/96` and RFC 8215 `64:ff9b:1::/48`) embeds an
+        // IPv4 destination at a prefix-length-dependent position (RFC 6052 §2.2).
+        // The egress screen must extract that embedded v4 with the correct layout
+        // and re-apply the IPv4 policy, so a NAT64 tunnel cannot be used to reach
+        // a private/metadata host (SSRF) while a NAT64 tunnel to a genuine public
+        // v4 stays usable (not wholesale-denied).
+        //
+        // helpers: build a NAT64 address embedding v4 octets `o` per RFC 6052 §2.2.
+        // /96: v4 in bits 96..127 (the low 32 bits).
+        let nat64_96 = |o: [u8; 4]| {
+            IpAddr::V6(Ipv6Addr::new(
+                0x0064,
+                0xff9b,
+                0,
+                0,
+                0,
+                0,
+                u16::from(o[0]) << 8 | u16::from(o[1]),
+                u16::from(o[2]) << 8 | u16::from(o[3]),
+            ))
+        };
+        // /48: v4 in bits 48..63 and 72..87, u octet (zero) at bits 64..71,
+        // arbitrary suffix from bit 88.
+        let nat64_48 = |o: [u8; 4], suffix: [u16; 3]| {
+            IpAddr::V6(Ipv6Addr::new(
+                0x0064,
+                0xff9b,
+                0x0001,
+                u16::from(o[0]) << 8 | u16::from(o[1]),
+                u16::from(o[2]),
+                u16::from(o[3]) << 8 | (suffix[0] & 0xff),
+                suffix[1],
+                suffix[2],
+            ))
+        };
+
+        let private_v4 = [
+            ([10, 0, 0, 1], "RFC1918 10/8"),
+            ([192, 168, 1, 1], "RFC1918 192.168/16"),
+            ([127, 0, 0, 1], "loopback"),
+            ([169, 254, 169, 254], "link-local cloud metadata"),
+            ([0, 0, 0, 0], "unspecified / octets[0]==0"),
+        ];
+        let public_v4 = [[8, 8, 8, 8], [1, 1, 1, 1], [93, 184, 216, 34]];
+
+        // Embedded PRIVATE / special v4 must be DENIED under BOTH prefixes. For
+        // /48 the suffix carries a public-looking decoy (`8.8.8.8` in the low 32
+        // bits): a low-32-bit extraction would read the decoy and let the
+        // translator reach the private embedded target.
+        for (o, why) in private_v4 {
+            for addr in [nat64_96(o), nat64_48(o, [0, 0x0808, 0x0808])] {
+                assert!(
+                    is_denied_outbound_ip(addr),
+                    "NAT64 {addr} embedding {o:?} ({why}) must be denied"
+                );
+                if let IpAddr::V6(v6) = addr {
+                    assert!(
+                        is_ipv6_nat64(v6),
+                        "{addr} must classify as a denied NAT64 address"
+                    );
+                }
+            }
+        }
+
+        // Embedded PUBLIC v4 must be ALLOWED under BOTH prefixes (not wholesale-
+        // denied): this is the behaviour change from "deny the whole 64:ff9b:*
+        // space" to "screen the embedded destination". The /48 case uses a ZERO
+        // suffix: a low-32-bit extraction would read `0.0.0.0` and wrongly deny a
+        // legitimate public NAT64 target (the RFC 8215 overblocking bug).
+        for o in public_v4 {
+            for addr in [nat64_96(o), nat64_48(o, [0, 0, 0])] {
+                assert!(
+                    !is_denied_outbound_ip(addr),
+                    "NAT64 {addr} embedding public {o:?} must be allowed"
+                );
+                if let IpAddr::V6(v6) = addr {
+                    assert!(
+                        !is_ipv6_nat64(v6),
+                        "{addr} embeds a public v4 and must not classify as denied NAT64"
+                    );
+                }
+            }
+        }
+
+        // Segment-boundary pin for the /48 layout: 192.168.1.1 embeds as
+        // 64:ff9b:1:c0a8:1:100:: (segments[3]=0xc0a8, u|o2=0x0001, o3|suffix=0x0100),
+        // straddling three hextets. Any off-by-one-octet extraction misreads it.
+        assert!(is_ipv6_nat64(Ipv6Addr::new(
+            0x0064, 0xff9b, 0x0001, 0xc0a8, 0x0001, 0x0100, 0, 0
+        )));
+
+        // An address that merely shares the first hextet but is neither prefix
+        // (e.g. `64:ff9c::` / `64:ff9b:2::`) must NOT be treated as NAT64.
+        assert!(!is_ipv6_nat64(Ipv6Addr::new(
+            0x0064, 0xff9c, 0, 0, 0, 0, 0x0a00, 0x0001
+        )));
+        assert!(!is_ipv6_nat64(Ipv6Addr::new(
+            0x0064, 0xff9b, 0x0002, 0, 0, 0, 0x0a00, 0x0001
+        )));
+    }
+
+    #[test]
+    fn ipv4_6to4_relay_anycast_is_denied_outbound() {
+        // 6to4 relay anycast 192.88.99.0/24 (RFC 7526, deprecated): must be denied
+        // outbound both directly on the v4 policy and via the IpAddr entrypoint.
+        for last in [0u8, 1, 128, 255] {
+            let ip = Ipv4Addr::new(192, 88, 99, last);
+            assert!(
+                is_denied_outbound_ipv4(ip),
+                "{ip} (6to4 relay anycast) must be denied"
+            );
+            assert!(
+                is_denied_outbound_ip(IpAddr::V4(ip)),
+                "{ip} must be denied via is_denied_outbound_ip"
+            );
+        }
+        // Adjacent addresses outside the /24 remain allowed (guards `octets[2]==99`).
+        assert!(!is_denied_outbound_ipv4(Ipv4Addr::new(192, 88, 98, 1)));
+        assert!(!is_denied_outbound_ipv4(Ipv4Addr::new(192, 88, 100, 1)));
+    }
+
+    #[test]
     fn speed_test_dos_ceilings_match_their_documented_values() {
         // These are SECURITY ceilings that bound an authenticated client's speed-test
         // request (a malicious client could otherwise request terabytes of generated
@@ -9609,5 +10012,299 @@ mod tests {
             "a multi-MiB saturating transfer must engage the read-ahead pipeline branch \
              (the saturated gate must not be vacuously always-serial)",
         );
+    }
+
+    /// Item #1 (deterministic teeth): on a mid-relay ERROR the download loop must
+    /// FIN (call `shutdown` on) its client-facing write half — not bare-drop it.
+    /// A mock `LegWriter` whose write always fails drives the loop into its error
+    /// path and records whether `shutdown` was invoked. Transport-agnostic, so it
+    /// distinguishes the fix from the pre-fix bare-drop (which never called
+    /// `shutdown`), independent of tokio's TCP shutdown-on-drop.
+    #[tokio::test]
+    async fn download_loop_fins_client_write_on_relay_error() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::time::{timeout, Duration};
+
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordCodec};
+
+        struct FinRecordingWriter {
+            shutdown_called: Arc<AtomicBool>,
+        }
+        impl LegWriter for FinRecordingWriter {
+            async fn write_records(&mut self, _bytes: &[u8]) -> io::Result<()> {
+                // Force the relay's error path on the very first client write.
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client stopped reading",
+                ))
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                self.shutdown_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let key = [0x33_u8; KEY_LEN];
+        let nonce = [0x44_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let codec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+
+        // Target -> loop: a real TCP pair; the peer sends a few bytes (a sub-buffer
+        // burst, so the loop takes the serial branch and reaches the client write)
+        // and stays open, so the loop's error is the failing WRITE, not an EOF.
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let mut target = tokio::net::TcpStream::connect(origin_addr).await.unwrap();
+            target.write_all(b"some-origin-bytes").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let (origin_for_loop, _) = origin_listener.accept().await.unwrap();
+        let (target_read, _target_write) = origin_for_loop.into_split();
+
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let writer = FinRecordingWriter {
+            shutdown_called: shutdown_called.clone(),
+        };
+
+        let target_buf = vec![0_u8; relay_read_buffer_len(max_plaintext_len(0))];
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let traffic = TrafficConfig::default();
+        let result = timeout(
+            Duration::from_secs(10),
+            server_download_loop(
+                target_read,
+                writer,
+                codec,
+                target_buf,
+                TimingProfile::from_config(traffic),
+                CoverTrafficProfile::from_config(traffic),
+                activity,
+                21,
+            ),
+        )
+        .await
+        .expect("download loop must return promptly on a client write error");
+
+        assert!(
+            result.is_err(),
+            "a failing client write must surface as a relay error"
+        );
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "on a mid-relay error the download loop must FIN (shutdown) the client-facing \
+             write half, not bare-drop it",
+        );
+        origin.abort();
+    }
+
+    /// Item #1 (observable, over real TCP): a mid-relay error (here: the TARGET
+    /// resets) must leave the client-facing socket a clean FIN — the client peer's
+    /// drain ends in `read == 0`, never `ECONNRESET`. This is the no-RST-on-teardown
+    /// invariant the loop must uphold on the error path, not just the clean-EOF path.
+    #[tokio::test]
+    async fn download_loop_relay_error_fins_client_not_rst() {
+        use tokio::io::AsyncReadExt;
+        use tokio::time::{timeout, Duration};
+
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{max_plaintext_len, relay_read_buffer_len, DataRecordCodec};
+
+        let key = [0x35_u8; KEY_LEN];
+        let nonce = [0x46_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let codec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+
+        // Target side: the peer sets SO_LINGER(0) and drops after a short delay, so
+        // the server's target read errors with a RST (ECONNRESET), driving the loop
+        // into its error path (NOT a clean EOF).
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_peer = tokio::spawn(async move {
+            let peer = tokio::net::TcpStream::connect(target_addr).await.unwrap();
+            // Force an RST (not a FIN) on drop by setting SO_LINGER(0). Use socket2's
+            // SockRef (as the rest of the tree does) since tokio's `set_linger` is
+            // deprecated (it can block the thread on drop; here the socket is dropped
+            // explicitly with no queued send data, so the linger-close is immediate).
+            socket2::SockRef::from(&peer)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(peer); // linger 0 -> RST to the server's target read half
+        });
+        let (target_for_loop, _) = target_listener.accept().await.unwrap();
+        let (target_read, _target_write) = target_for_loop.into_split();
+
+        // Client side: the download loop's client-facing write half; the peer drains
+        // and must observe a FIN, never a reset.
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let client_peer = tokio::spawn(async move {
+            let (mut client_side, _) = client_listener.accept().await.unwrap();
+            let mut scratch = [0_u8; 4096];
+            loop {
+                match client_side.read(&mut scratch).await {
+                    Ok(0) => return Ok(()), // clean FIN
+                    Ok(_) => continue,      // relayed record bytes, keep draining
+                    Err(err) => return Err(err),
+                }
+            }
+        });
+        let client_for_loop = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+        let (_client_read, client_write) = client_for_loop.into_split();
+
+        let target_buf = vec![0_u8; relay_read_buffer_len(max_plaintext_len(0))];
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let traffic = TrafficConfig::default();
+        let download = server_download_loop(
+            target_read,
+            crate::transport::leg::TcpLegWriter(client_write),
+            codec,
+            target_buf,
+            TimingProfile::from_config(traffic),
+            CoverTrafficProfile::from_config(traffic),
+            activity,
+            23,
+        );
+
+        let (loop_res, peer_res, _target_res) = timeout(Duration::from_secs(10), async {
+            tokio::join!(download, client_peer, target_peer)
+        })
+        .await
+        .expect("relay-error teardown must complete promptly");
+
+        assert!(
+            loop_res.is_err(),
+            "the target RST must surface as a relay error"
+        );
+        let peer_drain = peer_res.expect("client peer task");
+        assert!(
+            peer_drain.is_ok(),
+            "client must see a clean FIN on relay error, got {:?} (an RST/ECONNRESET is the \
+             censor-observable teardown tell the loop must never produce)",
+            peer_drain.err().map(|e| e.kind()),
+        );
+    }
+
+    /// Item #3a: the `OfferRegistrationGuard` must unregister its `offer_id` on
+    /// EVERY scope exit. Before this guard the only unregister lived on the
+    /// probe-timeout arm, so an early `?` on the offer seal / offer-record write
+    /// returned first and leaked the carrier's oneshot sender (an unbounded
+    /// per-failed-negotiation registry leak). Here: register an offer, confirm the
+    /// receiver is live (pending, not closed), drop the guard, then confirm the
+    /// sender was removed — the receiver observes a CLOSED channel. A leak would
+    /// keep the sender parked in the registry and the receiver open, so the
+    /// closed-channel observation is exactly the tell the fix restores.
+    #[tokio::test]
+    async fn offer_registration_guard_unregisters_on_drop() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        // A production carrier bound on loopback: no external network is needed —
+        // the numeric fallback_addr resolves without DNS, the camouflage cert is
+        // self-signed in-process, the replay cache is a temp file, and the endpoint
+        // binds 127.0.0.1:0. This is the same build path production uses.
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let config = authenticated_server_config(
+            "127.0.0.1:443".parse().unwrap(),
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_dir.path().join("parallax-replay.cache"),
+        );
+        let carrier = build_quic_carrier_for_test(&config, PSK)
+            .await
+            .expect("bind loopback stable carrier");
+
+        let offer_id = [0x5c_u8; 16];
+        let mut rx = carrier.register(offer_id);
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "a freshly registered offer_id must have a live (pending) sender"
+        );
+
+        {
+            // The guard is the ONLY thing that unregisters here; dropping it at the
+            // end of this scope must remove the registry entry unconditionally.
+            let _guard = OfferRegistrationGuard {
+                carrier: carrier.clone(),
+                offer_id,
+            };
+        }
+
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Closed)),
+            "dropping the guard must unregister the offer_id (drop its sender) so the \
+             receiver observes a closed channel — not a leaked, still-open entry",
+        );
+    }
+
+    /// Item #3b: a non-reading authenticated client must not wedge the mux writer
+    /// forever. Once a client-facing write exceeds the idle backstop, the writer
+    /// SHEDS (returns `Timeout`) so `try_join!` tears the session down and releases
+    /// the frame channel + relayed target fds. A `LegWriter` whose `write_records`
+    /// never completes models the wedged client; with a short injected idle the
+    /// loop must return `Err(Timeout)` promptly instead of parking indefinitely.
+    #[tokio::test]
+    async fn mux_writer_sheds_when_client_write_stalls() {
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{max_plaintext_len, DataRecordCodec};
+
+        struct StalledWriter;
+        impl LegWriter for StalledWriter {
+            async fn write_records(&mut self, _bytes: &[u8]) -> io::Result<()> {
+                // A wedged client: the client-facing write never drains.
+                std::future::pending().await
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let key = [0x51_u8; KEY_LEN];
+        let nonce = [0x62_u8; NONCE_LEN];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let codec = DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+
+        let chunk_size = max_plaintext_len(0);
+        let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
+        let (frame_tx, frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+
+        // One real frame so the loop takes the write path (where the mock parks).
+        // Keep the sender alive so `recv()` never returns None — otherwise the loop
+        // would exit cleanly instead of exercising the wedge-shed.
+        frame_tx
+            .send(MuxFrame {
+                stream_id: 1,
+                kind: MuxFrameKind::Data,
+                payload: b"payload".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        // Cover is disabled by default (cover_max_interval_ms == 0), so the simpler
+        // non-cover write branch runs. Inject a short idle so the shed is observable
+        // without the production 600s wait.
+        let cover = CoverTrafficProfile::from_config(TrafficConfig::default());
+        assert!(
+            !cover.is_enabled(),
+            "test relies on the non-cover write branch"
+        );
+        let idle = Duration::from_millis(50);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_mux_writer_loop(StalledWriter, codec, frame_rx, cover, 7, payload_pool, idle),
+        )
+        .await
+        .expect("the mux writer must shed (return) well before the outer 5s budget");
+
+        assert!(
+            matches!(result, Err(HandshakeServerError::Timeout)),
+            "a wedged client-facing write past the idle backstop must shed as Timeout, \
+             got {result:?}",
+        );
+        drop(frame_tx);
     }
 }
