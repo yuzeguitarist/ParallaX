@@ -946,36 +946,33 @@ impl ClientMuxPool {
         loop {
             // Decide an action without awaiting under the lock. Prune dead and
             // surplus-idle sessions, then take a free slot on any live session.
-            let waiting_notify: Option<Arc<Notify>> = {
-                let mut state = self.inner.lock().await;
-                self.reap_sessions(&mut state);
-                if let Some(reserved) = reserve_slot(&state.sessions) {
-                    return Ok(reserved);
-                }
-                match &state.building {
-                    Some(notify) => Some(notify.clone()),
-                    None => {
-                        let notify = Arc::new(Notify::new());
-                        state.building = Some(Arc::clone(&notify));
-                        drop(state);
-                        // We are the sole builder. Establish OFF-LOCK, add the new
-                        // session, take its first slot, and wake waiters (which
-                        // re-check and may grab the new session's remaining slots).
-                        return self.build_and_reserve(notify).await;
-                    }
+            let mut state = self.inner.lock().await;
+            self.reap_sessions(&mut state);
+            if let Some(reserved) = reserve_slot(&state.sessions) {
+                return Ok(reserved);
+            }
+            let notify = match &state.building {
+                Some(notify) => Arc::clone(notify),
+                None => {
+                    let notify = Arc::new(Notify::new());
+                    state.building = Some(Arc::clone(&notify));
+                    drop(state);
+                    // We are the sole builder. Establish OFF-LOCK, add the new
+                    // session, take its first slot, and wake waiters (which
+                    // re-check and may grab the new session's remaining slots).
+                    return self.build_and_reserve(notify).await;
                 }
             };
 
             // Another connection is establishing a session. Park on its completion
-            // (registering BEFORE dropping the lock is handled above by cloning the
-            // Notify), then re-loop: the new session may now have a free slot, or
-            // we become the next builder.
-            if let Some(notify) = waiting_notify {
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                notified.await;
-            }
+            // (registering BEFORE dropping the lock by calling .notified() and
+            // .enable() while still holding state), then re-loop: the new session
+            // may now have a free slot, or we become the next builder.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(state);
+            notified.await;
         }
     }
 
@@ -1012,40 +1009,37 @@ impl ClientMuxPool {
     /// two sessions at once.
     async fn ensure_warm(&self) -> Result<(), ClientRuntimeError> {
         loop {
-            let waiting_notify: Option<Arc<Notify>> = {
-                let mut state = self.inner.lock().await;
-                self.reap_sessions(&mut state);
-                if !state.sessions.is_empty() {
-                    return Ok(());
-                }
-                match &state.building {
-                    Some(notify) => Some(notify.clone()),
-                    None => {
-                        let notify = Arc::new(Notify::new());
-                        state.building = Some(Arc::clone(&notify));
-                        drop(state);
-                        let result = self.spawn_build().await;
-                        let mut state = self.inner.lock().await;
-                        state.building = None;
-                        let outcome = match result {
-                            Ok(handle) => {
-                                state.sessions.push(handle);
-                                Ok(())
-                            }
-                            Err(err) => Err(err),
-                        };
-                        drop(state);
-                        notify.notify_waiters();
-                        return outcome;
-                    }
+            let mut state = self.inner.lock().await;
+            self.reap_sessions(&mut state);
+            if !state.sessions.is_empty() {
+                return Ok(());
+            }
+            let notify = match &state.building {
+                Some(notify) => Arc::clone(notify),
+                None => {
+                    let notify = Arc::new(Notify::new());
+                    state.building = Some(Arc::clone(&notify));
+                    drop(state);
+                    let result = self.spawn_build().await;
+                    let mut state = self.inner.lock().await;
+                    state.building = None;
+                    let outcome = match result {
+                        Ok(handle) => {
+                            state.sessions.push(handle);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    };
+                    drop(state);
+                    notify.notify_waiters();
+                    return outcome;
                 }
             };
-            if let Some(notify) = waiting_notify {
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                notified.await;
-            }
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(state);
+            notified.await;
         }
     }
 
