@@ -418,6 +418,19 @@ struct Stream {
     send_max: u64,
     /// Lost `(offset, len, fin)` ranges to resend before fresh bytes.
     retransmit: Vec<(u64, u64, bool)>,
+    /// Start offsets of this stream's STREAM ranges currently tracked in the DATA
+    /// space's `sent_content` (in flight, awaiting ACK), as a multiset
+    /// `offset -> count`. Kept in lockstep with `sent_content` by
+    /// [`Connection::index_sent_stream_ranges`] (packet recorded) /
+    /// [`Connection::unindex_sent_stream_ranges`] (packet acked, declared lost, or
+    /// consumed by a PTO probe), so [`Connection::compact_send_buffer`] reads the
+    /// lowest live offset in O(log n) via `first_key_value` instead of rescanning
+    /// every in-flight packet's ranges per acked stream — under a large cwnd
+    /// (thousands of in-flight packets) across ~128 streams that rescan cost
+    /// ~1e6 range visits per ACK. STREAM frames only ever ride 0-RTT/1-RTT
+    /// packets (both the DATA packet-number space here), so `discard_space` on
+    /// Initial/Handshake never bypasses the unindex step.
+    sent_range_offsets: BTreeMap<u64, usize>,
     /// The app has requested FIN after all buffered bytes.
     fin: bool,
     /// The FIN bit has been packetized at the final offset.
@@ -650,6 +663,16 @@ pub struct Connection {
     drained: bool,
     /// When a packet was last received (drives the idle timeout, RFC 9000 §10.1).
     last_recv_time: Option<Instant>,
+    /// When this connection was constructed: the cold-start backstop origin for the
+    /// idle deadline while `last_recv_time` is still `None` (no packet has ever
+    /// AEAD-opened). Without it such a connection arms NO idle timer at all — a
+    /// server-side connection created for a spoofed/undecryptable Initial would
+    /// return `next_timeout() == None` and sit in the endpoint's table forever
+    /// (table-exhaustion DoS), and a client whose peer never replies would
+    /// retransmit Initials indefinitely. `next_timeout` and `handle_timeout` both
+    /// read `last_recv_time.unwrap_or(created_at)`, so the armed deadline and the
+    /// fire condition never disagree.
+    created_at: Instant,
     /// Connection-level flow control (RFC 9000 §4.1). Send side: the peer's MAX_DATA
     /// limit and how much we have sent against it. Receive side: the limit we
     /// advertise, the last value sent, total received (enforcement), total consumed
@@ -759,6 +782,7 @@ impl Connection {
             close_time: None,
             drained: false,
             last_recv_time: None,
+            created_at: Instant::now(),
             send_max_data: 0,
             send_data_total: 0,
             recv_max_data: CONN_RECV_WINDOW,
@@ -1483,10 +1507,13 @@ impl Connection {
             }
         }
         // Idle timeout (RFC 9000 §10.1): tear down after no receipt for too long.
+        // Falls back to `created_at` while no packet has ever AEAD-opened, so a
+        // connection that never receives an openable packet (spoofed Initial on
+        // the server, silent peer on the client) still arms a teardown deadline
+        // instead of living forever with no timer.
         if self.closed.is_none() {
-            if let Some(last) = self.last_recv_time {
-                earliest(last + IDLE_TIMEOUT);
-            }
+            let last = self.last_recv_time.unwrap_or(self.created_at);
+            earliest(last + IDLE_TIMEOUT);
         }
         deadline
     }
@@ -1509,10 +1536,11 @@ impl Connection {
             return;
         }
         // Idle timeout (RFC 9000 §10.1): close the connection if silent too long.
+        // Reads the SAME `last_recv_time.unwrap_or(created_at)` origin as
+        // `next_timeout`, so the cold-start backstop deadline armed there also
+        // fires here even when no packet ever AEAD-opened.
         if self.closed.is_none()
-            && self
-                .last_recv_time
-                .is_some_and(|last| now >= last + IDLE_TIMEOUT)
+            && now >= self.last_recv_time.unwrap_or(self.created_at) + IDLE_TIMEOUT
         {
             self.closed = Some(CloseReason::IdleTimeout);
             self.close_time = Some(now);
@@ -1578,6 +1606,9 @@ impl Connection {
             let oldest = self.spaces[space].sent_content.keys().next().copied();
             if let Some(pn) = oldest {
                 let content = self.spaces[space].sent_content.remove(&pn).unwrap();
+                if space == SPACE_DATA {
+                    self.unindex_sent_stream_ranges(&content);
+                }
                 // The probed packet leaves bytes-in-flight but is NOT a loss signal
                 // (cwnd is unchanged); its data is resent in a fresh packet.
                 self.spaces[space].sent.discard(pn);
@@ -1688,6 +1719,11 @@ impl Connection {
             self.pacer.on_sent(now, size, rate, in_flight_before);
         }
         if ack_eliciting {
+            // Mirror the packet's STREAM ranges into the per-stream in-flight
+            // offset index (only DATA-space packets carry STREAM frames).
+            if space == SPACE_DATA {
+                self.index_sent_stream_ranges(&content);
+            }
             self.spaces[space].sent_content.insert(pn, content);
             self.spaces[space].last_ack_eliciting = Some(now);
         }
@@ -2631,6 +2667,9 @@ impl Connection {
         let mut acked_streams: Vec<u64> = Vec::new();
         for (pn, sp) in &newly {
             if let Some(content) = self.spaces[space].sent_content.remove(pn) {
+                if space == SPACE_DATA {
+                    self.unindex_sent_stream_ranges(&content);
+                }
                 for &(id, _, _, _) in &content.stream {
                     if !acked_streams.contains(&id) {
                         acked_streams.push(id);
@@ -2746,6 +2785,35 @@ impl Connection {
         Ok(())
     }
 
+    /// Fold a just-recorded DATA-space packet's STREAM ranges into each stream's
+    /// in-flight offset index (see [`Stream::sent_range_offsets`]). Paired with
+    /// [`Self::unindex_sent_stream_ranges`] at every site that removes the packet
+    /// from `sent_content` (acked / declared lost / consumed by a PTO probe), so
+    /// the index is an exact multiset mirror of the stream ranges held there.
+    fn index_sent_stream_ranges(&mut self, content: &SentContent) {
+        for &(id, off, _, _) in &content.stream {
+            if let Some(s) = self.streams.get_mut(&id) {
+                *s.sent_range_offsets.entry(off).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Remove a DATA-space packet's STREAM ranges from the in-flight offset index
+    /// as the packet leaves `sent_content`. Counterpart of
+    /// [`Self::index_sent_stream_ranges`].
+    fn unindex_sent_stream_ranges(&mut self, content: &SentContent) {
+        for &(id, off, _, _) in &content.stream {
+            if let Some(s) = self.streams.get_mut(&id) {
+                if let Some(n) = s.sent_range_offsets.get_mut(&off) {
+                    *n -= 1;
+                    if *n == 0 {
+                        s.sent_range_offsets.remove(&off);
+                    }
+                }
+            }
+        }
+    }
+
     /// Drop the fully-acknowledged prefix of stream `id`'s send buffer so a
     /// long-lived stream does not retain every byte ever sent (memory-DoS,
     /// finding #28). Everything below the lowest offset still needed for
@@ -2753,23 +2821,22 @@ impl Connection {
     /// ranges in flight awaiting an ACK — has been acknowledged and can never be
     /// resent, so it is dropped and `send_base` advanced to keep absolute-offset
     /// indexing correct. Amortized O(1)/byte: compaction only runs once the dead
-    /// prefix is at least as large as the live tail it would memmove.
+    /// prefix is at least as large as the live tail it would memmove. The lowest
+    /// in-flight offset comes from the per-stream index
+    /// ([`Stream::sent_range_offsets`], O(log n)) rather than rescanning every
+    /// in-flight packet's ranges, which cost
+    /// O(acked_streams × in_flight_packets) per ACK under a large cwnd.
     fn compact_send_buffer(&mut self, id: u64) {
-        let Some(s) = self.streams.get(&id) else {
+        let Some(s) = self.streams.get_mut(&id) else {
             return;
         };
         let mut low = s.send_off;
         for &(off, _, _) in &s.retransmit {
             low = low.min(off);
         }
-        for content in self.spaces[SPACE_DATA].sent_content.values() {
-            for &(sid, off, _, _) in &content.stream {
-                if sid == id {
-                    low = low.min(off);
-                }
-            }
+        if let Some((&off, _)) = s.sent_range_offsets.first_key_value() {
+            low = low.min(off);
         }
-        let s = self.streams.get_mut(&id).expect("checked above");
         let reclaim = low.saturating_sub(s.send_base) as usize;
         if reclaim == 0 || reclaim < s.send.len() - reclaim {
             return;
@@ -2798,10 +2865,17 @@ impl Connection {
             if space == SPACE_DATA && self.mtu_probe_pn == Some(pn) {
                 self.mtu_probe_pn = None;
                 self.pmtud.on_probe_lost();
-                self.spaces[space].sent_content.remove(&pn);
+                // A probe carries no STREAM ranges, but unindex uniformly so the
+                // offset index can never drift from sent_content.
+                if let Some(content) = self.spaces[space].sent_content.remove(&pn) {
+                    self.unindex_sent_stream_ranges(&content);
+                }
                 continue;
             }
             if let Some(content) = self.spaces[space].sent_content.remove(&pn) {
+                if space == SPACE_DATA {
+                    self.unindex_sent_stream_ranges(&content);
+                }
                 // A full-size DATA loss feeds the black-hole detector (sustained such
                 // losses at a grown MTU reset the path to BASE so the transfer
                 // self-heals). Ordinary loss below the threshold is ignored there.
@@ -3981,6 +4055,237 @@ mod tests {
         );
     }
 
+    /// The old `compact_send_buffer` implementation's source of truth: a full
+    /// rescan of every in-flight DATA packet's STREAM ranges. The per-stream
+    /// index ([`Stream::sent_range_offsets`]) that replaced it must be an exact
+    /// multiset mirror of this scan at all times — mirror equality implies the
+    /// "lowest live offset" (the only in-flight input `compact_send_buffer`
+    /// reads) is identical, and therefore every reclaim decision is identical.
+    fn scan_sent_range_offsets(c: &Connection) -> BTreeMap<u64, BTreeMap<u64, usize>> {
+        let mut scan: BTreeMap<u64, BTreeMap<u64, usize>> = BTreeMap::new();
+        for content in c.spaces[SPACE_DATA].sent_content.values() {
+            for &(sid, off, _, _) in &content.stream {
+                *scan.entry(sid).or_default().entry(off).or_insert(0) += 1;
+            }
+        }
+        scan
+    }
+
+    fn assert_index_mirrors_scan(c: &Connection, side: &str, step: usize) {
+        let scan = scan_sent_range_offsets(c);
+        for (&id, s) in &c.streams {
+            let expected = scan.get(&id).cloned().unwrap_or_default();
+            assert_eq!(
+                s.sent_range_offsets, expected,
+                "{side} step {step} stream {id}: offset index diverged from the sent_content scan"
+            );
+        }
+        // Every scanned stream id exists in `streams` (streams are never removed),
+        // so the loop above covered the whole scan; assert that assumption.
+        for id in scan.keys() {
+            assert!(
+                c.streams.contains_key(id),
+                "{side} step {step}: sent_content references unknown stream {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_send_buffer_index_matches_a_full_sent_content_scan() {
+        // Randomized equivalence proof for the compact_send_buffer index: drive a
+        // real client/server pair through a lossy, PTO-probing, retransmitting
+        // transfer over several streams and, after EVERY event that can touch
+        // sent_content, assert the per-stream offset index is an exact multiset
+        // mirror of the full scan the old implementation performed. Then drain
+        // losslessly and assert every stream's bytes arrived intact — reclaim
+        // never dropped bytes that were still needed.
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x1d; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x1d, 0xec, 0x0d, 0xed]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // Deterministic xorshift64 PRNG: reproducible "random" sizes/loss.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rng = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+
+        let ids: Vec<u64> = (0..4).map(|_| client.open_bi()).collect();
+        let mut sent: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut recvd: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for &id in &ids {
+            sent.insert(id, Vec::new());
+            recvd.insert(id, Vec::new());
+        }
+        let mut now = Instant::now();
+
+        for step in 0..400 {
+            // Queue a random chunk on a random stream (bytes from the PRNG so a
+            // mis-reclaimed retransmit is detected as corruption, not just length).
+            let id = ids[rng(ids.len() as u64) as usize];
+            let chunk: Vec<u8> = (0..64 + rng(1500)).map(|_| rng(256) as u8).collect();
+            client.send_stream(id, &chunk);
+            sent.entry(id).or_default().extend_from_slice(&chunk);
+
+            // Client transmits; ~25% of datagrams are dropped on the floor so
+            // packet-threshold loss, time-threshold loss, and retransmits all run.
+            while let Some(dg) = client.poll_transmit(now) {
+                assert_index_mirrors_scan(&client, "client", step);
+                if rng(4) != 0 {
+                    server.handle_datagram(&dg, now).unwrap();
+                }
+            }
+            // Server responds (ACKs, flow updates); ~10% of those are dropped so
+            // the client also PTO-probes DATA packets (queue_probe's unindex path).
+            while let Some(dg) = server.poll_transmit(now) {
+                assert_index_mirrors_scan(&server, "server", step);
+                if rng(10) != 0 {
+                    client.handle_datagram(&dg, now).unwrap();
+                }
+            }
+            assert_index_mirrors_scan(&client, "client-post-acks", step);
+
+            // Advance time and fire due timers (loss detection, PTO, keep-alive).
+            now += Duration::from_millis(20 + rng(180));
+            if client.next_timeout().is_some_and(|t| t <= now) {
+                client.handle_timeout(now);
+                assert_index_mirrors_scan(&client, "client-post-timeout", step);
+            }
+            if server.next_timeout().is_some_and(|t| t <= now) {
+                server.handle_timeout(now);
+            }
+            // Drain the server's app reads so flow-control windows keep extending.
+            for &id in &ids {
+                let got = server.read_stream(id);
+                recvd.entry(id).or_default().extend_from_slice(&got);
+            }
+        }
+
+        // Lossless drain: force retransmits via timers until everything arrives.
+        for _ in 0..10_000 {
+            let mut moved = false;
+            while let Some(dg) = client.poll_transmit(now) {
+                server.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            while let Some(dg) = server.poll_transmit(now) {
+                client.handle_datagram(&dg, now).unwrap();
+                moved = true;
+            }
+            assert_index_mirrors_scan(&client, "client-drain", usize::MAX);
+            for &id in &ids {
+                let got = server.read_stream(id);
+                recvd.entry(id).or_default().extend_from_slice(&got);
+            }
+            if recvd == sent {
+                break;
+            }
+            if !moved {
+                let t = client
+                    .next_timeout()
+                    .expect("undelivered data keeps a timer armed");
+                now = now.max(t);
+                client.handle_timeout(now);
+                if server.next_timeout().is_some_and(|st| st <= now) {
+                    server.handle_timeout(now);
+                }
+            }
+        }
+        for &id in &ids {
+            assert_eq!(
+                recvd.get(&id),
+                sent.get(&id),
+                "stream {id}: delivered bytes must match what was sent (reclaim \
+                 must never drop bytes still needed for retransmission)"
+            );
+        }
+    }
+
+    /// Timing harness for [`Connection::compact_send_buffer`] under a large
+    /// in-flight set (big cwnd, many streams). NOT a pass/fail perf gate — it
+    /// only prints per-call cost, so it cannot flake in CI. Run it manually in
+    /// release mode:
+    ///
+    /// ```text
+    /// cargo test --locked --lib --release bench_compact_send_buffer -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing harness; run manually in --release with --nocapture"]
+    fn bench_compact_send_buffer() {
+        const STREAMS: u64 = 128;
+        const PACKETS: u64 = 4096; // in-flight DATA packets: a few-MB cwnd of 1200B packets
+        const RANGE_LEN: u64 = 1200;
+        const ITERS: u32 = 100; // repeats of "compact every stream once" (one ACK batch)
+
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0xbe; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let now = Instant::now();
+        let ids: Vec<u64> = (0..STREAMS).map(|_| client.open_bi()).collect();
+        // Record the in-flight set through the REAL send-path bookkeeping
+        // (`record_sent`), one STREAM range per packet round-robin across the
+        // streams — the shape a bulk transfer produces.
+        for k in 0..PACKETS {
+            let id = ids[(k % STREAMS) as usize];
+            let off = (k / STREAMS) * RANGE_LEN;
+            let content = SentContent {
+                stream: vec![(id, off, RANGE_LEN, false)],
+                ..SentContent::default()
+            };
+            let pn = client.spaces[SPACE_DATA].send.allocate();
+            client.record_sent(SPACE_DATA, pn, RANGE_LEN as usize, true, content, now);
+        }
+        // Give each stream a send buffer + packetize frontier consistent with the
+        // recorded ranges. Offset 0 is still in flight on every stream, so there
+        // is nothing to reclaim: each call does its full "lowest live offset"
+        // lookup and early-outs — the steady-state hot path (and the worst case
+        // for the old full rescan of sent_content).
+        let per_stream = PACKETS / STREAMS;
+        for &id in &ids {
+            let s = client.streams.get_mut(&id).unwrap();
+            s.send = vec![0xa5; (per_stream * RANGE_LEN) as usize];
+            s.send_off = per_stream * RANGE_LEN;
+        }
+
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            for &id in &ids {
+                client.compact_send_buffer(id);
+            }
+        }
+        let elapsed = t.elapsed();
+        let calls = ITERS * STREAMS as u32;
+        eprintln!(
+            "compact_send_buffer: {STREAMS} streams, {PACKETS} in-flight packets: \
+             {calls} calls in {elapsed:?} ({:?}/call)",
+            elapsed / calls
+        );
+        // Sanity: nothing was reclaimed (offset 0 is still live everywhere).
+        for &id in &ids {
+            assert_eq!(client.streams[&id].send_base, 0, "nothing to reclaim yet");
+        }
+    }
+
     #[test]
     fn path_mtu_discovery_grows_the_datagram_over_a_clean_path() {
         // DPLPMTUD must climb above the conservative BASE on a path that carries larger
@@ -4940,6 +5245,148 @@ mod tests {
         assert!(
             server.last_recv_time.is_none(),
             "a garbage datagram must not start/refresh the idle timer"
+        );
+    }
+
+    #[test]
+    fn never_opening_server_connection_hits_the_cold_start_backstop() {
+        // DoS backstop: a server connection created for a spoofed/undecryptable
+        // Initial never AEAD-opens a packet, so `last_recv_time` stays `None`.
+        // Without the `created_at` fallback it would arm NO timer at all
+        // (`next_timeout() == None`) and sit in the endpoint's table forever.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x0d, 0x05, 0x0d, 0x05]),
+        )
+        .unwrap();
+        let t0 = server.created_at;
+        assert_eq!(
+            server.next_timeout(),
+            Some(t0 + IDLE_TIMEOUT),
+            "a connection that never opened a packet still arms the idle backstop"
+        );
+        // Garbage that never AEAD-opens must not refresh the backstop either.
+        let _ = server.handle_datagram(&[0xff; 1200], t0 + Duration::from_secs(1));
+        assert_eq!(
+            server.next_timeout(),
+            Some(t0 + IDLE_TIMEOUT),
+            "an un-openable datagram must not push the backstop deadline out"
+        );
+        // Just before the deadline: still open.
+        server.handle_timeout(t0 + IDLE_TIMEOUT - Duration::from_millis(1));
+        assert!(!server.is_closed(), "backstop must not fire early");
+        // At the deadline: torn down as an idle timeout.
+        server.handle_timeout(t0 + IDLE_TIMEOUT);
+        assert!(
+            matches!(server.close_reason(), Some(CloseReason::IdleTimeout)),
+            "cold-start zombie closes as an idle timeout, got {:?}",
+            server.close_reason()
+        );
+        // And after the drain period it is reapable by the endpoint.
+        let drain = server
+            .next_timeout()
+            .expect("a closing connection arms its drain deadline");
+        server.handle_timeout(drain);
+        assert!(
+            server.is_drained(),
+            "the endpoint can reap the never-opening connection"
+        );
+    }
+
+    #[test]
+    fn client_with_silent_peer_times_out_instead_of_probing_forever() {
+        // A client whose peer NEVER replies keeps `last_recv_time == None`; before
+        // the backstop its only timers were PTOs, so it would retransmit Initials
+        // forever. Drive it exactly as the endpoint does (handle_timeout at each
+        // armed deadline, then poll_transmit) and prove it closes by the backstop.
+        let dcid = ConnectionId::new(&[0x51, 0x1e, 0x47, 0x0e, 0x51, 0x1e, 0x47, 0x0e]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let t0 = client.created_at;
+        let mut now = t0;
+        while client.poll_transmit(now).is_some() {}
+        let mut fired = 0u32;
+        while !client.is_closed() {
+            let deadline = client
+                .next_timeout()
+                .expect("an unanswered client always has a timer armed");
+            assert!(
+                deadline <= t0 + IDLE_TIMEOUT,
+                "no timer may be armed past the cold-start backstop"
+            );
+            now = deadline;
+            client.handle_timeout(now);
+            while client.poll_transmit(now).is_some() {}
+            fired += 1;
+            assert!(fired < 1000, "must converge to a close, not probe forever");
+        }
+        assert!(
+            matches!(client.close_reason(), Some(CloseReason::IdleTimeout)),
+            "silent-peer client closes as an idle timeout, got {:?}",
+            client.close_reason()
+        );
+        assert_eq!(
+            now,
+            t0 + IDLE_TIMEOUT,
+            "teardown happens exactly at the backstop deadline"
+        );
+    }
+
+    #[test]
+    fn established_connection_idle_deadline_tracks_receipt_not_creation() {
+        // The backstop must be inert once a packet has AEAD-opened: the idle
+        // deadline follows `last_recv_time`, not `created_at`. Handshake at
+        // t0+10s, so the receipt-based deadline (t0+40s) is 10s later than the
+        // creation-based one (t0+30s) — the connection must survive the latter.
+        let dcid = ConnectionId::new(&[0x1d, 0x1e, 0x0f, 0x0f, 0x1d, 0x1e, 0x0f, 0x0f]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x1d, 0x1e, 0x0f, 0x0f]),
+        )
+        .unwrap();
+        let t0 = client.created_at;
+        // Lossless in-process pump (like `drive`) but at t0+10s, so last_recv_time
+        // lands well after created_at.
+        let hs = t0 + Duration::from_secs(10);
+        for _ in 0..16 {
+            let mut moved = false;
+            while let Some(dg) = client.poll_transmit(hs) {
+                server.handle_datagram(&dg, hs).unwrap();
+                moved = true;
+            }
+            while let Some(dg) = server.poll_transmit(hs) {
+                client.handle_datagram(&dg, hs).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "handshake completed");
+        assert_eq!(client.last_recv_time, Some(hs));
+        // Past created_at + IDLE_TIMEOUT but before last_recv + IDLE_TIMEOUT:
+        // must stay open (the backstop yields to the real receipt time).
+        client.handle_timeout(t0 + IDLE_TIMEOUT + Duration::from_secs(1));
+        assert!(
+            !client.is_closed(),
+            "a connection that has received packets must not close on the creation-based backstop"
+        );
+        // The receipt-based deadline still fires as before.
+        client.handle_timeout(hs + IDLE_TIMEOUT);
+        assert!(
+            matches!(client.close_reason(), Some(CloseReason::IdleTimeout)),
+            "the ordinary idle timeout is unaffected, got {:?}",
+            client.close_reason()
         );
     }
 
