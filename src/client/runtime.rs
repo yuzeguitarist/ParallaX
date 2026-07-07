@@ -168,6 +168,14 @@ const MUX_POOL_MAX_IDLE_SESSIONS: usize = 2;
 /// handshake and servers are often single-core; 8 captures nearly all the
 /// latency win of a larger fan-out at roughly half the peak handshake load.
 const MUX_MAX_CONCURRENT_SESSION_BUILDS: usize = 8;
+/// How many times `acquire` retries its OWN failed session build before giving
+/// up and failing the local connection. A single establishment can fail
+/// transiently on a hostile link (packet loss/reorder during the handshake, or a
+/// handshake timing out while many builds contend for a slow/lossy uplink) — the
+/// exact conditions ParallaX targets. Retrying a couple of times turns such a
+/// blip into a slightly slower connection instead of a hard reset, while the cap
+/// still fails fast against a genuinely down/blocked server.
+const MUX_ACQUIRE_MAX_BUILD_ATTEMPTS: u32 = 3;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -980,6 +988,7 @@ impl ClientMuxPool {
     async fn acquire(&self) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
         self.last_activity
             .store(relay_now_millis(), Ordering::Relaxed);
+        let mut build_attempts = 0u32;
         loop {
             let mut state = self.inner.lock().await;
             // Prune dead and surplus-idle sessions, then take a free slot on any
@@ -1006,7 +1015,29 @@ impl ClientMuxPool {
                 // Establish OFF-LOCK, add the new session, take its first substream
                 // slot, and wake parked waiters (which re-check and grab the new
                 // session's remaining slots).
-                return self.build_and_reserve().await;
+                match self.build_and_reserve().await {
+                    Ok(reserved) => return Ok(reserved),
+                    Err(err) => {
+                        // A transient establishment failure (handshake loss/reorder
+                        // on a hostile link, or a build timing out under contention)
+                        // should not hard-reset the local connection when a retry
+                        // is likely to succeed. Retry a bounded number of times,
+                        // then surface the error. `build_and_reserve` already
+                        // dropped the build slot and woke waiters, and the loop
+                        // re-checks existing sessions first, so a slot another build
+                        // just freed is still preferred over another handshake.
+                        build_attempts += 1;
+                        if build_attempts >= MUX_ACQUIRE_MAX_BUILD_ATTEMPTS {
+                            return Err(err);
+                        }
+                        tracing::debug!(
+                            attempt = build_attempts,
+                            error = %err,
+                            "client mux session establishment failed; retrying"
+                        );
+                        continue;
+                    }
+                }
             }
             // At the build-concurrency cap: park until an in-flight build lands,
             // then retry (usually grabbing a slot it freed). The `Notified` future
