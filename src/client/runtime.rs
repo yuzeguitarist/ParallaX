@@ -988,10 +988,20 @@ impl ClientMuxPool {
                 if let Some(reserved) = reserve_slot(&state.sessions) {
                     return Ok(reserved);
                 }
-                // No free slot. Grow the pool if we are under the concurrency cap;
-                // otherwise park until an in-flight build lands and retry (usually
-                // grabbing a slot it freed rather than building our own).
-                if state.builds_in_flight < MUX_MAX_CONCURRENT_SESSION_BUILDS {
+                // No free slot. While the pool is EMPTY, single-flight the first
+                // session so a cold-start burst COALESCES onto it (mux's whole
+                // point: many substreams share one session) instead of every
+                // connection opening its own. Once at least one session exists,
+                // growth may run several builds CONCURRENTLY so a burst that needs
+                // many sessions does not serialize their handshakes (the latency
+                // bug). Either way, park when at the cap and retry when a build
+                // lands — usually grabbing a slot it freed rather than building.
+                let max_builds = if state.sessions.is_empty() {
+                    1
+                } else {
+                    MUX_MAX_CONCURRENT_SESSION_BUILDS
+                };
+                if state.builds_in_flight < max_builds {
                     state.builds_in_flight += 1;
                     Waiter::Build
                 } else {
