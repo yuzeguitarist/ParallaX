@@ -1,7 +1,7 @@
 ParallaX — AI / ML Usage Restrictions
 =====================================
 
-Copyright (c) 2026 Yuze Pan
+Copyright (c) 2026 yuzeguitarist
 Project: ParallaX (https://github.com/yuzeguitarist/ParallaX)
 
 These restrictions are SUPPLEMENTAL to, and binding under, the PolyForm
