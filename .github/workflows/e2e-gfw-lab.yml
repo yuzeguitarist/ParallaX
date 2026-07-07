@@ -114,7 +114,12 @@ jobs:
     name: linux e2e (${{ matrix.transport }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: build
+    # Deliberately NOT `needs: build`. This job compiles Linux itself and runs the
+    # full E2E, so it must not wait behind the slow macOS/Windows build matrix — a
+    # compile break still fails it at its own build step, before any lab run. Runs
+    # in parallel with `build`, cutting PR wall-clock (was build-matrix + e2e,
+    # now max(build-matrix, e2e)). Coverage is unchanged: `build` still proves the
+    # three-OS compile/smoke, this still runs the networked lab.
     strategy:
       fail-fast: false
       matrix:

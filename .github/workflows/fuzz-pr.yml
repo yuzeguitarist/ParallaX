@@ -40,6 +40,8 @@ jobs:
           persist-credentials: false
       - name: Validate target map (fails if a fuzz target is unmapped)
         run: python3 fuzz/ci/select_targets.py --check
+      - name: Selector unit tests (nightly rotation coverage, no starvation)
+        run: python3 fuzz/ci/test_select_targets.py
       - name: Select targets from the PR diff
         id: sel
         env:

@@ -41,7 +41,7 @@ except ModuleNotFoundError:  # pragma: no cover - runner is 3.12
     sys.exit("select_targets.py needs Python >= 3.11 (tomllib); runner has older")
 
 DEFAULT_MAP = Path(__file__).resolve().parent / "target-map.toml"
-DEFAULT_CAP = {"pr": 4, "nightly": 6}
+DEFAULT_CAP = {"pr": 4, "nightly": 10}
 
 
 def load_map(path: Path) -> dict:
@@ -107,6 +107,47 @@ def rotation_fill(ordered: list[str], data: dict, cap: int) -> list[str]:
         if t not in out:
             out.append(t)
     return out[:cap]
+
+
+def nightly_select(
+    chosen: set[str],
+    core_flag: bool,
+    data: dict,
+    cap: int,
+    today_ord: int | None = None,
+) -> list[str]:
+    """Pick the nightly HEAD-fuzz targets.
+
+    Every core target runs each night (they are the highest-value pre-auth
+    surfaces, so this never regresses below the old behaviour); the remaining
+    slots date-rotate through the rest of the selected targets so *every* target
+    is fuzzed within a bounded number of nights.
+
+    Why this exists: the VPS pin is hundreds of commits behind HEAD, so the
+    since-pin diff selects the whole map. The old path (`order_and_cap` then
+    `rotation_fill`) then deterministically kept the same top-`cap` core set every
+    night and `rotation_fill` never fired (it only fills when < cap were chosen),
+    so the non-core targets — the newest, least-soaked parsers — were never fuzzed
+    at HEAD. Anchoring core + rotating the rest restores the intended full sweep.
+    """
+    picked = set(chosen)
+    if core_flag:
+        picked.update(data["selection"]["core"])
+    pool = [t for t in priority_order(data) if t in picked] or list(data["targets"].keys())
+    if len(pool) <= cap:
+        # Empty/small diff: run everything selected, fill the rest by rotation
+        # (the classic "even a no-change night still fuzzes `cap` targets" path).
+        return rotation_fill(pool, data, cap)
+    core = data["selection"]["core"]
+    anchors = [t for t in pool if t in core][:cap]  # all core, every night
+    rest = [t for t in pool if t not in core]
+    slots = cap - len(anchors)
+    if slots <= 0 or not rest:
+        return anchors[:cap]
+    ord_ = date.today().toordinal() if today_ord is None else today_ord
+    start = (ord_ * slots) % len(rest)
+    window = [rest[(start + i) % len(rest)] for i in range(min(slots, len(rest)))]
+    return anchors + window
 
 
 def changed_files(mode: str, base: str | None, pin: str | None) -> list[str]:
@@ -204,9 +245,10 @@ def main() -> int:
         files = changed_files(args.mode, args.base, args.pin)
 
     chosen, core_flag = select_for_files(files, data)
-    ordered = order_and_cap(chosen, core_flag, data, cap)
     if args.mode == "nightly":
-        ordered = rotation_fill(ordered, data, cap)
+        ordered = nightly_select(chosen, core_flag, data, cap)
+    else:
+        ordered = order_and_cap(chosen, core_flag, data, cap)
     emit_matrix(ordered)
     return 0
 

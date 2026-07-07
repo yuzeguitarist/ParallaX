@@ -3,7 +3,9 @@
 # Complements the VPS cluster (ops/fuzz-cluster/, pinned to commit d240e663):
 #   - the VPS deep-soaks the PINNED release 24/7;
 #   - this job fuzzes HEAD — the new code the pinned cluster structurally cannot
-#     reach — on an ADAPTIVE 4-6 target subset so it finishes in one ~5.5h window.
+#     reach — on a 10-target subset (all core every night + a date-rotated fill
+#     that sweeps every target within ~5 nights). Jobs run in parallel, so the
+#     window stays ~5.5h regardless of the cap.
 #
 # Timing: cron is UTC and 18:30 + ~5h fuzz + ~0.5h overhead ends ~00:00 UTC =
 # 08:00 Asia/Shanghai (wake time). cron can drift a few/-teen minutes under load;
@@ -21,7 +23,7 @@ on:
         default: '18000'
       cap:
         description: 'max targets this run'
-        default: '6'
+        default: '10'
 
 permissions:
   contents: read
@@ -45,7 +47,7 @@ jobs:
       - name: Select targets (changed since VPS pin, then date-rotation fill)
         id: sel
         env:
-          CAP: ${{ github.event.inputs.cap || '6' }}
+          CAP: ${{ github.event.inputs.cap || '10' }}
         run: |
           set -euo pipefail
           PIN="$(grep -oE 'PINNED_COMMIT="[0-9a-f]+"' ops/fuzz-cluster/bootstrap.sh | head -1 | grep -oE '[0-9a-f]{6,}')"
@@ -64,7 +66,7 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 10
       matrix:
         target: ${{ fromJSON(needs.select.outputs.targets) }}
     env:
@@ -101,6 +103,14 @@ jobs:
 
       - name: Install cargo-fuzz
         run: command -v cargo-fuzz >/dev/null || cargo +nightly-2026-06-10 install cargo-fuzz --version 0.13.2 --locked
+
+      # Build the target as its own step so a compile break at HEAD turns the
+      # night RED. Without this the `Fuzz HEAD` step below swallows cargo's exit
+      # code, so a harness that no longer compiles (a nightly/sanitizer-only break
+      # that stable `--cfg fuzzing` ci-fuzz-build can't catch) would look like a
+      # green "no crash" night. `fuzz run` reuses these artifacts, so it's ~free.
+      - name: Build target at HEAD (compile break => RED, not a silent-green night)
+        run: cargo +nightly-2026-06-10 fuzz build --sanitizer "$FUZZ_SANITIZER" "$TARGET"
 
       - name: Restore GHA-grown corpus
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
