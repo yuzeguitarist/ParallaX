@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a change or enhancement to ParallaX.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ParallaX has a deliberately **narrow product path** (local SOCKS5 in, a
+        Safari-shaped TCP/TLS camouflage transport, fallback passthrough, a
+        PQ-rekeyed AEAD data plane; the UDP/QUIC plane is experimental and off by
+        default). Changes that add speculative configurability, or that widen the
+        gap between ParallaX traffic and a real browser, are unlikely to be
+        accepted. Please frame your proposal against that boundary.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security/distinguishability matter (those go through private reporting).
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem are you trying to solve? Who hits it, and when?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What would you like ParallaX to do?
+    validations:
+      required: true
+  - type: textarea
+    id: fit
+    attributes:
+      label: How it fits ParallaX's threat model and product boundary
+      description: >-
+        Why does this belong in the narrow product path? Does it affect the
+        camouflage profile, the failure/fallback behavior, or the TCP byte-parity
+        guarantee? If it touches TLS/fingerprint/handshake/crypto, say how it stays
+        indistinguishable from the imitated browser.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed, and why you set them aside.
+    validations:
+      required: false

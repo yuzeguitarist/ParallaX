@@ -1,0 +1,33 @@
+name: Documentation issue
+description: Report something missing, wrong, or unclear in the docs.
+title: "[Docs]: "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For factual errors, gaps, or confusing wording in the README, `SPEC.md`,
+        `DEPLOYMENT.md`, or the [DeepWiki knowledge base](https://github.com/yuzeguitarist/ParallaX/tree/main/ParallaX-DeepWiki).
+        Small fixes (typos, broken links) are also welcome as a direct pull
+        request — no issue needed.
+  - type: input
+    id: location
+    attributes:
+      label: Which document / page?
+      description: File path or page title, and a section or line if you can.
+      placeholder: "e.g. README.md > Verification, or ParallaX-DeepWiki/Deployment.md"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix
+      description: How should it read instead? Optional, but appreciated.
+    validations:
+      required: false

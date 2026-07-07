@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security or distinguishability issue (PRIVATE)
+    url: https://github.com/yuzeguitarist/ParallaX/security/advisories/new
+    about: >-
+      Do NOT open a public issue for anything security-relevant. Because ParallaX
+      is a traffic-camouflage tool, a reliable way to fingerprint, classify, or
+      actively probe its traffic apart from the browser profile it imitates is a
+      security issue too. Use GitHub private reporting — see SECURITY.md.
+  - name: Usage & deployment questions
+    url: https://github.com/yuzeguitarist/ParallaX/blob/main/ParallaX-DeepWiki/Getting-Started-%26-CLI-Reference.md
+    about: >-
+      Check the Getting Started & CLI Reference and the DeepWiki knowledge base
+      before filing an issue.
+  - name: Code of Conduct
+    url: https://github.com/yuzeguitarist/ParallaX/blob/main/CODE_OF_CONDUCT.md
+    about: How we expect people in this community to behave, and how to report conduct issues privately.

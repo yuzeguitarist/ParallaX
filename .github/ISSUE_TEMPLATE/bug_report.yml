@@ -1,0 +1,94 @@
+name: Bug report
+description: Report a reproducible, non-security bug in ParallaX.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report.
+
+        **Stop — is this a security or distinguishability issue?** If your report
+        is about a vulnerability, or about a way to fingerprint, classify, or
+        actively probe ParallaX traffic apart from the browser profile it
+        imitates, do **not** file it here. Report it privately via the
+        [Security tab](https://github.com/yuzeguitarist/ParallaX/security/advisories/new)
+        (see [SECURITY.md](https://github.com/yuzeguitarist/ParallaX/blob/main/SECURITY.md)).
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: This is NOT a security or distinguishability issue (those go through private reporting).
+          required: true
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I removed all secrets (PSKs, private keys, host.key) from any config, log, or capture below.
+          required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of ParallaX does this affect?
+      options:
+        - CLI / config (plx check, init, seal, ...)
+        - Client runtime (SOCKS5 / relay)
+        - Server runtime (handshake / fallback)
+        - TLS camouflage (src/tls, src/fingerprint)
+        - Crypto / PQ / identity (src/crypto)
+        - UDP / QUIC fast plane (experimental)
+        - Deployment (scripts/deploy-vps.sh, systemd)
+        - Build / CI
+        - Documentation
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `plx --version`, or `git rev-parse HEAD` if built from source.
+      placeholder: "0.1.0 (commit abc1234)"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS / platform
+      placeholder: "e.g. Ubuntu 24.04 x86_64, macOS 15 arm64"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, ordered steps. Include the exact commands you ran.
+      placeholder: |
+        1. plx init ...
+        2. plx serve -c ...
+        3. curl --socks5-hostname 127.0.0.1:1080 https://...
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config (secrets redacted)
+      description: The minimal config needed to reproduce. Replace every secret with `REDACTED`.
+      render: toml
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant log output or error messages. This is rendered as a code block; no need for backticks.
+      render: shell
+    validations:
+      required: false
