@@ -1,7 +1,7 @@
 //! HTTP/3 façade orchestration over the QUIC fast plane.
 //!
-//! After a Verified probe both ends retain the QUIC connection for the
-//! single-Connect relay. Before any relay data flows, this module establishes the
+//! After a Verified probe both ends retain the QUIC connection for fast-plane
+//! relay/mux/speed paths. Before any payload data flows, this module establishes the
 //! HTTP/3 control-stream set a real Safari-26 H3 client/server would open, so the
 //! post-handshake on-wire behaviour is RFC 9114-compliant H3 rather than a bare
 //! QUIC byte stream:

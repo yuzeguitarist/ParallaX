@@ -23,8 +23,9 @@ transport.
 There is no `--quic` CLI flag, but an **experimental** UDP/QUIC fast plane (the
 "U" in TUDP) *is* wired into the client and server runtimes: setting
 `[udp].enabled = true` on **both** ends activates a masquerading-h3 QUIC carrier
-for the single-Connect data relay, authenticated by an exporter-bound probe token
-(the QUIC leg treats its server certificate as camouflage, not the trust anchor).
+for single-Connect relays, mux-over-QUIC substreams, and `plx speed`'s optional
+QUIC run, authenticated by an exporter-bound probe token (the QUIC leg treats
+its server certificate as camouflage, not the trust anchor).
 It is **off by default**; while disabled, every path stays byte-identical on TCP.
 When enabled, its QUIC client already emits a Safari-26 H3-shaped ClientHello by
 default, but the fast plane is not yet a production-ready operator mode, so
@@ -65,7 +66,7 @@ enabling it is for experimentation, not censorship-resistant production use.
 | Handshake authentication | PSK + X25519 material embedded into `ClientHello.random` and compatibility `SessionID`; replay cache gates authenticated handshakes. | `src/crypto/auth.rs`, `src/crypto/replay.rs` |
 | PQ and identity | ML-KEM-1024 rekey, transcript-bound server key exchange, ML-DSA-87 identity proof over the rekey binding. | `src/crypto/pq.rs`, `src/crypto/identity.rs`, `src/protocol/command.rs` |
 | Data plane | AEAD records (server-negotiated AES-256-GCM or ChaCha20-Poly1305; 96-bit per-record counter nonce) carried inside TLS `ApplicationData` frames, per-direction nonce ratchets, optional padding/timing/cover traffic; bulk batches seal/open across a shared multi-core crypto pool. | `src/crypto/session.rs`, `src/protocol/data.rs`, `src/crypto/parallel.rs`, `src/traffic.rs` |
-| TCP transport | Default TCP product transport with `TCP_NODELAY`, cross-platform TCP keepalive (SO_KEEPALIVE), fd-limit based relay concurrency, and 64 KiB relay buffers. | `src/transport/tcp.rs` |
+| TCP transport | Default TCP product transport with `TCP_NODELAY`, cross-platform TCP keepalive (SO_KEEPALIVE), fd-limit based relay concurrency, and 256 KiB relay buffers. | `src/transport/tcp.rs` |
 | Process hardening | Best-effort no-core-dump setup, non-dumpable process flag, `mlock`, `MADV_DONTDUMP`, and strict config file ownership/mode checks. | `src/process_hardening.rs`, `src/config.rs` |
 | Operations | Local build, binary-only VPS upload, hardened systemd unit, optional BBR/fq setup, optional Polar Signals / parca-agent profiling. | `scripts/deploy-vps.sh`, `scripts/uninstall-vps.sh` |
 | Validation | Unit/integration tests, Safari parity fixtures, ignored loopback tests, GFW simulator, fixed 59-case benchmark suite, speed evidence report. | `tests/`, `src/bench.rs`, `src/speed.rs` |
@@ -81,7 +82,7 @@ Requirements:
 - No `openssl-sys` or system OpenSSL dependency
 
 ```bash
-cargo build --release
+cargo build --locked --release
 ```
 
 The crate builds two entry points:
@@ -92,7 +93,7 @@ The crate builds two entry points:
 Install both from the repository root:
 
 ```bash
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ---
@@ -196,6 +197,8 @@ plx client [-c parallax.toml]
 
 plx speed [-c parallax.toml] [--json]
     Run a one-shot network speed evidence test against the configured server.
+    JSON reports contain runs[]: TCP first, plus a QUIC run when [udp] is enabled
+    and the UDP probe verifies.
 
 plx netmatrix [-c parallax.toml] [--json]
     Run a reproducible controlled-network RTT/bandwidth speed matrix against the
@@ -326,7 +329,7 @@ cargo test --locked -- --ignored --test-threads=1
 Run the GFW simulator directly:
 
 ```bash
-cargo test --test gfw_simulator
+cargo test --locked --test gfw_simulator
 ```
 
 ---
@@ -356,7 +359,8 @@ plx speed -c parallax.client.toml --json
 runs a fixed warmup plus three upload/download samples, and emits a structured
 report with config fingerprint, server address, SNI, traffic profile, payload
 sizes, handshake timing, warmup timing, per-sample throughput, and summary
-statistics.
+statistics. JSON evidence has a `runs[]` array: TCP is always first, and a QUIC
+second run is included only when `[udp].enabled` is on and the UDP probe verifies.
 
 `plx client` and `plx speed` use a runtime guard so a normal client process and
 a speed run do not accidentally compete against the same configured server.
@@ -405,9 +409,9 @@ src/
   handshake/              Client/server handshake and data-session state
   crypto/                 X25519, AEAD, parallel crypto pool, ML-KEM, ML-DSA, replay cache
   tls/                    Safari-shaped TLS camouflage and TLS records
-  fingerprint/            HTTP/2 Safari preface and header helpers
+  fingerprint/            HTTP/2 and HTTP/3 Safari façade helpers
   protocol/               Binary commands and encrypted data records
-  transport/              TCP transport helpers
+  transport/              TCP helpers plus experimental UDP/QUIC fast plane
   traffic.rs              Padding, timing, and cover-traffic profiles
   probe.rs                Camouflage target probing
   speed.rs                Network speed evidence report

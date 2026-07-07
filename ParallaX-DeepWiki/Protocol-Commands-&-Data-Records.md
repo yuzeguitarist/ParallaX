@@ -33,12 +33,12 @@ codec lives in `src/protocol/data.rs`.
 | `PX1O` | `UdpOffer` | server to client | UDP fast-plane offer: `offer_id` (also the RFC 5705 exporter-binding context), UDP port, and parameters. |
 | `PX1P` | `UdpProbeAck` | client to server | Client reports the UDP probe outcome over the TCP control plane, echoing the `offer_id`. |
 | `PX1N` | `UdpDecline` | server to client | Fail-soft decline of a `UdpRequest`; the client proceeds on TCP only. |
-| `PX1Z` | `QUIC_RELAY_DONE_MARKER` | client/server | AEAD-sealed end-of-relay marker exchanged on the QUIC fast plane to confirm a clean relay teardown. |
+| `PX1Z` | fixed QUIC done markers | client/server | AEAD-sealed fixed payloads on the QUIC fast plane: `PX1Z-quic-relay-done` for clean relay teardown and `PX1Z-speed-quic-done` for the QUIC speed run. |
 
 `PX1M` carries the default multiplexing path (`max_concurrent_streams > 1`), and
 `PX1G`/`PX1O`/`PX1P`/`PX1N` drive the experimental, off-by-default UDP/QUIC fast
-plane negotiation over the TCP control plane, and `PX1Z` is the AEAD-sealed
-marker both ends exchange to confirm a clean QUIC-leg relay teardown.
+plane negotiation over the TCP control plane. The `PX1Z...` done markers are
+fixed AEAD-sealed payloads, not standalone decoded `Command` variants.
 
 All decoders fail on truncation, bad magic, malformed lengths, empty required
 fields, and port `0` where a target port is present.

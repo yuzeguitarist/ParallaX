@@ -167,7 +167,8 @@ value asked for (the usual cause is an un-raised `*mem_max`).
 
 ## Local build modes
 
-On **Linux**, the script uses native `cargo build --release` by default.
+On **Linux**, the script uses native
+`cargo build --profile release --locked --quiet --bin plx` by default.
 
 On **macOS**, it prefers Docker when available; otherwise it falls back to
 local `cargo-zigbuild` and installs the missing local build helpers

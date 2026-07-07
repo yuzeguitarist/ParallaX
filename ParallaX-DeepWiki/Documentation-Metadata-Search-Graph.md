@@ -15,10 +15,11 @@ The current documentation contract is:
   [`../tests/gfw_sim/`](../tests/gfw_sim/) and
   [`../tests/gfw_simulator.rs`](../tests/gfw_simulator.rs).
 - **Experimental path:** an off-by-default UDP/QUIC fast plane (`[udp].enabled`
-  on both ends) is wired into the client/server runtimes for the single-Connect
-  relay; there is still no `--quic` CLI flag. When enabled, its QUIC client
-  already emits a Safari-26 H3-shaped ClientHello by default, but the plane stays
-  off by default and is not yet a production-ready operator mode.
+  on both ends) is wired into the client/server runtimes for single-Connect
+  relays, mux-over-QUIC substreams, and `plx speed`'s optional QUIC run; there is
+  still no `--quic` CLI flag. When enabled, its QUIC client already emits a
+  Safari-26 H3-shaped ClientHello by default, but the plane stays off by default
+  and is not yet a production-ready operator mode.
 
 ## Metadata schema
 
@@ -101,14 +102,14 @@ flowchart TD
 |---|---|---|
 | First install, local build, CLI overview | `quick start`, `cargo install`, `plx init`, `plx client`, `plx check` | [`Getting Started & CLI Reference`](Getting-Started-&-CLI-Reference.md) |
 | VPS rollout, remote service, binary-only deploy | `deploy-vps`, `systemd`, `BBR`, `fq`, `parca-agent`, `Polar Signals` | [`Deployment`](Deployment.md), [`VPS Deployment Script`](VPS-Deployment-Script.md) |
-| Config fields or validation failures | `mode`, `crypto.psk`, `authorized_sni`, `strict_tls13`, `replay_cache_path` | [`Configuration Reference`](Configuration-Reference.md) |
+| Config fields or validation failures | `mode`, `crypto.psk`, `low-entropy PSK`, `accept_language`, `cover_min_interval_ms`, `authorized_sni`, `strict_tls13`, `replay_cache_path` | [`Configuration Reference`](Configuration-Reference.md) |
 | Local SOCKS behavior | `SOCKS5`, `CONNECT`, `loopback`, `runtime guard`, `client.listen` | [`Client Runtime & SOCKS5 Proxy`](Client-Runtime-&-SOCKS5-Proxy.md) |
 | Probe-safe server behavior | `fallback`, `active probe`, `partial prefix`, `authorized SNI`, `strict TLS 1.3` | [`Server Runtime & Probing Resistance`](Server-Runtime-&-Probing-Resistance.md) |
 | Browser-shaped TLS | `Safari 26`, `ClientHello`, `GREASE`, `ALPN`, `handwritten TLS`, `HTTP/2 preface` | [`TLS Camouflage Layer`](TLS-Camouflage-Layer.md) |
 | Authentication before data plane | `ClientHello.random`, `SessionID`, `PSK`, `X25519`, `replay cache` | [`ClientHello Authentication (PSK + X25519)`](<ClientHello-Authentication-(PSK-+-X25519).md>) |
 | PQ rekey and server identity | `ML-KEM`, `ML-DSA`, `identity proof`, `server key exchange`, `sandwich rekey` | [`Post-Quantum Cryptography (ML-KEM & ML-DSA)`](<Post-Quantum-Cryptography-(ML-KEM-&-ML-DSA).md>) |
 | Encrypted records and relay payloads | `PX1C`, `PX1Q`, `PX1K`, `PX1S`, `ApplicationData`, `ChaCha20-Poly1305`, `AES-256-GCM` | [`Protocol Commands & Data Records`](Protocol-Commands-&-Data-Records.md) |
-| Performance or throughput evidence | `plx speed`, `plx bench`, `network evidence`, `benchmark`, `59 cases` | [`Probing & Benchmarking`](<Probing-&-Benchmarking.md>), [`Protocol Benchmarks`](Protocol-Benchmarks.md) |
+| Performance or throughput evidence | `plx speed`, `runs`, `quic`, `plx bench`, `network evidence`, `benchmark`, `59 cases` | [`Probing & Benchmarking`](<Probing-&-Benchmarking.md>), [`Protocol Benchmarks`](Protocol-Benchmarks.md) |
 | Censorship model and QUIC notes | `GFW`, `JA3`, `JA4`, `active prober`, `QUIC Initial`, `research-only` | [`GFW Simulator & QUIC Research`](<GFW-Simulator-&-QUIC-Research.md>) |
 | Experimental QUIC fast plane internals | `[udp].enabled`, `mux-over-QUIC`, `0-RTT`, `BBR`, `origin splice`, `quic_marker` | [`QUIC Fast Plane`](QUIC-Fast-Plane.md), [`QUIC Origin-Splice & Active-Probing Resistance`](QUIC-Origin-Splice-&-Active-Probing-Resistance.md) |
 | Machine-bound secret sealing | `plx seal`, `sealed bundle`, `host.key`, `KEK`, `machine-bind` | [`Secret Store & Sealed Configs`](Secret-Store-&-Sealed-Configs.md) |
@@ -195,9 +196,9 @@ flowchart TD
 Run these checks after broad documentation edits:
 
 ```bash
-cargo run --quiet --bin plx -- --help
-cargo fmt --check
-cargo test --test gfw_simulator
+cargo run --locked --quiet -- --help
+cargo fmt --all -- --check
+cargo test --locked --test gfw_simulator
 ```
 
 Then run a local Markdown link pass and stale-reference search:

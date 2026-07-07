@@ -17,7 +17,7 @@ request) so the post-handshake behavior remains browser-like.
 | SETTINGS frame | Uses the captured Safari 26.4 settings order and values. |
 | WINDOW_UPDATE | Emits the captured connection-level update. |
 | SETTINGS ACK parser | Lets the camouflage backend drain and ACK the server's SETTINGS after sending its own opening flight. |
-| HEADERS frame | Builds the Safari-like opening `GET` request header block, sent on the wire right after the preface (and reused by parity tests). |
+| HEADERS frame | Builds the Safari-like opening `GET` request header block, sent on the wire right after the preface (and reused by parity tests). `accept-language` defaults to Safari-like `en-US,en;q=0.9` but can be overridden with `client.accept_language`; the rest of the header order/values stay fixed. |
 
 ## Opening flight
 
@@ -46,7 +46,7 @@ tests/fixtures/safari26_h2_preface_localhost.bin
 The parity test is:
 
 ```bash
-cargo test --test safari_h2_parity_baseline
+cargo test --locked --test safari_h2_parity_baseline
 ```
 
 ## Operational meaning

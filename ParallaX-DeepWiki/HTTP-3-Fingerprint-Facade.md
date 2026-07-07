@@ -59,16 +59,20 @@ The request HEADERS frame uses Safari's exact field order. The pseudo-header ord
 is `:method :scheme :authority :path` (authority before path, matching the H2
 main-document order), followed by `sec-fetch-dest`, `user-agent`, `accept`,
 `sec-fetch-site`, `sec-fetch-mode`, `accept-language`, `priority`, `accept-encoding`.
-All values are hardcoded except `:authority`, which varies per request. The
-User-Agent and Accept-Language strings are reused from the
-[HTTP/2 Fingerprinting](HTTP-2-Fingerprinting.md) façade so the two faces agree.
+All values are hardcoded except `:authority`, which varies per request, and
+`accept-language`, which defaults to the same Safari-like value as the HTTP/2
+façade but may be overridden with `client.accept_language` so the two faces
+agree.
 
 ## API surface
 
 - Frames: `encode_frame`, `decode_frame`.
 - Settings: `safari26_settings`, `safari26_settings_frame`, `parse_settings_payload`,
   `is_safari26_settings`.
-- Headers: `safari26_headers_frame(authority)`, `safari26_request_fields(authority)`,
+- Headers: `safari26_headers_frame(authority)`,
+  `safari26_headers_frame_with_language(authority, accept_language)`,
+  `safari26_request_fields(authority)`,
+  `safari26_request_fields_with_language(authority, accept_language)`, and
   `response_status_200_headers_frame`.
 - QPACK: `encode_field_section`, `decode_field_section`.
 

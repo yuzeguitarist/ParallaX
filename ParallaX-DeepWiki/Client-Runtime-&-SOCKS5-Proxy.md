@@ -20,8 +20,9 @@ ParallaX data sessions. It is implemented in `src/client/runtime.rs` and
    default (`4`, i.e. `> 1`) selects a `ClientMuxPool` that multiplexes SOCKS
    streams as substreams over one authenticated session; `1` selects a
    `WarmSessionPool` of one-stream-per-session connections. With `[udp].enabled`
-   the client also drives the experimental UDP/QUIC fast plane (see below) and
-   keeps no warm TCP sessions.
+   the client also tries the experimental UDP/QUIC fast plane (see below): mux
+   mode can switch the shared session to mux-over-QUIC after a verified probe,
+   while single-stream mode can use a retained QUIC leg for that one relay.
 6. Each accepted local TCP connection is dispatched to the mux pool (default) or
    a warm session, in an async task under the fd-derived relay connection limit.
 
@@ -82,8 +83,8 @@ window (`MUX_WARM_KEEPER_ACTIVE_WINDOW`, 90 s after the last stream) — so an i
 client does not re-handshake on a timer, which would be a behavioral tell.
 
 **UDP/QUIC fast plane (experimental, opt-in).** When `[udp].enabled = true`, the
-client additionally tries to negotiate the QUIC fast plane for the single-Connect
-relay before falling back to TCP:
+client additionally tries to negotiate the QUIC fast plane before falling back to
+TCP:
 
 1. it sends a `UdpRequest` (`PX1G`) and expects a `UdpOffer` (`PX1O`) or a
    fail-soft `UdpDecline` (`PX1N`);
@@ -92,6 +93,11 @@ relay before falling back to TCP:
 3. a process-shared circuit breaker (`UdpReachability`) suppresses re-negotiation
    for 30 s after a failed probe, so a UDP black hole degrades to TCP once rather
    than re-probing on every connection.
+
+If the probe verifies, `max_concurrent_streams = 1` uses a retained QUIC request
+bidi for the single-Connect relay. With mux enabled (`> 1`), the shared mux
+session switches to native mux-over-QUIC: each SOCKS substream opens its own
+H3-shaped request bidi instead of carrying all mux traffic inside one TCP stream.
 
 While `[udp].enabled = false` (the default) none of this runs and the client
 stays byte-identical on TCP.
@@ -103,7 +109,7 @@ After the handshake:
 - client-to-server payloads are sealed with the client direction key
 - server-to-client records are opened with the server direction key
 - large payloads are chunked to fit TLS record limits
-- the relay uses 64 KiB target buffers from `src/protocol/data.rs`
+- the relay uses 256 KiB target buffers from `src/protocol/data.rs`
 - the mux writer batches frames into frame-aligned records and the mux reader
   batches already-buffered records; bulk batches seal/open across the shared
   crypto pool while small batches stay inline to keep RTT low

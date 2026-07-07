@@ -22,7 +22,7 @@ Unix rejects group/world-readable secret files.
 
 | Field | Required | Validation |
 |---|---:|---|
-| `psk` | yes | Base64 string that decodes to at least 32 bytes, **or** a secret reference (see below). |
+| `psk` | yes | CSPRNG-generated base64 string that decodes to at least 32 bytes, **or** a secret reference (see below). Obvious low-entropy PSKs hard-fail in server mode and warn in client/check mode. |
 
 The same PSK must appear in both generated configs. It is part of ClientHello
 authentication and the hybrid rekey sandwich input.
@@ -55,8 +55,8 @@ for what sealing protects against.
 | `max_padding` | `0` | Must leave room for a TLS ApplicationData payload. |
 | `min_delay_ms` | `0` | `max_delay_ms >= min_delay_ms` |
 | `max_delay_ms` | `0` | `0` disables timing jitter. |
-| `cover_min_interval_ms` | `0` | `cover_max_interval_ms >= cover_min_interval_ms` |
-| `cover_max_interval_ms` | `0` | `0` disables cover traffic. |
+| `cover_min_interval_ms` | `0` | `cover_max_interval_ms >= cover_min_interval_ms`; when cover is enabled, must be at least `50`. |
+| `cover_max_interval_ms` | `0` | `0` disables cover traffic; enabling cover also requires variable profile padding (`max_padding > min_padding`). |
 | `max_concurrent_streams` | `4` | Must be at least `1`; values above `1` enable authenticated session multiplexing. |
 
 Generated configs set every traffic-shaping value to `0` except
@@ -90,6 +90,7 @@ prerequisite.
 | `sni` | yes | SNI sent in the camouflage TLS handshake. |
 | `server_public_key` | yes | Base64 X25519 server public key, exactly 32 bytes. |
 | `server_identity_public_key` | yes | Base64 ML-DSA-87 server identity public key. |
+| `accept_language` | no | Optional ASCII, single-line H2/H3 camouflage `accept-language` header override. Defaults to Safari-like `en-US,en;q=0.9`. |
 
 ## `[server]`
 
@@ -204,6 +205,9 @@ server_identity_public_key = "base64-mldsa-public"
 - Config files must be owned by the current Unix user.
 - Group/world permission bits are rejected.
 - The server replay-cache path is normalized before use.
+- `plx check` can fall back to structure-only validation when a host key,
+  sidecar, or environment-backed secret is unavailable; long-lived
+  client/server/speed runs still require all secrets to resolve.
 - Secret strings are passed through best-effort memory hardening before the
   long-lived client/server/speed paths continue.
 

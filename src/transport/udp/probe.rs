@@ -13,8 +13,9 @@
 //! the client writes a HEADERS frame (Safari-26 request fields, method GET)
 //! followed by a DATA frame whose body is the `PXp1 + nonce` request; the server
 //! replies with a `:status 200` HEADERS frame and a DATA frame whose body is the
-//! `PXp2 + HMAC` response. The SAME bidi stream then carries the data relay (the
-//! probe round-trip IS the fast-plane Verified determination). See
+//! `PXp2 + HMAC` response. For single-Connect relay and speed runs, that retained
+//! request bidi can carry the fast-plane payload; mux-over-QUIC quiesces the
+//! probe bidi and opens fresh H3-shaped request bidis per business substream. See
 //! [`probe_client_over_bidi`] / [`serve_probe_over_bidi`].
 //!
 //! The bare-uni-stream round-trip ([`probe_client`] / [`serve_probe`]) is the
@@ -24,10 +25,8 @@
 //! lost packet is retransmitted rather than silently dropping the probe.
 //!
 //! Wired into the client/server runtimes: a Verified probe causes both ends to
-//! retain the QUIC connection and carry the single-Connect data relay over the
-//! request bidi stream. The demote/promote scheduler (switching transports
-//! mid-session) is a later slice; for now a Verified probe commits the relay to
-//! QUIC, and a mid-relay failure is a clean connection reset.
+//! retain the QUIC connection for single-Connect relay, mux-over-QUIC, or speed.
+//! A mid-leg failure is a clean connection reset/fallback at the caller boundary.
 
 use std::time::{Duration, Instant};
 

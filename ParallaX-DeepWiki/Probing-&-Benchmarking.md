@@ -36,6 +36,11 @@ configured server. It emits text or JSON evidence with:
 - three measured upload samples
 - median/mean/min/max/stddev throughput summaries
 
+JSON output uses `runs[]`: TCP is always the first transport run, and a second
+QUIC run is included only when `[udp].enabled` is on and the UDP probe verifies.
+Text output mirrors this with `[transport=tcp]` and, when applicable,
+`[transport=quic]` sections.
+
 Do not run `plx client` and `plx speed` for the same config at the same time;
 the runtime guard is designed to fail fast in that case.
 
@@ -69,4 +74,4 @@ server-receive time); the download figure is accurate.
 3. Use full `plx bench` for release/performance baselines.
 4. Use `plx speed --json` when archiving real network evidence.
 5. Use `plx netmatrix --json` for reproducible RTT/bandwidth regression sweeps.
-6. Use `cargo test --test gfw_simulator` for adversary-model regressions.
+6. Use `cargo test --locked --test gfw_simulator` for adversary-model regressions.

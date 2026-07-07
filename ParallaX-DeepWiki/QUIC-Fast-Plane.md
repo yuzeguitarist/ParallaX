@@ -20,9 +20,11 @@ only fingerprint-hardened transport, see [Transport Layer](Transport-Layer.md).
 
 A clean-room, `quinn`-free QUIC stack (`src/transport/udp/quic/`) built directly
 from RFC 9000 (transport), RFC 9001 (TLS), and RFC 9002 (loss recovery), carrying
-the single-Connect data relay over a reliable bidirectional QUIC stream. The
-vendored `quinn` + `quinn-proto` fork it replaced is gone from the dependency tree
-(Phase 2 of de-vendoring); each module carries its own RFC round-trip / KAT tests.
+single-Connect relays over a reliable bidirectional QUIC stream, mux-over-QUIC
+substreams as separate H3-shaped request bidis, and `plx speed`'s optional QUIC
+transport run. The vendored `quinn` + `quinn-proto` fork it replaced is gone from
+the dependency tree (Phase 2 of de-vendoring); each module carries its own RFC
+round-trip / KAT tests.
 
 When the plane is active, the relay is wrapped in the same `Leg` abstraction
 (`src/transport/leg.rs`) that unifies TCP and QUIC stream carriers, so the rest of
@@ -32,7 +34,7 @@ the relay machinery does not care which transport it rides on.
 
 | Area | Code | Responsibility |
 |---|---|---|
-| Endpoint / HTTP-3 face | `src/transport/udp/endpoint.rs`, `src/transport/udp/h3.rs` | QUIC connection, the H3 control + QPACK encoder uni streams, and the request bidi that carries the reachability probe and relay. |
+| Endpoint / HTTP-3 face | `src/transport/udp/endpoint.rs`, `src/transport/udp/h3.rs` | QUIC connection, the H3 control + QPACK encoder uni streams, and request bidis for the reachability probe, single-Connect relay, mux substreams, and speed run. |
 | Happy-Eyeballs probe | `src/transport/udp/probe.rs` | Decide UDP reachability before committing, with a TCP-only fallback on timeout. |
 | Stable-:443 carrier | `src/transport/udp/stable.rs` | Process-wide shared endpoint that marker-terminates authenticated clients, splices everything else to the origin, and routes accepted connections back to their session by DCID. |
 | Exporter-bound auth | `src/transport/udp/auth.rs` | RFC 5705 keying-material export backing the UDP auth token. |
@@ -90,8 +92,9 @@ H3-shaped rather than exposing a ParallaX-specific framing.
 4. **Auth.** The client proves itself with an exporter-bound UDP auth token
    (`auth.rs`) derived from RFC 5705 keying material, so the token is bound to that
    specific TLS session and cannot be transplanted.
-5. **Relay.** The single-Connect relay (or the mux relay) is carried over reliable
-   QUIC streams behind the `Leg` abstraction, unified with the TCP path.
+5. **Relay / evidence.** Single-Connect relays, mux-over-QUIC substreams, and
+   `plx speed`'s optional QUIC run are carried over reliable QUIC streams behind
+   the `Leg` abstraction, unified with the TCP path.
 
 ## Resumption (0-RTT)
 

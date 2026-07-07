@@ -17,8 +17,8 @@
 //! secret bound to a caller-supplied context. These ARE called at runtime by the
 //! reachability probe ([`crate::transport::udp::probe`]): when `[udp].enabled` is
 //! set on both ends, the client and server each derive this exporter-bound token
-//! over the live QUIC connection to authenticate the fast-plane probe before the
-//! single-Connect data relay is committed to QUIC.
+//! over the live QUIC connection to authenticate the fast-plane probe before a
+//! retained QUIC leg is committed to relay/mux/speed traffic.
 
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};

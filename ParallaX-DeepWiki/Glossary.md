@@ -9,7 +9,7 @@
 | ParallaX | The Rust proxy/protocol implemented in this repository. |
 | `plx` | Short CLI binary alias for the ParallaX command-line interface. |
 | Product path | The current shipped operator path: TCP/TLS camouflage, SOCKS5 client, server fallback, AEAD relay. |
-| UDP/QUIC fast plane | Experimental, off-by-default QUIC reliable-stream carrier for the single-Connect relay, enabled with `[udp].enabled = true` on both ends. |
+| UDP/QUIC fast plane | Experimental, off-by-default QUIC reliable-stream carrier for single-Connect relays, mux-over-QUIC substreams, and `plx speed`'s optional QUIC run, enabled with `[udp].enabled = true` on both ends. |
 | Fallback origin | A real TLS website/origin that unauthenticated or malformed traffic is relayed to. |
 | Camouflage | Making ParallaX's visible wire behavior resemble ordinary browser TLS traffic. |
 | Probe resistance | Server behavior that prevents scanners from receiving a distinct proxy-shaped failure. |

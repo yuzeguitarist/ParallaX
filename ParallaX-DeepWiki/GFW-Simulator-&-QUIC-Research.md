@@ -45,7 +45,7 @@ Current top-level scenarios cover:
 Run:
 
 ```bash
-cargo test --test gfw_simulator
+cargo test --locked --test gfw_simulator
 ```
 
 ## Detector families

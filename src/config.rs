@@ -621,8 +621,8 @@ pub enum UdpFecProfile {
 /// (byte-identical). All knobs have safe defaults so an operator never has to
 /// choose TCP vs UDP.
 ///
-/// LIVE knobs in this version (QUIC reliable-stream fast plane for the
-/// single-Connect relay path): `enabled`, `probe_timeout_ms`,
+/// LIVE knobs in this version (QUIC reliable-stream fast plane for relay/mux/speed
+/// paths): `enabled`, `probe_timeout_ms`,
 /// `max_udp_payload_bytes`, and the wire-invisible carrier-socket buffer knobs
 /// `send_buffer_bytes` / `recv_buffer_bytes`. Enabling requires matched binaries
 /// on both ends.

@@ -47,8 +47,8 @@ large, the config validator rejects it before runtime.
 ## Related checks
 
 ```bash
-cargo test traffic
-cargo test protocol::data
+cargo test --locked traffic
+cargo test --locked protocol::data
 cargo test --locked --no-fail-fast
 ```
 

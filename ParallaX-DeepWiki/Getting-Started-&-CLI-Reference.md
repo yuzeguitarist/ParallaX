@@ -12,13 +12,13 @@
 Build locally:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 ```
 
 Install locally:
 
 ```bash
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ## Beginner workflow
@@ -54,7 +54,7 @@ all-in-one configs instead. All files are created with mode `0600` on Unix and
 | `plx crypto-self-test` | Run a local AEAD derivation/seal/open sanity check. | Does not contact the network. |
 | `plx serve [-c FILE]` | Start the server listener. | Long-lived process hardening runs before config use. |
 | `plx client [-c FILE]` | Start the loopback SOCKS5 client. | Uses a runtime guard to avoid conflicts with `plx speed`. |
-| `plx speed [-c FILE] [--json]` | Run one network speed evidence test against the configured server. | Fixed warmup + three samples per direction. |
+| `plx speed [-c FILE] [--json]` | Run one network speed evidence test against the configured server. | Fixed warmup + three samples per direction; JSON contains `runs[]` with TCP first and optional QUIC second. |
 | `plx netmatrix [-c FILE] [--json]` | Run a reproducible controlled-network RTT/bandwidth speed matrix against the configured server. | Uses an emulated loopback shaper, not a live-network test. |
 | `plx bench [--quick] [--json]` | Run the fixed CPU benchmark suite. | `--quick` is a smoke profile, not a custom benchmark knob. |
 | `plx config-template ...` | Print paired server/client TOML templates to stdout. | Advanced mode; no file writes. |
@@ -91,7 +91,9 @@ When `DEST` is omitted, `probe` infers a target from config:
 ### `plx speed`
 
 `plx speed` reads a client config, performs a real ParallaX handshake, and emits
-either text or JSON. The JSON schema is `parallax.speed.evidence.v1`.
+either text or JSON. The JSON schema is `parallax.speed.evidence.v1`; `runs[]`
+always starts with TCP and includes a second QUIC transport run only when
+`[udp].enabled` is on and the UDP probe verifies.
 
 ## Verification commands
 
@@ -100,7 +102,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked --no-fail-fast
 cargo test --locked -- --ignored --test-threads=1
-cargo test --test gfw_simulator
+cargo test --locked --test gfw_simulator
 ```
 
 Use [Protocol Benchmarks](Protocol-Benchmarks.md) for local CPU timing and

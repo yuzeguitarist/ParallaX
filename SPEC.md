@@ -318,7 +318,7 @@ strings below or it will not interoperate.
 - `b"ParallaX v1 replay cache MAC key"`
 - `b"ParallaX v1 replay cache journal header MAC"`
 - `b"ParallaX v1 replay cache journal entry MAC"`
-- `b"parallax-replay-cache-v3"` (on-disk journal version line)
+- `b"parallax-replay-cache-v4"` (current on-disk journal version line; v3 is legacy read/upgrade input)
 
 **QUIC origin-splice marker:**
 - `b"ParallaX v1 QUIC marker keystream"`
@@ -473,7 +473,7 @@ The keys below are **ParallaX-internal** and share nothing with the carrier TLS
 transcript material. After the carrier ClientHello/origin-ServerHello are
 exchanged and the client is authenticated (§7.2), both peers hold:
 
-- `psk` — the pre-shared secret (MUST be non-empty),
+- `psk` — the pre-shared secret (MUST decode to at least 32 bytes),
 - `x25519_shared` — the **initial** X25519 shared secret. This is **NOT** the
   TLS `key_share` ECDH and **NOT** the carrier mask ECDH; it is computed from the
   client's *ParallaX ephemeral* key (the one carried, masked, inside
@@ -1075,7 +1075,9 @@ the ClientHello, and consults the replay cache (capacity/semantics §13.1,
 on-disk journal §18):
 
 - `timestamp` MUST satisfy `now − window ≤ timestamp ≤ now + 5s` (`window`
-  default 120 s; `+5 s` future skew clamp). Outside → `Stale`, splice.
+  default ≈720 s in the reference: `fallback_idle_floor_secs` default 600 s plus
+  the base 120 s replay window; `+5 s` future skew clamp). Outside → `Stale`,
+  splice.
 - The `(nonce, transcript_fingerprint)` MUST be unseen within the window.
   Seen → `Replayed`, splice.
 - On acceptance the entry is inserted (single-use).
@@ -1307,15 +1309,18 @@ decoding — so two peers interoperate regardless of each side's settings.
   no extra profile padding. Padding rides the same trailer, so the receiver
   strips it transparently.
 - **TimingProfile (`min_delay_ms`, `max_delay_ms`; default 0/0).** When enabled
-  (`max > min`), delays each flush by a sampled duration: with 60% probability it
-  draws from an observed browser inter-write delay distribution (clamped to
-  `[min, max]`), otherwise it draws uniformly from `[min, max]`. Default 0/0
-  disables delay.
+  (`max_delay_ms > 0`), delays each flush by a sampled duration: with 60%
+  probability it draws from an observed browser inter-write delay distribution
+  (clamped to `[min, max]`), otherwise it draws uniformly from `[min, max]`.
+  If `min == max > 0`, the delay is fixed. Default 0/0 disables delay.
 - **CoverTrafficProfile (`cover_min_interval_ms`, `cover_max_interval_ms`;
   default 0/0).** When enabled (`cover_max_interval_ms > 0`), emits `COVER`
   frames (MUX kind 5 on `stream_id = 0`, §6.5) at random intervals sampled in
   `[min, max]` during idle periods, so an idle tunnel still resembles a live
-  browser connection. The receiver discards COVER payloads.
+  browser connection. The receiver discards COVER payloads. Enabling cover
+  traffic requires `cover_min_interval_ms >= 50`; it also requires variable
+  profile padding (`max_padding > min_padding`) so cover frames do not form a
+  distinctive fixed-size beacon.
 
 Because these are local policy, a reimplementation MAY omit all three and remain
 interoperable; enabling them only changes this peer's own emitted padding/timing.
@@ -1642,7 +1647,7 @@ defaults:
 | `fallback_idle_floor_ms` | 600000 (10 min) | Idle backstop for a **spliced** (origin) relay. **Resets on every byte**, so it only fires on a genuinely silent connection. Must be ≥ 5000. |
 | `fallback_idle_jitter_ms` | 60000 (60 s) | The all-silent close time is spread uniformly into `[floor, floor+jitter]` per connection. This is REQUIRED: a fixed ~600 s close is a synthetic signature no real origin produces — do not emit a round, fixed idle close. |
 | `max_concurrent_streams` | 4 | Max concurrent logical (mux) streams per authenticated session. |
-| `replay_cache_capacity` | 49152 | Replay-cache entry capacity. Entries are retained for the freshness window (≈ pre-PQ deadline + skew). When full the server **fail-CLOSES new handshakes** (`CacheFull`) rather than admitting a possible replay — it never opens a replay hole. Capacity scales with the window; a busy bridge raises it proportionally. |
+| `replay_cache_capacity` | 49152 | Replay-cache entry capacity. Entries are retained for the freshness window (≈ fallback idle floor + base replay window + skew). When full the server **fail-CLOSES new handshakes** (`CacheFull`) rather than admitting a possible replay — it never opens a replay hole. Capacity scales with the window; a busy bridge raises it proportionally. |
 | `strict_tls13` | true | Require TLS 1.3 on the carrier. |
 | handshake timeout | 8 s | Whole authenticated handshake (Phases A–C) backstop; exceeding it closes like an idle origin. |
 | replay-close delay | `[0, 60 s]` | When a **replay** is detected post-PQ, the server delays the graceful close by a jittered `[0, 60 s]` (floor 0, jitter 60 s) so a flagged replay's close timing is not a distinct signature. |
@@ -1668,16 +1673,19 @@ SHOULD apply an equivalent policy:
 
 ---
 
-## 14. UDP Relay Specification
+## 14. UDP/QUIC Fast-Plane Specification
 
-Beyond the QUIC *carrier*, ParallaX can proxy the application's UDP-style
-traffic in two ways:
+This section describes ParallaX's experimental QUIC carrier over UDP. It is an
+alternate transport for ParallaX's authenticated stream protocol, not SOCKS5 UDP
+proxy semantics: the SOCKS5 ingress supports CONNECT only (§15.1), and SOCKS5
+UDP ASSOCIATE is rejected.
 
 1. **QUIC transport plane (carrier acceleration).** The QUIC plane (§9.2, §12.5)
    is an alternative carrier for the same `CONNECT`/record protocol; it is
    negotiated over an established TCP session via the `PX1G/O/P/N` messages
-   (§6.6), then a real QUIC/H3 connection is brought up and business streams
-   carry the tunnel. This is an optimization, not a separate proxy semantics.
+   (§6.6), then a real QUIC/H3 connection is brought up. It carries
+   single-Connect relays, mux-over-QUIC substreams, and the optional QUIC
+   `plx speed` run. This is an optimization, not a separate proxy semantics.
 
 2. **Negotiation handshake (over TCP):**
 
@@ -1695,9 +1703,8 @@ Brutal), and a FEC mode (`fec`: off / adaptive / Reed-Solomon). A 16-byte
 `offer_id` ties the probe ack to the offer. `UDP_DECLINE` reasons: `0` disabled,
 `1` unsupported.
 
-A minimal implementation MAY skip the QUIC plane entirely and serve all traffic
-(including the application's UDP, tunneled as needed by the SOCKS layer) over the
-TCP carrier.
+A minimal implementation MAY skip the QUIC plane entirely and serve all supported
+SOCKS CONNECT traffic over the TCP carrier.
 
 ### 14.1 QUIC-plane auth token (RFC 5705 exporter binding)
 
@@ -1876,18 +1883,22 @@ identity"`; the signed message is per §5.6. Verification is FIPS 204
   does not let an attacker forge carrier auth or recover the masks, and a leaked
   PSK alone does not either. Do not swap the HKDF salt/IKM roles (PSK is always
   the salt for these derivations).
-- **PSK is mandatory.** An empty PSK MUST be rejected at config load and at
-  runtime. With a zero/all-zero HKDF salt the PSK binding silently vanishes.
+- **PSK is mandatory.** The PSK MUST decode to at least 32 bytes. The reference
+  also checks for obvious low-entropy/all-repeated PSKs: server mode hard-fails,
+  while client/check mode warns so operators can inspect legacy configs. With a
+  zero/all-zero HKDF salt the PSK binding silently vanishes.
 - **Forward secrecy + PQ.** Traffic keys derive from ephemeral X25519 and (after
   rekey) ML-KEM-1024; a "harvest-now-decrypt-later" adversary cannot recover
   session keys even with a future quantum computer, because the chain secret is
   bound to the ML-KEM shared secret.
 - **Replay.** The carrier auth carries a timestamp + nonce; the server enforces
-  a freshness window (default 120 s, +5 s skew) and single-use nonce/transcript
-  caching. The on-disk replay journal is HMAC-chained
-  (`parallax-replay-cache-v3`: a version header line whose MAC chains the last
-  entry's MAC, then one HMAC-chained line per entry of `timestamp || nonce ||
-  transcript_fingerprint`) so any tampering or truncation is detected
+  a freshness window (effective default ≈720 s: `fallback_idle_floor_secs`
+  default 600 s plus the base 120 s replay window, with +5 s future skew) and
+  single-use nonce/transcript caching. The current on-disk replay journal is
+  HMAC-chained (`parallax-replay-cache-v4`; v3 is legacy read/upgrade input):
+  a version header line whose MAC chains the last entry's MAC, then one
+  HMAC-chained line per entry of `timestamp || nonce || transcript_fingerprint`
+  so any tampering or truncation is detected
   (`MacMismatch`) and the journal rejected. **This on-disk format is
   implementation-private**: two independent ParallaX implementations interoperate
   without sharing a replay file — each maintains its own cache. A reimplementation
@@ -2009,8 +2020,10 @@ A second implementation claiming interoperability with the reference SHOULD pass
 ## 22. Reference Implementation Notes
 
 - **Language/architecture.** The reference is a single Rust binary (`parallax`,
-  alias `plx`) with no external services. Both TLS and QUIC engines are
-  hand-written (no rustls/quinn at runtime) so every wire byte is controlled.
+  alias `plx`) with no external services. The live visible TLS/QUIC state
+  machines are hand-written and quinn-free so every carrier byte is controlled;
+  rustls/webpki/pki helper crates may still appear for certificate
+  parsing/verification support and tests.
 - **AEAD/KEM backends.** AES-GCM/ChaCha and ML-KEM use vetted libraries
   (`aws-lc-rs`, RustCrypto); ML-DSA-87 is implemented in-tree and validated
   against ACVP + a reference oracle.
@@ -2034,7 +2047,7 @@ A second implementation claiming interoperability with the reference SHOULD pass
 mode = "client" | "server"
 
 [crypto]
-psk = "<base64>"              # mandatory, non-empty; mixed into all KDFs
+psk = "<base64>"              # mandatory, >=32 decoded bytes; CSPRNG-generated; mixed into all KDFs
 
 # Client:
 [client]
@@ -2043,6 +2056,7 @@ server_addr = "host:443"             # ParallaX server public address
 sni = "cloudflare.com"               # camouflage SNI (must match fallback origin)
 server_public_key = "<base64>"        # server static X25519 public
 server_identity_public_key = "<base64>"  # server ML-DSA-87 public
+accept_language = "en-US,en;q=0.9"   # optional; overrides the H2/H3 camouflage request header
 
 # Server:
 [server]
@@ -2080,6 +2094,9 @@ tcp_recv_buffer_bytes = <bytes>       # OPTIONAL. SO_RCVBUF for relay sockets; u
             # send_buffer_bytes, recv_buffer_bytes. RESERVED (parsed, not honored):
             # cc, brutal_up_mbps, brutal_down_mbps, ignore_client_bandwidth, fec_profile,
             # port_hop, masque_front, ech.
+enabled = false                      # default; generated configs omit the table entirely
+probe_timeout_ms = 1000              # default; effective budget is max(this, 6x observed control RTT)
+max_udp_payload_bytes = 2048         # optional; unset uses this conservative effective default
 send_buffer_bytes = <bytes>           # OPTIONAL. SO_SNDBUF for the UDP carrier socket; unset = autotuning. Wire-invisible.
 recv_buffer_bytes = <bytes>           # OPTIONAL. SO_RCVBUF for the UDP carrier socket; unset = autotuning. Wire-invisible.
 ```
@@ -2087,8 +2104,8 @@ recv_buffer_bytes = <bytes>           # OPTIONAL. SO_RCVBUF for the UDP carrier 
 ### 22.2 CLI (reference)
 
 `plx init <domain>` generates a paired client+server config with matching keys
-(0600). `plx check <config>` validates a config (and enforces 0600). Other
-subcommands: `serve`, `client`, `keygen`, `crypto-self-test`, `speed`,
+(0600). `plx check -c <config>` validates a config (default `parallax.toml`) and
+enforces 0600. Other subcommands: `serve`, `client`, `keygen`, `crypto-self-test`, `speed`,
 `netmatrix`, `bench`, `config-template`, `probe`, `seal`.
 
 ---
@@ -2101,7 +2118,7 @@ subcommands: `serve`, `client`, `keygen`, `crypto-self-test`, `speed`,
 # server                         # client
 plx init example.com \           # generates paired configs (0600), matching keys
   --server-addr 1.2.3.4:8443
-plx serve server.toml            plx client client.toml   # SOCKS5 at 127.0.0.1:1080
+plx serve -c parallax.server.toml  plx client -c parallax.client.toml   # SOCKS5 at 127.0.0.1:1080
 
 curl --socks5-hostname 127.0.0.1:1080 https://example.org/
 ```
@@ -2169,4 +2186,3 @@ Role-specific obligations:
   the connection over only on a valid `PX1Q`. It needs **no** TLS certificate of
   its own, but DOES hold the ParallaX X25519 static key and ML-DSA-87 identity
   key (§22.1). `fallback_addr` MUST be reachable and serve a valid cert for `sni`.
-

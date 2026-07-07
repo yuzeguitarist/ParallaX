@@ -4,8 +4,9 @@
 //! validate it — authenticity is the exporter-bound auth token (REALITY-style),
 //! so a self-signed cert is sufficient until a real masquerade cert / CDN front
 //! is wired in a later slice. The server-side offer (PX1O) and the client-side
-//! connect/probe consume these, and on a Verified probe the same connection
-//! carries the single-Connect data relay over a reliable bidi stream.
+//! connect/probe consume these, and on a Verified probe the retained connection
+//! carries single-Connect relay, mux-over-QUIC substreams, or speed traffic over
+//! reliable bidi streams.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -71,7 +72,7 @@ pub async fn bind_server_endpoint_0rtt(
 /// route on), so if the client's NAT remaps its source port mid-connection the
 /// server cannot re-associate the datagrams and the connection drops. This is a
 /// deliberate Safari-faithful choice: Safari-26 itself emits a zero-length SCID,
-/// and ParallaX's UDP leg is a short-lived single-Connect relay, so the exposure
+/// and ParallaX's UDP leg is a short-lived fast-plane session, so the exposure
 /// window is small and a rebind simply surfaces as the existing clean
 /// connection-reset failure mode (the caller re-probes / falls back).
 pub async fn bind_client_endpoint(

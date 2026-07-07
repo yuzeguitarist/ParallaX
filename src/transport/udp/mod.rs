@@ -1,16 +1,16 @@
 //! UDP fast-plane transport (the "U" in TUDP).
 //!
 //! Provides the QUIC endpoint building blocks for the masquerading HTTP/3 face on
-//! UDP: a QUIC connection, the HTTP/3 control/encoder uni streams plus the request
-//! bidi that carries the reachability probe and relay, and RFC 5705 keying-material
-//! export backing the exporter-bound UDP auth token.
+//! UDP: a QUIC connection, the HTTP/3 control/encoder uni streams plus request
+//! bidis for reachability, relay/mux/speed, and RFC 5705 keying-material export
+//! backing the exporter-bound UDP auth token.
 //!
-//! Wired into the client/server runtimes for the single-Connect data relay: when
-//! `[udp].enabled` is set on both ends and the client's probe is Verified, the
-//! relay is carried over a reliable bidi QUIC stream through the `Leg`
-//! abstraction (which unifies it with the TCP carrier). With `enabled = false`
-//! (the default) this is a no-op for every existing code path and the relay stays
-//! byte-identical on TCP. Mux and speed-test paths remain on TCP.
+//! Wired into the client/server runtimes for single-Connect relay, mux-over-QUIC,
+//! and the QUIC `plx speed` run: when `[udp].enabled` is set on both ends and the
+//! client's probe is Verified, those paths ride reliable QUIC streams through the
+//! `Leg` abstraction (which unifies them with the TCP carrier). With
+//! `enabled = false` (the default) this is a no-op for every existing code path
+//! and the relay stays byte-identical on TCP.
 
 pub mod auth;
 pub mod endpoint;

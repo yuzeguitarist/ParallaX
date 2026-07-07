@@ -58,8 +58,8 @@ Any Safari profile or handshake change should be treated as profile-sensitive
 and verified with:
 
 ```bash
-cargo test --test safari_parity_baseline
-cargo test --test safari_h2_parity_baseline
+cargo test --locked --test safari_parity_baseline
+cargo test --locked --test safari_h2_parity_baseline
 cargo test --locked --no-fail-fast
 ```
 

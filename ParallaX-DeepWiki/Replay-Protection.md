@@ -9,14 +9,17 @@ resent later to distinguish or access the ParallaX server.
 
 ## Current scope
 
-Replay protection applies to the TCP/TLS product handshake. There is no current
-product QUIC runtime using a separate QUIC auth frame.
+Replay protection applies to the TCP/TLS product handshake. The experimental
+UDP/QUIC fast plane has separate replay guards: the QUIC origin-splice marker is
+single-use via `src/transport/udp/marker_replay.rs`, and 0-RTT tickets are
+single-use via `src/transport/udp/zero_rtt.rs`.
 
 ## Replay cache
 
 `src/crypto/replay.rs` stores replay entries derived from authenticated
 handshake material. The server wraps the cache in `Arc<Mutex<ReplayCache>>` so
-concurrent accepted connections share the same state.
+concurrent accepted connections share the same state. The current journal header
+is `parallax-replay-cache-v4`; v3 journals are legacy read/upgrade inputs.
 
 Generated server configs use:
 
@@ -26,6 +29,10 @@ replay_cache_path = "/var/lib/parallax/parallax-replay.cache"
 
 If a relative path is configured, `src/config.rs` resolves it relative to the
 config file before validation completes.
+
+The effective default freshness window is about 720 seconds: the server's
+10-minute fallback idle floor plus the base 120-second replay window, with a
+5-second future-skew allowance.
 
 ## Load/create behavior
 

@@ -13,8 +13,9 @@ TCP socket → TLS records → ParallaX encrypted data records
 There is no `--quic` CLI flag. An **experimental** UDP/QUIC fast plane is also
 wired into the client and server runtimes, but it is **off by default**: setting
 `[udp].enabled = true` on both ends (with matched binaries) activates a QUIC
-reliable-stream carrier for the single-Connect data relay. While disabled, every
-path stays byte-identical on TCP. When enabled, its QUIC client already emits a
+reliable-stream carrier for single-Connect relays, mux-over-QUIC substreams, and
+`plx speed`'s optional QUIC run. While disabled, every path stays byte-identical
+on TCP. When enabled, its QUIC client already emits a
 Safari-26 H3-shaped ClientHello by default, but it stays off by default and is
 not yet a production-ready operator mode, so it is for experimentation only. See
 the `[udp]`
