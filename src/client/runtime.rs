@@ -164,7 +164,10 @@ const MUX_POOL_MAX_IDLE_SESSIONS: usize = 2;
 /// dead slow / never load" symptom). Building several in parallel keeps growth
 /// fast; the cap bounds the momentary handshake burst (and thus server load and
 /// over-building) while waiters coalesce onto slots freed by sessions that land.
-const MUX_MAX_CONCURRENT_SESSION_BUILDS: usize = 16;
+/// Kept modest (8) because each build is a full camouflage-TLS + ML-KEM/ML-DSA
+/// handshake and servers are often single-core; 8 captures nearly all the
+/// latency win of a larger fan-out at roughly half the peak handshake load.
+const MUX_MAX_CONCURRENT_SESSION_BUILDS: usize = 8;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -737,14 +740,6 @@ impl MuxPoolState {
     }
 }
 
-/// The action a pool caller takes when no existing session has a free slot:
-/// either it owns a new in-flight build slot, or it parks on the next build
-/// completion and retries.
-enum Waiter {
-    Build,
-    Wait(Arc<Notify>),
-}
-
 #[derive(Clone)]
 struct ClientMuxPool {
     inner: Arc<Mutex<MuxPoolState>>,
@@ -974,62 +969,64 @@ impl ClientMuxPool {
     /// number of concurrent connections is NOT capped at `max_concurrent_streams`
     /// (the single-session starvation bug); it is bounded only by the fd-based
     /// connection limit, like the `max_concurrent_streams=1` path.
+    ///
+    /// Cancellation note: in production this future always runs to completion — a
+    /// per-connection task spawns it and is never aborted, and it is never wrapped
+    /// in `timeout`/`select!`. That guarantees every `builds_in_flight` increment
+    /// below is paired with the decrement in `build_and_reserve`. Do NOT wrap
+    /// `acquire` in a cancelling combinator without making that accounting
+    /// cancel-safe first (a leaked count would, in the empty-pool single-flight
+    /// case, wedge the pool).
     async fn acquire(&self) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
         self.last_activity
             .store(relay_now_millis(), Ordering::Relaxed);
         loop {
-            // Decide an action without awaiting under the lock. Prune dead and
-            // surplus-idle sessions, then take a free slot on any live session
-            // (reuse before build, so steady-state traffic amortizes onto existing
-            // sessions instead of opening new ones).
-            let waiter = {
-                let mut state = self.inner.lock().await;
-                self.reap_sessions(&mut state);
-                if let Some(reserved) = reserve_slot(&state.sessions) {
-                    return Ok(reserved);
-                }
-                // No free slot. While the pool is EMPTY, single-flight the first
-                // session so a cold-start burst COALESCES onto it (mux's whole
-                // point: many substreams share one session) instead of every
-                // connection opening its own. Once at least one session exists,
-                // growth may run several builds CONCURRENTLY so a burst that needs
-                // many sessions does not serialize their handshakes (the latency
-                // bug). Either way, park when at the cap and retry when a build
-                // lands — usually grabbing a slot it freed rather than building.
-                let max_builds = if state.sessions.is_empty() {
-                    1
-                } else {
-                    MUX_MAX_CONCURRENT_SESSION_BUILDS
-                };
-                if state.builds_in_flight < max_builds {
-                    state.builds_in_flight += 1;
-                    Waiter::Build
-                } else {
-                    Waiter::Wait(state.build_wakeup())
-                }
-            };
-
-            match waiter {
-                // We own an in-flight build slot: establish OFF-LOCK, add the new
-                // session, take its first substream slot, and wake parked waiters
-                // (which re-check and grab the new session's remaining slots).
-                Waiter::Build => return self.build_and_reserve().await,
-                // Enough builds are already in flight to (soon) cover us: park on
-                // the next build completion (registering the waiter BEFORE dropping
-                // the lock for lost-wakeup safety), then re-loop.
-                Waiter::Wait(notify) => {
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    notified.await;
-                }
+            let mut state = self.inner.lock().await;
+            // Prune dead and surplus-idle sessions, then take a free slot on any
+            // live session (reuse before build, so steady-state traffic amortizes
+            // onto existing sessions instead of opening new ones).
+            self.reap_sessions(&mut state);
+            if let Some(reserved) = reserve_slot(&state.sessions) {
+                return Ok(reserved);
             }
+            // No free slot. While the pool is EMPTY, single-flight the first
+            // session so a cold-start burst COALESCES onto it (mux's whole point:
+            // many substreams share one session) instead of every connection
+            // opening its own. Once at least one session exists, growth may run
+            // several builds CONCURRENTLY so a burst that needs many sessions does
+            // not serialize their handshakes (the latency bug).
+            let max_builds = if state.sessions.is_empty() {
+                1
+            } else {
+                MUX_MAX_CONCURRENT_SESSION_BUILDS
+            };
+            if state.builds_in_flight < max_builds {
+                state.builds_in_flight += 1;
+                drop(state);
+                // Establish OFF-LOCK, add the new session, take its first substream
+                // slot, and wake parked waiters (which re-check and grab the new
+                // session's remaining slots).
+                return self.build_and_reserve().await;
+            }
+            // At the build-concurrency cap: park until an in-flight build lands,
+            // then retry (usually grabbing a slot it freed). The `Notified` future
+            // is created AND enabled WHILE THE LOCK IS STILL HELD, so a
+            // `notify_waiters()` from a build that completes as we unlock cannot be
+            // missed (lost-wakeup safety) — only then is the lock dropped.
+            let notify = state.build_wakeup();
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(state);
+            notified.await;
         }
     }
 
     /// Builds a new session off-lock (the caller has already incremented
     /// `builds_in_flight`), records it, reserves its first substream slot, and
-    /// wakes parked waiters so they can grab the session's remaining slots.
+    /// wakes parked waiters so they can grab the session's remaining slots. Always
+    /// runs to completion in production (see the cancellation note on `acquire`),
+    /// so the `builds_in_flight` decrement always pairs with that increment.
     async fn build_and_reserve(
         &self,
     ) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
@@ -1060,54 +1057,52 @@ impl ClientMuxPool {
     /// Ensures at least one reusable session exists WITHOUT reserving a slot, for
     /// the warm-keeper. Only builds when the pool is empty AND no build is already
     /// in flight, so a warm rebuild never races a connection into an extra session.
+    /// Like `acquire`, it always runs to completion (the warm-keeper task never
+    /// cancels it), so its `builds_in_flight` increment/decrement stay paired.
     async fn ensure_warm(&self) -> Result<(), ClientRuntimeError> {
         loop {
-            let waiter = {
-                let mut state = self.inner.lock().await;
-                self.reap_sessions(&mut state);
-                if !state.sessions.is_empty() {
-                    return Ok(());
-                }
-                if state.builds_in_flight == 0 {
-                    state.builds_in_flight += 1;
-                    Waiter::Build
-                } else {
-                    Waiter::Wait(state.build_wakeup())
-                }
-            };
-            match waiter {
-                Waiter::Build => {
-                    let result = self.spawn_build().await;
-                    let mut state = self.inner.lock().await;
-                    state.builds_in_flight -= 1;
-                    let outcome = match result {
-                        Ok(handle) => {
-                            state.sessions.push(handle);
-                            Ok(())
-                        }
-                        Err(err) => Err(err),
-                    };
-                    let notify = state.build_notify.clone();
-                    drop(state);
-                    if let Some(notify) = notify {
-                        notify.notify_waiters();
-                    }
-                    return outcome;
-                }
-                Waiter::Wait(notify) => {
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    notified.await;
-                }
+            let mut state = self.inner.lock().await;
+            self.reap_sessions(&mut state);
+            if !state.sessions.is_empty() {
+                return Ok(());
             }
+            if state.builds_in_flight == 0 {
+                state.builds_in_flight += 1;
+                drop(state);
+                let result = self.spawn_build().await;
+                let mut state = self.inner.lock().await;
+                state.builds_in_flight -= 1;
+                let outcome = match result {
+                    Ok(handle) => {
+                        state.sessions.push(handle);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                };
+                let notify = state.build_notify.clone();
+                drop(state);
+                if let Some(notify) = notify {
+                    notify.notify_waiters();
+                }
+                return outcome;
+            }
+            // A build is already in flight. Enable the wakeup under the lock (as in
+            // `acquire`) so the completing build's notify is never missed, then
+            // park and re-check.
+            let notify = state.build_wakeup();
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(state);
+            notified.await;
         }
     }
 
     /// Runs `start_session` in a detached task and awaits it, so a PANIC inside
-    /// establishment surfaces as `Err` (self-heal) instead of unwinding past the
-    /// `building` reset and stranding every waiter on a Notify that never fires.
-    /// The (up to CLIENT_ESTABLISH_TIMEOUT) handshake runs OFF-LOCK so a slow or
+    /// establishment surfaces as `Err` (self-heal): the caller still decrements
+    /// `builds_in_flight` and wakes waiters instead of unwinding past that
+    /// accounting and stranding every waiter on a Notify that never fires. The
+    /// (up to CLIENT_ESTABLISH_TIMEOUT) handshake runs OFF-LOCK so a slow or
     /// stalling server never blocks other local connections behind the pool mutex.
     async fn spawn_build(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
         let pool = self.clone();
@@ -4743,7 +4738,7 @@ mod tests {
         let builder_pool = pool.clone();
         let builder = tokio::spawn(async move { builder_pool.acquire().await });
 
-        // Let it publish `building` and enter the stalled handshake.
+        // Let it record an in-flight build and enter the stalled handshake.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // The pool mutex MUST be free (not held across establishment) and a build
