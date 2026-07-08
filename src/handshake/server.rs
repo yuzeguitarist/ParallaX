@@ -3670,6 +3670,23 @@ const PX1_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// single-stream backpressure — using 600s here would still pin for ten minutes.
 const MUX_TARGET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Depth of a single substream's client->target upload channel: how many decrypted
+/// upload frames the shared mux reader may queue ahead of that substream's own
+/// task before it must wait for the task to drain to the target socket. Bounds
+/// per-stream memory while giving the task enough slack that a live-but-slow target
+/// never forces the reader to block. Mirrors the client's `CLIENT_MUX_STREAM_CHANNEL`.
+const SERVER_MUX_UPLOAD_CHANNEL: usize = 32;
+
+/// Grace the shared mux reader waits on a FULL upload channel before shedding the
+/// substream. A full channel alone does NOT mean the target is wedged: a live app
+/// draining slower than a bulk upload burst fills it transiently too. So on a full
+/// channel the reader waits UP TO this long for a slot instead of shedding at once
+/// (deliver, no reset, if the target drains within the window; shed only a genuine
+/// stall). Bounds how long ONE stalled upload can hold the shared reader — the only
+/// residual head-of-line term once connect/target-write moved off the reader onto
+/// per-stream tasks. Mirrors the client's `CLIENT_MUX_STALL_RESET_GRACE`.
+const SERVER_MUX_STALL_RESET_GRACE: Duration = Duration::from_secs(2);
+
 /// Brief grace, applied AFTER the teardown DONE `select!` returns its
 /// `conn.closed()` sentinel, for the reliable TCP DONE to arrive. The peer sends
 /// its DONE over the TCP control stream and THEN closes the QUIC connection; the
@@ -3703,78 +3720,225 @@ struct ServerMuxContext<'a> {
 
 /// Tracks the live substreams of one authenticated mux connection.
 ///
-/// `writes` holds the client->target write halves; `readers` holds the abort
-/// handles of the spawned target->client reader tasks. The two are tracked
-/// separately so that:
-///   - admission is gated on the count of *live readers* (a stream is alive as
-///     long as its target->client direction is), not on the write-half count —
-///     otherwise a client could `Fin` each stream (dropping the write half while
-///     the reader/fd lives) to open unboundedly many target sockets past
-///     `max_streams`;
-///   - a `Fin` (client done sending) closes only the write half, preserving the
-///     target's ability to keep streaming back (half-close), while a `Reset` or
-///     a connection teardown aborts the reader task too so no target fd/task is
-///     orphaned.
+/// Each live substream is ONE spawned supervisor task ([`server_mux_upstream_task`])
+/// that owns the target socket, connects it OFF the shared reader, and runs BOTH
+/// relay directions. The maps split routing from lifetime:
+///   - `uploads` holds the sender of each substream's client->target upload channel.
+///     The shared reader `try_send`s decrypted upload frames here and NEVER blocks
+///     on target I/O. A client `Fin` drops the sender (removed from the map); the
+///     channel then closes and the task half-closes the target write while the
+///     target keeps streaming back.
+///   - `tasks` holds each substream's supervisor `JoinHandle`. A stream occupies a
+///     `max_streams` slot for as long as its task is unfinished — and the task runs
+///     until BOTH directions finish — so `live_count` (the admission gate) counts
+///     exactly the streams with either direction still open. This is the same
+///     union-across-half-close bound the previous write/reader split enforced,
+///     collapsed onto one task per stream.
+///
+/// A `Reset` (or connection teardown) aborts the task so no target fd is orphaned.
 struct ServerMuxStreams {
-    writes: HashMap<u32, OwnedWriteHalf>,
-    readers: HashMap<u32, tokio::task::JoinHandle<()>>,
+    uploads: HashMap<u32, mpsc::Sender<Vec<u8>>>,
+    tasks: HashMap<u32, tokio::task::JoinHandle<()>>,
 }
 
 impl ServerMuxStreams {
     fn new() -> Self {
         Self {
-            writes: HashMap::new(),
-            readers: HashMap::new(),
+            uploads: HashMap::new(),
+            tasks: HashMap::new(),
         }
     }
 
-    /// Drop the handles of readers that have already finished so `live_count`
-    /// reflects only streams still doing work.
+    /// Drop finished supervisor tasks (both directions done) and their now-defunct
+    /// upload senders so `live_count` reflects only streams still doing work.
     fn prune_finished(&mut self) {
-        self.readers.retain(|_, h| !h.is_finished());
+        self.tasks.retain(|_, h| !h.is_finished());
+        self.uploads.retain(|id, _| self.tasks.contains_key(id));
     }
 
-    /// Number of substreams still holding a file descriptor (used for the
-    /// `max_streams` admission gate). A stream occupies a slot while EITHER half
-    /// is open: its client->target write half, or its (unfinished) target->client
-    /// reader. Counting the UNION bounds the per-connection fd footprint to
-    /// `max_streams` across half-closes — a client `Fin` drops the write half but
-    /// the reader lives (the target may still stream back), and a target EOF
-    /// finishes the reader but the write half lives until the client `Fin`s.
-    /// Gating on either side alone lets the other accumulate unbounded.
+    /// Number of substreams still holding a target fd (the `max_streams` admission
+    /// gate). Each live substream is exactly one supervisor task, which runs until
+    /// BOTH relay directions finish, so the unfinished-task count is precisely the
+    /// set of streams with either direction open — bounding the per-connection fd
+    /// footprint to `max_streams` across half-closes.
     fn live_count(&mut self) -> usize {
         self.prune_finished();
-        let readers_without_write = self
-            .readers
-            .keys()
-            .filter(|id| !self.writes.contains_key(id))
-            .count();
-        self.writes.len() + readers_without_write
+        self.tasks.len()
     }
 
-    /// Tear down every substream: abort all reader tasks (closing the target
-    /// read fds) and shut down every client->target write half.
+    /// Tear down every substream: drop all upload senders (closing each upload
+    /// channel) and abort every supervisor task (closing its target fds).
     async fn teardown(&mut self) {
-        for (_, handle) in self.readers.drain() {
+        self.uploads.clear();
+        for (_, handle) in self.tasks.drain() {
             handle.abort();
-        }
-        let writes = std::mem::take(&mut self.writes);
-        for (_, mut write) in writes {
-            let _ = write.shutdown().await;
         }
     }
 }
 
 impl Drop for ServerMuxStreams {
-    /// Backstop against orphaned target readers: a `JoinHandle` dropped without
-    /// `abort()` leaves its task (and the target fd it holds) running. Aborting
-    /// on drop guarantees that any return path out of the reader loop — including
-    /// `?` error propagation — reclaims every spawned reader.
+    /// Backstop against orphaned per-stream tasks: a `JoinHandle` dropped without
+    /// `abort()` leaves its task (and the target fds it holds) running. Aborting on
+    /// drop guarantees that any return path out of the reader loop — including `?`
+    /// error propagation — reclaims every spawned task.
     fn drop(&mut self) {
-        for (_, handle) in self.readers.drain() {
+        for (_, handle) in self.tasks.drain() {
             handle.abort();
         }
     }
+}
+
+/// Owned, `'static` slice of [`ServerMuxContext`] handed to a spawned per-substream
+/// task, which outlives the borrowed reader-loop context.
+struct ServerMuxStreamContext {
+    fixed_data_target: Option<String>,
+    timing: TimingProfile,
+    chunk_size: usize,
+    cid: u64,
+    target_write_timeout: Duration,
+}
+
+/// Per-substream supervisor, spawned by the shared mux reader on every `Open`. It
+/// performs the per-destination blocking work — DNS resolve, outbound connect
+/// (`HANDSHAKE_TIMEOUT`), and the initial-payload write (`target_write_timeout`) —
+/// OFF the shared reader, so a slow/blackholed/unreachable target stalls ONLY this
+/// substream and never head-of-line-blocks the carrier's other concurrent streams
+/// (the China-path failure this fixes). On any setup failure it sheds just this
+/// stream (Reset to the client). On success it runs both relay directions to
+/// completion; either direction's error tears down the other (its half of the
+/// target socket drops).
+async fn server_mux_upstream_task(
+    stream_id: u32,
+    connect_payload: Vec<u8>,
+    upload_rx: mpsc::Receiver<Vec<u8>>,
+    frame_tx: mpsc::Sender<MuxFrame>,
+    ctx: ServerMuxStreamContext,
+    payload_pool: MuxPayloadPool,
+) {
+    // Own the decrypted request in a scrub-on-drop buffer; copy out the target +
+    // initial payload (also scrub-on-drop) so the request buffer is dropped
+    // (scrubbed) before the connect await.
+    let mut connect_payload = Zeroizing::new(connect_payload);
+    let (target_addr, target_source, initial) = match resolve_connect_target(
+        connect_payload.as_mut_slice(),
+        ctx.fixed_data_target.as_deref(),
+    ) {
+        Ok((addr, source, initial)) => (addr, source, Zeroizing::new(initial.to_vec())),
+        Err(_) => {
+            tracing::debug!(
+                cid = ctx.cid,
+                stream_id,
+                "mux connect target resolve failed; resetting stream"
+            );
+            let _ = reset_unregistered_stream(&frame_tx, stream_id).await;
+            return;
+        }
+    };
+    drop(connect_payload);
+    crate::process_hardening::exclude_from_core_dump("mux.upstream.initial_payload", &initial);
+
+    let mut target = match connect_outbound_target(&target_addr, target_source).await {
+        Ok(target) => target,
+        Err(_) => {
+            tracing::debug!(
+                cid = ctx.cid,
+                stream_id,
+                "mux outbound connect failed; resetting stream"
+            );
+            let _ = reset_unregistered_stream(&frame_tx, stream_id).await;
+            return;
+        }
+    };
+    if tune_tcp_stream(&target).is_err() {
+        tracing::debug!(
+            cid = ctx.cid,
+            stream_id,
+            "mux target tune failed; resetting stream"
+        );
+        let _ = reset_unregistered_stream(&frame_tx, stream_id).await;
+        return;
+    }
+    if !initial.is_empty() {
+        match timeout(ctx.target_write_timeout, target.write_all(&initial)).await {
+            Ok(Ok(())) => {}
+            _ => {
+                tracing::debug!(
+                    cid = ctx.cid,
+                    stream_id,
+                    "mux target initial-payload write failed/stalled; resetting stream"
+                );
+                let _ = reset_unregistered_stream(&frame_tx, stream_id).await;
+                return;
+            }
+        }
+    }
+    drop(initial);
+
+    let (target_read, target_write) = target.into_split();
+    let reader = server_mux_target_reader_loop(
+        target_read,
+        frame_tx.clone(),
+        stream_id,
+        ctx.timing,
+        ctx.chunk_size,
+        ctx.cid,
+        payload_pool,
+    );
+    let writer = server_mux_upload_drain(
+        upload_rx,
+        target_write,
+        stream_id,
+        ctx.cid,
+        ctx.target_write_timeout,
+        &frame_tx,
+    );
+    // Run both directions; an error in either drops the other's half of the target
+    // socket. Half-close (client Fin) resolves `writer` Ok while `reader` keeps
+    // streaming the target back until its EOF.
+    let _ = tokio::try_join!(reader, writer);
+}
+
+/// Drains a substream's client->target upload channel to its target socket, OFF the
+/// shared mux reader. Each write is bounded by `write_timeout`; a stall sheds ONLY
+/// this substream (Reset to the client + `Err`, which drops the paired target
+/// reader). The channel closing (client `Fin` — the reader dropped the upload
+/// sender) half-closes the target write and returns Ok, so the target can keep
+/// streaming back (the paired reader stays live).
+async fn server_mux_upload_drain(
+    mut upload_rx: mpsc::Receiver<Vec<u8>>,
+    mut target_write: OwnedWriteHalf,
+    stream_id: u32,
+    cid: u64,
+    write_timeout: Duration,
+    frame_tx: &mpsc::Sender<MuxFrame>,
+) -> Result<(), HandshakeServerError> {
+    while let Some(payload) = upload_rx.recv().await {
+        if payload.is_empty() {
+            continue;
+        }
+        match timeout(write_timeout, target_write.write_all(&payload)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::debug!(cid, stream_id, "mux target write failed; resetting stream");
+                let _ = send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new())
+                    .await;
+                return Err(HandshakeServerError::Io(err));
+            }
+            Err(_) => {
+                tracing::debug!(cid, stream_id, "mux target write stalled; resetting stream");
+                let _ = send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new())
+                    .await;
+                return Err(HandshakeServerError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "mux target write stalled",
+                )));
+            }
+        }
+    }
+    // Client Fin (upload sender dropped): half-close the target write half so the
+    // target can keep streaming back; the paired reader remains live.
+    let _ = target_write.shutdown().await;
+    Ok(())
 }
 
 /// Monotonic milliseconds since a process-local epoch, backing the lock-free
@@ -4693,22 +4857,21 @@ async fn process_server_mux_frame(
 ) -> Result<(), HandshakeServerError> {
     match frame.kind {
         MuxFrameKind::Open => {
-            // Drop handles of readers that have already finished so a stream_id
-            // whose reader just exited (target EOF / idle) is not treated as a
-            // live duplicate below.
+            // Drop finished tasks so a stream_id whose task just exited (target EOF /
+            // idle) is not treated as a live duplicate below.
             streams.prune_finished();
-            if streams.writes.contains_key(&frame.stream_id)
-                || streams.readers.contains_key(&frame.stream_id)
+            if streams.uploads.contains_key(&frame.stream_id)
+                || streams.tasks.contains_key(&frame.stream_id)
             {
                 reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                 return Ok(());
             }
             if streams.live_count() >= context.max_streams {
                 // Per-connection substream ceiling reached: refuse the new stream
-                // and do not open an outbound connection. The client maps Reset
-                // to a ConnectionReset on that stream. Gating on live readers (not
-                // write halves) prevents a Fin-then-Open loop from opening more
-                // than `max_streams` concurrent target sockets.
+                // and do not spawn a supervisor (no outbound connection). The client
+                // maps Reset to a ConnectionReset on that stream. Gating on live
+                // tasks (each runs while EITHER direction is open) prevents a
+                // Fin-then-Open loop from opening more than `max_streams` targets.
                 tracing::debug!(
                     cid = context.cid,
                     stream_id = frame.stream_id,
@@ -4718,172 +4881,100 @@ async fn process_server_mux_frame(
                 reset_unregistered_stream(frame_tx, frame.stream_id).await?;
                 return Ok(());
             }
-            let mut payload = frame.payload.to_vec();
-            // Per-stream target setup (resolve / connect / tune) fails on routine
-            // client-chosen destinations: a bad ConnectRequest, DNS failure, a denied
-            // IP, or a refused/timed-out connect. Shed ONLY this substream on any of
-            // these — never `?`-propagate, which would poison the serial reader loop
-            // and tear down the whole mux session (one bad target killing every
-            // healthy concurrent stream). Nothing is registered yet, so a Reset for
-            // this stream id plus returning (dropping any half-built `target`, closing
-            // its fds) is the complete teardown — exactly like the cap-reached,
-            // duplicate-stream, and initial-payload-write arms.
-            let (target_addr, target_source, initial_payload) =
-                match resolve_connect_target(payload.as_mut_slice(), context.fixed_data_target) {
-                    Ok((target_addr, source, initial_payload)) => {
-                        (target_addr, source, initial_payload.to_vec())
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            cid = context.cid,
-                            stream_id = frame.stream_id,
-                            "mux connect target resolve failed; resetting stream"
-                        );
-                        reset_unregistered_stream(frame_tx, frame.stream_id).await?;
-                        return Ok(());
-                    }
-                };
-            let mut target = match connect_outbound_target(&target_addr, target_source).await {
-                Ok(target) => target,
-                Err(_) => {
-                    tracing::debug!(
-                        cid = context.cid,
-                        stream_id = frame.stream_id,
-                        "mux outbound connect failed; resetting stream"
-                    );
-                    reset_unregistered_stream(frame_tx, frame.stream_id).await?;
-                    return Ok(());
-                }
+            // Route this substream's client->target uploads over a BOUNDED channel to
+            // its own supervisor task, which performs ALL per-destination blocking
+            // work (resolve / connect / initial-payload write / relay) OFF this shared
+            // reader. This is the fix: a slow/blackholed/unreachable target can no
+            // longer head-of-line-block the carrier's other concurrent substreams —
+            // the reader only ever `try_send`s upload frames and spawns the task.
+            let (upload_tx, upload_rx) = mpsc::channel(SERVER_MUX_UPLOAD_CHANNEL);
+            let stream_ctx = ServerMuxStreamContext {
+                fixed_data_target: context.fixed_data_target.map(str::to_owned),
+                timing: context.timing,
+                chunk_size: context.chunk_size,
+                cid: context.cid,
+                target_write_timeout: context.target_write_timeout,
             };
-            if tune_tcp_stream(&target).is_err() {
-                tracing::debug!(
-                    cid = context.cid,
-                    stream_id = frame.stream_id,
-                    "mux target tune failed; resetting stream"
-                );
-                reset_unregistered_stream(frame_tx, frame.stream_id).await?;
-                return Ok(());
-            }
-            if !initial_payload.is_empty() {
-                // Bound the initial-payload write (H-3): a wedged target must not
-                // park the serial mux reader loop. Nothing is registered yet, so on
-                // stall just Reset the stream and drop `target` (both fds close).
-                match timeout(
-                    context.target_write_timeout,
-                    target.write_all(&initial_payload),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => {
-                        // Initial-payload write failed before anything was
-                        // registered: Reset this stream and drop `target` (both
-                        // fds close). Never poison the serial mux reader loop.
-                        tracing::debug!(
-                            cid = context.cid,
-                            stream_id = frame.stream_id,
-                            "mux target initial-payload write failed; resetting stream"
-                        );
-                        reset_unregistered_stream(frame_tx, frame.stream_id).await?;
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            cid = context.cid,
-                            stream_id = frame.stream_id,
-                            "mux target initial-payload write stalled; resetting stream"
-                        );
-                        reset_unregistered_stream(frame_tx, frame.stream_id).await?;
-                        return Ok(());
-                    }
-                }
-                let mut initial_payload = initial_payload;
-                initial_payload.zeroize();
-            }
-            let (target_read, target_write) = target.into_split();
-            streams.writes.insert(frame.stream_id, target_write);
             let stream_id = frame.stream_id;
-            let target_frame_tx = frame_tx.clone();
-            let target_pool = payload_pool.clone();
-            let handle = tokio::spawn(async move {
-                if let Err(err) = server_mux_target_reader_loop(
-                    target_read,
-                    target_frame_tx,
-                    stream_id,
-                    context.timing,
-                    context.chunk_size,
-                    context.cid,
-                    target_pool,
-                )
-                .await
-                {
-                    tracing::debug!(
-                        cid = context.cid,
-                        stream_id,
-                        error = %err,
-                        "server mux target reader stopped"
-                    );
-                }
-            });
-            streams.readers.insert(frame.stream_id, handle);
+            let handle = tokio::spawn(server_mux_upstream_task(
+                stream_id,
+                frame.payload.to_vec(),
+                upload_rx,
+                frame_tx.clone(),
+                stream_ctx,
+                payload_pool.clone(),
+            ));
+            streams.uploads.insert(stream_id, upload_tx);
+            streams.tasks.insert(stream_id, handle);
         }
         MuxFrameKind::Data => {
             if !frame.payload.is_empty() {
-                // Bound the target write (H-3) and shed ONLY this stream on stall,
-                // keeping the serial reader loop and every healthy substream alive.
-                // The get_mut borrow ends before we remove, so the outcome is owned.
-                let outcome = match streams.writes.get_mut(&frame.stream_id) {
-                    Some(target_write) => Some(
-                        timeout(
-                            context.target_write_timeout,
-                            target_write.write_all(frame.payload),
-                        )
-                        .await,
-                    ),
-                    None => None,
+                use tokio::sync::mpsc::error::TrySendError;
+                // Route to the substream's upload channel with a NON-BLOCKING
+                // `try_send` on the common path, so one slow local target never
+                // head-of-line-blocks this shared reader. Decide the outcome while
+                // borrowing the map (cloning the sender only for the rare full-channel
+                // grace); apply any shed AFTER the borrow ends.
+                enum UploadOutcome {
+                    Delivered,
+                    Shed,
+                    Grace(mpsc::Sender<Vec<u8>>, Vec<u8>),
+                }
+                let outcome = match streams.uploads.get(&frame.stream_id) {
+                    Some(sender) => match sender.try_send(frame.payload.to_vec()) {
+                        Ok(()) => UploadOutcome::Delivered,
+                        // Task gone (setup failed / relay ended): shed this stream.
+                        Err(TrySendError::Closed(_)) => UploadOutcome::Shed,
+                        // Full: the target is draining slower than this burst. Wait UP
+                        // TO the grace for a slot instead of shedding at once.
+                        Err(TrySendError::Full(payload)) => {
+                            UploadOutcome::Grace(sender.clone(), payload)
+                        }
+                    },
+                    // Unknown / already-Fin'd stream: ignore (matches half-close).
+                    None => UploadOutcome::Delivered,
                 };
                 match outcome {
-                    Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(_))) => {
-                        // Routine per-destination write failure (e.g. the target
-                        // closed its end). Shed ONLY this substream and keep the
-                        // serial reader loop + every healthy substream alive,
-                        // exactly as the stall path below does.
-                        tracing::debug!(
-                            cid = context.cid,
-                            stream_id = frame.stream_id,
-                            "mux target write failed; resetting stream"
-                        );
-                        shed_server_mux_substream(streams, frame_tx, frame.stream_id).await?;
-                        return Ok(());
-                    }
-                    Some(Err(_)) => {
-                        tracing::debug!(
-                            cid = context.cid,
-                            stream_id = frame.stream_id,
-                            "mux target write stalled; resetting stream"
-                        );
+                    UploadOutcome::Delivered => {}
+                    UploadOutcome::Shed => {
                         shed_server_mux_substream(streams, frame_tx, frame.stream_id).await?;
                     }
-                    None => {}
+                    UploadOutcome::Grace(sender, payload) => {
+                        match timeout(SERVER_MUX_STALL_RESET_GRACE, sender.send(payload)).await {
+                            // Drained within the window: live-but-slow target.
+                            Ok(Ok(())) => {}
+                            // Task vanished while we waited.
+                            Ok(Err(_)) => {
+                                shed_server_mux_substream(streams, frame_tx, frame.stream_id)
+                                    .await?;
+                            }
+                            // No slot freed for the whole window: a genuine stall.
+                            Err(_) => {
+                                tracing::debug!(
+                                    cid = context.cid,
+                                    stream_id = frame.stream_id,
+                                    "mux upload stalled; resetting the stream"
+                                );
+                                shed_server_mux_substream(streams, frame_tx, frame.stream_id)
+                                    .await?;
+                            }
+                        }
+                    }
                 }
             }
         }
         MuxFrameKind::Fin => {
-            // Client is done sending on this stream: close only the write half so
-            // the target can keep streaming back (half-close). The reader task is
-            // left running and will exit on target EOF or its own idle backstop.
-            if let Some(mut target_write) = streams.writes.remove(&frame.stream_id) {
-                let _ = target_write.shutdown().await;
-            }
+            // Client is done sending on this stream: drop the upload sender so the
+            // channel closes and the substream's task half-closes the target write
+            // (the target can keep streaming back). The task (and its slot) stays live
+            // until the target->client direction also finishes.
+            streams.uploads.remove(&frame.stream_id);
         }
         MuxFrameKind::Reset => {
-            // Full stream teardown: close the write half AND abort the reader so
-            // the target read fd/task is reclaimed immediately.
-            if let Some(mut target_write) = streams.writes.remove(&frame.stream_id) {
-                let _ = target_write.shutdown().await;
-            }
-            if let Some(handle) = streams.readers.remove(&frame.stream_id) {
+            // Full stream teardown: drop the upload sender AND abort the task so both
+            // target fds are reclaimed immediately.
+            streams.uploads.remove(&frame.stream_id);
+            if let Some(handle) = streams.tasks.remove(&frame.stream_id) {
                 handle.abort();
             }
         }
@@ -4892,20 +4983,19 @@ async fn process_server_mux_frame(
     Ok(())
 }
 
-/// Shed a single mux substream without disturbing the rest of the connection:
-/// close + drop its write half, abort + drop its reader task, and tell the
-/// client to tear down that stream id with a Reset. Used on per-destination
-/// write stalls/errors so one bad target never poisons the whole mux session.
+/// Shed a single mux substream without disturbing the rest of the connection: drop
+/// its upload sender, abort + drop its supervisor task (closing both target fds),
+/// and tell the client to tear down that stream id with a Reset. Used when a
+/// substream's upload channel stalls or its task has gone, so one bad target never
+/// poisons the whole mux session.
 async fn shed_server_mux_substream(
     streams: &mut ServerMuxStreams,
     frame_tx: &mpsc::Sender<MuxFrame>,
     stream_id: u32,
 ) -> Result<(), HandshakeServerError> {
-    if let Some(mut w) = streams.writes.remove(&stream_id) {
-        let _ = w.shutdown().await;
-    }
-    if let Some(h) = streams.readers.remove(&stream_id) {
-        h.abort();
+    streams.uploads.remove(&stream_id);
+    if let Some(handle) = streams.tasks.remove(&stream_id) {
+        handle.abort();
     }
     send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new()).await
 }
@@ -8078,23 +8168,26 @@ mod tests {
         .await
         .unwrap();
 
-        // No outbound connection was established for the over-cap stream.
-        assert!(streams.writes.is_empty());
-        assert!(streams.readers.is_empty());
+        // No supervisor task was spawned for the over-cap stream.
+        assert!(streams.uploads.is_empty());
+        assert!(streams.tasks.is_empty());
         // The client receives a Reset for that stream id.
         let reset = frame_rx.try_recv().unwrap();
         assert_eq!(reset.stream_id, 7);
         assert_eq!(reset.kind, MuxFrameKind::Reset);
     }
 
-    /// H-3: a wedged target (peer never reads) must not park the serial mux reader
-    /// loop on a single stream's write — only that stream is shed (Reset + close),
-    /// keeping the connection and every healthy substream alive. Uses an injected
-    /// short write deadline + an oversized payload that reliably blocks once the
-    /// socket buffers fill, so the test runs in real time.
+    /// The shared mux reader must NEVER block on a single substream's target I/O.
+    /// A wedged target (accepts but never reads) parks THAT substream's own task on
+    /// the target write; routing an upload frame to it must still return from the
+    /// reader PROMPTLY (a non-blocking `try_send`), and once the per-stream channel
+    /// fills the stalled stream is shed with a Reset — the connection and every
+    /// healthy substream stay alive. Before the fix the reader wrote client->target
+    /// INLINE and parked for `target_write_timeout` per stalled stream: the China
+    /// head-of-line-blocking bug this regression guards.
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
-    async fn mux_wedged_target_data_write_sheds_only_that_stream() {
+    async fn mux_wedged_target_upload_does_not_block_reader() {
         let traffic = TrafficConfig::default();
         let context = ServerMuxContext {
             fixed_data_target: None,
@@ -8103,7 +8196,9 @@ mod tests {
             chunk_size: max_plaintext_len(traffic.max_padding),
             max_streams: 8,
             cid: 1,
-            target_write_timeout: Duration::from_millis(100),
+            // Large enough that the task's OWN write deadline never fires during the
+            // test; the shed here is driven by the full-channel grace instead.
+            target_write_timeout: Duration::from_secs(30),
         };
         let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
         let payload_pool =
@@ -8117,20 +8212,44 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
             drop(s);
         });
-        let target = TcpStream::connect(target_addr).await.unwrap();
-        let (_target_read, target_write) = target.into_split();
 
         let mut streams = ServerMuxStreams::new();
-        streams.writes.insert(9, target_write);
-        // A live reader handle so the shed path's abort+remove is exercised.
-        streams
-            .readers
-            .insert(9, tokio::spawn(std::future::pending::<()>()));
 
-        // Oversized payload guarantees write_all blocks (exceeds any socket buffer).
+        // Open the substream toward the wedged target (empty initial payload). The
+        // supervisor task connects OFF the reader and begins draining uploads.
+        let open_payload = ConnectRequest {
+            host: target_addr.ip().to_string(),
+            port: target_addr.port(),
+            initial_payload: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        process_server_mux_frame(
+            MuxFrameRef {
+                stream_id: 9,
+                kind: MuxFrameKind::Open,
+                payload: &open_payload,
+            },
+            &mut streams,
+            &frame_tx,
+            context,
+            &payload_pool,
+        )
+        .await
+        .unwrap();
+        assert!(
+            streams.tasks.contains_key(&9),
+            "Open spawns the substream task"
+        );
+        // Let the task connect and park on its first (wedging) target write.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Oversized payload so the target's socket buffers fill and the task's write
+        // stays parked. Routing it to the reader must NOT block ~target_write_timeout;
+        // it `try_send`s into the per-stream channel and returns at once.
         let big = vec![0_u8; 4 * 1024 * 1024];
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
+        tokio::time::timeout(
+            Duration::from_millis(500),
             process_server_mux_frame(
                 MuxFrameRef {
                     stream_id: 9,
@@ -8144,21 +8263,39 @@ mod tests {
             ),
         )
         .await
-        .expect("process_server_mux_frame must return within the wall budget");
-        result.expect("shedding a wedged stream must not error the connection");
+        .expect("reader must not block on a wedged target's write")
+        .expect("routing an upload to a wedged stream must not error the connection");
 
-        // Only stream 9 is shed; the connection (and any other stream) survives.
+        // Keep routing until the bounded channel fills; the reader then waits at most
+        // the grace and sheds the stalled stream with a Reset, freeing its slot.
+        for _ in 0..(SERVER_MUX_UPLOAD_CHANNEL as u32 + 8) {
+            let _ = process_server_mux_frame(
+                MuxFrameRef {
+                    stream_id: 9,
+                    kind: MuxFrameKind::Data,
+                    payload: &big,
+                },
+                &mut streams,
+                &frame_tx,
+                context,
+                &payload_pool,
+            )
+            .await;
+        }
+
+        // The client is told to tear down the wedged stream, and its slot is freed.
+        let mut saw_reset = false;
+        while let Ok(frame) = frame_rx.try_recv() {
+            if frame.stream_id == 9 && frame.kind == MuxFrameKind::Reset {
+                saw_reset = true;
+            }
+        }
+        assert!(saw_reset, "wedged stream is eventually shed with a Reset");
+        streams.prune_finished();
         assert!(
-            !streams.writes.contains_key(&9),
-            "wedged stream's write half removed"
+            !streams.tasks.contains_key(&9),
+            "shed stream's task is removed"
         );
-        assert!(
-            !streams.readers.contains_key(&9),
-            "wedged stream's reader aborted"
-        );
-        let reset = frame_rx.try_recv().unwrap();
-        assert_eq!(reset.stream_id, 9);
-        assert_eq!(reset.kind, MuxFrameKind::Reset);
 
         acceptor.abort();
     }
