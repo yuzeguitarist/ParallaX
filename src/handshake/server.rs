@@ -4,7 +4,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
@@ -3693,12 +3693,13 @@ const SERVER_MUX_UPLOAD_CHANNEL: usize = 32;
 /// draining slower than a bulk upload burst fills it transiently too. So on a full
 /// channel the reader waits UP TO this long for a slot instead of shedding at once
 /// (deliver, no reset, if the target drains within the window; shed only a genuine
-/// stall). Bounds how long ONE stalled upload can hold the shared reader once its
-/// target is connected and draining — a still-connecting target waits the setup
-/// budget instead (see `ServerUploadRoute::draining`). This, plus the reader's own
-/// Reset sends on the frame channel, are the residual head-of-line terms after
-/// connect/target-write moved onto per-stream tasks. Mirrors the client's
-/// `CLIENT_MUX_STALL_RESET_GRACE`.
+/// stall). Kept SHORT and equal to the client's `CLIENT_MUX_STALL_RESET_GRACE` so
+/// one stalled substream can hold the shared reader only briefly — this, plus the
+/// reader's own Reset sends on the frame channel, are the residual head-of-line
+/// terms after connect/target-write moved onto per-stream tasks. A client that
+/// pipelines a >channel-depth upload burst to a target still taking longer than this
+/// to connect may see that substream reset (and retried) rather than the reader
+/// parking the whole carrier on it — the deliberate non-HOL tradeoff.
 const SERVER_MUX_STALL_RESET_GRACE: Duration = Duration::from_secs(2);
 
 /// Brief grace, applied AFTER the teardown DONE `select!` returns its
@@ -3751,23 +3752,12 @@ struct ServerMuxContext<'a> {
 ///
 /// A `Reset` (or connection teardown) aborts the task so no target fd is orphaned.
 struct ServerMuxStreams {
-    uploads: HashMap<u32, ServerUploadRoute>,
+    /// Per-substream client->target upload channel senders. Items are `Zeroizing`
+    /// so decrypted plaintext is scrubbed when the task drops each frame after
+    /// writing it (and when queued frames are dropped on shed/teardown), matching
+    /// the reader's own `Zeroizing` plaintext buffers.
+    uploads: HashMap<u32, mpsc::Sender<Zeroizing<Vec<u8>>>>,
     tasks: HashMap<u32, tokio::task::JoinHandle<()>>,
-}
-
-/// Routing handle for one substream's client->target uploads.
-struct ServerUploadRoute {
-    /// Bounded upload channel to the substream's task. Items are `Zeroizing` so
-    /// decrypted client->target plaintext is scrubbed when the task drops each frame
-    /// after writing it (and when queued frames are dropped on shed/teardown),
-    /// matching the reader's own `Zeroizing` plaintext buffers.
-    sender: mpsc::Sender<Zeroizing<Vec<u8>>>,
-    /// Set true by the substream task once setup (connect + initial write) is done
-    /// and it has begun draining uploads. Until then a full channel just means the
-    /// target is still connecting, so the reader waits the setup budget instead of
-    /// shedding at the short stall grace (which would falsely reset a slow-connecting
-    /// target's buffered upload — the exact slow-target case this whole change helps).
-    draining: Arc<AtomicBool>,
 }
 
 impl ServerMuxStreams {
@@ -3843,7 +3833,6 @@ async fn server_mux_upstream_task(
     frame_tx: mpsc::Sender<MuxFrame>,
     ctx: ServerMuxStreamContext,
     payload_pool: MuxPayloadPool,
-    draining: Arc<AtomicBool>,
 ) {
     // Own the decrypted request in a scrub-on-drop buffer; copy out the target +
     // initial payload (also scrub-on-drop) so the request buffer is dropped
@@ -3922,10 +3911,6 @@ async fn server_mux_upstream_task(
         ctx.target_write_timeout,
         &frame_tx,
     );
-    // Setup done: tell the reader this substream is now draining uploads, so a
-    // subsequently-full channel is treated as a genuine target stall (short grace)
-    // rather than a still-connecting target (which must not be falsely shed).
-    draining.store(true, Ordering::Relaxed);
     // Run both directions; an error in either drops the other's half of the target
     // socket. Half-close (client Fin) resolves `writer` Ok while `reader` keeps
     // streaming the target back until its EOF.
@@ -4923,7 +4908,6 @@ async fn process_server_mux_frame(
             // the reader only ever `try_send`s upload frames and spawns the task.
             let (upload_tx, upload_rx) =
                 mpsc::channel::<Zeroizing<Vec<u8>>>(SERVER_MUX_UPLOAD_CHANNEL);
-            let draining = Arc::new(AtomicBool::new(false));
             let stream_ctx = ServerMuxStreamContext {
                 fixed_data_target: context.fixed_data_target.map(str::to_owned),
                 timing: context.timing,
@@ -4939,15 +4923,8 @@ async fn process_server_mux_frame(
                 frame_tx.clone(),
                 stream_ctx,
                 payload_pool.clone(),
-                draining.clone(),
             ));
-            streams.uploads.insert(
-                stream_id,
-                ServerUploadRoute {
-                    sender: upload_tx,
-                    draining,
-                },
-            );
+            streams.uploads.insert(stream_id, upload_tx);
             streams.tasks.insert(stream_id, handle);
         }
         MuxFrameKind::Data => {
@@ -4961,37 +4938,22 @@ async fn process_server_mux_frame(
                 enum UploadOutcome {
                     Delivered,
                     Shed,
-                    Grace(
-                        mpsc::Sender<Zeroizing<Vec<u8>>>,
-                        Zeroizing<Vec<u8>>,
-                        Duration,
-                    ),
+                    Grace(mpsc::Sender<Zeroizing<Vec<u8>>>, Zeroizing<Vec<u8>>),
                 }
                 let outcome = match streams.uploads.get(&frame.stream_id) {
-                    Some(route) => {
-                        match route
-                            .sender
-                            .try_send(Zeroizing::new(frame.payload.to_vec()))
-                        {
-                            Ok(()) => UploadOutcome::Delivered,
-                            // Task gone (setup failed / relay ended): shed this stream.
-                            Err(TrySendError::Closed(_)) => UploadOutcome::Shed,
-                            // Full: the target is draining slower than this burst. Wait UP
-                            // TO the grace for a slot instead of shedding at once. If the
-                            // task is still CONNECTING (not yet draining), the target just
-                            // hasn't finished connecting — wait the setup budget, not the
-                            // short stall grace, so its buffered upload is not falsely
-                            // reset. Once draining, a full channel is a genuine stall.
-                            Err(TrySendError::Full(payload)) => {
-                                let grace = if route.draining.load(Ordering::Relaxed) {
-                                    SERVER_MUX_STALL_RESET_GRACE
-                                } else {
-                                    HANDSHAKE_TIMEOUT
-                                };
-                                UploadOutcome::Grace(route.sender.clone(), payload, grace)
-                            }
+                    Some(sender) => match sender.try_send(Zeroizing::new(frame.payload.to_vec())) {
+                        Ok(()) => UploadOutcome::Delivered,
+                        // Task gone (setup failed / relay ended): shed this stream.
+                        Err(TrySendError::Closed(_)) => UploadOutcome::Shed,
+                        // Full: the target is draining slower than this burst (or has not
+                        // finished connecting). Wait UP TO the SHORT grace for a slot
+                        // instead of shedding at once — but never longer, so one substream
+                        // can hold the shared reader only briefly (client-parity with
+                        // `dispatch_client_mux_frame`), never for the whole connect budget.
+                        Err(TrySendError::Full(payload)) => {
+                            UploadOutcome::Grace(sender.clone(), payload)
                         }
-                    }
+                    },
                     // Unknown / already-Fin'd stream: ignore (matches half-close).
                     None => UploadOutcome::Delivered,
                 };
@@ -5000,8 +4962,8 @@ async fn process_server_mux_frame(
                     UploadOutcome::Shed => {
                         shed_server_mux_substream(streams, frame_tx, frame.stream_id).await?;
                     }
-                    UploadOutcome::Grace(sender, payload, grace) => {
-                        match timeout(grace, sender.send(payload)).await {
+                    UploadOutcome::Grace(sender, payload) => {
+                        match timeout(SERVER_MUX_STALL_RESET_GRACE, sender.send(payload)).await {
                             // Drained within the window: live-but-slow (or still-connecting)
                             // target.
                             Ok(Ok(())) => {}
