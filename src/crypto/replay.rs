@@ -2462,7 +2462,7 @@ mod tests {
         assert_eq!(hex_value(b'F').unwrap(), 15);
         // Everything else is rejected, including the bytes adjacent to the valid ASCII
         // ranges ('/' = '0'-1, ':' = '9'+1, 'g'/'G' = 'f'/'F'+1) and the extremes.
-        for bad in [b' ', b'/', b':', b'g', b'G', b'x', b'\x00', b'\xff'] {
+        for bad in *b" /:gGx\x00\xff" {
             assert!(
                 matches!(hex_value(bad), Err(ReplayCacheError::MalformedHex)),
                 "0x{bad:02x} must be rejected as non-hex"
