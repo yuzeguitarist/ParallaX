@@ -156,6 +156,26 @@ const MUX_WARM_KEEPER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// beyond this that have every substream slot free are dropped (closing their
 /// carrier) so a post-burst client does not hoard idle TLS/QUIC sessions.
 const MUX_POOL_MAX_IDLE_SESSIONS: usize = 2;
+/// How many new mux sessions the pool may establish CONCURRENTLY when it has to
+/// grow. A browser opens dozens of connections at once; with a small
+/// `max_concurrent_streams` the pool needs `ceil(connections / streams)` sessions
+/// to serve them, and building those strictly one-at-a-time serializes that many
+/// full handshakes (seconds of added latency over a real RTT — the "new tabs are
+/// dead slow / never load" symptom). Building several in parallel keeps growth
+/// fast; the cap bounds the momentary handshake burst (and thus server load and
+/// over-building) while waiters coalesce onto slots freed by sessions that land.
+/// Kept modest (8) because each build is a full camouflage-TLS + ML-KEM/ML-DSA
+/// handshake and servers are often single-core; 8 captures nearly all the
+/// latency win of a larger fan-out at roughly half the peak handshake load.
+const MUX_MAX_CONCURRENT_SESSION_BUILDS: usize = 8;
+/// How many times `acquire` retries its OWN failed session build before giving
+/// up and failing the local connection. A single establishment can fail
+/// transiently on a hostile link (packet loss/reorder during the handshake, or a
+/// handshake timing out while many builds contend for a slow/lossy uplink) — the
+/// exact conditions ParallaX targets. Retrying a couple of times turns such a
+/// blip into a slightly slower connection instead of a hard reset, while the cap
+/// still fails fast against a genuinely down/blocked server.
+const MUX_ACQUIRE_MAX_BUILD_ATTEMPTS: u32 = 3;
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -696,19 +716,36 @@ fn warm_session_is_live(_stream: &TcpStream) -> bool {
 /// by the fd-based connection limit, exactly like the `max_concurrent_streams=1`
 /// per-connection path.
 ///
-/// `building` single-flights establishment WITHOUT holding the pool mutex across
-/// the (up to 15s) network handshake: it carries a `Notify` the in-flight builder
-/// fires on completion (success or failure) so concurrently-waiting connections
-/// share the one attempt (and then re-check the pool, which may now have a free
-/// slot) instead of each serializing a fresh handshake behind the lock.
+/// Session establishment runs OFF-LOCK (never holding the pool mutex across the
+/// up-to-15s handshake). Up to [`MUX_MAX_CONCURRENT_SESSION_BUILDS`] builds may be
+/// in flight at once so the pool grows in PARALLEL under a burst instead of
+/// serializing one handshake after another (the multi-second "new tab never
+/// loads" latency). A connection that finds every session saturated starts a new
+/// build only while the in-flight count is under the cap; otherwise it parks on
+/// `build_notify` and, when any build lands, re-checks — usually grabbing a slot
+/// freed by a session that just landed rather than building its own (coalescing).
 #[derive(Default)]
 struct MuxPoolState {
     /// Established sessions. Dead sessions are pruned on access; fully-idle
     /// sessions beyond [`MUX_POOL_MAX_IDLE_SESSIONS`] are dropped to bound the
     /// idle footprint.
     sessions: Vec<ClientMuxHandle>,
-    /// `Some` while a session build is in flight; waiters park on this `Notify`.
-    building: Option<Arc<Notify>>,
+    /// Number of session builds currently in flight (bounded by
+    /// [`MUX_MAX_CONCURRENT_SESSION_BUILDS`]).
+    builds_in_flight: usize,
+    /// Fired whenever a build finishes (success or failure) so parked waiters
+    /// re-check the pool. Lazily created; shared by all current waiters.
+    build_notify: Option<Arc<Notify>>,
+}
+
+impl MuxPoolState {
+    /// Returns the shared build-completion `Notify`, creating it on first use.
+    fn build_wakeup(&mut self) -> Arc<Notify> {
+        Arc::clone(
+            self.build_notify
+                .get_or_insert_with(|| Arc::new(Notify::new())),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -940,34 +977,74 @@ impl ClientMuxPool {
     /// number of concurrent connections is NOT capped at `max_concurrent_streams`
     /// (the single-session starvation bug); it is bounded only by the fd-based
     /// connection limit, like the `max_concurrent_streams=1` path.
+    ///
+    /// Cancellation note: in production this future always runs to completion — a
+    /// per-connection task spawns it and is never aborted, and it is never wrapped
+    /// in `timeout`/`select!`. That guarantees every `builds_in_flight` increment
+    /// below is paired with the decrement in `build_and_reserve`. Do NOT wrap
+    /// `acquire` in a cancelling combinator without making that accounting
+    /// cancel-safe first (a leaked count would, in the empty-pool single-flight
+    /// case, wedge the pool).
     async fn acquire(&self) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
         self.last_activity
             .store(relay_now_millis(), Ordering::Relaxed);
+        let mut build_attempts = 0u32;
         loop {
-            // Decide an action without awaiting under the lock. Prune dead and
-            // surplus-idle sessions, then take a free slot on any live session.
             let mut state = self.inner.lock().await;
+            // Prune dead and surplus-idle sessions, then take a free slot on any
+            // live session (reuse before build, so steady-state traffic amortizes
+            // onto existing sessions instead of opening new ones).
             self.reap_sessions(&mut state);
             if let Some(reserved) = reserve_slot(&state.sessions) {
                 return Ok(reserved);
             }
-            let notify = match &state.building {
-                Some(notify) => Arc::clone(notify),
-                None => {
-                    let notify = Arc::new(Notify::new());
-                    state.building = Some(Arc::clone(&notify));
-                    drop(state);
-                    // We are the sole builder. Establish OFF-LOCK, add the new
-                    // session, take its first slot, and wake waiters (which
-                    // re-check and may grab the new session's remaining slots).
-                    return self.build_and_reserve(notify).await;
-                }
+            // No free slot. While the pool is EMPTY, single-flight the first
+            // session so a cold-start burst COALESCES onto it (mux's whole point:
+            // many substreams share one session) instead of every connection
+            // opening its own. Once at least one session exists, growth may run
+            // several builds CONCURRENTLY so a burst that needs many sessions does
+            // not serialize their handshakes (the latency bug).
+            let max_builds = if state.sessions.is_empty() {
+                1
+            } else {
+                MUX_MAX_CONCURRENT_SESSION_BUILDS
             };
-
-            // Another connection is establishing a session. Park on its completion
-            // (registering BEFORE dropping the lock by calling .notified() and
-            // .enable() while still holding state), then re-loop: the new session
-            // may now have a free slot, or we become the next builder.
+            if state.builds_in_flight < max_builds {
+                state.builds_in_flight += 1;
+                drop(state);
+                // Establish OFF-LOCK, add the new session, take its first substream
+                // slot, and wake parked waiters (which re-check and grab the new
+                // session's remaining slots).
+                match self.build_and_reserve().await {
+                    Ok(reserved) => return Ok(reserved),
+                    Err(err) => {
+                        // A transient establishment failure (handshake loss/reorder
+                        // on a hostile link, or a build timing out under contention)
+                        // should not hard-reset the local connection when a retry
+                        // is likely to succeed. Retry a bounded number of times,
+                        // then surface the error. `build_and_reserve` already
+                        // dropped the build slot and woke waiters, and the loop
+                        // re-checks existing sessions first, so a slot another build
+                        // just freed is still preferred over another handshake.
+                        build_attempts += 1;
+                        if build_attempts >= MUX_ACQUIRE_MAX_BUILD_ATTEMPTS {
+                            return Err(err);
+                        }
+                        tracing::debug!(
+                            attempt = build_attempts,
+                            error = %err,
+                            "client mux session establishment failed; retrying"
+                        );
+                        continue;
+                    }
+                }
+            }
+            // At the build-concurrency cap: park until an in-flight build lands,
+            // then retry (usually grabbing a slot it freed). The `Notified` future
+            // is created AND enabled WHILE THE LOCK IS STILL HELD, so a
+            // `notify_waiters()` from a build that completes as we unlock cannot be
+            // missed (lost-wakeup safety) — only then is the lock dropped.
+            let notify = state.build_wakeup();
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -976,15 +1053,17 @@ impl ClientMuxPool {
         }
     }
 
-    /// Builds a new session off-lock (single-flighted via `notify`), records it,
-    /// reserves its first substream slot, and wakes any parked waiters.
+    /// Builds a new session off-lock (the caller has already incremented
+    /// `builds_in_flight`), records it, reserves its first substream slot, and
+    /// wakes parked waiters so they can grab the session's remaining slots. Always
+    /// runs to completion in production (see the cancellation note on `acquire`),
+    /// so the `builds_in_flight` decrement always pairs with that increment.
     async fn build_and_reserve(
         &self,
-        notify: Arc<Notify>,
     ) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
         let result = self.spawn_build().await;
         let mut state = self.inner.lock().await;
-        state.building = None;
+        state.builds_in_flight -= 1;
         let outcome = match result {
             Ok(handle) => {
                 // A fresh session always has free slots, so this cannot fail.
@@ -998,15 +1077,19 @@ impl ClientMuxPool {
             // becomes the next builder (preserves retry-on-failure).
             Err(err) => Err(err),
         };
+        let notify = state.build_notify.clone();
         drop(state);
-        notify.notify_waiters();
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
         outcome
     }
 
     /// Ensures at least one reusable session exists WITHOUT reserving a slot, for
-    /// the warm-keeper. Shares the same single-flight build coordinator as
-    /// [`Self::acquire`], so a warm rebuild never races a connection into building
-    /// two sessions at once.
+    /// the warm-keeper. Only builds when the pool is empty AND no build is already
+    /// in flight, so a warm rebuild never races a connection into an extra session.
+    /// Like `acquire`, it always runs to completion (the warm-keeper task never
+    /// cancels it), so its `builds_in_flight` increment/decrement stay paired.
     async fn ensure_warm(&self) -> Result<(), ClientRuntimeError> {
         loop {
             let mut state = self.inner.lock().await;
@@ -1014,27 +1097,30 @@ impl ClientMuxPool {
             if !state.sessions.is_empty() {
                 return Ok(());
             }
-            let notify = match &state.building {
-                Some(notify) => Arc::clone(notify),
-                None => {
-                    let notify = Arc::new(Notify::new());
-                    state.building = Some(Arc::clone(&notify));
-                    drop(state);
-                    let result = self.spawn_build().await;
-                    let mut state = self.inner.lock().await;
-                    state.building = None;
-                    let outcome = match result {
-                        Ok(handle) => {
-                            state.sessions.push(handle);
-                            Ok(())
-                        }
-                        Err(err) => Err(err),
-                    };
-                    drop(state);
+            if state.builds_in_flight == 0 {
+                state.builds_in_flight += 1;
+                drop(state);
+                let result = self.spawn_build().await;
+                let mut state = self.inner.lock().await;
+                state.builds_in_flight -= 1;
+                let outcome = match result {
+                    Ok(handle) => {
+                        state.sessions.push(handle);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                };
+                let notify = state.build_notify.clone();
+                drop(state);
+                if let Some(notify) = notify {
                     notify.notify_waiters();
-                    return outcome;
                 }
-            };
+                return outcome;
+            }
+            // A build is already in flight. Enable the wakeup under the lock (as in
+            // `acquire`) so the completing build's notify is never missed, then
+            // park and re-check.
+            let notify = state.build_wakeup();
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -1044,9 +1130,10 @@ impl ClientMuxPool {
     }
 
     /// Runs `start_session` in a detached task and awaits it, so a PANIC inside
-    /// establishment surfaces as `Err` (self-heal) instead of unwinding past the
-    /// `building` reset and stranding every waiter on a Notify that never fires.
-    /// The (up to CLIENT_ESTABLISH_TIMEOUT) handshake runs OFF-LOCK so a slow or
+    /// establishment surfaces as `Err` (self-heal): the caller still decrements
+    /// `builds_in_flight` and wakes waiters instead of unwinding past that
+    /// accounting and stranding every waiter on a Notify that never fires. The
+    /// (up to CLIENT_ESTABLISH_TIMEOUT) handshake runs OFF-LOCK so a slow or
     /// stalling server never blocks other local connections behind the pool mutex.
     async fn spawn_build(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
         let pool = self.clone();
@@ -4682,7 +4769,7 @@ mod tests {
         let builder_pool = pool.clone();
         let builder = tokio::spawn(async move { builder_pool.acquire().await });
 
-        // Let it publish `building` and enter the stalled handshake.
+        // Let it record an in-flight build and enter the stalled handshake.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // The pool mutex MUST be free (not held across establishment) and a build
@@ -4693,7 +4780,7 @@ mod tests {
                 .try_lock()
                 .expect("pool mutex must not be held across establishment");
             assert!(
-                state.building.is_some() && state.sessions.is_empty(),
+                state.builds_in_flight > 0 && state.sessions.is_empty(),
                 "a build must be in flight (no session yet) while establishing",
             );
         }
@@ -5934,6 +6021,73 @@ mod tests {
         // occupied both slots for the whole duration of the third connection.
         drop(hold_one);
         drop(hold_two);
+
+        client_task.abort();
+        server_task.abort();
+        target_task.abort();
+        fallback_task.abort();
+    }
+
+    /// Regression cover for the serial-session-build latency bug: a burst of
+    /// concurrent connections that needs SEVERAL sessions (here 12 connections
+    /// with `max_concurrent_streams = 2` needs >= 6 sessions) must all be served
+    /// promptly. The pool now grows sessions CONCURRENTLY; the previous
+    /// single-flight build serialized one handshake after another, so a burst like
+    /// this stacked many handshakes back-to-back (seconds of latency over a real
+    /// RTT — the "new tabs are dead slow / never load" symptom). Every connection
+    /// fully opening its substream (echo round-trip) proves the pool opened enough
+    /// sessions without starving or serially stalling any of them.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_concurrent_burst_opens_multiple_sessions_promptly() {
+        const CONNS: usize = 12;
+        const STREAMS: u8 = 2;
+
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback_multi().await;
+        let (target_addr, target_task) = spawn_multi_echo_target(CONNS).await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let mux_traffic = TrafficConfig {
+            max_concurrent_streams: STREAMS,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_multi(server_config, mux_traffic).await;
+        let (local_addr, client_task) = spawn_mux_local_client_accept_loop(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys,
+            STREAMS as usize,
+        )
+        .await;
+
+        // Fire all connections at once and require each to round-trip a distinct
+        // payload. With STREAMS=2 this needs >= CONNS/2 sessions built to satisfy
+        // them concurrently; if builds serialized, the later ones would stall.
+        let mut tasks = Vec::with_capacity(CONNS);
+        for i in 0..CONNS {
+            let payload = format!("burst-stream-{i:02}").into_bytes();
+            tasks.push(tokio::spawn(assert_payload_round_trip(
+                connect_socks_target(local_addr, target_addr).await,
+                payload,
+            )));
+        }
+        for task in tasks {
+            timeout(Duration::from_secs(20), task)
+                .await
+                .expect("a concurrent-burst connection stalled (serial session builds?)")
+                .expect("burst round-trip task panicked");
+        }
 
         client_task.abort();
         server_task.abort();
