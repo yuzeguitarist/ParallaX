@@ -3828,16 +3828,15 @@ struct ServerMuxStreamContext {
 /// target socket drops).
 async fn server_mux_upstream_task(
     stream_id: u32,
-    connect_payload: Vec<u8>,
+    mut connect_payload: Zeroizing<Vec<u8>>,
     upload_rx: mpsc::Receiver<Zeroizing<Vec<u8>>>,
     frame_tx: mpsc::Sender<MuxFrame>,
     ctx: ServerMuxStreamContext,
     payload_pool: MuxPayloadPool,
 ) {
-    // Own the decrypted request in a scrub-on-drop buffer; copy out the target +
-    // initial payload (also scrub-on-drop) so the request buffer is dropped
-    // (scrubbed) before the connect await.
-    let mut connect_payload = Zeroizing::new(connect_payload);
+    // The decrypted request is already scrub-on-drop before this task is spawned;
+    // copy out the target + initial payload (also scrub-on-drop) so the request
+    // buffer is dropped (scrubbed) before the connect await.
     let (target_addr, target_source, initial) = match resolve_connect_target(
         connect_payload.as_mut_slice(),
         ctx.fixed_data_target.as_deref(),
@@ -4918,7 +4917,7 @@ async fn process_server_mux_frame(
             let stream_id = frame.stream_id;
             let handle = tokio::spawn(server_mux_upstream_task(
                 stream_id,
-                frame.payload.to_vec(),
+                Zeroizing::new(frame.payload.to_vec()),
                 upload_rx,
                 frame_tx.clone(),
                 stream_ctx,
