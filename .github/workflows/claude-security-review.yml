@@ -57,7 +57,7 @@ jobs:
       # Advisory / best-effort: continue-on-error so a very large PR that exhausts
       # the turn budget (or any action error) never red-X's the PR. This is not a
       # required check; only the deterministic CI gates block merges.
-      - uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+      - uses: anthropics/claude-code-action@1298632ce7736903d02a1435002705aa2a594a6c # v1.0.175
         continue-on-error: true
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
