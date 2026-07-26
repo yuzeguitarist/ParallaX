@@ -1304,9 +1304,22 @@ fn parse_hello_retry_request(
     let mut tls13_selected = false;
     let mut selected_group = None;
     let mut cookie = None;
+    // RFC 8446 §4.2: "There MUST NOT be more than one extension of the same type
+    // in a given extension block." Enforced across EVERY type, not just the ones
+    // read below — a peer must not be able to steer the retry by appending a
+    // second, differing copy of anything a conforming client would have rejected
+    // outright. The list is a handful of entries, so a linear scan is the right
+    // shape here.
+    let mut seen_extensions: Vec<u16> = Vec::new();
     while e.remaining() > 0 {
         let ext_type = e.u16()?;
         let data = e.vec_u16()?;
+        if seen_extensions.contains(&ext_type) {
+            return Err(Safari26TlsError::Handshake(format!(
+                "HelloRetryRequest repeated extension {ext_type:#06x}"
+            )));
+        }
+        seen_extensions.push(ext_type);
         match ext_type {
             EXT_SUPPORTED_VERSIONS => {
                 if data.len() == 2 && u16::from_be_bytes([data[0], data[1]]) == TLS13 {
@@ -1315,17 +1328,7 @@ fn parse_hello_retry_request(
             }
             // In an HRR the key_share extension carries ONLY the selected group,
             // never a key_exchange (RFC 8446 §4.2.8).
-            //
-            // RFC 8446 §4.2 forbids repeating an extension type. Rejecting rather
-            // than letting the last copy win keeps a peer from steering the retry
-            // with a second, differing value that a conforming client would never
-            // have honored.
             EXT_KEY_SHARE => {
-                if selected_group.is_some() {
-                    return Err(Safari26TlsError::Handshake(
-                        "HelloRetryRequest repeated the key_share extension".to_owned(),
-                    ));
-                }
                 let mut ks = TlsCursor::new(data);
                 selected_group = Some(ks.u16()?);
                 if ks.remaining() != 0 {
@@ -1335,11 +1338,6 @@ fn parse_hello_retry_request(
                 }
             }
             EXT_COOKIE => {
-                if cookie.is_some() {
-                    return Err(Safari26TlsError::Handshake(
-                        "HelloRetryRequest repeated the cookie extension".to_owned(),
-                    ));
-                }
                 let mut ck = TlsCursor::new(data);
                 cookie = Some(ck.vec_u16()?.to_vec());
             }
@@ -3826,6 +3824,73 @@ mod tests {
 
         // A mismatched session_id echo is fatal, exactly as for a real ServerHello.
         assert!(parse_hello_retry_request(&hrr, &[0x00; 32]).is_err());
+    }
+
+    // RFC 8446 §4.2 bans a repeated extension type. The check must cover EVERY
+    // type, not only the two this parser reads: an earlier revision special-cased
+    // key_share/cookie while its own comment claimed the general rule, so a second
+    // supported_versions still sailed through.
+    #[test]
+    fn hello_retry_request_rejects_any_repeated_extension() {
+        let session_id = [0x6b; 32];
+
+        // Hand-build an HRR whose extension block repeats a type. `hrr_record`
+        // cannot express this, so assemble the block directly.
+        let malformed = |repeat: u16, payload: &[u8]| {
+            let mut exts = Vec::new();
+            push_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes()).unwrap();
+            push_extension(&mut exts, EXT_KEY_SHARE, &GROUP_SECP256R1.to_be_bytes()).unwrap();
+            push_extension(&mut exts, repeat, payload).unwrap();
+            let mut body = Vec::new();
+            body.extend_from_slice(&TLS12.to_be_bytes());
+            body.extend_from_slice(hrr_random());
+            body.push(session_id.len() as u8);
+            body.extend_from_slice(&session_id);
+            body.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+            body.push(0);
+            push_vec_u16(&mut body, &exts).unwrap();
+            handshake_record(TLS12.to_be_bytes(), HANDSHAKE_SERVER_HELLO, &body).unwrap()
+        };
+
+        for (label, repeat, payload) in [
+            (
+                "supported_versions",
+                EXT_SUPPORTED_VERSIONS,
+                TLS13.to_be_bytes().to_vec(),
+            ),
+            (
+                "key_share",
+                EXT_KEY_SHARE,
+                GROUP_SECP384R1.to_be_bytes().to_vec(),
+            ),
+        ] {
+            let record = malformed(repeat, &payload);
+            assert!(
+                parse_hello_retry_request(&record, &session_id).is_err(),
+                "a repeated {label} extension must be rejected"
+            );
+        }
+
+        // The same block without the repeat is accepted, so the assertions above
+        // are about the duplicate and not about some unrelated malformation.
+        let mut exts = Vec::new();
+        push_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes()).unwrap();
+        push_extension(&mut exts, EXT_KEY_SHARE, &GROUP_SECP256R1.to_be_bytes()).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&TLS12.to_be_bytes());
+        body.extend_from_slice(hrr_random());
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(&session_id);
+        body.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+        body.push(0);
+        push_vec_u16(&mut body, &exts).unwrap();
+        let clean = handshake_record(TLS12.to_be_bytes(), HANDSHAKE_SERVER_HELLO, &body).unwrap();
+        assert_eq!(
+            parse_hello_retry_request(&clean, &session_id)
+                .unwrap()
+                .selected_group,
+            GROUP_SECP256R1
+        );
     }
 
     #[test]
