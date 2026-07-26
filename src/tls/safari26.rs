@@ -1337,9 +1337,20 @@ fn parse_hello_retry_request(
                     ));
                 }
             }
+            // RFC 8446 §4.2.2 defines this as `opaque cookie<1..2^16-1>`, so an
+            // empty cookie is malformed, as are trailing bytes after the
+            // length-prefixed body. Worth being strict: whatever lands here is
+            // echoed verbatim into ClientHello2, so a lax parse would put a
+            // server-chosen malformed extension on the wire under our fingerprint.
             EXT_COOKIE => {
                 let mut ck = TlsCursor::new(data);
-                cookie = Some(ck.vec_u16()?.to_vec());
+                let value = ck.vec_u16()?.to_vec();
+                if value.is_empty() || ck.remaining() != 0 {
+                    return Err(Safari26TlsError::Handshake(
+                        "HelloRetryRequest cookie is malformed".to_owned(),
+                    ));
+                }
+                cookie = Some(value);
             }
             _ => {}
         }
@@ -3824,6 +3835,51 @@ mod tests {
 
         // A mismatched session_id echo is fatal, exactly as for a real ServerHello.
         assert!(parse_hello_retry_request(&hrr, &[0x00; 32]).is_err());
+    }
+
+    // The cookie is echoed verbatim into ClientHello2, so a lax parse here would
+    // let the server place a malformed extension on the wire under our
+    // fingerprint. RFC 8446 §4.2.2: `opaque cookie<1..2^16-1>`.
+    #[test]
+    fn hello_retry_request_rejects_a_malformed_cookie() {
+        let session_id = [0x6b; 32];
+        let with_cookie_body = |body: &[u8]| {
+            let mut exts = Vec::new();
+            push_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes()).unwrap();
+            push_extension(&mut exts, EXT_KEY_SHARE, &GROUP_SECP256R1.to_be_bytes()).unwrap();
+            push_extension(&mut exts, EXT_COOKIE, body).unwrap();
+            let mut hs = Vec::new();
+            hs.extend_from_slice(&TLS12.to_be_bytes());
+            hs.extend_from_slice(hrr_random());
+            hs.push(session_id.len() as u8);
+            hs.extend_from_slice(&session_id);
+            hs.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+            hs.push(0);
+            push_vec_u16(&mut hs, &exts).unwrap();
+            handshake_record(TLS12.to_be_bytes(), HANDSHAKE_SERVER_HELLO, &hs).unwrap()
+        };
+
+        // Zero-length cookie: violates the <1..> lower bound.
+        let mut empty = Vec::new();
+        push_vec_u16(&mut empty, b"").unwrap();
+        assert!(parse_hello_retry_request(&with_cookie_body(&empty), &session_id).is_err());
+
+        // Trailing bytes after the length-prefixed body.
+        let mut trailing = Vec::new();
+        push_vec_u16(&mut trailing, b"c00kie").unwrap();
+        trailing.push(0xff);
+        assert!(parse_hello_retry_request(&with_cookie_body(&trailing), &session_id).is_err());
+
+        // A well-formed cookie still parses, so the above are about malformation.
+        let mut good = Vec::new();
+        push_vec_u16(&mut good, b"c00kie").unwrap();
+        assert_eq!(
+            parse_hello_retry_request(&with_cookie_body(&good), &session_id)
+                .unwrap()
+                .cookie
+                .as_deref(),
+            Some(b"c00kie".as_slice())
+        );
     }
 
     // RFC 8446 §4.2 bans a repeated extension type. The check must cover EVERY
