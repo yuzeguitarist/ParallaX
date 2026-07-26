@@ -100,6 +100,43 @@ const FIRST_RECORD_WAIT_FLOOR: Duration = Duration::from_secs(8);
 /// prober converges to over many silent probes -- but it raises measuring the
 /// wait from a single shot to a multi-sample minimum. Only ever extends the wait.
 const FIRST_RECORD_WAIT_JITTER: Duration = Duration::from_secs(7);
+/// How long a freshly accepted connection may stay silent before we speculatively
+/// dial the camouflage origin (#197).
+///
+/// # What this fixes
+///
+/// The give-up wait above is client-facing, but it used to also gate when the
+/// origin was *dialed*: a silent prober's connection sat locally for 8-15s and
+/// only then established the origin connection, so the origin's own idle clock
+/// started 8-15s late and the observed close landed at `8-15s + origin_idle` —
+/// an additive offset against connecting to the bare origin, and the one close-
+/// timing signal a keyless prober could converge on.
+///
+/// Pre-dialing decouples the two: the origin connection (and therefore the
+/// origin's idle clock) starts at ~this delay, while the client-facing read keeps
+/// its FULL [`FIRST_RECORD_WAIT_FLOOR`] + jitter budget. A silent probe's close
+/// now lands at `~PREDIAL + origin_idle`, overlapping the bare-origin baseline.
+///
+/// # Why a delay at all rather than dialing on accept
+///
+/// A legitimate client's ClientHello arrives in the same flight as the handshake
+/// ACK, so it is essentially always present within this window; gating on it
+/// keeps ParallaX from opening (and immediately discarding) an origin connection
+/// for every authenticated session, which would multiply load on the camouflage
+/// origin for no anti-probing gain. The delay is deliberately far above a normal
+/// LAN/WAN delivery gap and far below the give-up floor.
+///
+/// # Residual
+///
+/// Two, both bounded and documented rather than hidden:
+///
+/// 1. This delay itself is still additive (~150ms vs the 8-15s it replaces).
+/// 2. An origin whose own idle timeout is SHORTER than the give-up wait would be
+///    closed by us at the give-up instead of at its own close time. Real
+///    camouflage origins sit far above it (nginx `ssl_handshake_timeout`
+///    defaults to 60s), so this does not arise in practice, and where it did the
+///    offset would be no worse than today's.
+const FIRST_RECORD_PREDIAL_DELAY: Duration = Duration::from_millis(150);
 /// Pure resource backstop for the camouflage relay idle cap -- NOT an
 /// anti-probing measure. A legitimate relay resets it on every byte and a real
 /// origin/client drives the close first, so this fires only on a deliberately
@@ -888,6 +925,14 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     // timing tell. Warming it here folds that cost into startup.
     reject_path_constant_work();
 
+    // Install the memory-scrape seccomp denylist now: keys are loaded, every
+    // listener is bound, and the reject-path ballast is warmed, so all of that
+    // startup work runs unfiltered — only the steady-state serving loop below is
+    // governed. Best-effort by construction (it warns and continues on an old
+    // kernel or a blocking container) and never touches the wire, so it cannot
+    // introduce an externally observable behavior change.
+    crate::process_hardening::install_late_seccomp_filter();
+
     loop {
         let (client, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -1041,24 +1086,45 @@ async fn handle_connection_inner(
     );
     let server_private = secrets.private_key();
     let server_public_key = secrets.server_public_key();
-    let first_record = match read_first_client_record(&mut client).await? {
+    let FirstReadWithOrigin {
+        read,
+        predialed_origin,
+    } = read_first_client_record_predialing(&mut client, &config.fallback_addr).await?;
+    let first_record = match read {
         FirstClientRead::Record(record) => record,
         FirstClientRead::FallbackPrefix(prefix) => {
             tracing::info!(
                 cid,
                 prefix_len = prefix.len(),
+                predialed = predialed_origin.is_some(),
                 "falling back to camouflage origin before a complete ClientHello"
             );
-            relay_fallback(client, &config.fallback_addr, prefix).await?;
+            relay_fallback_reusing_origin(client, &config.fallback_addr, prefix, predialed_origin)
+                .await?;
             return Ok(());
         }
     };
     match decide_connection_inbound(&first_record, psk, &config.authorized_sni, server_private)? {
         ConnectionDecision::Fallback(reason) => {
             tracing::info!(cid, ?reason, "falling back to camouflage origin");
-            relay_fallback(client, &config.fallback_addr, first_record).await?;
+            relay_fallback_reusing_origin(
+                client,
+                &config.fallback_addr,
+                first_record,
+                predialed_origin,
+            )
+            .await?;
         }
         ConnectionDecision::Authenticated(authenticated) => {
+            // A pre-dial only happens when the peer stayed silent past
+            // FIRST_RECORD_PREDIAL_DELAY, which an authenticating client normally
+            // does not, so this is the rare slow-client case. `accept_authenticated`
+            // opens its own origin connection for the real ServerHello, so release
+            // the spare with the same FIN-first teardown every other origin
+            // connection gets — never a bare drop, which would RST.
+            if let Some(spare) = predialed_origin {
+                graceful_close_tcp_stream(spare).await;
+            }
             let AuthenticatedInbound {
                 hello: client_hello,
                 x25519_shared_secret,
@@ -1415,13 +1481,37 @@ pub async fn relay_fallback(
     fallback_addr: &str,
     first_client_record: Vec<u8>,
 ) -> Result<(), HandshakeServerError> {
+    relay_fallback_reusing_origin(client, fallback_addr, first_client_record, None).await
+}
+
+/// [`relay_fallback`], optionally adopting an origin connection that was already
+/// dialed while waiting for the client's first record (#197).
+///
+/// Reusing it matters for more than efficiency: dialing a second time would make
+/// a silent-then-talkative probe open TWO origin connections where a real client
+/// opens one, and would put the give-up delay back in front of the connection
+/// that actually carries the splice.
+async fn relay_fallback_reusing_origin(
+    client: TcpStream,
+    fallback_addr: &str,
+    first_client_record: Vec<u8>,
+    predialed_origin: Option<TcpStream>,
+) -> Result<(), HandshakeServerError> {
     // Acquire the camouflage origin and replay the bytes we already read. If any
     // of this fails we must not just drop `client`: a bare drop with bytes still
     // queued in its receive buffer makes the kernel emit a RST, which is an
     // observable difference from an ordinary origin. Drain and FIN it instead,
     // exactly like the relay teardown, so both fallback exits behave the same.
-    let fallback = match connect_and_forward_to_fallback(fallback_addr, &first_client_record).await
-    {
+    let forwarded = match predialed_origin {
+        // Already connected and tuned by the pre-dial; only the replay is left.
+        Some(mut fallback) => fallback
+            .write_all(&first_client_record)
+            .await
+            .map(|()| fallback)
+            .map_err(HandshakeServerError::Io),
+        None => connect_and_forward_to_fallback(fallback_addr, &first_client_record).await,
+    };
+    let fallback = match forwarded {
         Ok(fallback) => fallback,
         Err(err) => {
             graceful_close_tcp_stream(client).await;
@@ -1852,6 +1942,75 @@ async fn read_first_client_record(
     stream: &mut TcpStream,
 ) -> Result<FirstClientRead, HandshakeServerError> {
     read_first_client_record_with_timeout(stream, first_record_wait_timeout()).await
+}
+
+/// The first-record read plus any origin connection opened while waiting for it.
+struct FirstReadWithOrigin {
+    read: FirstClientRead,
+    /// An origin connection dialed speculatively because the client stayed silent
+    /// past [`FIRST_RECORD_PREDIAL_DELAY`]. Carries NO forwarded bytes yet, so it
+    /// is equally usable by the splice path (forward the prefix onto it) and
+    /// discardable by the authenticated path.
+    predialed_origin: Option<TcpStream>,
+}
+
+/// Read the client's first record while starting the camouflage origin's clock
+/// early for a silent peer (#197).
+///
+/// The client-facing budget is unchanged — a slow-but-legitimate client still gets
+/// the full [`first_record_wait_timeout`]. The only thing that moves earlier is
+/// the origin *dial*, which is what the prober's close-timing measurement actually
+/// keys on. See [`FIRST_RECORD_PREDIAL_DELAY`].
+///
+/// A pre-dial failure is deliberately swallowed: the connection then behaves
+/// exactly as before this change (the splice path dials at give-up), so a
+/// broken/unreachable origin degrades into the pre-existing path rather than into
+/// a new, separately observable one.
+async fn read_first_client_record_predialing(
+    client: &mut TcpStream,
+    fallback_addr: &str,
+) -> Result<FirstReadWithOrigin, HandshakeServerError> {
+    let read = read_first_client_record_with_timeout(client, first_record_wait_timeout());
+    tokio::pin!(read);
+
+    // Phase 1: the common case. A real client's ClientHello is already here, so
+    // this resolves long before the delay and nothing is dialed.
+    tokio::select! {
+        biased;
+        read = &mut read => {
+            return Ok(FirstReadWithOrigin { read: read?, predialed_origin: None });
+        }
+        _ = sleep(FIRST_RECORD_PREDIAL_DELAY) => {}
+    }
+
+    // Phase 2: silent so far. Start the origin's idle clock NOW, concurrently with
+    // the remaining client-facing budget, so the eventual close time is driven by
+    // the origin rather than by our local give-up.
+    // Socket setup must match `connect_and_forward_to_fallback` exactly, so a
+    // pre-dialed origin connection is byte-for-byte interchangeable with one
+    // dialed at give-up time.
+    let dial = async {
+        let stream = connect_tcp_with_timeout(fallback_addr).await?;
+        tune_tcp_stream(&stream)?;
+        Ok::<TcpStream, HandshakeServerError>(stream)
+    };
+    tokio::pin!(dial);
+    let mut predialed_origin = None;
+    let mut dial_settled = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            read = &mut read => {
+                return Ok(FirstReadWithOrigin { read: read?, predialed_origin });
+            }
+            dialed = &mut dial, if !dial_settled => {
+                dial_settled = true;
+                // `Err` => no pre-dial; the splice path dials at give-up as before.
+                predialed_origin = dialed.ok();
+            }
+        }
+    }
 }
 
 async fn read_first_client_record_with_timeout<R>(
@@ -8734,6 +8893,97 @@ mod tests {
             "deadline must fire within a few records (remaining {})",
             reader.remaining
         );
+    }
+
+    // #197: a peer that sends its ClientHello promptly (every real client, and any
+    // prober that actually speaks) must take exactly the pre-change path — the read
+    // resolves inside phase 1, so NO speculative origin connection is opened. This
+    // is the no-regression half of the pre-dial change: without it, the fix would
+    // have doubled origin connections for ordinary traffic.
+    #[tokio::test]
+    async fn prompt_first_record_never_predials_the_origin() {
+        // Deliberately unroutable: if the prompt path dialed at all, the attempt
+        // would show up as a delay here rather than silently succeeding.
+        let unreachable_origin = "127.0.0.1:1";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let record = client_hello_fixture_with_key_share("example.com", &[0x33; 32]);
+        let sent = record.clone();
+        tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&sent).await.unwrap();
+            // Hold the connection open so the read cannot finish on EOF instead.
+            sleep(Duration::from_secs(30)).await;
+        });
+
+        let (mut server_side, _) = listener.accept().await.unwrap();
+        let outcome = read_first_client_record_predialing(&mut server_side, unreachable_origin)
+            .await
+            .expect("a complete first record must read cleanly");
+
+        assert!(
+            outcome.predialed_origin.is_none(),
+            "a prompt client must not trigger a speculative origin dial"
+        );
+        assert_eq!(outcome.read, FirstClientRead::Record(record));
+    }
+
+    // #197: the fix itself. For a SILENT peer the camouflage origin must be dialed
+    // on the pre-dial delay, not after the 8-15s give-up — the origin connection's
+    // establishment time is what starts the origin's own idle clock and therefore
+    // what sets the close time a keyless prober measures. Asserting the dial lands
+    // far below FIRST_RECORD_WAIT_FLOOR is exactly the "no additive 8-15s offset"
+    // acceptance criterion; the client-facing read budget is deliberately NOT
+    // shortened, which the returned-read assertion below pins.
+    #[tokio::test]
+    #[ignore = "dynamic wall-clock timing; run serially in the --ignored lane"]
+    async fn silent_probe_predials_origin_long_before_the_give_up() {
+        use std::time::Instant;
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap().to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The prober: connects, then says nothing at all. Held for the whole test.
+        let _prober = TcpStream::connect(addr).await.unwrap();
+        let (mut server_side, _) = listener.accept().await.unwrap();
+
+        let started = Instant::now();
+        let reader = tokio::spawn(async move {
+            read_first_client_record_predialing(&mut server_side, &origin_addr).await
+        });
+
+        // The origin must be reached well inside the give-up floor. A generous
+        // ceiling keeps this robust on a loaded CI box while still being an order
+        // of magnitude below the 8s floor it is asserting against.
+        let accepted = timeout(Duration::from_secs(2), origin_listener.accept())
+            .await
+            .expect("silent peer must trigger the origin dial before the give-up wait")
+            .expect("origin accept must succeed");
+        let dialed_after = started.elapsed();
+        drop(accepted);
+
+        assert!(
+            dialed_after < FIRST_RECORD_WAIT_FLOOR,
+            "origin was dialed after {dialed_after:?}, which is not below the {FIRST_RECORD_WAIT_FLOOR:?} \
+             give-up floor — the additive close-timing offset is back"
+        );
+        assert!(
+            dialed_after >= FIRST_RECORD_PREDIAL_DELAY,
+            "origin was dialed after {dialed_after:?}, before the {FIRST_RECORD_PREDIAL_DELAY:?} \
+             silence delay — prompt clients would be paying for an origin connection"
+        );
+
+        // The client-facing budget must be untouched: the read is still outstanding
+        // long past the pre-dial, i.e. a slow-but-legitimate client has not been
+        // cut short by the speculative dial.
+        assert!(
+            !reader.is_finished(),
+            "the first-record read must keep its full budget after a pre-dial"
+        );
+        reader.abort();
     }
 
     #[tokio::test]

@@ -118,6 +118,7 @@ jobs:
             --test safari_h3_clienthello_0rtt_baseline \
             --test safari_h3_clienthello_baseline \
             --test safari_parity_baseline \
+            --test seccomp_late_install \
             --test splice_equivalence
 
       # Loopback integration tests are marked #[ignore] because they open
