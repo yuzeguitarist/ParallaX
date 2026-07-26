@@ -311,6 +311,7 @@ impl Safari26TlsCamouflage {
             sni,
             accept_language: crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE.to_owned(),
             retry_key_share: None,
+            sent_compat_ccs: false,
             tap: VecRecordTap::default(),
         })
     }
@@ -336,6 +337,14 @@ pub struct Safari26TlsSession {
     /// Key share generated in response to a HelloRetryRequest, if one occurred.
     /// Its group supersedes the first ClientHello's shares for the ECDH step.
     retry_key_share: Option<RetryKeyShare>,
+    /// Whether the middlebox-compatibility ChangeCipherSpec has been sent.
+    ///
+    /// RFC 8446 §D.4 has the client send it exactly ONCE, immediately before its
+    /// second flight. Without a HelloRetryRequest that flight is the encrypted
+    /// Finished; with one it is ClientHello2, which arrives earlier. Both sites
+    /// set this and both honor it, so an HRR handshake emits one CCS rather than
+    /// two — a doubled CCS is a wire shape no real client produces.
+    sent_compat_ccs: bool,
     tap: VecRecordTap,
 }
 
@@ -405,6 +414,35 @@ impl Safari26TlsSession {
         })
     }
 
+    /// Send the TLS 1.3 middlebox-compatibility ChangeCipherSpec, at most once per
+    /// connection (RFC 8446 §D.4).
+    ///
+    /// A real BoringSSL/Safari client emits `14 03 03 00 01 01` immediately before
+    /// its SECOND flight. Without a HelloRetryRequest that flight is the encrypted
+    /// Finished; with one it is ClientHello2, which comes earlier — but it is the
+    /// same single record either way, so both sites route through here. Keeping the
+    /// "exactly once" rule inside ONE function rather than in two independently
+    /// gated copies is deliberate: the duplicated-emission bug this replaces came
+    /// from exactly that duplication.
+    ///
+    /// The CCS is a record-layer message, not a handshake message, so it is written
+    /// straight to the socket and never folded into the handshake transcript (which
+    /// must stay CH || SH || ... for the Finished verify_data). The server treats it
+    /// as undecryptable camouflage and forwards it verbatim to the origin.
+    async fn send_compat_ccs_once(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> Result<(), Safari26TlsError> {
+        if self.sent_compat_ccs {
+            return Ok(());
+        }
+        let ccs = change_cipher_spec();
+        self.tap_records(RecordDirection::Outbound, &ccs);
+        stream.write_all(&ccs).await?;
+        self.sent_compat_ccs = true;
+        Ok(())
+    }
+
     /// Answer a HelloRetryRequest the way Safari/BoringSSL does and return the
     /// real ServerHello that follows (#198).
     ///
@@ -440,9 +478,10 @@ impl Safari26TlsSession {
         transcript.collapse_for_hello_retry(hrr.cipher_suite)?;
         transcript.push_handshake_record(hrr_record)?;
 
-        let ccs = change_cipher_spec();
-        self.tap_records(RecordDirection::Outbound, &ccs);
-        stream.write_all(&ccs).await?;
+        // With a HelloRetryRequest the client's second flight is ClientHello2, so
+        // the compat CCS belongs here — and is therefore NOT repeated before the
+        // Finished. See `send_compat_ccs_once`.
+        self.send_compat_ccs_once(stream).await?;
 
         let key_share_body = single_key_share_extension(retry_share.group, &retry_share.public)?;
         let second_client_hello = rewrite_client_hello_for_retry(
@@ -460,6 +499,17 @@ impl Safari26TlsSession {
         if is_hello_retry_request(&next) {
             return Err(Safari26TlsError::Handshake(
                 "server sent a second HelloRetryRequest".to_owned(),
+            ));
+        }
+        // RFC 8446 §4.1.4: the ServerHello must keep the cipher suite the
+        // HelloRetryRequest chose. This is not just conformance — the transcript
+        // above was collapsed under the HRR suite's hash, while the key schedule
+        // is derived under the ServerHello's. Letting them diverge would silently
+        // build the handshake on two different hashes.
+        let selected = parse_safari_server_hello(&next, &self.sent_session_id)?.cipher_suite;
+        if selected != hrr.cipher_suite {
+            return Err(Safari26TlsError::Handshake(
+                "ServerHello cipher_suite does not match the HelloRetryRequest".to_owned(),
             ));
         }
         Ok(next)
@@ -656,21 +706,19 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
         transcript: &mut HandshakeTranscript,
     ) -> Result<(), Safari26TlsError> {
-        // TLS 1.3 middlebox-compatibility ChangeCipherSpec (RFC 8446 §D.4). Our
-        // ClientHello always carries a non-empty (32-byte) legacy_session_id and
-        // offers neither early_data nor pre_shared_key (a full handshake), so a real
-        // BoringSSL/Safari client sends `14 03 03 00 01 01` immediately before its
-        // SECOND flight — the encrypted Finished — i.e. AFTER the ServerHello, not
-        // after the ClientHello (that earlier position only matches a 0-RTT/early-data
-        // handshake, which this is not, and is itself a passive distinguisher).
-        // Omitting it entirely is also a distinguisher. The CCS is a non-handshake
-        // record, so it is written straight to the socket and deliberately NOT folded
-        // into the handshake transcript (which must remain CH || SH || ... for the
-        // Finished verify_data). The server treats it as undecryptable camouflage and
-        // forwards it verbatim to the origin, so no server-side change is required.
-        let ccs = change_cipher_spec();
-        self.tap_records(RecordDirection::Outbound, &ccs);
-        stream.write_all(&ccs).await?;
+        // Middlebox-compat ChangeCipherSpec (RFC 8446 §D.4). Our ClientHello always
+        // carries a non-empty (32-byte) legacy_session_id and offers neither
+        // early_data nor pre_shared_key (a full handshake), so a real
+        // BoringSSL/Safari client sends it immediately before its SECOND flight.
+        // On the ordinary path that flight is this encrypted Finished — i.e. AFTER
+        // the ServerHello, not after the ClientHello (that earlier position only
+        // matches a 0-RTT/early-data handshake, which this is not, and is itself a
+        // passive distinguisher). Omitting it entirely is also a distinguisher.
+        //
+        // After a HelloRetryRequest the second flight was ClientHello2 and the CCS
+        // already went out there, so `send_compat_ccs_once` makes this a no-op —
+        // two CCS records on one connection is a shape no real client produces.
+        self.send_compat_ccs_once(stream).await?;
 
         let verify_data = keys.client_finished_verify_data(transcript)?;
         let mut message = Vec::with_capacity(4 + verify_data.len());
@@ -1267,11 +1315,31 @@ fn parse_hello_retry_request(
             }
             // In an HRR the key_share extension carries ONLY the selected group,
             // never a key_exchange (RFC 8446 §4.2.8).
+            //
+            // RFC 8446 §4.2 forbids repeating an extension type. Rejecting rather
+            // than letting the last copy win keeps a peer from steering the retry
+            // with a second, differing value that a conforming client would never
+            // have honored.
             EXT_KEY_SHARE => {
+                if selected_group.is_some() {
+                    return Err(Safari26TlsError::Handshake(
+                        "HelloRetryRequest repeated the key_share extension".to_owned(),
+                    ));
+                }
                 let mut ks = TlsCursor::new(data);
                 selected_group = Some(ks.u16()?);
+                if ks.remaining() != 0 {
+                    return Err(Safari26TlsError::Handshake(
+                        "HelloRetryRequest key_share carried a key_exchange".to_owned(),
+                    ));
+                }
             }
             EXT_COOKIE => {
+                if cookie.is_some() {
+                    return Err(Safari26TlsError::Handshake(
+                        "HelloRetryRequest repeated the cookie extension".to_owned(),
+                    ));
+                }
                 let mut ck = TlsCursor::new(data);
                 cookie = Some(ck.vec_u16()?.to_vec());
             }
@@ -1354,6 +1422,22 @@ fn single_key_share_extension(group: u16, public: &[u8]) -> Result<Vec<u8>, Safa
 /// immediately after `key_share`, keeping the two HRR-driven edits adjacent and
 /// every pre-existing extension at its original index. See the module tests for
 /// the byte-level invariants this pins.
+///
+/// # Interaction with ParallaX authentication
+///
+/// ParallaX carries its own X25519 share unmasked inside the FIRST ClientHello's
+/// `key_share` (see [`Safari26TlsCamouflage::start`]), and this rewrite replaces
+/// that extension wholesale with a single EC entry — so the second ClientHello
+/// deliberately does NOT carry the ParallaX auth binding.
+///
+/// That is correct, not a gap. A ParallaX server never emits a HelloRetryRequest;
+/// the ServerHello on this path comes from the spliced camouflage origin, and an
+/// origin only retries for a group we did not share, which none does given the
+/// x25519 + X25519MLKEM768 shares on offer. If one ever did, the retried
+/// connection simply fails to present the marker and is treated as ordinary
+/// camouflage traffic — it degrades to the fallback splice rather than
+/// authenticating. Losing a session is the safe direction; forging the marker
+/// into a retry the server never expects would not be.
 fn rewrite_client_hello_for_retry(
     client_hello: &[u8],
     key_share_body: &[u8],
@@ -1429,7 +1513,7 @@ fn hrr_random() -> &'static [u8] {
     ]
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TlsCipherSuite {
     Aes128GcmSha256,
     Aes256GcmSha384,
@@ -3581,6 +3665,155 @@ mod tests {
         let plain = rewrite_client_hello_for_retry(&first, &body, None).unwrap();
         let (_, plain_exts) = split_client_hello(&plain);
         assert!(plain_exts.iter().all(|(t, _)| *t != EXT_COOKIE));
+    }
+
+    /// Drive the retry against a peer that sends an HRR selecting `group` and then
+    /// goes away, returning (the session afterwards, everything the client wrote).
+    ///
+    /// The HRR is built from the session's OWN `sent_session_id`: the parser
+    /// enforces the RFC 8446 echo, so a mismatched id would be rejected before
+    /// anything reached the wire and every downstream assertion would pass
+    /// vacuously.
+    async fn run_retry_and_capture_wire(group: u16) -> (Safari26TlsSession, Vec<u8>) {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_key = X25519KeyPair::generate();
+        let mut session = Safari26TlsCamouflage
+            .start(
+                "example.com".to_owned(),
+                b"0123456789abcdef0123456789abcdef",
+                &server_key.public,
+            )
+            .unwrap();
+
+        let hrr = hrr_record(group, &session.sent_session_id, None);
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut transcript = HandshakeTranscript::new();
+            transcript
+                .push_handshake_record(&session.client_hello)
+                .unwrap();
+            // The peer hangs up instead of answering, so this errors — the point
+            // is what the client WROTE before that.
+            let _ = session
+                .retry_after_hello_retry_request(&mut stream, &mut transcript, &hrr)
+                .await;
+            session
+        });
+
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut wire = Vec::new();
+        // Read until the client blocks waiting for a ServerHello, then close.
+        let mut buf = [0_u8; 4096];
+        loop {
+            match tokio::time::timeout(Duration::from_millis(300), peer.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => wire.extend_from_slice(&buf[..n]),
+                Ok(Err(_)) => break,
+            }
+        }
+        drop(peer);
+        (client.await.unwrap(), wire)
+    }
+
+    /// Split a byte stream into whole TLS records as (content_type, full_record).
+    fn split_records(mut wire: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        const HEADER: usize = 5;
+        while wire.len() >= HEADER {
+            let len = u16::from_be_bytes([wire[3], wire[4]]) as usize;
+            let total = HEADER + len;
+            if wire.len() < total {
+                break;
+            }
+            out.push((wire[0], wire[..total].to_vec()));
+            wire = &wire[total..];
+        }
+        out
+    }
+
+    // The retry must put EXACTLY ONE middlebox-compat ChangeCipherSpec on the wire
+    // (RFC 8446 D.4), immediately before ClientHello2 — the client's second flight.
+    // `write_client_finished` sends the same CCS on the non-HRR path, so without
+    // the `sent_compat_ccs` gate an HRR handshake emitted two, a wire shape no real
+    // client produces and a distinguisher in its own right.
+    #[tokio::test]
+    async fn hello_retry_emits_exactly_one_change_cipher_spec_before_client_hello2() {
+        let (session, wire) = run_retry_and_capture_wire(GROUP_SECP256R1).await;
+        let records = split_records(&wire);
+        assert!(
+            !records.is_empty(),
+            "the retry must have written something to the wire"
+        );
+
+        let ccs_count = records
+            .iter()
+            .filter(|(ty, _)| *ty == TLS_RECORD_CHANGE_CIPHER_SPEC)
+            .count();
+        assert_eq!(
+            ccs_count, 1,
+            "exactly one middlebox-compat CCS, got {ccs_count}"
+        );
+        assert_eq!(
+            records[0].0, TLS_RECORD_CHANGE_CIPHER_SPEC,
+            "the CCS must come first, immediately before ClientHello2"
+        );
+        assert_eq!(
+            records[1].0, TLS_RECORD_HANDSHAKE,
+            "ClientHello2 must follow the CCS"
+        );
+        assert!(
+            session.sent_compat_ccs,
+            "the flag that suppresses the second CCS in write_client_finished must be set"
+        );
+    }
+
+    // The other half of the invariant: once the retry has sent the CCS, the emitter
+    // that `write_client_finished` uses must be a no-op. Tested on the shared
+    // `send_compat_ccs_once` rather than through `write_client_finished` (which
+    // needs a full key schedule), which is precisely why the emission was collapsed
+    // into one function — the "exactly once" rule is now checkable in isolation.
+    #[tokio::test]
+    async fn compat_ccs_is_emitted_at_most_once_per_connection() {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut session = Safari26TlsCamouflage
+            .start(
+                "example.com".to_owned(),
+                b"0123456789abcdef0123456789abcdef",
+                &X25519KeyPair::generate().public,
+            )
+            .unwrap();
+
+        let writer = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            session.send_compat_ccs_once(&mut stream).await.unwrap();
+            // Every later call — including the one inside write_client_finished on
+            // a post-HRR handshake — must put nothing further on the wire.
+            for _ in 0..3 {
+                session.send_compat_ccs_once(&mut stream).await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+            session
+        });
+
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut wire = Vec::new();
+        peer.read_to_end(&mut wire).await.unwrap();
+        let session = writer.await.unwrap();
+
+        assert_eq!(
+            wire,
+            change_cipher_spec(),
+            "four calls must yield exactly one CCS record and nothing else"
+        );
+        assert!(session.sent_compat_ccs);
     }
 
     #[test]

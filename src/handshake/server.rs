@@ -1122,8 +1122,17 @@ async fn handle_connection_inner(
             // opens its own origin connection for the real ServerHello, so release
             // the spare with the same FIN-first teardown every other origin
             // connection gets — never a bare drop, which would RST.
+            //
+            // Detached on purpose: that teardown drains until the peer closes, up
+            // to GRACEFUL_FIN_DRAIN_BUDGET. Awaiting it here would charge a
+            // legitimate, already-authenticated client up to two seconds of extra
+            // handshake latency for cleanup it has no stake in.
             if let Some(spare) = predialed_origin {
-                graceful_close_tcp_stream(spare).await;
+                tokio::spawn(async move {
+                    if let Some(spare) = spare.into_stream().await {
+                        graceful_close_tcp_stream(spare).await;
+                    }
+                });
             }
             let AuthenticatedInbound {
                 hello: client_hello,
@@ -1495,8 +1504,12 @@ async fn relay_fallback_reusing_origin(
     client: TcpStream,
     fallback_addr: &str,
     first_client_record: Vec<u8>,
-    predialed_origin: Option<TcpStream>,
+    predialed_origin: Option<PredialedOrigin>,
 ) -> Result<(), HandshakeServerError> {
+    let predialed_origin = match predialed_origin {
+        Some(origin) => origin.into_stream().await,
+        None => None,
+    };
     // Acquire the camouflage origin and replay the bytes we already read. If any
     // of this fails we must not just drop `client`: a bare drop with bytes still
     // queued in its receive buffer makes the kernel emit a RST, which is an
@@ -1944,14 +1957,34 @@ async fn read_first_client_record(
     read_first_client_record_with_timeout(stream, first_record_wait_timeout()).await
 }
 
+/// An origin connection opened speculatively while waiting for the first record.
+///
+/// Carries NO forwarded bytes either way, so it is equally usable by the splice
+/// path (forward the prefix onto it) and discardable by the authenticated path.
+enum PredialedOrigin {
+    /// The dial completed before the read did.
+    Ready(TcpStream),
+    /// The read won while the dial was still in flight. Handed over rather than
+    /// dropped so the splice path awaits THIS connect instead of starting a
+    /// second one to the same origin.
+    Pending(tokio::task::JoinHandle<Result<TcpStream, HandshakeServerError>>),
+}
+
+impl PredialedOrigin {
+    /// Resolve to a connected origin, or `None` if the dial failed — in which case
+    /// the caller falls back to dialing at give-up, the pre-existing behavior.
+    async fn into_stream(self) -> Option<TcpStream> {
+        match self {
+            Self::Ready(stream) => Some(stream),
+            Self::Pending(handle) => handle.await.ok().and_then(Result::ok),
+        }
+    }
+}
+
 /// The first-record read plus any origin connection opened while waiting for it.
 struct FirstReadWithOrigin {
     read: FirstClientRead,
-    /// An origin connection dialed speculatively because the client stayed silent
-    /// past [`FIRST_RECORD_PREDIAL_DELAY`]. Carries NO forwarded bytes yet, so it
-    /// is equally usable by the splice path (forward the prefix onto it) and
-    /// discardable by the authenticated path.
-    predialed_origin: Option<TcpStream>,
+    predialed_origin: Option<PredialedOrigin>,
 }
 
 /// Read the client's first record while starting the camouflage origin's clock
@@ -1986,15 +2019,24 @@ async fn read_first_client_record_predialing(
     // Phase 2: silent so far. Start the origin's idle clock NOW, concurrently with
     // the remaining client-facing budget, so the eventual close time is driven by
     // the origin rather than by our local give-up.
+    //
+    // The dial runs as its own task rather than as a future polled by the select
+    // below, because the read can win the race while the dial is still in flight.
+    // A future dropped at that point abandons a connect that may already have
+    // completed the TCP handshake at the origin, and the splice path would then
+    // dial a SECOND time — two origin connections where a real client makes one,
+    // which is the establishment-pattern tell this whole path exists to avoid.
+    // Owning it as a task lets the winner hand it onward instead.
+    //
     // Socket setup must match `connect_and_forward_to_fallback` exactly, so a
     // pre-dialed origin connection is byte-for-byte interchangeable with one
     // dialed at give-up time.
-    let dial = async {
-        let stream = connect_tcp_with_timeout(fallback_addr).await?;
+    let addr = fallback_addr.to_owned();
+    let mut dial = tokio::spawn(async move {
+        let stream = connect_tcp_with_timeout(&addr).await?;
         tune_tcp_stream(&stream)?;
         Ok::<TcpStream, HandshakeServerError>(stream)
-    };
-    tokio::pin!(dial);
+    });
     let mut predialed_origin = None;
     let mut dial_settled = false;
 
@@ -2002,12 +2044,21 @@ async fn read_first_client_record_predialing(
         tokio::select! {
             biased;
             read = &mut read => {
-                return Ok(FirstReadWithOrigin { read: read?, predialed_origin });
+                let read = read?;
+                // Still connecting: pass the task on so whoever needs the origin
+                // awaits THIS dial rather than starting another.
+                let pending = (!dial_settled).then_some(dial);
+                return Ok(FirstReadWithOrigin {
+                    read,
+                    predialed_origin: predialed_origin.map(PredialedOrigin::Ready)
+                        .or(pending.map(PredialedOrigin::Pending)),
+                });
             }
             dialed = &mut dial, if !dial_settled => {
                 dial_settled = true;
-                // `Err` => no pre-dial; the splice path dials at give-up as before.
-                predialed_origin = dialed.ok();
+                // A dial error (or a panicked/cancelled task) means no pre-dial and
+                // the splice path dials at give-up, exactly as before this change.
+                predialed_origin = dialed.ok().and_then(Result::ok);
             }
         }
     }
