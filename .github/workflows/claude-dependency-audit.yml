@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -43,7 +43,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         with:
           tool: cargo-audit
 
@@ -72,7 +72,7 @@ jobs:
       # No github_token => Claude App token, so its PR triggers CI. The hook +
       # deny-list block any write to main and any PR merge.
       - if: steps.scan.outputs.has_findings == 'true' && github.event.pull_request.user.type != 'Bot'
-        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        uses: anthropics/claude-code-action@44423bdec74b97d67543eb16c110546762c110b2 # v1.0.181
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
