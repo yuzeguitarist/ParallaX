@@ -1390,10 +1390,28 @@ pub fn decode_psk(value: &str) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
     Ok(Zeroizing::new(decoded))
 }
 
-/// Heuristic, conservative low-entropy check for a decoded PSK. A CSPRNG-derived
-/// 32-byte key spans ~30 distinct byte values, so requiring at least 16 distinct
-/// values flags only obviously weak keys (repeated characters, short passphrases)
-/// with no false positives for random keys.
+/// Heuristic, conservative low-entropy check for a decoded PSK.
+///
+/// Three independent rejects, each chosen so that CSPRNG output essentially never
+/// trips it (a false positive would lock an operator out of a *good* key, which is
+/// worse than the weak key this gates):
+///
+/// 1. **Byte cardinality.** A CSPRNG-derived 32-byte key spans ~30 distinct byte
+///    values, so requiring at least 16 flags repeated characters and short
+///    passphrases.
+/// 2. **Periodicity.** Cardinality alone passes a repeated block such as
+///    `0123456789abcdef` twice over: 16 distinct bytes, yet only 16 bytes of real
+///    material and trivially guessable. A random 32-byte string has period `p`
+///    with probability `256^-(32-p)`, so for every `p <= len/2` this is
+///    unreachable by chance.
+/// 3. **Arithmetic progression.** Catches `0,1,2,...,31` and any constant-stride
+///    ramp — 32 distinct bytes, so cardinality waves it through, but fully
+///    predictable. A random string is a progression with probability `256^-(n-2)`.
+///
+/// This remains a heuristic, not an entropy estimator: a dictionary passphrase
+/// with enough byte diversity and no periodic structure still passes. The real
+/// defense is generated material (`plx init` / `openssl rand -base64 32`), which
+/// the warning in [`check_psk_strength`] points operators to.
 fn psk_looks_low_entropy(decoded: &[u8]) -> bool {
     const MIN_DISTINCT_BYTES: usize = 16;
     let mut seen = [false; 256];
@@ -1405,6 +1423,26 @@ fn psk_looks_low_entropy(decoded: &[u8]) -> bool {
         }
     }
     distinct < MIN_DISTINCT_BYTES
+        || has_repeating_period(decoded)
+        || is_arithmetic_progression(decoded)
+}
+
+/// True if `bytes` repeats with any period `p <= len / 2`, i.e. it is a short
+/// block tiled to length. Also covers the all-same-byte case (`p == 1`).
+fn has_repeating_period(bytes: &[u8]) -> bool {
+    (1..=bytes.len() / 2).any(|p| bytes[p..].iter().zip(bytes).all(|(a, b)| a == b))
+}
+
+/// True if every adjacent byte pair differs by the same (wrapping) stride, i.e.
+/// the key is a constant-step ramp such as `0,1,2,...,31`.
+fn is_arithmetic_progression(bytes: &[u8]) -> bool {
+    if bytes.len() < 3 {
+        return false;
+    }
+    let stride = bytes[1].wrapping_sub(bytes[0]);
+    bytes
+        .windows(2)
+        .all(|pair| pair[1].wrapping_sub(pair[0]) == stride)
 }
 
 /// Enforces PSK strength. In `strict` mode (a server) a low-entropy PSK is a hard
@@ -2175,10 +2213,97 @@ server_identity_public_key = "{KEY}"
 
     #[test]
     fn strong_psk_passes_strict_mode() {
-        // >= 16 distinct bytes => not flagged, so strict mode accepts it.
-        let strong = b"0123456789abcdef0123456789abcdef";
+        // 32 distinct bytes, no periodicity, no constant stride => not flagged.
+        // NOTE: the previous fixture here was `0123456789abcdef` repeated twice,
+        // which clears the cardinality bar but is a tiled 16-byte block — exactly
+        // the predictable-yet-diverse shape the periodicity check now rejects.
+        let strong = b"0123456789abcdefzyxwvutsrqponmlk";
         assert!(!psk_looks_low_entropy(strong));
         assert!(check_psk_strength(strong, true).is_ok());
+    }
+
+    #[test]
+    fn incrementing_ramp_psk_is_low_entropy() {
+        // 32 distinct bytes, so the cardinality check alone passes it, yet the key
+        // is fully predictable. The arithmetic-progression check is what rejects it.
+        let ramp: Vec<u8> = (0_u8..32).collect();
+        assert_eq!(distinct_byte_count(&ramp), 32);
+        assert!(psk_looks_low_entropy(&ramp));
+        assert!(matches!(
+            check_psk_strength(&ramp, true),
+            Err(ConfigError::LowEntropyPsk)
+        ));
+    }
+
+    #[test]
+    fn descending_ramp_psk_is_low_entropy() {
+        // Same shape, negative stride — the wrapping subtraction must catch it too.
+        let ramp: Vec<u8> = (0_u8..32).rev().collect();
+        assert!(psk_looks_low_entropy(&ramp));
+    }
+
+    #[test]
+    fn repeated_block_psk_is_low_entropy() {
+        // A tiled 16-byte block: 16 distinct bytes clears the cardinality bar, but
+        // it carries only 16 bytes of material.
+        let block = b"0123456789abcdef";
+        let mut tiled = Vec::with_capacity(32);
+        tiled.extend_from_slice(block);
+        tiled.extend_from_slice(block);
+        assert_eq!(distinct_byte_count(&tiled), 16);
+        assert!(psk_looks_low_entropy(&tiled));
+        assert!(matches!(
+            check_psk_strength(&tiled, true),
+            Err(ConfigError::LowEntropyPsk)
+        ));
+
+        // Shorter period, and a period that does not divide the length evenly
+        // (truncated final block) must both be caught.
+        let mut tiled4 = Vec::new();
+        for _ in 0..8 {
+            tiled4.extend_from_slice(b"\x01\x7f\xa3\xdd");
+        }
+        assert!(psk_looks_low_entropy(&tiled4));
+        let mut ragged = Vec::new();
+        while ragged.len() < 34 {
+            ragged.extend_from_slice(b"0123456789abcdefz");
+        }
+        ragged.truncate(34);
+        assert!(psk_looks_low_entropy(&ragged));
+    }
+
+    #[test]
+    fn csprng_psks_are_not_flagged_as_low_entropy() {
+        // The false-positive guard: a heuristic that rejects good keys would lock
+        // operators out of CSPRNG material, which is worse than the weak keys it
+        // gates. Every reject above is unreachable by chance at 32 bytes
+        // (periodicity <= 256^-16, progression <= 256^-30, cardinality by
+        // coupon-collector), so a large sample must come back completely clean.
+        use rand::RngCore;
+        let mut rng = rand::rngs::OsRng;
+        let mut key = [0_u8; 32];
+        for _ in 0..10_000 {
+            rng.fill_bytes(&mut key);
+            assert!(
+                !psk_looks_low_entropy(&key),
+                "false positive on CSPRNG key: {key:02x?}"
+            );
+        }
+    }
+
+    /// Test-only helper mirroring the cardinality half of `psk_looks_low_entropy`,
+    /// so the tests above can assert that a fixture clears the distinct-byte bar
+    /// and is therefore rejected by one of the newer structural checks.
+    fn distinct_byte_count(bytes: &[u8]) -> usize {
+        let mut seen = [false; 256];
+        let mut distinct = 0_usize;
+        for &b in bytes {
+            if !seen[b as usize] {
+                seen[b as usize] = true;
+                distinct += 1;
+            }
+        }
+        distinct
     }
 
     #[test]

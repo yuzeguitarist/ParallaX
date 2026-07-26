@@ -37,11 +37,12 @@ use super::{
     },
     safari_shape::{
         key_share_extension, signature_algorithms_extension, supported_groups_extension,
-        supported_versions_extension, GreaseSet, GROUP_X25519, GROUP_X25519_MLKEM768,
-        MLKEM768_PUBLIC_KEY_LEN, SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384,
-        SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512, SIG_RSA_PSS_RSAE_SHA256,
-        SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, TLS12, TLS13, TLS_AES_128_GCM_SHA256,
-        TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, X25519_KEY_LEN,
+        supported_versions_extension, GreaseSet, GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1,
+        GROUP_X25519, GROUP_X25519_MLKEM768, MLKEM768_PUBLIC_KEY_LEN, SIG_ECDSA_SECP256R1_SHA256,
+        SIG_ECDSA_SECP384R1_SHA384, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384,
+        SIG_RSA_PKCS1_SHA512, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384,
+        SIG_RSA_PSS_RSAE_SHA512, TLS12, TLS13, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
+        TLS_CHACHA20_POLY1305_SHA256, X25519_KEY_LEN,
     },
     server_hello::parse_server_hello,
 };
@@ -117,6 +118,9 @@ const HANDSHAKE_CERTIFICATE: u8 = 0x0b;
 const HANDSHAKE_CERTIFICATE_VERIFY: u8 = 0x0f;
 const HANDSHAKE_FINISHED: u8 = 0x14;
 const HANDSHAKE_COMPRESSED_CERTIFICATE: u8 = 0x19;
+/// Synthetic handshake type that stands in for ClientHello1 in a
+/// HelloRetryRequest transcript (RFC 8446 §4.4.1). Never sent on the wire.
+const HANDSHAKE_MESSAGE_HASH: u8 = 0xfe;
 
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_STATUS_REQUEST: u16 = 0x0005;
@@ -306,6 +310,8 @@ impl Safari26TlsCamouflage {
             sent_session_id: session_id,
             sni,
             accept_language: crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE.to_owned(),
+            retry_key_share: None,
+            sent_compat_ccs: false,
             tap: VecRecordTap::default(),
         })
     }
@@ -328,6 +334,17 @@ pub struct Safari26TlsSession {
     /// [`Self::with_accept_language`] so an operator's configured locale flows
     /// into the emitted request instead of a fleet-wide constant.
     accept_language: String,
+    /// Key share generated in response to a HelloRetryRequest, if one occurred.
+    /// Its group supersedes the first ClientHello's shares for the ECDH step.
+    retry_key_share: Option<RetryKeyShare>,
+    /// Whether the middlebox-compatibility ChangeCipherSpec has been sent.
+    ///
+    /// RFC 8446 §D.4 has the client send it exactly ONCE, immediately before its
+    /// second flight. Without a HelloRetryRequest that flight is the encrypted
+    /// Finished; with one it is ClientHello2, which arrives earlier. Both sites
+    /// set this and both honor it, so an HRR handshake emits one CCS rather than
+    /// two — a doubled CCS is a wire shape no real client produces.
+    sent_compat_ccs: bool,
     tap: VecRecordTap,
 }
 
@@ -357,7 +374,18 @@ impl Safari26TlsSession {
         self.tap_records(RecordDirection::Outbound, &client_hello);
         stream.write_all(&self.client_hello).await?;
 
-        let server_hello_record = self.read_server_hello_record(stream).await?;
+        let mut server_hello_record = self.read_server_hello_record(stream).await?;
+
+        // A HelloRetryRequest is a ServerHello carrying the reserved random. Real
+        // Safari answers it with a second ClientHello; aborting here (the previous
+        // behavior) was an active-probe distinguisher, since a cooperating server
+        // that always replies with HRR could separate this client from Safari
+        // without any passive signal. See `retry_after_hello_retry_request`.
+        if is_hello_retry_request(&server_hello_record) {
+            server_hello_record = self
+                .retry_after_hello_retry_request(stream, &mut transcript, &server_hello_record)
+                .await?;
+        }
         transcript.push_handshake_record(&server_hello_record)?;
         let server_hello = parse_safari_server_hello(&server_hello_record, &self.sent_session_id)?;
         let shared_secret = self.tls_shared_secret(&server_hello)?;
@@ -384,6 +412,107 @@ impl Safari26TlsSession {
             negotiated_alpn,
             post_handshake_records,
         })
+    }
+
+    /// Send the TLS 1.3 middlebox-compatibility ChangeCipherSpec, at most once per
+    /// connection (RFC 8446 §D.4).
+    ///
+    /// A real BoringSSL/Safari client emits `14 03 03 00 01 01` immediately before
+    /// its SECOND flight. Without a HelloRetryRequest that flight is the encrypted
+    /// Finished; with one it is ClientHello2, which comes earlier — but it is the
+    /// same single record either way, so both sites route through here. Keeping the
+    /// "exactly once" rule inside ONE function rather than in two independently
+    /// gated copies is deliberate: the duplicated-emission bug this replaces came
+    /// from exactly that duplication.
+    ///
+    /// The CCS is a record-layer message, not a handshake message, so it is written
+    /// straight to the socket and never folded into the handshake transcript (which
+    /// must stay CH || SH || ... for the Finished verify_data). The server treats it
+    /// as undecryptable camouflage and forwards it verbatim to the origin.
+    async fn send_compat_ccs_once(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> Result<(), Safari26TlsError> {
+        if self.sent_compat_ccs {
+            return Ok(());
+        }
+        let ccs = change_cipher_spec();
+        self.tap_records(RecordDirection::Outbound, &ccs);
+        stream.write_all(&ccs).await?;
+        self.sent_compat_ccs = true;
+        Ok(())
+    }
+
+    /// Answer a HelloRetryRequest the way Safari/BoringSSL does and return the
+    /// real ServerHello that follows (#198).
+    ///
+    /// Ordering follows RFC 8446 §4.4.1 and §4.1.4 exactly:
+    /// 1. validate the selected group (offered, and not one already shared),
+    /// 2. collapse ClientHello1 in the transcript into `message_hash`,
+    /// 3. hash the HelloRetryRequest,
+    /// 4. emit the middlebox-compatibility ChangeCipherSpec,
+    /// 5. send the second ClientHello and hash it,
+    /// 6. read the next ServerHello, refusing a second HelloRetryRequest.
+    ///
+    /// The ChangeCipherSpec is deliberately NOT hashed: it is a record-layer
+    /// message, not a handshake message.
+    async fn retry_after_hello_retry_request(
+        &mut self,
+        stream: &mut TcpStream,
+        transcript: &mut HandshakeTranscript,
+        hrr_record: &[u8],
+    ) -> Result<Vec<u8>, Safari26TlsError> {
+        let hrr = parse_hello_retry_request(hrr_record, &self.sent_session_id)?;
+
+        // RFC 8446 §4.1.4: abort if the server asks for a group we already sent a
+        // key share for — retrying would loop forever and no real client does it.
+        if matches!(hrr.selected_group, GROUP_X25519 | GROUP_X25519_MLKEM768) {
+            return Err(Safari26TlsError::Handshake(
+                "HelloRetryRequest selected a group already offered as a key_share".to_owned(),
+            ));
+        }
+        // Rejects anything outside the advertised supported_groups, including the
+        // GREASE group, which a real client never generates a share for.
+        let retry_share = generate_retry_key_share(hrr.selected_group)?;
+
+        transcript.collapse_for_hello_retry(hrr.cipher_suite)?;
+        transcript.push_handshake_record(hrr_record)?;
+
+        // With a HelloRetryRequest the client's second flight is ClientHello2, so
+        // the compat CCS belongs here — and is therefore NOT repeated before the
+        // Finished. See `send_compat_ccs_once`.
+        self.send_compat_ccs_once(stream).await?;
+
+        let key_share_body = single_key_share_extension(retry_share.group, &retry_share.public)?;
+        let second_client_hello = rewrite_client_hello_for_retry(
+            &self.client_hello,
+            &key_share_body,
+            hrr.cookie.as_deref(),
+        )?;
+        self.retry_key_share = Some(retry_share);
+
+        transcript.push_handshake_record(&second_client_hello)?;
+        self.tap_records(RecordDirection::Outbound, &second_client_hello);
+        stream.write_all(&second_client_hello).await?;
+
+        let next = self.read_server_hello_record(stream).await?;
+        if is_hello_retry_request(&next) {
+            return Err(Safari26TlsError::Handshake(
+                "server sent a second HelloRetryRequest".to_owned(),
+            ));
+        }
+        // RFC 8446 §4.1.4: the ServerHello must keep the cipher suite the
+        // HelloRetryRequest chose. This is not just conformance — the transcript
+        // above was collapsed under the HRR suite's hash, while the key schedule
+        // is derived under the ServerHello's. Letting them diverge would silently
+        // build the handshake on two different hashes.
+        let selected = parse_safari_server_hello(&next, &self.sent_session_id)?.cipher_suite;
+        if selected != hrr.cipher_suite {
+            return Err(Safari26TlsError::Handshake(
+                "ServerHello cipher_suite does not match the HelloRetryRequest".to_owned(),
+            ));
+        }
+        Ok(next)
     }
 
     async fn read_server_hello_record(
@@ -420,6 +549,28 @@ impl Safari26TlsSession {
         &self,
         server_hello: &ParsedServerHello,
     ) -> Result<Zeroizing<Vec<u8>>, Safari26TlsError> {
+        // After a HelloRetryRequest the negotiated group is the retried one, and
+        // the first ClientHello's shares are no longer on the table. Requiring an
+        // exact match closes the door on a server that answers the retry with a
+        // key_share for some OTHER group.
+        if let Some(retry) = &self.retry_key_share {
+            if server_hello.key_share_group != retry.group {
+                return Err(Safari26TlsError::Handshake(
+                    "ServerHello key_share group does not match the retried group".to_owned(),
+                ));
+            }
+            let peer = aws_lc_rs::agreement::UnparsedPublicKey::new(
+                retry.private.algorithm(),
+                server_hello.key_share.as_slice(),
+            );
+            let shared = aws_lc_rs::agreement::agree(
+                &retry.private,
+                peer,
+                Safari26TlsError::Handshake("EC key agreement failed".to_owned()),
+                |secret| Ok(Zeroizing::new(secret.to_vec())),
+            )?;
+            return Ok(shared);
+        }
         match server_hello.key_share_group {
             GROUP_X25519 => {
                 if server_hello.key_share.len() != X25519_KEY_LEN {
@@ -555,21 +706,19 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
         transcript: &mut HandshakeTranscript,
     ) -> Result<(), Safari26TlsError> {
-        // TLS 1.3 middlebox-compatibility ChangeCipherSpec (RFC 8446 §D.4). Our
-        // ClientHello always carries a non-empty (32-byte) legacy_session_id and
-        // offers neither early_data nor pre_shared_key (a full handshake), so a real
-        // BoringSSL/Safari client sends `14 03 03 00 01 01` immediately before its
-        // SECOND flight — the encrypted Finished — i.e. AFTER the ServerHello, not
-        // after the ClientHello (that earlier position only matches a 0-RTT/early-data
-        // handshake, which this is not, and is itself a passive distinguisher).
-        // Omitting it entirely is also a distinguisher. The CCS is a non-handshake
-        // record, so it is written straight to the socket and deliberately NOT folded
-        // into the handshake transcript (which must remain CH || SH || ... for the
-        // Finished verify_data). The server treats it as undecryptable camouflage and
-        // forwards it verbatim to the origin, so no server-side change is required.
-        let ccs = change_cipher_spec();
-        self.tap_records(RecordDirection::Outbound, &ccs);
-        stream.write_all(&ccs).await?;
+        // Middlebox-compat ChangeCipherSpec (RFC 8446 §D.4). Our ClientHello always
+        // carries a non-empty (32-byte) legacy_session_id and offers neither
+        // early_data nor pre_shared_key (a full handshake), so a real
+        // BoringSSL/Safari client sends it immediately before its SECOND flight.
+        // On the ordinary path that flight is this encrypted Finished — i.e. AFTER
+        // the ServerHello, not after the ClientHello (that earlier position only
+        // matches a 0-RTT/early-data handshake, which this is not, and is itself a
+        // passive distinguisher). Omitting it entirely is also a distinguisher.
+        //
+        // After a HelloRetryRequest the second flight was ClientHello2 and the CCS
+        // already went out there, so `send_compat_ccs_once` makes this a no-op —
+        // two CCS records on one connection is a shape no real client produces.
+        self.send_compat_ccs_once(stream).await?;
 
         let verify_data = keys.client_finished_verify_data(transcript)?;
         let mut message = Vec::with_capacity(4 + verify_data.len());
@@ -1087,6 +1236,284 @@ fn parse_safari_server_hello(
     })
 }
 
+/// `cookie` (RFC 8446 §4.2.2). Absent from a Safari ClientHello, and only ever
+/// echoed back when a HelloRetryRequest supplies one.
+const EXT_COOKIE: u16 = 0x002c;
+
+/// A HelloRetryRequest, which is a ServerHello carrying the special random.
+struct HelloRetryRequest {
+    cipher_suite: TlsCipherSuite,
+    /// The group the server wants a key share for.
+    selected_group: u16,
+    /// Opaque cookie to echo in the second ClientHello, if the server sent one.
+    cookie: Option<Vec<u8>>,
+}
+
+/// A freshly generated key share for the group a HelloRetryRequest selected.
+struct RetryKeyShare {
+    group: u16,
+    private: aws_lc_rs::agreement::PrivateKey,
+    /// Uncompressed EC point, i.e. the wire form of a `KeyShareEntry.key_exchange`.
+    public: Vec<u8>,
+}
+
+fn is_hello_retry_request(record: &[u8]) -> bool {
+    // record header (5) + handshake type (1) + u24 length (3) + legacy_version (2)
+    const RANDOM_OFFSET: usize = 5 + 1 + 3 + 2;
+    record
+        .get(RANDOM_OFFSET..RANDOM_OFFSET + 32)
+        .is_some_and(|random| random == hrr_random())
+}
+
+/// Parse a HelloRetryRequest, enforcing the same invariants the real ServerHello
+/// parser does (echoed session_id, TLS 1.3 actually selected).
+fn parse_hello_retry_request(
+    record: &[u8],
+    expected_session_id: &[u8; 32],
+) -> Result<HelloRetryRequest, Safari26TlsError> {
+    let (_, payload) = super::record::parse_exact(record)
+        .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+    let mut c = TlsCursor::new(payload);
+    if c.u8()? != HANDSHAKE_SERVER_HELLO {
+        return Err(Safari26TlsError::Handshake(
+            "expected HelloRetryRequest".to_owned(),
+        ));
+    }
+    let body_len = c.u24()? as usize;
+    let body = c.bytes(body_len)?;
+    let mut b = TlsCursor::new(body);
+    if b.u16()? != TLS12 {
+        return Err(Safari26TlsError::Handshake(
+            "HelloRetryRequest legacy_version is not TLS 1.2".to_owned(),
+        ));
+    }
+    let _random = b.bytes(32)?;
+    if b.vec_u8()? != expected_session_id {
+        return Err(Safari26TlsError::Handshake(
+            "HelloRetryRequest did not echo the ClientHello legacy_session_id".to_owned(),
+        ));
+    }
+    let cipher_suite = TlsCipherSuite::from_u16(b.u16()?)?;
+    if b.u8()? != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "HelloRetryRequest compression_method is not null".to_owned(),
+        ));
+    }
+
+    let mut e = TlsCursor::new(b.vec_u16()?);
+    let mut tls13_selected = false;
+    let mut selected_group = None;
+    let mut cookie = None;
+    // RFC 8446 §4.2: "There MUST NOT be more than one extension of the same type
+    // in a given extension block." Enforced across EVERY type, not just the ones
+    // read below — a peer must not be able to steer the retry by appending a
+    // second, differing copy of anything a conforming client would have rejected
+    // outright. The list is a handful of entries, so a linear scan is the right
+    // shape here.
+    let mut seen_extensions: Vec<u16> = Vec::new();
+    while e.remaining() > 0 {
+        let ext_type = e.u16()?;
+        let data = e.vec_u16()?;
+        if seen_extensions.contains(&ext_type) {
+            return Err(Safari26TlsError::Handshake(format!(
+                "HelloRetryRequest repeated extension {ext_type:#06x}"
+            )));
+        }
+        seen_extensions.push(ext_type);
+        match ext_type {
+            EXT_SUPPORTED_VERSIONS => {
+                if data.len() == 2 && u16::from_be_bytes([data[0], data[1]]) == TLS13 {
+                    tls13_selected = true;
+                }
+            }
+            // In an HRR the key_share extension carries ONLY the selected group,
+            // never a key_exchange (RFC 8446 §4.2.8).
+            EXT_KEY_SHARE => {
+                let mut ks = TlsCursor::new(data);
+                selected_group = Some(ks.u16()?);
+                if ks.remaining() != 0 {
+                    return Err(Safari26TlsError::Handshake(
+                        "HelloRetryRequest key_share carried a key_exchange".to_owned(),
+                    ));
+                }
+            }
+            // RFC 8446 §4.2.2 defines this as `opaque cookie<1..2^16-1>`, so an
+            // empty cookie is malformed, as are trailing bytes after the
+            // length-prefixed body. Worth being strict: whatever lands here is
+            // echoed verbatim into ClientHello2, so a lax parse would put a
+            // server-chosen malformed extension on the wire under our fingerprint.
+            EXT_COOKIE => {
+                let mut ck = TlsCursor::new(data);
+                let value = ck.vec_u16()?.to_vec();
+                if value.is_empty() || ck.remaining() != 0 {
+                    return Err(Safari26TlsError::Handshake(
+                        "HelloRetryRequest cookie is malformed".to_owned(),
+                    ));
+                }
+                cookie = Some(value);
+            }
+            _ => {}
+        }
+    }
+    if !tls13_selected {
+        return Err(Safari26TlsError::MissingServerHello);
+    }
+    Ok(HelloRetryRequest {
+        cipher_suite,
+        selected_group: selected_group.ok_or_else(|| {
+            Safari26TlsError::Handshake("HelloRetryRequest missing key_share group".to_owned())
+        })?,
+        cookie,
+    })
+}
+
+/// Generate a key share for the group a HelloRetryRequest selected.
+///
+/// Only the three EC groups this client advertises in `supported_groups` but does
+/// NOT send a key share for are reachable: RFC 8446 §4.1.4 forbids the server from
+/// requesting a group the client already shared (x25519, X25519MLKEM768), and a
+/// group outside `supported_groups` was never on offer. Both illegal cases are
+/// rejected by the caller before reaching here, matching BoringSSL, which treats
+/// either as `illegal_parameter`.
+fn generate_retry_key_share(group: u16) -> Result<RetryKeyShare, Safari26TlsError> {
+    use aws_lc_rs::agreement;
+    let algorithm = match group {
+        GROUP_SECP256R1 => &agreement::ECDH_P256,
+        GROUP_SECP384R1 => &agreement::ECDH_P384,
+        GROUP_SECP521R1 => &agreement::ECDH_P521,
+        _ => {
+            return Err(Safari26TlsError::Unsupported(
+                "HelloRetryRequest selected a group this client does not offer",
+            ))
+        }
+    };
+    let private = agreement::PrivateKey::generate(algorithm)
+        .map_err(|_| Safari26TlsError::Handshake("EC key generation failed".to_owned()))?;
+    let public = private
+        .compute_public_key()
+        .map_err(|_| Safari26TlsError::Handshake("EC public key encoding failed".to_owned()))?
+        .as_ref()
+        .to_vec();
+    Ok(RetryKeyShare {
+        group,
+        private,
+        public,
+    })
+}
+
+/// A `key_share` extension body carrying exactly one entry, which is the shape
+/// RFC 8446 §4.2.8 requires in a post-HelloRetryRequest ClientHello.
+fn single_key_share_extension(group: u16, public: &[u8]) -> Result<Vec<u8>, Safari26TlsError> {
+    let mut entry = Vec::with_capacity(4 + public.len());
+    entry.extend_from_slice(&group.to_be_bytes());
+    push_vec_u16(&mut entry, public)?;
+    let mut out = Vec::with_capacity(2 + entry.len());
+    push_vec_u16(&mut out, &entry)?;
+    Ok(out)
+}
+
+/// Build the second ClientHello by REWRITING the first one's bytes in place of
+/// rebuilding it (#198).
+///
+/// RFC 8446 §4.1.2 requires the second ClientHello to be identical to the first
+/// except for a closed list of fields; for this client that list reduces to the
+/// `key_share` (replaced with the single selected group) and `cookie` (added when
+/// the server supplied one) — there is no `early_data` or `pre_shared_key` to
+/// adjust. Rewriting guarantees that by construction: every other extension, the
+/// cipher-suite list, the GREASE placement, the random and the session_id are
+/// copied through byte-for-byte, so the retry cannot drift from the Safari 26
+/// fingerprint the first ClientHello was validated against. Rebuilding from the
+/// original inputs would re-derive all of that and put every field back at risk of
+/// divergence — the exact passive tell this change must not introduce.
+///
+/// Cookie placement is the one degree of freedom: a Safari ClientHello never
+/// carries `cookie`, so there is no captured ordering to match. It is emitted
+/// immediately after `key_share`, keeping the two HRR-driven edits adjacent and
+/// every pre-existing extension at its original index. See the module tests for
+/// the byte-level invariants this pins.
+///
+/// # Interaction with ParallaX authentication
+///
+/// ParallaX carries its own X25519 share unmasked inside the FIRST ClientHello's
+/// `key_share` (see [`Safari26TlsCamouflage::start`]), and this rewrite replaces
+/// that extension wholesale with a single EC entry — so the second ClientHello
+/// deliberately does NOT carry the ParallaX auth binding.
+///
+/// That is correct, not a gap. A ParallaX server never emits a HelloRetryRequest;
+/// the ServerHello on this path comes from the spliced camouflage origin, and an
+/// origin only retries for a group we did not share, which none does given the
+/// x25519 + X25519MLKEM768 shares on offer. If one ever did, the retried
+/// connection simply fails to present the marker and is treated as ordinary
+/// camouflage traffic — it degrades to the fallback splice rather than
+/// authenticating. Losing a session is the safe direction; forging the marker
+/// into a retry the server never expects would not be.
+fn rewrite_client_hello_for_retry(
+    client_hello: &[u8],
+    key_share_body: &[u8],
+    cookie: Option<&[u8]>,
+) -> Result<Vec<u8>, Safari26TlsError> {
+    let (_, payload) = super::record::parse_exact(client_hello)
+        .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+    let mut c = TlsCursor::new(payload);
+    if c.u8()? != HANDSHAKE_CLIENT_HELLO {
+        return Err(Safari26TlsError::Handshake(
+            "cannot retry a non-ClientHello".to_owned(),
+        ));
+    }
+    let body_len = c.u24()? as usize;
+    let body = c.bytes(body_len)?;
+
+    let mut b = TlsCursor::new(body);
+    let prefix_start = 0;
+    let _legacy_version = b.u16()?;
+    let _random = b.bytes(32)?;
+    let _session_id = b.vec_u8()?;
+    let _cipher_suites = b.vec_u16()?;
+    let _compression = b.vec_u8()?;
+    // Everything before the extension vector is reproduced verbatim.
+    let prefix_end = body.len() - b.remaining();
+    let prefix = &body[prefix_start..prefix_end];
+    let extensions = b.vec_u16()?;
+    if b.remaining() != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "trailing bytes after ClientHello extensions".to_owned(),
+        ));
+    }
+
+    let mut rebuilt = Vec::with_capacity(extensions.len() + key_share_body.len() + 64);
+    let mut e = TlsCursor::new(extensions);
+    let mut saw_key_share = false;
+    while e.remaining() > 0 {
+        let ext_type = e.u16()?;
+        let data = e.vec_u16()?;
+        if ext_type == EXT_KEY_SHARE {
+            saw_key_share = true;
+            push_extension(&mut rebuilt, EXT_KEY_SHARE, key_share_body)?;
+            if let Some(cookie) = cookie {
+                let mut cookie_body = Vec::with_capacity(2 + cookie.len());
+                push_vec_u16(&mut cookie_body, cookie)?;
+                push_extension(&mut rebuilt, EXT_COOKIE, &cookie_body)?;
+            }
+        } else {
+            push_extension(&mut rebuilt, ext_type, data)?;
+        }
+    }
+    if !saw_key_share {
+        return Err(Safari26TlsError::Handshake(
+            "first ClientHello carried no key_share to replace".to_owned(),
+        ));
+    }
+
+    let mut new_body = Vec::with_capacity(prefix.len() + 2 + rebuilt.len());
+    new_body.extend_from_slice(prefix);
+    push_vec_u16(&mut new_body, &rebuilt)?;
+    handshake_record(
+        TLS_RECORD_VERSION_CLIENT_HELLO,
+        HANDSHAKE_CLIENT_HELLO,
+        &new_body,
+    )
+}
+
 fn hrr_random() -> &'static [u8] {
     &[
         0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
@@ -1095,7 +1522,7 @@ fn hrr_random() -> &'static [u8] {
     ]
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TlsCipherSuite {
     Aes128GcmSha256,
     Aes256GcmSha384,
@@ -1808,6 +2235,33 @@ impl HandshakeTranscript {
         let (_, payload) = super::record::parse_exact(record)
             .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
         self.bytes.extend_from_slice(payload);
+        Ok(())
+    }
+
+    /// Collapse a first ClientHello into the synthetic `message_hash` message a
+    /// HelloRetryRequest handshake hashes in its place (RFC 8446 §4.4.1):
+    ///
+    /// ```text
+    /// Transcript-Hash(ClientHello1, HelloRetryRequest, ... Mn) =
+    ///     Hash(message_hash        ||  /* handshake type 254 */
+    ///          00 00 Hash.length   ||  /* u24 length          */
+    ///          Hash(ClientHello1)  ||
+    ///          HelloRetryRequest   || ... || Mn)
+    /// ```
+    ///
+    /// Must run BEFORE the HelloRetryRequest itself is pushed, and replaces the
+    /// whole accumulated transcript — at this point that is exactly ClientHello1.
+    /// Getting this wrong does not fail loudly at the rewrite; it surfaces as a
+    /// Finished-MAC mismatch at the very end of the handshake, so the unit test
+    /// pins the byte layout directly.
+    fn collapse_for_hello_retry(&mut self, suite: TlsCipherSuite) -> Result<(), Safari26TlsError> {
+        let hash = suite.digest(&self.bytes);
+        debug_assert_eq!(hash.len(), suite.hash_len());
+        let mut collapsed = Vec::with_capacity(4 + hash.len());
+        collapsed.push(HANDSHAKE_MESSAGE_HASH);
+        push_u24(&mut collapsed, hash.len())?;
+        collapsed.extend_from_slice(&hash);
+        self.bytes = collapsed;
         Ok(())
     }
 }
@@ -3065,6 +3519,475 @@ mod tests {
         assert!(matches!(err, Safari26TlsError::Handshake(_)));
     }
 
+    // ---- HelloRetryRequest retry path (#198) ----
+
+    /// A first ClientHello built by the real Safari 26 builder, so the retry
+    /// tests operate on the exact bytes the fingerprint was validated against.
+    fn hrr_test_client_hello() -> Vec<u8> {
+        build_safari_client_hello(
+            "example.com",
+            [0x5a; 32],
+            [0x6b; 32],
+            &[0x7c; 32],
+            &[0x8d; MLKEM768_PUBLIC_KEY_LEN],
+            GreaseSet::from_seed([1, 2, 3, 4, 5, 6]),
+        )
+        .expect("the Safari ClientHello fixture must build")
+    }
+
+    /// Split a ClientHello record into (bytes-before-extensions, [(type, body)]).
+    fn split_client_hello(record: &[u8]) -> (Vec<u8>, Vec<(u16, Vec<u8>)>) {
+        let (_, payload) = crate::tls::record::parse_exact(record).unwrap();
+        let mut c = TlsCursor::new(payload);
+        assert_eq!(c.u8().unwrap(), HANDSHAKE_CLIENT_HELLO);
+        let body_len = c.u24().unwrap() as usize;
+        let body = c.bytes(body_len).unwrap();
+        let mut b = TlsCursor::new(body);
+        b.u16().unwrap();
+        b.bytes(32).unwrap();
+        b.vec_u8().unwrap();
+        b.vec_u16().unwrap();
+        b.vec_u8().unwrap();
+        let prefix = body[..body.len() - b.remaining()].to_vec();
+        let mut e = TlsCursor::new(b.vec_u16().unwrap());
+        let mut exts = Vec::new();
+        while e.remaining() > 0 {
+            let t = e.u16().unwrap();
+            exts.push((t, e.vec_u16().unwrap().to_vec()));
+        }
+        (prefix, exts)
+    }
+
+    /// Build a HelloRetryRequest record selecting `group`, optionally with a cookie.
+    fn hrr_record(group: u16, session_id: &[u8; 32], cookie: Option<&[u8]>) -> Vec<u8> {
+        let mut exts = Vec::new();
+        push_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes()).unwrap();
+        push_extension(&mut exts, EXT_KEY_SHARE, &group.to_be_bytes()).unwrap();
+        if let Some(cookie) = cookie {
+            let mut body = Vec::new();
+            push_vec_u16(&mut body, cookie).unwrap();
+            push_extension(&mut exts, EXT_COOKIE, &body).unwrap();
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&TLS12.to_be_bytes());
+        body.extend_from_slice(hrr_random());
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+        body.push(0);
+        push_vec_u16(&mut body, &exts).unwrap();
+        handshake_record(TLS12.to_be_bytes(), HANDSHAKE_SERVER_HELLO, &body).unwrap()
+    }
+
+    #[test]
+    fn hello_retry_request_is_distinguished_from_a_real_server_hello() {
+        let hrr = hrr_record(GROUP_SECP256R1, &[0x6b; 32], None);
+        assert!(is_hello_retry_request(&hrr));
+
+        // A normal ServerHello differs from an HRR only in the random, so the
+        // detector must key on exactly that and nothing else.
+        let mut normal = hrr.clone();
+        let random_offset = 5 + 1 + 3 + 2;
+        normal[random_offset] ^= 0x01;
+        assert!(!is_hello_retry_request(&normal));
+    }
+
+    // THE fingerprint-safety invariant of #198: the second ClientHello must differ
+    // from the first ONLY in the fields RFC 8446 4.1.2 permits. Anything else that
+    // drifted here would be a passive tell — strictly worse than the active-probe
+    // tell the retry path exists to close.
+    #[test]
+    fn retry_client_hello_differs_from_the_first_only_in_key_share() {
+        let first = hrr_test_client_hello();
+        let share = generate_retry_key_share(GROUP_SECP256R1).unwrap();
+        let body = single_key_share_extension(share.group, &share.public).unwrap();
+        let second = rewrite_client_hello_for_retry(&first, &body, None).unwrap();
+
+        let (first_prefix, first_exts) = split_client_hello(&first);
+        let (second_prefix, second_exts) = split_client_hello(&second);
+
+        // legacy_version, random, session_id, cipher_suites, compression: verbatim.
+        assert_eq!(first_prefix, second_prefix);
+        // Same extensions, same order, same count — only key_share's body moved.
+        assert_eq!(
+            first_exts.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            second_exts.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+        );
+        for ((ty, before), (_, after)) in first_exts.iter().zip(&second_exts) {
+            if *ty == EXT_KEY_SHARE {
+                assert_ne!(
+                    before, after,
+                    "the key_share must be the field that changed"
+                );
+            } else {
+                assert_eq!(before, after, "extension {ty:#06x} must survive verbatim");
+            }
+        }
+    }
+
+    #[test]
+    fn retry_client_hello_carries_exactly_one_key_share_for_the_selected_group() {
+        for (group, point_len) in [
+            (GROUP_SECP256R1, 65_usize),
+            (GROUP_SECP384R1, 97),
+            (GROUP_SECP521R1, 133),
+        ] {
+            let first = hrr_test_client_hello();
+            let share = generate_retry_key_share(group).unwrap();
+            assert_eq!(share.public.len(), point_len, "uncompressed point size");
+            let body = single_key_share_extension(share.group, &share.public).unwrap();
+            let second = rewrite_client_hello_for_retry(&first, &body, None).unwrap();
+
+            let (_, exts) = split_client_hello(&second);
+            let key_share = exts
+                .iter()
+                .find(|(t, _)| *t == EXT_KEY_SHARE)
+                .map(|(_, b)| b.clone())
+                .expect("retry ClientHello must carry a key_share");
+            let mut c = TlsCursor::new(&key_share);
+            let shares = c.vec_u16().unwrap();
+            assert_eq!(c.remaining(), 0);
+            let mut s = TlsCursor::new(shares);
+            assert_eq!(s.u16().unwrap(), group);
+            assert_eq!(s.vec_u16().unwrap(), share.public.as_slice());
+            assert_eq!(s.remaining(), 0, "exactly one KeyShareEntry, per RFC 8446");
+        }
+    }
+
+    #[test]
+    fn retry_client_hello_echoes_the_cookie_next_to_the_key_share() {
+        let first = hrr_test_client_hello();
+        let cookie = b"opaque-hrr-cookie".to_vec();
+        let share = generate_retry_key_share(GROUP_SECP384R1).unwrap();
+        let body = single_key_share_extension(share.group, &share.public).unwrap();
+        let second = rewrite_client_hello_for_retry(&first, &body, Some(&cookie)).unwrap();
+
+        let (_, exts) = split_client_hello(&second);
+        let key_share_at = exts.iter().position(|(t, _)| *t == EXT_KEY_SHARE).unwrap();
+        let (cookie_ty, cookie_body) = &exts[key_share_at + 1];
+        assert_eq!(*cookie_ty, EXT_COOKIE, "cookie sits right after key_share");
+        let mut c = TlsCursor::new(cookie_body);
+        assert_eq!(c.vec_u16().unwrap(), cookie.as_slice());
+        assert_eq!(c.remaining(), 0);
+
+        // With no cookie offered, none is invented.
+        let plain = rewrite_client_hello_for_retry(&first, &body, None).unwrap();
+        let (_, plain_exts) = split_client_hello(&plain);
+        assert!(plain_exts.iter().all(|(t, _)| *t != EXT_COOKIE));
+    }
+
+    /// Drive the retry against a peer that sends an HRR selecting `group` and then
+    /// goes away, returning (the session afterwards, everything the client wrote).
+    ///
+    /// The HRR is built from the session's OWN `sent_session_id`: the parser
+    /// enforces the RFC 8446 echo, so a mismatched id would be rejected before
+    /// anything reached the wire and every downstream assertion would pass
+    /// vacuously.
+    async fn run_retry_and_capture_wire(group: u16) -> (Safari26TlsSession, Vec<u8>) {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_key = X25519KeyPair::generate();
+        let mut session = Safari26TlsCamouflage
+            .start(
+                "example.com".to_owned(),
+                b"0123456789abcdef0123456789abcdef",
+                &server_key.public,
+            )
+            .unwrap();
+
+        let hrr = hrr_record(group, &session.sent_session_id, None);
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut transcript = HandshakeTranscript::new();
+            transcript
+                .push_handshake_record(&session.client_hello)
+                .unwrap();
+            // The peer hangs up instead of answering, so this errors — the point
+            // is what the client WROTE before that.
+            let _ = session
+                .retry_after_hello_retry_request(&mut stream, &mut transcript, &hrr)
+                .await;
+            session
+        });
+
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut wire = Vec::new();
+        // Read until the client blocks waiting for a ServerHello, then close.
+        let mut buf = [0_u8; 4096];
+        loop {
+            match tokio::time::timeout(Duration::from_millis(300), peer.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => wire.extend_from_slice(&buf[..n]),
+                Ok(Err(_)) => break,
+            }
+        }
+        drop(peer);
+        (client.await.unwrap(), wire)
+    }
+
+    /// Split a byte stream into whole TLS records as (content_type, full_record).
+    fn split_records(mut wire: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        const HEADER: usize = 5;
+        while wire.len() >= HEADER {
+            let len = u16::from_be_bytes([wire[3], wire[4]]) as usize;
+            let total = HEADER + len;
+            if wire.len() < total {
+                break;
+            }
+            out.push((wire[0], wire[..total].to_vec()));
+            wire = &wire[total..];
+        }
+        out
+    }
+
+    // The retry must put EXACTLY ONE middlebox-compat ChangeCipherSpec on the wire
+    // (RFC 8446 D.4), immediately before ClientHello2 — the client's second flight.
+    // `write_client_finished` sends the same CCS on the non-HRR path, so without
+    // the `sent_compat_ccs` gate an HRR handshake emitted two, a wire shape no real
+    // client produces and a distinguisher in its own right.
+    #[tokio::test]
+    async fn hello_retry_emits_exactly_one_change_cipher_spec_before_client_hello2() {
+        let (session, wire) = run_retry_and_capture_wire(GROUP_SECP256R1).await;
+        let records = split_records(&wire);
+        assert!(
+            !records.is_empty(),
+            "the retry must have written something to the wire"
+        );
+
+        let ccs_count = records
+            .iter()
+            .filter(|(ty, _)| *ty == TLS_RECORD_CHANGE_CIPHER_SPEC)
+            .count();
+        assert_eq!(
+            ccs_count, 1,
+            "exactly one middlebox-compat CCS, got {ccs_count}"
+        );
+        assert_eq!(
+            records[0].0, TLS_RECORD_CHANGE_CIPHER_SPEC,
+            "the CCS must come first, immediately before ClientHello2"
+        );
+        assert_eq!(
+            records[1].0, TLS_RECORD_HANDSHAKE,
+            "ClientHello2 must follow the CCS"
+        );
+        assert!(
+            session.sent_compat_ccs,
+            "the flag that suppresses the second CCS in write_client_finished must be set"
+        );
+    }
+
+    // The other half of the invariant: once the retry has sent the CCS, the emitter
+    // that `write_client_finished` uses must be a no-op. Tested on the shared
+    // `send_compat_ccs_once` rather than through `write_client_finished` (which
+    // needs a full key schedule), which is precisely why the emission was collapsed
+    // into one function — the "exactly once" rule is now checkable in isolation.
+    #[tokio::test]
+    async fn compat_ccs_is_emitted_at_most_once_per_connection() {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut session = Safari26TlsCamouflage
+            .start(
+                "example.com".to_owned(),
+                b"0123456789abcdef0123456789abcdef",
+                &X25519KeyPair::generate().public,
+            )
+            .unwrap();
+
+        let writer = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            session.send_compat_ccs_once(&mut stream).await.unwrap();
+            // Every later call — including the one inside write_client_finished on
+            // a post-HRR handshake — must put nothing further on the wire.
+            for _ in 0..3 {
+                session.send_compat_ccs_once(&mut stream).await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+            session
+        });
+
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut wire = Vec::new();
+        peer.read_to_end(&mut wire).await.unwrap();
+        let session = writer.await.unwrap();
+
+        assert_eq!(
+            wire,
+            change_cipher_spec(),
+            "four calls must yield exactly one CCS record and nothing else"
+        );
+        assert!(session.sent_compat_ccs);
+    }
+
+    #[test]
+    fn hello_retry_request_parses_group_and_cookie() {
+        let session_id = [0x6b; 32];
+        let hrr = hrr_record(GROUP_SECP521R1, &session_id, Some(b"c00kie"));
+        let parsed = parse_hello_retry_request(&hrr, &session_id).unwrap();
+        assert_eq!(parsed.selected_group, GROUP_SECP521R1);
+        assert_eq!(parsed.cookie.as_deref(), Some(b"c00kie".as_slice()));
+
+        // A mismatched session_id echo is fatal, exactly as for a real ServerHello.
+        assert!(parse_hello_retry_request(&hrr, &[0x00; 32]).is_err());
+    }
+
+    // The cookie is echoed verbatim into ClientHello2, so a lax parse here would
+    // let the server place a malformed extension on the wire under our
+    // fingerprint. RFC 8446 §4.2.2: `opaque cookie<1..2^16-1>`.
+    #[test]
+    fn hello_retry_request_rejects_a_malformed_cookie() {
+        let session_id = [0x6b; 32];
+        let with_cookie_body = |body: &[u8]| {
+            let mut exts = Vec::new();
+            push_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes()).unwrap();
+            push_extension(&mut exts, EXT_KEY_SHARE, &GROUP_SECP256R1.to_be_bytes()).unwrap();
+            push_extension(&mut exts, EXT_COOKIE, body).unwrap();
+            let mut hs = Vec::new();
+            hs.extend_from_slice(&TLS12.to_be_bytes());
+            hs.extend_from_slice(hrr_random());
+            hs.push(session_id.len() as u8);
+            hs.extend_from_slice(&session_id);
+            hs.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+            hs.push(0);
+            push_vec_u16(&mut hs, &exts).unwrap();
+            handshake_record(TLS12.to_be_bytes(), HANDSHAKE_SERVER_HELLO, &hs).unwrap()
+        };
+
+        // Zero-length cookie: violates the <1..> lower bound.
+        let mut empty = Vec::new();
+        push_vec_u16(&mut empty, b"").unwrap();
+        assert!(parse_hello_retry_request(&with_cookie_body(&empty), &session_id).is_err());
+
+        // Trailing bytes after the length-prefixed body.
+        let mut trailing = Vec::new();
+        push_vec_u16(&mut trailing, b"c00kie").unwrap();
+        trailing.push(0xff);
+        assert!(parse_hello_retry_request(&with_cookie_body(&trailing), &session_id).is_err());
+
+        // A well-formed cookie still parses, so the above are about malformation.
+        let mut good = Vec::new();
+        push_vec_u16(&mut good, b"c00kie").unwrap();
+        assert_eq!(
+            parse_hello_retry_request(&with_cookie_body(&good), &session_id)
+                .unwrap()
+                .cookie
+                .as_deref(),
+            Some(b"c00kie".as_slice())
+        );
+    }
+
+    // RFC 8446 §4.2 bans a repeated extension type. The check must cover EVERY
+    // type, not only the two this parser reads: an earlier revision special-cased
+    // key_share/cookie while its own comment claimed the general rule, so a second
+    // supported_versions still sailed through.
+    #[test]
+    fn hello_retry_request_rejects_any_repeated_extension() {
+        let session_id = [0x6b; 32];
+
+        // Hand-build an HRR whose extension block repeats a type. `hrr_record`
+        // cannot express this, so assemble the block directly.
+        let malformed = |repeat: u16, payload: &[u8]| {
+            let mut exts = Vec::new();
+            push_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes()).unwrap();
+            push_extension(&mut exts, EXT_KEY_SHARE, &GROUP_SECP256R1.to_be_bytes()).unwrap();
+            push_extension(&mut exts, repeat, payload).unwrap();
+            let mut body = Vec::new();
+            body.extend_from_slice(&TLS12.to_be_bytes());
+            body.extend_from_slice(hrr_random());
+            body.push(session_id.len() as u8);
+            body.extend_from_slice(&session_id);
+            body.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+            body.push(0);
+            push_vec_u16(&mut body, &exts).unwrap();
+            handshake_record(TLS12.to_be_bytes(), HANDSHAKE_SERVER_HELLO, &body).unwrap()
+        };
+
+        for (label, repeat, payload) in [
+            (
+                "supported_versions",
+                EXT_SUPPORTED_VERSIONS,
+                TLS13.to_be_bytes().to_vec(),
+            ),
+            (
+                "key_share",
+                EXT_KEY_SHARE,
+                GROUP_SECP384R1.to_be_bytes().to_vec(),
+            ),
+        ] {
+            let record = malformed(repeat, &payload);
+            assert!(
+                parse_hello_retry_request(&record, &session_id).is_err(),
+                "a repeated {label} extension must be rejected"
+            );
+        }
+
+        // The same block without the repeat is accepted, so the assertions above
+        // are about the duplicate and not about some unrelated malformation.
+        let mut exts = Vec::new();
+        push_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes()).unwrap();
+        push_extension(&mut exts, EXT_KEY_SHARE, &GROUP_SECP256R1.to_be_bytes()).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&TLS12.to_be_bytes());
+        body.extend_from_slice(hrr_random());
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(&session_id);
+        body.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+        body.push(0);
+        push_vec_u16(&mut body, &exts).unwrap();
+        let clean = handshake_record(TLS12.to_be_bytes(), HANDSHAKE_SERVER_HELLO, &body).unwrap();
+        assert_eq!(
+            parse_hello_retry_request(&clean, &session_id)
+                .unwrap()
+                .selected_group,
+            GROUP_SECP256R1
+        );
+    }
+
+    #[test]
+    fn retry_rejects_groups_that_were_never_offered_or_already_shared() {
+        // Already shared as key_shares => retrying is a protocol violation. These
+        // are rejected in `retry_after_hello_retry_request` before key generation;
+        // here we pin that the generator itself also refuses them, so neither layer
+        // can silently start supporting an infinite retry loop.
+        for group in [GROUP_X25519, GROUP_X25519_MLKEM768] {
+            assert!(matches!(
+                generate_retry_key_share(group),
+                Err(Safari26TlsError::Unsupported(_))
+            ));
+        }
+        // Never advertised at all.
+        assert!(matches!(
+            generate_retry_key_share(0x1234),
+            Err(Safari26TlsError::Unsupported(_))
+        ));
+    }
+
+    // RFC 8446 4.4.1: ClientHello1 is replaced in the transcript by a synthetic
+    // `message_hash` message. A mistake here does not fail loudly — it surfaces as
+    // a Finished MAC mismatch at the very end of the handshake — so pin the bytes.
+    #[test]
+    fn transcript_collapses_client_hello1_into_message_hash() {
+        let first = hrr_test_client_hello();
+        let mut transcript = HandshakeTranscript::new();
+        transcript.push_handshake_record(&first).unwrap();
+        let hashed_input = transcript.bytes().to_vec();
+
+        let suite = TlsCipherSuite::Aes256GcmSha384;
+        transcript.collapse_for_hello_retry(suite).unwrap();
+
+        let digest = suite.digest(&hashed_input);
+        let mut expected = vec![HANDSHAKE_MESSAGE_HASH, 0x00, 0x00, digest.len() as u8];
+        expected.extend_from_slice(&digest);
+        assert_eq!(transcript.bytes(), expected.as_slice());
+        assert_eq!(digest.len(), suite.hash_len());
+    }
+
     // ---- hrr_random ----
 
     #[test]
@@ -3259,6 +4182,13 @@ mod tests {
     fn parse_safari_server_hello_rejects_hello_retry_request() {
         // random == hrr_random() must be rejected as HRR; kills the `==`->`!=`
         // mutation of that comparison.
+        //
+        // NOTE (#198): this is now a defense-in-depth invariant, not the client's
+        // outward behavior. `complete()` intercepts a HelloRetryRequest before this
+        // parser sees it and answers with a second ClientHello, and it refuses a
+        // SECOND retry, so by construction no HRR ever reaches here. Keeping the
+        // guard means a future refactor that lost the interception fails loudly
+        // instead of feeding an HRR into the ServerHello path as if it were real.
         let mut hrr = [0_u8; 32];
         hrr.copy_from_slice(hrr_random());
         let record = build_safari_server_hello(

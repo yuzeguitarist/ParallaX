@@ -5,6 +5,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const HARDEN_TRANSIENT_ENV: &str = "PARALLAX_HARDEN_TRANSIENT_PLAINTEXT";
 const DISABLE_ANTI_DEBUG_ENV: &str = "PARALLAX_DISABLE_ANTI_DEBUG";
+const DISABLE_SECCOMP_ENV: &str = "PARALLAX_DISABLE_SECCOMP";
 
 /// A long-lived secret kept XOR-masked in memory while idle (#3, obfuscated
 /// residency).
@@ -198,18 +199,27 @@ pub fn harden_current_process() {
 /// inherent, standard property of seccomp arch validation that native same-arch
 /// operation never triggers.
 ///
-/// # Recommended call site (not wired here)
+/// # Call site
 ///
-/// This module intentionally does **not** call this function; `src/cli.rs` /
-/// `src/main.rs` are owned elsewhere. The recommended placement is inside the
-/// long-running server path in `src/handshake/server.rs::run`, immediately after
-/// `let listener = TcpListener::bind(server.listen).await?;` (and after the
-/// optional UDP carrier bind), i.e. once keys are loaded and every listener is
-/// bound but before the `accept()` loop. It could also be gated behind a
-/// `PARALLAX_DISABLE_SECCOMP` env toggle by the owner of that call site, mirroring
-/// the existing `PARALLAX_DISABLE_ANTI_DEBUG` pattern, for operators who must run
-/// under unusual tracing tools.
+/// Wired in the long-running server path in `src/handshake/server.rs::run`, after
+/// every listener is bound (TCP accept socket and the optional UDP carrier) and
+/// after the reject-path ballast is warmed, but before the `accept()` loop — so
+/// key loading, binds and one-time warmup run unfiltered and only the steady-state
+/// serving loop is governed.
+///
+/// Honors `PARALLAX_DISABLE_SECCOMP` (mirroring `PARALLAX_DISABLE_ANTI_DEBUG`) for
+/// operators who must run under unusual tracing tools; when set truthy the filter
+/// is skipped and the reason is logged, so an inert layer is never silent.
 pub fn install_late_seccomp_filter() {
+    if !seccomp_enabled() {
+        tracing::info!(
+            "{DISABLE_SECCOMP_ENV} is set; skipping the memory-scrape seccomp denylist. \
+             The process is NOT protected against same-user memory scraping \
+             (ptrace / process_vm_readv)."
+        );
+        return;
+    }
+
     #[cfg(target_os = "linux")]
     install_late_seccomp_filter_linux();
 
@@ -380,6 +390,12 @@ fn anti_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| !std::env::var(DISABLE_ANTI_DEBUG_ENV).is_ok_and(|v| env_flag_truthy(&v)))
+}
+
+/// The late seccomp denylist is on unless `PARALLAX_DISABLE_SECCOMP` is truthy.
+fn seccomp_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var(DISABLE_SECCOMP_ENV).is_ok_and(|v| env_flag_truthy(&v)))
 }
 
 /// Mark key material as excluded from core dumps and try to pin its pages.
