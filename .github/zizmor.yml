@@ -22,6 +22,7 @@ rules:
     ignore:
       - cargo-geiger.yml
       - ci-fuzz-build.yml
+      - ci-netem-bdp-bench.yml
       - ci-pr.yml
       - ci-quick.yml
       - ci-relay-teardown.yml
@@ -41,6 +42,7 @@ rules:
     ignore:
       - cargo-geiger.yml
       - ci-fuzz-build.yml
+      - ci-netem-bdp-bench.yml
       - ci-pr.yml
       - ci-quick.yml
       - ci-relay-teardown.yml
