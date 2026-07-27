@@ -1506,6 +1506,29 @@ async fn relay_fallback_reusing_origin(
     first_client_record: Vec<u8>,
     predialed_origin: Option<PredialedOrigin>,
 ) -> Result<(), HandshakeServerError> {
+    relay_fallback_reusing_origin_with_idle(
+        client,
+        fallback_addr,
+        first_client_record,
+        predialed_origin,
+        fallback_idle_timeout(),
+    )
+    .await
+}
+
+/// [`relay_fallback_reusing_origin`] with the relay's idle backstop supplied by the
+/// caller, so the cap-shed path can reuse the IDENTICAL pre-dial-adopting, RST-safe
+/// splice while drawing its idle from [`cap_shed_fallback_idle`] (the named
+/// call-site helper the M-4 guard pins). The two idle helpers currently return the
+/// same band; threading the value keeps that a call-site choice rather than a
+/// constant baked into the shared relay.
+async fn relay_fallback_reusing_origin_with_idle(
+    client: TcpStream,
+    fallback_addr: &str,
+    first_client_record: Vec<u8>,
+    predialed_origin: Option<PredialedOrigin>,
+    idle_timeout: Duration,
+) -> Result<(), HandshakeServerError> {
     let predialed_origin = match predialed_origin {
         Some(origin) => origin.into_stream().await,
         None => None,
@@ -1531,7 +1554,7 @@ async fn relay_fallback_reusing_origin(
             return Err(err);
         }
     };
-    relay_fallback_with_idle_timeout(client, fallback, fallback_idle_timeout()).await
+    relay_fallback_with_idle_timeout(client, fallback, idle_timeout).await
 }
 
 async fn connect_and_forward_to_fallback(
@@ -1605,55 +1628,64 @@ async fn graceful_close_tcp_stream(mut stream: TcpStream) {
 /// healthy splice; if the budget is full or the origin dial fails, fall back to a
 /// graceful FIN (the prior behavior).
 ///
-/// L8: read the client's first record BEFORE dialing the origin, then forward it —
-/// mirroring the healthy splice's dial-AFTER-read ordering. Dialing upfront with an
-/// empty prefix (the old behavior) made a cap-shed connection's handshake-start
-/// timing observably different from a healthy splice to a keyless prober that could
-/// drive the box to its cap; reading first removes that establishment-ordering tell.
-/// The read is bounded by `first_record_wait_timeout` and the whole path by the 64
-/// cap-shed slots, so it cannot be amplified into a resource exhaustion.
+/// Indistinguishability from the healthy splice is on two axes. (1) Client socket:
+/// `tune_tcp_stream` is applied to the cap-shed client just as the healthy path
+/// applies it at accept, so NODELAY / quick-ACK / buffer options don't fingerprint
+/// the server->client side as "box at cap". (2) Establishment timing: the first
+/// record is read via [`read_first_client_record_predialing`], so a SILENT peer's
+/// origin idle-clock starts at [`FIRST_RECORD_PREDIAL_DELAY`] (#197) and a PROMPT
+/// peer dials after-read — identical on both paths. Dialing a silent peer's origin
+/// only at the 8-15s give-up (the prior cap-shed behavior) left its origin-driven
+/// close ~8-15s later than a healthy splice's; that additive establishment offset
+/// was a tell a keyless prober could read as "front box at its per-source cap" (a
+/// real origin's close timing does not shift with THIS box's permit accounting).
+/// Reusing the pre-dialed origin closes it. The read is bounded by
+/// `first_record_wait_timeout` and the relay by the 64 cap-shed slots, so it cannot
+/// be amplified into a resource exhaustion.
 async fn cap_shed_fallback_or_fin(mut client: TcpStream, fallback_addr: String) {
     let Some(_slot) = try_enter_cap_shed_fallback() else {
         graceful_close_tcp_stream(client).await;
         return;
     };
-    // Read the ClientHello (or the partial give-up prefix) first, exactly as the
-    // healthy path does, so the origin dial happens AFTER the read on both paths.
-    let prefix = match read_first_client_record(&mut client).await {
-        Ok(FirstClientRead::Record(record)) => record,
-        Ok(FirstClientRead::FallbackPrefix(prefix)) => prefix,
+    // Match the healthy path's client-socket tuning (handle_connection_inner applies
+    // this at accept). Without it a cap-shed client keeps default TCP options (Nagle
+    // / delayed-ACK / default buffers) while a healthy splice gets NODELAY / quick-ACK
+    // / tuned buffers — a server->client fingerprint that would separate the "box at
+    // cap" population from healthy splices regardless of the pre-dial timing parity
+    // below. Best-effort: a setsockopt failure on a live accepted socket is
+    // effectively unreachable and only degrades to the prior untuned relay.
+    let _ = tune_tcp_stream(&client);
+    // Read the first record while pre-dialing the origin for a silent peer, exactly
+    // as the healthy splice does (#197), so the origin's idle clock starts at
+    // FIRST_RECORD_PREDIAL_DELAY rather than at the 8-15s give-up.
+    let FirstReadWithOrigin {
+        read,
+        predialed_origin,
+    } = match read_first_client_record_predialing(&mut client, &fallback_addr).await {
+        Ok(first) => first,
         Err(_) => {
             graceful_close_tcp_stream(client).await;
             return;
         }
     };
-    match connect_and_forward_to_fallback(&fallback_addr, &prefix).await {
-        Ok(fallback) => {
-            // Draw the idle backstop from the SAME distribution as a healthy splice
-            // ([`fallback_idle_timeout`], [600s, 660s]) rather than a separate tight
-            // band. A separate band ([10s, 90s]) was disjoint from the healthy band,
-            // so a prober that timed our server-originated FIN on a silent relay could
-            // separate the two populations in a handful of samples and read "this box
-            // is at its cap" — a threshold-triggered, externally observable state tell
-            // (a real origin's idle policy does not switch on THIS front box's permit
-            // accounting). Unifying the band removes that idle-close-time tell. The
-            // former handshake-start difference (cap-shed dialed BEFORE reading a
-            // ClientHello, healthy splice dials after) is now also gone: cap-shed
-            // reads the first record first (L8), so both paths dial-after-read.
-            //
-            // The cap-as-DoS-amplifier concern is still defused by construction: the
-            // hard [`MAX_CONCURRENT_CAP_SHED_FALLBACKS`] (64) ceiling bounds the
-            // CONCURRENCY of cap-shed relays regardless of flood volume (the idle
-            // resets on every byte, so a trickling prober can hold a slot past 660s —
-            // exactly as a healthy splice can — but never more than 64 at once). 64
-            // idle origin connections is negligible for any real origin: bounded, no
-            // growth. That fixed concurrency bound, not a tightened idle, is the
-            // actual resource backstop.
-            let _ =
-                relay_fallback_with_idle_timeout(client, fallback, cap_shed_fallback_idle()).await;
-        }
-        Err(_) => graceful_close_tcp_stream(client).await,
-    }
+    let prefix = match read {
+        FirstClientRead::Record(record) => record,
+        FirstClientRead::FallbackPrefix(prefix) => prefix,
+    };
+    // Relay through the SAME pre-dial-adopting, RST-safe splice as the healthy path.
+    // The idle backstop is drawn from `cap_shed_fallback_idle()` (identical to the
+    // healthy band, so the close time is not a separable "box at cap" tell; the
+    // anti-amplification bound stays the 64-slot cap-shed concurrency ceiling, not a
+    // tightened idle). On origin-dial failure the reuse relay drains-and-FINs the
+    // client rather than a bare-drop RST.
+    let _ = relay_fallback_reusing_origin_with_idle(
+        client,
+        &fallback_addr,
+        prefix,
+        predialed_origin,
+        cap_shed_fallback_idle(),
+    )
+    .await;
     // `_slot` drops here, releasing the cap-shed budget.
 }
 
@@ -1949,12 +1981,6 @@ where
         .await
         .map_err(|_| HandshakeServerError::Timeout)?
         .map_err(HandshakeServerError::Io)
-}
-
-async fn read_first_client_record(
-    stream: &mut TcpStream,
-) -> Result<FirstClientRead, HandshakeServerError> {
-    read_first_client_record_with_timeout(stream, first_record_wait_timeout()).await
 }
 
 /// An origin connection opened speculatively while waiting for the first record.
@@ -9171,6 +9197,61 @@ mod tests {
         drop(held);
     }
 
+    // #197 parity for the cap-shed path: a SILENT cap-shed probe (a source at its
+    // per-source cap that then stays silent) must have the camouflage origin dialed
+    // on the pre-dial delay, exactly like the healthy splice — NOT after the 8-15s
+    // give-up. Dialing only at give-up left the origin-driven close ~8-15s later than
+    // a healthy splice's, an additive offset a prober driving the box to its cap
+    // could read as a "front box" tell. Asserting the dial lands far below
+    // FIRST_RECORD_WAIT_FLOOR is exactly the "no additive 8-15s offset" acceptance
+    // criterion. Ignored + serial: real sockets, dynamic wall-clock timing, and it
+    // mutates the process-global cap-shed budget.
+    #[tokio::test]
+    #[ignore = "dynamic wall-clock timing + mutates the process-global cap-shed budget; run serially in the --ignored lane"]
+    async fn silent_cap_shed_probe_predials_origin_long_before_the_give_up() {
+        use std::time::Instant;
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap().to_string();
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        // The prober: connects to the cap-shed path, then says nothing at all.
+        let _prober = TcpStream::connect(parallax_addr).await.unwrap();
+        let (server_side, _) = parallax_listener.accept().await.unwrap();
+
+        let started = Instant::now();
+        let relay = tokio::spawn(async move {
+            cap_shed_fallback_or_fin(server_side, origin_addr).await;
+        });
+
+        // The origin must be reached well inside the give-up floor — proving the
+        // cap-shed path now pre-dials for a silent peer instead of waiting out the
+        // full 8-15s read. A generous 2s ceiling keeps this robust on a loaded CI box
+        // while staying an order of magnitude below the 8s floor it asserts against.
+        let accepted = timeout(Duration::from_secs(2), origin_listener.accept())
+            .await
+            .expect("silent cap-shed probe must trigger the origin dial before the give-up wait")
+            .expect("origin accept must succeed");
+        let dialed_after = started.elapsed();
+        drop(accepted);
+
+        assert!(
+            dialed_after < FIRST_RECORD_WAIT_FLOOR,
+            "cap-shed origin was dialed after {dialed_after:?}, not below the \
+             {FIRST_RECORD_WAIT_FLOOR:?} give-up floor — the additive close-timing \
+             offset is back on the cap-shed path"
+        );
+        assert!(
+            dialed_after >= FIRST_RECORD_PREDIAL_DELAY,
+            "cap-shed origin was dialed after {dialed_after:?}, before the \
+             {FIRST_RECORD_PREDIAL_DELAY:?} silence delay — prompt clients would be \
+             paying for a speculative origin connection"
+        );
+
+        relay.abort();
+    }
+
     /// H-1 / M-4: a cap-shed close's IDLE-CLOSE TIME must not be separable from a
     /// healthy splice's. The prior design gave cap-shed relays a SEPARATE tight idle
     /// band ([10s, 90s]) that was disjoint from the healthy band ([600s, 660s]); a
@@ -9180,9 +9261,10 @@ mod tests {
     /// which must stay inside the healthy splice band. Sampling the actual call-site
     /// helper (not `fallback_idle_timeout` directly) means a future revert that points
     /// cap-shed at a separate tight band fails HERE. The anti-amplification bound is
-    /// carried solely by the 64-concurrency ceiling. (A pre-existing handshake-START
-    /// timing difference — cap-shed dials before reading the ClientHello — is out of
-    /// scope here and unchanged by the fix.)
+    /// carried solely by the 64-concurrency ceiling. (Handshake-ESTABLISHMENT timing
+    /// is unified separately: cap-shed now pre-dials a silent peer's origin at
+    /// FIRST_RECORD_PREDIAL_DELAY exactly like the healthy splice — pinned by
+    /// `silent_cap_shed_probe_predials_origin_long_before_the_give_up`.)
     #[test]
     fn cap_shed_fallback_idle_matches_healthy_band() {
         // Sample the cap-shed call site's own idle helper: every value it can produce
