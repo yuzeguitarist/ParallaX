@@ -1,0 +1,27 @@
+# OSV-Scanner suppressions — https://google.github.io/osv-scanner/configuration/
+#
+# Auto-loaded by OSV-Scanner for lockfiles in THIS directory (it does not
+# propagate to child dirs) — here that is `semgrep-requirements.txt`.
+#
+# `mcp` is a hard, transitive dependency of Semgrep (see the "# via semgrep"
+# markers in semgrep-requirements.txt): Semgrep pins `mcp==1.23.3` *exactly*, and
+# that pin is unchanged through Semgrep's latest release, so `mcp` cannot be
+# bumped without dropping Semgrep. ParallaX runs Semgrep only as a CLI SAST
+# scanner (`semgrep scan --config p/rust`, see workflows/semgrep.yml) and never
+# starts an MCP server, so these MCP *server-transport* / *task-handler*
+# vulnerabilities are unreachable in this repo. Suppress them here until Semgrep
+# upstream bumps its `mcp` pin; the corresponding Dependabot alerts are dismissed
+# as not-affected for the same reason. cargo-deny remains the blocking gate for
+# the Rust dependency tree; this only scopes OSV noise from the Semgrep CI pin.
+
+[[IgnoredVulns]]
+id = "GHSA-hvrp-rf83-w775" # CVE-2026-52870 — experimental task handlers reachable cross-client
+reason = "Semgrep hard-pins mcp==1.23.3; run as a CLI scanner only, the MCP server is never started"
+
+[[IgnoredVulns]]
+id = "GHSA-jpw9-pfvf-9f58" # CVE-2026-52869 — HTTP transport serves requests without verifying the principal
+reason = "Semgrep hard-pins mcp==1.23.3; run as a CLI scanner only, the MCP server is never started"
+
+[[IgnoredVulns]]
+id = "GHSA-vj7q-gjh5-988w" # CVE-2026-59950 — WebSocket transport lacks Host/Origin validation
+reason = "Semgrep hard-pins mcp==1.23.3; run as a CLI scanner only, the MCP server is never started"
