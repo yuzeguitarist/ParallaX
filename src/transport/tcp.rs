@@ -738,7 +738,16 @@ mod kernel_splice {
                     continue;
                 };
                 if written == 0 {
-                    return Ok(());
+                    // A non-empty pipe yields bytes or EAGAIN, and a closed
+                    // destination yields EPIPE, so no-progress-with-bytes-buffered
+                    // is not expected to be reachable. If it ever is, those bytes go
+                    // away with the pipe, and returning success here would let the
+                    // caller FIN and masquerade the truncated stream as a clean
+                    // close — the exact hazard the idle-timeout arm above rejects.
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "write-side splice made no progress with buffered data",
+                    ));
                 }
                 remaining -= written;
                 last_progress = Instant::now();

@@ -2997,6 +2997,15 @@ impl Connection {
         // All checks passed: now it is safe to create + accept-queue the stream.
         self.ensure_stream(id)?;
         let s = self.streams.get_mut(&id).expect("just ensured");
+        // A stream already in Reset Recvd had everything up to its final size
+        // accounted as delivered when the reset was processed (RFC 9000 §4.5), so
+        // reassembling a late retransmit would hand `read_stream` bytes to credit a
+        // second time and inflate the connection window. The reset fixed the final
+        // size, so `delta` is necessarily 0 here — there is nothing left to charge —
+        // and RFC 9000 §3.2 lets the receiver discard data once the stream is reset.
+        if s.recv_reset.is_some() {
+            return Ok(());
+        }
         s.recv_high = new_high;
         self.recv_data_total += delta;
         if fin {
@@ -3098,8 +3107,39 @@ impl Connection {
         let s = self.streams.get_mut(&id).expect("just ensured");
         s.recv_high = final_size;
         s.recv_fin = Some(final_size);
+        // Only the FIRST reset may release flow control: a duplicate RESET_STREAM
+        // carries delta == 0, so crediting again would inflate the window past what
+        // the peer actually consumed.
+        let first_reset = s.recv_reset.is_none();
         s.recv_reset = Some(error_code);
+        // Bytes the application can still take: what it already read plus what is
+        // reassembled in order and waiting (the reader drains that before the reset
+        // surfaces as ConnectionReset). Everything else this stream charged to the
+        // connection window — the gap the reset skipped, out-of-order fragments that
+        // can no longer be reassembled, and the tail up to `final_size` — is now
+        // undeliverable, so `read_stream` will never credit it.
+        let deliverable = s.recv_consumed + s.recv.len() as u64;
+        let stranded_fragments: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
+        if first_reset {
+            // No further STREAM frames can arrive (the final size is fixed), so the
+            // gaps in front of these fragments will never fill: they are dead weight
+            // on the reassembly budget as well as on flow control.
+            s.recv_pending = Vec::new();
+        }
         self.recv_data_total += delta;
+        if first_reset {
+            self.recv_pending_total = self.recv_pending_total.saturating_sub(stranded_fragments);
+            // RFC 9000 §4.5: the reset's bytes count as delivered for flow control.
+            // Reclaiming them keeps MAX_DATA moving; without this a peer that resets
+            // streams at their full final size permanently freezes the connection
+            // window (recv_data_total climbs to the limit while recv_data_consumed
+            // stays put) and the connection can never receive again.
+            self.recv_data_consumed += final_size.saturating_sub(deliverable);
+            self.recv_max_data = self.recv_data_consumed + CONN_RECV_WINDOW;
+            if self.recv_max_data - self.recv_max_data_sent >= CONN_RECV_WINDOW / 2 {
+                self.need_max_data = true;
+            }
+        }
         Ok(())
     }
 
@@ -4967,6 +5007,90 @@ mod tests {
         assert!(
             client.spaces[SPACE_INITIAL].crypto_pending.is_empty(),
             "empty CRYPTO fragments are not buffered (no unbounded growth)"
+        );
+    }
+
+    #[test]
+    fn reset_stream_reclaims_connection_flow_control_credit() {
+        // RFC 9000 §4.5: a RESET_STREAM's bytes count as delivered for connection
+        // flow control. Charging the reset tail to recv_data_total without ever
+        // crediting recv_data_consumed froze MAX_DATA for good: a peer that opens a
+        // stream, sends one byte and resets at the full stream window strands 2 MiB
+        // each time, so ~8 resets pin recv_data_total at the 16 MiB CONN_RECV_WINDOW
+        // with recv_data_consumed still 0 and the connection can never receive again.
+        let mut server = Connection::new_server(
+            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x6d, 0x6d, 0x6d, 0x6d]),
+        )
+        .unwrap();
+
+        // MAX_PEER_STREAMS × STREAM_RECV_WINDOW (128 MiB) is many times the 16 MiB
+        // connection window, so every one of these succeeds only if each reset
+        // releases the credit it consumed.
+        for n in 0..MAX_PEER_STREAMS as u64 {
+            let id = n * 4; // client-initiated bidi == peer-initiated for the server
+            server.recv_stream(id, 0, false, &[0xAB]).unwrap();
+            server
+                .recv_reset_stream(id, 0, STREAM_RECV_WINDOW)
+                .unwrap_or_else(|e| {
+                    panic!("reset #{n} must not exhaust the connection window: {e:?}")
+                });
+        }
+        assert!(
+            server.need_max_data,
+            "reclaimed credit must re-arm a MAX_DATA grant"
+        );
+        assert!(
+            server.recv_data_consumed <= server.recv_data_total,
+            "credit reclaimed ({}) must never exceed what was charged ({})",
+            server.recv_data_consumed,
+            server.recv_data_total,
+        );
+        assert_eq!(
+            server.recv_pending_total, 0,
+            "a reset stream's unreassemblable fragments must release the budget"
+        );
+
+        // A duplicate RESET_STREAM carries delta == 0 and must not credit again,
+        // which would inflate the window past what the peer actually consumed.
+        let consumed = server.recv_data_consumed;
+        server.recv_reset_stream(0, 0, STREAM_RECV_WINDOW).unwrap();
+        assert_eq!(
+            server.recv_data_consumed, consumed,
+            "a duplicate RESET_STREAM must not credit the same bytes twice"
+        );
+
+        // Bytes already reassembled in order stay readable (the reader drains them
+        // before the reset surfaces), and are credited exactly once, by the read.
+        assert_eq!(server.read_stream(0), vec![0xAB]);
+        assert_eq!(
+            server.recv_data_consumed,
+            consumed + 1,
+            "the still-deliverable byte is credited by the read, not by the reset"
+        );
+
+        // A late retransmit on a reset stream must not be reassembled: its bytes
+        // were already counted as delivered by the reset, and `delta` is 0 at this
+        // point, so delivering them would credit the window a second time for bytes
+        // that were never charged to it.
+        let after_read = server.recv_data_consumed;
+        server.recv_stream(0, 0, false, &[0xAB; 64]).unwrap();
+        assert!(
+            server.read_stream(0).is_empty(),
+            "a reset stream must not deliver post-reset data"
+        );
+        assert_eq!(
+            server.recv_data_consumed, after_read,
+            "post-reset data must not credit the connection window again"
+        );
+        assert!(
+            server.recv_data_consumed <= server.recv_data_total,
+            "credit ({}) must never exceed what was charged ({})",
+            server.recv_data_consumed,
+            server.recv_data_total,
         );
     }
 

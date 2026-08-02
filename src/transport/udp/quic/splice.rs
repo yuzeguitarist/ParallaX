@@ -97,6 +97,13 @@ impl SpliceFlow {
 /// or the flow is dropped. The buffer holds the largest possible UDP datagram
 /// ([`MAX_RELAY_PAYLOAD`]) so an origin datagram is never silently truncated —
 /// symmetric with the uncapped client→origin forward.
+///
+/// Sizing it down (and growing on demand) would cut the memory a `MAX_SPLICE_FLOWS`
+/// flood can pin, but there is no portable way to tell a full buffer from a
+/// truncated datagram, so the first over-sized datagram of every flow would have to
+/// be dropped or relayed short — re-opening exactly the non-transparent forwarding
+/// that finding #35 closed. The flood cost is hard-bounded by the flow cap and the
+/// relay is 1:1, so transparency wins here.
 async fn pump_origin_to_client(
     to_origin: Arc<UdpSocket>,
     listen: Arc<UdpSocket>,

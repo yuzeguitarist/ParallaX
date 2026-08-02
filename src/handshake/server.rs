@@ -1506,24 +1506,13 @@ async fn relay_fallback_reusing_origin(
     first_client_record: Vec<u8>,
     predialed_origin: Option<PredialedOrigin>,
 ) -> Result<(), HandshakeServerError> {
-    let predialed_origin = match predialed_origin {
-        Some(origin) => origin.into_stream().await,
-        None => None,
-    };
     // Acquire the camouflage origin and replay the bytes we already read. If any
     // of this fails we must not just drop `client`: a bare drop with bytes still
     // queued in its receive buffer makes the kernel emit a RST, which is an
     // observable difference from an ordinary origin. Drain and FIN it instead,
     // exactly like the relay teardown, so both fallback exits behave the same.
-    let forwarded = match predialed_origin {
-        // Already connected and tuned by the pre-dial; only the replay is left.
-        Some(mut fallback) => fallback
-            .write_all(&first_client_record)
-            .await
-            .map(|()| fallback)
-            .map_err(HandshakeServerError::Io),
-        None => connect_and_forward_to_fallback(fallback_addr, &first_client_record).await,
-    };
+    let forwarded =
+        forward_first_record_to_origin(fallback_addr, &first_client_record, predialed_origin).await;
     let fallback = match forwarded {
         Ok(fallback) => fallback,
         Err(err) => {
@@ -1542,6 +1531,33 @@ async fn connect_and_forward_to_fallback(
     tune_tcp_stream(&fallback)?;
     fallback.write_all(first_client_record).await?;
     Ok(fallback)
+}
+
+/// Obtain the camouflage origin for a splice and replay the bytes already read,
+/// adopting a pre-dialed connection when one is available (#197).
+///
+/// Shared by every splice entry point (healthy fallback AND cap-shed) so the
+/// origin-acquisition behavior cannot drift between them: a path that dialed on
+/// its own would put the give-up delay back in front of the origin's idle clock
+/// and re-open the close-timing tell the pre-dial exists to remove.
+async fn forward_first_record_to_origin(
+    fallback_addr: &str,
+    first_client_record: &[u8],
+    predialed_origin: Option<PredialedOrigin>,
+) -> Result<TcpStream, HandshakeServerError> {
+    let predialed_origin = match predialed_origin {
+        Some(origin) => origin.into_stream().await,
+        None => None,
+    };
+    match predialed_origin {
+        // Already connected and tuned by the pre-dial; only the replay is left.
+        Some(mut fallback) => fallback
+            .write_all(first_client_record)
+            .await
+            .map(|()| fallback)
+            .map_err(HandshakeServerError::Io),
+        None => connect_and_forward_to_fallback(fallback_addr, first_client_record).await,
+    }
 }
 
 /// Wall-clock budget for the FIN-first lingering drain. Bounded so a peer that
@@ -1612,22 +1628,38 @@ async fn graceful_close_tcp_stream(mut stream: TcpStream) {
 /// drive the box to its cap; reading first removes that establishment-ordering tell.
 /// The read is bounded by `first_record_wait_timeout` and the whole path by the 64
 /// cap-shed slots, so it cannot be amplified into a resource exhaustion.
+///
+/// The read uses the SAME pre-dialing reader as the healthy path (#197), not a plain
+/// one: for a peer that stays silent, a plain read defers the origin dial until the
+/// full [`first_record_wait_timeout`] ([8s, 15s]) elapses, so the ORIGIN's own idle
+/// clock — which is what drives the close a prober times — starts that much later
+/// and the observed close lands 8-15s after a healthy splice's. A prober can reach
+/// this path pre-auth simply by tripping the connection cap from its own address, so
+/// the difference is externally selectable; sharing the reader keeps both paths on
+/// one origin-dial schedule.
 async fn cap_shed_fallback_or_fin(mut client: TcpStream, fallback_addr: String) {
     let Some(_slot) = try_enter_cap_shed_fallback() else {
         graceful_close_tcp_stream(client).await;
         return;
     };
     // Read the ClientHello (or the partial give-up prefix) first, exactly as the
-    // healthy path does, so the origin dial happens AFTER the read on both paths.
-    let prefix = match read_first_client_record(&mut client).await {
-        Ok(FirstClientRead::Record(record)) => record,
-        Ok(FirstClientRead::FallbackPrefix(prefix)) => prefix,
+    // healthy path does, so the origin dial happens AFTER the read on both paths —
+    // and pre-dials on the same schedule for a silent peer.
+    let FirstReadWithOrigin {
+        read,
+        predialed_origin,
+    } = match read_first_client_record_predialing(&mut client, &fallback_addr).await {
+        Ok(first) => first,
         Err(_) => {
             graceful_close_tcp_stream(client).await;
             return;
         }
     };
-    match connect_and_forward_to_fallback(&fallback_addr, &prefix).await {
+    let prefix = match read {
+        FirstClientRead::Record(record) => record,
+        FirstClientRead::FallbackPrefix(prefix) => prefix,
+    };
+    match forward_first_record_to_origin(&fallback_addr, &prefix, predialed_origin).await {
         Ok(fallback) => {
             // Draw the idle backstop from the SAME distribution as a healthy splice
             // ([`fallback_idle_timeout`], [600s, 660s]) rather than a separate tight
@@ -1949,12 +1981,6 @@ where
         .await
         .map_err(|_| HandshakeServerError::Timeout)?
         .map_err(HandshakeServerError::Io)
-}
-
-async fn read_first_client_record(
-    stream: &mut TcpStream,
-) -> Result<FirstClientRead, HandshakeServerError> {
-    read_first_client_record_with_timeout(stream, first_record_wait_timeout()).await
 }
 
 /// An origin connection opened speculatively while waiting for the first record.
@@ -9169,6 +9195,48 @@ mod tests {
 
         // Restore the process-global budget for any other ignored/serial tests.
         drop(held);
+    }
+
+    /// The cap-shed path must pre-dial the camouflage origin on the SAME schedule as
+    /// a healthy splice. Reading with a plain reader deferred the dial until the
+    /// 8-15s give-up, so a silent prober that tripped the connection cap started the
+    /// ORIGIN's own idle clock 8-15s late and saw the close land that much later than
+    /// against a bare origin — an additive, externally selectable close-timing tell
+    /// (the cap is reachable pre-auth from the prober's own address). Ignored +
+    /// serial: real sockets, wall-clock timing, and it holds a process-global
+    /// cap-shed slot.
+    #[tokio::test]
+    #[ignore = "dynamic wall-clock timing + mutates the process-global cap-shed budget"]
+    async fn cap_shed_silent_probe_predials_origin_before_the_give_up() {
+        use std::time::Instant;
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap().to_string();
+
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        // The prober: connects, then says nothing at all. Held for the whole test.
+        let _prober = TcpStream::connect(parallax_addr).await.unwrap();
+        let (server_side, _) = parallax_listener.accept().await.unwrap();
+
+        let started = Instant::now();
+        let shed = tokio::spawn(cap_shed_fallback_or_fin(server_side, origin_addr));
+
+        let accepted = timeout(Duration::from_secs(2), origin_listener.accept())
+            .await
+            .expect("a cap-shed silent peer must dial the origin before the give-up wait")
+            .expect("origin accept must succeed");
+        let dialed_after = started.elapsed();
+        drop(accepted);
+
+        assert!(
+            dialed_after < FIRST_RECORD_WAIT_FLOOR,
+            "cap-shed dialed the origin after {dialed_after:?}, which is not below the \
+             {FIRST_RECORD_WAIT_FLOOR:?} give-up floor — the additive cap-shed \
+             close-timing offset is back"
+        );
+
+        shed.abort();
     }
 
     /// H-1 / M-4: a cap-shed close's IDLE-CLOSE TIME must not be separable from a

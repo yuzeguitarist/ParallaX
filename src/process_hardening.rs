@@ -177,6 +177,18 @@ pub fn harden_current_process() {
 /// for anti-forensics — those return `EPERM` instead. It is defense-in-depth,
 /// not a guarantee.
 ///
+/// One residual is worth naming precisely, because it is the same capability by a
+/// different route: `open`/`openat` + `pread` on `/proc/<pid>/mem` is NOT blocked.
+/// The kernel gates that open behind a ptrace-attach permission check, so it is
+/// unavailable under the common `yama.ptrace_scope >= 1`, but on a host left at
+/// `ptrace_scope = 0` an in-process foothold can still read a same-uid sibling's
+/// memory — a primitive equivalent to the `process_vm_readv` this filter denies.
+/// It cannot be closed here: seccomp BPF cannot dereference syscall pointer
+/// arguments, so `openat` cannot be filtered by path, and denying `openat`
+/// outright (or inverting this into an allowlist) is precluded by the
+/// CRITICAL-SAFETY constraint above. Operators who need that route closed should
+/// set `kernel.yama.ptrace_scope >= 1`.
+///
 /// # Best-effort / fail-open
 ///
 /// Every failure path (old kernel without `seccomp(2)`, a container that blocks

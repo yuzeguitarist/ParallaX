@@ -82,6 +82,12 @@ const BBR_STEADY_PACING_GAIN: f64 = 1.0;
 const BBR_PROBE_BW_GAIN_CYCLE: [f64; 8] = [5.0 / 4.0, 3.0 / 4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 /// Minimum cwnd (4 packets), used as the floor and during ProbeRTT (RFC/draft).
 const BBR_MIN_PIPE_CWND: u64 = 4 * MAX_DATAGRAM_SIZE;
+/// Ceiling for the pre-model bootstrap ramp (~32 MiB). The bootstrap branch runs
+/// only while no bandwidth sample exists, which normally lasts a couple of RTTs;
+/// a peer that keeps every ACK app-limited can hold it there forever, so the ramp
+/// needs a stop. Far above any window a real path uses, so it never binds a healthy
+/// transfer — once `bdp` is known the BDP-derived target takes over regardless.
+const BBR_MAX_BOOTSTRAP_CWND: u64 = 32 * 1024 * 1024;
 /// RTprop min-filter window: re-take the minimum RTT at least this often.
 const BBR_RTPROP_WINDOW: Duration = Duration::from_secs(10);
 /// How often to dip into ProbeRTT to re-measure RTprop.
@@ -272,8 +278,14 @@ impl Bbr {
         let bdp = self.bdp();
         if bdp == 0 {
             // Bootstrap before the model exists: grow like slow start so the first
-            // RTTs ramp up and produce delivery-rate samples.
-            self.cwnd = (self.cwnd + bytes_acked).max(BBR_MIN_PIPE_CWND);
+            // RTTs ramp up and produce delivery-rate samples. Bounded on both ends —
+            // a peer whose ACKs are all app-limited never yields a `btlbw` sample, so
+            // `bdp` can stay 0 indefinitely and an unchecked add would grow the
+            // window every ACK with nothing to stop it.
+            self.cwnd = self
+                .cwnd
+                .saturating_add(bytes_acked)
+                .clamp(BBR_MIN_PIPE_CWND, BBR_MAX_BOOTSTRAP_CWND);
             return;
         }
         let gain = if self.mode == BbrMode::Startup {

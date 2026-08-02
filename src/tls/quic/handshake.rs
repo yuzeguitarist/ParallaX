@@ -54,6 +54,8 @@ const HANDSHAKE_COMPRESSED_CERTIFICATE: u8 = 0x19;
 const HANDSHAKE_NEW_SESSION_TICKET: u8 = 0x04;
 
 const EXT_ALPN: u16 = 0x0010;
+const EXT_SERVER_NAME: u16 = 0x0000;
+const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
@@ -690,7 +692,11 @@ impl ClientHandshake {
     }
 
     fn handle_encrypted_extensions(&mut self, body: &[u8]) -> Result<(), QuicTlsError> {
-        let parsed = parse_encrypted_extensions_body(body, &self.config.alpn_protocols)?;
+        let parsed = parse_encrypted_extensions_body(
+            body,
+            &self.config.alpn_protocols,
+            self.resumption_psk.is_some(),
+        )?;
         self.alpn = parsed.alpn;
         self.peer_transport_params = parsed.transport_params;
         self.early_data_accepted = parsed.early_data;
@@ -980,9 +986,12 @@ struct EncryptedExtensionsParsed {
 /// This is the pre-authentication byte walk over the server's EncryptedExtensions;
 /// `offered_alpn` is the client's offered ALPN list (`self.config.alpn_protocols`),
 /// used to reject an unoffered / missing selection exactly as the handshake does.
+/// `offered_early_data` is whether this handshake offered 0-RTT (i.e. resumed):
+/// the server may only echo `early_data` back if we asked for it.
 fn parse_encrypted_extensions_body(
     body: &[u8],
     offered_alpn: &[Vec<u8>],
+    offered_early_data: bool,
 ) -> Result<EncryptedExtensionsParsed, QuicTlsError> {
     let mut c = Cursor::new(body);
     let extensions = c.vec_u16()?;
@@ -1027,7 +1036,18 @@ fn parse_encrypted_extensions_body(
             }
             EXT_EARLY_DATA => {
                 // The server echoing `early_data` accepts 0-RTT (RFC 8446
-                // §4.2.10); its EncryptedExtensions body is empty.
+                // §4.2.10); its EncryptedExtensions body is empty. It may only echo
+                // one back if we offered it — a handshake with no ticket never sent
+                // `early_data`, so accepting it here both records a 0-RTT state we
+                // never entered and is the silent leniency a real client does not
+                // have (RFC 8446 §4.2: an unsolicited extension is
+                // unsupported_extension), i.e. an active-probe tell.
+                if !offered_early_data {
+                    return Err(QuicTlsError::alert(
+                        ALERT_UNSUPPORTED_EXTENSION,
+                        "EncryptedExtensions early_data we did not offer",
+                    ));
+                }
                 if !data.is_empty() {
                     return Err(QuicTlsError::alert(
                         ALERT_DECODE_ERROR,
@@ -1036,7 +1056,21 @@ fn parse_encrypted_extensions_body(
                 }
                 early_data = true;
             }
-            _ => {}
+            // RFC 8446 §4.2: a client MUST abort with unsupported_extension on an
+            // extension it did not request. Silently ignoring everything else left
+            // ParallaX completing EncryptedExtensions a conformant client rejects —
+            // a behavioral fingerprint a censor can select on. The two tolerated
+            // types below are ones we DO offer in the ClientHello and that RFC 8446
+            // permits the server to answer in EncryptedExtensions: an empty
+            // `server_name` acknowledging our SNI, and `supported_groups`. Neither
+            // carries state we act on, so they are accepted and ignored.
+            EXT_SERVER_NAME | EXT_SUPPORTED_GROUPS => {}
+            _ => {
+                return Err(QuicTlsError::alert(
+                    ALERT_UNSUPPORTED_EXTENSION,
+                    "unsolicited extension in EncryptedExtensions",
+                ));
+            }
         }
     }
     // Reject trailing bytes after the extensions block (active-probe distinguisher).
@@ -1270,11 +1304,20 @@ pub mod fuzz {
     }
 
     /// Parse an EncryptedExtensions body against the production offered-ALPN list.
+    /// Both 0-RTT states are exercised: they differ only in whether an `early_data`
+    /// echo is legal, so the cold (did-not-offer) parse is strictly the stricter of
+    /// the two and anything it accepts the resumed parse must accept too.
     pub fn parse_encrypted_extensions(body: &[u8]) -> Result<(), ()> {
         let offered_alpn = [b"h3".to_vec()];
-        super::parse_encrypted_extensions_body(body, &offered_alpn)
-            .map(|_| ())
-            .map_err(|_| ())
+        let cold = super::parse_encrypted_extensions_body(body, &offered_alpn, false);
+        let resumed = super::parse_encrypted_extensions_body(body, &offered_alpn, true);
+        if cold.is_ok() {
+            assert!(
+                resumed.is_ok(),
+                "offering 0-RTT must not reject an EncryptedExtensions the cold parse accepted"
+            );
+        }
+        cold.map(|_| ()).map_err(|_| ())
     }
 
     /// Parse a Certificate body into the DER chain.

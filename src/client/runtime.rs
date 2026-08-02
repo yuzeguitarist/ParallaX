@@ -1281,7 +1281,12 @@ impl ClientMuxPool {
                 Arc::clone(&self.server_identity_public),
             )
             .await?;
-        let stream_limit = self.traffic.max_concurrent_streams as usize;
+        // `TrafficConfig::validate` rejects 0, but clamp anyway: a programmatically
+        // built config never runs that check, and a zero-permit semaphore would turn
+        // `build_and_reserve`'s "a fresh session always has a free slot" expect into
+        // a panic that aborts the acquiring task. The mux channel capacities below
+        // already clamp the same way.
+        let stream_limit = (self.traffic.max_concurrent_streams as usize).max(1);
         let chunk_size = max_plaintext_len(self.traffic.max_padding);
 
         // Mux-over-QUIC fast plane: the UDP probe Verified, so multiplex each
