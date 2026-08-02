@@ -137,12 +137,23 @@ impl SentPackets {
     }
 
     /// Record an outgoing packet.
+    ///
+    /// Only ack-eliciting packets are tracked. RFC 9002 §2 defines the
+    /// loss-recovery state over ack-eliciting (in-flight) packets: a pure-ACK
+    /// packet carries no retransmittable content, contributes no bytes-in-flight,
+    /// and yields no RTT/delivery sample, so keeping it here would be pure
+    /// bookkeeping — and unbounded bookkeeping at that. Every reaping path is
+    /// driven by the peer: `on_ack` removes only acknowledged ranges,
+    /// `detect_lost` scans only below `largest_acked`, and the PTO `discard`
+    /// path walks the connection's `sent_content` (which pure-ACKs never enter).
+    /// A peer that floods ack-eliciting packets while withholding its own ACKs
+    /// makes us emit one pure-ACK per received datagram and never advances
+    /// `largest_acked`, so tracked pure-ACKs would accumulate without bound.
     pub fn on_sent(&mut self, pn: u64, sent: SentPacket) {
-        // Only ack-eliciting packets count toward bytes-in-flight (RFC 9002 §2);
-        // pure-ACK packets must not inflate congestion-window usage.
-        if sent.ack_eliciting {
-            self.in_flight += sent.size;
+        if !sent.ack_eliciting {
+            return;
         }
+        self.in_flight += sent.size;
         self.packets.insert(pn, sent);
     }
 
@@ -226,6 +237,55 @@ impl SentPackets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pure_ack_packets_are_never_tracked() {
+        // A peer that floods ack-eliciting packets (e.g. PING) while withholding its
+        // own ACKs makes us emit one pure-ACK per received datagram. Those carry no
+        // retransmittable content and no bytes-in-flight, and while `largest_acked`
+        // never advances NO reaping path can drop them (`on_ack` removes only
+        // acknowledged ranges, `detect_lost` scans only below `largest_acked`, and
+        // the PTO `discard` path walks `sent_content`, which pure-ACKs never enter).
+        // Tracking them at all therefore grows the map without bound, so they must
+        // not be recorded in the first place.
+        let mut sent = SentPackets::new();
+        let now = Instant::now();
+        for pn in 0..1_000 {
+            sent.on_sent(
+                pn,
+                SentPacket {
+                    time_sent: now,
+                    size: 40,
+                    ack_eliciting: false,
+                    delivered: 0,
+                },
+            );
+        }
+        assert_eq!(sent.in_flight(), 0, "pure-ACKs are not in flight");
+        // Nothing was retained: an ACK covering every emitted number finds no entry,
+        // and loss detection has nothing to walk.
+        assert!(
+            sent.on_ack(999, &[(0, 999)]).is_empty(),
+            "no pure-ACK should have been tracked"
+        );
+        let (lost, deadline) = sent.detect_lost(Duration::from_millis(10), now);
+        assert!(lost.is_empty());
+        assert!(deadline.is_none());
+
+        // An ack-eliciting packet on the same instance is still tracked normally.
+        sent.on_sent(
+            1_000,
+            SentPacket {
+                time_sent: now,
+                size: 1200,
+                ack_eliciting: true,
+                delivered: 0,
+            },
+        );
+        assert_eq!(sent.in_flight(), 1200);
+        assert_eq!(sent.on_ack(1_000, &[(1_000, 1_000)]).len(), 1);
+        assert_eq!(sent.in_flight(), 0);
+    }
 
     #[test]
     fn before_any_sample_uses_rfc_defaults() {

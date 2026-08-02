@@ -46,6 +46,8 @@ pub enum AuthError {
     InvalidSessionIdLen,
     #[error("ClientHello auth key derivation failed")]
     Hkdf,
+    #[error("degenerate (all-zero) X25519 shared secret")]
+    DegenerateSharedSecret,
     #[error("system clock is before UNIX epoch")]
     Clock,
 }
@@ -277,6 +279,27 @@ fn derive_auth_key(
     derive_auth_key_from_shared(psk, shared.as_bytes())
 }
 
+/// Reject a degenerate (all-zero) X25519 shared secret before it seeds an HKDF.
+///
+/// Both ECDH inputs on this path are attacker-influenced: `mask_ecdh` is
+/// X25519(server_static, the client's TLS key_share), and the auth-slot secret is
+/// X25519(server_static, the recovered ParallaX ephemeral). A small-order or
+/// identity point drives either to all zeros, collapsing that key to a pure
+/// function of the PSK and silently dropping the X25519 layer's contributory
+/// guarantee (the two-secret property documented on [`derive_mask_key`]). This is
+/// NOT an authentication bypass — the PSK is the HKDF *salt*, so a peer without it
+/// still cannot forge the tag — but rejecting keeps parity with the equivalent
+/// guards in `crypto/session.rs` and `crypto/pq.rs`. Compared in constant time.
+///
+/// On the server this error funnels to the origin like any other auth failure
+/// (see `handshake::server`), so it introduces no distinguishable reject shape.
+fn reject_degenerate_shared_secret(shared: &[u8; 32]) -> Result<(), AuthError> {
+    if bool::from(shared.ct_eq(&[0_u8; 32])) {
+        return Err(AuthError::DegenerateSharedSecret);
+    }
+    Ok(())
+}
+
 fn derive_auth_key_from_shared(
     psk: &[u8],
     x25519_shared_secret: &[u8; 32],
@@ -284,6 +307,7 @@ fn derive_auth_key_from_shared(
     if psk.is_empty() {
         return Err(AuthError::EmptyPsk);
     }
+    reject_degenerate_shared_secret(x25519_shared_secret)?;
 
     let hk = Hkdf::<Sha256>::new(Some(psk), x25519_shared_secret);
     // Wipe the derived auth key's stack slot on return, matching `derive_mask_key`
@@ -307,6 +331,7 @@ fn derive_mask_key(psk: &[u8], mask_ecdh: &[u8; 32]) -> Result<Zeroizing<[u8; 32
     if psk.is_empty() {
         return Err(AuthError::EmptyPsk);
     }
+    reject_degenerate_shared_secret(mask_ecdh)?;
 
     let hk = Hkdf::<Sha256>::new(Some(psk), mask_ecdh);
     let mut out = Zeroizing::new([0_u8; 32]);
@@ -518,7 +543,16 @@ mod tests {
         hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
         hello[parsed.session_id_range.clone()].copy_from_slice(&session_id);
 
-        for wrong in [[0_u8; 32], [0x11_u8; 32], [0xAB_u8; 32]] {
+        // An all-zero mask_ecdh is a degenerate X25519 output (what a small-order
+        // or identity peer point produces). It is now rejected outright instead of
+        // merely failing to recover the timestamp — strictly stronger than the
+        // oracle-closed property asserted for the other wrong masks below.
+        assert!(matches!(
+            recover_stateful_auth_material(&hello, psk, &[0_u8; 32]),
+            Err(AuthError::DegenerateSharedSecret)
+        ));
+
+        for wrong in [[0x11_u8; 32], [0xAB_u8; 32]] {
             let material = recover_stateful_auth_material(&hello, psk, &wrong)
                 .unwrap()
                 .unwrap();

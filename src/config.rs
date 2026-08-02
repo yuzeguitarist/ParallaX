@@ -422,7 +422,17 @@ fn resolve_file_secret(
 ) -> Result<Zeroizing<String>, ConfigError> {
     let (path_part, fragment) = crate::secret_store::split_fragment(spec);
     let path = crate::secret_store::resolve_path(base, path_part);
-    let text = read_secret_config_file(&path).map_err(|_| ConfigError::SecretRead { field })?;
+    let text = read_secret_config_file(&path).map_err(|err| match err {
+        // A world-readable / foreign-owned sidecar is NOT "the secret is unavailable
+        // on this host": the file is right there and readable, it is simply exposed.
+        // Collapsing it into `SecretRead` made `is_secret_unavailable` true, so
+        // `plx check` degraded to a structure-only pass and printed `ok: ... valid`
+        // while saying nothing about the exposed secret file. Propagate it verbatim
+        // so the check fails loudly. (`Config::load` already fails closed here, so
+        // this only ever masked the *diagnostic*.)
+        err @ ConfigError::InsecureConfigPermissions { .. } => err,
+        _ => ConfigError::SecretRead { field },
+    })?;
     match fragment {
         None => Ok(Zeroizing::new(text.trim().to_owned())),
         Some(key) => {
@@ -872,6 +882,19 @@ impl Config {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// True when the resolved PSK looks low-entropy (guessable).
+    ///
+    /// A server refuses to start on this ([`ConfigError::LowEntropyPsk`]); client
+    /// mode only warns, and that warning goes to `tracing::warn!`, which the default
+    /// log filter drops — so a guessable client PSK used to pass `plx check` with a
+    /// clean `ok: ... valid`. `plx check` calls this to print the verdict on stdout
+    /// alongside its other advisories.
+    pub fn has_low_entropy_psk(&self) -> bool {
+        decode_psk(self.crypto.psk.as_b64())
+            .map(|psk| psk_looks_low_entropy(&psk))
+            .unwrap_or(false)
     }
 
     pub fn protect_secret_memory(&self) {

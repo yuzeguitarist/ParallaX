@@ -341,39 +341,59 @@ fn active_instances(dir: &Path) -> Result<Vec<RuntimeInstance>, RuntimeGuardErro
     Ok(active)
 }
 
+/// Open `path` with `O_NOFOLLOW | O_DIRECTORY` and require the fd to be a
+/// euid-owned directory. A symlinked component fails `open()` with ELOOP
+/// (ENOTDIR on macOS), a non-dir with ENOTDIR, and a foreign owner is rejected
+/// here. Mirrors the fd-based ownership check in
+/// `config.rs::read_secret_config_file`.
+#[cfg(unix)]
+fn open_owned_dir_nofollow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let dir_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)?;
+    let metadata = dir_file.metadata()?;
+    let uid = metadata.uid();
+    let euid = rustix::process::geteuid().as_raw();
+    if !metadata.is_dir() || uid != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime state dir {} is not a euid-owned directory (uid={uid}, euid={euid})",
+                path.display()
+            ),
+        ));
+    }
+    Ok(dir_file)
+}
+
 fn ensure_state_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
 
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
 
         // The state dir path (/tmp/parallax-<euid>/runtime) is predictable, so on
         // a shared host an attacker can pre-create it or plant a symlink before we
-        // do. Re-open the final directory with O_NOFOLLOW | O_DIRECTORY and fstat
-        // the fd: a symlinked final component fails open() with ELOOP (ENOTDIR on
-        // macOS), a non-dir with ENOTDIR, and a foreign owner is rejected here.
-        // Mirrors the fd-based ownership check in config.rs::read_secret_config_file.
-        // Like that check, O_NOFOLLOW only guards the FINAL component — the parent
-        // /tmp/parallax-<euid> is not validated; this raises the bar without fully
-        // closing a hostile-parent race on a shared host.
-        let dir_file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(dir)?;
-        let metadata = dir_file.metadata()?;
-        let uid = metadata.uid();
-        let euid = rustix::process::geteuid().as_raw();
-        if !metadata.is_dir() || uid != euid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "runtime state dir {} is not a euid-owned directory (uid={uid}, euid={euid})",
-                    dir.display()
-                ),
-            ));
+        // do. Validate the PARENT as well as the final component: the parent is
+        // equally euid-predictable and lives in a world-writable /tmp, so an
+        // attacker who pre-creates it owns everything we then build inside — they
+        // could read the lock files' plaintext `server_addr` (which server a client
+        // is using) or plant flocked lock files to force a false `RuntimeConflict`.
+        // Checking only the leaf, as this did before, left that open.
+        //
+        // Residual: the two components are validated by path rather than via
+        // `openat` relative to the parent's fd, so a same-instant swap between the
+        // checks remains theoretically possible. Owning the parent is the step an
+        // attacker must win first, and that is now checked.
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _parent = open_owned_dir_nofollow(parent)?;
         }
+        let _dir = open_owned_dir_nofollow(dir)?;
     }
     Ok(())
 }
@@ -543,6 +563,21 @@ mod tests {
         symlink(&target, &link).unwrap();
         // O_NOFOLLOW must make the symlinked final component fail closed.
         assert!(ensure_state_dir(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        fs::create_dir_all(&real_parent).unwrap();
+        let linked_parent = tmp.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+        // The final component is a genuine euid-owned directory, but it is reached
+        // through a symlinked parent — the hostile-parent shape a leaf-only check
+        // accepts and this guard must reject.
+        assert!(ensure_state_dir(&linked_parent.join("runtime")).is_err());
     }
 
     #[test]

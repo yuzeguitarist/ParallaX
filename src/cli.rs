@@ -226,6 +226,16 @@ fn check_config(config: PathBuf) -> anyhow::Result<()> {
              secret values not decrypted"
         );
     }
+    if secrets_validated && cfg.has_low_entropy_psk() {
+        println!(
+            "warning: crypto.psk appears to have low entropy, so it is guessable; a \
+             server refuses to start with it."
+        );
+        println!(
+            "         Regenerate it with a CSPRNG (e.g. `plx init` or \
+             `openssl rand -base64 32`) on BOTH ends."
+        );
+    }
     match cfg.replay_cache_writability() {
         ReplayCacheWritability::NotServer | ReplayCacheWritability::Writable => {}
         ReplayCacheWritability::ParentMissingCreatable { missing } => {

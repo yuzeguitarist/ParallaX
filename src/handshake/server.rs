@@ -838,6 +838,17 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         )?,
     ));
     let secrets = ServerRuntimeSecrets::decode(&server)?;
+    // Install the memory-scrape seccomp denylist here: the PSK, replay cache and
+    // server identity are loaded (so all key-loading ran unfiltered), and this
+    // still precedes the UDP carrier bind below. That matters — `QuicCarrier::bind`
+    // immediately spawns an endpoint driver that begins parsing attacker-controlled
+    // QUIC Initials, so arming the filter after it left a window in which untrusted
+    // input was already being parsed with the scrape/pivot syscalls untrapped.
+    // Everything after this point (listener binds, ballast warm, the accept loop)
+    // needs none of the denied syscalls. Best-effort by construction (it warns and
+    // continues on an old kernel or a blocking container) and never touches the
+    // wire, so it cannot introduce an externally observable behavior change.
+    crate::process_hardening::install_late_seccomp_filter();
     // Enable 0-RTT on the experimental UDP fast plane: a STEK derived from the
     // server's stable static private key (server-only, and stable across the
     // per-session ephemeral QUIC endpoints) lets the server issue + accept
@@ -924,14 +935,6 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     // initialisation and be measurably slower than later rejects — a "first-packet"
     // timing tell. Warming it here folds that cost into startup.
     reject_path_constant_work();
-
-    // Install the memory-scrape seccomp denylist now: keys are loaded, every
-    // listener is bound, and the reject-path ballast is warmed, so all of that
-    // startup work runs unfiltered — only the steady-state serving loop below is
-    // governed. Best-effort by construction (it warns and continues on an old
-    // kernel or a blocking container) and never touches the wire, so it cannot
-    // introduce an externally observable behavior change.
-    crate::process_hardening::install_late_seccomp_filter();
 
     loop {
         let (client, peer) = match listener.accept().await {
@@ -1312,15 +1315,33 @@ fn decide_connection_inbound(
             &parsed,
         ) {
             Ok(recovered) => recovered,
-            Err(err) => {
+            Err(_) => {
+                // Funnel to the origin exactly like a tag mismatch. Returning Err
+                // here would bubble past the `ConnectionDecision` match in the
+                // caller and bare-drop the socket (kernel RST once the client has
+                // queued RX) — a proxy-specific reject shape that a prober can tell
+                // apart from the real origin, which always answers. Spend the
+                // auth-slot ballast and replay the same constant work as the
+                // recover==None arm so this stays wall-clock equal to the other
+                // reject shapes.
                 let _ = dh(&parsed.client_random); // ballast: auth-slot, recover error
-                return Err(err.into());
+                reject_path_constant_work();
+                return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
             }
         };
         if let Some(material) = recovered {
             let x25519_key_share = material.x25519_public;
             let x25519_shared_secret = dh(&x25519_key_share);
-            let auth_key = derive_server_auth_key_from_shared(psk, &x25519_shared_secret)?;
+            let auth_key = match derive_server_auth_key_from_shared(psk, &x25519_shared_secret) {
+                Ok(auth_key) => auth_key,
+                // Same funnel-to-origin fail-safe as the recover arm above: an
+                // auth-crypto error must never produce a distinguishable
+                // (bare-drop / RST) reject shape. Unreachable today — the PSK is
+                // config-enforced non-empty, the fixed-length HKDF-Expand is
+                // infallible, and the degenerate-shared-secret guard cannot fire
+                // on an honest peer.
+                Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
+            };
             let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
                 first_client_record,
                 auth_key.as_slice(),
@@ -1328,7 +1349,8 @@ fn decide_connection_inbound(
                 &parsed,
             ) {
                 Ok(auth) => auth,
-                Err(err @ (AuthError::EmptyPsk | AuthError::Hkdf)) => return Err(err.into()),
+                // Every verify failure — tag mismatch AND crypto error alike —
+                // funnels to the origin, so the reject shape carries no signal.
                 Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
             };
             if auth.authenticated {
@@ -1343,7 +1365,15 @@ fn decide_connection_inbound(
             // Masked auth failed. The two real DH ops (mask slot + auth slot) are
             // already done; the recover + derive + verify crypto budget this arm
             // just spent is what the two reject arms below replay via
-            // reject_path_constant_work, so all three are wall-clock equal.
+            // reject_path_constant_work, so the three reject shapes are equal up to
+            // one residual: this arm HMACs the peer's ACTUAL SNI (three passes,
+            // length attacker-chosen up to the record cap) while the ballast replays
+            // a fixed 15-byte SNI, so the reject cost still carries a small
+            // SNI-length term (~1-3us for a normal name, tens of us at the 16 KiB
+            // extreme). It is not a usable distinguisher — it sits below remote RTT
+            // jitter, is dwarfed by the origin-splice round trip that follows, and
+            // the real origin's own processing is SNI-length-dependent too — but it
+            // is a residual, not exact equality.
         } else {
             // recover==None: spend the auth-slot DH (op-count parity), then replay
             // the SAME recover+derive+verify crypto the auth-fail arm runs, so this
@@ -8560,7 +8590,7 @@ mod tests {
         let quic_server = Endpoint::server(
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(QuicServerConfig {
-                cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+                cert_chain: Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
                 signing_key_pkcs8: signing_key,
                 alpn_protocols: vec![b"h3".to_vec()],
                 zero_rtt: None,

@@ -201,11 +201,15 @@ pub fn harden_current_process() {
 ///
 /// # Call site
 ///
-/// Wired in the long-running server path in `src/handshake/server.rs::run`, after
-/// every listener is bound (TCP accept socket and the optional UDP carrier) and
-/// after the reject-path ballast is warmed, but before the `accept()` loop — so
-/// key loading, binds and one-time warmup run unfiltered and only the steady-state
-/// serving loop is governed.
+/// Wired in the long-running server path in `src/handshake/server.rs::run`, right
+/// after the PSK, replay cache and server identity are loaded — so all key loading
+/// runs unfiltered — and *before* the UDP origin-splice carrier is bound. That
+/// ordering is deliberate: `QuicCarrier::bind` immediately spawns an endpoint
+/// driver that starts parsing attacker-controlled QUIC Initials, so installing
+/// after it would leave a window in which untrusted input is parsed with the
+/// scrape/pivot syscalls still untrapped. Nothing that follows (the TCP listener
+/// bind, the reject-path ballast warm, the `accept()` loop) issues a denied
+/// syscall, so arming the filter this early costs nothing.
 ///
 /// Honors `PARALLAX_DISABLE_SECCOMP` (mirroring `PARALLAX_DISABLE_ANTI_DEBUG`) for
 /// operators who must run under unusual tracing tools; when set truthy the filter
