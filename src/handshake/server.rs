@@ -1303,11 +1303,17 @@ fn decide_connection_inbound(
     if let Some(mask_ecdh) = mask_ecdh.as_deref() {
         // `recover` runs after the mask-slot DH but before the auth-slot DH. Its
         // only error sources are EmptyPsk (config-enforced non-empty) and HKDF
-        // (infallible over fixed-length input), so on attacker-controlled parsed
-        // input it always resolves to Ok(None)/Ok(Some) -- never Err. Handle Err
-        // explicitly anyway, spending the auth-slot ballast first, so the M-2
-        // fixed 2-DH-op reject budget cannot regress to 1 op if recover's error
-        // surface is ever widened (mirrors the verify EmptyPsk/Hkdf arm below).
+        // (infallible over fixed-length output), so on attacker-controlled parsed
+        // input it always resolves to Ok(None)/Ok(Some) -- never Err. That is a
+        // deliberate property, not an accident: `derive_mask_key` specifically does
+        // NOT reject a degenerate mask_ecdh, because a small-order TLS key_share
+        // would otherwise let a prober divert an otherwise byte-identical
+        // ClientHello from the auth-fail arm onto the ballast arm below and time the
+        // difference (see `crypto::auth::reject_degenerate_shared_secret`). Handle
+        // Err anyway, spending the auth-slot ballast and the same constant work the
+        // recover==None arm spends, so neither the M-2 fixed 2-DH-op reject budget
+        // nor the reject shape can regress if recover's error surface is ever
+        // widened.
         let recovered = match recover_stateful_auth_material_from_parsed(
             first_client_record,
             psk,
@@ -1338,9 +1344,14 @@ fn decide_connection_inbound(
                 // auth-crypto error must never produce a distinguishable
                 // (bare-drop / RST) reject shape. Unreachable today — the PSK is
                 // config-enforced non-empty, the fixed-length HKDF-Expand is
-                // infallible, and the degenerate-shared-secret guard cannot fire
-                // on an honest peer.
-                Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
+                // infallible, and the auth-slot degenerate guard's input is
+                // PSK-derived, so a peer cannot steer it. Replay the constant work
+                // the other reject arms spend so this arm cannot become the cheapest
+                // (and therefore measurable) shape if it ever does become reachable.
+                Err(_) => {
+                    reject_path_constant_work();
+                    return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
+                }
             };
             let auth = match verify_masked_stateful_client_hello_auth_with_parsed_material(
                 first_client_record,

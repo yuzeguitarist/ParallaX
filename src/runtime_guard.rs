@@ -522,6 +522,20 @@ mod tests {
     use super::*;
     use crate::config::{CryptoConfig, TrafficConfig, UdpConfig};
 
+    /// A euid-owned state dir nested one level INSIDE a tempdir.
+    ///
+    /// `tempfile::tempdir()` places its root directly in the system temp dir, which
+    /// on Linux is the root-owned, world-writable `/tmp` — and `ensure_state_dir`
+    /// (correctly) refuses a parent it does not own. Production never sees that
+    /// shape: `default_state_dir()` is `/tmp/parallax-<euid>/runtime`, whose parent
+    /// `create_dir_all` creates and therefore owns. Tests nest one level down to
+    /// reproduce the production shape instead of weakening the check.
+    fn state_dir(tmp: &tempfile::TempDir) -> PathBuf {
+        let dir = tmp.path().join("runtime");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn config(server_addr: &str) -> Config {
         Config {
             mode: Mode::Client,
@@ -584,9 +598,9 @@ mod tests {
     fn speed_rejects_same_server_client() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config("203.0.113.10:443");
-        let _client = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap();
+        let _client = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir)).unwrap();
 
-        let err = RuntimeGuard::acquire_speed_in_dir(&cfg, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_speed_in_dir(&cfg, &state_dir(&dir)).unwrap_err();
         assert!(matches!(err, RuntimeGuardError::Conflict(_)));
         assert!(err.to_string().contains("Test a different server"));
     }
@@ -596,9 +610,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let client_cfg = config("203.0.113.10:443");
         let speed_cfg = config("203.0.113.11:443");
-        let _client = RuntimeGuard::acquire_client_in_dir(&client_cfg, dir.path()).unwrap();
+        let _client = RuntimeGuard::acquire_client_in_dir(&client_cfg, &state_dir(&dir)).unwrap();
 
-        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, dir.path()).unwrap();
+        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, &state_dir(&dir)).unwrap();
     }
 
     #[test]
@@ -606,9 +620,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let speed_cfg = config("203.0.113.10:443");
         let client_cfg = config("203.0.113.11:443");
-        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, dir.path()).unwrap();
+        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, &state_dir(&dir)).unwrap();
 
-        let err = RuntimeGuard::acquire_client_in_dir(&client_cfg, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_client_in_dir(&client_cfg, &state_dir(&dir)).unwrap_err();
         assert!(matches!(err, RuntimeGuardError::Conflict(_)));
         assert!(err.to_string().contains("plx speed run is already active"));
     }
@@ -618,9 +632,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = config("203.0.113.20:443");
         let b = config("203.0.113.21:443");
-        let _first = RuntimeGuard::acquire_speed_in_dir(&a, dir.path()).unwrap();
+        let _first = RuntimeGuard::acquire_speed_in_dir(&a, &state_dir(&dir)).unwrap();
 
-        let err = RuntimeGuard::acquire_speed_in_dir(&b, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_speed_in_dir(&b, &state_dir(&dir)).unwrap_err();
         match err {
             RuntimeGuardError::Conflict(conflict) => {
                 assert!(conflict
@@ -637,11 +651,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config("203.0.113.30:443");
         {
-            let _guard = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap();
+            let _guard = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir)).unwrap();
         }
         // After the first guard drops, the directory should be empty of lock files
         // and a fresh acquire should succeed.
-        let _guard = RuntimeGuard::acquire_speed_in_dir(&cfg, dir.path()).unwrap();
+        let _guard = RuntimeGuard::acquire_speed_in_dir(&cfg, &state_dir(&dir)).unwrap();
     }
 
     #[test]
@@ -649,7 +663,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config("203.0.113.40:443");
         cfg.mode = Mode::Server;
-        let err = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir)).unwrap_err();
         assert!(matches!(err, RuntimeGuardError::WrongMode));
     }
 
@@ -658,7 +672,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config("203.0.113.50:443");
         cfg.client = None;
-        let err = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir)).unwrap_err();
         assert!(matches!(err, RuntimeGuardError::MissingClient));
     }
 
@@ -747,7 +761,7 @@ mod tests {
             let dir = Arc::clone(&dir);
             handles.push(thread::spawn(move || {
                 let cfg = config(&format!("203.0.113.{i}:443"));
-                RuntimeGuard::acquire_client_in_dir(&cfg, dir.path())
+                RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir))
             }));
         }
         // Hold every guard until all threads have joined: distinct clients never
@@ -774,7 +788,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A live peer whose lock file carries a forward-incompatible extra key
         // (a newer plx version). Valid naming so it passes the directory filters.
-        let peer_path = dir.path().join("client-999999-deadbeefcafe.lock");
+        let peer_path = state_dir(&dir).join("client-999999-deadbeefcafe.lock");
         let mut peer = open_lock_file(&peer_path).unwrap();
         let contents = "role=client\npid=999999\nconfig_id=deadbeefcafe\n\
                         server_addr=203.0.113.9:443\nstarted_at=1234567890\n";
@@ -787,7 +801,7 @@ mod tests {
         // Acquisition must succeed by skipping the undecodable live peer rather
         // than aborting every launch with InvalidMetadata.
         let cfg = config("203.0.113.10:443");
-        let guard = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path());
+        let guard = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir));
         assert!(
             guard.is_ok(),
             "an unparseable live peer must not wedge acquisition, got {guard:?}"

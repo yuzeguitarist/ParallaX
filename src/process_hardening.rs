@@ -187,11 +187,13 @@ pub fn harden_current_process() {
 ///
 /// # Why "late"
 ///
-/// It must be installed **after** startup work that legitimately touches the
-/// filesystem/keys and after listeners are bound, so none of those startup
-/// syscalls are affected — the filter only governs the steady-state serving loop.
-/// The denied set is never used on the normal serving path, so installing it late
-/// is transparent to traffic.
+/// "Late" means after the process has loaded its long-lived key material, not at
+/// the very top of `main` — so key loading and the rest of startup run unfiltered.
+/// It does NOT mean after the listeners are bound: the filter is armed as early as
+/// possible once the keys are in memory, specifically BEFORE anything starts
+/// ingesting untrusted input (see `# Call site`). The denied set is never used on
+/// the normal serving path or anywhere in startup, so arming it early is
+/// transparent to traffic.
 ///
 /// The BPF is compiled for `std::env::consts::ARCH` (the running binary's arch)
 /// by the vetted, pure-Rust `seccompiler` crate (from the Firecracker project),
@@ -207,9 +209,11 @@ pub fn harden_current_process() {
 /// ordering is deliberate: `QuicCarrier::bind` immediately spawns an endpoint
 /// driver that starts parsing attacker-controlled QUIC Initials, so installing
 /// after it would leave a window in which untrusted input is parsed with the
-/// scrape/pivot syscalls still untrapped. Nothing that follows (the TCP listener
-/// bind, the reject-path ballast warm, the `accept()` loop) issues a denied
-/// syscall, so arming the filter this early costs nothing.
+/// scrape/pivot syscalls still untrapped. Everything that follows — the 0-RTT
+/// replay-cache load, the STEK derivation, `QuicCarrier::bind` (including its
+/// `lookup_host` DNS resolution and rcgen certificate generation), the TCP listener
+/// bind, the reject-path ballast warm and the `accept()` loop — issues none of the
+/// denied syscalls, so arming the filter this early costs nothing.
 ///
 /// Honors `PARALLAX_DISABLE_SECCOMP` (mirroring `PARALLAX_DISABLE_ANTI_DEBUG`) for
 /// operators who must run under unusual tracing tools; when set truthy the filter

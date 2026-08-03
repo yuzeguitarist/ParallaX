@@ -281,18 +281,22 @@ fn derive_auth_key(
 
 /// Reject a degenerate (all-zero) X25519 shared secret before it seeds an HKDF.
 ///
-/// Both ECDH inputs on this path are attacker-influenced: `mask_ecdh` is
-/// X25519(server_static, the client's TLS key_share), and the auth-slot secret is
-/// X25519(server_static, the recovered ParallaX ephemeral). A small-order or
-/// identity point drives either to all zeros, collapsing that key to a pure
-/// function of the PSK and silently dropping the X25519 layer's contributory
-/// guarantee (the two-secret property documented on [`derive_mask_key`]). This is
-/// NOT an authentication bypass — the PSK is the HKDF *salt*, so a peer without it
-/// still cannot forge the tag — but rejecting keeps parity with the equivalent
-/// guards in `crypto/session.rs` and `crypto/pq.rs`. Compared in constant time.
+/// Applied to the AUTH slot only — X25519(server_static, the ParallaX ephemeral
+/// recovered from the carrier). That input is PSK-derived, so a peer without the
+/// PSK cannot steer it, and the guard is unreachable in practice: it exists for
+/// parity with the equivalent checks in `crypto/session.rs` and `crypto/pq.rs`, and
+/// as a fail-safe if the recovery path ever changes. Compared in constant time.
 ///
-/// On the server this error funnels to the origin like any other auth failure
-/// (see `handshake::server`), so it introduces no distinguishable reject shape.
+/// DELIBERATELY NOT applied to the mask slot (`derive_mask_key`), whose `mask_ecdh`
+/// is X25519(server_static, the client's *raw TLS key_share*) and is therefore
+/// directly attacker-chosen. Guarding it would buy nothing — the PSK is the HKDF
+/// *salt*, so forcing `mask_ecdh` to zero still leaves the PRK unknown and the tag
+/// unforgeable to anyone without the PSK — while handing a prober a free
+/// distinguisher: a small-order key_share would divert an otherwise byte-identical
+/// ClientHello from the auth-fail arm (which HMACs the peer's real, variable-length
+/// SNI) onto the constant-work ballast arm (fixed 15-byte SNI), letting it select
+/// between two reject shapes while holding every other byte fixed. See the reject
+/// arms in `handshake::server::decide_connection_inbound`.
 fn reject_degenerate_shared_secret(shared: &[u8; 32]) -> Result<(), AuthError> {
     if bool::from(shared.ct_eq(&[0_u8; 32])) {
         return Err(AuthError::DegenerateSharedSecret);
@@ -331,7 +335,10 @@ fn derive_mask_key(psk: &[u8], mask_ecdh: &[u8; 32]) -> Result<Zeroizing<[u8; 32
     if psk.is_empty() {
         return Err(AuthError::EmptyPsk);
     }
-    reject_degenerate_shared_secret(mask_ecdh)?;
+    // NO degenerate-shared-secret guard here, deliberately: `mask_ecdh` is derived
+    // from the client's raw TLS key_share, so a guard would be a prober-selectable
+    // reject-shape fork and buys no security (the PSK is the salt). See
+    // [`reject_degenerate_shared_secret`].
 
     let hk = Hkdf::<Sha256>::new(Some(psk), mask_ecdh);
     let mut out = Zeroizing::new([0_u8; 32]);
@@ -543,16 +550,11 @@ mod tests {
         hello[random_offset..random_offset + 32].copy_from_slice(&encoded_random);
         hello[parsed.session_id_range.clone()].copy_from_slice(&session_id);
 
-        // An all-zero mask_ecdh is a degenerate X25519 output (what a small-order
-        // or identity peer point produces). It is now rejected outright instead of
-        // merely failing to recover the timestamp — strictly stronger than the
-        // oracle-closed property asserted for the other wrong masks below.
-        assert!(matches!(
-            recover_stateful_auth_material(&hello, psk, &[0_u8; 32]),
-            Err(AuthError::DegenerateSharedSecret)
-        ));
-
-        for wrong in [[0x11_u8; 32], [0xAB_u8; 32]] {
+        // An all-zero mask_ecdh (what a small-order/identity peer point produces) is
+        // deliberately NOT rejected — see `reject_degenerate_shared_secret` — so it
+        // must behave like any other wrong mask: recovery succeeds structurally but
+        // yields garbage, never the real timestamp.
+        for wrong in [[0_u8; 32], [0x11_u8; 32], [0xAB_u8; 32]] {
             let material = recover_stateful_auth_material(&hello, psk, &wrong)
                 .unwrap()
                 .unwrap();

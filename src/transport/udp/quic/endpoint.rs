@@ -282,11 +282,18 @@ pub struct ZeroRttKeys {
 pub struct ServerConfig {
     /// DER-encoded certificate chain presented in the TLS Certificate message.
     ///
-    /// Shared behind an `Arc`: a server `Core` is built for every well-formed v1
-    /// Initial — including the unauthenticated, source-spoofable ones that only
+    /// Shared behind an `Arc` because a server `Core` is built for every well-formed
+    /// v1 Initial — including the unauthenticated, source-spoofable ones that only
     /// ever reach the short-lived `pending` table — so cloning the chain by value
-    /// turned each forged datagram into a fresh multi-KB DER copy. The chain is
-    /// immutable after configuration, so sharing it costs one refcount bump.
+    /// copied it once per forged datagram. The chain is immutable after
+    /// configuration, so sharing it is free.
+    ///
+    /// This trims the per-Initial allocation; it does NOT remove the pre-auth cost.
+    /// `Core::new_server_with_stek` still parses the PKCS#8 signing key
+    /// (`EcdsaKeyPair::from_pkcs8`) and builds the full handshake + BBR + packet-space
+    /// state per datagram, which dominates. Bounding that properly needs address
+    /// validation (Retry) or a per-source pending budget — deliberately not done here,
+    /// since a Retry the fronted origin does not send would itself be a distinguisher.
     pub cert_chain: Arc<Vec<Vec<u8>>>,
     /// PKCS#8 ECDSA P-256 signing key for the CertificateVerify.
     pub signing_key_pkcs8: Vec<u8>,
@@ -1929,6 +1936,12 @@ mod tests {
     ///
     /// Linux-only: elsewhere `recv_from` truncates to the cap, so an intact
     /// over-cap datagram never materialises.
+    ///
+    /// Coverage limit: the mock origin is on loopback (MTU 65536), so this proves
+    /// the ROUTING decision but not the on-path send. Reaching a remote origin over
+    /// a 1500-MTU path additionally needs `SpliceFlow`'s `allow_fragmentation`,
+    /// since Linux would otherwise refuse the over-MTU relay send with EMSGSIZE and
+    /// the datagram would be dropped after all.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn oversized_datagram_splices_to_origin_instead_of_going_silent() {
@@ -1979,6 +1992,63 @@ mod tests {
             .expect("the follow-up datagram reaches the origin")
             .unwrap();
         assert_eq!(n2, b"small-probe".len());
+    }
+
+    /// The `oversize` disjunct must be load-bearing, not shadowed by
+    /// `!looks_like_initial`.
+    ///
+    /// The sibling test above sends a short-header payload, for which
+    /// `looks_like_initial` is already false — so it would splice even without the
+    /// over-cap term. This one sends an over-cap datagram that IS a well-formed v1
+    /// Initial, so `looks_like_initial` is TRUE and `oversize` is the only reason it
+    /// takes the splice instead of being parsed into a held `Core`. It also pins the
+    /// resource property: an over-cap Initial must never allocate connection state.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn oversized_valid_initial_splices_without_allocating_a_core() {
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (otx, mut orx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 65536];
+            loop {
+                let (n, _) = origin.recv_from(&mut b).await.unwrap();
+                if otx.send(n).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_splicing(origin_addr),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // A well-formed v1 long-header Initial (0xc0, version 1) padded to 3000
+        // bytes: passes `looks_like_initial`, exceeds the 2048-byte recv cap.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut initial = vec![0xc0u8, 0x00, 0x00, 0x00, 0x01];
+        initial.resize(3000, 0);
+        client.send_to(&initial, server_addr).await.unwrap();
+
+        let n = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("an over-cap v1 Initial must reach the origin")
+            .unwrap();
+        assert_eq!(n, 3000, "relayed verbatim rather than parsed locally");
+
+        // The splice now owns this 4-tuple, so an ordinary follow-up is forwarded
+        // verbatim too — had the Initial been parsed into `pending` instead, this
+        // datagram would have been fed to that held core rather than the origin.
+        client.send_to(b"after-initial", server_addr).await.unwrap();
+        let n2 = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("the follow-up reaches the origin over the same splice")
+            .unwrap();
+        assert_eq!(n2, b"after-initial".len());
     }
 
     #[test]

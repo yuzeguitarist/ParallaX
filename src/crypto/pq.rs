@@ -106,11 +106,11 @@ pub fn encapsulate(public_key: &[u8]) -> Result<MlKemEncapsulation, PqError> {
 
 /// Decapsulate to the ML-KEM-1024 shared secret.
 ///
-/// Returns `Zeroizing` rather than a bare `[u8; 32]` so every transient copy is
-/// scrubbed: a bare array would leave the secret resident in the return slot and
-/// — on the `spawn_blocking` rekey path in `client/runtime.rs` — in the tokio
-/// blocking-pool task-output cell, neither of which the caller's own `Zeroizing`
-/// wrapper can reach. Mirrors `encapsulate`, whose secret is already `Zeroizing`.
+/// Returns `Zeroizing` rather than a bare `[u8; 32]` so the secret self-scrubs when
+/// its final owner drops it and callers cannot forget to wrap it. (A Rust move does
+/// not drop the source, so this does not scrub every intermediate slot the value
+/// passes through — it makes the landed value's cleanup automatic rather than
+/// caller-dependent.) Mirrors `encapsulate`, whose secret is already `Zeroizing`.
 pub fn decapsulate(
     ciphertext: &[u8],
     secret_key: &[u8],

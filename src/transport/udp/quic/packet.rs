@@ -358,14 +358,15 @@ impl Header {
             if first & SHORT_RESERVED_BITS != 0 {
                 return Err(DecodeError::ReservedBitsSet);
             }
-            let pn_offset = 1 + local_cid_len;
             // `local_cid_len` is the caller's own SCID length (a `ConnectionId`, so
             // <= MAX_CID_LEN by construction), but reject an out-of-range value
             // explicitly rather than letting `ConnectionId::new` assert on it — the
             // long-header path already fails closed this way via `Cursor::cid`.
+            // Checked BEFORE `1 + local_cid_len` so the guard also covers that add.
             if local_cid_len > MAX_CID_LEN {
                 return Err(DecodeError::CidTooLong);
             }
+            let pn_offset = 1 + local_cid_len;
             let dcid = ConnectionId::new(buf.get(1..pn_offset).ok_or(DecodeError::Truncated)?);
             let pn_len = ((first & PN_LEN_MASK) + 1) as usize;
             let packet_number =
@@ -394,6 +395,11 @@ pub fn locate_pn_offset(buf: &[u8], local_cid_len: usize) -> Result<usize, Decod
         return Err(DecodeError::MissingFixedBit);
     }
     if first & LONG_HEADER_FORM == 0 {
+        // Same guard as the short-header branch of `Header::decode`: reject an
+        // out-of-range caller CID length before the add rather than overflowing.
+        if local_cid_len > MAX_CID_LEN {
+            return Err(DecodeError::CidTooLong);
+        }
         return Ok(1 + local_cid_len);
     }
     match LongType::from_first_byte(first) {

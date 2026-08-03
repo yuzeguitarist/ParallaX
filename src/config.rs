@@ -430,6 +430,11 @@ fn resolve_file_secret(
         // while saying nothing about the exposed secret file. Propagate it verbatim
         // so the check fails loudly. (`Config::load` already fails closed here, so
         // this only ever masked the *diagnostic*.)
+        //
+        // `#[cfg(unix)]`: the variant itself is Unix-only (the 0600/owner check is),
+        // so an ungated arm fails to compile on Windows with E0599 — the same trap
+        // already documented at `secret_store.rs`'s equivalent arm.
+        #[cfg(unix)]
         err @ ConfigError::InsecureConfigPermissions { .. } => err,
         _ => ConfigError::SecretRead { field },
     })?;
