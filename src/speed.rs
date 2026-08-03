@@ -27,12 +27,13 @@ const REPORT_SCHEMA: &str = "parallax.speed.evidence.v1";
 const DEFAULT_WARMUP_BYTES: u64 = 1024 * 1024;
 const DEFAULT_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_SAMPLE_COUNT: u16 = 3;
-/// How many payload-less records in a row a speed phase tolerates before giving up.
-/// Padding-only records are legitimate, so this cannot be zero, but a run of them
-/// carries no bytes and cannot advance either read loop — without a ceiling a peer
-/// that streams only empties hangs the measurement forever. Generous enough that no
-/// honest padding pattern reaches it.
-const MAX_CONSECUTIVE_EMPTY_RECORDS: u32 = 1024;
+/// How many payload-less records a speed phase tolerates in total. Padding-only
+/// records are legitimate, so this cannot be zero, but they carry no bytes and
+/// cannot advance either read loop. The budget is on the TOTAL, not on a
+/// consecutive run: a peer that interleaves one real byte every N empties resets
+/// any streak counter and would otherwise keep the phase alive essentially forever.
+/// Generous enough that no honest padding pattern reaches it.
+const MAX_EMPTY_RECORDS_PER_PHASE: u32 = 4096;
 
 #[derive(Debug, Error)]
 pub enum SpeedError {
@@ -600,23 +601,22 @@ where
     let mut start: Option<Instant> = None;
     let mut received = 0_u64;
     let mut record = Vec::new();
-    let mut empty_streak = 0_u32;
+    let mut empty_records = 0_u32;
 
     while received < expected_bytes {
         reader.read_record_into(&mut record).await?;
         let payload = data_session.open_server_record_in_place_payload_range(&mut record)?;
         if payload.is_empty() {
             // An empty record carries no bytes, so the loop condition cannot advance
-            // on it. Padding-only records are legitimate, but an unbounded run of
-            // them is not: without a cap a peer that streams nothing but empties
-            // pins this loop forever.
-            empty_streak += 1;
-            if empty_streak > MAX_CONSECUTIVE_EMPTY_RECORDS {
-                return Err(SpeedError::StalledOnEmptyRecords(empty_streak));
+            // on it. Padding-only records are legitimate, but an unbounded number of
+            // them is not: without this ceiling a peer that pads indefinitely (even
+            // while dribbling occasional real bytes) pins this loop.
+            empty_records += 1;
+            if empty_records > MAX_EMPTY_RECORDS_PER_PHASE {
+                return Err(SpeedError::StalledOnEmptyRecords(empty_records));
             }
             continue;
         }
-        empty_streak = 0;
         // Start the clock at the first real data byte, not before the request RTT,
         // so the download window measures transfer time only (comparable to the
         // upload window, which stops before its trailing ack RTT).
@@ -693,16 +693,16 @@ where
     R: LegReader,
 {
     let mut record = Vec::new();
-    let mut empty_streak = 0_u32;
+    let mut empty_records = 0_u32;
     loop {
         reader.read_record_into(&mut record).await?;
         let payload = data_session.open_server_record_in_place_payload_range(&mut record)?;
         if payload.is_empty() {
             // Same unbounded-wait shape as the download loop: an ack never arrives
-            // in an empty record, so a peer streaming only empties would hang us.
-            empty_streak += 1;
-            if empty_streak > MAX_CONSECUTIVE_EMPTY_RECORDS {
-                return Err(SpeedError::StalledOnEmptyRecords(empty_streak));
+            // in an empty record, so a peer that only pads would hang us.
+            empty_records += 1;
+            if empty_records > MAX_EMPTY_RECORDS_PER_PHASE {
+                return Err(SpeedError::StalledOnEmptyRecords(empty_records));
             }
             continue;
         }

@@ -1638,6 +1638,14 @@ async fn graceful_close_tcp_stream(mut stream: TcpStream) {
 /// the difference is externally selectable; sharing the reader keeps both paths on
 /// one origin-dial schedule.
 async fn cap_shed_fallback_or_fin(mut client: TcpStream, fallback_addr: String) {
+    // Tune the client socket exactly as the healthy path does (`run_server_connection`).
+    // Without this a cap-shed splice ran with Nagle on, default buffers and no
+    // quickack while every other connection did not, so its ACK cadence, advertised
+    // window and segmentation were separable at the TCP layer by anyone who could
+    // trip the cap. Errors are ignored rather than propagated: the healthy path's `?`
+    // has a caller to return to, and failing to tune is not a reason to deviate from
+    // the origin-facing splice.
+    let _ = tune_tcp_stream(&client);
     let Some(_slot) = try_enter_cap_shed_fallback() else {
         graceful_close_tcp_stream(client).await;
         return;
@@ -2070,7 +2078,28 @@ async fn read_first_client_record_predialing(
         tokio::select! {
             biased;
             read = &mut read => {
-                let read = read?;
+                let read = match read {
+                    Ok(read) => read,
+                    Err(err) => {
+                        // The client failed/timed out before we could use the origin.
+                        // Do NOT just drop the handle: tokio detaches a dropped
+                        // JoinHandle, so the connect still completes and the socket
+                        // is then bare-dropped with nobody to FIN it. Release it the
+                        // same way the authenticated path releases its spare, so a
+                        // client that hangs up mid-pre-dial costs the origin one
+                        // gracefully-closed connection, not an abandoned one.
+                        let spare = predialed_origin.map(PredialedOrigin::Ready)
+                            .or((!dial_settled).then_some(PredialedOrigin::Pending(dial)));
+                        if let Some(spare) = spare {
+                            tokio::spawn(async move {
+                                if let Some(spare) = spare.into_stream().await {
+                                    graceful_close_tcp_stream(spare).await;
+                                }
+                            });
+                        }
+                        return Err(err);
+                    }
+                };
                 // Still connecting: pass the task on so whoever needs the origin
                 // awaits THIS dial rather than starting another.
                 let pending = (!dial_settled).then_some(dial);

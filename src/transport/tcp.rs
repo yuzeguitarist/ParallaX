@@ -741,9 +741,10 @@ mod kernel_splice {
                     // A non-empty pipe yields bytes or EAGAIN, and a closed
                     // destination yields EPIPE, so no-progress-with-bytes-buffered
                     // is not expected to be reachable. If it ever is, those bytes go
-                    // away with the pipe, and returning success here would let the
-                    // caller FIN and masquerade the truncated stream as a clean
-                    // close — the exact hazard the idle-timeout arm above rejects.
+                    // away with the pipe, so the direction WAS truncated and must not
+                    // report success: `splice_one_direction` FINs either way (a wire
+                    // RST is forbidden here), and `result` is the only channel that
+                    // tells the relay a truncation happened.
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "write-side splice made no progress with buffered data",

@@ -1093,6 +1093,11 @@ fn alpn_extension() -> Result<Vec<u8>, Safari26TlsError> {
     Ok(out)
 }
 
+/// The ALPN protocols the Safari-shaped ClientHello offers, in wire order — exactly
+/// what [`alpn_extension`] encodes (pinned by a test). A server selecting anything
+/// outside this list is rejected in EncryptedExtensions (RFC 7301 §3.2).
+const OFFERED_ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
+
 fn push_extension(out: &mut Vec<u8>, ext_type: u16, data: &[u8]) -> Result<(), Safari26TlsError> {
     out.extend_from_slice(&ext_type.to_be_bytes());
     push_vec_u16(out, data)
@@ -2016,15 +2021,55 @@ fn process_server_handshake_messages(
     }
 }
 
+/// Parse the server's EncryptedExtensions.
+///
+/// As strict as the QUIC client's equivalent, and for the same reason: silently
+/// accepting a message a real client rejects is an active-probe distinguisher, and
+/// this is the plane that carries most traffic. Strictness costs no interop —
+/// anything rejected here (trailing bytes, a duplicate extension, an unsolicited
+/// extension, an unoffered ALPN) would equally fail against Safari, Chrome and
+/// Firefox, so no reachable origin can depend on it.
 fn parse_encrypted_extensions(body: &[u8], keys: &mut Tls13Keys) -> Result<(), Safari26TlsError> {
     let mut c = TlsCursor::new(body);
     let extensions = c.vec_u16()?;
+    if c.remaining() != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "trailing bytes after EncryptedExtensions".to_owned(),
+        ));
+    }
     let mut e = TlsCursor::new(extensions);
+    // RFC 8446 §4.2: at most one extension of a given type per block.
+    let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
     while e.remaining() > 0 {
         let ext_type = e.u16()?;
         let data = e.vec_u16()?;
-        if ext_type == EXT_ALPN {
-            keys.negotiated_alpn = Some(parse_selected_alpn(data)?.to_vec());
+        if !seen.insert(ext_type) {
+            return Err(Safari26TlsError::Handshake(
+                "duplicate extension in EncryptedExtensions".to_owned(),
+            ));
+        }
+        match ext_type {
+            EXT_ALPN => {
+                let selected = parse_selected_alpn(data)?;
+                // RFC 7301 §3.2: the server MUST select a protocol we offered.
+                if !OFFERED_ALPN.contains(&selected) {
+                    return Err(Safari26TlsError::Handshake(
+                        "server selected an ALPN protocol the client did not offer".to_owned(),
+                    ));
+                }
+                keys.negotiated_alpn = Some(selected.to_vec());
+            }
+            // The only other extensions we offer that RFC 8446 §4.2 lets a server
+            // answer in EncryptedExtensions: an empty `server_name` acknowledging
+            // our SNI, and `supported_groups`. Neither carries state we act on.
+            // (A server omitting ALPN entirely stays legal — unlike QUIC, TLS over
+            // TCP does not require it, and the caller treats `None` as http/1.1.)
+            EXT_SERVER_NAME | EXT_SUPPORTED_GROUPS => {}
+            _ => {
+                return Err(Safari26TlsError::Handshake(
+                    "unsolicited extension in EncryptedExtensions".to_owned(),
+                ));
+            }
         }
     }
     Ok(())
@@ -4566,6 +4611,76 @@ mod tests {
         let mut keys = app_keys();
         parse_encrypted_extensions(&body, &mut keys).unwrap();
         assert_eq!(keys.negotiated_alpn.as_deref(), Some(b"h2".as_slice()));
+    }
+
+    #[test]
+    fn offered_alpn_matches_the_clienthello_extension() {
+        // OFFERED_ALPN gates what the server may select, so it must stay exactly what
+        // the ClientHello advertises or a legitimate selection would be rejected.
+        let mut expected = Vec::new();
+        for proto in OFFERED_ALPN {
+            expected.push(proto.len() as u8);
+            expected.extend_from_slice(proto);
+        }
+        assert_eq!(alpn_extension().unwrap(), u16_len_prefixed(&expected));
+    }
+
+    #[test]
+    fn encrypted_extensions_rejects_unsolicited_and_malformed() {
+        // RFC 8446 §4.2 / RFC 7301 §3.2: a real client rejects every one of these,
+        // so tolerating them is an active-probe distinguisher on the plane that
+        // carries most traffic.
+        let alpn_ext = {
+            let mut ext = EXT_ALPN.to_be_bytes().to_vec();
+            ext.extend_from_slice(&u16_len_prefixed(&alpn_selection(b"h2")));
+            ext
+        };
+
+        // An extension we never offered (record_size_limit).
+        let mut ext = alpn_ext.clone();
+        ext.extend_from_slice(&0x001c_u16.to_be_bytes());
+        ext.extend_from_slice(&u16_len_prefixed(&[0x40, 0x01]));
+        assert!(parse_encrypted_extensions(&u16_len_prefixed(&ext), &mut app_keys()).is_err());
+
+        // A duplicate extension.
+        let mut ext = alpn_ext.clone();
+        ext.extend_from_slice(&alpn_ext);
+        assert!(parse_encrypted_extensions(&u16_len_prefixed(&ext), &mut app_keys()).is_err());
+
+        // An ALPN protocol we did not offer.
+        let mut ext = EXT_ALPN.to_be_bytes().to_vec();
+        ext.extend_from_slice(&u16_len_prefixed(&alpn_selection(b"h3")));
+        assert!(parse_encrypted_extensions(&u16_len_prefixed(&ext), &mut app_keys()).is_err());
+
+        // Trailing bytes after the extensions block.
+        let mut body = u16_len_prefixed(&alpn_ext);
+        body.push(0x00);
+        assert!(parse_encrypted_extensions(&body, &mut app_keys()).is_err());
+    }
+
+    #[test]
+    fn encrypted_extensions_accepts_what_a_real_server_answers() {
+        // The strict catch-all must not break ordinary origins: an empty server_name
+        // acknowledging our SNI and supported_groups are both EE-legal answers to
+        // extensions we offer, and a server may omit ALPN entirely.
+        let mut ext = EXT_SERVER_NAME.to_be_bytes().to_vec();
+        ext.extend_from_slice(&u16_len_prefixed(&[]));
+        ext.extend_from_slice(&EXT_SUPPORTED_GROUPS.to_be_bytes());
+        ext.extend_from_slice(&u16_len_prefixed(&[0x00, 0x02, 0x00, 0x1d]));
+        ext.extend_from_slice(&EXT_ALPN.to_be_bytes());
+        ext.extend_from_slice(&u16_len_prefixed(&alpn_selection(b"http/1.1")));
+
+        let mut keys = app_keys();
+        parse_encrypted_extensions(&u16_len_prefixed(&ext), &mut keys).unwrap();
+        assert_eq!(
+            keys.negotiated_alpn.as_deref(),
+            Some(b"http/1.1".as_slice())
+        );
+
+        // No ALPN at all: legal over TCP, leaves the negotiation unset.
+        let mut keys = app_keys();
+        parse_encrypted_extensions(&u16_len_prefixed(&[]), &mut keys).unwrap();
+        assert_eq!(keys.negotiated_alpn, None);
     }
 
     fn certificate_entry(cert: &[u8]) -> Vec<u8> {

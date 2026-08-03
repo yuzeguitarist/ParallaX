@@ -447,6 +447,13 @@ struct Stream {
     recv_high: u64,
     /// Bytes the app has read (drives the receive-window extension).
     recv_consumed: u64,
+    /// Bytes of this stream already released to the CONNECTION window
+    /// (`recv_data_consumed`). Normally equal to `recv_consumed`, but a reset or an
+    /// abandoned receive half also releases bytes the app will never read, so the
+    /// two diverge. Tracked explicitly so every release site can credit exactly
+    /// `target - recv_credited` and the invariant `recv_credited <= recv_high`
+    /// — hence `recv_data_consumed <= recv_data_total` — holds by construction.
+    recv_credited: u64,
     /// Our advertised MAX_STREAM_DATA limit, and the last value we sent.
     recv_max: u64,
     recv_max_sent: u64,
@@ -1104,17 +1111,14 @@ impl Connection {
         let data = std::mem::take(&mut s.recv);
         let n = data.len() as u64;
         s.recv_consumed += n;
+        s.recv_credited += n;
         s.recv_max = s.recv_consumed + STREAM_RECV_WINDOW;
         // Advertise a bigger window once half of it has been consumed since the
         // last MAX_STREAM_DATA (avoids a frame per read).
         if s.recv_max - s.recv_max_sent >= STREAM_RECV_WINDOW / 2 {
             s.need_max_stream_data = true;
         }
-        self.recv_data_consumed += n;
-        self.recv_max_data = self.recv_data_consumed + CONN_RECV_WINDOW;
-        if self.recv_max_data - self.recv_max_data_sent >= CONN_RECV_WINDOW / 2 {
-            self.need_max_data = true;
-        }
+        self.credit_connection_window(n);
         data
     }
 
@@ -3112,19 +3116,27 @@ impl Connection {
         // the peer actually consumed.
         let first_reset = s.recv_reset.is_none();
         s.recv_reset = Some(error_code);
-        // Bytes the application can still take: what it already read plus what is
-        // reassembled in order and waiting (the reader drains that before the reset
-        // surfaces as ConnectionReset). Everything else this stream charged to the
-        // connection window — the gap the reset skipped, out-of-order fragments that
-        // can no longer be reassembled, and the tail up to `final_size` — is now
+        // Bytes the application can still take: what is reassembled in order and
+        // waiting (the reader drains that before the reset surfaces as
+        // ConnectionReset). Everything else this stream charged to the connection
+        // window — the gap the reset skipped, out-of-order fragments that can no
+        // longer be reassembled, and the tail up to `final_size` — is now
         // undeliverable, so `read_stream` will never credit it.
-        let deliverable = s.recv_consumed + s.recv.len() as u64;
+        let still_readable = s.recv.len() as u64;
         let stranded_fragments: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
         if first_reset {
             // No further STREAM frames can arrive (the final size is fixed), so the
             // gaps in front of these fragments will never fill: they are dead weight
             // on the reassembly budget as well as on flow control.
             s.recv_pending = Vec::new();
+        }
+        // Credit up to `final_size - still_readable`, minus whatever this stream has
+        // already released, so the release is exact and cannot double-count.
+        let credit = final_size
+            .saturating_sub(still_readable)
+            .saturating_sub(s.recv_credited);
+        if first_reset {
+            s.recv_credited += credit;
         }
         self.recv_data_total += delta;
         if first_reset {
@@ -3134,13 +3146,49 @@ impl Connection {
             // streams at their full final size permanently freezes the connection
             // window (recv_data_total climbs to the limit while recv_data_consumed
             // stays put) and the connection can never receive again.
-            self.recv_data_consumed += final_size.saturating_sub(deliverable);
-            self.recv_max_data = self.recv_data_consumed + CONN_RECV_WINDOW;
-            if self.recv_max_data - self.recv_max_data_sent >= CONN_RECV_WINDOW / 2 {
-                self.need_max_data = true;
-            }
+            self.credit_connection_window(credit);
         }
         Ok(())
+    }
+
+    /// Release the connection-level flow-control credit for `bytes` and re-arm a
+    /// MAX_DATA grant once half the window has been reclaimed. Shared by every
+    /// release site (delivery, reset, abandonment) so they cannot drift.
+    fn credit_connection_window(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.recv_data_consumed += bytes;
+        self.recv_max_data = self.recv_data_consumed + CONN_RECV_WINDOW;
+        if self.recv_max_data - self.recv_max_data_sent >= CONN_RECV_WINDOW / 2 {
+            self.need_max_data = true;
+        }
+    }
+
+    /// Abandon stream `id`'s receive half: nothing will ever read it again, so
+    /// release the connection-level credit for everything it still holds and drop
+    /// the buffers.
+    ///
+    /// Without this an abandoned stream ratchets the connection window shut exactly
+    /// like an uncredited reset did: the server's mux drops the `recv` half of a
+    /// bidi it rejects at the per-connection substream cap, and with no
+    /// STOP_SENDING the peer may already have filled the full stream window. Eight
+    /// such streams reach `CONN_RECV_WINDOW` with nothing consumed and the next
+    /// STREAM frame fails the connection.
+    pub fn discard_stream_recv(&mut self, id: u64) {
+        let Some(s) = self.streams.get_mut(&id) else {
+            return;
+        };
+        // Everything this stream charged to the window, less what it already
+        // released. `recv_high` is its total charge, so this leaves the stream fully
+        // credited and can never over-credit.
+        let credit = s.recv_high.saturating_sub(s.recv_credited);
+        s.recv_credited = s.recv_high;
+        s.recv = Vec::new();
+        let stranded_fragments: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
+        s.recv_pending = Vec::new();
+        self.recv_pending_total = self.recv_pending_total.saturating_sub(stranded_fragments);
+        self.credit_connection_window(credit);
     }
 
     /// Create a stream on first sight, queuing a peer-initiated one for `accept_*`.
