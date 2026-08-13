@@ -104,14 +104,14 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry and target/
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: parallax-ci
           # Nightly mutation builds are unusual; never write back to the shared cache.
           save-if: false
 
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-mutants@27.1.0
 
