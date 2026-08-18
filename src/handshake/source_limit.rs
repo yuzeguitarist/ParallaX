@@ -44,6 +44,14 @@ const AGG_V6_PREFIX_LEN: u8 = 48;
 /// The /48 aggregate ceiling is `cap_v6 * AGG_V6_FANOUT`: one /48 may hold a
 /// small multiple of a single /64's cap (so a handful of legitimate /64s in one
 /// org still connect), but not unbounded /64 rotation.
+///
+/// The rollup deliberately cannot tell one abuser rotating /64s from several
+/// unrelated customers who happen to share a /48 — which is what an ISP handing
+/// out /56s or /60s per subscriber produces. Where that matters, the ceiling is
+/// tuned through `server.max_concurrent_per_source_v6`, since it scales with it;
+/// the rollup prefix and fanout are intentionally not separate knobs, because a
+/// per-deployment aggregation width is a fingerprint of the deployment as much as
+/// a capacity setting.
 const AGG_V6_FANOUT: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -208,13 +216,18 @@ impl SourceLimiter {
                 return None;
             }
         }
+        // Per-source cap, also checked read-only BEFORE the entry is created. An
+        // entry becomes evictable only when a permit drop stamps it idle and logs
+        // it, so one created for a connection that was never admitted is never
+        // pruned: inserting first left a permanent entry behind on every rejection,
+        // and with `cap == 0` (reject everything) every distinct source leaked one.
+        if inner.map.get(&key).map_or(0, |entry| entry.active) >= cap {
+            return None;
+        }
         let entry = inner.map.entry(key).or_insert(Entry {
             active: 0,
             idle_since: None,
         });
-        if entry.active >= cap {
-            return None;
-        }
         entry.active += 1;
         entry.idle_since = None;
         if let Some(agg_key) = agg_key {
@@ -346,6 +359,29 @@ mod tests {
         assert!(Arc::clone(&limiter)
             .try_admit(v4(198, 51, 100, 1))
             .is_some());
+    }
+
+    #[test]
+    fn rejected_sources_leave_no_permanent_entry() {
+        // An entry only becomes evictable once a permit drop stamps it idle and
+        // logs it, so an entry created for a connection that was never admitted is
+        // unprunable. Inserting before the cap check leaked one per distinct source
+        // — with cap 0 (reject everything) that is unbounded growth.
+        let limiter = SourceLimiter::with_params(0, 0, 64, 4096, SOURCE_IDLE_GRACE);
+        for i in 0..512u32 {
+            let octets = i.to_be_bytes();
+            let ip = v4(198, 51, octets[2], octets[3]);
+            assert!(
+                Arc::clone(&limiter).try_admit(ip).is_none(),
+                "cap 0 must reject every source"
+            );
+        }
+        let inner = limiter.inner.lock().unwrap();
+        assert!(
+            inner.map.is_empty(),
+            "rejected admits must leave no map entries behind, found {}",
+            inner.map.len()
+        );
     }
 
     #[test]

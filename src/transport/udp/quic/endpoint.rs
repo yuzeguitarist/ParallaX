@@ -1756,6 +1756,30 @@ impl RecvStream {
     }
 }
 
+impl Drop for RecvStream {
+    /// Releasing the handle means nothing will ever read this stream again, so hand
+    /// its outstanding connection-level flow-control credit back.
+    ///
+    /// Dropping an unread receive half is a normal outcome, not an error path: the
+    /// server's mux rejects a bidi that exceeds the per-connection substream cap by
+    /// resetting the send half and dropping the recv half unread, and nothing sends
+    /// STOP_SENDING, so the peer may already have filled the whole stream window.
+    /// Left uncredited those bytes stay charged to the connection window forever and
+    /// a handful of rejected substreams wedge the session shut.
+    fn drop(&mut self) {
+        // A poisoned lock means some other task panicked mid-update; skip rather
+        // than panic again while unwinding.
+        let Ok(mut core) = self.shared.core.lock() else {
+            return;
+        };
+        core.discard_stream_recv(self.id);
+        drop(core);
+        // The credit may have re-armed a MAX_DATA grant; wake the driver to flush it
+        // (a blocked sender transmits nothing, so nothing else would).
+        self.shared.nudge();
+    }
+}
+
 impl AsyncRead for RecvStream {
     fn poll_read(
         self: Pin<&mut Self>,

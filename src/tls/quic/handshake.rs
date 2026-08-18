@@ -54,6 +54,8 @@ const HANDSHAKE_COMPRESSED_CERTIFICATE: u8 = 0x19;
 const HANDSHAKE_NEW_SESSION_TICKET: u8 = 0x04;
 
 const EXT_ALPN: u16 = 0x0010;
+const EXT_SERVER_NAME: u16 = 0x0000;
+const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
@@ -690,7 +692,13 @@ impl ClientHandshake {
     }
 
     fn handle_encrypted_extensions(&mut self, body: &[u8]) -> Result<(), QuicTlsError> {
-        let parsed = parse_encrypted_extensions_body(body, &self.config.alpn_protocols)?;
+        // Gate on the PSK the server actually ACCEPTED, not merely on having offered
+        // one: a server that answers a ticket-bearing ClientHello with a ServerHello
+        // carrying no pre_shared_key has rejected 0-RTT, and RFC 8446 §4.2.10 then
+        // forbids an early_data echo. `psk_accepted` is set by `handle_server_hello`,
+        // which always runs first.
+        let parsed =
+            parse_encrypted_extensions_body(body, &self.config.alpn_protocols, self.psk_accepted)?;
         self.alpn = parsed.alpn;
         self.peer_transport_params = parsed.transport_params;
         self.early_data_accepted = parsed.early_data;
@@ -980,9 +988,13 @@ struct EncryptedExtensionsParsed {
 /// This is the pre-authentication byte walk over the server's EncryptedExtensions;
 /// `offered_alpn` is the client's offered ALPN list (`self.config.alpn_protocols`),
 /// used to reject an unoffered / missing selection exactly as the handshake does.
+/// `offered_early_data` is whether 0-RTT is actually live for this handshake (the
+/// client offered a ticket AND the server accepted the PSK): the server may only
+/// echo `early_data` back when that holds.
 fn parse_encrypted_extensions_body(
     body: &[u8],
     offered_alpn: &[Vec<u8>],
+    offered_early_data: bool,
 ) -> Result<EncryptedExtensionsParsed, QuicTlsError> {
     let mut c = Cursor::new(body);
     let extensions = c.vec_u16()?;
@@ -990,17 +1002,21 @@ fn parse_encrypted_extensions_body(
     let mut alpn = None;
     let mut transport_params = None;
     let mut early_data = false;
+    // RFC 8446 §4.2: at most one extension of a given type per block. Mirrors the
+    // ClientHello parser's guard (`server.rs`), HashSet-based for the same reason —
+    // repeated Vec scans would be quadratic in a pre-authentication byte walk.
+    let mut seen_extensions: std::collections::HashSet<u16> = std::collections::HashSet::new();
     while e.remaining() > 0 {
         let ext_type = e.u16()?;
         let data = e.vec_u16()?;
+        if !seen_extensions.insert(ext_type) {
+            return Err(QuicTlsError::alert(
+                ALERT_ILLEGAL_PARAMETER,
+                "duplicate extension in EncryptedExtensions",
+            ));
+        }
         match ext_type {
             EXT_ALPN => {
-                if alpn.is_some() {
-                    return Err(QuicTlsError::alert(
-                        ALERT_ILLEGAL_PARAMETER,
-                        "duplicate ALPN extension in EncryptedExtensions",
-                    ));
-                }
                 let selected = parse_selected_alpn(data)?;
                 // RFC 7301 §3.2: the server MUST select a protocol the client
                 // offered. Reject an unoffered (or empty) selection rather than
@@ -1017,17 +1033,22 @@ fn parse_encrypted_extensions_body(
                 alpn = Some(selected.to_vec());
             }
             EXT_QUIC_TRANSPORT_PARAMETERS => {
-                if transport_params.is_some() {
-                    return Err(QuicTlsError::alert(
-                        ALERT_ILLEGAL_PARAMETER,
-                        "duplicate quic_transport_parameters in EncryptedExtensions",
-                    ));
-                }
                 transport_params = Some(data.to_vec());
             }
             EXT_EARLY_DATA => {
                 // The server echoing `early_data` accepts 0-RTT (RFC 8446
-                // §4.2.10); its EncryptedExtensions body is empty.
+                // §4.2.10); its EncryptedExtensions body is empty. It may only echo
+                // one back if we offered it — a handshake with no ticket never sent
+                // `early_data`, so accepting it here both records a 0-RTT state we
+                // never entered and is the silent leniency a real client does not
+                // have (RFC 8446 §4.2: an unsolicited extension is
+                // unsupported_extension), i.e. an active-probe tell.
+                if !offered_early_data {
+                    return Err(QuicTlsError::alert(
+                        ALERT_UNSUPPORTED_EXTENSION,
+                        "EncryptedExtensions early_data we did not offer",
+                    ));
+                }
                 if !data.is_empty() {
                     return Err(QuicTlsError::alert(
                         ALERT_DECODE_ERROR,
@@ -1036,7 +1057,21 @@ fn parse_encrypted_extensions_body(
                 }
                 early_data = true;
             }
-            _ => {}
+            // RFC 8446 §4.2: a client MUST abort with unsupported_extension on an
+            // extension it did not request. Silently ignoring everything else left
+            // ParallaX completing EncryptedExtensions a conformant client rejects —
+            // a behavioral fingerprint a censor can select on. The two tolerated
+            // types below are ones we DO offer in the ClientHello and that RFC 8446
+            // permits the server to answer in EncryptedExtensions: an empty
+            // `server_name` acknowledging our SNI, and `supported_groups`. Neither
+            // carries state we act on, so they are accepted and ignored.
+            EXT_SERVER_NAME | EXT_SUPPORTED_GROUPS => {}
+            _ => {
+                return Err(QuicTlsError::alert(
+                    ALERT_UNSUPPORTED_EXTENSION,
+                    "unsolicited extension in EncryptedExtensions",
+                ));
+            }
         }
     }
     // Reject trailing bytes after the extensions block (active-probe distinguisher).
@@ -1270,9 +1305,15 @@ pub mod fuzz {
     }
 
     /// Parse an EncryptedExtensions body against the production offered-ALPN list.
+    /// Run in both 0-RTT states: they differ only in whether an `early_data` echo is
+    /// legal, so exercising both covers the accept branch as well as the reject one.
+    /// (No cross-state assertion: the cold parse is strictly the stricter of the two,
+    /// so any relation between the outcomes holds trivially and would not be an
+    /// oracle.)
     pub fn parse_encrypted_extensions(body: &[u8]) -> Result<(), ()> {
         let offered_alpn = [b"h3".to_vec()];
-        super::parse_encrypted_extensions_body(body, &offered_alpn)
+        let _ = super::parse_encrypted_extensions_body(body, &offered_alpn, true);
+        super::parse_encrypted_extensions_body(body, &offered_alpn, false)
             .map(|_| ())
             .map_err(|_| ())
     }
@@ -1564,6 +1605,69 @@ mod tests {
             .read_handshake(&msg(HANDSHAKE_ENCRYPTED_EXTENSIONS, &ee))
             .unwrap_err();
         assert_eq!(err.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+    }
+
+    #[test]
+    fn unsolicited_encrypted_extension_is_rejected() {
+        // RFC 8446 §4.2: a client MUST abort with unsupported_extension on an
+        // extension it did not request. Silently ignoring it completed handshakes a
+        // conformant client rejects — an active-probe distinguisher.
+        let mut hs = handshake();
+        hs.read_state = ReadState::EncryptedExtensions;
+        let alpn = alpn_ext_body(b"h3");
+        // padding(21): legal in a ClientHello, never in EncryptedExtensions.
+        let ee = encrypted_extensions(&[
+            (EXT_ALPN, alpn.as_slice()),
+            (EXT_QUIC_TRANSPORT_PARAMETERS, &[0x0f, 0x00][..]),
+            (0x0015, &[][..]),
+        ]);
+        let err = hs
+            .read_handshake(&msg(HANDSHAKE_ENCRYPTED_EXTENSIONS, &ee))
+            .unwrap_err();
+        assert_eq!(err.alert_description(), Some(ALERT_UNSUPPORTED_EXTENSION));
+    }
+
+    #[test]
+    fn early_data_without_a_0rtt_offer_is_rejected() {
+        // The server may echo early_data only if we offered 0-RTT. A cold-start
+        // handshake never sent it, so accepting the echo would record an accepted
+        // 0-RTT state that never existed, and is leniency a real client lacks.
+        let mut hs = handshake();
+        assert!(
+            hs.resumption_psk.is_none(),
+            "the cold-start fixture must offer no 0-RTT"
+        );
+        hs.read_state = ReadState::EncryptedExtensions;
+        let alpn = alpn_ext_body(b"h3");
+        let ee = encrypted_extensions(&[
+            (EXT_ALPN, alpn.as_slice()),
+            (EXT_QUIC_TRANSPORT_PARAMETERS, &[0x0f, 0x00][..]),
+            (EXT_EARLY_DATA, &[][..]),
+        ]);
+        let err = hs
+            .read_handshake(&msg(HANDSHAKE_ENCRYPTED_EXTENSIONS, &ee))
+            .unwrap_err();
+        assert_eq!(err.alert_description(), Some(ALERT_UNSUPPORTED_EXTENSION));
+    }
+
+    #[test]
+    fn offered_extensions_answered_in_encrypted_extensions_are_accepted() {
+        // The strict catch-all must not reject what a REAL server legitimately
+        // answers: we offer server_name and supported_groups, and RFC 8446 §4.2
+        // permits both in EncryptedExtensions. Rejecting an SNI acknowledgement
+        // would break interop with ordinary TLS servers.
+        let mut hs = handshake();
+        hs.read_state = ReadState::EncryptedExtensions;
+        let alpn = alpn_ext_body(b"h3");
+        let ee = encrypted_extensions(&[
+            (EXT_SERVER_NAME, &[][..]),
+            (EXT_SUPPORTED_GROUPS, &[0x00, 0x02, 0x00, 0x1d][..]),
+            (EXT_ALPN, alpn.as_slice()),
+            (EXT_QUIC_TRANSPORT_PARAMETERS, &[0x0f, 0x00][..]),
+        ]);
+        hs.read_handshake(&msg(HANDSHAKE_ENCRYPTED_EXTENSIONS, &ee))
+            .unwrap();
+        assert_eq!(hs.alpn_protocol(), Some(&b"h3"[..]));
     }
 
     #[test]
