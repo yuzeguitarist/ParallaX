@@ -2689,13 +2689,11 @@ async fn apply_server_key_exchange_record_blocking(
         zeroize::Zeroizing::new(pending_rekey.x25519_shared_secret(&exchange.server_x25519_public));
     let mlkem_ciphertext = exchange.mlkem_ciphertext.to_vec();
     let secret_key = zeroize::Zeroizing::new(pending_rekey.mlkem_secret_key().to_vec());
-    let pq_shared = zeroize::Zeroizing::new(
-        tokio::task::spawn_blocking(move || {
-            pq::decapsulate(&mlkem_ciphertext, secret_key.as_slice())
-                .map_err(ClientHandshakeError::from)
-        })
-        .await??,
-    );
+    let pq_shared = tokio::task::spawn_blocking(move || {
+        pq::decapsulate(&mlkem_ciphertext, secret_key.as_slice())
+            .map_err(ClientHandshakeError::from)
+    })
+    .await??;
     data_session.apply_pq_rekey_shared_with_identity_binding(
         cipher_suite,
         &x25519_shared,

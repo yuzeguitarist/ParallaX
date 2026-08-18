@@ -534,7 +534,7 @@ enum ServerState {
 /// [`KeySchedule`], and verifies the client Finished.
 pub struct ServerHandshake {
     alpn_protocols: Vec<Vec<u8>>,
-    cert_chain: Vec<Vec<u8>>,
+    cert_chain: Arc<Vec<Vec<u8>>>,
     signing_key: EcdsaKeyPair,
     transport_params: Vec<u8>,
     suite: CipherSuite,
@@ -594,7 +594,7 @@ impl ServerHandshake {
     /// list to select from, and the server's transport-parameters blob. The QUIC
     /// v1 Initial suite (`TLS_AES_128_GCM_SHA256`) is pinned.
     pub fn new(
-        cert_chain: Vec<Vec<u8>>,
+        cert_chain: Arc<Vec<Vec<u8>>>,
         signing_key_pkcs8: &[u8],
         alpn_protocols: Vec<Vec<u8>>,
         transport_params: Vec<u8>,
@@ -1373,7 +1373,7 @@ mod tests {
 
         // A dummy cover certificate (the REALITY client accepts any) and the
         // server/client transport-parameter blobs (opaque to the TLS handshake).
-        let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        let cert_chain = Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
         let server_tp = vec![0x01, 0x02, 0x03, 0x04];
         let key =
             EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
@@ -1493,7 +1493,7 @@ mod tests {
             all
         }
 
-        let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        let cert_chain = Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
         let key =
             EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
                 .unwrap();
@@ -1591,7 +1591,7 @@ mod tests {
             (all, zerortt)
         }
 
-        let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        let cert_chain = Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
         let key =
             EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
                 .unwrap();
@@ -1775,7 +1775,7 @@ mod tests {
         let ch = drain_client(&mut client);
 
         let build_server = |bound_dcid: &[u8]| {
-            let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+            let cert_chain = Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
             let key =
                 EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
                     .unwrap();
@@ -1817,7 +1817,7 @@ mod tests {
         // the client's SNI ("example.com") drops the otherwise-valid marker, so the
         // endpoint fronts the flow to the origin (authorized-SNI gate parity with TCP).
         let mut server_unauth = {
-            let cert_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+            let cert_chain = Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
             let key =
                 EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
                     .unwrap();

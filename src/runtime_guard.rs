@@ -341,39 +341,59 @@ fn active_instances(dir: &Path) -> Result<Vec<RuntimeInstance>, RuntimeGuardErro
     Ok(active)
 }
 
+/// Open `path` with `O_NOFOLLOW | O_DIRECTORY` and require the fd to be a
+/// euid-owned directory. A symlinked component fails `open()` with ELOOP
+/// (ENOTDIR on macOS), a non-dir with ENOTDIR, and a foreign owner is rejected
+/// here. Mirrors the fd-based ownership check in
+/// `config.rs::read_secret_config_file`.
+#[cfg(unix)]
+fn open_owned_dir_nofollow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let dir_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)?;
+    let metadata = dir_file.metadata()?;
+    let uid = metadata.uid();
+    let euid = rustix::process::geteuid().as_raw();
+    if !metadata.is_dir() || uid != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime state dir {} is not a euid-owned directory (uid={uid}, euid={euid})",
+                path.display()
+            ),
+        ));
+    }
+    Ok(dir_file)
+}
+
 fn ensure_state_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
 
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
 
         // The state dir path (/tmp/parallax-<euid>/runtime) is predictable, so on
         // a shared host an attacker can pre-create it or plant a symlink before we
-        // do. Re-open the final directory with O_NOFOLLOW | O_DIRECTORY and fstat
-        // the fd: a symlinked final component fails open() with ELOOP (ENOTDIR on
-        // macOS), a non-dir with ENOTDIR, and a foreign owner is rejected here.
-        // Mirrors the fd-based ownership check in config.rs::read_secret_config_file.
-        // Like that check, O_NOFOLLOW only guards the FINAL component — the parent
-        // /tmp/parallax-<euid> is not validated; this raises the bar without fully
-        // closing a hostile-parent race on a shared host.
-        let dir_file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(dir)?;
-        let metadata = dir_file.metadata()?;
-        let uid = metadata.uid();
-        let euid = rustix::process::geteuid().as_raw();
-        if !metadata.is_dir() || uid != euid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "runtime state dir {} is not a euid-owned directory (uid={uid}, euid={euid})",
-                    dir.display()
-                ),
-            ));
+        // do. Validate the PARENT as well as the final component: the parent is
+        // equally euid-predictable and lives in a world-writable /tmp, so an
+        // attacker who pre-creates it owns everything we then build inside — they
+        // could read the lock files' plaintext `server_addr` (which server a client
+        // is using) or plant flocked lock files to force a false `RuntimeConflict`.
+        // Checking only the leaf, as this did before, left that open.
+        //
+        // Residual: the two components are validated by path rather than via
+        // `openat` relative to the parent's fd, so a same-instant swap between the
+        // checks remains theoretically possible. Owning the parent is the step an
+        // attacker must win first, and that is now checked.
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _parent = open_owned_dir_nofollow(parent)?;
         }
+        let _dir = open_owned_dir_nofollow(dir)?;
     }
     Ok(())
 }
@@ -502,6 +522,20 @@ mod tests {
     use super::*;
     use crate::config::{CryptoConfig, TrafficConfig, UdpConfig};
 
+    /// A euid-owned state dir nested one level INSIDE a tempdir.
+    ///
+    /// `tempfile::tempdir()` places its root directly in the system temp dir, which
+    /// on Linux is the root-owned, world-writable `/tmp` — and `ensure_state_dir`
+    /// (correctly) refuses a parent it does not own. Production never sees that
+    /// shape: `default_state_dir()` is `/tmp/parallax-<euid>/runtime`, whose parent
+    /// `create_dir_all` creates and therefore owns. Tests nest one level down to
+    /// reproduce the production shape instead of weakening the check.
+    fn state_dir(tmp: &tempfile::TempDir) -> PathBuf {
+        let dir = tmp.path().join("runtime");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn config(server_addr: &str) -> Config {
         Config {
             mode: Mode::Client,
@@ -545,13 +579,28 @@ mod tests {
         assert!(ensure_state_dir(&link).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        fs::create_dir_all(&real_parent).unwrap();
+        let linked_parent = tmp.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+        // The final component is a genuine euid-owned directory, but it is reached
+        // through a symlinked parent — the hostile-parent shape a leaf-only check
+        // accepts and this guard must reject.
+        assert!(ensure_state_dir(&linked_parent.join("runtime")).is_err());
+    }
+
     #[test]
     fn speed_rejects_same_server_client() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config("203.0.113.10:443");
-        let _client = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap();
+        let _client = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir)).unwrap();
 
-        let err = RuntimeGuard::acquire_speed_in_dir(&cfg, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_speed_in_dir(&cfg, &state_dir(&dir)).unwrap_err();
         assert!(matches!(err, RuntimeGuardError::Conflict(_)));
         assert!(err.to_string().contains("Test a different server"));
     }
@@ -561,9 +610,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let client_cfg = config("203.0.113.10:443");
         let speed_cfg = config("203.0.113.11:443");
-        let _client = RuntimeGuard::acquire_client_in_dir(&client_cfg, dir.path()).unwrap();
+        let _client = RuntimeGuard::acquire_client_in_dir(&client_cfg, &state_dir(&dir)).unwrap();
 
-        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, dir.path()).unwrap();
+        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, &state_dir(&dir)).unwrap();
     }
 
     #[test]
@@ -571,9 +620,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let speed_cfg = config("203.0.113.10:443");
         let client_cfg = config("203.0.113.11:443");
-        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, dir.path()).unwrap();
+        let _speed = RuntimeGuard::acquire_speed_in_dir(&speed_cfg, &state_dir(&dir)).unwrap();
 
-        let err = RuntimeGuard::acquire_client_in_dir(&client_cfg, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_client_in_dir(&client_cfg, &state_dir(&dir)).unwrap_err();
         assert!(matches!(err, RuntimeGuardError::Conflict(_)));
         assert!(err.to_string().contains("plx speed run is already active"));
     }
@@ -583,9 +632,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = config("203.0.113.20:443");
         let b = config("203.0.113.21:443");
-        let _first = RuntimeGuard::acquire_speed_in_dir(&a, dir.path()).unwrap();
+        let _first = RuntimeGuard::acquire_speed_in_dir(&a, &state_dir(&dir)).unwrap();
 
-        let err = RuntimeGuard::acquire_speed_in_dir(&b, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_speed_in_dir(&b, &state_dir(&dir)).unwrap_err();
         match err {
             RuntimeGuardError::Conflict(conflict) => {
                 assert!(conflict
@@ -602,11 +651,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config("203.0.113.30:443");
         {
-            let _guard = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap();
+            let _guard = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir)).unwrap();
         }
         // After the first guard drops, the directory should be empty of lock files
         // and a fresh acquire should succeed.
-        let _guard = RuntimeGuard::acquire_speed_in_dir(&cfg, dir.path()).unwrap();
+        let _guard = RuntimeGuard::acquire_speed_in_dir(&cfg, &state_dir(&dir)).unwrap();
     }
 
     #[test]
@@ -614,7 +663,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config("203.0.113.40:443");
         cfg.mode = Mode::Server;
-        let err = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir)).unwrap_err();
         assert!(matches!(err, RuntimeGuardError::WrongMode));
     }
 
@@ -623,7 +672,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config("203.0.113.50:443");
         cfg.client = None;
-        let err = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path()).unwrap_err();
+        let err = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir)).unwrap_err();
         assert!(matches!(err, RuntimeGuardError::MissingClient));
     }
 
@@ -712,7 +761,7 @@ mod tests {
             let dir = Arc::clone(&dir);
             handles.push(thread::spawn(move || {
                 let cfg = config(&format!("203.0.113.{i}:443"));
-                RuntimeGuard::acquire_client_in_dir(&cfg, dir.path())
+                RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir))
             }));
         }
         // Hold every guard until all threads have joined: distinct clients never
@@ -739,7 +788,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A live peer whose lock file carries a forward-incompatible extra key
         // (a newer plx version). Valid naming so it passes the directory filters.
-        let peer_path = dir.path().join("client-999999-deadbeefcafe.lock");
+        let peer_path = state_dir(&dir).join("client-999999-deadbeefcafe.lock");
         let mut peer = open_lock_file(&peer_path).unwrap();
         let contents = "role=client\npid=999999\nconfig_id=deadbeefcafe\n\
                         server_addr=203.0.113.9:443\nstarted_at=1234567890\n";
@@ -752,7 +801,7 @@ mod tests {
         // Acquisition must succeed by skipping the undecodable live peer rather
         // than aborting every launch with InvalidMetadata.
         let cfg = config("203.0.113.10:443");
-        let guard = RuntimeGuard::acquire_client_in_dir(&cfg, dir.path());
+        let guard = RuntimeGuard::acquire_client_in_dir(&cfg, &state_dir(&dir));
         assert!(
             guard.is_ok(),
             "an unparseable live peer must not wedge acquisition, got {guard:?}"

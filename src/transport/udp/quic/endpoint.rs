@@ -281,7 +281,20 @@ pub struct ZeroRttKeys {
 /// see [`Driver::on_datagram`].
 pub struct ServerConfig {
     /// DER-encoded certificate chain presented in the TLS Certificate message.
-    pub cert_chain: Vec<Vec<u8>>,
+    ///
+    /// Shared behind an `Arc` because a server `Core` is built for every well-formed
+    /// v1 Initial — including the unauthenticated, source-spoofable ones that only
+    /// ever reach the short-lived `pending` table — so cloning the chain by value
+    /// copied it once per forged datagram. The chain is immutable after
+    /// configuration, so sharing it is free.
+    ///
+    /// This trims the per-Initial allocation; it does NOT remove the pre-auth cost.
+    /// `Core::new_server_with_stek` still parses the PKCS#8 signing key
+    /// (`EcdsaKeyPair::from_pkcs8`) and builds the full handshake + BBR + packet-space
+    /// state per datagram, which dominates. Bounding that properly needs address
+    /// validation (Retry) or a per-source pending budget — deliberately not done here,
+    /// since a Retry the fronted origin does not send would itself be a distinguisher.
+    pub cert_chain: Arc<Vec<Vec<u8>>>,
     /// PKCS#8 ECDSA P-256 signing key for the CertificateVerify.
     pub signing_key_pkcs8: Vec<u8>,
     /// Offered ALPN protocols (the relay offers exactly `h3`).
@@ -852,21 +865,15 @@ impl Driver {
                                 let chunks = total.div_ceil(seg).max(1) as u64;
                                 super::offload::record_gro_read(chunks);
                             }
-                            // Enforce the configured `max_udp_payload` recv ceiling per
-                            // datagram (issue #75). On Linux the read buffer is the 64 KiB
-                            // GRO gather buffer, so a single non-coalesced datagram larger
-                            // than recv_cap() arrives INTACT here (never truncated by the
-                            // kernel) and would otherwise be parsed in full — drop such
-                            // chunks so the cap holds on every platform. Off Linux the
-                            // buffer is exactly recv_cap() bytes (oversized datagrams are
-                            // truncated by recv_from), so this check never fires. A GRO
-                            // read's shorter tail chunk is a genuine original datagram
-                            // and passes untouched.
-                            let cap = self.recv_cap();
+                            // The configured `max_udp_payload` recv ceiling (issue
+                            // #75) is enforced in `on_datagram`, NOT here: on Linux
+                            // the read buffer is the 64 KiB GRO gather buffer, so a
+                            // single non-coalesced datagram larger than recv_cap()
+                            // arrives INTACT, and dropping it at this level also
+                            // suppressed the origin-splice relay — leaving ParallaX
+                            // silent for a datagram the real origin would answer.
+                            // The cap now gates only the paths that parse locally.
                             for chunk in buf[..total].chunks(seg) {
-                                if chunk.len() > cap {
-                                    continue;
-                                }
                                 self.on_datagram(chunk, peer, ecn);
                             }
                         }
@@ -954,7 +961,20 @@ impl Driver {
     fn on_datagram(&mut self, data: &[u8], peer: SocketAddr, ecn: u8) {
         let now = Instant::now();
         let ecn = super::conn::EcnCodepoint::from_bits(ecn);
+        // The `max_udp_payload` recv ceiling (issue #75) bounds what we PARSE, so it
+        // gates only the locally-terminating paths below. It must NOT gate the
+        // origin-splice relay: dropping an over-cap datagram before the splice made
+        // ParallaX go silent in the [recv_cap, 64 KiB] window, while the real origin
+        // it fronts would parse and answer that same datagram — an active-probe
+        // distinguisher. Over-cap traffic is now relayed verbatim and the ORIGIN
+        // decides, which is exactly the property the splice exists to provide.
+        let oversize = data.len() > self.recv_cap();
         if let Some(c) = self.conns.get(&peer) {
+            // Established (already authenticated) connection: nothing to conceal
+            // from this peer, so the cap simply holds.
+            if oversize {
+                return;
+            }
             let _ = c.core.lock().unwrap().handle_datagram_ecn(data, ecn, now);
             c.wake_handles();
             return;
@@ -969,6 +989,9 @@ impl Driver {
         // and re-evaluate the terminate-vs-splice fork (the Safari ClientHello spans
         // two Initials, so the decision matures only once the whole CH is parsed).
         if self.pending.contains_key(&peer) {
+            if oversize {
+                return;
+            }
             self.feed_pending(peer, data, ecn, now);
             return;
         }
@@ -981,8 +1004,9 @@ impl Driver {
         // QUIC analogue of the TCP REALITY fallback: relay it verbatim to the real
         // origin so an active prober reaches the TRUE origin and ParallaX emits
         // nothing of its own. Dormant (drop, the prior behaviour) until the server
-        // runtime supplies `origin_udp_addr`.
-        if !looks_like_initial(data) {
+        // runtime supplies `origin_udp_addr`. An over-cap datagram takes this same
+        // route: we will not parse it, so the origin — not our silence — answers.
+        if oversize || !looks_like_initial(data) {
             if let Some(origin) = cfg.origin_udp_addr {
                 self.open_splice(peer, origin, data, now);
             }
@@ -1828,7 +1852,7 @@ mod tests {
                 .as_ref()
                 .to_vec();
         Arc::new(ServerConfig {
-            cert_chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            cert_chain: Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             signing_key_pkcs8: key,
             alpn_protocols: vec![b"h3".to_vec()],
             zero_rtt: None,
@@ -1899,16 +1923,28 @@ mod tests {
         );
     }
 
-    /// The configured `max_udp_payload` recv ceiling holds on the Linux GRO path
-    /// (issue #75). The Linux read buffer is the 64 KiB GRO gather buffer, so a
-    /// single non-coalesced datagram between `recv_cap()` (default 2048) and
-    /// 64 KiB arrives INTACT — the driver must drop it before parsing/routing,
-    /// not hand it to `on_datagram` in full. Observable via the origin splice: an
-    /// oversized non-Initial datagram would be spliced verbatim to the origin if
-    /// parsed, so the origin must see only the within-cap follow-up datagram.
+    /// An over-cap datagram must reach the real origin rather than vanish.
+    ///
+    /// This REVERSES the original issue-#75 behaviour (drop it outright). The recv
+    /// ceiling's job is to bound what ParallaX PARSES, and that still holds: an
+    /// over-cap datagram never reaches the local terminate path, never allocates a
+    /// `Core`, and is only ever relayed as opaque bytes. But dropping it *before*
+    /// the origin splice also made ParallaX go silent across the
+    /// `[recv_cap, 64 KiB]` window, while the origin it fronts would parse and
+    /// answer that same datagram — a free active-probe distinguisher. Relaying it
+    /// verbatim lets the ORIGIN decide, which is the whole point of the splice.
+    ///
+    /// Linux-only: elsewhere `recv_from` truncates to the cap, so an intact
+    /// over-cap datagram never materialises.
+    ///
+    /// Coverage limit: the mock origin is on loopback (MTU 65536), so this proves
+    /// the ROUTING decision but not the on-path send. Reaching a remote origin over
+    /// a 1500-MTU path additionally needs `SpliceFlow`'s `allow_fragmentation`,
+    /// since Linux would otherwise refuse the over-MTU relay send with EMSGSIZE and
+    /// the datagram would be dropped after all.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn oversized_datagram_is_dropped_against_recv_cap_on_the_gro_path() {
+    async fn oversized_datagram_splices_to_origin_instead_of_going_silent() {
         // Mock origin: report the size of every datagram that reaches it.
         let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = origin.local_addr().unwrap();
@@ -1933,33 +1969,86 @@ mod tests {
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         // 3000 bytes: over the default 2048-byte cap, under the 64 KiB GRO buffer,
-        // and NOT a v1 Initial (short-header first byte) — so if it were parsed it
-        // would open an origin splice and arrive at the origin verbatim. The recv
-        // cap must drop it first.
+        // and NOT a v1 Initial (short-header first byte).
         client
             .send_to(&vec![0x5au8; 3000], server_addr)
             .await
             .unwrap();
-        // A within-cap garbage datagram from the same peer must still be processed
-        // (it opens the splice), proving the drop is per-datagram, not a stall.
-        client.send_to(b"small-probe", server_addr).await.unwrap();
 
         let n = tokio::time::timeout(Duration::from_secs(5), orx.recv())
             .await
-            .expect("the within-cap datagram reaches the origin")
+            .expect("an over-cap datagram must reach the origin, not be dropped")
             .unwrap();
         assert_eq!(
-            n,
-            b"small-probe".len(),
-            "only the within-cap datagram is spliced; the oversized one is dropped"
+            n, 3000,
+            "the over-cap datagram is relayed verbatim, neither dropped nor truncated"
         );
-        // And nothing else arrives: the oversized datagram was dropped, not queued.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), orx.recv())
-                .await
-                .is_err(),
-            "the oversized datagram must never reach the origin"
-        );
+
+        // A within-cap datagram from the same peer keeps flowing on the now-open
+        // splice, proving the over-cap path did not wedge or bypass the flow.
+        client.send_to(b"small-probe", server_addr).await.unwrap();
+        let n2 = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("the follow-up datagram reaches the origin")
+            .unwrap();
+        assert_eq!(n2, b"small-probe".len());
+    }
+
+    /// The `oversize` disjunct must be load-bearing, not shadowed by
+    /// `!looks_like_initial`.
+    ///
+    /// The sibling test above sends a short-header payload, for which
+    /// `looks_like_initial` is already false — so it would splice even without the
+    /// over-cap term. This one sends an over-cap datagram that IS a well-formed v1
+    /// Initial, so `looks_like_initial` is TRUE and `oversize` is the only reason it
+    /// takes the splice instead of being parsed into a held `Core`. It also pins the
+    /// resource property: an over-cap Initial must never allocate connection state.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn oversized_valid_initial_splices_without_allocating_a_core() {
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (otx, mut orx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 65536];
+            loop {
+                let (n, _) = origin.recv_from(&mut b).await.unwrap();
+                if otx.send(n).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let server = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_splicing(origin_addr),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // A well-formed v1 long-header Initial (0xc0, version 1) padded to 3000
+        // bytes: passes `looks_like_initial`, exceeds the 2048-byte recv cap.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut initial = vec![0xc0u8, 0x00, 0x00, 0x00, 0x01];
+        initial.resize(3000, 0);
+        client.send_to(&initial, server_addr).await.unwrap();
+
+        let n = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("an over-cap v1 Initial must reach the origin")
+            .unwrap();
+        assert_eq!(n, 3000, "relayed verbatim rather than parsed locally");
+
+        // The splice now owns this 4-tuple, so an ordinary follow-up is forwarded
+        // verbatim too — had the Initial been parsed into `pending` instead, this
+        // datagram would have been fed to that held core rather than the origin.
+        client.send_to(b"after-initial", server_addr).await.unwrap();
+        let n2 = tokio::time::timeout(Duration::from_secs(5), orx.recv())
+            .await
+            .expect("the follow-up reaches the origin over the same splice")
+            .unwrap();
+        assert_eq!(n2, b"after-initial".len());
     }
 
     #[test]

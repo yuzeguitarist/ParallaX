@@ -6,7 +6,7 @@
 //! accounting, loss detection, and the congestion controllers build on top in
 //! later slices.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// RFC 9002 §6.2: the timer granularity (1 ms) flooring the PTO RTT-variance term.
@@ -119,6 +119,28 @@ pub struct SentPacket {
     pub delivered: u64,
 }
 
+/// Cap on tracked non-ack-eliciting (pure-ACK) packets per packet-number space.
+///
+/// RFC 9002 keeps every sent packet in `sent_packets` for a reason: an ACK whose
+/// `largest` is one of our pure-ACKs still has to yield an RTT sample and drive
+/// loss detection. ParallaX never piggybacks ACKs onto data packets — it emits a
+/// standalone pure-ACK packet, and `poll_transmit` gives a pending ACK top
+/// priority — so on a download-dominated flow the highest-numbered packet we sent
+/// is usually a pure-ACK. Dropping them from tracking entirely therefore blinds
+/// the RTT/BBR sample and the `newly.is_empty()` fast path in `Connection::recv_ack`.
+///
+/// But pure-ACKs escape every reaping path while the peer withholds its own ACKs:
+/// `on_ack` removes only acknowledged ranges, `detect_lost` scans only below
+/// `largest_acked`, and the PTO `discard` path walks the connection's
+/// `sent_content`, which pure-ACKs never enter. A peer that floods ack-eliciting
+/// packets while never acknowledging ours makes us emit one pure-ACK per received
+/// datagram with `largest_acked` frozen — unbounded, attacker-driven growth.
+///
+/// So bound the tracking rather than removing it. Only recent entries can still be
+/// the `largest` of an incoming ACK, so evicting the oldest costs the recovery path
+/// nothing while capping the memory an unacknowledging peer can pin.
+const MAX_NON_ACK_ELICITING_TRACKED: usize = 256;
+
 /// One packet-number space's sent-packet bookkeeping + RFC 9002 §6.1 loss
 /// detection. The connection records each send, feeds received ACKs, and asks for
 /// the packets to declare lost (and retransmit). Bytes-in-flight feed the
@@ -126,6 +148,11 @@ pub struct SentPacket {
 #[derive(Debug, Default)]
 pub struct SentPackets {
     packets: BTreeMap<u64, SentPacket>,
+    /// Send-ordered packet numbers of the tracked non-ack-eliciting packets, so the
+    /// oldest can be evicted in O(1) once [`MAX_NON_ACK_ELICITING_TRACKED`] is hit.
+    /// May hold numbers already removed from `packets` (acked/lost); evicting one of
+    /// those is a harmless no-op, and the deque itself is capped.
+    non_ack_eliciting: VecDeque<u64>,
     largest_acked: Option<u64>,
     in_flight: u64,
 }
@@ -137,11 +164,25 @@ impl SentPackets {
     }
 
     /// Record an outgoing packet.
+    ///
+    /// Non-ack-eliciting packets are tracked too (loss recovery needs them to
+    /// resolve an ACK's `largest`), but only the most recent
+    /// [`MAX_NON_ACK_ELICITING_TRACKED`] of them — see that constant for why
+    /// unbounded tracking is an attacker-driven memory sink.
     pub fn on_sent(&mut self, pn: u64, sent: SentPacket) {
         // Only ack-eliciting packets count toward bytes-in-flight (RFC 9002 §2);
         // pure-ACK packets must not inflate congestion-window usage.
         if sent.ack_eliciting {
             self.in_flight += sent.size;
+        } else {
+            self.non_ack_eliciting.push_back(pn);
+            while self.non_ack_eliciting.len() > MAX_NON_ACK_ELICITING_TRACKED {
+                if let Some(evicted) = self.non_ack_eliciting.pop_front() {
+                    // Carries no retransmittable content and no in-flight bytes, so
+                    // forgetting it only forgoes a stale RTT sample.
+                    self.packets.remove(&evicted);
+                }
+            }
         }
         self.packets.insert(pn, sent);
     }
@@ -226,6 +267,71 @@ impl SentPackets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pure_ack_tracking_is_bounded_but_retained() {
+        // Pure-ACKs must STAY tracked: ParallaX never piggybacks ACKs onto data
+        // packets, and `poll_transmit` gives a pending ACK top priority, so the
+        // highest-numbered packet we sent is often a pure-ACK — and
+        // `Connection::recv_ack` resolves its RTT / delivery-rate sample by locating
+        // `ack.largest` among the newly-acked packets. Dropping them from tracking
+        // would silently blind that sample.
+        //
+        // They must also stay BOUNDED: a peer that floods ack-eliciting packets while
+        // withholding its own ACKs makes us emit one pure-ACK per received datagram
+        // with `largest_acked` frozen, and no reaping path can drop them then
+        // (`on_ack` covers only acknowledged ranges, `detect_lost` scans only below
+        // `largest_acked`, and the PTO `discard` path walks `sent_content`, which
+        // pure-ACKs never enter).
+        let mut sent = SentPackets::new();
+        let now = Instant::now();
+        let flood = (MAX_NON_ACK_ELICITING_TRACKED * 4) as u64;
+        for pn in 0..flood {
+            sent.on_sent(
+                pn,
+                SentPacket {
+                    time_sent: now,
+                    size: 40,
+                    ack_eliciting: false,
+                    delivered: 0,
+                },
+            );
+        }
+        assert_eq!(sent.in_flight(), 0, "pure-ACKs are never in flight");
+        assert_eq!(
+            sent.packets.len(),
+            MAX_NON_ACK_ELICITING_TRACKED,
+            "an unacknowledging peer cannot pin more than the cap"
+        );
+
+        // The most recent pure-ACK is still resolvable — this is what recv_ack needs
+        // to fold an RTT sample when the peer's ACK largest is one of our pure-ACKs.
+        let newest = flood - 1;
+        assert_eq!(
+            sent.on_ack(newest, &[(newest, newest)]).len(),
+            1,
+            "the newest pure-ACK is still tracked"
+        );
+        assert_eq!(
+            sent.in_flight(),
+            0,
+            "acking a pure-ACK never touches in_flight"
+        );
+
+        // An ack-eliciting packet on the same instance is tracked normally.
+        sent.on_sent(
+            flood,
+            SentPacket {
+                time_sent: now,
+                size: 1200,
+                ack_eliciting: true,
+                delivered: 0,
+            },
+        );
+        assert_eq!(sent.in_flight(), 1200);
+        assert_eq!(sent.on_ack(flood, &[(flood, flood)]).len(), 1);
+        assert_eq!(sent.in_flight(), 0);
+    }
 
     #[test]
     fn before_any_sample_uses_rfc_defaults() {

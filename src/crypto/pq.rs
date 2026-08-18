@@ -100,11 +100,21 @@ pub fn encapsulate(public_key: &[u8]) -> Result<MlKemEncapsulation, PqError> {
         .map_err(|_| PqError::InvalidPublicKey)?;
     Ok(MlKemEncapsulation {
         ciphertext: ciphertext.as_ref().to_vec(),
-        shared_secret: zeroize::Zeroizing::new(shared_secret_32(shared_secret.as_ref())?),
+        shared_secret: shared_secret_32(shared_secret.as_ref())?,
     })
 }
 
-pub fn decapsulate(ciphertext: &[u8], secret_key: &[u8]) -> Result<[u8; 32], PqError> {
+/// Decapsulate to the ML-KEM-1024 shared secret.
+///
+/// Returns `Zeroizing` rather than a bare `[u8; 32]` so the secret self-scrubs when
+/// its final owner drops it and callers cannot forget to wrap it. (A Rust move does
+/// not drop the source, so this does not scrub every intermediate slot the value
+/// passes through — it makes the landed value's cleanup automatic rather than
+/// caller-dependent.) Mirrors `encapsulate`, whose secret is already `Zeroizing`.
+pub fn decapsulate(
+    ciphertext: &[u8],
+    secret_key: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; 32]>, PqError> {
     let secret =
         DecapsulationKey::new(&ML_KEM_1024, secret_key).map_err(|_| PqError::InvalidSecretKey)?;
     let shared_secret = secret
@@ -211,11 +221,11 @@ fn write_hybrid_rekey_ikm_vec(
     out.extend_from_slice(&(symmetric_secret.len() as u32).to_be_bytes());
     out.extend_from_slice(symmetric_secret);
 }
-fn shared_secret_32(shared_secret: &[u8]) -> Result<[u8; 32], PqError> {
+fn shared_secret_32(shared_secret: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>, PqError> {
     if shared_secret.len() != 32 {
         return Err(PqError::InvalidCiphertext);
     }
-    let mut out = [0_u8; 32];
+    let mut out = zeroize::Zeroizing::new([0_u8; 32]);
     out.copy_from_slice(shared_secret);
     Ok(out)
 }
@@ -243,7 +253,7 @@ mod tests {
         let keys = keypair();
         let enc = encapsulate(&keys.public).unwrap();
         let dec = decapsulate(&enc.ciphertext, &keys.secret).unwrap();
-        assert_eq!(*enc.shared_secret, dec);
+        assert_eq!(*enc.shared_secret, *dec);
         assert_eq!(keys.public.len(), public_key_bytes());
         assert_eq!(keys.secret.len(), secret_key_bytes());
         assert_eq!(enc.ciphertext.len(), ciphertext_bytes());
@@ -403,7 +413,7 @@ mod tests {
         assert!(matches!(err, PqError::InvalidCiphertext));
 
         let ok = shared_secret_32(&[1_u8; 32]).unwrap();
-        assert_eq!(ok, [1_u8; 32]);
+        assert_eq!(*ok, [1_u8; 32]);
     }
 
     #[test]

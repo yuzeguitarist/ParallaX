@@ -80,7 +80,7 @@ pub fn server_config(
     key: PrivateKeyDer<'static>,
 ) -> Result<Arc<quic::endpoint::ServerConfig>, UdpTransportError> {
     Ok(Arc::new(quic::endpoint::ServerConfig {
-        cert_chain: vec![cert.as_ref().to_vec()],
+        cert_chain: Arc::new(vec![cert.as_ref().to_vec()]),
         // rcgen emits ECDSA P-256 PKCS#8 DER, which `secret_der` returns verbatim
         // — exactly what the hand-rolled ServerHandshake's signer expects.
         signing_key_pkcs8: key.secret_der().to_vec(),
@@ -117,7 +117,7 @@ pub fn server_config_0rtt(
     guard: Arc<dyn ZeroRttGuard>,
 ) -> Result<Arc<quic::endpoint::ServerConfig>, UdpTransportError> {
     Ok(Arc::new(quic::endpoint::ServerConfig {
-        cert_chain: vec![cert.as_ref().to_vec()],
+        cert_chain: Arc::new(vec![cert.as_ref().to_vec()]),
         signing_key_pkcs8: key.secret_der().to_vec(),
         alpn_protocols: vec![UDP_ALPN.to_vec()],
         zero_rtt: Some(quic::endpoint::ZeroRttKeys { stek, guard }),
@@ -155,7 +155,7 @@ pub fn server_config_stable(
     max_udp_payload: usize,
 ) -> Result<Arc<quic::endpoint::ServerConfig>, UdpTransportError> {
     Ok(Arc::new(quic::endpoint::ServerConfig {
-        cert_chain: vec![cert.as_ref().to_vec()],
+        cert_chain: Arc::new(vec![cert.as_ref().to_vec()]),
         signing_key_pkcs8: key.secret_der().to_vec(),
         alpn_protocols: vec![UDP_ALPN.to_vec()],
         zero_rtt,

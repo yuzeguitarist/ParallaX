@@ -138,7 +138,11 @@ impl std::fmt::Debug for ConnectionId {
 pub fn encode_packet_number(full_pn: u64, largest_acked: Option<u64>) -> ([u8; 4], usize) {
     let num_unacked = match largest_acked {
         Some(largest) => full_pn.saturating_sub(largest),
-        None => full_pn + 1,
+        // `saturating_add` for symmetry with the acked arm: this is a send-path
+        // helper whose `full_pn` is our own next packet number (far below 2^62), so
+        // the bound is never neared in practice — saturating just keeps the fn total
+        // over its input domain instead of panicking in a debug build.
+        None => full_pn.saturating_add(1),
     };
     // Smallest `len` whose range 2^(8*len) strictly exceeds twice `num_unacked`.
     let twice = u128::from(num_unacked) * 2;
@@ -161,6 +165,11 @@ pub fn encode_packet_number(full_pn: u64, largest_acked: Option<u64>) -> ([u8; 4
 /// the largest packet number already processed in this space (RFC 9000 §17.1 /
 /// Appendix A.3). `pn_len` is `1..=4`.
 pub fn decode_packet_number(largest_pn: u64, truncated: u64, pn_len: usize) -> u64 {
+    // Every in-crate caller derives `pn_len` from `(first & PN_LEN_MASK) + 1`, so it
+    // is always 1..=4 and the shift below is 8..=32. Clamp anyway: this is a `pub`
+    // fn, and a caller that ever passed >= 8 would shift by >= 64 (a debug-build
+    // panic, garbage `pn_win` in release) rather than fail cleanly.
+    let pn_len = pn_len.clamp(1, 4);
     let pn_nbits = pn_len * 8;
     let expected = largest_pn.wrapping_add(1);
     let pn_win = 1u64 << pn_nbits; // pn_len 1..=4 ⇒ shift 8..=32, always in range
@@ -349,6 +358,14 @@ impl Header {
             if first & SHORT_RESERVED_BITS != 0 {
                 return Err(DecodeError::ReservedBitsSet);
             }
+            // `local_cid_len` is the caller's own SCID length (a `ConnectionId`, so
+            // <= MAX_CID_LEN by construction), but reject an out-of-range value
+            // explicitly rather than letting `ConnectionId::new` assert on it — the
+            // long-header path already fails closed this way via `Cursor::cid`.
+            // Checked BEFORE `1 + local_cid_len` so the guard also covers that add.
+            if local_cid_len > MAX_CID_LEN {
+                return Err(DecodeError::CidTooLong);
+            }
             let pn_offset = 1 + local_cid_len;
             let dcid = ConnectionId::new(buf.get(1..pn_offset).ok_or(DecodeError::Truncated)?);
             let pn_len = ((first & PN_LEN_MASK) + 1) as usize;
@@ -378,6 +395,11 @@ pub fn locate_pn_offset(buf: &[u8], local_cid_len: usize) -> Result<usize, Decod
         return Err(DecodeError::MissingFixedBit);
     }
     if first & LONG_HEADER_FORM == 0 {
+        // Same guard as the short-header branch of `Header::decode`: reject an
+        // out-of-range caller CID length before the add rather than overflowing.
+        if local_cid_len > MAX_CID_LEN {
+            return Err(DecodeError::CidTooLong);
+        }
         return Ok(1 + local_cid_len);
     }
     match LongType::from_first_byte(first) {
