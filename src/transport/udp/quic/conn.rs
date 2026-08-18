@@ -5067,7 +5067,7 @@ mod tests {
         // each time, so ~8 resets pin recv_data_total at the 16 MiB CONN_RECV_WINDOW
         // with recv_data_consumed still 0 and the connection can never receive again.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
