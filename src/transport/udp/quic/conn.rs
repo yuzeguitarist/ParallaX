@@ -850,7 +850,7 @@ impl Connection {
     /// keys and the client's CID are learned from the first Initial datagram.
     #[allow(dead_code)] // cold-start (no-STEK) server ctor; prod uses new_server_with_stek, tests use this
     pub fn new_server(
-        cert_chain: Vec<Vec<u8>>,
+        cert_chain: Arc<Vec<Vec<u8>>>,
         signing_key_pkcs8: &[u8],
         alpn_protocols: Vec<Vec<u8>>,
         transport_params: Vec<u8>,
@@ -869,7 +869,7 @@ impl Connection {
     /// Like [`Self::new_server`] but with a Session-Ticket Encryption Key (STEK) so
     /// the server issues + accepts 0-RTT resumption tickets (RFC 8446 §4.6.1).
     pub fn new_server_with_stek(
-        cert_chain: Vec<Vec<u8>>,
+        cert_chain: Arc<Vec<Vec<u8>>>,
         signing_key_pkcs8: &[u8],
         alpn_protocols: Vec<Vec<u8>>,
         transport_params: Vec<u8>,
@@ -3330,7 +3330,7 @@ mod tests {
         // mirrors the confidentiality-limit close exactly (NO_ERROR / code 0), so it
         // introduces no externally distinct fingerprint.
         let mut conn = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -3384,7 +3384,7 @@ mod tests {
         // `retain` these fully-consumed fragments would wedge the bounded
         // reassembly budget and stall further reassembly.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -3474,7 +3474,7 @@ mod tests {
                 .unwrap();
         // A dummy cover cert (the REALITY client accepts any) + a server TP blob.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -3531,7 +3531,7 @@ mod tests {
                 .unwrap();
         let stek = Zeroizing::new([0x33u8; 32]);
         let mut server = Connection::new_server_with_stek(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -3563,7 +3563,7 @@ mod tests {
     #[test]
     fn zero_rtt_early_data_flows_to_the_server() {
         let stek = Zeroizing::new([0x44u8; 32]);
-        let cover = || vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        let cover = || Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
 
         // 1. Cold-start handshake to obtain a resumption ticket.
         let mut client = Connection::new_client(
@@ -3667,7 +3667,7 @@ mod tests {
         });
 
         let stek = Zeroizing::new([0x55u8; 32]);
-        let cover = || vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        let cover = || Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
 
         // Mint a ticket via a cold-start handshake.
         let mut client = Connection::new_client(
@@ -3772,7 +3772,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -3805,7 +3805,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0xab; 16 * 1024]],
+            Arc::new(vec![vec![0xab; 16 * 1024]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -3909,7 +3909,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -3946,7 +3946,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -3987,7 +3987,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4039,7 +4039,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4090,7 +4090,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4195,7 +4195,7 @@ mod tests {
         )
         .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4385,7 +4385,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4446,7 +4446,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4494,7 +4494,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4559,7 +4559,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4625,7 +4625,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4663,7 +4663,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4712,7 +4712,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4779,7 +4779,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4905,7 +4905,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -4989,7 +4989,7 @@ mod tests {
             )
         };
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5149,7 +5149,7 @@ mod tests {
         // fully covered by the already-buffered copy, so it must be dropped:
         // buffering every copy would grow recv_pending at zero flow-control cost.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5186,7 +5186,7 @@ mod tests {
         // per kind) accumulate while CONN_RECV_WINDOW is never engaged. The
         // aggregate budget must reject buffering past MAX_CONN_REASSEMBLY.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5244,7 +5244,7 @@ mod tests {
     #[test]
     fn final_size_violations_are_rejected() {
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5266,7 +5266,7 @@ mod tests {
     #[test]
     fn reset_stream_final_size_is_validated_and_flow_accounted() {
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5290,7 +5290,7 @@ mod tests {
         // half-open). Otherwise a peer cycling fresh stream ids could pile zombie
         // streams up to the per-peer limit.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5318,7 +5318,7 @@ mod tests {
         // never fall inside any window). It must be rejected before any state
         // mutation — and must not panic (debug) or wrap past the window (release).
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5342,7 +5342,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5381,7 +5381,7 @@ mod tests {
         // is a protocol violation (RFC 9000 §13.1) and must be rejected before it can
         // poison largest_acked and trigger a spurious-loss retransmit storm.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5405,7 +5405,7 @@ mod tests {
         // Garbage that never AEAD-opens must not refresh the idle timer (RFC 9000
         // §10.1), else an off-path attacker could pin a connection open forever.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5427,7 +5427,7 @@ mod tests {
         // Without the `created_at` fallback it would arm NO timer at all
         // (`next_timeout() == None`) and sit in the endpoint's table forever.
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5519,7 +5519,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5571,7 +5571,7 @@ mod tests {
     #[test]
     fn oversized_and_boundary_datagrams_fail_safe() {
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),
@@ -5614,7 +5614,7 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         let mut server = Connection::new_server(
-            vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]],
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
             server_tp(),

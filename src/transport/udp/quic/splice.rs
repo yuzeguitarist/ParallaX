@@ -69,6 +69,7 @@ impl SpliceFlow {
     ) -> std::io::Result<SpliceFlow> {
         let recv_std = std::net::UdpSocket::bind(unspecified_for(origin))?;
         recv_std.connect(origin)?;
+        allow_fragmentation(&recv_std, origin.is_ipv6());
         // Non-blocking is required by `UdpSocket::from_std` and is shared with the
         // cloned send half (O_NONBLOCK is a per-open-file-description flag).
         recv_std.set_nonblocking(true)?;
@@ -122,6 +123,53 @@ async fn pump_origin_to_client(
         }
     }
 }
+
+/// Let the kernel FRAGMENT an oversized relayed datagram instead of refusing it.
+///
+/// Linux turns on UDP path-MTU discovery by default (udp(7)): it sets DF and fails
+/// a `send` larger than the known path MTU with `EMSGSIZE`. That breaks the relay's
+/// verbatim contract for exactly the datagrams the origin splice exists to cover —
+/// a prober's over-MTU datagram is fragmented in flight, reassembled by our kernel,
+/// and must then be passed on. Refusing it would leave ParallaX silent where the
+/// real origin answers, which is the distinguisher the splice removes. Asking for
+/// fragmentation reproduces what the prober's own path already did.
+///
+/// Best-effort: on a kernel or platform without the option the relay still works
+/// for every within-MTU datagram, which is all of normal QUIC.
+#[cfg(target_os = "linux")]
+fn allow_fragmentation(socket: &std::net::UdpSocket, is_ipv6: bool) {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let (level, optname, value) = if is_ipv6 {
+        (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            libc::IPV6_PMTUDISC_DONT,
+        )
+    } else {
+        (
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_DONT,
+        )
+    };
+    let value: libc::c_int = value;
+    // SAFETY: setsockopt with a pointer to a stack-local c_int of matching length on
+    // a valid borrowed fd; it only mutates this socket's option state.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        );
+    }
+}
+
+/// Non-Linux: UDP sends do not set DF by default, so the kernel already fragments.
+#[cfg(not(target_os = "linux"))]
+fn allow_fragmentation(_socket: &std::net::UdpSocket, _is_ipv6: bool) {}
 
 /// The wildcard bind address in the origin's address family, so the upstream
 /// socket can reach an IPv4 or IPv6 origin.

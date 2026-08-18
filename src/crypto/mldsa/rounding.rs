@@ -60,20 +60,32 @@ pub fn decompose(a: i32) -> (i32, i32) {
 /// (`rounding.c:62-68`). The boundary is asymmetric: `+GAMMA2` is NOT a hint;
 /// `-GAMMA2` is a hint only when `a1 != 0`.
 ///
-/// This is sanctioned as variable-time on the reference's terms: it is only ever
-/// applied to the public hint polynomial during signing/verification, never to
-/// secret coefficients.
+/// The C reference spells this as a short-circuiting `if` and does not claim
+/// constant time for it. Here it is evaluated branchlessly: on the signing path
+/// `a0` is the SECRET low part `LowBits(w) - c*s2 + c*t0` (`sign.rs` zeroizes it
+/// as a secret), so a data-dependent branch would leak which overflow direction
+/// fired at each hinted position. The emitted hint bit is public either way —
+/// only the branch is removed, matching the constant-time posture of
+/// `decompose` above and `poly::chknorm`.
 #[inline]
 pub fn make_hint(a0: i32, a1: i32) -> u32 {
-    // Kept as the literal `rounding.c:63` predicate (NOT rewritten to a
-    // `RangeInclusive::contains`) so this line diffs 1:1 against the C reference;
-    // the asymmetric `-GAMMA2 && a1 != 0` arm is part of the same condition.
-    #[allow(clippy::manual_range_contains)]
-    if a0 > GAMMA2 || a0 < -GAMMA2 || (a0 == -GAMMA2 && a1 != 0) {
-        1
-    } else {
-        0
-    }
+    // Sign-mask formulation of the `rounding.c:63` predicate:
+    //   a0 >  GAMMA2  <=>  (GAMMA2 - a0) < 0
+    //   a0 < -GAMMA2  <=>  (a0 + GAMMA2) < 0
+    //   a0 == -GAMMA2 <=>  (a0 + GAMMA2) == 0
+    //   a1 != 0       <=>  (a1 | -a1) < 0
+    // `wrapping_*` keeps the port faithful to the C `int32_t` arithmetic (and
+    // panic-free in debug) exactly as the rest of this module does.
+    let below = a0.wrapping_add(GAMMA2);
+    let gt = (GAMMA2.wrapping_sub(a0) >> 31) & 1;
+    let lt = (below >> 31) & 1;
+    // `(x | -x) >> 31` is 0 for x == 0 and -1 otherwise, so `+1` maps
+    // zero -> 1 and nonzero -> 0 (and vice versa for the `& 1` form).
+    let eq_neg_gamma2 = ((below | below.wrapping_neg()) >> 31).wrapping_add(1);
+    let a1_nonzero = ((a1 | a1.wrapping_neg()) >> 31) & 1;
+    // `black_box` stops the optimizer from recognizing the mask algebra and
+    // lowering it back to a branch (same defense as `decompose`'s sign mask).
+    core::hint::black_box(gt | lt | (eq_neg_gamma2 & a1_nonzero)) as u32
 }
 
 /// Correct the high bits of `a` according to the `hint` bit (`rounding.c:80-92`).

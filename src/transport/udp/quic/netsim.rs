@@ -282,8 +282,8 @@ fn client_config() -> Arc<ClientConfig> {
     ))
 }
 
-fn cover_cert() -> Vec<Vec<u8>> {
-    vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]
+fn cover_cert() -> Arc<Vec<Vec<u8>>> {
+    Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]])
 }
 
 /// The cover-certificate signing key, generated ONCE per process and shared by

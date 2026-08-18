@@ -570,10 +570,13 @@ fn read_qpack_string_with_prefix(
     let huffman = first & (1u8 << prefix_bits) != 0;
     let (len_u64, len_bytes) =
         read_qpack_integer(buf, prefix_bits).ok_or(Http3Error::QpackTruncated)?;
-    let len = len_u64 as usize;
-    if len > MAX_PAYLOAD_LEN {
+    // Compare BEFORE narrowing to `usize`, matching `decode_frame`: on a 32-bit
+    // target `len_u64 as usize` truncates, so a >4 GiB advertised length would slip
+    // under the cap instead of being rejected as FrameTooLarge.
+    if len_u64 > MAX_PAYLOAD_LEN as u64 {
         return Err(Http3Error::FrameTooLarge);
     }
+    let len = len_u64 as usize;
     let end = len_bytes
         .checked_add(len)
         .ok_or(Http3Error::QpackTruncated)?;
