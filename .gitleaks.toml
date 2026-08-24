@@ -15,4 +15,24 @@ regexes = [
   # base64 of the literal "secret-psk-base64-value-32bytes" — the PSK fixture in
   # src/secret_store.rs `seal_open_round_trips`. High entropy trips generic-api-key.
   '''c2VjcmV0LXBzay1iYXNlNjQtdmFsdWUtMzJieXRlcw==''',
+
+  # RFC 9001 Appendix A.1 client Initial-keys test vectors, reproduced verbatim in
+  # tests/gfw_sim/detection/quic_initial.rs `rfc9001_initial_keys_match_appendix_a`
+  # (both the comment block quoting the RFC and the assert_eq! expectations). These
+  # are published constants in the RFC itself, derived from the well-known
+  # Destination Connection ID 0x8394c8f03e515708 — not credentials. Their hex form
+  # trips generic-api-key on entropy. Listed as the full A.1 block so an entropy or
+  # rule-threshold change upstream cannot reopen this on a neighbouring line.
+  '''ebf8fa56f12931b9f1d63cfdb9a9b1d6''', # initial_secret (first half)
+  '''2acd00c8c8c75e2c66c80ad8e6ed3cf3''', # initial_secret (second half)
+  '''c00cf151ca5be075ed0ebfb5c80323c4''', # client_initial_secret (first half)
+  '''2d6b7db67881289af4008f1f6c357aea''', # client_initial_secret (second half)
+  '''1f369613dd76d5467730efcbe3b1a22d''', # client key
+  '''fa044b2f42a3fd3b46fb255c''',         # client iv
+  '''9f50449e04a0e810283a1e9933adedd2''', # client header-protection key
+
+  # The AEAD algorithm *name* as it appears in prose in ParallaX-DeepWiki/*.md.
+  # A public cipher-suite identifier, never a credential; the mixed-case/digit
+  # shape trips generic-api-key on entropy.
+  '''XChaCha20-Poly1305''',
 ]
