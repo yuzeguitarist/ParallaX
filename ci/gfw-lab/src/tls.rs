@@ -129,8 +129,8 @@ pub fn inspect_client_hello(buf: &[u8]) -> ClientHelloInfo {
         return info;
     };
     let mut ja3_ciphers = Vec::new();
-    for pair in cs.chunks_exact(2) {
-        let v = u16::from_be_bytes([pair[0], pair[1]]);
+    for pair in cs.as_chunks::<2>().0 {
+        let v = u16::from_be_bytes(*pair);
         if !is_grease(v) {
             ja3_ciphers.push(v.to_string());
         }
@@ -179,8 +179,8 @@ pub fn inspect_client_hello(buf: &[u8]) -> ClientHelloInfo {
                     let mut gc = Cursor::new(edata);
                     if let Some(list_len) = gc.u16() {
                         if let Some(list) = gc.take(list_len as usize) {
-                            for pair in list.chunks_exact(2) {
-                                let v = u16::from_be_bytes([pair[0], pair[1]]);
+                            for pair in list.as_chunks::<2>().0 {
+                                let v = u16::from_be_bytes(*pair);
                                 if !is_grease(v) {
                                     ja3_groups.push(v.to_string());
                                 }
