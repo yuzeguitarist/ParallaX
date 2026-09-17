@@ -43,7 +43,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-audit
 
@@ -72,7 +72,7 @@ jobs:
       # No github_token => Claude App token, so its PR triggers CI. The hook +
       # deny-list block any write to main and any PR merge.
       - if: steps.scan.outputs.has_findings == 'true' && github.event.pull_request.user.type != 'Bot'
-        uses: anthropics/claude-code-action@459ad358ae43fea66bfefd0a1f8d840b4b9791fb # v1.0.194
+        uses: anthropics/claude-code-action@51db78a4b844e144f8d02425cb280435c04a3474 # v1.0.224
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
