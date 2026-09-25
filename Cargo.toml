@@ -61,7 +61,7 @@ rcgen = "0.13"
 # `unsafe { libc::* }` blocks. The handful rustix does not cover stay on libc
 # (mlock/madvise, macOS PT_DENY_ATTACH, FreeBSD procctl, SO_PREFER_BUSY_POLL).
 rustix = { version = "1", features = ["event", "fs", "net", "param", "pipe", "process", "thread"] }
-rustls = { version = "=0.23.40", features = ["std", "aws_lc_rs"] }
+rustls = { version = "=0.23.45", features = ["std", "aws_lc_rs"] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "aws-lc-rs"] }
