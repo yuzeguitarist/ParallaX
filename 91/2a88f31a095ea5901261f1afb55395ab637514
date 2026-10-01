@@ -1,0 +1,19 @@
+.github/semgrep-requirements.txt
+  s_ce9cd462492bab::t_e2fd1046d8bacb 902-904
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "912a88f31a095ea5901261f1afb55395ab637514",
+  "prompts": {},
+  "sessions": {
+    "s_ce9cd462492bab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "88811502-06b9-416d-82aa-d1bd7c5ab218",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
