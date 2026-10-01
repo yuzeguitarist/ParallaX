@@ -25,3 +25,61 @@ reason = "Semgrep hard-pins mcp==1.23.3; run as a CLI scanner only, the MCP serv
 [[IgnoredVulns]]
 id = "GHSA-vj7q-gjh5-988w" # CVE-2026-59950 — WebSocket transport lacks Host/Origin validation
 reason = "Semgrep hard-pins mcp==1.23.3; run as a CLI scanner only, the MCP server is never started"
+
+# `pyjwt` is likewise a transitive dependency of Semgrep (via `mcp`): Semgrep
+# pins `pyjwt[crypto]>=2.13.0,<2.14.dev0` through its latest release (1.178.0),
+# while every fix below needs pyjwt >= 2.14. ParallaX runs Semgrep only as a CLI
+# SAST scanner and never decodes JWTs or uses PyJWKClient, so these are
+# unreachable here. Suppress until Semgrep upstream relaxes its pyjwt pin.
+
+[[IgnoredVulns]]
+id = "GHSA-ffc3-869f-jxw9" # CVE-2026-102268 — asymmetric-PEM detection bypass skips the HS/asymmetric confusion guard
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-9j54-fg26-wv3r" # CVE-2026-102266 — PyJWK accepts empty HMAC keys
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-9v7f-9g4p-ffgj" # CVE-2026-102267 — PyJWKClient follows redirects when fetching JWKS
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, PyJWKClient is never used"
+
+[[IgnoredVulns]]
+id = "GHSA-p4g4-x82p-q773" # CVE-2026-102271 — DER public keys accepted as HMAC secrets
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-w2cx-738m-mc7w" # CVE-2026-102273 — public JWK containers accepted as HMAC secrets
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-r6x4-923q-g947" # CVE-2026-102272 — BOM bypass
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-gvp8-978c-rx2q" # CVE-2026-103001 — decode() options-dict mutation enables claim-verification bypass
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-42vr-xj54-vc7v" # CVE-2026-101918 — unauthenticated RecursionError DoS in pre-verification payload parse
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-jwrc-g2q2-pq5p" # CVE-2026-102270 — ReDoS in is_pem_format
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-8wjv-2p76-3863" # CVE-2026-102265 — RecursionError in decode() on deeply nested token header
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-hxm8-2xgr-2p9m" # CVE-2026-102269 — non-canonical signature segments enable raw-token revocation bypass
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWTs are decoded"
+
+[[IgnoredVulns]]
+id = "GHSA-2gx3-rcp4-g85q" # CVE-2026-101917 — PyJWKClient amplifies unauthenticated JWKS fetches on unknown kid
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, PyJWKClient is never used"
+
+[[IgnoredVulns]]
+id = "GHSA-w6j9-cwv2-h6wq" # CVE-2026-102274 — malformed RSA JWK aborts parsing of a whole JWK Set
+reason = "Semgrep hard-pins pyjwt<2.14; run as a CLI scanner only, no JWKs are parsed"
