@@ -1,0 +1,19 @@
+.github/osv-scanner.toml
+  s_ce9cd462492bab::t_a0b28da68e680c 28-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "adb692587e44f8b3e4ed04ae448190cdea2af21d",
+  "prompts": {},
+  "sessions": {
+    "s_ce9cd462492bab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "88811502-06b9-416d-82aa-d1bd7c5ab218",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
