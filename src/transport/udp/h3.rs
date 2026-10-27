@@ -40,7 +40,7 @@ use crate::fingerprint::http3::{
     FRAME_TYPE_HEADERS, FRAME_TYPE_SETTINGS, STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER,
     STREAM_TYPE_QPACK_ENCODER,
 };
-use crate::transport::udp::quic::endpoint::{Connection, RecvStream, SendStream};
+use crate::transport::udp::quic::endpoint::{Connection, RecvStream, SendStream, VarInt};
 
 /// Defensive cap on the SETTINGS frame this façade will read off the peer's
 /// control stream. Safari's SETTINGS frame is a few bytes; a hostile peer must
@@ -97,6 +97,18 @@ pub(crate) async fn open_h3_control_stream(conn: &Connection) -> Result<SendStre
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
     Ok(control_send)
+}
+
+/// HTTP/3 `H3_REQUEST_CANCELLED` (RFC 9114 §8.1).
+const H3_REQUEST_CANCELLED: u32 = 0x10c;
+
+/// Open one request bidi stream and cancel it unused (STOP_SENDING +
+/// RESET_STREAM, `H3_REQUEST_CANCELLED`, no data), so the real request rides the
+/// NEXT bidi stream. Safari does this on every H3 connection right after the
+/// handshake (26.3 and 27.2 wire, cold and 0-RTT, 2026-10-27). Call it before
+/// opening the relay request stream.
+pub(crate) fn cancel_empty_request_stream(conn: &Connection) {
+    conn.open_cancelled_bi(VarInt::from_u32(H3_REQUEST_CANCELLED));
 }
 
 /// Open this endpoint's HTTP/3 **QPACK encoder** uni stream (writes

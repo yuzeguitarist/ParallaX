@@ -10,8 +10,9 @@
 //!     active prober reaches the TRUE origin and ParallaX emits nothing of its own;
 //!   * routes each accepted (terminated) connection back to the TCP session that
 //!     offered the fast plane, keyed by the client-chosen Destination Connection ID
-//!     (the client sets it to the session `offer_id`; the server cannot predict the
-//!     client's UDP source port in advance, so the DCID is the correlation handle).
+//!     (the client sets it to [`offer_dcid`] of the session `offer_id`; the server
+//!     cannot predict the client's UDP source port in advance, so the DCID is the
+//!     correlation handle).
 //!
 //! This is the QUIC analogue of the TCP REALITY fallback: authentication lives in
 //! the first Initial (the marker), and everything unauthenticated is handed to the
@@ -25,8 +26,23 @@ use tokio::sync::oneshot;
 
 use super::quic::endpoint::{Connection, Endpoint, ServerConfig};
 
-/// Maps a pending session's `offer_id` to the channel that delivers its connection.
-type OfferRegistry = Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Connection>>>>;
+/// Maps a pending session's [`offer_dcid`] to the channel that delivers its
+/// connection.
+type OfferRegistry = Arc<Mutex<HashMap<[u8; OFFER_DCID_LEN], oneshot::Sender<Connection>>>>;
+
+/// Safari's first-Initial DCID length (8 bytes on every captured connection). A
+/// 16-byte DCID would be visible to any on-path observer, since Initials are
+/// decryptable by anyone.
+pub(crate) const OFFER_DCID_LEN: usize = 8;
+
+/// The first-Initial DCID a client uses for the session `offer_id`: its first
+/// [`OFFER_DCID_LEN`] bytes (the offer_id is CSPRNG output, so a prefix collision
+/// between two pending sessions is negligible).
+pub(crate) fn offer_dcid(offer_id: &[u8; 16]) -> [u8; OFFER_DCID_LEN] {
+    let mut dcid = [0u8; OFFER_DCID_LEN];
+    dcid.copy_from_slice(&offer_id[..OFFER_DCID_LEN]);
+    dcid
+}
 
 /// The process-wide stable-:443 carrier (see the module docs).
 pub(crate) struct QuicCarrier {
@@ -64,11 +80,12 @@ impl QuicCarrier {
             // `accept()` only yields marker-terminated connections — probers are
             // spliced to the origin inside the endpoint and never surface here.
             while let Some(conn) = accept_ep.accept().await {
-                // Route by the client-chosen DCID (= the session `offer_id`). A
-                // connection whose DCID is not a registered 16-byte offer_id (a stray,
-                // a late arrival after the session gave up, or a marked client with no
-                // pending session) is dropped — closing it cleanly via the handle drop.
-                let Ok(offer_id) = <[u8; 16]>::try_from(conn.peer_initial_dcid()) else {
+                // Route by the client-chosen DCID (= `offer_dcid` of the session
+                // `offer_id`). A connection whose DCID is not a registered offer DCID
+                // (a stray, a late arrival after the session gave up, or a marked
+                // client with no pending session) is dropped — closing it cleanly via
+                // the handle drop.
+                let Ok(dcid) = <[u8; OFFER_DCID_LEN]>::try_from(conn.peer_initial_dcid()) else {
                     continue;
                 };
                 // Recover from a poisoned registry rather than unwrap-panicking: this
@@ -80,7 +97,7 @@ impl QuicCarrier {
                 let waiter = accept_reg
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&offer_id);
+                    .remove(&dcid);
                 if let Some(tx) = waiter {
                     // Receiver gone (session timed out) → the connection drops here.
                     let _ = tx.send(conn);
@@ -110,15 +127,15 @@ impl QuicCarrier {
 
     /// Register a session's `offer_id` and return a receiver for its connection. The
     /// session sends the client an offer carrying this id; the client connects to the
-    /// carrier with the id as its first-Initial DCID, and the accept loop delivers the
-    /// connection. The session MUST await (bounded) and, on timeout, call
-    /// [`Self::unregister`] so a no-show registration does not leak.
+    /// carrier with [`offer_dcid`] of the id as its first-Initial DCID, and the accept
+    /// loop delivers the connection. The session MUST await (bounded) and, on timeout,
+    /// call [`Self::unregister`] so a no-show registration does not leak.
     pub(crate) fn register(&self, offer_id: [u8; 16]) -> oneshot::Receiver<Connection> {
         let (tx, rx) = oneshot::channel();
         self.registry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(offer_id, tx);
+            .insert(offer_dcid(&offer_id), tx);
         rx
     }
 
@@ -127,7 +144,7 @@ impl QuicCarrier {
         self.registry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(offer_id);
+            .remove(&offer_dcid(offer_id));
     }
 }
 
@@ -203,8 +220,11 @@ mod tests {
         let rx = carrier.register(offer_id);
 
         // Drive the client connect and the server-side handoff concurrently.
-        let connect =
-            client.connect_with_dcid(carrier_addr, "example.com", ConnectionId::new(&offer_id));
+        let connect = client.connect_with_dcid(
+            carrier_addr,
+            "example.com",
+            ConnectionId::new(&offer_dcid(&offer_id)),
+        );
         let (client_res, server_res) = tokio::join!(
             tokio::time::timeout(Duration::from_secs(5), connect),
             tokio::time::timeout(Duration::from_secs(5), rx),
@@ -218,8 +238,8 @@ mod tests {
             .expect("the carrier delivered the connection to the registered session");
         assert_eq!(
             server_conn.peer_initial_dcid(),
-            &offer_id,
-            "the routed connection carries the session offer_id as its DCID"
+            &offer_dcid(&offer_id),
+            "the routed connection carries the session's 8-byte offer DCID"
         );
     }
 

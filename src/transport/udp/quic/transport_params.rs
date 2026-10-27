@@ -6,19 +6,18 @@
 //! for BOTH what we advertise on the wire AND what we enforce — no
 //! advertised-vs-actual gap.
 //!
-//! The client encoder reproduces Safari-26 H3's exact `0x39` blob: the confirmed
-//! id set in STRICT ASCENDING order, then Apple's vendor/GREASE codepoint last,
-//! omitting every id Safari does not send (omit is NOT the same as value 0). This
-//! is a byte-exact camouflage invariant: `tests/gfw_simulator.rs` guards the live
-//! carrier's wire image, and the in-file drift guard keeps these native constants
-//! in lockstep with it (this native encoder is not yet on the wire).
+//! The client encoder reproduces Safari 27.2 H3's `0x39` blob: the confirmed id
+//! set, ascending but rotated to a random start per connection, omitting every id
+//! Safari does not send (omit is NOT the same as value 0). This is a camouflage
+//! invariant guarded by `tests/gfw_simulator.rs`.
 
 use super::varint;
 use std::collections::BTreeSet;
 
 // --- Transport-parameter ids (RFC 9000 §18.2 codepoints) -----------------------
-// Only the ids Safari-26 H3 actually emits; everything else is omitted on the
+// Only the ids Safari H3 actually emits; everything else is omitted on the
 // client wire and merely recognized on read.
+const TP_MAX_IDLE_TIMEOUT: u64 = 0x01;
 const TP_INITIAL_MAX_DATA: u64 = 0x04;
 const TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 0x05;
 const TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
@@ -28,11 +27,32 @@ const TP_INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
 const TP_ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
 const TP_INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
 
-/// Apple's vendor/GREASE transport-parameter codepoint (value 0). It is the
-/// largest id, so strict-ascending order places it AFTER every standard id.
-const TP_VENDOR_GREASE_ID: u64 = 0x17f7586d2cb571;
+/// The Safari 27.2 client id set in ascending order. Safari does NOT emit it in
+/// this order: it rotates the list to a random start per connection (see below).
+/// (Safari 26.3 had no 0x01 but appended a vendor id 0xff080808 = 7; 27.2 dropped
+/// that and added max_idle_timeout — 2026-10-27 wire.)
+const SAFARI_TP_ORDER: [u64; 8] = [
+    TP_MAX_IDLE_TIMEOUT,
+    TP_INITIAL_MAX_DATA,
+    TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+    TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+    TP_INITIAL_MAX_STREAM_DATA_UNI,
+    TP_INITIAL_MAX_STREAMS_UNI,
+    TP_ACTIVE_CONNECTION_ID_LIMIT,
+    TP_INITIAL_SOURCE_CONNECTION_ID,
+];
 
-// --- Confirmed Safari-26 H3 values (CFNetwork/libquic, disassembly-confirmed) ---
+/// How often Safari 27.2 starts the rotated list at each `SAFARI_TP_ORDER`
+/// position: counts out of 105 captured connections (2026-10-27). The skew is
+/// real (start 0x0e ~33%, 0x04 ~18%, 0x01 ~15%), so a uniform pick would itself
+/// be a distribution tell.
+const SAFARI_TP_ROTATION_WEIGHTS: [u16; 8] = [16, 19, 7, 6, 7, 9, 35, 6];
+
+// --- Confirmed Safari H3 values (CFNetwork/libquic) ------------------------------
+/// Advertised max_idle_timeout (300 s, Safari 27.2 wire). Wire-only: the local idle
+/// timer stays conn.rs `IDLE_TIMEOUT` (30 s), which keep-alive PINGs (10-20 s)
+/// never let fire on a live path, so the shorter local timer is not observable.
+const SAFARI_MAX_IDLE_TIMEOUT_MS: u64 = 300_000;
 const SAFARI_INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
 const SAFARI_INITIAL_MAX_STREAM_DATA: u64 = 2 * 1024 * 1024;
 const SAFARI_MAX_STREAMS_UNI: u64 = 8;
@@ -105,43 +125,35 @@ impl TransportParameters {
         }
     }
 
-    /// Serialize the client's `0x39` blob: the Safari id set in strict ascending
-    /// order, then the vendor/GREASE codepoint last. Every id Safari does not send
-    /// is omitted. The emit order below IS ascending by id, by construction.
+    /// Serialize the client's `0x39` blob: the Safari id set, ascending but rotated
+    /// to a start drawn from Safari's measured distribution. Every id Safari does
+    /// not send is omitted.
     pub fn encode_safari_client(&self) -> Vec<u8> {
+        self.encode_safari_client_from(safari_tp_rotation_start())
+    }
+
+    /// [`Self::encode_safari_client`] with an explicit rotation `start` (an index
+    /// into `SAFARI_TP_ORDER`), so tests can pin every rotation.
+    fn encode_safari_client_from(&self, start: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(48);
-        put_param(&mut out, TP_INITIAL_MAX_DATA, self.initial_max_data);
-        put_param(
-            &mut out,
-            TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
-            self.initial_max_stream_data_bidi_local,
-        );
-        put_param(
-            &mut out,
-            TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
-            self.initial_max_stream_data_bidi_remote,
-        );
-        put_param(
-            &mut out,
-            TP_INITIAL_MAX_STREAM_DATA_UNI,
-            self.initial_max_stream_data_uni,
-        );
-        put_param(
-            &mut out,
-            TP_INITIAL_MAX_STREAMS_UNI,
-            self.initial_max_streams_uni,
-        );
-        put_param(
-            &mut out,
-            TP_ACTIVE_CONNECTION_ID_LIMIT,
-            self.active_connection_id_limit,
-        );
-        put_param_bytes(
-            &mut out,
-            TP_INITIAL_SOURCE_CONNECTION_ID,
-            &self.initial_src_cid,
-        );
-        put_param(&mut out, TP_VENDOR_GREASE_ID, 0);
+        for i in 0..SAFARI_TP_ORDER.len() {
+            let id = SAFARI_TP_ORDER[(start + i) % SAFARI_TP_ORDER.len()];
+            if id == TP_INITIAL_SOURCE_CONNECTION_ID {
+                put_param_bytes(&mut out, id, &self.initial_src_cid);
+                continue;
+            }
+            let value = match id {
+                TP_MAX_IDLE_TIMEOUT => SAFARI_MAX_IDLE_TIMEOUT_MS,
+                TP_INITIAL_MAX_DATA => self.initial_max_data,
+                TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => self.initial_max_stream_data_bidi_local,
+                TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE => self.initial_max_stream_data_bidi_remote,
+                TP_INITIAL_MAX_STREAM_DATA_UNI => self.initial_max_stream_data_uni,
+                TP_INITIAL_MAX_STREAMS_UNI => self.initial_max_streams_uni,
+                // The last SAFARI_TP_ORDER entry left (0x0f is handled above).
+                _ => self.active_connection_id_limit,
+            };
+            put_param(&mut out, id, value);
+        }
         out
     }
 
@@ -303,6 +315,29 @@ fn put_param_bytes(out: &mut Vec<u8>, id: u64, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+/// Draw a `SAFARI_TP_ORDER` rotation start from Safari's measured distribution
+/// (`SAFARI_TP_ROTATION_WEIGHTS`), using the system CSPRNG.
+fn safari_tp_rotation_start() -> usize {
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0u8; 2];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("system RNG available");
+    let total: u16 = SAFARI_TP_ROTATION_WEIGHTS.iter().sum();
+    rotation_start_for(u16::from_be_bytes(bytes) % total)
+}
+
+/// Map a draw in `0..sum(SAFARI_TP_ROTATION_WEIGHTS)` to its rotation start.
+fn rotation_start_for(mut draw: u16) -> usize {
+    for (start, &weight) in SAFARI_TP_ROTATION_WEIGHTS.iter().enumerate() {
+        if draw < weight {
+            return start;
+        }
+        draw -= weight;
+    }
+    0
+}
+
 /// Decode a varint-typed parameter body that MUST be exactly one varint.
 fn read_varint_body(body: &[u8]) -> Result<u64, Error> {
     let (value, n) = varint::decode(body).ok_or(Error::Truncated)?;
@@ -343,25 +378,45 @@ mod tests {
     }
 
     #[test]
-    fn safari_client_blob_ids_are_the_safari_set_plus_grease_ascending() {
-        let blob = TransportParameters::safari_client(&[]).encode_safari_client();
-        let ids: Vec<u64> = decode_pairs(&blob).into_iter().map(|(id, _)| id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                0x04,
-                0x05,
-                0x06,
-                0x07,
-                0x09,
-                0x0e,
-                0x0f,
-                TP_VENDOR_GREASE_ID
-            ]
-        );
-        for w in ids.windows(2) {
-            assert!(w[0] < w[1], "ids not strictly ascending at {w:?}");
+    fn safari_client_blob_is_a_rotation_of_the_safari_set() {
+        let ascending = [0x01, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0e, 0x0f];
+        let tp = TransportParameters::safari_client(&[]);
+        for start in 0..ascending.len() {
+            let blob = tp.encode_safari_client_from(start);
+            let ids: Vec<u64> = decode_pairs(&blob).into_iter().map(|(id, _)| id).collect();
+            let expected: Vec<u64> = ascending[start..]
+                .iter()
+                .chain(&ascending[..start])
+                .copied()
+                .collect();
+            assert_eq!(ids, expected, "rotation start {start}");
+            // Safari's blob is 39 bytes for a zero-length SCID in every rotation.
+            assert_eq!(blob.len(), 39);
         }
+        // Safari 27.2 wire bytes for rotation start 0x0e (2026-10-27 capture).
+        assert_eq!(
+            tp.encode_safari_client_from(6),
+            [
+                &[0x0e, 0x02, 0x40, 0x40, 0x0f, 0x00][..],
+                &[0x01, 0x04, 0x80, 0x04, 0x93, 0xe0],
+                &[0x04, 0x04, 0x81, 0x00, 0x00, 0x00],
+                &[0x05, 0x04, 0x80, 0x20, 0x00, 0x00],
+                &[0x06, 0x04, 0x80, 0x20, 0x00, 0x00],
+                &[0x07, 0x04, 0x80, 0x20, 0x00, 0x00],
+                &[0x09, 0x01, 0x08],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn rotation_start_follows_the_measured_weights() {
+        let mut counts = [0u16; 8];
+        let total: u16 = SAFARI_TP_ROTATION_WEIGHTS.iter().sum();
+        for draw in 0..total {
+            counts[rotation_start_for(draw)] += 1;
+        }
+        assert_eq!(counts, SAFARI_TP_ROTATION_WEIGHTS);
     }
 
     #[test]
@@ -369,11 +424,11 @@ mod tests {
         let blob = TransportParameters::safari_client(&[]).encode_safari_client();
         let ids: Vec<u64> = decode_pairs(&blob).into_iter().map(|(id, _)| id).collect();
         // RFC ids Safari omits + quinn-only GREASE TPs that must never appear.
-        for absent in [
-            0x01, 0x03, 0x08, 0x0a, 0x0b, 0x0c, 0x20, 0x2ab2, 0xff04de1b, 0x1b,
-        ] {
+        for absent in [0x03, 0x08, 0x0a, 0x0b, 0x0c, 0x20, 0x2ab2, 0xff04de1b, 0x1b] {
             assert!(!ids.contains(&absent), "id {absent:#x} must be omitted");
         }
+        // Safari 26.3's trailing vendor id, dropped in 27.2.
+        assert!(!ids.contains(&0xff08_0808));
     }
 
     #[test]
@@ -390,7 +445,7 @@ mod tests {
         assert_eq!(val(0x07), 2 * 1024 * 1024);
         assert_eq!(val(0x09), 8);
         assert_eq!(val(0x0e), 64);
-        assert_eq!(val(TP_VENDOR_GREASE_ID), 0);
+        assert_eq!(val(0x01), 300_000);
         let (_, scid) = pairs.iter().find(|(id, _)| *id == 0x0f).unwrap();
         assert!(scid.is_empty(), "Safari client SCID is zero-length");
     }
