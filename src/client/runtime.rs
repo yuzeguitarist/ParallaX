@@ -189,6 +189,9 @@ const MUX_CARRIER_DEAD_AFTER: Duration = Duration::from_secs(25);
 /// and then completed proves the server is ACKing, so an upload that keeps the
 /// server silent (an HTTP/1.1 POST) is not mistaken for a dead carrier.
 const MUX_WRITE_WAIT_PROVES_LIVENESS: Duration = Duration::from_millis(20);
+/// How soon the watchdog looks again at a dead verdict it held back because a
+/// client->server write was still draining (see [`MuxCarrierHealth`]).
+const MUX_CARRIER_DEFERRED_RECHECK: Duration = Duration::from_secs(1);
 /// Backstop on one batched client->server mux write (at most
 /// `MUX_FRAME_BATCH_LIMIT` frames, ~1 MiB, so >=17 KiB/s never trips it): a write
 /// that cannot drain for this long means the carrier is dead, and the session is
@@ -805,6 +808,13 @@ struct MuxCarrierHealth {
     /// Set by the watchdog while an Open has gone unanswered with no proof of
     /// life; the pool places no new substreams here until it clears.
     suspect: AtomicBool,
+    /// Set while the writer is inside a client->server write. An Open queued
+    /// behind that write (a slow uplink draining earlier upload frames) has not
+    /// reached the server yet, so its silence is no evidence the carrier died:
+    /// the watchdog holds a dead verdict until the write finishes — whose own
+    /// wait then proves life — and a write that never drains is the writer's
+    /// stall bound to catch.
+    write_in_flight: AtomicBool,
 }
 
 impl MuxCarrierHealth {
@@ -812,6 +822,7 @@ impl MuxCarrierHealth {
         Self {
             last_alive_ms: AtomicU64::new(relay_now_millis()),
             suspect: AtomicBool::new(false),
+            write_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -862,8 +873,14 @@ impl MuxCarrierWatchdog {
     }
 
     fn verdict(&self, unanswered: &HashMap<u32, u64>, health: &MuxCarrierHealth) -> CarrierVerdict {
+        // The write flag first (Acquire): a write that just finished recorded its
+        // proof of life before clearing the flag, so the silence read next is
+        // current whenever the flag reads clear.
+        let writing = health.write_in_flight.load(Ordering::Acquire);
         match self.silence(unanswered, health) {
-            Some(silent) if silent >= self.dead_after.as_millis() as u64 => CarrierVerdict::Dead,
+            Some(silent) if silent >= self.dead_after.as_millis() as u64 && !writing => {
+                CarrierVerdict::Dead
+            }
             Some(silent) if silent >= self.suspect_after.as_millis() as u64 => {
                 CarrierVerdict::Suspect
             }
@@ -883,9 +900,13 @@ impl MuxCarrierWatchdog {
         } else {
             self.suspect_after
         };
-        Some(Duration::from_millis(
-            (threshold.as_millis() as u64).saturating_sub(silent),
-        ))
+        let due = (threshold.as_millis() as u64).saturating_sub(silent);
+        if due == 0 && health.is_suspect() {
+            // Past the dead threshold yet still alive here: the verdict was held
+            // back by a draining write, so look again shortly instead of spinning.
+            return Some(MUX_CARRIER_DEFERRED_RECHECK);
+        }
+        Some(Duration::from_millis(due))
     }
 }
 
@@ -1509,25 +1530,13 @@ impl ClientMuxPool {
             Arc::clone(&health),
             CLIENT_MUX_WRITE_STALL_TIMEOUT,
         );
-        // Separate tasks (the two directions run in parallel), but a failure on
-        // either side ends the whole session: a dead carrier caught by the
-        // reader's watchdog aborts the writer (and its parked write), and a
-        // stalled writer aborts the reader, whose streams then report Reset
-        // instead of waiting out the idle backstop.
-        let reader = tokio::spawn(reader);
-        let writer = tokio::spawn(writer);
-        let (reader_abort, writer_abort) = (reader.abort_handle(), writer.abort_handle());
-        tokio::spawn(async move {
-            let joined = tokio::try_join!(
-                async { reader.await.map_err(ClientRuntimeError::from)? },
-                async { writer.await.map_err(ClientRuntimeError::from)? },
-            );
-            if let Err(err) = joined {
-                reader_abort.abort();
-                writer_abort.abort();
-                tracing::debug!(cid = session_cid, error = %err, "client mux session stopped");
-            }
-        });
+        // Separate tasks so the two directions run in parallel, supervised so
+        // that either one ending ends the session.
+        tokio::spawn(supervise_client_mux_session(
+            tokio::spawn(reader),
+            tokio::spawn(writer),
+            session_cid,
+        ));
 
         Ok(ClientMuxHandle {
             next_stream_id: Arc::new(AtomicU32::new(1)),
@@ -1540,6 +1549,35 @@ impl ClientMuxPool {
             },
             health,
         })
+    }
+}
+
+/// Ends a TCP mux session as soon as either direction ends, cleanly or not, by
+/// aborting the other. A reader that hit the dead-carrier watchdog, the idle
+/// backstop, or the server's FIN has already stamped every substream's outcome,
+/// so the writer has nothing left worth sending (and may be parked on a dead
+/// socket); a writer that ended either stalled (its substreams must see Reset,
+/// which dropping the reader's stream map delivers) or ran out of frame senders,
+/// which means no substream is left for the reader to serve.
+async fn supervise_client_mux_session(
+    mut reader: tokio::task::JoinHandle<Result<(), ClientRuntimeError>>,
+    mut writer: tokio::task::JoinHandle<Result<(), ClientRuntimeError>>,
+    cid: u64,
+) {
+    let (side, outcome) = tokio::select! {
+        outcome = &mut reader => {
+            writer.abort();
+            ("reader", outcome)
+        }
+        outcome = &mut writer => {
+            reader.abort();
+            ("writer", outcome)
+        }
+    };
+    match outcome {
+        Ok(Ok(())) => tracing::debug!(cid, side, "client mux session ended"),
+        Ok(Err(err)) => tracing::debug!(cid, side, error = %err, "client mux session stopped"),
+        Err(err) => tracing::debug!(cid, side, error = %err, "client mux session task failed"),
     }
 }
 
@@ -4209,6 +4247,7 @@ async fn bounded_client_mux_write(
     health: &MuxCarrierHealth,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
+    let in_flight = WriteInFlight::start(health);
     let started = Instant::now();
     match timeout(stall, write).await {
         Ok(result) => result?,
@@ -4220,7 +4259,29 @@ async fn bounded_client_mux_write(
     if started.elapsed() >= MUX_WRITE_WAIT_PROVES_LIVENESS {
         health.mark_alive();
     }
+    // Only now: the proof of life above must be visible before the flag clears.
+    drop(in_flight);
     Ok(())
+}
+
+/// Marks a client->server write in flight for the watchdog (see
+/// [`MuxCarrierHealth`]'s `write_in_flight`), clearing it when dropped however
+/// the write ends.
+struct WriteInFlight<'a>(&'a MuxCarrierHealth);
+
+impl<'a> WriteInFlight<'a> {
+    fn start(health: &'a MuxCarrierHealth) -> Self {
+        health.write_in_flight.store(true, Ordering::Relaxed);
+        Self(health)
+    }
+}
+
+impl Drop for WriteInFlight<'_> {
+    fn drop(&mut self) {
+        // Release pairs with the watchdog's Acquire load: a proof of life the
+        // writer recorded before clearing the flag is seen along with the clear.
+        self.0.write_in_flight.store(false, Ordering::Release);
+    }
 }
 
 async fn write_client_mux_frame<W, R>(
@@ -5284,6 +5345,78 @@ mod tests {
         assert!(
             matches!(loop_result, Ok(())),
             "a carrier with fresh proof of life must reach the idle backstop, got {loop_result:?}",
+        );
+    }
+
+    /// An Open queued behind a client->server write that is still draining (a
+    /// slow uplink busy with earlier upload frames) has not reached the server,
+    /// so the watchdog must not call the carrier dead while that write is in
+    /// flight — only suspect — and must decide once the write is done.
+    #[tokio::test]
+    async fn client_mux_watchdog_holds_a_dead_verdict_while_a_write_drains() {
+        let (register_rx, outcome_rx, open_from_server, _sockets) =
+            registered_mux_stream(true).await;
+        let health = Arc::new(MuxCarrierHealth::new());
+        let writing = WriteInFlight::start(&health);
+
+        let reader = tokio::spawn(client_mux_reader_loop(
+            SilentLegReader,
+            open_from_server,
+            register_rx,
+            1,
+            Duration::from_secs(60),
+            Arc::clone(&health),
+            TEST_WATCHDOG,
+        ));
+        tokio::time::sleep(TEST_WATCHDOG.dead_after * 2).await;
+        assert!(
+            !reader.is_finished(),
+            "a write still draining must hold back the dead verdict"
+        );
+        assert!(
+            health.is_suspect(),
+            "the carrier is still steered away from"
+        );
+
+        // The write ends without draining anything (no proof of life): the held
+        // verdict lands at the next recheck.
+        drop(writing);
+        let loop_result = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the dead verdict must land soon after the write ends")
+            .unwrap();
+        assert!(
+            matches!(&loop_result, Err(ClientRuntimeError::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "an unresponsive carrier ends the session with TimedOut, got {loop_result:?}",
+        );
+        assert!(client_mux_await_download(outcome_rx, 1).await.is_err());
+    }
+
+    /// The session ends as soon as either direction ends, cleanly or not: a
+    /// reader that finished (server FIN, idle backstop) must not leave the writer
+    /// parked — on a dead socket or an open frame channel — until every frame
+    /// sender happens to go away.
+    #[tokio::test]
+    async fn mux_session_supervisor_stops_the_writer_when_the_reader_ends_cleanly() {
+        let reader = tokio::spawn(async { Ok::<(), ClientRuntimeError>(()) });
+        let (writer_dropped_tx, writer_dropped_rx) = oneshot::channel::<()>();
+        let writer = tokio::spawn(async move {
+            // Dropped with this future when the task is aborted.
+            let _dropped = writer_dropped_tx;
+            std::future::pending::<Result<(), ClientRuntimeError>>().await
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise_client_mux_session(reader, writer, 1),
+        )
+        .await
+        .expect("the supervisor returns once the reader has ended");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), writer_dropped_rx)
+                .await
+                .is_ok(),
+            "the writer task must be aborted once the reader has ended"
         );
     }
 
