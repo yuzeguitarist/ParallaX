@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -20,7 +20,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, Semaphore, TryAcquireError},
+    sync::{mpsc, Notify, Semaphore, TryAcquireError},
     time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -245,7 +245,34 @@ const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_
 /// two ends must share a unit), and the forward's final read is capped at the
 /// remaining budget so this end can never overshoot what the client tolerates.
 const PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
-const SERVER_MUX_FRAME_CHANNEL: usize = 1024;
+/// Ceiling on download frames one mux connection may hold queued toward the
+/// client, summed over its substreams: each substream gets an equal share (see
+/// [`server_mux_downlink`]), so the per-connection memory bound is the one the
+/// old single shared FIFO had — but no substream ever queues behind another's.
+const SERVER_MUX_DOWNLINK_FRAMES: usize = 1024;
+/// Clamp on a single substream's own download queue. The upper bound also caps
+/// how far a bulk stream can run ahead of its own later frames (~256 KiB).
+const SERVER_MUX_STREAM_DOWNLINK_MIN: usize = 4;
+const SERVER_MUX_STREAM_DOWNLINK_MAX: usize = 16;
+/// Depth of the ordered reader->writer control channel (substream registrations,
+/// purges, and Resets for queue-less substreams). A full channel back-pressures
+/// the reader exactly as the old shared frame channel did.
+const SERVER_MUX_CONTROL_CHANNEL: usize = 1024;
+/// Payload budget of one mux write while the client link is the bottleneck. Once
+/// a batch is sealed its order is fixed, so a newly active substream can wait
+/// behind up to one whole batch: small batches keep that wait short on a slow
+/// link, where they cost no throughput (the link, not the CPU, is the limit).
+const SERVER_MUX_FAIR_BATCH_BYTES: usize = 64 * 1024;
+/// A mux write that waits at least this long for socket space means the client
+/// link is the bottleneck; the writer then uses fair-sized batches for
+/// `SERVER_MUX_LINK_BOUND_HOLD`. Fair batches matter below ~20 MB/s, where a
+/// full batch would hold other substreams back by 50ms+ per round trip and even
+/// a fair batch waits far longer than this. Faster links, and the CPU-bound
+/// loopback benchmark (whose brief stalls a smaller threshold mistook for a slow
+/// link, costing ~10% of 8-stream throughput), keep the full
+/// `SERVER_MUX_FRAME_BATCH_LIMIT` batches that let the crypto pool fan out.
+const SERVER_MUX_LINK_BOUND_WAIT: Duration = Duration::from_millis(10);
+const SERVER_MUX_LINK_BOUND_HOLD: Duration = Duration::from_secs(1);
 /// Server-side ceilings on an authenticated speed-test request. The on-wire
 /// format permits arbitrary u64 byte counts and a u16 sample count; without a
 /// server-enforced bound a malicious authenticated client can request terabytes
@@ -4113,6 +4140,211 @@ impl Drop for ServerMuxStreams {
     }
 }
 
+/// Ordered reader -> writer instructions for a mux connection's download path.
+enum DownlinkControl {
+    /// A newly opened substream's own download queue.
+    Register(u32, mpsc::Receiver<MuxFrame>),
+    /// Discard everything still queued for this substream (client Reset, or shed).
+    Purge(u32),
+    /// A frame for a substream that has no queue: a refused Open, or the Reset that
+    /// follows a shed. Written ahead of substream data.
+    Frame(MuxFrame),
+}
+
+/// Reader-side handle of a mux connection's download path.
+///
+/// The download direction used to be ONE shared FIFO (1024 frames, ~16 MiB): a
+/// bulk substream filled it and every other substream's response — a page's HTML,
+/// a TLS ServerHello — waited behind the whole backlog for backlog/link-rate
+/// seconds, and kept waiting after the bulk stream was reset because its queued
+/// frames were never dropped. On a slow China->VPS link that was tens of seconds
+/// to minutes of "nothing loads". Now each substream queues into its OWN bounded
+/// channel and the writer serves the channels round-robin
+/// ([`ServerMuxScheduler`]), so a substream waits behind at most one frame of
+/// each busy substream, and a Reset purges the reset substream's backlog.
+struct ServerMuxDownlink {
+    control: mpsc::Sender<DownlinkControl>,
+    wake: Arc<Notify>,
+    stream_queue_depth: usize,
+}
+
+impl ServerMuxDownlink {
+    /// Creates `stream_id`'s own download queue and hands it to the writer. The
+    /// registration is ordered before any frame the substream sends.
+    async fn register(&self, stream_id: u32) -> Result<ServerMuxStreamTx, HandshakeServerError> {
+        let (frames, queue) = mpsc::channel(self.stream_queue_depth);
+        self.send_control(DownlinkControl::Register(stream_id, queue))
+            .await?;
+        Ok(ServerMuxStreamTx {
+            stream_id,
+            frames,
+            wake: Arc::clone(&self.wake),
+        })
+    }
+
+    /// Drops every download frame still queued for `stream_id`.
+    async fn purge(&self, stream_id: u32) -> Result<(), HandshakeServerError> {
+        self.send_control(DownlinkControl::Purge(stream_id)).await
+    }
+
+    /// Resets a substream that has no download queue (duplicate id, stream cap, or
+    /// the Reset after a purge). Centralizes the `Reset + empty payload` shape.
+    async fn reset_unregistered(&self, stream_id: u32) -> Result<(), HandshakeServerError> {
+        self.send_control(DownlinkControl::Frame(MuxFrame {
+            stream_id,
+            kind: MuxFrameKind::Reset,
+            payload: Vec::new(),
+        }))
+        .await
+    }
+
+    async fn send_control(&self, control: DownlinkControl) -> Result<(), HandshakeServerError> {
+        self.control.send(control).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "mux downlink writer is gone").into()
+        })
+    }
+}
+
+/// One substream's producer handle on its own download queue: a full queue
+/// back-pressures only this substream's target reader, never the others.
+#[derive(Clone)]
+struct ServerMuxStreamTx {
+    stream_id: u32,
+    frames: mpsc::Sender<MuxFrame>,
+    wake: Arc<Notify>,
+}
+
+impl ServerMuxStreamTx {
+    async fn send(&self, kind: MuxFrameKind, payload: Vec<u8>) -> Result<(), HandshakeServerError> {
+        self.frames
+            .send(MuxFrame {
+                stream_id: self.stream_id,
+                kind,
+                payload,
+            })
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    /// Resets this substream (empty-payload Reset, queued after its data).
+    async fn reset(&self) -> Result<(), HandshakeServerError> {
+        self.send(MuxFrameKind::Reset, Vec::new()).await
+    }
+}
+
+impl Drop for ServerMuxStreamTx {
+    /// A finished substream gives no frame to wake the writer on, so wake it here:
+    /// once every handle is gone the writer sees the queue disconnected, drops it,
+    /// and — with the reader gone too — flushes and shuts the client write down.
+    fn drop(&mut self) {
+        self.wake.notify_one();
+    }
+}
+
+/// Writer-side half of the download path: serves substream queues round-robin.
+struct ServerMuxScheduler {
+    control: mpsc::Receiver<DownlinkControl>,
+    control_open: bool,
+    wake: Arc<Notify>,
+    /// Substream queues in service order; the front is served next.
+    queues: VecDeque<(u32, mpsc::Receiver<MuxFrame>)>,
+    /// Frames for queue-less substreams, written before substream data.
+    unqueued: VecDeque<MuxFrame>,
+}
+
+impl ServerMuxScheduler {
+    fn apply(&mut self, control: DownlinkControl) {
+        match control {
+            DownlinkControl::Register(stream_id, queue) => {
+                // A client reusing a stream id must never see the old
+                // incarnation's tail (e.g. its Fin) interleave with the new one.
+                self.purge(stream_id);
+                self.queues.push_back((stream_id, queue));
+            }
+            DownlinkControl::Purge(stream_id) => self.purge(stream_id),
+            DownlinkControl::Frame(frame) => self.unqueued.push_back(frame),
+        }
+    }
+
+    fn purge(&mut self, stream_id: u32) {
+        self.queues.retain(|(queued, _)| *queued != stream_id);
+    }
+
+    fn drain_control(&mut self) {
+        while self.control_open {
+            match self.control.try_recv() {
+                Ok(control) => self.apply(control),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => self.control_open = false,
+            }
+        }
+    }
+
+    /// Moves up to `max_frames` frames (stopping once `max_bytes` of payload is
+    /// reached) into `batch`: queue-less frames first, then ONE frame per
+    /// substream per turn, round-robin, resuming where the previous batch
+    /// stopped. Drained queues whose substream is gone are dropped.
+    fn fill(&mut self, batch: &mut Vec<MuxFrame>, max_frames: usize, max_bytes: usize) {
+        let mut bytes = 0;
+        while batch.len() < max_frames && bytes < max_bytes {
+            let Some(frame) = self.unqueued.pop_front() else {
+                break;
+            };
+            bytes += frame.payload.len();
+            batch.push(frame);
+        }
+        // Stop after a full pass over the queues yields nothing.
+        let mut idle_turns = 0;
+        while batch.len() < max_frames && bytes < max_bytes && idle_turns < self.queues.len() {
+            let Some((stream_id, mut queue)) = self.queues.pop_front() else {
+                break;
+            };
+            match queue.try_recv() {
+                Ok(frame) => {
+                    idle_turns = 0;
+                    bytes += frame.payload.len();
+                    batch.push(frame);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => idle_turns += 1,
+                Err(mpsc::error::TryRecvError::Disconnected) => continue,
+            }
+            self.queues.push_back((stream_id, queue));
+        }
+    }
+
+    /// The reader is gone and everything it and the substreams queued is written.
+    fn is_finished(&self) -> bool {
+        !self.control_open && self.queues.is_empty() && self.unqueued.is_empty()
+    }
+}
+
+/// Builds the two halves of a mux connection's fair download path. Each
+/// substream's queue depth is an equal share of [`SERVER_MUX_DOWNLINK_FRAMES`].
+fn server_mux_downlink(max_streams: usize) -> (ServerMuxDownlink, ServerMuxScheduler) {
+    let (control_tx, control_rx) = mpsc::channel(SERVER_MUX_CONTROL_CHANNEL);
+    let wake = Arc::new(Notify::new());
+    let stream_queue_depth = (SERVER_MUX_DOWNLINK_FRAMES / max_streams.max(1)).clamp(
+        SERVER_MUX_STREAM_DOWNLINK_MIN,
+        SERVER_MUX_STREAM_DOWNLINK_MAX,
+    );
+    (
+        ServerMuxDownlink {
+            control: control_tx,
+            wake: Arc::clone(&wake),
+            stream_queue_depth,
+        },
+        ServerMuxScheduler {
+            control: control_rx,
+            control_open: true,
+            wake,
+            queues: VecDeque::new(),
+            unqueued: VecDeque::new(),
+        },
+    )
+}
+
 /// Owned, `'static` slice of [`ServerMuxContext`] handed to a spawned per-substream
 /// task, which outlives the borrowed reader-loop context.
 struct ServerMuxStreamContext {
@@ -4136,7 +4368,7 @@ async fn server_mux_upstream_task(
     stream_id: u32,
     mut connect_payload: Zeroizing<Vec<u8>>,
     upload_rx: mpsc::Receiver<Zeroizing<Vec<u8>>>,
-    frame_tx: mpsc::Sender<MuxFrame>,
+    downlink: ServerMuxStreamTx,
     ctx: ServerMuxStreamContext,
     payload_pool: MuxPayloadPool,
 ) {
@@ -4154,7 +4386,7 @@ async fn server_mux_upstream_task(
                 stream_id,
                 "mux connect target resolve failed; resetting stream"
             );
-            let _ = reset_unregistered_stream(&frame_tx, stream_id).await;
+            let _ = downlink.reset().await;
             return;
         }
     };
@@ -4169,7 +4401,7 @@ async fn server_mux_upstream_task(
                 stream_id,
                 "mux outbound connect failed; resetting stream"
             );
-            let _ = reset_unregistered_stream(&frame_tx, stream_id).await;
+            let _ = downlink.reset().await;
             return;
         }
     };
@@ -4179,7 +4411,7 @@ async fn server_mux_upstream_task(
             stream_id,
             "mux target tune failed; resetting stream"
         );
-        let _ = reset_unregistered_stream(&frame_tx, stream_id).await;
+        let _ = downlink.reset().await;
         return;
     }
     if !initial.is_empty() {
@@ -4191,7 +4423,7 @@ async fn server_mux_upstream_task(
                     stream_id,
                     "mux target initial-payload write failed/stalled; resetting stream"
                 );
-                let _ = reset_unregistered_stream(&frame_tx, stream_id).await;
+                let _ = downlink.reset().await;
                 return;
             }
         }
@@ -4201,7 +4433,7 @@ async fn server_mux_upstream_task(
     let (target_read, target_write) = target.into_split();
     let reader = server_mux_target_reader_loop(
         target_read,
-        frame_tx.clone(),
+        downlink.clone(),
         stream_id,
         ctx.timing,
         ctx.chunk_size,
@@ -4214,7 +4446,7 @@ async fn server_mux_upstream_task(
         stream_id,
         ctx.cid,
         ctx.target_write_timeout,
-        &frame_tx,
+        &downlink,
     );
     // Run both directions; an error in either drops the other's half of the target
     // socket. Half-close (client Fin) resolves `writer` Ok while `reader` keeps
@@ -4234,7 +4466,7 @@ async fn server_mux_upload_drain(
     stream_id: u32,
     cid: u64,
     write_timeout: Duration,
-    frame_tx: &mpsc::Sender<MuxFrame>,
+    downlink: &ServerMuxStreamTx,
 ) -> Result<(), HandshakeServerError> {
     while let Some(payload) = upload_rx.recv().await {
         if payload.is_empty() {
@@ -4244,14 +4476,12 @@ async fn server_mux_upload_drain(
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 tracing::debug!(cid, stream_id, "mux target write failed; resetting stream");
-                let _ = send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new())
-                    .await;
+                let _ = downlink.reset().await;
                 return Err(HandshakeServerError::Io(err));
             }
             Err(_) => {
                 tracing::debug!(cid, stream_id, "mux target write stalled; resetting stream");
-                let _ = send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new())
-                    .await;
+                let _ = downlink.reset().await;
                 return Err(HandshakeServerError::Io(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "mux target write stalled",
@@ -4651,12 +4881,12 @@ async fn run_authenticated_mux_data_mode(
     context: ServerMuxContext<'_>,
 ) -> Result<(), HandshakeServerError> {
     tracing::info!(cid = context.cid, "ParallaX mux data mode started");
-    let (frame_tx, frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+    let (downlink, scheduler) = server_mux_downlink(context.max_streams);
     let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
     let reader = server_mux_client_reader_loop(
         TcpLegReader(client_records),
         client_open,
-        frame_tx,
+        downlink,
         first_frames,
         context,
         payload_pool.clone(),
@@ -4664,7 +4894,7 @@ async fn run_authenticated_mux_data_mode(
     let writer = server_mux_writer_loop(
         TcpLegWriter(client_write),
         server_seal,
-        frame_rx,
+        scheduler,
         context.cover,
         context.cid,
         payload_pool,
@@ -5025,7 +5255,7 @@ async fn serve_mux_quic_substream_inner(
 async fn server_mux_client_reader_loop<R>(
     mut client_records: R,
     mut client_open: DataRecordCodec,
-    frame_tx: mpsc::Sender<MuxFrame>,
+    downlink: ServerMuxDownlink,
     first_frames: Vec<MuxFrame>,
     context: ServerMuxContext<'_>,
     payload_pool: MuxPayloadPool,
@@ -5042,7 +5272,7 @@ where
                 payload: &frame.payload,
             },
             &mut streams,
-            &frame_tx,
+            &downlink,
             context,
             &payload_pool,
         )
@@ -5165,7 +5395,7 @@ where
         let mut frames = frames_payload;
         while !frames.is_empty() {
             let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
-            process_server_mux_frame(frame, &mut streams, &frame_tx, context, &payload_pool)
+            process_server_mux_frame(frame, &mut streams, &downlink, context, &payload_pool)
                 .await?;
             frames = &frames[used..];
         }
@@ -5175,7 +5405,7 @@ where
 async fn process_server_mux_frame(
     frame: MuxFrameRef<'_>,
     streams: &mut ServerMuxStreams,
-    frame_tx: &mpsc::Sender<MuxFrame>,
+    downlink: &ServerMuxDownlink,
     context: ServerMuxContext<'_>,
     payload_pool: &MuxPayloadPool,
 ) -> Result<(), HandshakeServerError> {
@@ -5187,7 +5417,7 @@ async fn process_server_mux_frame(
             if streams.uploads.contains_key(&frame.stream_id)
                 || streams.tasks.contains_key(&frame.stream_id)
             {
-                reset_unregistered_stream(frame_tx, frame.stream_id).await?;
+                downlink.reset_unregistered(frame.stream_id).await?;
                 return Ok(());
             }
             if streams.live_count() >= context.max_streams {
@@ -5202,7 +5432,7 @@ async fn process_server_mux_frame(
                     max_streams = context.max_streams,
                     "mux stream cap reached; resetting"
                 );
-                reset_unregistered_stream(frame_tx, frame.stream_id).await?;
+                downlink.reset_unregistered(frame.stream_id).await?;
                 return Ok(());
             }
             // Route this substream's client->target uploads over a BOUNDED channel to
@@ -5221,11 +5451,14 @@ async fn process_server_mux_frame(
                 target_write_timeout: context.target_write_timeout,
             };
             let stream_id = frame.stream_id;
+            // The substream's own download queue, registered with the writer before
+            // the task can send on it.
+            let stream_downlink = downlink.register(stream_id).await?;
             let handle = tokio::spawn(server_mux_upstream_task(
                 stream_id,
                 Zeroizing::new(frame.payload.to_vec()),
                 upload_rx,
-                frame_tx.clone(),
+                stream_downlink,
                 stream_ctx,
                 payload_pool.clone(),
             ));
@@ -5265,7 +5498,7 @@ async fn process_server_mux_frame(
                 match outcome {
                     UploadOutcome::Delivered => {}
                     UploadOutcome::Shed => {
-                        shed_server_mux_substream(streams, frame_tx, frame.stream_id).await?;
+                        shed_server_mux_substream(streams, downlink, frame.stream_id).await?;
                     }
                     UploadOutcome::Grace(sender, payload) => {
                         match timeout(SERVER_MUX_STALL_RESET_GRACE, sender.send(payload)).await {
@@ -5274,7 +5507,7 @@ async fn process_server_mux_frame(
                             Ok(Ok(())) => {}
                             // Task vanished while we waited (setup failed / stream ended).
                             Ok(Err(_)) => {
-                                shed_server_mux_substream(streams, frame_tx, frame.stream_id)
+                                shed_server_mux_substream(streams, downlink, frame.stream_id)
                                     .await?;
                             }
                             // No slot freed for the whole window: a genuine stall.
@@ -5284,7 +5517,7 @@ async fn process_server_mux_frame(
                                     stream_id = frame.stream_id,
                                     "mux upload stalled; resetting the stream"
                                 );
-                                shed_server_mux_substream(streams, frame_tx, frame.stream_id)
+                                shed_server_mux_substream(streams, downlink, frame.stream_id)
                                     .await?;
                             }
                         }
@@ -5301,11 +5534,14 @@ async fn process_server_mux_frame(
         }
         MuxFrameKind::Reset => {
             // Full stream teardown: drop the upload sender AND abort the task so both
-            // target fds are reclaimed immediately.
+            // target fds are reclaimed immediately, and drop the download frames
+            // still queued for it — the client no longer wants them, and writing
+            // them would only delay every other substream.
             streams.uploads.remove(&frame.stream_id);
             if let Some(handle) = streams.tasks.remove(&frame.stream_id) {
                 handle.abort();
             }
+            downlink.purge(frame.stream_id).await?;
         }
         MuxFrameKind::Cover => {}
     }
@@ -5314,24 +5550,25 @@ async fn process_server_mux_frame(
 
 /// Shed a single mux substream without disturbing the rest of the connection: drop
 /// its upload sender, abort + drop its supervisor task (closing both target fds),
-/// and tell the client to tear down that stream id with a Reset. Used when a
-/// substream's upload channel stalls or its task has gone, so one bad target never
-/// poisons the whole mux session.
+/// drop its queued download frames, and tell the client to tear down that stream
+/// id with a Reset. Used when a substream's upload channel stalls or its task has
+/// gone, so one bad target never poisons the whole mux session.
 async fn shed_server_mux_substream(
     streams: &mut ServerMuxStreams,
-    frame_tx: &mpsc::Sender<MuxFrame>,
+    downlink: &ServerMuxDownlink,
     stream_id: u32,
 ) -> Result<(), HandshakeServerError> {
     streams.uploads.remove(&stream_id);
     if let Some(handle) = streams.tasks.remove(&stream_id) {
         handle.abort();
     }
-    send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new()).await
+    downlink.purge(stream_id).await?;
+    downlink.reset_unregistered(stream_id).await
 }
 
 async fn server_mux_target_reader_loop(
     mut target_read: OwnedReadHalf,
-    frame_tx: mpsc::Sender<MuxFrame>,
+    downlink: ServerMuxStreamTx,
     stream_id: u32,
     timing: TimingProfile,
     chunk_size: usize,
@@ -5348,8 +5585,8 @@ async fn server_mux_target_reader_loop(
     let mut rng = StdRng::from_entropy();
     // Per-read idle backstop: a target that connects then stays silent (after the
     // client Fin'd its write half, or an attacker-controlled target deliberately
-    // holding the socket) must not pin this reader — and therefore its frame_tx
-    // clone and target fd — forever. On idle, send Fin and exit so the slot is
+    // holding the socket) must not pin this reader — and therefore its downlink
+    // handle and target fd — forever. On idle, send Fin and exit so the slot is
     // reclaimed and the writer can drain.
     let read_idle_timeout = fallback_idle_timeout();
 
@@ -5360,19 +5597,17 @@ async fn server_mux_target_reader_loop(
                 // Target read failed: tell the client to tear down this substream
                 // promptly (best-effort) instead of letting it dangle until the
                 // whole-session idle backstop, mirroring the Fin-on-EOF handling.
-                let _ =
-                    send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Reset, Vec::new())
-                        .await;
+                let _ = downlink.reset().await;
                 return Err(HandshakeServerError::Io(err));
             }
             Err(_) => {
                 tracing::debug!(cid, stream_id, "mux target reader idle backstop reached");
-                send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
+                downlink.send(MuxFrameKind::Fin, Vec::new()).await?;
                 return Ok(());
             }
         };
         if n == 0 {
-            send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
+            downlink.send(MuxFrameKind::Fin, Vec::new()).await?;
             return Ok(());
         }
         let n = match drain_ready_tcp_read(&target_read, &mut target_buf, n) {
@@ -5380,9 +5615,7 @@ async fn server_mux_target_reader_loop(
             Err(err) => {
                 // Drain of additional ready bytes failed: same prompt teardown as
                 // the primary read-error path above.
-                let _ =
-                    send_server_mux_frame(&frame_tx, stream_id, MuxFrameKind::Reset, Vec::new())
-                        .await;
+                let _ = downlink.reset().await;
                 return Err(HandshakeServerError::Io(err));
             }
         };
@@ -5391,13 +5624,9 @@ async fn server_mux_target_reader_loop(
             sleep(delay).await;
         }
         for chunk in target_buf[..n].chunks(max_payload_len) {
-            send_server_mux_frame(
-                &frame_tx,
-                stream_id,
-                MuxFrameKind::Data,
-                payload_pool.take_filled(chunk),
-            )
-            .await?;
+            downlink
+                .send(MuxFrameKind::Data, payload_pool.take_filled(chunk))
+                .await?;
         }
         tracing::trace!(
             cid,
@@ -5408,21 +5637,24 @@ async fn server_mux_target_reader_loop(
     }
 }
 
+/// Writes the mux connection's download path: substream frames served
+/// round-robin by `downlink` (see [`ServerMuxDownlink`]), plus cover frames.
+///
 /// Item #3b: bound every client-facing write. The batched writer does one
-/// `write_records` await per drained batch; with no bound, an authenticated
-/// client that stops reading wedges that write once its kernel receive buffer
-/// fills, pinning this session, the 1024-deep frame channel, and every relayed
-/// target fd for the life of the process (dropping the frame senders only wakes
-/// `recv()`, never a task already parked in `write_records`). Mirror the client's
-/// `client_mux_download_loop`: bound each write by the `idle` backstop (the
-/// production caller passes [`fallback_idle_timeout`]) and SHED (tear the session
-/// down) on expiry. A live-but-slow client keeps making progress well inside the
-/// (600s-scale) window and is never falsely shed; `idle` is a parameter so the
-/// wedge-shed path is testable without a 600s wait.
+/// `write_records` await per batch; with no bound, an authenticated client that
+/// stops reading wedges that write once its kernel receive buffer fills, pinning
+/// this session, every substream queue, and every relayed target fd for the life
+/// of the process (dropping the frame senders never wakes a task already parked
+/// in `write_records`). Mirror the client's `client_mux_download_loop`: bound each
+/// write by the `idle` backstop (the production caller passes
+/// [`fallback_idle_timeout`]) and SHED (tear the session down) on expiry. A
+/// live-but-slow client keeps making progress well inside the (600s-scale) window
+/// and is never falsely shed; `idle` is a parameter so the wedge-shed path is
+/// testable without a 600s wait.
 async fn server_mux_writer_loop<W>(
     mut client_write: W,
     mut server_seal: DataRecordCodec,
-    mut frame_rx: mpsc::Receiver<MuxFrame>,
+    mut downlink: ServerMuxScheduler,
     cover: CoverTrafficProfile,
     cid: u64,
     payload_pool: MuxPayloadPool,
@@ -5433,25 +5665,28 @@ where
 {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(server_seal.max_plaintext_len());
     let mut rng = StdRng::from_entropy();
-    if !cover.is_enabled() {
-        loop {
-            let Some(frame) = frame_rx.recv().await else {
-                let _ = client_write.shutdown().await;
-                return Ok(());
-            };
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+    let mut batch = Vec::with_capacity(SERVER_MUX_FRAME_BATCH_LIMIT);
+    // While set and in the future, the client link is the bottleneck: write
+    // fair-sized batches (see `SERVER_MUX_FAIR_BATCH_BYTES`).
+    let mut link_bound_until: Option<Instant> = None;
+
+    loop {
+        if cover.is_enabled() && cover_sleep.is_elapsed() {
             match timeout(
                 idle,
-                write_server_mux_frames_batched(
+                write_server_mux_frame(
                     &mut client_write,
                     &mut server_seal,
-                    frame,
-                    ServerMuxBatchState {
-                        frame_rx: &mut frame_rx,
+                    MuxFrame {
+                        stream_id: 0,
+                        kind: MuxFrameKind::Cover,
+                        payload: Vec::new(),
                     },
                     &mut rng,
                     &mut seal_scratch,
-                    RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
-                    &payload_pool,
+                    cid,
+                    "server-mux-cover-writer",
                 ),
             )
             .await
@@ -5459,59 +5694,54 @@ where
                 Ok(res) => res?,
                 Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
             }
+            cover_sleep
+                .as_mut()
+                .reset(Instant::now() + cover.sample_interval(&mut rng));
+            continue;
         }
-    }
 
-    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+        downlink.drain_control();
+        let max_bytes = if link_bound_until.is_some_and(|until| Instant::now() < until) {
+            SERVER_MUX_FAIR_BATCH_BYTES
+        } else {
+            usize::MAX
+        };
+        downlink.fill(&mut batch, SERVER_MUX_FRAME_BATCH_LIMIT, max_bytes);
+        if batch.is_empty() {
+            if downlink.is_finished() {
+                let _ = client_write.shutdown().await;
+                return Ok(());
+            }
+            tokio::select! {
+                _ = &mut cover_sleep, if cover.is_enabled() => {}
+                control = downlink.control.recv(), if downlink.control_open => match control {
+                    Some(control) => downlink.apply(control),
+                    None => downlink.control_open = false,
+                },
+                _ = downlink.wake.notified() => {}
+            }
+            continue;
+        }
 
-    loop {
-        tokio::select! {
-            _ = &mut cover_sleep, if cover.is_enabled() => {
-                match timeout(
-                    idle,
-                    write_server_mux_frame(
-                        &mut client_write,
-                        &mut server_seal,
-                        MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
-                        &mut rng,
-                        &mut seal_scratch,
-                        cid,
-                        "server-mux-cover-writer",
-                    ),
-                )
-                .await
-                {
-                    Ok(res) => res?,
-                    Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
-                }
-                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
-            }
-            frame = frame_rx.recv() => {
-                let Some(frame) = frame else {
-                    let _ = client_write.shutdown().await;
-                    return Ok(());
-                };
-                match timeout(
-                    idle,
-                    write_server_mux_frames_batched(
-                        &mut client_write,
-                        &mut server_seal,
-                        frame,
-                        ServerMuxBatchState {
-                            frame_rx: &mut frame_rx,
-                        },
-                        &mut rng,
-                        &mut seal_scratch,
-                        RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
-                        &payload_pool,
-                    ),
-                )
-                .await
-                {
-                    Ok(res) => res?,
-                    Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
-                }
-            }
+        let waited = match timeout(
+            idle,
+            write_server_mux_frames_batched(
+                &mut client_write,
+                &mut server_seal,
+                &mut batch,
+                &mut rng,
+                &mut seal_scratch,
+                RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
+                &payload_pool,
+            ),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
+        };
+        if waited >= SERVER_MUX_LINK_BOUND_WAIT {
+            link_bound_until = Some(Instant::now() + SERVER_MUX_LINK_BOUND_HOLD);
         }
     }
 }
@@ -5519,7 +5749,7 @@ where
 /// Item #3b: the shed outcome when the mux writer's client-facing write exceeds
 /// the idle backstop (a non-reading authenticated client). Logs once and maps to
 /// a `Timeout` error so the writer loop returns and `try_join!` tears the whole
-/// session down, releasing the frame channel and every relayed target fd.
+/// session down, releasing every substream queue and relayed target fd.
 fn shed_mux_writer_on_stalled_client(cid: u64) -> HandshakeServerError {
     tracing::warn!(
         cid,
@@ -5553,26 +5783,20 @@ where
     .await
 }
 
-pub(crate) struct ServerMuxBatchState<'a> {
-    pub(crate) frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
-}
-
-/// Encodes the first frame plus any immediately available frames into
-/// frame-aligned plaintext records (one record per `max_plaintext_len`
-/// window), then seals the whole batch — inline for small batches, fanned out
-/// across the shared crypto pool for bulk — and writes the records in order
-/// with a single socket write.
-#[allow(clippy::too_many_arguments)]
+/// Encodes `frames` (drained, in order) into frame-aligned plaintext records
+/// (one record per `max_plaintext_len` window), then seals the whole batch —
+/// inline for small batches, fanned out across the shared crypto pool for bulk
+/// — and writes the records in order with a single socket write. Returns how
+/// long that write waited for socket space (the link-bottleneck signal).
 pub(crate) async fn write_server_mux_frames_batched<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,
-    first_frame: MuxFrame,
-    batch: ServerMuxBatchState<'_>,
+    frames: &mut Vec<MuxFrame>,
     rng: &mut R,
     scratch: &mut RelaySealScratch,
     log: RelayWriteLog,
     payload_pool: &MuxPayloadPool,
-) -> Result<(), HandshakeServerError>
+) -> Result<Duration, HandshakeServerError>
 where
     W: LegWriter,
     R: Rng + rand::RngCore + ?Sized,
@@ -5583,28 +5807,18 @@ where
             crate::tls::record::TlsRecordError::PayloadTooLarge(0).into(),
         ));
     }
+    if frames.is_empty() {
+        return Ok(Duration::ZERO);
+    }
 
-    // Phase A: drain frames into frame-aligned plaintext records, tracking
+    // Phase A: encode the frames into frame-aligned plaintext records, tracking
     // each record's length so the record boundaries are fixed before sealing.
     scratch.plaintext_buf.clear();
     scratch.record_lens.clear();
-    let mut record_plaintext_len = encode_server_mux_frame(
-        &mut scratch.plaintext_buf,
-        first_frame,
-        max_plaintext_len,
-        payload_pool,
-    )?;
-
-    let mut drained = 0;
-    while drained < SERVER_MUX_FRAME_BATCH_LIMIT {
-        let frame = match batch.frame_rx.try_recv() {
-            Ok(frame) => frame,
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                break;
-            }
-        };
+    let mut record_plaintext_len = 0;
+    for frame in frames.drain(..) {
         let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
-        if record_plaintext_len + frame_len > max_plaintext_len {
+        if record_plaintext_len > 0 && record_plaintext_len + frame_len > max_plaintext_len {
             scratch.record_lens.push(record_plaintext_len);
             record_plaintext_len = 0;
         }
@@ -5614,7 +5828,6 @@ where
             max_plaintext_len,
             payload_pool,
         )?;
-        drained += 1;
     }
     scratch.record_lens.push(record_plaintext_len);
 
@@ -5638,9 +5851,11 @@ where
         )?;
     }
     log_outer_write_batch(log, &scratch.record_lens, &scratch.records_buf);
+    let write_started = Instant::now();
     writer.write_records(scratch.records_buf.as_slice()).await?;
+    let waited = write_started.elapsed();
     scratch.records_buf.clear();
-    Ok(())
+    Ok(waited)
 }
 
 /// Debug-logs each sealed record of a batch, mirroring the per-record
@@ -5680,34 +5895,6 @@ fn encode_server_mux_frame(
     frame.encode_into(out)?;
     payload_pool.put(frame.payload);
     Ok(frame_len)
-}
-
-async fn send_server_mux_frame(
-    frame_tx: &mpsc::Sender<MuxFrame>,
-    stream_id: u32,
-    kind: MuxFrameKind,
-    payload: Vec<u8>,
-) -> Result<(), HandshakeServerError> {
-    frame_tx
-        .send(MuxFrame {
-            stream_id,
-            kind,
-            payload,
-        })
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into())
-}
-
-/// Shed a substream that failed setup before anything was registered for it
-/// (duplicate id, stream cap, resolve/connect/tune failure, initial-payload
-/// write failure). Enqueues an empty RESET for `stream_id`; the caller then
-/// `return`s, dropping any half-built target. Centralizes the
-/// `Reset + empty payload` shape every such arm repeats so they cannot drift.
-async fn reset_unregistered_stream(
-    frame_tx: &mpsc::Sender<MuxFrame>,
-    stream_id: u32,
-) -> Result<(), HandshakeServerError> {
-    send_server_mux_frame(frame_tx, stream_id, MuxFrameKind::Reset, Vec::new()).await
 }
 
 /// Validate a speed request against the server's per-phase and aggregate ceilings.
@@ -8478,7 +8665,7 @@ mod tests {
             cid: 1,
             target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
         };
-        let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+        let (downlink, mut scheduler) = server_mux_downlink(context.max_streams);
         let payload_pool =
             MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
         let mut streams = ServerMuxStreams::new();
@@ -8490,7 +8677,7 @@ mod tests {
                 payload: &[],
             },
             &mut streams,
-            &frame_tx,
+            &downlink,
             context,
             &payload_pool,
         )
@@ -8501,9 +8688,171 @@ mod tests {
         assert!(streams.uploads.is_empty());
         assert!(streams.tasks.is_empty());
         // The client receives a Reset for that stream id.
-        let reset = frame_rx.try_recv().unwrap();
-        assert_eq!(reset.stream_id, 7);
-        assert_eq!(reset.kind, MuxFrameKind::Reset);
+        let frames = drain_downlink(&mut scheduler);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].stream_id, 7);
+        assert_eq!(frames[0].kind, MuxFrameKind::Reset);
+    }
+
+    /// Everything the download path would write right now, in write order.
+    fn drain_downlink(scheduler: &mut ServerMuxScheduler) -> Vec<MuxFrame> {
+        scheduler.drain_control();
+        let mut frames = Vec::new();
+        scheduler.fill(&mut frames, usize::MAX, usize::MAX);
+        frames
+    }
+
+    /// The download path must serve substreams round-robin: a small response
+    /// that arrives while a bulk substream has a backlog goes out right behind
+    /// ONE bulk frame, not behind the whole backlog. The old single FIFO wrote
+    /// all ten bulk frames first — on a slow link, tens of seconds during which
+    /// a page's HTML or a TLS ServerHello simply did not arrive.
+    #[tokio::test]
+    async fn mux_downlink_serves_substreams_round_robin() {
+        let (downlink, mut scheduler) = server_mux_downlink(4);
+        let bulk = downlink.register(1).await.unwrap();
+        for _ in 0..10 {
+            bulk.send(MuxFrameKind::Data, vec![0xB5; 1024])
+                .await
+                .unwrap();
+        }
+        let small = downlink.register(3).await.unwrap();
+        small
+            .send(MuxFrameKind::Data, b"small response".to_vec())
+            .await
+            .unwrap();
+        small.send(MuxFrameKind::Fin, Vec::new()).await.unwrap();
+
+        scheduler.drain_control();
+        let mut batch = Vec::new();
+        scheduler.fill(&mut batch, 4, usize::MAX);
+        let order: Vec<(u32, MuxFrameKind)> = batch.iter().map(|f| (f.stream_id, f.kind)).collect();
+        assert_eq!(
+            order,
+            [
+                (1, MuxFrameKind::Data),
+                (3, MuxFrameKind::Data),
+                (1, MuxFrameKind::Data),
+                (3, MuxFrameKind::Fin),
+            ],
+            "the small substream's data and Fin must interleave with the bulk backlog",
+        );
+
+        // A byte budget cuts the batch short; the next batch resumes the rotation.
+        batch.clear();
+        scheduler.fill(&mut batch, usize::MAX, 1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].stream_id, 1);
+    }
+
+    /// A client Reset (or a shed) must drop the substream's queued download
+    /// frames instead of writing them: the client has already discarded the
+    /// stream, so writing its backlog would only delay every other substream
+    /// for backlog/link-rate seconds after the user cancelled a download.
+    #[tokio::test]
+    async fn mux_downlink_purge_drops_queued_frames_of_reset_substream() {
+        let (downlink, mut scheduler) = server_mux_downlink(4);
+        let bulk = downlink.register(1).await.unwrap();
+        for _ in 0..8 {
+            bulk.send(MuxFrameKind::Data, vec![0xB5; 1024])
+                .await
+                .unwrap();
+        }
+        let other = downlink.register(3).await.unwrap();
+        other
+            .send(MuxFrameKind::Data, b"still wanted".to_vec())
+            .await
+            .unwrap();
+
+        // The shed sequence: purge, then the Reset that tells the client.
+        downlink.purge(1).await.unwrap();
+        downlink.reset_unregistered(1).await.unwrap();
+
+        let frames = drain_downlink(&mut scheduler);
+        let order: Vec<(u32, MuxFrameKind)> =
+            frames.iter().map(|f| (f.stream_id, f.kind)).collect();
+        assert_eq!(
+            order,
+            [(1, MuxFrameKind::Reset), (3, MuxFrameKind::Data)],
+            "the purged backlog is never written; the Reset and other streams are",
+        );
+        // The purged substream's producer is cut off, so it stops promptly.
+        assert!(bulk
+            .send(MuxFrameKind::Data, vec![0xB5; 1024])
+            .await
+            .is_err());
+    }
+
+    /// The download path ends only once the reader and every substream are gone
+    /// and everything they queued is written — and a substream that finishes
+    /// without sending another frame still wakes the writer to notice.
+    #[tokio::test]
+    async fn mux_writer_flushes_and_exits_once_reader_and_substreams_are_done() {
+        use crate::crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN};
+        use crate::protocol::data::{max_plaintext_len, DataRecordCodec};
+
+        #[derive(Clone, Default)]
+        struct RecordingWriter {
+            bytes: Arc<AtomicUsize>,
+            shut_down: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl LegWriter for RecordingWriter {
+            async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
+                self.bytes.fetch_add(bytes.len(), Ordering::Relaxed);
+                Ok(())
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                self.shut_down.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let codec = DataRecordCodec::new(
+            AeadCodec::new([0x51_u8; KEY_LEN], [0x62_u8; NONCE_LEN]),
+            padding,
+            SERVER_TO_CLIENT_AAD,
+        );
+        let payload_pool =
+            MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(max_plaintext_len(0)));
+        let cover = CoverTrafficProfile::from_config(TrafficConfig::default());
+        let sink = RecordingWriter::default();
+
+        let (downlink, scheduler) = server_mux_downlink(4);
+        let stream = downlink.register(1).await.unwrap();
+        let writer = tokio::spawn(server_mux_writer_loop(
+            sink.clone(),
+            codec,
+            scheduler,
+            cover,
+            7,
+            payload_pool,
+            Duration::from_secs(5),
+        ));
+        stream
+            .send(MuxFrameKind::Data, b"payload".to_vec())
+            .await
+            .unwrap();
+        stream.send(MuxFrameKind::Fin, Vec::new()).await.unwrap();
+        drop(downlink);
+        drop(stream);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the writer must exit once the reader and every substream are gone")
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "clean end of the download path, got {result:?}"
+        );
+        assert!(
+            sink.bytes.load(Ordering::Relaxed) > 0,
+            "queued frames are flushed first"
+        );
+        assert!(
+            sink.shut_down.load(Ordering::Relaxed),
+            "the client write half is shut down"
+        );
     }
 
     /// The shared mux reader must NEVER block on a single substream's target I/O.
@@ -8529,7 +8878,7 @@ mod tests {
             // test; the shed here is driven by the full-channel grace instead.
             target_write_timeout: Duration::from_secs(30),
         };
-        let (frame_tx, mut frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+        let (downlink, mut scheduler) = server_mux_downlink(context.max_streams);
         let payload_pool =
             MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
 
@@ -8560,7 +8909,7 @@ mod tests {
                 payload: &open_payload,
             },
             &mut streams,
-            &frame_tx,
+            &downlink,
             context,
             &payload_pool,
         )
@@ -8586,7 +8935,7 @@ mod tests {
                     payload: &big,
                 },
                 &mut streams,
-                &frame_tx,
+                &downlink,
                 context,
                 &payload_pool,
             ),
@@ -8605,7 +8954,7 @@ mod tests {
                     payload: &big,
                 },
                 &mut streams,
-                &frame_tx,
+                &downlink,
                 context,
                 &payload_pool,
             )
@@ -8613,12 +8962,9 @@ mod tests {
         }
 
         // The client is told to tear down the wedged stream, and its slot is freed.
-        let mut saw_reset = false;
-        while let Ok(frame) = frame_rx.try_recv() {
-            if frame.stream_id == 9 && frame.kind == MuxFrameKind::Reset {
-                saw_reset = true;
-            }
-        }
+        let saw_reset = drain_downlink(&mut scheduler)
+            .iter()
+            .any(|frame| frame.stream_id == 9 && frame.kind == MuxFrameKind::Reset);
         assert!(saw_reset, "wedged stream is eventually shed with a Reset");
         streams.prune_finished();
         assert!(
@@ -10868,17 +11214,15 @@ mod tests {
 
         let chunk_size = max_plaintext_len(0);
         let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
-        let (frame_tx, frame_rx) = mpsc::channel(SERVER_MUX_FRAME_CHANNEL);
+        let (downlink, scheduler) = server_mux_downlink(4);
 
         // One real frame so the loop takes the write path (where the mock parks).
-        // Keep the sender alive so `recv()` never returns None — otherwise the loop
-        // would exit cleanly instead of exercising the wedge-shed.
-        frame_tx
-            .send(MuxFrame {
-                stream_id: 1,
-                kind: MuxFrameKind::Data,
-                payload: b"payload".to_vec(),
-            })
+        // Keep the reader and substream handles alive so the download path never
+        // finishes — otherwise the loop would exit cleanly instead of exercising
+        // the wedge-shed.
+        let stream = downlink.register(1).await.unwrap();
+        stream
+            .send(MuxFrameKind::Data, b"payload".to_vec())
             .await
             .unwrap();
 
@@ -10894,7 +11238,15 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            server_mux_writer_loop(StalledWriter, codec, frame_rx, cover, 7, payload_pool, idle),
+            server_mux_writer_loop(
+                StalledWriter,
+                codec,
+                scheduler,
+                cover,
+                7,
+                payload_pool,
+                idle,
+            ),
         )
         .await
         .expect("the mux writer must shed (return) well before the outer 5s budget");
@@ -10904,6 +11256,6 @@ mod tests {
             "a wedged client-facing write past the idle backstop must shed as Timeout, \
              got {result:?}",
         );
-        drop(frame_tx);
+        drop((stream, downlink));
     }
 }
