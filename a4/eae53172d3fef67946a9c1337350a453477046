@@ -1,0 +1,42 @@
+src/client/runtime.rs
+  s_c5682f8dcefc62::t_58c76e7f729044 1491,1493-1511,1528,1541
+  s_c5682f8dcefc62::t_94b95820f5f62c 1476-1477
+  s_c5682f8dcefc62::t_c4fe549a25bb83 3741-3754
+  s_c5682f8dcefc62::t_39e60cae2d5060 1616,1633
+  s_c5682f8dcefc62::t_eeb9e7a3e79ed5 3897
+  s_c5682f8dcefc62::t_059de6d9184618 179-196
+  s_c5682f8dcefc62::t_d75dfc594c2d15 3860-3861
+  s_c5682f8dcefc62::t_a4c99239578637 3896
+  s_c5682f8dcefc62::t_d414af67d2e060 3816-3818
+  s_c5682f8dcefc62::t_22d3720bdb8084 4937,4942-4958
+  s_c5682f8dcefc62::t_de58881d77fabc 4217,5170-5175
+  s_c5682f8dcefc62::t_e810444ad1452d 792-889,3755,4224
+  s_c5682f8dcefc62::t_09613228771b64 4108,4116-4117,4131-4146,4157-4168,4179-4194,4202-4216,4220-4223
+  s_c5682f8dcefc62::t_ff9e66b46c2699 3802-3803,3814,3821,3830,3856-3859,3862-3879
+  s_c5682f8dcefc62::t_d733abd2df5ba0 3923
+  s_c5682f8dcefc62::t_81cf248a8b86d9 6
+  s_c5682f8dcefc62::t_7e72c8baaed0f1 3964
+  s_c5682f8dcefc62::t_d169867a404657 1512-1519,1521-1527
+  s_c5682f8dcefc62::t_81055b1307bfa2 4218-4219,4959,5085,5114-5115,5133-5169,5176-5344
+  s_c5682f8dcefc62::t_f4927905c5dd8c 27
+  s_c5682f8dcefc62::t_76997ce8fe7cd6 1054,1057-1061
+  s_c5682f8dcefc62::t_81252f5c7c3886 3842-3846
+  s_c5682f8dcefc62::t_44fb2d81605daf 966-968
+  s_c5682f8dcefc62::t_d67baff1448eaf 3756,3880-3882,4225,4960,5345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a4eae53172d3fef67946a9c1337350a453477046",
+  "prompts": {},
+  "sessions": {
+    "s_c5682f8dcefc62": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5038dc0-5835-4bdb-8efe-7e91e2b0dc13",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
