@@ -1,0 +1,34 @@
+Cargo.toml
+  s_6a4630a7db9893::t_dd66f0b80d6eda 64
+.github/osv-scanner.toml
+  s_6a4630a7db9893::t_88cd05951ebe68 7-8,18-19,21-23,26-27
+.github/semgrep-requirements.in
+  s_6a4630a7db9893::t_e8480c6c8fa4c9 1
+.github/semgrep-requirements.txt
+  s_6a4630a7db9893::t_7367b438157c94 38-40
+  s_6a4630a7db9893::t_6aee693f3fdbd5 813-821
+  s_6a4630a7db9893::t_bee333c431c9a5 592-594
+  s_6a4630a7db9893::t_0c9df6e9b16c8b 364-366
+Cargo.lock
+  s_6a4630a7db9893::t_fc088bf60287c7 389,989,994,996,1030,1032,1241,1294,1296
+ci/gfw-lab/Cargo.lock
+  s_6a4630a7db9893::t_c7922463723537 344,346
+fuzz/Cargo.lock
+  s_6a4630a7db9893::t_ccf2104828ffbf 392,875,880,882,916,918,1154,1156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "14f2a9e3b4ff8c3e49b1684a2c99fca1bc622297",
+  "prompts": {},
+  "sessions": {
+    "s_6a4630a7db9893": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9f20303a-0df7-4c7c-84b9-4c4ffcf828e8",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
