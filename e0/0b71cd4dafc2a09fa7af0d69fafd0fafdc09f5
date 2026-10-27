@@ -1,0 +1,55 @@
+src/bench.rs
+  s_c5682f8dcefc62::t_ce724a149f9d1c 55
+  s_c5682f8dcefc62::t_32d7d620e29ef7 1613-1614,1618-1619,1625
+src/handshake/server.rs
+  s_c5682f8dcefc62::t_84714ac632c7b0 5537-5539,5544,5553-5555,5558,5565-5566,5571
+  s_c5682f8dcefc62::t_074d62b758f4fd 5398
+  s_c5682f8dcefc62::t_4798a2256a00a4 11259
+  s_c5682f8dcefc62::t_1732553d2bbf94 4436,4449
+  s_c5682f8dcefc62::t_4ca8860b102cc2 5752
+  s_c5682f8dcefc62::t_868534073730f2 8938
+  s_c5682f8dcefc62::t_e16f253845065f 5408,5420
+  s_c5682f8dcefc62::t_cf12585a7a7607 268-274
+  s_c5682f8dcefc62::t_787b0061f369bd 5854,5856,5858
+  s_c5682f8dcefc62::t_073712d1dfe43b 4426
+  s_c5682f8dcefc62::t_c06011a3c75d6e 5501,5510,5520
+  s_c5682f8dcefc62::t_4d6613db54925d 8881
+  s_c5682f8dcefc62::t_d040a4d7ca1d44 8912
+  s_c5682f8dcefc62::t_b8fd01a20ed234 4404
+  s_c5682f8dcefc62::t_bac16e38fcd100 5640-5642,5644-5653,5657,5668-5675,5678,5681-5684,5688-5689,5697-5700,5703-5713,5715-5721,5723-5744
+  s_c5682f8dcefc62::t_95fc135ecff3c5 8668,8680,8691-8771,8774-8815,8818-8843
+  s_c5682f8dcefc62::t_f2d8f1b1a26e31 11217,11220-11225
+  s_c5682f8dcefc62::t_3374b065d4ce11 8957,8965-8967
+  s_c5682f8dcefc62::t_8a77d4a4ee80a4 2
+  s_c5682f8dcefc62::t_0c3f7fccf21de0 4371
+  s_c5682f8dcefc62::t_80d62a6d0cceb6 5588-5589
+  s_c5682f8dcefc62::t_5a0c2626e7dd35 4143-4327,4332-4347
+  s_c5682f8dcefc62::t_1d500b2a53439f 5786-5790,5794,5799,5810-5812,5814,5818-5819,5821
+  s_c5682f8dcefc62::t_5ff71857abff51 5258,5275
+  s_c5682f8dcefc62::t_f68de299088988 5454-5456,5461
+  s_c5682f8dcefc62::t_b2134a1d736fa2 248-267,275
+  s_c5682f8dcefc62::t_87984b8020bcaa 5435
+  s_c5682f8dcefc62::t_3a6176076b606b 5600,5605,5610,5618,5627-5629
+  s_c5682f8dcefc62::t_2e4da70cd3e75d 4884,4889,4897
+  s_c5682f8dcefc62::t_b05e8baee90f08 4414
+  s_c5682f8dcefc62::t_de58881d77fabc 4328-4331,8772-8773,8816-8817,8844-8855,11241-11249
+  s_c5682f8dcefc62::t_adcca09dbfe0df 4389
+  s_c5682f8dcefc62::t_53fb9747f595e9 23
+  s_c5682f8dcefc62::t_99fc3646bb03d8 4469,4479,4484
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e00b71cd4dafc2a09fa7af0d69fafd0fafdc09f5",
+  "prompts": {},
+  "sessions": {
+    "s_c5682f8dcefc62": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5038dc0-5835-4bdb-8efe-7e91e2b0dc13",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
