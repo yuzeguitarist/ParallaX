@@ -85,7 +85,14 @@ jobs:
       - name: relay teardown emits FIN, never RST
         run: |
           set -euo pipefail
-          sudo tcpdump -i lo -nn -w /tmp/cap.pcap tcp >/tmp/tcpdump.log 2>&1 &
+          # Capture only the tests' own connections: every teardown exercised
+          # below binds and dials 127.0.0.1 on both ends (a test added here on
+          # another loopback address must widen this filter). The runner's
+          # loopback can also carry traffic that is not ParallaX's: on one
+          # ubuntu-26.04 runner, something dialed the closed 127.0.0.2:443 once
+          # a second throughout the capture, and a bare `tcp` capture counted
+          # each kernel refusal RST against the relay (a rerun was clean).
+          sudo tcpdump -i lo -nn -w /tmp/cap.pcap 'tcp and src host 127.0.0.1 and dst host 127.0.0.1' >/tmp/tcpdump.log 2>&1 &
           TD=$!
           sleep 3
           # Exercise the Linux splice teardown and the userspace fallback idle
