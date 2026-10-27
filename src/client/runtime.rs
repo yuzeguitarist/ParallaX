@@ -3,7 +3,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -24,7 +24,7 @@ use tokio::{
         TcpListener, TcpStream,
     },
     sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
-    time::{sleep, timeout, Instant},
+    time::{sleep, timeout, timeout_at, Instant},
 };
 
 use crate::{
@@ -176,6 +176,27 @@ const MUX_MAX_CONCURRENT_SESSION_BUILDS: usize = 8;
 /// blip into a slightly slower connection instead of a hard reset, while the cap
 /// still fails fast against a genuinely down/blocked server.
 const MUX_ACQUIRE_MAX_BUILD_ATTEMPTS: u32 = 3;
+/// Dead-carrier watchdog for a TCP mux session (see [`MuxCarrierWatchdog`]). An
+/// Open that carried the app's first bytes (a TLS ClientHello, an HTTP request)
+/// always draws a server record — data, Fin, or a Reset no later than the
+/// server's DNS + connect budget (2 x 8s). If NOTHING has come back from the
+/// carrier for `SUSPECT` the session gets no new substreams; after `DEAD` its
+/// substreams are reset (apps retry on a fresh session) and the carrier is
+/// dropped. Nothing is sent to detect this: no ping, no keepalive.
+const MUX_CARRIER_SUSPECT_AFTER: Duration = Duration::from_secs(5);
+const MUX_CARRIER_DEAD_AFTER: Duration = Duration::from_secs(25);
+/// A client->server mux write that waited at least this long for socket space
+/// and then completed proves the server is ACKing, so an upload that keeps the
+/// server silent (an HTTP/1.1 POST) is not mistaken for a dead carrier.
+const MUX_WRITE_WAIT_PROVES_LIVENESS: Duration = Duration::from_millis(20);
+/// How soon the watchdog looks again at a dead verdict it held back because a
+/// client->server write was still draining (see [`MuxCarrierHealth`]).
+const MUX_CARRIER_DEFERRED_RECHECK: Duration = Duration::from_secs(1);
+/// Backstop on one batched client->server mux write (at most
+/// `MUX_FRAME_BATCH_LIMIT` frames, ~1 MiB, so >=17 KiB/s never trips it): a write
+/// that cannot drain for this long means the carrier is dead, and the session is
+/// torn down instead of pinning every substream queued behind it.
+const CLIENT_MUX_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -771,6 +792,122 @@ struct ClientMuxHandle {
     stream_slots: Arc<Semaphore>,
     chunk_size: usize,
     carrier: MuxCarrier,
+    health: Arc<MuxCarrierHealth>,
+}
+
+/// Liveness of a TCP mux session's carrier, shared by its reader, writer, and
+/// pool handle. `is_reusable` only proves the session's TASKS are alive; a
+/// carrier blackholed by the path (GFW, NAT loss, sleep/roam) leaves both tasks
+/// parked forever, and the pool used to keep handing such a session new
+/// substreams that silently never answered.
+struct MuxCarrierHealth {
+    /// `relay_now_millis()` of the last proof the carrier still moves bytes: a
+    /// record from the server, or a write that waited for socket space and then
+    /// drained (the server is ACKing).
+    last_alive_ms: AtomicU64,
+    /// Set by the watchdog while an Open has gone unanswered with no proof of
+    /// life; the pool places no new substreams here until it clears.
+    suspect: AtomicBool,
+    /// Set while the writer is inside a client->server write. An Open queued
+    /// behind that write (a slow uplink draining earlier upload frames) has not
+    /// reached the server yet, so its silence is no evidence the carrier died:
+    /// the watchdog holds a dead verdict until the write finishes — whose own
+    /// wait then proves life — and a write that never drains is the writer's
+    /// stall bound to catch.
+    write_in_flight: AtomicBool,
+}
+
+impl MuxCarrierHealth {
+    fn new() -> Self {
+        Self {
+            last_alive_ms: AtomicU64::new(relay_now_millis()),
+            suspect: AtomicBool::new(false),
+            write_in_flight: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_alive(&self) {
+        self.last_alive_ms
+            .store(relay_now_millis(), Ordering::Relaxed);
+        self.suspect.store(false, Ordering::Relaxed);
+    }
+
+    fn mark_suspect(&self) {
+        self.suspect.store(true, Ordering::Relaxed);
+    }
+
+    fn is_suspect(&self) -> bool {
+        self.suspect.load(Ordering::Relaxed)
+    }
+}
+
+/// The dead-carrier watchdog's thresholds (production:
+/// [`MUX_CARRIER_SUSPECT_AFTER`] / [`MUX_CARRIER_DEAD_AFTER`]; injected by tests).
+/// The silence clock runs from the later of the oldest unanswered Open and the
+/// last proof of life, so a busy carrier (records still flowing for other
+/// substreams) is never suspected, however slow one target is.
+#[derive(Clone, Copy)]
+struct MuxCarrierWatchdog {
+    suspect_after: Duration,
+    dead_after: Duration,
+}
+
+const MUX_CARRIER_WATCHDOG: MuxCarrierWatchdog = MuxCarrierWatchdog {
+    suspect_after: MUX_CARRIER_SUSPECT_AFTER,
+    dead_after: MUX_CARRIER_DEAD_AFTER,
+};
+
+enum CarrierVerdict {
+    Alive,
+    Suspect,
+    Dead,
+}
+
+impl MuxCarrierWatchdog {
+    /// How long the carrier has been silent while an Open waits for an answer,
+    /// or `None` when no Open is waiting.
+    fn silence(&self, unanswered: &HashMap<u32, u64>, health: &MuxCarrierHealth) -> Option<u64> {
+        let oldest = *unanswered.values().min()?;
+        let since = oldest.max(health.last_alive_ms.load(Ordering::Relaxed));
+        Some(relay_now_millis().saturating_sub(since))
+    }
+
+    fn verdict(&self, unanswered: &HashMap<u32, u64>, health: &MuxCarrierHealth) -> CarrierVerdict {
+        // The write flag first (Acquire): a write that just finished recorded its
+        // proof of life before clearing the flag, so the silence read next is
+        // current whenever the flag reads clear.
+        let writing = health.write_in_flight.load(Ordering::Acquire);
+        match self.silence(unanswered, health) {
+            Some(silent) if silent >= self.dead_after.as_millis() as u64 && !writing => {
+                CarrierVerdict::Dead
+            }
+            Some(silent) if silent >= self.suspect_after.as_millis() as u64 => {
+                CarrierVerdict::Suspect
+            }
+            _ => CarrierVerdict::Alive,
+        }
+    }
+
+    /// Delay until the next verdict is due, or `None` when no Open is waiting.
+    fn next_check(
+        &self,
+        unanswered: &HashMap<u32, u64>,
+        health: &MuxCarrierHealth,
+    ) -> Option<Duration> {
+        let silent = self.silence(unanswered, health)?;
+        let threshold = if health.is_suspect() {
+            self.dead_after
+        } else {
+            self.suspect_after
+        };
+        let due = (threshold.as_millis() as u64).saturating_sub(silent);
+        if due == 0 && health.is_suspect() {
+            // Past the dead threshold yet still alive here: the verdict was held
+            // back by a draining write, so look again shortly instead of spinning.
+            return Some(MUX_CARRIER_DEFERRED_RECHECK);
+        }
+        Some(Duration::from_millis(due))
+    }
 }
 
 /// The transport a mux session multiplexes substreams over. `Tcp` is the existing
@@ -847,6 +984,9 @@ struct ClientStreamRegistration {
     stream_id: u32,
     local_write: OwnedWriteHalf,
     outcome_tx: oneshot::Sender<DownloadOutcome>,
+    /// The Open carries the app's first bytes, so a live server must answer it;
+    /// arms the dead-carrier watchdog until the stream's first server frame.
+    awaits_response: bool,
 }
 
 /// Control messages a per-connection task sends to the single mux reader loop.
@@ -932,9 +1072,14 @@ impl StreamTerminal {
 
 /// Reserves one substream slot on the first pooled session that still has a free
 /// slot, returning that session's handle plus the owning permit. `None` when every
-/// session is saturated (the caller then opens a new session).
+/// session is saturated or suspect (the caller then opens a new session).
 fn reserve_slot(sessions: &[ClientMuxHandle]) -> Option<(ClientMuxHandle, OwnedSemaphorePermit)> {
     for handle in sessions {
+        // A carrier gone silent on an unanswered Open gets no new substreams until
+        // it proves alive again: they would most likely never be answered either.
+        if handle.health.is_suspect() {
+            continue;
+        }
         if let Ok(permit) = Arc::clone(&handle.stream_slots).try_acquire_owned() {
             return Some((handle.clone(), permit));
         }
@@ -1349,6 +1494,8 @@ impl ClientMuxPool {
                     _tcp_read: Arc::new(server_read_half),
                     _tcp_write: Arc::new(server_write_half),
                 },
+                // QUIC carries its own liveness (idle timeout); never marked.
+                health: Arc::new(MuxCarrierHealth::new()),
             });
         }
 
@@ -1362,35 +1509,34 @@ impl ClientMuxPool {
         let (register_tx, register_rx) = mpsc::channel(stream_limit.max(1));
         let session_cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
-        tokio::spawn(async move {
-            if let Err(err) = client_mux_reader_loop(
-                TcpLegReader::buffered(server_read),
-                open_from_server,
-                register_rx,
-                session_cid,
-                client_relay_idle_timeout(),
-            )
-            .await
-            {
-                tracing::debug!(cid = session_cid, error = %err, "client mux reader stopped");
-            }
-        });
+        let health = Arc::new(MuxCarrierHealth::new());
         let cover = CoverTrafficProfile::from_config(self.traffic);
-        let writer_pool = payload_pool.clone();
-        tokio::spawn(async move {
-            if let Err(err) = client_mux_writer_loop(
-                TcpLegWriter(server_write),
-                seal_to_server,
-                frame_rx,
-                cover,
-                session_cid,
-                writer_pool,
-            )
-            .await
-            {
-                tracing::debug!(cid = session_cid, error = %err, "client mux writer stopped");
-            }
-        });
+        let reader = client_mux_reader_loop(
+            TcpLegReader::buffered(server_read),
+            open_from_server,
+            register_rx,
+            session_cid,
+            client_relay_idle_timeout(),
+            Arc::clone(&health),
+            MUX_CARRIER_WATCHDOG,
+        );
+        let writer = client_mux_writer_loop(
+            TcpLegWriter(server_write),
+            seal_to_server,
+            frame_rx,
+            cover,
+            session_cid,
+            payload_pool.clone(),
+            Arc::clone(&health),
+            CLIENT_MUX_WRITE_STALL_TIMEOUT,
+        );
+        // Separate tasks so the two directions run in parallel, supervised so
+        // that either one ending ends the session.
+        tokio::spawn(supervise_client_mux_session(
+            tokio::spawn(reader),
+            tokio::spawn(writer),
+            session_cid,
+        ));
 
         Ok(ClientMuxHandle {
             next_stream_id: Arc::new(AtomicU32::new(1)),
@@ -1401,7 +1547,37 @@ impl ClientMuxPool {
                 register_tx,
                 payload_pool,
             },
+            health,
         })
+    }
+}
+
+/// Ends a TCP mux session as soon as either direction ends, cleanly or not, by
+/// aborting the other. A reader that hit the dead-carrier watchdog, the idle
+/// backstop, or the server's FIN has already stamped every substream's outcome,
+/// so the writer has nothing left worth sending (and may be parked on a dead
+/// socket); a writer that ended either stalled (its substreams must see Reset,
+/// which dropping the reader's stream map delivers) or ran out of frame senders,
+/// which means no substream is left for the reader to serve.
+async fn supervise_client_mux_session(
+    mut reader: tokio::task::JoinHandle<Result<(), ClientRuntimeError>>,
+    mut writer: tokio::task::JoinHandle<Result<(), ClientRuntimeError>>,
+    cid: u64,
+) {
+    let (side, outcome) = tokio::select! {
+        outcome = &mut reader => {
+            writer.abort();
+            ("reader", outcome)
+        }
+        outcome = &mut writer => {
+            reader.abort();
+            ("writer", outcome)
+        }
+    };
+    match outcome {
+        Ok(Ok(())) => tracing::debug!(cid, side, "client mux session ended"),
+        Ok(Err(err)) => tracing::debug!(cid, side, error = %err, "client mux session stopped"),
+        Err(err) => tracing::debug!(cid, side, error = %err, "client mux session task failed"),
     }
 }
 
@@ -1475,6 +1651,7 @@ async fn handle_local_mux_connection_with_cid(
         unreachable!("QUIC carrier handled above");
     };
     let stream_id = next_mux_stream_id(&mux.next_stream_id);
+    let awaits_response = !connect_request.initial_payload.is_empty();
     let connect_payload = connect_request.encode()?;
     let open_frame = MuxFrame {
         stream_id,
@@ -1491,6 +1668,7 @@ async fn handle_local_mux_connection_with_cid(
             stream_id,
             local_write,
             outcome_tx,
+            awaits_response,
         }))
         .await
         .is_err()
@@ -3598,6 +3776,22 @@ async fn client_mux_download_loop(
     let _ = outcome_tx.send(outcome);
 }
 
+/// Keeps the reader's unanswered-Open set (stream id -> `relay_now_millis()` when
+/// opened) in step with a control message: an Open carrying the app's first bytes
+/// arms the dead-carrier watchdog; the per-connection task's exit disarms it.
+fn track_unanswered_open(unanswered: &mut HashMap<u32, u64>, control: &ClientStreamControl) {
+    match control {
+        ClientStreamControl::Register(reg) => {
+            if reg.awaits_response {
+                unanswered.insert(reg.stream_id, relay_now_millis());
+            }
+        }
+        ClientStreamControl::Deregister(stream_id) => {
+            unanswered.remove(stream_id);
+        }
+    }
+}
+
 /// Applies a control message to the reader-owned download-stream map. Register
 /// spawns the stream's download task and records its data sender + terminal flag;
 /// Deregister drops the sender (the task drains any queued data, then exits with
@@ -3643,6 +3837,8 @@ async fn client_mux_reader_loop<R>(
     mut register_rx: mpsc::Receiver<ClientStreamControl>,
     cid: u64,
     idle: Duration,
+    health: Arc<MuxCarrierHealth>,
+    watchdog: MuxCarrierWatchdog,
 ) -> Result<(), ClientRuntimeError>
 where
     R: LegReader,
@@ -3653,9 +3849,14 @@ where
     let mut batch_plaintext = Vec::new();
     let mut deferred_read_error: Option<io::Error> = None;
     let mut local_writes: HashMap<u32, ClientDownloadStream> = HashMap::new();
+    let mut unanswered_opens: HashMap<u32, u64> = HashMap::new();
     let mut register_open = true;
+    // Only a real record pushes the idle backstop out; the register and watchdog
+    // arms loop back without touching it.
+    let mut idle_deadline = Instant::now() + idle;
 
     loop {
+        let watchdog_due = watchdog.next_check(&unanswered_opens, &health);
         let read_result = if let Some(err) = deferred_read_error.take() {
             Err(err)
         } else {
@@ -3664,6 +3865,7 @@ where
                 registration = register_rx.recv(), if register_open => {
                     match registration {
                         Some(control) => {
+                            track_unanswered_open(&mut unanswered_opens, &control);
                             apply_client_stream_control(&mut local_writes, control, idle);
                         }
                         None => register_open = false,
@@ -3675,11 +3877,11 @@ where
                 // connection permit, every per-connection task (each waiting on its
                 // outcome_rx) with its stream permit and local fd — until the client
                 // stops accepting new SOCKS connections. A real record resets the
-                // clock implicitly (the read returns and the loop re-arms). Mirrors
-                // the server's per-session mux backstop; the register arm stays
-                // outside the timeout (it is liveness, not relay activity).
-                result = timeout(
-                    idle,
+                // clock (`idle_deadline`, below). Mirrors the server's per-session
+                // mux backstop; the register arm stays outside the timeout (it is
+                // liveness, not relay activity).
+                result = timeout_at(
+                    idle_deadline,
                     server_records.read_record_into(&mut server_record),
                 ) => match result {
                     Ok(inner) => inner,
@@ -3689,6 +3891,33 @@ where
                         return Ok(());
                     }
                 },
+                // Dead-carrier watchdog: an Open the server must answer, and no
+                // record (nor a drained write) from the carrier since. Steer new
+                // substreams away first; past the dead threshold, reset every
+                // substream so apps retry on a fresh session instead of hanging
+                // until the idle backstop. Purely local: nothing is sent. Polled
+                // after the read so a record that has already arrived counts.
+                _ = sleep(watchdog_due.unwrap_or_default()), if watchdog_due.is_some() => {
+                    match watchdog.verdict(&unanswered_opens, &health) {
+                        CarrierVerdict::Dead => {
+                            tracing::debug!(cid, "client mux carrier unresponsive; resetting its streams");
+                            shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Reset);
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "client mux carrier unresponsive",
+                            )
+                            .into());
+                        }
+                        CarrierVerdict::Suspect => {
+                            if !health.is_suspect() {
+                                tracing::debug!(cid, "client mux carrier silent; steering new streams away");
+                                health.mark_suspect();
+                            }
+                        }
+                        CarrierVerdict::Alive => {}
+                    }
+                    continue;
+                }
             }
         };
         match read_result {
@@ -3702,6 +3931,8 @@ where
                 return Err(ClientRuntimeError::Io(err));
             }
         }
+        idle_deadline = Instant::now() + idle;
+        health.mark_alive();
         log_record_read(
             cid,
             "server->client",
@@ -3727,6 +3958,7 @@ where
         // stream's write half is always present before its first Data, and a
         // deregister from an exited per-connection task is applied promptly.
         while let Ok(control) = register_rx.try_recv() {
+            track_unanswered_open(&mut unanswered_opens, &control);
             apply_client_stream_control(&mut local_writes, control, idle);
         }
 
@@ -3767,6 +3999,7 @@ where
             let mut frames = frames_payload;
             while !frames.is_empty() {
                 let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
+                unanswered_opens.remove(&frame.stream_id);
                 dispatch_client_mux_frame(&mut local_writes, frame, cid).await;
                 frames = &frames[used..];
             }
@@ -3910,6 +4143,7 @@ fn shutdown_client_download_streams(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn client_mux_writer_loop<W>(
     mut server_write: W,
     mut seal_to_server: DataRecordCodec,
@@ -3917,6 +4151,8 @@ async fn client_mux_writer_loop<W>(
     cover: CoverTrafficProfile,
     cid: u64,
     payload_pool: MuxPayloadPool,
+    health: Arc<MuxCarrierHealth>,
+    stall: Duration,
 ) -> Result<(), ClientRuntimeError>
 where
     W: LegWriter,
@@ -3930,44 +4166,7 @@ where
                 let _ = server_write.shutdown().await;
                 return Ok(());
             };
-            write_client_mux_frames_batched(
-                &mut server_write,
-                &mut seal_to_server,
-                frame,
-                ClientMuxBatchState {
-                    frame_rx: &mut frame_rx,
-                },
-                &mut rng,
-                &mut seal_scratch,
-                RelayWriteLog::new(cid, "client->server", "client-mux-writer"),
-                &payload_pool,
-            )
-            .await?;
-        }
-    }
-
-    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
-
-    loop {
-        tokio::select! {
-            _ = &mut cover_sleep, if cover.is_enabled() => {
-                write_client_mux_frame(
-                    &mut server_write,
-                    &mut seal_to_server,
-                    MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
-                    &mut rng,
-                    &mut seal_scratch,
-                    cid,
-                    "client-mux-cover-writer",
-                )
-                .await?;
-                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
-            }
-            frame = frame_rx.recv() => {
-                let Some(frame) = frame else {
-                    let _ = server_write.shutdown().await;
-                    return Ok(());
-                };
+            bounded_client_mux_write(
                 write_client_mux_frames_batched(
                     &mut server_write,
                     &mut seal_to_server,
@@ -3979,10 +4178,109 @@ where
                     &mut seal_scratch,
                     RelayWriteLog::new(cid, "client->server", "client-mux-writer"),
                     &payload_pool,
+                ),
+                stall,
+                &health,
+                cid,
+            )
+            .await?;
+        }
+    }
+
+    let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
+
+    loop {
+        tokio::select! {
+            _ = &mut cover_sleep, if cover.is_enabled() => {
+                bounded_client_mux_write(
+                    write_client_mux_frame(
+                        &mut server_write,
+                        &mut seal_to_server,
+                        MuxFrame { stream_id: 0, kind: MuxFrameKind::Cover, payload: Vec::new() },
+                        &mut rng,
+                        &mut seal_scratch,
+                        cid,
+                        "client-mux-cover-writer",
+                    ),
+                    stall,
+                    &health,
+                    cid,
+                )
+                .await?;
+                cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
+            }
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else {
+                    let _ = server_write.shutdown().await;
+                    return Ok(());
+                };
+                bounded_client_mux_write(
+                    write_client_mux_frames_batched(
+                        &mut server_write,
+                        &mut seal_to_server,
+                        frame,
+                        ClientMuxBatchState {
+                            frame_rx: &mut frame_rx,
+                        },
+                        &mut rng,
+                        &mut seal_scratch,
+                        RelayWriteLog::new(cid, "client->server", "client-mux-writer"),
+                        &payload_pool,
+                    ),
+                    stall,
+                    &health,
+                    cid,
                 )
                 .await?;
             }
         }
+    }
+}
+
+/// Bounds one client->server mux write by `stall` (the carrier is dead if it
+/// cannot drain for that long; the error ends the session), and records a write
+/// that had to wait for socket space and then drained as proof the server is
+/// still ACKing — see [`MUX_WRITE_WAIT_PROVES_LIVENESS`].
+async fn bounded_client_mux_write(
+    write: impl std::future::Future<Output = Result<(), ClientRuntimeError>>,
+    stall: Duration,
+    health: &MuxCarrierHealth,
+    cid: u64,
+) -> Result<(), ClientRuntimeError> {
+    let in_flight = WriteInFlight::start(health);
+    let started = Instant::now();
+    match timeout(stall, write).await {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::debug!(cid, "client mux server-write stalled; tearing down session");
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "client mux write stalled").into());
+        }
+    }
+    if started.elapsed() >= MUX_WRITE_WAIT_PROVES_LIVENESS {
+        health.mark_alive();
+    }
+    // Only now: the proof of life above must be visible before the flag clears.
+    drop(in_flight);
+    Ok(())
+}
+
+/// Marks a client->server write in flight for the watchdog (see
+/// [`MuxCarrierHealth`]'s `write_in_flight`), clearing it when dropped however
+/// the write ends.
+struct WriteInFlight<'a>(&'a MuxCarrierHealth);
+
+impl<'a> WriteInFlight<'a> {
+    fn start(health: &'a MuxCarrierHealth) -> Self {
+        health.write_in_flight.store(true, Ordering::Relaxed);
+        Self(health)
+    }
+}
+
+impl Drop for WriteInFlight<'_> {
+    fn drop(&mut self) {
+        // Release pairs with the watchdog's Acquire load: a proof of life the
+        // writer recorded before clearing the flag is seen along with the clear.
+        self.0.write_in_flight.store(false, Ordering::Release);
     }
 }
 
@@ -4697,8 +4995,28 @@ mod tests {
                 register_tx,
                 payload_pool: MuxPayloadPool::with_capacity(1024),
             },
+            health: Arc::new(MuxCarrierHealth::new()),
         };
         (handle, frame_rx, register_rx)
+    }
+
+    /// A carrier the watchdog has flagged as silent gets no new substreams, so a
+    /// browser's next connections land on a healthy (or new) session instead of
+    /// the blackholed one; it is eligible again as soon as it proves alive.
+    #[test]
+    fn reserve_slot_skips_a_suspect_carrier_until_it_proves_alive() {
+        let (handle, _frame_rx, _register_rx) = dummy_mux_handle();
+        let sessions = vec![handle.clone()];
+        assert!(reserve_slot(&sessions).is_some());
+
+        handle.health.mark_suspect();
+        assert!(
+            reserve_slot(&sessions).is_none(),
+            "a suspect carrier must not be given a new substream"
+        );
+
+        handle.health.mark_alive();
+        assert!(reserve_slot(&sessions).is_some());
     }
 
     #[test]
@@ -4825,6 +5143,7 @@ mod tests {
                 stream_id: 1,
                 local_write,
                 outcome_tx,
+                awaits_response: false,
             }))
             .await
             .unwrap();
@@ -4853,6 +5172,8 @@ mod tests {
                 register_rx,
                 1,
                 Duration::from_millis(80),
+                Arc::new(MuxCarrierHealth::new()),
+                MUX_CARRIER_WATCHDOG,
             ),
         )
         .await
@@ -4868,6 +5189,291 @@ mod tests {
             client_mux_await_download(outcome_rx, 1).await,
             Ok(())
         ));
+    }
+
+    /// One registered substream on a reader-side mux session, over a real local
+    /// socket: the reader's control receiver, the stream's outcome, the
+    /// server->client codec, and the socket ends that must outlive the test.
+    async fn registered_mux_stream(
+        awaits_response: bool,
+    ) -> (
+        mpsc::Receiver<ClientStreamControl>,
+        oneshot::Receiver<DownloadOutcome>,
+        DataRecordCodec,
+        (TcpStream, OwnedReadHalf),
+    ) {
+        let (register_tx, register_rx) = mpsc::channel::<ClientStreamControl>(4);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (app_side, _) = listener.accept().await.unwrap();
+        let (local_read, local_write) = connect.await.unwrap().into_split();
+        let (outcome_tx, outcome_rx) = oneshot::channel::<DownloadOutcome>();
+        register_tx
+            .send(ClientStreamControl::Register(ClientStreamRegistration {
+                stream_id: 1,
+                local_write,
+                outcome_tx,
+                awaits_response,
+            }))
+            .await
+            .unwrap();
+        drop(register_tx);
+        let session_keys = derive_client_keys(
+            &[0x5a_u8; 32],
+            &X25519KeyPair::generate().private,
+            &X25519KeyPair::generate().public,
+            &[7_u8; 32],
+        )
+        .unwrap();
+        let (open_from_server, _seal) =
+            data_codecs(&session_keys, TrafficConfig::default()).unwrap();
+        (
+            register_rx,
+            outcome_rx,
+            open_from_server,
+            (app_side, local_read),
+        )
+    }
+
+    const TEST_WATCHDOG: MuxCarrierWatchdog = MuxCarrierWatchdog {
+        suspect_after: Duration::from_millis(60),
+        dead_after: Duration::from_millis(200),
+    };
+
+    /// A carrier that silently died (blackholed: no FIN, no RST, reads just never
+    /// return) must not hold an unanswered Open — and every other substream on
+    /// it — until the 10-minute idle backstop. The watchdog first marks the
+    /// carrier suspect (the pool steers new substreams away), then resets its
+    /// substreams so apps retry on a fresh session.
+    #[tokio::test]
+    async fn client_mux_watchdog_resets_streams_on_an_unresponsive_carrier() {
+        let (register_rx, outcome_rx, open_from_server, _sockets) =
+            registered_mux_stream(true).await;
+        let health = Arc::new(MuxCarrierHealth::new());
+
+        let reader = tokio::spawn(client_mux_reader_loop(
+            SilentLegReader,
+            open_from_server,
+            register_rx,
+            1,
+            Duration::from_secs(60),
+            Arc::clone(&health),
+            TEST_WATCHDOG,
+        ));
+        tokio::time::sleep(Duration::from_millis(130)).await;
+        assert!(
+            health.is_suspect(),
+            "past the suspect threshold the carrier must stop getting new substreams"
+        );
+
+        let loop_result = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the watchdog must end the session long before the idle backstop")
+            .unwrap();
+        assert!(
+            matches!(&loop_result, Err(ClientRuntimeError::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "an unresponsive carrier ends the session with TimedOut, got {loop_result:?}",
+        );
+        assert!(
+            client_mux_await_download(outcome_rx, 1).await.is_err(),
+            "the waiting substream must see a Reset (so the app retries), not a clean EOF"
+        );
+    }
+
+    /// The watchdog must not fire on a quiet but healthy session: an Open with no
+    /// first payload (the app waits for the server, or has nothing to say yet)
+    /// may legitimately stay unanswered, so only the idle backstop applies.
+    #[tokio::test]
+    async fn client_mux_watchdog_ignores_an_open_without_first_payload() {
+        let (register_rx, _outcome_rx, open_from_server, _sockets) =
+            registered_mux_stream(false).await;
+        let health = Arc::new(MuxCarrierHealth::new());
+
+        let loop_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_mux_reader_loop(
+                SilentLegReader,
+                open_from_server,
+                register_rx,
+                1,
+                Duration::from_millis(500),
+                Arc::clone(&health),
+                TEST_WATCHDOG,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(loop_result, Ok(())),
+            "only the idle backstop may end this session, got {loop_result:?}",
+        );
+        assert!(!health.is_suspect());
+    }
+
+    /// Proof of life from the writer (a write that waited for socket space, then
+    /// drained) keeps the watchdog quiet while the server has nothing to send —
+    /// e.g. a large HTTP/1.1 upload — even with an Open still unanswered.
+    #[tokio::test]
+    async fn client_mux_watchdog_defers_to_proof_of_life() {
+        let (register_rx, _outcome_rx, open_from_server, _sockets) =
+            registered_mux_stream(true).await;
+        let health = Arc::new(MuxCarrierHealth::new());
+        let writer_health = Arc::clone(&health);
+        let writer = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                writer_health.mark_alive();
+            }
+        });
+
+        let loop_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_mux_reader_loop(
+                SilentLegReader,
+                open_from_server,
+                register_rx,
+                1,
+                Duration::from_millis(600),
+                Arc::clone(&health),
+                TEST_WATCHDOG,
+            ),
+        )
+        .await
+        .unwrap();
+        writer.abort();
+        assert!(
+            matches!(loop_result, Ok(())),
+            "a carrier with fresh proof of life must reach the idle backstop, got {loop_result:?}",
+        );
+    }
+
+    /// An Open queued behind a client->server write that is still draining (a
+    /// slow uplink busy with earlier upload frames) has not reached the server,
+    /// so the watchdog must not call the carrier dead while that write is in
+    /// flight — only suspect — and must decide once the write is done.
+    #[tokio::test]
+    async fn client_mux_watchdog_holds_a_dead_verdict_while_a_write_drains() {
+        let (register_rx, outcome_rx, open_from_server, _sockets) =
+            registered_mux_stream(true).await;
+        let health = Arc::new(MuxCarrierHealth::new());
+        let writing = WriteInFlight::start(&health);
+
+        let reader = tokio::spawn(client_mux_reader_loop(
+            SilentLegReader,
+            open_from_server,
+            register_rx,
+            1,
+            Duration::from_secs(60),
+            Arc::clone(&health),
+            TEST_WATCHDOG,
+        ));
+        tokio::time::sleep(TEST_WATCHDOG.dead_after * 2).await;
+        assert!(
+            !reader.is_finished(),
+            "a write still draining must hold back the dead verdict"
+        );
+        assert!(
+            health.is_suspect(),
+            "the carrier is still steered away from"
+        );
+
+        // The write ends without draining anything (no proof of life): the held
+        // verdict lands at the next recheck.
+        drop(writing);
+        let loop_result = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the dead verdict must land soon after the write ends")
+            .unwrap();
+        assert!(
+            matches!(&loop_result, Err(ClientRuntimeError::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "an unresponsive carrier ends the session with TimedOut, got {loop_result:?}",
+        );
+        assert!(client_mux_await_download(outcome_rx, 1).await.is_err());
+    }
+
+    /// The session ends as soon as either direction ends, cleanly or not: a
+    /// reader that finished (server FIN, idle backstop) must not leave the writer
+    /// parked — on a dead socket or an open frame channel — until every frame
+    /// sender happens to go away.
+    #[tokio::test]
+    async fn mux_session_supervisor_stops_the_writer_when_the_reader_ends_cleanly() {
+        let reader = tokio::spawn(async { Ok::<(), ClientRuntimeError>(()) });
+        let (writer_dropped_tx, writer_dropped_rx) = oneshot::channel::<()>();
+        let writer = tokio::spawn(async move {
+            // Dropped with this future when the task is aborted.
+            let _dropped = writer_dropped_tx;
+            std::future::pending::<Result<(), ClientRuntimeError>>().await
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise_client_mux_session(reader, writer, 1),
+        )
+        .await
+        .expect("the supervisor returns once the reader has ended");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), writer_dropped_rx)
+                .await
+                .is_ok(),
+            "the writer task must be aborted once the reader has ended"
+        );
+    }
+
+    /// A client->server mux write that cannot drain (dead carrier, full send
+    /// buffer) must end the session after the stall bound instead of pinning the
+    /// writer — and every substream queued behind it — forever.
+    #[tokio::test]
+    async fn client_mux_writer_ends_session_when_server_write_stalls() {
+        struct StalledWriter;
+        impl LegWriter for StalledWriter {
+            async fn write_records(&mut self, _bytes: &[u8]) -> io::Result<()> {
+                std::future::pending().await
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let session_keys = derive_client_keys(
+            &[0x5a_u8; 32],
+            &X25519KeyPair::generate().private,
+            &X25519KeyPair::generate().public,
+            &[7_u8; 32],
+        )
+        .unwrap();
+        let (_open, seal_to_server) = data_codecs(&session_keys, TrafficConfig::default()).unwrap();
+        let (frame_tx, frame_rx) = mpsc::channel(4);
+        frame_tx
+            .send(MuxFrame {
+                stream_id: 1,
+                kind: MuxFrameKind::Data,
+                payload: b"payload".to_vec(),
+            })
+            .await
+            .unwrap();
+        let cover = CoverTrafficProfile::from_config(TrafficConfig::default());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_mux_writer_loop(
+                StalledWriter,
+                seal_to_server,
+                frame_rx,
+                cover,
+                1,
+                MuxPayloadPool::with_capacity(1024),
+                Arc::new(MuxCarrierHealth::new()),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("the writer must give up on a stalled write within the wall budget");
+        assert!(
+            matches!(&result, Err(ClientRuntimeError::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "a stalled server write ends the session with TimedOut, got {result:?}",
+        );
+        drop(frame_tx);
     }
 
     /// A local app that stops reading but holds its socket open wedges the

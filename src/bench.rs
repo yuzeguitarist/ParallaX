@@ -52,7 +52,7 @@ use crate::{
     handshake::client::ClientDataSession,
     handshake::server::{
         decide_inbound, write_server_mux_frames_batched, InboundDecision, RelaySealScratch,
-        RelayWriteLog, ServerMuxBatchState,
+        RelayWriteLog,
     },
     protocol::{
         command::{
@@ -1610,33 +1610,19 @@ async fn mux_batch_seal_once(
     out: &mut Vec<u8>,
     pool: &MuxPayloadPool,
 ) -> Result<u64> {
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<MuxFrame>(8);
-    let mut first_frame = None;
-    for index in 0..4 {
-        let frame = MuxFrame {
+    let mut frames: Vec<MuxFrame> = (0..4)
+        .map(|_| MuxFrame {
             stream_id: 7,
             kind: MuxFrameKind::Data,
             payload: vec![0x42_u8; frame_payload_len],
-        };
-        if index == 0 {
-            first_frame = Some(frame);
-        } else {
-            frame_tx
-                .try_send(frame)
-                .map_err(|err| anyhow::anyhow!("bench mux channel full: {err}"))?;
-        }
-    }
-    drop(frame_tx);
-    let first_frame = first_frame.expect("first frame is always created");
+        })
+        .collect();
 
     out.clear();
     write_server_mux_frames_batched(
         &mut VecLegWriter(out),
         codec,
-        first_frame,
-        ServerMuxBatchState {
-            frame_rx: &mut frame_rx,
-        },
+        &mut frames,
         rng,
         scratch,
         RelayWriteLog::new(0, "server->client", "bench-mux-writer"),
