@@ -2937,7 +2937,11 @@ mod tests {
             record
         };
         let open = session.open_http2_connection(&mut stream, &mut session_keys);
-        let (opened, record) = tokio::join!(timeout(Duration::from_secs(5), open), read_first);
+        let (opened, record) = tokio::join!(
+            timeout(Duration::from_secs(5), open),
+            timeout(Duration::from_secs(5), read_first)
+        );
+        let record = record.expect("the opening flight record arrives");
         opened
             .expect("open_http2_connection returns once the peer closes")
             .unwrap();

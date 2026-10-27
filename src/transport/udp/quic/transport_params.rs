@@ -159,8 +159,9 @@ impl TransportParameters {
 
     /// The relay server's transport parameters. Unlike the client, the server is
     /// not fingerprinted, so this is a plain encode (ascending id order). It grants
-    /// the client exactly one bidirectional stream (the relay's stream) and the
-    /// Safari uni budget, with the same flow-control windows the client advertises.
+    /// the client two bidirectional streams — the cancelled-unused request stream
+    /// (`h3::cancel_empty_request_stream`) and the relay's stream — and the Safari
+    /// uni budget, with the same flow-control windows the client advertises.
     /// `scid` is the server's chosen source connection id.
     pub fn server(scid: &[u8]) -> Self {
         Self {
@@ -168,7 +169,7 @@ impl TransportParameters {
             initial_max_stream_data_bidi_local: SAFARI_INITIAL_MAX_STREAM_DATA,
             initial_max_stream_data_bidi_remote: SAFARI_INITIAL_MAX_STREAM_DATA,
             initial_max_stream_data_uni: SAFARI_INITIAL_MAX_STREAM_DATA,
-            initial_max_streams_bidi: 1,
+            initial_max_streams_bidi: 2,
             initial_max_streams_uni: SAFARI_MAX_STREAMS_UNI,
             active_connection_id_limit: MIN_ACTIVE_CONNECTION_ID_LIMIT,
             initial_src_cid: scid.to_vec(),
@@ -471,7 +472,10 @@ mod tests {
             TransportParameters::read(&TransportParameters::server(&scid).encode_server()).unwrap();
         assert_eq!(tp.initial_max_data, 16 * 1024 * 1024);
         assert_eq!(tp.initial_max_stream_data_bidi_remote, 2 * 1024 * 1024);
-        assert_eq!(tp.initial_max_streams_bidi, 1, "server grants one bidi");
+        assert_eq!(
+            tp.initial_max_streams_bidi, 2,
+            "server grants the cancelled stream + the relay stream"
+        );
         assert_eq!(tp.initial_max_streams_uni, 8);
         assert_eq!(tp.initial_src_cid, scid, "server SCID echoed in 0x0f");
     }
