@@ -817,16 +817,16 @@ impl Safari26TlsSession {
         // preface and the opening HEADERS back-to-back as one flight, then drain
         // and ACK the server's SETTINGS afterward.
         //
-        // Keep them as two separate writes (their existing record framing) rather
-        // than coalescing into one TLS record: no capture pins the real Safari
-        // opening-flight record boundary — the committed fixture is a plaintext
-        // reassembly that proves byte shape, not record count. Change only the
-        // proven tell (the wait), not the on-wire record framing.
+        // The flight is ONE TLS record, [preface + SETTINGS + WINDOW_UPDATE +
+        // HEADERS], as real Safari sends it over a real network (2026-06-23 capture:
+        // first app-data record carries H2 frame types 4,8,1). Two records would put
+        // a preface-sized record length on the wire that Safari never produces.
         let fingerprint = Http2Fingerprint::safari26();
-        let preface = fingerprint.connection_preface()?;
-        self.write_application_data(stream, keys, &preface).await?;
-        let headers = fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?;
-        self.write_application_data(stream, keys, &headers).await?;
+        let mut flight = fingerprint.connection_preface()?;
+        flight.extend_from_slice(
+            &fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?,
+        );
+        self.write_application_data(stream, keys, &flight).await?;
         self.await_http2_settings_ack(stream, keys).await?;
         Ok(())
     }
@@ -2913,6 +2913,52 @@ mod tests {
             chunk.plaintext,
             Http2Fingerprint::settings_ack_frame().unwrap()
         );
+    }
+
+    /// Safari's H2 opening flight is ONE TLS record: preface + SETTINGS +
+    /// WINDOW_UPDATE + HEADERS (frame types 4,8,1), not a preface record followed
+    /// by a separate HEADERS record.
+    #[tokio::test]
+    async fn http2_opening_flight_is_one_record_with_settings_window_update_headers() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        session_keys.negotiated_alpn = Some(b"h2".to_vec());
+        let mut peer_keys = app_keys();
+
+        // Read the first record, then drop the peer: the close ends the client's
+        // wait for the server SETTINGS.
+        let read_first = async move {
+            let mut record = Vec::new();
+            TlsRecordReader::new(&mut peer)
+                .read_record_into(&mut record)
+                .await
+                .unwrap();
+            record
+        };
+        let open = session.open_http2_connection(&mut stream, &mut session_keys);
+        let (opened, record) = tokio::join!(
+            timeout(Duration::from_secs(5), open),
+            timeout(Duration::from_secs(5), read_first)
+        );
+        let record = record.expect("the opening flight record arrives");
+        opened
+            .expect("open_http2_connection returns once the peer closes")
+            .unwrap();
+
+        let plaintext = peer_keys
+            .client_application
+            .decrypt_record(&record)
+            .unwrap()
+            .plaintext;
+        let fingerprint = Http2Fingerprint::safari26();
+        let mut expected = fingerprint.connection_preface().unwrap();
+        expected.extend_from_slice(
+            &fingerprint
+                .headers_frame_with_language(&session.sni, &session.accept_language)
+                .unwrap(),
+        );
+        assert_eq!(plaintext, expected);
     }
 
     // ---- drain_post_handshake ----

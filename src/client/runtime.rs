@@ -2334,7 +2334,9 @@ async fn run_client_udp_probe(
                 sni,
                 ticket,
                 current_unix_millis(),
-                crate::transport::udp::quic::packet::ConnectionId::new(&offer.offer_id),
+                crate::transport::udp::quic::packet::ConnectionId::new(
+                    &crate::transport::udp::stable::offer_dcid(&offer.offer_id),
+                ),
             ),
         )
         .await
@@ -2352,6 +2354,7 @@ async fn run_client_udp_probe(
             Ok(Ok(s)) => s,
             _ => return unreachable(),
         };
+        crate::transport::udp::h3::cancel_empty_request_stream(&conn);
         let (mut relay_send, mut relay_recv) = conn.open_bi();
         // Probe request (HEADERS + DATA) as 0-RTT early data — no exporter token is
         // needed to SEND it (the token only gates response verification).
@@ -2388,7 +2391,9 @@ async fn run_client_udp_probe(
             endpoint.connect_with_dcid(
                 udp_addr,
                 sni,
-                crate::transport::udp::quic::packet::ConnectionId::new(&offer.offer_id),
+                crate::transport::udp::quic::packet::ConnectionId::new(
+                    &crate::transport::udp::stable::offer_dcid(&offer.offer_id),
+                ),
             ),
         )
         .await
@@ -2417,6 +2422,7 @@ async fn run_client_udp_probe(
         // The hand-rolled `open_bi` is synchronous and infallible (it allocates the
         // stream id locally; flow-control is enforced when bytes are transmitted), so
         // it neither awaits nor returns a Result.
+        crate::transport::udp::h3::cancel_empty_request_stream(&conn);
         let (mut relay_send, mut relay_recv) = conn.open_bi();
         let outcome = crate::transport::udp::probe::probe_client_over_bidi(
             &conn,

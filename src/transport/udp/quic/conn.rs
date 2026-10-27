@@ -151,6 +151,11 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 /// A conservative max UDP payload for non-Initial packets (one datagram holds the
 /// whole Handshake flight in practice).
 const MAX_DATAGRAM: usize = 1252;
+/// Safari's per-packet cap on client Initial CRYPTO bytes: its ClientHello is cut
+/// 999 + rest, the first Initial padded out with PADDING (Safari 26.3 wire, every
+/// connection, cold and 0-RTT, 2026-10-27). Initial keys are public, so an
+/// observer sees this split.
+const SAFARI_INITIAL_CRYPTO_CHUNK: usize = 999;
 
 /// Cap on out-of-order CRYPTO bytes buffered per space. The handshake transcript
 /// is small; since Initial keys derive from the public DCID, an unbounded buffer
@@ -439,6 +444,12 @@ struct Stream {
     reset: Option<u64>,
     /// The RESET_STREAM frame has been packetized.
     reset_sent: bool,
+    /// The stream is cancelled in both directions: STOP_SENDING (same code) rides
+    /// in the RESET_STREAM packet. See [`Connection::cancel_stream`].
+    stop_sending: bool,
+    /// Streams whose data was queued (unsent) when this stream was cancelled. The
+    /// cancellation waits until they are sent, so it never overtakes them.
+    cancel_after: Vec<u64>,
     // Receive half (bytes this endpoint receives on the stream).
     recv: Vec<u8>,
     recv_off: u64,
@@ -620,6 +631,9 @@ pub struct Connection {
     /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
     /// HANDSHAKE_DONE, the client when it receives it.
     handshake_confirmed: bool,
+    /// A client saw a Handshake packet while it still owed an Initial ACK: it
+    /// discards the Initial space right after sending that ACK instead of at once.
+    discard_initial_after_ack: bool,
     /// The peer's address is validated (RFC 9000 §8.1). A client trusts the server
     /// address it dialed, so it starts `true`; a server starts `false` and flips
     /// when a packet from the peer opens under Handshake keys — proof the peer
@@ -770,6 +784,7 @@ impl Connection {
             data_packets_open_failed: 0,
             handshake_done_pending: false,
             handshake_confirmed: false,
+            discard_initial_after_ack: false,
             peer_addr_validated: side == Side::Client,
             anti_amp_recv: 0,
             anti_amp_sent: 0,
@@ -1052,9 +1067,21 @@ impl Connection {
         s.send_max = s.send_max.max(send_max);
     }
 
-    /// Take the id of the next peer-initiated bidirectional stream, if any.
+    /// Take the id of the next peer-initiated bidirectional stream, if any. A stream
+    /// the peer reset before sending a byte (a cancelled HTTP/3 request stream,
+    /// which Safari opens and cancels ahead of its real request) carries nothing to
+    /// serve, so it is skipped rather than handed to the application.
     pub fn accept_bi(&mut self) -> Option<u64> {
-        self.accept_bidi.pop_front()
+        while let Some(id) = self.accept_bidi.pop_front() {
+            let cancelled_empty = self
+                .streams
+                .get(&id)
+                .is_some_and(|s| s.recv_reset.is_some() && s.recv_high == 0);
+            if !cancelled_empty {
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Take the id of the next peer-initiated unidirectional stream, if any.
@@ -1098,6 +1125,38 @@ impl Connection {
                 s.reset = Some(error_code);
             }
         }
+    }
+
+    /// Cancel stream `id` in both directions with `error_code`: one packet carries
+    /// STOP_SENDING then RESET_STREAM (RFC 9000 §19.5 / §19.4), as Safari cancels an
+    /// HTTP/3 request stream it opened but never used. The cancellation is sent
+    /// only after every byte already queued on other streams (Safari: the H3
+    /// control SETTINGS goes out first), since RESET_STREAM otherwise outranks
+    /// stream data in [`Self::poll_transmit`].
+    pub fn cancel_stream(&mut self, id: u64, error_code: u64) {
+        self.reset_stream(id, error_code);
+        let cancel_after: Vec<u64> = self
+            .streams
+            .keys()
+            .copied()
+            .filter(|&other| other != id && self.has_unsent_data(other))
+            .collect();
+        if let Some(s) = self.streams.get_mut(&id) {
+            if !s.stop_sending {
+                s.stop_sending = true;
+                // A RESET_STREAM already packetized carried no STOP_SENDING: send
+                // the combined pair again.
+                s.reset_sent = false;
+                s.cancel_after = cancel_after;
+            }
+        }
+    }
+
+    /// Stream `id` has fresh bytes buffered that are not yet packetized.
+    fn has_unsent_data(&self, id: u64) -> bool {
+        self.streams
+            .get(&id)
+            .is_some_and(|s| s.reset.is_none() && s.send_off < s.send_base + s.send.len() as u64)
     }
 
     /// Take the bytes reassembled in order from stream `id`'s STREAM frames, and
@@ -1344,7 +1403,22 @@ impl Connection {
         // never blocked by the congestion window (they are not ack-eliciting).
         for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
             if self.spaces[space].keys.is_some() && self.spaces[space].ack_pending {
-                return Some(self.build_ack_packet(space, now));
+                // A client holds its Initial ACK until the ServerHello is complete
+                // (Handshake keys installed), so a ServerHello split across several
+                // Initial datagrams draws ONE padded ACK, as Safari sends — not one
+                // per datagram. A lost tail Initial is resent by the server's PTO.
+                if space == SPACE_INITIAL
+                    && self.side == Side::Client
+                    && self.spaces[SPACE_HANDSHAKE].keys.is_none()
+                {
+                    continue;
+                }
+                let ack = self.build_ack_packet(space, now);
+                if space == SPACE_INITIAL && self.discard_initial_after_ack {
+                    self.discard_initial_after_ack = false;
+                    self.discard_space(SPACE_INITIAL);
+                }
+                return Some(ack);
             }
         }
         // Ack-eliciting data is gated on the congestion window, except a PTO probe
@@ -1784,7 +1858,21 @@ impl Connection {
         let header = self.make_header(space, pn, pn_len);
         let datagram = {
             let keys = self.spaces[space].keys.as_ref().unwrap();
-            seal_packet(&keys.local, header, &[Frame::Ack(ack)])
+            let ack = Frame::Ack(ack);
+            // RFC 9000 §14.1: a client pads EVERY datagram carrying an Initial, an
+            // ACK-only one included (Safari: ACK + PADDING to 1200).
+            if space == SPACE_INITIAL && self.side == Side::Client {
+                let mut probe = Vec::new();
+                let pn_offset = header.encode(&mut probe);
+                let mut payload = Vec::new();
+                ack.encode(&mut payload);
+                let pad = MIN_INITIAL_DATAGRAM.saturating_sub(
+                    pn_offset + pn_len + payload.len() + keys.local.packet.tag_len(),
+                );
+                seal_packet(&keys.local, header, &[ack, Frame::Padding(pad)])
+            } else {
+                seal_packet(&keys.local, header, &[ack])
+            }
         };
         self.spaces[space].ack_pending = false;
         self.spaces[space].largest_recv_time = None;
@@ -2041,7 +2129,10 @@ impl Connection {
                 } else {
                     MAX_DATAGRAM
                 };
-                let budget = cap.saturating_sub(pn_offset + pn_len + tag_len + crypto_hdr);
+                let mut budget = cap.saturating_sub(pn_offset + pn_len + tag_len + crypto_hdr);
+                if space == SPACE_INITIAL && self.side == Side::Client {
+                    budget = budget.min(SAFARI_INITIAL_CRYPTO_CHUNK);
+                }
                 let remaining = self.spaces[space].crypto_send.len() - off;
                 (off, off + remaining.min(budget.max(1)), false)
             };
@@ -2114,7 +2205,11 @@ impl Connection {
     fn next_stream_to_reset(&self) -> Option<u64> {
         self.streams
             .iter()
-            .find(|(_, s)| s.reset.is_some() && !s.reset_sent)
+            .find(|(_, s)| {
+                s.reset.is_some()
+                    && !s.reset_sent
+                    && !s.cancel_after.iter().any(|&id| self.has_unsent_data(id))
+            })
             .map(|(&id, _)| id)
     }
 
@@ -2127,6 +2222,7 @@ impl Connection {
         let s = &self.streams[&id];
         let error_code = s.reset.unwrap_or(0);
         let final_size = s.send_off;
+        let stop_sending = s.stop_sending;
         let datagram = {
             let frame = Frame::ResetStream {
                 id,
@@ -2134,7 +2230,14 @@ impl Connection {
                 final_size,
             };
             let keys = self.spaces[SPACE_DATA].keys.as_ref().unwrap();
-            seal_packet(&keys.local, header, &[frame, Frame::Padding(3)])
+            if stop_sending {
+                // A cancelled stream: STOP_SENDING then RESET_STREAM in one packet,
+                // Safari's HTTP/3 request-cancel shape (frame types 0x05, 0x04).
+                let stop = Frame::StopSending { id, error_code };
+                seal_packet(&keys.local, header, &[stop, frame])
+            } else {
+                seal_packet(&keys.local, header, &[frame, Frame::Padding(3)])
+            }
         };
         if let Some(s) = self.streams.get_mut(&id) {
             s.reset_sent = true;
@@ -2477,8 +2580,17 @@ impl Connection {
         // keys, hence received our Initial CRYPTO: discard Initial keys + state (RFC
         // 9001 §4.9.1). Safe for both roles — the server's §4.9.1 trigger exactly,
         // and for the client it implies the server acked our ClientHello.
+        //
+        // A client still owing an Initial ACK sends it first (poll_transmit discards
+        // right after): Safari ACKs the server's Initial flight even when its tail
+        // arrives coalesced with Handshake packets. RFC 9001 §4.9.1 lets a client keep
+        // Initial keys until it first sends a Handshake packet.
         if space == SPACE_HANDSHAKE && self.spaces[SPACE_INITIAL].keys.is_some() {
-            self.discard_space(SPACE_INITIAL);
+            if self.side == Side::Client && self.spaces[SPACE_INITIAL].ack_pending {
+                self.discard_initial_after_ack = true;
+            } else {
+                self.discard_space(SPACE_INITIAL);
+            }
         }
         // The same proof validates the peer's address (RFC 9000 §8.1: "receipt of
         // a packet protected with Handshake keys"): only an on-path peer at its
@@ -3451,6 +3563,7 @@ mod tests {
 
         let initial_keys = conn.spaces[SPACE_INITIAL].keys.as_ref().unwrap();
         let mut crypto = Vec::new();
+        let mut per_packet = Vec::new();
         let mut largest: Option<u64> = None;
         for d in &datagrams {
             let mut buf = d.clone();
@@ -3460,10 +3573,185 @@ mod tests {
                 if let Frame::Crypto { offset, data } = f.unwrap() {
                     assert_eq!(offset as usize, crypto.len(), "contiguous CRYPTO offsets");
                     crypto.extend_from_slice(data);
+                    per_packet.push(data.len());
                 }
             }
         }
         assert_eq!(crypto[0], 0x01, "CRYPTO stream starts with ClientHello");
+        // Safari cuts its ClientHello 999 + rest: every Initial but the last
+        // carries exactly SAFARI_INITIAL_CRYPTO_CHUNK bytes.
+        let (last, full) = per_packet.split_last().unwrap();
+        assert!(
+            full.iter().all(|&n| n == SAFARI_INITIAL_CRYPTO_CHUNK),
+            "{per_packet:?}"
+        );
+        assert!(*last <= SAFARI_INITIAL_CRYPTO_CHUNK, "{per_packet:?}");
+    }
+
+    #[test]
+    fn cancelled_empty_bidi_is_skipped_by_accept_and_the_request_rides_the_next() {
+        let dcid = ConnectionId::new(&[0xc0, 0xff, 0xee, 0x00, 0x11, 0x22, 0x33, 0x44]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+
+        // Safari: cancel an unused request stream, then send the request on the next.
+        let cancelled = client.open_bi();
+        client.cancel_stream(cancelled, 0x10c);
+        let request = client.open_bi();
+        assert_eq!((cancelled, request), (0, 4));
+        client.send_stream(request, b"request");
+        drive(&mut client, &mut server);
+
+        assert_eq!(server.stream_reset(cancelled), Some(0x10c));
+        assert_eq!(
+            server.accept_bi(),
+            Some(request),
+            "the cancelled stream is skipped"
+        );
+        assert_eq!(server.accept_bi(), None);
+        assert_eq!(server.read_stream(request), b"request");
+    }
+
+    #[test]
+    fn cancellation_waits_for_data_queued_before_it() {
+        let dcid = ConnectionId::new(&[0xc0, 0xff, 0xee, 0x00, 0x11, 0x22, 0x33, 0x44]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+
+        // H3 control SETTINGS queued first, then the cancelled request stream.
+        let control = client.open_uni();
+        client.send_stream(control, b"control settings");
+        let cancelled = client.open_bi();
+        client.cancel_stream(cancelled, 0x10c);
+        assert_eq!(client.next_stream_to_reset(), None, "control goes first");
+        let now = Instant::now();
+        client.poll_transmit(now).expect("control stream packet");
+        assert_eq!(client.next_stream_to_reset(), Some(cancelled));
+    }
+
+    #[test]
+    fn cancelling_an_already_reset_stream_resends_with_stop_sending() {
+        let dcid = ConnectionId::new(&[0xc0, 0xff, 0xee, 0x00, 0x11, 0x22, 0x33, 0x44]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+
+        let id = client.open_bi();
+        client.reset_stream(id, 0x10c);
+        client.poll_transmit(Instant::now()).expect("RESET_STREAM");
+        assert_eq!(client.next_stream_to_reset(), None);
+        client.cancel_stream(id, 0x10c);
+        assert_eq!(
+            client.next_stream_to_reset(),
+            Some(id),
+            "re-armed with STOP_SENDING"
+        );
+    }
+
+    #[test]
+    fn coalesced_initial_and_handshake_still_draw_one_padded_initial_ack() {
+        let dcid = ConnectionId::new(&[0xc0, 0xff, 0xee, 0x00, 0x11, 0x22, 0x33, 0x44]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
+        )
+        .unwrap();
+        let now = Instant::now();
+        while let Some(dg) = client.poll_transmit(now) {
+            server.handle_datagram(&dg, now).unwrap();
+        }
+        // The server's whole first flight — Initial(s) then Handshake — in ONE
+        // datagram: the Handshake packet arrives before the client could ACK.
+        let mut flight = Vec::new();
+        while let Some(dg) = server.poll_transmit(now) {
+            flight.extend_from_slice(&dg);
+        }
+        client.handle_datagram(&flight, now).unwrap();
+
+        let first = client.poll_transmit(now).expect("client reply");
+        assert_eq!(first[0] & 0xb0, 0x80, "an Initial ACK leads the reply");
+        assert!(first.len() >= MIN_INITIAL_DATAGRAM, "padded");
+        assert!(
+            client.spaces[SPACE_INITIAL].keys.is_none(),
+            "Initial space discarded right after its ACK"
+        );
+    }
+
+    #[test]
+    fn client_acks_the_server_initial_flight_once_padded_to_1200() {
+        let dcid = ConnectionId::new(&[0xc0, 0xff, 0xee, 0x00, 0x11, 0x22, 0x33, 0x44]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
+        )
+        .unwrap();
+        let now = Instant::now();
+        while let Some(dg) = client.poll_transmit(now) {
+            server.handle_datagram(&dg, now).unwrap();
+        }
+        // Like the endpoint driver: deliver the server's flight one datagram at a
+        // time, draining the client's output after each. The ServerHello spans
+        // more than one Initial datagram, yet the client must ACK it exactly once.
+        let mut server_flight = Vec::new();
+        while let Some(dg) = server.poll_transmit(now) {
+            server_flight.push(dg);
+        }
+        let mut client_initials = Vec::new();
+        for dg in &server_flight {
+            client.handle_datagram(dg, now).unwrap();
+            while let Some(out) = client.poll_transmit(now) {
+                if out[0] & 0xb0 == 0x80 {
+                    client_initials.push(out);
+                }
+            }
+        }
+        assert_eq!(client_initials.len(), 1, "one Initial ACK for the flight");
+        assert!(
+            client_initials[0].len() >= MIN_INITIAL_DATAGRAM,
+            "padded: {} bytes",
+            client_initials[0].len()
+        );
     }
 
     #[test]
@@ -3473,11 +3761,13 @@ mod tests {
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
                 .unwrap();
         // A dummy cover cert (the REALITY client accepts any) + a server TP blob.
+        // Encoded once: the Safari encoding's id order is randomized per call.
+        let server_tp = server_tp();
         let mut server = Connection::new_server(
             Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
             &server_key(),
             vec![b"h3".to_vec()],
-            server_tp(),
+            server_tp.clone(),
             ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
         )
         .unwrap();
@@ -3503,7 +3793,7 @@ mod tests {
         // Transport parameters were exchanged both ways.
         assert_eq!(
             client.peer_transport_parameters(),
-            Some(server_tp().as_ref()),
+            Some(server_tp.as_ref()),
             "client received the server's transport parameters"
         );
         assert!(

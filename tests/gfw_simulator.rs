@@ -1018,12 +1018,11 @@ async fn udp_leg_initial_first_datagram_holds_only_partial_clienthello() {
 // Safari-26 H3 spec: the 20-cipher GREASE-led list, the static Safari extension
 // order (GREASE matched by class) with extended_master_secret (0x17) /
 // renegotiation_info (0xff01) ABSENT, supported_versions = GREASE + 0x0304 only,
-// and the ascending `quic_transport_parameters` (0x39) id set with
+// and the rotated-ascending `quic_transport_parameters` (0x39) id set with
 // 0x03/0x0a/0x0b/0x0c/0x20 OMITTED (full disassembly: no max_udp_payload_size, no
-// datagrams), `initial_source_connection_id` (0x0f) ZERO-LENGTH, and the
-// vendor/GREASE codepoint 0x17f7586d2cb571 LAST. It also asserts the confirmed
-// transport-param VALUES (idle=0, stream_data=2 MiB, bidi=0, uni=8, vendor
-// GREASE=0) — EXCEPT initial_max_data (0x04), the single runtime-read value
+// datagrams) and `initial_source_connection_id` (0x0f) ZERO-LENGTH. It also asserts
+// the confirmed transport-param VALUES (idle=300 s, stream_data=2 MiB, bidi
+// omitted, uni=8) — EXCEPT initial_max_data (0x04), the single runtime-read value
 // (presence only). active_connection_id_limit asserts Safari's confirmed 64,
 // reachable because vendor/quinn-proto raises CidQueue::LEN to 64.
 //
@@ -1271,35 +1270,37 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         "QUIC supported_versions must NOT offer TLS 1.2 (0x0303)"
     );
 
-    // 4) quic_transport_parameters (0x39): present, ids strictly ascending, the
-    //    exact confirmed Safari id set with 0x01/0x03/0x08/0x0a/0x0b/0x0c/0x20
-    //    ABSENT (CFNetwork measurement 2026-06 + full disassembly: no
-    //    max_idle_timeout, no initial_max_streams_bidi, no max_udp_payload_size, no
-    //    datagrams — omit ≠ value=0), 0x0f zero-length, and the vendor/GREASE
-    //    codepoint 0x17f7586d2cb571 LAST. The confirmed VALUES are asserted too —
-    //    EXCEPT initial_max_data (0x04), whose number is the single runtime-read
-    //    value (assert presence only).
-    const VENDOR_GREASE_TP: u64 = 0x17f7586d2cb571;
+    // 4) quic_transport_parameters (0x39): present, the exact confirmed Safari 27.2
+    //    id set with 0x03/0x08/0x0a/0x0b/0x0c/0x20 ABSENT (no
+    //    initial_max_streams_bidi, no max_udp_payload_size, no datagrams — omit ≠
+    //    value=0), 0x0f zero-length, 0x01 max_idle_timeout = 300 s. Safari 27.2
+    //    (2026-10-27 wire, 105 connections) emits the set ascending but ROTATED to a
+    //    random start, with no vendor id (26.3's trailing 0xff080808 is gone). The
+    //    confirmed VALUES are asserted too — EXCEPT initial_max_data (0x04), whose
+    //    number is the single runtime-read value (assert presence only).
+    const SAFARI_26_3_VENDOR_TP: u64 = 0xff08_0808;
     let tp_body =
         extension_body(&record, 0x0039).expect("quic_transport_parameters (0x39) present");
     let tp = parse_transport_params(&tp_body).expect("0x39 body parses as TP list");
     let tp_ids: Vec<u64> = tp.iter().map(|(id, _)| *id).collect();
-    for w in tp_ids.windows(2) {
-        assert!(
-            w[0] < w[1],
-            "transport-param ids must be STRICTLY ascending; saw {:#x} then {:#x} in {:x?}",
-            w[0],
-            w[1],
-            tp_ids
-        );
-    }
-    let expected_tp_ids: Vec<u64> =
-        vec![0x04, 0x05, 0x06, 0x07, 0x09, 0x0e, 0x0f, VENDOR_GREASE_TP];
-    assert_eq!(
-        tp_ids, expected_tp_ids,
-        "transport-param id set must be the confirmed Safari ascending set (no 0x01/0x03/0x08/0x0a/0x0b/0x0c/0x20, vendor GREASE last)"
+    let ascending: [u64; 8] = [0x01, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0e, 0x0f];
+    let is_rotation = (0..ascending.len()).any(|start| {
+        let rotated: Vec<u64> = ascending[start..]
+            .iter()
+            .chain(&ascending[..start])
+            .copied()
+            .collect();
+        rotated == tp_ids
+    });
+    assert!(
+        is_rotation,
+        "transport-param ids must be a rotation of the confirmed Safari 27.2 set (no 0x03/0x08/0x0a/0x0b/0x0c/0x20); got {tp_ids:x?}"
     );
-    for dropped in [0x01_u64, 0x03, 0x08, 0x0a, 0x0b, 0x0c, 0x20] {
+    assert!(
+        !tp_ids.contains(&SAFARI_26_3_VENDOR_TP),
+        "Safari 26.3's vendor id 0xff080808 must be omitted (27.2 dropped it)"
+    );
+    for dropped in [0x03_u64, 0x08, 0x0a, 0x0b, 0x0c, 0x20] {
         assert!(
             !tp_ids.contains(&dropped),
             "transport-param {dropped:#x} must be omitted per the confirmed spec"
@@ -1312,11 +1313,6 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
         !tp_ids.contains(&0x20),
         "max_datagram_frame_size (0x20) must be ABSENT (Safari sends no datagrams)"
     );
-    assert_eq!(
-        *tp_ids.last().unwrap(),
-        VENDOR_GREASE_TP,
-        "the vendor/GREASE transport parameter must sort LAST"
-    );
     assert!(
         !tp_ids.contains(&0x2ab2),
         "grease_quic_bit (0x2ab2) must be omitted"
@@ -1328,9 +1324,10 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
 
     // Confirmed VALUES (initial_max_data 0x04 excepted — runtime value, presence
     // only; initial_source_connection_id 0x0f is the SCID, asserted zero-length).
-    assert!(
-        !tp.iter().any(|(id, _)| *id == 0x01),
-        "max_idle_timeout (0x01) must be ABSENT (Safari omits it; omit ≠ value=0)"
+    assert_eq!(
+        tp_varint_value(&tp, 0x01),
+        Some(300_000),
+        "max_idle_timeout (0x01) must be Safari 27.2's 300000 ms"
     );
     assert!(
         !tp.iter().any(|(id, _)| *id == 0x03),
@@ -1380,11 +1377,6 @@ async fn udp_leg_clienthello_matches_safari26_h3_structure() {
     assert!(
         !tp.iter().any(|(id, _)| *id == 0x20),
         "max_datagram_frame_size (0x20) must be ABSENT (Safari sends no datagrams)"
-    );
-    assert_eq!(
-        tp_varint_value(&tp, VENDOR_GREASE_TP),
-        Some(0),
-        "vendor/GREASE transport parameter value must be 0"
     );
 }
 

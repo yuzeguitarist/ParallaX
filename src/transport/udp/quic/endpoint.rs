@@ -678,7 +678,7 @@ impl Endpoint {
     }
 
     /// Like [`Self::connect_resumption_0rtt`] but the first Initial carries `dcid` as
-    /// its Destination Connection ID (= the session offer_id), so a stable-:443
+    /// its Destination Connection ID (= the session's offer DCID), so a stable-:443
     /// carrier can route the resumed connection back to its session.
     pub async fn connect_resumption_0rtt_with_dcid(
         &self,
@@ -711,7 +711,7 @@ impl Endpoint {
 
     /// Open a client connection whose first Initial carries `dcid` as its Destination
     /// Connection ID (instead of a random CID), awaiting handshake completion. A
-    /// stable-:443 carrier sets `dcid` to the session `offer_id` so the server can
+    /// stable-:443 carrier sets `dcid` to the session's offer DCID so the server can
     /// route the accepted connection back to its originating session.
     pub async fn connect_with_dcid(
         &self,
@@ -1468,7 +1468,7 @@ impl Connection {
     /// The client-chosen Destination Connection ID from the first Initial. On a
     /// server endpoint this is the value the client put on the wire; a stable-:443
     /// carrier routes an accepted connection back to its originating session by this
-    /// id (the client sets it to the session `offer_id` via
+    /// id (the client sets it to the session's offer DCID via
     /// [`Endpoint::connect_with_dcid`]).
     pub fn peer_initial_dcid(&self) -> &[u8] {
         self.shared.initial_dcid.as_slice()
@@ -1586,6 +1586,18 @@ impl Connection {
             .lock()
             .unwrap()
             .reset_stream(id, error_code.into_inner());
+        self.shared.nudge();
+    }
+
+    /// Open an outgoing bidirectional stream and immediately cancel it in both
+    /// directions with `error_code` (STOP_SENDING + RESET_STREAM, no data), as
+    /// Safari does with an HTTP/3 request stream it never uses.
+    pub fn open_cancelled_bi(&self, error_code: VarInt) {
+        {
+            let mut core = self.shared.core.lock().unwrap();
+            let id = core.open_bi();
+            core.cancel_stream(id, error_code.into_inner());
+        }
         self.shared.nudge();
     }
 
