@@ -86,6 +86,15 @@ resource-resistance mechanisms. Defaults are configurable under `[server]`; see
   record has a floor (`first_record_wait_floor_ms`, default 8000) plus upward
   jitter (`first_record_wait_jitter_ms`, default 7000), so the timeout a prober
   observes is not a fixed, fingerprintable constant.
+- **Silent-peer origin pre-dial.** The give-up wait above is client-facing, but it
+  must not delay the camouflage origin's own idle clock (which drives the close a
+  prober times). Once a connection has stayed silent for
+  `FIRST_RECORD_PREDIAL_DELAY` (150 ms, a fixed constant), the server dials the
+  fallback origin concurrently with the still-pending read, and the later splice
+  adopts that connection instead of dialing a second one. A silent probe's close
+  then lands at about 150 ms plus the origin's idle time rather than 8–15 s plus it.
+  A pre-dial failure is swallowed (the splice dials at give-up, as before); a client
+  that sends its ClientHello promptly never triggers it.
 - **Per-source concurrency caps.** A source limiter
   (`src/handshake/source_limit.rs`) bounds concurrent connections per IPv4 /32
   and per IPv6 prefix (`source_ipv6_prefix_len`, default /64), each capped at
@@ -94,9 +103,14 @@ resource-resistance mechanisms. Defaults are configurable under `[server]`; see
   routed allocation. These are concurrency caps, not rate limits.
 - **Cap-shed fallback.** When the global connection cap is reached, the server
   does not emit a bare FIN; it relays the excess connection to the fallback
-  origin under a small independent budget (64 concurrent) with a tight idle
-  timeout (10 s + 2 s jitter), so an over-cap probe still sees ordinary origin
-  behavior.
+  origin under a small independent budget (64 concurrent), so an over-cap probe
+  still sees ordinary origin behavior. It uses the same pre-dialing first-record
+  reader and the same idle distribution as a healthy splice (the fallback idle
+  backstop below), so the cap-shed close is not separable from a healthy one; on a
+  read error it releases its speculative origin dial like the authenticated path.
+  Past the 64-relay budget it degrades to a graceful FIN. The per-source limiter
+  checks the cap before creating a tracking entry, so rejected sources leave no
+  permanent state.
 - **Fallback idle backstop.** Camouflage relays use a per-gap idle backstop
   (`fallback_idle_floor_ms`, default 600000 = 10 min, min enforced 5000; plus
   `fallback_idle_jitter_ms`, default 60000). The timer resets on every byte in
@@ -106,6 +120,21 @@ resource-resistance mechanisms. Defaults are configurable under `[server]`; see
   (`replay_cache_capacity`, default 49152) sized against the handshake freshness
   window; when it is full the server fails closed (`CacheFull`) rather than
   accepting a possibly replayed handshake.
+
+## Mux download scheduling
+
+On the TCP-plane mux, each substream queues its target-to-client frames into its own
+bounded channel (an equal share of a 1024-frame per-connection bound, clamped to
+4..16 frames), and the single writer serves the queues round-robin, one frame per
+substream per turn. A client `RESET` (or a shed) purges that substream's queued
+frames first, so a cancelled download stops draining at once. While batched writes
+wait 10 ms or more for socket space (the client link is the bottleneck), batches are
+capped at 64 KiB for the next second so a newly active substream waits behind at
+most one small batch; faster links keep the full 64-frame batches that let the
+crypto pool fan out. Connect, dial and target writes run on a per-substream task,
+never on the shared reader, so one slow target cannot block the carrier. Before this
+change one shared FIFO let a bulk stream delay every other stream's response by
+`backlog / link_rate`.
 
 ## Operational logs
 

@@ -54,7 +54,7 @@ the relay machinery does not care which transport it rides on.
 | `congestion.rs` | BBR-style congestion control (the safe default). |
 | `mux.rs` | Multiplexes the relay over native QUIC streams (mux-over-QUIC). |
 | `splice.rs` | Origin-splice decision and verbatim relay of non-ParallaX Initials. |
-| `transport_params.rs` | QUIC transport parameters (the Safari-shaped set). |
+| `transport_params.rs` | QUIC transport parameters (the Safari-shaped set; client list is the Safari 27.2 id set, ascending but rotated to a random, Safari-weighted start per connection, with `max_idle_timeout` = 300 s and no vendor id; the server grants the client 2 bidi streams). |
 | `netsim.rs` | Deterministic loss/reorder network simulator used by transport tests. |
 
 ### Congestion control
@@ -70,7 +70,15 @@ see the `[udp]` table in [Configuration Reference](Configuration-Reference.md).
 When the mux relay is active, it is multiplexed over native QUIC streams rather
 than tunneled inside a single stream. Business connections open as bidirectional
 QUIC streams carrying H3 request HEADERS, so the stream-open pattern stays
-H3-shaped rather than exposing a ParallaX-specific framing.
+H3-shaped rather than exposing a ParallaX-specific framing. Because every
+connection first opens and cancels an unused request stream (see
+[HTTP/3 Fingerprint Façade](HTTP-3-Fingerprint-Facade.md)), the server grants the
+client two bidi streams and the first business stream is stream 4.
+
+Flow-control credit is released for every byte charged to the connection window,
+including bytes of a stream that was reset (counted once) or a receive half dropped
+unread (e.g. a substream rejected at the per-connection cap); otherwise a few
+rejected or reset streams could fill the 16 MiB window and wedge the session.
 
 ## Connection lifecycle
 
@@ -88,7 +96,13 @@ H3-shaped rather than exposing a ParallaX-specific framing.
 3. **Handshake.** The hand-written QUIC TLS 1.3 engine (`src/tls/quic/`) completes
    the handshake, emitting a Safari-26 H3-shaped ClientHello and the H3 SETTINGS /
    control-stream flight. Accepted connections are routed back to their waiting
-   session by Destination Connection ID.
+   session by Destination Connection ID. The first-Initial DCID is the first 8
+   bytes of the session `offer_id` (`OFFER_DCID_LEN = 8`, Safari's length; a 16-byte
+   DCID would be visible to any observer since Initial keys are public). The
+   ClientHello is cut 999 + rest across Initials, and an ACK-only client Initial is
+   padded to 1200 and held until the ServerHello is complete, so a multi-datagram
+   server Initial flight draws one ACK as Safari sends. The exporter-bound token
+   below still uses the full 16-byte `offer_id`.
 4. **Auth.** The client proves itself with an exporter-bound UDP auth token
    (`auth.rs`) derived from RFC 5705 keying material, so the token is bound to that
    specific TLS session and cannot be transplanted.

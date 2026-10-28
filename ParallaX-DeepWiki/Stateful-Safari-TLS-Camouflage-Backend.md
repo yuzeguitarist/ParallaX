@@ -42,6 +42,21 @@ complete()
   └─ emit the HTTP/2 camouflage opening flight (preface + opening HEADERS) when h2 is negotiated
 ```
 
+## HelloRetryRequest handling
+
+If the fallback origin answers with a HelloRetryRequest, `complete()` answers it like
+Safari/BoringSSL instead of aborting (an abort was an active-probe distinguisher: a
+server that always replies with an HRR could separate this client from Safari). The
+selected group must be one the client advertised (not GREASE) and not one it already
+sent a share for; the transcript is collapsed into a `message_hash` per RFC 8446
+§4.4.1; the compat ChangeCipherSpec is emitted at that point and not repeated before
+the Finished (exactly one per connection); and the second ClientHello is produced by
+rewriting the first one's bytes — only the `key_share` is replaced by a single entry
+and an optional `cookie` inserted after it — so it cannot drift from the validated
+fingerprint. A second HRR, a changed cipher suite, or a mismatched `key_share` group
+is a hard error. The second ClientHello does not carry the ParallaX auth binding, so
+a retried connection degrades to ordinary origin traffic rather than authenticating.
+
 ## HTTP/2 post-handshake behavior
 
 When HTTP/2 is negotiated, the backend sends a Safari-shaped opening flight —

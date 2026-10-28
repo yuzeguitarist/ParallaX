@@ -77,6 +77,24 @@ authenticated ParallaX session, instead of one session per connection. Setting
 `max_concurrent_streams = 1` falls back to a `WarmSessionPool` of
 one-stream-per-session connections.
 
+The pool grows concurrently: a cold-start burst is single-flighted onto the first
+session so connections share one carrier, then, when every session is full, up to
+`MUX_MAX_CONCURRENT_SESSION_BUILDS` (8) sessions are built in parallel rather than
+one handshake after another (a 60-connection burst over a 68 ms RTT went from p50
+about 4 s to about 0.75 s). Waiters register for build-completion wakeups while
+holding the pool lock, so a finishing build cannot notify before they listen.
+
+**Dead-carrier detection.** A carrier blackholed by the path leaves the mux reader
+and writer parked, so "tasks alive" does not mean "usable". Without sending anything
+new: if an `OPEN` that carried the app's first bytes is unanswered and the carrier
+shows no proof of life (no record read, no write that waited for socket space then
+drained) for 5 s, the session accepts no new substreams; after 25 s its substreams
+are reset so apps retry on a fresh session, and the carrier is dropped. While a
+client-to-server write is in flight the watchdog only marks the session suspect and
+rechecks every second, so a slow uplink does not condemn a healthy carrier. A mux
+write that cannot drain for 60 s ends the session, and either the reader or the
+writer ending aborts the other.
+
 A warm-keeper proactively rebuilds a dead shared mux tunnel *during active use*
 (resilience to a mid-session RST/blackhole), but only within a short activity
 window (`MUX_WARM_KEEPER_ACTIVE_WINDOW`, 90 s after the last stream) — so an idle

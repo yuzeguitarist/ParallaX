@@ -18,7 +18,7 @@ source file.
 ParallaX is a **circumvention transport**: a client forwards application traffic
 (typically SOCKS5) to a server, which relays it to arbitrary destinations. Its
 design goal is that, to a passive or active network observer, a ParallaX flow is
-**byte-for-byte indistinguishable from a Safari 26 connection to a real TLS or
+**byte-for-byte indistinguishable from a Safari 26/27 connection to a real TLS or
 QUIC origin**, while authenticated peers run a fully independent
 post-quantum-secure tunnel inside that carrier.
 
@@ -26,7 +26,8 @@ Two transport planes exist and are interoperable peers of the same handshake
 secrets:
 
 - **TCP plane** — disguised as Safari 26 **TLS 1.3 over TCP + HTTP/2**.
-- **QUIC plane** — disguised as Safari 26 **QUIC v1 + HTTP/3**.
+- **QUIC plane** — disguised as Safari **QUIC v1 + HTTP/3** (wire shape
+  recaptured against Safari 26.3 and 27.2; §12).
 
 A conforming implementation MAY implement only one plane. The TCP plane is the
 normative baseline; the QUIC plane is an optional accelerated path that reuses
@@ -175,7 +176,10 @@ encrypted records.
 | `PX1U` | `50 58 31 55` | SPEED upload-done | S↔C | (diagnostic) |
 
 `SPEED_*` messages are an optional, non-essential bandwidth self-test and may be
-omitted by a minimal implementation.
+omitted by a minimal implementation. The reference bounds each speed phase to at
+most `MAX_EMPTY_RECORDS_PER_PHASE = 4096` payload-less (padding-only) records in
+total — not per consecutive run — and aborts the phase beyond that, so a peer
+that pads indefinitely cannot pin the loop.
 
 **Teardown markers (fixed plaintext, not magic-prefixed messages).** Two
 fixed-byte markers are sealed as ordinary records to coordinate clean teardown
@@ -278,6 +282,8 @@ Carried as the trailing byte of `SERVER_KEY_EXCHANGE` (§5.6).
 |------|-------|
 | `UDP_NEGOTIATION_VERSION` | 1 |
 | `UDP_OFFER_ID_LEN` | 16 |
+| `OFFER_DCID_LEN` | 8 (the first-Initial DCID is the first 8 bytes of `offer_id`, §12.5) |
+| `SAFARI_INITIAL_CRYPTO_CHUNK` | 999 (max client Initial CRYPTO bytes per packet, §12.5) |
 | `UDP_DECLINE_DISABLED` / `_UNSUPPORTED` | 0 / 1 |
 | `UDP_CC_BBR` / `UDP_CC_BRUTAL` | 0 / 1 |
 | `UDP_FEC_OFF` / `_ADAPTIVE` / `_RS` | 0 / 1 / 2 |
@@ -464,6 +470,18 @@ initial KEX and to every PQ rekey. The check (and likewise the ClientHello auth
 tag comparison, §7.2, and the QUIC marker tag comparison, §12.7) MUST use a
 **constant-time** comparison — never `==`/`memcmp` on secret-derived bytes — to
 avoid timing oracles (the reference uses `subtle::ConstantTimeEq`).
+
+The zero-check is applied to the **auth slot** — `X25519(parallax_ephemeral,
+server_static)` that seeds `auth_key` (§7.2) — as well as to the initial KEX and
+every PQ rekey (`AuthError::DegenerateSharedSecret`). It is deliberately **NOT**
+applied to the **mask slot** (`mask_ecdh`, §7.2): that value is derived from the
+client's raw TLS `key_share`, so it is directly attacker-chosen, and rejecting a
+small-order `key_share` would hand a prober a free reject-shape fork (an
+otherwise byte-identical ClientHello diverted onto a different splice-timing
+path, I2). Nothing is lost: the PSK is the HKDF salt, so a zeroed `mask_ecdh`
+still leaves the mask key unknowable without the PSK. A zero `mask_ecdh` is
+therefore treated like any other wrong mask — recovery succeeds structurally,
+yields garbage, and the tag fails to verify.
 
 ### 5.3 Initial key schedule
 
@@ -1207,7 +1225,63 @@ matching substream keys; §5 substream labels). The first record on a substream
 is the sealed `CONNECT`. Teardown is per-QUIC-stream (clean FIN on success,
 `RESET_STREAM` on error). Business streams are opened as HTTP/3 request streams
 carrying a `GET` HEADERS frame, with ParallaX records riding inside H3 `DATA`
-frames (§12).
+frames (§12). The first request stream the client opens on a connection is the
+cancelled, unused one of §12.6, so the first business stream is the second client
+bidi (stream id 4), and a server MUST grant the client at least two bidi streams
+(§12.5).
+
+### 9.3 Mux scheduling and liveness (implementation behavior, wire-transparent)
+
+None of the following changes a byte on the wire — a peer sees only ordinary
+`PX1M` frames — but they are what keep a multiplexed session usable under bulk
+transfer and path failure, so a production reimplementation SHOULD match them.
+
+**Server download fairness (TCP-plane mux).** Each substream queues its
+target→client frames into its **own** bounded channel (an equal share of a
+1024-frame per-connection bound, clamped to 4..16 frames per substream, so
+per-connection memory is the same as one shared FIFO but no substream queues behind
+another). The single writer serves the queues **round-robin, one frame per
+substream per turn**. A client `RESET` (or a server-side shed) **purges** that
+substream's queued frames before anything else is written for it, so a cancelled
+download stops draining immediately. While batched writes wait ≥ 10 ms for socket
+space (the client link is the bottleneck), batches are capped at 64 KiB for the
+next second so a newly active substream waits behind at most one small batch;
+otherwise full 64-frame batches are kept so the parallel-seal pool can fan out
+(§10.1). A single shared FIFO instead lets one bulk stream delay every other
+stream's response (an HTML page, a TLS ServerHello) by `backlog / link_rate`.
+
+**Server per-stream tasks.** `CONNECT`/dial and target writes run on a per-substream
+task, never inline on the shared reader, so one slow target cannot head-of-line
+block the carrier. Each substream's client→target upload channel is bounded (32
+frames); a full channel gets a short grace (2 s) before that one substream is
+reset rather than parking the whole reader. A substream occupies a
+`max_concurrent_streams` slot until **both** directions finish (so a FIN-then-OPEN
+loop cannot exceed the cap); an `OPEN` beyond the cap is answered with `RESET` and
+no outbound dial. The server clamps the configured cap to at most 256.
+
+**Client session pool.** The client keeps a pool of mux sessions rather than one.
+A cold-start burst is single-flighted onto the **first** session (so many
+connections share one carrier), after which the pool grows by building up to
+`MUX_MAX_CONCURRENT_SESSION_BUILDS = 8` sessions **in parallel** when every
+existing session is at `max_concurrent_streams`; building them serially stacks
+full ParallaX handshakes back-to-back (a 60-connection browser burst measured
+p50 ≈ 4 s serial vs ≈ 0.75 s concurrent over a 68 ms RTT). Idle sessions are reaped
+(`MUX_POOL_MAX_IDLE_SESSIONS = 2` kept warm).
+
+**Client dead-carrier detection.** A carrier blackholed by the path (firewall,
+NAT loss, sleep/roaming) leaves reader and writer tasks parked forever, so
+"tasks alive" is not "session usable". Without sending anything new: when an
+`OPEN` that carried the application's first bytes is unanswered and the carrier
+shows no proof of life (no record read, and no write that waited for socket space
+and then drained) for `MUX_CARRIER_SUSPECT_AFTER = 5 s`, the session is
+**suspect** and accepts no new substreams; after `MUX_CARRIER_DEAD_AFTER = 25 s`
+its substreams are reset (so applications retry on a fresh session) and the
+carrier is dropped. While a client→server write is in flight the watchdog only
+marks suspect and rechecks every 1 s (a slow uplink must not condemn a healthy
+carrier). A batched mux write that cannot drain for
+`CLIENT_MUX_WRITE_STALL_TIMEOUT = 60 s` ends the session. Either the reader or the
+writer ending aborts the other. The idle backstop is a deadline pushed out only by
+real records, not by stream registration.
 
 ---
 
@@ -1224,9 +1298,16 @@ TCP plane. Flow control is delegated:
   the **camouflage** HTTP/2 one, §12, which is a fixed cosmetic value, not real
   flow control).
 - **QUIC plane.** Native QUIC connection- and stream-level flow control governs
-  pacing, using the Safari-26 transport-parameter values (§12): connection
+  pacing, using the Safari transport-parameter values (§12.5): connection
   `initial_max_data` 16 MiB, per-stream `initial_max_stream_data_*` 2 MiB,
-  `initial_max_streams_uni` 8, `active_connection_id_limit` 64.
+  `initial_max_streams_uni` 8; the client's `active_connection_id_limit` is 64
+  (the server's is the RFC minimum 2). Connection-level credit MUST be released
+  for every byte charged to the window, including bytes of a stream that is reset
+  (RFC 9000 §4.5: a `RESET_STREAM`'s bytes count as delivered, exactly once —
+  a duplicate reset or a post-reset retransmit credits nothing further) and of a
+  receive half dropped unread (e.g. a substream rejected at the per-connection cap
+  with no `STOP_SENDING`); otherwise a handful of rejected or reset streams can
+  fill the 16 MiB connection window with nothing consumed and wedge the session.
 
 Consequently, an interoperable peer needs only to honor carrier-level
 backpressure and the QUIC transport parameters; it does not implement a bespoke
@@ -1326,8 +1407,15 @@ Because these are local policy, a reimplementation MAY omit all three and remain
 interoperable; enabling them only changes this peer's own emitted padding/timing.
 
 This section is normative for invariant I1. The values below are the exact
-Safari 26 fingerprint the reference implementation reproduces; deviating from
+Safari fingerprint the reference implementation reproduces; deviating from
 them in field order or value is a distinguishing tell.
+
+**Capture provenance.** The TCP-plane values (§12.1–12.4) come from Safari 26
+captures (2026-06). The QUIC-plane values (§12.5–12.6) were re-captured on
+Safari 26.3 and 27.2 (2026-10-27, clean network, real sites plus a keylogged
+H2/H3 server): where the two differ (QUIC transport parameters) the reference
+follows **27.2**; where they agree (Initial CRYPTO split, first-Initial DCID
+length, cancelled H3 request stream) the shape is common to both.
 
 ### 12.1 GREASE
 
@@ -1414,6 +1502,38 @@ the client to **abort the session** (it closes like any failed TLS handshake —
 distinguishable signal). The echo lets the client recover its own auth material
 if needed.
 
+**HelloRetryRequest.** The origin may answer the ClientHello with a
+HelloRetryRequest (a ServerHello carrying the RFC 8446 §4.1.3 reserved random).
+A real Safari answers it with a second ClientHello, so a client that aborted
+instead would be separable from Safari by any server that always replies with an
+HRR. The reference client therefore answers **one** HRR exactly as
+Safari/BoringSSL does (RFC 8446 §4.1.2 / §4.4.1):
+
+1. The HRR's `selected_group` MUST be a group the client advertised in
+   `supported_groups` (not the GREASE group) and MUST NOT be one it already sent
+   a `key_share` for; otherwise abort.
+2. The transcript hash used for TLS key derivation is collapsed per §4.4.1
+   (ClientHello1 replaced by a synthetic `message_hash`, handshake type `0xfe`),
+   then the HRR is hashed.
+3. The compat ChangeCipherSpec (§4.2) is emitted **now** — the client's second
+   flight is ClientHello2 — and is **not** repeated before the Finished: exactly
+   one compat CCS per connection.
+4. ClientHello2 is produced by **rewriting ClientHello1's bytes**, not by
+   rebuilding it: the `key_share` extension is replaced by a single entry for the
+   selected group, a `cookie` extension (if the HRR carried one) is inserted
+   immediately after `key_share`, and every other byte (random, `session_id`,
+   cipher list, GREASE placement, all other extensions) is copied verbatim, so the
+   retry cannot drift from the validated Safari fingerprint.
+5. The next ServerHello MUST NOT be another HRR, MUST keep the cipher suite the
+   HRR selected, and its `key_share` group MUST equal the retried group.
+
+ClientHello2 does **not** carry the ParallaX auth binding (the `key_share` it
+replaces held the ParallaX/mask material). A ParallaX-fronted origin never emits
+an HRR for the offered `x25519` + `X25519MLKEM768` shares, so this path is only
+reached against an unusual origin; the retried connection then simply fails to
+authenticate and degrades to ordinary origin traffic (a lost session, the safe
+direction).
+
 ### 12.4 HTTP/2 fingerprint (TCP plane)
 
 After the TLS handshake, the connection looks like Safari's HTTP/2:
@@ -1423,8 +1543,13 @@ After the TLS handshake, the connection looks like Safari's HTTP/2:
 - **WINDOW_UPDATE**: connection-level increment `+10_420_225` (raising the
   connection window to ~10 MiB). This is cosmetic camouflage, not ParallaX flow
   control (§10).
-- The opening client write coalesces the H2 preface + SETTINGS + WINDOW_UPDATE +
-  first HEADERS into one record, matching Safari.
+- The opening client flight is **one** TLS application-data record containing the
+  H2 preface + SETTINGS + WINDOW_UPDATE + first HEADERS (H2 frame types 4, 8, 1),
+  matching Safari when the request is ready at connect time. The client sends the
+  opening request right after its own preface without first waiting for the
+  server's SETTINGS (then drains and ACKs the server SETTINGS afterwards); a
+  preface-only first record, or a block-on-server-SETTINGS-then-HEADERS pattern,
+  is a tell no browser exhibits.
 - **Request pseudo-header order:** `:method`, `:scheme`, `:authority`, `:path`
   (m, s, a, p).
 
@@ -1449,29 +1574,57 @@ boundary, matching Safari's bulk-transfer behavior.
 >   true origin and ParallaX emits nothing of its own (the QUIC analogue of TCP
 >   origin-splice).
 >
-> The client sets the QUIC **Destination Connection ID to the session's 16-byte
-> `offer_id`** (from `PX1O`, §6.6); the server uses that DCID to correlate the
-> incoming QUIC connection back to the TCP session that offered the fast plane
-> (it cannot predict the client's UDP source port). The QUIC plane reuses the
-> PSK + server-static-X25519 trust, not the TCP session's traffic keys; it runs
-> its own QUIC handshake and (after it) the exporter-bound auth token of §14.1.
+> The client sets the first Initial's QUIC **Destination Connection ID to
+> `offer_dcid(offer_id)` = the first `OFFER_DCID_LEN = 8` bytes of the session's
+> 16-byte `offer_id`** (from `PX1O`, §6.6); the server registers pending sessions
+> under that 8-byte prefix and uses the DCID to correlate the incoming QUIC
+> connection back to the TCP session that offered the fast plane (it cannot
+> predict the client's UDP source port). The DCID is 8 bytes, not 16, because
+> Initial packets are decryptable by any on-path observer and Safari's first-Initial
+> DCID is 8 bytes on every captured connection; a 16-byte DCID would be a tell.
+> (`offer_id` is CSPRNG output, so a prefix collision between two pending sessions
+> is negligible.) The full 16-byte `offer_id` is still the `context` of the
+> exporter-bound token (§14.1). The QUIC plane reuses the PSK +
+> server-static-X25519 trust, not the TCP session's traffic keys; it runs its own
+> QUIC handshake and (after it) the exporter-bound auth token of §14.1.
 
 - **QUIC version:** v1 (`0x00000001`) only.
 - **Cipher suites (4):** `[GREASE], 0x1302, 0x1303, 0x1301` — pruned to TLS 1.3
   AEADs only (UNLIKE the 21-suite TCP list).
 - **Connection IDs:** the client SCID is **zero-length**
-  (`initial_source_connection_id` empty), matching Safari.
+  (`initial_source_connection_id` empty), matching Safari; the first-Initial DCID
+  is 8 bytes (above).
+- **Initial packetization (observable: Initial keys are public).** The
+  ClientHello's CRYPTO data is cut `999 + rest`: every client Initial but the last
+  carries exactly `SAFARI_INITIAL_CRYPTO_CHUNK = 999` CRYPTO bytes, the datagram
+  padded to 1200 with PADDING (RFC 9000 §14.1) — not max-packed. The same padding
+  applies to an **ACK-only** client Initial (ACK + PADDING to 1200). The client
+  holds its Initial ACK until the server's ServerHello is complete, so a
+  ServerHello spanning several Initial datagrams draws **one** padded ACK (as
+  Safari does), not one per datagram; a client that still owes an Initial ACK when
+  a Handshake packet arrives sends it before discarding the Initial space (RFC 9001
+  §4.9.1 lets a client keep Initial keys until its first Handshake packet).
 - **key_share:** includes the PQ group X25519MLKEM768 plus X25519, like the TCP
   hello, GREASE-led.
 - **ParallaX auth marker:** the 32-byte `ClientHello.random` of the QUIC Initial
   carries `tag(12) || nonce(12) || timestamp(8)`, each XORed with a keystream
   derived from `X25519(client_ephemeral, server_static)` and the PSK (§12.7).
 
-**QUIC transport parameters (client), emitted in strict ascending id order, then
-Apple's vendor codepoint last:**
+**QUIC transport parameters (client, Safari 27.2).** The client emits exactly
+this 8-id set, in **ascending id order rotated to a random start per
+connection** — the list is ascending, but the position it begins at is drawn per
+connection (e.g. `0x0e, 0x0f, 0x01, 0x04, …`), then wraps. Safari's measured
+start distribution is skewed (105 captured connections), so the start is drawn
+from that **weighted** distribution, not uniformly (a uniform pick would itself be
+a distribution tell):
+
+| start id (position) | `0x01` | `0x04` | `0x05` | `0x06` | `0x07` | `0x09` | `0x0e` | `0x0f` |
+|---------------------|--------|--------|--------|--------|--------|--------|--------|--------|
+| weight (of 105)     | 16     | 19     | 7      | 6      | 7      | 9      | 35     | 6      |
 
 | id | parameter | value |
 |----|-----------|-------|
+| `0x01` | `max_idle_timeout` | 300 s (300000 ms) |
 | `0x04` | `initial_max_data` | 16 MiB (16777216) |
 | `0x05` | `initial_max_stream_data_bidi_local` | 2 MiB (2097152) |
 | `0x06` | `initial_max_stream_data_bidi_remote` | 2 MiB |
@@ -1479,20 +1632,27 @@ Apple's vendor codepoint last:**
 | `0x09` | `initial_max_streams_uni` | 8 |
 | `0x0e` | `active_connection_id_limit` | 64 |
 | `0x0f` | `initial_source_connection_id` | zero-length |
-| `0x17f7586d2cb571` | Apple vendor/GREASE | 0 (value), placed last |
 
+`max_idle_timeout` is **wire-only**: the advertised 300 s is what Safari sends,
+while the local idle timer stays shorter (30 s) — keep-alive PINGs every 10–20 s
+mean it never fires on a live path, so the difference is not observable. There is
+**no vendor/GREASE codepoint**: Safari 26.3 appended a trailing vendor id
+(`0xff080808`; earlier ParallaX builds emitted `0x17f7586d2cb571`), but 27.2 sends
+none, and emitting an id Safari does not send is a tell.
 `initial_max_streams_bidi` (id `0x08`) is intentionally **omitted** from the
-client parameters (matching Safari, which relies on the peer's grant). Emitting
-any id Safari does not send is a distinguishing tell, so the omission is
-non-negotiable for camouflage.
+client parameters (matching Safari, which relies on the peer's grant); omitting a
+parameter is not the same as sending value 0. Both omissions are non-negotiable
+for camouflage.
 
-**QUIC transport parameters (server).** The server uses the same flow-control
-values as the client, **but additionally sends `initial_max_streams_bidi` (id
-`0x08`) = 1**, granting the client exactly one bidirectional stream for the relay
-tunnel. (The server is the real origin's role here, so it is not bound to Safari
-*client* fingerprinting; it must, however, grant at least one bidi for the tunnel
-to open.) All other server parameters match the client set above (16 MiB conn
-data, 2 MiB per stream, uni-streams 8, active CID limit 64).
+**QUIC transport parameters (server).** The server is the origin's role here, so
+it is not bound to Safari *client* fingerprinting; it is encoded plainly in
+ascending id order, **without** `max_idle_timeout`. Flow control matches the
+client's (16 MiB conn data, 2 MiB per stream, uni-streams 8), with two
+differences: it sends `initial_max_streams_bidi` (id `0x08`) = **2**, granting the
+client two bidirectional streams — the cancelled-unused H3 request stream (§12.6)
+and the relay's request stream — and `active_connection_id_limit` is the RFC 9000
+minimum **2** (not 64). A server MUST grant at least two bidi streams or the
+client's cancelled stream consumes the only one and the relay cannot open.
 
 ### 12.6 HTTP/3 fingerprint (QUIC plane)
 
@@ -1501,6 +1661,18 @@ data, 2 MiB per stream, uni-streams 8, active CID limit 64).
   type 0x02)**, interleaving the request bidi between the two uni opens. Both
   control and encoder uni-streams stay open for the connection's life (RFC 9114
   §6.2.1). Deviating from this open order is detectable.
+- **Cancelled request stream (every connection).** Right after the handshake,
+  after the control stream and before the real request, Safari opens one
+  request bidi stream and cancels it unused: a single packet carrying
+  `STOP_SENDING` then `RESET_STREAM` (frame types `0x05`, `0x04`) with error code
+  `H3_REQUEST_CANCELLED = 0x10c` and no data (26.3 and 27.2, cold and 0-RTT). The
+  relay's real request therefore rides the **next** client bidi stream (QUIC
+  stream id 4, not 0). The cancellation never overtakes data already queued on
+  other streams — the control-stream SETTINGS goes out first — and on a 0-RTT
+  resumption it follows the early request (it is sent under 1-RTT keys). A server
+  skips a peer stream that was reset before any byte arrived rather than handing
+  it to the application, so the server side needs no special casing beyond granting
+  the extra bidi stream (§12.5).
 - **Control stream (uni, type 0x00):** a SETTINGS frame with exactly three
   settings, in this on-wire order: `QPACK_MAX_TABLE_CAPACITY = 16383`,
   `QPACK_BLOCKED_STREAMS = 100`, then one per-connection GREASE setting. Safari
@@ -1543,7 +1715,7 @@ ak      = HKDF(salt=psk, IKM=ecdh) expand b"ParallaX v1 QUIC marker auth key"  �
 tag     = HMAC-SHA256(ak,
             b"ParallaX v1 QUIC marker tag"
          || u16_be(len(sni)) || sni
-         || u16_be(len(dcid)) || dcid       // dcid = the session offer_id (16 B), §6.6
+         || u16_be(len(dcid)) || dcid       // dcid = first-Initial DCID = offer_id[0..8] (8 B), §12.5
          || nonce[12] || u64_be(timestamp) )[0..12]
 
 // carrier plaintext = tag[12] || nonce[12] || u64_be(timestamp)[8]  (32 B),
@@ -1551,11 +1723,12 @@ tag     = HMAC-SHA256(ak,
 random  = (tag XOR ks[0..12]) || (nonce XOR ks[12..24]) || (u64_be(ts) XOR ks[24..32])   // 32B
 ```
 
-The `dcid` bound into the tag is the QUIC Destination Connection ID, which the
-client sets to the session's 16-byte `offer_id` (§12.5); both peers therefore
-compute the same tag. The server recomputes `tag` (constant-time compare) and
-applies the same freshness window as the TCP replay check (§7.4). A
-non-matching/replayed marker triggers QUIC origin-splice (§13).
+The `dcid` bound into the tag is the QUIC Destination Connection ID **as it appears
+on the wire in the first Initial** — the 8-byte `offer_dcid(offer_id)` prefix
+(§12.5), so the HMAC input is `u16_be(8) || dcid[8]`, not the 16-byte `offer_id`;
+both peers therefore compute the same tag. The server recomputes `tag`
+(constant-time compare) and applies the same freshness window as the TCP replay
+check (§7.4). A non-matching/replayed marker triggers QUIC origin-splice (§13).
 
 ### 12.8 QUIC 0-RTT resumption (optional)
 
@@ -1581,6 +1754,12 @@ MAY omit it (always do a full 1-RTT handshake).
   labels: ticket AAD `b"ParallaX v1 QUIC 0-RTT ticket"`, STEK HKDF info
   `b"parallax-quic-0rtt-stek-v1"`, ticket version 1 — these are server-internal
   and not required for client interop, since the ticket is opaque.)
+- **early_data echo is gated on the accepted PSK.** A client MUST accept an
+  `early_data` extension in EncryptedExtensions only if the ServerHello actually
+  selected its `pre_shared_key` (RFC 8446 §4.2.10): a server that answers a
+  ticket-bearing ClientHello with no `pre_shared_key` has rejected 0-RTT and may
+  not echo `early_data`. (The TCP-plane client applies the same strict
+  EncryptedExtensions validation.)
 - **Early data.** When resuming, the client MAY attach early application bytes
   (the same 0-RTT idea as the `CONNECT` initial payload, §15.1) in QUIC 0-RTT
   packets; they share the 0-RTT/1-RTT packet-number space per RFC 9001.
@@ -1604,6 +1783,23 @@ completes a real TLS 1.3 handshake against the origin's genuine certificate for
   the server keeps relaying client↔origin indefinitely. The connection is a
   genuine TLS session to the origin; no ParallaX bytes, timing, or error are
   ever emitted.
+- **Silent peer — origin pre-dial.** A peer that connects and then sends nothing
+  is a probe signature that closes on a timer. The client-facing wait for the
+  first record is `first_record_wait_floor + rand[0, jitter]` (8–15 s, §13.1), but
+  the origin's own idle clock — which is what the observed close time keys on —
+  must not start 8–15 s late. So once a connection has stayed silent for
+  `FIRST_RECORD_PREDIAL_DELAY = 150 ms`, the server speculatively dials the
+  fallback origin (the dial runs concurrently with the still-pending read), and
+  the later splice **adopts that already-open connection** instead of dialing a
+  second one: a silent-then-talkative probe opens exactly one origin connection,
+  as a real client would. The silent probe's close then lands at
+  `~150 ms + origin_idle` rather than `8–15 s + origin_idle`. A pre-dial failure
+  is swallowed (the splice then dials at give-up, the pre-existing behavior); an
+  authenticated client normally sends its ClientHello inside the window, so no
+  pre-dial is made for it, and a spare pre-dialed connection is torn down
+  detached. The pre-dial is shared by every splice entry point, including the
+  cap-shed path (§13.2), so the origin-dial schedule cannot differ between a
+  healthy splice and a shed one.
 - **Auth succeeds:** the server keeps relaying until the client sends `PX1Q`
   (§7.3) inside the established TLS stream, then drops the origin and runs
   ParallaX. A prober never sends a valid `PX1Q` (it lacks the keys), so it can
@@ -1621,6 +1817,27 @@ the endpoint, so a prober reaches the true origin. To avoid a tell from holding
 an ambiguous first packet forever, there is a bounded decide delay (≈50 ms): a
 stalled/incomplete first flight times out and is spliced, rather than silently
 held.
+
+Two further QUIC-plane rules follow from "ParallaX emits nothing the origin would
+not":
+
+- **Over-cap datagrams are spliced, not dropped.** The configured
+  `max_udp_payload_bytes` receive ceiling bounds only what the server *parses*
+  locally (an over-cap datagram never reaches the terminate path or allocates
+  connection state). A datagram larger than the ceiling from an unknown 4-tuple —
+  including a well-formed v1 Initial padded past it — is relayed **verbatim** to
+  the origin, which decides how to answer. Dropping it would leave ParallaX silent
+  across `[recv_cap, 64 KiB]` where the fronted origin would respond. (On an
+  already-established connection or a held pending Initial the cap simply holds.)
+  The splice socket asks the kernel to fragment (`IP_PMTUDISC_DONT` /
+  `IPV6_PMTUDISC_DONT` on Linux) so an over-MTU relay is not refused with
+  `EMSGSIZE`.
+- **No Retry, no address validation.** The server never sends a QUIC `Retry`: the
+  fronted origin does not, so one would itself be a distinguisher. A
+  source-spoofable Initial therefore costs the server a short-lived pending entry
+  (held at most ≈50 ms, §13 above; at most 4 Initials buffered per peer) and, once
+  spliced, a flow-table slot (capped at 4096 concurrent splice flows); the
+  per-Initial handshake state is not address-validated.
 
 **Normative requirements:**
 
@@ -1646,6 +1863,7 @@ defaults:
 | `first_record_wait_jitter_ms` | 7000 | Upward jitter on the above, so the effective first-record deadline is uniform in `[8s, 15s]` per connection. |
 | `fallback_idle_floor_ms` | 600000 (10 min) | Idle backstop for a **spliced** (origin) relay. **Resets on every byte**, so it only fires on a genuinely silent connection. Must be ≥ 5000. |
 | `fallback_idle_jitter_ms` | 60000 (60 s) | The all-silent close time is spread uniformly into `[floor, floor+jitter]` per connection. This is REQUIRED: a fixed ~600 s close is a synthetic signature no real origin produces — do not emit a round, fixed idle close. |
+| `FIRST_RECORD_PREDIAL_DELAY` | 150 ms (constant, not configurable) | How long a fresh connection may stay silent before the server speculatively dials the fallback origin so the origin's idle clock does not start 8–15 s late (§13). Deliberately a fixed constant: a per-deployment value would itself fingerprint the deployment. |
 | `max_concurrent_streams` | 4 | Max concurrent logical (mux) streams per authenticated session. |
 | `replay_cache_capacity` | 49152 | Replay-cache entry capacity. Entries are retained for the freshness window (≈ fallback idle floor + base replay window + skew). When full the server **fail-CLOSES new handshakes** (`CacheFull`) rather than admitting a possible replay — it never opens a replay hole. Capacity scales with the window; a busy bridge raises it proportionally. |
 | `strict_tls13` | true | Require TLS 1.3 on the carrier. |
@@ -1670,6 +1888,27 @@ SHOULD apply an equivalent policy:
   aggregate rollup ceiling so one routed prefix
   cannot rotate `/64`s to evade the cap.
 - A global connection limit as the real backstop.
+- The per-source cap is checked read-only **before** a tracking entry is created,
+  so a rejected source leaves no permanent state (a cap of 0, "reject everything",
+  therefore cannot grow the table).
+- The `/48` rollup cannot tell one abuser rotating `/64`s from several unrelated
+  customers sharing a `/48` (e.g. an ISP delegating `/56`s). Its ceiling is
+  `4 ×` the per-`/64` cap, so it is tuned via `max_concurrent_per_source_v6`; the
+  rollup prefix and fan-out are intentionally not separate knobs, because a
+  per-deployment aggregation width is a deployment fingerprint.
+
+**Cap-shed splice.** A connection rejected by the per-source or global cap is
+still relayed to the origin (it is never closed with a bare, ServerHello-less FIN
+a prober could use to count the cap). It must be indistinguishable from a healthy
+splice: it reads its first record with the same pre-dialing reader (§13, so the
+origin's idle clock starts on the same schedule), applies the same client-socket
+tuning, uses the same idle distribution (`fallback_idle_*`, §13.1), and — when the
+read fails — releases its speculative origin dial the way the authenticated path
+does rather than leaking a detached, un-FIN'd connect. Cap-shed relays draw from a
+small separate budget (64 concurrent); past it the server degrades to a graceful
+FIN. TCP teardown on the splice path is FIN-only (never a wire RST); a splice
+direction that cannot make progress while data is buffered reports a truncation
+rather than success.
 
 ---
 
@@ -1824,7 +2063,8 @@ chunks), `OutOfOrder` (offset ≠ next expected). `ServerIdentityProofError`:
 (all-zero X25519), `EmptyPsk`.
 
 `AuthError`: `EmptyPsk`, `ClientHello` (parse failure), `InvalidSessionIdLen`
-(≠ 32), `Hkdf`, `Clock` (system time before epoch).
+(≠ 32), `Hkdf`, `DegenerateSharedSecret` (all-zero auth-slot X25519, §5.2),
+`Clock` (system time before epoch).
 
 `ReplayCacheError`: `Io`, `MalformedLine`, `MalformedHex`, `MacMismatch`
 (journal tamper), `Clock`.
@@ -1884,9 +2124,20 @@ identity"`; the signed message is per §5.6. Verification is FIPS 204
   PSK alone does not either. Do not swap the HKDF salt/IKM roles (PSK is always
   the salt for these derivations).
 - **PSK is mandatory.** The PSK MUST decode to at least 32 bytes. The reference
-  also checks for obvious low-entropy/all-repeated PSKs: server mode hard-fails,
-  while client/check mode warns so operators can inspect legacy configs. With a
-  zero/all-zero HKDF salt the PSK binding silently vanishes.
+  also rejects obviously low-entropy PSKs by three independent structural checks,
+  chosen so that CSPRNG output essentially never trips them (a false positive would
+  lock an operator out of a good key; 10 000 random 32-byte keys are pinned to
+  zero false positives): (1) fewer than 16 distinct byte values; (2) a repeating
+  period `p ≤ len/2` (a short block tiled to length — `0123456789abcdef` twice has
+  16 distinct bytes yet only 16 bytes of material); (3) a constant-stride
+  arithmetic progression, wrapping (`0,1,2,…,31`, or descending). Server mode
+  hard-fails (`LowEntropyPsk`); client mode only warns, and `plx check` prints the
+  verdict on stdout for either mode (the client warning alone goes to a log level
+  the default filter drops). This is a heuristic, not an entropy estimator: a
+  dictionary passphrase with enough byte diversity and no periodic structure still
+  passes — the real defense is generated material (`plx init`,
+  `openssl rand -base64 32`). With a zero/all-zero HKDF salt the PSK binding
+  silently vanishes.
 - **Forward secrecy + PQ.** Traffic keys derive from ephemeral X25519 and (after
   rekey) ML-KEM-1024; a "harvest-now-decrypt-later" adversary cannot recover
   session keys even with a future quantum computer, because the chain secret is
@@ -1916,7 +2167,19 @@ identity"`; the signed message is per §5.6. Verification is FIPS 204
   that a real Safari client would not produce.
 - **Memory hygiene.** The reference zeroizes derived keys and excludes plaintext
   buffers from core dumps; a port SHOULD apply equivalent secret-handling
-  discipline.
+  discipline. On Linux the server additionally arms a seccomp **denylist** against
+  same-user memory scraping (`ptrace`, `process_vm_readv`/`writev`), installed
+  once the long-lived keys are loaded and **before** anything ingests untrusted
+  input — in particular before the UDP carrier binds, since that immediately
+  spawns a driver parsing attacker-controlled QUIC Initials. It is skipped when
+  `PARALLAX_DISABLE_SECCOMP` is truthy (logged, never silent). It is a denylist, not
+  an allowlist: `open`+`pread` on `/proc/<pid>/mem` is not blocked, so hosts should
+  also set `kernel.yama.ptrace_scope >= 1`. ML-KEM decapsulation returns its secret
+  in a self-scrubbing wrapper, and the in-tree ML-DSA signing path is branchless on
+  secret-derived values (`make_hint`). The runtime state directory
+  (`/tmp/parallax-<euid>/…`) is validated component-wise: the leaf AND its parent
+  must be euid-owned directories opened `O_NOFOLLOW|O_DIRECTORY`, so a co-tenant
+  cannot pre-create the predictable parent.
 - **Constant time.** Auth-tag and marker comparisons, and the X25519 zero-check,
   MUST be constant-time.
 
@@ -1941,6 +2204,10 @@ identity"`; the signed message is per §5.6. Verification is FIPS 204
 - **Warm tunnel.** During active-use windows the client keeps a warm muxed
   tunnel alive (cover frames) so a new SOCKS connection reuses an established
   carrier instead of paying a fresh handshake.
+- **Concurrent session growth and fair scheduling.** A browser opens dozens of
+  connections at once; the client grows its mux-session pool by building several
+  sessions in parallel, and the server drains substreams round-robin so a bulk
+  download cannot starve small requests (§9.3).
 
 ---
 
@@ -1970,8 +2237,10 @@ this document; an implementer should reproduce these checks:
   byte 0 and 6 MUST be rejected (`InvalidKind`).
 - **Safari fingerprint baselines.** The TCP ClientHello, H2 settings, and the H3
   ClientHello/SETTINGS are pinned against captured Safari 26 wire bytes
-  (`tests/safari_*_baseline.rs`); a port SHOULD diff its emitted bytes against
-  the same captures.
+  (`tests/safari_*_baseline.rs`); the QUIC transport-parameter set, Initial CRYPTO
+  split, first-Initial DCID length and cancelled H3 request stream follow the
+  26.3/27.2 recapture (§12) and are guarded by `tests/gfw_simulator.rs`. A port
+  SHOULD diff its emitted bytes against the same captures.
 
 ### 20.1 Worked size constants (sanity checks)
 
@@ -1995,7 +2264,8 @@ A second implementation claiming interoperability with the reference SHOULD pass
 2. **Fingerprint parity.** The new client's TLS ClientHello, H2 SETTINGS +
    WINDOW_UPDATE, and (if QUIC) the QUIC ClientHello + transport parameters are
    byte-identical to the reference's for the same SNI/seed inputs (modulo the
-   randomized GREASE/key-share/random fields).
+   randomized GREASE/key-share/random fields and, on QUIC, the per-connection
+   rotation start of the transport-parameter list, §12.5).
 3. **Full tunnel.** New client ↔ reference server: complete Phase A–D, fetch a
    known resource through the tunnel, compare bytes.
 4. **PQ rekey.** Epoch advances to 1, both sides derive identical traffic keys;
@@ -2105,7 +2375,11 @@ recv_buffer_bytes = <bytes>           # OPTIONAL. SO_RCVBUF for the UDP carrier 
 
 `plx init <domain>` generates a paired client+server config with matching keys
 (0600). `plx check -c <config>` validates a config (default `parallax.toml`) and
-enforces 0600. Other subcommands: `serve`, `client`, `keygen`, `crypto-self-test`, `speed`,
+enforces 0600. A referenced secret sidecar (file/env/sealed) that exists but has
+insecure permissions or a foreign owner makes `plx check` **fail** (it is never
+downgraded to "secret unavailable on this host", which would print `ok` while
+saying nothing about the exposed file), and the check prints the low-entropy-PSK
+verdict (§18). Other subcommands: `serve`, `client`, `keygen`, `crypto-self-test`, `speed`,
 `netmatrix`, `bench`, `config-template`, `probe`, `seal`.
 
 ---
@@ -2162,7 +2436,8 @@ record it is padded up to one randomly chosen `CONNECT_RECORD_SIZE_BANDS` value
 client → server :  50 58 31 47 01                 "PX1G" version=1
 server → client :  50 58 31 4F <id[16]> <port> .. "PX1O" offer (cc, fec)
 client → server :  50 58 31 50 <id[16]> <st> ..   "PX1P" probe ack
-   ... client brings up Safari-26 QUIC v1 / H3 with the marker in the Initial ...
+   ... client brings up Safari QUIC v1 / H3 with the marker in the Initial,
+       first-Initial DCID = offer_id[0..8] (8 B), ClientHello cut 999 + rest ...
 ```
 
 ---

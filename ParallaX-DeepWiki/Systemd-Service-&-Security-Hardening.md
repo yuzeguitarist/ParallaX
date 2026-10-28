@@ -69,6 +69,18 @@ Before long-lived `serve` and `client` paths continue, ParallaX also attempts:
 These protections are best-effort and platform-dependent; they complement, but
 do not replace, file permissions and service sandboxing.
 
+On Linux the server additionally arms a seccomp **denylist** (`ptrace`,
+`process_vm_readv`/`process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise`)
+against same-user memory scraping. It is installed once the PSK, replay cache and
+identity key are loaded and **before** the UDP carrier binds, because the carrier
+immediately starts parsing attacker-controlled QUIC Initials; nothing after that
+point needs a denied syscall. Set `PARALLAX_DISABLE_SECCOMP` to a truthy value to skip
+it for unusual tracing tools (the skip is logged, never silent). It is a denylist, not
+an allowlist: `open` + `pread` on `/proc/<pid>/mem` is not blocked, so also set
+`kernel.yama.ptrace_scope >= 1` on the host. The runtime state directory
+(`/tmp/parallax-<euid>/…`) is checked component-wise: both the leaf and its parent
+must be euid-owned directories opened `O_NOFOLLOW|O_DIRECTORY`.
+
 ## Logs and debugging
 
 ```bash

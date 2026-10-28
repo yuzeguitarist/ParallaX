@@ -22,7 +22,7 @@ Unix rejects group/world-readable secret files.
 
 | Field | Required | Validation |
 |---|---:|---|
-| `psk` | yes | CSPRNG-generated base64 string that decodes to at least 32 bytes, **or** a secret reference (see below). Obvious low-entropy PSKs hard-fail in server mode and warn in client/check mode. |
+| `psk` | yes | CSPRNG-generated base64 string that decodes to at least 32 bytes, **or** a secret reference (see below). Obvious low-entropy PSKs hard-fail in server mode and warn in client mode; "obvious" means fewer than 16 distinct byte values, a repeating period of at most half the length (a short block tiled to length), or a constant-stride byte ramp such as `0,1,2,…`. `plx check` prints the verdict for either mode and fails if a referenced secret file has insecure permissions. |
 
 The same PSK must appear in both generated configs. It is part of ClientHello
 authentication and the hybrid rekey sandwich input.

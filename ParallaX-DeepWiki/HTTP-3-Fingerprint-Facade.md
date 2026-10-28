@@ -53,6 +53,20 @@ wire order:
 Notably Safari does **not** send `MAX_FIELD_SECTION_SIZE` (`0x06`); the codec omits
 it deliberately. `is_safari26_settings()` validates this exact shape.
 
+## Stream-open order and the cancelled request stream
+
+The connection-level stream pattern is part of the fingerprint, and lives in
+`src/transport/udp/h3.rs` rather than this codec: control uni stream, then a request
+bidi, then the QPACK encoder uni stream. On every connection (Safari 26.3 and 27.2,
+cold and 0-RTT) Safari additionally opens one request bidi and cancels it unused —
+`STOP_SENDING` + `RESET_STREAM` in one packet with `H3_REQUEST_CANCELLED` (`0x10c`)
+and no data — before its real request, so the real request rides the next bidi
+(stream 4). `cancel_empty_request_stream` reproduces this: the cancellation never
+overtakes data queued on other streams (the control SETTINGS goes out first), and on
+a 0-RTT resumption it follows the early request. The server needs no special casing
+beyond granting the extra bidi stream; its accept path skips a peer stream reset
+before any byte arrived.
+
 ## Safari-26 request fields
 
 The request HEADERS frame uses Safari's exact field order. The pseudo-header order

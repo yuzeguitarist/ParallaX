@@ -24,7 +24,7 @@ static X25519 key can mint a valid one.
 | Property | Value / source |
 |---|---|
 | Carrier layout | `tag[12] ‖ nonce[12] ‖ timestamp_be[8]` (`MARKER_LEN = 32`) |
-| Tag | 96-bit HMAC-SHA256 over a domain-separated `(version, sni, dcid, nonce, timestamp)` input — binds the marker to this Initial's Destination Connection ID and SNI. |
+| Tag | 96-bit HMAC-SHA256 over a domain-separated `(version, sni, dcid, nonce, timestamp)` input — binds the marker to this Initial's Destination Connection ID and SNI. The `dcid` is the on-wire 8-byte first-Initial DCID (`offer_id[0..8]`), not the full 16-byte `offer_id`. |
 | Key derivation | `HKDF-SHA256(salt = psk, ikm = X25519 shared secret)` expands a keystream key and an auth key under distinct info labels. PSK is the **salt** so a leaked server static key alone cannot derive either key. |
 | Freshness | Accepted when `timestamp <= now + 5s` (clock skew) and `now <= timestamp + window`. `FUTURE_SKEW_SECS = 5`. |
 | Constant work | `open()` always runs HKDF + HMAC + a constant-time tag comparison, with no early exit — so a forged or stale marker is not distinguishable by timing. |
@@ -61,6 +61,16 @@ The process-wide `:443` carrier decides each connection from its **first Initial
    origin (`splice.rs`), so a prober sees the genuine origin's QUIC behavior.
 5. A peer that sends a partial first flight then vanishes is reaped after
    `PENDING_IDLE = 2s`, freeing the held core.
+6. **Over-cap datagrams are spliced, not dropped.** `max_udp_payload_bytes` bounds
+   only what ParallaX parses locally. A datagram larger than the cap from an unknown
+   peer — even a well-formed v1 Initial padded past it — is relayed verbatim to the
+   origin without allocating connection state, because dropping it would leave
+   ParallaX silent where the fronted origin answers. The splice socket asks the
+   kernel to fragment on Linux so an over-MTU relay is not refused with `EMSGSIZE`.
+   On an established connection or a held pending Initial the cap simply holds.
+7. **No Retry.** The server never sends a QUIC `Retry` (the fronted origin does not,
+   so it would itself be a distinguisher); a forged Initial costs a short-lived
+   pending entry and, once spliced, a slot in the capped splice-flow table.
 
 ## The bounded timing residual (documented, not closed)
 
