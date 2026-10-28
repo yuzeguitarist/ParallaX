@@ -1,0 +1,71 @@
+ParallaX-DeepWiki/Configuration-Reference.md
+  s_960ad4c606a0b9::t_8bfe0207115e26 25
+ParallaX-DeepWiki/Server-Runtime-&-Probing-Resistance.md
+  s_960ad4c606a0b9::t_8c123193d0a6b0 89-97
+  s_960ad4c606a0b9::t_4a0daafefcdd7e 106-113
+  s_960ad4c606a0b9::t_c793ccedc62f47 124-138
+ParallaX-DeepWiki/HTTP-3-Fingerprint-Facade.md
+  s_960ad4c606a0b9::t_f967c4b802ba9c 56-69
+ParallaX-DeepWiki/Client-Runtime-&-SOCKS5-Proxy.md
+  s_960ad4c606a0b9::t_ca99b89dd3c3e0 80-97
+ParallaX-DeepWiki/QUIC-Fast-Plane.md
+  s_960ad4c606a0b9::t_3825f29ac572f3 57
+  s_960ad4c606a0b9::t_c1b98ec6205618 99-105
+  s_960ad4c606a0b9::t_d8717f8ca59b0f 73-81
+ParallaX-DeepWiki/QUIC-Origin-Splice-&-Active-Probing-Resistance.md
+  s_960ad4c606a0b9::t_9ba2250954bd2d 27
+  s_960ad4c606a0b9::t_c3d934bfd72270 64-73
+ParallaX-DeepWiki/Systemd-Service-&-Security-Hardening.md
+  s_960ad4c606a0b9::t_02997d4f52d2ee 72-83
+SPEC.md
+  s_960ad4c606a0b9::t_528f60487ec656 1821-1835,1841
+  s_960ad4c606a0b9::t_e57bdadebbf05e 2127-2140
+  s_960ad4c606a0b9::t_0b642c94f7a0a3 179-182
+  s_960ad4c606a0b9::t_196846acc65a6d 1505-1536
+  s_960ad4c606a0b9::t_baae150d79d7c4 1546-1552
+  s_960ad4c606a0b9::t_cf62a29af68aa1 2066-2067
+  s_960ad4c606a0b9::t_db4a9f3bd3d1e3 1410,1413-1418
+  s_960ad4c606a0b9::t_e3e3a3f0355d90 1664-1675
+  s_960ad4c606a0b9::t_a03c8f4a83ad9b 285-286
+  s_960ad4c606a0b9::t_4090846536ee32 1726-1728
+  s_960ad4c606a0b9::t_0efb71229dff05 2240-2243
+  s_960ad4c606a0b9::t_72181c845bd7b7 1301,1303-1310
+  s_960ad4c606a0b9::t_593a9e1e619c3d 1258-1260
+  s_960ad4c606a0b9::t_ba3b9e0cfd9be6 474-485
+  s_960ad4c606a0b9::t_30323e456ccb0b 1613-1623,1627,1636-1641,1643-1655
+  s_960ad4c606a0b9::t_18c467a9ec41b7 2207-2210
+  s_960ad4c606a0b9::t_fb2423134602b6 1228-1257,1261-1284
+  s_960ad4c606a0b9::t_d31a516c887eb5 1595-1606
+  s_960ad4c606a0b9::t_d026b9307b0406 1836-1840
+  s_960ad4c606a0b9::t_625da65344dd0d 1866
+  s_960ad4c606a0b9::t_8f1c1b0ed2305d 2267-2268
+  s_960ad4c606a0b9::t_6413980a1be46b 1718
+  s_960ad4c606a0b9::t_55d67eb9b706fc 1729-1731
+  s_960ad4c606a0b9::t_d2b2d056b62528 1757-1762
+  s_960ad4c606a0b9::t_a1ce39ea6b1941 2439-2440
+  s_960ad4c606a0b9::t_a84cc92b0957d4 1786-1802
+  s_960ad4c606a0b9::t_f776babdbbfb34 1577-1589
+  s_960ad4c606a0b9::t_c9d4101fa28d11 2378-2382
+  s_960ad4c606a0b9::t_b65e66e007ab05 2170-2182
+  s_960ad4c606a0b9::t_83ab0da79a1396 21,29-30
+  s_960ad4c606a0b9::t_3c5aa65a618473 1891-1911
+  s_960ad4c606a0b9::t_8cb5dc36e8dc12 1419
+ParallaX-DeepWiki/Stateful-Safari-TLS-Camouflage-Backend.md
+  s_960ad4c606a0b9::t_fae5138160703d 45-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c99e9a19effdb31f052f5232d5451b45b1c2a8be",
+  "prompts": {},
+  "sessions": {
+    "s_960ad4c606a0b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15efbdbe-a6a4-4e8d-a214-e276ab5b2aab",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
