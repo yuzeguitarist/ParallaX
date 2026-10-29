@@ -2,6 +2,7 @@
 .cursor/
 .claude/worktrees/
 .claude/
+.codex/
 .devin/
 target/
 docs/
