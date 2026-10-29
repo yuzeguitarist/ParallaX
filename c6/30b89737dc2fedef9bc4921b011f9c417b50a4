@@ -1,0 +1,33 @@
+.github/workflows/claude.yml
+  s_a33aae4562b92c::t_54736872cdc3b5 24-28
+.github/workflows/mutants-autofix.yml
+  s_a33aae4562b92c::t_65ea9b84ffa71b 22
+  s_a33aae4562b92c::t_9f3db80e0932b0 39-42,45-48
+  s_a33aae4562b92c::t_121d37f210c33f 12-14
+.github/osv-scanner.toml
+  s_a33aae4562b92c::t_c5ea43524b224a 8-16
+  s_a33aae4562b92c::t_cc0bdfeb5c70d3 22-38
+.github/workflows/mutants-report.yml
+  s_a33aae4562b92c::t_0572d2b8fc48c3 36-42
+  s_a33aae4562b92c::t_8cd92a95e4ede4 11-15,18
+fuzz/osv-scanner.toml
+  s_a33aae4562b92c::t_746fac309269d2 1-7
+osv-scanner.toml
+  s_a33aae4562b92c::t_fba21247e7f301 1-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c630b89737dc2fedef9bc4921b011f9c417b50a4",
+  "prompts": {},
+  "sessions": {
+    "s_a33aae4562b92c": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "c8db1952-08e3-4a14-9705-c67e6cbf7978",
+        "model": "grok-4.7"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
