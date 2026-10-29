@@ -1,0 +1,19 @@
+.gitignore
+  s_a33aae4562b92c::t_cdaa201ce7a3c4 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "161258655b6b6e73a4ec111d1c33f2db8746246d",
+  "prompts": {},
+  "sessions": {
+    "s_a33aae4562b92c": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "c8db1952-08e3-4a14-9705-c67e6cbf7978",
+        "model": "grok-4.7"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
