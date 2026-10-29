@@ -21,7 +21,11 @@ name: claude
 # write is required for the OIDC exchange that mints that token.
 
 on:
-  issue_comment:
+  # issue_comment runs in the base repo. The job below still refuses every
+  # author who is not OWNER, MEMBER, or COLLABORATOR, checks out the default
+  # branch (not a PR head), and treats comment text as untrusted. @claude on a
+  # comment is the product behavior this workflow exists for.
+  issue_comment: # zizmor: ignore[dangerous-triggers] OWNER/MEMBER/COLLABORATOR only; comment text is untrusted
     types: [created]
   pull_request_review_comment:
     types: [created]

@@ -5,18 +5,36 @@
 #
 # `mcp` is a hard, transitive dependency of Semgrep (see the "# via semgrep"
 # markers in semgrep-requirements.txt): Semgrep pins `mcp==1.29.0` *exactly*, and
-# that pin is still in place in Semgrep's latest release, so `mcp` cannot be
-# bumped without dropping Semgrep. ParallaX runs Semgrep only as a CLI SAST
-# scanner (`semgrep scan --config p/rust`, see workflows/semgrep.yml) and never
-# starts an MCP server, so these MCP *server-transport* / *task-handler*
-# vulnerabilities are unreachable in this repo. Suppress them here until Semgrep
-# upstream bumps its `mcp` pin; the corresponding Dependabot alerts are dismissed
-# as not-affected for the same reason. cargo-deny remains the blocking gate for
-# the Rust dependency tree; this only scopes OSV noise from the Semgrep CI pin.
+# that pin is still in place in Semgrep's latest release (1.182.1), so `mcp`
+# cannot be bumped without dropping Semgrep. ParallaX runs Semgrep only as a CLI
+# SAST scanner (`semgrep scan --config p/rust`, see workflows/semgrep.yml) and
+# never starts an MCP server or client transport, so these MCP server-auth /
+# HTTP-transport / tool-result advisories are unreachable. Suppress them here
+# until Semgrep upstream bumps its `mcp` pin; the corresponding Dependabot
+# alerts are dismissed as not-affected for the same reason. cargo-deny remains
+# the blocking gate for the Rust dependency tree; this only scopes OSV noise
+# from the Semgrep CI pin.
 
 [[IgnoredVulns]]
 id = "GHSA-84m7-p3x7-pcfv" # CVE-2026-59951 — unbounded session accumulation in StreamableHTTP transport
 reason = "Semgrep hard-pins mcp==1.29.0 (fix is 1.30.0); run as a CLI scanner only, the MCP server is never started"
+
+# Same pin, three later MCP SDK advisories. Semgrep 1.182.1 (current latest)
+# still requires mcp==1.29.0 exactly, and upstream declined to loosen it.
+# `semgrep scan` never starts an MCP server, never follows MCP HTTP redirects,
+# and never validates tool-result schemas, so none of these are reachable.
+
+[[IgnoredVulns]]
+id = "GHSA-w4fh-qvv9-3v23" # CVE-2026-116684 — server bearer tokens accepted for a different resource
+reason = "Semgrep hard-pins mcp==1.29.0; CLI scan never starts the MCP server, so bearer-token auth is unreachable"
+
+[[IgnoredVulns]]
+id = "GHSA-5h93-6whr-6q8j" # CVE-2026-116685 — HTTP client transports follow cross-origin redirects
+reason = "Semgrep hard-pins mcp==1.29.0; CLI scan never uses the MCP HTTP client transport"
+
+[[IgnoredVulns]]
+id = "GHSA-rwrf-2pqf-9j8j" # CVE-2026-116686 — client fetches server-chosen $ref URLs while validating tool results
+reason = "Semgrep hard-pins mcp==1.29.0; CLI scan never validates MCP tool results"
 
 # `opentelemetry-api` is likewise pinned by Semgrep (`~=1.37.0`, still the pin in
 # its latest release; the fix is 1.45.1). Semgrep runs as a CLI that never

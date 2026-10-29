@@ -1,0 +1,18 @@
+# OSV-Scanner suppressions for the root Cargo.lock.
+# https://google.github.io/osv-scanner/configuration/
+#
+# Does not propagate into child directories (fuzz/ and ci/gfw-lab/ have their
+# own lockfiles). cargo-deny stays the blocking RustSec gate; this file only
+# stops OSV's SARIF upload from re-opening a false positive.
+
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+# block-buffer 0.10.4 via digest 0.10 (sha2/hmac/hkdf/sha3). Upstream's bug is
+# the 0.11+ layout that stores the cursor in a byte of the block; a panicking
+# compress closure can then break `pos < block_size` and hit
+# unreachable_unchecked. 0.10.4 keeps `pos` in its own u8 field
+# (block-buffer 0.10.4 src/lib.rs), and ReadBuffer does not exist on that line.
+# The patched release is 0.12.1, which requires digest 0.11. GitHub's OSV import
+# widened the range to `< 0.12.1`, so the scanner flags 0.10.4. There is no
+# patched 0.10. This repo stays on one digest 0.10 stack on purpose (Cargo.toml).
+reason = "block-buffer 0.10.4 stores pos in a separate field; GHSA-qwgh-2vcv-g2f7 is the 0.11+ inlined-cursor bug, and OSV's <0.12.1 range over-approximates it"

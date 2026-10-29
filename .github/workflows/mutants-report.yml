@@ -8,9 +8,14 @@ name: mutants-report
 # artifact, and rewrites that shard's section of the rolling issue via
 # .github/scripts/mutants_issue.py. Closes the issue when no reported shard has
 # survivors; (re)opens it when any do. Non-gating: failures here never affect a PR.
+#
+# workflow_run is the only way for nightly-mutants' GITHUB_TOKEN to start this
+# file. The job allowlists the two triggers nightly-mutants actually has
+# (schedule, workflow_dispatch) and requires the upstream head to be this repo's
+# default branch, so a later pull_request trigger cannot drive the issue write.
 
 on:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] same-repo default branch; schedule or workflow_dispatch only
     workflows: ["nightly-mutants"]
     types: [completed]
 
@@ -28,6 +33,13 @@ concurrency:
 
 jobs:
   report:
+    # Fail closed. nightly-mutants is schedule + workflow_dispatch only; if a
+    # pull_request trigger is added upstream, this job does not follow it.
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+      (github.event.workflow_run.event == 'schedule' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
