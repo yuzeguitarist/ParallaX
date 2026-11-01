@@ -2847,28 +2847,31 @@ async fn run_authenticated_data_mode(
                                 // then withholding a stream or frame.
                                 let probed_conn: Option<ServerProbedQuic> =
                                     match timeout_at(probe_deadline, rx).await {
-                                        Ok(Ok(conn))
-                                            if expect_ip
-                                                .is_some_and(|ip| conn.remote_address().ip() == ip) =>
-                                        {
+                                        Ok(Ok(pending)) => {
+                                            let conn = pending.into_connection();
+                                            // No await between taking the queued
+                                            // lease and installing session cleanup.
                                             quic_cleanup.0 = Some(conn.clone());
-                                            serve_probed_quic_on_conn(
-                                                conn,
-                                                sandwich_secret,
-                                                &offer_id,
-                                                cid,
-                                                probe_deadline,
-                                            )
-                                            .await
-                                        }
-                                        Ok(Ok(conn)) => {
-                                            tracing::debug!(
-                                                cid,
-                                                peer = %conn.remote_address(),
-                                                "declining fast-plane QUIC (source IP / fail-closed)"
-                                            );
-                                            conn.close(0u32.into(), b"source-ip-mismatch");
-                                            None
+                                            if expect_ip
+                                                .is_some_and(|ip| conn.remote_address().ip() == ip)
+                                            {
+                                                serve_probed_quic_on_conn(
+                                                    conn,
+                                                    sandwich_secret,
+                                                    &offer_id,
+                                                    cid,
+                                                    probe_deadline,
+                                                )
+                                                .await
+                                            } else {
+                                                tracing::debug!(
+                                                    cid,
+                                                    peer = %conn.remote_address(),
+                                                    "declining fast-plane QUIC (source IP / fail-closed)"
+                                                );
+                                                conn.close(0u32.into(), b"source-ip-mismatch");
+                                                None
+                                            }
                                         }
                                         _ => {
                                             carrier.unregister(&offer_id);

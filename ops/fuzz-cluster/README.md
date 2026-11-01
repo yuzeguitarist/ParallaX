@@ -120,7 +120,7 @@ unset T
 
 `bootstrap.sh` picks the PAT up from `PLXFUZZ_PAT`, stores it `0600` at
 `/etc/plxfuzz/pat`, then unattended: installs the pinned toolchain + build deps,
-configures `gh auth git-credential`, clones `d240e663`, warm-builds the fuzzers,
+configures Git's credential helper with `gh auth setup-git`, clones `d240e663`, warm-builds the fuzzers,
 installs+enables the systemd units, and starts fuzzing. It is idempotent —
 re-pasting on a half-built box self-heals. When it prints `cluster node box-a live`,
 walk away.

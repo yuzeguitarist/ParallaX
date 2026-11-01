@@ -14,6 +14,22 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/uninstall-vps.sh"
 
+
+def run_bounded_command(command, *, env=None, stdin=None):
+    process = subprocess.Popen(command, text=True, stdin=stdin, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True, env=env)
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate(timeout=5)
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 STUB = r'''
 import json
 import os
@@ -70,21 +86,10 @@ class UninstallStopTests(unittest.TestCase):
     def setUpClass(cls):
         cls.bash = shutil.which("bash")
         command = [cls.bash, str(SCRIPT), "--host", "root@sandbox.invalid", "--keep-local", "--dry-run"]
-        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   start_new_session=True)
-        try:
-            stdout, stderr = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.communicate(timeout=5)
-            raise
-        if process.returncode:
-            raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
-        start = stdout.index('set -Eeuo pipefail\nexport PATH=')
-        cls.remote_script = stdout[start:].split("\nDry run finished.", 1)[0]
+        result = run_bounded_command(command)
+        result.check_returncode()
+        start = result.stdout.index('set -Eeuo pipefail\nexport PATH=')
+        cls.remote_script = result.stdout[start:].split("\nDry run finished.", 1)[0]
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="parallax-uninstall-stop-")
@@ -131,8 +136,11 @@ class UninstallStopTests(unittest.TestCase):
             "SERVICE_NAME": "parallax", "REMOVE_USER": "1", "REMOVE_PARCA_AGENT": "1",
             "FAIL_STOP": "", "FAIL_INVENTORY": "", **options,
         }
-        self.result = subprocess.run([self.bash, "-s"], input=script, env=env,
-                                     text=True, capture_output=True)
+        # Regular stdin avoids blocking Python writes to small macOS pipes.
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as script_input:
+            script_input.write(script)
+            script_input.seek(0)
+            self.result = run_bounded_command([self.bash, "-s"], env=env, stdin=script_input)
         log = self.root / "commands.jsonl"
         self.commands = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
@@ -150,6 +158,12 @@ class UninstallStopTests(unittest.TestCase):
         self.run_payload(FAIL_STOP="parallax.service")
         self.assert_aborted_intact()
         self.assertEqual(self.commands[-1], ["systemctl", "stop", "parallax.service"])
+
+    def test_large_payload_preserves_stop_failure(self):
+        self.remote_script = "# " + "x" * (80 * 1024) + "\n" + self.remote_script
+        self.run_payload(FAIL_STOP="parallax.service")
+        self.assert_aborted_intact()
+        self.assertEqual(self.result.returncode, 1)
 
     def test_loaded_unit_without_file_still_requires_successful_stop(self):
         (self.root / self.artifacts.pop(0)).unlink()

@@ -48,6 +48,26 @@ pub enum CloseReason {
     IdleTimeout,
 }
 
+fn transport_error(error_code: u64, frame_type: u64, reason: impl Into<String>) -> QuicTlsError {
+    QuicTlsError::Transport {
+        error_code,
+        frame_type,
+        reason: reason.into(),
+    }
+}
+
+/// Preserve the transport code while attaching the actual decoded wire type.
+fn with_frame_type(error: QuicTlsError, frame_type: u64) -> QuicTlsError {
+    match error {
+        QuicTlsError::Transport {
+            error_code, reason, ..
+        } => transport_error(error_code, frame_type, reason),
+        QuicTlsError::Protocol(reason) => transport_error(0x0a, frame_type, reason),
+        QuicTlsError::Crypto(reason) => transport_error(0x01, frame_type, reason),
+        other => other,
+    }
+}
+
 /// Error opening (decrypting/parsing) an incoming packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenError {
@@ -2795,9 +2815,10 @@ impl Connection {
         // before pointing this path at any non-ParallaX peer.
         let mut frames = Iter::new(&payload);
         while let Some(frame) = frames.next() {
-            let frame =
-                frame.map_err(|e| QuicTlsError::Crypto(format!("frame decode failed: {e:?}")))?;
             let frame_type = frames.last_frame_type();
+            let frame = frame.map_err(|e| {
+                transport_error(0x07, frame_type, format!("frame decode failed: {e:?}"))
+            })?;
             // RFC 9000 §12.4/§12.5: Initial and Handshake packets may carry only
             // PADDING, PING, ACK, CRYPTO, and a transport CONNECTION_CLOSE (0x1c).
             // Any other frame is a PROTOCOL_VIOLATION. This matters because Initial
@@ -2812,22 +2833,17 @@ impl Connection {
                 )
                 && !matches!(frame, Frame::Close(ref c) if !c.application)
             {
-                return Err(QuicTlsError::Protocol(
-                    "frame type not permitted in Initial/Handshake space".into(),
+                return Err(transport_error(
+                    0x0a,
+                    frame_type,
+                    "frame type not permitted in Initial/Handshake space",
                 ));
             }
             match frame {
                 Frame::Crypto { offset, data } => {
                     ack_eliciting = true;
                     self.recv_crypto(space, offset, data)
-                        .map_err(|error| match error {
-                            QuicTlsError::Protocol(reason) => QuicTlsError::Transport {
-                                error_code: 0x0a,
-                                frame_type: 0x06,
-                                reason,
-                            },
-                            other => other,
-                        })?;
+                        .map_err(|error| with_frame_type(error, frame_type))?;
                 }
                 Frame::Stream {
                     id,
@@ -2837,16 +2853,7 @@ impl Connection {
                 } => {
                     ack_eliciting = true;
                     self.recv_stream(id, offset, fin, data)
-                        .map_err(|error| match error {
-                            QuicTlsError::Transport {
-                                error_code, reason, ..
-                            } => QuicTlsError::Transport {
-                                error_code,
-                                frame_type,
-                                reason,
-                            },
-                            other => other,
-                        })?;
+                        .map_err(|error| with_frame_type(error, frame_type))?;
                 }
                 Frame::ResetStream {
                     id,
@@ -2874,7 +2881,7 @@ impl Connection {
                                     .into(),
                             });
                         }
-                        self.ensure_stream(id)?;
+                        self.ensure_stream(id, frame_type)?;
                         self.reset_stream(id, error_code);
                     }
                 }
@@ -2904,7 +2911,9 @@ impl Connection {
                     let kind = usize::from(dir == Dir::Uni);
                     self.send_max_streams[kind] = self.send_max_streams[kind].max(max);
                 }
-                Frame::Ack(ack) => self.recv_ack(space, &ack, now)?,
+                Frame::Ack(ack) => self
+                    .recv_ack(space, &ack, now)
+                    .map_err(|error| with_frame_type(error, frame_type))?,
                 Frame::HandshakeDone => {
                     ack_eliciting = true;
                     // RFC 9001 §4.1.2: the client treats HANDSHAKE_DONE as handshake
@@ -3266,8 +3275,10 @@ impl Connection {
                     || buffered + data.len() > MAX_CRYPTO_REASSEMBLY
                     || sp.crypto_pending.len() >= MAX_CRYPTO_PENDING_FRAGMENTS
                 {
-                    return Err(QuicTlsError::Crypto(
-                        "CRYPTO reassembly window exceeded".into(),
+                    return Err(transport_error(
+                        0x0d,
+                        0x06,
+                        "CRYPTO reassembly window exceeded",
                     ));
                 }
                 sp.crypto_pending.push((offset, data.to_vec()));
@@ -3311,13 +3322,13 @@ impl Connection {
         if self.stream_retired(id) {
             return Ok(());
         }
-        // `end` overflowing u64 is a protocol violation, not arithmetic to wrap:
+        // `end` overflowing u64 is a frame encoding error, not arithmetic to wrap:
         // such an offset can never fall inside any receive window (debug builds
         // would panic, release builds would wrap to a small `end` and bypass the
         // window check below). Reject before touching connection state.
         let end = offset
             .checked_add(data.len() as u64)
-            .ok_or_else(|| QuicTlsError::Protocol("STREAM frame offset overflows u64".into()))?;
+            .ok_or_else(|| transport_error(0x07, 0x08, "STREAM frame offset overflows u64"))?;
         // Validate against the stream's current state (or a fresh stream's defaults
         // if this frame would open it) BEFORE `ensure_stream` inserts and accept-
         // queues the stream: a flow-control / final-size violation must not leave a
@@ -3333,19 +3344,25 @@ impl Connection {
         // place the final size below data already received.
         if let Some(final_size) = cur_fin {
             if end > final_size || (fin && end != final_size) {
-                return Err(QuicTlsError::Protocol(
-                    "STREAM frame violates the stream's final size".into(),
+                return Err(transport_error(
+                    0x06,
+                    0x08,
+                    "STREAM frame violates the stream's final size",
                 ));
             }
         }
         if fin && end < cur_high {
-            return Err(QuicTlsError::Protocol(
-                "FIN final size below data already received".into(),
+            return Err(transport_error(
+                0x06,
+                0x08,
+                "FIN final size below data already received",
             ));
         }
         if end > cur_max {
-            return Err(QuicTlsError::Crypto(
-                "peer exceeded the stream receive window".into(),
+            return Err(transport_error(
+                0x03,
+                0x08,
+                "peer exceeded the stream receive window",
             ));
         }
         let new_high = end.max(cur_high);
@@ -3356,13 +3373,15 @@ impl Connection {
         match self.recv_data_total.checked_add(delta) {
             Some(total) if total <= self.recv_max_data => {}
             _ => {
-                return Err(QuicTlsError::Crypto(
-                    "peer exceeded the connection receive window".into(),
+                return Err(transport_error(
+                    0x03,
+                    0x08,
+                    "peer exceeded the connection receive window",
                 ));
             }
         }
         // All checks passed: now it is safe to create + accept-queue the stream.
-        self.ensure_stream(id)?;
+        self.ensure_stream(id, 0x08)?;
         let s = self.streams.get_mut(&id).expect("just ensured");
         // A stream already in Reset Recvd had everything up to its final size
         // accounted as delivered when the reset was processed (RFC 9000 §4.5), so
@@ -3411,8 +3430,10 @@ impl Connection {
                     || s.recv_pending.len() >= MAX_STREAM_PENDING_FRAGMENTS
                     || self.recv_pending_total + data.len() > MAX_CONN_REASSEMBLY
                 {
-                    return Err(QuicTlsError::Crypto(
-                        "stream reassembly buffer exceeded".into(),
+                    return Err(transport_error(
+                        0x01,
+                        0x08,
+                        "stream reassembly buffer exceeded",
                     ));
                 }
                 self.recv_pending_total += data.len();
@@ -3464,18 +3485,24 @@ impl Connection {
         // size and must not be below data already received; the bytes up to it count
         // toward connection-level flow control (they are considered delivered).
         if cur_fin.is_some_and(|known| known != final_size) {
-            return Err(QuicTlsError::Protocol(
-                "RESET_STREAM final size conflicts with a known final size".into(),
+            return Err(transport_error(
+                0x06,
+                0x04,
+                "RESET_STREAM final size conflicts with a known final size",
             ));
         }
         if final_size < cur_high {
-            return Err(QuicTlsError::Protocol(
-                "RESET_STREAM final size below data already received".into(),
+            return Err(transport_error(
+                0x06,
+                0x04,
+                "RESET_STREAM final size below data already received",
             ));
         }
         if final_size > cur_max {
-            return Err(QuicTlsError::Crypto(
-                "RESET_STREAM exceeded the stream receive window".into(),
+            return Err(transport_error(
+                0x03,
+                0x04,
+                "RESET_STREAM exceeded the stream receive window",
             ));
         }
         let delta = final_size - cur_high;
@@ -3483,13 +3510,15 @@ impl Connection {
         match self.recv_data_total.checked_add(delta) {
             Some(total) if total <= self.recv_max_data => {}
             _ => {
-                return Err(QuicTlsError::Crypto(
-                    "RESET_STREAM exceeded the connection receive window".into(),
+                return Err(transport_error(
+                    0x03,
+                    0x04,
+                    "RESET_STREAM exceeded the connection receive window",
                 ));
             }
         }
         // All checks passed: now it is safe to create + accept-queue the stream.
-        self.ensure_stream(id)?;
+        self.ensure_stream(id, 0x04)?;
         let s = self.streams.get_mut(&id).expect("just ensured");
         s.recv_high = final_size;
         s.recv_fin = Some(final_size);
@@ -3580,7 +3609,7 @@ impl Connection {
     /// Caps concurrent peer-initiated streams (a memory-exhaustion DoS guard,
     /// RFC 9000 §4.6 STREAM_LIMIT_ERROR), and seeds the send window from the peer's
     /// transport parameters.
-    fn ensure_stream(&mut self, id: u64) -> Result<(), QuicTlsError> {
+    fn ensure_stream(&mut self, id: u64, frame_type: u64) -> Result<(), QuicTlsError> {
         if self.streams.contains_key(&id) {
             return Ok(());
         }
@@ -3590,8 +3619,10 @@ impl Connection {
         // and would otherwise bypass the peer-stream cap below (the count filters on
         // is_peer_initiated, so an our-space id was never counted — unbounded creation).
         if !self.is_peer_initiated(id) {
-            return Err(QuicTlsError::Protocol(
-                "peer referenced an unopened locally-initiated stream".into(),
+            return Err(transport_error(
+                0x05,
+                frame_type,
+                "peer referenced an unopened locally-initiated stream",
             ));
         }
         let kind_uni = is_uni(id);
@@ -3606,8 +3637,10 @@ impl Connection {
             || opened.saturating_sub(self.peer_streams_opened[kind])
                 > MAX_PEER_STREAMS.saturating_sub(live) as u64
         {
-            return Err(QuicTlsError::Crypto(
-                "peer exceeded the stream limit".into(),
+            return Err(transport_error(
+                0x04,
+                frame_type,
+                "peer exceeded the stream limit",
             ));
         }
         let bits = id & 3;
@@ -3634,6 +3667,13 @@ mod tests {
 
     fn test_keys() -> DirectionalKeys {
         DirectionalKeys::from_secret(CipherSuite::Aes128GcmSha256, &[0x42u8; 32]).unwrap()
+    }
+
+    fn assert_transport_error(error: QuicTlsError, expected: u64) {
+        assert!(
+            matches!(error, QuicTlsError::Transport { error_code, .. } if error_code == expected),
+            "expected transport error {expected:#x}, got {error:?}"
+        );
     }
 
     #[test]
@@ -5670,10 +5710,7 @@ mod tests {
         let err = server
             .handle_datagram(&forged, now)
             .expect_err("a forged STREAM in the Initial space is a protocol violation");
-        assert!(
-            matches!(err, QuicTlsError::Protocol(_)),
-            "expected PROTOCOL_VIOLATION, got {err:?}"
-        );
+        assert_transport_error(err, 0x0a);
     }
 
     #[test]
@@ -5871,7 +5908,8 @@ mod tests {
                 // Each fragment extends the previous by one byte, so it is not a
                 // full duplicate (it is buffered) but costs only delta == 1 after
                 // the first (which charges its full length).
-                if server.recv_stream(id, i + 1, false, &chunk).is_err() {
+                if let Err(error) = server.recv_stream(id, i + 1, false, &chunk) {
+                    assert_transport_error(error, 0x01);
                     rejected = true;
                     break 'streams;
                 }
@@ -6150,7 +6188,7 @@ mod tests {
         let err = client
             .recv_stream(0, 0, false, b"x")
             .expect_err("a peer may not open a locally-initiated stream");
-        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert_transport_error(err, 0x05);
     }
 
     #[test]
@@ -6168,11 +6206,11 @@ mod tests {
         let err = server
             .recv_stream(0, 5, false, b"more")
             .expect_err("data past the final size is rejected");
-        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert_transport_error(err, 0x06);
         let err2 = server
             .recv_stream(0, 0, true, b"hi")
             .expect_err("a conflicting final size is rejected");
-        assert!(matches!(err2, QuicTlsError::Protocol(_)), "got {err2:?}");
+        assert_transport_error(err2, 0x06);
     }
 
     #[test]
@@ -6189,7 +6227,7 @@ mod tests {
         let err = server
             .recv_reset_stream(0, 7, 100)
             .expect_err("a reset below data already received is rejected");
-        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert_transport_error(err, 0x06);
         // A consistent reset (final size >= received) is accepted.
         server.recv_reset_stream(0, 7, 200).unwrap();
     }
@@ -6213,7 +6251,7 @@ mod tests {
         let err = server
             .recv_stream(0, STREAM_RECV_WINDOW + 1, false, b"x")
             .expect_err("exceeding a fresh stream's window is rejected");
-        assert!(matches!(err, QuicTlsError::Crypto(_)), "got {err:?}");
+        assert_transport_error(err, 0x03);
         assert!(
             !server.streams.contains_key(&0),
             "a rejected opening STREAM must not leave the stream inserted"
@@ -6226,7 +6264,7 @@ mod tests {
 
     #[test]
     fn stream_offset_overflow_is_rejected_without_opening() {
-        // offset + len overflowing u64 is a protocol violation (the offset can
+        // offset + len overflowing u64 is a frame encoding error (the offset can
         // never fall inside any window). It must be rejected before any state
         // mutation — and must not panic (debug) or wrap past the window (release).
         let mut server = Connection::new_server(
@@ -6240,7 +6278,7 @@ mod tests {
         let err = server
             .recv_stream(0, u64::MAX, false, b"xx")
             .expect_err("an offset that overflows u64 is rejected");
-        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert_transport_error(err, 0x07);
         assert!(
             !server.streams.contains_key(&0),
             "an overflowing STREAM must not leave the stream inserted"

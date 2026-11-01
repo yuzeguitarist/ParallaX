@@ -21,7 +21,7 @@ with (root / 'commands.jsonl').open('a') as log:
     log.write(json.dumps([command, *args]) + '\n')
 def checked(value):
     path = pathlib.Path(value)
-    assert path.is_relative_to(root), 'mutation outside sandbox: ' + value
+    assert path == root or root in path.parents, 'mutation outside sandbox: ' + value
     return path
 if command == 'install':
     paths, mode, directory = [], 0o755, False
@@ -245,5 +245,112 @@ fn interrupted_bundle_install_keeps_new_inline_config_consistent() {
     let current = Config::load(&active).unwrap();
     assert!(current.inline_secret_fields().is_empty());
     assert_same_config(&current, &expected);
+
+    // Operators can reuse a downloaded legacy config and ciphertext without
+    // copying the VPS host key locally. Migrate its relative bare fragments
+    // while another instance keeps using distinct entries in the old bundle.
+    let old_server = old.server.as_ref().unwrap();
+    let new_server = expected.server.as_ref().unwrap();
+    let legacy = parallax::secret_store::seal_all(
+        &parallax::secret_store::load_host_key(None).unwrap(),
+        [
+            ("psk", old.crypto.psk.as_b64()),
+            ("private_key", old_server.private_key.as_b64()),
+            (
+                "identity_secret_key",
+                old_server.identity_secret_key.as_b64(),
+            ),
+            ("other_psk", expected.crypto.psk.as_b64()),
+            ("other_private_key", new_server.private_key.as_b64()),
+            (
+                "other_identity_secret_key",
+                new_server.identity_secret_key.as_b64(),
+            ),
+        ],
+    );
+    let legacy_bytes = parallax::secret_store::bundle_to_toml(&legacy);
+    let legacy_bundle = active.with_file_name("parallax.secrets.enc");
+    fs::write(&legacy_bundle, &legacy_bytes).unwrap();
+    fs::write(
+        old_path.with_file_name("parallax.secrets.enc"),
+        &legacy_bytes,
+    )
+    .unwrap();
+    let legacy_text = |path: &Path, config: &Config, prefix: &str| {
+        let mut text = fs::read_to_string(path).unwrap();
+        let server = config.server.as_ref().unwrap();
+        for (field, value) in [
+            ("psk", config.crypto.psk.as_b64()),
+            ("private_key", server.private_key.as_b64()),
+            ("identity_secret_key", server.identity_secret_key.as_b64()),
+        ] {
+            let assignment = format!("{field} = \"{value}\"");
+            assert!(text.contains(&assignment));
+            text = text.replacen(
+                &assignment,
+                &format!("{field} = {{ sealed = \"parallax.secrets.enc#{prefix}{field}\" }}"),
+                1,
+            );
+        }
+        text
+    };
+    let legacy_config = old_path.with_file_name("legacy.toml");
+    fs::write(&legacy_config, legacy_text(&old_path, &old, "")).unwrap();
+    fs::set_permissions(&legacy_config, fs::Permissions::from_mode(0o600)).unwrap();
+    let other = active.with_file_name("other.toml");
+    fs::write(&other, legacy_text(&new_path, &expected, "other_")).unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_same_config(&Config::load(&other).unwrap(), &expected);
+    let local_check = Command::new(env!("CARGO_BIN_EXE_plx"))
+        .args(["check", "--config"])
+        .arg(&legacy_config)
+        .env(
+            parallax::secret_store::HOST_KEY_ENV,
+            root.join("missing.key"),
+        )
+        .output()
+        .unwrap();
+    assert!(local_check.status.success(), "{:?}", local_check);
+    assert!(String::from_utf8(local_check.stdout)
+        .unwrap()
+        .contains("structure and permissions only"));
+
+    let reuse_generator = generator.replace("\nREUSE_CONFIG=0\n", "\nREUSE_CONFIG=1\n");
+    assert_ne!(reuse_generator, generator);
+    let generated = bash(&reuse_generator, root, false);
+    assert!(generated.status.success(), "{:?}", generated);
+    let generated = String::from_utf8(generated.stdout).unwrap();
+    let mut reuse_payload = generated
+        .split_once("REMOTE_SCRIPT\n")
+        .unwrap()
+        .1
+        .split_once("\nEND_REMOTE_SCRIPT")
+        .unwrap()
+        .0
+        .to_owned();
+    for prefix in [
+        "/etc/",
+        "/var/lib/",
+        "/usr/local/bin",
+        "/tmp/parallax-deploy.",
+    ] {
+        reuse_payload = reuse_payload.replace(prefix, &format!("{}{prefix}", root.display()));
+    }
+    stage_upload(&legacy_config);
+    let interrupted = bash(&reuse_payload, root, true);
+    assert_eq!(interrupted.status.code(), Some(97), "{:?}", interrupted);
+    assert_same_config(&Config::load(&active).unwrap(), &old);
+    assert_same_config(&Config::load(&other).unwrap(), &expected);
+    assert_eq!(fs::read_to_string(&legacy_bundle).unwrap(), legacy_bytes);
+
+    stage_upload(&legacy_config);
+    let migrated = bash(&reuse_payload, root, false);
+    assert!(migrated.status.success(), "{:?}", migrated);
+    let migrated_text = fs::read_to_string(&active).unwrap();
+    assert!(migrated_text.contains("parallax.toml.secrets.enc#config-"));
+    assert!(!migrated_text.contains("parallax.secrets.enc#"));
+    assert_same_config(&Config::load(&active).unwrap(), &old);
+    assert_same_config(&Config::load(&other).unwrap(), &expected);
+    assert_eq!(fs::read_to_string(&legacy_bundle).unwrap(), legacy_bytes);
     std::env::remove_var(parallax::secret_store::HOST_KEY_ENV);
 }

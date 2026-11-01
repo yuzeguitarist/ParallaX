@@ -660,7 +660,6 @@ mod tests {
         let mut bad_extensions_len = body;
         bad_extensions_len[12..14].copy_from_slice(&[0, 0]);
         cases.push(bad_extensions_len);
-        cases.push(raw_new_session_ticket_body(&vec![0; usize::from(u16::MAX)]));
         for extensions in [
             vec![0],
             vec![0, 0x2a],
@@ -675,6 +674,26 @@ mod tests {
         for malformed in cases {
             let error = decode_new_session_ticket(&malformed).unwrap_err();
             assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+        }
+    }
+
+    #[test]
+    fn new_session_ticket_extensions_limit_is_65534_bytes() {
+        // RFC 8446 §4.6.1: Extension extensions<0..2^16-2>. Both cases contain
+        // one well-formed unknown extension, isolating the outer vector bound.
+        for extensions_len in [65534, 65535] {
+            let mut extensions = vec![0xbe, 0xef];
+            extensions.extend_from_slice(&((extensions_len - 4) as u16).to_be_bytes());
+            extensions.resize(extensions_len, 0xaa);
+            let result = decode_new_session_ticket(&raw_new_session_ticket_body(&extensions));
+            if extensions_len == 65534 {
+                assert_eq!(result.unwrap().max_early_data, None);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().alert_description(),
+                    Some(ALERT_DECODE_ERROR)
+                );
+            }
         }
     }
 

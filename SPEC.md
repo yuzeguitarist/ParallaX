@@ -1564,8 +1564,11 @@ ParallaX epoch-0 keys from `(ClientHello1, HRR)`, while the client uses
 `(ClientHello1, final ServerHello)`. These are the ParallaX transcript inputs
 (§5.3), separate from the correctly collapsed TLS transcript above.
 
-ClientHello2 replaces the `key_share` that held the ParallaX/mask material, but
-the server does not reauthenticate that retry or update its saved transcript.
+ClientHello2 replaces the original TLS `key_share`, whose standalone X25519
+public key (`tls_ephemeral_pub`) is used to derive the carrier mask (§7.2).
+The distinct ParallaX authentication public key (`parallax_x25519_pub`) remains
+masked in `ClientHello.random`, which the retry copies unchanged. The server
+does not reauthenticate that retry or update its saved transcript.
 Consequently the epoch-0 keys differ: the camouflage TLS handshake may finish,
 but the server cannot recognize the client's encrypted `PX1Q`, and proxy
 establishment fails in the bounded pre-`PX1Q` origin-splice phase (§7.1). This is

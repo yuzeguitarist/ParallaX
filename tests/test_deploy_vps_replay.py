@@ -21,15 +21,17 @@ CACHE = "var/lib/parallax/replay-parallax.cache"
 SUFFIXES = ("", ".0rtt", ".marker")
 # Captured from the previous heredoc builders, evaluated in the same Bash with
 # reference-only padding to select its tempfile backend, then removing padding.
+# Seal-enabled snapshots include the legacy-bundle resolution copy; removing
+# only its five emitted lines reproduces the historical snapshots byte-for-byte.
 PAYLOAD_SHA256 = {
     ("0", "0", "none"): "bc973151a7195f6f95e5d615ebc9df4a21a970150ceb09647e14cf27066f4719",
     ("0", "0", "polar-cloud"): "8fe2688f438307b0e35c45a5d09b3d6826bc9c5a5a4831afb696f1b549aa5efb",
-    ("0", "1", "none"): "73c09ae86870f44af88b89e04788a7c4f430e62fe5b55a19911d3e066b40cd13",
-    ("0", "1", "polar-cloud"): "2e6e72788af5ef04b6e2978dbc40bfd5e13cc8142516ac611a783d1f6130ddab",
+    ("0", "1", "none"): "1c030a794f8255481d64eb507070238725c47e0dec771901a8d4be146f9abe24",
+    ("0", "1", "polar-cloud"): "cc0781046ddba2aece9fa75002e8bfdef09bc204f6933f453ebab6484e3e2535",
     ("1", "0", "none"): "3569bf8c486f5f4a080c4d80280618be04947e276e63446ba9b2127091bdf091",
     ("1", "0", "polar-cloud"): "6b705ac4760c691926263864197d925941e5b49b2d90e31260b83a13de937c86",
-    ("1", "1", "none"): "2141baf6033ddd15772a496bfd29a6064f4cb12abb3f6e1fde45b70012224312",
-    ("1", "1", "polar-cloud"): "ba340415336f8b712b8a1c3f741b51be04813385681bbd7e70ecd36f452d682e",
+    ("1", "1", "none"): "7cf7144f87a6359aad0494fdfb192908ee38e8979a8b03d2a05b0f2d2e744d70",
+    ("1", "1", "polar-cloud"): "1d4743b4531d6627215bac40d1c32f95f75d8e68f42117cfdc1e1815ce0726dc",
 }
 
 

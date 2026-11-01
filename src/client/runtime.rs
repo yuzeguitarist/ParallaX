@@ -56,7 +56,7 @@ use crate::{
             LegWriter, TcpLegReader, TcpLegWriter,
         },
         tcp::{
-            connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
+            connect_tuned_tcp_any, drain_ready_tcp_read, is_fd_exhaustion_error,
             is_transient_accept_error, relay_connection_limit, tune_tcp_stream,
         },
     },
@@ -2792,26 +2792,7 @@ async fn connect_client_server_addrs(
     addrs: &[SocketAddr],
     deadline: Instant,
 ) -> io::Result<TcpStream> {
-    let mut last_err = io::Error::new(
-        io::ErrorKind::AddrNotAvailable,
-        "no server addresses resolved",
-    );
-    for (index, addr) in addrs.iter().enumerate() {
-        // A black-holed first address must leave time for the other answers.
-        let budget =
-            deadline.saturating_duration_since(Instant::now()) / (addrs.len() - index) as u32;
-        match timeout(budget, connect_tuned_tcp_addr(*addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(err)) => last_err = err,
-            Err(_) => {
-                last_err = io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "server address TCP connect timed out",
-                );
-            }
-        }
-    }
-    Err(last_err)
+    connect_tuned_tcp_any(addrs, deadline).await
 }
 
 async fn resolve_client_server_addr(
@@ -3312,7 +3293,8 @@ fn relay_now_millis() -> u64 {
 type ClientRelayActivity = Arc<AtomicU64>;
 
 fn bump_client_relay_activity(activity: &ClientRelayActivity) {
-    activity.store(relay_now_millis(), Ordering::Relaxed);
+    // Concurrent directions may publish their samples out of order.
+    activity.fetch_max(relay_now_millis(), Ordering::Relaxed);
 }
 
 async fn client_relay_idle_watchdog(activity: ClientRelayActivity, idle_timeout: Duration) {
@@ -4725,6 +4707,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_addr_resolver_tries_cached_answers_beyond_first_race_batch() {
+        let mut unavailable = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap());
+            unavailable.push(listener);
+        }
+        let available = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = available.local_addr().unwrap();
+        addrs.push(reachable);
+        drop(unavailable);
+        let resolver = cached_server_addr_resolver(addrs.clone());
+
+        let stream = resolver
+            .connect_with_resolver(|| async { panic!("cached fifth answer should avoid refresh") })
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+        assert_eq!(*resolver.cached.lock().await, addrs);
+    }
+
+    #[tokio::test]
     async fn server_addr_resolver_refresh_tries_backup_after_unchanged_first() {
         let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let first = unavailable.local_addr().unwrap();
@@ -4882,6 +4887,44 @@ mod tests {
             fired.is_err(),
             "watchdog must not fire before the idle timeout"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_relay_activity_ignores_older_samples() {
+        // Seed another direction's newer sample to model reversed publication
+        // order without depending on thread scheduling. The frozen clock makes
+        // the helper's sampled timestamp deterministically older.
+        let newer_sample = relay_now_millis() + 40;
+        let activity: ClientRelayActivity = Arc::new(AtomicU64::new(newer_sample));
+        bump_client_relay_activity(&activity);
+        assert_eq!(activity.load(Ordering::Relaxed), newer_sample);
+
+        tokio::time::advance(Duration::from_millis(20)).await;
+        bump_client_relay_activity(&activity);
+        assert_eq!(activity.load(Ordering::Relaxed), newer_sample);
+
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert!(
+            timeout(
+                Duration::from_millis(10),
+                client_relay_idle_watchdog(activity.clone(), Duration::from_millis(50)),
+            )
+            .await
+            .is_err(),
+            "an older publication must not cause the newer activity to expire early"
+        );
+        tokio::time::advance(Duration::from_millis(11)).await;
+        timeout(
+            Duration::from_millis(1),
+            client_relay_idle_watchdog(activity.clone(), Duration::from_millis(50)),
+        )
+        .await
+        .expect("genuine silence must still expire after the newer activity");
+
+        // A subsequent fresh sample must still move the clock forward.
+        let fresh_sample = relay_now_millis();
+        bump_client_relay_activity(&activity);
+        assert_eq!(activity.load(Ordering::Relaxed), fresh_sample);
     }
 
     #[tokio::test]

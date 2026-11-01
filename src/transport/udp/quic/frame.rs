@@ -413,6 +413,7 @@ impl<'a> Iter<'a> {
     }
 
     fn parse_one(&mut self) -> Result<Frame<'a>, FrameError> {
+        self.last_frame_type = 0;
         let ty = self.varint()?;
         self.last_frame_type = ty;
         match ty {

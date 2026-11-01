@@ -120,8 +120,10 @@ the old bundle untouched. To keep using the old shared bundle, pass
 `--output parallax.secrets.enc`; its bare entries are retained for configs that
 still reference them. The same default-path rule applies when re-sealing a config
 that previously used any other explicit output. Re-sealing after moving a config
-uses its new canonical path's namespace and retains older entries in the output
-bundle.
+uses its new canonical path's namespace and defaults to the new
+`<config-path>.secrets.enc`. Only entries already in the selected output bundle
+are retained; a different previously referenced bundle is left untouched, and its
+other entries are not copied into the output.
 
 ## Drift risks
 

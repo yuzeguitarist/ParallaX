@@ -36,6 +36,11 @@ def run_bash(shell, args, *, script=None, env=None):
 
 
 class DeployUnitPathTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not SHELLS:
+            raise unittest.SkipTest("Bash is not installed; deployment unit-path tests were not run")
+
     def test_nonliteral_unit_paths_fail_before_build_or_ssh(self):
         # systemd unquotes/unescapes ExecStart, substitutes ${ENV}, and expands
         # %n to the unit name. Installing these literal paths cannot match that.

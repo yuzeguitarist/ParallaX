@@ -68,6 +68,8 @@ def run_bash(shell, args, *, script=None, env=None):
 class DeployShellCompatibilityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not SHELLS:
+            raise unittest.SkipTest("Bash is not installed; deployment shell compatibility tests were not run")
         source = SCRIPT.read_text()
         cls.functions = source.split('\nSSH_TARGET=""\n', 1)[0]
         cls.guidance = source.split(

@@ -193,6 +193,7 @@ class FuzzPrWorkflowTests(unittest.TestCase):
         workflow = WORKFLOW.read_text()
         upload = step("Preserve raw crash artifacts")
         self.assertIn("if: always() && env.FUZZ_RC != '0'", upload)
+        self.assertRegex(upload, r"(?m)^        continue-on-error: true$")
         self.assertRegex(upload, r"uses: actions/upload-artifact@[0-9a-f]{40}\b")
         self.assertIn("path: fuzz/artifacts/${{ matrix.target }}/", upload)
         self.assertIn("if-no-files-found: ignore", upload)

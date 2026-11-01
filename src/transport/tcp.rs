@@ -239,13 +239,13 @@ where
     Fut: Future<Output = io::Result<S>>,
 {
     let mut attempts = Vec::new();
-    let mut addr_iter = addrs.iter().copied().take(MAX_PARALLEL_CONNECT_ATTEMPTS);
+    let mut addr_iter = addrs.iter().copied();
 
     // Keep the bounded races in this future: cancelling it closes every socket
     // before the caller releases its relay permit. Reservations travel with a
     // completed socket until losing attempts are dropped, not just until connect
     // returns (several connects may complete before their results are polled).
-    while addr_iter.len() > 0 {
+    while addr_iter.len() > 0 && attempts.len() < MAX_PARALLEL_CONNECT_ATTEMPTS {
         let guard = if attempts.is_empty() {
             None // The first outbound socket is covered by relay admission.
         } else {
@@ -260,12 +260,15 @@ where
     }
 
     let mut last_err = None;
-    // The parallel batch is one stage; every still-serial candidate needs a
-    // share of the same absolute deadline if the batch is black-holed.
-    let now = Instant::now();
-    let batch_deadline =
-        now + deadline.saturating_duration_since(now) / (addr_iter.len() + 1) as u32;
+    // Pending parallel candidates share time with every unstarted address.
+    // Recompute after immediate failures so a black hole cannot retain the
+    // failed candidates' shares and starve a later reachable address.
     while !attempts.is_empty() {
+        let now = Instant::now();
+        let pending = attempts.len();
+        let batch_deadline = now
+            + deadline.saturating_duration_since(now) * pending as u32
+                / (pending + addr_iter.len()) as u32;
         let ready = poll_fn(|cx| {
             for (index, attempt) in attempts.iter_mut().enumerate() {
                 if let Poll::Ready(result) = attempt.as_mut().poll(cx) {
@@ -1566,6 +1569,16 @@ mod tests {
         }
     }
 
+    fn counted_connect_socket(counts: Rc<ConnectCounts>) -> io::Result<(TcpSocket, CountedSocket)> {
+        let socket = TcpSocket::new_v4()?;
+        counts.started.set(counts.started.get() + 1);
+        counts.live.set(counts.live.get() + 1);
+        counts.peak.set(counts.peak.get().max(counts.live.get()));
+        // Tuple fields drop in order: close the real socket before decrementing
+        // the live count, including when a pending connect is cancelled.
+        Ok((socket, CountedSocket(counts)))
+    }
+
     async fn injected_connect(
         addr: SocketAddr,
         counts: Rc<ConnectCounts>,
@@ -1576,13 +1589,7 @@ mod tests {
             0,
             "the prior socket must close before the next dial"
         );
-        let socket = TcpSocket::new_v4()?;
-        counts.started.set(counts.started.get() + 1);
-        counts.live.set(counts.live.get() + 1);
-        counts.peak.set(counts.peak.get().max(counts.live.get()));
-        // Tuple fields drop in order: close the real socket before decrementing
-        // the live count, including when a pending connect is cancelled.
-        let socket = (socket, CountedSocket(counts));
+        let socket = counted_connect_socket(counts)?;
         if all_pending || addr.port() == 1 {
             std::future::pending::<()>().await;
         }
@@ -1613,7 +1620,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn serial_connect_all_black_holes_share_one_absolute_deadline() {
-        let addrs = [1, 2, 3, 4].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let addrs = [1, 2, 3, 4, 5, 6, 7, 8].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
         let counts = Rc::new(ConnectCounts::default());
         let started = Instant::now();
         let err =
@@ -1625,9 +1632,112 @@ mod tests {
             .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), Duration::from_secs(5));
-        assert_eq!(counts.started.get(), 4);
+        assert_eq!(counts.started.get(), 8);
         assert_eq!(counts.peak.get(), 1);
         assert_eq!(counts.live.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_race_preserves_high_rtt_candidate() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(3);
+        let addrs = [1, 2, 3, 4, 5, 6].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let counts = Rc::new(ConnectCounts::default());
+        let started = Instant::now();
+        let stream = connect_tuned_tcp_race_with(
+            &addrs,
+            Some(&BUDGET),
+            started + Duration::from_secs(5),
+            |addr| {
+                let counts = Rc::clone(&counts);
+                async move {
+                    let socket = counted_connect_socket(counts)?;
+                    if addr.port() == 1 {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(socket)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(counts.started.get(), 4);
+        assert_eq!(counts.peak.get(), 4);
+        assert_eq!(counts.live.get(), 1);
+        assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
+        drop(stream);
+        assert_eq!(counts.live.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_failing_prefix_preserves_last_candidate_budget() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(3);
+        let addrs = [1, 2, 3, 4, 5].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        for budget in [None, Some(&BUDGET)] {
+            let counts = Rc::new(ConnectCounts::default());
+            let started = Instant::now();
+            let stream = connect_tuned_tcp_race_with(
+                &addrs,
+                budget,
+                started + Duration::from_secs(5),
+                |addr| {
+                    let counts = Rc::clone(&counts);
+                    async move {
+                        if budget.is_none() {
+                            assert_eq!(counts.live.get(), 0);
+                        }
+                        let socket = counted_connect_socket(counts)?;
+                        match addr.port() {
+                            1..=3 => return Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+                            4 => std::future::pending::<()>().await,
+                            _ => tokio::time::sleep(Duration::from_secs(2)).await,
+                        }
+                        Ok(socket)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(started.elapsed(), Duration::from_millis(4500));
+            assert_eq!(counts.started.get(), 5);
+            assert!(counts.peak.get() <= if budget.is_some() { 4 } else { 1 });
+            assert_eq!(counts.live.get(), 1);
+            assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
+            drop(stream);
+            assert_eq!(counts.live.get(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_parallel_window_is_bounded_across_all_candidates() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(256);
+        let addrs = [1, 2, 3, 4, 5, 6, 7, 8].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let counts = Rc::new(ConnectCounts::default());
+        let started = Instant::now();
+        let err = connect_tuned_tcp_race_with(
+            &addrs,
+            Some(&BUDGET),
+            started + Duration::from_secs(5),
+            |_| {
+                let counts = Rc::clone(&counts);
+                async move {
+                    let socket = counted_connect_socket(counts)?;
+                    std::future::pending::<()>().await;
+                    Ok(socket)
+                }
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(counts.started.get(), 8);
+        assert_eq!(counts.peak.get(), 4);
+        assert_eq!(counts.live.get(), 0);
+        assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
     }
 
     #[cfg(target_os = "linux")]

@@ -28,7 +28,25 @@ use super::quic::endpoint::{Connection, Endpoint, ServerConfig};
 
 /// Maps a pending session's [`offer_dcid`] to the channel that delivers its
 /// connection.
-type OfferRegistry = Arc<Mutex<HashMap<[u8; OFFER_DCID_LEN], oneshot::Sender<Connection>>>>;
+type OfferRegistry = Arc<Mutex<HashMap<[u8; OFFER_DCID_LEN], oneshot::Sender<PendingConnection>>>>;
+
+/// Keep the connection protected while it is queued in a successful oneshot
+/// send. A cancelled receiver drops the queued value without taking ownership.
+pub(crate) struct PendingConnection(Option<Connection>);
+
+impl PendingConnection {
+    pub(crate) fn into_connection(mut self) -> Connection {
+        self.0.take().expect("pending connection is consumed once")
+    }
+}
+
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = &self.0 {
+            conn.close(0u32.into(), b"offer-expired");
+        }
+    }
+}
 
 /// Safari's first-Initial DCID length (8 bytes on every captured connection). A
 /// 16-byte DCID would be visible to any on-path observer, since Initials are
@@ -100,11 +118,9 @@ impl QuicCarrier {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&dcid);
                 if let Some(tx) = waiter {
-                    // A receiver can disappear between remove and send when its
-                    // negotiation deadline expires. Close the undelivered connection.
-                    if let Err(conn) = tx.send(conn) {
-                        conn.close(0u32.into(), b"offer-expired");
-                    }
+                    // Cover cancellation both before send and after a successful
+                    // send queues the value but before the receiver consumes it.
+                    let _ = tx.send(PendingConnection(Some(conn)));
                 } else {
                     conn.close(0u32.into(), b"offer-expired");
                 }
@@ -136,7 +152,7 @@ impl QuicCarrier {
     /// carrier with [`offer_dcid`] of the id as its first-Initial DCID, and the accept
     /// loop delivers the connection. The session MUST await (bounded) and, on timeout,
     /// call [`Self::unregister`] so a no-show registration does not leak.
-    pub(crate) fn register(&self, offer_id: [u8; 16]) -> oneshot::Receiver<Connection> {
+    pub(crate) fn register(&self, offer_id: [u8; 16]) -> oneshot::Receiver<PendingConnection> {
         let (tx, rx) = oneshot::channel();
         self.registry
             .lock()
@@ -182,7 +198,54 @@ mod tests {
     use crate::transport::udp::quic::endpoint::Endpoint;
     use crate::transport::udp::quic::packet::ConnectionId;
     use crate::transport::udp::server_config_stable;
-    use crate::transport::udp::test_support::self_signed_cert;
+    use crate::transport::udp::test_support::{loopback_pair, self_signed_cert};
+
+    #[tokio::test]
+    async fn pending_handoff_closes_when_receiver_cancels_after_successful_send() {
+        let (_server, _client, client_conn, server_conn) = loopback_pair().await;
+        let observer = server_conn.clone();
+        let (tx, rx) = oneshot::channel();
+        assert!(tx.send(PendingConnection(Some(server_conn))).is_ok());
+        assert!(!observer.is_closed(), "send only queues the connection");
+
+        // No scheduling race or timer is needed: send succeeded, but the
+        // receiver is dropped before it ever polls or consumes the queued value.
+        drop(rx);
+        assert!(observer.is_closed(), "queued cancellation must close QUIC");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::transport::udp::endpoint::conn_closed(&client_conn),
+        )
+        .await
+        .expect("peer must observe the explicit handoff cancellation close");
+    }
+
+    #[tokio::test]
+    async fn pending_handoff_transfers_an_open_connection_when_consumed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (_server, _client, client_conn, server_conn) = loopback_pair().await;
+        let observer = server_conn.clone();
+        let (tx, rx) = oneshot::channel();
+        assert!(tx.send(PendingConnection(Some(server_conn))).is_ok());
+        let server_conn = rx.await.unwrap().into_connection();
+        assert!(
+            !observer.is_closed(),
+            "taking ownership must disarm cleanup"
+        );
+
+        let (mut send, _recv) = client_conn.open_bi();
+        send.write_all(b"handoff").await.unwrap();
+        let (_send, mut recv) =
+            tokio::time::timeout(Duration::from_secs(5), server_conn.accept_bi())
+                .await
+                .expect("consumed connection must remain usable")
+                .unwrap();
+        let mut received = [0; 7];
+        recv.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"handoff");
+        server_conn.close(0u32.into(), b"test-done");
+    }
 
     /// A marked client connecting to the carrier with its DCID set to the session
     /// `offer_id` is terminated locally AND routed to the exact session that
@@ -246,7 +309,8 @@ mod tests {
             .expect("marked client terminates locally (handshake completes)");
         let server_conn = server_res
             .expect("session handoff did not time out")
-            .expect("the carrier delivered the connection to the registered session");
+            .expect("the carrier delivered the connection to the registered session")
+            .into_connection();
         assert_eq!(
             server_conn.peer_initial_dcid(),
             &offer_dcid(&offer_id),

@@ -976,11 +976,10 @@ impl Driver {
                 return;
             }
             let mut core = c.core.lock().unwrap();
-            let established = !core.is_handshaking();
             if let Some(error) = core
                 .handle_datagram_ecn(data, ecn, now)
                 .err()
-                .filter(|_| established)
+                .filter(|_| !core.is_handshaking())
             {
                 // Only authenticated packet processing reports errors. Pending
                 // marker/origin-splice decisions below retain their silent path.
@@ -2438,6 +2437,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handshake_completion_and_invalid_data_in_one_datagram_sends_transport_close() {
+        use super::super::frame::{Dir, Frame};
+        use super::super::transport_params::TransportParameters;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = peer_socket.local_addr().unwrap();
+        let (_, connect_rx) = mpsc::unbounded_channel();
+        let (_, close_rx) = mpsc::unbounded_channel();
+        let (accept_tx, _) = mpsc::unbounded_channel();
+        // Drive the endpoint directly so the final Handshake packet and the
+        // authenticated invalid 1-RTT packet arrive in exactly one datagram.
+        let mut driver = Driver {
+            socket,
+            wake: Arc::new(Notify::new()),
+            conns: HashMap::new(),
+            splices: HashMap::new(),
+            marker_replay: HashMap::new(),
+            pending: HashMap::new(),
+            server: None,
+            accept_tx,
+            connect_rx,
+            close_rx,
+            #[cfg(target_os = "linux")]
+            gso_scratch: Vec::new(),
+        };
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        driver.on_connect(ConnectRequest {
+            addr: peer,
+            server_name: "example.com".to_owned(),
+            config: client_config(),
+            ticket: None,
+            now_ms: 0,
+            dcid: None,
+            reply,
+        });
+        let client = receive.await.unwrap().unwrap();
+        let config = server_config();
+        let scid = ConnectionId::new(&[0xab, 0xcd, 0xef, 1]);
+        let mut server = Core::new_server(
+            config.cert_chain.clone(),
+            &config.signing_key_pkcs8,
+            config.alpn_protocols.clone(),
+            TransportParameters::server(scid.as_slice()).encode_server(),
+            scid,
+        )
+        .unwrap();
+        let now = Instant::now();
+        while let Some(datagram) = client.core.lock().unwrap().poll_transmit(now) {
+            server.handle_datagram(&datagram, now).unwrap();
+        }
+        let mut coalesced = loop {
+            let datagram = server.poll_transmit(now).expect("server handshake flight");
+            if first_packet_space(&datagram) == Some(PacketSpace::Handshake) {
+                break datagram;
+            }
+            driver.on_datagram(&datagram, peer, 0);
+        };
+        assert!(client.is_handshaking());
+        coalesced.extend_from_slice(&server.test_data_packet(&[Frame::MaxStreams {
+            dir: Dir::Bidi,
+            max: (1 << 60) + 1,
+        }]));
+        assert!(coalesced.len() <= MAX_UDP_PAYLOAD);
+        driver.on_datagram(&coalesced, peer, 0);
+        assert!(!client.is_handshaking(), "the first packet completes TLS");
+        assert!(matches!(
+            client.core.lock().unwrap().close_reason(),
+            Some(CloseReason::LocalTransport(0x07, 0x12, _))
+        ));
+        driver.flush().await;
+        let mut datagram = [0; MAX_UDP_PAYLOAD];
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (size, _) = peer_socket.recv_from(&mut datagram).await.unwrap();
+                server
+                    .handle_datagram(&datagram[..size], Instant::now())
+                    .unwrap();
+                if let Some(reason) = server.close_reason() {
+                    break reason.clone();
+                }
+            }
+        })
+        .await
+        .expect("the coalesced error reaches the peer over UDP");
+        assert!(matches!(
+            received,
+            CloseReason::PeerTransport(0x07, 0x12, _)
+        ));
+    }
+
+    #[tokio::test]
     async fn established_invalid_max_streams_sends_transport_close() {
         use super::super::frame::{Dir, Frame};
 
@@ -2584,6 +2675,233 @@ mod tests {
         for id in [0, 2] {
             assert_invalid_stop_sending_close(id).await;
         }
+    }
+
+    async fn assert_server_transport_error(
+        frames: &[super::super::frame::Frame<'_>],
+        expected: (u64, u64),
+    ) {
+        let (client, server, client_conn, server_conn) = established_pair().await;
+        let datagram = server_conn
+            .shared
+            .core
+            .lock()
+            .unwrap()
+            .test_data_packet(frames);
+        server
+            .socket
+            .send_to(&datagram, client.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(peer_transport_close(&server_conn).await, expected);
+        assert!(client_conn.is_closed());
+    }
+
+    #[tokio::test]
+    async fn endpoint_flow_control_errors_preserve_transport_code_over_udp() {
+        use super::super::frame::Frame;
+        use super::super::transport_params::TransportParameters;
+
+        let limit = TransportParameters::safari_client(&[]).initial_max_stream_data_uni;
+        for (frame, frame_type) in [
+            (
+                Frame::Stream {
+                    id: 3,
+                    offset: limit,
+                    fin: false,
+                    data: b"x",
+                },
+                0x0e,
+            ),
+            (
+                Frame::ResetStream {
+                    id: 3,
+                    error_code: 7,
+                    final_size: limit + 1,
+                },
+                0x04,
+            ),
+        ] {
+            assert_server_transport_error(&[frame], (0x03, frame_type)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_stream_limit_errors_preserve_transport_code_over_udp() {
+        use super::super::frame::Frame;
+
+        // This peer-initiated bidi is beyond initial and later stream grants.
+        let id = (1 << 62) - 3;
+        for (frame, frame_type) in [
+            (
+                Frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: b"",
+                },
+                0x0a,
+            ),
+            (
+                Frame::ResetStream {
+                    id,
+                    error_code: 7,
+                    final_size: 0,
+                },
+                0x04,
+            ),
+            (Frame::StopSending { id, error_code: 7 }, 0x05),
+        ] {
+            assert_server_transport_error(&[frame], (0x04, frame_type)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_crypto_buffer_error_preserves_transport_code_over_udp() {
+        use super::super::frame::Frame;
+
+        assert_server_transport_error(
+            &[Frame::Crypto {
+                offset: 64 * 1024 + 1,
+                data: b"x",
+            }],
+            (0x0d, 0x06),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_connection_flow_control_errors_preserve_transport_code_over_udp() {
+        use super::super::frame::Frame;
+        use super::super::transport_params::TransportParameters;
+
+        let params = TransportParameters::safari_client(&[]);
+        for reset in [false, true] {
+            let (client, server, client_conn, server_conn) = established_pair().await;
+            let (local_bidi, _recv) = client_conn.open_bi();
+            // Charge the full connection window through legal per-stream offsets;
+            // empty fragments avoid allocating buffers for the skipped bytes.
+            let mut frames: Vec<_> = (0..params.initial_max_streams_uni)
+                .map(|ordinal| Frame::Stream {
+                    id: ordinal * 4 + 3,
+                    offset: params.initial_max_stream_data_uni,
+                    fin: false,
+                    data: b"",
+                })
+                .collect();
+            assert_eq!(
+                params.initial_max_streams_uni * params.initial_max_stream_data_uni,
+                params.initial_max_data,
+            );
+            frames.push(if reset {
+                Frame::ResetStream {
+                    id: local_bidi.id(),
+                    error_code: 7,
+                    final_size: 1,
+                }
+            } else {
+                Frame::Stream {
+                    id: local_bidi.id(),
+                    offset: 0,
+                    fin: false,
+                    data: b"x",
+                }
+            });
+            let datagram = server_conn
+                .shared
+                .core
+                .lock()
+                .unwrap()
+                .test_data_packet(&frames);
+            server
+                .socket
+                .send_to(&datagram, client.local_addr().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                peer_transport_close(&server_conn).await,
+                (0x03, if reset { 0x04 } else { 0x0a })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_stream_state_and_final_size_errors_preserve_transport_code_over_udp() {
+        use super::super::frame::Frame;
+
+        for (frame, frame_type) in [
+            (
+                Frame::Stream {
+                    id: 0,
+                    offset: 0,
+                    fin: false,
+                    data: b"x",
+                },
+                0x0a,
+            ),
+            (
+                Frame::ResetStream {
+                    id: 0,
+                    error_code: 7,
+                    final_size: 0,
+                },
+                0x04,
+            ),
+        ] {
+            assert_server_transport_error(&[frame], (0x05, frame_type)).await;
+        }
+        for (frame, frame_type) in [
+            (
+                Frame::Stream {
+                    id: 3,
+                    offset: 1,
+                    fin: false,
+                    data: b"x",
+                },
+                0x0e,
+            ),
+            (
+                Frame::ResetStream {
+                    id: 3,
+                    error_code: 7,
+                    final_size: 0,
+                },
+                0x04,
+            ),
+        ] {
+            assert_server_transport_error(
+                &[
+                    Frame::Stream {
+                        id: 3,
+                        offset: 0,
+                        fin: true,
+                        data: b"x",
+                    },
+                    frame,
+                ],
+                (0x06, frame_type),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_frame_encoding_error_preserves_transport_code_over_udp() {
+        use super::super::frame::Frame;
+
+        assert_server_transport_error(
+            &[
+                Frame::Ping,
+                Frame::NewConnectionId {
+                    seq: 0,
+                    retire_prior_to: 0,
+                    cid: &[],
+                    reset_token: &[0; 16],
+                },
+            ],
+            (0x07, 0x18),
+        )
+        .await;
     }
 
     fn server_config_marker(

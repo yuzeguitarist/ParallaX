@@ -1421,6 +1421,11 @@ if command -v runuser >/dev/null 2>&1; then
   if $sudo_prefix test -f $q_remote_config.secrets.enc; then
     $sudo_prefix install -m 0600 -o parallax -g parallax $q_remote_config.secrets.enc \"\$seal_staging/\$seal_config_name.secrets.enc\"
   fi
+  # Reused legacy configs can reference the shared bundle by relative name.
+  # Copy it only for resolution; publish only the config-specific bundle below.
+  if $sudo_prefix test -f $q_remote_config_dir/parallax.secrets.enc; then
+    $sudo_prefix install -m 0600 -o parallax -g parallax $q_remote_config_dir/parallax.secrets.enc \"\$seal_staging/parallax.secrets.enc\"
+  fi
   if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c \"\$seal_staging/\$seal_config_name\"; then
     $sudo_prefix install -m 0600 -o parallax -g parallax \"\$seal_staging/\$seal_config_name.secrets.enc\" $q_remote_config.secrets.enc
     $sudo_prefix install -m 0600 -o parallax -g parallax \"\$seal_staging/\$seal_config_name\" $q_remote_config
