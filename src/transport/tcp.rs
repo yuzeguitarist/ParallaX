@@ -54,11 +54,17 @@ impl ExtraFdBudget {
     }
 
     fn try_reserve(&self, count: usize) -> Option<ExtraFdReservation<'_>> {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(count).filter(|next| *next <= self.limit)
-            })
-            .ok()?;
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let next = used.checked_add(count).filter(|next| *next <= self.limit)?;
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
         Some(ExtraFdReservation {
             budget: self,
             count,
@@ -1300,6 +1306,35 @@ mod tests {
         let splice = budget.try_reserve(RESERVED_FDS_PER_KERNEL_SPLICE).unwrap();
         assert!(budget.try_reserve(1).is_none());
         drop(splice);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn optional_fd_budget_concurrent_reservations_do_not_oversubscribe() {
+        let budget = ExtraFdBudget::new(8);
+        let admitted_fds = AtomicUsize::new(0);
+        let phase = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    phase.wait();
+                    let reservation = budget.try_reserve(2);
+                    if reservation.is_some() {
+                        admitted_fds.fetch_add(2, Ordering::AcqRel);
+                    }
+                    phase.wait();
+                    phase.wait();
+                    drop(reservation);
+                });
+            }
+            phase.wait();
+            phase.wait();
+            let admitted = admitted_fds.load(Ordering::Acquire);
+            let held = budget.used.load(Ordering::Acquire);
+            phase.wait();
+            assert_eq!(admitted, 8);
+            assert_eq!(held, 8);
+        });
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 
