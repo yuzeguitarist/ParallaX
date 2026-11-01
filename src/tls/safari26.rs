@@ -312,6 +312,7 @@ impl Safari26TlsCamouflage {
             accept_language: crate::fingerprint::http2::SAFARI26_ACCEPT_LANGUAGE.to_owned(),
             retry_key_share: None,
             sent_compat_ccs: false,
+            pending_http2_plaintext: Vec::new(),
             tap: VecRecordTap::default(),
         })
     }
@@ -345,6 +346,9 @@ pub struct Safari26TlsSession {
     /// set this and both honor it, so an HRR handshake emits one CCS rather than
     /// two — a doubled CCS is a wire shape no real client produces.
     sent_compat_ccs: bool,
+    /// HTTP/2 bytes received alongside post-handshake TLS tickets, before the
+    /// client has sent its own HTTP/2 preface. Retain even a partial frame here.
+    pending_http2_plaintext: Vec<u8>,
     tap: VecRecordTap,
 }
 
@@ -791,6 +795,15 @@ impl Safari26TlsSession {
                         }
                         return Err(Safari26TlsError::Alert { level, description });
                     }
+                    if decrypted.content_type == TLS_RECORD_APPLICATION_DATA && keys.negotiated_h2()
+                    {
+                        // Servers can send their H2 preface immediately after TLS
+                        // Finished. Decrypt once, preserve the bytes, then send our
+                        // own preface before ACKing these SETTINGS in the H2 phase.
+                        self.pending_http2_plaintext
+                            .extend_from_slice(&decrypted.plaintext);
+                        return Ok(observed);
+                    }
                 }
                 _ => {}
             }
@@ -852,7 +865,13 @@ impl Safari26TlsSession {
         stream: &mut TcpStream,
         keys: &mut Tls13Keys,
     ) -> Result<(), Safari26TlsError> {
-        let mut plaintext = Vec::new();
+        let mut plaintext = std::mem::take(&mut self.pending_http2_plaintext);
+        if self
+            .process_http2_frames(&mut plaintext, stream, keys)
+            .await?
+        {
+            return Ok(());
+        }
         // Long-lived UNBUFFERED reader (see drain_post_handshake): a mid-record
         // timeout must not discard buffered bytes and desync the stream. The
         // settings-ack write is routed through reader.get_mut() because the reader
@@ -927,24 +946,21 @@ impl Safari26TlsSession {
     ) -> Result<bool, Safari26TlsError> {
         let mut offset = 0;
         let mut saw_settings_ack = false;
-        let mut should_ack_peer_settings = false;
 
         while let Some((header, total)) = Http2FrameHeader::parse_complete(&plaintext[offset..]) {
             if header.is_settings_ack() {
                 saw_settings_ack = true;
             } else if header.is_settings() {
-                should_ack_peer_settings = true;
+                // RFC 9113 §6.5.3 requires one ACK per SETTINGS, in receipt order;
+                // a batch containing multiple frames must not collapse their ACKs.
+                let ack = Http2Fingerprint::settings_ack_frame()?;
+                self.write_application_data(stream, keys, &ack).await?;
             }
             offset += total;
         }
 
         if offset > 0 {
             plaintext.drain(..offset);
-        }
-
-        if should_ack_peer_settings {
-            let ack = Http2Fingerprint::settings_ack_frame()?;
-            self.write_application_data(stream, keys, &ack).await?;
         }
 
         Ok(saw_settings_ack)
@@ -1439,19 +1455,19 @@ fn single_key_share_extension(group: u16, public: &[u8]) -> Result<Vec<u8>, Safa
 ///
 /// # Interaction with ParallaX authentication
 ///
-/// ParallaX carries its own X25519 share unmasked inside the FIRST ClientHello's
-/// `key_share` (see [`Safari26TlsCamouflage::start`]), and this rewrite replaces
-/// that extension wholesale with a single EC entry — so the second ClientHello
-/// deliberately does NOT carry the ParallaX auth binding.
+/// Recovering ParallaX's masked auth material depends on the FIRST ClientHello's
+/// X25519 `key_share` (see [`Safari26TlsCamouflage::start`]). This rewrite replaces
+/// that extension wholesale, so ClientHello2 does not preserve the auth binding.
 ///
-/// That is correct, not a gap. A ParallaX server never emits a HelloRetryRequest;
-/// the ServerHello on this path comes from the spliced camouflage origin, and an
-/// origin only retries for a group we did not share, which none does given the
-/// x25519 + X25519MLKEM768 shares on offer. If one ever did, the retried
-/// connection simply fails to present the marker and is treated as ordinary
-/// camouflage traffic — it degrades to the fallback splice rather than
-/// authenticating. Losing a session is the safe direction; forging the marker
-/// into a retry the server never expects would not be.
+/// Authenticated TCP proxy sessions through an HRR origin are unsupported: the
+/// server already authenticated ClientHello1 and derives epoch-0 keys from
+/// (ClientHello1, HRR), while this client returns the final ServerHello for its
+/// ParallaX key derivation. The server neither reauthenticates ClientHello2 nor
+/// updates that context. The TLS retry can finish, but the mismatched epoch-0
+/// keys prevent PX1Q takeover, so proxy establishment fails in the bounded
+/// pre-PQ splice. This is not a transparent downgrade to an ordinary origin
+/// session; deployments must verify their fallback origin accepts an initially
+/// offered share without HRR. See SPEC §12.3.
 fn rewrite_client_hello_for_retry(
     client_hello: &[u8],
     key_share_body: &[u8],
@@ -2915,6 +2931,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn process_http2_frames_acks_each_settings_in_one_batch() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        let mut peer_keys = app_keys();
+        let settings = h2_frame(0x4, 0x0, &[]);
+        let mut plaintext = settings.repeat(2);
+        plaintext.extend_from_slice(&h2_frame(0x4, 0x1, &[]));
+
+        assert!(session
+            .process_http2_frames(&mut plaintext, &mut stream, &mut session_keys)
+            .await
+            .unwrap());
+        assert!(plaintext.is_empty());
+
+        let mut reader = TlsRecordReader::new(&mut peer);
+        let mut record = Vec::new();
+        for _ in 0..2 {
+            timeout(Duration::from_secs(1), reader.read_record_into(&mut record))
+                .await
+                .expect("each SETTINGS needs its own ACK")
+                .unwrap();
+            let chunk = peer_keys
+                .client_application
+                .decrypt_record(&record)
+                .unwrap();
+            assert_eq!(chunk.plaintext, h2_frame(0x4, 0x1, &[]));
+        }
+    }
+
     /// Safari's H2 opening flight is ONE TLS record: preface + SETTINGS +
     /// WINDOW_UPDATE + HEADERS (frame types 4,8,1), not a preface record followed
     /// by a separate HEADERS record.
@@ -2962,6 +3009,85 @@ mod tests {
     }
 
     // ---- drain_post_handshake ----
+
+    async fn assert_early_h2_settings_are_acked(split: Option<usize>) {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut session_keys = app_keys();
+        session_keys.negotiated_alpn = Some(b"h2".to_vec());
+        let mut peer_keys = app_keys();
+        let settings = h2_frame(0x4, 0x0, &[0, 3, 0, 0, 0, 100]);
+        let split = split.unwrap_or(settings.len());
+        // An NST uses the same application traffic keys, but its inner handshake
+        // bytes must never enter the HTTP/2 frame buffer.
+        let ticket = peer_keys
+            .server_application
+            .encrypt_record(TLS_RECORD_HANDSHAKE, &[4, 0, 0, 0])
+            .unwrap();
+        peer.write_all(&ticket).await.unwrap();
+        let early = peer_keys
+            .server_application
+            .encrypt_record(TLS_RECORD_APPLICATION_DATA, &settings[..split])
+            .unwrap();
+        peer.write_all(&early).await.unwrap();
+        assert_eq!(
+            session
+                .drain_post_handshake(&mut stream, &mut session_keys)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let peer_exchange = async move {
+            let mut record = Vec::new();
+            TlsRecordReader::new(&mut peer)
+                .read_record_into(&mut record)
+                .await
+                .unwrap();
+            let opening = peer_keys
+                .client_application
+                .decrypt_record(&record)
+                .unwrap();
+            assert!(opening
+                .plaintext
+                .starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
+            let mut tail = settings[split..].to_vec();
+            tail.extend_from_slice(&h2_frame(0x4, 0x1, &[]));
+            let response = peer_keys
+                .server_application
+                .encrypt_record(TLS_RECORD_APPLICATION_DATA, &tail)
+                .unwrap();
+            peer.write_all(&response).await.unwrap();
+            timeout(
+                Duration::from_secs(1),
+                TlsRecordReader::new(&mut peer).read_record_into(&mut record),
+            )
+            .await
+            .expect("SETTINGS read during the ticket drain must still be ACKed")
+            .unwrap();
+            let ack = peer_keys
+                .client_application
+                .decrypt_record(&record)
+                .unwrap();
+            assert_eq!(ack.plaintext, h2_frame(0x4, 0x1, &[]));
+        };
+        let (opened, ()) = tokio::join!(
+            session.open_http2_connection(&mut stream, &mut session_keys),
+            peer_exchange
+        );
+        opened.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_preserves_early_h2_settings() {
+        assert_early_h2_settings_are_acked(None).await;
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_preserves_h2_frame_split_across_phases() {
+        assert_early_h2_settings_are_acked(Some(5)).await;
+        assert_early_h2_settings_are_acked(Some(12)).await;
+    }
 
     #[tokio::test]
     async fn drain_post_handshake_tolerates_encrypted_close_notify() {

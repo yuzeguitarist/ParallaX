@@ -222,9 +222,12 @@ plx init <DEST> [--server-addr ...] [--server-listen ...]
 
 plx seal [-c parallax.toml] [--output BUNDLE] [--host-key PATH]
     Encrypt the config's secrets into a machine-bound sealed bundle (default
-    <config-dir>/parallax.secrets.enc) under a host-local key, then rewrite the
+    <config-path>.secrets.enc) under a host-local key, then rewrite the
     config to reference it and delete the plaintext sidecar it read them from.
     After sealing, the config and bundle are useless on any other machine.
+    Bundle entries are scoped to the config, including when --output shares a
+    bundle. Existing sealed references remain readable when re-sealing migrates
+    them to config-scoped entries; old entries are retained for other configs.
     With a non-default --host-key, set PARALLAX_HOST_KEY_FILE to that path in the
     runtime environment or loading the sealed config will fail.
 ```
@@ -297,7 +300,7 @@ back-compat) or an indirection that keeps the bytes out of the config file:
 psk = "base64=="                              # inline — file IS a credential
 psk = { file = "parallax.secrets.toml#psk" } # 0600 sidecar file (init default)
 psk = { env = "PARALLAX_PSK" }               # environment / systemd credential
-psk = { sealed = "parallax.secrets.enc#psk" }# machine-bound, written by `plx seal`
+psk = { sealed = "parallax.toml.secrets.enc#config-<hash>.psk" } # written by `plx seal`
 ```
 
 All other fields are public parameters. See

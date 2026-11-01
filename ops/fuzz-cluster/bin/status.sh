@@ -14,6 +14,7 @@
 # /var/lib/plxfuzz/state/branch-fuzz-status — never in /var/lib/plxfuzz/src,
 # which is the pinned source tree the fuzzers are actively running from.
 set -uo pipefail
+umask 077
 
 ETC=/etc/plxfuzz
 STATE=/var/lib/plxfuzz/state
@@ -24,10 +25,10 @@ read_cfg() { [ -r "$ETC/$1" ] && tr -d ' \t\r\n' < "$ETC/$1" || true; }
 NODE_ID="$(read_cfg node-id)"
 PINNED="$(read_cfg pinned-commit)"
 REPO="$(read_cfg repo)";        REPO="${REPO:-yuzeguitarist/ParallaX}"
+REPO_URL="https://github.com/${REPO}.git"
 TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-d240e663}"
 export GH_REPO="$REPO"   # gh reads this; PAT is an env var (NEVER argv).
-# Token via env (matches sync.sh) so gh works under systemd even if the
-# bootstrap `gh auth login` creds aren't on this unit's HOME. Never argv.
+# Token via env for gh and its git credential helper under systemd.
 export GH_TOKEN="${GH_TOKEN:-$(read_cfg pat)}"
 
 # Authoritative shard table (sourced, never written here).
@@ -198,21 +199,10 @@ build_json() {  # $1 = absolute output path
 }
 
 # --- dedicated status clone: never touch the source tree's branch -----------
-# Authenticated remote uses the PAT from /etc/plxfuzz/pat ONLY inside the URL of
-# this throwaway clone; the token is never passed as a command-line argument.
-auth_remote() {
-  local tok=""
-  [ -r "$ETC/pat" ] && tok="$(tr -d ' \t\r\n' < "$ETC/pat" 2>/dev/null || true)"
-  if [ -n "$tok" ]; then
-    printf 'https://x-access-token:%s@github.com/%s' "$tok" "$REPO"
-  else
-    printf 'https://github.com/%s' "$REPO"
-  fi
-}
-
 ensure_status_clone() {
   if [ -d "$WT/.git" ]; then
-    git -C "$WT" remote set-url origin "$(auth_remote)" 2>/dev/null || true
+    git -C "$WT" config --replace-all remote.origin.url "$REPO_URL" 2>/dev/null || return 1
+    git -C "$WT" config --unset-all remote.origin.pushurl 2>/dev/null || true
     return 0
   fi
   mkdir -p "$STATE" 2>/dev/null || true
@@ -220,11 +210,11 @@ ensure_status_clone() {
   # `git clone --branch` accepts a tag name too (detached HEAD at the tag), so
   # this works whether fuzz-status currently resolves to the tag or (legacy) a
   # branch. push_status does the real work via an explicit tag fetch below.
-  if git clone --depth 1 --branch "$REFNAME" --single-branch "$(auth_remote)" "$WT" -q 2>/dev/null; then
+  if git clone --depth 1 --branch "$REFNAME" --single-branch "$REPO_URL" "$WT" -q 2>/dev/null; then
     return 0
   fi
   # Neither tag nor branch exists yet — start from an empty checkout.
-  if git clone --depth 1 "$(auth_remote)" "$WT" -q 2>/dev/null; then
+  if git clone --depth 1 "$REPO_URL" "$WT" -q 2>/dev/null; then
     git -C "$WT" checkout --orphan "$REFNAME" -q 2>/dev/null || true
     git -C "$WT" rm -rf --cached . -q 2>/dev/null || true
     git -C "$WT" clean -fdq 2>/dev/null || true
@@ -250,7 +240,6 @@ gc_status_clone() {
 push_status() {
   ensure_status_clone || return 0
   gc_status_clone
-  git -C "$WT" remote set-url origin "$(auth_remote)" 2>/dev/null || true
 
   local i base tree commit
   for i in 1 2 3; do

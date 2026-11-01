@@ -975,7 +975,29 @@ impl Driver {
             if oversize {
                 return;
             }
-            let _ = c.core.lock().unwrap().handle_datagram_ecn(data, ecn, now);
+            let mut core = c.core.lock().unwrap();
+            let established = !core.is_handshaking();
+            if let Some(error) = core
+                .handle_datagram_ecn(data, ecn, now)
+                .err()
+                .filter(|_| established)
+            {
+                // Only authenticated packet processing reports errors. Pending
+                // marker/origin-splice decisions below retain their silent path.
+                let (code, frame_type) = match &error {
+                    QuicTlsError::Transport {
+                        error_code,
+                        frame_type,
+                        ..
+                    } => (*error_code, *frame_type),
+                    QuicTlsError::Alert { description, .. } => {
+                        (0x100 + u64::from(*description), 0x06)
+                    }
+                    _ => (0x0a, 0), // PROTOCOL_VIOLATION.
+                };
+                core.close_transport(code, frame_type, error.to_string().as_bytes());
+            }
+            drop(core);
             c.wake_handles();
             return;
         }
@@ -1564,8 +1586,12 @@ impl Connection {
                     reason: reason.clone(),
                 })
             }
-            CloseReason::PeerTransport(code, _) => ConnectionError::ConnectionClosed(VarInt(*code)),
-            CloseReason::LocalApp(_, _) => ConnectionError::LocallyClosed,
+            CloseReason::PeerTransport(code, _, _) => {
+                ConnectionError::ConnectionClosed(VarInt(*code))
+            }
+            CloseReason::LocalApp(_, _) | CloseReason::LocalTransport(_, _, _) => {
+                ConnectionError::LocallyClosed
+            }
             CloseReason::IdleTimeout => ConnectionError::TimedOut,
         })
     }
@@ -1710,6 +1736,12 @@ impl AsyncWrite for SendStream {
                 "connection closed",
             )));
         }
+        if core.stream_send_finished(self.id) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream finished",
+            )));
+        }
         // Backpressure (memory-DoS guard, finding #28): the core caps each stream's
         // buffered send backlog; without a cap an app writing faster than the peer
         // acks would grow the buffer without bound. Accept at most the remaining
@@ -1750,6 +1782,8 @@ pub struct RecvStream {
     /// Leftover bytes from a read that did not fit the caller's buffer.
     pending: Vec<u8>,
     pos: usize,
+    /// Preserve the receive result after the core releases terminal stream state.
+    reset: Option<u64>,
 }
 
 impl RecvStream {
@@ -1759,6 +1793,7 @@ impl RecvStream {
             id,
             pending: Vec::new(),
             pos: 0,
+            reset: None,
         }
     }
 
@@ -1826,7 +1861,11 @@ impl AsyncRead for RecvStream {
             me.pos = n;
             return Poll::Ready(Ok(()));
         }
-        if let Some(code) = core.stream_reset(me.id) {
+        if let Some(code) = me.reset.or_else(|| core.stream_reset(me.id)) {
+            me.reset = Some(code);
+            core.discard_stream_recv(me.id);
+            drop(core);
+            me.shared.nudge();
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 format!("stream reset by peer (code {code})"),
@@ -2247,6 +2286,11 @@ mod tests {
         let mut resp = Vec::new();
         recv.read_to_end(&mut resp).await.unwrap();
         assert_eq!(resp, b"ping-pong", "bidi stream echoes with FIN → EOF");
+        assert_eq!(
+            send.write_all(b"late write").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe,
+            "a surviving handle cannot recreate a finished stream"
+        );
         srv.await.unwrap();
     }
 
@@ -2358,6 +2402,188 @@ mod tests {
             })),
             "the server observes the client's application close code + reason"
         );
+    }
+
+    async fn established_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        let loop_addr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
+        let client_conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.connect(server.local_addr().unwrap(), "example.com"),
+        )
+        .await
+        .expect("local handshake completes")
+        .unwrap();
+        let server_conn = server.accept().await.unwrap();
+        (client, server, client_conn, server_conn)
+    }
+
+    async fn peer_transport_close(conn: &Connection) -> (u64, u64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let reason = conn.shared.core.lock().unwrap().close_reason().cloned();
+                if let Some(reason) = reason {
+                    return match reason {
+                        CloseReason::PeerTransport(code, frame_type, _) => (code, frame_type),
+                        other => panic!("expected a peer transport close, got {other:?}"),
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("authenticated error must reach the peer over UDP")
+    }
+
+    #[tokio::test]
+    async fn established_invalid_max_streams_sends_transport_close() {
+        use super::super::frame::{Dir, Frame};
+
+        for (dir, frame_type) in [(Dir::Bidi, 0x12), (Dir::Uni, 0x13)] {
+            let (client, server, client_conn, server_conn) = established_pair().await;
+            let datagram =
+                client_conn
+                    .shared
+                    .core
+                    .lock()
+                    .unwrap()
+                    .test_data_packet(&[Frame::MaxStreams {
+                        dir,
+                        max: (1 << 60) + 1,
+                    }]);
+            client
+                .socket
+                .send_to(&datagram, server.local_addr().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(peer_transport_close(&client_conn).await, (0x07, frame_type));
+            assert!(server_conn.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn established_invalid_ticket_early_data_sends_transport_close() {
+        use super::super::frame::Frame;
+        use crate::tls::quic::{encode_new_session_ticket, NewSessionTicket};
+
+        for max_early_data in [0, 1, u32::MAX - 1] {
+            let (client, server, client_conn, server_conn) = established_pair().await;
+            let ticket = encode_new_session_ticket(&NewSessionTicket {
+                lifetime_secs: 60,
+                age_add: 1,
+                nonce: vec![1],
+                ticket: vec![2],
+                max_early_data: Some(max_early_data),
+            })
+            .unwrap();
+            let datagram =
+                server_conn
+                    .shared
+                    .core
+                    .lock()
+                    .unwrap()
+                    .test_data_packet(&[Frame::Crypto {
+                        offset: 0,
+                        data: &ticket,
+                    }]);
+            server
+                .socket
+                .send_to(&datagram, client.local_addr().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(peer_transport_close(&server_conn).await, (0x0a, 0x06));
+            assert!(client_conn.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn established_tls_alert_sends_crypto_transport_close() {
+        use super::super::frame::Frame;
+
+        let (client, server, client_conn, server_conn) = established_pair().await;
+        // An unknown post-handshake TLS message produces unexpected_message (10).
+        let datagram = server_conn
+            .shared
+            .core
+            .lock()
+            .unwrap()
+            .test_data_packet(&[Frame::Crypto {
+                offset: 0,
+                data: &[0xff, 0, 0, 0],
+            }]);
+        server
+            .socket
+            .send_to(&datagram, client.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(peer_transport_close(&server_conn).await, (0x10a, 0x06));
+        assert!(client_conn.is_closed());
+    }
+
+    #[tokio::test]
+    async fn established_send_only_stream_error_preserves_wire_frame_type() {
+        use super::super::frame::Frame;
+
+        for (offset, fin, frame_type) in [
+            (0, false, 0x0a),
+            (0, true, 0x0b),
+            (1, false, 0x0e),
+            (1, true, 0x0f),
+        ] {
+            let (client, server, client_conn, server_conn) = established_pair().await;
+            let send_only = client_conn.open_uni();
+            let datagram = server_conn.shared.core.lock().unwrap().test_data_packet(&[
+                Frame::Ping,
+                Frame::Stream {
+                    id: send_only.id(),
+                    offset,
+                    fin,
+                    data: b"invalid receive direction",
+                },
+            ]);
+            server
+                .socket
+                .send_to(&datagram, client.local_addr().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(peer_transport_close(&server_conn).await, (0x05, frame_type));
+            assert!(client_conn.is_closed());
+        }
+    }
+
+    async fn assert_invalid_stop_sending_close(id: u64) {
+        use super::super::frame::Frame;
+
+        let (client, server, client_conn, server_conn) = established_pair().await;
+        let datagram = server_conn
+            .shared
+            .core
+            .lock()
+            .unwrap()
+            .test_data_packet(&[Frame::StopSending { id, error_code: 7 }]);
+        server
+            .socket
+            .send_to(&datagram, client.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(peer_transport_close(&server_conn).await, (0x05, 0x05));
+        assert!(client_conn.is_closed());
+    }
+
+    #[tokio::test]
+    async fn established_stop_sending_receive_only_stream_sends_stream_state_close() {
+        // A server-initiated uni is receive-only at the client.
+        assert_invalid_stop_sending_close(3).await;
+    }
+
+    #[tokio::test]
+    async fn established_stop_sending_unopened_local_stream_sends_stream_state_close() {
+        // Neither the client's first bidi nor its first uni has been opened.
+        for id in [0, 2] {
+            assert_invalid_stop_sending_close(id).await;
+        }
     }
 
     fn server_config_marker(

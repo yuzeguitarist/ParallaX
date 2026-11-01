@@ -93,34 +93,47 @@ to sync creates it race-safely (it ignores `already_exists`).
 
 ## Start the cluster (paste one line per box)
 
-Open two c-4 boxes. On each, paste **as root** the three-line block for that
-box. The first line reads the PAT (input hidden, kept out of shell history); it
+Open two c-4 boxes. On each, paste **as root** the block for that
+box. The prompt reads the PAT (input hidden, kept out of shell history); it
 authenticates both the `bootstrap.sh` download **and** the private-repo clone.
 The **only** difference between boxes is the trailing node-id.
 
 ```bash
 # box-a
+set +x
 read -rsp 'GitHub PAT: ' T; echo
-curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-a
+printf 'Authorization: Bearer %s\n' "$T" | curl -fsSL --header @- https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-a
+unset T
 ```
 ```bash
 # box-b
+set +x
 read -rsp 'GitHub PAT: ' T; echo
-curl -fsSL -H "Authorization: Bearer $T" https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-b
+printf 'Authorization: Bearer %s\n' "$T" | curl -fsSL --header @- https://raw.githubusercontent.com/yuzeguitarist/ParallaX/main/ops/fuzz-cluster/bootstrap.sh | PLXFUZZ_PAT="$T" bash -s -- box-b
+unset T
 ```
 
 > The repo is **private**, so the bootstrap download and the clone both need the
-> token — that's why the PAT rides in via `Authorization:` (for curl) and
-> `PLXFUZZ_PAT` (for the script) instead of an interactive prompt. The boxes are
-> disposable, single-user root; the token in the launch line's env is acceptable
-> there and never gets committed.
+> token. Bash's built-in `printf` supplies curl's header on stdin; the token
+> never enters curl's arguments. `PLXFUZZ_PAT` supplies bootstrap's environment.
+> Run with shell tracing disabled (`set +x`) to keep the token out of logs.
 
 `bootstrap.sh` picks the PAT up from `PLXFUZZ_PAT`, stores it `0600` at
 `/etc/plxfuzz/pat`, then unattended: installs the pinned toolchain + build deps,
-clones `d240e663`, `gh auth login --with-token`, warm-builds the fuzzers,
+configures `gh auth git-credential`, clones `d240e663`, warm-builds the fuzzers,
 installs+enables the systemd units, and starts fuzzing. It is idempotent —
 re-pasting on a half-built box self-heals. When it prints `cluster node box-a live`,
 walk away.
+
+The service home is `0700`. Git remotes contain only the plain HTTPS repository
+URL; GitHub CLI reads `GH_TOKEN` from each service's environment. Re-running
+bootstrap also removes legacy credential-bearing fetch/push URLs from existing
+source, status, and crash clones. A local bootstrap installs its adjacent
+operator package. With `curl | bash`, `PLXFUZZ_OPS_COMMIT` selects the operator
+revision (default `main`); bootstrap resolves and logs one commit SHA and
+installs the entire package from that commit while fuzz source stays pinned.
+For a repeatable deployment, use a reviewed SHA in both the download URL and
+`PLXFUZZ_OPS_COMMIT`.
 
 > Paste the block over a fast connection if you can — step one is a one-time
 > multi-GB `cargo fuzz build`. Subsequent restarts reuse the build.

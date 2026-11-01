@@ -83,9 +83,10 @@ impl QuicCarrier {
                 // Route by the client-chosen DCID (= `offer_dcid` of the session
                 // `offer_id`). A connection whose DCID is not a registered offer DCID
                 // (a stray, a late arrival after the session gave up, or a marked
-                // client with no pending session) is dropped — closing it cleanly via
-                // the handle drop.
+                // client with no pending session) is explicitly closed: dropping a
+                // custom Connection handle leaves its driver state alive.
                 let Ok(dcid) = <[u8; OFFER_DCID_LEN]>::try_from(conn.peer_initial_dcid()) else {
+                    conn.close(0u32.into(), b"invalid-offer");
                     continue;
                 };
                 // Recover from a poisoned registry rather than unwrap-panicking: this
@@ -99,8 +100,13 @@ impl QuicCarrier {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&dcid);
                 if let Some(tx) = waiter {
-                    // Receiver gone (session timed out) → the connection drops here.
-                    let _ = tx.send(conn);
+                    // A receiver can disappear between remove and send when its
+                    // negotiation deadline expires. Close the undelivered connection.
+                    if let Err(conn) = tx.send(conn) {
+                        conn.close(0u32.into(), b"offer-expired");
+                    }
+                } else {
+                    conn.close(0u32.into(), b"offer-expired");
                 }
             }
         });
@@ -145,6 +151,11 @@ impl QuicCarrier {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&offer_dcid(offer_id));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_offers_for_test(&self) -> usize {
+        self.registry.lock().unwrap().len()
     }
 }
 
@@ -241,6 +252,88 @@ mod tests {
             &offer_dcid(&offer_id),
             "the routed connection carries the session's 8-byte offer DCID"
         );
+    }
+
+    #[tokio::test]
+    async fn expired_or_undeliverable_offers_close_the_quic_connection() {
+        let server_kp = X25519KeyPair::generate();
+        let psk = zeroize::Zeroizing::new(b"parallax-quic-stable-carrier-psk".to_vec());
+        let (cert, key) = self_signed_cert();
+        let config = server_config_stable(
+            cert,
+            key,
+            None,
+            (psk.clone(), zeroize::Zeroizing::new(server_kp.private)),
+            None,
+            "127.0.0.1:9".parse().unwrap(),
+            vec!["example.com".to_owned()],
+            0,
+        )
+        .unwrap();
+        let carrier = QuicCarrier::bind("127.0.0.1:0".parse().unwrap(), config)
+            .await
+            .unwrap();
+
+        for case in 0..3_u8 {
+            let offer_id = [0x70 + case; 16];
+            if case == 0 {
+                // A timed-out session removes its registration before the
+                // client's late handshake reaches the accept loop.
+                let mut rx = carrier.register(offer_id);
+                assert!(tokio::time::timeout(Duration::ZERO, &mut rx).await.is_err());
+                carrier.unregister(&offer_id);
+                assert!(rx.await.is_err(), "expired registration must be removed");
+            } else if case == 1 {
+                // The deadline can drop the receiver just before the accept
+                // loop sends its connection; send then returns that connection.
+                drop(carrier.register(offer_id));
+            }
+            let dcid = if case == 2 {
+                // A valid QUIC DCID with no valid offer-id shape.
+                ConnectionId::new(&[0x72; OFFER_DCID_LEN + 1])
+            } else {
+                ConnectionId::new(&offer_dcid(&offer_id))
+            };
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            client.set_default_client_config(Arc::new(
+                ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                    QuicMarkerConfig {
+                        psk: psk.clone(),
+                        server_static_public: server_kp.public,
+                    },
+                ),
+            ));
+            let conn = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.connect_with_dcid(carrier.local_addr().unwrap(), "example.com", dcid),
+            )
+            .await
+            .expect("marked client handshake completes")
+            .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::transport::udp::endpoint::conn_closed(&conn),
+            )
+            .await
+            .expect("carrier must explicitly close every undelivered connection");
+            let Some(super::super::quic::endpoint::ConnectionError::ApplicationClosed(close)) =
+                conn.close_reason()
+            else {
+                panic!("case {case}: expected an application close from the carrier");
+            };
+            assert_eq!(close.error_code.into_inner(), 0);
+            assert_eq!(
+                close.reason,
+                if case == 2 {
+                    b"invalid-offer".as_slice()
+                } else {
+                    b"offer-expired".as_slice()
+                }
+            );
+            assert!(carrier.registry.lock().unwrap().is_empty());
+        }
     }
 
     /// Dropping the carrier must stop its accept loop and free the bound

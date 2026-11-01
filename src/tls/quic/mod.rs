@@ -41,6 +41,8 @@ pub use verify::{AcceptAnyServerCert, CertVerifyError, ServerCertVerifier};
 // these source-of-truth values via compile-time assertions (issue: cross-file
 // window constants drifting apart).
 pub(crate) use server::{MARKER_WINDOW_SECS, TICKET_LIFETIME_SECS};
+#[cfg(test)]
+pub(crate) use ticket::{encode_new_session_ticket, NewSessionTicket};
 
 use std::sync::Arc;
 
@@ -77,8 +79,9 @@ pub(crate) const ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 /// Errors surfaced by the hand-written TLS engine.
 ///
 /// [`QuicTlsError::Alert`] carries the TLS alert description the peer should see;
-/// the quinn adapter turns it into a QUIC `CRYPTO_ERROR`. The remaining variants
-/// map to `PROTOCOL_VIOLATION` (or the `ConnectError` cases at `start_session`).
+/// the endpoint turns it into a QUIC `CRYPTO_ERROR`. [`QuicTlsError::Transport`]
+/// preserves a specific transport code and triggering frame; the remaining
+/// variants map to `PROTOCOL_VIOLATION` (or errors starting a session).
 #[derive(Debug, Error)]
 pub enum QuicTlsError {
     /// A fatal TLS alert (`description`) with a human-readable reason.
@@ -90,6 +93,13 @@ pub enum QuicTlsError {
     /// A QUIC-layer protocol violation (RFC 9000 §11): maps to PROTOCOL_VIOLATION.
     #[error("QUIC protocol violation: {0}")]
     Protocol(String),
+    /// A QUIC transport error with its triggering frame type (RFC 9000 §20.1).
+    #[error("QUIC transport error {error_code:#x} on frame {frame_type:#x}: {reason}")]
+    Transport {
+        error_code: u64,
+        frame_type: u64,
+        reason: String,
+    },
     /// Certificate or CertificateVerify rejected by the verifier.
     #[error("certificate verification failed: {0}")]
     Certificate(String),
@@ -341,6 +351,11 @@ mod tests {
         for err in [
             QuicTlsError::Crypto("x".into()),
             QuicTlsError::Protocol("x".into()),
+            QuicTlsError::Transport {
+                error_code: 0x07,
+                frame_type: 0x12,
+                reason: "x".into(),
+            },
             QuicTlsError::Certificate("x".into()),
             QuicTlsError::UnsupportedVersion,
             QuicTlsError::InvalidServerName("x".into()),

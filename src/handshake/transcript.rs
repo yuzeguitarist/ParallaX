@@ -46,4 +46,58 @@ mod tests {
             "the client/server boundary must be canonicalized"
         );
     }
+
+    #[test]
+    fn hrr_and_final_server_hello_produce_incompatible_epoch_zero_keys() {
+        use crate::{
+            crypto::session::{derive_server_keys_from_shared, AeadCodec, SessionError},
+            handshake::client::derive_session_keys_from_shared,
+            protocol::data::CLIENT_TO_SERVER_AAD,
+            tls::{client_hello::tests::client_hello_fixture, server_hello},
+        };
+
+        let client_hello = client_hello_fixture("example.com");
+        let final_server_hello = server_hello::tests::server_hello_fixture();
+        // TLS 1.3 HRR selecting secp256r1, with the fixture's echoed session ID.
+        let mut hrr = vec![
+            0x16, 0x03, 0x03, 0x00, 0x58, 0x02, 0x00, 0x00, 0x54, 0x03, 0x03,
+        ];
+        hrr.extend_from_slice(&[
+            0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65,
+            0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+            0xc8, 0xa8, 0x33, 0x9c,
+        ]);
+        hrr.push(32);
+        hrr.extend_from_slice(&[0x55; 32]);
+        hrr.extend_from_slice(&[
+            0x13, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00,
+            0x02, 0x00, 0x17,
+        ]);
+        // The server's first-response parser accepts HRR as a TLS 1.3 ServerHello.
+        assert!(
+            server_hello::parse_server_hello(&hrr)
+                .unwrap()
+                .tls13_selected
+        );
+
+        let psk = [0x5a; 32];
+        let shared = [0x42; 32];
+        let server_context = transcript_hash(&client_hello, &hrr);
+        let server_keys = derive_server_keys_from_shared(&psk, &shared, &server_context).unwrap();
+        let client_keys =
+            derive_session_keys_from_shared(&psk, &shared, &client_hello, &final_server_hello)
+                .unwrap();
+        assert_eq!(server_keys.epoch, 0);
+        assert_eq!(client_keys.epoch, 0);
+        assert_ne!(server_keys.transcript_hash, client_keys.transcript_hash);
+        assert_ne!(server_keys.client_key, client_keys.client_key);
+
+        let mut seal = AeadCodec::new(client_keys.client_key, client_keys.client_nonce);
+        let ciphertext = seal.seal(b"PX1Q", CLIENT_TO_SERVER_AAD).unwrap();
+        let mut open = AeadCodec::new(server_keys.client_key, server_keys.client_nonce);
+        assert!(matches!(
+            open.open(&ciphertext, CLIENT_TO_SERVER_AAD),
+            Err(SessionError::Aead)
+        ));
+    }
 }

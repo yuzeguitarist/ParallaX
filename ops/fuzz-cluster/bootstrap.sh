@@ -16,7 +16,9 @@
 # Idempotent: re-pasting on a half-built box self-heals (every step checks for
 # its own completion). Every network op is wrapped so a transient failure is
 # retried rather than aborting the box.
+set +x
 set -uo pipefail
+umask 077
 
 # ---------------------------------------------------------------------------
 # Locked campaign constants.
@@ -109,7 +111,8 @@ fi
 # the next oneshot plx-status run picks up the new group automatically.
 usermod -aG systemd-journal "$FUZZ_USER" 2>/dev/null \
   || warn "could not add $FUZZ_USER to systemd-journal; exec/s will read 0"
-install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$HOME_DIR" "$BIN" "$LOGS"
+install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0700 "$HOME_DIR"
+install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$BIN" "$LOGS"
 
 # ---------------------------------------------------------------------------
 # 3. rustup + pinned nightly + cargo-fuzz (installed AS the plxfuzz user so the
@@ -118,7 +121,7 @@ install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$HOME_DIR" "$BIN" "$LOGS"
 log "[3/11] rustup + $NIGHTLY + cargo-fuzz $CARGO_FUZZ_VERSION"
 RUSTUP="$HOME_DIR/.cargo/bin/rustup"
 # run a command as the fuzz user with the cargo env on PATH
-as_fuzz() { sudo -u "$FUZZ_USER" -H env PATH="$HOME_DIR/.cargo/bin:/usr/local/bin:/usr/bin:/bin" "$@"; }
+as_fuzz() { sudo -u "$FUZZ_USER" -H --preserve-env=GH_TOKEN env PATH="$HOME_DIR/.cargo/bin:/usr/local/bin:/usr/bin:/bin" "$@"; }
 
 if [ ! -x "$RUSTUP" ]; then
   retry 3 10 bash -c "curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
@@ -136,52 +139,11 @@ if ! as_fuzz cargo "+$NIGHTLY" fuzz --version >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Clone the pinned source (shallow) and check out the exact commit.
-# ---------------------------------------------------------------------------
-log "[4/11] clone + checkout $PINNED_COMMIT into $SRC"
-# The repo is PRIVATE, so the clone/fetch must be authenticated. When the box is
-# launched via the documented one-liner the PAT arrives in $PLXFUZZ_PAT; use the
-# x-access-token URL for the initial clone (step 7 later re-sets the same remote
-# for the long-lived units). Fall back to the bare URL only if no PAT is present
-# (e.g. a public-repo run), which preserves the previous behaviour there.
-CLONE_URL="$REPO_URL"
-if [ -n "${PLXFUZZ_PAT:-}" ]; then
-  CLONE_URL="https://x-access-token:${PLXFUZZ_PAT}@github.com/${REPO}.git"
-fi
-if [ ! -d "$SRC/.git" ]; then
-  rm -rf "$SRC" 2>/dev/null || true
-  # Full single-branch clone (NOT --depth 1): the pinned commit is an ancestor
-  # of the default branch, and a shallow clone holds only the tip, so it could
-  # never check the pinned commit out. Single-branch keeps the unrelated codex/
-  # devin branches out while still carrying the default branch's full history.
-  retry 3 10 sudo -u "$FUZZ_USER" -H git clone --single-branch "$CLONE_URL" "$SRC" \
-    || die "git clone failed"
-fi
-# Ensure the pinned commit is present. If $SRC is an older *shallow* clone from a
-# previous run, deepen it (--unshallow); a normal fetch covers the non-shallow
-# "object simply missing" case.
-if ! sudo -u "$FUZZ_USER" -H git -C "$SRC" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null; then
-  retry 3 10 sudo -u "$FUZZ_USER" -H git -C "$SRC" fetch --unshallow "$CLONE_URL" 2>/dev/null \
-    || retry 3 10 sudo -u "$FUZZ_USER" -H git -C "$SRC" fetch "$CLONE_URL" '+refs/heads/*:refs/remotes/origin/*' \
-    || warn "fetch to obtain $PINNED_COMMIT failed; checkout may fail"
-fi
-# Check out the exact pinned commit. git resolves the abbreviated SHA from local
-# objects once the history is present. No FETCH_HEAD fallback: that would risk
-# silently building a *different* commit than the campaign is pinned to.
-sudo -u "$FUZZ_USER" -H git -C "$SRC" checkout -q --detach "$PINNED_COMMIT" \
-  || die "could not check out $PINNED_COMMIT"
-ACTUAL="$(sudo -u "$FUZZ_USER" -H git -C "$SRC" rev-parse HEAD 2>/dev/null || true)"
-case "$ACTUAL" in
-  "$PINNED_COMMIT"*) log "source at $ACTUAL" ;;
-  *) warn "HEAD is $ACTUAL, expected $PINNED_COMMIT* (continuing)" ;;
-esac
-
-# ---------------------------------------------------------------------------
-# 5. PROMPT for the PAT — read from the controlling terminal, never argv.
+# 4. PROMPT for the PAT before the first private-repo clone.
 #    (When run via `curl | bash`, stdin is the pipe, so we read /dev/tty.)
 #    PLXFUZZ_PAT may pre-seed it for non-interactive re-runs; still not argv.
 # ---------------------------------------------------------------------------
-log "[5/11] GitHub PAT"
+log "[4/11] GitHub PAT"
 PAT="${PLXFUZZ_PAT:-}"
 if [ -z "$PAT" ] && [ -s "$ETC/pat" ]; then
   PAT="$(tr -d ' \t\r\n' < "$ETC/pat")"
@@ -205,9 +167,9 @@ PAT="$(printf '%s' "$PAT" | tr -d ' \t\r\n')"
 [ -n "$PAT" ] || die "no PAT provided"
 
 # ---------------------------------------------------------------------------
-# 6. Write /etc/plxfuzz/{node-id,pat,pinned-commit,repo,campaign-tag}.
+# 5. Write /etc/plxfuzz/{node-id,pat,pinned-commit,repo,campaign-tag}.
 # ---------------------------------------------------------------------------
-log "[6/11] write $ETC/*"
+log "[5/11] write $ETC/*"
 install -d -m 0755 "$ETC"
 umask 077
 printf '%s\n' "$NODE_ID"       > "$ETC/node-id"
@@ -215,7 +177,6 @@ printf '%s\n' "$PINNED_COMMIT" > "$ETC/pinned-commit"
 printf '%s\n' "$REPO"          > "$ETC/repo"
 printf '%s\n' "$CAMPAIGN_TAG"  > "$ETC/campaign-tag"
 printf '%s\n' "$PAT"           > "$ETC/pat"
-umask 022
 chmod 0644 "$ETC/node-id" "$ETC/pinned-commit" "$ETC/repo" "$ETC/campaign-tag"
 # The PAT file is mode 0600 (contract) and OWNED BY plxfuzz so the fuzz units
 # (sync.sh/crash-push.sh/status.sh run as plxfuzz) can read it via owner-read,
@@ -225,44 +186,75 @@ chown "$FUZZ_USER:$FUZZ_USER" "$ETC/pat"
 chmod 0600 "$ETC/pat"
 
 # ---------------------------------------------------------------------------
-# 7. gh auth login --with-token  +  authenticated git remote (token via stdin,
-#    never argv). Do this AS the plxfuzz user so the units inherit the auth.
+# 6. GitHub CLI credential helper. Only the private PAT file persists the
+#    token; gh and git read GH_TOKEN from the environment, never a URL/argv.
 # ---------------------------------------------------------------------------
-log "[7/11] gh auth login --with-token"
-# Re-pipe the PAT on each attempt: a piped `retry ...` would feed the (already
-# consumed) stdin only once, so an explicit loop that re-supplies it is correct.
-_auth_i=0
-while :; do
-  if printf '%s\n' "$PAT" | as_fuzz gh auth login --with-token; then break; fi
-  _auth_i=$((_auth_i+1))
-  [ "$_auth_i" -ge 3 ] && { warn "gh auth login failed; units fall back to GH_TOKEN from \$ETC/pat"; break; }
-  sleep 10
+log "[6/11] configure GitHub credential helper"
+export GH_TOKEN="$PAT"
+unset PAT PLXFUZZ_PAT
+as_fuzz gh auth setup-git --hostname github.com --force \
+  || die "could not configure GitHub credential helper"
+
+# Migrate all existing clones before any fetch/push. Replace ALL fetch URLs
+# and remove explicit push URLs left by older bootstraps.
+for clone in "$SRC" "$HOME_DIR/state/branch-fuzz-status" "$HOME_DIR/state/branch-fuzz-crashes"; do
+  [ -e "$clone/.git" ] || continue
+  as_fuzz git -C "$clone" config --replace-all remote.origin.url "$REPO_URL" \
+    || die "could not clean origin URL in $clone"
+  as_fuzz git -C "$clone" config --unset-all remote.origin.pushurl || true
 done
-# Authenticated remote so git push to the orphan branches works headless. The
-# token lives only inside the remote URL of the plxfuzz-owned clone (under the
-# 0700-ish home); it is the documented x-access-token mechanism, not a logged arg.
-sudo -u "$FUZZ_USER" -H git -C "$SRC" remote set-url origin \
-  "https://x-access-token:${PAT}@github.com/${REPO}.git" 2>/dev/null \
-  || warn "could not set authenticated git remote"
+
+# ---------------------------------------------------------------------------
+# 7. Clone the pinned source and check out the exact commit.
+# ---------------------------------------------------------------------------
+log "[7/11] clone + checkout $PINNED_COMMIT into $SRC"
+if [ ! -d "$SRC/.git" ]; then
+  rm -rf "$SRC" 2>/dev/null || true
+  # Full single-branch history is needed for the ancestor campaign pin.
+  retry 3 10 as_fuzz git clone --single-branch "$REPO_URL" "$SRC" \
+    || die "git clone failed"
+fi
+if ! as_fuzz git -C "$SRC" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null; then
+  retry 3 10 as_fuzz git -C "$SRC" fetch --unshallow origin 2>/dev/null \
+    || retry 3 10 as_fuzz git -C "$SRC" fetch origin '+refs/heads/*:refs/remotes/origin/*' \
+    || warn "fetch to obtain $PINNED_COMMIT failed; checkout may fail"
+fi
+as_fuzz git -C "$SRC" checkout -q --detach "$PINNED_COMMIT" \
+  || die "could not check out $PINNED_COMMIT"
+ACTUAL="$(as_fuzz git -C "$SRC" rev-parse HEAD 2>/dev/null || true)"
+case "$ACTUAL" in
+  "$PINNED_COMMIT"*) log "source at $ACTUAL" ;;
+  *) warn "HEAD is $ACTUAL, expected $PINNED_COMMIT* (continuing)" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 8. Copy bin/ + lib/ + config/ next to each other under $BIN so every
 #    sibling's shard-table / suppressions probe path resolves on the box.
 # ---------------------------------------------------------------------------
 log "[8/11] install scripts to $BIN"
-# Under `curl | bash` the script has no backing file, so BASH_SOURCE[0] is unset
-# and `set -u` would abort here; fall back to $0 and never let a failed cd abort
-# — the pinned clone ($SRC/ops/fuzz-cluster) is the primary package source, this
-# is only a manual-local-run fallback.
+# Local execution uses the package beside this bootstrap. Under curl | bash,
+# resolve the requested operator revision once and extract the whole package
+# from that commit. The old campaign pin must not reinstall vulnerable scripts.
 _self="${BASH_SOURCE[0]:-$0}"
 SELF_DIR="$(cd "$(dirname "$_self")" 2>/dev/null && pwd || true)"
-# Prefer files from the freshly-cloned, pinned source tree; fall back to the
-# directory this script was pasted from (e.g. a manual local run).
-PKG_DIR=""
-for cand in "$SRC/ops/fuzz-cluster" "$SELF_DIR"; do
-  if [ -d "$cand/bin" ] && [ -f "$cand/lib/shard-table.sh" ]; then PKG_DIR="$cand"; break; fi
-done
-[ -n "$PKG_DIR" ] || die "cannot locate ops/fuzz-cluster package (bin/ + lib/)"
+PKG_DIR="$SELF_DIR"
+if [ ! -f "$_self" ] || [ ! -d "$PKG_DIR/bin" ] || [ ! -f "$PKG_DIR/lib/shard-table.sh" ]; then
+  OPS_REV="${PLXFUZZ_OPS_COMMIT:-main}"
+  retry 3 10 as_fuzz git -C "$SRC" fetch origin "$OPS_REV" \
+    || die "could not fetch operator revision $OPS_REV"
+  OPS_COMMIT="$(as_fuzz git -C "$SRC" rev-parse 'FETCH_HEAD^{commit}')" \
+    || die "could not resolve operator revision"
+  log "installing operator scripts at $OPS_COMMIT (fuzz pin=$PINNED_COMMIT)"
+  PKG_TMP="$(mktemp -d)" || die "could not create operator package directory"
+  trap 'rm -rf "$PKG_TMP"' EXIT
+  # Root opens the private output file; the fuzz user only writes stdout.
+  # Complete the archive first: tar may stop before consuming trailing padding.
+  as_fuzz git -C "$SRC" archive "$OPS_COMMIT" ops/fuzz-cluster \
+    > "$PKG_TMP/operator.tar" || die "could not archive operator scripts"
+  tar -xf "$PKG_TMP/operator.tar" -C "$PKG_TMP" \
+    || die "could not extract operator scripts"
+  PKG_DIR="$PKG_TMP/ops/fuzz-cluster"
+fi
 
 install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$BIN" "$BIN/lib" "$BIN/config"
 install -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$PKG_DIR"/bin/*.sh "$BIN/"

@@ -40,7 +40,7 @@ runtime is unchanged regardless of where the bytes came from.
 | Inline | `psk = "base64=="` | Legacy. The config file IS a credential — `plx check` warns. |
 | File | `psk = { file = "parallax.secrets.toml#psk" }` | Reads a `#key` entry from a 0600 TOML sidecar (the `plx init` default), or the whole file when no `#fragment` is given. Relative paths resolve next to the config. Owner-only `0600` is enforced. |
 | Env | `psk = { env = "PARALLAX_PSK" }` | Reads the base64 from an environment variable — composes with systemd `LoadCredential=` / container secrets. |
-| Sealed | `psk = { sealed = "parallax.secrets.enc#psk" }` | Machine-bound: decrypted at load with the host keyfile (`$PARALLAX_HOST_KEY_FILE` or `/var/lib/parallax/host.key`). Written by `plx seal`. |
+| Sealed | `psk = { sealed = "parallax.toml.secrets.enc#config-<hash>.psk" }` | Machine-bound: decrypted at load with the host keyfile (`$PARALLAX_HOST_KEY_FILE` or `/var/lib/parallax/host.key`). `plx seal` uses a config-scoped entry name; see [Secret Store & Sealed Configs](Secret-Store-&-Sealed-Configs.md) for shared bundles and legacy references. |
 
 Exactly one of `file` / `env` / `sealed` may be set per reference. Only these
 three fields are secret; every other config field is a public parameter. See the

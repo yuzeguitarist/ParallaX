@@ -2,8 +2,7 @@
 set -Eeuo pipefail
 
 usage() {
-  cat <<'USAGE'
-ParallaX private VPS deployer.
+  printf '%s' 'ParallaX private VPS deployer.
 
 This script keeps source code on the local machine:
   - builds the Linux server binary locally
@@ -13,7 +12,7 @@ This script keeps source code on the local machine:
 Interactive (recommended for beginners):
   scripts/deploy-vps.sh
 
-  With no arguments, you'll be prompted step by step on a normal terminal.
+  With no arguments, you'\''ll be prompted step by step on a normal terminal.
   Polar Signals tokens are pasted at the prompt (no token file needed).
 
 Traditional usage (explicit arguments):
@@ -69,7 +68,7 @@ Options:
 After deploy:
   plx client -c target/parallax-deploy/<host>/parallax.client.toml
   curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
-USAGE
+'
 }
 
 die() {
@@ -133,7 +132,7 @@ trim_space() {
   local s=$1
   s="${s//$'\r'/}"
   # shellcheck disable=SC2001
-  s="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$s")"
+  s="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' < <(printf '%s\n' "$s"))"
   printf '%s' "$s"
 }
 
@@ -217,8 +216,7 @@ tolower_one() {
 }
 
 interactive_banner() {
-  cat <<'BANNER'
-
+  printf '%s' '
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ParallaX VPS deploy — guided setup
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -230,7 +228,7 @@ For Polar Signals, you paste a single-line token at the prompt (no token file).
 Secrets are typed hidden and are never echoed back here.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-BANNER
+'
 }
 
 interactive_prompt_dry_run() {
@@ -667,6 +665,13 @@ require_safe_remote_path() {
   [[ "$value" == /* ]] || die "$name must be an absolute path: $value"
   require_no_space "$name" "$value"
   require_no_control "$name" "$value"
+  # These paths are written verbatim into ExecStart. systemd would interpret
+  # quoting, C escapes, environment variables, or specifiers as different paths.
+  case "$value" in
+    *"'"*|*'"'*|*'\'*|*'$'*|*'%'*)
+      die "$name must not contain systemd command-line metacharacters (quotes, backslash, dollar, percent): $value"
+      ;;
+  esac
 }
 
 require_safe_service_name() {
@@ -707,14 +712,37 @@ safe_name() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
 }
 
-require_deploy_replay_cache_path() {
-  local server_cfg=$1 bad_line
-  bad_line="$(
-    grep -E '^[[:space:]]*replay_cache_path[[:space:]]*=' "$server_cfg" 2>/dev/null \
-      | grep -Ev '^[[:space:]]*replay_cache_path[[:space:]]*=[[:space:]]*"/var/lib/parallax/parallax-replay\.cache"[[:space:]]*(#.*)?$' \
-      || true
-  )"
-  [[ -z "$bad_line" ]] || die "server config replay_cache_path must be /var/lib/parallax/parallax-replay.cache under the deployed systemd sandbox; rerun without --reuse-config to regenerate $server_cfg"
+deploy_replay_cache_path() {
+  # SERVICE_NAME uniquely identifies the systemd unit stopped before rotation.
+  # Use a new namespace so a fresh deploy never deletes the legacy shared cache.
+  printf '/var/lib/parallax/replay-%s.cache' "$SERVICE_NAME"
+}
+
+normalize_server_replay_cache_path() {
+  local server_cfg=$1 cache_path tmp
+  [[ "$DRY_RUN" == "0" ]] || return 0
+  cache_path=$(deploy_replay_cache_path)
+  if [[ "$REUSE_CONFIG" != "1" ]]; then
+    tmp=$(mktemp "$server_cfg.replay.XXXXXX") || die "failed to stage server replay cache path"
+    if ! awk -v path="$cache_path" '
+      /^[[:space:]]*replay_cache_path[[:space:]]*=/ {
+        print "replay_cache_path = \"" path "\""; count++; next
+      }
+      { print }
+      END { if (count != 1) exit 1 }
+    ' "$server_cfg" >"$tmp"; then
+      rm -f "$tmp"
+      die "generated server config must contain exactly one replay_cache_path"
+    fi
+    mv -f "$tmp" "$server_cfg"
+  elif ! awk -v path="\"$cache_path\"" '
+    /^[[:space:]]*replay_cache_path[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, "")
+      if ($0 != path && $0 != "\"/var/lib/parallax/parallax-replay.cache\"") exit 1
+    }
+  ' "$server_cfg"; then
+    die "reused server replay_cache_path must be the legacy cache or $cache_path; rerun without --reuse-config to regenerate $server_cfg"
+  fi
 }
 
 build_host_tools_and_configs() {
@@ -744,7 +772,7 @@ build_host_tools_and_configs() {
       --inline-secrets
   fi
 
-  require_deploy_replay_cache_path "$server_cfg"
+  normalize_server_replay_cache_path "$server_cfg"
 
   # plx check refuses group/other bits on config files (default umask often yields 0644).
   if [[ "$DRY_RUN" == "0" ]]; then
@@ -885,8 +913,7 @@ ensure_zigbuild_tools() {
 
 write_unit_file() {
   local unit_file=$1
-  cat >"$unit_file" <<UNIT
-[Unit]
+  printf '%s' "[Unit]
 Description=ParallaX server
 Wants=network-online.target
 After=network-online.target
@@ -969,7 +996,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+" >"$unit_file"
 }
 
 profiling_enabled() {
@@ -1025,8 +1052,7 @@ validate_profile_options() {
 
 write_parca_agent_unit_file() {
   local unit_file=$1
-  cat >"$unit_file" <<UNIT
-[Unit]
+  printf '%s' "[Unit]
 Description=Parca Agent for ParallaX Polar Signals Cloud
 Wants=network-online.target
 After=network-online.target parallax.service
@@ -1041,18 +1067,17 @@ LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+" >"$unit_file"
 }
 
 write_polar_env_file() {
   local env_file=$1
-  cat >"$env_file" <<ENV
-PARCA_REMOTE_STORE_ADDRESS=$POLAR_STORE_ADDRESS
+  printf '%s' "PARCA_REMOTE_STORE_ADDRESS=$POLAR_STORE_ADDRESS
 PARCA_NODE=$POLAR_NODE
 PARCA_HTTP_ADDRESS=$PARCA_HTTP_ADDRESS
 PARCA_EXTERNAL_LABELS=$POLAR_LABELS
 PARCA_PROJECT_ID=$POLAR_PROJECT_ID
-ENV
+" >"$env_file"
 }
 
 prepare_polar_token_file() {
@@ -1161,47 +1186,53 @@ install_remote() {
   q_service_path=$(shell_quote "/etc/systemd/system/$SERVICE_NAME.service")
   q_remote_bin_dir=$(shell_quote "$(dirname "$REMOTE_BIN")")
   q_remote_config_dir=$(shell_quote "$(dirname "$REMOTE_CONFIG")")
-  q_remote_replay_cache=$(shell_quote "/var/lib/parallax/parallax-replay.cache")
+  q_remote_replay_cache=$(shell_quote "$(deploy_replay_cache_path)")
   q_parca_agent_channel=$(shell_quote "$PARCA_AGENT_CHANNEL")
 
   local sudo_prefix=$REMOTE_SUDO
   local replay_cache_reset_script=""
   if [[ "$REUSE_CONFIG" != "1" ]]; then
-    replay_cache_reset_script=$(cat <<REMOTE_REPLAY_CACHE_RESET
-echo "Rotating ParallaX replay cache for fresh generated config."
-# Stop the old service BEFORE deleting the cache: otherwise the still-running old
-# server (with the old PSK-derived MAC key) can recreate the cache during the
-# window before restart, and the new server then fails to load it with a MAC
-# mismatch, crash-looping the deploy.
+    printf -v replay_cache_reset_script '%s' "echo \"Rotating ParallaX replay cache for fresh generated config.\"
+# Stop the old service BEFORE deleting its PSK-authenticated caches: otherwise
+# the still-running old server can recreate them with the old MAC key. Do not
+# delete any cache if stopping the service fails.
 if command -v systemctl >/dev/null 2>&1; then
-  $sudo_prefix systemctl stop $q_service 2>/dev/null || true
+  if ! $sudo_prefix systemctl stop $q_service; then
+    # A fresh install has no unit yet; every other stop failure is unsafe.
+    if [[ \"\$($sudo_prefix systemctl show --property=LoadState --value $q_service)\" != \"not-found\" ]]; then
+      echo \"Cannot rotate replay caches: failed to stop $SERVICE_NAME.service.\" >&2
+      exit 1
+    fi
+  fi
+elif $sudo_prefix test -e $q_remote_replay_cache || $sudo_prefix test -e $q_remote_replay_cache.0rtt || $sudo_prefix test -e $q_remote_replay_cache.marker; then
+  echo \"Cannot rotate existing replay caches without systemctl to stop the old service.\" >&2
+  exit 1
 fi
-$sudo_prefix rm -f $q_remote_replay_cache
-REMOTE_REPLAY_CACHE_RESET
-)
+# Both sibling names append to the full auth-cache filename, as in the server.
+# Exact paths leave other instances' caches and unrelated state untouched.
+$sudo_prefix rm -f $q_remote_replay_cache $q_remote_replay_cache.0rtt $q_remote_replay_cache.marker"
   fi
   local bbr_install_script=""
   if [[ "$ENABLE_BBR" == "1" ]]; then
-    bbr_install_script=$(cat <<REMOTE_BBR
-echo "Checking VPS TCP BBR/fq tuning..."
-if [[ "\$(uname -s)" != "Linux" ]]; then
-  echo "BBR auto-setup requires Linux on the VPS" >&2
+    printf -v bbr_install_script '%s' "echo \"Checking VPS TCP BBR/fq tuning...\"
+if [[ \"\$(uname -s)\" != \"Linux\" ]]; then
+  echo \"BBR auto-setup requires Linux on the VPS\" >&2
   exit 1
 fi
-available_cc="\$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-if ! grep -qw bbr <<<"\$available_cc"; then
+available_cc=\"\$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)\"
+if ! grep -qw bbr <<<\"\$available_cc\"; then
   if command -v modprobe >/dev/null 2>&1; then
     $sudo_prefix modprobe tcp_bbr
   elif command -v /sbin/modprobe >/dev/null 2>&1; then
     $sudo_prefix /sbin/modprobe tcp_bbr
   else
-    echo "tcp_bbr is not available and modprobe was not found" >&2
+    echo \"tcp_bbr is not available and modprobe was not found\" >&2
     exit 1
   fi
 fi
-available_cc="\$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-if ! grep -qw bbr <<<"\$available_cc"; then
-  echo "tcp_bbr is still unavailable after loading module; kernel may not support BBR" >&2
+available_cc=\"\$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)\"
+if ! grep -qw bbr <<<\"\$available_cc\"; then
+  echo \"tcp_bbr is still unavailable after loading module; kernel may not support BBR\" >&2
   exit 1
 fi
 $sudo_prefix install -d -m 0755 /etc/modules-load.d /etc/sysctl.d
@@ -1214,19 +1245,17 @@ net.ipv4.tcp_wmem=4096 65536 67108864
 net.ipv4.tcp_mtu_probing=1
 PARALLAX_BBR_SYSCTL
 $sudo_prefix sysctl --system >/dev/null
-current_cc="\$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-current_qdisc="\$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-if [[ "\$current_cc" != "bbr" ]]; then
-  echo "failed to enable BBR: net.ipv4.tcp_congestion_control=\$current_cc" >&2
+current_cc=\"\$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)\"
+current_qdisc=\"\$(sysctl -n net.core.default_qdisc 2>/dev/null || true)\"
+if [[ \"\$current_cc\" != \"bbr\" ]]; then
+  echo \"failed to enable BBR: net.ipv4.tcp_congestion_control=\$current_cc\" >&2
   exit 1
 fi
-if [[ "\$current_qdisc" != "fq" ]]; then
-  echo "failed to enable fq qdisc: net.core.default_qdisc=\$current_qdisc" >&2
+if [[ \"\$current_qdisc\" != \"fq\" ]]; then
+  echo \"failed to enable fq qdisc: net.core.default_qdisc=\$current_qdisc\" >&2
   exit 1
 fi
-echo "BBR/fq enabled: tcp_congestion_control=\$current_cc default_qdisc=\$current_qdisc"
-REMOTE_BBR
-)
+echo \"BBR/fq enabled: tcp_congestion_control=\$current_cc default_qdisc=\$current_qdisc\""
   fi
   # Socket-buffer maxima (net.core.{r,w}mem_max) are a prerequisite for the
   # [transport] tcp_send_buffer_bytes / tcp_recv_buffer_bytes feature REGARDLESS of
@@ -1236,22 +1265,20 @@ REMOTE_BBR
   # fatal) elsewhere. Only raises the caps; autotuning is unaffected unless an
   # explicit buffer is actually configured.
   local net_buffer_sysctl_script
-  net_buffer_sysctl_script=$(cat <<REMOTE_NETBUF
-if [[ "\$(uname -s)" == "Linux" ]]; then
-  echo "Configuring VPS socket-buffer maxima (net.core.{r,w}mem_max)..."
+  printf -v net_buffer_sysctl_script '%s' "if [[ \"\$(uname -s)\" == \"Linux\" ]]; then
+  echo \"Configuring VPS socket-buffer maxima (net.core.{r,w}mem_max)...\"
   $sudo_prefix install -d -m 0755 /etc/sysctl.d
   cat <<'PARALLAX_NETBUF_SYSCTL' | $sudo_prefix tee /etc/sysctl.d/99-parallax-netbuf.conf >/dev/null
 net.core.rmem_max=67108864
 net.core.wmem_max=67108864
 PARALLAX_NETBUF_SYSCTL
   $sudo_prefix sysctl --system >/dev/null 2>&1 || true
-fi
-REMOTE_NETBUF
-)
+fi"
   local profile_install_script=""
   if profiling_enabled; then
-    profile_install_script=$(cat <<REMOTE_PROFILE
-if ! command -v parca-agent >/dev/null 2>&1; then
+    local polar_token_upload_name
+    polar_token_upload_name=$(basename "$POLAR_TOKEN_UPLOAD_FILE")
+    printf -v profile_install_script '%s' "if ! command -v parca-agent >/dev/null 2>&1; then
   if ! command -v snap >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
     $sudo_prefix apt-get update
     $sudo_prefix apt-get install -y snapd
@@ -1260,9 +1287,9 @@ if ! command -v parca-agent >/dev/null 2>&1; then
       $sudo_prefix systemctl start snapd.service || true
     fi
   fi
-  command -v snap >/dev/null 2>&1 || { echo "snap is required to install parca-agent automatically" >&2; exit 1; }
-  if [[ -n "\$PARCA_AGENT_CHANNEL" ]]; then
-    $sudo_prefix snap install parca-agent --classic --channel "\$PARCA_AGENT_CHANNEL"
+  command -v snap >/dev/null 2>&1 || { echo \"snap is required to install parca-agent automatically\" >&2; exit 1; }
+  if [[ -n \"\$PARCA_AGENT_CHANNEL\" ]]; then
+    $sudo_prefix snap install parca-agent --classic --channel \"\$PARCA_AGENT_CHANNEL\"
   else
     $sudo_prefix snap install parca-agent --classic
   fi
@@ -1273,12 +1300,12 @@ for i in {1..12}; do
   fi
   sleep 2
 done
-agent_cmd="\$(command -v parca-agent || true)"
-if [[ -z "\$agent_cmd" && -x /snap/bin/parca-agent ]]; then
+agent_cmd=\"\$(command -v parca-agent || true)\"
+if [[ -z \"\$agent_cmd\" && -x /snap/bin/parca-agent ]]; then
   agent_cmd=/snap/bin/parca-agent
 fi
-if [[ -z "\$agent_cmd" ]]; then
-  echo "parca-agent was installed but no executable was found in PATH or /snap/bin" >&2
+if [[ -z \"\$agent_cmd\" ]]; then
+  echo \"parca-agent was installed but no executable was found in PATH or /snap/bin\" >&2
   exit 1
 fi
 # The parca-agent service runs as root (no User= in the unit) and execs
@@ -1287,35 +1314,35 @@ fi
 # is not group/world-writable — otherwise a non-root sudo deploy account whose
 # PATH resolves parca-agent to a planted/writable binary could obtain root code
 # execution via the root service.
-resolved_agent="\$(readlink -f "\$agent_cmd" 2>/dev/null || echo "\$agent_cmd")"
-case "\$resolved_agent" in
+resolved_agent=\"\$(readlink -f \"\$agent_cmd\" 2>/dev/null || echo \"\$agent_cmd\")\"
+case \"\$resolved_agent\" in
   /snap/*|/usr/bin/*|/usr/sbin/*|/usr/local/bin/*|/usr/local/sbin/*|/bin/*|/sbin/*) ;;
   *)
-    echo "refusing to link parca-agent from untrusted path: \$resolved_agent" >&2
+    echo \"refusing to link parca-agent from untrusted path: \$resolved_agent\" >&2
     exit 1
     ;;
 esac
-agent_owner="\$(stat -c '%u' "\$resolved_agent" 2>/dev/null || echo 1)"
-agent_perms="\$(stat -c '%a' "\$resolved_agent" 2>/dev/null || echo 777)"
-if [[ "\$agent_owner" != "0" ]]; then
-  echo "refusing to link parca-agent not owned by root: \$resolved_agent" >&2
+agent_owner=\"\$(stat -c '%u' \"\$resolved_agent\" 2>/dev/null || echo 1)\"
+agent_perms=\"\$(stat -c '%a' \"\$resolved_agent\" 2>/dev/null || echo 777)\"
+if [[ \"\$agent_owner\" != \"0\" ]]; then
+  echo \"refusing to link parca-agent not owned by root: \$resolved_agent\" >&2
   exit 1
 fi
 if (( 0\$agent_perms & 022 )); then
-  echo "refusing to link group/world-writable parca-agent: \$resolved_agent" >&2
+  echo \"refusing to link group/world-writable parca-agent: \$resolved_agent\" >&2
   exit 1
 fi
-agent_cmd="\$resolved_agent"
-if [[ "\$agent_cmd" != "/usr/local/bin/parca-agent" ]]; then
-  $sudo_prefix ln -sf "\$agent_cmd" /usr/local/bin/parca-agent
+agent_cmd=\"\$resolved_agent\"
+if [[ \"\$agent_cmd\" != \"/usr/local/bin/parca-agent\" ]]; then
+  $sudo_prefix ln -sf \"\$agent_cmd\" /usr/local/bin/parca-agent
 fi
 if [[ ! -x /snap/bin/parca-agent ]]; then
   $sudo_prefix mkdir -p /snap/bin
-  $sudo_prefix ln -sf "\$agent_cmd" /snap/bin/parca-agent
+  $sudo_prefix ln -sf \"\$agent_cmd\" /snap/bin/parca-agent
 fi
-$sudo_prefix install -m 0600 "$remote_tmp/$(basename "$POLAR_TOKEN_UPLOAD_FILE")" /etc/parallax/polarsignals.token
-$sudo_prefix install -m 0644 "$remote_tmp/polarsignals.env" /etc/parallax/polarsignals.env
-$sudo_prefix install -m 0644 "$remote_tmp/parca-agent.service" /etc/systemd/system/parca-agent.service
+$sudo_prefix install -m 0600 \"$remote_tmp/$polar_token_upload_name\" /etc/parallax/polarsignals.token
+$sudo_prefix install -m 0644 \"$remote_tmp/polarsignals.env\" /etc/parallax/polarsignals.env
+$sudo_prefix install -m 0644 \"$remote_tmp/parca-agent.service\" /etc/systemd/system/parca-agent.service
 if command -v systemctl >/dev/null 2>&1; then
   $sudo_prefix systemctl daemon-reload
   $sudo_prefix systemctl enable parca-agent.service
@@ -1324,28 +1351,26 @@ if command -v systemctl >/dev/null 2>&1; then
   if command -v curl >/dev/null 2>&1; then
     ok=0
     for i in {1..12}; do
-      metrics="\$(curl -fsS http://127.0.0.1:7071/metrics || true)"
-      if grep -q 'grpc_client_handled_total{grpc_code="OK",grpc_method="Write"' <<<"\$metrics"; then
+      metrics=\"\$(curl -fsS http://127.0.0.1:7071/metrics || true)\"
+      if grep -q 'grpc_client_handled_total{grpc_code=\"OK\",grpc_method=\"Write\"' <<<\"\$metrics\"; then
         ok=1
         break
       fi
       sleep 10
     done
 
-    if [[ "\$ok" != "1" ]]; then
-      echo "parca-agent is running, but Polar Signals Cloud write did not succeed." >&2
-      echo "Relevant metrics:" >&2
+    if [[ \"\$ok\" != \"1\" ]]; then
+      echo \"parca-agent is running, but Polar Signals Cloud write did not succeed.\" >&2
+      echo \"Relevant metrics:\" >&2
       curl -s http://127.0.0.1:7071/metrics | egrep 'grpc_client_handled_total.*Write|sample_writes_total' >&2 || true
-      echo "If grpc_code is PermissionDenied, fix Polar Signals role binding: service account needs writer/profile-writer on this project." >&2
-      echo "If grpc_code is Unavailable, check projectID/token/network." >&2
+      echo \"If grpc_code is PermissionDenied, fix Polar Signals role binding: service account needs writer/profile-writer on this project.\" >&2
+      echo \"If grpc_code is Unavailable, check projectID/token/network.\" >&2
       exit 1
     fi
   else
-    echo "curl not found; skipping Polar Signals write verification" >&2
+    echo \"curl not found; skipping Polar Signals write verification\" >&2
   fi
-fi
-REMOTE_PROFILE
-)
+fi"
   fi
   # Seal the uploaded config's inline secrets on the server (plx seal encrypts
   # them under a host-local key so nothing plaintext stays at rest). It must run
@@ -1369,8 +1394,9 @@ REMOTE_PROFILE
         warn "config dir $(dirname "$REMOTE_CONFIG") is a shared system directory; refusing to manage its ownership or write a sealed bundle into it, so plx seal is SKIPPED and the server config keeps INLINE PLAINTEXT secrets (0600). Use a dedicated --remote-config directory (default /etc/parallax) to enable sealing."
         ;;
       *)
-        seal_secrets_script=$(cat <<REMOTE_SEAL
-echo "Sealing server secrets at rest (plx seal)..."
+        local q_seal_config_name
+        q_seal_config_name=$(shell_quote "$(basename "$REMOTE_CONFIG")")
+        printf -v seal_secrets_script '%s' "echo \"Sealing server secrets at rest (plx seal)...\"
 # The config dir stays root-owned: only the config file itself (and the state
 # dir) belong to the service user. The chown also reverts dirs handed to
 # parallax by earlier revisions of this script.
@@ -1382,31 +1408,30 @@ if command -v runuser >/dev/null 2>&1; then
   # host key is created at /var/lib/parallax/host.key either way, and the
   # rewritten config references the bundle by bare file name, which resolves
   # against whatever directory the config is loaded from.
-  seal_staging=/var/lib/parallax/.seal-staging
-  $sudo_prefix rm -rf "\$seal_staging"
-  $sudo_prefix install -d -m 0700 -o parallax -g parallax "\$seal_staging"
-  $sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml "\$seal_staging/parallax.server.toml"
+  seal_config_name=$q_seal_config_name
+  seal_identity=\"\$(printf %s $q_remote_config | sha256sum)\"
+  seal_staging=\"/var/lib/parallax/.seal-staging-\${seal_identity%% *}\"
+  $sudo_prefix rm -rf \"\$seal_staging\"
+  $sudo_prefix install -d -m 0700 -o parallax -g parallax \"\$seal_staging\"
+  $sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml \"\$seal_staging/\$seal_config_name\"
   # Seed the staging dir with the CURRENT live bundle (if any) so 'plx seal'
-  # MERGES into it rather than replacing it — otherwise sealing in an empty dir
-  # would silently drop sealed entries this bundle holds for other configs that
-  # share it (cubic P2). Copied as parallax so the seal (run as parallax) can
-  # rewrite it in place.
-  if $sudo_prefix test -f $q_remote_config_dir/parallax.secrets.enc; then
-    $sudo_prefix install -m 0600 -o parallax -g parallax $q_remote_config_dir/parallax.secrets.enc "\$seal_staging/parallax.secrets.enc"
+  # retains its entries. The config-specific name and stable staging identity
+  # keep separate deployments from replacing one another's keys. Legacy shared
+  # parallax.secrets.enc bundles remain untouched for configs that still use them.
+  if $sudo_prefix test -f $q_remote_config.secrets.enc; then
+    $sudo_prefix install -m 0600 -o parallax -g parallax $q_remote_config.secrets.enc \"\$seal_staging/\$seal_config_name.secrets.enc\"
   fi
-  if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c "\$seal_staging/parallax.server.toml"; then
-    $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.server.toml" $q_remote_config
-    $sudo_prefix install -m 0600 -o parallax -g parallax "\$seal_staging/parallax.secrets.enc" $q_remote_config_dir/parallax.secrets.enc
-    echo "Server secrets are machine-bound (sealed); the config on this VPS is no longer a plaintext bearer credential."
+  if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c \"\$seal_staging/\$seal_config_name\"; then
+    $sudo_prefix install -m 0600 -o parallax -g parallax \"\$seal_staging/\$seal_config_name.secrets.enc\" $q_remote_config.secrets.enc
+    $sudo_prefix install -m 0600 -o parallax -g parallax \"\$seal_staging/\$seal_config_name\" $q_remote_config
+    echo \"Server secrets are machine-bound (sealed); the config on this VPS is no longer a plaintext bearer credential.\"
   else
     echo 'warning: plx seal failed; the server config still holds INLINE PLAINTEXT secrets at '$q_remote_config' (kept 0600, owner parallax). Fix the reported error and re-run the deploy to retry sealing.' >&2
   fi
-  $sudo_prefix rm -rf "\$seal_staging"
+  $sudo_prefix rm -rf \"\$seal_staging\"
 else
   echo 'warning: runuser not found on the VPS; skipped plx seal — the server config holds INLINE PLAINTEXT secrets at '$q_remote_config' (kept 0600, owner parallax). Install runuser (util-linux) and re-run the deploy to seal.' >&2
-fi
-REMOTE_SEAL
-)
+fi"
         ;;
     esac
   else
@@ -1414,9 +1439,11 @@ REMOTE_SEAL
   fi
 
   local remote_script
-  remote_script=$(cat <<REMOTE
-set -Eeuo pipefail
-export PATH="\$PATH:/usr/sbin:/sbin"
+  # Build in memory with builtin printf, as for the blocks above. Bash can write
+  # a heredoc before starting cat, while macOS can shrink its pipe to 512 bytes;
+  # even a small document can then block deployment before SSH runs.
+  printf -v remote_script '%s' "set -Eeuo pipefail
+export PATH=\"\$PATH:/usr/sbin:/sbin\"
 PARCA_AGENT_CHANNEL=$q_parca_agent_channel
 cleanup_remote_tmp() {
   rm -rf $q_tmp
@@ -1425,12 +1452,12 @@ trap cleanup_remote_tmp EXIT
 $net_buffer_sysctl_script
 $bbr_install_script
 if ! id -u parallax >/dev/null 2>&1; then
-  echo "Creating dedicated parallax system user for the service..."
-  nologin_shell="\$(command -v nologin || echo /usr/sbin/nologin)"
+  echo \"Creating dedicated parallax system user for the service...\"
+  nologin_shell=\"\$(command -v nologin || echo /usr/sbin/nologin)\"
   if getent group parallax >/dev/null 2>&1; then
-    $sudo_prefix useradd --system --gid parallax --home-dir /var/lib/parallax --no-create-home --shell "\$nologin_shell" parallax
+    $sudo_prefix useradd --system --gid parallax --home-dir /var/lib/parallax --no-create-home --shell \"\$nologin_shell\" parallax
   else
-    $sudo_prefix useradd --system --user-group --home-dir /var/lib/parallax --no-create-home --shell "\$nologin_shell" parallax
+    $sudo_prefix useradd --system --user-group --home-dir /var/lib/parallax --no-create-home --shell \"\$nologin_shell\" parallax
   fi
 fi
 $sudo_prefix mkdir -p $q_remote_bin_dir $q_remote_config_dir
@@ -1451,16 +1478,14 @@ if command -v systemctl >/dev/null 2>&1; then
   $sudo_prefix systemctl restart $q_service
   $sudo_prefix systemctl --no-pager --full status $q_service
 else
-  echo "systemctl not found; binary and config were installed but service was not started" >&2
+  echo \"systemctl not found; binary and config were installed but service was not started\" >&2
 fi
-if command -v ufw >/dev/null 2>&1 && $sudo_prefix ufw status | grep -q "Status: active"; then
+if command -v ufw >/dev/null 2>&1 && $sudo_prefix ufw status | grep -q \"Status: active\"; then
   $sudo_prefix ufw allow 443/tcp comment ParallaX || true
 fi
 $profile_install_script
 cleanup_remote_tmp
-trap - EXIT
-REMOTE
-)
+trap - EXIT"
 
   run "${ssh_args[@]}" "$remote_script"
 
@@ -1668,29 +1693,27 @@ if profiling_enabled; then
 fi
 install_remote "$DEPLOY_DIR" "$SERVER_CFG" "$UNIT_FILE"
 
-cat <<NEXT
-
+printf '%s' "
 ParallaX VPS deploy finished.
 
 Start the local client:
-  plx client -c "$CLIENT_CFG"
+  plx client -c \"$CLIENT_CFG\"
 
 Test through the local SOCKS5 listener:
   curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 
 Check the server later:
-  ssh -p "$SSH_PORT" "$SSH_TARGET" '${REMOTE_SUDO:+$REMOTE_SUDO }systemctl status $SERVICE_NAME --no-pager'
-  ssh -p "$SSH_PORT" "$SSH_TARGET" '${REMOTE_SUDO:+$REMOTE_SUDO }journalctl -u $SERVICE_NAME -n 80 --no-pager'
-NEXT
+  ssh -p \"$SSH_PORT\" \"$SSH_TARGET\" '${REMOTE_SUDO:+$REMOTE_SUDO }systemctl status $SERVICE_NAME --no-pager'
+  ssh -p \"$SSH_PORT\" \"$SSH_TARGET\" '${REMOTE_SUDO:+$REMOTE_SUDO }journalctl -u $SERVICE_NAME -n 80 --no-pager'
+"
 
 if profiling_enabled; then
-  cat <<NEXT_POLAR
-
+  printf '%s' "
 Check Polar Signals / Parca Agent:
-  ssh -p "$SSH_PORT" "$SSH_TARGET" '${REMOTE_SUDO:+$REMOTE_SUDO }systemctl status parca-agent --no-pager'
-  ssh -p "$SSH_PORT" "$SSH_TARGET" '${REMOTE_SUDO:+$REMOTE_SUDO }journalctl -u parca-agent -n 120 --no-pager'
-  ssh -L 7071:127.0.0.1:7071 -p "$SSH_PORT" "$SSH_TARGET"
+  ssh -p \"$SSH_PORT\" \"$SSH_TARGET\" '${REMOTE_SUDO:+$REMOTE_SUDO }systemctl status parca-agent --no-pager'
+  ssh -p \"$SSH_PORT\" \"$SSH_TARGET\" '${REMOTE_SUDO:+$REMOTE_SUDO }journalctl -u parca-agent -n 120 --no-pager'
+  ssh -L 7071:127.0.0.1:7071 -p \"$SSH_PORT\" \"$SSH_TARGET\"
 
 Then open http://127.0.0.1:7071 for the local Parca Agent page.
-NEXT_POLAR
+"
 fi

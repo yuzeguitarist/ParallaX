@@ -25,7 +25,7 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 use super::server::TICKET_LIFETIME_SECS;
-use super::QuicTlsError;
+use super::{QuicTlsError, ALERT_DECODE_ERROR, ALERT_ILLEGAL_PARAMETER};
 
 /// XChaCha20-Poly1305 nonce length.
 const STEK_NONCE_LEN: usize = 24;
@@ -262,30 +262,41 @@ pub(crate) fn encode_new_session_ticket(nst: &NewSessionTicket) -> Result<Vec<u8
 }
 
 /// Decode a NewSessionTicket message body (WITHOUT the 4-byte handshake header).
-pub(crate) fn decode_new_session_ticket(body: &[u8]) -> Option<NewSessionTicket> {
+pub(crate) fn decode_new_session_ticket(body: &[u8]) -> Result<NewSessionTicket, QuicTlsError> {
+    let malformed = || QuicTlsError::alert(ALERT_DECODE_ERROR, "malformed NewSessionTicket");
     let mut r = Reader::new(body);
-    let lifetime_secs = r.u32()?;
-    let age_add = r.u32()?;
-    let nonce = r.vec_u8()?.to_vec();
-    let ticket = r.vec_u16()?.to_vec();
-    let exts = r.vec_u16()?;
-    if r.remaining() != 0 {
-        return None;
+    let lifetime_secs = r.u32().ok_or_else(malformed)?;
+    let age_add = r.u32().ok_or_else(malformed)?;
+    let nonce = r.vec_u8().ok_or_else(malformed)?.to_vec();
+    let ticket = r.vec_u16().ok_or_else(malformed)?.to_vec();
+    let exts = r.vec_u16().ok_or_else(malformed)?;
+    if ticket.is_empty() || exts.len() > 65534 || r.remaining() != 0 {
+        return Err(malformed());
     }
     let mut max_early_data = None;
+    let mut seen_extensions = std::collections::HashSet::new();
     let mut er = Reader::new(exts);
     while er.remaining() > 0 {
-        let ext_type = er.u16()?;
-        let ext_body = er.vec_u16()?;
+        let ext_type = er.u16().ok_or_else(malformed)?;
+        let ext_body = er.vec_u16().ok_or_else(malformed)?;
         if ext_type == EXT_EARLY_DATA {
-            let mut br = Reader::new(ext_body);
-            max_early_data = Some(br.u32()?);
-            if br.remaining() != 0 {
-                return None;
+            let bytes: [u8; 4] = ext_body.try_into().map_err(|_| malformed())?;
+            let max = u32::from_be_bytes(bytes);
+            if max != QUIC_MAX_EARLY_DATA {
+                return Err(QuicTlsError::Protocol(
+                    "NewSessionTicket max_early_data_size must be 0xffffffff for QUIC".into(),
+                ));
             }
+            max_early_data = Some(max);
+        }
+        if !seen_extensions.insert(ext_type) {
+            return Err(QuicTlsError::alert(
+                ALERT_ILLEGAL_PARAMETER,
+                "duplicate extension in NewSessionTicket",
+            ));
         }
     }
-    Some(NewSessionTicket {
+    Ok(NewSessionTicket {
         lifetime_secs,
         age_add,
         nonce,
@@ -573,6 +584,98 @@ mod tests {
         };
         let msg = encode_new_session_ticket(&nst).unwrap();
         assert_eq!(decode_new_session_ticket(&msg[4..]).unwrap(), nst);
+    }
+
+    fn raw_new_session_ticket_body(extensions: &[u8]) -> Vec<u8> {
+        // lifetime=7, age_add=1, empty nonce, one-byte opaque ticket. Keep this
+        // fixture independent of the encoder so malformed wire bytes stay raw.
+        let mut body = vec![0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 1, 0xab];
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+        body
+    }
+
+    #[test]
+    fn new_session_ticket_rejects_invalid_early_data_in_either_duplicate_order() {
+        let allowed = [0x00, 0x2a, 0x00, 0x04, 0xff, 0xff, 0xff, 0xff];
+        for max in [0_u32, 1, QUIC_MAX_EARLY_DATA - 1] {
+            let mut forbidden = vec![0x00, 0x2a, 0x00, 0x04];
+            forbidden.extend_from_slice(&max.to_be_bytes());
+            for extensions in [
+                forbidden.clone(),
+                [forbidden.as_slice(), allowed.as_slice()].concat(),
+                [allowed.as_slice(), forbidden.as_slice()].concat(),
+            ] {
+                let error = decode_new_session_ticket(&raw_new_session_ticket_body(&extensions))
+                    .expect_err("any invalid early_data value must fail, even before a valid one");
+                assert!(matches!(error, QuicTlsError::Protocol(_)), "{error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn new_session_ticket_rejects_duplicate_known_and_unknown_extensions() {
+        for extension in [
+            vec![0x00, 0x2a, 0x00, 0x04, 0xff, 0xff, 0xff, 0xff],
+            vec![0xbe, 0xef, 0x00, 0x01, 0xaa],
+        ] {
+            let body =
+                raw_new_session_ticket_body(&[extension.as_slice(), extension.as_slice()].concat());
+            let error = decode_new_session_ticket(&body).unwrap_err();
+            assert_eq!(error.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+        }
+        // Unknown extensions remain ignorable when they occur once (RFC 8446 §4.6.1).
+        let body = raw_new_session_ticket_body(&[0xbe, 0xef, 0x00, 0x01, 0xaa]);
+        assert_eq!(
+            decode_new_session_ticket(&body).unwrap().max_early_data,
+            None
+        );
+    }
+
+    #[test]
+    fn new_session_ticket_rejects_truncation_and_bad_lengths() {
+        let body = raw_new_session_ticket_body(&[0x00, 0x2a, 0x00, 0x04, 0xff, 0xff, 0xff, 0xff]);
+        for end in 0..body.len() {
+            let error = decode_new_session_ticket(&body[..end]).unwrap_err();
+            assert_eq!(
+                error.alert_description(),
+                Some(ALERT_DECODE_ERROR),
+                "prefix {end}"
+            );
+        }
+        let mut cases = Vec::new();
+        let mut trailing = body.clone();
+        trailing.push(0);
+        cases.push(trailing);
+        let mut bad_nonce_len = body.clone();
+        bad_nonce_len[8] = 0xff;
+        cases.push(bad_nonce_len);
+        let mut bad_ticket_len = body.clone();
+        bad_ticket_len[9..11].copy_from_slice(&[0xff, 0xff]);
+        cases.push(bad_ticket_len);
+        let mut empty_ticket = body.clone();
+        empty_ticket[9..11].copy_from_slice(&[0, 0]);
+        empty_ticket.remove(11);
+        cases.push(empty_ticket);
+        let mut bad_extensions_len = body;
+        bad_extensions_len[12..14].copy_from_slice(&[0, 0]);
+        cases.push(bad_extensions_len);
+        cases.push(raw_new_session_ticket_body(&vec![0; usize::from(u16::MAX)]));
+        for extensions in [
+            vec![0],
+            vec![0, 0x2a],
+            vec![0, 0x2a, 0],
+            vec![0, 0x2a, 0, 0],
+            vec![0, 0x2a, 0, 3, 0xff, 0xff, 0xff],
+            vec![0, 0x2a, 0, 5, 0xff, 0xff, 0xff, 0xff],
+            vec![0, 0x2a, 0, 5, 0xff, 0xff, 0xff, 0xff, 0xff],
+        ] {
+            cases.push(raw_new_session_ticket_body(&extensions));
+        }
+        for malformed in cases {
+            let error = decode_new_session_ticket(&malformed).unwrap_err();
+            assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+        }
     }
 
     #[test]

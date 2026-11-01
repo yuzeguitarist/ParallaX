@@ -341,19 +341,23 @@ fn active_instances(dir: &Path) -> Result<Vec<RuntimeInstance>, RuntimeGuardErro
     Ok(active)
 }
 
-/// Open `path` with `O_NOFOLLOW | O_DIRECTORY` and require the fd to be a
-/// euid-owned directory. A symlinked component fails `open()` with ELOOP
+/// Open `path` relative to `parent` with `O_NOFOLLOW | O_DIRECTORY` and require
+/// the fd to be a euid-owned directory. A symlinked final component fails with ELOOP
 /// (ENOTDIR on macOS), a non-dir with ENOTDIR, and a foreign owner is rejected
 /// here. Mirrors the fd-based ownership check in
 /// `config.rs::read_secret_config_file`.
 #[cfg(unix)]
-fn open_owned_dir_nofollow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+fn open_owned_dir_nofollow(parent: impl std::os::fd::AsFd, path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::MetadataExt;
 
-    let dir_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-        .open(path)?;
+    use rustix::fs::{openat, Mode, OFlags};
+
+    let dir_file = File::from(openat(
+        parent,
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
     let metadata = dir_file.metadata()?;
     let uid = metadata.uid();
     let euid = rustix::process::geteuid().as_raw();
@@ -370,31 +374,48 @@ fn open_owned_dir_nofollow(path: &Path) -> io::Result<File> {
 }
 
 fn ensure_state_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        use rustix::fs::{mkdirat, Mode, CWD};
+        use rustix::io::Errno;
 
         // The state dir path (/tmp/parallax-<euid>/runtime) is predictable, so on
-        // a shared host an attacker can pre-create it or plant a symlink before we
-        // do. Validate the PARENT as well as the final component: the parent is
-        // equally euid-predictable and lives in a world-writable /tmp, so an
-        // attacker who pre-creates it owns everything we then build inside — they
-        // could read the lock files' plaintext `server_addr` (which server a client
-        // is using) or plant flocked lock files to force a false `RuntimeConflict`.
-        // Checking only the leaf, as this did before, left that open.
-        //
-        // Residual: the two components are validated by path rather than via
-        // `openat` relative to the parent's fd, so a same-instant swap between the
-        // checks remains theoretically possible. Owning the parent is the step an
-        // attacker must win first, and that is now checked.
-        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _parent = open_owned_dir_nofollow(parent)?;
+        // a shared host an attacker can plant either component. Validate the
+        // parent before creating anything inside it, then keep creation, opening,
+        // and chmod anchored to verified directory handles so path swaps cannot
+        // redirect chmod to a symlink target before we reject it.
+        let parent_path = dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = dir.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "runtime state dir has no name")
+        })?;
+        let parent = match open_owned_dir_nofollow(CWD, parent_path) {
+            Ok(parent) => parent,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent_path)?;
+                open_owned_dir_nofollow(CWD, parent_path)?
+            }
+            Err(err) => return Err(err),
+        };
+        // Later registry operations resolve paths through this private namespace;
+        // other users must not be able to rename or replace its runtime entry.
+        parent.set_permissions(fs::Permissions::from_mode(0o700))?;
+        match mkdirat(&parent, name, Mode::from_raw_mode(0o700)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(err) => return Err(err.into()),
         }
-        let _dir = open_owned_dir_nofollow(dir)?;
+        let dir_file = open_owned_dir_nofollow(&parent, Path::new(name))?;
+        dir_file.set_permissions(fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir)?;
     Ok(())
 }
 
@@ -560,38 +581,166 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ensure_state_dir_accepts_owned_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("runtime");
         ensure_state_dir(&dir).unwrap();
         assert!(dir.is_dir());
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_state_dir(&dir).unwrap();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_creates_private_parent_and_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("new-parent");
+        let dir = parent.join("runtime");
+
+        ensure_state_dir(&dir).unwrap();
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_secures_existing_writable_parent() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let parent = tmp.path().join("namespace");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let dir = parent.join("runtime");
+        let cfg = config("203.0.113.10:443");
+        let _guard = RuntimeGuard::acquire_client_in_dir(&cfg, &dir).unwrap();
+        assert_eq!(
+            fs::metadata(&parent).unwrap().uid(),
+            rustix::process::geteuid().as_raw()
+        );
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_rejects_foreign_owned_parent_without_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use rustix::fs::chown;
+        use rustix::process::Uid;
+
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("requires root to create a foreign-owned directory inside a tempdir");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("foreign-parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o751)).unwrap();
+        chown(&parent, Some(Uid::from_raw(1)), None).unwrap();
+
+        let err = ensure_state_dir(&parent.join("runtime")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!parent.join("runtime").exists());
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn ensure_state_dir_rejects_symlinked_final_component() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("real");
         fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o751)).unwrap();
         let link = tmp.path().join("link");
         symlink(&target, &link).unwrap();
         // O_NOFOLLOW must make the symlinked final component fail closed.
         assert!(ensure_state_dir(&link).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn ensure_state_dir_rejects_symlinked_parent() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let tmp = tempfile::tempdir().unwrap();
         let real_parent = tmp.path().join("real-parent");
         fs::create_dir_all(&real_parent).unwrap();
+        fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o751)).unwrap();
+        let target = real_parent.join("runtime");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o751)).unwrap();
         let linked_parent = tmp.path().join("linked-parent");
         symlink(&real_parent, &linked_parent).unwrap();
         // The final component is a genuine euid-owned directory, but it is reached
         // through a symlinked parent — the hostile-parent shape a leaf-only check
         // accepts and this guard must reject.
         assert!(ensure_state_dir(&linked_parent.join("runtime")).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert_eq!(
+            fs::metadata(&real_parent).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_does_not_create_through_symlinked_parent() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o751)).unwrap();
+        let linked_parent = tmp.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        assert!(ensure_state_dir(&linked_parent.join("runtime")).is_err());
+        assert!(!real_parent.join("runtime").exists());
+        assert_eq!(
+            fs::metadata(&real_parent).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
     }
 
     #[test]

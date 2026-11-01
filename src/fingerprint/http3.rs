@@ -513,7 +513,12 @@ fn read_qpack_integer(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
     loop {
         let b = *buf.get(idx)?;
         idx += 1;
-        value = value.checked_add(u64::from(b & 0x7f).checked_shl(shift)?)?;
+        let digit = u64::from(b & 0x7f);
+        // checked_shl only checks the shift count, not bits shifted out.
+        if digit > (u64::MAX >> shift) {
+            return None;
+        }
+        value = value.checked_add(digit << shift)?;
         if b & 0x80 == 0 {
             break;
         }
@@ -1118,7 +1123,7 @@ mod tests {
         // Round-trip a spread of values across every prefix width, including the
         // exact `max_prefix` value (the first continuation case) and multi-byte
         // continuations.
-        for prefix_bits in [3u8, 4, 5, 6, 7] {
+        for prefix_bits in [3u8, 4, 5, 6, 7, 8] {
             let max_prefix = (1u64 << prefix_bits) - 1;
             for value in [
                 0,
@@ -1167,6 +1172,61 @@ mod tests {
         evil.extend([0x80u8; 10]);
         evil.push(0x01);
         assert!(read_qpack_integer(&evil, 7).is_none());
+    }
+
+    #[test]
+    fn qpack_integer_read_largest_value_and_addition_overflow() {
+        // A six-bit prefix followed by the base-128 encoding of u64::MAX - 63.
+        let mut largest = vec![0x3f, 0xc0];
+        largest.extend([0xff; 8]);
+        largest.push(0x01);
+        assert_eq!(read_qpack_integer(&largest, 6), Some((u64::MAX, 11)));
+
+        // The continuation still fits in u64, but adding the prefix would not.
+        largest[1] = 0xc1;
+        assert!(read_qpack_integer(&largest, 6).is_none());
+    }
+
+    #[test]
+    fn qpack_integer_read_shifted_high_bits_overflow_is_none() {
+        for prefix_bits in [3u8, 4, 5, 6, 7, 8] {
+            let mut overflow = vec![((1u16 << prefix_bits) - 1) as u8];
+            overflow.extend([0x80; 9]);
+            // At shift 63 only the low bit fits, even though checked_shl accepts
+            // any payload when the shift count itself is less than 64.
+            for last in 2..=0x7f {
+                overflow.push(last);
+                assert!(read_qpack_integer(&overflow, prefix_bits).is_none());
+                overflow.pop();
+            }
+        }
+    }
+
+    #[test]
+    fn qpack_integer_read_overlong_and_truncated_are_none() {
+        let mut overlong = vec![0x3f];
+        overlong.extend([0x80; 10]);
+        assert!(read_qpack_integer(&overlong, 6).is_none());
+        overlong.push(0x00);
+        assert!(read_qpack_integer(&overlong, 6).is_none());
+    }
+
+    #[test]
+    fn qpack_decode_rejects_overflow_alias_of_static_index() {
+        // This represents index 2^64 + 63 and must not alias static index 63.
+        let mut section = vec![0x00, 0x00, 0xff];
+        section.extend([0x80; 9]);
+        section.push(0x02);
+        assert_eq!(
+            decode_field_section(&section),
+            Err(Http3Error::QpackTruncated)
+        );
+
+        // The actual static index 63 remains valid.
+        assert_eq!(
+            decode_field_section(&[0x00, 0x00, 0xff, 0x00]).unwrap(),
+            vec![(":status".to_string(), "100".to_string())]
+        );
     }
 
     // --- SETTINGS: Safari-26 ground truth ---------------------------------

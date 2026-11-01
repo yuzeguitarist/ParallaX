@@ -106,7 +106,12 @@ const WINDOW: usize = 6;
 /// three are inbound origin reads in the same loop, bounded identically to the
 /// loop's other reads (EOF termination + the external `relay_idle_watchdog`), so
 /// they are a conscious no-new-DoS bump, not a new untimed DoS surface.
-const EXPECTED_UNTIMED_SERVER: usize = 11;
+///
+/// +2: the TCP mux session's `client_records.read_record_into(&mut client_record)`
+/// and substream's `target_read.read(&mut target_buf)` now share activity across
+/// both directions instead of timing each read; their sibling/supervisor
+/// `relay_idle_watchdog` bounds are pinned below, and Cover does not renew them.
+const EXPECTED_UNTIMED_SERVER: usize = 13;
 
 /// Untimed inbound-read sites in `src/client/runtime.rs` production code.
 ///
@@ -126,7 +131,11 @@ const EXPECTED_UNTIMED_SERVER: usize = 11;
 /// branch), and a serial read (non-saturated branch), a net +2 read sites. All are
 /// loopback reads bounded by the loop's EOF termination and the external
 /// `client_relay_idle_watchdog`, so this is a conscious no-new-DoS bump.
-const EXPECTED_UNTIMED_RUNTIME: usize = 9;
+///
+/// +1: `client_mux_reader_loop`'s `server_records.read_record_into(&mut server_record)`
+/// now shares business activity with the writer; its priority sibling
+/// `client_relay_idle_watchdog` replaces the per-read timeout and excludes Cover.
+const EXPECTED_UNTIMED_RUNTIME: usize = 10;
 
 /// One classified inbound-read call site.
 struct ReadSite {
@@ -307,8 +316,8 @@ fn combined_inbound_read_census_is_pinned() {
         server.iter().filter(|s| s.timed).count() + runtime.iter().filter(|s| s.timed).count();
     let untimed = total - timed;
 
-    // Total inbound-read call sites across both production files today: 23
-    // (server) + 12 (runtime) = 35. This catches a *removed* read site too,
+    // Total inbound-read call sites across both production files today: 25
+    // (server) + 12 (runtime) = 37. This catches a *removed* read site too,
     // which would otherwise slip past the per-file untimed-only assertions.
     // (+2 server vs the mux-over-QUIC baseline of 28: the speed QUIC-run request
     // read and the speed QUIC-run TCP DONE read — both TIMED. +5 for the
@@ -321,9 +330,10 @@ fn combined_inbound_read_census_is_pinned() {
     // reads — `graceful_fin_then_drain` and `graceful_fin_then_drain_stream` — each
     // a `read()` bounded by `timeout_at(GRACEFUL_FIN_DRAIN_BUDGET)`, so both TIMED.)
     const EXPECTED_TOTAL_SITES: usize = 37;
-    // Timed sites: 14 (server) + 3 (runtime) = 17. (+2 server vs the prior 15: the
-    // two FIN-first drain reads above, both bounded by `GRACEFUL_FIN_DRAIN_BUDGET`.)
-    const EXPECTED_TIMED_SITES: usize = 17;
+    // Timed sites: 12 (server) + 2 (runtime) = 14. The three existing TCP mux
+    // reads moved from per-read timeouts to shared idle watchdogs, not new reads;
+    // `mux_structural_idle_bounds_are_pinned` guards their enclosing boundaries.
+    const EXPECTED_TIMED_SITES: usize = 14;
 
     assert_eq!(
         total, EXPECTED_TOTAL_SITES,
@@ -343,6 +353,83 @@ fn combined_inbound_read_census_is_pinned() {
          per-file baselines ({} + {}).",
         EXPECTED_UNTIMED_SERVER,
         EXPECTED_UNTIMED_RUNTIME
+    );
+}
+
+/// The three mux reads reclassified above must retain their shared idle bounds;
+/// changing only the count must not allow a removed watchdog to go unnoticed.
+#[test]
+fn mux_structural_idle_bounds_are_pinned() {
+    fn function(relative_path: &str, name: &str) -> String {
+        let lines = read_production_region(relative_path);
+        let signature = format!("async fn {name}");
+        let start = lines
+            .iter()
+            .position(|line| line.starts_with(&signature))
+            .unwrap_or_else(|| panic!("missing production function {name}"));
+        // rustfmt leaves the function's closing brace at column zero; inner
+        // blocks are indented. Keep fingerprints inside this function's scope.
+        let end = lines[start..]
+            .iter()
+            .position(|line| line == "}")
+            .expect("missing function closing brace");
+        lines[start..=start + end].join("\n")
+    }
+
+    fn assert_ordered(source: &str, fingerprints: &[&str]) {
+        let mut remaining = source;
+        for fingerprint in fingerprints {
+            let index = remaining.find(fingerprint).unwrap_or_else(|| {
+                panic!("missing or reordered mux idle-bound fingerprint: {fingerprint}")
+            });
+            remaining = &remaining[index + fingerprint.len()..];
+        }
+    }
+
+    let client = function("src/client/runtime.rs", "client_mux_reader_loop");
+    assert_ordered(
+        &client,
+        &[
+            "tokio::select! {",
+            "biased;",
+            "_ = client_relay_idle_watchdog(health.relay_activity.clone(), idle) => {",
+            "return Ok(());",
+            "result = server_records.read_record_into(&mut server_record) => result,",
+            "if frame.kind != MuxFrameKind::Cover {",
+            "bump_client_relay_activity(&health.relay_activity);",
+        ],
+    );
+
+    let server = function("src/handshake/server.rs", "server_mux_client_reader_loop");
+    assert_ordered(
+        &server,
+        &[
+            "None => tokio::select! {",
+            "result = client_records.read_record_into(&mut client_record) => result,",
+            "_ = relay_idle_watchdog(activity.clone(), context.idle_timeout) => {",
+            "streams.teardown().await;",
+            "return Ok(());",
+            "if frame.kind != MuxFrameKind::Cover {",
+            "bump_relay_activity(&activity);",
+        ],
+    );
+
+    let target = function("src/handshake/server.rs", "server_mux_target_reader_loop");
+    assert!(target.contains("let n = match target_read.read(&mut target_buf).await {"));
+    let supervisor = function("src/handshake/server.rs", "server_mux_upstream_task");
+    assert_ordered(
+        &supervisor,
+        &[
+            "let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));",
+            "let reader = server_mux_target_reader_loop(",
+            "activity.clone(),",
+            "let writer = server_mux_upload_drain(",
+            "activity.clone(),",
+            "tokio::select! {",
+            "_ = async { tokio::try_join!(reader, writer) } => {}",
+            "_ = relay_idle_watchdog(activity, ctx.idle_timeout) => {",
+            "let _ = downlink.send(MuxFrameKind::Fin, Vec::new()).await;",
+        ],
     );
 }
 

@@ -444,20 +444,22 @@ impl ClientHandshake {
     }
 
     /// Parse a post-handshake NewSessionTicket and store a [`ClientTicket`] for a
-    /// future 0-RTT resumption. Best-effort: a malformed or premature ticket is
-    /// silently ignored (the next connection just falls back to cold-start).
-    fn store_session_ticket(&mut self, body: &[u8]) {
-        let Some(nst) = decode_new_session_ticket(body) else {
-            return;
-        };
+    /// future 0-RTT resumption. A ticket without early-data permission is ignored
+    /// because this cache is only used for 0-RTT. Invalid QUIC early-data limits
+    /// are a connection error (RFC 9001 §4.6.1).
+    fn store_session_ticket(&mut self, body: &[u8]) -> Result<(), QuicTlsError> {
+        let nst = decode_new_session_ticket(body)?;
+        if nst.max_early_data.is_none() {
+            return Ok(());
+        }
         let (Some(suite), Some(alpn)) = (self.suite, self.alpn.clone()) else {
-            return;
+            return Ok(());
         };
         let Ok(res_master) = self.resumption_master_secret() else {
-            return;
+            return Ok(());
         };
         let Ok(psk) = resumption_psk(suite, &res_master, &nst.nonce) else {
-            return;
+            return Ok(());
         };
         self.pending_session_ticket = Some(ClientTicket {
             ticket: nst.ticket,
@@ -469,6 +471,7 @@ impl ClientHandshake {
             lifetime_secs: nst.lifetime_secs,
             received_at_ms: 0,
         });
+        Ok(())
     }
 
     /// Take the stored resumption ticket (if a NewSessionTicket was received),
@@ -573,10 +576,7 @@ impl ClientHandshake {
             }
             // Post-handshake NewSessionTicket (1-RTT CRYPTO): parse + store a
             // resumption ticket for a future 0-RTT connection.
-            (ReadState::Complete, HANDSHAKE_NEW_SESSION_TICKET) => {
-                self.store_session_ticket(body);
-                Ok(())
-            }
+            (ReadState::Complete, HANDSHAKE_NEW_SESSION_TICKET) => self.store_session_ticket(body),
             (state, ty) => Err(QuicTlsError::alert(
                 ALERT_UNEXPECTED_MESSAGE,
                 format!("unexpected handshake message {ty:#04x} in state {state:?}"),
@@ -920,6 +920,12 @@ fn parse_server_hello_body(
             // than silently tolerating it — silent leniency is an active-probe
             // tell.
             EXT_PRE_SHARED_KEY => {
+                if psk_selected {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "duplicate pre_shared_key in ServerHello",
+                    ));
+                }
                 // The server selects one of the PSK identities we offered. We
                 // offer exactly one (index 0), so this is illegal unless we
                 // resumed, and the selected_identity must be 0.
@@ -1493,6 +1499,80 @@ mod tests {
     }
 
     #[test]
+    fn session_ticket_requires_quic_early_data_sentinel() {
+        use super::super::ticket::{
+            encode_new_session_ticket, NewSessionTicket, QUIC_MAX_EARLY_DATA,
+        };
+
+        for max_early_data in [
+            None,
+            Some(0),
+            Some(1),
+            Some(QUIC_MAX_EARLY_DATA - 1),
+            Some(QUIC_MAX_EARLY_DATA),
+        ] {
+            let mut hs = handshake();
+            // Set up the completed connection's resumption key schedule so a
+            // valid ticket reaches the cache rather than an earlier return.
+            let suite = CipherSuite::Aes128GcmSha256;
+            let (mut schedule, _) =
+                KeySchedule::after_server_hello(suite, None, &[0x11; 32], &[0x22; 32]).unwrap();
+            schedule.derive_application(&[0x33; 32]).unwrap();
+            hs.suite = Some(suite);
+            hs.schedule = Some(schedule);
+            hs.alpn = Some(b"h3".to_vec());
+            hs.read_state = ReadState::Complete;
+            hs.handshake_complete = true;
+            let nst = encode_new_session_ticket(&NewSessionTicket {
+                lifetime_secs: 7200,
+                age_add: 1,
+                nonce: vec![2],
+                ticket: vec![3; 160],
+                max_early_data,
+            })
+            .unwrap();
+
+            let result = hs.read_handshake(&nst);
+            if max_early_data.is_some_and(|max| max != QUIC_MAX_EARLY_DATA) {
+                assert!(
+                    matches!(result, Err(QuicTlsError::Protocol(_))),
+                    "{max_early_data:?}: {result:?}"
+                );
+                assert!(hs.take_session_ticket(1_000_000).is_none());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    hs.take_session_ticket(1_000_000).is_some(),
+                    max_early_data.is_some()
+                );
+                assert!(!hs.is_handshaking());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_session_ticket_is_not_silently_ignored() {
+        use super::super::ticket::{encode_new_session_ticket, NewSessionTicket};
+
+        let nst = encode_new_session_ticket(&NewSessionTicket {
+            lifetime_secs: 7200,
+            age_add: 1,
+            nonce: Vec::new(),
+            ticket: vec![3],
+            max_early_data: None,
+        })
+        .unwrap();
+        let mut hs = handshake();
+        hs.read_state = ReadState::Complete;
+        let truncated_body = &nst[4..nst.len() - 1];
+        let error = hs
+            .read_handshake(&msg(HANDSHAKE_NEW_SESSION_TICKET, truncated_body))
+            .expect_err("malformed NewSessionTicket must fail the connection");
+        assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+        assert!(hs.take_session_ticket(1_000_000).is_none());
+    }
+
+    #[test]
     fn hello_retry_request_is_cleanly_rejected() {
         let mut hs = handshake();
         let err = hs
@@ -1529,6 +1609,82 @@ mod tests {
             ))
             .unwrap_err();
         assert_eq!(err.alert_description(), Some(ALERT_MISSING_EXTENSION));
+    }
+
+    fn server_hello_with_extra_extensions(extra: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        extensions.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+        extensions.extend_from_slice(&36_u16.to_be_bytes());
+        extensions.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        extensions.extend_from_slice(&32_u16.to_be_bytes());
+        extensions.extend_from_slice(&[0x22; 32]);
+        for (ty, data) in extra {
+            extensions.extend_from_slice(&ty.to_be_bytes());
+            extensions.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(data);
+        }
+        server_hello_body([0x33; 32], &extensions)
+    }
+
+    #[test]
+    fn server_hello_duplicate_pre_shared_key_is_rejected() {
+        let body = server_hello_with_extra_extensions(&[
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x00]),
+        ]);
+        let err = parse_server_hello_body(&body, true)
+            .err()
+            .expect("duplicate pre_shared_key must be rejected");
+        assert_eq!(err.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+    }
+
+    #[test]
+    fn server_hello_duplicate_key_share_and_supported_versions_are_rejected() {
+        let mut key_share = vec![0x00, 0x1d, 0x00, 0x20];
+        key_share.extend_from_slice(&[0x22; 32]);
+        for (ty, data) in [
+            (EXT_SUPPORTED_VERSIONS, &[0x03, 0x04][..]),
+            (EXT_KEY_SHARE, key_share.as_slice()),
+        ] {
+            let body = server_hello_with_extra_extensions(&[(ty, data)]);
+            let err = parse_server_hello_body(&body, false)
+                .err()
+                .expect("duplicate ServerHello extension must be rejected");
+            assert_eq!(err.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+        }
+    }
+
+    #[test]
+    fn server_hello_unknown_and_grease_extensions_are_rejected_even_if_repeated() {
+        // Unknown extensions already fail on their first occurrence. GREASE is
+        // an offer, never a valid ServerHello selection (RFC 8701 section 3.1).
+        for ty in [0xbeef, 0x0a0a] {
+            for count in [1, 2] {
+                let extra = vec![(ty, &[][..]); count];
+                let body = server_hello_with_extra_extensions(&extra);
+                let err = parse_server_hello_body(&body, true)
+                    .err()
+                    .expect("unknown ServerHello extension must be rejected");
+                assert_eq!(err.alert_description(), Some(ALERT_UNSUPPORTED_EXTENSION));
+            }
+        }
+    }
+
+    #[test]
+    fn server_hello_valid_cold_and_resumed_extensions_are_accepted() {
+        let cold = server_hello_with_extra_extensions(&[]);
+        for offered_psk in [false, true] {
+            // A server may decline resumption and return a cold ServerHello.
+            let parsed = parse_server_hello_body(&cold, offered_psk).unwrap();
+            assert_eq!(parsed.suite, CipherSuite::Aes128GcmSha256);
+            assert_eq!(parsed.key_share_group, GROUP_X25519);
+            assert_eq!(parsed.key_share, [0x22; 32]);
+            assert!(!parsed.psk_selected);
+        }
+        let resumed = server_hello_with_extra_extensions(&[(EXT_PRE_SHARED_KEY, &[0x00, 0x00])]);
+        let parsed = parse_server_hello_body(&resumed, true).unwrap();
+        assert!(parsed.psk_selected);
+        assert_eq!(parsed.key_share, [0x22; 32]);
     }
 
     #[test]

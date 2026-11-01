@@ -22,8 +22,10 @@ The two post-quantum primitives now sit on different backends:
 
 `pqcrypto-mldsa` and `pqcrypto-traits` were removed from the runtime dependency
 tree. They remain in **`[dev-dependencies]` only**, kept deliberately as a
-differential-test oracle so every hand-rolled operation can be cross-checked
-byte-for-byte against the original C-backed implementation (`tests/mldsa_differential.rs`).
+signature-interoperability oracle (`tests/mldsa_differential.rs`). The oracle
+does not expose seed or signing-randomness injection, so these tests do not
+compare generated keys or signatures byte-for-byte. Byte-exact known-answer
+checks instead use the vendored ACVP vectors (`tests/mldsa_acvp.rs`).
 Do not delete the `pqcrypto` dev-dependency — it is the oracle, not dead weight.
 
 ## Module layout
@@ -86,10 +88,15 @@ its own identity-proof error type and calls `keypair`/`sign`/`verify` directly.
 
 ## Validation
 
-- **Differential oracle:** `tests/mldsa_differential.rs` cross-checks against the
-  `pqcrypto` dev-dependency.
-- **ACVP KATs:** `tests/mldsa_acvp.rs` validates against NIST ACVP vectors; a
-  test-only `sign_deterministic` seam supplies the ACVP sigGen randomness.
+- **Differential oracle:** `tests/mldsa_differential.rs` checks signature
+  verification in both directions against the `pqcrypto` dev-dependency,
+  including shared-key interoperability, the public hedged signer, and selected
+  signature/message tampering.
+- **ACVP KATs:** `tests/mldsa_acvp.rs` compares ML-DSA-87 keyGen and deterministic /
+  hedged sigGen outputs byte-for-byte with NIST ACVP vectors, using
+  `sign::keygen_internal` and `sign::signature_ctx` to supply the vector's seed
+  and signing randomness. sigGen and sigVer cover the external/pure interface;
+  sigVer checks that acceptance matches each vector's `testPassed` value.
 - **Self-tests / round-trips:** unit tests in `mod.rs` cover keygen sizes, sign /
   verify round-trip, empty-message support, and every error variant.
 

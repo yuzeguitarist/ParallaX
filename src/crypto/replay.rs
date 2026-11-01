@@ -19,12 +19,9 @@ pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 2 * 60;
 /// Maximum clock skew tolerated on a client-supplied (MAC-bound) handshake
 /// timestamp dated in the FUTURE. The past bound stays at `window_secs`, but the
 /// future bound is clamped tight: without this, a PSK-holding client could date
-/// an entry up to `now + window_secs` ahead, which both doubles that entry's
-/// lifetime AND lands it at the FRONT of the arrival-ordered `order` deque, so
-/// `prune_expired` (which assumes arrival order == expiry order and stops at the
-/// first still-fresh entry) returns early forever and never reaps the genuinely
-/// stale entries behind it — accelerating CacheFull fail-close. 5s covers real
-/// clock skew without giving an attacker a future-dating lever.
+/// an entry up to `now + window_secs` ahead, doubling its retention lifetime
+/// and accelerating CacheFull fail-close. 5s covers real clock skew without
+/// giving an attacker a future-dating lever.
 const MAX_FUTURE_SKEW_SECS: u64 = 5;
 const AUTH_JOURNAL_VERSION: &str = "parallax-replay-cache-v4";
 /// Previous on-disk format: ONE header line rewritten in place at offset 0 on
@@ -121,6 +118,9 @@ pub struct ReplayCache {
     mac_key: Option<CacheMacKey>,
     auth_journal: Option<AuthJournalState>,
     order: VecDeque<ReplayEntry>,
+    /// Minimum retained timestamp, independent of arrival order. No entry can
+    /// expire before this timestamp plus the current `window_secs`.
+    oldest_timestamp: Option<u64>,
     encoded_entries: VecDeque<String>,
     nonces: HashSet<[u8; 8]>,
     transcripts: HashSet<[u8; 32]>,
@@ -135,6 +135,8 @@ pub struct ReplayCache {
     /// [`Self::persist_authenticated_entry`] (tests only).
     #[cfg(test)]
     fail_header_commit: Option<HeaderCommitFailure>,
+    #[cfg(test)]
+    prune_scanned_entries: usize,
 }
 
 /// Test-only fault injection for the header-commit phase of
@@ -160,12 +162,15 @@ impl ReplayCache {
             mac_key: None,
             auth_journal: None,
             order: VecDeque::with_capacity(capacity),
+            oldest_timestamp: None,
             encoded_entries: VecDeque::with_capacity(capacity),
             nonces: HashSet::with_capacity(capacity),
             transcripts: HashSet::with_capacity(capacity),
             pending_persist: VecDeque::new(),
             #[cfg(test)]
             fail_header_commit: None,
+            #[cfg(test)]
+            prune_scanned_entries: 0,
         }
     }
 
@@ -425,9 +430,8 @@ impl ReplayCache {
     }
 
     fn is_fresh(&self, timestamp: u64, now: u64) -> bool {
-        // Future bound clamped to MAX_FUTURE_SKEW_SECS (not window_secs) so a
-        // future-dated entry cannot linger at the front of `order` and starve
-        // prune_expired; past bound stays at the full replay window.
+        // Future bound clamped to MAX_FUTURE_SKEW_SECS (not window_secs) to
+        // limit future-dated retention; past bound stays at the full replay window.
         timestamp <= now.saturating_add(MAX_FUTURE_SKEW_SECS)
             && timestamp.saturating_add(self.window_secs) >= now
     }
@@ -441,6 +445,10 @@ impl ReplayCache {
     fn push_loaded_entry(&mut self, entry: ReplayEntry) {
         let encoded =
             (self.path.is_some() && self.mac_key.is_none()).then(|| encode_plain_entry(&entry));
+        self.oldest_timestamp = Some(
+            self.oldest_timestamp
+                .map_or(entry.timestamp, |oldest| oldest.min(entry.timestamp)),
+        );
         self.order.push_back(entry);
         if let Some(encoded) = encoded {
             self.encoded_entries.push_back(encoded);
@@ -452,6 +460,9 @@ impl ReplayCache {
     /// when `persist` fails so in-memory state never drifts ahead of the journal.
     fn pop_pushed_entry(&mut self) -> Option<ReplayEntry> {
         let entry = self.order.pop_back()?;
+        if self.oldest_timestamp == Some(entry.timestamp) {
+            self.oldest_timestamp = self.order.iter().map(|entry| entry.timestamp).min();
+        }
         if self.path.is_some() && self.mac_key.is_none() {
             self.encoded_entries.pop_back();
         }
@@ -459,16 +470,54 @@ impl ReplayCache {
     }
 
     fn prune_expired(&mut self, now: u64) {
-        while let Some(entry) = self.order.front() {
-            if self.is_fresh(entry.timestamp, now) {
-                break;
-            }
-            if let Some(old) = self.order.pop_front() {
-                let _ = self.encoded_entries.pop_front();
-                self.nonces.remove(&old.nonce);
-                self.transcripts.remove(&old.transcript_fingerprint);
-            }
+        let Some(oldest) = self.oldest_timestamp else {
+            return;
+        };
+        if oldest.saturating_add(self.window_secs) >= now {
+            return;
         }
+        let previous_len = self.order.len();
+        let window_secs = self.window_secs;
+        let is_unexpired = |entry: &ReplayEntry| entry.timestamp.saturating_add(window_secs) >= now;
+        // Arrival order is not timestamp order: a still-fresh entry can precede
+        // expired entries, even when every timestamp was valid on arrival.
+        // Keep recorded future timestamps across clock rollback: once the clock
+        // catches up, those handshakes must still be blocked as replays.
+        #[cfg(test)]
+        let scanned_entries = &mut self.prune_scanned_entries;
+        self.order.retain(|entry| {
+            #[cfg(test)]
+            {
+                *scanned_entries += 1;
+            }
+            is_unexpired(entry)
+        });
+        if self.order.len() == previous_len {
+            return;
+        }
+
+        // A journal can contain an expired entry whose fields were reused by a
+        // later fresh entry. Rebuild from survivors so pruning the old line on
+        // load cannot remove the fresh entry's replay protection.
+        self.nonces.clear();
+        self.transcripts.clear();
+        self.oldest_timestamp = None;
+        for entry in &self.order {
+            self.nonces.insert(entry.nonce);
+            self.transcripts.insert(entry.transcript_fingerprint);
+            self.oldest_timestamp = Some(
+                self.oldest_timestamp
+                    .map_or(entry.timestamp, |oldest| oldest.min(entry.timestamp)),
+            );
+        }
+        if self.path.is_some() && self.mac_key.is_none() {
+            self.encoded_entries.clear();
+            self.encoded_entries
+                .extend(self.order.iter().map(encode_plain_entry));
+        }
+        self.pending_persist.retain(is_unexpired);
+        // The authenticated count/tail still describe the committed on-disk
+        // chain, including expired lines, until its next atomic compaction.
     }
 
     fn persist(&mut self) -> Result<(), ReplayCacheError> {
@@ -1431,6 +1480,342 @@ mod tests {
         assert!(cache.insert_new(second, 100).unwrap());
         assert!(!cache.insert_new(third, 100).unwrap());
         assert!(!cache.insert_new(first, 100).unwrap());
+    }
+
+    #[test]
+    fn out_of_order_expiry_releases_capacity_and_keeps_fresh_replays_blocked() {
+        let entry = |timestamp, id| ReplayEntry {
+            timestamp,
+            nonce: [id; 8],
+            transcript_fingerprint: [id; 32],
+        };
+        let mut cache = ReplayCache::new(2);
+        let fresh = entry(1_000, 1);
+        let expired = entry(880, 2);
+        let next = entry(1_001, 3);
+        assert!(cache.insert_new(fresh.clone(), 1_000).unwrap());
+        assert!(cache.insert_new(expired.clone(), 1_000).unwrap());
+        assert_eq!(cache.oldest_timestamp, Some(880));
+        assert_eq!(
+            cache.insert_new_outcome(next.clone(), 1_001).unwrap(),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(cache.order, VecDeque::from([fresh.clone(), next]));
+        assert_eq!(cache.oldest_timestamp, Some(1_000));
+        assert!(!cache.nonces.contains(&expired.nonce));
+        assert!(!cache.transcripts.contains(&expired.transcript_fingerprint));
+        for replay in [
+            ReplayEntry {
+                nonce: fresh.nonce,
+                ..entry(1_001, 4)
+            },
+            ReplayEntry {
+                transcript_fingerprint: fresh.transcript_fingerprint,
+                ..entry(1_001, 5)
+            },
+        ] {
+            assert_eq!(
+                cache.insert_new_outcome(replay, 1_001).unwrap(),
+                ReplayInsertOutcome::Replayed
+            );
+        }
+    }
+
+    #[test]
+    fn full_fresh_cache_repeated_checks_do_not_scan_entries() {
+        let capacity = 49_152;
+        let mut cache = ReplayCache::new(capacity);
+        let entry = |id: u64| {
+            let mut transcript_fingerprint = [0; 32];
+            transcript_fingerprint[..8].copy_from_slice(&id.to_be_bytes());
+            ReplayEntry {
+                timestamp: 1_000,
+                nonce: id.to_be_bytes(),
+                transcript_fingerprint,
+            }
+        };
+        // Match the default capacity without making setup depend on the insert
+        // path under test: loading records uses the same push helper as inserts.
+        for id in 0..capacity as u64 {
+            cache.insert_loaded(entry(id));
+        }
+        for _ in 0..64 {
+            assert_eq!(
+                cache.insert_new_outcome_deferred(entry(0), 1_001),
+                ReplayInsertOutcome::Replayed
+            );
+            assert_eq!(
+                cache.insert_new_outcome_deferred(entry(capacity as u64), 1_001),
+                ReplayInsertOutcome::CacheFull
+            );
+        }
+        assert_eq!(cache.prune_scanned_entries, 0);
+        assert_eq!(cache.order.len(), capacity);
+    }
+
+    #[test]
+    fn expiry_watermark_tracks_survivors_window_changes_and_empty_cache() {
+        let mut cache = ReplayCache::new(4);
+        for (timestamp, id) in [(1_000, 1), (900, 2), (880, 3), (1_005, 4)] {
+            assert!(cache
+                .insert_new(
+                    ReplayEntry {
+                        timestamp,
+                        nonce: [id; 8],
+                        transcript_fingerprint: [id; 32],
+                    },
+                    1_000,
+                )
+                .unwrap());
+        }
+        cache.prune_expired(1_000);
+        assert_eq!(cache.prune_scanned_entries, 0);
+        cache.prune_expired(1_001);
+        assert_eq!(cache.oldest_timestamp, Some(900));
+        assert_eq!(cache.prune_scanned_entries, 4);
+        cache.prune_expired(1_020);
+        assert_eq!(cache.prune_scanned_entries, 4);
+        cache.prune_expired(1_021);
+        assert_eq!(cache.oldest_timestamp, Some(1_000));
+        assert_eq!(cache.prune_scanned_entries, 7);
+        cache.prune_expired(990);
+        assert_eq!(cache.prune_scanned_entries, 7);
+
+        // Store a timestamp rather than a precomputed deadline so a changed
+        // retention window takes effect without invalidating the watermark.
+        cache = cache.with_window_secs(720);
+        cache.prune_expired(1_121);
+        assert_eq!(cache.prune_scanned_entries, 7);
+        cache = cache.with_window_secs(120);
+        cache.prune_expired(1_121);
+        assert_eq!(cache.oldest_timestamp, Some(1_005));
+        assert_eq!(cache.prune_scanned_entries, 9);
+        cache.prune_expired(1_126);
+        assert_eq!(cache.oldest_timestamp, None);
+        assert_eq!(cache.prune_scanned_entries, 10);
+        cache.prune_expired(u64::MAX);
+        assert_eq!(cache.prune_scanned_entries, 10);
+    }
+
+    #[test]
+    fn persist_rollback_recomputes_watermark_when_failed_entry_was_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-watermark-rollback.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let entry = |timestamp, id| ReplayEntry {
+            timestamp,
+            nonce: [id; 8],
+            transcript_fingerprint: [id; 32],
+        };
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 2, key).unwrap();
+        let recorded = entry(now, 1);
+        assert!(cache.insert_new(recorded.clone(), now).unwrap());
+        cache.fail_header_commit = Some(HeaderCommitFailure::BeforeWrite);
+        assert!(matches!(
+            cache.insert_new_outcome(entry(now - DEFAULT_REPLAY_WINDOW_SECS, 2), now),
+            Err(ReplayCacheError::Io(_))
+        ));
+        assert_eq!(cache.oldest_timestamp, Some(now));
+        assert_eq!(
+            cache.insert_new_outcome(recorded, now + 1).unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+        assert_eq!(cache.prune_scanned_entries, 0);
+    }
+
+    #[test]
+    fn clock_rollback_keeps_recorded_entries_protected_when_clock_recovers() {
+        let mut cache = ReplayCache::new(2);
+        let entry = |timestamp, id| ReplayEntry {
+            timestamp,
+            nonce: [id; 8],
+            transcript_fingerprint: [id; 32],
+        };
+        let recorded = entry(1_000, 1);
+        assert!(cache.insert_new(recorded.clone(), 1_000).unwrap());
+        assert!(cache.insert_new(entry(995, 2), 1_000).unwrap());
+        assert_eq!(
+            cache.insert_new_outcome(entry(990, 3), 990).unwrap(),
+            ReplayInsertOutcome::CacheFull,
+            "a clock rollback must not discard an unexpired recorded handshake"
+        );
+        assert_eq!(
+            cache.insert_new_outcome(recorded, 1_000).unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+    }
+
+    #[test]
+    fn out_of_order_expiry_preserves_plain_and_authenticated_journals() {
+        let entry = |timestamp, id| ReplayEntry {
+            timestamp,
+            nonce: [id; 8],
+            transcript_fingerprint: [id; 32],
+        };
+        for authenticated in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("replay-out-of-order.cache");
+            let key = b"0123456789abcdef0123456789abcdef";
+            let load = || {
+                if authenticated {
+                    ReplayCache::load_or_create_authenticated(&path, 2, key).unwrap()
+                } else {
+                    ReplayCache::load_or_create(&path, 2).unwrap()
+                }
+            };
+            let now = current_unix_timestamp().unwrap();
+            let fresh = entry(now - 1, 1);
+            let expired = entry(now - 1 - DEFAULT_REPLAY_WINDOW_SECS, 2);
+            let next = entry(now, 3);
+            let mut cache = load();
+            assert!(cache.insert_new(fresh.clone(), now - 1).unwrap());
+            assert!(cache.insert_new(expired, now - 1).unwrap());
+            drop(cache);
+
+            // Loading must prune the expired tail even though the first entry is fresh.
+            let mut cache = load();
+            assert_eq!(cache.order, VecDeque::from([fresh.clone()]));
+            assert_eq!(cache.oldest_timestamp, Some(fresh.timestamp));
+            assert!(cache.insert_new(next.clone(), now).unwrap());
+            if authenticated {
+                // Pruning memory must not change the committed count/tail MAC:
+                // the next append still extends the original authenticated chain.
+                let raw = fs::read_to_string(&path).unwrap();
+                let (_, journal, needs_rewrite) =
+                    parse_authenticated_journal_entries(&raw, &cache_mac_key(key)).unwrap();
+                assert_eq!(journal.count, 3);
+                assert!(!needs_rewrite);
+            } else {
+                assert_eq!(cache.encoded_entries.len(), 2);
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    serialize_cached_entries(&VecDeque::from([
+                        encode_plain_entry(&fresh),
+                        encode_plain_entry(&next),
+                    ]))
+                );
+            }
+            drop(cache);
+            let mut reloaded = load();
+            assert_eq!(
+                reloaded.order,
+                VecDeque::from([fresh.clone(), next.clone()])
+            );
+            for replay in [fresh, next] {
+                assert_eq!(
+                    reloaded.insert_new_outcome(replay, now).unwrap(),
+                    ReplayInsertOutcome::Replayed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn load_pruning_keeps_reused_nonce_and_transcript_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-reused-fields.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let old_time = now - DEFAULT_REPLAY_WINDOW_SECS - 1;
+        let entry = |timestamp, nonce, transcript| ReplayEntry {
+            timestamp,
+            nonce: [nonce; 8],
+            transcript_fingerprint: [transcript; 32],
+        };
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 2, key).unwrap();
+        assert!(cache.insert_new(entry(old_time, 1, 2), old_time).unwrap());
+        assert!(cache.insert_new(entry(now, 1, 3), now).unwrap());
+        assert!(cache.insert_new(entry(now, 4, 2), now).unwrap());
+        drop(cache);
+
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 2, key).unwrap();
+        for replay in [entry(now, 1, 5), entry(now, 6, 2)] {
+            assert_eq!(
+                reloaded.insert_new_outcome(replay, now).unwrap(),
+                ReplayInsertOutcome::Replayed,
+                "pruning an old journal line must not remove a fresh entry's reused field"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_order_pruning_survives_authenticated_persist_rollback() {
+        let entry = |timestamp, id| ReplayEntry {
+            timestamp,
+            nonce: [id; 8],
+            transcript_fingerprint: [id; 32],
+        };
+        for failure in [
+            HeaderCommitFailure::BeforeWrite,
+            HeaderCommitFailure::AfterDurableWrite,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("replay-out-of-order-rollback.cache");
+            let key = b"0123456789abcdef0123456789abcdef";
+            let now = current_unix_timestamp().unwrap();
+            let fresh = entry(now - 1, 1);
+            let expired = entry(now - 1 - DEFAULT_REPLAY_WINDOW_SECS, 2);
+            let next = entry(now, 3);
+            let mut cache = ReplayCache::load_or_create_authenticated(&path, 2, key).unwrap();
+            assert!(cache.insert_new(fresh.clone(), now - 1).unwrap());
+            assert!(cache.insert_new(expired, now - 1).unwrap());
+            cache.fail_header_commit = Some(failure);
+            assert!(matches!(
+                cache.insert_new_outcome(next.clone(), now),
+                Err(ReplayCacheError::Io(_))
+            ));
+            assert_eq!(cache.order, VecDeque::from([fresh.clone()]));
+            assert_eq!(
+                cache.insert_new_outcome(fresh.clone(), now).unwrap(),
+                ReplayInsertOutcome::Replayed
+            );
+            assert!(cache.insert_new(next.clone(), now).unwrap());
+            drop(cache);
+            let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 2, key).unwrap();
+            for replay in [fresh, next] {
+                assert_eq!(
+                    reloaded.insert_new_outcome(replay, now).unwrap(),
+                    ReplayInsertOutcome::Replayed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_order_pruning_removes_expired_pending_entry_before_nonce_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-out-of-order-pending.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let entry = |timestamp, id| ReplayEntry {
+            timestamp,
+            nonce: [id; 8],
+            transcript_fingerprint: [id; 32],
+        };
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 2, key).unwrap();
+        assert!(cache.insert_new(entry(now - 1, 1), now - 1).unwrap());
+        assert_eq!(
+            cache.insert_new_outcome_deferred(
+                entry(now - 1 - DEFAULT_REPLAY_WINDOW_SECS, 2),
+                now - 1
+            ),
+            ReplayInsertOutcome::Inserted
+        );
+        let next = entry(now, 2);
+        assert_eq!(
+            cache.insert_new_outcome_deferred(next.clone(), now),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(cache.pending_persist, VecDeque::from([next.clone()]));
+        cache.persist_pending().unwrap();
+        assert_eq!(cache.auth_journal.unwrap().count, 2);
+        drop(cache);
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 2, key).unwrap();
+        assert_eq!(
+            reloaded.insert_new_outcome(next, now).unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
     }
 
     #[test]

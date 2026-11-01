@@ -161,7 +161,7 @@ encrypted records.
 | `PX1C` | `50 58 31 43` | CONNECT | C→S | 6.1 |
 | `PX1Q` | `50 58 31 51` | PQ_REKEY request | C→S | 5.7 |
 | `PX1K` | `50 58 31 4B` | SERVER_KEY_EXCHANGE | S→C | 5.7 |
-| `PX1S` | `50 58 31 53` | SERVER_IDENTITY (proof, whole) | S→C | 5.6 |
+| `PX1S` | `50 58 31 53` | SERVER_IDENTITY (inner proof, carried in `PX1I`) | S→C | 5.6 |
 | `PX1I` | `50 58 31 49` | SERVER_IDENTITY_CHUNK | S→C | 5.6 |
 | `PX1F` | `50 58 31 46` | FRAMED_CHUNK (generic chunk reassembly) | both | 5.8 |
 | `PX1M` | `50 58 31 4D` | MUX_FRAME | both | 7 |
@@ -646,9 +646,10 @@ rekey (§5.7), so `self.keys.epoch` is already 1 when it verifies. The
 `server_ephemeral_x25519_public` is the `server_x25519_public` from the `PX1K`
 (§6.3) that drove this rekey.
 
-The proof is transported as a `PX1S` message, or fragmented into `PX1I` chunks
-(§6.4) when it exceeds a single shaped record (the ML-DSA-87 signature alone is
-4627 bytes).
+The proof is encoded as a complete `PX1S` message and transported in `PX1I`
+chunks (§6.4), including the `PX1S` magic and signature-length field. The
+ML-DSA-87 signature is 4627 bytes; the reassembled `PX1S` message is 4635 bytes.
+A standalone `PX1S` record is not accepted by the client identity reader.
 
 > **`pq_rekey_binding` precise input order (§5.6).** The SHA-256 covers, in
 > order: the label, then a `u32_be` length followed by the **encoded `PX1Q`
@@ -782,9 +783,10 @@ expects the with-suite form.) `cipher_suite_tag` is a ParallaX AEAD selector
 
 ### 6.4 SERVER_IDENTITY (`PX1S`) and chunk (`PX1I`) — server → client
 
-Carries the ML-DSA-87 server-identity proof (§5.6). When the proof fits a single
-shaped record it is sent whole as `PX1S`; otherwise it is fragmented into `PX1I`
-chunks reassembled in offset order.
+Carries the ML-DSA-87 server-identity proof (§5.6). The complete encoded `PX1S`
+message is always carried inside `PX1I` chunks, reassembled in offset order.
+Even a proof carried by a single chunk MUST have the outer `PX1I` header; a
+standalone `PX1S` record is not an alternative transport format.
 
 **`PX1S` (ServerIdentityProof), 8-byte header:**
 
@@ -798,13 +800,13 @@ offset  size      field
 Total length MUST equal `8 + sig_len`. The `signature` is the raw FIPS 204
 signature; the verifier checks it against the signed message of §5.6.
 
-**`PX1I` (ServerIdentityChunk), 16-byte header — used when fragmenting:**
+**`PX1I` (ServerIdentityChunk), 16-byte header — required outer carrier:**
 
 ```
 offset  size       field
 0       4          magic = "PX1I"
-4       4          total_len  (u32 BE, full reassembled proof byte length)
-8       4          offset     (u32 BE, this chunk's byte offset into the proof)
+4       4          total_len  (u32 BE, full encoded PX1S length, including its header)
+8       4          offset     (u32 BE, this chunk's byte offset into encoded PX1S)
 12      4          chunk_len  (u32 BE, non-zero, bytes in this chunk)
 16      chunk_len  bytes
 ```
@@ -814,14 +816,28 @@ Total record length MUST equal `16 + chunk_len`. Validation: empty chunk →
 `InvalidOffset`; a chunk arriving with `offset ≠ next_expected` → `OutOfOrder`; a
 `total_len` differing between chunks → `InconsistentTotal`. The receiver
 concatenates chunk `bytes` strictly in increasing-offset order to recover the
-`PX1S` proof body (the reassembled bytes are the signature itself, then verified
-per §5.6).
+entire `PX1S` message, including its 8-byte header. It then decodes that header,
+checks `len == 8 + sig_len`, and verifies only the extracted signature per §5.6.
+Reassembling raw signature bytes without the `PX1S` header is invalid. The client
+also rejects `total_len > 16384` before allocating the reassembly buffer.
+
+For ML-DSA-87, `sig_len = 4627 = 0x1213` and every chunk's
+`total_len = 4635 = 0x121b`. Thus a first chunk carrying 1024 payload bytes starts
+with the following hex bytes, followed by the first 1016 signature bytes:
+
+```
+50 58 31 49  00 00 12 1b  00 00 00 00  00 00 04 00  # PX1I header
+50 58 31 53  00 00 12 13                            # PX1S header
+```
+
+The next chunk's `offset` is 1024, measured from the start of `PX1S`, not from
+the start of the signature. Chunk boundaries may split either inner header field.
 
 > **Note on chunk reassembly vs. `PX1F`.** `PX1I` and the generic `PX1F`
 > (`FramedChunk`, §5.8) share the identical 16-byte
 > `magic||total_len||offset||chunk_len` header layout and in-order semantics;
 > they differ only in magic and in what the reassembled payload is (`PX1I` →
-> ML-DSA proof; `PX1F` → the `PX1Q` PQ-rekey request body).
+> complete encoded `PX1S`; `PX1F` → complete encoded `PX1Q` or `PX1K`).
 
 ### 6.5 MUX_FRAME (`PX1M`) — bidirectional
 
@@ -962,7 +978,7 @@ CLIENT                          PARALLAX SERVER                      FALLBACK OR
   │                                   │ relaying, drops origin ───────────╳ (origin closed)
   │                                   │ and answers as ParallaX itself:   │
   │◄── PX1K ServerKeyExchange (+tag) ─│                                  ───
-  │◄── PX1S/PX1I ServerIdentityProof ─│  (ML-DSA-87 signature)             
+  │◄── PX1I chunks of encoded PX1S ──│  (ML-DSA-87 signature)
   │== rekey: epoch=1, seq=0, new keys │  (§5.7)                           
   │ (client verifies ML-DSA sig; FAIL ─► abort)                          
   │                                   │                                    
@@ -1077,8 +1093,8 @@ the client to the fallback origin (§7.1); on decrypting a valid `PX1Q` it drops
 the origin connection and answers as the ParallaX server itself. (A client that
 authenticated MUST send `PX1Q` promptly — within ms — or the server tears down at
 the pre-`PX1Q` deadline.) The server replies with `PX1K` (its ephemeral X25519 +
-ML-KEM ciphertext + 1-byte cipher tag), then the `PX1S`/`PX1I` ML-DSA-87 identity
-proof. Both perform the hybrid ratchet (§5.7):
+ML-KEM ciphertext + 1-byte cipher tag), then the `PX1I`-carried `PX1S` ML-DSA-87
+identity proof. Both perform the hybrid ratchet (§5.7):
 `epoch → 1`, `sequence → 0`, fresh traffic keys. The client MUST verify the
 ML-DSA-87 signature before sending any `CONNECT`; verification failure aborts the
 session (no `CONNECT`, connection closed like a normal origin would).
@@ -1150,7 +1166,7 @@ connection over.
           await client's first PX1Q)                  indistinguishable from a real origin)
               │ recv valid PX1Q → drop origin
               ▼
-        SEND_KEX+IDENTITY (PX1K, PX1S/PX1I) ──► REKEYED
+        SEND_KEX+IDENTITY (PX1K, PX1I carrying PX1S) ──► REKEYED
               │
               ▼
         AWAIT_FIRST_RECORD ── dispatch on magic (§9 mode selection) ──┐
@@ -1201,9 +1217,13 @@ Each logical stream is identified by a `u32` `stream_id`.
   plane; the client always initiates.)
 - **OPEN (kind 1).** Carries a complete `CONNECT` (`PX1C`) as its payload,
   telling the server the target for this stream. After OPEN the server dials and
-  the stream is established.
+  the stream is established. Once the request is parsed, the TCP-plane server
+  acknowledges receipt with an empty DATA frame **before** DNS, dial, or target
+  writes. This confirms carrier liveness, not target connection success; setup
+  failures still send RESET.
 - **DATA (kind 2).** Carries stream payload bytes. Multiple DATA frames per
-  stream, interleaved with other streams' frames.
+  stream, interleaved with other streams' frames. Empty DATA is legal and
+  delivers no bytes to the application, including the OPEN receipt acknowledgement.
 - **FIN (kind 3).** Graceful half-close: the sender will send no more DATA on
   this `stream_id`. The reverse direction may keep flowing until its own FIN.
 - **RESET (kind 4).** Abortive close of the stream (e.g. target connect failed,
@@ -1232,8 +1252,8 @@ bidi (stream id 4), and a server MUST grant the client at least two bidi streams
 
 ### 9.3 Mux scheduling and liveness (implementation behavior, wire-transparent)
 
-None of the following changes a byte on the wire — a peer sees only ordinary
-`PX1M` frames — but they are what keep a multiplexed session usable under bulk
+The following uses only ordinary `PX1M` frames, without new frame kinds or
+version negotiation, to keep a multiplexed session usable under bulk
 transfer and path failure, so a production reimplementation SHOULD match them.
 
 **Server download fairness (TCP-plane mux).** Each substream queues its
@@ -1270,18 +1290,27 @@ p50 ≈ 4 s serial vs ≈ 0.75 s concurrent over a 68 ms RTT). Idle sessions are
 
 **Client dead-carrier detection.** A carrier blackholed by the path (firewall,
 NAT loss, sleep/roaming) leaves reader and writer tasks parked forever, so
-"tasks alive" is not "session usable". Without sending anything new: when an
-`OPEN` that carried the application's first bytes is unanswered and the carrier
+"tasks alive" is not "session usable". Without periodic probes: when an
+queued `OPEN` (including an empty initial payload) is unanswered and the carrier
 shows no proof of life (no record read, and no write that waited for socket space
 and then drained) for `MUX_CARRIER_SUSPECT_AFTER = 5 s`, the session is
 **suspect** and accepts no new substreams; after `MUX_CARRIER_DEAD_AFTER = 25 s`
 its substreams are reset (so applications retry on a fresh session) and the
-carrier is dropped. While a client→server write is in flight the watchdog only
+carrier is dropped. The server's empty DATA acknowledgement disarms this wait
+before any target I/O, so a healthy target may delay its response beyond 25 s.
+Existing clients already ignore empty DATA payloads. Updated clients wait for
+acknowledgements for **every** OPEN, including an empty initial payload. Deploy
+the updated server before this client behavior: against an older server that
+sends no receipt acknowledgement, an otherwise healthy server-first stream or
+delayed target can be reset after 25 s. Frame-format compatibility does not remove
+this server-update requirement.
+While a client→server write is in flight the watchdog only
 marks suspect and rechecks every 1 s (a slow uplink must not condemn a healthy
 carrier). A batched mux write that cannot drain for
 `CLIENT_MUX_WRITE_STALL_TIMEOUT = 60 s` ends the session. Either the reader or the
 writer ending aborts the other. The idle backstop is a deadline pushed out only by
-real records, not by stream registration.
+business-frame activity in either direction; COVER frames and local stream
+registration do not extend it.
 
 ---
 
@@ -1527,12 +1556,22 @@ Safari/BoringSSL does (RFC 8446 §4.1.2 / §4.4.1):
 5. The next ServerHello MUST NOT be another HRR, MUST keep the cipher suite the
    HRR selected, and its `key_share` group MUST equal the retried group.
 
-ClientHello2 does **not** carry the ParallaX auth binding (the `key_share` it
-replaces held the ParallaX/mask material). A ParallaX-fronted origin never emits
-an HRR for the offered `x25519` + `X25519MLKEM768` shares, so this path is only
-reached against an unusual origin; the retried connection then simply fails to
-authenticate and degrades to ordinary origin traffic (a lost session, the safe
-direction).
+**Authenticated-proxy limitation.** The TLS camouflage client handles this retry,
+but the reference TCP proxy does **not** support an authenticated session when
+the configured fallback origin returns an HRR. The server has already
+authenticated ClientHello1 before reading the origin's response. It derives the
+ParallaX epoch-0 keys from `(ClientHello1, HRR)`, while the client uses
+`(ClientHello1, final ServerHello)`. These are the ParallaX transcript inputs
+(§5.3), separate from the correctly collapsed TLS transcript above.
+
+ClientHello2 replaces the `key_share` that held the ParallaX/mask material, but
+the server does not reauthenticate that retry or update its saved transcript.
+Consequently the epoch-0 keys differ: the camouflage TLS handshake may finish,
+but the server cannot recognize the client's encrypted `PX1Q`, and proxy
+establishment fails in the bounded pre-`PX1Q` origin-splice phase (§7.1). This is
+not a transparent downgrade to an ordinary origin session. Deployments SHOULD
+select and verify a fallback origin that accepts an initial `X25519` or
+`X25519MLKEM768` share without an HRR for the configured SNI.
 
 ### 12.4 HTTP/2 fingerprint (TCP plane)
 
@@ -1903,12 +1942,18 @@ a prober could use to count the cap). It must be indistinguishable from a health
 splice: it reads its first record with the same pre-dialing reader (§13, so the
 origin's idle clock starts on the same schedule), applies the same client-socket
 tuning, uses the same idle distribution (`fallback_idle_*`, §13.1), and — when the
-read fails — releases its speculative origin dial the way the authenticated path
-does rather than leaking a detached, un-FIN'd connect. Cap-shed relays draw from a
-small separate budget (64 concurrent); past it the server degrades to a graceful
-FIN. TCP teardown on the splice path is FIN-only (never a wire RST); a splice
-direction that cannot make progress while data is buffered reports a truncation
-rather than success.
+read fails — awaits cleanup of its speculative origin dial before releasing its
+admission slot. Cap-shed relays draw from a small separate budget (64 concurrent),
+reserved before spawning. When full, the accept loop waits for a slot with only
+its current accepted socket, applying listener backpressure without spawning a
+close task or dropping unread input. The server's main connection budget reserves
+the 64 client/origin socket pairs plus that one waiting socket separately from its
+ordinary process headroom. Cap-shed relays always use the userspace splice,
+including on Linux, so this reservation covers their two sockets without
+kernel-splice descriptor clones, pipes or native per-relay threads. Once a slot
+opens, the waiting connection uses that splice and FIN/drain path. TCP teardown
+on the splice path is FIN-only (never a wire RST); a splice direction that cannot
+make progress while data is buffered reports a truncation rather than success.
 
 ---
 

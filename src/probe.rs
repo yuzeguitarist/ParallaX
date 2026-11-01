@@ -200,7 +200,11 @@ async fn probe_with_timeout(
     deadline: Duration,
 ) -> Result<ProbeReport, ProbeError> {
     let started = Instant::now();
-    let connect = timeout(deadline, connect_tuned_tcp_host(&target.authority())).await;
+    let connect = timeout(
+        deadline,
+        connect_tuned_tcp_host(&target.authority(), started + deadline),
+    )
+    .await;
     let mut notes = Vec::new();
 
     let Ok(Ok(mut stream)) = connect else {
