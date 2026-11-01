@@ -9,6 +9,7 @@ use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use rand::{rngs::OsRng, RngCore};
+use sha2::{Digest, Sha256};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
@@ -137,7 +138,7 @@ enum Command {
     Seal {
         #[arg(short, long, default_value = "parallax.toml")]
         config: PathBuf,
-        /// Sealed bundle output path (default: <config-dir>/parallax.secrets.enc).
+        /// Sealed bundle output path (default: <config-path>.secrets.enc).
         #[arg(long)]
         output: Option<PathBuf>,
         /// Host keyfile path (default: $PARALLAX_HOST_KEY_FILE or
@@ -461,9 +462,24 @@ fn seal_config(
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let bundle_path = output
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| config_dir.join("parallax.secrets.enc"));
+    let bundle_path = output.map(Path::to_path_buf).unwrap_or_else(|| {
+        let mut path = config.as_os_str().to_owned();
+        path.push(".secrets.enc");
+        PathBuf::from(path)
+    });
+    // Explicit --output may share a bundle with another config. Scope entries
+    // to the config's canonical identity so equal field names never replace
+    // another config's keys. Existing bare fragments remain readable and are
+    // retained when their config migrates to these namespaced references.
+    let config_identity = config.canonicalize()?;
+    let namespace = format!(
+        "config-{:x}",
+        Sha256::digest(config_identity.as_os_str().as_encoded_bytes())
+    );
+    let entries: Vec<(&str, String)> = secrets
+        .iter()
+        .map(|(field, _)| (*field, format!("{namespace}.{field}")))
+        .collect();
 
     // Merge into an existing bundle rather than clobbering it, so sealing one
     // config never silently drops entries another config sealed into the same
@@ -482,9 +498,10 @@ fn seal_config(
     secret_store::seal_into(
         &mut bundle,
         &host_key_bytes,
-        secrets
+        entries
             .iter()
-            .map(|(field, value)| (*field, value.as_str())),
+            .zip(&secrets)
+            .map(|((_, entry), (_, value))| (entry.as_str(), value.as_str())),
     )
     .with_context(|| {
         format!(
@@ -509,7 +526,9 @@ fn seal_config(
     let rewritten = Zeroizing::new(rewrite_secrets_to_sealed(
         original.as_str(),
         &bundle_ref,
-        secrets.iter().map(|(field, _)| *field),
+        entries
+            .iter()
+            .map(|(field, entry)| (*field, entry.as_str())),
     ));
 
     // Fail closed: re-parse the rewrite and refuse to touch the config if ANY
@@ -641,22 +660,22 @@ fn sealed_bundle_reference(config_dir: &Path, bundle_path: &Path) -> anyhow::Res
         .context("sealed bundle output path must be valid UTF-8")
 }
 
-/// Rewrite each named secret assignment line to a `{ sealed = "<bundle>#<field>" }`
+/// Rewrite each named secret assignment line to a `{ sealed = "<bundle>#<entry>" }`
 /// reference, preserving the rest of the file (comments, formatting, ordering).
 /// Secrets are always single-line assignments, so a line-targeted rewrite is
 /// safe and avoids a lossy TOML round-trip.
 fn rewrite_secrets_to_sealed<'a>(
     original: &str,
     bundle_name: &str,
-    fields: impl IntoIterator<Item = &'a str>,
+    fields: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> String {
-    let targets: Vec<&str> = fields.into_iter().collect();
+    let targets: Vec<(&str, &str)> = fields.into_iter().collect();
     let mut out = String::with_capacity(original.len());
     for line in original.lines() {
         let trimmed = line.trim_start();
         let indent = &line[..line.len() - trimmed.len()];
         let mut replaced = false;
-        for field in &targets {
+        for (field, entry) in &targets {
             // Match `psk = ...` / `private_key= ...` etc. at the start of the
             // logical assignment (after indentation), not as a substring.
             if let Some(rest) = trimmed.strip_prefix(field) {
@@ -665,7 +684,7 @@ fn rewrite_secrets_to_sealed<'a>(
                     // Escape the reference as a TOML basic string: an absolute
                     // --output path may legally contain `"`, `\`, or control
                     // bytes, which raw interpolation would turn into broken TOML.
-                    let value = toml_basic_string(&format!("{bundle_name}#{field}"));
+                    let value = toml_basic_string(&format!("{bundle_name}#{entry}"));
                     out.push_str(indent);
                     out.push_str(field);
                     out.push_str(" = { sealed = ");
@@ -1491,14 +1510,14 @@ mod tests {
 
         seal_config(&server_path, None, None).unwrap();
 
-        let bundle_path = dir.path().join("parallax.secrets.enc");
+        let bundle_path = dir.path().join("parallax.server.toml.secrets.enc");
         assert!(bundle_path.exists());
         let rewritten = fs::read_to_string(&server_path).unwrap();
         assert!(
             !rewritten.contains(&private_b64),
             "sealed config must not retain the raw private key"
         );
-        assert!(rewritten.contains("sealed = \"parallax.secrets.enc#private_key\""));
+        assert!(rewritten.contains("sealed = \"parallax.server.toml.secrets.enc#config-"));
 
         // Reload resolves the sealed bundle back to the original secret bytes.
         let after = Config::load(&server_path).unwrap();
@@ -1535,7 +1554,7 @@ mod tests {
         std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
 
         seal_config(&server_path, None, None).unwrap();
-        let bundle_path = dir.path().join("parallax.secrets.enc");
+        let bundle_path = dir.path().join("parallax.server.toml.secrets.enc");
         let bundle_id = |path: &Path| -> String {
             let value: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             value["id"].as_str().unwrap().to_owned()
@@ -1556,6 +1575,202 @@ mod tests {
         let after = Config::load(&server_path).unwrap();
         std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
         assert_eq!(after.crypto.psk.as_b64(), psk_b64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_keeps_distinct_configs_and_rotations_independent() {
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
+        for shared_output in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let host_key = dir.path().join("host.key");
+            std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+            let first_path = dir.path().join("first.toml");
+            let second_path = dir.path().join("second.toml");
+            let bundle_path = dir.path().join("shared.enc");
+            let output = shared_output.then_some(bundle_path.as_path());
+            let mut expected = Vec::new();
+            for path in [&first_path, &second_path] {
+                let generated = generate_config_template(
+                    "127.0.0.1:0",
+                    "127.0.0.1:1080",
+                    "example.com:443",
+                    "example.com:443",
+                    "example.com",
+                );
+                write_secret_file(path, &generated.server).unwrap();
+                expected.push(Config::load(path).unwrap());
+                seal_config(path, output, None).unwrap();
+            }
+            assert_ne!(
+                expected[0].crypto.psk.as_b64(),
+                expected[1].crypto.psk.as_b64()
+            );
+            let assert_secrets = |path: &Path, expected: &Config| {
+                let (actual, validated) = Config::load_for_check(path).unwrap();
+                assert!(validated);
+                for (actual, expected) in actual
+                    .secret_sources()
+                    .iter()
+                    .zip(expected.secret_sources())
+                {
+                    assert_eq!(actual.source.as_b64(), expected.source.as_b64());
+                }
+            };
+            assert_secrets(&first_path, &expected[0]);
+            assert_secrets(&second_path, &expected[1]);
+
+            // Re-sealing and replacing one config's inline keys must preserve
+            // the other config, including when --output deliberately shares a bundle.
+            seal_config(&first_path, output, None).unwrap();
+            assert_secrets(&first_path, &expected[0]);
+            assert_secrets(&second_path, &expected[1]);
+            let rotated = generate_config_template(
+                "127.0.0.1:0",
+                "127.0.0.1:1080",
+                "example.com:443",
+                "example.com:443",
+                "example.com",
+            );
+            write_secret_file_overwrite(&first_path, &rotated.server).unwrap();
+            let rotated = Config::load(&first_path).unwrap();
+            seal_config(&first_path, output, None).unwrap();
+            assert_secrets(&first_path, &rotated);
+            assert_secrets(&second_path, &expected[1]);
+            if !shared_output {
+                assert!(dir.path().join("first.toml.secrets.enc").exists());
+                assert!(dir.path().join("second.toml.secrets.enc").exists());
+            }
+            std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_migrates_legacy_references_without_changing_their_secrets() {
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
+        for shared_output in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let host_key = dir.path().join("host.key");
+            std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+            let generated = generate_config_template(
+                "127.0.0.1:0",
+                "127.0.0.1:1080",
+                "example.com:443",
+                "example.com:443",
+                "example.com",
+            );
+            let before: Config = toml::from_str(&generated.server).unwrap();
+            let key = secret_store::create_host_key(None).unwrap();
+            let fields = before.secret_sources();
+            let legacy = secret_store::seal_all(
+                &key,
+                fields
+                    .iter()
+                    .map(|field| (field.seal_key, field.source.as_b64())),
+            );
+            let legacy_path = dir.path().join("parallax.secrets.enc");
+            let legacy_text = secret_store::bundle_to_toml(&legacy);
+            write_secret_file(&legacy_path, &legacy_text).unwrap();
+            let legacy_config = rewrite_secrets_to_sealed(
+                &generated.server,
+                "parallax.secrets.enc",
+                fields.iter().map(|field| (field.seal_key, field.seal_key)),
+            );
+            let config_path = dir.path().join("server.toml");
+            let other_path = dir.path().join("other.toml");
+            write_secret_file(&config_path, &legacy_config).unwrap();
+            write_secret_file(&other_path, &legacy_config).unwrap();
+            seal_config(
+                &config_path,
+                shared_output.then_some(legacy_path.as_path()),
+                None,
+            )
+            .unwrap();
+            for path in [&config_path, &other_path] {
+                let actual = Config::load(path).unwrap();
+                for (actual, expected) in actual.secret_sources().iter().zip(&fields) {
+                    assert_eq!(actual.source.as_b64(), expected.source.as_b64());
+                }
+            }
+            if !shared_output {
+                assert_eq!(fs::read_to_string(&legacy_path).unwrap(), legacy_text);
+            }
+            // Rotating the migrated config must not alter a second config
+            // that still references the legacy unscoped entries.
+            let rotated = generate_config_template(
+                "127.0.0.1:0",
+                "127.0.0.1:1080",
+                "example.com:443",
+                "example.com:443",
+                "example.com",
+            );
+            write_secret_file_overwrite(&config_path, &rotated.server).unwrap();
+            seal_config(
+                &config_path,
+                shared_output.then_some(legacy_path.as_path()),
+                None,
+            )
+            .unwrap();
+            let other = Config::load(&other_path).unwrap();
+            for (actual, expected) in other.secret_sources().iter().zip(&fields) {
+                assert_eq!(actual.source.as_b64(), expected.source.as_b64());
+            }
+            std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_seal_survives_install_and_independent_redeploys() {
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let host_key = dir.path().join("host.key");
+        std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+        let mut installed: Vec<(PathBuf, Config)> = Vec::new();
+        for deployment in 0..2 {
+            for instance in ["one", "two"] {
+                // Match deploy-vps: a stable instance-specific staging path,
+                // the final basename, and a bundle copied alongside the config.
+                let staging = dir.path().join(format!("staging-{instance}"));
+                let destination = dir.path().join(instance);
+                fs::create_dir_all(&staging).unwrap();
+                fs::create_dir_all(&destination).unwrap();
+                let staged_config = staging.join("server.toml");
+                let staged_bundle = staging.join("server.toml.secrets.enc");
+                let final_config = destination.join("server.toml");
+                let final_bundle = destination.join("server.toml.secrets.enc");
+                if deployment > 0 {
+                    fs::copy(&final_bundle, &staged_bundle).unwrap();
+                }
+                let generated = generate_config_template(
+                    "127.0.0.1:0",
+                    "127.0.0.1:1080",
+                    "example.com:443",
+                    "example.com:443",
+                    "example.com",
+                );
+                write_secret_file(&staged_config, &generated.server).unwrap();
+                let expected = Config::load(&staged_config).unwrap();
+                seal_config(&staged_config, None, None).unwrap();
+                fs::copy(&staged_bundle, &final_bundle).unwrap();
+                fs::copy(&staged_config, &final_config).unwrap();
+                fs::remove_dir_all(&staging).unwrap();
+                installed.retain(|(path, _)| path != &final_config);
+                installed.push((final_config, expected));
+                for (path, expected) in &installed {
+                    let actual = Config::load(path).unwrap();
+                    for (actual, expected) in actual
+                        .secret_sources()
+                        .iter()
+                        .zip(expected.secret_sources())
+                    {
+                        assert_eq!(actual.source.as_b64(), expected.source.as_b64());
+                    }
+                }
+            }
+        }
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
     }
 
     #[cfg(unix)]
@@ -1590,7 +1805,7 @@ mod tests {
         let rewritten = fs::read_to_string(&server_path).unwrap();
         let expected = bundle_path.canonicalize().unwrap();
         assert!(
-            rewritten.contains(&format!("{}#psk", expected.display())),
+            rewritten.contains(&format!("{}#config-", expected.display())),
             "sealed reference must retain the bundle directory: {rewritten}"
         );
 
@@ -1642,13 +1857,13 @@ mod tests {
             !sidecar.exists(),
             "plx seal must remove the plaintext sidecar in the default flow"
         );
-        assert!(dir.path().join("parallax.secrets.enc").exists());
+        assert!(dir.path().join("parallax.server.toml.secrets.enc").exists());
 
         // The rewritten config references the bundle, with no inline secret bytes.
         let rewritten = fs::read_to_string(&server_path).unwrap();
         assert!(!rewritten.contains(&psk_b64));
         assert!(!rewritten.contains(&private_b64));
-        assert!(rewritten.contains("sealed = \"parallax.secrets.enc#psk\""));
+        assert!(rewritten.contains("sealed = \"parallax.server.toml.secrets.enc#config-"));
 
         // It loads and resolves back to the original secret bytes.
         std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);

@@ -141,6 +141,9 @@ retry() {
 
 # refresh (or create) the fuzz-crashes worktree pinned to origin's branch.
 prepare_worktree() {
+  git -C "$SRC" config --replace-all remote.origin.url "https://github.com/${REPO}.git" \
+    >/dev/null 2>&1 || return 1
+  git -C "$SRC" config --unset-all remote.origin.pushurl >/dev/null 2>&1 || true
   # The source clone is --single-branch, so a bare `fetch origin fuzz-crashes`
   # does NOT create refs/remotes/origin/fuzz-crashes — the show-ref check below
   # then fails and we'd wrongly fork the branch off the detached pinned commit,

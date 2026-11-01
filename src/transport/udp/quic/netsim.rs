@@ -310,7 +310,7 @@ fn server_key() -> Vec<u8> {
 }
 
 fn server_tp() -> Vec<u8> {
-    super::transport_params::TransportParameters::safari_client(&[]).encode_safari_client()
+    super::transport_params::TransportParameters::server(&[]).encode_server()
 }
 
 // ---- scenarios ------------------------------------------------------------------

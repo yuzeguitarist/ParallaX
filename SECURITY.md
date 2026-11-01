@@ -112,7 +112,7 @@ a credential:
 psk = "base64=="                              # inline — file IS a credential
 psk = { file = "parallax.secrets.toml#psk" } # 0600 sidecar file (default for `plx init`)
 psk = { env = "PARALLAX_PSK" }               # environment / systemd LoadCredential
-psk = { sealed = "parallax.secrets.enc#psk" }# machine-bound, encrypted at rest
+psk = { sealed = "parallax.toml.secrets.enc#config-<hash>.psk" } # machine-bound, encrypted at rest
 ```
 
 - `plx init` writes **referenced** secrets (0600 sidecar files) by default;

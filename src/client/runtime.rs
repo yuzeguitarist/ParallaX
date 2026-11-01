@@ -24,7 +24,7 @@ use tokio::{
         TcpListener, TcpStream,
     },
     sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
-    time::{sleep, timeout, timeout_at, Instant},
+    time::{sleep, timeout, Instant},
 };
 
 use crate::{
@@ -56,7 +56,7 @@ use crate::{
             LegWriter, TcpLegReader, TcpLegWriter,
         },
         tcp::{
-            connect_tuned_tcp_addr, drain_ready_tcp_read, is_fd_exhaustion_error,
+            connect_tuned_tcp_any, drain_ready_tcp_read, is_fd_exhaustion_error,
             is_transient_accept_error, relay_connection_limit, tune_tcp_stream,
         },
     },
@@ -177,10 +177,10 @@ const MUX_MAX_CONCURRENT_SESSION_BUILDS: usize = 8;
 /// still fails fast against a genuinely down/blocked server.
 const MUX_ACQUIRE_MAX_BUILD_ATTEMPTS: u32 = 3;
 /// Dead-carrier watchdog for a TCP mux session (see [`MuxCarrierWatchdog`]). An
-/// Open that carried the app's first bytes (a TLS ClientHello, an HTTP request)
-/// always draws a server record — data, Fin, or a Reset no later than the
-/// server's DNS + connect budget (2 x 8s). If NOTHING has come back from the
-/// carrier for `SUSPECT` the session gets no new substreams; after `DEAD` its
+/// Open, including one with no initial app bytes, draws an empty Data
+/// acknowledgement before server-side target I/O. Target
+/// response latency is therefore independent of this clock. If NOTHING returns
+/// from the carrier for `SUSPECT` the session gets no new substreams; after `DEAD` its
 /// substreams are reset (apps retry on a fresh session) and the carrier is
 /// dropped. Nothing is sent to detect this: no ping, no keepalive.
 const MUX_CARRIER_SUSPECT_AFTER: Duration = Duration::from_secs(5);
@@ -801,6 +801,9 @@ struct ClientMuxHandle {
 /// parked forever, and the pool used to keep handing such a session new
 /// substreams that silently never answered.
 struct MuxCarrierHealth {
+    /// Business traffic in either direction keeps the session's idle backstop
+    /// alive, independently of the carrier watchdog's proof-of-life clock.
+    relay_activity: ClientRelayActivity,
     /// `relay_now_millis()` of the last proof the carrier still moves bytes: a
     /// record from the server, or a write that waited for socket space and then
     /// drained (the server is ACKing).
@@ -820,6 +823,7 @@ struct MuxCarrierHealth {
 impl MuxCarrierHealth {
     fn new() -> Self {
         Self {
+            relay_activity: Arc::new(AtomicU64::new(relay_now_millis())),
             last_alive_ms: AtomicU64::new(relay_now_millis()),
             suspect: AtomicBool::new(false),
             write_in_flight: AtomicBool::new(false),
@@ -984,9 +988,6 @@ struct ClientStreamRegistration {
     stream_id: u32,
     local_write: OwnedWriteHalf,
     outcome_tx: oneshot::Sender<DownloadOutcome>,
-    /// The Open carries the app's first bytes, so a live server must answer it;
-    /// arms the dead-carrier watchdog until the stream's first server frame.
-    awaits_response: bool,
 }
 
 /// Control messages a per-connection task sends to the single mux reader loop.
@@ -1651,13 +1652,20 @@ async fn handle_local_mux_connection_with_cid(
         unreachable!("QUIC carrier handled above");
     };
     let stream_id = next_mux_stream_id(&mux.next_stream_id);
-    let awaits_response = !connect_request.initial_payload.is_empty();
     let connect_payload = connect_request.encode()?;
     let open_frame = MuxFrame {
         stream_id,
         kind: MuxFrameKind::Open,
         payload: connect_payload,
     };
+
+    // Wait for queue capacity before arming the Open watchdog. Once registered,
+    // enqueue synchronously so an ACK cannot race ahead of the download half and
+    // time spent outside a full writer queue is not mistaken for carrier silence.
+    let open_slot = frame_tx
+        .reserve()
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
 
     let (local_read, local_write) = local.into_split();
     let (outcome_tx, outcome_rx) = oneshot::channel();
@@ -1668,22 +1676,18 @@ async fn handle_local_mux_connection_with_cid(
             stream_id,
             local_write,
             outcome_tx,
-            awaits_response,
         }))
         .await
         .is_err()
     {
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client mux reader is gone").into());
     }
-    if let Err(err) = frame_tx.send(open_frame).await {
-        // Register succeeded but the Open frame never reached the server:
-        // deregister the just-registered stream so the reader drops its cached
-        // write half + outcome_tx instead of leaking them (no Fin/Reset will ever
-        // arrive for a stream the server never saw).
+    open_slot.send(open_frame);
+    if frame_tx.is_closed() {
         let _ = register_tx
             .send(ClientStreamControl::Deregister(stream_id))
             .await;
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()).into());
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client mux writer is gone").into());
     }
 
     let upload = client_mux_upload_loop(
@@ -2711,15 +2715,19 @@ async fn establish_authenticated_data_session_inner(
 #[derive(Clone)]
 struct ServerAddrResolver {
     original: Arc<str>,
-    cached: Arc<Mutex<SocketAddr>>,
+    cached: Arc<Mutex<Vec<SocketAddr>>>,
     literal: bool,
 }
+
+// Leave room for the authenticated handshake inside CLIENT_ESTABLISH_TIMEOUT.
+// Hostnames reserve half this budget for refreshing a failed cached answer.
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ServerAddrResolver {
     async fn new(server_addr: &str) -> Result<Self, ClientRuntimeError> {
         let parsed = server_addr.parse::<SocketAddr>().ok();
         let initial = match parsed {
-            Some(addr) => addr,
+            Some(addr) => vec![addr],
             None => resolve_client_server_addr(server_addr).await?,
         };
         Ok(Self {
@@ -2730,34 +2738,83 @@ impl ServerAddrResolver {
     }
 
     async fn connect(&self) -> Result<TcpStream, ClientRuntimeError> {
-        let cached = *self.cached.lock().await;
-        match connect_tuned_tcp_addr(cached).await {
-            Ok(stream) => Ok(stream),
-            Err(err) if self.literal => Err(err.into()),
-            Err(first_err) => {
-                let refreshed = resolve_client_server_addr(self.original.as_ref()).await?;
-                *self.cached.lock().await = refreshed;
-                if refreshed == cached {
-                    return Err(first_err.into());
+        self.connect_with_resolver(|| resolve_client_server_addr(self.original.as_ref()))
+            .await
+    }
+
+    async fn connect_with_resolver<F, Fut>(
+        &self,
+        resolve: F,
+    ) -> Result<TcpStream, ClientRuntimeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<SocketAddr>, ClientRuntimeError>>,
+    {
+        let deadline = Instant::now() + CLIENT_CONNECT_TIMEOUT;
+        timeout(CLIENT_CONNECT_TIMEOUT, async {
+            let cached = self.cached.lock().await.clone();
+            let cached_deadline = if self.literal {
+                deadline
+            } else {
+                deadline - CLIENT_CONNECT_TIMEOUT / 2
+            };
+            match connect_client_server_addrs(&cached, cached_deadline).await {
+                Ok(stream) => Ok(stream),
+                Err(err) if self.literal => Err(err.into()),
+                Err(first_err) => {
+                    let refreshed = resolve().await?;
+                    *self.cached.lock().await = refreshed.clone();
+                    // An unchanged first answer must not hide usable later A/AAAA
+                    // answers. Each cached address already failed in this call,
+                    // so only newly resolved addresses need another attempt.
+                    let untried: Vec<_> = refreshed
+                        .into_iter()
+                        .filter(|addr| !cached.contains(addr))
+                        .collect();
+                    if untried.is_empty() {
+                        return Err(first_err.into());
+                    }
+                    Ok(connect_client_server_addrs(&untried, deadline).await?)
                 }
-                Ok(connect_tuned_tcp_addr(refreshed).await?)
             }
-        }
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ParallaX server TCP connect timed out",
+            )
+        })?
     }
 }
 
-async fn resolve_client_server_addr(server_addr: &str) -> Result<SocketAddr, ClientRuntimeError> {
+async fn connect_client_server_addrs(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+) -> io::Result<TcpStream> {
+    connect_tuned_tcp_any(addrs, deadline).await
+}
+
+async fn resolve_client_server_addr(
+    server_addr: &str,
+) -> Result<Vec<SocketAddr>, ClientRuntimeError> {
     if let Ok(addr) = server_addr.parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(vec![addr]);
     }
 
-    let mut addrs = lookup_host(server_addr).await?;
-    addrs.next().ok_or_else(|| {
-        ClientRuntimeError::Io(io::Error::new(
+    let mut addrs = Vec::new();
+    for addr in lookup_host(server_addr).await? {
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    if addrs.is_empty() {
+        return Err(ClientRuntimeError::Io(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             format!("client.server_addr did not resolve: {server_addr}"),
-        ))
-    })
+        )));
+    }
+    Ok(addrs)
 }
 
 /// Reads the server's PQ key-exchange (PX1K), tolerating residual camouflage
@@ -3236,7 +3293,8 @@ fn relay_now_millis() -> u64 {
 type ClientRelayActivity = Arc<AtomicU64>;
 
 fn bump_client_relay_activity(activity: &ClientRelayActivity) {
-    activity.store(relay_now_millis(), Ordering::Relaxed);
+    // Concurrent directions may publish their samples out of order.
+    activity.fetch_max(relay_now_millis(), Ordering::Relaxed);
 }
 
 async fn client_relay_idle_watchdog(activity: ClientRelayActivity, idle_timeout: Duration) {
@@ -3783,14 +3841,12 @@ async fn client_mux_download_loop(
 }
 
 /// Keeps the reader's unanswered-Open set (stream id -> `relay_now_millis()` when
-/// opened) in step with a control message: an Open carrying the app's first bytes
-/// arms the dead-carrier watchdog; the per-connection task's exit disarms it.
+/// opened) in step with a control message: every queued Open waits for a receipt
+/// acknowledgement; the per-connection task's exit disarms it.
 fn track_unanswered_open(unanswered: &mut HashMap<u32, u64>, control: &ClientStreamControl) {
     match control {
         ClientStreamControl::Register(reg) => {
-            if reg.awaits_response {
-                unanswered.insert(reg.stream_id, relay_now_millis());
-            }
+            unanswered.insert(reg.stream_id, relay_now_millis());
         }
         ClientStreamControl::Deregister(stream_id) => {
             unanswered.remove(stream_id);
@@ -3857,10 +3913,6 @@ where
     let mut local_writes: HashMap<u32, ClientDownloadStream> = HashMap::new();
     let mut unanswered_opens: HashMap<u32, u64> = HashMap::new();
     let mut register_open = true;
-    // Only a real record pushes the idle backstop out; the register and watchdog
-    // arms loop back without touching it.
-    let mut idle_deadline = Instant::now() + idle;
-
     loop {
         let watchdog_due = watchdog.next_check(&unanswered_opens, &health);
         let read_result = if let Some(err) = deferred_read_error.take() {
@@ -3868,6 +3920,13 @@ where
         } else {
             tokio::select! {
                 biased;
+                // Poll idle first so a continuously readable cover-only carrier
+                // cannot starve the business-traffic backstop.
+                _ = client_relay_idle_watchdog(health.relay_activity.clone(), idle) => {
+                    tracing::debug!(cid, "client mux idle backstop reached; tearing down session");
+                    shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin);
+                    return Ok(());
+                },
                 registration = register_rx.recv(), if register_open => {
                     match registration {
                         Some(control) => {
@@ -3878,25 +3937,7 @@ where
                     }
                     continue;
                 }
-                // Idle backstop (H-2): without it, a server that goes silent parks
-                // this SHARED per-session reader on the read forever, pinning the
-                // connection permit, every per-connection task (each waiting on its
-                // outcome_rx) with its stream permit and local fd — until the client
-                // stops accepting new SOCKS connections. A real record resets the
-                // clock (`idle_deadline`, below). Mirrors the server's per-session
-                // mux backstop; the register arm stays outside the timeout (it is
-                // liveness, not relay activity).
-                result = timeout_at(
-                    idle_deadline,
-                    server_records.read_record_into(&mut server_record),
-                ) => match result {
-                    Ok(inner) => inner,
-                    Err(_) => {
-                        tracing::debug!(cid, "client mux idle backstop reached; tearing down session");
-                        shutdown_client_download_streams(&mut local_writes, DownloadOutcome::Fin);
-                        return Ok(());
-                    }
-                },
+                result = server_records.read_record_into(&mut server_record) => result,
                 // Dead-carrier watchdog: an Open the server must answer, and no
                 // record (nor a drained write) from the carrier since. Steer new
                 // substreams away first; past the dead threshold, reset every
@@ -3937,7 +3978,6 @@ where
                 return Err(ClientRuntimeError::Io(err));
             }
         }
-        idle_deadline = Instant::now() + idle;
         health.mark_alive();
         log_record_read(
             cid,
@@ -4005,6 +4045,9 @@ where
             let mut frames = frames_payload;
             while !frames.is_empty() {
                 let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
+                if frame.kind != MuxFrameKind::Cover {
+                    bump_client_relay_activity(&health.relay_activity);
+                }
                 unanswered_opens.remove(&frame.stream_id);
                 dispatch_client_mux_frame(&mut local_writes, frame, cid).await;
                 frames = &frames[used..];
@@ -4190,6 +4233,7 @@ where
                 cid,
             )
             .await?;
+            bump_client_relay_activity(&health.relay_activity);
         }
     }
 
@@ -4238,6 +4282,7 @@ where
                     cid,
                 )
                 .await?;
+                bump_client_relay_activity(&health.relay_activity);
             }
         }
     }
@@ -4635,6 +4680,149 @@ mod tests {
 
     use super::*;
 
+    fn cached_server_addr_resolver(addrs: Vec<SocketAddr>) -> ServerAddrResolver {
+        ServerAddrResolver {
+            original: Arc::from("server.invalid:443"),
+            cached: Arc::new(Mutex::new(addrs)),
+            literal: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn server_addr_resolver_uses_cached_backup_before_refresh() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = unavailable.local_addr().unwrap();
+        let available = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = available.local_addr().unwrap();
+        drop(unavailable);
+        let resolver = cached_server_addr_resolver(vec![first, second]);
+
+        let stream = resolver
+            .connect_with_resolver(|| async { panic!("cached backup should avoid DNS refresh") })
+            .await
+            .unwrap();
+
+        assert_eq!(stream.peer_addr().unwrap(), second);
+        assert_eq!(*resolver.cached.lock().await, vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn server_addr_resolver_tries_cached_answers_beyond_first_race_batch() {
+        let mut unavailable = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap());
+            unavailable.push(listener);
+        }
+        let available = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = available.local_addr().unwrap();
+        addrs.push(reachable);
+        drop(unavailable);
+        let resolver = cached_server_addr_resolver(addrs.clone());
+
+        let stream = resolver
+            .connect_with_resolver(|| async { panic!("cached fifth answer should avoid refresh") })
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+        assert_eq!(*resolver.cached.lock().await, addrs);
+    }
+
+    #[tokio::test]
+    async fn server_addr_resolver_refresh_tries_backup_after_unchanged_first() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = unavailable.local_addr().unwrap();
+        let available = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = available.local_addr().unwrap();
+        drop(unavailable);
+        let resolver = cached_server_addr_resolver(vec![first]);
+
+        let stream = resolver
+            .connect_with_resolver(|| async { Ok(vec![first, second]) })
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), second);
+        assert_eq!(*resolver.cached.lock().await, vec![first, second]);
+        drop(stream);
+
+        let stream = resolver
+            .connect_with_resolver(|| async { panic!("refreshed backup must remain cached") })
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), second);
+    }
+
+    #[tokio::test]
+    async fn server_addr_resolver_reports_all_cached_and_refreshed_addresses_failing() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = first_listener.local_addr().unwrap();
+        let second = second_listener.local_addr().unwrap();
+        drop((first_listener, second_listener));
+        let resolver = cached_server_addr_resolver(vec![first]);
+
+        let error = resolver
+            .connect_with_resolver(|| async { Ok(vec![first, second]) })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientRuntimeError::Io(err) if err.kind() == io::ErrorKind::ConnectionRefused)
+        );
+        assert_eq!(*resolver.cached.lock().await, vec![first, second]);
+
+        let refreshed = AtomicBool::new(false);
+        let error = resolver
+            .connect_with_resolver(|| async {
+                refreshed.store(true, Ordering::Relaxed);
+                Ok(vec![first, second])
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientRuntimeError::Io(err) if err.kind() == io::ErrorKind::ConnectionRefused)
+        );
+        assert!(refreshed.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn server_addr_resolver_literal_skips_dns_refresh() {
+        let available = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = available.local_addr().unwrap();
+        let resolver = ServerAddrResolver::new(&addr.to_string()).await.unwrap();
+        assert_eq!(*resolver.cached.lock().await, vec![addr]);
+        let stream = resolver
+            .connect_with_resolver(|| async { panic!("literal address must not resolve DNS") })
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), addr);
+        drop((stream, available));
+
+        assert!(resolver
+            .connect_with_resolver(|| async {
+                panic!("failed literal address must not resolve DNS")
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_addr_resolver_total_connect_deadline_includes_refresh() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let resolver = cached_server_addr_resolver(vec![first]);
+        let started = Instant::now();
+        let error = resolver
+            .connect_with_resolver(std::future::pending)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientRuntimeError::Io(err) if err.kind() == io::ErrorKind::TimedOut)
+        );
+        assert_eq!(started.elapsed(), CLIENT_CONNECT_TIMEOUT);
+    }
+
     #[test]
     fn udp_probe_budget_is_rtt_aware_with_a_floor() {
         use std::time::Duration as StdDuration;
@@ -4699,6 +4887,44 @@ mod tests {
             fired.is_err(),
             "watchdog must not fire before the idle timeout"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_relay_activity_ignores_older_samples() {
+        // Seed another direction's newer sample to model reversed publication
+        // order without depending on thread scheduling. The frozen clock makes
+        // the helper's sampled timestamp deterministically older.
+        let newer_sample = relay_now_millis() + 40;
+        let activity: ClientRelayActivity = Arc::new(AtomicU64::new(newer_sample));
+        bump_client_relay_activity(&activity);
+        assert_eq!(activity.load(Ordering::Relaxed), newer_sample);
+
+        tokio::time::advance(Duration::from_millis(20)).await;
+        bump_client_relay_activity(&activity);
+        assert_eq!(activity.load(Ordering::Relaxed), newer_sample);
+
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert!(
+            timeout(
+                Duration::from_millis(10),
+                client_relay_idle_watchdog(activity.clone(), Duration::from_millis(50)),
+            )
+            .await
+            .is_err(),
+            "an older publication must not cause the newer activity to expire early"
+        );
+        tokio::time::advance(Duration::from_millis(11)).await;
+        timeout(
+            Duration::from_millis(1),
+            client_relay_idle_watchdog(activity.clone(), Duration::from_millis(50)),
+        )
+        .await
+        .expect("genuine silence must still expire after the newer activity");
+
+        // A subsequent fresh sample must still move the clock forward.
+        let fresh_sample = relay_now_millis();
+        bump_client_relay_activity(&activity);
+        assert_eq!(activity.load(Ordering::Relaxed), fresh_sample);
     }
 
     #[tokio::test]
@@ -5129,6 +5355,103 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn client_mux_idle_tracks_upload_and_download_without_cover() {
+        use crate::crypto::session::AeadCodec;
+        use crate::traffic::PaddingProfile;
+
+        struct RecordingWriter(mpsc::Sender<Vec<u8>>);
+        impl LegWriter for RecordingWriter {
+            async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
+                self.0.send(bytes.to_vec()).await.unwrap();
+                Ok(())
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let codec = || {
+            DataRecordCodec::new(
+                AeadCodec::new([0x51; 32], [0x62; 12]),
+                PaddingProfile::new(0, 0).unwrap(),
+                b"mux-idle",
+            )
+        };
+        let idle = Duration::from_millis(100);
+        let cover = CoverTrafficProfile::from_config(TrafficConfig::default());
+        assert!(!cover.is_enabled());
+        for (upload_only, kind) in [
+            (true, MuxFrameKind::Data),
+            (false, MuxFrameKind::Data),
+            (false, MuxFrameKind::Cover),
+        ] {
+            let health = Arc::new(MuxCarrierHealth::new());
+            let (_register_tx, register_rx) = mpsc::channel(1);
+            let (mut peer_write, reader_io) = duplex(4096);
+            let reader = tokio::spawn(client_mux_reader_loop(
+                TcpLegReader::buffered(reader_io),
+                codec(),
+                register_rx,
+                1,
+                idle,
+                health.clone(),
+                MUX_CARRIER_WATCHDOG,
+            ));
+            let (frame_tx, frame_rx) = mpsc::channel(4);
+            let (written_tx, mut written_rx) = mpsc::channel(4);
+            let writer = tokio::spawn(client_mux_writer_loop(
+                RecordingWriter(written_tx),
+                codec(),
+                frame_rx,
+                cover,
+                1,
+                MuxPayloadPool::with_capacity(1024),
+                health,
+                idle,
+            ));
+            let mut peer_seal = codec();
+            tokio::task::yield_now().await;
+            let rounds = if kind == MuxFrameKind::Cover { 1 } else { 5 };
+            for _ in 0..rounds {
+                tokio::time::advance(Duration::from_millis(60)).await;
+                let frame = MuxFrame {
+                    stream_id: if kind == MuxFrameKind::Cover { 0 } else { 1 },
+                    kind,
+                    payload: if kind == MuxFrameKind::Cover {
+                        Vec::new()
+                    } else {
+                        b"payload".to_vec()
+                    },
+                };
+                if upload_only {
+                    frame_tx.send(frame).await.unwrap();
+                    written_rx.recv().await.unwrap();
+                } else {
+                    let record = peer_seal
+                        .seal(&frame.encode().unwrap(), &mut OsRng)
+                        .unwrap();
+                    peer_write.write_all(&record).await.unwrap();
+                }
+                tokio::task::yield_now().await;
+                assert!(
+                    !reader.is_finished(),
+                    "one-way traffic must extend mux idle"
+                );
+            }
+            let silence = if kind == MuxFrameKind::Cover {
+                Duration::from_millis(41)
+            } else {
+                idle + Duration::from_millis(1)
+            };
+            tokio::time::advance(silence).await;
+            tokio::task::yield_now().await;
+            assert!(reader.is_finished(), "complete silence must still expire");
+            assert!(reader.await.unwrap().is_ok());
+            writer.abort();
+        }
+    }
+
     /// H-2: the SHARED per-session mux reader must tear down on an idle backstop, so
     /// a silent server cannot pin the connection permit and every parked
     /// per-connection task (each holding a stream permit + local fd) forever.
@@ -5149,7 +5472,6 @@ mod tests {
                 stream_id: 1,
                 local_write,
                 outcome_tx,
-                awaits_response: false,
             }))
             .await
             .unwrap();
@@ -5200,9 +5522,7 @@ mod tests {
     /// One registered substream on a reader-side mux session, over a real local
     /// socket: the reader's control receiver, the stream's outcome, the
     /// server->client codec, and the socket ends that must outlive the test.
-    async fn registered_mux_stream(
-        awaits_response: bool,
-    ) -> (
+    async fn registered_mux_stream() -> (
         mpsc::Receiver<ClientStreamControl>,
         oneshot::Receiver<DownloadOutcome>,
         DataRecordCodec,
@@ -5220,7 +5540,6 @@ mod tests {
                 stream_id: 1,
                 local_write,
                 outcome_tx,
-                awaits_response,
             }))
             .await
             .unwrap();
@@ -5247,6 +5566,133 @@ mod tests {
         dead_after: Duration::from_millis(200),
     };
 
+    /// The server acknowledges an Open with empty Data before waiting on the
+    /// target. Its first application bytes may arrive after 25s without resetting
+    /// this stream or its quiet sibling, and the acknowledgement adds no bytes.
+    #[tokio::test]
+    async fn client_mux_delayed_first_response_preserves_other_streams() {
+        let (register_tx, register_rx) = mpsc::channel(4);
+        let mut apps = Vec::new();
+        let mut local_reads = Vec::new();
+        let mut outcomes = Vec::new();
+        for stream_id in [1, 3] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let (app, _) = listener.accept().await.unwrap();
+            let (local_read, local_write) = connect.await.unwrap().into_split();
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            register_tx
+                .send(ClientStreamControl::Register(ClientStreamRegistration {
+                    stream_id,
+                    local_write,
+                    outcome_tx,
+                }))
+                .await
+                .unwrap();
+            apps.push(app);
+            local_reads.push(local_read);
+            outcomes.push(outcome_rx);
+        }
+        let keys = derive_client_keys(
+            &[0x5a_u8; 32],
+            &X25519KeyPair::generate().private,
+            &X25519KeyPair::generate().public,
+            &[7_u8; 32],
+        )
+        .unwrap();
+        let (_, open_from_server) = data_codecs(&keys, TrafficConfig::default()).unwrap();
+        let (_, mut seal_from_server) = data_codecs(&keys, TrafficConfig::default()).unwrap();
+        let (mut server_write, server_read) = duplex(4096);
+        let health = Arc::new(MuxCarrierHealth::new());
+        let mut acknowledgements = Vec::new();
+        for stream_id in [1, 3] {
+            MuxFrame::encode_borrowed_into(
+                stream_id,
+                MuxFrameKind::Data,
+                &[],
+                &mut acknowledgements,
+            )
+            .unwrap();
+        }
+        let mut record = Vec::new();
+        let mut rng = StdRng::seed_from_u64(7);
+        seal_from_server
+            .seal_into(&acknowledgements, &mut rng, &mut record)
+            .unwrap();
+        tokio::time::pause();
+        let reader = tokio::spawn(client_mux_reader_loop(
+            TcpLegReader::buffered(server_read),
+            open_from_server,
+            register_rx,
+            1,
+            Duration::from_secs(600),
+            Arc::clone(&health),
+            MUX_CARRIER_WATCHDOG,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(health.is_suspect(), "every Open must wait for an ACK");
+        server_write.write_all(&record).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !health.is_suspect(),
+            "an ACK must immediately clear suspicion"
+        );
+        for app in &apps {
+            assert_eq!(
+                app.try_read(&mut [0_u8; 1]).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "empty Data acknowledgements must not reach the application"
+            );
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !reader.is_finished(),
+            "a target's delayed response must not tear down the shared carrier"
+        );
+        assert!(
+            !health.is_suspect(),
+            "target silence is not carrier failure"
+        );
+        for outcome in &mut outcomes {
+            assert!(matches!(
+                outcome.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        tokio::time::resume();
+
+        let mut plaintext = Vec::new();
+        for stream_id in [1, 3] {
+            for (kind, payload) in [
+                (MuxFrameKind::Data, b"delayed response".to_vec()),
+                (MuxFrameKind::Fin, Vec::new()),
+            ] {
+                MuxFrame::encode_borrowed_into(stream_id, kind, &payload, &mut plaintext).unwrap();
+            }
+        }
+        record.clear();
+        seal_from_server
+            .seal_into(&plaintext, &mut rng, &mut record)
+            .unwrap();
+        server_write.write_all(&record).await.unwrap();
+        for (mut app, outcome) in apps.into_iter().zip(outcomes) {
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(5), app.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response, b"delayed response");
+            assert!(matches!(outcome.await.unwrap(), DownloadOutcome::Fin));
+        }
+        drop(server_write);
+        drop(register_tx);
+        assert!(reader.await.unwrap().is_ok());
+    }
+
     /// A carrier that silently died (blackholed: no FIN, no RST, reads just never
     /// return) must not hold an unanswered Open — and every other substream on
     /// it — until the 10-minute idle backstop. The watchdog first marks the
@@ -5254,8 +5700,7 @@ mod tests {
     /// substreams so apps retry on a fresh session.
     #[tokio::test]
     async fn client_mux_watchdog_resets_streams_on_an_unresponsive_carrier() {
-        let (register_rx, outcome_rx, open_from_server, _sockets) =
-            registered_mux_stream(true).await;
+        let (register_rx, outcome_rx, open_from_server, _sockets) = registered_mux_stream().await;
         let health = Arc::new(MuxCarrierHealth::new());
 
         let reader = tokio::spawn(client_mux_reader_loop(
@@ -5287,34 +5732,43 @@ mod tests {
         );
     }
 
-    /// The watchdog must not fire on a quiet but healthy session: an Open with no
-    /// first payload (the app waits for the server, or has nothing to say yet)
-    /// may legitimately stay unanswered, so only the idle backstop applies.
+    /// Every Open gets a receipt acknowledgement, including an Open whose 2ms
+    /// capture found no application bytes. A blackholed empty Open must not wait
+    /// until the 10-minute relay idle backstop.
     #[tokio::test]
-    async fn client_mux_watchdog_ignores_an_open_without_first_payload() {
-        let (register_rx, _outcome_rx, open_from_server, _sockets) =
-            registered_mux_stream(false).await;
+    async fn client_mux_watchdog_resets_an_empty_open_without_acknowledgement() {
+        let (register_rx, outcome_rx, open_from_server, _sockets) = registered_mux_stream().await;
         let health = Arc::new(MuxCarrierHealth::new());
-
-        let loop_result = tokio::time::timeout(
-            Duration::from_secs(5),
-            client_mux_reader_loop(
-                SilentLegReader,
-                open_from_server,
-                register_rx,
-                1,
-                Duration::from_millis(500),
-                Arc::clone(&health),
-                TEST_WATCHDOG,
-            ),
-        )
-        .await
-        .unwrap();
+        tokio::time::pause();
+        let reader = tokio::spawn(client_mux_reader_loop(
+            SilentLegReader,
+            open_from_server,
+            register_rx,
+            1,
+            Duration::from_secs(600),
+            Arc::clone(&health),
+            MUX_CARRIER_WATCHDOG,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
         assert!(
-            matches!(loop_result, Ok(())),
-            "only the idle backstop may end this session, got {loop_result:?}",
+            health.is_suspect(),
+            "an empty Open must wait for an ACK too"
         );
-        assert!(!health.is_suspect());
+        tokio::time::advance(MUX_CARRIER_DEAD_AFTER - MUX_CARRIER_SUSPECT_AFTER).await;
+        tokio::task::yield_now().await;
+        assert!(
+            reader.is_finished(),
+            "an unacknowledged Open expires at 25s"
+        );
+        tokio::time::resume();
+        let loop_result = reader.await.unwrap();
+        assert!(
+            matches!(&loop_result, Err(ClientRuntimeError::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "an unacknowledged empty Open must reset the carrier, got {loop_result:?}",
+        );
+        assert!(client_mux_await_download(outcome_rx, 1).await.is_err());
     }
 
     /// Proof of life from the writer (a write that waited for socket space, then
@@ -5322,8 +5776,7 @@ mod tests {
     /// e.g. a large HTTP/1.1 upload — even with an Open still unanswered.
     #[tokio::test]
     async fn client_mux_watchdog_defers_to_proof_of_life() {
-        let (register_rx, _outcome_rx, open_from_server, _sockets) =
-            registered_mux_stream(true).await;
+        let (register_rx, _outcome_rx, open_from_server, _sockets) = registered_mux_stream().await;
         let health = Arc::new(MuxCarrierHealth::new());
         let writer_health = Arc::clone(&health);
         let writer = tokio::spawn(async move {
@@ -5360,8 +5813,7 @@ mod tests {
     /// flight — only suspect — and must decide once the write is done.
     #[tokio::test]
     async fn client_mux_watchdog_holds_a_dead_verdict_while_a_write_drains() {
-        let (register_rx, outcome_rx, open_from_server, _sockets) =
-            registered_mux_stream(true).await;
+        let (register_rx, outcome_rx, open_from_server, _sockets) = registered_mux_stream().await;
         let health = Arc::new(MuxCarrierHealth::new());
         let writing = WriteInFlight::start(&health);
 

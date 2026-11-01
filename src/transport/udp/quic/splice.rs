@@ -15,7 +15,7 @@
 //! parses, decrypts, or reframes QUIC — it preserves datagram boundaries verbatim,
 //! so it cannot itself become a fingerprint distinct from a transparent forwarder.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
@@ -67,7 +67,7 @@ impl SpliceFlow {
         origin: SocketAddr,
         first: &[u8],
     ) -> std::io::Result<SpliceFlow> {
-        let recv_std = std::net::UdpSocket::bind(unspecified_for(origin))?;
+        let recv_std = std::net::UdpSocket::bind(upstream_bind_for(origin))?;
         recv_std.connect(origin)?;
         allow_fragmentation(&recv_std, origin.is_ipv6());
         // Non-blocking is required by `UdpSocket::from_std` and is shared with the
@@ -171,20 +171,74 @@ fn allow_fragmentation(socket: &std::net::UdpSocket, is_ipv6: bool) {
 #[cfg(not(target_os = "linux"))]
 fn allow_fragmentation(_socket: &std::net::UdpSocket, _is_ipv6: bool) {}
 
-/// The wildcard bind address in the origin's address family, so the upstream
-/// socket can reach an IPv4 or IPv6 origin.
-fn unspecified_for(origin: SocketAddr) -> SocketAddr {
-    if origin.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        SocketAddr::from(([0u16; 8], 0))
-    }
+/// Bind loopback origins explicitly: some macOS network configurations reject
+/// sends from a wildcard-bound, connected IPv4 socket to loopback with
+/// `EADDRNOTAVAIL`. Other origins retain wildcard binding and kernel source
+/// address selection in the origin's address family.
+fn upstream_bind_for(origin: SocketAddr) -> SocketAddr {
+    let ip = match origin.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_loopback() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    SocketAddr::new(ip, 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn non_loopback_origins_keep_wildcard_binding() {
+        for (origin, bind) in [
+            ("192.0.2.1:443", "0.0.0.0:0"),
+            ("[2001:db8::1]:443", "[::]:0"),
+        ] {
+            assert_eq!(
+                upstream_bind_for(origin.parse().unwrap()),
+                bind.parse().unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_origins_relay_in_both_address_families() {
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let origin = UdpSocket::bind(bind).await.unwrap();
+            let origin_addr = origin.local_addr().unwrap();
+            let listen = Arc::new(UdpSocket::bind(bind).await.unwrap());
+            let listen_addr = listen.local_addr().unwrap();
+            let client = UdpSocket::bind(bind).await.unwrap();
+            let flow = SpliceFlow::open(
+                listen,
+                client.local_addr().unwrap(),
+                origin_addr,
+                b"loopback-request",
+            )
+            .unwrap();
+
+            let mut buf = [0; 64];
+            let (n, relay_addr) =
+                tokio::time::timeout(Duration::from_secs(5), origin.recv_from(&mut buf))
+                    .await
+                    .expect("loopback origin receives first datagram")
+                    .unwrap();
+            assert_eq!(&buf[..n], b"loopback-request");
+            assert_eq!(relay_addr.ip(), origin_addr.ip());
+            origin.send_to(b"loopback-reply", relay_addr).await.unwrap();
+
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                    .await
+                    .expect("client receives loopback origin reply")
+                    .unwrap();
+            assert_eq!(&buf[..n], b"loopback-reply");
+            assert_eq!(from, listen_addr);
+            drop(flow);
+        }
+    }
 
     /// The relay forwards client→origin and origin→client datagrams byte-for-byte,
     /// with origin replies arriving at the client FROM the listener address (so the

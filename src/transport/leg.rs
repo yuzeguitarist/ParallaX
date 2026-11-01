@@ -175,7 +175,7 @@ pub(crate) static QUIC_LEG_BYTES_WRITTEN: std::sync::atomic::AtomicU64 =
 //
 // On the H3 request bidi the relay record byte-stream is carried inside HTTP/3
 // DATA frames (RFC 9114 §7.2.1): the writer wraps each `write_records` batch in
-// one `DATA = varint(0x00) varint(len) bytes` frame, and the reader strips DATA
+// bounded `DATA = varint(0x00) varint(len) bytes` frames, and the reader strips DATA
 // frame headers to recover the original record byte-stream before the TLS-record
 // splitter runs on it. Records may span DATA frames and a DATA frame may contain
 // partial records — exactly the H3 body model — because the de-framer presents a
@@ -193,12 +193,7 @@ use std::{
 
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::fingerprint::http3::{read_stream_type, FRAME_TYPE_DATA};
-
-/// Max H3 DATA frame payload the de-framer will accept, mirroring the codec's
-/// [`crate::fingerprint::http3::MAX_PAYLOAD_LEN`] bound so a hostile peer cannot
-/// announce an unbounded DATA frame.
-const MAX_H3_DATA_FRAME_LEN: u64 = 1 << 20;
+use crate::fingerprint::http3::{read_stream_type, FRAME_TYPE_DATA, MAX_PAYLOAD_LEN};
 
 /// An `AsyncRead` that de-frames HTTP/3 DATA frames from an inner reader, yielding
 /// only the concatenated DATA-frame payload bytes. Frame headers (`DATA` type +
@@ -244,7 +239,7 @@ where
                             format!("non-DATA H3 frame on relay bidi (type {frame_type:#x})"),
                         )));
                     }
-                    if len > MAX_H3_DATA_FRAME_LEN {
+                    if len > MAX_PAYLOAD_LEN as u64 {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("H3 DATA frame length {len} exceeds bound"),
@@ -355,18 +350,27 @@ impl LegReader for H3DataFrameLegReader {
     }
 }
 
-/// QUIC-stream record-writer leg that frames each record batch as one HTTP/3 DATA
-/// frame: it prepends a `DATA` frame header to every `write_records` batch (RFC
-/// 9114 §7.2.1) before writing to the reliable bidi QUIC `SendStream`.
+/// QUIC-stream record-writer leg that frames each record batch as bounded HTTP/3
+/// DATA frames (RFC 9114 §7.2.1) before writing to the reliable bidi QUIC
+/// `SendStream`. Record bytes remain continuous across frame boundaries.
 /// `shutdown` finishes the stream (no trailing frame).
 pub(crate) struct H3DataFrameLegWriter(pub crate::transport::udp::quic::endpoint::SendStream);
 
 impl LegWriter for H3DataFrameLegWriter {
     async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
-        // Wrap this batch in a single DATA frame: varint(0x00) varint(len) bytes.
-        let framed = crate::fingerprint::http3::encode_frame(FRAME_TYPE_DATA, bytes)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-        AsyncWriteExt::write_all(&mut self.0, &framed).await?;
+        let mut remaining = bytes;
+        loop {
+            // Stage at most one bounded frame, preserving a single empty DATA
+            // frame for an empty write as well.
+            let (chunk, rest) = remaining.split_at(remaining.len().min(MAX_PAYLOAD_LEN));
+            let framed = crate::fingerprint::http3::encode_frame(FRAME_TYPE_DATA, chunk)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+            AsyncWriteExt::write_all(&mut self.0, &framed).await?;
+            if rest.is_empty() {
+                break;
+            }
+            remaining = rest;
+        }
         #[cfg(test)]
         QUIC_LEG_BYTES_WRITTEN.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -382,6 +386,7 @@ mod tests {
     use std::time::Duration;
 
     use rand::{rngs::StdRng, SeedableRng};
+    use tokio::io::AsyncReadExt;
 
     use crate::{
         crypto::session::{AeadCodec, KEY_LEN, NONCE_LEN},
@@ -396,10 +401,139 @@ mod tests {
         // Matched key+nonce_base on both seal and open sides; zero padding keeps
         // the wire bytes deterministic. CLIENT_TO_SERVER_AAD because we test the
         // opener (client) -> acceptor (server) direction.
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        data_codec_with_padding(padding)
+    }
+
+    fn data_codec_with_padding(padding: PaddingProfile) -> DataRecordCodec {
         let key = [0x11_u8; KEY_LEN];
         let nonce = [0x22_u8; NONCE_LEN];
-        let padding = PaddingProfile::new(0, 0).unwrap();
         DataRecordCodec::new(AeadCodec::new(key, nonce), padding, CLIENT_TO_SERVER_AAD)
+    }
+
+    #[tokio::test]
+    async fn h3_data_frame_writer_bounds_frames_and_preserves_empty_writes() {
+        use crate::fingerprint::http3::{decode_frame, MAX_PAYLOAD_LEN};
+
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+        let lengths = [
+            0,
+            MAX_PAYLOAD_LEN - 1,
+            MAX_PAYLOAD_LEN,
+            MAX_PAYLOAD_LEN + 1,
+            2 * MAX_PAYLOAD_LEN + 37,
+        ];
+        let opener = tokio::spawn(async move {
+            let (send, _recv) = client_conn.open_bi();
+            let mut writer = H3DataFrameLegWriter(send);
+            for len in lengths {
+                let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                writer.write_records(&bytes).await?;
+            }
+            writer.shutdown().await?;
+            Ok::<_, io::Error>(client_conn)
+        });
+        let receive = async {
+            let (_send, mut recv) = server_conn.accept_bi().await.unwrap();
+            let mut wire = Vec::new();
+            recv.read_to_end(&mut wire).await.unwrap();
+            wire
+        };
+        let (write_result, wire) = tokio::join!(
+            opener,
+            tokio::time::timeout(Duration::from_secs(15), receive)
+        );
+        let _client_conn = write_result
+            .unwrap()
+            .expect("all batch sizes must be writable");
+        let wire = wire.expect("bounded DATA frames must arrive");
+        let mut remaining = wire.as_slice();
+        for len in lengths {
+            let mut offset = 0;
+            loop {
+                let (header, payload, consumed) = decode_frame(remaining).unwrap();
+                let want = (len - offset).min(MAX_PAYLOAD_LEN);
+                assert_eq!(header.frame_type, FRAME_TYPE_DATA);
+                assert_eq!(header.len, want);
+                assert!(payload
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == ((offset + i) % 251) as u8));
+                remaining = &remaining[consumed..];
+                offset += want;
+                if offset == len {
+                    break;
+                }
+            }
+        }
+        assert!(
+            remaining.is_empty(),
+            "no extra DATA frame at an exact boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn h3_data_frame_leg_round_trips_heavily_padded_relay_batch() {
+        use crate::{
+            config::TrafficConfig, fingerprint::http3::MAX_PAYLOAD_LEN,
+            protocol::data::RELAY_READ_BUFFER_TARGET,
+        };
+
+        let traffic = TrafficConfig {
+            min_padding: 15359,
+            max_padding: 15359,
+            ..TrafficConfig::default()
+        };
+        traffic.validate().unwrap();
+        let padding = PaddingProfile::from_config(traffic).unwrap();
+        let mut seal = data_codec_with_padding(padding);
+        let mut open = data_codec_with_padding(padding);
+        let plaintext: Vec<u8> = (0..RELAY_READ_BUFFER_TARGET)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut sealed = Vec::new();
+        let records = seal
+            .seal_chunks_into(&plaintext, &mut StdRng::seed_from_u64(12), &mut sealed)
+            .unwrap();
+        assert!(sealed.len() > 4 * MAX_PAYLOAD_LEN);
+        // A frame boundary falls inside a record, so recovery must preserve the
+        // continuous record byte stream across the writer's split.
+        assert!(records.iter().any(|record| {
+            record.range.start < MAX_PAYLOAD_LEN && record.range.end > MAX_PAYLOAD_LEN
+        }));
+
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
+        let opener = tokio::spawn(async move {
+            let (send, _recv) = client_conn.open_bi();
+            let mut writer = H3DataFrameLegWriter(send);
+            writer.write_records(&[]).await?;
+            writer.write_records(&sealed).await?;
+            writer.write_records(&[]).await?;
+            writer.shutdown().await?;
+            Ok::<_, io::Error>(client_conn)
+        });
+        let receive = async {
+            let (_send, recv) = server_conn.accept_bi().await.unwrap();
+            let mut reader = H3DataFrameLegReader::buffered(recv);
+            let mut record = Vec::new();
+            let mut recovered = Vec::new();
+            for _ in records {
+                reader.read_record_into(&mut record).await.unwrap();
+                recovered.extend_from_slice(&open.open(&record).unwrap());
+            }
+            assert_eq!(recovered, plaintext);
+            let err = reader.read_record_into(&mut record).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(reader.is_clean_close(&err));
+        };
+        let (write_result, read_result) = tokio::join!(
+            opener,
+            tokio::time::timeout(Duration::from_secs(15), receive)
+        );
+        let _client_conn = write_result
+            .unwrap()
+            .expect("legal padding must not fail H3 framing");
+        read_result.expect("padded records must round-trip across DATA boundaries");
     }
 
     /// Proves the H3 DATA-frame relay leg is a drop-in record carrier for the

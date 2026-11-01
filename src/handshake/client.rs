@@ -492,6 +492,7 @@ mod tests {
     use super::*;
     use crate::{
         crypto::session::{derive_server_keys, X25519KeyPair, NONCE_LEN},
+        protocol::command::pq_flight_max_chunk_size,
         tls::client_hello::tests::client_hello_fixture,
     };
 
@@ -938,6 +939,72 @@ mod tests {
         assert!(second_session
             .verify_server_identity_payload(&proof, &identity_keys.public, &server_static.public)
             .is_err());
+    }
+
+    #[test]
+    fn server_identity_chunks_require_the_complete_signed_px1s_message() {
+        let traffic = TrafficConfig::default();
+        let mut rng = StdRng::seed_from_u64(67);
+        let (mut session, binding) = apply_test_pq_rekey(test_session_keys(), traffic, &mut rng);
+        let identity_keys = identity::keypair();
+        let server_x25519 = X25519KeyPair::generate();
+        let signature = identity::sign_server_identity(
+            &identity_keys.secret,
+            &session.transcript_hash(),
+            &server_x25519.public,
+            &binding,
+            session.epoch(),
+        )
+        .unwrap();
+        assert_eq!(signature.len(), 4627);
+        let proof = ServerIdentityProof { signature }.encode().unwrap();
+        assert_eq!(proof.len(), 4635);
+        assert_eq!(&proof[..8], b"PX1S\x00\x00\x12\x13");
+        let (_, mut server_seal) = data_codecs(&session.keys, traffic).unwrap();
+
+        // The same carrier can frame either byte string, but only the complete
+        // PX1S message is a valid reassembled identity payload.
+        for (payload, should_verify) in [(&proof[..], true), (&proof[8..], false)] {
+            let chunks = ServerIdentityChunk::encode_all_browser_shaped(
+                payload,
+                pq_flight_max_chunk_size(server_seal.max_plaintext_len()),
+                &mut rng,
+            )
+            .unwrap();
+            assert!(chunks.len() > 1);
+            let mut assembled = Vec::new();
+            for chunk in chunks {
+                assert_eq!(&chunk[..4], b"PX1I");
+                let record = server_seal.seal(&chunk, &mut rng).unwrap();
+                let decoded = session.open_server_identity_chunk(&record).unwrap();
+                assert_eq!(decoded.total_len as usize, payload.len());
+                assert_eq!(decoded.offset as usize, assembled.len());
+                assembled.extend_from_slice(&decoded.bytes);
+            }
+            assert_eq!(assembled, payload);
+            let result = session.verify_server_identity_payload(
+                &assembled,
+                &identity_keys.public,
+                &server_x25519.public,
+            );
+            if should_verify {
+                result.unwrap();
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ClientHandshakeError::ServerIdentityProof(_))
+                ));
+            }
+        }
+
+        // A complete PX1S proof still needs a PX1I carrier at the record layer.
+        let direct_proof_record = server_seal.seal(&proof, &mut rng).unwrap();
+        assert!(matches!(
+            session.open_server_identity_chunk(&direct_proof_record),
+            Err(ClientHandshakeError::ServerIdentityChunk(
+                ServerIdentityChunkError::BadMagic
+            ))
+        ));
     }
 
     fn test_session_keys() -> SessionKeys {

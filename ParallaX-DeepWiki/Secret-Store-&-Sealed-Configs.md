@@ -30,19 +30,27 @@ specific machine's keyfile."
 | Element | Detail |
 |---|---|
 | Host key | A 32-byte random key in a keyfile, default `/var/lib/parallax/host.key` (override with `$PARALLAX_HOST_KEY_FILE`). Must be `0600` and owned by the running user, exactly 32 bytes base64. |
-| Per-secret KEK | `HKDF-SHA256(ikm = host_key, salt = random 32B, info = "parallax-seal-v1\|<field>")`. |
-| Sealing AEAD | The base64 secret text is sealed with XChaCha20-Poly1305 (24-byte random nonce), AAD = `version ‖ bundle_id ‖ field`. |
-| Bundle | TOML with a version (`1`), a random per-bundle id, and one sealed entry (`{salt, nonce, ciphertext}`) per field. |
+| Per-secret KEK | `HKDF-SHA256(ikm = host_key, salt = random 32B, info = "parallax-seal-v1\|<entry-name>")`. |
+| Sealing AEAD | The base64 secret text is sealed with XChaCha20-Poly1305 (24-byte random nonce), AAD = `version ‖ bundle_id ‖ entry-name`. |
+| Bundle | TOML with a version (`1`), a random per-bundle id, and a map of named sealed entries (`{salt, nonce, ciphertext}`). |
 
-The random **bundle id** is bound into every entry's AAD, so an entry cannot be
-transplanted into a different bundle or rolled back to a stale one.
+New entry names are `config-<hash>.<field>`, where `<hash>` is the hexadecimal
+SHA-256 of the config's canonical path and `<field>` is `psk`, `private_key`, or
+`identity_secret_key`. This keeps different configs' secrets separate even when
+they share a bundle. The loader looks up the reference's literal entry name; it
+does not recompute the namespace from the config path when loading.
+
+The random **bundle id** is bound into every entry's AAD. Every seal, including a
+re-seal, rotates that id and re-encrypts retained entries, so an old entry cannot
+be spliced into a different or re-sealed bundle. This does not prevent restoring
+an entire older bundle.
 
 ## Why HKDF salt vs IKM
 
 The host key is the HKDF **input keying material**, and the per-secret salt is
 random per entry, so two machines never derive the same KEK even for the same field
-value. Each field gets a distinct `info` label, so the KEK for `psk` cannot decrypt
-the `server.private_key` entry.
+value. Each entry name gets a distinct `info` label, so the KEK for one entry
+cannot decrypt another entry.
 
 ## Memory hygiene
 
@@ -56,6 +64,9 @@ matches the zeroization discipline used across the crypto subsystems.
   generate the host keyfile; `create_host_key` refuses to overwrite an existing one.
 - `seal_all(host_key, secrets)` — seal `(field, base64_secret)` pairs into a
   `SealedBundle`.
+- `seal_into(bundle, host_key, secrets)` — add or replace named entries, retaining
+  the other entries and rotating the bundle id. Retained entries must decrypt
+  under the same host key or the operation fails without changing the bundle.
 - `read_bundle(path)` — deserialize a TOML sealed bundle.
 - `open_sealed_reference(base, "path#field", overrides)` — resolve a `sealed`
   reference to its plaintext base64 (used by the config loader).
@@ -67,17 +78,52 @@ matches the zeroization discipline used across the crypto subsystems.
 ```bash
 # 1. Have a config whose secrets are inline or in a sidecar.
 # 2. Machine-bind them: encrypts secrets into a sealed bundle and rewrites
-#    the config to reference it (creates the host keyfile if absent).
+#    the config to reference it, then attempts to remove the plaintext sidecars it read
+#    (creates the host keyfile if absent).
 plx seal --config parallax.toml
-# Optional: --output <bundle path>   (default <config-dir>/parallax.secrets.enc)
+# Optional: --output <bundle path>   (default <config-path>.secrets.enc)
 #           --host-key <path>        (default $PARALLAX_HOST_KEY_FILE or the path above)
 
 # 3. plx check now reports the config alone is not a credential.
 plx check --config parallax.toml
 ```
 
+The default appends `.secrets.enc` to the full config path:
+`parallax.server.toml` uses `parallax.server.toml.secrets.enc`, while
+`parallax.client.toml` uses `parallax.client.toml.secrets.enc`. The rewritten PSK
+reference for `parallax.toml` looks like:
+
+```toml
+psk = { sealed = "parallax.toml.secrets.enc#config-<hash>.psk" }
+```
+
+When the bundle is next to the config, the reference uses its file name and
+resolves relative to the config directory. An `--output` in another directory
+produces an absolute bundle reference. A custom `--host-key` path is not stored
+in the config; set `PARALLAX_HOST_KEY_FILE` to that path in the runtime environment.
+
 A `sealed` reference that cannot be opened produces a clear error distinguishing a
 missing/insecure host keyfile from a wrong key or tampered bundle.
+
+## Re-sealing and legacy references
+
+`plx seal` first resolves the config's current secrets, including existing sealed
+references. It then writes config-scoped entries and rewrites the references.
+An explicit `--output` can share a bundle across configs: re-sealing or replacing
+one config's secrets retains the other configs' entry names and secret values.
+An unreadable output bundle, or a retained entry that cannot decrypt under the
+selected host key, aborts the operation rather than overwriting that bundle.
+
+Legacy references such as `parallax.secrets.enc#psk` remain readable. Re-sealing
+without `--output` migrates that config to `<config-path>.secrets.enc` and leaves
+the old bundle untouched. To keep using the old shared bundle, pass
+`--output parallax.secrets.enc`; its bare entries are retained for configs that
+still reference them. The same default-path rule applies when re-sealing a config
+that previously used any other explicit output. Re-sealing after moving a config
+uses its new canonical path's namespace and defaults to the new
+`<config-path>.secrets.enc`. Only entries already in the selected output bundle
+are retained; a different previously referenced bundle is left untouched, and its
+other entries are not copied into the output.
 
 ## Drift risks
 

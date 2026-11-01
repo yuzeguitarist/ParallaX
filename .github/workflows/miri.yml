@@ -1,11 +1,11 @@
 name: miri
 
 # Nightly Miri (undefined-behavior interpreter) over the FFI-free pure-logic
-# modules: the UDP reorder buffer, the padding math, and the protocol command
+# modules: the QUIC varint/frame codecs, the padding math, and the protocol command
 # codecs -- the untrusted-input parsers and arithmetic where a UB bug (OOB
 # slice, integer-overflow-derived index, invalid-value transmute) would be most
-# dangerous. The crypto, TLS-record and relay paths call aws-lc-rs / ring /
-# quinn FFI, which Miri cannot execute, so they are intentionally excluded here
+# dangerous. The crypto, TLS-record and relay paths call FFI or network syscalls,
+# which Miri cannot execute, so they are intentionally excluded here
 # and covered by the fuzz suite + loopback tests instead. Miri is slow, so beyond
 # the weekly baseline it runs on PRs/pushes only when one of the pure-logic
 # modules it covers changes (path-filtered below), not on every push.
@@ -16,14 +16,16 @@ on:
   pull_request:
     branches: [main, master]
     paths:
-      - 'src/transport/udp/reorder.rs'
+      - 'src/transport/udp/quic/varint.rs'
+      - 'src/transport/udp/quic/frame.rs'
       - 'src/traffic.rs'
       - 'src/protocol/command.rs'
       - '.github/workflows/miri.yml'
   push:
     branches: [main, master]
     paths:
-      - 'src/transport/udp/reorder.rs'
+      - 'src/transport/udp/quic/varint.rs'
+      - 'src/transport/udp/quic/frame.rs'
       - 'src/traffic.rs'
       - 'src/protocol/command.rs'
       - '.github/workflows/miri.yml'
@@ -64,13 +66,26 @@ jobs:
         with:
           shared-key: parallax-miri
 
-      # Pure-logic modules only (no aws-lc-rs/ring/quinn FFI on these paths).
+      # Pure-logic modules only (no crypto FFI or network syscalls on these paths).
       # disable-isolation lets the deterministic StdRng/time helpers run.
-      - name: cargo miri test (reorder + padding + command codecs)
+      - name: cargo miri test (varint + frame + padding + command codecs)
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
-        run: >
-          cargo +nightly miri test --locked --lib --
-          'transport::udp::reorder::'
-          'traffic::'
-          'protocol::command::'
+        shell: bash
+        run: |
+          for test_filter in \
+            'transport::udp::quic::varint::' \
+            'transport::udp::quic::frame::' \
+            'traffic::' \
+            'protocol::command::'
+          do
+            # libtest ORs multiple filters, so check each module separately:
+            # a stale filter must fail even when the other modules have tests.
+            test_list="$(cargo +nightly miri test --locked --lib -- "$test_filter" --list)"
+            printf '%s\n' "$test_list"
+            if ! grep -q ': test$' <<< "$test_list"; then
+              echo "::error::Miri filter matched no tests: $test_filter"
+              exit 1
+            fi
+            cargo +nightly miri test --locked --lib -- "$test_filter"
+          done

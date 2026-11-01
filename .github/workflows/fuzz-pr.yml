@@ -124,19 +124,41 @@ jobs:
           set -e
           echo "FUZZ_RC=$rc" >> "$GITHUB_ENV"
 
+      - name: Preserve raw crash artifacts
+        if: always() && env.FUZZ_RC != '0'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-pr-${{ matrix.target }}-${{ github.run_attempt }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Annotate crash (warn only, never blocks)
         if: env.FUZZ_RC != '0'
         run: |
           set -uo pipefail
-          art="$(find "fuzz/artifacts/$TARGET" -maxdepth 1 -type f \( -name 'crash-*' -o -name 'oom-*' -o -name 'timeout-*' \) ! -name '*.handled' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+          art=""
+          for candidate in "fuzz/artifacts/$TARGET"/{crash,oom,timeout}-*; do
+            [[ -f "$candidate" && "$candidate" != *.handled ]] || continue
+            if [ -z "$art" ] || [ "$candidate" -nt "$art" ]; then
+              art="$candidate"
+            fi
+          done
           {
             echo "### fuzz smoke: \`$TARGET\` CRASHED (non-blocking)"
             echo "The PR-targeted smoke fuzz found a crash in \`$TARGET\` on this PR's code."
             if [ -n "$art" ]; then
-              cargo +nightly-2026-06-10 fuzz tmin --sanitizer "$FUZZ_SANITIZER" "$TARGET" "fuzz/artifacts/$TARGET/$art" >/dev/null 2>&1 || true
-              minf="$(find "fuzz/artifacts/$TARGET" -maxdepth 1 -type f -name 'minimized-from-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
-              [ -n "$minf" ] || minf="fuzz/artifacts/$TARGET/$art"
-              echo '<details><summary>minimized reproducer (base64)</summary>'
+              minf="$art"
+              if cargo +nightly-2026-06-10 fuzz tmin --sanitizer "$FUZZ_SANITIZER" "$TARGET" "$art" >/dev/null 2>&1; then
+                for candidate in "fuzz/artifacts/$TARGET"/minimized-from-*; do
+                  [ -f "$candidate" ] || continue
+                  if [ "$minf" = "$art" ] || [ "$candidate" -nt "$minf" ]; then
+                    minf="$candidate"
+                  fi
+                done
+              fi
+              echo '<details><summary>reproducer (base64; minimized when available)</summary>'
               echo
               echo '```'
               base64 < "$minf"

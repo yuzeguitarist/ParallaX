@@ -1,18 +1,29 @@
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 use std::{
+    future::{poll_fn, Future},
     io,
     net::SocketAddr,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        OnceLock,
+    },
+    task::Poll,
 };
 
 use tokio::{
     net::{lookup_host, tcp::OwnedReadHalf, TcpSocket, TcpStream},
-    task::JoinSet,
+    time::{timeout_at, Instant},
 };
 
 const RESERVED_PROCESS_FDS: usize = 64;
 const FDS_PER_RELAY_CONNECTION: usize = 2;
+pub(crate) const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
+// The server may hold the 64 cap-shed client/origin pairs plus one accepted
+// socket waiting for a slot. Cap-shed always uses userspace (no splice clones or
+// pipes). Keep this separate from the client's fd budget.
+const RESERVED_CAP_SHED_FDS: usize =
+    MAX_CONCURRENT_CAP_SHED_FALLBACKS * FDS_PER_RELAY_CONNECTION + 1;
 const MAX_RELAY_CONNECTION_LIMIT: usize = 16_384;
 const MAX_PARALLEL_CONNECT_ATTEMPTS: usize = 4;
 /// Aggregate cap on the *extra* (beyond the first) parallel connect sockets held
@@ -24,19 +35,69 @@ const MAX_PARALLEL_CONNECT_ATTEMPTS: usize = 4;
 /// exhausting RLIMIT_NOFILE.
 const MAX_INFLIGHT_EXTRA_CONNECT_ATTEMPTS: usize = 256;
 static INFLIGHT_EXTRA_CONNECTS: AtomicUsize = AtomicUsize::new(0);
+// Optional connect racers and Linux splice descriptors share headroom reserved
+// before the relay admission limit is calculated. Until startup configures it,
+// optional work stays disabled and connections use their base socket budget.
+static EXTRA_FD_BUDGET: OnceLock<ExtraFdBudget> = OnceLock::new();
+
+struct ExtraFdBudget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl ExtraFdBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_reserve(&self, count: usize) -> Option<ExtraFdReservation<'_>> {
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let next = used.checked_add(count).filter(|next| *next <= self.limit)?;
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
+        Some(ExtraFdReservation {
+            budget: self,
+            count,
+        })
+    }
+}
+
+struct ExtraFdReservation<'a> {
+    budget: &'a ExtraFdBudget,
+    count: usize,
+}
+
+impl Drop for ExtraFdReservation<'_> {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.count, Ordering::AcqRel);
+    }
+}
 
 /// RAII reservation for one extra (non-first) parallel connect attempt. Held for
-/// the lifetime of the connect task and released on completion or abort.
-struct ExtraConnectGuard;
+/// the attempt and its completed socket until losing attempts have closed.
+struct ExtraConnectGuard {
+    _fds: ExtraFdReservation<'static>,
+}
 
 impl ExtraConnectGuard {
-    fn try_acquire() -> Option<Self> {
+    fn try_acquire(budget: &'static ExtraFdBudget) -> Option<Self> {
+        let fds = budget.try_reserve(1)?;
         let prev = INFLIGHT_EXTRA_CONNECTS.fetch_add(1, Ordering::AcqRel);
         if prev >= MAX_INFLIGHT_EXTRA_CONNECT_ATTEMPTS {
             INFLIGHT_EXTRA_CONNECTS.fetch_sub(1, Ordering::AcqRel);
             None
         } else {
-            Some(Self)
+            Some(Self { _fds: fds })
         }
     }
 }
@@ -49,19 +110,21 @@ impl Drop for ExtraConnectGuard {
 
 /// Bounds concurrent Linux kernel-splice fallback relays. Each splice relay holds
 /// ~8 fds (2 sockets + 2 clones + 2 pipes) and 2 native OS threads, far more than
-/// the 2 fds the admission semaphore budgets per connection, so unauthenticated
-/// fallback traffic could drive fd/thread exhaustion before the connection limit
-/// is reached. Beyond this cap, callers fall back to the userspace async relay
-/// (2 fds, no native threads), which scales without per-relay threads.
-#[cfg(target_os = "linux")]
+/// the 2 fds the admission semaphore budgets per connection. Reserve all 8 from
+/// the shared budget too: cancelling the async caller releases admission while
+/// its blocking splice workers can still hold both original sockets.
+/// Beyond either cap, callers use the userspace async relay (2 fds, no native
+/// threads).
 const MAX_CONCURRENT_KERNEL_SPLICE_RELAYS: usize = 256;
 #[cfg(target_os = "linux")]
 static ACTIVE_KERNEL_SPLICE_RELAYS: AtomicUsize = AtomicUsize::new(0);
+const RESERVED_FDS_PER_KERNEL_SPLICE: usize = 8;
 
-/// Path-attribution counters for fallback relays: how often the zero-copy kernel
-/// splice path was taken vs forced to userspace, and why. Observability only --
-/// no behavior change. Read via [`splice_path_stats`]; the relay decision in
+/// Path-attribution counters for ordinary fallback relays: how often the
+/// zero-copy kernel splice path was taken vs forced to userspace, and why.
+/// Observability only -- no behavior change. Read via [`splice_path_stats`]; the relay decision in
 /// `handshake::server::relay_fallback_with_idle_timeout` records into them.
+/// Cap-shed relays always use userspace and bypass that kernel selector.
 static SPLICE_KERNEL_TAKEN: AtomicU64 = AtomicU64::new(0);
 static SPLICE_USERSPACE_CAP_HIT: AtomicU64 = AtomicU64::new(0);
 static SPLICE_USERSPACE_NON_LINUX: AtomicU64 = AtomicU64::new(0);
@@ -72,7 +135,7 @@ pub fn record_kernel_splice_relay() {
 }
 
 /// Records that a fallback relay was forced to userspace because the kernel
-/// splice cap was reached.
+/// splice cap or shared fd budget was reached.
 pub fn record_userspace_cap_hit_relay() {
     SPLICE_USERSPACE_CAP_HIT.fetch_add(1, Ordering::Relaxed);
 }
@@ -94,7 +157,9 @@ pub fn splice_path_stats() -> (u64, u64, u64) {
 
 /// RAII slot for a kernel-splice relay; releases the slot on drop.
 #[cfg(target_os = "linux")]
-pub struct KernelSpliceSlot(());
+pub struct KernelSpliceSlot {
+    _fds: ExtraFdReservation<'static>,
+}
 
 #[cfg(target_os = "linux")]
 impl Drop for KernelSpliceSlot {
@@ -103,16 +168,24 @@ impl Drop for KernelSpliceSlot {
     }
 }
 
-/// Reserves a kernel-splice relay slot, or returns `None` when the cap is reached
-/// (signalling the caller to use the userspace relay instead).
+/// Reserves a kernel-splice relay slot and all its fds, or returns `None` when
+/// either budget is full (signalling the caller to use the userspace relay).
 #[cfg(target_os = "linux")]
 pub fn try_enter_kernel_splice_relay() -> Option<KernelSpliceSlot> {
+    try_enter_kernel_splice_relay_with_budget(EXTRA_FD_BUDGET.get()?)
+}
+
+#[cfg(target_os = "linux")]
+fn try_enter_kernel_splice_relay_with_budget(
+    budget: &'static ExtraFdBudget,
+) -> Option<KernelSpliceSlot> {
+    let fds = budget.try_reserve(RESERVED_FDS_PER_KERNEL_SPLICE)?;
     let prev = ACTIVE_KERNEL_SPLICE_RELAYS.fetch_add(1, Ordering::AcqRel);
     if prev >= MAX_CONCURRENT_KERNEL_SPLICE_RELAYS {
         ACTIVE_KERNEL_SPLICE_RELAYS.fetch_sub(1, Ordering::AcqRel);
         None
     } else {
-        Some(KernelSpliceSlot(()))
+        Some(KernelSpliceSlot { _fds: fds })
     }
 }
 #[cfg(target_os = "linux")]
@@ -120,57 +193,126 @@ const TCP_NOTSENT_LOWAT_BYTES: libc::c_uint = 256 * 1024;
 #[cfg(target_os = "linux")]
 const SOCKET_BUSY_POLL_MICROS: libc::c_int = 50;
 
-pub async fn connect_tuned_tcp_host(addr: &str) -> io::Result<TcpStream> {
-    let addrs: Vec<SocketAddr> = lookup_host(addr).await?.collect();
-    connect_tuned_tcp_any(&addrs).await
+pub async fn connect_tuned_tcp_host(addr: &str, deadline: Instant) -> io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = timeout_at(deadline, lookup_host(addr))
+        .await
+        .map_err(|_| connect_timeout_error())??
+        .collect();
+    connect_tuned_tcp_any(&addrs, deadline).await
 }
 
-pub async fn connect_tuned_tcp_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+pub async fn connect_tuned_tcp_any(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+) -> io::Result<TcpStream> {
+    if !addrs.is_empty() && Instant::now() >= deadline {
+        return Err(connect_timeout_error());
+    }
     match addrs {
         [] => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "no socket addresses resolved",
         )),
-        [addr] => connect_tuned_tcp_addr(*addr).await,
-        _ => connect_tuned_tcp_race(addrs).await,
+        [addr] => timeout_at(deadline, connect_tuned_tcp_addr(*addr))
+            .await
+            .map_err(|_| connect_timeout_error())?,
+        _ => connect_tuned_tcp_race(addrs, Some(connect_fd_budget()?), deadline).await,
     }
 }
 
-async fn connect_tuned_tcp_race(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
-    let mut attempts = JoinSet::new();
-    let mut addr_iter = addrs.iter().copied().take(MAX_PARALLEL_CONNECT_ATTEMPTS);
+async fn connect_tuned_tcp_race(
+    addrs: &[SocketAddr],
+    extra_fd_budget: Option<&'static ExtraFdBudget>,
+    deadline: Instant,
+) -> io::Result<TcpStream> {
+    connect_tuned_tcp_race_with(addrs, extra_fd_budget, deadline, connect_tuned_tcp_addr).await
+}
 
-    // The first attempt is always raced: its outbound fd is covered by the
-    // per-relay budget. Extra attempts only spawn while the process-wide
-    // connect-race budget has room, so a burst of multi-address dials cannot
-    // over-commit fds beyond what the connection limit assumes.
-    if let Some(first) = addr_iter.next() {
-        attempts.spawn(async move { connect_tuned_tcp_addr(first).await });
-    }
-    for addr in addr_iter {
-        let Some(guard) = ExtraConnectGuard::try_acquire() else {
-            break;
+async fn connect_tuned_tcp_race_with<F, Fut, S>(
+    addrs: &[SocketAddr],
+    extra_fd_budget: Option<&'static ExtraFdBudget>,
+    deadline: Instant,
+    mut connect: F,
+) -> io::Result<S>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = io::Result<S>>,
+{
+    let mut attempts = Vec::new();
+    let mut addr_iter = addrs.iter().copied();
+
+    // Keep the bounded races in this future: cancelling it closes every socket
+    // before the caller releases its relay permit. Reservations travel with a
+    // completed socket until losing attempts are dropped, not just until connect
+    // returns (several connects may complete before their results are polled).
+    while addr_iter.len() > 0 && attempts.len() < MAX_PARALLEL_CONNECT_ATTEMPTS {
+        let guard = if attempts.is_empty() {
+            None // The first outbound socket is covered by relay admission.
+        } else {
+            let Some(guard) = extra_fd_budget.and_then(ExtraConnectGuard::try_acquire) else {
+                break;
+            };
+            Some(guard)
         };
-        attempts.spawn(async move {
-            let _guard = guard;
-            connect_tuned_tcp_addr(addr).await
-        });
+        let addr = addr_iter.next().expect("remaining connect address");
+        let connect = connect(addr);
+        attempts.push(Box::pin(async move { (connect.await, guard) }));
     }
 
     let mut last_err = None;
-    while let Some(result) = attempts.join_next().await {
+    // Pending parallel candidates share time with every unstarted address.
+    // Recompute after immediate failures so a black hole cannot retain the
+    // failed candidates' shares and starve a later reachable address.
+    while !attempts.is_empty() {
+        let now = Instant::now();
+        let pending = attempts.len();
+        let batch_deadline = now
+            + deadline.saturating_duration_since(now) * pending as u32
+                / (pending + addr_iter.len()) as u32;
+        let ready = poll_fn(|cx| {
+            for (index, attempt) in attempts.iter_mut().enumerate() {
+                if let Poll::Ready(result) = attempt.as_mut().poll(cx) {
+                    return Poll::Ready((index, result));
+                }
+            }
+            Poll::Pending
+        });
+        let Ok((index, result)) = timeout_at(batch_deadline, ready).await else {
+            last_err = Some(connect_timeout_error());
+            break;
+        };
+        drop(attempts.swap_remove(index));
         match result {
-            Ok(Ok(stream)) => {
-                attempts.abort_all();
+            (Ok(stream), guard) => {
+                drop(attempts);
+                drop(guard);
                 return Ok(stream);
             }
+            (Err(err), _) => last_err = Some(err),
+        }
+    }
+    // Cancel and close every timed-out socket before opening another one.
+    drop(attempts);
+    while let Some(addr) = addr_iter.next() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(connect_timeout_error());
+        }
+        let attempt_deadline =
+            now + deadline.saturating_duration_since(now) / (addr_iter.len() + 1) as u32;
+        match timeout_at(attempt_deadline, connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(err)) => last_err = Some(err),
-            Err(err) => last_err = Some(io::Error::other(err)),
+            Err(_) => last_err = Some(connect_timeout_error()),
         }
     }
 
     Err(last_err
         .unwrap_or_else(|| io::Error::other("all parallel TCP connect attempts were cancelled")))
+}
+
+fn connect_timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out")
 }
 
 pub async fn connect_tuned_tcp_addr(addr: SocketAddr) -> io::Result<TcpStream> {
@@ -231,10 +373,14 @@ pub async fn relay_kernel_splice_bidirectional_with_idle_timeout(
     left: TcpStream,
     right: TcpStream,
     idle_timeout: Duration,
+    splice_slot: KernelSpliceSlot,
 ) -> io::Result<()> {
     let left = left.into_std()?;
     let right = right.into_std()?;
     tokio::task::spawn_blocking(move || {
+        // Blocking splice threads survive cancellation of the async caller.
+        // Keep their fd/thread reservation until both directions have joined.
+        let _splice_slot = splice_slot;
         kernel_splice::splice_bidirectional_with_idle_timeout(left, right, idle_timeout)
     })
     .await
@@ -327,7 +473,12 @@ pub fn is_transient_accept_error(err: &io::Error) -> bool {
 }
 
 pub fn relay_connection_limit(udp_enabled: bool) -> io::Result<usize> {
-    relay_connection_limit_from_nofile(nofile_soft_limit()?, udp_enabled).ok_or_else(|| {
+    configure_relay_fd_budget(
+        nofile_soft_limit()?,
+        client_fds_per_relay(udp_enabled),
+        RESERVED_PROCESS_FDS,
+    )
+    .ok_or_else(|| {
         io::Error::other(format!(
             "RLIMIT_NOFILE soft limit is too low; need more than \
                  {RESERVED_PROCESS_FDS} file descriptors"
@@ -335,21 +486,119 @@ pub fn relay_connection_limit(udp_enabled: bool) -> io::Result<usize> {
     })
 }
 
+pub(crate) fn server_relay_connection_limit(
+    udp_enabled: bool,
+    max_streams: usize,
+) -> io::Result<usize> {
+    configure_relay_fd_budget(
+        nofile_soft_limit()?,
+        server_fds_per_relay(udp_enabled, max_streams),
+        RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS,
+    )
+    .ok_or_else(|| {
+        io::Error::other(format!(
+            "RLIMIT_NOFILE soft limit is too low; need more than {} file descriptors",
+            RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS,
+        ))
+    })
+}
+
+#[cfg(test)]
+fn server_relay_connection_limit_from_nofile(
+    nofile_soft_limit: usize,
+    udp_enabled: bool,
+    max_streams: usize,
+) -> Option<usize> {
+    relay_fd_budget_from_nofile(
+        nofile_soft_limit,
+        server_fds_per_relay(udp_enabled, max_streams),
+        RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS,
+    )
+    .map(|budget| budget.relay_limit)
+}
+
 pub fn relay_connection_limit_from_nofile(
     nofile_soft_limit: usize,
     udp_enabled: bool,
 ) -> Option<usize> {
-    let available = nofile_soft_limit.checked_sub(RESERVED_PROCESS_FDS)?;
-    // Each relay holds the TCP control pair (FDS_PER_RELAY_CONNECTION). With the
-    // UDP fast plane enabled, a Verified probe also retains a quinn::Endpoint (its
-    // own UDP-socket fd) for the relay's lifetime, so budget one extra fd per
-    // connection or the process can approach EMFILE before the semaphore blocks.
-    let fds_per_conn = if udp_enabled {
-        FDS_PER_RELAY_CONNECTION + 1
-    } else {
-        FDS_PER_RELAY_CONNECTION
-    };
-    let limit = available / fds_per_conn;
+    relay_fd_budget_from_nofile(
+        nofile_soft_limit,
+        client_fds_per_relay(udp_enabled),
+        RESERVED_PROCESS_FDS,
+    )
+    .map(|budget| budget.relay_limit)
+}
+
+fn client_fds_per_relay(udp_enabled: bool) -> usize {
+    FDS_PER_RELAY_CONNECTION + usize::from(udp_enabled)
+}
+
+fn server_fds_per_relay(udp_enabled: bool, max_streams: usize) -> usize {
+    // One incoming control socket, every live target socket, and a speculative
+    // origin socket draining concurrently with an authenticated session.
+    // Non-mux handshakes/fallbacks need one origin socket even if mux is disabled.
+    2 + max_streams.max(1) + usize::from(udp_enabled)
+}
+
+fn connect_fd_budget() -> io::Result<&'static ExtraFdBudget> {
+    if let Some(budget) = EXTRA_FD_BUDGET.get() {
+        return Ok(budget);
+    }
+    let nofile = nofile_soft_limit()?;
+    let extra_fds =
+        relay_fd_budget_from_nofile(nofile, FDS_PER_RELAY_CONNECTION, RESERVED_PROCESS_FDS)
+            .map_or(0, |budget| budget.extra_fds);
+    Ok(EXTRA_FD_BUDGET.get_or_init(|| ExtraFdBudget::new(extra_fds)))
+}
+
+struct RelayFdBudget {
+    relay_limit: usize,
+    extra_fds: usize,
+}
+
+fn configure_relay_fd_budget(
+    nofile: usize,
+    fds_per_relay: usize,
+    reserved_fds: usize,
+) -> Option<usize> {
+    let budget = relay_fd_budget_from_nofile(nofile, fds_per_relay, reserved_fds)?;
+    let shared = EXTRA_FD_BUDGET.get_or_init(|| ExtraFdBudget::new(budget.extra_fds));
+    // The process normally starts either a client or a server once. If reused,
+    // admission must still reserve the already configured optional fd pool.
+    relay_limit_with_extra_fds(nofile, fds_per_relay, reserved_fds, shared.limit)
+}
+
+fn relay_fd_budget_from_nofile(
+    nofile: usize,
+    fds_per_relay: usize,
+    reserved_fds: usize,
+) -> Option<RelayFdBudget> {
+    let available = nofile.checked_sub(reserved_fds)?;
+    // Keep most capacity for ordinary relays. Low limits shrink this optional
+    // pool to zero rather than requiring hundreds of spare fds to start.
+    let max_extra_fds = MAX_INFLIGHT_EXTRA_CONNECT_ATTEMPTS
+        + if cfg!(target_os = "linux") {
+            MAX_CONCURRENT_KERNEL_SPLICE_RELAYS * RESERVED_FDS_PER_KERNEL_SPLICE
+        } else {
+            0
+        };
+    let extra_fds = (available / 4)
+        .min(max_extra_fds)
+        .min(available.checked_sub(fds_per_relay)?);
+    Some(RelayFdBudget {
+        relay_limit: relay_limit_with_extra_fds(nofile, fds_per_relay, reserved_fds, extra_fds)?,
+        extra_fds,
+    })
+}
+
+fn relay_limit_with_extra_fds(
+    nofile: usize,
+    fds_per_relay: usize,
+    reserved_fds: usize,
+    extra_fds: usize,
+) -> Option<usize> {
+    let available = nofile.checked_sub(reserved_fds)?.checked_sub(extra_fds)?;
+    let limit = available / fds_per_relay;
     if limit == 0 {
         None
     } else {
@@ -624,6 +873,7 @@ mod kernel_splice {
         io,
         net::{Shutdown, TcpStream as StdTcpStream},
         os::fd::{AsFd, BorrowedFd, OwnedFd},
+        sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
@@ -631,11 +881,23 @@ mod kernel_splice {
     use rustix::event::PollFlags;
 
     const SPLICE_CHUNK: usize = 256 * 1024;
+    type SpliceWorker = Box<dyn FnOnce() -> io::Result<()> + Send>;
 
     pub(super) fn splice_bidirectional_with_idle_timeout(
         left: StdTcpStream,
         right: StdTcpStream,
         idle_timeout: Duration,
+    ) -> io::Result<()> {
+        splice_bidirectional_with_spawner(left, right, idle_timeout, |worker| {
+            thread::Builder::new().spawn(worker)
+        })
+    }
+
+    pub(super) fn splice_bidirectional_with_spawner(
+        left: StdTcpStream,
+        right: StdTcpStream,
+        idle_timeout: Duration,
+        mut spawn: impl FnMut(SpliceWorker) -> io::Result<thread::JoinHandle<io::Result<()>>>,
     ) -> io::Result<()> {
         left.set_nonblocking(true)?;
         right.set_nonblocking(true)?;
@@ -644,12 +906,33 @@ mod kernel_splice {
         let right_to_left_read = right;
         let right_to_left_write = left;
 
-        let left_to_right = thread::spawn(move || {
+        // Do not enter a long poll until both workers exist. A failed second
+        // spawn closes this rendezvous, waking the first worker for FIN teardown
+        // without another fd or an unbounded queue.
+        let (start_tx, start_rx) = mpsc::sync_channel(0);
+        let left_to_right = spawn(Box::new(move || {
+            if start_rx.recv().is_err() {
+                let _ = left_to_right_read.shutdown(Shutdown::Write);
+                fin_write_then_drain_read(&left_to_right_read, &left_to_right_write);
+                fin_write_then_drain_read(&left_to_right_write, &left_to_right_read);
+                return Ok(());
+            }
             splice_one_direction(left_to_right_read, left_to_right_write, idle_timeout)
-        });
-        let right_to_left = thread::spawn(move || {
+        }))?;
+        let right_to_left = match spawn(Box::new(move || {
             splice_one_direction(right_to_left_read, right_to_left_write, idle_timeout)
-        });
+        })) {
+            Ok(worker) => worker,
+            Err(err) => {
+                drop(start_tx);
+                // The blocking caller still owns KernelSpliceSlot. Join before
+                // returning so neither its fd budget nor its active slot can be
+                // released while this worker survives the failed startup.
+                let _ = join_splice_thread(left_to_right);
+                return Err(err);
+            }
+        };
+        let _ = start_tx.send(());
 
         // Always join BOTH threads before returning so neither relay thread (and
         // its socket/pipe fds) is detached when the sibling direction errors;
@@ -906,6 +1189,7 @@ mod kernel_splice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::Cell, rc::Rc, time::Duration};
 
     #[test]
     fn splice_path_stats_counts_each_path() {
@@ -923,10 +1207,292 @@ mod tests {
     fn relay_connection_limit_reserves_process_fds() {
         assert_eq!(relay_connection_limit_from_nofile(64, false), None);
         assert_eq!(relay_connection_limit_from_nofile(66, false), Some(1));
-        assert_eq!(relay_connection_limit_from_nofile(256, false), Some(96));
+        assert_eq!(relay_connection_limit_from_nofile(256, false), Some(72));
         // With the UDP fast plane on, each relay also retains a QUIC endpoint fd,
         // so the per-connection budget is 3 and the limit drops accordingly.
-        assert_eq!(relay_connection_limit_from_nofile(256, true), Some(64));
+        assert_eq!(relay_connection_limit_from_nofile(256, true), Some(48));
+    }
+
+    #[test]
+    fn server_connection_limit_reserves_cap_shed_pairs_and_waiting_socket() {
+        let reserved = RESERVED_PROCESS_FDS + MAX_CONCURRENT_CAP_SHED_FALLBACKS * 2 + 1;
+        assert_eq!(
+            server_relay_connection_limit_from_nofile(reserved, false, 1),
+            None
+        );
+        assert_eq!(
+            server_relay_connection_limit_from_nofile(reserved + 3, false, 1),
+            Some(1)
+        );
+        assert_eq!(
+            server_relay_connection_limit_from_nofile(256, false, 1),
+            Some(16)
+        );
+        assert_eq!(
+            server_relay_connection_limit_from_nofile(256, true, 1),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn server_fd_budget_reserves_all_mux_targets_at_saturation() {
+        let reserved = RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS;
+        for max_streams in [1, 4, 255, 256] {
+            for udp_enabled in [false, true] {
+                let fds_per_relay = server_fds_per_relay(udp_enabled, max_streams);
+                assert_eq!(
+                    server_relay_connection_limit_from_nofile(
+                        reserved + fds_per_relay - 1,
+                        udp_enabled,
+                        max_streams,
+                    ),
+                    None,
+                );
+                for nofile in [reserved + fds_per_relay, 1024, 4096, 65_536] {
+                    let budget = relay_fd_budget_from_nofile(nofile, fds_per_relay, reserved)
+                        .expect("enough fds for one fully populated mux carrier");
+                    assert!(
+                        reserved + budget.relay_limit * fds_per_relay + budget.extra_fds <= nofile
+                    );
+                    assert!(budget.relay_limit > 0);
+                }
+                let minimum =
+                    relay_fd_budget_from_nofile(reserved + fds_per_relay, fds_per_relay, reserved)
+                        .unwrap();
+                assert_eq!(minimum.relay_limit, 1);
+                assert_eq!(minimum.extra_fds, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn relay_fd_budget_covers_relays_cap_shed_racers_and_splice() {
+        for reserved in [
+            RESERVED_PROCESS_FDS,
+            RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS,
+        ] {
+            for udp_enabled in [false, true] {
+                let fds_per_relay = if udp_enabled { 3 } else { 2 };
+                for nofile in [66, 67, 195, 196, 256, 1024, 4096, 65_536, usize::MAX] {
+                    let Some(budget) = relay_fd_budget_from_nofile(nofile, fds_per_relay, reserved)
+                    else {
+                        assert!(nofile < reserved + fds_per_relay);
+                        continue;
+                    };
+                    let relay_fds = budget.relay_limit * fds_per_relay;
+                    assert!(reserved + relay_fds + budget.extra_fds <= nofile);
+                    for splice_relays in 0..=MAX_CONCURRENT_KERNEL_SPLICE_RELAYS {
+                        let splice_fds = splice_relays * RESERVED_FDS_PER_KERNEL_SPLICE;
+                        if splice_fds > budget.extra_fds {
+                            break;
+                        }
+                        let racers = (budget.extra_fds - splice_fds)
+                            .min(MAX_INFLIGHT_EXTRA_CONNECT_ATTEMPTS);
+                        assert!(reserved + relay_fds + splice_fds + racers <= nofile);
+                    }
+                }
+                let minimum =
+                    relay_fd_budget_from_nofile(reserved + fds_per_relay, fds_per_relay, reserved)
+                        .unwrap();
+                assert_eq!(minimum.relay_limit, 1);
+                assert_eq!(minimum.extra_fds, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn optional_fd_budget_is_shared_and_released_on_drop() {
+        let budget = ExtraFdBudget::new(RESERVED_FDS_PER_KERNEL_SPLICE);
+        let racer = budget.try_reserve(1).unwrap();
+        assert!(budget.try_reserve(RESERVED_FDS_PER_KERNEL_SPLICE).is_none());
+        drop(racer);
+        let splice = budget.try_reserve(RESERVED_FDS_PER_KERNEL_SPLICE).unwrap();
+        assert!(budget.try_reserve(1).is_none());
+        drop(splice);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn optional_fd_budget_concurrent_reservations_do_not_oversubscribe() {
+        let budget = ExtraFdBudget::new(8);
+        let admitted_fds = AtomicUsize::new(0);
+        let phase = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    phase.wait();
+                    let reservation = budget.try_reserve(2);
+                    if reservation.is_some() {
+                        admitted_fds.fetch_add(2, Ordering::AcqRel);
+                    }
+                    phase.wait();
+                    phase.wait();
+                    drop(reservation);
+                });
+            }
+            phase.wait();
+            phase.wait();
+            let admitted = admitted_fds.load(Ordering::Acquire);
+            let held = budget.used.load(Ordering::Acquire);
+            phase.wait();
+            assert_eq!(admitted, 8);
+            assert_eq!(held, 8);
+        });
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn reused_process_reserves_the_already_configured_optional_pool() {
+        let nofile = 1024;
+        for first_reserved in [
+            RESERVED_PROCESS_FDS,
+            RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS,
+        ] {
+            let shared = relay_fd_budget_from_nofile(nofile, 2, first_reserved)
+                .unwrap()
+                .extra_fds;
+            for reserved in [
+                RESERVED_PROCESS_FDS,
+                RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS,
+            ] {
+                for udp_enabled in [false, true] {
+                    let fds_per_relay = client_fds_per_relay(udp_enabled);
+                    let limit = relay_limit_with_extra_fds(nofile, fds_per_relay, reserved, shared)
+                        .unwrap();
+                    let relay_fds = limit * fds_per_relay;
+                    assert!(reserved + relay_fds + shared <= nofile);
+                    let server_fds = server_fds_per_relay(udp_enabled, 4);
+                    let server_limit =
+                        relay_limit_with_extra_fds(nofile, server_fds, reserved, shared).unwrap();
+                    assert!(reserved + server_limit * server_fds + shared <= nofile);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_splice_requires_shared_fd_headroom() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(RESERVED_FDS_PER_KERNEL_SPLICE);
+        let racer = BUDGET.try_reserve(1).unwrap();
+        assert!(try_enter_kernel_splice_relay_with_budget(&BUDGET).is_none());
+        drop(racer);
+        let splice = try_enter_kernel_splice_relay_with_budget(&BUDGET).unwrap();
+        assert!(BUDGET.try_reserve(1).is_none());
+        drop(splice);
+        assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_splice_keeps_all_eight_fds_reserved_until_workers_finish() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(RESERVED_FDS_PER_KERNEL_SPLICE);
+        let left_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(left_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (left, _) = left_listener.accept().await.unwrap();
+        let right_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let right = TcpStream::connect(right_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut origin, _) = right_listener.accept().await.unwrap();
+        let slot = try_enter_kernel_splice_relay_with_budget(&BUDGET).unwrap();
+        let relay = tokio::spawn(relay_kernel_splice_bidirectional_with_idle_timeout(
+            left,
+            right,
+            Duration::from_secs(60),
+            slot,
+        ));
+
+        // Receiving a relayed byte proves the blocking workers have started.
+        client.write_all(b"x").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), origin.read_exact(&mut [0_u8; 1]))
+            .await
+            .unwrap()
+            .unwrap();
+        relay.abort();
+        assert!(relay.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            BUDGET.used.load(Ordering::Acquire),
+            RESERVED_FDS_PER_KERNEL_SPLICE
+        );
+        drop(client);
+        drop(origin);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while BUDGET.used.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished splice workers release their fd reservation");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_second_splice_spawn_joins_worker_before_releasing_fd_budget() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(RESERVED_FDS_PER_KERNEL_SPLICE);
+        let left_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(left_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (left, _) = left_listener.accept().await.unwrap();
+        let right_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let right = TcpStream::connect(right_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (origin, _) = right_listener.accept().await.unwrap();
+        drop(client);
+        drop(origin);
+        let slot = try_enter_kernel_splice_relay_with_budget(&BUDGET).unwrap();
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let relay = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let mut first = Some((paused_tx, release_rx));
+            kernel_splice::splice_bidirectional_with_spawner(
+                left.into_std().unwrap(),
+                right.into_std().unwrap(),
+                Duration::from_secs(600),
+                |worker| {
+                    let Some((paused_tx, release_rx)) = first.take() else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "injected second worker spawn failure",
+                        ));
+                    };
+                    std::thread::Builder::new().spawn(move || {
+                        let result = worker();
+                        // Pause just before thread exit: the failed startup
+                        // must still be joining us with both budgets held.
+                        let _ = paused_tx.send(());
+                        let _ = release_rx.recv();
+                        assert_eq!(
+                            BUDGET.used.load(Ordering::Acquire),
+                            RESERVED_FDS_PER_KERNEL_SPLICE
+                        );
+                        assert!(ACTIVE_KERNEL_SPLICE_RELAYS.load(Ordering::Acquire) > 0);
+                        result
+                    })
+                },
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(5), paused_rx)
+            .await
+            .expect("failed startup wakes its worker instead of polling for 600s")
+            .unwrap();
+        assert!(!relay.is_finished(), "failed startup must join its worker");
+        assert_eq!(
+            BUDGET.used.load(Ordering::Acquire),
+            RESERVED_FDS_PER_KERNEL_SPLICE
+        );
+        assert!(BUDGET.try_reserve(1).is_none());
+        release_tx.send(()).unwrap();
+        let err = relay.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -939,12 +1505,15 @@ mod tests {
 
     #[tokio::test]
     async fn tuned_connect_rejects_empty_addr_list() {
-        let err = connect_tuned_tcp_any(&[]).await.unwrap_err();
+        let err = connect_tuned_tcp_any(&[], Instant::now())
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]
     async fn tuned_connect_races_to_reachable_addr() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(3);
         let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let refused_addr = unused.local_addr().unwrap();
         drop(unused);
@@ -955,11 +1524,226 @@ mod tests {
             let _ = reachable.accept().await.unwrap();
         });
 
-        let stream = connect_tuned_tcp_any(&[refused_addr, reachable_addr])
+        let stream = connect_tuned_tcp_race(
+            &[refused_addr, reachable_addr],
+            Some(&BUDGET),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable_addr);
+        assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tuned_connect_without_extra_fd_headroom_tries_next_address() {
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_addr = unused.local_addr().unwrap();
+        drop(unused);
+        let reachable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable_addr = reachable.local_addr().unwrap();
+        let stream = connect_tuned_tcp_race(
+            &[refused_addr, reachable_addr],
+            None,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable_addr);
+        let _ = reachable.accept().await.unwrap();
+    }
+
+    #[derive(Default)]
+    struct ConnectCounts {
+        live: Cell<usize>,
+        peak: Cell<usize>,
+        started: Cell<usize>,
+    }
+
+    struct CountedSocket(Rc<ConnectCounts>);
+
+    impl Drop for CountedSocket {
+        fn drop(&mut self) {
+            self.0.live.set(self.0.live.get() - 1);
+        }
+    }
+
+    fn counted_connect_socket(counts: Rc<ConnectCounts>) -> io::Result<(TcpSocket, CountedSocket)> {
+        let socket = TcpSocket::new_v4()?;
+        counts.started.set(counts.started.get() + 1);
+        counts.live.set(counts.live.get() + 1);
+        counts.peak.set(counts.peak.get().max(counts.live.get()));
+        // Tuple fields drop in order: close the real socket before decrementing
+        // the live count, including when a pending connect is cancelled.
+        Ok((socket, CountedSocket(counts)))
+    }
+
+    async fn injected_connect(
+        addr: SocketAddr,
+        counts: Rc<ConnectCounts>,
+        all_pending: bool,
+    ) -> io::Result<(TcpSocket, CountedSocket)> {
+        assert_eq!(
+            counts.live.get(),
+            0,
+            "the prior socket must close before the next dial"
+        );
+        let socket = counted_connect_socket(counts)?;
+        if all_pending || addr.port() == 1 {
+            std::future::pending::<()>().await;
+        }
+        Ok(socket)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serial_connect_black_hole_leaves_time_for_reachable_candidate() {
+        let addrs = [
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        ];
+        let counts = Rc::new(ConnectCounts::default());
+        let started = Instant::now();
+        let stream =
+            connect_tuned_tcp_race_with(&addrs, None, started + Duration::from_secs(8), |addr| {
+                injected_connect(addr, Rc::clone(&counts), false)
+            })
             .await
             .unwrap();
-        assert_eq!(stream.peer_addr().unwrap(), reachable_addr);
-        accept.await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+        assert_eq!(counts.started.get(), 2);
+        assert_eq!(counts.peak.get(), 1);
+        assert_eq!(counts.live.get(), 1);
+        drop(stream);
+        assert_eq!(counts.live.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serial_connect_all_black_holes_share_one_absolute_deadline() {
+        let addrs = [1, 2, 3, 4, 5, 6, 7, 8].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let counts = Rc::new(ConnectCounts::default());
+        let started = Instant::now();
+        let err =
+            connect_tuned_tcp_race_with(&addrs, None, started + Duration::from_secs(5), |addr| {
+                injected_connect(addr, Rc::clone(&counts), true)
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(counts.started.get(), 8);
+        assert_eq!(counts.peak.get(), 1);
+        assert_eq!(counts.live.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_race_preserves_high_rtt_candidate() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(3);
+        let addrs = [1, 2, 3, 4, 5, 6].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let counts = Rc::new(ConnectCounts::default());
+        let started = Instant::now();
+        let stream = connect_tuned_tcp_race_with(
+            &addrs,
+            Some(&BUDGET),
+            started + Duration::from_secs(5),
+            |addr| {
+                let counts = Rc::clone(&counts);
+                async move {
+                    let socket = counted_connect_socket(counts)?;
+                    if addr.port() == 1 {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(socket)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(counts.started.get(), 4);
+        assert_eq!(counts.peak.get(), 4);
+        assert_eq!(counts.live.get(), 1);
+        assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
+        drop(stream);
+        assert_eq!(counts.live.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_failing_prefix_preserves_last_candidate_budget() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(3);
+        let addrs = [1, 2, 3, 4, 5].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        for budget in [None, Some(&BUDGET)] {
+            let counts = Rc::new(ConnectCounts::default());
+            let started = Instant::now();
+            let stream = connect_tuned_tcp_race_with(
+                &addrs,
+                budget,
+                started + Duration::from_secs(5),
+                |addr| {
+                    let counts = Rc::clone(&counts);
+                    async move {
+                        if budget.is_none() {
+                            assert_eq!(counts.live.get(), 0);
+                        }
+                        let socket = counted_connect_socket(counts)?;
+                        match addr.port() {
+                            1..=3 => return Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+                            4 => std::future::pending::<()>().await,
+                            _ => tokio::time::sleep(Duration::from_secs(2)).await,
+                        }
+                        Ok(socket)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(started.elapsed(), Duration::from_millis(4500));
+            assert_eq!(counts.started.get(), 5);
+            assert!(counts.peak.get() <= if budget.is_some() { 4 } else { 1 });
+            assert_eq!(counts.live.get(), 1);
+            assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
+            drop(stream);
+            assert_eq!(counts.live.get(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_parallel_window_is_bounded_across_all_candidates() {
+        static BUDGET: ExtraFdBudget = ExtraFdBudget::new(256);
+        let addrs = [1, 2, 3, 4, 5, 6, 7, 8].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let counts = Rc::new(ConnectCounts::default());
+        let started = Instant::now();
+        let err = connect_tuned_tcp_race_with(
+            &addrs,
+            Some(&BUDGET),
+            started + Duration::from_secs(5),
+            |_| {
+                let counts = Rc::clone(&counts);
+                async move {
+                    let socket = counted_connect_socket(counts)?;
+                    std::future::pending::<()>().await;
+                    Ok(socket)
+                }
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(counts.started.get(), 8);
+        assert_eq!(counts.peak.get(), 4);
+        assert_eq!(counts.live.get(), 0);
+        assert_eq!(BUDGET.used.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_kernel_splice_slot() -> KernelSpliceSlot {
+        server_relay_connection_limit(false, 1).unwrap();
+        try_enter_kernel_splice_relay().expect("test fd budget has splice headroom")
     }
 
     #[test]
@@ -993,6 +1777,7 @@ mod tests {
                 client_side,
                 origin_side,
                 Duration::from_millis(50),
+                test_kernel_splice_slot(),
             )
             .await
             .unwrap();
@@ -1043,6 +1828,7 @@ mod tests {
                 client_side,
                 origin_side,
                 Duration::from_millis(100),
+                test_kernel_splice_slot(),
             )
             .await
         });
@@ -1121,6 +1907,7 @@ mod tests {
                 client_side,
                 origin_side,
                 Duration::from_millis(100),
+                test_kernel_splice_slot(),
             )
             .await
         });
@@ -1204,6 +1991,7 @@ mod tests {
                 client_side,
                 origin_side,
                 Duration::from_millis(100),
+                test_kernel_splice_slot(),
             )
             .await
         });

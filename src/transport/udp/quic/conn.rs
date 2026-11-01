@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::congestion::{AckInfo, Bbr, Controller};
-use super::frame::{Ack, Frame, Iter};
+use super::frame::{Ack, Dir, Frame, Iter};
 use super::pacer::Pacer;
 use super::packet::{self, ConnectionId, Header, LongType, PacketSpace};
 use super::pmtud::Pmtud;
@@ -38,12 +38,34 @@ use zeroize::Zeroizing;
 pub enum CloseReason {
     /// This endpoint closed with an application error code + reason.
     LocalApp(u64, Vec<u8>),
+    /// This endpoint closed with a transport error code, frame type, and reason.
+    LocalTransport(u64, u64, Vec<u8>),
     /// The peer sent an application CONNECTION_CLOSE (0x1d).
     PeerApp(u64, Vec<u8>),
     /// The peer sent a transport CONNECTION_CLOSE (0x1c).
-    PeerTransport(u64, Vec<u8>),
+    PeerTransport(u64, u64, Vec<u8>),
     /// The idle timeout fired (RFC 9000 §10.1).
     IdleTimeout,
+}
+
+fn transport_error(error_code: u64, frame_type: u64, reason: impl Into<String>) -> QuicTlsError {
+    QuicTlsError::Transport {
+        error_code,
+        frame_type,
+        reason: reason.into(),
+    }
+}
+
+/// Preserve the transport code while attaching the actual decoded wire type.
+fn with_frame_type(error: QuicTlsError, frame_type: u64) -> QuicTlsError {
+    match error {
+        QuicTlsError::Transport {
+            error_code, reason, ..
+        } => transport_error(error_code, frame_type, reason),
+        QuicTlsError::Protocol(reason) => transport_error(0x0a, frame_type, reason),
+        QuicTlsError::Crypto(reason) => transport_error(0x01, frame_type, reason),
+        other => other,
+    }
 }
 
 /// Error opening (decrypting/parsing) an incoming packet.
@@ -354,6 +376,8 @@ struct SentContent {
     max_data: bool,
     /// Stream ids whose MAX_STREAM_DATA this packet carried; re-arm them if lost.
     max_stream_data: Vec<u64>,
+    /// Directions whose cumulative MAX_STREAMS grant must be re-armed if lost.
+    max_streams: [bool; 2],
     /// Stream ids whose RESET_STREAM this packet carried; re-arm them if lost.
     reset: Vec<u64>,
 }
@@ -364,6 +388,9 @@ struct SentContent {
 #[derive(Default)]
 struct Space {
     keys: Option<Keys>,
+    /// Discard is permanent: absent keys alone also describes an Initial space
+    /// whose keys have not yet been derived on the server.
+    discarded: bool,
     send: PacketNumberSpace,
     recv: ReceivedPackets,
     /// Sent-packet bookkeeping for loss detection + RTT (RFC 9002 §6.1).
@@ -440,10 +467,12 @@ struct Stream {
     fin: bool,
     /// The FIN bit has been packetized at the final offset.
     fin_sent: bool,
+    fin_acked: bool,
     /// The app requested RESET_STREAM with this error code; stop sending data.
     reset: Option<u64>,
     /// The RESET_STREAM frame has been packetized.
     reset_sent: bool,
+    reset_acked: bool,
     /// The stream is cancelled in both directions: STOP_SENDING (same code) rides
     /// in the RESET_STREAM packet. See [`Connection::cancel_stream`].
     stop_sending: bool,
@@ -474,6 +503,8 @@ struct Stream {
     recv_fin: Option<u64>,
     /// A peer RESET_STREAM error code, if the receive half was reset.
     recv_reset: Option<u64>,
+    /// The application consumed the final bytes or dropped its receive half.
+    recv_released: bool,
 }
 
 impl Stream {
@@ -511,7 +542,8 @@ pub(super) const STREAM_SEND_BUFFER: usize = 2 * 1024 * 1024;
 const CONN_RECV_WINDOW: u64 = 16 * 1024 * 1024;
 
 /// Cap on concurrent peer-initiated streams of each kind (a memory-exhaustion DoS
-/// guard, ≥ what our transport parameters advertise so it never wrongly rejects).
+/// guard). Initial transport parameters retain the Safari profile; MAX_STREAMS
+/// expands to this budget once 1-RTT keys are available and replenishes on retire.
 const MAX_PEER_STREAMS: usize = 64;
 
 /// Stream-id bit 1 (RFC 9000 §2.1): set for unidirectional streams.
@@ -668,15 +700,25 @@ pub struct Connection {
     /// Next stream id this endpoint will allocate for an outgoing bidi / uni stream.
     next_bidi: u64,
     next_uni: u64,
+    /// Cumulative opened/allowed peer streams, indexed by bidi=0, uni=1. Opening
+    /// an id implicitly opens all lower ids of its kind; missing ids below this
+    /// frontier have retired and must never be recreated by late frames.
+    peer_streams_opened: [u64; 2],
+    recv_max_streams: [u64; 2],
+    recv_max_streams_sent: [u64; 2],
+    need_max_streams: [bool; 2],
+    /// Cumulative stream credit granted by the peer, including MAX_STREAMS.
+    send_max_streams: [u64; 2],
     /// Peer-initiated streams newly observed, awaiting `accept_bi` / `accept_uni`.
     accept_bidi: VecDeque<u64>,
     accept_uni: VecDeque<u64>,
     /// Why the connection closed, if it has (local close, peer close, or idle).
     closed: Option<CloseReason>,
-    /// A pending application CONNECTION_CLOSE to transmit `(error_code, reason)`.
-    app_close_pending: Option<(u64, Vec<u8>)>,
+    /// A pending CONNECTION_CLOSE `(error_code, transport frame type, reason)`.
+    /// `None` for the frame type denotes an application close.
+    close_pending: Option<(u64, Option<u64>, Vec<u8>)>,
     /// The CONNECTION_CLOSE has been put on the wire.
-    app_close_sent: bool,
+    close_sent: bool,
     /// When the connection entered the closing/draining state (RFC 9000 §10.2),
     /// for the 3×PTO drain countdown after which it can be reaped.
     close_time: Option<Instant>,
@@ -796,11 +838,16 @@ impl Connection {
             streams: BTreeMap::new(),
             next_bidi,
             next_uni,
+            peer_streams_opened: [0; 2],
+            recv_max_streams: [MAX_PEER_STREAMS as u64; 2],
+            recv_max_streams_sent: [0; 2],
+            need_max_streams: [true; 2],
+            send_max_streams: [0; 2],
             accept_bidi: VecDeque::new(),
             accept_uni: VecDeque::new(),
             closed: None,
-            app_close_pending: None,
-            app_close_sent: false,
+            close_pending: None,
+            close_sent: false,
             close_time: None,
             drained: false,
             last_recv_time: None,
@@ -850,6 +897,7 @@ impl Connection {
         };
         // Client-initiated stream ids: bidi 0,4,8,…; uni 2,6,10,… (RFC 9000 §2.1).
         let mut conn = Self::new_inner(Side::Client, Box::new(tls), dcid, dcid, scid, 0, 2);
+        conn.recv_max_streams_sent = [tp.initial_max_streams_bidi, tp.initial_max_streams_uni];
         conn.spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
         // 0-RTT: seed flow control from the remembered transport parameters so
         // early data can be sent before the server's parameters arrive (RFC 9001
@@ -891,6 +939,9 @@ impl Connection {
         scid: ConnectionId,
         stek: Option<Zeroizing<[u8; 32]>>,
     ) -> Result<Self, QuicTlsError> {
+        let limits = TransportParameters::read(&transport_params)
+            .map(|tp| [tp.initial_max_streams_bidi, tp.initial_max_streams_uni])
+            .unwrap_or([0; 2]);
         let tls = ServerHandshake::new(
             cert_chain,
             signing_key_pkcs8,
@@ -900,7 +951,7 @@ impl Connection {
         )?;
         // Server-initiated stream ids: bidi 1,5,9,…; uni 3,7,11,… (RFC 9000 §2.1).
         // The initial/dcid CIDs are learned from the first Initial datagram.
-        Ok(Self::new_inner(
+        let mut conn = Self::new_inner(
             Side::Server,
             Box::new(tls),
             ConnectionId::new(&[]),
@@ -908,7 +959,9 @@ impl Connection {
             scid,
             1,
             3,
-        ))
+        );
+        conn.recv_max_streams_sent = limits;
+        Ok(conn)
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -973,7 +1026,20 @@ impl Connection {
             return;
         }
         self.closed = Some(CloseReason::LocalApp(error_code, reason.to_vec()));
-        self.app_close_pending = Some((error_code, reason.to_vec()));
+        self.close_pending = Some((error_code, None, reason.to_vec()));
+    }
+
+    /// Close with a transport error, preserving its code and triggering frame.
+    pub fn close_transport(&mut self, error_code: u64, frame_type: u64, reason: &[u8]) {
+        if self.closed.is_some() {
+            return;
+        }
+        self.closed = Some(CloseReason::LocalTransport(
+            error_code,
+            frame_type,
+            reason.to_vec(),
+        ));
+        self.close_pending = Some((error_code, Some(frame_type), reason.to_vec()));
     }
 
     /// Why the connection closed, if it has (local close, peer close, or idle).
@@ -1046,7 +1112,6 @@ impl Connection {
     /// The relay's first call returns the data stream ([`RELAY_STREAM_ID`]).
     pub fn open_bi(&mut self) -> u64 {
         let id = self.next_bidi;
-        self.next_bidi += 4;
         self.create_local_stream(id);
         id
     }
@@ -1054,17 +1119,27 @@ impl Connection {
     /// Open a new outgoing unidirectional stream (HTTP/3 control / QPACK).
     pub fn open_uni(&mut self) -> u64 {
         let id = self.next_uni;
-        self.next_uni += 4;
         self.create_local_stream(id);
         id
     }
 
     /// Insert a locally-opened stream with its initial windows + peer send limit.
     fn create_local_stream(&mut self, id: u64) {
+        if self.stream_retired(id) {
+            return;
+        }
         self.ensure_peer_flow();
         let send_max = self.peer_send_limit(id);
         let s = self.streams.entry(id).or_insert_with(Stream::fresh);
         s.send_max = s.send_max.max(send_max);
+        if !self.is_peer_initiated(id) {
+            let next = if is_uni(id) {
+                &mut self.next_uni
+            } else {
+                &mut self.next_bidi
+            };
+            *next = (*next).max(id + 4);
+        }
     }
 
     /// Take the id of the next peer-initiated bidirectional stream, if any. A stream
@@ -1080,6 +1155,7 @@ impl Connection {
             if !cancelled_empty {
                 return Some(id);
             }
+            self.discard_stream_recv(id);
         }
         None
     }
@@ -1093,11 +1169,11 @@ impl Connection {
     /// frames once the handshake installs Data keys. Creates the stream if absent.
     pub fn send_stream(&mut self, id: u64, data: &[u8]) {
         self.create_local_stream(id);
-        self.streams
-            .get_mut(&id)
-            .expect("just created")
-            .send
-            .extend_from_slice(data);
+        if let Some(s) = self.streams.get_mut(&id) {
+            if !s.fin && s.reset.is_none() {
+                s.send.extend_from_slice(data);
+            }
+        }
     }
 
     /// Remaining bytes stream `id` may buffer for sending before hitting the
@@ -1107,6 +1183,14 @@ impl Connection {
     pub fn stream_send_capacity(&self, id: u64) -> usize {
         let buffered = self.streams.get(&id).map_or(0, |s| s.send.len());
         STREAM_SEND_BUFFER.saturating_sub(buffered)
+    }
+
+    pub fn stream_send_finished(&self, id: u64) -> bool {
+        self.stream_retired(id)
+            || self
+                .streams
+                .get(&id)
+                .is_some_and(|s| s.fin || s.reset.is_some())
     }
 
     /// Mark stream `id` finished (a FIN is sent after all buffered bytes).
@@ -1123,6 +1207,7 @@ impl Connection {
         if let Some(s) = self.streams.get_mut(&id) {
             if s.reset.is_none() {
                 s.reset = Some(error_code);
+                s.retransmit.clear();
             }
         }
     }
@@ -1147,9 +1232,11 @@ impl Connection {
                 // A RESET_STREAM already packetized carried no STOP_SENDING: send
                 // the combined pair again.
                 s.reset_sent = false;
+                s.reset_acked = false;
                 s.cancel_after = cancel_after;
             }
         }
+        self.discard_stream_recv(id);
     }
 
     /// Stream `id` has fresh bytes buffered that are not yet packetized.
@@ -1177,16 +1264,22 @@ impl Connection {
         if s.recv_max - s.recv_max_sent >= STREAM_RECV_WINDOW / 2 {
             s.need_max_stream_data = true;
         }
+        if s.recv_reset.is_none() && s.recv_fin.is_some_and(|fin| s.recv_off >= fin) {
+            s.recv_released = true;
+        }
         self.credit_connection_window(n);
+        self.retire_stream(id);
         data
     }
 
     /// Whether stream `id`'s receive half has delivered all bytes through a FIN
     /// (a clean end-of-stream, RFC 9000 §4.5).
     pub fn stream_recv_finished(&self, id: u64) -> bool {
-        self.streams
-            .get(&id)
-            .is_some_and(|s| s.recv_fin.is_some_and(|fin| s.recv_off >= fin))
+        self.stream_retired(id)
+            || self
+                .streams
+                .get(&id)
+                .is_some_and(|s| s.recv_fin.is_some_and(|fin| s.recv_off >= fin))
     }
 
     /// The RESET_STREAM error code if stream `id`'s receive half was reset by the
@@ -1202,6 +1295,58 @@ impl Connection {
         (id & 0x1) != our_bit
     }
 
+    /// Missing streams below their opened frontier are terminal, not new. This
+    /// constant-size history prevents retransmitted frames resurrecting them.
+    fn stream_retired(&self, id: u64) -> bool {
+        if self.streams.contains_key(&id) {
+            return false;
+        }
+        if self.is_peer_initiated(id) {
+            id / 4 < self.peer_streams_opened[usize::from(is_uni(id))]
+        } else {
+            id < if is_uni(id) {
+                self.next_uni
+            } else {
+                self.next_bidi
+            }
+        }
+    }
+
+    fn stream_can_send(&self, id: u64) -> bool {
+        if self.is_peer_initiated(id) {
+            !is_uni(id)
+        } else {
+            id / 4 < self.send_max_streams[usize::from(is_uni(id))]
+        }
+    }
+
+    /// Release terminal state after send data/FIN or RESET is acknowledged and
+    /// the application consumed or abandoned the receive half. No per-retired-
+    /// stream tombstones are needed (RFC 9000 §4.5).
+    fn retire_stream(&mut self, id: u64) {
+        let peer = self.is_peer_initiated(id);
+        let Some(s) = self.streams.get(&id) else {
+            return;
+        };
+        let send_done = (is_uni(id) && peer) || s.reset_acked || s.fin_acked;
+        let recv_done = (is_uni(id) && !peer)
+            || (s.recv_released
+                && s.recv_fin
+                    .is_some_and(|fin| s.recv_reset.is_some() || s.recv_off >= fin));
+        if !send_done || !recv_done || !s.sent_range_offsets.is_empty() || !s.retransmit.is_empty()
+        {
+            return;
+        }
+        self.streams.remove(&id);
+        self.accept_bidi.retain(|&queued| queued != id);
+        self.accept_uni.retain(|&queued| queued != id);
+        if peer {
+            let kind = usize::from(is_uni(id));
+            self.recv_max_streams[kind] = (self.recv_max_streams[kind] + 1).min(1 << 60);
+            self.need_max_streams[kind] = true;
+        }
+    }
+
     /// Seed flow-control limits from a resumption ticket's remembered transport
     /// parameters (RFC 9001 §7.4.1) so a 0-RTT client can send early data before the
     /// server's parameters arrive. Leaves `peer_flow_applied` false so
@@ -1214,6 +1359,7 @@ impl Connection {
         self.peer_msd_bidi_local = tp.initial_max_stream_data_bidi_local;
         self.peer_msd_bidi_remote = tp.initial_max_stream_data_bidi_remote;
         self.peer_msd_uni = tp.initial_max_stream_data_uni;
+        self.send_max_streams = [tp.initial_max_streams_bidi, tp.initial_max_streams_uni];
     }
 
     /// Parse the peer's transport parameters once (available after the handshake
@@ -1233,6 +1379,8 @@ impl Connection {
         self.peer_msd_bidi_local = tp.initial_max_stream_data_bidi_local;
         self.peer_msd_bidi_remote = tp.initial_max_stream_data_bidi_remote;
         self.peer_msd_uni = tp.initial_max_stream_data_uni;
+        self.send_max_streams[0] = self.send_max_streams[0].max(tp.initial_max_streams_bidi);
+        self.send_max_streams[1] = self.send_max_streams[1].max(tp.initial_max_streams_uni);
         self.peer_flow_applied = true;
         // Raise the send window of streams already created before the TP arrived.
         let ids: Vec<u64> = self.streams.keys().copied().collect();
@@ -1299,7 +1447,10 @@ impl Connection {
     /// decrypt — and so the public Initial keys stop AEAD-opening forged packets once
     /// the handshake has moved on.
     fn discard_space(&mut self, space: usize) {
-        self.spaces[space] = Space::default();
+        self.spaces[space] = Space {
+            discarded: true,
+            ..Space::default()
+        };
     }
 
     /// Force a local close once the 1-RTT AEAD confidentiality limit is reached
@@ -1375,7 +1526,7 @@ impl Connection {
             if self.close_time.is_none() {
                 self.close_time = Some(now);
             }
-            if self.app_close_pending.is_some() && !self.app_close_sent {
+            if self.close_pending.is_some() && !self.close_sent {
                 if let Some(dg) = self.build_close_packet(now) {
                     return Some(dg);
                 }
@@ -1711,8 +1862,11 @@ impl Connection {
         }
         for (id, offset, len, fin) in content.stream {
             if let Some(s) = self.streams.get_mut(&id) {
-                s.retransmit.push((offset, len, fin));
+                if s.reset.is_none() {
+                    s.retransmit.push((offset, len, fin));
+                }
             }
+            self.retire_stream(id);
         }
         if content.handshake_done {
             self.handshake_done_pending = true;
@@ -1728,8 +1882,13 @@ impl Connection {
         }
         for id in content.reset {
             if let Some(s) = self.streams.get_mut(&id) {
-                s.reset_sent = false;
+                if !s.reset_acked {
+                    s.reset_sent = false;
+                }
             }
+        }
+        for (kind, sent) in content.max_streams.into_iter().enumerate() {
+            self.need_max_streams[kind] |= sent;
         }
     }
 
@@ -1887,10 +2046,10 @@ impl Connection {
         datagram
     }
 
-    /// Build a packet carrying the queued application CONNECTION_CLOSE (RFC 9000
+    /// Build a packet carrying the queued CONNECTION_CLOSE (RFC 9000
     /// §19.19) in the highest space with keys. `None` if no keys exist yet.
     fn build_close_packet(&mut self, now: Instant) -> Option<Vec<u8>> {
-        let (code, reason) = self.app_close_pending.clone()?;
+        let (code, frame_type, reason) = self.close_pending.clone()?;
         let space = [SPACE_DATA, SPACE_HANDSHAKE, SPACE_INITIAL]
             .into_iter()
             .find(|&s| self.spaces[s].keys.is_some())?;
@@ -1901,7 +2060,14 @@ impl Connection {
         // packets (RFC 9000 §12.5). If 1-RTT keys are not yet installed, close with
         // a transport CONNECTION_CLOSE (0x1c) carrying APPLICATION_ERROR and no
         // application-specific code/reason (RFC 9000 §10.2.3).
-        let close = if space == SPACE_DATA {
+        let close = if let Some(frame_type) = frame_type {
+            super::frame::Close {
+                application: false,
+                error_code: code,
+                frame_type,
+                reason: &reason,
+            }
+        } else if space == SPACE_DATA {
             super::frame::Close {
                 application: true,
                 error_code: code,
@@ -1924,7 +2090,7 @@ impl Connection {
                 &[Frame::Close(close), Frame::Padding(3)],
             )
         };
-        self.app_close_sent = true;
+        self.close_sent = true;
         // CONNECTION_CLOSE is not ack-eliciting (RFC 9002 §2).
         self.record_sent(
             space,
@@ -1958,6 +2124,12 @@ impl Connection {
         };
         self.record_sent(SPACE_DATA, pn, datagram.len(), ack_eliciting, content, now);
         datagram
+    }
+
+    /// Encode an authenticated peer input for endpoint-level UDP regressions.
+    #[cfg(test)]
+    pub(crate) fn test_data_packet(&mut self, frames: &[Frame]) -> Vec<u8> {
+        self.seal_data_packet(frames, true, SentContent::default(), Instant::now())
     }
 
     /// Build a 1-RTT packet carrying HANDSHAKE_DONE (RFC 9001 §4.1.2). Ack-eliciting
@@ -2041,14 +2213,15 @@ impl Connection {
         datagram
     }
 
-    /// Whether any receive window has grown enough to owe the peer a MAX_DATA or
-    /// MAX_STREAM_DATA update.
+    /// Whether receive windows or stream concurrency credit owe a peer update.
     fn flow_update_pending(&self) -> bool {
-        self.need_max_data || self.streams.values().any(|s| s.need_max_stream_data)
+        self.need_max_data
+            || self.need_max_streams.iter().any(|pending| *pending)
+            || self.streams.values().any(|s| s.need_max_stream_data)
     }
 
-    /// Build a 1-RTT packet carrying the pending MAX_DATA + MAX_STREAM_DATA window
-    /// updates (RFC 9000 §19.9–19.10), recording them so they are re-armed if lost.
+    /// Build pending MAX_DATA, MAX_STREAM_DATA, and MAX_STREAMS updates, recording
+    /// them so lost grants are re-armed (RFC 9000 §19.9–19.11).
     fn build_flow_update_packet(&mut self, now: Instant) -> Vec<u8> {
         let pn = self.spaces[SPACE_DATA].send.allocate();
         let (_, pn_len) = packet::encode_packet_number(pn, None);
@@ -2059,6 +2232,16 @@ impl Connection {
         if self.need_max_data {
             frames.push(Frame::MaxData(self.recv_max_data));
             content.max_data = true;
+        }
+        for (kind, dir) in [Dir::Bidi, Dir::Uni].into_iter().enumerate() {
+            if self.need_max_streams[kind] {
+                frames.push(Frame::MaxStreams {
+                    dir,
+                    max: self.recv_max_streams[kind],
+                });
+                content.max_streams[kind] = true;
+                self.recv_max_streams_sent[kind] = self.recv_max_streams[kind];
+            }
         }
         let grown: Vec<(u64, u64)> = self
             .streams
@@ -2092,6 +2275,7 @@ impl Connection {
             self.recv_max_data_sent = self.recv_max_data;
             self.need_max_data = false;
         }
+        self.need_max_streams = [false; 2];
         for (id, max) in grown {
             if let Some(s) = self.streams.get_mut(&id) {
                 s.recv_max_sent = max;
@@ -2182,7 +2366,10 @@ impl Connection {
         let conn_window = self.send_max_data.saturating_sub(self.send_data_total);
         self.streams
             .iter()
-            .find(|(_, s)| {
+            .find(|(&id, s)| {
+                if !self.stream_can_send(id) {
+                    return false;
+                }
                 if s.reset.is_some() {
                     return false; // a reset stream sends RESET_STREAM, not data
                 }
@@ -2205,8 +2392,9 @@ impl Connection {
     fn next_stream_to_reset(&self) -> Option<u64> {
         self.streams
             .iter()
-            .find(|(_, s)| {
-                s.reset.is_some()
+            .find(|(&id, s)| {
+                self.stream_can_send(id)
+                    && s.reset.is_some()
                     && !s.reset_sent
                     && !s.cancel_after.iter().any(|&id| self.has_unsent_data(id))
             })
@@ -2268,18 +2456,19 @@ impl Connection {
         let pn_offset = header.encode(&mut probe);
 
         let s = &self.streams[&id];
+        let offset = s.retransmit.first().map_or(s.send_off, |range| range.0);
+        let frame_hdr = 1 + super::varint::size(id) + super::varint::size(offset) + 2;
+        // A lost range may have been sent before a PMTU blackhole reset, so size
+        // retransmissions and fresh data against the current validated MTU.
+        let budget = self
+            .pmtud
+            .current_mtu()
+            .saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
         let (offset, end, fin, is_retransmit) = if let Some(&(off, len, fin)) = s.retransmit.first()
         {
-            (off, off + len, fin, true)
+            let chunk = len.min(budget.max(1) as u64);
+            (off, off + chunk, fin && chunk == len, true)
         } else {
-            let offset = s.send_off;
-            let frame_hdr = 1 + super::varint::size(id) + super::varint::size(offset) + 2;
-            // Packetize to the path MTU the connection has validated (DPLPMTUD): bulk
-            // DATA fills the discovered datagram size instead of the fixed 1252 ceiling.
-            let budget = self
-                .pmtud
-                .current_mtu()
-                .saturating_sub(pn_offset + pn_len + tag_len + frame_hdr);
             let buffered_end = s.send_base + s.send.len() as u64;
             let remaining = (buffered_end - offset) as usize;
             // Clamp the fresh chunk to both flow-control windows (RFC 9000 §4.1).
@@ -2313,7 +2502,13 @@ impl Connection {
         self.record_sent(SPACE_DATA, pn, datagram.len(), true, content, now);
         let s = self.streams.get_mut(&id).unwrap();
         if is_retransmit {
-            s.retransmit.remove(0);
+            let (_, len, range_fin) = s.retransmit[0];
+            let sent = end - offset;
+            if sent == len {
+                s.retransmit.remove(0);
+            } else {
+                s.retransmit[0] = (end, len - sent, range_fin);
+            }
         } else {
             // Fresh bytes consume connection-level flow-control credit.
             self.send_data_total += end - s.send_off;
@@ -2481,6 +2676,9 @@ impl Connection {
             None => return Ok(()), // unsupported type / clear fixed bit: drop
         };
         let space = space_index(pspace);
+        if self.spaces[space].discarded {
+            return Ok(());
+        }
 
         // Peek the long-header CIDs but DO NOT latch any state from them yet: a
         // forged/unauthenticated datagram must not be able to corrupt CID routing
@@ -2615,9 +2813,12 @@ impl Connection {
         // key-update handling would be fingerprints/interop breaks against a real
         // origin, but a ParallaX peer never sends them. See frame.rs's invariant note
         // before pointing this path at any non-ParallaX peer.
-        for frame in Iter::new(&payload) {
-            let frame =
-                frame.map_err(|e| QuicTlsError::Crypto(format!("frame decode failed: {e:?}")))?;
+        let mut frames = Iter::new(&payload);
+        while let Some(frame) = frames.next() {
+            let frame_type = frames.last_frame_type();
+            let frame = frame.map_err(|e| {
+                transport_error(0x07, frame_type, format!("frame decode failed: {e:?}"))
+            })?;
             // RFC 9000 §12.4/§12.5: Initial and Handshake packets may carry only
             // PADDING, PING, ACK, CRYPTO, and a transport CONNECTION_CLOSE (0x1c).
             // Any other frame is a PROTOCOL_VIOLATION. This matters because Initial
@@ -2632,14 +2833,17 @@ impl Connection {
                 )
                 && !matches!(frame, Frame::Close(ref c) if !c.application)
             {
-                return Err(QuicTlsError::Protocol(
-                    "frame type not permitted in Initial/Handshake space".into(),
+                return Err(transport_error(
+                    0x0a,
+                    frame_type,
+                    "frame type not permitted in Initial/Handshake space",
                 ));
             }
             match frame {
                 Frame::Crypto { offset, data } => {
                     ack_eliciting = true;
-                    self.recv_crypto(space, offset, data)?;
+                    self.recv_crypto(space, offset, data)
+                        .map_err(|error| with_frame_type(error, frame_type))?;
                 }
                 Frame::Stream {
                     id,
@@ -2648,7 +2852,8 @@ impl Connection {
                     data,
                 } => {
                     ack_eliciting = true;
-                    self.recv_stream(id, offset, fin, data)?;
+                    self.recv_stream(id, offset, fin, data)
+                        .map_err(|error| with_frame_type(error, frame_type))?;
                 }
                 Frame::ResetStream {
                     id,
@@ -2658,13 +2863,26 @@ impl Connection {
                     ack_eliciting = true;
                     self.recv_reset_stream(id, error_code, final_size)?;
                 }
-                Frame::StopSending { id, .. } => {
+                Frame::StopSending { id, error_code } => {
                     ack_eliciting = true;
-                    // The peer will not read more of this stream: stop sending it.
-                    // (A full RESET_STREAM emission lands with flow control.)
-                    if let Some(s) = self.streams.get_mut(&id) {
-                        s.send_off = s.send_base + s.send.len() as u64;
-                        s.retransmit.clear();
+                    if is_uni(id) && self.is_peer_initiated(id) {
+                        return Err(QuicTlsError::Transport {
+                            error_code: 0x05,
+                            frame_type: 0x05,
+                            reason: "STOP_SENDING on a receive-only stream".into(),
+                        });
+                    }
+                    if !self.stream_retired(id) {
+                        if !self.is_peer_initiated(id) && !self.streams.contains_key(&id) {
+                            return Err(QuicTlsError::Transport {
+                                error_code: 0x05,
+                                frame_type: 0x05,
+                                reason: "STOP_SENDING on an unopened locally-initiated stream"
+                                    .into(),
+                            });
+                        }
+                        self.ensure_stream(id, frame_type)?;
+                        self.reset_stream(id, error_code);
                     }
                 }
                 Frame::MaxData(max) => {
@@ -2681,7 +2899,21 @@ impl Connection {
                         s.send_max = s.send_max.max(max);
                     }
                 }
-                Frame::Ack(ack) => self.recv_ack(space, &ack, now)?,
+                Frame::MaxStreams { dir, max } => {
+                    ack_eliciting = true;
+                    if max > (1 << 60) {
+                        return Err(QuicTlsError::Transport {
+                            error_code: 0x07, // FRAME_ENCODING_ERROR, RFC 9000 §19.11.
+                            frame_type: if dir == Dir::Uni { 0x13 } else { 0x12 },
+                            reason: "MAX_STREAMS exceeds 2^60".into(),
+                        });
+                    }
+                    let kind = usize::from(dir == Dir::Uni);
+                    self.send_max_streams[kind] = self.send_max_streams[kind].max(max);
+                }
+                Frame::Ack(ack) => self
+                    .recv_ack(space, &ack, now)
+                    .map_err(|error| with_frame_type(error, frame_type))?,
                 Frame::HandshakeDone => {
                     ack_eliciting = true;
                     // RFC 9001 §4.1.2: the client treats HANDSHAKE_DONE as handshake
@@ -2701,7 +2933,7 @@ impl Connection {
                         self.closed = Some(if c.application {
                             CloseReason::PeerApp(c.error_code, reason)
                         } else {
-                            CloseReason::PeerTransport(c.error_code, reason)
+                            CloseReason::PeerTransport(c.error_code, c.frame_type, reason)
                         });
                         self.close_time = Some(now);
                     }
@@ -2787,6 +3019,21 @@ impl Connection {
                     self.unindex_sent_stream_ranges(&content);
                 }
                 for &(id, _, _, _) in &content.stream {
+                    if !acked_streams.contains(&id) {
+                        acked_streams.push(id);
+                    }
+                }
+                for &(id, _, _, fin) in &content.stream {
+                    if fin {
+                        if let Some(s) = self.streams.get_mut(&id) {
+                            s.fin_acked = true;
+                        }
+                    }
+                }
+                for id in content.reset {
+                    if let Some(s) = self.streams.get_mut(&id) {
+                        s.reset_acked = true;
+                    }
                     if !acked_streams.contains(&id) {
                         acked_streams.push(id);
                     }
@@ -2897,6 +3144,7 @@ impl Connection {
         // counts as needed.
         for id in acked_streams {
             self.compact_send_buffer(id);
+            self.retire_stream(id);
         }
         Ok(())
     }
@@ -3027,8 +3275,10 @@ impl Connection {
                     || buffered + data.len() > MAX_CRYPTO_REASSEMBLY
                     || sp.crypto_pending.len() >= MAX_CRYPTO_PENDING_FRAGMENTS
                 {
-                    return Err(QuicTlsError::Crypto(
-                        "CRYPTO reassembly window exceeded".into(),
+                    return Err(transport_error(
+                        0x0d,
+                        0x06,
+                        "CRYPTO reassembly window exceeded",
                     ));
                 }
                 sp.crypto_pending.push((offset, data.to_vec()));
@@ -3060,13 +3310,25 @@ impl Connection {
         fin: bool,
         data: &[u8],
     ) -> Result<(), QuicTlsError> {
-        // `end` overflowing u64 is a protocol violation, not arithmetic to wrap:
+        // A locally initiated uni is send-only even after retirement. Validate
+        // direction before ignoring closed streams or charging receive credit.
+        if is_uni(id) && !self.is_peer_initiated(id) {
+            return Err(QuicTlsError::Transport {
+                error_code: 0x05,
+                frame_type: 0x08,
+                reason: "STREAM on a send-only stream".into(),
+            });
+        }
+        if self.stream_retired(id) {
+            return Ok(());
+        }
+        // `end` overflowing u64 is a frame encoding error, not arithmetic to wrap:
         // such an offset can never fall inside any receive window (debug builds
         // would panic, release builds would wrap to a small `end` and bypass the
         // window check below). Reject before touching connection state.
         let end = offset
             .checked_add(data.len() as u64)
-            .ok_or_else(|| QuicTlsError::Protocol("STREAM frame offset overflows u64".into()))?;
+            .ok_or_else(|| transport_error(0x07, 0x08, "STREAM frame offset overflows u64"))?;
         // Validate against the stream's current state (or a fresh stream's defaults
         // if this frame would open it) BEFORE `ensure_stream` inserts and accept-
         // queues the stream: a flow-control / final-size violation must not leave a
@@ -3082,19 +3344,25 @@ impl Connection {
         // place the final size below data already received.
         if let Some(final_size) = cur_fin {
             if end > final_size || (fin && end != final_size) {
-                return Err(QuicTlsError::Protocol(
-                    "STREAM frame violates the stream's final size".into(),
+                return Err(transport_error(
+                    0x06,
+                    0x08,
+                    "STREAM frame violates the stream's final size",
                 ));
             }
         }
         if fin && end < cur_high {
-            return Err(QuicTlsError::Protocol(
-                "FIN final size below data already received".into(),
+            return Err(transport_error(
+                0x06,
+                0x08,
+                "FIN final size below data already received",
             ));
         }
         if end > cur_max {
-            return Err(QuicTlsError::Crypto(
-                "peer exceeded the stream receive window".into(),
+            return Err(transport_error(
+                0x03,
+                0x08,
+                "peer exceeded the stream receive window",
             ));
         }
         let new_high = end.max(cur_high);
@@ -3105,13 +3373,15 @@ impl Connection {
         match self.recv_data_total.checked_add(delta) {
             Some(total) if total <= self.recv_max_data => {}
             _ => {
-                return Err(QuicTlsError::Crypto(
-                    "peer exceeded the connection receive window".into(),
+                return Err(transport_error(
+                    0x03,
+                    0x08,
+                    "peer exceeded the connection receive window",
                 ));
             }
         }
         // All checks passed: now it is safe to create + accept-queue the stream.
-        self.ensure_stream(id)?;
+        self.ensure_stream(id, 0x08)?;
         let s = self.streams.get_mut(&id).expect("just ensured");
         // A stream already in Reset Recvd had everything up to its final size
         // accounted as delivered when the reset was processed (RFC 9000 §4.5), so
@@ -3126,6 +3396,15 @@ impl Connection {
         self.recv_data_total += delta;
         if fin {
             s.recv_fin = Some(end);
+        }
+        if s.recv_released {
+            s.recv_credited += delta;
+            if s.recv_fin.is_some_and(|fin| new_high >= fin) {
+                s.recv_off = new_high;
+            }
+            self.credit_connection_window(delta);
+            self.retire_stream(id);
+            return Ok(());
         }
         // In-order reassembly. Flow control above bounds the high watermark, but
         // NOT this buffer: a zero-length fragment (e.g. a bare FIN, already recorded
@@ -3151,8 +3430,10 @@ impl Connection {
                     || s.recv_pending.len() >= MAX_STREAM_PENDING_FRAGMENTS
                     || self.recv_pending_total + data.len() > MAX_CONN_REASSEMBLY
                 {
-                    return Err(QuicTlsError::Crypto(
-                        "stream reassembly buffer exceeded".into(),
+                    return Err(transport_error(
+                        0x01,
+                        0x08,
+                        "stream reassembly buffer exceeded",
                     ));
                 }
                 self.recv_pending_total += data.len();
@@ -3180,6 +3461,16 @@ impl Connection {
         error_code: u64,
         final_size: u64,
     ) -> Result<(), QuicTlsError> {
+        if is_uni(id) && !self.is_peer_initiated(id) {
+            return Err(QuicTlsError::Transport {
+                error_code: 0x05,
+                frame_type: 0x04,
+                reason: "RESET_STREAM on a send-only stream".into(),
+            });
+        }
+        if self.stream_retired(id) {
+            return Ok(());
+        }
         // Validate against the stream's current state (or a fresh stream's defaults
         // if this RESET would open it) BEFORE `ensure_stream` inserts and accept-
         // queues the stream, so a flow-control / final-size violation leaves no
@@ -3194,18 +3485,24 @@ impl Connection {
         // size and must not be below data already received; the bytes up to it count
         // toward connection-level flow control (they are considered delivered).
         if cur_fin.is_some_and(|known| known != final_size) {
-            return Err(QuicTlsError::Protocol(
-                "RESET_STREAM final size conflicts with a known final size".into(),
+            return Err(transport_error(
+                0x06,
+                0x04,
+                "RESET_STREAM final size conflicts with a known final size",
             ));
         }
         if final_size < cur_high {
-            return Err(QuicTlsError::Protocol(
-                "RESET_STREAM final size below data already received".into(),
+            return Err(transport_error(
+                0x06,
+                0x04,
+                "RESET_STREAM final size below data already received",
             ));
         }
         if final_size > cur_max {
-            return Err(QuicTlsError::Crypto(
-                "RESET_STREAM exceeded the stream receive window".into(),
+            return Err(transport_error(
+                0x03,
+                0x04,
+                "RESET_STREAM exceeded the stream receive window",
             ));
         }
         let delta = final_size - cur_high;
@@ -3213,13 +3510,15 @@ impl Connection {
         match self.recv_data_total.checked_add(delta) {
             Some(total) if total <= self.recv_max_data => {}
             _ => {
-                return Err(QuicTlsError::Crypto(
-                    "RESET_STREAM exceeded the connection receive window".into(),
+                return Err(transport_error(
+                    0x03,
+                    0x04,
+                    "RESET_STREAM exceeded the connection receive window",
                 ));
             }
         }
         // All checks passed: now it is safe to create + accept-queue the stream.
-        self.ensure_stream(id)?;
+        self.ensure_stream(id, 0x04)?;
         let s = self.streams.get_mut(&id).expect("just ensured");
         s.recv_high = final_size;
         s.recv_fin = Some(final_size);
@@ -3260,6 +3559,7 @@ impl Connection {
             // stays put) and the connection can never receive again.
             self.credit_connection_window(credit);
         }
+        self.retire_stream(id);
         Ok(())
     }
 
@@ -3296,18 +3596,20 @@ impl Connection {
         // credited and can never over-credit.
         let credit = s.recv_high.saturating_sub(s.recv_credited);
         s.recv_credited = s.recv_high;
+        s.recv_released = true;
         s.recv = Vec::new();
         let stranded_fragments: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
         s.recv_pending = Vec::new();
         self.recv_pending_total = self.recv_pending_total.saturating_sub(stranded_fragments);
         self.credit_connection_window(credit);
+        self.retire_stream(id);
     }
 
     /// Create a stream on first sight, queuing a peer-initiated one for `accept_*`.
     /// Caps concurrent peer-initiated streams (a memory-exhaustion DoS guard,
     /// RFC 9000 §4.6 STREAM_LIMIT_ERROR), and seeds the send window from the peer's
     /// transport parameters.
-    fn ensure_stream(&mut self, id: u64) -> Result<(), QuicTlsError> {
+    fn ensure_stream(&mut self, id: u64, frame_type: u64) -> Result<(), QuicTlsError> {
         if self.streams.contains_key(&id) {
             return Ok(());
         }
@@ -3317,29 +3619,43 @@ impl Connection {
         // and would otherwise bypass the peer-stream cap below (the count filters on
         // is_peer_initiated, so an our-space id was never counted — unbounded creation).
         if !self.is_peer_initiated(id) {
-            return Err(QuicTlsError::Protocol(
-                "peer referenced an unopened locally-initiated stream".into(),
+            return Err(transport_error(
+                0x05,
+                frame_type,
+                "peer referenced an unopened locally-initiated stream",
             ));
         }
         let kind_uni = is_uni(id);
-        let count = self
+        let kind = usize::from(kind_uni);
+        let opened = id / 4 + 1;
+        let live = self
             .streams
             .keys()
-            .filter(|&&k| self.is_peer_initiated(k) && is_uni(k) == kind_uni)
+            .filter(|&&other| self.is_peer_initiated(other) && is_uni(other) == kind_uni)
             .count();
-        if count >= MAX_PEER_STREAMS {
-            return Err(QuicTlsError::Crypto(
-                "peer exceeded the stream limit".into(),
+        if opened > self.recv_max_streams_sent[kind]
+            || opened.saturating_sub(self.peer_streams_opened[kind])
+                > MAX_PEER_STREAMS.saturating_sub(live) as u64
+        {
+            return Err(transport_error(
+                0x04,
+                frame_type,
+                "peer exceeded the stream limit",
             ));
         }
-        let mut s = Stream::fresh();
-        s.send_max = self.peer_send_limit(id);
-        self.streams.insert(id, s);
-        if is_uni(id) {
-            self.accept_uni.push_back(id);
-        } else {
-            self.accept_bidi.push_back(id);
+        let bits = id & 3;
+        for ordinal in self.peer_streams_opened[kind]..opened {
+            let opened_id = ordinal * 4 + bits;
+            let mut s = Stream::fresh();
+            s.send_max = self.peer_send_limit(opened_id);
+            self.streams.insert(opened_id, s);
+            if kind_uni {
+                self.accept_uni.push_back(opened_id);
+            } else {
+                self.accept_bidi.push_back(opened_id);
+            }
         }
+        self.peer_streams_opened[kind] = opened;
         Ok(())
     }
 }
@@ -3351,6 +3667,13 @@ mod tests {
 
     fn test_keys() -> DirectionalKeys {
         DirectionalKeys::from_secret(CipherSuite::Aes128GcmSha256, &[0x42u8; 32]).unwrap()
+    }
+
+    fn assert_transport_error(error: QuicTlsError, expected: u64) {
+        assert!(
+            matches!(error, QuicTlsError::Transport { error_code, .. } if error_code == expected),
+            "expected transport error {expected:#x}, got {error:?}"
+        );
     }
 
     #[test]
@@ -3531,11 +3854,12 @@ mod tests {
             .to_vec()
     }
 
-    /// A valid server transport-parameters blob (16 MiB conn / 2 MiB stream
-    /// windows) so flow control admits real data. (Reusing the Safari encoding is
-    /// fine for the test — only the limits matter here, not the fingerprint.)
+    /// Server transport parameters with full test concurrency and receive windows.
     fn server_tp() -> Vec<u8> {
-        TransportParameters::safari_client(&[]).encode_safari_client()
+        let mut tp = TransportParameters::server(&[]);
+        tp.initial_max_streams_bidi = MAX_PEER_STREAMS as u64;
+        tp.initial_max_streams_uni = MAX_PEER_STREAMS as u64;
+        tp.encode_server()
     }
 
     #[test]
@@ -4143,7 +4467,10 @@ mod tests {
     /// to send (handshake CRYPTO + ACKs, then 1-RTT data). Lossless, so a single
     /// `now` suffices (no timers fire).
     fn drive(a: &mut Connection, b: &mut Connection) {
-        let now = Instant::now();
+        drive_at(a, b, Instant::now());
+    }
+
+    fn drive_at(a: &mut Connection, b: &mut Connection, now: Instant) {
         for _ in 0..16 {
             let mut moved = false;
             while let Some(dg) = a.poll_transmit(now) {
@@ -4174,6 +4501,11 @@ mod tests {
             while let Some(dg) = a.poll_transmit(now) {
                 from_a.extend_from_slice(&dg);
                 moved = true;
+                // A short header has no Length field and must end the datagram.
+                if dg[0] & 0x80 == 0 {
+                    b.handle_datagram(&from_a, now).unwrap();
+                    from_a.clear();
+                }
             }
             if !from_a.is_empty() {
                 b.handle_datagram(&from_a, now).unwrap();
@@ -4182,6 +4514,10 @@ mod tests {
             while let Some(dg) = b.poll_transmit(now) {
                 from_b.extend_from_slice(&dg);
                 moved = true;
+                if dg[0] & 0x80 == 0 {
+                    a.handle_datagram(&from_b, now).unwrap();
+                    from_b.clear();
+                }
             }
             if !from_b.is_empty() {
                 a.handle_datagram(&from_b, now).unwrap();
@@ -4458,8 +4794,8 @@ mod tests {
                 "{side} step {step} stream {id}: offset index diverged from the sent_content scan"
             );
         }
-        // Every scanned stream id exists in `streams` (streams are never removed),
-        // so the loop above covered the whole scan; assert that assumption.
+        // Streams retire only after their in-flight ranges have drained, so the
+        // loop above must still cover every stream referenced by sent_content.
         for id in scan.keys() {
             assert!(
                 c.streams.contains_key(id),
@@ -4723,6 +5059,90 @@ mod tests {
             client.current_mtu() <= super::super::pmtud::MAX_MTU,
             "MTU never exceeds the search ceiling"
         );
+    }
+
+    #[test]
+    fn lost_stream_ranges_shrink_after_a_path_mtu_blackhole() {
+        let mut now = Instant::now();
+        let dcid = ConnectionId::new(&[0x6e; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x6e; 4]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+
+        // Validate a large MTU, then model a route that only carries BASE-sized
+        // datagrams. Bypass pacing to isolate packetization and loss recovery.
+        while client.pmtud.next_probe_size().is_some() {
+            client.pmtud.on_probe_acked();
+        }
+        let base = super::super::pmtud::BASE_MTU;
+        assert!(client.current_mtu() > base);
+        let payload: Vec<u8> = (0..5500u32).map(|i| (i % 251) as u8).collect();
+        client.send_stream(RELAY_STREAM_ID, &payload);
+        client.finish_stream(RELAY_STREAM_ID);
+        let mut dropped = 0;
+        while client.next_stream_to_send().is_some() {
+            let dg = client.build_stream_packet(RELAY_STREAM_ID, now);
+            assert!(dg.len() > base, "the smaller path drops each old packet");
+            dropped += 1;
+        }
+        assert_eq!(dropped, 4);
+        let charged = client.send_data_total;
+        client.send_max_data = charged;
+        client.streams.get_mut(&RELAY_STREAM_ID).unwrap().send_max = payload.len() as u64;
+
+        // A small PING traverses the new path; its ACK and the subsequent loss
+        // timer declare all four oversized STREAM packets lost and reset PMTU.
+        now += Duration::from_millis(10);
+        let ping = client.build_ping_packet(now);
+        assert!(ping.len() <= base);
+        server.handle_datagram(&ping, now).unwrap();
+        let ack = server.build_ack_packet(SPACE_DATA, now);
+        client.handle_datagram(&ack, now).unwrap();
+        now += Duration::from_secs(1);
+        client.handle_timeout(now);
+        assert_eq!(client.current_mtu(), base, "blackhole reset reached BASE");
+        assert_eq!(client.streams[&RELAY_STREAM_ID].retransmit.len(), dropped);
+        assert_index_mirrors_scan(&client, "client", 0);
+
+        let mut offset = 0;
+        let mut retransmitted = 0;
+        while client.next_stream_to_send().is_some() {
+            let dg = client.build_stream_packet(RELAY_STREAM_ID, now);
+            assert!(dg.len() <= base, "retransmission fits the smaller path");
+            let content = client.spaces[SPACE_DATA]
+                .sent_content
+                .last_key_value()
+                .unwrap()
+                .1;
+            let &(id, off, len, fin) = content.stream.first().unwrap();
+            assert_eq!((id, off), (RELAY_STREAM_ID, offset));
+            offset += len;
+            assert_eq!(fin, offset == payload.len() as u64);
+            assert_eq!(client.send_data_total, charged, "resends consume no credit");
+            server.handle_datagram(&dg, now).unwrap();
+            let ack = server.build_ack_packet(SPACE_DATA, now);
+            client.handle_datagram(&ack, now).unwrap();
+            retransmitted += 1;
+            assert_index_mirrors_scan(&client, "client", retransmitted);
+        }
+        assert!(retransmitted > dropped, "lost ranges were split");
+        assert_eq!(offset, payload.len() as u64);
+        assert!(
+            server.stream_recv_finished(RELAY_STREAM_ID),
+            "FIN recovered"
+        );
+        assert_eq!(server.read_stream(RELAY_STREAM_ID), payload);
+        assert!(client.streams[&RELAY_STREAM_ID].send.is_empty());
+        assert!(client.streams[&RELAY_STREAM_ID].fin_acked);
     }
 
     #[test]
@@ -5290,10 +5710,7 @@ mod tests {
         let err = server
             .handle_datagram(&forged, now)
             .expect_err("a forged STREAM in the Initial space is a protocol violation");
-        assert!(
-            matches!(err, QuicTlsError::Protocol(_)),
-            "expected PROTOCOL_VIOLATION, got {err:?}"
-        );
+        assert_transport_error(err, 0x0a);
     }
 
     #[test]
@@ -5491,7 +5908,8 @@ mod tests {
                 // Each fragment extends the previous by one byte, so it is not a
                 // full duplicate (it is buffered) but costs only delta == 1 after
                 // the first (which charges its full length).
-                if server.recv_stream(id, i + 1, false, &chunk).is_err() {
+                if let Err(error) = server.recv_stream(id, i + 1, false, &chunk) {
+                    assert_transport_error(error, 0x01);
                     rejected = true;
                     break 'streams;
                 }
@@ -5518,6 +5936,248 @@ mod tests {
     }
 
     #[test]
+    fn sequential_finished_streams_replenish_credit_and_release_state() {
+        let dcid = ConnectionId::new(&[0x71; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            TransportParameters::server(&[]).encode_server(),
+            ConnectionId::new(&[0x72; 8]),
+        )
+        .unwrap();
+        let start = Instant::now();
+        drive_at(&mut client, &mut server, start);
+        for iteration in 0..(MAX_PEER_STREAMS * 3) {
+            let now = start + Duration::from_millis(iteration as u64 * 10);
+            let id = client.open_bi();
+            client.send_stream(id, b"request");
+            client.finish_stream(id);
+            drive_at(&mut client, &mut server, now);
+            assert_eq!(server.accept_bi(), Some(id));
+            assert_eq!(server.read_stream(id), b"request");
+            server.send_stream(id, b"response");
+            server.finish_stream(id);
+            drive_at(&mut client, &mut server, now);
+            assert_eq!(client.read_stream(id), b"response");
+            assert!(client.stream_recv_finished(id));
+            drive_at(&mut client, &mut server, now);
+            assert!(
+                client.streams.is_empty(),
+                "client retained finished stream {id}"
+            );
+            assert!(
+                server.streams.is_empty(),
+                "server retained finished stream {id}"
+            );
+        }
+        assert!(!client.is_closed() && !server.is_closed());
+        assert!(client.send_max_streams[0] > MAX_PEER_STREAMS as u64);
+        let received = server.recv_data_total;
+        let consumed = server.recv_data_consumed;
+        // Fresh packets may retransmit an old STREAM or RESET after retirement.
+        // Neither the stream nor its flow-control charge may be resurrected.
+        server.recv_stream(0, 0, true, b"request").unwrap();
+        server.recv_reset_stream(0, 9, 7).unwrap();
+        client.send_stream(0, b"late write");
+        client.reset_stream(0, 9);
+        assert!(client.streams.is_empty() && server.streams.is_empty());
+        assert_eq!(
+            (server.recv_data_total, server.recv_data_consumed),
+            (received, consumed)
+        );
+        assert!(server.accept_bidi.is_empty());
+        // STOP_SENDING must elicit RESET_STREAM even for a newly opened empty
+        // request; otherwise cancelled streams can never finish both halves.
+        for iteration in 0..MAX_PEER_STREAMS * 2 {
+            let now = start + Duration::from_secs(3) + Duration::from_millis(iteration as u64 * 10);
+            let id = client.open_bi();
+            client.cancel_stream(id, 0x10c);
+            drive_at(&mut client, &mut server, now);
+            assert_eq!(server.accept_bi(), None);
+            drive_at(&mut client, &mut server, now);
+            assert!(client.streams.is_empty() && server.streams.is_empty());
+        }
+    }
+
+    #[test]
+    fn implicit_stream_opening_and_advertised_credit_are_bounded() {
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            TransportParameters::server(&[]).encode_server(),
+            ConnectionId::new(&[0x73; 8]),
+        )
+        .unwrap();
+        // The initial server transport parameters grant only two bidis. Merely
+        // intending to send a larger MAX_STREAMS is not permission to use it.
+        assert!(server.recv_stream(8, 0, false, b"").is_err());
+        assert!(server.streams.is_empty());
+        server.recv_max_streams_sent[0] = MAX_PEER_STREAMS as u64;
+        let last = (MAX_PEER_STREAMS as u64 - 1) * 4;
+        server.recv_stream(last, 0, false, b"").unwrap();
+        assert_eq!(server.streams.len(), MAX_PEER_STREAMS);
+        assert_eq!(server.accept_bidi.len(), MAX_PEER_STREAMS);
+        assert!(server.recv_stream(last + 4, 0, false, b"").is_err());
+        assert!(server.recv_stream((1 << 60) * 4, 0, false, b"").is_err());
+        assert_eq!(server.streams.len(), MAX_PEER_STREAMS);
+        assert_eq!(server.peer_streams_opened[0], MAX_PEER_STREAMS as u64);
+    }
+
+    #[test]
+    fn finished_uni_retains_fin_until_ack_and_ignores_fresh_packet_retransmit() {
+        let dcid = ConnectionId::new(&[0x74; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x75; 8]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        let id = client.open_uni();
+        client.send_stream(id, b"control");
+        client.finish_stream(id);
+        let now = Instant::now();
+        let first = client.build_stream_packet(id, now);
+        server.handle_datagram(&first, now).unwrap();
+        assert_eq!(server.accept_uni(), Some(id));
+        assert_eq!(server.read_stream(id), b"control");
+        assert!(!server.streams.contains_key(&id));
+        assert!(
+            client.streams.contains_key(&id),
+            "FIN has not been acknowledged"
+        );
+        // A PTO replaces the unacknowledged FIN packet. The receiver has already
+        // retired the stream, but must acknowledge its retransmission in a new PN.
+        client.queue_probe();
+        assert_eq!(client.next_stream_to_send(), Some(id));
+        let retry = client.build_stream_packet(id, now);
+        server.handle_datagram(&retry, now).unwrap();
+        assert!(!server.streams.contains_key(&id));
+        assert!(server.accept_uni().is_none());
+        drive(&mut client, &mut server);
+        assert!(!client.streams.contains_key(&id));
+        assert_eq!(server.recv_data_total, 7);
+        assert_eq!(server.recv_data_consumed, 7);
+        // A lost grant must re-arm even if a newer grant has since been queued.
+        let mut lost = SentContent::default();
+        lost.max_streams[1] = true;
+        server.need_max_streams = [false; 2];
+        server.requeue(SPACE_DATA, lost);
+        assert!(server.need_max_streams[1]);
+    }
+
+    #[test]
+    fn send_only_uni_rejects_receive_frames_before_and_after_retirement() {
+        let dcid = ConnectionId::new(&[0x76; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x77; 8]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        let id = client.open_uni();
+        for retired in [false, true] {
+            if retired {
+                client.finish_stream(id);
+                drive(&mut client, &mut server);
+                assert!(client.stream_retired(id), "FIN must be acknowledged");
+            }
+            let before = (
+                client.recv_data_total,
+                client.recv_data_consumed,
+                client.recv_pending_total,
+                client.recv_max_data,
+                client.need_max_data,
+                client.streams.len(),
+            );
+            let stream_err = client
+                .recv_stream(id, 1, false, b"x")
+                .expect_err("STREAM on a send-only uni must be rejected");
+            assert!(matches!(
+                stream_err,
+                QuicTlsError::Transport {
+                    error_code: 0x05,
+                    frame_type: 0x08,
+                    ..
+                }
+            ));
+            let reset_err = client
+                .recv_reset_stream(id, 7, 2)
+                .expect_err("RESET_STREAM on a send-only uni must be rejected");
+            assert!(matches!(
+                reset_err,
+                QuicTlsError::Transport {
+                    error_code: 0x05,
+                    frame_type: 0x04,
+                    ..
+                }
+            ));
+            assert_eq!(
+                (
+                    client.recv_data_total,
+                    client.recv_data_consumed,
+                    client.recv_pending_total,
+                    client.recv_max_data,
+                    client.need_max_data,
+                    client.streams.len(),
+                ),
+                before,
+                "invalid receive frames must not change accounting (retired={retired})"
+            );
+            if let Some(s) = client.streams.get(&id) {
+                assert_eq!(
+                    (s.recv_high, s.recv_off, s.recv_consumed, s.recv_credited),
+                    (0, 0, 0, 0)
+                );
+                assert!(s.recv_fin.is_none() && s.recv_reset.is_none());
+                assert!(s.recv.is_empty() && s.recv_pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn receive_direction_guard_allows_peer_uni_and_both_bidi_directions() {
+        let dcid = ConnectionId::new(&[0x78; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        client.recv_max_streams_sent = [MAX_PEER_STREAMS as u64; 2];
+        let local_bidi = client.open_bi();
+        for (id, data) in [
+            (local_bidi, b"local bidi".as_slice()),
+            (1, b"peer bidi"),
+            (3, b"peer uni"),
+        ] {
+            client.recv_stream(id, 0, true, data).unwrap();
+            assert_eq!(client.read_stream(id), data);
+        }
+        // RESET_STREAM is valid on the same three receive-capable kinds, too.
+        for id in [local_bidi, 1, 7] {
+            let final_size = client.streams.get(&id).map_or(0, |s| s.recv_high);
+            client.recv_reset_stream(id, 9, final_size).unwrap();
+            assert_eq!(client.stream_reset(id), Some(9));
+        }
+        assert_eq!(client.recv_pending_total, 0);
+        assert_eq!(client.recv_data_total, client.recv_data_consumed);
+    }
+
+    #[test]
     fn peer_cannot_open_a_locally_initiated_stream() {
         // A client never opened stream 0 (client-initiated bidi); a peer STREAM frame
         // for it is a STREAM_STATE_ERROR and must not bypass the peer-stream cap.
@@ -5528,7 +6188,7 @@ mod tests {
         let err = client
             .recv_stream(0, 0, false, b"x")
             .expect_err("a peer may not open a locally-initiated stream");
-        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert_transport_error(err, 0x05);
     }
 
     #[test]
@@ -5546,11 +6206,11 @@ mod tests {
         let err = server
             .recv_stream(0, 5, false, b"more")
             .expect_err("data past the final size is rejected");
-        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert_transport_error(err, 0x06);
         let err2 = server
             .recv_stream(0, 0, true, b"hi")
             .expect_err("a conflicting final size is rejected");
-        assert!(matches!(err2, QuicTlsError::Protocol(_)), "got {err2:?}");
+        assert_transport_error(err2, 0x06);
     }
 
     #[test]
@@ -5567,7 +6227,7 @@ mod tests {
         let err = server
             .recv_reset_stream(0, 7, 100)
             .expect_err("a reset below data already received is rejected");
-        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert_transport_error(err, 0x06);
         // A consistent reset (final size >= received) is accepted.
         server.recv_reset_stream(0, 7, 200).unwrap();
     }
@@ -5591,7 +6251,7 @@ mod tests {
         let err = server
             .recv_stream(0, STREAM_RECV_WINDOW + 1, false, b"x")
             .expect_err("exceeding a fresh stream's window is rejected");
-        assert!(matches!(err, QuicTlsError::Crypto(_)), "got {err:?}");
+        assert_transport_error(err, 0x03);
         assert!(
             !server.streams.contains_key(&0),
             "a rejected opening STREAM must not leave the stream inserted"
@@ -5604,7 +6264,7 @@ mod tests {
 
     #[test]
     fn stream_offset_overflow_is_rejected_without_opening() {
-        // offset + len overflowing u64 is a protocol violation (the offset can
+        // offset + len overflowing u64 is a frame encoding error (the offset can
         // never fall inside any window). It must be rejected before any state
         // mutation — and must not panic (debug) or wrap past the window (release).
         let mut server = Connection::new_server(
@@ -5618,7 +6278,7 @@ mod tests {
         let err = server
             .recv_stream(0, u64::MAX, false, b"xx")
             .expect_err("an offset that overflows u64 is rejected");
-        assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
+        assert_transport_error(err, 0x07);
         assert!(
             !server.streams.contains_key(&0),
             "an overflowing STREAM must not leave the stream inserted"
@@ -5663,6 +6323,43 @@ mod tests {
         client.send_stream(RELAY_STREAM_ID, msg);
         drive(&mut client, &mut server);
         assert_eq!(server.read_stream(RELAY_STREAM_ID), msg);
+    }
+
+    #[test]
+    fn late_initial_cannot_reopen_discarded_keys_or_refresh_idle_time() {
+        let dcid = ConnectionId::new(&[0x3a; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x3a; 4]),
+        )
+        .unwrap();
+        let now = Instant::now();
+        let initial = client.poll_transmit(now).expect("first Initial");
+        server.handle_datagram(&initial, now).unwrap();
+        drive(&mut client, &mut server);
+        assert!(server.handshake_confirmed);
+        assert!(server.spaces[SPACE_INITIAL].keys.is_none());
+        let last_recv = server.last_recv_time;
+
+        // Delayed/replayed handshake traffic cannot restore a discarded space,
+        // including its public keys, packet-number set, or idle activity.
+        server
+            .handle_datagram(&initial, now + Duration::from_secs(1))
+            .unwrap();
+        assert!(server.spaces[SPACE_INITIAL].keys.is_none());
+        assert_eq!(server.spaces[SPACE_INITIAL].recv.largest(), None);
+        assert_eq!(server.last_recv_time, last_recv);
+        assert!(!server.is_closed());
+
+        client.send_stream(RELAY_STREAM_ID, b"still established");
+        drive(&mut client, &mut server);
+        assert_eq!(server.read_stream(RELAY_STREAM_ID), b"still established");
     }
 
     #[test]

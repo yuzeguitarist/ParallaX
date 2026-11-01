@@ -71,6 +71,15 @@ jobs:
       # toolchain rather than spending a separate rounded-up job-minute.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+      - name: Maintenance regression tests
+        run: |
+          command -v git
+          command -v gh
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+          python3 -m unittest discover -s tests -p 'test_*.py'
+          python3 -m unittest discover -s ops/fuzz-cluster/tests -p 'test_*.py'
+          python3 -m unittest discover -s fuzz/ci -p 'test_*.py'
+          python3 scripts/wiki_sync/test_convert.py
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -105,6 +114,7 @@ jobs:
             --bins \
             --test chaos_liveness \
             --test ci_test_allowlist_complete \
+            --test deploy_seal_interruption \
             --test distinguisher_battery \
             --test e2e_tunnel_roundtrip \
             --test gfw_live_replay \
@@ -115,6 +125,7 @@ jobs:
             --test no_timeout_ratchet \
             --test prober_loop \
             --test safari_h2_parity_baseline \
+            --test safari_h2_settings \
             --test safari_h3_clienthello_0rtt_baseline \
             --test safari_h3_clienthello_baseline \
             --test safari_parity_baseline \

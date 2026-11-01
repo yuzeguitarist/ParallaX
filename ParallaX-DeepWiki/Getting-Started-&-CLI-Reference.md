@@ -60,7 +60,7 @@ all-in-one configs instead. All files are created with mode `0600` on Unix and
 | `plx config-template ...` | Print paired server/client TOML templates to stdout. | Advanced mode; no file writes. |
 | `plx probe [DEST] [-c FILE]` | Probe an explicit or config-derived camouflage target. | Accepts `domain`, `domain:port`, or `https://domain`. |
 | `plx init <DEST> ...` | Generate paired config files with fresh key material. | Secrets go into 0600 sidecar files by default; `--inline-secrets` writes the legacy all-in-one config. Use `-o DIR` to choose the output directory. |
-| `plx seal [-c FILE] [--output BUNDLE] [--host-key PATH]` | Encrypt a config's secrets into a machine-bound sealed bundle and rewrite the config to reference it. | Default bundle `<config-dir>/parallax.secrets.enc`; config + bundle are useless on any other machine. |
+| `plx seal [-c FILE] [--output BUNDLE] [--host-key PATH]` | Encrypt a config's secrets into a machine-bound sealed bundle and rewrite the config to reference it. | Default bundle `<config-path>.secrets.enc`; entries are scoped to the config, including with a shared `--output`. See [Secret Store & Sealed Configs](Secret-Store-&-Sealed-Configs.md) for re-sealing and migration. |
 
 There is no `--quic` CLI flag; the experimental UDP/QUIC fast plane is enabled via `[udp].enabled` in config, not the CLI.
 

@@ -26,6 +26,7 @@
 # Every gh/git network op is wrapped (|| true) so a transient failure never
 # kills the box; the next daily tick retries. Idempotent.
 set -uo pipefail
+umask 077
 
 export CARGO_HOME="${CARGO_HOME:-/var/lib/plxfuzz/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-/var/lib/plxfuzz/.rustup}"
@@ -41,6 +42,7 @@ read_cfg() { [ -r "$ETC/$1" ] && tr -d ' \t\r\n' < "$ETC/$1" || true; }
 
 NODE_ID="$(read_cfg node-id)"
 REPO="$(read_cfg repo)";        REPO="${REPO:-yuzeguitarist/ParallaX}"
+REPO_URL="https://github.com/${REPO}.git"
 TAG="$(read_cfg campaign-tag)"; TAG="${TAG:-fuzz-corpus-d240e663}"
 export GH_REPO="$REPO"
 export GH_TOKEN="${GH_TOKEN:-$(read_cfg pat)}"   # env, never argv (matches sync.sh)
@@ -98,23 +100,16 @@ rss_for() {
   printf '%s' "$rss"
 }
 
-# --- auth'd remote for the dedicated crash clone (PAT only in URL) ----------
-auth_remote() {
-  local tok=""
-  [ -r "$ETC/pat" ] && tok="$(tr -d ' \t\r\n' < "$ETC/pat" 2>/dev/null || true)"
-  if [ -n "$tok" ]; then printf 'https://x-access-token:%s@github.com/%s' "$tok" "$REPO"
-  else printf 'https://github.com/%s' "$REPO"; fi
-}
-
 # Best-effort: get the minimized crash repros for <target> into $1 (a dir).
 fetch_crash_repros() {
   local t="$1" dest="$2" cw="$STATE/branch-fuzz-crashes"
   mkdir -p "$dest" 2>/dev/null || true
   if [ ! -d "$cw/.git" ]; then
     rm -rf "$cw" 2>/dev/null || true
-    git clone --depth 1 --branch "$CRASH_BRANCH" --single-branch "$(auth_remote)" "$cw" -q 2>/dev/null || true
+    git clone --depth 1 --branch "$CRASH_BRANCH" --single-branch "$REPO_URL" "$cw" -q 2>/dev/null || true
   else
-    git -C "$cw" remote set-url origin "$(auth_remote)" 2>/dev/null || true
+    git -C "$cw" config --replace-all remote.origin.url "$REPO_URL" 2>/dev/null || return 0
+    git -C "$cw" config --unset-all remote.origin.pushurl 2>/dev/null || true
     git -C "$cw" fetch origin "$CRASH_BRANCH" -q 2>/dev/null || true
     git -C "$cw" reset --hard "origin/$CRASH_BRANCH" -q 2>/dev/null || true
   fi

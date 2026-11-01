@@ -3,12 +3,16 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};
@@ -20,7 +24,8 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, Notify, Semaphore, TryAcquireError},
+    sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
+    task::JoinSet,
     time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -80,7 +85,7 @@ use crate::{
         },
         tcp::{
             connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
-            is_fd_exhaustion_error, is_transient_accept_error, relay_connection_limit,
+            is_fd_exhaustion_error, is_transient_accept_error, server_relay_connection_limit,
             tune_tcp_stream,
         },
     },
@@ -171,11 +176,14 @@ const FALLBACK_IDLE_TIMEOUT_JITTER: Duration = Duration::from_secs(60);
 /// from the healthy [600s, 660s] band and thus a probe-separable "box at cap" state
 /// tell) is what keeps a cap-shed close's IDLE TIME indistinguishable from a healthy
 /// one (a pre-existing handshake-start dial-RTT difference is separate and unchanged).
-/// 64 userspace relays ~= 128 fds: a fixed reservation that cannot itself exhaust fds.
-/// Past the budget we degrade to a graceful FIN — a casual prober always lands
-/// inside it; only a genuine flood sees FINs, which a real origin under flood also
-/// produces.
-const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
+/// Cap-shed relays always use userspace, including on Linux: 64 relays ~= 128
+/// fds, reserved by the server's connection budget, without splice pipes/clones
+/// or native per-relay threads.
+/// Admission happens before spawning, so the budget also bounds waiting readers
+/// and lingering closes. When full, the accept loop waits with just its current
+/// socket rather than spawning more tasks or closing unread sockets with a RST.
+const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize =
+    crate::transport::tcp::MAX_CONCURRENT_CAP_SHED_FALLBACKS;
 
 /// Replayed-ClientHello close is detected only AFTER the full PQ exchange, so a
 /// replay's teardown lands at a near-fixed moment in the handshake (no server PQ
@@ -192,25 +200,20 @@ const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
 const REPLAY_CLOSE_DELAY_FLOOR: Duration = Duration::from_secs(0);
 const REPLAY_CLOSE_DELAY_JITTER: Duration = Duration::from_secs(60);
 
-static ACTIVE_CAP_SHED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+static CAP_SHED_FALLBACK_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CAP_SHED_FALLBACKS);
 
 /// RAII slot for a cap-shed fallback relay; releases the budget on drop.
-struct CapShedFallbackSlot(());
-impl Drop for CapShedFallbackSlot {
-    fn drop(&mut self) {
-        ACTIVE_CAP_SHED_FALLBACKS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
+type CapShedFallbackSlot = tokio::sync::SemaphorePermit<'static>;
 
 /// Takes a cap-shed fallback slot if the budget allows, else `None`.
+#[cfg(test)]
 fn try_enter_cap_shed_fallback() -> Option<CapShedFallbackSlot> {
-    let prev = ACTIVE_CAP_SHED_FALLBACKS.fetch_add(1, Ordering::AcqRel);
-    if prev >= MAX_CONCURRENT_CAP_SHED_FALLBACKS {
-        ACTIVE_CAP_SHED_FALLBACKS.fetch_sub(1, Ordering::AcqRel);
-        None
-    } else {
-        Some(CapShedFallbackSlot(()))
-    }
+    CAP_SHED_FALLBACK_SLOTS.try_acquire().ok()
+}
+
+#[cfg(test)]
+fn active_cap_shed_fallbacks() -> usize {
+    MAX_CONCURRENT_CAP_SHED_FALLBACKS - CAP_SHED_FALLBACK_SLOTS.available_permits()
 }
 const SERVER_IDENTITY_CHUNK_MIN_DELAY: Duration = Duration::from_millis(45);
 // The client's residual-skip byte budget, mirrored here only for the
@@ -288,8 +291,8 @@ const MAX_SPEED_TEST_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 const SERVER_MUX_FRAME_BATCH_LIMIT: usize = 64;
 /// Hard cap on concurrent mux substreams per authenticated connection. Excess
 /// `Open` frames are answered with `Reset` and never establish an outbound
-/// connection, so an authenticated client cannot use substreams to bypass the
-/// fd-based connection limit (which budgets ~2 fds per connection). Enforced by
+/// connection. The fd-based carrier limit reserves this many target sockets,
+/// using the lower of this cap and the server's configured stream count. Enforced by
 /// the server on its own terms rather than trusting the client's advertised
 /// `max_concurrent_streams`.
 const SERVER_MUX_MAX_STREAMS: usize = 256;
@@ -641,6 +644,19 @@ impl Drop for OfferRegistrationGuard {
     }
 }
 
+/// Keep QUIC cleanup armed through PX1P validation, command dispatch and the
+/// relay. A Connection handle's drop does not close its driver state, so every
+/// session exit (including `?` and cancellation) needs an explicit close.
+struct SessionQuicCloseGuard(Option<crate::transport::udp::quic::endpoint::Connection>);
+
+impl Drop for SessionQuicCloseGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = &self.0 {
+            conn.close(0u32.into(), b"session-ended");
+        }
+    }
+}
+
 /// Bind the stable origin-splice carrier: marker key = the shared PSK + the server's
 /// static X25519 private key (the same REALITY static key the TCP plane authenticates
 /// with), splice origin = the camouflage origin's UDP `:443` (resolved from
@@ -942,7 +958,10 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         }
     }
     let listener = TcpListener::bind(server.listen).await?;
-    let connection_limit = relay_connection_limit(udp.enabled)?;
+    let connection_limit = server_relay_connection_limit(
+        udp.enabled,
+        (traffic.max_concurrent_streams as usize).min(SERVER_MUX_MAX_STREAMS),
+    )?;
     let connection_slots = Arc::new(Semaphore::new(connection_limit));
     let source_limiter = SourceLimiter::new(
         server.max_concurrent_per_source_v4,
@@ -987,8 +1006,8 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
             Err(err) => return Err(err.into()),
         };
         // Per-source admission first, so a single source flooding the box is shed
-        // before it can burn a global permit. Rejects FIN (detached) like every
-        // other close path.
+        // before it can burn a global permit. Cap-shed admission must happen
+        // before spawning, including for connections that only need closing.
         let source_permit = match Arc::clone(&source_limiter).try_admit(peer.ip()) {
             Some(permit) => permit,
             None => {
@@ -1000,12 +1019,9 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 // origin ServerHello and cannot count our cap by the missing one;
                 // bounded by the 64-relay concurrency ceiling, with idle drawn from
                 // the SAME band as a healthy splice (so the close time is not a probe-
-                // separable "box at cap" tell), degrading to a graceful FIN past the
-                // budget. Detached so a flood at the cap cannot stall the loop.
-                tokio::spawn(cap_shed_fallback_or_fin(
-                    client,
-                    server.fallback_addr.clone(),
-                ));
+                // separable "box at cap" tell). At capacity, stop accepting until
+                // a slot opens; only this one socket waits outside the 64 slots.
+                drop(spawn_cap_shed_fallback(client, &server.fallback_addr).await);
                 continue;
             }
         };
@@ -1020,13 +1036,10 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 // Relay to the camouflage origin (H-1) so a prober still sees the
                 // origin ServerHello and cannot count our cap by the missing one.
                 // Bounded by the 64-relay concurrency ceiling, with idle unified with
-                // the healthy splice band (cap_shed_fallback_or_fin), degrading to a
-                // graceful FIN past the budget. Detached so a connection flood at the
-                // limit cannot stall the accept loop.
-                tokio::spawn(cap_shed_fallback_or_fin(
-                    client,
-                    server.fallback_addr.clone(),
-                ));
+                // the healthy splice band. Release the unused source admission
+                // before waiting in the accept loop for a cap-shed slot.
+                drop(source_permit);
+                drop(spawn_cap_shed_fallback(client, &server.fallback_addr).await);
                 continue;
             }
             Err(TryAcquireError::Closed) => {
@@ -1041,7 +1054,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         let replay_cache = Arc::clone(&replay_cache);
         let secrets = secrets.clone();
         tokio::spawn(async move {
-            let _connection_permit = connection_permit;
+            let connection_permit = Arc::new(connection_permit);
             let _source_permit = source_permit;
             if let Err(err) = handle_connection_with_replay(
                 client,
@@ -1052,6 +1065,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 replay_cache,
                 &secrets,
                 cid,
+                &connection_permit,
             )
             .await
             {
@@ -1070,7 +1084,7 @@ pub async fn handle_connection(
 ) -> Result<(), HandshakeServerError> {
     let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let secrets = ServerRuntimeSecrets::decode(config)?;
-    handle_connection_inner(client, config, traffic, udp, psk, None, &secrets, cid).await
+    handle_connection_inner(client, config, traffic, udp, psk, None, &secrets, cid, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1083,6 +1097,7 @@ async fn handle_connection_with_replay(
     replay_cache: Arc<Mutex<ReplayCache>>,
     secrets: &ServerRuntimeSecrets,
     cid: u64,
+    admission: &Arc<OwnedSemaphorePermit>,
 ) -> Result<(), HandshakeServerError> {
     handle_connection_inner(
         client,
@@ -1093,6 +1108,7 @@ async fn handle_connection_with_replay(
         Some(replay_cache),
         secrets,
         cid,
+        Some(admission),
     )
     .await
 }
@@ -1107,6 +1123,7 @@ async fn handle_connection_inner(
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
     secrets: &ServerRuntimeSecrets,
     cid: u64,
+    admission: Option<&Arc<OwnedSemaphorePermit>>,
 ) -> Result<(), HandshakeServerError> {
     tune_tcp_stream(&client)?;
     tracing::info!(
@@ -1158,11 +1175,7 @@ async fn handle_connection_inner(
             // legitimate, already-authenticated client up to two seconds of extra
             // handshake latency for cleanup it has no stake in.
             if let Some(spare) = predialed_origin {
-                tokio::spawn(async move {
-                    if let Some(spare) = spare.into_stream().await {
-                        graceful_close_tcp_stream(spare).await;
-                    }
-                });
+                drop(release_predialed_origin(spare, admission.cloned()));
             }
             let AuthenticatedInbound {
                 hello: client_hello,
@@ -1201,6 +1214,7 @@ async fn handle_connection_inner(
                 udp,
                 pending_replay,
                 cid,
+                admission,
             )
             .await?;
         }
@@ -1683,11 +1697,24 @@ async fn graceful_close_tcp_stream(mut stream: TcpStream) {
     graceful_fin_then_drain_stream(&mut stream).await;
 }
 
-/// Cap-rejection close that stays indistinguishable from the origin (H-1): relay
-/// to the camouflage origin so the client still gets a real ServerHello, bounded by
-/// the 64-relay concurrency ceiling with the idle drawn from the SAME band as a
-/// healthy splice; if the budget is full or the origin dial fails, fall back to a
-/// graceful FIN (the prior behavior).
+/// Reserve the entire cap-shed lifetime before creating a task. When full, wait
+/// in the accept loop with its current socket, applying listener backpressure
+/// without another task or peer-EOF drain. Once admitted, use the same splice and
+/// FIN/drain as any other cap-shed connection, including already-queued input.
+async fn spawn_cap_shed_fallback(
+    client: TcpStream,
+    fallback_addr: &str,
+) -> tokio::task::JoinHandle<()> {
+    let slot = CAP_SHED_FALLBACK_SLOTS
+        .acquire()
+        .await
+        .expect("cap-shed semaphore is never closed");
+    tokio::spawn(cap_shed_fallback(client, fallback_addr.to_owned(), slot))
+}
+
+/// Cap-rejection relay that stays indistinguishable from the origin (H-1) while
+/// inside the 64-slot budget: relay the real ServerHello and use the healthy
+/// splice's idle band. The slot covers first-read, origin dial, relay and teardown.
 ///
 /// L8: read the client's first record BEFORE dialing the origin, then forward it —
 /// mirroring the healthy splice's dial-AFTER-read ordering. Dialing upfront with an
@@ -1705,7 +1732,11 @@ async fn graceful_close_tcp_stream(mut stream: TcpStream) {
 /// this path pre-auth simply by tripping the connection cap from its own address, so
 /// the difference is externally selectable; sharing the reader keeps both paths on
 /// one origin-dial schedule.
-async fn cap_shed_fallback_or_fin(mut client: TcpStream, fallback_addr: String) {
+async fn cap_shed_fallback(
+    mut client: TcpStream,
+    fallback_addr: String,
+    _slot: CapShedFallbackSlot,
+) {
     // Tune the client socket exactly as the healthy path does (`run_server_connection`).
     // Without this a cap-shed splice ran with Nagle on, default buffers and no
     // quickack while every other connection did not, so its ACK cadence, advertised
@@ -1714,10 +1745,6 @@ async fn cap_shed_fallback_or_fin(mut client: TcpStream, fallback_addr: String) 
     // has a caller to return to, and failing to tune is not a reason to deviate from
     // the origin-facing splice.
     let _ = tune_tcp_stream(&client);
-    let Some(_slot) = try_enter_cap_shed_fallback() else {
-        graceful_close_tcp_stream(client).await;
-        return;
-    };
     // Read the ClientHello (or the partial give-up prefix) first, exactly as the
     // healthy path does, so the origin dial happens AFTER the read on both paths —
     // and pre-dials on the same schedule for a silent peer.
@@ -1757,8 +1784,15 @@ async fn cap_shed_fallback_or_fin(mut client: TcpStream, fallback_addr: String) 
             // idle origin connections is negligible for any real origin: bounded, no
             // growth. That fixed concurrency bound, not a tightened idle, is the
             // actual resource backstop.
-            let _ =
-                relay_fallback_with_idle_timeout(client, fallback, cap_shed_fallback_idle()).await;
+            // The cap-shed fd reservation covers exactly the client/origin pair.
+            // Bypass the Linux kernel-splice selector: its cloned descriptors,
+            // pipes and native threads would exceed that two-fd reservation.
+            let _ = relay_fallback_userspace_with_idle_timeout(
+                client,
+                fallback,
+                cap_shed_fallback_idle(),
+            )
+            .await;
         }
         Err(_) => graceful_close_tcp_stream(client).await,
     }
@@ -1773,24 +1807,24 @@ async fn relay_fallback_with_idle_timeout(
     #[cfg(target_os = "linux")]
     {
         if crate::transport::tcp::kernel_splice_available() {
-            // Bound concurrent kernel-splice relays: each holds ~8 fds + 2 native
-            // threads, far above the 2 fds the admission semaphore budgets, so
-            // unauthenticated fallback floods could exhaust fds/threads first.
-            // Beyond the cap, fall through to the userspace relay (2 fds, no
-            // native threads), which scales without per-relay threads.
-            if let Some(_splice_slot) = crate::transport::tcp::try_enter_kernel_splice_relay() {
+            // Reserve all 8 splice fds from the shared optional pool as well as
+            // a native-thread slot. Blocking workers retain that reservation if
+            // the async caller is cancelled and releases its base admission.
+            // Without headroom, use the userspace socket pair instead.
+            if let Some(splice_slot) = crate::transport::tcp::try_enter_kernel_splice_relay() {
                 tracing::debug!("using Linux splice(2) kernel relay for fallback TCP tunnel");
                 crate::transport::tcp::record_kernel_splice_relay();
                 return crate::transport::tcp::relay_kernel_splice_bidirectional_with_idle_timeout(
                     client,
                     fallback,
                     idle_timeout,
+                    splice_slot,
                 )
                 .await
                 .map_err(HandshakeServerError::Io);
             }
             tracing::debug!(
-                "kernel splice relay cap reached; using userspace fallback relay instead"
+                "kernel splice relay cap or fd budget reached; using userspace fallback relay instead"
             );
             crate::transport::tcp::record_userspace_cap_hit_relay();
         }
@@ -1799,6 +1833,17 @@ async fn relay_fallback_with_idle_timeout(
     #[cfg(not(target_os = "linux"))]
     crate::transport::tcp::record_userspace_non_linux_relay();
 
+    relay_fallback_userspace_with_idle_timeout(client, fallback, idle_timeout).await
+}
+
+/// Userspace splice with only its client/origin socket pair. Shared by ordinary
+/// fallbacks that cannot use kernel splice and every cap-shed relay, whose fd
+/// reservation deliberately excludes the kernel path's extra descriptors.
+async fn relay_fallback_userspace_with_idle_timeout(
+    client: TcpStream,
+    fallback: TcpStream,
+    idle_timeout: Duration,
+) -> Result<(), HandshakeServerError> {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut fallback_read, mut fallback_write) = fallback.into_split();
 
@@ -2069,7 +2114,7 @@ enum PredialedOrigin {
     /// The read won while the dial was still in flight. Handed over rather than
     /// dropped so the splice path awaits THIS connect instead of starting a
     /// second one to the same origin.
-    Pending(tokio::task::JoinHandle<Result<TcpStream, HandshakeServerError>>),
+    Pending(Pin<Box<dyn Future<Output = Result<TcpStream, HandshakeServerError>> + Send>>),
 }
 
 impl PredialedOrigin {
@@ -2078,9 +2123,21 @@ impl PredialedOrigin {
     async fn into_stream(self) -> Option<TcpStream> {
         match self {
             Self::Ready(stream) => Some(stream),
-            Self::Pending(handle) => handle.await.ok().and_then(Result::ok),
+            Self::Pending(dial) => dial.await.ok(),
         }
     }
+}
+
+fn release_predialed_origin(
+    spare: PredialedOrigin,
+    admission: Option<Arc<OwnedSemaphorePermit>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _admission = admission;
+        if let Some(spare) = spare.into_stream().await {
+            graceful_close_tcp_stream(spare).await;
+        }
+    })
 }
 
 /// The first-record read plus any origin connection opened while waiting for it.
@@ -2122,23 +2179,20 @@ async fn read_first_client_record_predialing(
     // the remaining client-facing budget, so the eventual close time is driven by
     // the origin rather than by our local give-up.
     //
-    // The dial runs as its own task rather than as a future polled by the select
-    // below, because the read can win the race while the dial is still in flight.
-    // A future dropped at that point abandons a connect that may already have
-    // completed the TCP handshake at the origin, and the splice path would then
-    // dial a SECOND time — two origin connections where a real client makes one,
-    // which is the establishment-pattern tell this whole path exists to avoid.
-    // Owning it as a task lets the winner hand it onward instead.
+    // Keep the dial pinned so a winning read can hand the SAME in-flight future
+    // onward without abandoning/restarting it. Unlike a detached task, cancelling
+    // the owning connection immediately drops its pending sockets too.
     //
     // Socket setup must match `connect_and_forward_to_fallback` exactly, so a
     // pre-dialed origin connection is byte-for-byte interchangeable with one
     // dialed at give-up time.
     let addr = fallback_addr.to_owned();
-    let mut dial = tokio::spawn(async move {
-        let stream = connect_tcp_with_timeout(&addr).await?;
-        tune_tcp_stream(&stream)?;
-        Ok::<TcpStream, HandshakeServerError>(stream)
-    });
+    let mut dial: Pin<Box<dyn Future<Output = Result<TcpStream, HandshakeServerError>> + Send>> =
+        Box::pin(async move {
+            let stream = connect_tcp_with_timeout(&addr).await?;
+            tune_tcp_stream(&stream)?;
+            Ok::<TcpStream, HandshakeServerError>(stream)
+        });
     let mut predialed_origin = None;
     let mut dial_settled = false;
 
@@ -2150,20 +2204,14 @@ async fn read_first_client_record_predialing(
                     Ok(read) => read,
                     Err(err) => {
                         // The client failed/timed out before we could use the origin.
-                        // Do NOT just drop the handle: tokio detaches a dropped
-                        // JoinHandle, so the connect still completes and the socket
-                        // is then bare-dropped with nobody to FIN it. Release it the
-                        // same way the authenticated path releases its spare, so a
-                        // client that hangs up mid-pre-dial costs the origin one
-                        // gracefully-closed connection, not an abandoned one.
+                        // Keep cleanup within the connection's admission lifetime: a
+                        // detached cleanup could outlive and bypass cap-shed slots.
                         let spare = predialed_origin.map(PredialedOrigin::Ready)
                             .or((!dial_settled).then_some(PredialedOrigin::Pending(dial)));
                         if let Some(spare) = spare {
-                            tokio::spawn(async move {
-                                if let Some(spare) = spare.into_stream().await {
-                                    graceful_close_tcp_stream(spare).await;
-                                }
-                            });
+                            if let Some(spare) = spare.into_stream().await {
+                                graceful_close_tcp_stream(spare).await;
+                            }
                         }
                         return Err(err);
                     }
@@ -2179,9 +2227,9 @@ async fn read_first_client_record_predialing(
             }
             dialed = &mut dial, if !dial_settled => {
                 dial_settled = true;
-                // A dial error (or a panicked/cancelled task) means no pre-dial and
+                // A dial error means no pre-dial and
                 // the splice path dials at give-up, exactly as before this change.
-                predialed_origin = dialed.ok().and_then(Result::ok);
+                predialed_origin = dialed.ok();
             }
         }
     }
@@ -2266,7 +2314,8 @@ where
 }
 
 async fn connect_tcp_with_timeout(addr: &str) -> Result<TcpStream, HandshakeServerError> {
-    connect_future_with_timeout(connect_tuned_tcp_host(addr), HANDSHAKE_TIMEOUT).await
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    connect_future_with_timeout(connect_tuned_tcp_host(addr, deadline), HANDSHAKE_TIMEOUT).await
 }
 
 async fn connect_future_with_timeout<F>(
@@ -2292,6 +2341,7 @@ async fn run_authenticated_data_mode(
     udp: &UdpConfig,
     mut pending_replay: Option<PendingReplayEntry>,
     cid: u64,
+    admission: Option<&Arc<OwnedSemaphorePermit>>,
 ) -> Result<(), HandshakeServerError> {
     handshake.session_keys.protect_secret_memory();
     let padding = PaddingProfile::from_config(traffic)?;
@@ -2668,6 +2718,7 @@ async fn run_authenticated_data_mode(
                         // (declined, probe not Verified, or udp.enabled=false), in
                         // which case the relay stays byte-identical on TCP.
                         let mut retained_quic: Option<ServerProbedQuic> = None;
+                        let mut quic_cleanup = SessionQuicCloseGuard(None);
 
                         // Client-initiated, fail-soft UDP negotiation (PX1G). The
                         // server NEVER offers UDP unsolicited. When udp.enabled it
@@ -2772,11 +2823,10 @@ async fn run_authenticated_data_mode(
                                     u64::from(udp.probe_timeout_ms.max(1)),
                                 )
                                 .saturating_mul(2);
-                                // Lift the accepted connection OUT of the timeout
-                                // scope so it can outlive the probe. quinn
-                                // application-closes a connection when its last
-                                // `Connection` handle drops, so we must hold it
-                                // (and the endpoint) for the relay's whole life.
+                                let probe_deadline = Instant::now() + probe_budget;
+                                // Retain the accepted connection and its H3 streams
+                                // beyond the negotiation deadline on success; the
+                                // helper explicitly closes it on timeout or failure.
                                 // `serve_probe` only QUEUES its reply, so the
                                 // connection must stay alive past the probe
                                 // regardless; here we additionally keep it for the
@@ -2791,38 +2841,46 @@ async fn run_authenticated_data_mode(
                                 // stay on TCP).
                                 let expect_ip = client_write.peer_addr().ok().map(|a| a.ip());
                                 // Await the carrier's handoff for this offer_id (bounded
-                                // by the probe budget), then serve the probe on the
-                                // routed connection. A timeout / dropped sender means no
-                                // client connected in time — unregister so the offer_id
-                                // does not leak, and stay on TCP.
+                                // by the probe deadline), then use the SAME deadline
+                                // for the H3 probe and SETTINGS exchange. A peer must
+                                // not escape the budget by completing the handoff and
+                                // then withholding a stream or frame.
                                 let probed_conn: Option<ServerProbedQuic> =
-                                    match tokio::time::timeout(probe_budget, rx).await {
-                                        Ok(Ok(conn))
+                                    match timeout_at(probe_deadline, rx).await {
+                                        Ok(Ok(pending)) => {
+                                            let conn = pending.into_connection();
+                                            // No await between taking the queued
+                                            // lease and installing session cleanup.
+                                            quic_cleanup.0 = Some(conn.clone());
                                             if expect_ip
-                                                .is_some_and(|ip| conn.remote_address().ip() == ip) =>
-                                        {
-                                            serve_probed_quic_on_conn(
-                                                conn,
-                                                sandwich_secret,
-                                                &offer_id,
-                                                cid,
-                                            )
-                                            .await
-                                        }
-                                        Ok(Ok(conn)) => {
-                                            tracing::debug!(
-                                                cid,
-                                                peer = %conn.remote_address(),
-                                                "declining fast-plane QUIC (source IP / fail-closed)"
-                                            );
-                                            drop(conn);
-                                            None
+                                                .is_some_and(|ip| conn.remote_address().ip() == ip)
+                                            {
+                                                serve_probed_quic_on_conn(
+                                                    conn,
+                                                    sandwich_secret,
+                                                    &offer_id,
+                                                    cid,
+                                                    probe_deadline,
+                                                )
+                                                .await
+                                            } else {
+                                                tracing::debug!(
+                                                    cid,
+                                                    peer = %conn.remote_address(),
+                                                    "declining fast-plane QUIC (source IP / fail-closed)"
+                                                );
+                                                conn.close(0u32.into(), b"source-ip-mismatch");
+                                                None
+                                            }
                                         }
                                         _ => {
                                             carrier.unregister(&offer_id);
                                             None
                                         }
                                     };
+                                if probed_conn.is_none() {
+                                    quic_cleanup.0 = None;
+                                }
 
                                 client_record.clear();
                                 // BOUNDED read: we are holding the ephemeral QUIC
@@ -2945,6 +3003,7 @@ async fn run_authenticated_data_mode(
                                         if let Some(probed) = probed_conn {
                                             probed.conn.close(0u32.into(), b"done");
                                         }
+                                        quic_cleanup.0 = None;
                                     }
                                 }
                             } else {
@@ -3051,6 +3110,7 @@ async fn run_authenticated_data_mode(
                                             traffic,
                                             fixed_data_target,
                                             cid,
+                                            admission,
                                         },
                                         fallback_idle_timeout(),
                                     )
@@ -3081,8 +3141,10 @@ async fn run_authenticated_data_mode(
                                     // value can't inflate per-connection fd usage.
                                     max_streams: (traffic.max_concurrent_streams as usize)
                                         .min(SERVER_MUX_MAX_STREAMS),
+                                    admission,
                                     cid,
                                     target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
+                                    idle_timeout: fallback_idle_timeout(),
                                 },
                             )
                             .await;
@@ -3404,7 +3466,12 @@ async fn connect_outbound_target(
                 "target DNS resolve timed out",
             ))
         })??;
-    connect_future_with_timeout(connect_tuned_tcp_any(addrs.as_slice()), HANDSHAKE_TIMEOUT).await
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    connect_future_with_timeout(
+        connect_tuned_tcp_any(addrs.as_slice(), deadline),
+        HANDSHAKE_TIMEOUT,
+    )
+    .await
 }
 
 async fn resolve_public_target_addrs(
@@ -3856,6 +3923,7 @@ async fn accept_probed_quic_from_peer(
     sandwich_secret: &[u8],
     offer_id: &[u8; 16],
     cid: u64,
+    deadline: Instant,
 ) -> Option<ServerProbedQuic> {
     // Fail closed: if the authenticated TCP peer IP could not be determined, do
     // not accept a fast-plane QUIC connection from any source (which would let a
@@ -3889,7 +3957,7 @@ async fn accept_probed_quic_from_peer(
         drop(c); // silent: no CONNECTION_CLOSE on the wire (no response oracle)
     };
 
-    serve_probed_quic_on_conn(conn, sandwich_secret, offer_id, cid).await
+    serve_probed_quic_on_conn(conn, sandwich_secret, offer_id, cid, deadline).await
 }
 
 /// Serve the H3 reachability probe on an already-accepted (and source-IP-validated)
@@ -3899,6 +3967,36 @@ async fn accept_probed_quic_from_peer(
 /// ([`accept_probed_quic_from_peer`]) and the stable carrier handoff (which performs
 /// its own source-IP check on the routed connection before calling this).
 async fn serve_probed_quic_on_conn(
+    conn: crate::transport::udp::quic::endpoint::Connection,
+    sandwich_secret: &[u8],
+    offer_id: &[u8; 16],
+    cid: u64,
+    deadline: Instant,
+) -> Option<ServerProbedQuic> {
+    // The carrier handoff and every H3 operation share one absolute deadline.
+    // Dropping our Connection handle does not close the custom QUIC transport,
+    // so retain a handle and explicitly close on timeout or failed negotiation.
+    // The timed future is polled inline: cancellation leaves no probe task behind.
+    let probe = negotiate_probed_quic_on_conn(conn.clone(), sandwich_secret, offer_id, cid);
+    match timeout_at(deadline, probe).await {
+        Ok(Some(probed)) => Some(probed),
+        result => {
+            let reason: &[u8] = if result.is_err() {
+                tracing::debug!(
+                    cid,
+                    "udp H3 negotiation deadline reached; declining fast plane"
+                );
+                b"probe-timeout"
+            } else {
+                b"probe-failed"
+            };
+            conn.close(0u32.into(), reason);
+            None
+        }
+    }
+}
+
+async fn negotiate_probed_quic_on_conn(
     conn: crate::transport::udp::quic::endpoint::Connection,
     sandwich_secret: &[u8],
     offer_id: &[u8; 16],
@@ -4059,11 +4157,15 @@ struct ServerMuxContext<'a> {
     chunk_size: usize,
     /// Server-enforced ceiling on concurrent substreams for this connection.
     max_streams: usize,
+    /// Keep the carrier's reserved target fds charged until spawned tasks drop.
+    admission: Option<&'a Arc<OwnedSemaphorePermit>>,
     cid: u64,
     /// Per-write deadline on a client->target mux write (H-3): a wedged target
     /// must not park the serial reader loop. Injectable so tests can use a short
     /// value; production passes `MUX_TARGET_WRITE_TIMEOUT`.
     target_write_timeout: Duration,
+    /// Shared session/substream silence bound; either traffic direction renews it.
+    idle_timeout: Duration,
 }
 
 /// Tracks the live substreams of one authenticated mux connection.
@@ -4118,12 +4220,14 @@ impl ServerMuxStreams {
         self.tasks.len()
     }
 
-    /// Tear down every substream: drop all upload senders (closing each upload
-    /// channel) and abort every supervisor task (closing its target fds).
+    /// Tear down every substream and wait until aborted tasks close their targets.
     async fn teardown(&mut self) {
         self.uploads.clear();
-        for (_, handle) in self.tasks.drain() {
+        for handle in self.tasks.values() {
             handle.abort();
+        }
+        for (_, handle) in self.tasks.drain() {
+            let _ = handle.await;
         }
     }
 }
@@ -4353,6 +4457,7 @@ struct ServerMuxStreamContext {
     chunk_size: usize,
     cid: u64,
     target_write_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 /// Per-substream supervisor, spawned by the shared mux reader on every `Open`. It
@@ -4393,6 +4498,13 @@ async fn server_mux_upstream_task(
     drop(connect_payload);
     crate::process_hardening::exclude_from_core_dump("mux.upstream.initial_payload", &initial);
 
+    // Confirm receipt before any target I/O: a slow DNS/connect/write or a target
+    // that delays its first response says nothing about the carrier's liveness.
+    // Empty Data is already legal and delivers no bytes to the local app.
+    if downlink.send(MuxFrameKind::Data, Vec::new()).await.is_err() {
+        return;
+    }
+
     let mut target = match connect_outbound_target(&target_addr, target_source).await {
         Ok(target) => target,
         Err(_) => {
@@ -4430,6 +4542,7 @@ async fn server_mux_upstream_task(
     }
     drop(initial);
 
+    let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
     let (target_read, target_write) = target.into_split();
     let reader = server_mux_target_reader_loop(
         target_read,
@@ -4439,6 +4552,7 @@ async fn server_mux_upstream_task(
         ctx.chunk_size,
         ctx.cid,
         payload_pool,
+        activity.clone(),
     );
     let writer = server_mux_upload_drain(
         upload_rx,
@@ -4447,11 +4561,18 @@ async fn server_mux_upstream_task(
         ctx.cid,
         ctx.target_write_timeout,
         &downlink,
+        activity.clone(),
     );
     // Run both directions; an error in either drops the other's half of the target
     // socket. Half-close (client Fin) resolves `writer` Ok while `reader` keeps
     // streaming the target back until its EOF.
-    let _ = tokio::try_join!(reader, writer);
+    tokio::select! {
+        _ = async { tokio::try_join!(reader, writer) } => {}
+        _ = relay_idle_watchdog(activity, ctx.idle_timeout) => {
+            tracing::debug!(cid = ctx.cid, stream_id, "mux target idle backstop reached");
+            let _ = downlink.send(MuxFrameKind::Fin, Vec::new()).await;
+        }
+    }
 }
 
 /// Drains a substream's client->target upload channel to its target socket, OFF the
@@ -4467,13 +4588,14 @@ async fn server_mux_upload_drain(
     cid: u64,
     write_timeout: Duration,
     downlink: &ServerMuxStreamTx,
+    activity: RelayActivity,
 ) -> Result<(), HandshakeServerError> {
     while let Some(payload) = upload_rx.recv().await {
         if payload.is_empty() {
             continue;
         }
         match timeout(write_timeout, target_write.write_all(&payload)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => bump_relay_activity(&activity),
             Ok(Err(err)) => {
                 tracing::debug!(cid, stream_id, "mux target write failed; resetting stream");
                 let _ = downlink.reset().await;
@@ -4883,6 +5005,7 @@ async fn run_authenticated_mux_data_mode(
     tracing::info!(cid = context.cid, "ParallaX mux data mode started");
     let (downlink, scheduler) = server_mux_downlink(context.max_streams);
     let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(context.chunk_size));
+    let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
     let reader = server_mux_client_reader_loop(
         TcpLegReader(client_records),
         client_open,
@@ -4890,6 +5013,7 @@ async fn run_authenticated_mux_data_mode(
         first_frames,
         context,
         payload_pool.clone(),
+        activity.clone(),
     );
     let writer = server_mux_writer_loop(
         TcpLegWriter(client_write),
@@ -4898,7 +5022,8 @@ async fn run_authenticated_mux_data_mode(
         context.cover,
         context.cid,
         payload_pool,
-        fallback_idle_timeout(),
+        context.idle_timeout,
+        activity,
     );
     let ((), ()) = tokio::try_join!(reader, writer)?;
     Ok(())
@@ -4930,6 +5055,7 @@ struct ServerMuxQuicContext<'a> {
     traffic: TrafficConfig,
     fixed_data_target: Option<&'a str>,
     cid: u64,
+    admission: Option<&'a Arc<OwnedSemaphorePermit>>,
 }
 
 /// Mux-over-QUIC data mode: accept business substreams as QUIC bidis on the probed
@@ -4967,22 +5093,13 @@ async fn run_authenticated_mux_quic_data_mode(
     // Hold the H3 control set alive for the session's duration.
     let _h3_control = h3_control;
 
-    // Bind the session lifetime to the parked TCP control connection: when the
-    // client drops the mux session, its TCP read half hits EOF, and this watcher
-    // closes the QUIC connection so the `accept_bi` loop below returns `None` and
-    // the session ends. Per-substream teardown is independent (QUIC stream
-    // FIN/RESET); this only governs the whole-session end. The write half is held
-    // by the watcher too so the outer TCP connection stays open until then.
+    // Watch the parked TCP control connection in this task so cancelling the
+    // session also closes both control halves. Any TCP read result ends the
+    // whole session; per-substream teardown remains independent (QUIC FIN/RESET).
     let mut client_read = client_records.into_inner().into_inner();
-    let watch_conn = conn.clone();
-    let tcp_watch = tokio::spawn(async move {
-        let _client_write = client_write;
-        let mut buf = [0_u8; 1];
-        // A real client sends no further TCP bytes after the mux-mode signal, so
-        // any read result (EOF, a stray byte, or an error) ends the session.
-        let _ = client_read.read(&mut buf).await;
-        watch_conn.close(0u32.into(), b"mux-session-end");
-    });
+    let _client_write = client_write;
+    let mut control_byte = [0_u8; 1];
+    let mut tasks = JoinSet::new();
 
     let max_streams = (context.traffic.max_concurrent_streams as usize).min(SERVER_MUX_MAX_STREAMS);
     let live = Arc::new(Semaphore::new(max_streams));
@@ -5008,6 +5125,11 @@ async fn run_authenticated_mux_quic_data_mode(
     loop {
         let accepted = tokio::select! {
             accepted = conn.accept_bi() => accepted,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+            _ = client_read.read(&mut control_byte) => {
+                conn.close(0u32.into(), b"mux-session-end");
+                return Ok(());
+            },
             _ = &mut idle_sleep => {
                 if live.available_permits() < max_streams {
                     // Substreams are still relaying: the session is not idle.
@@ -5019,14 +5141,12 @@ async fn run_authenticated_mux_quic_data_mode(
                     "mux-over-QUIC session idle backstop reached; tearing down"
                 );
                 conn.close(RELAY_IDLE_CLOSE_CODE.into(), b"mux-idle");
-                tcp_watch.abort();
                 return Ok(());
             }
         };
         let Some((send, recv)) = accepted else {
             // The QUIC connection closed (client dropped the session, surfaced via
             // the TCP watcher, or a transport close): no further substreams.
-            tcp_watch.abort();
             return Ok(());
         };
         let stream_id = recv.id();
@@ -5063,7 +5183,9 @@ async fn run_authenticated_mux_quic_data_mode(
         let fixed_data_target = context.fixed_data_target.map(str::to_owned);
         let cid = context.cid;
         let substream_conn = conn.clone();
-        tokio::spawn(async move {
+        let admission = context.admission.cloned();
+        tasks.spawn(async move {
+            let _admission = admission;
             let _permit = permit;
             if let Err(err) = serve_mux_quic_substream(
                 substream_conn,
@@ -5259,12 +5381,16 @@ async fn server_mux_client_reader_loop<R>(
     first_frames: Vec<MuxFrame>,
     context: ServerMuxContext<'_>,
     payload_pool: MuxPayloadPool,
+    activity: RelayActivity,
 ) -> Result<(), HandshakeServerError>
 where
     R: LegReader,
 {
     let mut streams = ServerMuxStreams::new();
     for frame in first_frames {
+        if frame.kind != MuxFrameKind::Cover {
+            bump_relay_activity(&activity);
+        }
         process_server_mux_frame(
             MuxFrameRef {
                 stream_id: frame.stream_id,
@@ -5293,29 +5419,21 @@ where
     let mut batch_records = Zeroizing::new(Vec::new());
     let mut batch_plaintext = Zeroizing::new(Vec::new());
     let mut deferred_read_error: Option<io::Error> = None;
-    // Idle backstop for the whole mux session. Without it, a client that goes
-    // silent (while its target readers also idle out) would leave this loop
-    // blocked on read forever, holding the connection slot, permits, and every
-    // target fd. A real record resets the clock implicitly (the read returns).
-    let mux_idle_timeout = fallback_idle_timeout();
+    // The whole session is idle only when neither client direction moves real
+    // frames. Downloads renew this clock in the writer; cover does not.
     loop {
         let read_result = match deferred_read_error.take() {
             Some(err) => Err(err),
-            None => match timeout(
-                mux_idle_timeout,
-                client_records.read_record_into(&mut client_record),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
+            None => tokio::select! {
+                result = client_records.read_record_into(&mut client_record) => result,
+                _ = relay_idle_watchdog(activity.clone(), context.idle_timeout) => {
                     tracing::debug!(
                         cid = context.cid,
                         "mux client idle backstop reached; tearing down session"
                     );
                     streams.teardown().await;
                     return Ok(());
-                }
+                },
             },
         };
         match read_result {
@@ -5395,6 +5513,9 @@ where
         let mut frames = frames_payload;
         while !frames.is_empty() {
             let (frame, used) = MuxFrame::decode_ref_prefix(frames)?;
+            if frame.kind != MuxFrameKind::Cover {
+                bump_relay_activity(&activity);
+            }
             process_server_mux_frame(frame, &mut streams, &downlink, context, &payload_pool)
                 .await?;
             frames = &frames[used..];
@@ -5449,19 +5570,27 @@ async fn process_server_mux_frame(
                 chunk_size: context.chunk_size,
                 cid: context.cid,
                 target_write_timeout: context.target_write_timeout,
+                idle_timeout: context.idle_timeout,
             };
             let stream_id = frame.stream_id;
             // The substream's own download queue, registered with the writer before
             // the task can send on it.
             let stream_downlink = downlink.register(stream_id).await?;
-            let handle = tokio::spawn(server_mux_upstream_task(
-                stream_id,
-                Zeroizing::new(frame.payload.to_vec()),
-                upload_rx,
-                stream_downlink,
-                stream_ctx,
-                payload_pool.clone(),
-            ));
+            let admission = context.admission.cloned();
+            let open_payload = Zeroizing::new(frame.payload.to_vec());
+            let stream_payload_pool = payload_pool.clone();
+            let handle = tokio::spawn(async move {
+                let _admission = admission;
+                server_mux_upstream_task(
+                    stream_id,
+                    open_payload,
+                    upload_rx,
+                    stream_downlink,
+                    stream_ctx,
+                    stream_payload_pool,
+                )
+                .await;
+            });
             streams.uploads.insert(stream_id, upload_tx);
             streams.tasks.insert(stream_id, handle);
         }
@@ -5533,12 +5662,13 @@ async fn process_server_mux_frame(
             streams.uploads.remove(&frame.stream_id);
         }
         MuxFrameKind::Reset => {
-            // Full stream teardown: drop the upload sender AND abort the task so both
-            // target fds are reclaimed immediately, and drop the download frames
+            // Full stream teardown: drop the upload sender AND abort the task.
+            // Keep its slot charged until cancellation actually closes the target.
+            // Drop the download frames
             // still queued for it — the client no longer wants them, and writing
             // them would only delay every other substream.
             streams.uploads.remove(&frame.stream_id);
-            if let Some(handle) = streams.tasks.remove(&frame.stream_id) {
+            if let Some(handle) = streams.tasks.get(&frame.stream_id) {
                 handle.abort();
             }
             downlink.purge(frame.stream_id).await?;
@@ -5549,7 +5679,7 @@ async fn process_server_mux_frame(
 }
 
 /// Shed a single mux substream without disturbing the rest of the connection: drop
-/// its upload sender, abort + drop its supervisor task (closing both target fds),
+/// its upload sender, abort its supervisor while retaining its slot until it exits,
 /// drop its queued download frames, and tell the client to tear down that stream
 /// id with a Reset. Used when a substream's upload channel stalls or its task has
 /// gone, so one bad target never poisons the whole mux session.
@@ -5559,13 +5689,14 @@ async fn shed_server_mux_substream(
     stream_id: u32,
 ) -> Result<(), HandshakeServerError> {
     streams.uploads.remove(&stream_id);
-    if let Some(handle) = streams.tasks.remove(&stream_id) {
+    if let Some(handle) = streams.tasks.get(&stream_id) {
         handle.abort();
     }
     downlink.purge(stream_id).await?;
     downlink.reset_unregistered(stream_id).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn server_mux_target_reader_loop(
     mut target_read: OwnedReadHalf,
     downlink: ServerMuxStreamTx,
@@ -5574,6 +5705,7 @@ async fn server_mux_target_reader_loop(
     chunk_size: usize,
     cid: u64,
     payload_pool: MuxPayloadPool,
+    activity: RelayActivity,
 ) -> Result<(), HandshakeServerError> {
     let max_payload_len = MuxFrame::max_payload_len(chunk_size);
     if max_payload_len == 0 {
@@ -5583,33 +5715,24 @@ async fn server_mux_target_reader_loop(
     }
     let mut target_buf = vec![0_u8; relay_read_buffer_len(max_payload_len)];
     let mut rng = StdRng::from_entropy();
-    // Per-read idle backstop: a target that connects then stays silent (after the
-    // client Fin'd its write half, or an attacker-controlled target deliberately
-    // holding the socket) must not pin this reader — and therefore its downlink
-    // handle and target fd — forever. On idle, send Fin and exit so the slot is
-    // reclaimed and the writer can drain.
-    let read_idle_timeout = fallback_idle_timeout();
-
     loop {
-        let n = match timeout(read_idle_timeout, target_read.read(&mut target_buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => {
+        // The supervisor bounds silence across BOTH target directions. A
+        // per-read timeout would truncate a sustained upload-only stream.
+        let n = match target_read.read(&mut target_buf).await {
+            Ok(n) => n,
+            Err(err) => {
                 // Target read failed: tell the client to tear down this substream
                 // promptly (best-effort) instead of letting it dangle until the
                 // whole-session idle backstop, mirroring the Fin-on-EOF handling.
                 let _ = downlink.reset().await;
                 return Err(HandshakeServerError::Io(err));
             }
-            Err(_) => {
-                tracing::debug!(cid, stream_id, "mux target reader idle backstop reached");
-                downlink.send(MuxFrameKind::Fin, Vec::new()).await?;
-                return Ok(());
-            }
         };
         if n == 0 {
             downlink.send(MuxFrameKind::Fin, Vec::new()).await?;
             return Ok(());
         }
+        bump_relay_activity(&activity);
         let n = match drain_ready_tcp_read(&target_read, &mut target_buf, n) {
             Ok(n) => n,
             Err(err) => {
@@ -5651,6 +5774,7 @@ async fn server_mux_target_reader_loop(
 /// live-but-slow client keeps making progress well inside the (600s-scale) window
 /// and is never falsely shed; `idle` is a parameter so the wedge-shed path is
 /// testable without a 600s wait.
+#[allow(clippy::too_many_arguments)]
 async fn server_mux_writer_loop<W>(
     mut client_write: W,
     mut server_seal: DataRecordCodec,
@@ -5659,6 +5783,7 @@ async fn server_mux_writer_loop<W>(
     cid: u64,
     payload_pool: MuxPayloadPool,
     idle: Duration,
+    activity: RelayActivity,
 ) -> Result<(), HandshakeServerError>
 where
     W: LegWriter,
@@ -5740,6 +5865,7 @@ where
             Ok(res) => res?,
             Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
         };
+        bump_relay_activity(&activity);
         if waited >= SERVER_MUX_LINK_BOUND_WAIT {
             link_bound_until = Some(Instant::now() + SERVER_MUX_LINK_BOUND_HOLD);
         }
@@ -8376,6 +8502,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_probe_deadline_closes_peer_that_never_opens_bidi() {
+        use crate::transport::udp::{h3, test_support::loopback_pair};
+
+        let (_server_ep, _client_ep, client_conn, server_conn) = loopback_pair().await;
+        let server_observer = server_conn.clone();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let server = tokio::spawn(async move {
+            serve_probed_quic_on_conn(server_conn, PSK, &[0x61; 16], 0, deadline).await
+        });
+        // Receiving SETTINGS proves negotiation has passed the carrier handoff
+        // and opened the server control stream. The client never opens a bidi.
+        timeout(
+            Duration::from_secs(5),
+            h3::read_peer_h3_settings(&client_conn),
+        )
+        .await
+        .expect("server opened its H3 control stream")
+        .unwrap();
+
+        let result = timeout_at(deadline + Duration::from_secs(1), server)
+            .await
+            .expect("missing bidi must not escape the negotiation deadline")
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "timed-out negotiation must not retain QUIC"
+        );
+        assert!(server_observer.is_closed(), "timeout must close QUIC");
+        timeout(
+            Duration::from_secs(5),
+            crate::transport::udp::endpoint::conn_closed(&client_conn),
+        )
+        .await
+        .expect("peer must observe the explicit QUIC close");
+    }
+
+    #[tokio::test]
+    async fn udp_probe_deadline_closes_peer_that_withholds_settings() {
+        use crate::transport::udp::{
+            h3,
+            probe::{probe_client_over_bidi, ProbeOutcome},
+            test_support::loopback_pair,
+        };
+
+        let (_server_ep, _client_ep, client_conn, server_conn) = loopback_pair().await;
+        let server_observer = server_conn.clone();
+        let offer_id = [0x62; 16];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let server = tokio::spawn(async move {
+            serve_probed_quic_on_conn(server_conn, PSK, &offer_id, 0, deadline).await
+        });
+        // Materialize the client's control stream, but send no SETTINGS frame.
+        let mut incomplete_control = client_conn.open_uni();
+        incomplete_control.write_all(&[0]).await.unwrap();
+        let (mut send, mut recv) = client_conn.open_bi();
+        let outcome = probe_client_over_bidi(
+            &client_conn,
+            &mut send,
+            &mut recv,
+            "localhost",
+            PSK,
+            &offer_id,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ProbeOutcome::Verified { .. }));
+        h3::read_peer_h3_settings(&client_conn).await.unwrap();
+        let mut encoder = timeout(Duration::from_secs(5), client_conn.accept_uni())
+            .await
+            .expect("server reached the SETTINGS verification phase")
+            .unwrap();
+        assert_eq!(encoder.read_u8().await.unwrap(), 2);
+
+        let result = timeout_at(deadline + Duration::from_secs(1), server)
+            .await
+            .expect("missing SETTINGS must not escape the original deadline")
+            .unwrap();
+        assert!(result.is_none());
+        assert!(server_observer.is_closed(), "timeout must close QUIC");
+        timeout(
+            Duration::from_secs(5),
+            crate::transport::udp::endpoint::conn_closed(&client_conn),
+        )
+        .await
+        .expect("peer must observe the explicit QUIC close");
+    }
+
+    #[tokio::test]
+    async fn udp_probe_deadline_retains_a_completed_negotiation() {
+        use crate::transport::udp::{
+            h3,
+            probe::{probe_client_over_bidi, ProbeOutcome},
+            test_support::loopback_pair,
+        };
+
+        let (_server_ep, _client_ep, client_conn, server_conn) = loopback_pair().await;
+        let offer_id = [0x63; 16];
+        let server = serve_probed_quic_on_conn(
+            server_conn,
+            PSK,
+            &offer_id,
+            0,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let client = async {
+            let control = h3::open_h3_control_stream(&client_conn).await.unwrap();
+            let (mut send, mut recv) = client_conn.open_bi();
+            let outcome = probe_client_over_bidi(
+                &client_conn,
+                &mut send,
+                &mut recv,
+                "localhost",
+                PSK,
+                &offer_id,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let encoder = h3::open_h3_encoder_stream(&client_conn).await.unwrap();
+            (outcome, control, encoder, send, recv)
+        };
+        let (probed, (outcome, _control, _encoder, _send, _recv)) =
+            timeout(Duration::from_secs(5), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .expect("normal H3 negotiation completes within its budget");
+        assert!(matches!(outcome, ProbeOutcome::Verified { .. }));
+        let probed = probed.expect("a complete negotiation retains QUIC");
+        assert!(!probed.conn.is_closed());
+        probed.conn.close(0u32.into(), b"test-done");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP + UDP sockets and the shared carrier injector"]
+    async fn udp_ack_failure_closes_quic_and_releases_offer() {
+        use crate::protocol::command::{
+            UdpOffer, UdpProbeAck, UdpProbeStatus, UdpRequest, UDP_NEGOTIATION_VERSION,
+        };
+        use crate::tls::quic::{AcceptAnyServerCert, ClientConfig, QuicMarkerConfig};
+        use crate::transport::udp::{
+            h3,
+            probe::{probe_client_over_bidi, ProbeOutcome},
+            quic::{endpoint::Endpoint, packet::ConnectionId},
+            stable::offer_dcid,
+        };
+
+        // Serial with other injector-based integration tests. Restore the prior
+        // carrier even if a regression makes one of the assertions panic.
+        struct RestoreCarrier(Option<Arc<crate::transport::udp::stable::QuicCarrier>>);
+        impl Drop for RestoreCarrier {
+            fn drop(&mut self) {
+                set_quic_carrier_for_test(self.0.take());
+            }
+        }
+        let _restore = RestoreCarrier(SERVER_QUIC_CARRIER.lock().unwrap().clone());
+
+        for invalid_tls in [true, false] {
+            let (fallback_addr, fallback_task) = spawn_server_hello_fallback().await;
+            let server_keys = X25519KeyPair::generate();
+            let identity_keys = identity::keypair();
+            let replay_dir = tempfile::tempdir().unwrap();
+            let config = authenticated_server_config(
+                fallback_addr,
+                &server_keys,
+                &identity_keys,
+                replay_dir.path().join("replay.cache"),
+            );
+            let carrier = build_quic_carrier_for_test(&config, PSK).await.unwrap();
+            set_quic_carrier_for_test(Some(carrier.clone()));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let traffic = TrafficConfig::default();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let udp = UdpConfig {
+                    enabled: true,
+                    probe_timeout_ms: 5_000,
+                    ..UdpConfig::default()
+                };
+                handle_connection(tcp, &config, traffic, &udp, PSK).await
+            });
+            let (mut tcp, mut session, mut rng) = open_authenticated_data_session(
+                addr,
+                &server_keys,
+                &identity_keys.public,
+                &X25519KeyPair::generate(),
+                traffic,
+            )
+            .await;
+            let request = UdpRequest {
+                version: UDP_NEGOTIATION_VERSION,
+            }
+            .encode();
+            tcp.write_all(&session.seal_payload(&request, &mut rng).unwrap())
+                .await
+                .unwrap();
+            let mut offer_record = read_record(&mut tcp).await.unwrap();
+            session
+                .open_server_record_in_place(&mut offer_record)
+                .unwrap();
+            let offer = UdpOffer::decode(&offer_record).unwrap();
+
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            client.set_default_client_config(Arc::new(
+                ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                    QuicMarkerConfig {
+                        psk: Zeroizing::new(PSK.to_vec()),
+                        server_static_public: server_keys.public,
+                    },
+                ),
+            ));
+            let conn = client
+                .connect_with_dcid(
+                    carrier.local_addr().unwrap(),
+                    "example.com",
+                    ConnectionId::new(&offer_dcid(&offer.offer_id)),
+                )
+                .await
+                .unwrap();
+            let _control = h3::open_h3_control_stream(&conn).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi();
+            let probe = probe_client_over_bidi(
+                &conn,
+                &mut send,
+                &mut recv,
+                "example.com",
+                PSK,
+                &offer.offer_id,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(probe, ProbeOutcome::Verified { .. }));
+            let _encoder = h3::open_h3_encoder_stream(&conn).await.unwrap();
+
+            if invalid_tls {
+                // The real TCP record reader rejects the oversized TLS length
+                // with InvalidData, which is not one of its clean-close errors.
+                tcp.write_all(&[0x17, 0x03, 0x03, 0xff, 0xff])
+                    .await
+                    .unwrap();
+            } else {
+                let ack = UdpProbeAck {
+                    offer_id: offer.offer_id,
+                    status: UdpProbeStatus::Verified,
+                    rtt_micros: 0,
+                }
+                .encode();
+                let mut corrupt = session.seal_payload(&ack, &mut rng).unwrap();
+                *corrupt.last_mut().unwrap() ^= 1;
+                tcp.write_all(&corrupt).await.unwrap();
+            }
+            let error = timeout(Duration::from_secs(5), server)
+                .await
+                .expect("failed PX1P must release the authenticated session")
+                .unwrap()
+                .unwrap_err();
+            if invalid_tls {
+                assert!(matches!(error, HandshakeServerError::Io(ref err)
+                    if err.kind() == io::ErrorKind::InvalidData));
+            } else {
+                assert!(matches!(
+                    error,
+                    HandshakeServerError::DataRecord(DataRecordError::Aead(_))
+                ));
+            }
+            timeout(
+                Duration::from_secs(5),
+                crate::transport::udp::endpoint::conn_closed(&conn),
+            )
+            .await
+            .expect("PX1P failure must explicitly close the successfully probed QUIC peer");
+            assert_eq!(carrier.pending_offers_for_test(), 0);
+            fallback_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn accept_probed_quic_pins_to_authenticated_peer_ip() {
         let server_ep = crate::transport::udp::endpoint::bind_server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
@@ -8410,6 +8818,7 @@ mod tests {
                 PSK,
                 &offer_id,
                 0,
+                Instant::now() + Duration::from_millis(300),
             ),
         )
         .await;
@@ -8651,6 +9060,274 @@ mod tests {
         assert!(!is_denied_outbound_ip(public_v6));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn mux_session_idle_tracks_upload_and_download_without_cover() {
+        struct RecordingWriter(mpsc::Sender<usize>);
+        impl LegWriter for RecordingWriter {
+            async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
+                self.0.send(bytes.len()).await.unwrap();
+                Ok(())
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let codec = || {
+            DataRecordCodec::new(
+                AeadCodec::new([0x51; 32], [0x62; 12]),
+                PaddingProfile::new(0, 0).unwrap(),
+                b"mux-idle",
+            )
+        };
+        let traffic = TrafficConfig::default();
+        let idle = Duration::from_millis(100);
+        let context = ServerMuxContext {
+            fixed_data_target: None,
+            timing: TimingProfile::from_config(traffic),
+            cover: CoverTrafficProfile::from_config(traffic),
+            chunk_size: max_plaintext_len(0),
+            max_streams: 1,
+            admission: None,
+            cid: 1,
+            target_write_timeout: idle,
+            idle_timeout: idle,
+        };
+        assert!(!context.cover.is_enabled());
+        for (upload_only, kind) in [
+            (true, MuxFrameKind::Data),
+            (false, MuxFrameKind::Data),
+            (true, MuxFrameKind::Cover),
+        ] {
+            let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+            let (downlink, scheduler) = server_mux_downlink(1);
+            let stream = downlink.register(1).await.unwrap();
+            let payload_pool = MuxPayloadPool::with_capacity(1024);
+            let (mut peer_write, reader_io) = tokio::io::duplex(4096);
+            let reader = tokio::spawn(server_mux_client_reader_loop(
+                TcpLegReader::buffered(reader_io),
+                codec(),
+                downlink,
+                Vec::new(),
+                context,
+                payload_pool.clone(),
+                activity.clone(),
+            ));
+            let (written_tx, mut written_rx) = mpsc::channel(4);
+            let writer = tokio::spawn(server_mux_writer_loop(
+                RecordingWriter(written_tx),
+                codec(),
+                scheduler,
+                context.cover,
+                1,
+                payload_pool,
+                idle,
+                activity,
+            ));
+            let mut peer_seal = codec();
+            tokio::task::yield_now().await;
+            let rounds = if kind == MuxFrameKind::Cover { 1 } else { 5 };
+            for _ in 0..rounds {
+                tokio::time::advance(Duration::from_millis(60)).await;
+                if upload_only {
+                    let frame = MuxFrame {
+                        stream_id: if kind == MuxFrameKind::Cover { 0 } else { 1 },
+                        kind,
+                        payload: if kind == MuxFrameKind::Cover {
+                            Vec::new()
+                        } else {
+                            b"payload".to_vec()
+                        },
+                    };
+                    let record = peer_seal
+                        .seal(&frame.encode().unwrap(), &mut StdRng::seed_from_u64(7))
+                        .unwrap();
+                    peer_write.write_all(&record).await.unwrap();
+                } else {
+                    stream
+                        .send(MuxFrameKind::Data, b"payload".to_vec())
+                        .await
+                        .unwrap();
+                    written_rx.recv().await.unwrap();
+                }
+                tokio::task::yield_now().await;
+                assert!(
+                    !reader.is_finished(),
+                    "one-way traffic must extend mux idle"
+                );
+            }
+            let silence = if kind == MuxFrameKind::Cover {
+                Duration::from_millis(41)
+            } else {
+                idle + Duration::from_millis(1)
+            };
+            tokio::time::advance(silence).await;
+            tokio::task::yield_now().await;
+            assert!(reader.is_finished(), "complete silence must still expire");
+            assert!(reader.await.unwrap().is_ok());
+            writer.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_substream_idle_tracks_upload_and_download() {
+        let traffic = TrafficConfig::default();
+        let idle = Duration::from_secs(10);
+        for upload_only in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (downlink, mut scheduler) = server_mux_downlink(1);
+            let stream = downlink.register(1).await.unwrap();
+            scheduler.drain_control();
+            let (_, mut frames) = scheduler.queues.pop_front().unwrap();
+            let (upload_tx, upload_rx) = mpsc::channel(4);
+            let task = tokio::spawn(server_mux_upstream_task(
+                1,
+                Zeroizing::new(
+                    ConnectRequest {
+                        host: "example.com".to_owned(),
+                        port: 443,
+                        initial_payload: Vec::new(),
+                    }
+                    .encode()
+                    .unwrap(),
+                ),
+                upload_rx,
+                stream,
+                ServerMuxStreamContext {
+                    fixed_data_target: Some(listener.local_addr().unwrap().to_string()),
+                    timing: TimingProfile::from_config(traffic),
+                    chunk_size: max_plaintext_len(0),
+                    cid: 1,
+                    target_write_timeout: idle,
+                    idle_timeout: idle,
+                },
+                MuxPayloadPool::with_capacity(1024),
+            ));
+            let (mut target, _) = listener.accept().await.unwrap();
+            let ack = frames.recv().await.unwrap();
+            assert_eq!(ack.kind, MuxFrameKind::Data);
+            assert!(ack.payload.is_empty());
+            tokio::task::yield_now().await;
+            tokio::time::pause();
+            for _ in 0..5 {
+                tokio::time::advance(Duration::from_secs(6)).await;
+                // Real socket I/O runs with time resumed, so virtual-time
+                // auto-advance cannot outrun the OS readiness notification.
+                tokio::time::resume();
+                if upload_only {
+                    upload_tx
+                        .send(Zeroizing::new(b"payload".to_vec()))
+                        .await
+                        .unwrap();
+                    let mut bytes = [0_u8; 7];
+                    target.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes, b"payload");
+                } else {
+                    target.write_all(b"payload").await.unwrap();
+                    let frame = frames.recv().await.unwrap();
+                    assert_eq!(frame.kind, MuxFrameKind::Data);
+                    assert_eq!(frame.payload, b"payload");
+                }
+                assert!(!task.is_finished(), "one-way target traffic must stay live");
+                tokio::time::pause();
+            }
+            tokio::time::advance(idle + Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                task.is_finished(),
+                "silent target must release both directions"
+            );
+            task.await.unwrap();
+            assert!(
+                upload_tx.is_closed(),
+                "idle teardown releases the upload receiver"
+            );
+            assert_eq!(frames.recv().await.unwrap().kind, MuxFrameKind::Fin);
+            tokio::time::resume();
+        }
+    }
+
+    /// Receiving an Open proves carrier liveness independently of the target's
+    /// response latency. The empty Data acknowledgement is not application data.
+    #[tokio::test]
+    async fn mux_open_is_acknowledged_before_target_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = listener.local_addr().unwrap().to_string();
+        let request = ConnectRequest {
+            host: "example.com".to_owned(),
+            port: 443,
+            initial_payload: b"request".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        let traffic = TrafficConfig::default();
+        let (downlink, mut scheduler) = server_mux_downlink(1);
+        let stream_downlink = downlink.register(1).await.unwrap();
+        scheduler.drain_control();
+        let (_, mut frames) = scheduler.queues.pop_front().unwrap();
+        let (upload_tx, upload_rx) = mpsc::channel(4);
+        let upstream = tokio::spawn(server_mux_upstream_task(
+            1,
+            Zeroizing::new(request),
+            upload_rx,
+            stream_downlink,
+            ServerMuxStreamContext {
+                fixed_data_target: Some(target_addr),
+                timing: TimingProfile::from_config(traffic),
+                chunk_size: max_plaintext_len(traffic.max_padding),
+                cid: 1,
+                target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
+                idle_timeout: fallback_idle_timeout(),
+            },
+            MuxPayloadPool::with_capacity(1024),
+        ));
+        let (mut target, _) = listener.accept().await.unwrap();
+        let mut request_bytes = [0_u8; 7];
+        target.read_exact(&mut request_bytes).await.unwrap();
+        assert_eq!(&request_bytes, b"request");
+        let ack = timeout(Duration::from_millis(100), frames.recv())
+            .await
+            .expect("Open must be acknowledged while the target is still silent")
+            .unwrap();
+        assert_eq!(ack.stream_id, 1);
+        assert_eq!(ack.kind, MuxFrameKind::Data);
+        assert!(ack.payload.is_empty());
+        assert_eq!(
+            target.try_read(&mut [0_u8; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "the acknowledgement must not be written to the target"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!upstream.is_finished());
+        tokio::time::resume();
+        target.write_all(b"delayed response").await.unwrap();
+        target.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        loop {
+            let frame = timeout(Duration::from_secs(5), frames.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match frame.kind {
+                MuxFrameKind::Data => response.extend_from_slice(&frame.payload),
+                MuxFrameKind::Fin => break,
+                kind => panic!("unexpected frame after Open acknowledgement: {kind:?}"),
+            }
+        }
+        assert_eq!(response, b"delayed response");
+        drop(upload_tx);
+        timeout(Duration::from_secs(5), upstream)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn mux_open_beyond_stream_cap_is_reset_without_outbound() {
         let traffic = TrafficConfig::default();
@@ -8662,8 +9339,10 @@ mod tests {
             cover: CoverTrafficProfile::from_config(traffic),
             chunk_size: max_plaintext_len(traffic.max_padding),
             max_streams: 0,
+            admission: None,
             cid: 1,
             target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
+            idle_timeout: fallback_idle_timeout(),
         };
         let (downlink, mut scheduler) = server_mux_downlink(context.max_streams);
         let payload_pool =
@@ -8692,6 +9371,224 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].stream_id, 7);
         assert_eq!(frames[0].kind, MuxFrameKind::Reset);
+    }
+
+    #[tokio::test]
+    async fn mux_reset_keeps_slot_until_aborted_task_closes() {
+        let traffic = TrafficConfig::default();
+        let context = ServerMuxContext {
+            fixed_data_target: None,
+            timing: TimingProfile::from_config(traffic),
+            cover: CoverTrafficProfile::from_config(traffic),
+            chunk_size: max_plaintext_len(traffic.max_padding),
+            max_streams: 1,
+            admission: None,
+            cid: 1,
+            target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
+            idle_timeout: fallback_idle_timeout(),
+        };
+        let (downlink, mut scheduler) = server_mux_downlink(1);
+        let pool = MuxPayloadPool::with_capacity(1024);
+        for shed in [false, true] {
+            let mut streams = ServerMuxStreams::new();
+            streams
+                .tasks
+                .insert(1, tokio::spawn(std::future::pending()));
+            if shed {
+                shed_server_mux_substream(&mut streams, &downlink, 1)
+                    .await
+                    .unwrap();
+            } else {
+                process_server_mux_frame(
+                    MuxFrameRef {
+                        stream_id: 1,
+                        kind: MuxFrameKind::Reset,
+                        payload: &[],
+                    },
+                    &mut streams,
+                    &downlink,
+                    context,
+                    &pool,
+                )
+                .await
+                .unwrap();
+            }
+            // No scheduler turn has run the aborted task's destructors yet.
+            assert_eq!(streams.live_count(), 1);
+            process_server_mux_frame(
+                MuxFrameRef {
+                    stream_id: 2,
+                    kind: MuxFrameKind::Open,
+                    payload: &[],
+                },
+                &mut streams,
+                &downlink,
+                context,
+                &pool,
+            )
+            .await
+            .unwrap();
+            assert!(!streams.tasks.contains_key(&2));
+            assert!(drain_downlink(&mut scheduler)
+                .iter()
+                .any(|frame| { frame.stream_id == 2 && frame.kind == MuxFrameKind::Reset }));
+            streams.teardown().await;
+            assert_eq!(streams.live_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_four_targets_keep_carrier_admission_until_cancelled_tasks_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = listener.local_addr().unwrap().to_string();
+        let admissions = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
+        let traffic = TrafficConfig::default();
+        assert_eq!(traffic.max_concurrent_streams, 4);
+        let context = ServerMuxContext {
+            fixed_data_target: Some(&target_addr),
+            timing: TimingProfile::from_config(traffic),
+            cover: CoverTrafficProfile::from_config(traffic),
+            chunk_size: max_plaintext_len(traffic.max_padding),
+            max_streams: traffic.max_concurrent_streams as usize,
+            admission: Some(&admission),
+            cid: 1,
+            target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
+            idle_timeout: fallback_idle_timeout(),
+        };
+        let (downlink, mut scheduler) = server_mux_downlink(context.max_streams);
+        let pool = MuxPayloadPool::with_capacity(1024);
+        let mut streams = ServerMuxStreams::new();
+        let mut targets = Vec::new();
+        for stream_id in 1..=4 {
+            let payload = ConnectRequest {
+                host: "example.com".into(),
+                port: 443,
+                initial_payload: vec![stream_id as u8],
+            }
+            .encode()
+            .unwrap();
+            process_server_mux_frame(
+                MuxFrameRef {
+                    stream_id,
+                    kind: MuxFrameKind::Open,
+                    payload: &payload,
+                },
+                &mut streams,
+                &downlink,
+                context,
+                &pool,
+            )
+            .await
+            .unwrap();
+            let (mut target, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut initial = [0; 1];
+            target.read_exact(&mut initial).await.unwrap();
+            assert_eq!(initial, [stream_id as u8]);
+            targets.push(target);
+        }
+        assert_eq!(streams.live_count(), 4);
+        process_server_mux_frame(
+            MuxFrameRef {
+                stream_id: 5,
+                kind: MuxFrameKind::Open,
+                payload: &[],
+            },
+            &mut streams,
+            &downlink,
+            context,
+            &pool,
+        )
+        .await
+        .unwrap();
+        assert!(!streams.tasks.contains_key(&5));
+        assert!(drain_downlink(&mut scheduler)
+            .iter()
+            .any(|frame| { frame.stream_id == 5 && frame.kind == MuxFrameKind::Reset }));
+
+        // This is the reader's cancellation path: Drop aborts the children but
+        // must not return the carrier's reserved fds before those children close.
+        drop(streams);
+        drop(admission);
+        assert_eq!(admissions.available_permits(), 0);
+        timeout(Duration::from_secs(5), async {
+            for target in &mut targets {
+                assert_eq!(target.read(&mut [0; 1]).await.unwrap(), 0);
+            }
+            while admissions.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(admissions.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn predial_cleanup_keeps_admission_until_origin_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (peer, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        let mut peer = peer.unwrap();
+        let (origin, _) = accepted.unwrap();
+        let admissions = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
+        let cleanup = release_predialed_origin(PredialedOrigin::Ready(origin), Some(admission));
+        assert_eq!(
+            timeout(Duration::from_secs(5), peer.read(&mut [0; 1]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            admissions.available_permits(),
+            0,
+            "origin is still draining"
+        );
+        drop(peer);
+        timeout(Duration::from_secs(5), cleanup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admissions.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn cancelled_pending_predial_drops_origin_without_detaching() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (peer, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        let mut peer = peer.unwrap();
+        let (origin, _) = accepted.unwrap();
+        let pending = PredialedOrigin::Pending(Box::pin(async move {
+            let _origin = origin;
+            std::future::pending().await
+        }));
+        let mut dial = Box::pin(pending.into_stream());
+        std::future::poll_fn(|cx| {
+            assert!(dial.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(dial);
+        assert_eq!(
+            timeout(Duration::from_secs(5), peer.read(&mut [0; 1]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
     }
 
     /// Everything the download path would write right now, in write order.
@@ -8828,6 +9725,7 @@ mod tests {
             7,
             payload_pool,
             Duration::from_secs(5),
+            Arc::new(AtomicU64::new(relay_now_millis())),
         ));
         stream
             .send(MuxFrameKind::Data, b"payload".to_vec())
@@ -8873,10 +9771,12 @@ mod tests {
             cover: CoverTrafficProfile::from_config(traffic),
             chunk_size: max_plaintext_len(traffic.max_padding),
             max_streams: 8,
+            admission: None,
             cid: 1,
             // Large enough that the task's OWN write deadline never fires during the
             // test; the shed here is driven by the full-channel grace instead.
             target_write_timeout: Duration::from_secs(30),
+            idle_timeout: fallback_idle_timeout(),
         };
         let (downlink, mut scheduler) = server_mux_downlink(context.max_streams);
         let payload_pool =
@@ -8966,6 +9866,11 @@ mod tests {
             .iter()
             .any(|frame| frame.stream_id == 9 && frame.kind == MuxFrameKind::Reset);
         assert!(saw_reset, "wedged stream is eventually shed with a Reset");
+        if let Some(task) = streams.tasks.get_mut(&9) {
+            let _ = timeout(Duration::from_secs(5), task)
+                .await
+                .expect("shed task must finish cancellation before releasing its slot");
+        }
         streams.prune_finished();
         assert!(
             !streams.tasks.contains_key(&9),
@@ -8985,6 +9890,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback UDP + TCP sockets"]
     async fn mux_quic_idle_backstop_reclaims_silent_session() {
+        check_mux_quic_teardown(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback UDP + TCP sockets"]
+    async fn mux_quic_cancel_closes_target_before_releasing_admission() {
+        check_mux_quic_teardown(true).await;
+    }
+
+    async fn check_mux_quic_teardown(cancel_with_target: bool) {
         use crate::crypto::session::derive_server_keys;
         use crate::protocol::data::is_relay_idle_close_reason;
         use crate::tls::quic::{AcceptAnyServerCert, ClientConfig as QuicClientConfig};
@@ -9039,7 +9954,7 @@ mod tests {
         let h3_control = H3ControlStreams::new(server_conn.open_uni(), server_conn.open_uni());
 
         // The parked TCP control connection: the client half stays open and
-        // SILENT for the whole test (no EOF, no stray byte), so `tcp_watch`
+        // SILENT for the whole test (no EOF, no stray byte), so the TCP watcher
         // never fires — exactly the DoS shape.
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tcp_addr = tcp_listener.local_addr().unwrap();
@@ -9054,10 +9969,44 @@ mod tests {
         let session_keys =
             derive_server_keys(PSK, &server_x.private, &client_x.public, &[7_u8; 32]).unwrap();
 
+        let admissions = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap().to_string();
+        let business = if cancel_with_target {
+            let (mut send, recv) = client_conn.open_bi();
+            let (mut seal, _) = crate::transport::udp::quic::mux::client_substream_codecs(
+                &session_keys,
+                TrafficConfig::default(),
+                send.id(),
+            )
+            .unwrap();
+            crate::transport::udp::h3::write_business_request_headers(
+                &mut send,
+                "example.com",
+                None,
+            )
+            .await
+            .unwrap();
+            let request = ConnectRequest {
+                host: "example.com".into(),
+                port: 443,
+                initial_payload: b"live".to_vec(),
+            }
+            .encode()
+            .unwrap();
+            let record = seal.seal(&request, &mut StdRng::seed_from_u64(16)).unwrap();
+            let mut writer = H3DataFrameLegWriter(send);
+            writer.write_records(&record).await.unwrap();
+            Some((writer, recv))
+        } else {
+            None
+        };
+
         // The client opens ZERO substreams: the session must be reclaimed by the
         // idle backstop (the call RETURNS within the wall budget) rather than
         // pinned on `accept_bi` indefinitely.
-        let session = run_authenticated_mux_quic_data_mode(
+        let mut session = Box::pin(run_authenticated_mux_quic_data_mode(
             BufferedTlsRecordReader::buffered(server_tcp_read),
             server_tcp_write,
             ServerProbedQuic {
@@ -9069,11 +10018,43 @@ mod tests {
             ServerMuxQuicContext {
                 session_keys: &session_keys,
                 traffic: TrafficConfig::default(),
-                fixed_data_target: None,
+                fixed_data_target: Some(&target_addr),
                 cid: 1,
+                admission: Some(&admission),
             },
             Duration::from_millis(100),
-        );
+        ));
+        if cancel_with_target {
+            let (mut target, _) = tokio::select! {
+                result = &mut session => panic!("session ended with a live target: {result:?}"),
+                accepted = timeout(Duration::from_secs(5), target_listener.accept()) => {
+                    accepted.unwrap().unwrap()
+                },
+            };
+            let mut initial = [0; 4];
+            target.read_exact(&mut initial).await.unwrap();
+            assert_eq!(&initial, b"live");
+            drop(session);
+            drop(admission);
+            assert_eq!(admissions.available_permits(), 0);
+            assert_eq!(
+                timeout(Duration::from_secs(5), target.read(&mut [0; 1]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            timeout(Duration::from_secs(5), async {
+                while admissions.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(admissions.available_permits(), 1);
+            drop(business);
+            return;
+        }
         tokio::time::timeout(Duration::from_secs(5), session)
             .await
             .expect("a zero-substream silent session must be reclaimed by the idle backstop")
@@ -9534,6 +10515,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets + mutates the process-global cap-shed budget"]
     async fn cap_shed_fallback_relays_serverhello_not_bare_fin() {
+        #[cfg(target_os = "linux")]
+        let kernel_paths_before = {
+            crate::transport::tcp::server_relay_connection_limit(false, 1).unwrap();
+            // Prove the kernel selector could admit us: staying in userspace
+            // must not pass merely because the kernel-splice budget is full.
+            let slot = crate::transport::tcp::try_enter_kernel_splice_relay()
+                .expect("serial cap-shed test has an available kernel-splice slot");
+            drop(slot);
+            crate::transport::tcp::splice_path_stats()
+        };
         let client_hello = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
         let server_hello = crate::tls::record::wrap_application_data(b"origin-server-hello")
             .expect("test ServerHello fits");
@@ -9554,7 +10545,10 @@ mod tests {
         let origin_addr_str = origin_addr.to_string();
         let relay_task = tokio::spawn(async move {
             let (server_side, _) = parallax_listener.accept().await.unwrap();
-            cap_shed_fallback_or_fin(server_side, origin_addr_str).await;
+            spawn_cap_shed_fallback(server_side, &origin_addr_str)
+                .await
+                .await
+                .unwrap();
         });
 
         let mut client = TcpStream::connect(parallax_addr).await.unwrap();
@@ -9564,53 +10558,152 @@ mod tests {
             received, server_hello,
             "cap-shed must relay the origin ServerHello, not emit a bare FIN",
         );
+        #[cfg(target_os = "linux")]
+        {
+            let kernel_paths_after = crate::transport::tcp::splice_path_stats();
+            assert_eq!(
+                (kernel_paths_after.0, kernel_paths_after.1),
+                (kernel_paths_before.0, kernel_paths_before.1),
+                "cap-shed must bypass kernel splice, even when a slot is available",
+            );
+        }
         drop(client);
         origin_task.await.unwrap();
         relay_task.await.unwrap();
     }
 
-    /// H-1: when the cap-shed budget is full, a cap-rejected connection degrades to
-    /// a graceful FIN (EOF), never a hang or RST. Ignored + serial: it saturates
-    /// the process-global budget.
+    /// All 64 admitted connections stay open, while the accept-loop admission
+    /// future holds just one additional socket and creates no task. Queued input
+    /// must survive saturation, then splice normally after a slot is released.
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets + mutates the process-global cap-shed budget"]
-    async fn cap_shed_fallback_budget_exhausted_falls_back_to_fin() {
-        // Saturate the cap-shed budget and hold the guards for the whole test.
-        let held: Vec<CapShedFallbackSlot> = (0..MAX_CONCURRENT_CAP_SHED_FALLBACKS)
-            .map(|_| try_enter_cap_shed_fallback().expect("within budget"))
-            .collect();
-        assert!(
-            try_enter_cap_shed_fallback().is_none(),
-            "budget exhausted must yield no further slot",
-        );
+    async fn cap_shed_saturation_waits_without_spawning_or_closing_socket() {
+        use std::os::fd::AsRawFd;
 
-        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let parallax_addr = parallax_listener.local_addr().unwrap();
-        let relay_task = tokio::spawn(async move {
-            let (server_side, _) = parallax_listener.accept().await.unwrap();
-            // The address is never dialed: the budget is full, so it FINs directly.
-            cap_shed_fallback_or_fin(server_side, "127.0.0.1:9".to_string()).await;
-        });
-
-        // Client connects and reads without writing: it must see a prompt graceful
-        // FIN (EOF), proving the budget-full path closes instead of relaying. (We
-        // deliberately do not write here — a client write that races the close is a
-        // harness artifact, not the production cap path where the ClientHello is
-        // already queued and drained before the FIN.)
-        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
-        let mut one = [0_u8; 1];
-        let n = timeout(Duration::from_secs(2), client.read(&mut one))
-            .await
-            .expect("budget-full cap-shed must close promptly, not hang")
-            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let mut peers = Vec::new();
+        let mut admitted = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CAP_SHED_FALLBACKS {
+            peers.push(TcpStream::connect(addr).await.unwrap());
+            let (server_side, _) = listener.accept().await.unwrap();
+            admitted.push(spawn_cap_shed_fallback(server_side, "127.0.0.1:9").await);
+        }
         assert_eq!(
-            n, 0,
-            "budget-full cap-shed must be a graceful FIN (EOF), not a relay",
+            active_cap_shed_fallbacks(),
+            MAX_CONCURRENT_CAP_SHED_FALLBACKS
         );
-        relay_task.await.unwrap();
 
-        // Restore the process-global budget for any other ignored/serial tests.
-        drop(held);
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap().to_string();
+        let client_hello = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let mut waiting_peer = TcpStream::connect(addr).await.unwrap();
+        waiting_peer.write_all(&client_hello).await.unwrap();
+        let (server_side, _) = listener.accept().await.unwrap();
+        let fd = server_side.as_raw_fd();
+        let mut waiting = Box::pin(spawn_cap_shed_fallback(server_side, &origin_addr));
+        let tasks_before = metrics.num_alive_tasks();
+        let open_fds = || std::fs::read_dir("/dev/fd").unwrap().count();
+        let fds_before = open_fds();
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        for _ in 0..16 {
+            assert!(waiting.as_mut().poll(&mut context).is_pending());
+            assert_eq!(metrics.num_alive_tasks(), tasks_before);
+            assert_eq!(open_fds(), fds_before);
+            // The only over-budget accepted fd remains live in this future;
+            // polling it neither accepts more sockets nor spawns a closer.
+            // SAFETY: F_GETFD accepts an integer fd without pointer arguments.
+            assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        }
+        let mut one = [0_u8; 1];
+        assert!(
+            timeout(Duration::from_millis(20), waiting_peer.read(&mut one))
+                .await
+                .is_err(),
+            "saturation must not FIN or reset a socket with a queued ClientHello",
+        );
+        assert_eq!(
+            active_cap_shed_fallbacks(),
+            MAX_CONCURRENT_CAP_SHED_FALLBACKS
+        );
+
+        peers[0].shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), admitted.remove(0))
+            .await
+            .unwrap()
+            .unwrap();
+        let relay = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("releasing a slot resumes accept-loop admission");
+        let (mut origin, _) = timeout(Duration::from_secs(2), origin_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_record(&mut origin).await.unwrap(), client_hello);
+        let server_hello = crate::tls::record::wrap_application_data(b"origin-server-hello")
+            .expect("test ServerHello fits");
+        origin.write_all(&server_hello).await.unwrap();
+        assert_eq!(read_record(&mut waiting_peer).await.unwrap(), server_hello);
+        waiting_peer.shutdown().await.unwrap();
+        origin.shutdown().await.unwrap();
+        assert_eq!(waiting_peer.read(&mut one).await.unwrap(), 0);
+        timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+
+        for task in &admitted {
+            task.abort();
+        }
+        for task in admitted {
+            let _ = task.await;
+        }
+        assert_eq!(active_cap_shed_fallbacks(), 0);
+        drop(peers);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets + mutates the process-global cap-shed budget"]
+    async fn cap_shed_failed_read_holds_slot_through_origin_cleanup() {
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_side, _) = listener.accept().await.unwrap();
+        let shed = spawn_cap_shed_fallback(
+            server_side,
+            &origin_listener.local_addr().unwrap().to_string(),
+        )
+        .await;
+        let (mut origin, _) = timeout(Duration::from_secs(2), origin_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // EOF without a header fails the first read. The speculative origin has
+        // already connected and must remain within the same slot while closing.
+        peer.shutdown().await.unwrap();
+        let mut one = [0_u8; 1];
+        assert_eq!(
+            timeout(Duration::from_secs(1), origin.read(&mut one))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+        );
+        tokio::task::yield_now().await;
+        assert!(!shed.is_finished(), "origin has not sent its EOF yet");
+        assert_eq!(active_cap_shed_fallbacks(), 1);
+
+        origin.shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), shed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active_cap_shed_fallbacks(), 0);
     }
 
     /// The cap-shed path must pre-dial the camouflage origin on the SAME schedule as
@@ -9636,7 +10729,7 @@ mod tests {
         let (server_side, _) = parallax_listener.accept().await.unwrap();
 
         let started = Instant::now();
-        let shed = tokio::spawn(cap_shed_fallback_or_fin(server_side, origin_addr));
+        let shed = spawn_cap_shed_fallback(server_side, &origin_addr).await;
 
         let accepted = timeout(Duration::from_secs(2), origin_listener.accept())
             .await
@@ -10631,25 +11724,19 @@ mod tests {
 
     #[test]
     fn cap_shed_fallback_admission_enforces_budget_and_releases_on_drop() {
-        // RAII admission control for cap-shed fallback relays. This is the ONLY unit
-        // test that touches the process-global ACTIVE_CAP_SHED_FALLBACKS counter, so
-        // there is no intra-binary race; we still measure relative to the baseline
-        // and restore it. Pins three things:
-        //   - a slot is granted while under budget (kills `-> None` and `>=` -> `<`),
-        //   - the counter rises by exactly one per granted slot,
-        //   - Drop releases the slot (kills the no-op Drop replacement).
-        let baseline = ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire);
+        // The only non-ignored test that reserves the process-global semaphore.
+        let baseline = active_cap_shed_fallbacks();
         assert_eq!(baseline, 0, "test fixture expects a quiescent counter");
 
         // Under budget: the first entry must succeed and bump the counter to 1.
         let slot = try_enter_cap_shed_fallback().expect("under budget -> Some");
-        assert_eq!(ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire), 1);
+        assert_eq!(active_cap_shed_fallbacks(), 1);
 
         // Dropping the slot must release the budget back to the baseline. A no-op
         // Drop would leave the counter at 1.
         drop(slot);
         assert_eq!(
-            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            active_cap_shed_fallbacks(),
             baseline,
             "dropping a slot must release the budget"
         );
@@ -10661,22 +11748,22 @@ mod tests {
             slots.push(try_enter_cap_shed_fallback().expect("within budget -> Some"));
         }
         assert_eq!(
-            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            active_cap_shed_fallbacks(),
             MAX_CONCURRENT_CAP_SHED_FALLBACKS
         );
         assert!(
             try_enter_cap_shed_fallback().is_none(),
             "at the cap a further entry must be refused"
         );
-        // The refused attempt must not have leaked budget (its fetch_add was undone).
+        // A refused attempt must not consume a permit.
         assert_eq!(
-            ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire),
+            active_cap_shed_fallbacks(),
             MAX_CONCURRENT_CAP_SHED_FALLBACKS
         );
 
         // Release everything; the counter returns to baseline.
         drop(slots);
-        assert_eq!(ACTIVE_CAP_SHED_FALLBACKS.load(Ordering::Acquire), baseline);
+        assert_eq!(active_cap_shed_fallbacks(), baseline);
     }
 
     /// Read-ahead pipelining regression: the bulk `server_download_loop` overlaps
@@ -11246,6 +12333,7 @@ mod tests {
                 7,
                 payload_pool,
                 idle,
+                Arc::new(AtomicU64::new(relay_now_millis())),
             ),
         )
         .await

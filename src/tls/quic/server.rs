@@ -1556,6 +1556,49 @@ mod tests {
             &state.psk[..],
             "client and server derive the same resumption PSK"
         );
+
+        // A server can issue a resumption ticket without granting 0-RTT. This
+        // application's cache only drives 0-RTT, so it leaves the slot empty and
+        // the next connection follows the normal cold 1-RTT path.
+        let no_early_data = encode_new_session_ticket(&NewSessionTicket {
+            max_early_data: None,
+            ..nst
+        })
+        .unwrap();
+        client.read_handshake(&no_early_data).unwrap();
+        assert!(client.take_session_ticket(1_000_000).is_none());
+
+        let mut next_client = ClientHandshake::new(
+            Arc::new(ClientConfig::new(
+                Arc::new(AcceptAnyServerCert),
+                vec![b"h3".to_vec()],
+            )),
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0xaa, 0xbb],
+            &[],
+        )
+        .unwrap();
+        let mut next_server = ServerHandshake::new(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            key.as_ref(),
+            vec![b"h3".to_vec()],
+            vec![0x01, 0x02, 0x03, 0x04],
+            Some(stek),
+        )
+        .unwrap();
+        next_server
+            .read_handshake(&drain(|b| next_client.write_handshake(b)))
+            .unwrap();
+        next_client
+            .read_handshake(&drain(|b| next_server.write_handshake(b)))
+            .unwrap();
+        next_server
+            .read_handshake(&drain(|b| next_client.write_handshake(b)))
+            .unwrap();
+        assert!(!next_client.is_handshaking() && !next_server.is_handshaking());
+        assert!(!next_client.is_early_data_accepted());
+        assert!(!next_server.is_early_data_accepted());
     }
 
     #[test]

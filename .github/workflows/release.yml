@@ -59,6 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -68,12 +69,19 @@ jobs:
 
       - name: Resolve version
         id: ver
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          PUSH_COMMIT: ${{ github.event_name == 'push' && github.sha || '' }}
         shell: bash
         run: |
           set -euo pipefail
-          ref="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "tag=${ref}" >> "$GITHUB_OUTPUT"
-          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          [[ "$RELEASE_TAG" == v* ]]
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          [[ "$head_commit" == "$tag_commit" ]]
+          [[ -z "$PUSH_COMMIT" || "$head_commit" == "$PUSH_COMMIT" ]]
+          printf 'tag=%s\nversion=%s\n' "$RELEASE_TAG" "${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build
         shell: bash
@@ -81,12 +89,15 @@ jobs:
 
       - name: Package
         id: pkg
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          TARGET: ${{ matrix.target }}
         shell: bash
         run: |
           set -euo pipefail
-          dist="parallax-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          dist="parallax-${VERSION}-${TARGET}"
           mkdir -p "$dist"
-          bindir="target/${{ matrix.target }}/release"
+          bindir="target/${TARGET}/release"
           for b in parallax plx; do
             cp "$bindir/$b" "$dist/"
             strip "$dist/$b" 2>/dev/null || true
@@ -100,6 +111,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.ver.outputs.tag }}
+          TARBALL: ${{ steps.pkg.outputs.tarball }}
         shell: bash
         run: |
           set -euo pipefail
@@ -107,6 +119,6 @@ jobs:
           # through to the upload (|| true swallows the "already exists" error).
           gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag 2>/dev/null || true
           gh release upload "$TAG" \
-            "${{ steps.pkg.outputs.tarball }}" \
-            "${{ steps.pkg.outputs.tarball }}.sha256" \
+            "$TARBALL" \
+            "$TARBALL.sha256" \
             --clobber

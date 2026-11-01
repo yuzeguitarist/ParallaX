@@ -358,11 +358,21 @@ fn encode_ack(ack: &Ack, out: &mut Vec<u8>) {
 pub struct Iter<'a> {
     buf: &'a [u8],
     pos: usize,
+    last_frame_type: u64,
 }
 
 impl<'a> Iter<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            last_frame_type: 0,
+        }
+    }
+
+    /// Original wire type of the last decoded frame, including STREAM flags.
+    pub(crate) fn last_frame_type(&self) -> u64 {
+        self.last_frame_type
     }
 
     fn varint(&mut self) -> Result<u64, FrameError> {
@@ -403,7 +413,9 @@ impl<'a> Iter<'a> {
     }
 
     fn parse_one(&mut self) -> Result<Frame<'a>, FrameError> {
+        self.last_frame_type = 0;
         let ty = self.varint()?;
+        self.last_frame_type = ty;
         match ty {
             FT_PADDING => {
                 // Coalesce the whole run of zero bytes.
