@@ -1651,7 +1651,6 @@ async fn handle_local_mux_connection_with_cid(
         unreachable!("QUIC carrier handled above");
     };
     let stream_id = next_mux_stream_id(&mux.next_stream_id);
-    let awaits_response = !connect_request.initial_payload.is_empty();
     let connect_payload = connect_request.encode()?;
     let open_frame = MuxFrame {
         stream_id,
@@ -1668,7 +1667,13 @@ async fn handle_local_mux_connection_with_cid(
             stream_id,
             local_write,
             outcome_tx,
-            awaits_response,
+            // A successfully forwarded initial payload does not imply that the
+            // destination must answer promptly. In particular, a healthy target
+            // may remain silent until the ordinary randomized idle backstop.
+            // Do not arm the carrier-wide watchdog from application behavior:
+            // doing so lets one silent target reset unrelated mux substreams and
+            // creates a fixed, externally observable carrier-close deadline.
+            awaits_response: false,
         }))
         .await
         .is_err()
@@ -5247,44 +5252,37 @@ mod tests {
         dead_after: Duration::from_millis(200),
     };
 
-    /// A carrier that silently died (blackholed: no FIN, no RST, reads just never
-    /// return) must not hold an unanswered Open — and every other substream on
-    /// it — until the 10-minute idle backstop. The watchdog first marks the
-    /// carrier suspect (the pool steers new substreams away), then resets its
-    /// substreams so apps retry on a fresh session.
+    /// A destination may legitimately accept an Open's initial payload without
+    /// replying. Application silence must not arm the carrier watchdog: otherwise
+    /// one slow target can reset every unrelated substream and make the client
+    /// close its carrier at a fixed, externally observable deadline.
     #[tokio::test]
-    async fn client_mux_watchdog_resets_streams_on_an_unresponsive_carrier() {
-        let (register_rx, outcome_rx, open_from_server, _sockets) =
-            registered_mux_stream(true).await;
+    async fn client_mux_initial_payload_does_not_arm_carrier_watchdog() {
+        // Production registrations deliberately leave `awaits_response` false,
+        // including when the encoded Open carries an initial payload.
+        let (register_rx, _outcome_rx, open_from_server, _sockets) =
+            registered_mux_stream(false).await;
         let health = Arc::new(MuxCarrierHealth::new());
 
-        let reader = tokio::spawn(client_mux_reader_loop(
-            SilentLegReader,
-            open_from_server,
-            register_rx,
-            1,
-            Duration::from_secs(60),
-            Arc::clone(&health),
-            TEST_WATCHDOG,
-        ));
-        tokio::time::sleep(Duration::from_millis(130)).await;
+        let loop_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_mux_reader_loop(
+                SilentLegReader,
+                open_from_server,
+                register_rx,
+                1,
+                Duration::from_millis(500),
+                Arc::clone(&health),
+                TEST_WATCHDOG,
+            ),
+        )
+        .await
+        .expect("the ordinary idle backstop must end the silent session");
         assert!(
-            health.is_suspect(),
-            "past the suspect threshold the carrier must stop getting new substreams"
+            matches!(loop_result, Ok(())),
+            "application silence must reach the idle backstop, got {loop_result:?}",
         );
-
-        let loop_result = tokio::time::timeout(Duration::from_secs(5), reader)
-            .await
-            .expect("the watchdog must end the session long before the idle backstop")
-            .unwrap();
-        assert!(
-            matches!(&loop_result, Err(ClientRuntimeError::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
-            "an unresponsive carrier ends the session with TimedOut, got {loop_result:?}",
-        );
-        assert!(
-            client_mux_await_download(outcome_rx, 1).await.is_err(),
-            "the waiting substream must see a Reset (so the app retries), not a clean EOF"
-        );
+        assert!(!health.is_suspect());
     }
 
     /// The watchdog must not fire on a quiet but healthy session: an Open with no
