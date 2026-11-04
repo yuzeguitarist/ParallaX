@@ -46,8 +46,8 @@ Auth failure, a missing SNI, and an unauthorized SNI splice to the camouflage
 origin and install no keys. A degenerate all-zero X25519 shared secret is
 rejected after that auth, inside `derive_keys_from_shared`, and closes
 without splicing. The same reject in `hybrid_sandwich_rekey` fails the PQ
-rekey and does not advance the epoch. Replay is decided when the PQ rekey
-frame is committed. A missing cache fails closed the same way. `FallbackReason::Replay`
+rekey after that insert and does not advance the epoch. Replay is decided
+when the PQ rekey frame is committed. A missing cache fails closed the same way. `FallbackReason::Replay`
 is not constructed; a replay, a stale timestamp, or a full cache closes the
 connection before `apply_server_pq_rekey`.
 
@@ -108,8 +108,8 @@ and the ticket is not burned. CacheFull and an 8-byte nonce prefix collision
 are decided under a free lock and do not burn the ticket. The journal fsync
 is deferred; a restart before it can accept the ticket again.
 `AcceptsAtMostOnce` counts one boot, not a crash before that fsync. A second
-offer of an accepted ticket is a replay. Relay bytes, QUIC retain, and the
-next stored ticket wait until the handshake, a verified probe, and Safari
+offer of an accepted ticket is a replay. Relay bytes wait for the handshake.
+QUIC retain and the next stored ticket wait for a verified probe and Safari
 SETTINGS. A verified probe that fails SETTINGS stores nothing. `dead` is a
 handshake timeout; it drops the attempt.
 

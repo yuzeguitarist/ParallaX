@@ -11,7 +11,7 @@
 \*   IdleAndReconnectAreFresh: idle, including after reconnect, holds no keys, binding, app data, or failure class
 \*   AuthedHasNoKeys: authentication alone has not installed epoch-0 keys
 \*   PostAuthDegenerateDoesNotSplice: an all-zero shared secret after auth closes with no keys and is not a fallback splice
-\*   RekeyDegenerateStaysAtEpochZero: an all-zero ephemeral in hybrid_sandwich_rekey fails the rekey without splicing or advancing the epoch
+\*   RekeyDegenerateStaysAtEpochZero: an all-zero ephemeral in hybrid_sandwich_rekey fails after the replay insert, without splicing or advancing the epoch
 \*   SpliceIsTheInboundReject: a fallback splice is an inbound auth or SNI reject before keys exist
 \*   TerminalDropsUsableKeys: rejected, closed, and failed sessions cannot seal or send app data
 \*   UdpRetainOnlyAfterApp: a retained QUIC leg exists only on a live, identity-verified app session
@@ -119,13 +119,14 @@ RekeyMalformed ==
   /\ UNCHANGED << epoch, binding, keys, replay, attempt, how >>
 
 RekeyDegenerate ==
-  /\ (phase = "rekey_wait")
+  /\ (phase = "rekey_wait" /\ replay = "pending")
   /\ phase' = "failed"
   /\ usable' = FALSE
+  /\ replay' = "inserted"
   /\ app' = FALSE
   /\ udp' = "none"
   /\ how' = "rekey_degen"
-  /\ UNCHANGED << epoch, binding, keys, replay, attempt >>
+  /\ UNCHANGED << epoch, binding, keys, attempt >>
 
 VerifyBeforeBinding ==
   /\ (phase \in {"epoch0", "rekey_wait"})
@@ -255,9 +256,9 @@ AuthedHasNoKeys ==
 PostAuthDegenerateDoesNotSplice ==
   how = "degen" => (phase = "failed" /\ ~keys /\ ~usable /\ epoch = 0 /\ ~binding /\ ~app)
 
-\* an all-zero ephemeral in hybrid_sandwich_rekey fails the rekey without splicing or advancing the epoch
+\* an all-zero ephemeral in hybrid_sandwich_rekey fails after the replay insert, without splicing or advancing the epoch
 RekeyDegenerateStaysAtEpochZero ==
-  how = "rekey_degen" => (phase = "failed" /\ epoch = 0 /\ keys /\ ~usable /\ ~binding /\ ~app)
+  how = "rekey_degen" => (phase = "failed" /\ epoch = 0 /\ keys /\ ~usable /\ ~binding /\ ~app /\ replay = "inserted")
 
 \* a fallback splice is an inbound auth or SNI reject before keys exist
 SpliceIsTheInboundReject ==

@@ -69,7 +69,7 @@ ClientFinished ==
   /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_ch, saw_sfin, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
 
 ClientNewSessionTicket ==
-  /\ (complete /\ client = "done" /\ ~client_alert /\ ~nst)
+  /\ (complete /\ client = "done" /\ ~client_alert /\ ~post_alert /\ ~nst)
   /\ nst' = TRUE
   /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket >>
 
@@ -104,12 +104,12 @@ ServerUnexpected ==
   /\ UNCHANGED << client, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, post_alert, server_post_alert, server_ticket, nst >>
 
 ServerIssueTicket ==
-  /\ (server_complete /\ ~server_alert /\ ~server_ticket)
+  /\ (server_complete /\ ~server_alert /\ ~server_post_alert /\ ~server_ticket)
   /\ server_ticket' = TRUE
   /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, nst >>
 
 ServerUnexpectedAfterComplete ==
-  /\ (server_complete /\ ~server_alert /\ ~server_post_alert)
+  /\ (server_complete /\ server_ticket /\ ~server_alert /\ ~server_post_alert)
   /\ server_post_alert' = TRUE
   /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_ticket, nst >>
 

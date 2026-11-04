@@ -26,10 +26,13 @@ vars == << offer, accept, c, s, c_zrtt, s_zrtt, c_hs, s_hs, c_1rtt, s_1rtt, stek
 Init ==
   \/ (offer = FALSE /\ accept = FALSE /\ c = "start" /\ s = "start" /\ c_zrtt = FALSE /\ s_zrtt = FALSE /\ c_hs = FALSE /\ s_hs = FALSE /\ c_1rtt = FALSE /\ s_1rtt = FALSE /\ stek = TRUE)
   \/ (offer = TRUE /\ accept = FALSE /\ c = "start" /\ s = "start" /\ c_zrtt = FALSE /\ s_zrtt = FALSE /\ c_hs = FALSE /\ s_hs = FALSE /\ c_1rtt = FALSE /\ s_1rtt = FALSE /\ stek = TRUE)
-  \/ (offer = TRUE /\ accept = TRUE /\ c = "start" /\ s = "start" /\ c_zrtt = FALSE /\ s_zrtt = FALSE /\ c_hs = FALSE /\ s_hs = FALSE /\ c_1rtt = FALSE /\ s_1rtt = FALSE /\ stek = TRUE)
   \/ (offer = FALSE /\ accept = FALSE /\ c = "start" /\ s = "start" /\ c_zrtt = FALSE /\ s_zrtt = FALSE /\ c_hs = FALSE /\ s_hs = FALSE /\ c_1rtt = FALSE /\ s_1rtt = FALSE /\ stek = FALSE)
   \/ (offer = TRUE /\ accept = FALSE /\ c = "start" /\ s = "start" /\ c_zrtt = FALSE /\ s_zrtt = FALSE /\ c_hs = FALSE /\ s_hs = FALSE /\ c_1rtt = FALSE /\ s_1rtt = FALSE /\ stek = FALSE)
-  \/ (offer = TRUE /\ accept = TRUE /\ c = "start" /\ s = "start" /\ c_zrtt = FALSE /\ s_zrtt = FALSE /\ c_hs = FALSE /\ s_hs = FALSE /\ c_1rtt = FALSE /\ s_1rtt = FALSE /\ stek = FALSE)
+
+AcceptEarly ==
+  /\ (s = "start" /\ offer /\ ~accept)
+  /\ accept' = TRUE
+  /\ UNCHANGED << offer, c, s, c_zrtt, s_zrtt, c_hs, s_hs, c_1rtt, s_1rtt, stek >>
 
 EmitCh ==
   /\ (c = "start")
@@ -94,6 +97,7 @@ EmitNst ==
   /\ UNCHANGED << offer, accept, c, c_zrtt, s_zrtt, c_hs, s_hs, c_1rtt, s_1rtt, stek >>
 
 Next ==
+  \/ AcceptEarly
   \/ EmitCh
   \/ EmitCZrtt
   \/ EmitCHsNoZrtt

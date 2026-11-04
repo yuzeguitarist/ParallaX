@@ -117,7 +117,7 @@ DecodeFail ==
   /\ UNCHANGED << obs, have, outcome, status, offer >>
 
 RejectAck ==
-  /\ (status = "verified" /\ decision = "pending" /\ read = "pending")
+  /\ (status \in {"verified", "unreachable", "failed"} /\ decision = "pending" /\ read = "pending")
   /\ offer' = "mismatch"
   /\ read' = "ok"
   /\ decision' = "stay"

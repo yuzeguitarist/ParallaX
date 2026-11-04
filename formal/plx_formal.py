@@ -735,8 +735,9 @@ def session_machine() -> Machine:
             ),
             act(
                 "RekeyDegenerate",
-                'phase = "rekey_wait"',
+                'phase = "rekey_wait" /\\ replay = "pending"',
                 phase='"failed"',
+                replay='"inserted"',
                 how='"rekey_degen"',
                 **drop,
             ),
@@ -831,8 +832,8 @@ def session_machine() -> Machine:
             ),
             claim(
                 "RekeyDegenerateStaysAtEpochZero",
-                "an all-zero ephemeral in hybrid_sandwich_rekey fails the rekey without splicing or advancing the epoch",
-                'how = "rekey_degen" => (phase = "failed" /\\ epoch = 0 /\\ keys /\\ ~usable /\\ ~binding /\\ ~app)',
+                "an all-zero ephemeral in hybrid_sandwich_rekey fails after the replay insert, without splicing or advancing the epoch",
+                'how = "rekey_degen" => (phase = "failed" /\\ epoch = 0 /\\ keys /\\ ~usable /\\ ~binding /\\ ~app /\\ replay = "inserted")',
             ),
             claim(
                 "SpliceIsTheInboundReject",
@@ -1038,7 +1039,7 @@ def quic_machine() -> Machine:
             ),
             act(
                 "ClientNewSessionTicket",
-                'complete /\\ client = "done" /\\ ~client_alert /\\ ~nst',
+                'complete /\\ client = "done" /\\ ~client_alert /\\ ~post_alert /\\ ~nst',
                 nst="TRUE",
             ),
             act(
@@ -1073,12 +1074,12 @@ def quic_machine() -> Machine:
             ),
             act(
                 "ServerIssueTicket",
-                "server_complete /\\ ~server_alert /\\ ~server_ticket",
+                "server_complete /\\ ~server_alert /\\ ~server_post_alert /\\ ~server_ticket",
                 server_ticket="TRUE",
             ),
             act(
                 "ServerUnexpectedAfterComplete",
-                "server_complete /\\ ~server_alert /\\ ~server_post_alert",
+                "server_complete /\\ server_ticket /\\ ~server_alert /\\ ~server_post_alert",
                 server_post_alert="TRUE",
             ),
         ),
@@ -1182,7 +1183,7 @@ def quic_machine() -> Machine:
             ),
         ),
         terminal=(
-            "(client_alert \\/ (complete /\\ nst /\\ post_alert))"
+            "(client_alert \\/ (complete /\\ post_alert))"
             " /\\ (server_alert \\/ (server_complete /\\ server_ticket /\\ server_post_alert))"
         ),
     )
@@ -1980,7 +1981,7 @@ def probe_machine() -> Machine:
             ),
             act(
                 "RejectAck",
-                'status = "verified" /\\ decision = "pending" /\\ read = "pending"',
+                'status \\in {"verified", "unreachable", "failed"} /\\ decision = "pending" /\\ read = "pending"',
                 offer='"mismatch"',
                 read='"ok"',
                 decision='"stay"',
@@ -2254,7 +2255,8 @@ def keys_machine() -> Machine:
 
     The client emits ClientHello, then 0-RTT keys only when a ticket was
     offered, then Handshake keys, then 1-RTT keys together with Finished.
-    The server emits 0-RTT open keys only when it accepted early data, and
+    Accepting early data is a transition guarded by an offered ticket, not an
+    input flag. The server emits 0-RTT open keys only after that accept, and
     it does that before ServerHello; Handshake keys come before 1-RTT keys.
     A server with a STEK emits the NewSessionTicket only after 1-RTT keys.
     A server with no STEK reaches 1-RTT and emits no ticket. The two sides
@@ -2296,12 +2298,15 @@ def keys_machine() -> Machine:
         initials=(
             {},
             {"offer": True},
-            {"offer": True, "accept": True},
             {"stek": False},
             {"offer": True, "stek": False},
-            {"offer": True, "accept": True, "stek": False},
         ),
         actions=(
+            act(
+                "AcceptEarly",
+                's = "start" /\\ offer /\\ ~accept',
+                accept="TRUE",
+            ),
             act("EmitCh", 'c = "start"', c='"ch"'),
             act(
                 "EmitCZrtt",
@@ -3476,10 +3481,20 @@ def correspond(root: Path = ROOT) -> None:
             "server data-mode read must stay after PQ rekey and the identity flight"
         )
     entry = _extract_fn(server, "handle_connection")
-    if "load_or_create_authenticated_with_window(" not in entry or "Some(replay_cache)" not in entry:
+    if "shared_replay_cache(" not in entry or "Some(replay_cache)" not in entry:
         problems.append(
-            "handle_connection must load the replay cache and pass it in, as run() does"
+            "handle_connection must pass in the shared replay cache, as run() passes its cache"
         )
+    shared = _extract_fn(server, "shared_replay_cache")
+    _order(
+        shared,
+        (
+            "load_or_create_authenticated_with_window(",
+            "Entry::Occupied",
+        ),
+        "direct callers share one replay cache per path; a losing load is dropped",
+        problems,
+    )
     commit_fn = _extract_fn(server, "commit_pending_replay_entry")
     if "return Ok(true)" in commit_fn or "return Ok(false)" not in commit_fn:
         problems.append(
