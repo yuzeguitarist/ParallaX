@@ -263,9 +263,8 @@ fn fallback_server_config(fallback_addr: SocketAddr) -> ServerConfig {
     let server_keys = X25519KeyPair::generate();
     let server_identity_keys = identity::keypair();
     // Use a private tempdir (like prober_loop.rs / chaos_liveness.rs) rather than
-    // a predictable name in the shared temp dir. The fallback path never opens
-    // this file, but a unique, non-world-guessable path is the right default; we
-    // leak the handle so the path stays valid for the whole test process.
+    // a predictable name in the shared temp dir. `handle_connection` opens the
+    // replay cache here; leak the handle so the path stays valid for the process.
     let replay_dir = tempfile::tempdir().unwrap();
     let replay_cache_path = replay_dir.path().join("parallax-replay.cache");
     std::mem::forget(replay_dir);
@@ -276,9 +275,8 @@ fn fallback_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         private_key: STANDARD.encode(server_keys.private).into(),
         identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
         replay_cache_path,
-        // The fallback path never touches the replay cache; any positive
-        // capacity is fine. (`DEFAULT_REPLAY_CACHE_CAPACITY` is `pub(crate)` and
-        // unreachable from an integration test.)
+        // Any positive capacity is fine. (`DEFAULT_REPLAY_CACHE_CAPACITY` is
+        // `pub(crate)` and unreachable from an integration test.)
         replay_cache_capacity: 1024,
         authorized_sni: vec![ORIGIN_SNI.to_owned()],
         strict_tls13: true,

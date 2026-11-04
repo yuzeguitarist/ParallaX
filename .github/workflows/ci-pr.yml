@@ -79,6 +79,7 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_*.py'
           python3 -m unittest discover -s ops/fuzz-cluster/tests -p 'test_*.py'
           python3 -m unittest discover -s fuzz/ci -p 'test_*.py'
+          python3 -m unittest discover -s formal -p 'test_*.py'
           python3 scripts/wiki_sync/test_convert.py
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets --locked -- -D warnings

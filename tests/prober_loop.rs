@@ -218,8 +218,7 @@ fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
     let replay_dir = tempfile::tempdir().unwrap();
     let replay_cache_path = replay_dir.path().join("parallax-replay.cache");
     // Keep the tempdir alive for the process: leak it (test-only). Dropping it
-    // would unlink the path, but the no-replay handle_connection path never
-    // opens it, so this is belt-and-suspenders.
+    // would unlink the path. `handle_connection` opens the replay cache there.
     std::mem::forget(replay_dir);
 
     ServerConfig {
@@ -231,8 +230,7 @@ fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         private_key: STANDARD.encode(server_keys.private).into(),
         identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
         replay_cache_path,
-        // DEFAULT_REPLAY_CACHE_CAPACITY is pub(crate); a literal is fine since
-        // the replay cache is not constructed on this code path.
+        // DEFAULT_REPLAY_CACHE_CAPACITY is pub(crate); a literal is fine.
         replay_cache_capacity: 49_152,
         authorized_sni: vec![String::from("example.com")],
         strict_tls13: true,

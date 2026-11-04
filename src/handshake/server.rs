@@ -1075,6 +1075,12 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     }
 }
 
+/// One connection on the public entry.
+///
+/// Loads the same authenticated replay cache [`run`] installs and passes it
+/// in. A missing cache used to skip `commit_pending_replay_entry` and still
+/// rekey; that insert now fails closed, and this entry no longer takes that
+/// path. The accept-loop admission permit stays with [`run`].
 pub async fn handle_connection(
     client: TcpStream,
     config: &ServerConfig,
@@ -1084,7 +1090,26 @@ pub async fn handle_connection(
 ) -> Result<(), HandshakeServerError> {
     let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let secrets = ServerRuntimeSecrets::decode(config)?;
-    handle_connection_inner(client, config, traffic, udp, psk, None, &secrets, cid, None).await
+    let replay_cache = Arc::new(Mutex::new(
+        ReplayCache::load_or_create_authenticated_with_window(
+            &config.replay_cache_path,
+            config.replay_cache_capacity,
+            psk,
+            replay_freshness_window_secs(),
+        )?,
+    ));
+    handle_connection_inner(
+        client,
+        config,
+        traffic,
+        udp,
+        psk,
+        Some(replay_cache),
+        &secrets,
+        cid,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3702,8 +3727,11 @@ async fn insert_replay_entry_blocking(
 async fn commit_pending_replay_entry(
     pending_replay: &mut Option<PendingReplayEntry>,
 ) -> Result<bool, HandshakeServerError> {
+    // No cache means this handshake was not recorded. Treating that as a fresh
+    // insert let a caller rekey with replay protection skipped. Fail closed the
+    // same way a replay does: the data path returns before `apply_server_pq_rekey`.
     let Some(pending) = pending_replay.take() else {
-        return Ok(true);
+        return Ok(false);
     };
     insert_replay_entry_blocking(pending.cache, pending.entry).await
 }
@@ -7379,6 +7407,12 @@ mod tests {
         assert!(first.is_none());
         assert!(!commit_pending_replay_entry(&mut replayed).await.unwrap());
         assert!(replayed.is_none());
+
+        let mut missing = None;
+        assert!(
+            !commit_pending_replay_entry(&mut missing).await.unwrap(),
+            "a missing replay cache is not a fresh insert"
+        );
     }
 
     #[test]
