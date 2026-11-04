@@ -1140,7 +1140,7 @@ async fn shared_replay_cache(
     }
     let path = config.replay_cache_path.clone();
     let capacity = config.replay_cache_capacity;
-    let psk = psk.to_vec();
+    let psk = Zeroizing::new(psk.to_vec());
     let window = replay_freshness_window_secs();
     let loaded = tokio::task::spawn_blocking(move || {
         ReplayCache::load_or_create_authenticated_with_window(&path, capacity, &psk, window)

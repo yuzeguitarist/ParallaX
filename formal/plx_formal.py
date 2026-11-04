@@ -1121,8 +1121,8 @@ def quic_machine() -> Machine:
             ),
             claim(
                 "ServerAlertAfterCompleteDoesNotUndo",
-                "an unexpected server message after completion does not clear handshake_complete",
-                "server_post_alert => (server_complete /\\ server = \"done\" /\\ saw_sfin /\\ ~server_alert)",
+                "an unexpected server message after completion does not clear handshake_complete, and the ticket was already issued",
+                "server_post_alert => (server_complete /\\ server = \"done\" /\\ saw_sfin /\\ ~server_alert /\\ server_ticket)",
             ),
             claim(
                 "VerifyFollowsCertificate",
@@ -1347,7 +1347,11 @@ def zero_rtt_machine() -> Machine:
                 probe='"settings_fail"',
                 settings='"bad"',
             ),
-            act("Relay", "hs /\\ ~relay /\\ ~dead", relay="TRUE"),
+            act(
+                "Relay",
+                'hs /\\ probe = "verified" /\\ settings = "ok" /\\ ~relay /\\ ~dead',
+                relay="TRUE",
+            ),
             act(
                 "Retain",
                 'probe = "verified" /\\ settings = "ok" /\\ ~retained /\\ ~dead',
@@ -1408,8 +1412,8 @@ def zero_rtt_machine() -> Machine:
             ),
             claim(
                 "RelayWaitsForHandshake",
-                "relay bytes are sent only after the handshake, and not on a dead attempt",
-                "relay => (hs /\\ ~dead)",
+                "relay bytes are sent only after the handshake, a verified probe, and Safari SETTINGS",
+                'relay => (hs /\\ ~dead /\\ probe = "verified" /\\ settings = "ok")',
             ),
             claim(
                 "RetainOnlyVerified",
@@ -1516,10 +1520,10 @@ def zero_rtt_machine() -> Machine:
         ),
         terminal=(
             "(dead /\\ ~relay /\\ ~retained /\\ ~stored /\\ ~hs /\\ (~burned \\/ replay_decided))"
-            " \\/ (~dead /\\ hs /\\ relay /\\ (accepts = 0 \\/ replay_decided) /\\ ("
-            '(probe = "verified" /\\ settings = "ok" /\\ retained /\\ stored)'
-            ' \\/ (probe = "failed" /\\ ~retained /\\ ~stored)'
-            ' \\/ (probe = "settings_fail" /\\ settings = "bad" /\\ ~retained /\\ ~stored)))'
+            " \\/ (~dead /\\ hs /\\ (accepts = 0 \\/ replay_decided) /\\ ("
+            '(probe = "verified" /\\ settings = "ok" /\\ relay /\\ retained /\\ stored)'
+            ' \\/ (probe = "failed" /\\ ~relay /\\ ~retained /\\ ~stored)'
+            ' \\/ (probe = "settings_fail" /\\ settings = "bad" /\\ ~relay /\\ ~retained /\\ ~stored)))'
         ),
     )
 
@@ -2063,7 +2067,7 @@ def probe_machine() -> Machine:
             ),
             claim(
                 "MismatchStaysOnTcp",
-                "a Verified status byte whose offer_id does not match stays on TCP even if the conn is held",
+                "any decoded PX1P status whose offer_id does not match stays on TCP even if the conn is held",
                 'offer = "mismatch" => (decision = "stay" /\\ read = "ok")',
             ),
             claim(

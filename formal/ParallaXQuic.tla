@@ -11,7 +11,7 @@
 \*   AlertBeforeCompleteIsNotSuccess: an unexpected message before completion alerts and does not complete
 \*   AlertAfterCompleteDoesNotUndo: an unexpected message after completion alerts and leaves the handshake complete
 \*   ServerAlertIsNotComplete: an unexpected server message before completion alerts and does not complete
-\*   ServerAlertAfterCompleteDoesNotUndo: an unexpected server message after completion does not clear handshake_complete
+\*   ServerAlertAfterCompleteDoesNotUndo: an unexpected server message after completion does not clear handshake_complete, and the ticket was already issued
 \*   VerifyFollowsCertificate: CertificateVerify is only recorded after a Certificate
 \*   PskNeverEntersCertificate: a resumption never sits in the Certificate states
 \*   TicketOnlyAfterComplete: a NewSessionTicket is stored only after the handshake completes
@@ -160,9 +160,9 @@ AlertAfterCompleteDoesNotUndo ==
 ServerAlertIsNotComplete ==
   server = "alert" => (server_alert /\ ~server_complete /\ ~server_post_alert)
 
-\* an unexpected server message after completion does not clear handshake_complete
+\* an unexpected server message after completion does not clear handshake_complete, and the ticket was already issued
 ServerAlertAfterCompleteDoesNotUndo ==
-  server_post_alert => (server_complete /\ server = "done" /\ saw_sfin /\ ~server_alert)
+  server_post_alert => (server_complete /\ server = "done" /\ saw_sfin /\ ~server_alert /\ server_ticket)
 
 \* CertificateVerify is only recorded after a Certificate
 VerifyFollowsCertificate ==

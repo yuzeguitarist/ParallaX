@@ -13,7 +13,7 @@
 \*   SetupIsFailed: a bind or setup failure is Failed, the status the client returns for that path
 \*   RetainOnlyMatchingAck: QUIC is retained only for an AEAD-opened PX1P ack with a matching offer_id, status Verified, and the conn still held
 \*   VerifiedWithoutConnHardFails: a matching Verified ack with no probed connection is a hard failure, not a silent TCP fallback
-\*   MismatchStaysOnTcp: a Verified status byte whose offer_id does not match stays on TCP even if the conn is held
+\*   MismatchStaysOnTcp: any decoded PX1P status whose offer_id does not match stays on TCP even if the conn is held
 \*   VerifiedStayIsARejectedAck: staying on TCP after a Verified status is a mismatched offer_id or a decode failure
 \*   Px1pTimeoutAborts: a PX1P read timeout aborts and does not stay on TCP
 \*   Px1pEofAborts: a PX1P read EOF aborts and does not stay on TCP
@@ -210,7 +210,7 @@ RetainOnlyMatchingAck ==
 VerifiedWithoutConnHardFails ==
   decision = "hard_fail" => (status = "verified" /\ offer = "match" /\ read = "ok" /\ ~have)
 
-\* a Verified status byte whose offer_id does not match stays on TCP even if the conn is held
+\* any decoded PX1P status whose offer_id does not match stays on TCP even if the conn is held
 MismatchStaysOnTcp ==
   offer = "mismatch" => (decision = "stay" /\ read = "ok")
 

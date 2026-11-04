@@ -108,7 +108,8 @@ and the ticket is not burned. CacheFull and an 8-byte nonce prefix collision
 are decided under a free lock and do not burn the ticket. The journal fsync
 is deferred; a restart before it can accept the ticket again.
 `AcceptsAtMostOnce` counts one boot, not a crash before that fsync. A second
-offer of an accepted ticket is a replay. Relay bytes wait for the handshake.
+offer of an accepted ticket is a replay. Relay bytes wait for the handshake,
+a verified probe, and Safari SETTINGS.
 QUIC retain and the next stored ticket wait for a verified probe and Safari
 SETTINGS. A verified probe that fails SETTINGS stores nothing. `dead` is a
 handshake timeout; it drops the attempt.
@@ -122,7 +123,7 @@ handshake timeout; it drops the attempt.
 | `DurableAcceptStaysBurned` | A durable journal whose accept was cleared |
 | `RestartUndoesUndurableAccept` | A pre-fsync restart that leaves the ticket burned |
 | `FullOrClashDoesNotBurn` | CacheFull or a nonce-prefix collision that burns the ticket |
-| `RelayWaitsForHandshake` | Relay bytes before the handshake, or on a timed-out attempt |
+| `RelayWaitsForHandshake` | Relay bytes before the handshake, before a verified probe and Safari SETTINGS, or on a timed-out attempt |
 | `RetainOnlyVerified` | A retained QUIC leg without a verified probe |
 | `StoreTicketOnlyVerified` | Storing the next resumption ticket without a verified probe and Safari SETTINGS |
 | `SettingsFailDoesNotStore` | A verified probe that fails SETTINGS and still stores or retains |
@@ -279,7 +280,7 @@ They are not a claim that a cold JVM finishes in one second.
 
 | Command | Before | After |
 | --- | --- | --- |
-| `python3 formal/plx_formal.py check` | 0.06s, three machines, three runs | 0.11s, ten machines plus the ledger and the byte sweeps |
+| `python3 formal/plx_formal.py check` | 0.06s, three machines, three runs | 0.06s, ten machines plus the ledger and the byte sweeps |
 | `python3 formal/plx_formal.py correspond` | 0.04s, three runs | 0.05s, three runs (six more Rust files) |
 | `python3 formal/plx_formal.py tlc --jar /tmp/tla2tools.jar` | 6.90s for the original three specs; the first JVM was cold and TLC timed that spec at 5s | 0.92s then 0.79s for all ten specs at once, on a warm machine |
 
