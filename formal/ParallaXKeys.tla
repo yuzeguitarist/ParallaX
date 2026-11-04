@@ -30,7 +30,7 @@ Init ==
   \/ (offer = TRUE /\ accept = FALSE /\ c = "start" /\ s = "start" /\ c_zrtt = FALSE /\ s_zrtt = FALSE /\ c_hs = FALSE /\ s_hs = FALSE /\ c_1rtt = FALSE /\ s_1rtt = FALSE /\ stek = FALSE)
 
 AcceptEarly ==
-  /\ (s = "start" /\ offer /\ ~accept)
+  /\ (s = "start" /\ offer /\ ~accept /\ c # "start")
   /\ accept' = TRUE
   /\ UNCHANGED << offer, c, s, c_zrtt, s_zrtt, c_hs, s_hs, c_1rtt, s_1rtt, stek >>
 

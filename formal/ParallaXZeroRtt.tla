@@ -11,7 +11,7 @@
 \*   DurableAcceptStaysBurned: once the journal fsync has landed, that accept is still burned
 \*   RestartUndoesUndurableAccept: a restart before fsync clears the in-memory accept
 \*   FullOrClashDoesNotBurn: CacheFull and an 8-byte nonce-prefix collision decide the ticket without burning it
-\*   RelayWaitsForHandshake: relay bytes are sent only after the handshake, and not on a dead attempt
+\*   RelayWaitsForHandshake: relay bytes are sent only after the handshake, a verified probe, and Safari SETTINGS
 \*   RetainOnlyVerified: the QUIC leg is retained only after a verified probe, Safari SETTINGS, and the handshake
 \*   StoreTicketOnlyVerified: the next resumption ticket is stored only after a verified probe and Safari SETTINGS
 \*   SettingsFailDoesNotStore: a verified probe that fails the Safari SETTINGS check does not retain or store a ticket
@@ -127,7 +127,7 @@ SettingsFail ==
   /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 Relay ==
-  /\ (hs /\ ~relay /\ ~dead)
+  /\ (hs /\ probe = "verified" /\ settings = "ok" /\ ~relay /\ ~dead)
   /\ relay' = TRUE
   /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
@@ -204,9 +204,9 @@ RestartUndoesUndurableAccept ==
 FullOrClashDoesNotBurn ==
   reject \in {"full", "clash"} => (decided /\ ~burned /\ ~early /\ accepts = 0 /\ guard = "free" /\ binder = "ok")
 
-\* relay bytes are sent only after the handshake, and not on a dead attempt
+\* relay bytes are sent only after the handshake, a verified probe, and Safari SETTINGS
 RelayWaitsForHandshake ==
-  relay => (hs /\ ~dead)
+  relay => (hs /\ ~dead /\ probe = "verified" /\ settings = "ok")
 
 \* the QUIC leg is retained only after a verified probe, Safari SETTINGS, and the handshake
 RetainOnlyVerified ==

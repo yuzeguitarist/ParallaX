@@ -1371,7 +1371,7 @@ def zero_rtt_machine() -> Machine:
             ),
             act(
                 "Relay",
-                "hs /\\ ~relay /\\ ~dead",
+                'hs /\\ probe = "verified" /\\ settings = "ok" /\\ ~relay /\\ ~dead',
                 relay="TRUE",
             ),
             act(
@@ -1434,8 +1434,8 @@ def zero_rtt_machine() -> Machine:
             ),
             claim(
                 "RelayWaitsForHandshake",
-                "relay bytes are sent only after the handshake, and not on a dead attempt",
-                "relay => (hs /\\ ~dead)",
+                "relay bytes are sent only after the handshake, a verified probe, and Safari SETTINGS",
+                'relay => (hs /\\ ~dead /\\ probe = "verified" /\\ settings = "ok")',
             ),
             claim(
                 "RetainOnlyVerified",
@@ -1542,10 +1542,10 @@ def zero_rtt_machine() -> Machine:
         ),
         terminal=(
             "(dead /\\ ~relay /\\ ~retained /\\ ~stored /\\ ~hs /\\ (~burned \\/ replay_decided))"
-            " \\/ (~dead /\\ hs /\\ relay /\\ (accepts = 0 \\/ replay_decided) /\\ ("
-            '(probe = "verified" /\\ settings = "ok" /\\ retained /\\ stored)'
-            ' \\/ (probe = "failed" /\\ ~retained /\\ ~stored)'
-            ' \\/ (probe = "settings_fail" /\\ settings = "bad" /\\ ~retained /\\ ~stored)))'
+            " \\/ (~dead /\\ hs /\\ (accepts = 0 \\/ replay_decided) /\\ ("
+            '(probe = "verified" /\\ settings = "ok" /\\ relay /\\ retained /\\ stored)'
+            ' \\/ (probe = "failed" /\\ ~relay /\\ ~retained /\\ ~stored)'
+            ' \\/ (probe = "settings_fail" /\\ settings = "bad" /\\ ~relay /\\ ~retained /\\ ~stored)))'
         ),
     )
 
@@ -2330,7 +2330,7 @@ def keys_machine() -> Machine:
         actions=(
             act(
                 "AcceptEarly",
-                's = "start" /\\ offer /\\ ~accept',
+                's = "start" /\\ offer /\\ ~accept /\\ c # "start"',
                 accept="TRUE",
             ),
             act("EmitCh", 'c = "start"', c='"ch"'),
