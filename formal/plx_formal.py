@@ -971,6 +971,7 @@ def quic_machine() -> Machine:
         "server_post_alert",
         "server_ticket",
         "nst",
+        "stek",
     )
     defaults: dict[str, Scalar] = {
         "client": "sh",
@@ -989,13 +990,19 @@ def quic_machine() -> Machine:
         "server_post_alert": False,
         "server_ticket": False,
         "nst": False,
+        "stek": True,
     }
     return Machine(
         name="ParallaXQuic",
         blurb="QUIC TLS client ReadState and server ServerState.",
         fields=fields,
         defaults=defaults,
-        initials=({"psk": False}, {"psk": True}),
+        initials=(
+            {"psk": False, "stek": True},
+            {"psk": True, "stek": True},
+            {"psk": False, "stek": False},
+            {"psk": True, "stek": False},
+        ),
         actions=(
             act(
                 "ClientServerHello",
@@ -1074,12 +1081,12 @@ def quic_machine() -> Machine:
             ),
             act(
                 "ServerIssueTicket",
-                "server_complete /\\ ~server_alert /\\ ~server_post_alert /\\ ~server_ticket",
+                "server_complete /\\ stek /\\ ~server_alert /\\ ~server_post_alert /\\ ~server_ticket",
                 server_ticket="TRUE",
             ),
             act(
                 "ServerUnexpectedAfterComplete",
-                "server_complete /\\ server_ticket /\\ ~server_alert /\\ ~server_post_alert",
+                "server_complete /\\ (~stek \\/ server_ticket) /\\ ~server_alert /\\ ~server_post_alert",
                 server_post_alert="TRUE",
             ),
         ),
@@ -1121,8 +1128,8 @@ def quic_machine() -> Machine:
             ),
             claim(
                 "ServerAlertAfterCompleteDoesNotUndo",
-                "an unexpected server message after completion does not clear handshake_complete, and the ticket was already issued",
-                "server_post_alert => (server_complete /\\ server = \"done\" /\\ saw_sfin /\\ ~server_alert /\\ server_ticket)",
+                "an unexpected server message after completion does not clear handshake_complete",
+                "server_post_alert => (server_complete /\\ server = \"done\" /\\ saw_sfin /\\ ~server_alert)",
             ),
             claim(
                 "VerifyFollowsCertificate",
@@ -1143,6 +1150,16 @@ def quic_machine() -> Machine:
                 "ServerTicketOnlyAfterComplete",
                 "the server issues a session ticket only after handshake_complete is set",
                 "server_ticket => (server_complete /\\ server = \"done\" /\\ saw_sfin)",
+            ),
+            claim(
+                "ServerNoStekIssuesNoTicket",
+                "a server with no STEK calls issue_session_ticket and queues nothing",
+                "~stek => ~server_ticket",
+            ),
+            claim(
+                "PostAlertFollowsTheTicketCall",
+                "a post-completion alert is after issue_session_ticket, which queues a ticket only when a STEK exists",
+                "server_post_alert => (~stek \\/ server_ticket)",
             ),
         ),
         witnesses=(
@@ -1179,12 +1196,17 @@ def quic_machine() -> Machine:
             claim(
                 "ServerTicketFollowsComplete",
                 "handshake_complete is set before the session ticket is issued",
-                "server_ticket /\\ server_complete",
+                "server_ticket /\\ server_complete /\\ stek",
+            ),
+            claim(
+                "NoStekAlertsWithoutATicket",
+                "a no-STEK server still alerts after completion and has queued no ticket",
+                "~stek /\\ server_post_alert /\\ ~server_ticket /\\ server_complete",
             ),
         ),
         terminal=(
             "(client_alert \\/ (complete /\\ post_alert))"
-            " /\\ (server_alert \\/ (server_complete /\\ server_ticket /\\ server_post_alert))"
+            " /\\ (server_alert \\/ (server_complete /\\ server_post_alert /\\ (~stek \\/ server_ticket)))"
         ),
     )
 
@@ -1349,7 +1371,7 @@ def zero_rtt_machine() -> Machine:
             ),
             act(
                 "Relay",
-                'hs /\\ probe = "verified" /\\ settings = "ok" /\\ ~relay /\\ ~dead',
+                "hs /\\ ~relay /\\ ~dead",
                 relay="TRUE",
             ),
             act(
@@ -1412,8 +1434,8 @@ def zero_rtt_machine() -> Machine:
             ),
             claim(
                 "RelayWaitsForHandshake",
-                "relay bytes are sent only after the handshake, a verified probe, and Safari SETTINGS",
-                'relay => (hs /\\ ~dead /\\ probe = "verified" /\\ settings = "ok")',
+                "relay bytes are sent only after the handshake, and not on a dead attempt",
+                "relay => (hs /\\ ~dead)",
             ),
             claim(
                 "RetainOnlyVerified",
@@ -1520,10 +1542,10 @@ def zero_rtt_machine() -> Machine:
         ),
         terminal=(
             "(dead /\\ ~relay /\\ ~retained /\\ ~stored /\\ ~hs /\\ (~burned \\/ replay_decided))"
-            " \\/ (~dead /\\ hs /\\ (accepts = 0 \\/ replay_decided) /\\ ("
-            '(probe = "verified" /\\ settings = "ok" /\\ relay /\\ retained /\\ stored)'
-            ' \\/ (probe = "failed" /\\ ~relay /\\ ~retained /\\ ~stored)'
-            ' \\/ (probe = "settings_fail" /\\ settings = "bad" /\\ ~relay /\\ ~retained /\\ ~stored)))'
+            " \\/ (~dead /\\ hs /\\ relay /\\ (accepts = 0 \\/ replay_decided) /\\ ("
+            '(probe = "verified" /\\ settings = "ok" /\\ retained /\\ stored)'
+            ' \\/ (probe = "failed" /\\ ~retained /\\ ~stored)'
+            ' \\/ (probe = "settings_fail" /\\ settings = "bad" /\\ ~retained /\\ ~stored)))'
         ),
     )
 

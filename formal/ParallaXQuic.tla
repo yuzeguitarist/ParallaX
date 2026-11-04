@@ -11,107 +11,111 @@
 \*   AlertBeforeCompleteIsNotSuccess: an unexpected message before completion alerts and does not complete
 \*   AlertAfterCompleteDoesNotUndo: an unexpected message after completion alerts and leaves the handshake complete
 \*   ServerAlertIsNotComplete: an unexpected server message before completion alerts and does not complete
-\*   ServerAlertAfterCompleteDoesNotUndo: an unexpected server message after completion does not clear handshake_complete, and the ticket was already issued
+\*   ServerAlertAfterCompleteDoesNotUndo: an unexpected server message after completion does not clear handshake_complete
 \*   VerifyFollowsCertificate: CertificateVerify is only recorded after a Certificate
 \*   PskNeverEntersCertificate: a resumption never sits in the Certificate states
 \*   TicketOnlyAfterComplete: a NewSessionTicket is stored only after the handshake completes
 \*   ServerTicketOnlyAfterComplete: the server issues a session ticket only after handshake_complete is set
+\*   ServerNoStekIssuesNoTicket: a server with no STEK calls issue_session_ticket and queues nothing
+\*   PostAlertFollowsTheTicketCall: a post-completion alert is after issue_session_ticket, which queues a ticket only when a STEK exists
 
 ---- MODULE ParallaXQuic ----
 EXTENDS Integers
 
-VARIABLES client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst
+VARIABLES client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek
 
-vars == << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+vars == << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 Init ==
-  \/ (client = "sh" /\ server = "expect_ch" /\ psk = FALSE /\ saw_cert = FALSE /\ saw_cv = FALSE /\ saw_fin = FALSE /\ saw_ch = FALSE /\ saw_sfin = FALSE /\ complete = FALSE /\ server_complete = FALSE /\ client_alert = FALSE /\ server_alert = FALSE /\ post_alert = FALSE /\ server_post_alert = FALSE /\ server_ticket = FALSE /\ nst = FALSE)
-  \/ (client = "sh" /\ server = "expect_ch" /\ psk = TRUE /\ saw_cert = FALSE /\ saw_cv = FALSE /\ saw_fin = FALSE /\ saw_ch = FALSE /\ saw_sfin = FALSE /\ complete = FALSE /\ server_complete = FALSE /\ client_alert = FALSE /\ server_alert = FALSE /\ post_alert = FALSE /\ server_post_alert = FALSE /\ server_ticket = FALSE /\ nst = FALSE)
+  \/ (client = "sh" /\ server = "expect_ch" /\ psk = FALSE /\ saw_cert = FALSE /\ saw_cv = FALSE /\ saw_fin = FALSE /\ saw_ch = FALSE /\ saw_sfin = FALSE /\ complete = FALSE /\ server_complete = FALSE /\ client_alert = FALSE /\ server_alert = FALSE /\ post_alert = FALSE /\ server_post_alert = FALSE /\ server_ticket = FALSE /\ nst = FALSE /\ stek = TRUE)
+  \/ (client = "sh" /\ server = "expect_ch" /\ psk = TRUE /\ saw_cert = FALSE /\ saw_cv = FALSE /\ saw_fin = FALSE /\ saw_ch = FALSE /\ saw_sfin = FALSE /\ complete = FALSE /\ server_complete = FALSE /\ client_alert = FALSE /\ server_alert = FALSE /\ post_alert = FALSE /\ server_post_alert = FALSE /\ server_ticket = FALSE /\ nst = FALSE /\ stek = TRUE)
+  \/ (client = "sh" /\ server = "expect_ch" /\ psk = FALSE /\ saw_cert = FALSE /\ saw_cv = FALSE /\ saw_fin = FALSE /\ saw_ch = FALSE /\ saw_sfin = FALSE /\ complete = FALSE /\ server_complete = FALSE /\ client_alert = FALSE /\ server_alert = FALSE /\ post_alert = FALSE /\ server_post_alert = FALSE /\ server_ticket = FALSE /\ nst = FALSE /\ stek = FALSE)
+  \/ (client = "sh" /\ server = "expect_ch" /\ psk = TRUE /\ saw_cert = FALSE /\ saw_cv = FALSE /\ saw_fin = FALSE /\ saw_ch = FALSE /\ saw_sfin = FALSE /\ complete = FALSE /\ server_complete = FALSE /\ client_alert = FALSE /\ server_alert = FALSE /\ post_alert = FALSE /\ server_post_alert = FALSE /\ server_ticket = FALSE /\ nst = FALSE /\ stek = FALSE)
 
 ClientServerHello ==
   /\ (client = "sh" /\ ~client_alert)
   /\ client' = "ee"
-  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ClientEncryptedExtensionsFull ==
   /\ (client = "ee" /\ ~client_alert /\ ~psk)
   /\ client' = "cert"
-  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ClientEncryptedExtensionsPsk ==
   /\ (client = "ee" /\ ~client_alert /\ psk)
   /\ client' = "fin"
-  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ClientCertificate ==
   /\ (client = "cert" /\ ~client_alert /\ ~psk)
   /\ client' = "cv"
   /\ saw_cert' = TRUE
-  /\ UNCHANGED << server, psk, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << server, psk, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ClientCompressedCertificate ==
   /\ (client = "cert" /\ ~client_alert /\ ~psk)
   /\ client' = "cv"
   /\ saw_cert' = TRUE
-  /\ UNCHANGED << server, psk, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << server, psk, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ClientCertificateVerify ==
   /\ (client = "cv" /\ ~client_alert /\ ~psk)
   /\ client' = "fin"
   /\ saw_cv' = TRUE
-  /\ UNCHANGED << server, psk, saw_cert, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << server, psk, saw_cert, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ClientFinished ==
   /\ (client = "fin" /\ ~client_alert)
   /\ client' = "done"
   /\ saw_fin' = TRUE
   /\ complete' = TRUE
-  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_ch, saw_sfin, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_ch, saw_sfin, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ClientNewSessionTicket ==
   /\ (complete /\ client = "done" /\ ~client_alert /\ ~post_alert /\ ~nst)
   /\ nst' = TRUE
-  /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket >>
+  /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, stek >>
 
 ClientUnexpected ==
   /\ (~client_alert /\ ~complete)
   /\ client' = "alert"
   /\ client_alert' = TRUE
-  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ClientUnexpectedAfterComplete ==
   /\ (complete /\ ~client_alert /\ ~post_alert)
   /\ post_alert' = TRUE
-  /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, server_post_alert, server_ticket, nst, stek >>
 
 ServerClientHello ==
   /\ (server = "expect_ch" /\ ~server_alert)
   /\ server' = "expect_fin"
   /\ saw_ch' = TRUE
-  /\ UNCHANGED << client, psk, saw_cert, saw_cv, saw_fin, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << client, psk, saw_cert, saw_cv, saw_fin, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ServerFinished ==
   /\ (server = "expect_fin" /\ ~server_alert)
   /\ server' = "done"
   /\ saw_sfin' = TRUE
   /\ server_complete' = TRUE
-  /\ UNCHANGED << client, psk, saw_cert, saw_cv, saw_fin, saw_ch, complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << client, psk, saw_cert, saw_cv, saw_fin, saw_ch, complete, client_alert, server_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ServerUnexpected ==
   /\ (~server_alert /\ ~server_complete)
   /\ server' = "alert"
   /\ server_alert' = TRUE
-  /\ UNCHANGED << client, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, post_alert, server_post_alert, server_ticket, nst >>
+  /\ UNCHANGED << client, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, post_alert, server_post_alert, server_ticket, nst, stek >>
 
 ServerIssueTicket ==
-  /\ (server_complete /\ ~server_alert /\ ~server_post_alert /\ ~server_ticket)
+  /\ (server_complete /\ stek /\ ~server_alert /\ ~server_post_alert /\ ~server_ticket)
   /\ server_ticket' = TRUE
-  /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, nst >>
+  /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_post_alert, nst, stek >>
 
 ServerUnexpectedAfterComplete ==
-  /\ (server_complete /\ server_ticket /\ ~server_alert /\ ~server_post_alert)
+  /\ (server_complete /\ (~stek \/ server_ticket) /\ ~server_alert /\ ~server_post_alert)
   /\ server_post_alert' = TRUE
-  /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_ticket, nst >>
+  /\ UNCHANGED << client, server, psk, saw_cert, saw_cv, saw_fin, saw_ch, saw_sfin, complete, server_complete, client_alert, server_alert, post_alert, server_ticket, nst, stek >>
 
 Next ==
   \/ ClientServerHello
@@ -160,9 +164,9 @@ AlertAfterCompleteDoesNotUndo ==
 ServerAlertIsNotComplete ==
   server = "alert" => (server_alert /\ ~server_complete /\ ~server_post_alert)
 
-\* an unexpected server message after completion does not clear handshake_complete, and the ticket was already issued
+\* an unexpected server message after completion does not clear handshake_complete
 ServerAlertAfterCompleteDoesNotUndo ==
-  server_post_alert => (server_complete /\ server = "done" /\ saw_sfin /\ ~server_alert /\ server_ticket)
+  server_post_alert => (server_complete /\ server = "done" /\ saw_sfin /\ ~server_alert)
 
 \* CertificateVerify is only recorded after a Certificate
 VerifyFollowsCertificate ==
@@ -179,5 +183,13 @@ TicketOnlyAfterComplete ==
 \* the server issues a session ticket only after handshake_complete is set
 ServerTicketOnlyAfterComplete ==
   server_ticket => (server_complete /\ server = "done" /\ saw_sfin)
+
+\* a server with no STEK calls issue_session_ticket and queues nothing
+ServerNoStekIssuesNoTicket ==
+  ~stek => ~server_ticket
+
+\* a post-completion alert is after issue_session_ticket, which queues a ticket only when a STEK exists
+PostAlertFollowsTheTicketCall ==
+  server_post_alert => (~stek \/ server_ticket)
 
 ====

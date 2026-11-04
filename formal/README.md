@@ -98,6 +98,8 @@ The server sets `handshake_complete` and only then issues the session ticket.
 | `PskNeverEntersCertificate` | A resumption sitting in the Certificate states |
 | `TicketOnlyAfterComplete` | A NewSessionTicket stored before the handshake completes |
 | `ServerTicketOnlyAfterComplete` | A server session ticket issued before `handshake_complete` |
+| `ServerNoStekIssuesNoTicket` | A no-STEK server that queues a NewSessionTicket |
+| `PostAlertFollowsTheTicketCall` | A post-completion alert that skips `issue_session_ticket`, or a no-STEK server that queued a ticket first |
 
 ### 0-RTT and reconnect (`ParallaXZeroRtt`)
 
