@@ -1,0 +1,41 @@
+formal/README.md
+  s_e2585611d1e855::t_5d92f150a599c5 101-102
+formal/plx_formal.py
+  s_e2585611d1e855::t_1e92f94feeef6e 1545-1548
+  s_e2585611d1e855::t_075ea0fb346549 993
+  s_e2585611d1e855::t_a44ea8098f0f1e 1437-1438
+  s_e2585611d1e855::t_c03242e0ee173e 1084,1089
+  s_e2585611d1e855::t_70378e7f76210c 1199-1204,1209
+  s_e2585611d1e855::t_47ee08b20856e6 1374
+  s_e2585611d1e855::t_f98bf0ac2ef3b9 1154-1163
+  s_e2585611d1e855::t_f0ed697edf3478 974
+  s_e2585611d1e855::t_abf9a9fd16ab8f 1000-1005
+  s_e2585611d1e855::t_db450726c86fae 1131-1132
+formal/test_plx_formal.py
+  s_e2585611d1e855::t_5325dd650dc7da 234
+  s_e2585611d1e855::t_9ffdb3915eef40 218
+  s_e2585611d1e855::t_786c1824897db2 223-224
+  s_e2585611d1e855::t_111c985376e4e0 20-21
+formal/ParallaXQuic.cfg
+  s_e2585611d1e855::t_48e4c4cb64c1a0 15-16
+formal/ParallaXQuic.tla
+  s_e2585611d1e855::t_286ad9cac1db64 14,19-20,25,27,30-33,38,43,48,54,60,66,73,78,84,89,95,102,108,111,113,116,118,167,169,187-194
+formal/ParallaXZeroRtt.tla
+  s_e2585611d1e855::t_c9903b305c2577 14,130,207,209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bf9d7759f8204944bd99a182e2d00b570bfc2783",
+  "prompts": {},
+  "sessions": {
+    "s_e2585611d1e855": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "19ebe487-563a-4e88-b991-1ca889f25257",
+        "model": "grok-4.7-medium"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
