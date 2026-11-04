@@ -8,8 +8,10 @@
 \*   FailClosedDoesNotBurnOrAccept: a busy or checked-out replay guard accepts nothing and does not burn the ticket
 \*   BadBinderDoesNotBurnOrAccept: a bad binder is rejected before the guard and does not burn the ticket
 \*   AcceptsAtMostOnce: one boot accepts the ticket at most once; a crash before the deferred fsync is not this count
-\*   DurableAcceptStaysBurned: once the journal fsync has landed, that accept is still burned
-\*   RestartUndoesUndurableAccept: a restart before fsync clears the in-memory accept
+\*   DurableAcceptStaysBurned: once the journal fsync has landed, that accept is still burned and the cache is back
+\*   CheckoutIsUndurableAccept: the cache is checked out only after a fresh accept and before the deferred fsync
+\*   CheckoutRejectsTheConcurrentOffer: a second offer while the cache is checked out is rejected and does not accept again
+\*   RestartUndoesUndurableAccept: a restart before fsync clears the in-memory accept and the checkout
 \*   FullOrClashDoesNotBurn: CacheFull and an 8-byte nonce-prefix collision decide the ticket without burning it
 \*   RelayWaitsForHandshake: relay bytes are sent only after the handshake, a verified probe, and Safari SETTINGS
 \*   RetainOnlyVerified: the QUIC leg is retained only after a verified probe, Safari SETTINGS, and the handshake
@@ -24,27 +26,27 @@
 ---- MODULE ParallaXZeroRtt ----
 EXTENDS Integers
 
-VARIABLES guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead
+VARIABLES guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead
 
-vars == << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+vars == << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 Init ==
-  \/ (guard = "free" /\ binder = "ok" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
-  \/ (guard = "free" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
-  \/ (guard = "busy" /\ binder = "ok" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
-  \/ (guard = "busy" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
-  \/ (guard = "out" /\ binder = "ok" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
-  \/ (guard = "out" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
+  \/ (guard = "free" /\ binder = "ok" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
+  \/ (guard = "free" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
+  \/ (guard = "busy" /\ binder = "ok" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
+  \/ (guard = "busy" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
+  \/ (guard = "out" /\ binder = "ok" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
+  \/ (guard = "out" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
 
 Offer ==
   /\ (~offered /\ ~dead)
   /\ offered' = TRUE
-  /\ UNCHANGED << guard, binder, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 ProbeEarly ==
   /\ (offered /\ probe = "none" /\ ~hs /\ ~dead)
   /\ probe' = "early"
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 Accept ==
   /\ (offered /\ ~decided /\ binder = "ok" /\ guard = "free" /\ accepts = 0 /\ ~burned /\ ~dead)
@@ -53,25 +55,31 @@ Accept ==
   /\ burned' = TRUE
   /\ durable' = FALSE
   /\ accepts' = accepts + 1
-  /\ UNCHANGED << guard, binder, offered, restarted, reject, hs, probe, settings, relay, retained, stored, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, journal, restarted, reject, hs, probe, settings, relay, retained, stored, replay_offered, replay_decided, replay_rejected, dead >>
 
 CacheFull ==
   /\ (offered /\ ~decided /\ binder = "ok" /\ guard = "free" /\ accepts = 0 /\ ~burned /\ ~dead)
   /\ decided' = TRUE
   /\ early' = FALSE
   /\ reject' = "full"
-  /\ UNCHANGED << guard, binder, offered, burned, durable, restarted, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, burned, durable, journal, restarted, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 PrefixClash ==
   /\ (offered /\ ~decided /\ binder = "ok" /\ guard = "free" /\ accepts = 0 /\ ~burned /\ ~dead)
   /\ decided' = TRUE
   /\ early' = FALSE
   /\ reject' = "clash"
-  /\ UNCHANGED << guard, binder, offered, burned, durable, restarted, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, burned, durable, journal, restarted, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+
+Checkout ==
+  /\ (burned /\ accepts = 1 /\ ~durable /\ journal = "idle")
+  /\ journal' = "out"
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 Persist ==
-  /\ (burned /\ accepts = 1 /\ ~durable /\ ~dead)
+  /\ (burned /\ accepts = 1 /\ ~durable /\ journal = "out")
   /\ durable' = TRUE
+  /\ journal' = "back"
   /\ UNCHANGED << guard, binder, offered, decided, early, burned, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 Restart ==
@@ -79,6 +87,7 @@ Restart ==
   /\ decided' = FALSE
   /\ early' = FALSE
   /\ burned' = FALSE
+  /\ journal' = "idle"
   /\ restarted' = TRUE
   /\ accepts' = 0
   /\ UNCHANGED << guard, binder, offered, durable, reject, hs, probe, settings, relay, retained, stored, replay_offered, replay_decided, replay_rejected, dead >>
@@ -87,70 +96,76 @@ FailClosed ==
   /\ (offered /\ ~decided /\ binder = "ok" /\ guard # "free" /\ accepts = 0 /\ ~dead)
   /\ decided' = TRUE
   /\ early' = FALSE
-  /\ UNCHANGED << guard, binder, offered, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 BadBinder ==
   /\ (offered /\ ~decided /\ binder = "bad" /\ ~dead)
   /\ decided' = TRUE
   /\ early' = FALSE
-  /\ UNCHANGED << guard, binder, offered, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 Handshake ==
   /\ (decided /\ probe = "early" /\ ~hs /\ ~dead)
   /\ hs' = TRUE
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 HsTimeout ==
   /\ (offered /\ decided /\ ~hs /\ ~dead)
   /\ dead' = TRUE
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected >>
 
 ProbeFailed ==
   /\ (hs /\ probe = "early" /\ ~dead)
   /\ probe' = "failed"
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 ProbeVerified ==
   /\ (hs /\ probe = "early" /\ ~dead)
   /\ probe' = "verified"
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, settings, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 SettingsOk ==
   /\ (probe = "verified" /\ settings = "none" /\ ~dead)
   /\ settings' = "ok"
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 SettingsFail ==
   /\ (probe = "verified" /\ settings = "none" /\ ~retained /\ ~stored /\ ~dead)
   /\ probe' = "settings_fail"
   /\ settings' = "bad"
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, relay, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 Relay ==
   /\ (hs /\ probe = "verified" /\ settings = "ok" /\ ~relay /\ ~dead)
   /\ relay' = TRUE
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, retained, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 Retain ==
   /\ (probe = "verified" /\ settings = "ok" /\ ~retained /\ ~dead)
   /\ retained' = TRUE
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, stored, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 StoreTicket ==
   /\ (probe = "verified" /\ settings = "ok" /\ ~stored /\ ~dead)
   /\ stored' = TRUE
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, retained, accepts, replay_offered, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, accepts, replay_offered, replay_decided, replay_rejected, dead >>
 
 ReplayOffer ==
-  /\ (burned /\ accepts = 1 /\ ~replay_offered /\ (hs \/ dead))
+  /\ (burned /\ accepts = 1 /\ ~replay_offered /\ (journal = "out" \/ hs \/ dead))
   /\ replay_offered' = TRUE
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_decided, replay_rejected, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_decided, replay_rejected, dead >>
 
 ReplayReject ==
-  /\ (replay_offered /\ ~replay_decided)
+  /\ (replay_offered /\ ~replay_decided /\ journal # "out")
   /\ replay_decided' = TRUE
   /\ replay_rejected' = TRUE
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, dead >>
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, dead >>
+
+CheckoutReject ==
+  /\ (replay_offered /\ ~replay_decided /\ journal = "out")
+  /\ replay_decided' = TRUE
+  /\ replay_rejected' = TRUE
+  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, dead >>
 
 Next ==
   \/ Offer
@@ -158,6 +173,7 @@ Next ==
   \/ Accept
   \/ CacheFull
   \/ PrefixClash
+  \/ Checkout
   \/ Persist
   \/ Restart
   \/ FailClosed
@@ -173,6 +189,7 @@ Next ==
   \/ StoreTicket
   \/ ReplayOffer
   \/ ReplayReject
+  \/ CheckoutReject
 
 Spec == Init /\ [][Next]_vars
 
@@ -192,13 +209,21 @@ BadBinderDoesNotBurnOrAccept ==
 AcceptsAtMostOnce ==
   accepts \in {0, 1}
 
-\* once the journal fsync has landed, that accept is still burned
+\* once the journal fsync has landed, that accept is still burned and the cache is back
 DurableAcceptStaysBurned ==
-  durable => (burned /\ early /\ accepts = 1)
+  durable => (burned /\ early /\ accepts = 1 /\ journal = "back")
 
-\* a restart before fsync clears the in-memory accept
+\* the cache is checked out only after a fresh accept and before the deferred fsync
+CheckoutIsUndurableAccept ==
+  journal = "out" => (burned /\ early /\ accepts = 1 /\ ~durable /\ guard = "free")
+
+\* a second offer while the cache is checked out is rejected and does not accept again
+CheckoutRejectsTheConcurrentOffer ==
+  journal = "out" /\ replay_decided => (replay_rejected /\ accepts = 1 /\ burned /\ ~durable)
+
+\* a restart before fsync clears the in-memory accept and the checkout
 RestartUndoesUndurableAccept ==
-  restarted /\ accepts = 0 => (~burned /\ ~early /\ ~durable)
+  restarted /\ accepts = 0 => (~burned /\ ~early /\ ~durable /\ journal = "idle")
 
 \* CacheFull and an 8-byte nonce-prefix collision decide the ticket without burning it
 FullOrClashDoesNotBurn ==

@@ -107,8 +107,10 @@ One ticket identity. The client consumes it on offer. The server consults the
 guard only after the binder matches. `busy` is a contended lock; `out` is the
 cache checked out for a persist. Both fail closed: early data is not accepted
 and the ticket is not burned. CacheFull and an 8-byte nonce prefix collision
-are decided under a free lock and do not burn the ticket. The journal fsync
-is deferred; a restart before it can accept the ticket again.
+are decided under a free lock and do not burn the ticket. After a fresh
+accept the background persist checks the cache out. A second offer in that
+window fails closed and does not look like a replay. The journal fsync is
+deferred; a restart before it can accept the ticket again.
 `AcceptsAtMostOnce` counts one boot, not a crash before that fsync. A second
 offer of an accepted ticket is a replay. Relay bytes wait for the handshake,
 a verified probe, and Safari SETTINGS.
@@ -122,8 +124,10 @@ handshake timeout; it drops the attempt.
 | `FailClosedDoesNotBurnOrAccept` | A busy or checked-out guard accepting 0-RTT or burning the ticket |
 | `BadBinderDoesNotBurnOrAccept` | A bad binder burning the ticket or accepting early data |
 | `AcceptsAtMostOnce` | A second accept in the same boot. A crash before fsync is a new boot |
-| `DurableAcceptStaysBurned` | A durable journal whose accept was cleared |
-| `RestartUndoesUndurableAccept` | A pre-fsync restart that leaves the ticket burned |
+| `DurableAcceptStaysBurned` | A durable journal whose accept was cleared, or whose cache is still checked out |
+| `CheckoutIsUndurableAccept` | A checked-out cache with no fresh accept, or after fsync |
+| `CheckoutRejectsTheConcurrentOffer` | A second offer during checkout that is accepted again |
+| `RestartUndoesUndurableAccept` | A pre-fsync restart that leaves the ticket burned or the cache checked out |
 | `FullOrClashDoesNotBurn` | CacheFull or a nonce-prefix collision that burns the ticket |
 | `RelayWaitsForHandshake` | Relay bytes before the handshake, before a verified probe and Safari SETTINGS, or on a timed-out attempt |
 | `RetainOnlyVerified` | A retained QUIC leg without a verified probe |

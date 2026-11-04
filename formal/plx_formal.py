@@ -1215,9 +1215,12 @@ def zero_rtt_machine() -> Machine:
     """One 0-RTT ticket identity, including a replay of that same ticket.
 
     ``guard = busy`` is a contended or poisoned lock. ``guard = out`` is the
-    cache checked out by a background persist. Both fail closed: the ticket is
-    not burned and early data is not accepted. CacheFull and an 8-byte nonce
-    prefix collision are decisions under a free lock: the ticket is not
+    cache already checked out when this attempt starts. Both fail closed: the
+    ticket is not burned and early data is not accepted. After a fresh accept,
+    ``Checkout`` is the background persist taking the cache, and a second offer
+    in that window is ``CheckoutReject`` (fail closed, not a replay lookup).
+    ``Persist`` returns the cache and makes the accept durable. CacheFull and an
+    8-byte nonce prefix collision are decisions under a free lock: the ticket is not
     accepted and not burned, which is not the lock-busy path. The insert is
     ``insert_new_outcome_deferred``; the fsync is later. A restart before that
     fsync drops the in-memory accept so the same ticket can be accepted again.
@@ -1235,6 +1238,7 @@ def zero_rtt_machine() -> Machine:
         "early",
         "burned",
         "durable",
+        "journal",
         "restarted",
         "reject",
         "hs",
@@ -1257,6 +1261,7 @@ def zero_rtt_machine() -> Machine:
         "early": False,
         "burned": False,
         "durable": False,
+        "journal": "idle",
         "restarted": False,
         "reject": "none",
         "hs": False,
@@ -1313,9 +1318,15 @@ def zero_rtt_machine() -> Machine:
                 reject='"clash"',
             ),
             act(
+                "Checkout",
+                'burned /\\ accepts = 1 /\\ ~durable /\\ journal = "idle"',
+                journal='"out"',
+            ),
+            act(
                 "Persist",
-                "burned /\\ accepts = 1 /\\ ~durable /\\ ~dead",
+                'burned /\\ accepts = 1 /\\ ~durable /\\ journal = "out"',
                 durable="TRUE",
+                journal='"back"',
             ),
             act(
                 "Restart",
@@ -1324,6 +1335,7 @@ def zero_rtt_machine() -> Machine:
                 early="FALSE",
                 burned="FALSE",
                 accepts="0",
+                journal='"idle"',
                 restarted="TRUE",
             ),
             act(
@@ -1386,12 +1398,18 @@ def zero_rtt_machine() -> Machine:
             ),
             act(
                 "ReplayOffer",
-                "burned /\\ accepts = 1 /\\ ~replay_offered /\\ (hs \\/ dead)",
+                'burned /\\ accepts = 1 /\\ ~replay_offered /\\ (journal = "out" \\/ hs \\/ dead)',
                 replay_offered="TRUE",
             ),
             act(
                 "ReplayReject",
-                "replay_offered /\\ ~replay_decided",
+                'replay_offered /\\ ~replay_decided /\\ journal # "out"',
+                replay_decided="TRUE",
+                replay_rejected="TRUE",
+            ),
+            act(
+                "CheckoutReject",
+                'replay_offered /\\ ~replay_decided /\\ journal = "out"',
                 replay_decided="TRUE",
                 replay_rejected="TRUE",
             ),
@@ -1419,13 +1437,23 @@ def zero_rtt_machine() -> Machine:
             ),
             claim(
                 "DurableAcceptStaysBurned",
-                "once the journal fsync has landed, that accept is still burned",
-                "durable => (burned /\\ early /\\ accepts = 1)",
+                "once the journal fsync has landed, that accept is still burned and the cache is back",
+                'durable => (burned /\\ early /\\ accepts = 1 /\\ journal = "back")',
+            ),
+            claim(
+                "CheckoutIsUndurableAccept",
+                "the cache is checked out only after a fresh accept and before the deferred fsync",
+                'journal = "out" => (burned /\\ early /\\ accepts = 1 /\\ ~durable /\\ guard = "free")',
+            ),
+            claim(
+                "CheckoutRejectsTheConcurrentOffer",
+                "a second offer while the cache is checked out is rejected and does not accept again",
+                'journal = "out" /\\ replay_decided => (replay_rejected /\\ accepts = 1 /\\ burned /\\ ~durable)',
             ),
             claim(
                 "RestartUndoesUndurableAccept",
-                "a restart before fsync clears the in-memory accept",
-                "restarted /\\ accepts = 0 => (~burned /\\ ~early /\\ ~durable)",
+                "a restart before fsync clears the in-memory accept and the checkout",
+                'restarted /\\ accepts = 0 => (~burned /\\ ~early /\\ ~durable /\\ journal = "idle")',
             ),
             claim(
                 "FullOrClashDoesNotBurn",
@@ -1493,6 +1521,11 @@ def zero_rtt_machine() -> Machine:
                 "CheckedOutGuardFailsClosed",
                 "a checked-out cache fails closed without burning the ticket",
                 'decided /\\ ~early /\\ ~burned /\\ guard = "out"',
+            ),
+            claim(
+                "ConcurrentOfferWhileCheckedOut",
+                "a second offer during the deferred fsync is rejected without a second accept",
+                'journal = "out" /\\ replay_rejected /\\ accepts = 1 /\\ ~durable /\\ early',
             ),
             claim(
                 "BadBinderRejected",
