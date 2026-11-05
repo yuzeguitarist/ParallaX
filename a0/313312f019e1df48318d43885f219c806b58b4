@@ -1,0 +1,41 @@
+ops/traffic-lab/shaper.py
+  s_917905b5f21d93::t_bfaaa0eb15b208 15,17,27-66,164
+ops/traffic-lab/test_shaper.py
+  s_917905b5f21d93::t_a6b543dfc7a38f 7,198-199,202,207,210,246-276,336-410
+scripts/traffic_lab/README.md
+  s_27cf9424f2c8dd::t_a8d222e090ed2b 159-161
+src/transport/udp/quic/conn.rs
+  s_0b5b231c3e422a::t_c25c75e96d85e0 8920-8921,8923,8926-8932,8934-8936,8945-8946,8950,8954-8964
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a0313312f019e1df48318d43885f219c806b58b4",
+  "prompts": {},
+  "sessions": {
+    "s_0b5b231c3e422a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aa16-905c-7a91-8ac0-e86498fa5e64",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_27cf9424f2c8dd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6df-f7ec-7ef2-b5ce-4b4102d93194",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_917905b5f21d93": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aa16-3a6c-78e1-84bd-0006b2ac3e7f",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
