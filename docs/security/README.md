@@ -2,6 +2,8 @@
 
 Start with the [threat model](threat-model.md),
 [design/review record](assurance-design.md) and [OpenSSF mapping](baseline.md).
+The [dated validation record](validation-2026-11-05.md) links completed runs,
+review findings, audit debt and remaining external acceptance conditions.
 These controls supplement existing fuzz, Kani, Miri, constant-time, browser
 parity, GFW simulation and static-analysis jobs.
 

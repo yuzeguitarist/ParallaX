@@ -188,6 +188,32 @@ limitation. Passing checks are reported for the actual candidate commit.
   three interceptor addresses. Match rustc/Clang's normal placement: archive
   and dynamic list use `-Zpre-link-arg`; explicit system libraries stay late.
   Native compatibility, canary and application validation remains required.
+- **A TLS origin fixture assumed that its first accept carried ClientHello.**
+  Under TSan, the production server's 150 ms origin pre-dial can complete before
+  the authenticated client sends its first bytes. The server correctly closes
+  that unused spare, but the old fixture mistook its empty EOF for a truncated
+  TLS exchange and dropped the listener. An independent 300 ms client-delay
+  mutation reproduced the same failure; restoring the production code removed
+  it. The fixture now permits at most one precisely empty spare before one
+  completed TLS connection. A gated scenario waits for actual origin accept
+  before releasing client bytes and requires exactly one spare, a completed
+  handshake, the entire 1 MiB payload, clean EOF and every named task result.
+  A one-byte TLS prefix followed by EOF must still fail. The outer owner cancels
+  and awaits remaining tasks on failure. The independent reviewer approved the
+  immutable correction and reproduced both direct and forced-pre-dial success.
+- **Large H3 fixture deadlines lacked progress evidence.** Two unchanged
+  multi-megabyte transfers exceeded the old 15-second TSan deadline. The revised
+  tests preserve all payload, framing, record-count, decryption and EOF checks,
+  the separately spawned writer with its own waker, and the original receiver
+  polling. One 120-second watchdog bounds both halves; failure cancels and
+  drains the writer within another five seconds. Event-driven counters add no
+  periodic wakeups and report exact bytes, progress at the old deadline, read
+  gaps and terminal states. The final native TSan run completed both transfers
+  in 20.699 s and 15.722 s, with progress immediately beyond the old deadline,
+  exact final counts, bounded read-event gaps, shutdown and EOF. The independent
+  reviewer closed the inadequate test-deadline finding for this workload.
+  The [dated validation record](validation-2026-11-05.md) preserves the measurements
+  and the distinction from a general proof of transport liveness.
 
 PR work may push its feature branch to execute unprivileged GitHub-hosted
 checks. It must not create a tag, publish a release, change repository access
