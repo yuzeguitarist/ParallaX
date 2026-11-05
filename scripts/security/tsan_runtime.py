@@ -46,7 +46,7 @@ PATCH_PATHS = (
     "compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp",
     "compiler-rt/test/tsan/Linux/fd_fcntl_dupfd_cloexec_norace.cpp",
 )
-SOURCE_PREFIXES = ("compiler-rt/", "cmake/", "llvm/cmake/", "llvm/include/", "llvm/utils/")
+SOURCE_PREFIXES = ("compiler-rt/", "cmake/", "llvm/cmake/", "llvm/include/")
 SOURCE_FILES = ("llvm/CMakeLists.txt", "LICENSE.TXT")
 OFF_COMPONENTS = ("BUILTINS", "LIBFUZZER", "PROFILE", "XRAY", "CTX_PROFILE", "MEMPROF", "ORC", "GWP_ASAN")
 REQUIRED_SYMBOLS = frozenset(("__tsan_init", "__interceptor_fcntl", "__interceptor_fcntl64"))

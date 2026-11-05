@@ -113,6 +113,16 @@ class RuntimeBuilderGuards(unittest.TestCase):
                 rt.extract_sources(self.archive(info), self.root / f"source-{number}")
         self.assertFalse((self.root / "escape").exists())
 
+    def test_unneeded_llvm_utilities_are_not_extracted(self):
+        # The pinned archive has symlinks in LLVM's unrelated MLGO utilities.
+        # Standalone compiler-rt uses its own symbol-generation scripts.
+        ignored = tarfile.TarInfo(
+            f"llvm-project-{rt.SOURCE_COMMIT}/llvm/utils/mlgo-utils/combine_training_corpus.py")
+        ignored.type = tarfile.SYMTYPE
+        ignored.linkname = "mlgo/corpus/combine.py"
+        rt.extract_sources(self.archive(ignored), self.root / "source")
+        self.assertFalse((self.root / "source/llvm/utils").exists())
+
     def test_patch_identity_and_exact_changed_paths(self):
         patch = self.root / "fix.patch"
         text = f"From {rt.PATCH_COMMIT} Mon Sep 17 00:00:00 2001\n"
