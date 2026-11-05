@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,6 +17,24 @@ SPEC.loader.exec_module(sanitizers)
 
 
 class SanitizerControls(unittest.TestCase):
+    def test_runtime_builder_can_clean_up_before_timeout_failure(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+                sanitizers, "ROOT", Path(temporary)):
+            marker = Path(temporary) / "cleanup-complete"
+            code = (
+                "import pathlib, signal, sys, time\n"
+                "def stop(signum, frame):\n"
+                "    pathlib.Path(sys.argv[1]).write_text('cleaned')\n"
+                "    raise SystemExit(0)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                "time.sleep(60)\n"
+            )
+            runner = sanitizers.Runner("thread", sanitizers.NIGHTLY, False)
+            with self.assertRaisesRegex(RuntimeError, "exceeded 2s"):
+                runner.run("tsan-runtime-build", [sys.executable, "-c", code, str(marker)],
+                           timeout=2)
+            self.assertEqual(marker.read_text(), "cleaned")
+
     def test_epoll_control_requires_clean_completed_execution(self):
         marker = "sanitizer-epoll-publication-control-complete: duplicate-fd"
         for code, output in ((66, marker), (0, ""), (0, marker + " ThreadSanitizer: data race")):

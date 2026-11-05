@@ -162,6 +162,17 @@ class Runner:
             try:
                 returncode = process.wait(timeout=timeout)
             except BaseException as error:
+                if label == "tsan-runtime-build":
+                    # The builder owns separate compiler process groups. Let
+                    # its SIGTERM handler reap those before killing its group.
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
