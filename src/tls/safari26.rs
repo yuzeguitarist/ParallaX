@@ -5119,6 +5119,31 @@ mod tests {
     }
 
     #[test]
+    fn tls_cursor_u16_and_byte_slice_advance_exactly_and_fail_closed() {
+        let mut empty = TlsCursor::new(&[]);
+        assert!(empty.u16().is_err());
+        assert!(empty.bytes(1).is_err());
+
+        let mut short = TlsCursor::new(&[0xaa]);
+        assert!(short.u16().is_err());
+        assert_eq!(short.remaining(), 1);
+        assert!(short.bytes(2).is_err());
+        assert_eq!(short.remaining(), 1);
+
+        let mut cursor = TlsCursor::new(&[0x99, 0x12, 0x34, 0xde, 0xad, 0x42]);
+        assert_eq!(cursor.u8().unwrap(), 0x99);
+        assert_eq!(cursor.u16().unwrap(), 0x1234);
+        assert_eq!(cursor.bytes(2).unwrap(), &[0xde, 0xad]);
+        assert_eq!(cursor.u8().unwrap(), 0x42);
+        assert_eq!(cursor.remaining(), 0);
+        assert!(cursor.bytes(1).is_err());
+
+        let mut exact = TlsCursor::new(&[0xcc, 0xdd]);
+        assert_eq!(exact.bytes(2).unwrap(), &[0xcc, 0xdd]);
+        assert_eq!(exact.remaining(), 0);
+    }
+
+    #[test]
     fn hello_retry_request_rejects_tls12_in_supported_versions() {
         let id = [0x6b; 32];
         let mut record = hrr_record(GROUP_SECP256R1, &id, None);
