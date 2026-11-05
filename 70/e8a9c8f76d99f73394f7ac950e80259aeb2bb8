@@ -1,0 +1,19 @@
+.github/workflows/security-assurance.yml
+  s_47b16dbf3646cd::t_aec9ae0899d034 72-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "70e8a9c8f76d99f73394f7ac950e80259aeb2bb8",
+  "prompts": {},
+  "sessions": {
+    "s_47b16dbf3646cd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a9eb-f865-7752-8502-4b712655feb3",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
