@@ -1387,6 +1387,90 @@ mod tests {
     }
 
     #[test]
+    fn uncommitted_header_with_nonempty_stale_prefix_must_compact_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-prefix.cache");
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let mac_key = cache_mac_key(psk);
+        let now = current_unix_timestamp().unwrap();
+        let entry = ReplayEntry {
+            timestamp: now,
+            nonce: [0x51; 8],
+            transcript_fingerprint: [0x61; 32],
+        };
+        let mut cache = ReplayCache::new(8);
+        cache.path = Some(path.clone());
+        cache.mac_key = Some(mac_key.clone());
+        cache.auth_journal = Some(AuthJournalState {
+            generation: 0,
+            count: 0,
+            tail_mac: [0; 32],
+            active_slot: 0,
+        });
+        cache.insert_loaded(entry.clone());
+        fs::write(&path, b"leftover incomplete header").unwrap();
+
+        assert!(
+            cache
+                .persist_authenticated_entry(&path, &mac_key, Some(entry.clone()))
+                .unwrap(),
+            "count=0 must force an atomic rewrite rather than append to stale bytes"
+        );
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .starts_with(AUTH_JOURNAL_VERSION));
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, psk).unwrap();
+        assert_eq!(
+            reloaded.insert_new_outcome(entry, now).unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+    }
+
+    #[test]
+    fn authenticated_append_and_externally_truncated_journal_choose_distinct_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append-versus-truncated.cache");
+        let psk = b"0123456789abcdef0123456789abcdef";
+        let mac_key = cache_mac_key(psk);
+        let now = current_unix_timestamp().unwrap();
+        let entry = |byte| ReplayEntry {
+            timestamp: now,
+            nonce: [byte; 8],
+            transcript_fingerprint: [byte; 32],
+        };
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, psk).unwrap();
+        assert!(cache.insert_new(entry(1), now).unwrap());
+        assert_eq!(cache.auth_journal.unwrap().count, 1);
+
+        cache.insert_loaded(entry(2));
+        assert!(
+            !cache
+                .persist_authenticated_entry(&path, &mac_key, Some(entry(2)))
+                .unwrap(),
+            "a nonempty authenticated journal must append, not compact"
+        );
+        assert_eq!(cache.auth_journal.unwrap().count, 2);
+
+        // External truncation must be healed by a fresh atomic rewrite even
+        // though the in-memory committed header still advertises count=2.
+        fs::write(&path, []).unwrap();
+        cache.insert_loaded(entry(3));
+        assert!(
+            cache
+                .persist_authenticated_entry(&path, &mac_key, Some(entry(3)))
+                .unwrap(),
+            "a truncated file must be re-created atomically, not appended"
+        );
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, psk).unwrap();
+        for byte in 1..=3 {
+            assert_eq!(
+                reloaded.insert_new_outcome(entry(byte), now).unwrap(),
+                ReplayInsertOutcome::Replayed
+            );
+        }
+    }
+
+    #[test]
     fn authenticated_rollback_never_discards_plain_journal_lines() {
         let mut cache = ReplayCache::new(4);
         cache.path = Some(PathBuf::from("authenticated-journal.cache"));
