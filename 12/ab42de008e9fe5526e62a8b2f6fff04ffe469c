@@ -1,0 +1,21 @@
+scripts/security/test_tsan_runtime.py
+  s_835d9bd821cc07::t_543331b7d0ada1 352-450
+scripts/security/tsan_runtime.py
+  s_835d9bd821cc07::t_c07701c1a23600 64-100,286-299,319-322,324,338-339,341-347,349-353,591,593-594,601-602
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "12ab42de008e9fe5526e62a8b2f6fff04ffe469c",
+  "prompts": {},
+  "sessions": {
+    "s_835d9bd821cc07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d498bf26-5e3d-44fa-a1fd-5041f126d038",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
