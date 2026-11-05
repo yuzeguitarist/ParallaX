@@ -1,0 +1,59 @@
+.github/workflows/cargo-deny.yml
+  s_835d9bd821cc07::t_117d48160489fc 3-4,7,9-10,12,24-30,35,37-43
+deny.toml
+  s_835d9bd821cc07::t_aa6ea2f49472bd 48-49,61-72
+fuzz/Cargo.toml
+  s_835d9bd821cc07::t_6d3260a238b1fd 4
+scripts/security/dependencies.py
+  s_835d9bd821cc07::t_a92e85cac9efe2 1-231
+supply-chain/README.md
+  s_835d9bd821cc07::t_9049ce58dc0736 1-46
+supply-chain/audit-debt.json
+  s_835d9bd821cc07::t_843811a2a11b18 1-2930
+supply-chain/audits.toml
+  s_835d9bd821cc07::t_d9361548b0abdc 1-15
+supply-chain/config.toml
+  s_835d9bd821cc07::t_064d570a20fe7c 1-13
+supply-chain/imports.lock
+  s_835d9bd821cc07::t_4859cb8b182c09 1-99
+supply-chain/reviews/untrusted-0.9.0.md
+  s_835d9bd821cc07::t_f1845472033ca0 1-30
+verification/concurrency/Cargo.toml
+  s_835d9bd821cc07::t_5c8f402ef53403 4
+.github/scripts/test_release_workflow.py
+  s_2e4cf85eec9b64::t_c13d7d3934a8ea 2-6,11-12,16,18-23,27-35,42-69,71,74-88,91,93-96,99-125,128-129,133-324,328-342
+scripts/security/release_artifacts.py
+  s_27cf9424f2c8dd::t_da06978730bf8c 1-235
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2571d73c1ac49a94b097626583893b2aa20e0969",
+  "prompts": {},
+  "sessions": {
+    "s_27cf9424f2c8dd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6df-f7ec-7ef2-b5ce-4b4102d93194",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_2e4cf85eec9b64": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6ee-377f-7ff2-91ac-ec2cdf32381b",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_835d9bd821cc07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d498bf26-5e3d-44fa-a1fd-5041f126d038",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
