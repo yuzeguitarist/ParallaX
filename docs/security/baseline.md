@@ -50,6 +50,13 @@ These settings and policies are not changed by the security PR. Existing
 SECURITY/CONTRIBUTING material should be evaluated against current operating
 practice; file presence alone does not establish compliance.
 
+Read-only repository API observation on 2026-11-05: `main` reported
+`protected: false`, the repository ruleset list was empty, default workflow
+permissions were `read`, and workflow approval of pull-request reviews was
+disabled. Required security checks and non-author human approval therefore
+still need owner enforcement. This snapshot does not establish collaborator
+MFA, bypass permissions, or future settings, and no administration was changed.
+
 ## How to update this record
 
 For each claimed control, attach the relevant commit, workflow run or release

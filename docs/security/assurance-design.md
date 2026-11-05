@@ -178,12 +178,16 @@ limitation. Passing checks are reported for the actual candidate commit.
   reviewer verified the committed file hashes and reran all 27 native Linux
   guards, including separate process groups/sessions, missed snapshots,
   cancellation and permission failure; all passed.
-- **Explicit runtime linking must account for Rust's `-nodefaultlibs`.** The
-  first native patched-runtime build succeeded, but the following Rust control
-  failed to link because driver-level `-pthread` was ignored and libc had been
-  scanned before the runtime archive. Supply literal `-lpthread` and a trailing
-  `-lc` after the archive, with an ordering regression. Native compatibility,
-  canary and application validation remains required after this correction.
+- **Explicit runtime linking must preserve the sanitizer's normal placement.**
+  The first native patched-runtime build succeeded, but Rust's `-nodefaultlibs`
+  requires literal system-library arguments. A second run also exposed GNU
+  ld's binding of three weak interceptor aliases when libc precedes the runtime;
+  a trailing `-lc` alone does not repair it. Two agents independently reproduced
+  the exact three versioned-symbol failures with LLVM-style aliases, then
+  verified that placing the archive before libc resolves them and retains all
+  three interceptor addresses. Match rustc/Clang's normal placement: archive
+  and dynamic list use `-Zpre-link-arg`; explicit system libraries stay late.
+  Native compatibility, canary and application validation remains required.
 
 PR work may push its feature branch to execute unprivileged GitHub-hosted
 checks. It must not create a tag, publish a release, change repository access
