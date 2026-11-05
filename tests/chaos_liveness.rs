@@ -52,18 +52,14 @@ const TERMINATE_BOUND: Duration = Duration::from_secs(10);
 const REAL_CLIENT_HELLO: &[u8] = include_bytes!("fixtures/safari26_apple_com_clienthello.bin");
 
 /// Build the same real `ServerConfig` shape the production server runs with
-/// (fresh keys, a leaked tempdir replay path). Mirrors the proven setup in
+/// (fresh keys, an owned private replay directory). Mirrors the setup in
 /// `tests/prober_loop.rs` / `src/client/runtime.rs` tests.
-fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
+fn live_server_config(fallback_addr: SocketAddr) -> (ServerConfig, tempfile::TempDir) {
     let server_keys = X25519KeyPair::generate();
     let server_identity_keys = identity::keypair();
     let replay_dir = tempfile::tempdir().unwrap();
     let replay_cache_path = replay_dir.path().join("parallax-replay.cache");
-    // Leak the tempdir (test-only): the no-replay handle_connection fallback path
-    // never opens it, but this keeps the path valid for the whole process.
-    std::mem::forget(replay_dir);
-
-    ServerConfig {
+    let config = ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         fallback_addr: fallback_addr.to_string(),
         data_target: None,
@@ -81,7 +77,8 @@ fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         fallback_idle_floor_ms: 600_000,
         fallback_idle_jitter_ms: 0,
         tcp_congestion: None,
-    }
+    };
+    (config, replay_dir)
 }
 
 /// A fake fallback origin: accept every dial and immediately close it (drop the
@@ -107,7 +104,7 @@ async fn spawn_closing_origin() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 async fn spawn_one_shot_server(
     fallback_addr: SocketAddr,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let config = live_server_config(fallback_addr);
+    let (config, replay_dir) = live_server_config(fallback_addr);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
@@ -124,6 +121,7 @@ async fn spawn_one_shot_server(
             PSK,
         )
         .await;
+        drop(replay_dir);
     });
     (addr, handle)
 }

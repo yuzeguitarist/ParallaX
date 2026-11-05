@@ -259,17 +259,13 @@ fn untrusting_verifier() -> Arc<dyn ServerCertVerifier> {
 /// The keys only have to *decode* (the fallback path never uses them for a
 /// handshake), but they must be real keypairs because `ServerRuntimeSecrets`
 /// validates them. `data_target` is unset: the fallback path ignores it.
-fn fallback_server_config(fallback_addr: SocketAddr) -> ServerConfig {
+fn fallback_server_config(fallback_addr: SocketAddr) -> (ServerConfig, tempfile::TempDir) {
     let server_keys = X25519KeyPair::generate();
     let server_identity_keys = identity::keypair();
-    // Use a private tempdir (like prober_loop.rs / chaos_liveness.rs) rather than
-    // a predictable name in the shared temp dir. The fallback path never opens
-    // this file, but a unique, non-world-guessable path is the right default; we
-    // leak the handle so the path stays valid for the whole test process.
+    // Keep the private replay directory owned until the handler terminates.
     let replay_dir = tempfile::tempdir().unwrap();
     let replay_cache_path = replay_dir.path().join("parallax-replay.cache");
-    std::mem::forget(replay_dir);
-    ServerConfig {
+    let config = ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         fallback_addr: fallback_addr.to_string(),
         data_target: None,
@@ -290,7 +286,8 @@ fn fallback_server_config(fallback_addr: SocketAddr) -> ServerConfig {
         fallback_idle_floor_ms: 600_000,
         fallback_idle_jitter_ms: 0,
         tcp_congestion: None,
-    }
+    };
+    (config, replay_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +358,7 @@ async fn serve_origin_tls(mut stream: TcpStream) -> std::io::Result<()> {
 async fn spawn_parallax(fallback_addr: SocketAddr) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = fallback_server_config(fallback_addr);
+    let (config, replay_dir) = fallback_server_config(fallback_addr);
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let _ = server::handle_connection(
@@ -372,6 +369,7 @@ async fn spawn_parallax(fallback_addr: SocketAddr) -> (SocketAddr, tokio::task::
             PSK,
         )
         .await;
+        drop(replay_dir);
     });
     (addr, task)
 }
