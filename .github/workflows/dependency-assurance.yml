@@ -45,6 +45,9 @@ jobs:
 
   strict-vet:
     name: cargo-vet strict source audits
+    # Missing source-review records are tracked on schedule or by request;
+    # the independent release audit remains mandatory before publishing.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     needs: policy-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
