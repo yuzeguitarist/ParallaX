@@ -1,0 +1,21 @@
+scripts/security/test_tsan_runtime.py
+  s_2e4cf85eec9b64::t_6bd304e4b27264 116-125
+scripts/security/tsan_runtime.py
+  s_2e4cf85eec9b64::t_6438bcaeb26ebb 49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5e71e4796d4ad5b46da91a5983f1e98560e17ac1",
+  "prompts": {},
+  "sessions": {
+    "s_2e4cf85eec9b64": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6ee-377f-7ff2-91ac-ec2cdf32381b",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
