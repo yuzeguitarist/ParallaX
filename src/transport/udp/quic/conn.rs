@@ -5131,18 +5131,60 @@ mod tests {
             ConnectionId::new(&[0xab, 0xcd, 0xef, 0x01]),
         )
         .unwrap();
-        drive(&mut client, &mut server);
+        let mut now = Instant::now();
+        drive_acked_at(&mut client, &mut server, &mut now);
 
+        // A real peer PING makes an ACK due before the queued RESET_STREAM.
+        // Slow/instrumented execution can encounter this same ACK-first path
+        // after the handshake; one poll is not evidence that reset was sent.
+        let ping = server.build_ping_packet(now);
+        client.handle_datagram(&ping, now).unwrap();
+        now = client.pending_data_ack_deadline().expect("PING ACK timer");
+        assert!(client.ack_ready_for_space(SPACE_DATA, now));
         let id = client.open_bi();
         client.reset_stream(id, 0x10c);
-        client.poll_transmit(Instant::now()).expect("RESET_STREAM");
+        let first = client.poll_transmit(now).expect("due ACK before reset");
+        server.handle_datagram(&first, now).unwrap();
+        assert_eq!(server.stream_reset(id), None, "ACK did not carry reset");
+        assert_eq!(
+            client.next_stream_to_reset(),
+            Some(id),
+            "reset still queued"
+        );
+        for step in 1..64 {
+            let sent_at = now + Duration::from_millis(step);
+            if let Some(packet) = client.poll_transmit(sent_at) {
+                server.handle_datagram(&packet, sent_at).unwrap();
+            }
+            if server.stream_reset(id).is_some() {
+                break;
+            }
+        }
+        assert_eq!(server.stream_reset(id), Some(0x10c), "RESET_STREAM arrived");
         assert_eq!(client.next_stream_to_reset(), None);
+        assert_eq!(server.streams[&id].reset, None, "no STOP_SENDING yet");
         client.cancel_stream(id, 0x10c);
         assert_eq!(
             client.next_stream_to_reset(),
             Some(id),
             "re-armed with STOP_SENDING"
         );
+        for step in 64..128 {
+            let sent_at = now + Duration::from_millis(step);
+            if let Some(packet) = client.poll_transmit(sent_at) {
+                server.handle_datagram(&packet, sent_at).unwrap();
+            }
+            if server.streams[&id].reset.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            server.streams[&id].reset,
+            Some(0x10c),
+            "STOP_SENDING arrived"
+        );
+        assert_eq!(server.stream_reset(id), Some(0x10c));
+        assert_eq!(client.next_stream_to_reset(), None);
     }
 
     #[test]
