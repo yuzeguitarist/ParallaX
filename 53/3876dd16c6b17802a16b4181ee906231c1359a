@@ -1,0 +1,19 @@
+src/transport/leg.rs
+  s_27cf9424f2c8dd::t_c91e683ef9d6b8 386-392,406-543,570-577,583,586-591,595-605,607-609,611-626,628-636,638,641,698-703,707,709,711,713-718,722-727,732-733,740-741,743-756,758-767,769
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "533876dd16c6b17802a16b4181ee906231c1359a",
+  "prompts": {},
+  "sessions": {
+    "s_27cf9424f2c8dd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6df-f7ec-7ef2-b5ce-4b4102d93194",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
