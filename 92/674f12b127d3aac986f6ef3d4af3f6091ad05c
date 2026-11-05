@@ -1,0 +1,29 @@
+docs/security/README.md
+  s_835d9bd821cc07::t_aef8decdfa25bd 5-6
+docs/security/assurance-design.md
+  s_2bfe63e477f089::t_c446621bd7ead7 191-216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "92674f12b127d3aac986f6ef3d4af3f6091ad05c",
+  "prompts": {},
+  "sessions": {
+    "s_2bfe63e477f089": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e23e3ded-0925-478b-bf3c-746fc7faa3cc",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_835d9bd821cc07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d498bf26-5e3d-44fa-a1fd-5041f126d038",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
