@@ -99,15 +99,23 @@ def completed_counts(output: str, selected: int, *, allow_ignored: bool = False)
 
 
 def configured_environment(kind: str, target_dir: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    for key in list(env):
-        if key in {"RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_ENCODED_RUSTFLAGS",
-                   "ASAN_OPTIONS", "TSAN_OPTIONS", "LSAN_OPTIONS"}:
-            env.pop(key)
-        elif key.startswith(("CFLAGS", "CXXFLAGS")):
-            env.pop(key)
-        elif key.startswith("CARGO_TARGET_") and key.endswith("_RUSTFLAGS"):
-            env.pop(key)
+    # Build/test dependencies must not inherit compiler wrappers, arbitrary
+    # Cargo overrides, loader injection, or application/service credentials.
+    # Preserve tool/cache locations and the proxy/CA settings required by the
+    # host's network path; flags and compilers are configured below.
+    inherited = {
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP",
+        "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+        "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_DIST_SERVER", "RUSTUP_UPDATE_ROOT",
+        "RUSTUP_MAX_RETRIES", "CARGO_NET_RETRY", "CARGO_NET_OFFLINE",
+        "CARGO_HTTP_TIMEOUT", "CARGO_HTTP_MULTIPLEXING", "CARGO_HTTP_PROXY",
+        "CARGO_HTTP_CAINFO", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+        "GIT_SSL_CAINFO", "GIT_SSL_CAPATH",
+    }
+    env = {key: value for key, value in os.environ.items() if key in inherited}
     rustflags = f"-Zsanitizer={kind} -Cforce-frame-pointers=yes -Cdebuginfo=2"
     native_flags = f"-fsanitize={kind} -fno-omit-frame-pointer -g"
     env.update({

@@ -73,11 +73,20 @@ class RuntimeBuilderGuards(unittest.TestCase):
 
     def test_download_redirects_remain_https_on_pinned_hosts(self):
         rt.check_download_url(rt.SOURCE_URL)
+        request = rt.urllib.request.Request(rt.SOURCE_URL)
+        redirects = rt.PinnedRedirects()
         for url in ("http://github.com/a", "https://example.com/a",
                     "https://github.com.evil.invalid/a",
                     "https://name:password@github.com/a", "https://github.com:444/a"):
             with self.subTest(url=url), self.assertRaises(rt.BuildError):
                 rt.check_download_url(url)
+            # Exercise the actual handler used by acquire(), not just its
+            # standalone URL predicate. No network request is made.
+            with self.subTest(redirect=url), self.assertRaises(rt.BuildError):
+                redirects.redirect_request(request, mock.Mock(), 302, "Found", {}, url)
+        allowed = "https://codeload.github.com/llvm/llvm-project/tar.gz/pinned"
+        redirected = redirects.redirect_request(request, mock.Mock(), 302, "Found", {}, allowed)
+        self.assertEqual(redirected.full_url, allowed)
 
     def archive(self, extra=None):
         destination = self.root / "source.tar.gz"

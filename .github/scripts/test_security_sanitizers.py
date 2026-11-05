@@ -168,6 +168,37 @@ class SanitizerControls(unittest.TestCase):
         self.assertNotIn("suppressions", env["TSAN_OPTIONS"])
         self.assertNotIn("detect_leaks=0", env["LSAN_OPTIONS"])
 
+    def test_build_environment_excludes_wrappers_and_credentials(self):
+        preserved = {
+            "PATH": "/usr/bin", "HOME": "/tmp/home", "CARGO_HOME": "/tmp/cargo",
+            "RUSTUP_HOME": "/tmp/rustup", "TMPDIR": "/tmp/build",
+            "HTTP_PROXY": "http://proxy:8080", "https_proxy": "http://proxy:8080",
+            "NO_PROXY": "localhost,127.0.0.1", "SSL_CERT_FILE": "/tmp/ca.pem",
+            "SSL_CERT_DIR": "/tmp/certificates", "CARGO_HTTP_CAINFO": "/tmp/ca.pem",
+        }
+        excluded = {
+            "RUSTC_WRAPPER": "untrusted-wrapper", "RUSTC_WORKSPACE_WRAPPER": "wrapper",
+            "CARGO_BUILD_RUSTC_WRAPPER": "wrapper", "RUSTC": "wrong-compiler",
+            "CARGO_BUILD_RUSTC": "wrong-compiler", "RUSTC_BOOTSTRAP": "1",
+            "LD_PRELOAD": "/tmp/injected.so", "BASH_ENV": "/tmp/injected.sh",
+            "CCACHE_PREFIX": "wrapper", "SCCACHE_TOKEN": "fixture-token",
+            "GITHUB_TOKEN": "fixture-token", "GH_TOKEN": "fixture-token",
+            "AWS_SECRET_ACCESS_KEY": "fixture-secret", "OPENAI_API_KEY": "fixture-key",
+            "CARGO_REGISTRIES_PRIVATE_TOKEN": "fixture-token",
+            "UNRECOGNIZED_SERVICE_CREDENTIAL": "fixture-secret",
+        }
+        with patch.dict(os.environ, {**preserved, **excluded}, clear=True):
+            env = sanitizers.configured_environment("address", Path("/tmp/sanitized"))
+        for name, value in preserved.items():
+            with self.subTest(preserved=name):
+                self.assertEqual(env[name], value)
+        for name in excluded:
+            with self.subTest(excluded=name):
+                self.assertNotIn(name, env)
+        self.assertEqual(env["CC_x86_64_unknown_linux_gnu"], "clang")
+        self.assertEqual(env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"], "clang")
+        self.assertIn("-Zsanitizer=address", env["RUSTFLAGS"])
+
     def test_native_and_production_paths_are_selected(self):
         names = {name for name, _, _ in sanitizers.SUITES}
         self.assertTrue({"library", "linux-fd-lifetimes", "production-cert-tunnel",
