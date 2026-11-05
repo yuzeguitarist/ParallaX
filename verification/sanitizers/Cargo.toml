@@ -1,0 +1,10 @@
+[package]
+name = "parallax-sanitizer-canaries"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+# Deliberately defective, isolated executables. Never linked into ParallaX.
+# No third-party dependencies: these validate the sanitizer toolchain itself.

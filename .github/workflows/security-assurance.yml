@@ -1,0 +1,91 @@
+name: security-assurance
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/security/**'
+      - 'verification/concurrency/**'
+      - '.github/scripts/test_security_*.py'
+      - '.github/workflows/security-assurance.yml'
+  push:
+    branches: [main, master, 'g2l/security-*']
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/security/**'
+      - 'verification/concurrency/**'
+      - '.github/scripts/test_security_*.py'
+      - '.github/workflows/security-assurance.yml'
+  schedule:
+    - cron: '11 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-assurance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  PYTHONUNBUFFERED: '1'
+  PARALLAX_LOOM_PREEMPTIONS: '2'
+  PARALLAX_SHUTTLE_ITERATIONS: '200'
+  PARALLAX_SHUTTLE_SEED: '20260828'
+
+jobs:
+  assurance:
+    name: ${{ matrix.suite }} assurance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: protocol
+            toolchain: stable
+          - suite: listener
+            toolchain: stable
+          - suite: std
+            toolchain: stable
+          - suite: loom
+            toolchain: nightly-2026-06-17
+          - suite: shuttle
+            toolchain: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt
+      - name: Guard the test runners against false success
+        run: |
+          python3 -m unittest discover -s .github/scripts -p 'test_security_*.py'
+          python3 scripts/security/test_tsan_runtime.py
+      - name: Check isolated workspace formatting
+        if: matrix.suite == 'std' || matrix.suite == 'loom' || matrix.suite == 'shuttle'
+        run: cargo fmt --manifest-path verification/concurrency/Cargo.toml -- --check
+      - name: Execute bounded project suite
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: python3 scripts/security/assurance.py "$SUITE"
+      - name: Retain selected tests, bounds and reproduction logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: assurance-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/security/assurance/${{ matrix.suite }}/
+          if-no-files-found: error
+          retention-days: 10

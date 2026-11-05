@@ -1,0 +1,214 @@
+"""Controls against vacuous sanitizer success and environment contamination."""
+import importlib.util
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location(
+    "parallax_sanitizers", ROOT / "scripts/security/sanitizers.py")
+sanitizers = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(sanitizers)
+
+
+class SanitizerControls(unittest.TestCase):
+    def test_runtime_builder_can_clean_up_before_timeout_failure(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+                sanitizers, "ROOT", Path(temporary)):
+            marker = Path(temporary) / "cleanup-complete"
+            code = (
+                "import pathlib, signal, sys, time\n"
+                "def stop(signum, frame):\n"
+                "    pathlib.Path(sys.argv[1]).write_text('cleaned')\n"
+                "    raise SystemExit(0)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                "time.sleep(60)\n"
+            )
+            runner = sanitizers.Runner("thread", sanitizers.NIGHTLY, False)
+            with self.assertRaisesRegex(RuntimeError, "exceeded 2s"):
+                runner.run("tsan-runtime-build", [sys.executable, "-c", code, str(marker)],
+                           timeout=2)
+            self.assertEqual(marker.read_text(), "cleaned")
+
+    def test_epoll_control_requires_clean_completed_execution(self):
+        marker = "sanitizer-epoll-publication-control-complete: duplicate-fd"
+        for code, output in ((66, marker), (0, ""), (0, marker + " ThreadSanitizer: data race")):
+            self.assertFalse(sanitizers.epoll_control_completed(
+                subprocess.CompletedProcess([], code, output), "duplicate-fd"))
+        self.assertTrue(sanitizers.epoll_control_completed(
+            subprocess.CompletedProcess([], 0, marker), "duplicate-fd"))
+
+    def test_runtime_inputs_and_artifact_hashes_are_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            archive = directory / "runtime with spaces.a"
+            symbols = directory / "runtime with spaces.a.syms"
+            archive.write_bytes(b"archive fixture")
+            symbols.write_bytes(b"symbols fixture")
+            report = {"schema": 1, "status": "passed", "source_commit": sanitizers.TSAN_SOURCE,
+                      "patch_commit": sanitizers.TSAN_PATCH}
+            for key, path in (("archive", archive), ("dynamic_list", symbols)):
+                report[key] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            early, late = sanitizers.runtime_link_arguments(report, directory)
+            args = early + late
+            self.assertIn(str(archive.resolve()), early)
+            self.assertIn(f"-Wl,--dynamic-list={symbols.resolve()}", early)
+            self.assertNotIn(str(archive.resolve()), late)
+            self.assertIn("-lpthread", late)
+            self.assertIn("-lc", late)
+            self.assertNotIn("-pthread", args)
+            self.assertGreater(args.index("-lpthread"), args.index(str(archive.resolve())))
+            self.assertGreater(args.index("-lc"), args.index(str(archive.resolve())))
+            for key, value in (("status", "running"), ("source_commit", "main"),
+                               ("patch_commit", "main"), ("schema", 2), ("archive", [])):
+                with self.assertRaises(RuntimeError):
+                    sanitizers.runtime_link_arguments({**report, key: value}, directory)
+            with self.assertRaises(RuntimeError):
+                sanitizers.runtime_link_arguments(report, directory / "different-root")
+            archive.write_bytes(b"changed archive")
+            with self.assertRaises(RuntimeError):
+                sanitizers.runtime_link_arguments(report, directory)
+
+    def test_patched_build_uses_early_runtime_and_preserves_encoded_paths(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+                sanitizers, "ROOT", Path(temporary)):
+            directory = (Path(temporary) / "target/security/tsan-runtime").resolve()
+            directory.mkdir(parents=True)
+            report = {"schema": 1, "status": "passed", "source_commit": sanitizers.TSAN_SOURCE,
+                      "patch_commit": sanitizers.TSAN_PATCH}
+            for key, name in (("archive", "runtime with spaces.a"),
+                              ("dynamic_list", "runtime with spaces.a.syms")):
+                path = directory / name
+                path.write_bytes(key.encode())
+                report[key] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            (directory / "report.json").write_text(json.dumps(report))
+            runner = sanitizers.Runner("thread", sanitizers.NIGHTLY, False)
+            environments = {}
+
+            def fake_run(label, argv, **kwargs):
+                environments[label] = runner.env.copy()
+                if label == "bundled-epoll-duplicate-fd":
+                    return subprocess.CompletedProcess(
+                        argv, 66, "ThreadSanitizer: data race epoll_publication.rs")
+                output = ""
+                if label.endswith(("same-fd", "duplicate-fd")):
+                    output = f"sanitizer-epoll-publication-control-complete: {argv[-1]}"
+                return subprocess.CompletedProcess(argv, 0, output)
+
+            with patch.object(runner, "run", side_effect=fake_run):
+                runner.prepare_thread_runtime()
+            self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", environments["bundled-epoll-build"])
+            encoded = environments["patched-epoll-build"]["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+            for argument in ("-Wl,--whole-archive", report["archive"]["path"],
+                             "-Wl,--no-whole-archive",
+                             f"-Wl,--dynamic-list={report['dynamic_list']['path']}"):
+                self.assertIn(f"-Zpre-link-arg={argument}", encoded)
+                self.assertNotIn(f"-Clink-arg={argument}", encoded)
+            for argument in ("-lpthread", "-lc"):
+                self.assertIn(f"-Clink-arg={argument}", encoded)
+                self.assertNotIn(f"-Zpre-link-arg={argument}", encoded)
+            self.assertIn("-Zsanitizer=thread", encoded)
+            self.assertIn("-Zexternal-clangrt", encoded)
+
+    def test_compile_or_loader_failure_does_not_count_as_detection(self):
+        for kind, diagnostic in sanitizers.DIAGNOSTICS.items():
+            self.assertFalse(sanitizers.expected_detection(kind, 1, "compile error"))
+            self.assertFalse(sanitizers.expected_detection(kind, 0, diagnostic))
+            self.assertTrue(sanitizers.expected_detection(kind, 23, diagnostic))
+
+    def test_empty_or_filtered_list_cannot_pass(self):
+        self.assertEqual(sanitizers.listed_tests("0 tests, 0 benchmarks\n"), [])
+        self.assertEqual(sanitizers.listed_tests("compile note: test\n"), [])
+        self.assertEqual(sanitizers.listed_tests("a::b: test\nc: benchmark\n"), ["a::b"])
+
+    def test_dedicated_suites_cannot_silently_ignore_cases(self):
+        output = "test result: ok. 1 passed; 0 failed; 1 ignored;"
+        with self.assertRaises(RuntimeError):
+            sanitizers.completed_counts(output, 2)
+        self.assertEqual(sanitizers.completed_counts(output, 2, allow_ignored=True),
+                         {"passed": 1, "failed": 0, "ignored": 1})
+        with self.assertRaises(RuntimeError):
+            sanitizers.completed_counts("test result: ok. 0 passed; 0 failed; 0 ignored;", 0)
+
+    def test_runtime_failure_remains_failure_after_collecting_other_suites(self):
+        listing = subprocess.CompletedProcess([], 0, "case: test\n", None)
+        success = subprocess.CompletedProcess(
+            [], 0, "test result: ok. 1 passed; 0 failed; 0 ignored;", None)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                sanitizers, "ROOT", Path(directory)), patch.object(
+                sanitizers, "SUITES", (("first", [], []), ("second", [], []))):
+            runner = sanitizers.Runner("thread", sanitizers.NIGHTLY, False)
+            with patch.object(runner, "run", side_effect=[listing, RuntimeError("race"),
+                                                          listing, success]), patch.object(
+                    runner, "native_inventory"):
+                with self.assertRaisesRegex(RuntimeError, "failed: first"):
+                    runner.application()
+            self.assertEqual(runner.report["tests"]["first"]["status"], "failed")
+            self.assertEqual(runner.report["tests"]["second"]["status"], "passed")
+
+    def test_flags_and_suppressions_are_not_inherited(self):
+        contaminated = {
+            "RUSTFLAGS": "-Copt-level=3", "CARGO_ENCODED_RUSTFLAGS": "bad",
+            "CFLAGS_x86_64-unknown-linux-gnu": "-fno-sanitize=all",
+            "TSAN_OPTIONS": "suppressions=/tmp/ignore-everything",
+            "LSAN_OPTIONS": "detect_leaks=0", "PATH": os.environ.get("PATH", ""),
+        }
+        with patch.dict(os.environ, contaminated, clear=True):
+            env = sanitizers.configured_environment("thread", Path("/tmp/sanitized"))
+        self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", env)
+        self.assertNotIn("CFLAGS_x86_64-unknown-linux-gnu", env)
+        self.assertIn("-Zsanitizer=thread", env["RUSTFLAGS"])
+        self.assertIn("-fsanitize=thread", env["CFLAGS_x86_64_unknown_linux_gnu"])
+        self.assertNotIn("suppressions", env["TSAN_OPTIONS"])
+        self.assertNotIn("detect_leaks=0", env["LSAN_OPTIONS"])
+
+    def test_build_environment_excludes_wrappers_and_credentials(self):
+        preserved = {
+            "PATH": "/usr/bin", "HOME": "/tmp/home", "CARGO_HOME": "/tmp/cargo",
+            "RUSTUP_HOME": "/tmp/rustup", "TMPDIR": "/tmp/build",
+            "HTTP_PROXY": "http://proxy:8080", "https_proxy": "http://proxy:8080",
+            "NO_PROXY": "localhost,127.0.0.1", "SSL_CERT_FILE": "/tmp/ca.pem",
+            "SSL_CERT_DIR": "/tmp/certificates", "CARGO_HTTP_CAINFO": "/tmp/ca.pem",
+        }
+        excluded = {
+            "RUSTC_WRAPPER": "untrusted-wrapper", "RUSTC_WORKSPACE_WRAPPER": "wrapper",
+            "CARGO_BUILD_RUSTC_WRAPPER": "wrapper", "RUSTC": "wrong-compiler",
+            "CARGO_BUILD_RUSTC": "wrong-compiler", "RUSTC_BOOTSTRAP": "1",
+            "LD_PRELOAD": "/tmp/injected.so", "BASH_ENV": "/tmp/injected.sh",
+            "CCACHE_PREFIX": "wrapper", "SCCACHE_TOKEN": "fixture-token",
+            "GITHUB_TOKEN": "fixture-token", "GH_TOKEN": "fixture-token",
+            "AWS_SECRET_ACCESS_KEY": "fixture-secret", "OPENAI_API_KEY": "fixture-key",
+            "CARGO_REGISTRIES_PRIVATE_TOKEN": "fixture-token",
+            "UNRECOGNIZED_SERVICE_CREDENTIAL": "fixture-secret",
+        }
+        with patch.dict(os.environ, {**preserved, **excluded}, clear=True):
+            env = sanitizers.configured_environment("address", Path("/tmp/sanitized"))
+        for name, value in preserved.items():
+            with self.subTest(preserved=name):
+                self.assertEqual(env[name], value)
+        for name in excluded:
+            with self.subTest(excluded=name):
+                self.assertNotIn(name, env)
+        self.assertEqual(env["CC_x86_64_unknown_linux_gnu"], "clang")
+        self.assertEqual(env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"], "clang")
+        self.assertIn("-Zsanitizer=address", env["RUSTFLAGS"])
+
+    def test_native_and_production_paths_are_selected(self):
+        names = {name for name, _, _ in sanitizers.SUITES}
+        self.assertTrue({"library", "linux-fd-lifetimes", "production-cert-tunnel",
+                         "mldsa-oracle", "fault-injection"} <= names)
+        workflow = (ROOT / ".github/workflows/security-sanitizers.yml").read_text()
+        self.assertIn("kind: [address, thread, leak]", workflow)
+        self.assertNotIn("continue-on-error", workflow)
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertNotIn("id-token: write", workflow)
+
+
+if __name__ == "__main__":
+    unittest.main()

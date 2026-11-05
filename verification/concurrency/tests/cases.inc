@@ -1,0 +1,10 @@
+case!(source_mapped_alias);
+case!(source_ipv6_aggregate);
+case!(source_unwind_releases);
+case!(fd_overlapping_reservations);
+case!(fd_unwind_releases);
+case!(fd_overflow_and_zero);
+case!(pool_concurrent_order);
+case!(pool_panics_complete_and_release);
+case!(pool_shutdown_wakes_idle);
+case!(pool_inline_path);

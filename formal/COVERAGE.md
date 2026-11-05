@@ -31,6 +31,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/client/mod.rs` | not-exhaustive | module wiring |
 | `src/client/runtime.rs` | bounded-elsewhere | Kani checks mux activation and bounded tail append arithmetic. ParallaXSession and ParallaXZeroRtt cover control order only; TCP and QUIC I/O are not proved |
 | `src/client/socks.rs` | not-exhaustive | SOCKS byte parser and sockets |
+| `src/concurrency.rs` | not-exhaustive | std synchronization facade; isolated Loom/Shuttle builds substitute instrumented primitives, not a whole-program OS model |
 | `src/config.rs` | not-exhaustive | config files, secrets, and OS paths |
 | `src/crypto/auth.rs` | not-exhaustive | PSK, HMAC, and X25519 shared-secret bytes |
 | `src/crypto/identity.rs` | not-exhaustive | ML-DSA identity-proof bytes |
@@ -48,6 +49,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/crypto/parallel.rs` | not-exhaustive | thread pool and AEAD fan-out |
 | `src/crypto/pq.rs` | not-exhaustive | ML-KEM-1024 encapsulation bytes. ParallaXSession anchors the all-zero X25519 reject in hybrid_sandwich_rekey |
 | `src/crypto/quic_marker.rs` | not-exhaustive | HMAC over ClientHello.random |
+| `src/crypto/pool.rs` | not-exhaustive | production worker queue and lifecycle are exercised under bounded Loom/Shuttle schedules; arbitrary closures, OS threads and all schedules are not proved |
 | `src/crypto/replay.rs` | bounded-elsewhere | Kani checks post-HMAC digest copying and wiping. ParallaXReplay is the in-memory stage_insert order for one slot; the journal MAC and disk are not proved |
 | `src/crypto/session.rs` | bounded-elsewhere | Kani proves nonce injectivity in the sequence and substream HKDF-info injectivity in the stream id. AEAD and HKDF bytes are not enumerated. ParallaXSession only anchors the degenerate-secret check |
 | `src/fingerprint/http2.rs` | not-exhaustive | HTTP/2 frame bytes |
@@ -87,6 +89,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/traffic.rs` | bounded-elsewhere | Kani proves the padding-length parser does not panic for every input up to 8 bytes. Cover-traffic sampling uses OS randomness |
 | `src/transport/leg.rs` | not-exhaustive | socket reads and writes of records |
 | `src/transport/mod.rs` | not-exhaustive | module wiring |
+| `src/transport/fd_budget.rs` | not-exhaustive | atomic reservation and RAII release use bounded Loom/Shuttle models; process-wide FD ownership and OS limits are not proved |
 | `src/transport/tcp.rs` | not-exhaustive | TCP sockets and timeouts |
 | `src/transport/udp/auth.rs` | not-exhaustive | exporter-bound HMAC token |
 | `src/transport/udp/endpoint.rs` | not-exhaustive | UDP socket setup |

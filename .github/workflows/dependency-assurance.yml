@@ -1,0 +1,124 @@
+name: dependency-assurance
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, 'g2l/security-*']
+  schedule:
+    - cron: '17 5 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 120
+
+concurrency:
+  group: dependency-assurance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy-tests:
+    name: dependency policy and release guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Exercise policy and artifact rejection cases
+        run: |
+          python3 .github/scripts/test_dependency_policy.py
+          python3 .github/scripts/test_release_workflow.py
+      - name: Enforce workspace inventory and zero exemptions
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ -n "$BASE_SHA" ]]; then
+            python3 scripts/security/dependencies.py policy --base "$BASE_SHA"
+          else
+            python3 scripts/security/dependencies.py policy
+          fi
+
+  strict-vet:
+    name: cargo-vet strict source audits
+    # Missing source-review records are tracked on schedule or by request;
+    # the independent release audit remains mandatory before publishing.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    needs: policy-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.96.0'
+      - name: Install pinned cargo-vet
+        run: cargo install --locked --version 0.10.3 cargo-vet
+      # Deliberately fails while real source audits are missing. No init,
+      # regenerate exemptions, blanket trust, or continue-on-error in CI.
+      - name: Check all workspaces against frozen audit snapshots
+        run: python3 scripts/security/dependencies.py check --report target/security/dependency-report.json
+      - name: Preserve audit results even on missing coverage
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-source-audit-report
+          path: target/security/dependency-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  release-smoke:
+    name: package smoke ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.96.0'
+          targets: ${{ matrix.target }}
+      - name: Install pinned SBOM generator
+        run: cargo install --locked --version 0.5.9 cargo-cyclonedx
+      - name: Build native locked binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET" --bin parallax --bin plx
+      - name: Exercise real offline packaging without signing or publishing
+        env:
+          TARGET: ${{ matrix.target }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          python3 scripts/security/release_artifacts.py --tag v0.0.0-smoke --target "$TARGET" --commit "$SOURCE_SHA" --output "target/release-smoke/$TARGET"
+          python3 .github/scripts/test_release_workflow.py validate-artifacts --directory "target/release-smoke/$TARGET" --tag v0.0.0-smoke --target "$TARGET" --commit "$SOURCE_SHA"
+      - name: Run final stripped native binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "target/release-smoke/$TARGET/parallax" --version
+          "target/release-smoke/$TARGET/plx" --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-package-smoke-${{ matrix.target }}
+          path: target/release-smoke/${{ matrix.target }}/*
+          if-no-files-found: error
+          retention-days: 3

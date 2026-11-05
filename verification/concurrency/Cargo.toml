@@ -1,0 +1,33 @@
+[package]
+name = "parallax-concurrency"
+version = "0.0.0"
+license = "PolyForm-Noncommercial-1.0.0"
+edition = "2021"
+publish = false
+
+# Model dependencies must never enter the production application's graph.
+[workspace]
+
+[lib]
+test = false
+doctest = false
+
+[features]
+default = []
+loom = ["dep:loom"]
+shuttle = ["dep:shuttle"]
+
+[dependencies]
+loom = { version = "=0.7.2", optional = true }
+shuttle = { version = "=0.9.8", optional = true }
+
+[[test]]
+name = "loom"
+required-features = ["loom"]
+
+[[test]]
+name = "shuttle"
+required-features = ["shuttle"]
+
+[profile.release]
+debug = 1
