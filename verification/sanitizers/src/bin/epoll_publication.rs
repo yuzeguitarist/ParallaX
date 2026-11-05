@@ -44,7 +44,11 @@ mod linux {
     }
 
     pub fn run() {
-        let mode = std::env::args().nth(1).expect("same-fd or duplicate-fd");
+        let mode = std::env::args_os()
+            .nth(1)
+            .expect("same-fd or duplicate-fd")
+            .into_string()
+            .expect("ASCII publication mode");
         assert!(matches!(mode.as_str(), "same-fd" | "duplicate-fd"));
         // SAFETY: flags are valid Linux UAPI values.
         let poll = Arc::new(owned(unsafe { epoll_create1(CLOEXEC) }));

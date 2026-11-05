@@ -80,7 +80,7 @@ jobs:
           # Resolve proves this immutable event commit is the selected tag.
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: '1.96.0'
       - run: cargo install --locked --version 0.10.3 cargo-vet
@@ -115,7 +115,7 @@ jobs:
           # Keep checkout authority tied to the event, not a job output.
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: '1.96.0'
           targets: ${{ matrix.target }}

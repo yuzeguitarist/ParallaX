@@ -471,8 +471,12 @@ fn codec(
 
 #[test]
 fn framed_aead_matches_independent_backend_in_both_directions_across_counter_carry_and_rekey() {
-    let key = [0x73; 32];
-    let base = [0x95; 12];
+    // Only session secrets vary: payloads, padding and sequence boundaries stay
+    // reproducible, and both independent backends receive the same key/nonce.
+    let key: [u8; 32] = rand::random();
+    let base: [u8; 12] = rand::random();
+    let next_key: [u8; 32] = rand::random();
+    let next_base: [u8; 12] = rand::random();
     let mut checked = 0;
     for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
         for (aad, reference_aad) in DIRECTIONS {
@@ -509,13 +513,13 @@ fn framed_aead_matches_independent_backend_in_both_directions_across_counter_car
                 } else {
                     CipherSuite::Aes256Gcm
                 };
-                sender.rekey_with_suite(next_suite, [0xb1; 32], [0xc3; 12]);
-                receiver.rekey_with_suite(next_suite, [0xb1; 32], [0xc3; 12]);
+                sender.rekey_with_suite(next_suite, next_key, next_base);
+                receiver.rekey_with_suite(next_suite, next_key, next_base);
                 let wire = sender.seal(b"rekey resets sequence", &mut rng).unwrap();
                 let decoded = oracle_decrypt(
                     next_suite,
-                    [0xb1; 32],
-                    spec_nonce([0xc3; 12], 0),
+                    next_key,
+                    spec_nonce(next_base, 0),
                     reference_aad,
                     &wire[5..],
                 )
@@ -531,8 +535,8 @@ fn framed_aead_matches_independent_backend_in_both_directions_across_counter_car
                 .is_none());
                 let reference = oracle_record(
                     next_suite,
-                    [0xb1; 32],
-                    spec_nonce([0xc3; 12], 0),
+                    next_key,
+                    spec_nonce(next_base, 0),
                     reference_aad,
                     b"rekey resets sequence",
                     padding,
@@ -549,8 +553,8 @@ fn serial_and_parallel_record_paths_match_the_independent_batch_oracle() {
     let pool = CryptoPool::new(3);
     for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
         for (aad, reference_aad) in DIRECTIONS {
-            let key = [0x81; 32];
-            let base = [0x2a; 12];
+            let key: [u8; 32] = rand::random();
+            let base: [u8; 12] = rand::random();
             let mut payload = Vec::new();
             let mut lens = Vec::new();
             let mut expected_wire = Vec::new();

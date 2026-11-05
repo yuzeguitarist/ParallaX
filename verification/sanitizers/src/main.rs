@@ -46,7 +46,11 @@ fn leak_defect() {
 }
 
 fn main() {
-    let mode = std::env::args().nth(1).expect("good/address/thread/leak");
+    let mode = std::env::args_os()
+        .nth(1)
+        .expect("good/address/thread/leak")
+        .into_string()
+        .expect("ASCII canary mode");
     match mode.as_str() {
         "good" => {
             let value = std::sync::Arc::new(std::sync::Mutex::new(vec![7_u8; 256]));
