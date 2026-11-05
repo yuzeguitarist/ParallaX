@@ -1,0 +1,19 @@
+docs/security/baseline.md
+  s_0b5b231c3e422a::t_4aa3cd0846aac3 53-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fed0ccd08351a3a1561c6374cf1ee6e204c1279c",
+  "prompts": {},
+  "sessions": {
+    "s_0b5b231c3e422a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aa16-905c-7a91-8ac0-e86498fa5e64",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
