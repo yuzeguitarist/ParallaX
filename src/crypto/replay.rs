@@ -786,6 +786,14 @@ fn write_cache_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    // Test-only observation of the actual directory selected for sync. On-disk
+    // crash durability itself cannot be asserted without a crash/fault harness.
+    static LAST_FSYNC_PARENT_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Best-effort fsync of `path`'s parent directory so a preceding rename into it
 /// is durable. Errors are ignored (not all filesystems support directory fsync).
 #[cfg(unix)]
@@ -793,6 +801,8 @@ fn fsync_parent_dir(path: &Path) {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = parent.unwrap_or_else(|| Path::new("."));
     if let Ok(dir_file) = fs::File::open(dir) {
+        #[cfg(test)]
+        LAST_FSYNC_PARENT_DIR.with(|last| *last.borrow_mut() = Some(dir.to_path_buf()));
         let _ = dir_file.sync_all();
     }
 }
@@ -1328,6 +1338,85 @@ mod tests {
         cache = ReplayCache::new(2048);
         assert!(!cache.should_compact_authenticated_journal(journal(2048)));
         assert!(cache.should_compact_authenticated_journal(journal(2049)));
+    }
+
+    #[test]
+    fn replay_window_constant_and_mac_key_debug_redaction_are_exact() {
+        // A mutation from multiplication to addition would silently shorten
+        // the two-minute default replay-protection horizon to 62 seconds.
+        assert_eq!(DEFAULT_REPLAY_WINDOW_SECS, 120);
+        let key = CacheMacKey([0x42; 32]);
+        assert_eq!(format!("{key:?}"), "<redacted>");
+    }
+
+    #[test]
+    fn fresh_authenticated_cache_initializes_and_commits_its_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("initial-journal.cache");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert!(matches!(
+            cache.auth_journal,
+            Some(AuthJournalState {
+                count: 0,
+                generation: 0,
+                ..
+            })
+        ));
+        assert!(cache
+            .insert_new(
+                ReplayEntry {
+                    timestamp: now,
+                    nonce: [0x13; 8],
+                    transcript_fingerprint: [0x24; 32],
+                },
+                now,
+            )
+            .unwrap());
+        assert!(matches!(
+            cache.auth_journal,
+            Some(AuthJournalState { count: 1, .. })
+        ));
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .starts_with(AUTH_JOURNAL_VERSION));
+        let reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        assert_eq!(reloaded.order.len(), 1);
+        assert_eq!(reloaded.auth_journal.unwrap().count, 1);
+    }
+
+    #[test]
+    fn authenticated_rollback_never_discards_plain_journal_lines() {
+        let mut cache = ReplayCache::new(4);
+        cache.path = Some(PathBuf::from("authenticated-journal.cache"));
+        cache.mac_key = Some(CacheMacKey([0x11; 32]));
+        // Deliberately seed a sentinel in the normally-unused plain queue so
+        // the && guard is testable: authenticated rollback must never pop it.
+        cache
+            .encoded_entries
+            .push_back("plain-only sentinel".to_owned());
+        let entry = ReplayEntry {
+            timestamp: 42,
+            nonce: [0x23; 8],
+            transcript_fingerprint: [0x34; 32],
+        };
+        cache.push_loaded_entry(entry.clone());
+        assert_eq!(cache.pop_pushed_entry(), Some(entry));
+        assert_eq!(
+            cache.encoded_entries.front().map(String::as_str),
+            Some("plain-only sentinel")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_parent_dir_uses_the_real_journal_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        LAST_FSYNC_PARENT_DIR.with(|last| last.borrow_mut().take());
+        fsync_parent_dir(&dir.path().join("replay.cache"));
+        let synced = LAST_FSYNC_PARENT_DIR.with(|last| last.borrow().clone());
+        assert_eq!(synced.as_deref(), Some(dir.path()));
     }
 
     #[test]
