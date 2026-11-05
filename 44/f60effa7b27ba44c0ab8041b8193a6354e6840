@@ -1,0 +1,73 @@
+.github/scripts/check_crypto_rules.py
+  s_835d9bd821cc07::t_65a3e23312c90a 78-84,86-113,155,157
+.github/scripts/check_mux_receipts.py
+  s_2bfe63e477f089::t_624bf5067bccee 297-301
+.github/scripts/check_tls_drain.py
+  s_835d9bd821cc07::t_053665aa53f7b1 2,76-77,103-105,107-130
+.github/semgrep/crypto.rs
+  s_835d9bd821cc07::t_6a8bd309f4dd84 3-44,65-69
+.github/semgrep/crypto.yml
+  s_835d9bd821cc07::t_b31fdf6cabc4e0 2-30,88-90
+.github/semgrep/mux_receipt.rs
+  s_2bfe63e477f089::t_e1d8ee846648da 42-45
+.github/semgrep/mux_receipt.yml
+  s_2bfe63e477f089::t_57145dffe49b21 65-66
+.github/semgrep/tls_drain.rs
+  s_835d9bd821cc07::t_2c6cd6bba031f8 54-56,77-99
+.github/semgrep/tls_drain.yml
+  s_835d9bd821cc07::t_c8c38a3bf9fd56 77-79,95-120,124
+.github/workflows/ci-pr.yml
+  s_835d9bd821cc07::t_89fb457ad1588f 56-58,103-106,111
+.github/workflows/proverif.yml
+  s_835d9bd821cc07::t_1c903c81091516 57
+.github/workflows/semgrep.yml
+  s_835d9bd821cc07::t_12e85fd104084b 36-38
+README.md
+  s_835d9bd821cc07::t_53b7a0a8b0fd3d 270-274
+ops/traffic-lab/shaper.py
+  s_835d9bd821cc07::t_352095621f79e2 104,113,121-123
+ops/traffic-lab/test_relay.py
+  s_835d9bd821cc07::t_0fd94989f4c9ac 13,229
+ops/traffic-lab/test_shaper.py
+  s_835d9bd821cc07::t_04482d5673c3bf 197,200-201,206-211
+scripts/traffic_lab/README.md
+  s_2bfe63e477f089::t_52a09452660680 11,14-16,68-69,86-90
+scripts/traffic_lab/analyze.py
+  s_835d9bd821cc07::t_c816617b490b27 471,477,481,500
+scripts/traffic_lab/test_analyze.py
+  s_835d9bd821cc07::t_79493892182cc3 246-283
+src/crypto/session.rs
+  s_835d9bd821cc07::t_9f6d25b193ea74 832-834,848-851,856-857
+src/protocol/data.rs
+  s_835d9bd821cc07::t_ed041e64260c11 187,193,264,291,304-330,344,2719-2772
+src/tls/quic/handshake.rs
+  s_2bfe63e477f089::t_7d37f63b63a0f2 1404-1495
+src/tls/quic/server.rs
+  s_835d9bd821cc07::t_156218d203e6a8 422-423
+src/tls/safari26.rs
+  s_835d9bd821cc07::t_e9500323ad01c9 1780-1784,1810-1838,1893-1921,3324-3394,3421,3424,3559,3645,3799,3802,3817,3824,3866-3869
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "44f60effa7b27ba44c0ab8041b8193a6354e6840",
+  "prompts": {},
+  "sessions": {
+    "s_2bfe63e477f089": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e23e3ded-0925-478b-bf3c-746fc7faa3cc",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_835d9bd821cc07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d498bf26-5e3d-44fa-a1fd-5041f126d038",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
