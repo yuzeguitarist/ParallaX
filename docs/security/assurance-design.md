@@ -152,19 +152,38 @@ limitation. Passing checks are reported for the actual candidate commit.
   digest. Empty-cache reproduction also showed why a release-only build is
   insufficient for later offline metadata. Fetch the complete locked graph
   before offline SBOM generation, preserve errors, and recheck lock bytes.
-  Real ARM cold-cache packaging passed the same inline signer validator;
-  native Linux and Intel macOS smoke results remain separate evidence.
+  Real ARM cold-cache packaging passed the same inline signer validator.
+  Actions run `41969234783` subsequently passed all three native Linux, ARM
+  macOS and Intel macOS packaging jobs, including both final stripped binaries'
+  version commands and the inline validator. Strict source audits still failed
+  on the recorded uncovered dependency versions, as required.
 - **Old socket fixtures intentionally leaked temporary directories.** Actual
   ASan/LSan execution found two 15-byte path allocations in splice equivalence
   and five in socket chaos. Replace `mem::forget` with ownership in the handler
   future and release after the handler completes. Normal socket retests pass;
-  sanitized retests are required before claiming these lanes pass.
+  both complete ASan and LSan application lanes passed in Actions run
+  `41969234821` after the fix.
 - **TSan must understand the application's OS synchronization.** The pinned
   runtime lacked LLVM's fcntl descriptor-duplication interceptor. An independent
   source investigation traced Mio's duplicated epoll registry and the upstream
   fix. A narrowly pinned runtime backport, clean duplicated-epoll controls and
   ordinary true-race canaries are required; suppressing the application report
   would not establish a valid test environment.
+- **A process-group kill misses Ninja's compiler descendants.** The independent
+  reviewer rejected cleanup based on one PGID or an empty process snapshot.
+  The Linux-only runtime builder now establishes exclusive child-subreaper
+  ownership, retains the leader with `WNOWAIT`, signals adopted children with
+  pidfds and proves completion only through kernel `ECHILD` with `__WALL`.
+  Uncertain cleanup fails and retains the working directory. The independent
+  reviewer verified the committed file hashes and reran all 27 native Linux
+  guards, including separate process groups/sessions, missed snapshots,
+  cancellation and permission failure; all passed.
+- **Explicit runtime linking must account for Rust's `-nodefaultlibs`.** The
+  first native patched-runtime build succeeded, but the following Rust control
+  failed to link because driver-level `-pthread` was ignored and libc had been
+  scanned before the runtime archive. Supply literal `-lpthread` and a trailing
+  `-lc` after the archive, with an ordering regression. Native compatibility,
+  canary and application validation remains required after this correction.
 
 PR work may push its feature branch to execute unprivileged GitHub-hosted
 checks. It must not create a tag, publish a release, change repository access

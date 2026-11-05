@@ -108,6 +108,13 @@ need the accompanying native/OS boundary inventory. Missing cargo-vet audits
 remain explicit inherited debt and make the strict vet check fail. They are
 not converted into deployment approval through bootstrap exemptions.
 
+The cargo-vet policy covers the four enumerated Cargo workspaces. Pinned tool
+versions, locked installations, Action commit pins and compiler provenance do
+not constitute completed source audits of every verifier, SBOM generator,
+compiler, operating-system package or their transitive dependencies. These
+tools remain part of the build trust boundary; the source-audit debt inventory
+must not be described as an exhaustive audit of that broader toolchain.
+
 A contributor who can change both a guard and its policy can weaken both in one
 PR. Branch protections, required checks, non-author human approval and careful
 review of workflow/audit-policy edits remain necessary. This change does not
