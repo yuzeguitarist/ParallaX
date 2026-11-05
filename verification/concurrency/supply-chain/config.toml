@@ -1,0 +1,16 @@
+
+# cargo-vet config file
+
+[cargo-vet]
+version = "0.10"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/8cec794c38751495cf7a6c083220c207af1303d6/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/4716047f88d72d0685224af330bf21d0c2435b69/audits.toml"
+
+[policy.parallax-concurrency]
+audit-as-crates-io = false
+criteria = "safe-to-run"
+dev-criteria = "safe-to-run"

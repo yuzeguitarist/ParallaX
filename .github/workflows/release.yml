@@ -1,37 +1,23 @@
 name: release
 
-# Build native release binaries for ParallaX's real platforms and publish them to
-# a GitHub Release when a `v*` tag is pushed.
-#
-# NATIVE build per target (no cross-compilation): each target builds on a matching
-# runner so the heavy crypto deps (aws-lc-rs, pqcrypto, ring) compile with their
-# native toolchain — this deliberately avoids the cross-compile fragility that the
-# zigbuild path in scripts/deploy-vps.sh exists to work around.
-#
-# Adds NO third-party action: the Release is created and assets uploaded with the
-# bundled `gh` CLI (github.token, contents: write). The default token is fine here
-# — a Release does not need to trigger downstream CI.
-#
-# aarch64-unknown-linux-gnu is omitted because a native build needs an arm Linux
-# runner. To ship it, add this matrix entry (requires arm runners on your plan):
-#   - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-
+# Read-only native builders -> isolated attestation jobs -> one publisher.
+# Dispatch must select the SAME version tag as the workflow ref so OIDC
+# provenance identifies the exact source compiled by the build jobs.
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to (re)build and upload, e.g. v0.1.0'
+        description: 'Version tag; also select this tag in the Run workflow ref selector'
         required: true
+        type: string
 
-# Least-privilege at top level; the job below elevates to write (Scorecard hardening).
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -40,15 +26,81 @@ env:
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
+  resolve:
+    name: validate release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+      commit: ${{ steps.ver.outputs.commit }}
+    steps:
+      - name: Validate event ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == push || "$EVENT_NAME" == workflow_dispatch ]]
+          [[ "$EVENT_REF" == "refs/tags/$EVENT_TAG" ]]
+          [[ "$EVENT_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          [[ ${#EVENT_TAG} -le 100 ]]
+          [[ -z "$INPUT_TAG" || "$INPUT_TAG" == "$EVENT_TAG" ]]
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Resolve version
+        id: ver
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EVENT_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          [[ "$head_commit" == "$tag_commit" && "$head_commit" == "$EVENT_COMMIT" ]]
+          printf 'tag=%s\nversion=%s\ncommit=%s\n' "$RELEASE_TAG" "${RELEASE_TAG#v}" "$head_commit" >> "$GITHUB_OUTPUT"
+
+  audit:
+    name: enforce dependency source audits
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.96.0'
+      - run: cargo install --locked --version 0.10.3 cargo-vet
+      - name: Require audited dependencies before release
+        run: python3 scripts/security/dependencies.py check --report target/security/dependency-report.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() }}
+        with:
+          name: release-dependency-audits
+          path: target/security/dependency-report.json
+          if-no-files-found: error
+          retention-days: 14
+
   build:
     name: build ${{ matrix.target }}
-    permissions:
-      contents: write   # create the Release and upload assets
+    needs: [resolve, audit]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
@@ -59,66 +111,251 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ needs.resolve.outputs.commit }}
           persist-credentials: false
-
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: stable
+          toolchain: '1.96.0'
           targets: ${{ matrix.target }}
-
-      - name: Resolve version
-        id: ver
+      - name: Install pinned SBOM generator
+        run: cargo install --locked --version 0.5.9 cargo-cyclonedx
+      - name: Build locked native binaries
         env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-          PUSH_COMMIT: ${{ github.event_name == 'push' && github.sha || '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_TAG" == v* ]]
-          git check-ref-format "refs/tags/$RELEASE_TAG"
-          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          head_commit="$(git rev-parse --verify 'HEAD^{commit}')"
-          [[ "$head_commit" == "$tag_commit" ]]
-          [[ -z "$PUSH_COMMIT" || "$head_commit" == "$PUSH_COMMIT" ]]
-          printf 'tag=%s\nversion=%s\n' "$RELEASE_TAG" "${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Build
-        shell: bash
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin parallax --bin plx
-
-      - name: Package
-        id: pkg
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
           TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET" --bin parallax --bin plx
+      - name: Package binaries and target SBOMs
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.commit }}
+        run: python3 scripts/security/release_artifacts.py --tag "$TAG" --target "$TARGET" --commit "$SOURCE_SHA" --output "target/release-artifacts/$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: target/release-artifacts/${{ matrix.target }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: attest ${{ matrix.target }}
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      # No checkout or source/build execution in this privileged job.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-input
+      - name: Validate release artifacts
+        id: validate
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.commit }}
+          ARTIFACT_DIR: ${{ runner.temp }}/release-input
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import gzip, hashlib, io, json, os, re, tarfile
+          from pathlib import Path
+          def require(value, message):
+              if not value:
+                  raise SystemExit(message)
+          def unique(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result, "duplicate JSON key")
+                  result[key] = value
+              return result
+          def read_json(path):
+              require(path.stat().st_size <= 16 * 1024 * 1024, "oversized JSON")
+              return json.loads(path.read_text(), object_pairs_hook=unique)
+          def sha(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+          tag, target, commit = (os.environ[key] for key in ("RELEASE_TAG", "TARGET", "SOURCE_SHA"))
+          require(re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", tag) and len(tag) <= 100, "invalid tag")
+          require(target in ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"), "invalid target")
+          require(re.fullmatch(r"[0-9a-f]{40}", commit), "invalid source commit")
+          root = Path(os.environ["ARTIFACT_DIR"])
+          name = f"parallax-{tag[1:]}-{target}"
+          files = {"parallax", "plx", f"{name}.tar.gz", f"{name}.tar.gz.sha256",
+                   f"{name}.parallax.cdx.json", f"{name}.plx.cdx.json", f"{name}.native.json"}
+          manifest_name = f"{name}.manifest.json"
+          require({path.name for path in root.iterdir()} == files | {manifest_name}, "unexpected/missing artifacts")
+          for path in root.iterdir():
+              require(path.is_file() and not path.is_symlink(), "non-regular artifact")
+              require(0 < path.stat().st_size <= 512 * 1024 * 1024, "invalid artifact size")
+          manifest = read_json(root / manifest_name)
+          require(manifest["schema"] == 1 and manifest["tag"] == tag and manifest["target"] == target, "wrong manifest")
+          require(manifest["source_commit"] == commit and manifest["source_ref"] == f"refs/tags/{tag}", "wrong source")
+          require(set(manifest["files"]) == files, "wrong manifest file set")
+          require(re.fullmatch(r"[0-9a-f]{64}", manifest["cargo_lock_sha256"]), "invalid Cargo.lock digest")
+          for filename, entry in manifest["files"].items():
+              path = root / filename
+              require(type(entry["size"]) is int and entry["size"] == path.stat().st_size, "size mismatch")
+              require(entry["sha256"] == sha(path), "digest mismatch")
+          require((root / f"{name}.tar.gz.sha256").read_text() == f"{sha(root / (name + '.tar.gz'))}  {name}.tar.gz\n", "wrong checksum file")
+          for binary in ("parallax", "plx"):
+              bom = read_json(root / f"{name}.{binary}.cdx.json")
+              require(bom["bomFormat"] == "CycloneDX" and bom["specVersion"] == "1.5", "wrong SBOM format")
+              require(bom["metadata"]["component"]["name"] == binary, "wrong SBOM binary")
+              require(bom["metadata"]["component"]["hashes"] == [{"alg": "SHA-256", "content": sha(root / binary)}], "SBOM binary mismatch")
+              props = unique((entry["name"], entry["value"]) for entry in bom["metadata"]["properties"])
+              require(props["parallax:source:commit"] == commit and props["parallax:source:ref"] == f"refs/tags/{tag}", "SBOM source mismatch")
+              require(props["parallax:release:target"] == target, "SBOM target mismatch")
+              require(bom["components"], "empty SBOM")
+          native = read_json(root / f"{name}.native.json")
+          require(native["schema"] == 1 and native["target"] == target, "wrong native inventory")
+          # Read bounded archive data; never extract or execute downloaded files.
+          # Bind the bytes users unpack to the separately signed binary SBOMs.
+          with gzip.open(root / f"{name}.tar.gz", "rb") as compressed:
+              archive_bytes = compressed.read(256 * 1024 * 1024 + 1)
+          require(len(archive_bytes) <= 256 * 1024 * 1024, "oversized expanded archive")
+          packaged = {"parallax", "plx", f"{name}.parallax.cdx.json", f"{name}.plx.cdx.json",
+                      f"{name}.native.json", "README.md", "LICENSE", "NOTICE"}
+          expected_members = {name} | {f"{name}/{item}" for item in packaged}
+          with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+              seen = set()
+              for member in archive:
+                  require(member.name in expected_members and member.name not in seen, "unexpected/duplicate archive entry")
+                  seen.add(member.name)
+                  if member.name == name:
+                      require(member.isdir() and member.mode == 0o755, "invalid archive root")
+                      continue
+                  require(member.type == tarfile.REGTYPE and 0 < member.size <= 128 * 1024 * 1024, "non-regular/oversized archive file")
+                  filename = member.name[len(name) + 1:]
+                  require(member.mode == (0o755 if filename in ("parallax", "plx") else 0o644), "unsafe archive mode")
+                  if filename in files:
+                      with archive.extractfile(member) as stream:
+                          require(hashlib.file_digest(stream, "sha256").hexdigest() == sha(root / filename), "archive content mismatch")
+              require(seen == expected_members, "missing archive entries")
+              require(not any(archive_bytes[archive.offset:]), "data after archive end")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"prefix={name}\n")
+          PY
+      - name: Attest build provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: '${{ runner.temp }}/release-input/*'
+          create-storage-record: false
+      - name: Attest parallax SBOM
+        id: parallax-sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: '${{ runner.temp }}/release-input/parallax'
+          sbom-path: '${{ runner.temp }}/release-input/${{ steps.validate.outputs.prefix }}.parallax.cdx.json'
+          create-storage-record: false
+      - name: Attest plx SBOM
+        id: plx-sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: '${{ runner.temp }}/release-input/plx'
+          sbom-path: '${{ runner.temp }}/release-input/${{ steps.validate.outputs.prefix }}.plx.cdx.json'
+          create-storage-record: false
+      - name: Preserve signing bundles
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/release-input
+          PREFIX: ${{ steps.validate.outputs.prefix }}
+          PROVENANCE: ${{ steps.provenance.outputs.bundle-path }}
+          PARALLAX_SBOM: ${{ steps.parallax-sbom.outputs.bundle-path }}
+          PLX_SBOM: ${{ steps.plx-sbom.outputs.bundle-path }}
         shell: bash
         run: |
           set -euo pipefail
-          dist="parallax-${VERSION}-${TARGET}"
-          mkdir -p "$dist"
-          bindir="target/${TARGET}/release"
-          for b in parallax plx; do
-            cp "$bindir/$b" "$dist/"
-            strip "$dist/$b" 2>/dev/null || true
-          done
-          cp README.md "$dist/" 2>/dev/null || true
-          tar -czf "$dist.tar.gz" "$dist"
-          shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
-          echo "tarball=$dist.tar.gz" >> "$GITHUB_OUTPUT"
+          cp "$PROVENANCE" "$ARTIFACT_DIR/$PREFIX.provenance.sigstore.jsonl"
+          cp "$PARALLAX_SBOM" "$ARTIFACT_DIR/$PREFIX.parallax.sbom.sigstore.jsonl"
+          cp "$PLX_SBOM" "$ARTIFACT_DIR/$PREFIX.plx.sbom.sigstore.jsonl"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-${{ matrix.target }}
+          path: '${{ runner.temp }}/release-input/*'
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Publish to GitHub Release
+  publish:
+    name: verify and publish complete release
+    needs: [resolve, build, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      # Same workflow/run only. No source checkout, binary execution, or archive extraction.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: signed-*
+          path: ${{ runner.temp }}/release-assets
+      - name: Verify attestations and publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.ver.outputs.tag }}
-          TARBALL: ${{ steps.pkg.outputs.tarball }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.commit }}
+          ARTIFACT_DIR: ${{ runner.temp }}/release-assets
         shell: bash
         run: |
-          set -euo pipefail
-          # Create the Release once; concurrent matrix jobs that lose the race fall
-          # through to the upload (|| true swallows the "already exists" error).
-          gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag 2>/dev/null || true
-          gh release upload "$TAG" \
-            "$TARBALL" \
-            "$TARBALL.sha256" \
-            --clobber
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          def require(value, message):
+              if not value:
+                  raise SystemExit(message)
+          def run(args):
+              subprocess.run(args, check=True)
+          tag, source, repo, ref = (os.environ[key] for key in ("RELEASE_TAG", "SOURCE_SHA", "GITHUB_REPOSITORY", "GITHUB_REF"))
+          require(re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", tag) and len(tag) <= 100, "invalid tag")
+          require(ref == f"refs/tags/{tag}" and re.fullmatch(r"[0-9a-f]{40}", source), "wrong event source")
+          require(repo == "yuzeguitarist/ParallaX", "unexpected release repository")
+          targets = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin")
+          root = Path(os.environ["ARTIFACT_DIR"])
+          require({path.name for path in root.iterdir()} == {f"signed-{target}" for target in targets}, "missing/extra targets")
+          assets = []
+          for target in targets:
+              directory = root / f"signed-{target}"
+              require(directory.is_dir() and not directory.is_symlink(), "invalid target directory")
+              name = f"parallax-{tag[1:]}-{target}"
+              published = [f"{name}{suffix}" for suffix in (".tar.gz", ".tar.gz.sha256", ".parallax.cdx.json", ".plx.cdx.json", ".native.json", ".manifest.json")]
+              bundles = [f"{name}{suffix}" for suffix in (".provenance.sigstore.jsonl", ".parallax.sbom.sigstore.jsonl", ".plx.sbom.sigstore.jsonl")]
+              expected = set(published + bundles + ["parallax", "plx"])
+              require({path.name for path in directory.iterdir()} == expected, "unexpected/missing signed files")
+              for path in directory.iterdir():
+                  require(path.is_file() and not path.is_symlink(), "non-regular signed artifact")
+                  require(0 < path.stat().st_size <= 512 * 1024 * 1024, "invalid signed artifact size")
+              common = ["--repo", repo, "--signer-workflow", f"{repo}/.github/workflows/release.yml",
+                        "--source-ref", ref, "--source-digest", source, "--deny-self-hosted-runners"]
+              for filename in published + ["parallax", "plx"]:
+                  run(["gh", "attestation", "verify", str(directory / filename),
+                       "--bundle", str(directory / bundles[0]), *common])
+              for binary in ("parallax", "plx"):
+                  run(["gh", "attestation", "verify", str(directory / binary), "--bundle",
+                       str(directory / f"{name}.{binary}.sbom.sigstore.jsonl"),
+                       "--predicate-type", "https://cyclonedx.org/bom", *common])
+              assets.extend(str(directory / filename) for filename in published + bundles)
+          # Resolve the exact remote tag namespace, including annotated tags. Do not use
+          # the ambiguous commits/<name> API, which can select a same-named branch.
+          response = subprocess.check_output(["gh", "api", f"repos/{repo}/git/ref/tags/{tag}"], text=True)
+          obj = json.loads(response)["object"]
+          for _ in range(8):
+              if obj["type"] == "commit":
+                  break
+              require(obj["type"] == "tag" and re.fullmatch(r"[0-9a-f]{40}", obj["sha"]), "unexpected tag object")
+              response = subprocess.check_output(["gh", "api", f"repos/{repo}/git/tags/{obj['sha']}"], text=True)
+              obj = json.loads(response)["object"]
+          require(obj["type"] == "commit" and obj["sha"] == source, "release tag moved after build")
+          # Creation fails on any existing release; never overwrite published bytes.
+          # A failed upload leaves a draft for explicit maintainer inspection.
+          run(["gh", "release", "create", tag, *assets, "--repo", repo, "--verify-tag",
+               "--draft", "--generate-notes", "--title", tag])
+          run(["gh", "release", "edit", tag, "--repo", repo, "--draft=false"])
+          PY

@@ -45,6 +45,8 @@ allow = [
   "CC0-1.0",
   "Zlib",
   "Unicode-3.0",
+  # libfuzzer-sys bundles LLVM's fuzzer under the permissive NCSA terms.
+  "NCSA",
 ]
 confidence-threshold = 0.8
 
@@ -54,6 +56,18 @@ confidence-threshold = 0.8
 # the license to our own crate only.
 [[licenses.exceptions]]
 crate = "parallax"
+allow = ["PolyForm-Noncommercial-1.0.0"]
+
+[[licenses.exceptions]]
+crate = "parallax-fuzz"
+allow = ["PolyForm-Noncommercial-1.0.0"]
+
+[[licenses.exceptions]]
+crate = "gfw-lab"
+allow = ["PolyForm-Noncommercial-1.0.0"]
+
+[[licenses.exceptions]]
+crate = "parallax-concurrency"
 allow = ["PolyForm-Noncommercial-1.0.0"]
 
 [bans]
