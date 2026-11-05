@@ -2,6 +2,8 @@
 import importlib.util
 import os
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +25,31 @@ class SanitizerControls(unittest.TestCase):
         self.assertEqual(sanitizers.listed_tests("0 tests, 0 benchmarks\n"), [])
         self.assertEqual(sanitizers.listed_tests("compile note: test\n"), [])
         self.assertEqual(sanitizers.listed_tests("a::b: test\nc: benchmark\n"), ["a::b"])
+
+    def test_dedicated_suites_cannot_silently_ignore_cases(self):
+        output = "test result: ok. 1 passed; 0 failed; 1 ignored;"
+        with self.assertRaises(RuntimeError):
+            sanitizers.completed_counts(output, 2)
+        self.assertEqual(sanitizers.completed_counts(output, 2, allow_ignored=True),
+                         {"passed": 1, "failed": 0, "ignored": 1})
+        with self.assertRaises(RuntimeError):
+            sanitizers.completed_counts("test result: ok. 0 passed; 0 failed; 0 ignored;", 0)
+
+    def test_runtime_failure_remains_failure_after_collecting_other_suites(self):
+        listing = subprocess.CompletedProcess([], 0, "case: test\n", None)
+        success = subprocess.CompletedProcess(
+            [], 0, "test result: ok. 1 passed; 0 failed; 0 ignored;", None)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                sanitizers, "ROOT", Path(directory)), patch.object(
+                sanitizers, "SUITES", (("first", [], []), ("second", [], []))):
+            runner = sanitizers.Runner("thread", sanitizers.NIGHTLY, False)
+            with patch.object(runner, "run", side_effect=[listing, RuntimeError("race"),
+                                                          listing, success]), patch.object(
+                    runner, "native_inventory"):
+                with self.assertRaisesRegex(RuntimeError, "failed: first"):
+                    runner.application()
+            self.assertEqual(runner.report["tests"]["first"]["status"], "failed")
+            self.assertEqual(runner.report["tests"]["second"]["status"], "passed")
 
     def test_flags_and_suppressions_are_not_inherited(self):
         contaminated = {

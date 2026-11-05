@@ -71,6 +71,11 @@ class RefTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # Fixture repositories must not inherit signing hooks, maintenance or
+        # fsmonitor daemons from the developer's real Git configuration.
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("GIT_")}
+        self.env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
         self.git("init", "-b", "main")
         self.git("-c", "user.name=Release Test", "-c", "user.email=test@example.invalid",
                  "commit", "--allow-empty", "-m", "old")
@@ -85,7 +90,7 @@ class RefTests(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.run(["git", "-c", "gc.auto=0", *args], cwd=self.root,
-                              capture_output=True, text=True, check=True)
+                              capture_output=True, text=True, check=True, env=self.env)
 
     def run_step(self, name, **env):
         output = self.root / "outputs"
@@ -93,7 +98,7 @@ class RefTests(unittest.TestCase):
         source = script(name)
         self.assertNotIn("${{", source)
         result = subprocess.run(["bash", "-c", source], cwd=self.root, capture_output=True,
-                                text=True, env={**os.environ, "GITHUB_OUTPUT": str(output), **env})
+                                text=True, env={**self.env, "GITHUB_OUTPUT": str(output), **env})
         return result, output.read_text()
 
     def test_dispatch_requires_same_tag_ref(self):

@@ -62,7 +62,7 @@ trust assumption.
 | Runtime → durable replay (`crypto/replay.rs`) | Duplicate insertion, full cache, truncated/tampered journal, partial persistence, restart | HMAC journal/commit logic and existing failure injection; real server seeded replay, capacity and startup-corruption tests |
 | Files/host → secrets (`config.rs`, `secret_store.rs`, `runtime_guard.rs`) | Bad permissions/owner, symlink swap, copied bundle, corrupt seal, stale state directory | Owner/mode/no-follow checks, authenticated bundles, deploy interruption tests, normal hardening regression suite |
 | Rust ↔ native/syscall (`aws-lc`, `ring`, PQClean, QUIC offload, TCP splice) | OOB/UAF, native race, FD leaks, malformed ancillary data, cancellation lifetime bugs | ASan/TSan/LSan with instrumented std/native compilation, C and Rust canaries, archive evidence, Linux FD lifetime workloads |
-| Source/dependency → build | Malicious update, missing nested workspace, unaudited version, trust expansion | Locked graphs, cargo-vet stores/import snapshots and exact exemption ledger, cargo-deny, OSV, secret and workflow scanners |
+| Source/dependency → build | Malicious update, missing nested workspace, unaudited version, trust expansion | Locked graphs, frozen cargo-vet imports, explicit missing-audit inventory and zero-exemption gate, cargo-deny, OSV, secret and workflow scanners |
 | Build → signed release → consumer | Tag/ref mismatch, mutable artifacts, incomplete matrix, forged metadata, consumer accepts wrong identity | Separate read-only build and privileged jobs, per-target BOM/linkage/hashes, exact source checks, immutable artifact naming and consumer verification |
 
 ## Residual risks that tests must not hide
@@ -104,8 +104,9 @@ samples controlled schedules. Neither substitutes for Tokio/kernel/network
 coverage. TSan has documented limitations for atomic fences and synchronization
 implemented in assembly. A native archive containing sanitizer references does
 not mean every instruction in that archive is instrumented. SBOM Cargo graphs
-need the accompanying native/OS boundary inventory. Baseline cargo-vet
-exemptions are unaudited inherited debt, even when the policy check succeeds.
+need the accompanying native/OS boundary inventory. Missing cargo-vet audits
+remain explicit inherited debt and make the strict vet check fail. They are
+not converted into deployment approval through bootstrap exemptions.
 
 A contributor who can change both a guard and its policy can weaken both in one
 PR. Branch protections, required checks, non-author human approval and careful
@@ -117,7 +118,7 @@ controls have been independently verified.
 
 An independent assessor should receive a frozen commit, build/release manifests,
 exact test commands and reports, the architecture/specification, this threat
-model, audit exemption/import ledgers, and an isolated local reproduction
+model, missing-audit inventory/import records, and an isolated local reproduction
 setup. Require independence from the implementation team and disclose AI
 assistance. Agree on owned infrastructure, methods, resource limits and private
 reporting before any external network assessment.

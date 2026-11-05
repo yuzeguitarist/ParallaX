@@ -72,7 +72,7 @@ RustCrypto against production aws-lc, with independent nonce/direction derivatio
 sequence carry, rekey and serial/parallel batches. This is not a second complete
 TLS/QUIC implementation.
 
-Fault fixtures cover partial reads/writes, Pending, cancellation, EOF, errors,
+Fault fixtures cover partial reads, Pending, cancellation, EOF, errors,
 authentication failure, poisoning and output rollback. Listener tests spawn the
 production binary with fresh keys and a local trusted origin. Rejection requires
 observing the actual gate and zero target connections; timeout alone is insufficient.
@@ -95,7 +95,7 @@ validation. Their presence does not make them required merge checks; configure
 branch rules separately.
 
 Read [dependency policy/debt](../../supply-chain/README.md) and
-[consumer release verification](RELEASE-VERIFICATION.md). Uncovered dependencies
+[consumer release verification](../../supply-chain/RELEASE-VERIFICATION.md). Uncovered dependencies
 remain review debt and fail strict vet; they are not granted deployment approval.
 No tag/release is needed for PR checks.
 

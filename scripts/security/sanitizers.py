@@ -29,7 +29,7 @@ DIAGNOSTICS = {
 }
 SUITES = (
     ("library", ["--lib"], []),
-    ("linux-fd-lifetimes", ["--lib", "transport::tcp::"], ["--ignored"]),
+    ("linux-fd-lifetimes", ["--lib", "transport::tcp::"], []),
     ("protocol-oracles", ["--test", "security_protocol_differential"], []),
     ("fault-injection", ["--test", "security_fault_injection"], []),
     ("plaintext-reallocation", ["--test", "security_plaintext_allocation"], []),
@@ -47,6 +47,15 @@ def expected_detection(kind: str, returncode: int, output: str) -> bool:
 
 def listed_tests(output: str) -> list[str]:
     return re.findall(r"^([A-Za-z_][A-Za-z0-9_:]*): test$", output, flags=re.MULTILINE)
+
+
+def completed_counts(output: str, selected: int, *, allow_ignored: bool = False) -> dict[str, int]:
+    summaries = re.findall(
+        r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", output)
+    passed, failed, ignored = [sum(int(row[i]) for row in summaries) for i in range(3)]
+    if not passed or failed or passed + ignored != selected or (ignored and not allow_ignored):
+        raise RuntimeError("Incomplete sanitizer test execution")
+    return {"passed": passed, "failed": failed, "ignored": ignored}
 
 
 def configured_environment(kind: str, target_dir: Path) -> dict[str, str]:
@@ -200,24 +209,31 @@ class Runner:
             "sanitizer-symbols-observed-for-each-native-dependency; assembly-excluded")
 
     def application(self) -> None:
+        failures = []
         for label, selection, runtime in SUITES:
             command = self.cargo() + selection + ["--"] + runtime
             listing = self.run(label + "-list", command + ["--list"])
             names = listed_tests(listing.stdout)
             if not names:
                 raise RuntimeError(f"Empty sanitizer test selection: {label}")
-            self.report["tests"][label] = {"listed": names}
-            execution = self.run(label, command + ["--test-threads=1"])
-            summaries = re.findall(
-                r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;",
-                execution.stdout)
-            passed, failed, ignored = [
-                sum(int(row[i]) for row in summaries) for i in range(3)]
-            if not passed or failed or passed + ignored != len(names):
-                raise RuntimeError(f"Incomplete application test execution: {label}")
-            self.report["tests"][label].update(
-                {"passed": passed, "failed": failed, "ignored": ignored})
+            entry = {"listed": names, "status": "running"}
+            self.report["tests"][label] = entry
+            self.save()
+            try:
+                execution = self.run(label, command + ["--test-threads=1"])
+                entry.update(completed_counts(execution.stdout, len(names),
+                                              allow_ignored=label == "library"))
+                entry["status"] = "passed"
+            except RuntimeError as error:
+                # Retain failures and collect evidence from other compiled
+                # targets. Any failure still makes the overall run fail.
+                entry.update({"status": "failed", "error": str(error)})
+                failures.append(label)
+            finally:
+                self.save()
         self.native_inventory()
+        if failures:
+            raise RuntimeError(f"Sanitizer workload(s) failed: {', '.join(failures)}")
 
     def save(self) -> None:
         (self.output / "report.json").write_text(

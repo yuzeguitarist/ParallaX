@@ -38,7 +38,7 @@ Source implementation takes precedence where older descriptive prose differs.
 | Loom | Compile actual production synchronization logic through a small backend facade; explore explicit finite scenarios | Exhaustive exploration of Tokio, the OS, network or complete application |
 | Shuttle | Same production logic, deterministic workload and recorded scheduling seed, larger randomized schedules | Proof of every schedule or weak-memory behavior |
 | ASan / TSan / LSan | Separate target directories and instrumented std/native build, positive and negative canaries, executed production tests | Inspection of unexecuted paths, all handwritten assembly, or external OS libraries |
-| Dependency review | Frozen cargo-vet stores for each workspace, immutable imports and exact exemption ratchet | A baseline exemption is not a source audit; AI review is not independent human certification |
+| Dependency review | Frozen cargo-vet stores for each workspace, immutable imports, zero exemptions and explicit missing-audit inventory | Missing audits fail strict vet; AI review is not independent human certification |
 | Release evidence | Read-only builds, per-target SBOM/native inventory, final-byte hashes, source-free privileged attestation/publish | SLSA Build L3 or a completed live signing run before a release event |
 | Protocol differential | Independent SPEC-derived parsers and an independent AEAD backend, accepted and rejected corpora | Interoperability with a full independently implemented ParallaX peer |
 | Fault injection | Explicit cancellation/Pending/EOF/error boundaries and real process/listener tests | Every possible kernel/resource/network failure |
@@ -96,6 +96,12 @@ Source implementation takes precedence where older descriptive prose differs.
     noncommercial license does not satisfy the Baseline's open-source-license
     controls; this change does not alter licensing. MFA, branch protection and
     independent human approval cannot be asserted from repository files alone.
+
+During implementation, automatic approval review rejected broad bootstrap vet
+exemptions because they would grant deployment criteria without source audits.
+The adopted fallback uses zero exemptions: missing reviews are recorded as debt
+and strict vet fails until actual review evidence covers them. A passing policy
+test must never be described as a passing dependency source audit.
 
 ## Implementation and acceptance process
 

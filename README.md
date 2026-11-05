@@ -335,6 +335,18 @@ Run the GFW simulator directly:
 cargo test --locked --test gfw_simulator
 ```
 
+Project-specific security suites are documented in the
+[security assurance guide](./docs/security/README.md): actual-source Loom/Shuttle
+models, Linux ASan/TSan/LSan workloads, protocol differential and fault tests,
+and real-listener admission/replay checks. They run in dedicated Actions jobs
+and retain their test selections, bounds and diagnostics.
+
+See the [threat model](./docs/security/threat-model.md),
+[dependency source-audit policy and open audit debt](./supply-chain/README.md),
+and [release SBOM/provenance verification](./supply-chain/RELEASE-VERIFICATION.md).
+Strict cargo-vet remains failing until missing source audits are completed;
+policy validation does not grant exemptions or imply completed audits.
+
 ---
 
 ## Benchmarking and speed evidence
