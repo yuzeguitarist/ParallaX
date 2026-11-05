@@ -1075,6 +1075,14 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     }
 }
 
+/// One connection on the public entry.
+///
+/// Shares one authenticated replay cache per path, the same object every
+/// direct caller uses, and passes it in. A per-call `load_or_create` used to
+/// give concurrent callers distinct snapshots, so a ClientHello accepted by
+/// one could be rekeyed by another before either fsync. A missing cache still
+/// fails closed in `commit_pending_replay_entry`. The accept-loop admission
+/// permit stays with [`run`], which keeps the cache it loaded at startup.
 pub async fn handle_connection(
     client: TcpStream,
     config: &ServerConfig,
@@ -1084,7 +1092,82 @@ pub async fn handle_connection(
 ) -> Result<(), HandshakeServerError> {
     let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let secrets = ServerRuntimeSecrets::decode(config)?;
-    handle_connection_inner(client, config, traffic, udp, psk, None, &secrets, cid, None).await
+    let replay_cache = shared_replay_cache(config, psk).await?;
+    handle_connection_inner(
+        client,
+        config,
+        traffic,
+        udp,
+        psk,
+        Some(replay_cache),
+        &secrets,
+        cid,
+        None,
+    )
+    .await
+}
+
+type ReplayCacheKey = (std::path::PathBuf, usize, [u8; 32]);
+type SharedReplayCacheSlot = Arc<Mutex<Option<Arc<Mutex<ReplayCache>>>>>;
+
+fn shared_replay_cache_table() -> &'static Mutex<HashMap<ReplayCacheKey, SharedReplayCacheSlot>> {
+    static TABLE: OnceLock<Mutex<HashMap<ReplayCacheKey, SharedReplayCacheSlot>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn initialize_shared_replay_cache(
+    slot: SharedReplayCacheSlot,
+    load: impl FnOnce() -> Result<ReplayCache, ReplayCacheError> + Send + 'static,
+) -> Result<Arc<Mutex<ReplayCache>>, HandshakeServerError> {
+    tokio::task::spawn_blocking(move || {
+        // Loading can compact/upgrade the journal. Keep the single-flight lock
+        // inside the blocking task so cancelling its async waiter cannot let a
+        // second loader rewrite the file while the first is still running.
+        let mut initialized = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cache) = initialized.as_ref() {
+            return Ok(Arc::clone(cache));
+        }
+        let cache = Arc::new(Mutex::new(load()?));
+        *initialized = Some(Arc::clone(&cache));
+        Ok::<_, ReplayCacheError>(cache)
+    })
+    .await?
+    .map_err(Into::into)
+}
+
+/// The replay cache for `config.replay_cache_path`. The first caller loads it
+/// on a blocking thread; every later caller with the same path, capacity, and
+/// PSK receives that `Arc`. Publish the initialization slot before any load,
+/// since recovery and legacy-format upgrades can rewrite the journal.
+async fn shared_replay_cache(
+    config: &ServerConfig,
+    psk: &[u8],
+) -> Result<Arc<Mutex<ReplayCache>>, HandshakeServerError> {
+    let mut mac = Sha256::new();
+    mac.update(psk);
+    let key: ReplayCacheKey = (
+        config.replay_cache_path.clone(),
+        config.replay_cache_capacity,
+        mac.finalize().into(),
+    );
+    let slot = {
+        let mut table = shared_replay_cache_table()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            table
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(None))),
+        )
+    };
+    let path = config.replay_cache_path.clone();
+    let capacity = config.replay_cache_capacity;
+    let psk = Zeroizing::new(psk.to_vec());
+    let window = replay_freshness_window_secs();
+    initialize_shared_replay_cache(slot, move || {
+        ReplayCache::load_or_create_authenticated_with_window(&path, capacity, &psk, window)
+    })
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3702,8 +3785,11 @@ async fn insert_replay_entry_blocking(
 async fn commit_pending_replay_entry(
     pending_replay: &mut Option<PendingReplayEntry>,
 ) -> Result<bool, HandshakeServerError> {
+    // No cache means this handshake was not recorded. Treating that as a fresh
+    // insert let a caller rekey with replay protection skipped. Fail closed the
+    // same way a replay does: the data path returns before `apply_server_pq_rekey`.
     let Some(pending) = pending_replay.take() else {
-        return Ok(true);
+        return Ok(false);
     };
     insert_replay_entry_blocking(pending.cache, pending.entry).await
 }
@@ -7379,6 +7465,136 @@ mod tests {
         assert!(first.is_none());
         assert!(!commit_pending_replay_entry(&mut replayed).await.unwrap());
         assert!(replayed.is_none());
+
+        let mut missing = None;
+        assert!(
+            !commit_pending_replay_entry(&mut missing).await.unwrap(),
+            "a missing replay cache is not a fresh insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_connections_share_one_replay_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_keys = X25519KeyPair::generate();
+        let identity_keys = identity::keypair();
+        let config = authenticated_server_config(
+            "127.0.0.1:1".parse().unwrap(),
+            &server_keys,
+            &identity_keys,
+            dir.path().join("replay.cache"),
+        );
+        let (first, second) = tokio::join!(
+            shared_replay_cache(&config, PSK),
+            shared_replay_cache(&config, PSK)
+        );
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two direct callers of one path must commit into the same cache"
+        );
+        let now = current_unix_timestamp().unwrap();
+        let entry = ReplayEntry {
+            timestamp: now,
+            nonce: [9; 8],
+            transcript_fingerprint: [9; 32],
+        };
+        assert_eq!(
+            first
+                .lock()
+                .unwrap()
+                .insert_new_outcome(entry.clone(), now)
+                .unwrap(),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(
+            second
+                .lock()
+                .unwrap()
+                .insert_new_outcome(entry, now)
+                .unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_replay_cache_waiter_does_not_start_a_second_journal_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.cache");
+        let slot: SharedReplayCacheSlot = Arc::new(Mutex::new(None));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_slot = Arc::clone(&slot);
+        let first_loads = Arc::clone(&loads);
+        let first_path = path.clone();
+        let now = current_unix_timestamp().unwrap();
+        let entry = ReplayEntry {
+            timestamp: now,
+            nonce: [19; 8],
+            transcript_fingerprint: [29; 32],
+        };
+        let first_entry = entry.clone();
+        let first = tokio::spawn(initialize_shared_replay_cache(first_slot, move || {
+            first_loads.fetch_add(1, Ordering::SeqCst);
+            let mut cache = ReplayCache::load_or_create_authenticated(&first_path, 8, PSK)?;
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                cache.insert_new_outcome(first_entry, now)?,
+                ReplayInsertOutcome::Inserted
+            );
+            Ok(cache)
+        }));
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_loads = Arc::clone(&loads);
+        let second_path = path.clone();
+        let mut second = tokio::spawn(initialize_shared_replay_cache(slot, move || {
+            second_loads.fetch_add(1, Ordering::SeqCst);
+            ReplayCache::load_or_create_authenticated(&second_path, 8, PSK)
+        }));
+        // The first blocking loader still owns initialization after its waiter
+        // is cancelled. A competing caller must wait rather than load a stale
+        // snapshot that can later compact over the first loader's durable entry.
+        assert!(timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err());
+        release_tx.send(()).unwrap();
+        let cache = timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cache
+                .lock()
+                .unwrap()
+                .insert_new_outcome(entry.clone(), now)
+                .unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, PSK).unwrap();
+        assert_eq!(
+            reloaded.insert_new_outcome(entry, now).unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_cache_initialization_failure_can_be_retried() {
+        let slot: SharedReplayCacheSlot = Arc::new(Mutex::new(None));
+        assert!(initialize_shared_replay_cache(Arc::clone(&slot), || {
+            Err(ReplayCacheError::Io(io::Error::other("load failure")))
+        })
+        .await
+        .is_err());
+        initialize_shared_replay_cache(slot, || Ok(ReplayCache::new(8)))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -11145,13 +11361,16 @@ mod tests {
         let mut client = TcpStream::connect(parallax_addr).await.unwrap();
         let auth_key =
             *derive_client_auth_key(PSK, &client_keys.private, &server_keys.public).unwrap();
+        // `handle_connection` now commits this ClientHello into a real replay
+        // cache before the PQ rekey. A frozen 2023 timestamp is Stale and the
+        // server closes instead of answering PX1K.
         let client_hello = masked_authed_client_hello(
             &server_keys.private,
             &client_keys.public,
             &[0x44_u8; 32],
             "example.com",
             &auth_key,
-            1_700_000_001,
+            current_unix_timestamp().unwrap(),
         );
         let mut rng = StdRng::seed_from_u64(20);
         client.write_all(&client_hello).await.unwrap();
