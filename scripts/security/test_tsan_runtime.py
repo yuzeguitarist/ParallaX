@@ -11,8 +11,13 @@ import importlib.util
 import io
 import json
 import os
+import signal
+import subprocess
+import sys
 import tarfile
 import tempfile
+import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -203,6 +208,156 @@ class RuntimeBuilderGuards(unittest.TestCase):
             with self.assertRaisesRegex(rt.BuildError, "native Linux x86_64"):
                 rt.build_runtime(args)
         self.assertFalse(output.exists())
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX command-group cleanup")
+class RuntimeProcessGuards(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.groups = set()
+        self.caller_group = os.getpgrp()
+        self.helper = self.root / "process_fixture.py"
+        self.helper.write_text(textwrap.dedent("""\
+            import os
+            import signal
+            import subprocess
+            import sys
+            import time
+            from pathlib import Path
+
+            mode, directory = sys.argv[1:]
+            root = Path(directory)
+            if mode == "grandchild":
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                (root / "grandchild.pid").write_text(str(os.getpid()))
+                while True:
+                    time.sleep(0.1)
+            (root / "parent.pid").write_text(str(os.getpid()))
+            child = subprocess.Popen([sys.executable, __file__, "grandchild", directory])
+            deadline = time.monotonic() + 10
+            while not (root / "grandchild.pid").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("grandchild did not start")
+                time.sleep(0.01)
+            if mode == "fail":
+                raise SystemExit(7)
+            while True:
+                time.sleep(0.1)
+            """), encoding="utf-8")
+
+    def tearDown(self):
+        # A broken cleanup implementation must not leave test descendants.
+        parent = self.root / "parent.pid"
+        if parent.exists():
+            self.groups.add(int(parent.read_text()))
+        for group in self.groups:
+            if group != self.caller_group and group > 1:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.temporary.cleanup()
+
+    def wait_for(self, path):
+        deadline = time.monotonic() + 10
+        while not path.exists():
+            if time.monotonic() >= deadline:
+                self.fail(f"fixture did not create {path.name}")
+            time.sleep(0.02)
+
+    def assert_descendants_exited(self):
+        for filename in ("parent.pid", "grandchild.pid"):
+            path = self.root / filename
+            self.assertTrue(path.is_file(), f"missing real-process fixture: {filename}")
+            pid = int(path.read_text())
+            with self.assertRaises(ProcessLookupError, msg=f"process {pid} survived cleanup"):
+                os.kill(pid, 0)
+        self.assertEqual(os.getpgrp(), self.caller_group)
+
+    def test_timeout_cleans_real_descendants_without_signalling_caller(self):
+        report = {"commands": []}
+        commands = rt.Commands(self.root, rt.clean_environment(dict(os.environ)), report)
+        with mock.patch.object(rt.os, "killpg", wraps=os.killpg) as signal_group:
+            with rt.work_directory(self.root, commands) as work:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    commands.run([sys.executable, str(self.helper), "hang", str(self.root)],
+                                 "timeout-fixture", work, timeout=3)
+                self.assertTrue(work.is_dir())
+            self.assertFalse(work.exists())
+            self.assertTrue(signal_group.called)
+            for call in signal_group.call_args_list:
+                self.assertGreater(call.args[0], 1)
+                self.assertNotEqual(call.args[0], self.caller_group)
+        self.assertTrue(report["commands"][0]["cleanup_complete"])
+        self.assert_descendants_exited()
+
+    def test_nonzero_exit_cleans_abandoned_descendants(self):
+        report = {"commands": []}
+        commands = rt.Commands(self.root, rt.clean_environment(dict(os.environ)), report)
+        with self.assertRaisesRegex(rt.BuildError, r"failed \(7\)"):
+            commands.run([sys.executable, str(self.helper), "fail", str(self.root)],
+                         "nonzero-fixture", self.root, timeout=10)
+        self.assertTrue(report["commands"][0]["cleanup_complete"])
+        self.assert_descendants_exited()
+
+    def test_sigterm_unwinds_main_and_cleans_nested_command_group(self):
+        driver = self.root / "driver_fixture.py"
+        driver.write_text(textwrap.dedent("""\
+            import importlib.util
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            spec = importlib.util.spec_from_file_location("runtime_builder", sys.argv[1])
+            rt = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(rt)
+            root = Path(sys.argv[2])
+            report = {"commands": []}
+            def build_fixture(_args):
+                commands = rt.Commands(root, rt.clean_environment(dict(os.environ)), report)
+                with rt.work_directory(root, commands) as work:
+                    (root / "work.path").write_text(str(work))
+                    try:
+                        commands.run([sys.executable, str(root / "process_fixture.py"),
+                                      "hang", str(root)], "term-fixture", work, timeout=30)
+                    finally:
+                        (root / "commands.json").write_text(json.dumps(report))
+            rt.build_runtime = build_fixture
+            raise SystemExit(rt.main([]))
+            """), encoding="utf-8")
+        with (self.root / "driver.log").open("w") as stream:
+            driver_process = subprocess.Popen(
+                [sys.executable, str(driver), str(Path(rt.__file__).resolve()), str(self.root)],
+                stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+            self.groups.add(driver_process.pid)
+            try:
+                self.wait_for(self.root / "grandchild.pid")
+                command_group = int((self.root / "parent.pid").read_text())
+                self.assertNotEqual(command_group, driver_process.pid)
+                self.assertNotEqual(command_group, self.caller_group)
+                driver_process.send_signal(signal.SIGTERM)
+                self.assertEqual(driver_process.wait(timeout=10), 1)
+            finally:
+                if driver_process.poll() is None:
+                    os.killpg(driver_process.pid, signal.SIGKILL)
+                    driver_process.wait(timeout=5)
+        report = json.loads((self.root / "commands.json").read_text())
+        self.assertTrue(report["commands"][0]["cleanup_complete"])
+        self.assertIn("terminated by signal", (self.root / "driver.log").read_text())
+        self.assertFalse(Path((self.root / "work.path").read_text()).exists())
+        self.assert_descendants_exited()
+
+    def test_unconfirmed_cleanup_retains_work_for_failed_report(self):
+        report = {"commands": []}
+        commands = rt.Commands(self.root, {}, report)
+        with self.assertRaisesRegex(rt.BuildError, "fixture cleanup failed"):
+            with rt.work_directory(self.root, commands) as work:
+                commands.safe_to_clean = False
+                raise rt.BuildError("fixture cleanup failed")
+        self.assertTrue(work.is_dir())
+        self.assertEqual(report["retained_work_directory"], str(work))
 
 
 @unittest.skipUnless(os.environ.get("PARALLAX_TSAN_VERIFY_INPUTS") == "1",

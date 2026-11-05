@@ -15,12 +15,14 @@ Sources and intermediate build files are temporary; every invocation rebuilds.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -242,6 +244,30 @@ class Commands:
         self.output = output
         self.environment = environment
         self.report = report
+        self.safe_to_clean = True
+
+    def finish_group(self, process: subprocess.Popen, record: dict) -> None:
+        # CMake can have Ninja/compiler descendants after its own exit. Each
+        # command owns a session, so cleanup must target that group, never the
+        # caller's session. Keep cleanup below the outer runner's 10s grace.
+        if process.pid == os.getpgrp():
+            raise BuildError("refusing to signal the runtime builder's process group")
+        deadline = time.monotonic() + 5
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        while True:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                self.safe_to_clean = True
+                record["cleanup_complete"] = True
+                return
+            if time.monotonic() >= deadline:
+                raise BuildError(f"command group {process.pid} did not exit after SIGKILL")
+            time.sleep(0.02)
 
     def run(self, command: list[str], label: str, cwd: Path,
             timeout: int = 1800) -> str:
@@ -254,14 +280,37 @@ class Commands:
         with log.open("w", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
             stream.flush()
-            process = subprocess.run(command, cwd=cwd, env=self.environment,
-                                     stdout=stream, stderr=subprocess.STDOUT,
-                                     timeout=timeout, check=False)
-        record["returncode"] = process.returncode
+            process = subprocess.Popen(command, cwd=cwd, env=self.environment,
+                                       stdout=stream, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+            self.safe_to_clean = False
+            record["process_group"] = process.pid
+            record["cleanup_complete"] = False
+            try:
+                process.wait(timeout=timeout)
+            finally:
+                try:
+                    self.finish_group(process, record)
+                finally:
+                    record["returncode"] = process.returncode
         text = log.read_text(encoding="utf-8", errors="replace")
         if process.returncode:
             raise BuildError(f"{label} failed ({process.returncode}); see {log}\n{text[-4000:]}")
         return text
+
+
+@contextlib.contextmanager
+def work_directory(output: Path, commands: Commands):
+    work = Path(tempfile.mkdtemp(prefix=".work-", dir=output))
+    try:
+        yield work
+    finally:
+        if commands.safe_to_clean:
+            shutil.rmtree(work)
+        else:
+            # Fail closed if a process could still be using its sources. A
+            # retained path is diagnostic evidence, never a usable runtime.
+            commands.report["retained_work_directory"] = str(work)
 
 
 def executable(name: str) -> Path:
@@ -405,8 +454,7 @@ def build_runtime(args) -> dict:
             report["llvm_config"] = {"path": str(llvm_cmake / "LLVMConfig.cmake"),
                                      "sha256": sha256_file(llvm_cmake / "LLVMConfig.cmake")}
             report["removed_environment_names"] = sorted(set(os.environ) - set(environment))
-            with tempfile.TemporaryDirectory(prefix=".work-", dir=output) as temporary:
-                work = Path(temporary)
+            with work_directory(output, commands) as work:
                 archive = work / "llvm-project.tar.gz"
                 patch = work / "upstream.patch"
                 print(f"{TOOL}: acquiring pinned source and patch", flush=True)
@@ -481,12 +529,23 @@ def arguments(argv=None):
     return args
 
 
+def terminate_build(signum, _frame) -> None:
+    # The outer sanitizer runner allows cleanup before escalating to SIGKILL.
+    # Ignore repeated TERM while unwinding the active command's finally block.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise BuildError(f"runtime build terminated by signal {signum}")
+
+
 def main(argv=None) -> int:
+    previous = signal.signal(signal.SIGTERM, terminate_build)
     try:
-        report = build_runtime(arguments(argv))
-    except (BuildError, OSError, ValueError) as error:
-        print(f"{TOOL}: {error}", file=sys.stderr)
-        return 1
+        try:
+            report = build_runtime(arguments(argv))
+        except (BuildError, OSError, ValueError) as error:
+            print(f"{TOOL}: {error}", file=sys.stderr)
+            return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous)
     print(json.dumps({"report": str(Path(report["archive"]["path"]).parent / "report.json"),
                       "archive": report["archive"], "dynamic_list": report["dynamic_list"]},
                      sort_keys=True))
